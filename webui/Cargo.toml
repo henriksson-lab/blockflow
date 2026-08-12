@@ -1,0 +1,30 @@
+# Its own workspace: this crate targets `wasm32-unknown-unknown` and is built by
+# `trunk`, not by `cargo` from the parent directory. Declaring `[workspace]` here
+# keeps it out of `blockflow`'s, so `cargo test` in `blockflow` neither builds it
+# nor resolves its dependencies — which is the whole reason the browser half is a
+# separate crate rather than a feature of the server one.
+[workspace]
+
+[package]
+name = "blockflow-webui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The browser view for blockflow's block-scheduler progress server."
+
+[dependencies]
+yew = { version = "0.21", features = ["csr"] }
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+serde = { version = "1", features = ["derive"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlInputElement"] }
+
+[profile.release]
+# The page is fetched over an SSH forward that may be a long way away, so size
+# is worth more here than the last few percent of speed.
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1

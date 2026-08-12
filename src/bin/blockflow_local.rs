@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: MIT
+//
+// Original work for this crate.
+//
+// Local multi-node mode: one command, a coordinator and N workers, **as
+// separate processes**.
+//
+//     blockflow-local --workers 4
+//     blockflow-local --workers 8 --blocks 32 --phases 2 --policy nearest-first
+//     blockflow-local --workers 3 --kill 0:2        # a worker dies mid-run
+//
+// Processes rather than threads, and that is the point rather than an
+// implementation detail. A thread-based fake shares one address space, one
+// cache, one memory budget and one set of file handles, so it would exercise
+// the message shapes and none of the things that actually go wrong: a worker
+// reading an intermediate the writer had not flushed, two processes writing one
+// file, an event stream that merges correctly only because both ends were the
+// same object, a work list that stays ahead only because the "network" was a
+// function call.
+//
+// It runs the same two binaries a cluster runs, over the same rendezvous, with
+// the same protocol. What differs on a cluster is which rendezvous and who
+// starts the processes.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use blockflow::distributed::local::{self, LocalOptions};
+use blockflow::distributed::shared_volume::SharedVolumes;
+use blockflow::distributed::spec::{probe_job_over, ChainSpec, StoreSpec};
+use blockflow::distributed::HandoutPolicy;
+use blockflow::error::{Error, Result};
+use ndarray::Array3;
+
+const USAGE: &str = "\
+blockflow-local — a coordinator and N workers, as separate processes, here.
+
+    blockflow-local [--workers N] [options]
+
+  --workers N       How many worker processes. Default 2.
+  --blocks N        Blocks along the split axis. Default 16.
+  --phases N        Phases in the chain. Default 1.
+  --policy NAME     naive | nearest-first | cache-modelled. Default nearest-first.
+  --ahead N         Tasks each worker keeps in hand. Default 2.
+  --kill I:N        SIGKILL worker I once the job reports N tasks done. The
+                    process is taken wherever it is — possibly inside a task,
+                    certainly holding the tasks its list was keeping ahead — so
+                    the coordinator finds out the only way it can: the lease runs
+                    out and the claims are reissued.
+  --lease-ms N      How long a claim survives without a completion. Default
+                    30000; lower it to see a reissue quickly.
+  --dir PATH        Where to put the job, the volumes and the reports.
+                    Default: a fresh directory under the system temporary one.
+  --keep            Do not delete the directory afterwards.
+  --quiet           Do not pass the children's output through.
+  --help
+";
+
+fn main() {
+    if let Err(error) = go() {
+        eprintln!("blockflow-local: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn go() -> Result<()> {
+    let mut workers = 2usize;
+    let mut blocks = 16usize;
+    let mut phases = 1usize;
+    let mut policy = HandoutPolicy::default();
+    let mut ahead = 2usize;
+    let mut kill: Vec<(usize, usize)> = Vec::new();
+    let mut lease_ms: Option<u64> = None;
+    let mut dir: Option<PathBuf> = None;
+    let mut keep = false;
+    let mut quiet = false;
+
+    let mut rest = std::env::args().skip(1);
+    while let Some(flag) = rest.next() {
+        let mut value = || {
+            rest.next()
+                .ok_or_else(|| Error::invalid(format!("{flag} needs a value")))
+        };
+        let number = |text: String, what: &str| -> Result<usize> {
+            text.parse()
+                .map_err(|_| Error::invalid(format!("{what} takes a number")))
+        };
+        match flag.as_str() {
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            "--workers" => workers = number(value()?, "--workers")?,
+            "--blocks" => blocks = number(value()?, "--blocks")?,
+            "--phases" => phases = number(value()?, "--phases")?,
+            "--ahead" => ahead = number(value()?, "--ahead")?,
+            "--policy" => {
+                let name = value()?;
+                policy = HandoutPolicy::parse(&name).ok_or_else(|| {
+                    Error::invalid(format!(
+                        "{name:?} is not a handout policy: naive, nearest-first, \
+                         cache-modelled"
+                    ))
+                })?;
+            }
+            "--kill" => {
+                let text = value()?;
+                let (which, after) = text.split_once(':').ok_or_else(|| {
+                    Error::invalid("--kill takes WORKER:TASKS, for example 0:2".to_string())
+                })?;
+                kill.push((
+                    number(which.to_string(), "--kill")?,
+                    number(after.to_string(), "--kill")?,
+                ));
+            }
+            "--lease-ms" => {
+                lease_ms = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| Error::invalid("--lease-ms takes a number".to_string()))?,
+                )
+            }
+            "--dir" => dir = Some(PathBuf::from(value()?)),
+            "--keep" => keep = true,
+            "--quiet" => quiet = true,
+            other => return Err(Error::invalid(format!("unknown flag {other:?}\n\n{USAGE}"))),
+        }
+    }
+
+    let dir = dir.unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("blockflow-local-{}", std::process::id()))
+    });
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| Error::backend(format!("creating {}: {err}", dir.display())))?;
+    let volumes = dir.join("volumes");
+
+    let (mut spec, decomposition) = probe_job_over(
+        blocks,
+        phases,
+        ChainSpec::identity(),
+        StoreSpec::Files {
+            dir: volumes.clone(),
+        },
+    );
+    spec.policy = policy;
+    if let Some(lease) = lease_ms {
+        spec.lease_ms = lease;
+    }
+
+    // The input, written once, by whoever submits the job. On a cluster this is
+    // an array that already exists; here it has to be made.
+    let store = SharedVolumes::create(
+        &volumes,
+        spec.workflow.shape,
+        spec.workflow.chunk,
+        decomposition.n_phases(),
+    )?;
+    store.write_level(0, &ramp(spec.workflow.shape))?;
+    drop(store);
+
+    let mut options = LocalOptions::new(dir.clone(), workers)?;
+    options.kill_at_progress = kill;
+    options.inherit_output = !quiet;
+    options.ahead = ahead;
+    options.timeout = Duration::from_secs(300);
+
+    println!(
+        "{} workers, {} tasks over {} phases, {:?} voxels, handout {}",
+        workers,
+        decomposition.n_tasks(),
+        decomposition.n_phases(),
+        decomposition.volume,
+        spec.policy.as_str()
+    );
+    let run = local::run(&options, &spec, &decomposition)?;
+    println!(
+        "\ndone in {:?}: {} of {} tasks, {} reissued, {} events, {} workers",
+        run.elapsed,
+        run.status.done,
+        run.status.tasks,
+        run.status.reissued,
+        run.status.events,
+        run.status.workers
+    );
+    println!(
+        "coverage: {}",
+        if run
+            .report
+            .get("coverage_ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            "every block, every op, in order".to_string()
+        } else {
+            format!(
+                "FAILED — {}",
+                run.report
+                    .get("coverage")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("(no reason recorded)")
+            )
+        }
+    );
+    println!(
+        "pipeline: {} tasks started with work already in hand, {} starved",
+        run.started_ready(),
+        run.starved()
+    );
+    if !run.reissued().is_empty() {
+        println!("reissued: {:?}", run.reissued());
+    }
+    println!("output and reports in {}", dir.display());
+    if !keep {
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    Ok(())
+}
+
+/// A volume whose every voxel is different, so a block written to the wrong
+/// place is visible rather than plausible.
+fn ramp(shape: [usize; 3]) -> Array3<f64> {
+    let mut array = Array3::zeros((shape[0], shape[1], shape[2]));
+    for (flat, value) in array.iter_mut().enumerate() {
+        *value = flat as f64;
+    }
+    array
+}

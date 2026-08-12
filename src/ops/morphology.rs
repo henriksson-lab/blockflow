@@ -1,0 +1,434 @@
+// SPDX-License-Identifier: MIT
+//
+// Original work for this crate.
+//
+// Binary morphology over a parameterised structuring element: erosion,
+// dilation, and the two compositions of them.
+//
+// Opening and closing are written **once**, as compositions
+// -------------------------------------------------------
+// `open = dilate(erode(x))`, `close = erode(dilate(x))`, and neither has a loop
+// of its own. Two consequences follow and both are worth having:
+//
+// * there is no second erosion to drift from the first;
+// * the reach falls out of the composition rather than being asserted. An
+//   opening reads **twice** the element's radius, because its dilation consumes
+//   erosion values up to a radius away and each of those consumed input up to a
+//   radius beyond that. A hand-written opening is exactly the kind of op whose
+//   author writes `radius` in the halo formula and is wrong by a factor of two
+//   with no symptom except at block seams — which is the failure
+//   `docs/design/BLOCK_OPS.md` exists to remove.
+//
+// Edge behaviour
+// --------------
+// The element is clamped to the array handed in, and the clamp is the identity
+// of the operation: erosion takes the conjunction over the voxels that exist, so
+// what lies outside behaves as set; dilation takes the disjunction, so it
+// behaves as clear. That is the standard "the boundary does not erode the image
+// away" convention, it is right at a real volume boundary, and — as for the rank
+// filter — it is deliberately *wrong* at a block seam, which is what makes a
+// short halo visible instead of silent.
+
+use ndarray::{Array3, ArrayView3, ArrayViewMut3};
+
+use crate::dtype::Dtype;
+use crate::error::{Error, Result};
+use crate::op::{Anchor, BlockOp};
+use crate::voxels::Voxels;
+
+use super::element::StructuringElement;
+use super::shapes_agree;
+use super::voxelwise::{from_set, is_set};
+
+/// The conjunction of the element around every voxel.
+pub fn erode_into(
+    input: ArrayView3<'_, bool>,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
+    sweep(input, element, out, false, "erode_into")
+}
+
+/// The disjunction of the element around every voxel.
+pub fn dilate_into(
+    input: ArrayView3<'_, bool>,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
+    sweep(input, element, out, true, "dilate_into")
+}
+
+/// An erosion followed by a dilation. **Reaches twice the element's radius.**
+pub fn open_into(
+    input: ArrayView3<'_, bool>,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
+    let mut between = Array3::from_elem(input.raw_dim(), false);
+    erode_into(input, element, between.view_mut())?;
+    dilate_into(between.view(), element, out)
+}
+
+/// A dilation followed by an erosion. **Reaches twice the element's radius.**
+pub fn close_into(
+    input: ArrayView3<'_, bool>,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
+    let mut between = Array3::from_elem(input.raw_dim(), false);
+    dilate_into(input, element, between.view_mut())?;
+    erode_into(between.view(), element, out)
+}
+
+/// The one loop both primitives use.
+///
+/// `hit` is the value that decides the answer as soon as it is seen: `true` for
+/// a dilation (any set voxel sets the output), `false` for an erosion (any clear
+/// voxel clears it). Everything else about the two is identical, including the
+/// clamp, so writing them as one loop is not a saving of lines — it is a
+/// guarantee that they clamp the same way.
+fn sweep(
+    input: ArrayView3<'_, bool>,
+    element: &StructuringElement,
+    mut out: ArrayViewMut3<'_, bool>,
+    hit: bool,
+    what: &str,
+) -> Result<()> {
+    shapes_agree(input.shape(), out.shape(), what)?;
+    if element.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "{what}: an empty element has nothing to reduce over"
+        )));
+    }
+    let extent = [
+        input.shape()[0] as isize,
+        input.shape()[1] as isize,
+        input.shape()[2] as isize,
+    ];
+    for i in 0..input.shape()[0] {
+        for j in 0..input.shape()[1] {
+            for k in 0..input.shape()[2] {
+                let centre = [i as isize, j as isize, k as isize];
+                let mut answer = !hit;
+                for offset in element.offsets() {
+                    let a = centre[0] + offset[0];
+                    let b = centre[1] + offset[1];
+                    let c = centre[2] + offset[2];
+                    if a < 0 || b < 0 || c < 0 || a >= extent[0] || b >= extent[1] || c >= extent[2]
+                    {
+                        continue;
+                    }
+                    if input[[a as usize, b as usize, c as usize]] == hit {
+                        answer = hit;
+                        break;
+                    }
+                }
+                out[[i, j, k]] = answer;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Which of the four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Morphology {
+    Erode,
+    Dilate,
+    Open,
+    Close,
+}
+
+impl Morphology {
+    /// How many times the element's radius this operation reads.
+    ///
+    /// **Derived from the composition, not declared beside it.** A composition
+    /// of two passes reads two radii; that is the whole of the derivation, and
+    /// it is here rather than in the op so that a caller reasoning about the
+    /// kernels gets the same number as the planner does.
+    pub fn reach_factor(self) -> usize {
+        match self {
+            Morphology::Erode | Morphology::Dilate => 1,
+            Morphology::Open | Morphology::Close => 2,
+        }
+    }
+
+    pub fn apply_into(
+        self,
+        input: ArrayView3<'_, bool>,
+        element: &StructuringElement,
+        out: ArrayViewMut3<'_, bool>,
+    ) -> Result<()> {
+        match self {
+            Morphology::Erode => erode_into(input, element, out),
+            Morphology::Dilate => dilate_into(input, element, out),
+            Morphology::Open => open_into(input, element, out),
+            Morphology::Close => close_into(input, element, out),
+        }
+    }
+}
+
+/// Erode, dilate, open or close a mask over a parameterised element.
+pub struct MorphologyOp {
+    name: &'static str,
+    kind: Morphology,
+    element: StructuringElement,
+    cost: f64,
+}
+
+impl MorphologyOp {
+    pub fn new(name: &'static str, kind: Morphology, element: StructuringElement) -> Self {
+        let cost = cost_for(kind, &element);
+        Self {
+            name,
+            kind,
+            element,
+            cost,
+        }
+    }
+
+    pub fn element(&self) -> &StructuringElement {
+        &self.element
+    }
+
+    pub fn kind(&self) -> Morphology {
+        self.kind
+    }
+
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+impl BlockOp for MorphologyOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The element's radius times the number of passes. Nothing configures it,
+    /// and an opening reports twice what its element does.
+    fn reach(&self, axis: usize, _volume_len: usize) -> usize {
+        self.element.reach(axis) * self.kind.reach_factor()
+    }
+
+    /// A mask, held as a mask or held as `f64`.
+    ///
+    /// **`Bool` is the point of this pass.** A binary volume is what this op is
+    /// for and what the storage it comes from holds; carrying it as `f64` cost
+    /// eight bytes a voxel to represent one bit, plus a widen on the way in and
+    /// a narrow on the way out at every block. Both are now gone for the
+    /// `Bool` arm. `F64` stays because a chain may hold a mask as `f64` under
+    /// this module's `is_set`/`from_set` convention, and dropping it would break
+    /// every such chain for no gain.
+    fn accepts(&self, dtype: Dtype) -> bool {
+        matches!(dtype, Dtype::Bool | Dtype::F64)
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        match input.dtype() {
+            // No conversion and no intermediate: the kernel is a `bool` kernel
+            // and the buffer is a `bool` buffer.
+            Dtype::Bool => self.kind.apply_into(
+                input.view::<bool>()?,
+                &self.element,
+                out.view_mut::<bool>()?,
+            ),
+            _ => {
+                let mask = input.view::<f64>()?.mapv(is_set);
+                let mut result = Array3::from_elem(mask.raw_dim(), false);
+                self.kind
+                    .apply_into(mask.view(), &self.element, result.view_mut())?;
+                let mut out = out.view_mut::<f64>()?;
+                ndarray::Zip::from(&mut out)
+                    .and(&result)
+                    .for_each(|slot, &value| *slot = from_set(value));
+                Ok(())
+            }
+        }
+    }
+
+    /// Exactly the constant, as a mask, for all four operations.
+    ///
+    /// An erosion of an all-set neighbourhood is set and of an all-clear one is
+    /// clear; a dilation likewise; and a composition of two such passes is the
+    /// same constant again. The output is `0.0` or `1.0`, so a non-zero constant
+    /// maps to `1.0` — that is the mask convention applied consistently, not a
+    /// loss of information, since the op writes a mask whatever it was given.
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        Some(from_set(is_set(value)))
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+}
+
+/// Measured; see `super::COST_MEASUREMENT`.
+pub(super) fn cost_for(kind: Morphology, element: &StructuringElement) -> f64 {
+    MORPHOLOGY_COST_PER_ELEMENT_VOXEL * element.len() as f64 * kind.reach_factor() as f64
+}
+
+/// Measured; see `super::COST_MEASUREMENT`.
+pub(super) const MORPHOLOGY_COST_PER_ELEMENT_VOXEL: f64 = 1.38;
+
+#[cfg(test)]
+mod tests {
+    use super::super::element::{ElementShape, Rank};
+    use super::super::rank::rank_filter_into;
+    use super::*;
+
+    fn speckle(shape: (usize, usize, usize)) -> Array3<bool> {
+        Array3::from_shape_fn(shape, |(i, j, k)| (i * 31 + j * 17 + k * 7) % 5 < 2)
+    }
+
+    /// Erosion and dilation *are* the extreme ranks over the same element. The
+    /// morphology loop short-circuits and the rank filter selects, so they are
+    /// different code; they must not be different answers.
+    #[test]
+    fn erosion_and_dilation_are_the_extreme_ranks_of_the_same_element() {
+        let input = speckle((7, 6, 5));
+        for shape in [ElementShape::Box, ElementShape::Ellipsoid] {
+            for radius in [[1, 1, 1], [2, 0, 1]] {
+                let element = StructuringElement::from_radius(shape, radius);
+                let mut eroded = Array3::from_elem(input.raw_dim(), false);
+                erode_into(input.view(), &element, eroded.view_mut()).unwrap();
+                let mut lowest = Array3::from_elem(input.raw_dim(), false);
+                rank_filter_into(input.view(), &element, Rank::lowest(), lowest.view_mut())
+                    .unwrap();
+                assert_eq!(eroded, lowest, "erode {shape:?} {radius:?}");
+
+                let mut dilated = Array3::from_elem(input.raw_dim(), false);
+                dilate_into(input.view(), &element, dilated.view_mut()).unwrap();
+                let mut highest = Array3::from_elem(input.raw_dim(), false);
+                rank_filter_into(
+                    input.view(),
+                    &element,
+                    Rank::highest(&element),
+                    highest.view_mut(),
+                )
+                .unwrap();
+                assert_eq!(dilated, highest, "dilate {shape:?} {radius:?}");
+            }
+        }
+    }
+
+    /// The clamp behaves as the identity of the operation, which is what keeps a
+    /// volume from eroding away at its own faces.
+    #[test]
+    fn the_boundary_clamp_is_the_identity_of_the_operation() {
+        let input = Array3::from_elem((3, 3, 3), true);
+        let element = StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]);
+        let mut eroded = Array3::from_elem(input.raw_dim(), false);
+        erode_into(input.view(), &element, eroded.view_mut()).unwrap();
+        assert!(
+            eroded.iter().all(|&value| value),
+            "an all-set volume must survive its own boundary"
+        );
+
+        let input = Array3::from_elem((3, 3, 3), false);
+        let mut dilated = Array3::from_elem(input.raw_dim(), true);
+        dilate_into(input.view(), &element, dilated.view_mut()).unwrap();
+        assert!(dilated.iter().all(|&value| !value));
+    }
+
+    #[test]
+    fn opening_removes_an_isolated_voxel_and_closing_fills_an_isolated_hole() {
+        let element = StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]);
+
+        let mut speck = Array3::from_elem((7, 7, 7), false);
+        speck[[3, 3, 3]] = true;
+        let mut opened = Array3::from_elem(speck.raw_dim(), true);
+        open_into(speck.view(), &element, opened.view_mut()).unwrap();
+        assert!(opened.iter().all(|&value| !value));
+
+        let mut hole = Array3::from_elem((7, 7, 7), true);
+        hole[[3, 3, 3]] = false;
+        let mut closed = Array3::from_elem(hole.raw_dim(), false);
+        close_into(hole.view(), &element, closed.view_mut()).unwrap();
+        assert!(closed.iter().all(|&value| value));
+    }
+
+    /// The composition, and the reach that follows from it.
+    /// The `bool` arm and the `f64` arm are the same operation, and the `bool`
+    /// arm holds an eighth of the bytes. Both halves asserted, because the
+    /// second is the reason for the pass and the first is what makes it safe.
+    #[test]
+    fn a_mask_held_as_bool_and_as_f64_gives_the_same_answer_in_an_eighth_of_the_space() {
+        let element = StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]);
+        let op = MorphologyOp::new("open", Morphology::Open, element);
+        let mask = speckle((7, 6, 5));
+
+        let flags: Voxels = mask.clone().into();
+        let mut narrow = Voxels::zeros(Dtype::Bool, [7, 6, 5]).unwrap();
+        op.apply(&flags, &mut narrow, &Anchor::whole([7, 6, 5]))
+            .unwrap();
+
+        let wide_in: Voxels = mask.mapv(from_set).into();
+        let mut wide = Voxels::zeros(Dtype::F64, [7, 6, 5]).unwrap();
+        op.apply(&wide_in, &mut wide, &Anchor::whole([7, 6, 5]))
+            .unwrap();
+
+        let narrow_view = narrow.view::<bool>().unwrap();
+        let wide_view = wide.view::<f64>().unwrap();
+        for (flag, value) in narrow_view.iter().zip(wide_view.iter()) {
+            assert_eq!(from_set(*flag), *value);
+        }
+        assert_eq!(wide.bytes(), narrow.bytes() * 8);
+    }
+
+    #[test]
+    fn an_opening_reaches_twice_what_its_element_does() {
+        let element = StructuringElement::from_size(ElementShape::Box, [7, 7, 7]).unwrap();
+        let erode = MorphologyOp::new("erode", Morphology::Erode, element.clone());
+        let open = MorphologyOp::new("open", Morphology::Open, element);
+        assert_eq!(erode.reach(0, 1000), 3);
+        assert_eq!(open.reach(0, 1000), 6);
+    }
+
+    #[test]
+    fn opening_is_the_composition_and_not_a_second_implementation() {
+        let input = speckle((9, 8, 7));
+        let element = StructuringElement::from_radius(ElementShape::Ellipsoid, [2, 2, 2]);
+        let mut composed = Array3::from_elem(input.raw_dim(), false);
+        {
+            let mut between = Array3::from_elem(input.raw_dim(), false);
+            erode_into(input.view(), &element, between.view_mut()).unwrap();
+            dilate_into(between.view(), &element, composed.view_mut()).unwrap();
+        }
+        let mut opened = Array3::from_elem(input.raw_dim(), false);
+        open_into(input.view(), &element, opened.view_mut()).unwrap();
+        assert_eq!(opened, composed);
+    }
+
+    #[test]
+    fn every_operation_declares_the_constant_it_produces() {
+        let element = StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]);
+        for kind in [
+            Morphology::Erode,
+            Morphology::Dilate,
+            Morphology::Open,
+            Morphology::Close,
+        ] {
+            let op = MorphologyOp::new("m", kind, element.clone());
+            assert_eq!(op.constant_maps_to(0.0), Some(0.0), "{kind:?}");
+            assert_eq!(op.constant_maps_to(1.0), Some(1.0), "{kind:?}");
+            assert_eq!(op.constant_maps_to(9.0), Some(1.0), "{kind:?}");
+
+            // and computing it agrees with declaring it
+            for (constant, want) in [(0.0, 0.0), (9.0, 1.0)] {
+                let input: Voxels = Array3::from_elem((5, 5, 5), constant).into();
+                let mut out = Voxels::zeros(Dtype::F64, [5, 5, 5]).unwrap();
+                op.apply(&input, &mut out, &Anchor::whole([5, 5, 5]))
+                    .unwrap();
+                assert!(
+                    out.view::<f64>()
+                        .unwrap()
+                        .iter()
+                        .all(|&value| value == want),
+                    "{kind:?} on {constant}"
+                );
+            }
+        }
+    }
+}

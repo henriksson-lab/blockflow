@@ -1,0 +1,145 @@
+<!doctype html>
+<!--
+  SPDX-License-Identifier: MIT
+  Original work.
+
+  The shell trunk builds around `src/main.rs`. Everything visual is here, in one
+  stylesheet, so the WebAssembly is logic and the appearance can be read without
+  a compiler.
+
+  Colour, and why these particular values
+  ---------------------------------------
+  A block's fill encodes ONE thing: how far through the op chain it has got.
+  That is an ordered magnitude, so it gets a single-hue ordinal ramp, light to
+  dark, five steps — the most that keep a visible lightness gap between
+  neighbours. The two other things a block can be are absences of that: not yet
+  touched (the surface itself, with a hairline, so untouched reads as empty
+  rather than as "step zero"), and open (a ring, which is a shape channel and so
+  does not compete with the fill). Nothing is encoded by colour alone: the
+  legend names every step and every cell carries its exact state in its tooltip.
+
+  The dark steps are chosen for the dark surface rather than flipped, and the
+  ramp runs the other way there — on a dark ground, "more" is lighter.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>blockflow — schedule</title>
+    <link data-trunk rel="rust" data-wasm-opt="s" />
+    <style>
+      :root {
+        color-scheme: light;
+        --plane: #f9f9f7;
+        --surface: #fcfcfb;
+        --ink: #0b0b0b;
+        --ink-2: #52514e;
+        --muted: #898781;
+        --grid-line: #e1e0d9;
+        --border: rgba(11, 11, 11, 0.1);
+        --ring: rgba(11, 11, 11, 0.55);
+        /* ordinal chain-progress ramp, light surface (blue 250/350/450/550/700) */
+        --p0: #86b6ef;
+        --p1: #5598e7;
+        --p2: #2a78d6;
+        --p3: #1c5cab;
+        --p4: #0d366b;
+        --good: #0ca30c;
+        --critical: #d03b3b;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          color-scheme: dark;
+          --plane: #0d0d0d;
+          --surface: #1a1a19;
+          --ink: #ffffff;
+          --ink-2: #c3c2b7;
+          --muted: #898781;
+          --grid-line: #2c2c2a;
+          --border: rgba(255, 255, 255, 0.1);
+          --ring: rgba(255, 255, 255, 0.6);
+          /* the same hue, stepped for the dark surface, running the other way */
+          --p0: #184f95;
+          --p1: #256abf;
+          --p2: #3987e5;
+          --p3: #6da7ec;
+          --p4: #9ec5f4;
+        }
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--plane);
+        color: var(--ink);
+        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main { max-width: 78rem; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
+
+      h1 { font-size: 1.05rem; font-weight: 600; margin: 0; letter-spacing: .01em; }
+      h2 { font-size: .8rem; font-weight: 600; margin: 0 0 .6rem; color: var(--ink-2);
+           text-transform: uppercase; letter-spacing: .06em; }
+
+      .head { display: flex; flex-wrap: wrap; gap: .75rem 1.25rem; align-items: baseline;
+              margin-bottom: 1.1rem; }
+      .badge { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em;
+               border: 1px solid var(--border); border-radius: 999px; padding: .1rem .55rem;
+               color: var(--ink-2); }
+      .spacer { flex: 1; }
+      .link { display: inline-flex; align-items: center; gap: .4rem; color: var(--ink-2);
+              font-size: .8rem; }
+      .dot { width: .55rem; height: .55rem; border-radius: 50%; background: var(--good); }
+      .dot.down { background: var(--critical); }
+
+      .tiles { display: flex; flex-wrap: wrap; gap: 1.75rem; margin-bottom: 1.25rem; }
+      .tile .value { font-size: 1.5rem; font-weight: 600; line-height: 1.1; }
+      .tile .label { font-size: .75rem; color: var(--muted); }
+
+      .panel { background: var(--surface); border: 1px solid var(--border);
+               border-radius: 8px; padding: 1rem; margin-bottom: 1.1rem; }
+
+      .transport { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
+      button { font: inherit; font-size: .85rem; color: var(--ink); background: var(--surface);
+               border: 1px solid var(--border); border-radius: 6px; padding: .25rem .7rem;
+               cursor: pointer; }
+      button:hover { border-color: var(--muted); }
+      input[type="range"] { flex: 1; min-width: 12rem; accent-color: var(--p2); }
+      .scrub-label { font-size: .78rem; color: var(--muted);
+                     font-variant-numeric: tabular-nums; min-width: 9rem; text-align: right; }
+
+      .layers { display: flex; flex-wrap: wrap; gap: 1.25rem; }
+      .layer .caption { font-size: .72rem; color: var(--muted); margin-bottom: .35rem; }
+      .cells { display: grid; gap: 2px; }
+      .cell { aspect-ratio: 1; min-width: 4px; border-radius: 2px;
+              background: var(--surface); box-shadow: inset 0 0 0 1px var(--grid-line); }
+      .cell.s0 { background: var(--p0); box-shadow: none; }
+      .cell.s1 { background: var(--p1); box-shadow: none; }
+      .cell.s2 { background: var(--p2); box-shadow: none; }
+      .cell.s3 { background: var(--p3); box-shadow: none; }
+      .cell.s4 { background: var(--p4); box-shadow: none; }
+      .cell.open { box-shadow: inset 0 0 0 2px var(--ring); }
+
+      .legend { display: flex; flex-wrap: wrap; gap: .35rem 1.1rem; align-items: center;
+                font-size: .78rem; color: var(--ink-2); }
+      .key { display: inline-flex; align-items: center; gap: .4rem; }
+      .swatch { width: .8rem; height: .8rem; border-radius: 2px; background: var(--surface);
+                box-shadow: inset 0 0 0 1px var(--grid-line); }
+      .swatch.s0 { background: var(--p0); box-shadow: none; }
+      .swatch.s1 { background: var(--p1); box-shadow: none; }
+      .swatch.s2 { background: var(--p2); box-shadow: none; }
+      .swatch.s3 { background: var(--p3); box-shadow: none; }
+      .swatch.s4 { background: var(--p4); box-shadow: none; }
+      .swatch.open { box-shadow: inset 0 0 0 2px var(--ring); }
+
+      table { border-collapse: collapse; width: 100%; font-size: .8rem;
+              font-variant-numeric: tabular-nums; }
+      th { text-align: left; font-weight: 600; color: var(--muted); font-size: .72rem;
+           text-transform: uppercase; letter-spacing: .06em; padding: 0 .8rem .3rem 0; }
+      td { padding: .12rem .8rem .12rem 0; color: var(--ink-2); white-space: nowrap; }
+      .scroll { overflow-x: auto; }
+      .note { color: var(--muted); font-size: .82rem; }
+      code { background: var(--plane); border-radius: 3px; padding: .05em .3em; }
+    </style>
+  </head>
+  <body></body>
+</html>

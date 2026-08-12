@@ -1,0 +1,110 @@
+# Its own workspace: this crate is a sibling of `clearmap-rs`, not a member of
+# it. The dependency direction is one-way and enforced here — `blockflow` has no
+# `clearmap-rs` dependency and must never acquire one.
+[workspace]
+
+[package]
+name = "blockflow"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Out-of-core block processing: op chains, reach-derived valid regions, block decomposition, a task DAG, a shared chunk cache and a hint-driven prefetcher."
+
+[dependencies]
+# Deliberately short. Every entry here is a dependency the *framework* needs;
+# anything an individual op needs belongs in the crate that supplies the op.
+# The encoded tier needs *a* compressor. Which one is a parameter (`cache::Codec`);
+# this is the built-in default, chosen for being pure Rust and unsurprising.
+flate2 = "1"
+ndarray = "0.16"
+rayon = "1"
+serde_json = "1"
+# The `gui` feature only. A blocking HTTP server on ordinary threads: four small
+# transitive crates and no async runtime, for four JSON endpoints and a static
+# directory. See `src/gui/server.rs` for why not axum.
+tiny_http = { version = "0.12", optional = true }
+# The `zarr` feature only. The one storage backend this crate carries, and the
+# only dependency here that is not the framework's own machinery: a level has to
+# live somewhere, and everything before it was proven against arrays in memory.
+#
+# `default-features = false` and two features back on, deliberately. The
+# defaults add blosc (which builds C), zstd, sharding, transpose, crc32c and **a
+# second `ndarray`** — `zarrs` is on 0.17 and this crate on 0.16, so its ndarray
+# bridge would hand back arrays of a type nothing here can hold. `zarr_env`
+# therefore reads and writes through the element API (`Vec<T>`), which needs none
+# of it.
+#
+# The two that are asked for:
+#
+# * `filesystem` — the store. A level has to live somewhere.
+# * `gzip` — the codec `zarr_env::Compression` offers, and **it costs nothing**.
+#   `zarrs`'s `gzip` feature is exactly `dep:flate2`, and `flate2` is already a
+#   dependency of this crate for `cache::DeflateCodec`, at the same major
+#   version. The package count with `--features zarr` is therefore unchanged at
+#   156, no build script is added, and the incremental build cost is the codec
+#   module itself. That — rather than "gzip is the best compressor" — is why the
+#   one compressor this environment offers is gzip: `zstd` (3 packages, a C
+#   build), `blosc` (2 packages, a C build) and `bz2` would each have to buy
+#   their ratio, and the ratio that matters most here is on `bool` data where
+#   deflate is already near the ceiling.
+zarrs = { version = "0.23.13", optional = true, default-features = false, features = [
+    "filesystem",
+    "gzip",
+] }
+
+[features]
+# Off by default, and off is the configuration everything else is measured
+# against: with `gui` disabled this crate compiles, tests and resolves exactly as
+# it did before the feature existed, and adds nothing to a consumer's lockfile.
+gui = ["dep:tiny_http"]
+# A Zarr v3 `Environment`: levels as arrays on a filesystem store. Off by
+# default, and off is the configuration everything else is measured against —
+# with `zarr` disabled this crate compiles and tests exactly as it did before the
+# feature existed, and a consumer builds none of it.
+#
+# It is a feature rather than a plain dependency because of what it costs, and
+# the number is stated rather than felt: this crate's dependency graph is **38
+# packages** without it and **156 with**, and `zarrs` carries a build script
+# with a `libz-sys` build-dependency, so enabling it also asks for a C toolchain.
+# That is a fair price for reading and writing real arrays and an unreasonable
+# one for a framework that is only counting bytes or only holding them in memory
+# — and which of those a caller is doing is the caller's business, not this
+# file's. `default-features = false` on `zarrs` is part of the same accounting:
+# only its filesystem store is asked for, not blosc, zstd, sharding, transpose,
+# crc32c or its own (different, second) `ndarray`.
+zarr = ["dep:zarrs"]
+# The distribution **server** and the three binaries. Deliberately narrow: the
+# protocol, the coordinator's whole state machine, the handout policy, the cache
+# model, the rendezvous backends, the HTTP client and the worker loop compile and
+# are tested with no feature at all — only `tiny_http`, which the coordinator
+# serves over and which the progress view already pulls in, is behind this.
+distributed = ["dep:tiny_http"]
+
+# The browser half lives in `webui/` and is a separate crate with its own
+# workspace, compiled to WebAssembly by `trunk`, not by cargo. It is not
+# declared here because nothing in this crate links against it — the server
+# reads the built files off disk, and says how to build them when they are
+# missing.
+[[bin]]
+name = "block_gui"
+path = "src/bin/block_gui.rs"
+required-features = ["gui"]
+
+# The coordinator is its own program, always — never "rank 0 behaves
+# differently". The worker only ever connects, pulls, executes and reports, so
+# there is one worker binary whatever the environment. `blockflow-local` starts
+# both, N times, on one machine.
+[[bin]]
+name = "blockflow-coordinator"
+path = "src/bin/blockflow_coordinator.rs"
+required-features = ["distributed"]
+
+[[bin]]
+name = "blockflow-worker"
+path = "src/bin/blockflow_worker.rs"
+required-features = ["distributed"]
+
+[[bin]]
+name = "blockflow-local"
+path = "src/bin/blockflow_local.rs"
+required-features = ["distributed"]
