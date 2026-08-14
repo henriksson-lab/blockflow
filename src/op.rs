@@ -799,15 +799,41 @@ impl Chain {
         Chain::Sequence(children)
     }
 
+    /// A sequence whose children may each have failed to build.
+    ///
+    /// It exists because [`Chain::parallel`] is fallible and this one is not, so
+    /// a sequence containing a parallel could not be written as one expression —
+    /// the caller had to name the branch, `?` it, and then build the sequence,
+    /// which is two statements for one structure and reads as if the branch were
+    /// a separate thing. The asymmetry is right: a parallel can be malformed
+    /// (no branches, a combine that disagrees about arity) and a sequence
+    /// cannot. This is the adapter, not a relaxation of that.
+    pub fn try_sequence(children: Vec<Result<Chain>>) -> Result<Chain> {
+        Ok(Chain::Sequence(
+            children.into_iter().collect::<Result<Vec<_>>>()?,
+        ))
+    }
+
     /// A leaf that reads level `level`, which holds `dtype`.
+    ///
+    /// **`level` is a [`Level`](crate::assemble::Level) and not a phase index**,
+    /// and the two are different types for the reason that motivated the
+    /// distinction: phase `p` writes level `p + 1`, so the two numbers are
+    /// adjacent, both in range, and swapping them reads a real level that is the
+    /// wrong one. `usize` converts into a `Level`, so every caller that already
+    /// writes a literal is unchanged; what the type buys is that a caller
+    /// holding a [`Phase`](crate::assemble::Phase) handle cannot pass it here.
     ///
     /// Infallible here on purpose: whether the level exists, whether it is a
     /// forward reference and whether it really holds `dtype` are all questions
     /// about a *plan*, and this constructor has none. They are answered by
     /// [`check_source_levels`](crate::decomposition::check_source_levels), in
     /// one place, at plan time.
-    pub fn source(level: usize, dtype: Dtype) -> Chain {
-        Chain::Source { level, dtype }
+    pub fn source(level: impl Into<crate::assemble::Level>, dtype: Dtype) -> Chain {
+        Chain::Source {
+            level: level.into().index(),
+            dtype,
+        }
     }
 
     /// Every level named by a source leaf anywhere in the subtree, ascending

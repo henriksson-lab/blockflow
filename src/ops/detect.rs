@@ -174,6 +174,7 @@ use std::collections::BTreeMap;
 
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
+use crate::assemble::{Phase, PlanBuilder};
 use crate::decomposition::Decomposition;
 use crate::dtype::Dtype;
 use crate::env::BlockBuf;
@@ -729,6 +730,30 @@ impl RegionPointsOp {
         }
     }
 
+    /// The same op, addressed by a [`Phase`] handle instead of a number.
+    ///
+    /// See [`RegionPointsOp::new`] for what the phase half of the address is
+    /// for, and `crate::assemble::Phase` for why a handle is not a `usize`: a
+    /// literal that is off by one reads a different generation of the stream and
+    /// answers differently, with nothing to refuse it.
+    pub fn reading(
+        name: &'static str,
+        moments_stream: impl Into<String>,
+        moments: Phase,
+        points_stream: impl Into<String>,
+        lifecycle: Lifecycle,
+        grid: &BlockGrid,
+    ) -> Self {
+        Self::new(
+            name,
+            moments_stream,
+            moments.index(),
+            points_stream,
+            lifecycle,
+            grid,
+        )
+    }
+
     /// The stream the points are written to.
     pub fn points_stream(&self) -> &str {
         &self.points_stream
@@ -833,6 +858,50 @@ pub fn detect_phases(
     };
     plan.check()?;
     Ok(plan)
+}
+
+/// The same two phases, **appended to a plan that already has some**.
+///
+/// [`detect_phases`] builds a whole `Decomposition`, so it is unusable as soon
+/// as these two phases sit inside something larger; this is its body against a
+/// builder. Neither phase declares an element type — the labelling writes
+/// fragments and no pixels, and so does the emission — which is why this one is
+/// shorter than `regional::append_to` and not because it is doing less.
+///
+/// `moments_stream` carries the per-block accumulators from the labelling to the
+/// emission; the phase half of that address is wired here. `points_stream` is
+/// the run's output, which is why its lifecycle is nearly always
+/// [`Lifecycle::Persistent`].
+///
+/// **Both lifecycles are the caller's** and neither is defaulted, even though
+/// one of them has an obvious answer. What a run leaves behind is a decision,
+/// and this function is here to remove bookkeeping rather than to make
+/// decisions on a caller's behalf where the caller cannot see them.
+///
+/// Returns the emission's phase, which is where the point blobs are keyed and
+/// therefore where a reader has to look for them.
+pub fn append_to(
+    plan: &mut PlanBuilder,
+    moments_stream: impl Into<String>,
+    moments_lifecycle: Lifecycle,
+    points_stream: impl Into<String>,
+    points_lifecycle: Lifecycle,
+) -> Result<Phase> {
+    let moments_stream = moments_stream.into();
+    let grid = plan.grid().clone();
+    let moments = plan.fragments(LabelRegionsOp::new(
+        "region labelling",
+        moments_stream.clone(),
+        moments_lifecycle,
+    ))?;
+    plan.fragments(RegionPointsOp::reading(
+        "region points",
+        moments_stream,
+        moments,
+        points_stream,
+        points_lifecycle,
+        &grid,
+    ))
 }
 
 #[cfg(test)]

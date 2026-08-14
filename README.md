@@ -1,11 +1,35 @@
 # blockflow
 
-Out-of-core block processing, as a library: an op trait and a chain algebra, a
-reach-derived valid region, a deterministic block decomposition, a task DAG, a
-strategy contract with one shared executor, an event stream with pluggable
-listeners, and a shared chunk cache with a hint-driven prefetcher.
+This is an **experimental** crate for processing of large scale imaging data.
+Modern microscopes are able to churn out TB-scale datasets, making it impossible
+to load them into memory at once and using old bases. The solution is
+(1) "out of core processing", where only a part of the data is present in memory
+at once. Furthermore, (2) multithreading, GPUs and computing on multiple computers
+in parallel is required.
 
-MIT. Original work.
+Figuring out the optimal compute order is hard (likely NP-hard). The following factors
+need to be taken into account:
+
+* How much memory is available?
+* How many threads are available, and what CPU/how much cache memory?
+* How many computers are available?
+* Is a GPU available? And if so, what type, and which compute nodes have them?
+* How much time does it take to read data?
+* How much time does it take to write data?
+* How much time does it take to compress data?
+* How well does the data compress?
+* What operations are performed, and in which order?
+* What precision does the data need to be stored in?
+
+This crate aims to resolve the problem using the following ingredients:
+
+* Operations are represented as a DAG (direct acyclic graph), representing dependencies
+* Borrowing from database query planners, statistics about compute times are gathered during execution 
+* A 4d scheduler figures out the best order and adapts in realtime based on statistics
+* Designed for multiple compute nodes, GPUs and heterogenous compute environments from day one
+* OME-Zarr is used to enable distributed computing on chunks of image data
+
+This crate is not yet ready for general consumption.
 
 ## Why it is its own crate
 
@@ -599,3 +623,7 @@ and fabric interfaces with different names for one host.
 cargo test
 cargo test --features gui,distributed
 ```
+
+## License
+
+MIT (AI generated code)

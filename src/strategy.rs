@@ -537,7 +537,10 @@ pub fn execute_phases(
                     if decomposition.level_visibility(level) == Visibility::Internal
                         && !hints.keep_levels.contains(&level)
                     {
-                        env.discard_level(level)?;
+                        // The phase goes with the level, so that a reader who
+                        // wanted it back is told which `keep_levels` entry they
+                        // needed rather than only that it is gone.
+                        env.discard_level_after(level, phase)?;
                     }
                 }
                 if work[phase].writes_a_level() {

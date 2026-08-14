@@ -842,6 +842,74 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                     input.phase
                 )));
             }
+            // **The other half of the address, and the half nothing checked.**
+            // A stream written by two phases holds two generations, which is why
+            // an input names a phase as well as a stream. The consequence is that
+            // a wrong phase number is not out of range and does not fail: it
+            // reads real fragments of the wrong generation, and the run answers
+            // differently with no diagnostic anywhere. The forward reference
+            // above is refused because it cannot possibly work; this refuses the
+            // one that merely does not do what it says.
+            //
+            // **Scoped to the case this can be sure about**, and the scope is the
+            // interesting part. It fires when *some* phase of this plan writes
+            // the stream and the phase named is not one of them — the address
+            // exists and points at the wrong generation, which is unambiguous. It
+            // does not fire when no phase writes it at all, because that is not
+            // by itself an error: `Environment::write_sidecar` is public, so a
+            // stream may be seeded from outside the plan entirely, and a check
+            // that demanded an in-plan producer would refuse a legitimate run to
+            // catch a mistake that fails loudly at the first block anyway.
+            //
+            // It is here rather than in `Decomposition::check` for the same
+            // reason `check_dtypes` is: a plan records op *names*, and only the
+            // `(plan, work)` pair knows what each phase writes.
+            let writers: Vec<usize> = work
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| match entry {
+                    PhaseWork::Fragments(producer) => producer
+                        .outputs()
+                        .iter()
+                        .any(|out| out.stream == input.stream),
+                    _ => false,
+                })
+                .map(|(at, _)| at)
+                .collect();
+            if !writers.is_empty() && !writers.contains(&input.phase) {
+                let named = match work.get(input.phase) {
+                    Some(PhaseWork::Fragments(producer)) => format!(
+                        "runs fragment op {:?}, which writes {:?}",
+                        producer.name(),
+                        producer
+                            .outputs()
+                            .iter()
+                            .map(|out| out.stream.clone())
+                            .collect::<Vec<_>>()
+                    ),
+                    Some(PhaseWork::Pixels) => {
+                        "runs chain slots, which write a level and no stream".to_string()
+                    }
+                    Some(PhaseWork::Iterate(producer)) => format!(
+                        "runs iterative op {:?}, which writes a level and no stream",
+                        producer.name()
+                    ),
+                    None => "is not in the work list at all".to_string(),
+                };
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index}: fragment op {:?} reads stream {:?} from phase {}, but phase \
+                     {} {named}. {:?} is written by phase(s) {:?}. The phase is half the address \
+                     — a stream written by two phases holds two generations — so naming the \
+                     wrong one is a read of the wrong generation, which produces an answer \
+                     rather than an error.",
+                    op.name(),
+                    input.stream,
+                    input.phase,
+                    input.phase,
+                    input.stream,
+                    writers
+                )));
+            }
             let source = &plan.phases[input.phase].grid;
             if source.volume() != phase.grid.volume() || source.block() != edge {
                 return Err(Error::InvalidArgument(format!(

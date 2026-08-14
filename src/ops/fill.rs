@@ -147,6 +147,7 @@ use std::collections::BTreeMap;
 
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
+use crate::assemble::{Phase, PlanBuilder};
 use crate::decomposition::Decomposition;
 use crate::dtype::Dtype;
 use crate::env::BlockBuf;
@@ -524,6 +525,20 @@ impl FillHolesOp {
         }
     }
 
+    /// The same op, addressed by a [`Phase`] handle instead of a number.
+    ///
+    /// See `crate::assemble::Phase`: a phase index written as a literal is not
+    /// refused when it is wrong, it reads a different generation of the stream.
+    pub fn reading(
+        name: &'static str,
+        stream: impl Into<String>,
+        faces: Phase,
+        filled: Dtype,
+        grid: &BlockGrid,
+    ) -> Self {
+        Self::new(name, stream, faces.index(), filled, grid)
+    }
+
     /// The lattice this op was built for, which is also the reach it declares.
     pub fn lattice(&self) -> [usize; 3] {
         self.lattice
@@ -645,6 +660,37 @@ pub fn fill_phases(
     };
     plan.check()?;
     Ok(plan)
+}
+
+/// The same two phases, **appended to a plan that already has some**.
+///
+/// [`fill_phases`] builds a whole `Decomposition`, so it cannot be part of one;
+/// this is its body against a builder, with the two `dtype` lines gone because
+/// [`PlanBuilder::fragments`] asks the ops what they write.
+///
+/// `filled` is the element type the answer is written in — stated rather than
+/// inherited, for [`FillHolesOp::new`]'s reason. Returns the filling's phase,
+/// which is the one that writes the mask.
+pub fn append_to(
+    plan: &mut PlanBuilder,
+    stream: impl Into<String>,
+    lifecycle: Lifecycle,
+    filled: Dtype,
+) -> Result<Phase> {
+    let stream = stream.into();
+    let grid = plan.grid().clone();
+    let faces = plan.fragments(LabelBackgroundOp::new(
+        "background labelling",
+        stream.clone(),
+        lifecycle,
+    ))?;
+    plan.fragments(FillHolesOp::reading(
+        "hole filling",
+        stream,
+        faces,
+        filled,
+        &grid,
+    ))
 }
 
 /// A block's pixels as a mask, whatever width they arrived in.

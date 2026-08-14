@@ -40,7 +40,7 @@
 // materialisation?" a comparison rather than a flag.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 use ndarray::{ArrayD, Axis, IxDyn, Slice};
@@ -619,6 +619,20 @@ pub trait Environment: Sync {
         Ok(())
     }
 
+    /// The same, and **which phase's completion freed it**.
+    ///
+    /// A separate method with a default that forwards, rather than a sixth
+    /// argument to `discard_level`, so that every environment written before it
+    /// existed keeps compiling and keeps behaving identically. What it buys is
+    /// the diagnostic: "level 4 was discarded" is a fact a reader can do nothing
+    /// with, and "level 4 was freed after phase 3, which the plan says is its
+    /// last reader" tells them which `Hints::keep_levels` entry they wanted. An
+    /// environment that does not record the phase loses only the second half of
+    /// that sentence.
+    fn discard_level_after(&self, level: usize, _phase: usize) -> Result<()> {
+        self.discard_level(level)
+    }
+
     fn counters(&self) -> &EnvCounters;
 
     fn chunk_shape(&self) -> [usize; 3] {
@@ -754,6 +768,14 @@ pub struct ArrayEnvironment {
     /// happens to be small" are different facts and only one of them is an
     /// error to read.
     discarded: Vec<AtomicBool>,
+    /// The phase after whose completion each level was freed, or `usize::MAX`
+    /// for a level nobody has freed or one freed through `discard_level`, which
+    /// does not say.
+    ///
+    /// Beside `discarded` rather than folded into it because they answer
+    /// different questions — "may I read this" and "who took it away" — and the
+    /// first must stay a single relaxed load on a path the executor walks.
+    freed_after: Vec<AtomicUsize>,
     chunk: [usize; 3],
     /// The arrays ops write beside their primary result, by declared name.
     ///
@@ -792,6 +814,9 @@ impl ArrayEnvironment {
         }
         Ok(Self {
             discarded: (0..levels.len()).map(|_| AtomicBool::new(false)).collect(),
+            freed_after: (0..levels.len())
+                .map(|_| AtomicUsize::new(usize::MAX))
+                .collect(),
             volume,
             levels,
             chunk,
@@ -841,6 +866,9 @@ impl ArrayEnvironment {
         }
         Ok(Self {
             discarded: (0..levels.len()).map(|_| AtomicBool::new(false)).collect(),
+            freed_after: (0..levels.len())
+                .map(|_| AtomicUsize::new(usize::MAX))
+                .collect(),
             volume,
             levels,
             chunk,
@@ -868,15 +896,34 @@ impl ArrayEnvironment {
             .count()
     }
 
+    /// Which phase's completion freed `level`, when that was recorded.
+    ///
+    /// `None` for a live level and for one freed through `discard_level`, which
+    /// carries no phase; the two are distinguished by [`Self::is_discarded`].
+    pub fn freed_after(&self, level: usize) -> Option<usize> {
+        let phase = self.freed_after.get(level)?.load(Ordering::SeqCst);
+        (phase != usize::MAX).then_some(phase)
+    }
+
     fn refuse_if_discarded(&self, level: usize, what: &str) -> Result<()> {
-        if self.is_discarded(level) {
-            return Err(Error::InvalidArgument(format!(
-                "{what}: level {level} was discarded — the phase that reads it finished, so \
-                 the plan says nothing wants it again. Pin it with `Hints::keep_levels` if \
-                 something does."
-            )));
+        if !self.is_discarded(level) {
+            return Ok(());
         }
-        Ok(())
+        // The phase is named where it is known, because it is the whole of what
+        // a reader needs: `keep_levels` takes a level number, and the question
+        // that gets somebody there is "who freed it and why did the plan think
+        // it could". Without it the message says only that something happened.
+        let freed = match self.freed_after(level) {
+            Some(phase) => format!(
+                "was discarded after phase {phase}, whose completion the plan says is the last \
+                 read of it"
+            ),
+            None => "was discarded".to_string(),
+        };
+        Err(Error::InvalidArgument(format!(
+            "{what}: level {level} {freed}, so the plan says nothing wants it again. Pin it \
+             with `Hints::keep_levels` if something does."
+        )))
     }
 
     fn level_guard(&self, level: usize) -> std::sync::RwLockReadGuard<'_, Voxels> {
@@ -906,8 +953,33 @@ impl ArrayEnvironment {
             .clone()
     }
 
+    /// One level's data, or the refusal that names why it is not there.
+    ///
+    /// **The checked form, and the one to use.** A discarded level holds a
+    /// one-voxel placeholder — see [`Self::discard_level`] — so reading one
+    /// through [`Self::level`] used to hand back a `1 x 1 x 1` array that then
+    /// failed, somewhere else, as a shape mismatch against the volume. That is
+    /// the same class of defect as a freed level reading as zeros: the error
+    /// names a symptom, and the fact worth reporting — this level was freed, by
+    /// this phase, and `Hints::keep_levels` is how to keep it — is nowhere in
+    /// it.
+    pub fn try_level(&self, level: usize) -> Result<Voxels> {
+        self.refuse_if_discarded(level, "level")?;
+        Ok(self.level_guard(level).clone())
+    }
+
+    /// One level's data.
+    ///
+    /// **Panics on a discarded level**, with [`Self::try_level`]'s message. The
+    /// signature cannot become a `Result` without changing every caller of it,
+    /// and handing back the placeholder is the one behaviour that is definitely
+    /// wrong — so the accessor keeps its shape and states its precondition the
+    /// way an index does. A caller who does not know whether a level survived
+    /// the run is asking a question, and [`Self::try_level`] is the form that
+    /// answers it.
     pub fn level(&self, level: usize) -> Voxels {
-        self.level_guard(level).clone()
+        self.try_level(level)
+            .unwrap_or_else(|refusal| panic!("{refusal}"))
     }
 
     /// One side output, by declared name, or `None` if nothing declared it.
@@ -1173,6 +1245,20 @@ impl Environment for ArrayEnvironment {
         let dtype = guard.dtype();
         *guard = Voxels::zeros(dtype, [1, 1, 1])?;
         Ok(())
+    }
+
+    /// The same, recording the phase so that a later reader can be told who
+    /// took the level away rather than only that somebody did.
+    ///
+    /// Recorded **before** the discard, so that a level which is observably
+    /// discarded is never observably discarded-by-nobody: the flag is what a
+    /// concurrent reader tests, and the phase must already be there when it
+    /// flips.
+    fn discard_level_after(&self, level: usize, phase: usize) -> Result<()> {
+        if let Some(slot) = self.freed_after.get(level) {
+            slot.store(phase, Ordering::SeqCst);
+        }
+        self.discard_level(level)
     }
 
     fn counters(&self) -> &EnvCounters {

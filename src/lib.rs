@@ -56,6 +56,7 @@
 // | `points` | A set of positions, written per block and read by region. Two states, one query method, two interchangeable indexes, and an order that is a function of the point set rather than of the cut. |
 // | `geometry` | The inversion: read extent, trustworthy extent, `valid = core ∩ trustworthy`. |
 // | `decomposition` | The **binding** plan — parity-visible, deterministic, data-blind, hashable — plus the cost model used to choose it. |
+// | `assemble` | Writing one down: a slot cursor, the names, the per-phase reach, the element type a fragment phase writes, what each phase runs, and the source levels. Assembly only — it decides nothing the plan records, and hands back handles so a phase is never addressed by a literal. |
 // | `graph` | `(block, phase)` tasks with explicit dependencies. Thousands of nodes, never per-voxel. |
 // | `voxels` | What a block *is*: rank 3, element type as a run-time tag. Plus the dynamic-rank buffer a side output goes to, which is a different question. |
 // | `env` | The injected environment: real arrays, or a loader that only accumulates cost. |
@@ -84,6 +85,12 @@
 /// because label ids never agree between two labellings of the same volume.
 pub mod agreement;
 pub mod animate;
+/// Assembling a plan: the slot cursor, the names, the per-phase reach, the
+/// element type a fragment phase writes, what each phase runs, and the levels a
+/// phase reads besides its own input. **Assembly, not planning** — it decides
+/// nothing a `Decomposition` records, and everything it produces goes through
+/// the same five guards the executor runs.
+pub mod assemble;
 pub mod budget;
 pub mod cache;
 pub mod decomposition;
@@ -168,6 +175,7 @@ mod tests;
 
 pub use agreement::{compare_labels, Agreement, Matched, Merged, Split};
 pub use animate::{render, RenderRequest, View};
+pub use assemble::{Assembly, Level, Phase, PlanBuilder};
 pub use budget::{Class, Lease, MemoryBudget};
 pub use cache::{
     ArrayId, ArrayPolicy, CacheElement, CacheStats, CachingSource, ChunkCache, ChunkFetcher,

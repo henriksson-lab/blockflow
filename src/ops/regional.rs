@@ -147,6 +147,7 @@ use std::collections::BTreeMap;
 
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
+use crate::assemble::{Phase, PlanBuilder};
 use crate::decomposition::Decomposition;
 use crate::dtype::Dtype;
 use crate::env::BlockBuf;
@@ -673,6 +674,26 @@ impl RegionalMaximaOp {
         }
     }
 
+    /// The same op, addressed by a [`Phase`] handle instead of a number.
+    ///
+    /// **This is the constructor that cannot be got wrong.** `new` takes the
+    /// producing phase's index, which is a `usize` a caller can write as a
+    /// literal — and a literal that is off by one is not refused, it reads a
+    /// different generation of the same stream and answers differently. A
+    /// [`Phase`] can only come from the [`PlanBuilder`](crate::PlanBuilder) call
+    /// that created the phase, so there is no number to write. `new` stays for
+    /// hand-assembled plans, and `check_phase_work` refuses a phase that does
+    /// not write the stream by name.
+    pub fn reading(
+        name: &'static str,
+        stream: impl Into<String>,
+        faces: Phase,
+        mask: Dtype,
+        grid: &BlockGrid,
+    ) -> Self {
+        Self::new(name, stream, faces.index(), mask, grid)
+    }
+
     /// The lattice this op was built for, which is also the reach it declares.
     pub fn lattice(&self) -> [usize; 3] {
         self.lattice
@@ -795,6 +816,49 @@ pub fn regional_phases(
     };
     plan.check()?;
     Ok(plan)
+}
+
+/// The same two phases, **appended to a plan that already has some**.
+///
+/// [`regional_phases`] builds a whole `Decomposition` and is therefore unusable
+/// the moment these two phases are part of something larger: its body has to be
+/// re-derived by hand, including the `labelling.dtype` line, whose omission is
+/// refused by a message about a level's width rather than about the missing
+/// line. This is that body, against a builder instead of a fresh plan — and the
+/// element types are not restated here at all, because [`PlanBuilder::fragments`]
+/// asks the ops.
+///
+/// `stream` is where phase one's faces go and where phase two reads them; it is
+/// one name because it is one stream, and the phase half of the address is wired
+/// here rather than being a number the caller writes. `mask` is the element type
+/// the answer is written in — stated rather than inherited, for
+/// [`RegionalMaximaOp::new`]'s reason.
+///
+/// Returns the merge's phase, which is the one that writes the mask.
+pub fn append_to(
+    plan: &mut PlanBuilder,
+    stream: impl Into<String>,
+    lifecycle: Lifecycle,
+    mask: Dtype,
+) -> Result<Phase> {
+    let input_dtype = plan.reads();
+    if !accepts(input_dtype) {
+        return Err(refuse(input_dtype));
+    }
+    let stream = stream.into();
+    let grid = plan.grid().clone();
+    let plateaux = plan.fragments(LabelPlateauxOp::new(
+        "plateau labelling",
+        stream.clone(),
+        lifecycle,
+    ))?;
+    plan.fragments(RegionalMaximaOp::reading(
+        "regional maxima",
+        stream,
+        plateaux,
+        mask,
+        &grid,
+    ))
 }
 
 /// The whole-volume answer: the same kernels, called once, over everything.
