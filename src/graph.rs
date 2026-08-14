@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 use crate::region::Region;
 
 use super::decomposition::Decomposition;
-use super::geometry::{regions_intersect, BlockGeometry};
+use super::geometry::{regions_intersect, BlockGeometry, BlockGrid};
 
 /// One unit of work: apply phase `phase` to block `block`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +52,50 @@ pub struct Task {
     pub geometry: BlockGeometry,
     /// Task ids in the previous phase whose valid output this task reads.
     pub deps: Vec<usize>,
+    /// The same thing for every level this task reads through a source leaf:
+    /// one entry per level in `PhaseDecomposition::source_levels`.
+    ///
+    /// **Kept apart from `deps` rather than merged into it**, because the two
+    /// are checked against different regions of different levels.
+    /// `dependencies_cover_reads` asks whether the union of a set of valid
+    /// regions covers what is fetched, and that question is only well posed one
+    /// level at a time — merged, two producers of two levels would each cover
+    /// the fetch and the sum would be twice what was asked for.
+    ///
+    /// **Explicit rather than inferred from the phase order.** A source level is
+    /// written by a phase that has already run, so one can argue that the
+    /// transitive dependency is there anyway — but only while every level
+    /// between the two is on the same lattice, and a phase that resamples
+    /// breaks that argument without breaking any test. The edge that matters is
+    /// cheap to state, so it is stated.
+    pub source_deps: Vec<SourceDep>,
+}
+
+/// One level a task reads through a source leaf, and the tasks that wrote the
+/// part of it the task reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDep {
+    pub level: usize,
+    /// Task ids in phase `level - 1`. Empty for level 0, which no phase writes
+    /// — the same fact that makes level 0 the original source node.
+    pub deps: Vec<usize>,
+}
+
+impl Task {
+    /// How many completions this task waits on.
+    ///
+    /// A producer that appears in both lists is counted twice and decremented
+    /// twice, which is why nothing here deduplicates: `TaskGraph::dependents`
+    /// pushes one entry per occurrence, so the two stay balanced without either
+    /// side having to know about the other.
+    pub fn n_dependencies(&self) -> usize {
+        self.deps.len()
+            + self
+                .source_deps
+                .iter()
+                .map(|source| source.deps.len())
+                .sum::<usize>()
+    }
 }
 
 /// The whole schedule, as data.
@@ -73,54 +117,55 @@ impl TaskGraph {
             for (block, geometry) in phase.blocks.iter().enumerate() {
                 let deps = match previous {
                     None => Vec::new(),
-                    Some((from, previous_phase)) => {
-                        // Candidates come from the *grid*, not from a scan: the
-                        // previous phase's cores form a regular lattice, so the
-                        // blocks that can possibly overlap a read extent are an
-                        // index range per axis. Scanning every previous task was
-                        // O(blocks^2) per boundary, which is 45 M comparisons at
-                        // 6700 blocks and would have made the DAG cost more to
-                        // build than the work it schedules.
-                        // `source`, not `read`: what this task depends on is
-                        // what it *fetches*, and the two differ exactly when the
-                        // phase reads across grids. Using the read extent there
-                        // would look up the previous phase's lattice with
-                        // coordinates from a different space — the seam where a
-                        // shape change used to become two decompositions with no
-                        // edge between them at all.
-                        let grid = &decomposition.phases[phase_index - 1].grid;
-                        let counts = grid.blocks_per_axis();
-                        let edge = grid.block();
-                        let source = &geometry.source;
-                        let mut ranges = [(0usize, 0usize); 3];
-                        for axis in 0..3 {
-                            let lo = source.start[axis] / edge[axis];
-                            let hi = if source.shape[axis] == 0 {
-                                lo
-                            } else {
-                                (source.start[axis] + source.shape[axis] - 1) / edge[axis]
-                            };
-                            ranges[axis] = (lo.min(counts[axis] - 1), hi.min(counts[axis] - 1));
-                        }
-                        let mut deps = Vec::new();
-                        for i in ranges[0].0..=ranges[0].1 {
-                            for j in ranges[1].0..=ranges[1].1 {
-                                for k in ranges[2].0..=ranges[2].1 {
-                                    let flat = (i * counts[1] + j) * counts[2] + k;
-                                    let candidate = from + flat;
-                                    debug_assert!(candidate < previous_phase);
-                                    let producer: &Task = &tasks[candidate];
-                                    if producer.geometry.valid.voxels() > 0
-                                        && regions_intersect(&producer.geometry.valid, source)
-                                    {
-                                        deps.push(candidate);
-                                    }
-                                }
-                            }
-                        }
-                        deps
-                    }
+                    // `source`, not `read`: what this task depends on is what it
+                    // *fetches*, and the two differ exactly when the phase reads
+                    // across grids. Using the read extent there would look up
+                    // the previous phase's lattice with coordinates from a
+                    // different space — the seam where a shape change used to
+                    // become two decompositions with no edge between them at
+                    // all.
+                    Some((from, previous_end)) => producers_of(
+                        &tasks,
+                        from,
+                        previous_end,
+                        &decomposition.phases[phase_index - 1].grid,
+                        &geometry.source,
+                    ),
                 };
+                // Every level this phase reads besides the one it is handed.
+                // Read at the *same* region — a source leaf has reach 0 — which
+                // is exactly why `check_source_levels` requires the two levels
+                // to be on one lattice: without that, `geometry.source` would be
+                // the wrong integers here.
+                let source_deps = decomposition.phases[phase_index]
+                    .source_levels
+                    .iter()
+                    .map(|&level| SourceDep {
+                        level,
+                        deps: match level {
+                            // Level 0 is written by no phase. It is the original
+                            // source node, and the reason "a level with no
+                            // producing phase" is a case of a rule rather than a
+                            // special case.
+                            0 => Vec::new(),
+                            // `get`, not an index: a forward reference has no
+                            // entry here yet, and it is `check_source_levels`
+                            // that must report it — by name, with the two phase
+                            // numbers — rather than this line panicking on a
+                            // plan somebody handed us.
+                            _ => match phase_ranges.get(level - 1) {
+                                None => Vec::new(),
+                                Some(&(from, end)) => producers_of(
+                                    &tasks,
+                                    from,
+                                    end,
+                                    &decomposition.phases[level - 1].grid,
+                                    &geometry.source,
+                                ),
+                            },
+                        },
+                    })
+                    .collect();
                 tasks.push(Task {
                     id: start + block,
                     phase: phase_index,
@@ -128,6 +173,7 @@ impl TaskGraph {
                     index: geometry.index,
                     geometry: geometry.clone(),
                     deps,
+                    source_deps,
                 });
             }
             phase_ranges.push((start, tasks.len()));
@@ -163,6 +209,16 @@ impl TaskGraph {
             for &dep in &task.deps {
                 out[dep].push(task.id);
             }
+            // One entry per occurrence, deliberately: a task that is both a
+            // producer of the previous level and a producer of a level read by
+            // a source leaf appears twice here and is counted twice by
+            // `Task::n_dependencies`, so the indegree still reaches zero
+            // exactly once.
+            for source in &task.source_deps {
+                for &dep in &source.deps {
+                    out[dep].push(task.id);
+                }
+            }
         }
         out
     }
@@ -180,6 +236,37 @@ impl TaskGraph {
     /// is the check that says the two halves of such a plan are one plan.
     pub fn dependencies_cover_reads(&self, decomposition: &Decomposition) -> Result<(), String> {
         for task in &self.tasks {
+            // Every level a source leaf reads, on the same argument and against
+            // the same region: a source leaf has reach 0, so what it reads is
+            // what the task fetches. Level 0 is skipped because no phase writes
+            // it — it is there before the run, which is the whole reason a
+            // level with no producer is a case of the rule rather than an
+            // exception to it.
+            for source in &task.source_deps {
+                if source.level == 0 {
+                    continue;
+                }
+                let covered: usize = source
+                    .deps
+                    .iter()
+                    .map(|&dep| {
+                        intersection_voxels(&self.tasks[dep].geometry.valid, &task.geometry.source)
+                    })
+                    .sum();
+                let wanted = task.geometry.source.voxels();
+                if covered != wanted {
+                    return Err(format!(
+                        "task (phase {}, block {:?}) reads {wanted} voxels of level {} through a \
+                         source leaf, and the {} task(s) of phase {} it depends on produce \
+                         {covered} of them",
+                        task.phase,
+                        task.index,
+                        source.level,
+                        source.deps.len(),
+                        source.level - 1,
+                    ));
+                }
+            }
             if task.phase == 0 {
                 continue;
             }
@@ -219,6 +306,57 @@ impl TaskGraph {
             })
             .collect()
     }
+}
+
+/// The tasks in `tasks[from..end]` — one whole phase, laid out on `grid` — whose
+/// valid output intersects `wanted`.
+///
+/// Candidates come from the *grid*, not from a scan: a phase's cores form a
+/// regular lattice, so the blocks that can possibly overlap a region are an
+/// index range per axis. Scanning every task of the phase was O(blocks^2) per
+/// edge, which is 45 M comparisons at 6700 blocks and would have made the DAG
+/// cost more to build than the work it schedules.
+///
+/// Shared by the two kinds of edge — the phase before, and a level a source leaf
+/// reads — because they are the same question asked of a different phase, and a
+/// second copy of this arithmetic is a second place for the clamping to be
+/// wrong.
+fn producers_of(
+    tasks: &[Task],
+    from: usize,
+    end: usize,
+    grid: &BlockGrid,
+    wanted: &Region,
+) -> Vec<usize> {
+    let counts = grid.blocks_per_axis();
+    let edge = grid.block();
+    let mut ranges = [(0usize, 0usize); 3];
+    for axis in 0..3 {
+        let lo = wanted.start[axis] / edge[axis];
+        let hi = if wanted.shape[axis] == 0 {
+            lo
+        } else {
+            (wanted.start[axis] + wanted.shape[axis] - 1) / edge[axis]
+        };
+        ranges[axis] = (lo.min(counts[axis] - 1), hi.min(counts[axis] - 1));
+    }
+    let mut found = Vec::new();
+    for i in ranges[0].0..=ranges[0].1 {
+        for j in ranges[1].0..=ranges[1].1 {
+            for k in ranges[2].0..=ranges[2].1 {
+                let flat = (i * counts[1] + j) * counts[2] + k;
+                let candidate = from + flat;
+                debug_assert!(candidate < end);
+                let producer: &Task = &tasks[candidate];
+                if producer.geometry.valid.voxels() > 0
+                    && regions_intersect(&producer.geometry.valid, wanted)
+                {
+                    found.push(candidate);
+                }
+            }
+        }
+    }
+    found
 }
 
 fn intersection_voxels(left: &Region, right: &Region) -> usize {
@@ -304,6 +442,63 @@ mod tests {
         };
         let graph = TaskGraph::build(&decomposition);
         assert_eq!(graph.len(), 3072);
+    }
+
+    /// A level read by a source leaf is an edge in the graph, to the phase that
+    /// wrote it — not an assumption that the phase order made it available.
+    #[test]
+    fn a_source_level_is_an_edge_to_the_phase_that_wrote_it() {
+        let mut plan = two_phase([4, 0, 0], [4, 0, 0]);
+        // Phase 1 reads level 1 as its input and level 0 as a second arm.
+        plan.phases[1] = plan.phases[1].clone().with_source_levels([0]);
+        let graph = TaskGraph::build(&plan);
+        for task in graph.tasks_in_phase(0) {
+            assert!(task.source_deps.is_empty());
+            assert_eq!(task.n_dependencies(), 0);
+        }
+        for task in graph.tasks_in_phase(1) {
+            assert_eq!(task.source_deps.len(), 1);
+            // Level 0 is written by nobody, so it waits on nothing extra.
+            assert_eq!(task.source_deps[0].level, 0);
+            assert!(task.source_deps[0].deps.is_empty());
+            assert_eq!(task.n_dependencies(), task.deps.len());
+        }
+
+        // A three-phase plan whose last phase reads level 1: now there is a
+        // producing phase, and the edge points at the tasks that covered the
+        // fetch.
+        let mut plan = two_phase([4, 0, 0], [4, 0, 0]);
+        let grid = BlockGrid::new([64, 4, 4], [16, 4, 4]).unwrap();
+        plan.phases.push(
+            PhaseDecomposition::derive(
+                vec![2],
+                vec!["third".to_string()],
+                [0, 0, 0],
+                [0, 0, 0],
+                grid,
+            )
+            .with_source_levels([1]),
+        );
+        let graph = TaskGraph::build(&plan);
+        for task in graph.tasks_in_phase(2) {
+            let source = &task.source_deps[0];
+            assert_eq!(source.level, 1);
+            // Phase 0 wrote level 1, and a zero-reach block reads its own core.
+            assert_eq!(source.deps.len(), 1);
+            assert_eq!(graph.tasks[source.deps[0]].phase, 0);
+            assert_eq!(graph.tasks[source.deps[0]].block, task.block);
+            assert_eq!(task.n_dependencies(), task.deps.len() + 1);
+            // and both edges are recorded, so the producer releases it once for
+            // each
+            assert_eq!(
+                graph.dependents()[source.deps[0]]
+                    .iter()
+                    .filter(|&&id| id == task.id)
+                    .count(),
+                1
+            );
+        }
+        graph.dependencies_cover_reads(&plan).unwrap();
     }
 
     #[test]

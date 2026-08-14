@@ -203,6 +203,14 @@ pub fn decomposition_json(decomposition: &Decomposition) -> Result<Value> {
             if let Some(dtype) = phase.dtype {
                 entry["dtype"] = json!(dtype.numpy_name());
             }
+            // Likewise for the levels a phase reads besides its own input: a
+            // generator like the rest — the far end re-derives the geometry, and
+            // *which levels* is a fact only the plan carries — and absent for
+            // every plan that reads one level, which is the document this was
+            // before source leaves existed.
+            if !phase.source_levels.is_empty() {
+                entry["source_levels"] = json!(phase.source_levels);
+            }
             entry
         })
         .collect();
@@ -245,6 +253,9 @@ pub fn decomposition_from_json(value: &Value) -> Result<Decomposition> {
             rebuilt = rebuilt.with_dtype(Dtype::from_numpy_name(&name).ok_or_else(|| {
                 Error::invalid(format!("{name:?} is not an element type this build knows"))
             })?);
+        }
+        if phase.get("source_levels").is_some() {
+            rebuilt = rebuilt.with_source_levels(counts(phase, "source_levels")?);
         }
         phases.push(rebuilt);
     }
@@ -309,6 +320,29 @@ mod tests {
         document["fingerprint"] = json!("12345");
         let error = decomposition_from_json(&document).unwrap_err();
         assert!(error.to_string().contains("different builds"), "{error}");
+    }
+
+    /// The levels a phase reads besides its own input are part of the plan, so
+    /// they cross the wire — and a plan that reads one level says nothing, so
+    /// the document is the one it was before source leaves existed.
+    #[test]
+    fn the_levels_a_phase_also_reads_survive_the_wire_and_are_absent_without_them() {
+        let plain = a_decomposition();
+        assert!(decomposition_json(&plain).unwrap()["phases"][0]
+            .get("source_levels")
+            .is_none());
+
+        let mut original = plain.clone();
+        let last = original.phases.len() - 1;
+        original.phases[last] = original.phases[last].clone().with_source_levels([0]);
+        let document = decomposition_json(&original).unwrap();
+        assert_eq!(document["phases"][last]["source_levels"], json!([0]));
+
+        let rebuilt = decomposition_from_json(&document).unwrap();
+        assert_eq!(rebuilt, original);
+        assert_eq!(rebuilt.fingerprint(), original.fingerprint());
+        // and it really is a different plan from the one that reads one level
+        assert_ne!(original.fingerprint(), plain.fingerprint());
     }
 
     #[test]

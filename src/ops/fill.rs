@@ -159,9 +159,9 @@ use crate::sidecar::Lifecycle;
 use crate::voxels::Voxels;
 
 use super::components::{
-    bytes_to_words, core_within_read, empty_planes, expect_end, face_axes, offset, planes_of,
-    push_planes, read_header, take_planes, walk_seams, words_to_bytes, FacePlanes, LabelIndex,
-    Union, FACE_NEIGHBOURS, UNLABELLED,
+    bytes_to_words, core_within_read, empty_planes, expect_end, face_axes, label_members_into,
+    planes_of, push_planes, read_header, take_planes, walk_seams, words_to_bytes, FacePlanes,
+    LabelIndex, Union, UNLABELLED,
 };
 use super::shapes_agree;
 use super::voxelwise::is_set;
@@ -182,51 +182,18 @@ pub const FOREGROUND: u32 = UNLABELLED;
 /// Label the **background** of `mask` into `out`, six-connected, and return how
 /// many components were found.
 ///
-/// Deterministic, and deterministic in a way that matters: components are
-/// numbered in the order their lowest voxel is met in row-major order, so the
-/// same block always produces the same labels. Two runs of the same
-/// decomposition are then byte-identical in the intermediate level as well as
-/// in the output, which is what makes the intermediate worth looking at when
-/// something is wrong.
-///
-/// Iterative rather than recursive. A component can span the whole block, and a
-/// depth-first recursion over a 256-cube is a stack overflow rather than a slow
-/// answer.
+/// The traversal is `components::label_members_into` and the whole of what is
+/// said here is the membership test: a voxel belongs to the background exactly
+/// when the mask leaves it clear. Everything that makes the labelling
+/// deterministic, iterative and six-connected is stated there, once, for the two
+/// ops that share it.
 pub fn label_background_into(
     mask: ArrayView3<'_, bool>,
-    mut out: ArrayViewMut3<'_, u32>,
+    out: ArrayViewMut3<'_, u32>,
 ) -> Result<u32> {
     shapes_agree(mask.shape(), out.shape(), "label_background_into")?;
     let shape = [mask.shape()[0], mask.shape()[1], mask.shape()[2]];
-    out.fill(FOREGROUND);
-
-    let mut next = FOREGROUND;
-    let mut stack: Vec<[usize; 3]> = Vec::new();
-    for i in 0..shape[0] {
-        for j in 0..shape[1] {
-            for k in 0..shape[2] {
-                if mask[[i, j, k]] || out[[i, j, k]] != FOREGROUND {
-                    continue;
-                }
-                next += 1;
-                out[[i, j, k]] = next;
-                stack.push([i, j, k]);
-                while let Some(at) = stack.pop() {
-                    for (axis, step) in FACE_NEIGHBOURS {
-                        let Some(to) = offset(at, axis, step, shape) else {
-                            continue;
-                        };
-                        if mask[to] || out[to] != FOREGROUND {
-                            continue;
-                        }
-                        out[to] = next;
-                        stack.push(to);
-                    }
-                }
-            }
-        }
-    }
-    Ok(next)
+    label_members_into(shape, |at| !mask[at], out)
 }
 
 /// Rewrite a label volume into the filled mask.
@@ -681,7 +648,11 @@ pub fn fill_phases(
 }
 
 /// A block's pixels as a mask, whatever width they arrived in.
-fn as_mask(pixels: &Voxels) -> Result<Array3<bool>> {
+///
+/// `pub` because every op here that takes a mask needs the same bridge — this
+/// one and `ops::detect` — and two spellings of "what counts as set" is one too
+/// many. The rule is `voxelwise::is_set`'s and is stated there.
+pub fn as_mask(pixels: &Voxels) -> Result<Array3<bool>> {
     match pixels.dtype() {
         Dtype::Bool => Ok(pixels.view::<bool>()?.to_owned()),
         _ => Ok(pixels.widened().mapv(is_set)),

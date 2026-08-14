@@ -29,7 +29,16 @@
 //   axes a face spans;
 // * reading the six label planes off a block and encoding them as words;
 // * the flat `(block, label)` numbering, the seam walk over the lattice, and the
-//   fold of a per-label boolean onto its component's root.
+//   fold of a per-label boolean onto its component's root;
+// * the seeded flood fill itself, over a **per-voxel** membership test.
+//
+// The last one is here because two of the three ops built on this differ only in
+// that test — `fill` labels the voxels a mask leaves clear, `detect` labels the
+// ones it sets — and a second copy of a flood fill is a second place for a
+// traversal to be subtly different. `regional`'s labelling is deliberately *not*
+// expressed through it: what makes two voxels one plateau there is a comparison
+// between them rather than a fact about each, and a pairwise relation does not
+// fit a per-voxel predicate without carrying the seed's value into it.
 //
 // The extraction made `fill` shorter and changed none of its behaviour: its
 // fragment type, its magic, its public functions and its error messages are
@@ -50,7 +59,7 @@
 
 use std::collections::BTreeMap;
 
-use ndarray::ArrayView3;
+use ndarray::{ArrayView3, ArrayViewMut3};
 
 use crate::error::{Error, Result};
 use crate::fragment::BlockView;
@@ -100,6 +109,63 @@ pub fn face_axes(axis: usize) -> [usize; 2] {
         1 => [0, 2],
         _ => [0, 1],
     }
+}
+
+// ------------------------------------------------------------ labelling --
+
+/// Label the face-connected components of the voxels `member` accepts, into
+/// `out`, and return how many were found.
+///
+/// The membership test is per voxel and takes a position rather than a value, so
+/// that the caller keeps its own array and this borrows nothing: `fill` passes
+/// `|at| !mask[at]`, `detect` passes `|at| mask[at]`, and the *program* — which
+/// is everything else — is written once.
+///
+/// Deterministic, and deterministic in a way that matters: components are
+/// numbered in the order their lowest voxel is met in row-major order, so the
+/// same block always produces the same labels. Two runs of one decomposition are
+/// then byte-identical in the label volume as well as in whatever is derived from
+/// it, which is what makes the labels worth looking at when something is wrong.
+///
+/// Iterative rather than recursive. A component can span the whole block — a
+/// mask that is set everywhere is one — and a depth-first recursion over a
+/// 256-cube is a stack overflow rather than a slow answer.
+pub fn label_members_into(
+    shape: [usize; 3],
+    member: impl Fn([usize; 3]) -> bool,
+    mut out: ArrayViewMut3<'_, u32>,
+) -> Result<u32> {
+    crate::ops::shapes_agree(&shape, out.shape(), "label_members_into")?;
+    out.fill(UNLABELLED);
+
+    let mut next = UNLABELLED;
+    let mut stack: Vec<[usize; 3]> = Vec::new();
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let seed = [i, j, k];
+                if out[seed] != UNLABELLED || !member(seed) {
+                    continue;
+                }
+                next += 1;
+                out[seed] = next;
+                stack.push(seed);
+                while let Some(at) = stack.pop() {
+                    for (axis, step) in FACE_NEIGHBOURS {
+                        let Some(to) = offset(at, axis, step, shape) else {
+                            continue;
+                        };
+                        if out[to] != UNLABELLED || !member(to) {
+                            continue;
+                        }
+                        out[to] = next;
+                        stack.push(to);
+                    }
+                }
+            }
+        }
+    }
+    Ok(next)
 }
 
 // --------------------------------------------------------- face planes --
@@ -528,6 +594,54 @@ mod tests {
             "the flag must reach the whole component"
         );
         assert!(!a[forwards.find(3)], "and no further");
+    }
+
+    /// The one traversal, under the two predicates the ops built on it pass.
+    ///
+    /// A shell with a cavity: labelling the set voxels finds one component, and
+    /// labelling the clear ones finds two — the outside and the cavity — which
+    /// is the pair of answers `detect` and `fill` are respectively asking for.
+    /// Also the two things the numbering promises: scan order, and reproducible.
+    #[test]
+    fn the_labelling_takes_its_membership_from_the_caller_and_numbers_in_scan_order() {
+        let mut mask = Array3::from_elem((5, 5, 5), false);
+        for i in 1..=3 {
+            for j in 1..=3 {
+                for k in 1..=3 {
+                    mask[[i, j, k]] = !(i == 2 && j == 2 && k == 2);
+                }
+            }
+        }
+        let shape = [5usize, 5, 5];
+
+        let mut set = Array3::<u32>::zeros(mask.raw_dim());
+        assert_eq!(
+            label_members_into(shape, |at| mask[at], set.view_mut()).unwrap(),
+            1,
+            "the shell is one component"
+        );
+        assert_eq!(set[[0, 0, 0]], UNLABELLED);
+        assert_eq!(set[[1, 1, 1]], 1);
+
+        let mut clear = Array3::<u32>::zeros(mask.raw_dim());
+        assert_eq!(
+            label_members_into(shape, |at| !mask[at], clear.view_mut()).unwrap(),
+            2,
+            "the outside and the cavity"
+        );
+        // Numbered in the order their lowest voxel is met: the outside first.
+        assert_eq!(clear[[0, 0, 0]], 1);
+        assert_eq!(clear[[2, 2, 2]], 2);
+        assert_ne!(clear[[0, 0, 0]], clear[[2, 2, 2]]);
+
+        // and the same input twice gives the same labels
+        let mut again = Array3::<u32>::zeros(mask.raw_dim());
+        label_members_into(shape, |at| !mask[at], again.view_mut()).unwrap();
+        assert_eq!(clear, again);
+
+        // a mismatched output shape is refused rather than half-filled
+        let mut wrong = Array3::<u32>::zeros((4, 5, 5));
+        assert!(label_members_into(shape, |_| true, wrong.view_mut()).is_err());
     }
 
     #[test]

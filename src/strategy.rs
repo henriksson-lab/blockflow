@@ -54,15 +54,14 @@ use crate::region::Region;
 use crate::tiling::boxes_tile_exactly;
 
 use super::decomposition::{
-    check_block_constraints, check_dtypes, constraint_for, groups_for, is_planning_barrier,
-    price_phase, region_to_ranges, splittable_axes, Constraints, Decomposition, PhaseDecomposition,
-    Visibility,
+    check_block_constraints, check_dtypes, check_source_levels, constraint_for, groups_for,
+    is_planning_barrier, price_phase, region_to_ranges, splittable_axes, Constraints,
+    Decomposition, PhaseDecomposition, Visibility,
 };
-use super::env::block_shape;
-use super::env::Environment;
+use super::env::{block_shape, BlockBuf, Environment};
 use super::fragment::{check_phase_work, neighbourhood, BlockView, PhaseWork};
 use super::geometry::{chunks_touched, BlockGrid};
-use super::graph::TaskGraph;
+use super::graph::{Task, TaskGraph};
 use super::iterate::{IterativeOp, Operand};
 use super::listener::{Dispatch, EventListener};
 use super::log::{Event, Stats};
@@ -327,6 +326,12 @@ pub fn execute_phases(
     // the chain, and re-checked here because a plan whose levels are the wrong
     // width would otherwise be discovered one block at a time.
     check_dtypes(&workflow.chain, decomposition, work)?;
+    // And the same arrangement for the levels a phase reads besides its own
+    // input. **Before `prepare` and before the graph**: a forward reference is
+    // a plan that is not a plan, and it is refused by name here rather than
+    // becoming a missing dependency edge or a block asking for a level nothing
+    // has written.
+    check_source_levels(&workflow.chain, decomposition)?;
     env.prepare(decomposition)?;
     // Once, before any task, and by the executor rather than by each op: a
     // stream must exist before a block writes to it, and a declaration inside
@@ -366,7 +371,7 @@ pub fn execute_phases(
         .then(|| worker_pool(concurrency))
         .transpose()?;
 
-    let mut indegree: Vec<usize> = graph.tasks.iter().map(|task| task.deps.len()).collect();
+    let mut indegree: Vec<usize> = graph.tasks.iter().map(Task::n_dependencies).collect();
     let dependents = graph.dependents();
     // An iterative phase runs as a whole, so its tasks never enter the ready
     // heap: every block of substage `k+1` reads cores its neighbours wrote at
@@ -514,18 +519,26 @@ pub fn execute_phases(
             }
             phase_remaining[phase] -= 1;
             if phase_remaining[phase] == 0 {
-                // The level this phase *read* is now dead. Exactly one phase
-                // reads a level, and this one has finished every task of it, so
-                // there is no later reader to be wrong about — which is what
-                // makes this the unambiguous moment rather than a heuristic.
+                // Every level whose **last** reader is this phase is now dead.
+                //
+                // This used to be the single level `phase` reads, on the
+                // argument that exactly one phase reads a level. A source leaf
+                // makes that a special case: a level read by a later phase has a
+                // second reader, and freeing it here would free something still
+                // wanted. `levels_dead_after` is the general statement — a level
+                // dies after its last reader — and it answers `[phase]` for
+                // every plan with no source leaf, so this is the same behaviour
+                // stated in a way that stays true when there are two.
                 //
                 // The saving is the whole point of `Visibility`: without this an
                 // `N`-phase chain holds `N + 1` full levels for the length of
                 // the run, and only ever two of them are live.
-                if decomposition.level_visibility(phase) == Visibility::Internal
-                    && !hints.keep_levels.contains(&phase)
-                {
-                    env.discard_level(phase)?;
+                for level in decomposition.levels_dead_after(phase) {
+                    if decomposition.level_visibility(level) == Visibility::Internal
+                        && !hints.keep_levels.contains(&level)
+                    {
+                        env.discard_level(level)?;
+                    }
                 }
                 if work[phase].writes_a_level() {
                     // A phase that wrote no level has nothing to flush and
@@ -897,9 +910,41 @@ fn run_task(
         // which is what keeps a globally-anchored sample grid from moving with
         // the block.
         let at = Anchor::of_region(fetch, decomposition.volume_at(task.phase))?;
+        // The levels this phase's source leaves read, at **the same region**:
+        // a source leaf has reach 0, so what it reads is what the block already
+        // fetches, and `check_source_levels` is what makes those the same
+        // integers by requiring the two levels to be on one lattice.
+        //
+        // Read here rather than beside the input read for one reason: a block
+        // that short circuits has not looked at its input, and reading a second
+        // array for it would be paying for an arm nothing consumed. (Today a
+        // phase with a source leaf never short circuits — `Chain::Source`
+        // declines `constant_maps_to` — so this is a property of the code
+        // rather than of the plan, and worth keeping true by construction.)
+        let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_levels.len());
+        for &level in &phase.source_levels {
+            let started = Instant::now();
+            let stored = env.read(level, fetch)?;
+            let read_ns = started.elapsed().as_nanos() as u64;
+            // Priced exactly like the input read, through the same event, so a
+            // run that reads two arrays per block reports two arrays' worth of
+            // bytes. A second arm that cost nothing in the counters would make
+            // every measurement of this feature a measurement of the wrong plan.
+            events.emit(Event::RegionRead {
+                source: format!("level {level}"),
+                level,
+                index: Some(task.index),
+                region: fetch.clone(),
+                voxels: fetch.voxels(),
+                bytes: fetch.voxels() as u64 * decomposition.dtype_at(level).size_of() as u64,
+                chunks: chunks_touched(fetch, &env.chunk_shape()),
+                duration_ns: read_ns,
+            });
+            sources.push((level, stored));
+        }
         for &slot in &phase.slots {
             let started = Instant::now();
-            let next = env.apply(slots[slot], &buf, &at)?;
+            let next = env.apply(slots[slot], &buf, &sources, &at)?;
             let duration_ns = started.elapsed().as_nanos() as u64;
             // Side outputs, before the input buffer is released, because the op
             // is handed both what it read and what it produced. The regions come
@@ -945,6 +990,11 @@ fn run_task(
                 over: read.clone(),
                 duration_ns,
             });
+        }
+        // After the last slot, not after the first: a phase may fuse several
+        // slots and any of them may hold a source leaf naming the same level.
+        for (_, stored) in &sources {
+            env.release(stored);
         }
     }
 
@@ -1520,6 +1570,7 @@ impl Strategy for Trivial {
             chain_reach,
         };
         decomposition.declare_dtypes(&workflow.chain)?;
+        decomposition.declare_source_levels(&workflow.chain)?;
         decomposition.check()?;
         // The oracle has exactly one plan to offer, so it consults the ops'
         // constraint by *checking* rather than by choosing: an op that mandates
@@ -1785,6 +1836,7 @@ impl Strategy for Enumerating {
             chain_reach: workflow.chain.reach3(&volume),
         };
         decomposition.declare_dtypes(&workflow.chain)?;
+        decomposition.declare_source_levels(&workflow.chain)?;
         decomposition.check()?;
         Ok(decomposition)
     }
@@ -1964,6 +2016,7 @@ impl Strategy for Greedy {
             chain_reach: workflow.chain.reach3(&volume),
         };
         decomposition.declare_dtypes(&workflow.chain)?;
+        decomposition.declare_source_levels(&workflow.chain)?;
         decomposition.check()?;
         Ok(decomposition)
     }

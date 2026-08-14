@@ -631,6 +631,63 @@ pub trait Combine: Send + Sync {
     }
 }
 
+/// The stored levels a chain's [`Chain::Source`] leaves are handed, keyed by
+/// level.
+///
+/// **One entry per level, not one per leaf.** Two leaves naming the same level
+/// read the same voxels of the same array at the same extent, so giving them
+/// one buffer is not a cache — it is the statement that a level is one thing.
+/// It also removes the only ordering question a positional list would have had:
+/// a `Chain::Alternative` whose live branch skips a leaf would consume a
+/// different number of entries than the tree contains, and every fold in this
+/// file would then have to agree on a traversal order that nothing else needs.
+///
+/// Each buffer holds **exactly the extent the block was read at** — the phase's
+/// fetch region — because a source leaf has reach 0 and produces the shape it
+/// was handed. The executor reads it; nothing here fetches.
+#[derive(Clone, Copy)]
+pub struct SourceInputs<'a> {
+    entries: &'a [(usize, &'a Voxels)],
+}
+
+impl<'a> SourceInputs<'a> {
+    /// Nothing stored: what a chain with no source leaf is applied with, and
+    /// what [`Chain::apply`] passes.
+    pub const fn none() -> Self {
+        Self { entries: &[] }
+    }
+
+    pub fn new(entries: &'a [(usize, &'a Voxels)]) -> Self {
+        Self { entries }
+    }
+
+    /// The buffer for `level`, or an error naming what was supplied.
+    ///
+    /// An error rather than an `Option` because there is no sensible thing to
+    /// do without it: a missing operand is a block that would combine against
+    /// nothing, which is the class of quiet wrong answer this crate is arranged
+    /// against.
+    pub fn get(&self, level: usize) -> Result<&'a Voxels> {
+        self.entries
+            .iter()
+            .find(|(named, _)| *named == level)
+            .map(|(_, buf)| *buf)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "a source leaf reads level {level} and the executor supplied [{}]. The \
+                     levels a phase reads besides its own input are recorded in the plan \
+                     (`PhaseDecomposition::source_levels`) and read there; a leaf naming one \
+                     the plan does not list has nothing to be handed.",
+                    self.entries
+                        .iter()
+                        .map(|(named, _)| named.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
+    }
+}
+
 /// The structure of a chain: what is sequential, what is exclusive, what
 /// branches and rejoins.
 ///
@@ -683,6 +740,52 @@ pub enum Chain {
         combine: Box<dyn Combine>,
     },
     Op(Box<dyn BlockOp>),
+    /// A leaf that **reads** a stored level instead of computing one.
+    ///
+    /// Every other node in this tree is a function of the buffer handed to it.
+    /// This one ignores that buffer and answers with a level of the run, read
+    /// at the block's own read extent. It is what makes a two-array operation
+    /// expressible without holding the second array whole:
+    /// `Chain::parallel([computed, Chain::source(level, dtype)], combine)` is a
+    /// diamond whose second arm is an array on disk, and every fold below folds
+    /// it exactly as it folds a computed arm.
+    ///
+    /// **Why a leaf of the chain rather than a second input to a phase.**
+    /// `Combine::produces` and `Combine::accepts` already take **lists**, the
+    /// `Parallel` node already allocates one buffer per branch and joins them,
+    /// and `tests/fan_in.rs` already proves that machinery. A second input on
+    /// `PhaseDecomposition` would have needed a parallel set of folds — reach,
+    /// element type, shape, cost — for the same shape of question. So the edge
+    /// the design record asks for (`docs/design/BLOCK_OPS.md`, *"Levels are a
+    /// DAG"*) is added where the DAG already existed.
+    ///
+    /// **Reach 0, and that is exact rather than conservative.** It reads the
+    /// extent it is asked for and nothing around it, so it adds nothing to the
+    /// phase's halo. A source arm therefore never widens the read of the arm
+    /// beside it — which is the whole reason this is cheaper than the array it
+    /// replaces.
+    ///
+    /// **The element type is declared and then checked.** `produces` has only
+    /// an input element type to work from and a source leaf's answer does not
+    /// depend on it, so the leaf carries the answer. What the level actually
+    /// holds is known to the plan, not to the chain, so
+    /// [`check_source_levels`](crate::decomposition::check_source_levels)
+    /// compares the two — the same arrangement as every other quantity this
+    /// crate states twice.
+    ///
+    /// **`level` is a level of the plan, so a chain carrying one constrains the
+    /// plans it is valid for.** That is not a leak: which level is read is
+    /// parity-visible, it is recorded in `PhaseDecomposition::source_levels`,
+    /// and a partition that renumbers the level out from under a leaf is
+    /// refused by name at plan time rather than discovered at the first block.
+    Source {
+        /// The level read. Must be at or below the level its phase reads, so
+        /// that the phase that wrote it has run; a forward reference is refused
+        /// by `check_source_levels`.
+        level: usize,
+        /// The element type that level holds.
+        dtype: Dtype,
+    },
 }
 
 impl Chain {
@@ -694,6 +797,51 @@ impl Chain {
     /// A sequence of ops, each boxed.
     pub fn sequence(children: Vec<Chain>) -> Chain {
         Chain::Sequence(children)
+    }
+
+    /// A leaf that reads level `level`, which holds `dtype`.
+    ///
+    /// Infallible here on purpose: whether the level exists, whether it is a
+    /// forward reference and whether it really holds `dtype` are all questions
+    /// about a *plan*, and this constructor has none. They are answered by
+    /// [`check_source_levels`](crate::decomposition::check_source_levels), in
+    /// one place, at plan time.
+    pub fn source(level: usize, dtype: Dtype) -> Chain {
+        Chain::Source { level, dtype }
+    }
+
+    /// Every level named by a source leaf anywhere in the subtree, ascending
+    /// and without repeats.
+    ///
+    /// **Every branch of an `Alternative` counts, not just `taken`.** This is
+    /// the `reach` reading rather than the `side_outputs` reading, and for
+    /// `reach`'s reason: the level has to be *there* whichever branch is live,
+    /// so it must be kept alive and read for all of them. Over-declaring costs
+    /// a read; under-declaring is a branch with no operand.
+    pub fn source_levels(&self) -> Vec<usize> {
+        let mut seen = Vec::new();
+        self.collect_source_levels(&mut seen);
+        seen.sort_unstable();
+        seen.dedup();
+        seen
+    }
+
+    fn collect_source_levels(&self, seen: &mut Vec<usize>) {
+        match self {
+            Chain::Op(_) => {}
+            Chain::Source { level, .. } => seen.push(*level),
+            Chain::Sequence(children)
+            | Chain::Alternative {
+                branches: children, ..
+            }
+            | Chain::Parallel {
+                branches: children, ..
+            } => {
+                for child in children {
+                    child.collect_source_levels(seen);
+                }
+            }
+        }
     }
 
     /// Mutually exclusive branches, of which `taken` is live.
@@ -744,6 +892,7 @@ impl Chain {
     pub fn display_name(&self) -> String {
         match self {
             Chain::Op(op) => op.name().to_string(),
+            Chain::Source { level, .. } => format!("source(level {level})"),
             Chain::Parallel { branches, combine } => format!(
                 "par({})>{}",
                 branches
@@ -797,6 +946,10 @@ impl Chain {
     pub fn reach(&self, axis: usize, volume_len: usize) -> usize {
         match self {
             Chain::Op(op) => op.reach(axis, volume_len),
+            // Zero, exactly. A source leaf reads the extent it is handed and
+            // nothing around it, so it contributes nothing to its phase's halo
+            // and never widens the arm beside it.
+            Chain::Source { .. } => 0,
             Chain::Sequence(children) => children
                 .iter()
                 .map(|child| child.reach(axis, volume_len))
@@ -876,6 +1029,7 @@ impl Chain {
     fn fold_reach_spec(&self, volume: [usize; 3]) -> Result<Reach> {
         match self {
             Chain::Op(op) => Ok(op.reach_spec(volume)),
+            Chain::Source { .. } => Ok(Reach::none()),
             Chain::Sequence(children) => fold_specs(children, volume, Reach::add),
             Chain::Alternative { branches, .. } => fold_specs(branches, volume, Reach::max),
             Chain::Parallel { branches, combine } => {
@@ -922,6 +1076,13 @@ impl Chain {
                 }
                 Ok(op.produces(input))
             }
+            // **Accepts anything and answers what it holds.** A source leaf is
+            // not a function of the buffer it was handed — it ignores it — so
+            // refusing an element type here would be refusing something it
+            // never looks at. The declaration is checked against the level it
+            // names by `check_source_levels`, which is the only place that
+            // knows what the level holds.
+            Chain::Source { dtype, .. } => Ok(*dtype),
             Chain::Sequence(children) => {
                 let mut current = input;
                 for child in children {
@@ -996,6 +1157,12 @@ impl Chain {
     pub fn output_shape(&self, input: [usize; 3]) -> Result<[usize; 3]> {
         match self {
             Chain::Op(op) => Ok(op.output_shape(input)),
+            // The extent it was asked for, which is the whole of what "reach 0"
+            // means for a leaf that reads rather than computes. It is also what
+            // makes a source arm joinable with a computed arm that keeps its
+            // extent, and what makes it *refused* — by the combine, naming both
+            // shapes — beside one that resizes.
+            Chain::Source { .. } => Ok(input),
             Chain::Sequence(children) => {
                 let mut current = input;
                 for child in children {
@@ -1036,12 +1203,34 @@ impl Chain {
         }
     }
 
-    /// The same walk as `reach`, over the same tree.
+    /// The same walk as `reach`, over the same tree, for a subtree that reads
+    /// nothing but its input.
     ///
     /// `out` must be what the subtree declared it produces, in both shape and
     /// element type. It is checked rather than assumed because this is the seam
     /// where a wrong declaration would otherwise become a wrong volume.
+    ///
+    /// A subtree containing a [`Chain::Source`] fails here, naming the level:
+    /// this entry point has no stored operands to hand it, and producing a
+    /// buffer without one would be the quiet wrong answer rather than the loud
+    /// one. Use [`Self::apply_with`].
     pub fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
+        self.apply_with(input, SourceInputs::none(), out, at)
+    }
+
+    /// [`Self::apply`], with the stored levels this subtree's source leaves
+    /// read.
+    ///
+    /// `sources` is threaded down unchanged, exactly as `at` is and for the
+    /// same reason: a leaf deep inside a `Parallel` branch must see the same
+    /// buffer the executor read, not one re-derived on the way down.
+    pub fn apply_with(
+        &self,
+        input: &Voxels,
+        sources: SourceInputs<'_>,
+        out: &mut Voxels,
+        at: &Anchor,
+    ) -> Result<()> {
         let wanted_shape = self.output_shape(input.shape())?;
         let wanted_dtype = self.produces(input.dtype())?;
         if out.shape() != wanted_shape {
@@ -1061,7 +1250,33 @@ impl Chain {
         }
         match self {
             Chain::Op(op) => op.apply(input, out, at),
-            Chain::Alternative { branches, taken } => branches[*taken].apply(input, out, at),
+            // The one node that answers from something other than `input`. The
+            // buffer holds the block's read extent of the level, so this is a
+            // copy and not a slice: the executor already asked for exactly the
+            // extent, at reach 0, and anything else would mean the plan and the
+            // read disagreed.
+            Chain::Source { level, dtype } => {
+                let stored = sources.get(*level)?;
+                if stored.dtype() != *dtype {
+                    return Err(Error::InvalidArgument(format!(
+                        "a source leaf declares level {level} holds {} and the buffer read from \
+                         it holds {}. The declaration is what every fold of this chain was built \
+                         from, so the two have to be one fact.",
+                        dtype.numpy_name(),
+                        stored.dtype().numpy_name()
+                    )));
+                }
+                if stored.shape() != out.shape() {
+                    return Err(Error::ShapeMismatch {
+                        expected: out.shape().to_vec(),
+                        got: stored.shape().to_vec(),
+                    });
+                }
+                out.assign(stored)
+            }
+            Chain::Alternative { branches, taken } => {
+                branches[*taken].apply_with(input, sources, out, at)
+            }
             // Every branch, over the **same** buffer at the **same** anchor,
             // then the combine over all of their results. The shared input is
             // what makes this a fan-in rather than two chains that happen to be
@@ -1081,25 +1296,25 @@ impl Chain {
                         branch.produces(input.dtype())?,
                         branch.output_shape(input.shape())?,
                     )?;
-                    branch.apply(input, &mut result, at)?;
+                    branch.apply_with(input, sources, &mut result, at)?;
                     results.push(result);
                 }
                 combine.apply(&results, out, at)
             }
             Chain::Sequence(children) => match children.len() {
                 0 => out.assign(input),
-                1 => children[0].apply(input, out, at),
+                1 => children[0].apply_with(input, sources, out, at),
                 n => {
                     let mut current = input.clone();
                     for (position, child) in children.iter().enumerate() {
                         if position + 1 == n {
-                            return child.apply(&current, out, at);
+                            return child.apply_with(&current, sources, out, at);
                         }
                         let mut next = Voxels::zeros(
                             child.produces(current.dtype())?,
                             child.output_shape(current.shape())?,
                         )?;
-                        child.apply(&current, &mut next, at)?;
+                        child.apply_with(&current, sources, &mut next, at)?;
                         current = next;
                     }
                     Ok(())
@@ -1129,6 +1344,8 @@ impl Chain {
     pub fn side_outputs(&self, volume: [usize; 3]) -> Vec<Output> {
         match self {
             Chain::Op(op) => op.side_outputs(volume),
+            // A leaf that reads writes nothing.
+            Chain::Source { .. } => Vec::new(),
             Chain::Sequence(children) => children
                 .iter()
                 .flat_map(|child| child.side_outputs(volume))
@@ -1145,6 +1362,9 @@ impl Chain {
     pub fn side_region(&self, which: usize, valid: &Region, volume: [usize; 3]) -> Result<Region> {
         match self {
             Chain::Op(op) => op.side_region(which, valid, volume),
+            Chain::Source { level, .. } => Err(Error::InvalidArgument(format!(
+                "side output {which} of a leaf reading level {level}, which declares none"
+            ))),
             Chain::Alternative { branches, taken } => {
                 branches[*taken].side_region(which, valid, volume)
             }
@@ -1178,6 +1398,17 @@ impl Chain {
     /// [`Self::slots`] entry and a slot is never a `Sequence`; it is paid only by
     /// a caller applying a whole chain by hand, which is the whole-volume
     /// reference case and is meant to be simple rather than fast.
+    ///
+    /// **Side outputs and source leaves do not compose yet, and the failure is
+    /// loud.** Re-deriving an intermediate calls [`Self::apply`] rather than
+    /// [`Self::apply_with`], so a subtree that both declares a side output and
+    /// contains a [`Chain::Source`] fails naming the level. The combination the
+    /// executor actually meets is safe: a `Parallel` skips every branch that
+    /// declares no side output, so a source arm beside a side-output arm is
+    /// never re-derived. Threading the stored operands through here as well
+    /// would widen [`crate::env::Environment::apply_side`] for a case nothing
+    /// exercises, and a widening nothing tests is worse than a refusal that
+    /// says what is missing.
     pub fn apply_side(
         &self,
         input: &Voxels,
@@ -1186,6 +1417,7 @@ impl Chain {
     ) -> Result<Vec<ArrayD<f64>>> {
         match self {
             Chain::Op(op) => op.apply_side(input, primary, block),
+            Chain::Source { .. } => Ok(Vec::new()),
             Chain::Alternative { branches, taken } => {
                 branches[*taken].apply_side(input, primary, block)
             }
@@ -1258,6 +1490,9 @@ impl Chain {
     pub fn block_constraint(&self, volume: [usize; 3]) -> Result<Option<BlockConstraint>> {
         match self {
             Chain::Op(op) => Ok(op.block_constraint(volume)),
+            // Nothing. A source leaf takes the extent it is given, so it can
+            // never be the branch that makes a fan-in unsatisfiable.
+            Chain::Source { .. } => Ok(None),
             Chain::Alternative { branches, taken } => branches[*taken].block_constraint(volume),
             // **Concurrent branches must agree, and unlike a `Sequence` there
             // is no cut that would resolve a disagreement.** A `Parallel` is
@@ -1328,6 +1563,11 @@ impl Chain {
     pub fn cost_per_voxel(&self) -> f64 {
         match self {
             Chain::Op(op) => op.cost_per_voxel(),
+            // Zero *compute*. What a source arm costs is a read, and a read is
+            // priced where every other read is — by voxels fetched from a level,
+            // through `Environment::read` and `Decomposition::exact_read_voxels`
+            // — not by a compute figure that would then be counted twice.
+            Chain::Source { .. } => 0.0,
             Chain::Sequence(children) => children.iter().map(Chain::cost_per_voxel).sum(),
             Chain::Alternative { branches, .. } => branches
                 .iter()
@@ -1360,6 +1600,13 @@ impl Chain {
     pub fn constant_maps_to(&self, value: f64) -> Option<f64> {
         match self {
             Chain::Op(op) => op.constant_maps_to(value),
+            // **`None`, always.** The short circuit's premise is that a uniform
+            // input determines the output, and a source leaf's output is
+            // determined by data nobody has looked at. So a phase with a source
+            // arm never short circuits — which is the correct answer and not a
+            // missed optimisation: the arm it did not read is exactly the thing
+            // that could have made the block non-uniform.
+            Chain::Source { .. } => None,
             Chain::Alternative { branches, taken } => branches[*taken].constant_maps_to(value),
             Chain::Parallel { branches, combine } => {
                 let values = branches
@@ -1399,6 +1646,10 @@ impl Chain {
                     }
                 }
             }
+            // No preference. A traversal order is a claim about locality of the
+            // work, and this node does none; the order it is read in is the one
+            // the arm beside it asked for.
+            Chain::Source { .. } => {}
             // Every branch of a fan-in runs, so every branch's preference is
             // real and a disagreement between two of them is exactly the
             // "candidate phase boundary" signal — with the caveat that this one

@@ -525,8 +525,14 @@ impl Environment for RegridEnvironment {
         self.inner.read(level, region)
     }
 
-    fn apply(&self, slot: &Chain, input: &BlockBuf, at: &Anchor) -> Result<BlockBuf> {
-        self.inner.apply(slot, input, at)
+    fn apply(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Anchor,
+    ) -> Result<BlockBuf> {
+        self.inner.apply(slot, input, sources, at)
     }
 
     fn write(&self, level: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {

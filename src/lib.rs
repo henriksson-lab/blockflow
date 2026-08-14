@@ -174,8 +174,9 @@ pub use cache::{
     ChunkKey, Codec, DeflateCodec, RegionSourceFetcher, Tier,
 };
 pub use decomposition::{
-    check_block_constraints, check_chunk_exclusive_writes, constraint_for, is_planning_barrier,
-    reaches_whole_axis, splittable_axes, Constraints, CostModel, Decomposition, PhaseDecomposition,
+    check_block_constraints, check_chunk_exclusive_writes, check_source_levels, constraint_for,
+    is_planning_barrier, reaches_whole_axis, splittable_axes, Constraints, CostModel,
+    Decomposition, PhaseDecomposition,
 };
 pub use distributed::{
     Assignment, ChunkGrid, Coordinator, Handout, HandoutPolicy, JobSpec, JobStatus, ModelledCache,
@@ -193,7 +194,7 @@ pub use fragment::{
     Coverage, FragmentInput, FragmentOp, FragmentOutput, PhaseWork, StreamCoverage,
 };
 pub use geometry::{BlockCore, BlockGeometry, BlockGrid};
-pub use graph::{Task, TaskGraph};
+pub use graph::{SourceDep, Task, TaskGraph};
 pub use iterate::{
     check_iterative, iterative_phase, substage_reach, IterativeOp, Operand, Substage,
     SubstageLimit, SubstageOperand,
@@ -201,7 +202,7 @@ pub use iterate::{
 pub use listener::{BlockProgress, EventListener, LatestOpPerChunk, OrderLog, ProgressKind};
 pub use log::{Event, ExecutionLog, Stats};
 pub use observed_io::{ObservedSink, ObservedSource};
-pub use op::{Anchor, BlockConstraint, BlockOp, Chain, Combine, Output, SideBlock};
+pub use op::{Anchor, BlockConstraint, BlockOp, Chain, Combine, Output, SideBlock, SourceInputs};
 pub use points::{
     decode_points, encode_points, Layout, Point, PointIndex, PointStore, State, WORDS_PER_POINT,
 };

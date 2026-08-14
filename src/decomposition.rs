@@ -97,6 +97,26 @@ pub struct PhaseDecomposition {
     /// of plausible wrong answer a binding plan must not contain. Resolve it
     /// with [`Decomposition::dtype_at`], which folds the chain from level 0.
     pub dtype: Option<Dtype>,
+    /// Levels this phase reads **besides** the one it is handed, ascending and
+    /// without repeats: one per [`Chain::Source`] leaf in its slots.
+    ///
+    /// **Two different things in this file are called a source, and this is the
+    /// one that is a level.** `BlockGeometry::source` is a *region* — where in
+    /// the level below a block fetches from — and every phase has one per
+    /// block. This is a list of *levels*, and it is empty for every phase that
+    /// does not read a second array. They meet in exactly one place: a source
+    /// level is read at each block's `source` region, because a source leaf has
+    /// reach 0 and therefore reads what the phase already fetches.
+    ///
+    /// **In the binding half of the plan, unlike `Visibility`.** Which level an
+    /// arm reads changes voxels, so it is recorded, fingerprinted and shipped —
+    /// the "explicit edges in the binding plan" of `docs/design/BLOCK_OPS.md`
+    /// §"Levels are a DAG", in the one shape this crate needs them.
+    ///
+    /// Derived from the chain by [`Decomposition::declare_source_levels`] and
+    /// verified against it by [`check_source_levels`], the same split
+    /// `declare_dtypes` and `check_dtypes` have.
+    pub source_levels: Vec<usize>,
     /// Cores, read extents and valid regions, derived and recorded.
     pub blocks: Vec<BlockGeometry>,
 }
@@ -139,6 +159,7 @@ impl PhaseDecomposition {
             halo,
             grid,
             dtype: None,
+            source_levels: Vec::new(),
             blocks,
         }
     }
@@ -161,6 +182,19 @@ impl PhaseDecomposition {
     /// Say this phase writes a different element type than it read.
     pub fn with_dtype(mut self, dtype: Dtype) -> Self {
         self.dtype = Some(dtype);
+        self
+    }
+
+    /// Say this phase also reads these levels, through source leaves.
+    ///
+    /// Normalised on the way in — ascending, no repeats — because the list is
+    /// fingerprinted and two plans that read the same levels must hash the same
+    /// whatever order the chain was walked in.
+    pub fn with_source_levels(mut self, levels: impl IntoIterator<Item = usize>) -> Self {
+        let mut levels: Vec<usize> = levels.into_iter().collect();
+        levels.sort_unstable();
+        levels.dedup();
+        self.source_levels = levels;
         self
     }
 
@@ -298,14 +332,63 @@ impl Decomposition {
         dtype
     }
 
+    /// Every phase that reads `level`, ascending: the phase it is the input of,
+    /// plus every later phase naming it in `source_levels`.
+    ///
+    /// **The refcount.** Before source leaves existed this was always a single
+    /// phase — level `p` is phase `p`'s input and nobody else's — and the whole
+    /// lifetime rule was written to that special case. A source leaf is a
+    /// second reader, so the general statement is the one the design record
+    /// asks for: *a level dies after its last reader*. With no source leaf
+    /// anywhere this returns `vec![level]` for every level a phase reads, and
+    /// [`Self::levels_dead_after`] reduces to exactly what it replaced.
+    ///
+    /// The last level has no reader at all, which is why it is `Published`.
+    pub fn readers_of_level(&self, level: usize) -> Vec<usize> {
+        let mut readers = Vec::new();
+        if level < self.n_phases() {
+            readers.push(level);
+        }
+        for (phase, decomposition) in self.phases.iter().enumerate() {
+            if phase != level && decomposition.source_levels.contains(&level) {
+                readers.push(phase);
+            }
+        }
+        readers.sort_unstable();
+        readers
+    }
+
+    /// The levels whose **last** reader is `phase`: what dies when this phase
+    /// finishes every one of its tasks.
+    ///
+    /// This is the quantity the executor wants, and stating it this way is what
+    /// keeps the executor from having to know whether the rule is "one reader"
+    /// or "several". A plan with no source leaf answers `[phase]`, which is the
+    /// level the phase read — the old rule, unchanged, as an instance of the
+    /// new one.
+    ///
+    /// Whether a level may be freed at all is still [`Self::level_visibility`]'s
+    /// question, and pinning is still the caller's; neither is folded in here,
+    /// because this is a fact about the plan and those two are policy.
+    pub fn levels_dead_after(&self, phase: usize) -> Vec<usize> {
+        (0..self.n_levels())
+            .filter(|&level| self.readers_of_level(level).last() == Some(&phase))
+            .collect()
+    }
+
     /// Whether a level survives the run, or exists only to get from one phase
     /// to the next.
     ///
     /// **Derived, not recorded.** Level 0 is the input and the last level is the
-    /// output; everything between them is written by one phase, read by exactly
+    /// output; everything between them is written by one phase, read by at least
     /// one phase, and then dead. Nothing in the plan needs to say so, and a
     /// field that could disagree with the arithmetic would be a field that
     /// eventually does.
+    ///
+    /// *Which* phase is the last reader is [`Self::levels_dead_after`]'s
+    /// question and has moved; whether the level is somebody else's to keep has
+    /// not, because a source leaf is inside the run and cannot make an
+    /// intermediate outlive it.
     ///
     /// This is deliberately **not** part of the binding half of the plan.
     /// Discarding an intermediate cannot change a voxel of the output, so
@@ -376,6 +459,34 @@ impl Decomposition {
         Ok(())
     }
 
+    /// Record which levels each phase reads besides its own input, from the
+    /// source leaves in its slots.
+    ///
+    /// The counterpart of [`Self::declare_dtypes`], and separate from
+    /// [`check_source_levels`] for the same reason: this one *derives* from a
+    /// chain the caller is holding, that one *verifies* a plan that may have
+    /// arrived from anywhere.
+    ///
+    /// A phase with no source leaf is left declaring nothing, which is what
+    /// keeps a plan that does not use the feature fingerprinting exactly as it
+    /// did before the feature existed.
+    pub fn declare_source_levels(&mut self, chain: &Chain) -> Result<()> {
+        let slots = chain.slots();
+        for phase in &mut self.phases {
+            let mut levels = Vec::new();
+            for &slot in &phase.slots {
+                let Some(node) = slots.get(slot) else {
+                    continue;
+                };
+                levels.extend(node.source_levels());
+            }
+            levels.sort_unstable();
+            levels.dedup();
+            phase.source_levels = levels;
+        }
+        Ok(())
+    }
+
     /// Exact voxels read, per phase, from the real clamped geometry.
     ///
     /// This is the number to compare against what a run actually counted. A
@@ -387,10 +498,20 @@ impl Decomposition {
     /// is asked for. Where a phase reads across grids the two differ, and the
     /// whole reason `source` is in the plan is that this figure was silently
     /// wrong by 4x when the mapping lived in an environment instead.
+    ///
+    /// **Once per level read, and a phase with source leaves reads more than
+    /// one.** Each one is fetched at the same region as the input — reach 0 —
+    /// so the multiplier is exactly `1 + source_levels.len()`. A figure that
+    /// counted only the input would be under by that factor for precisely the
+    /// plans this number is most worth checking, and it is compared against a
+    /// run's counter to the voxel.
     pub fn exact_read_voxels(&self) -> Vec<usize> {
         self.phases
             .iter()
-            .map(|phase| phase.blocks.iter().map(|block| block.source.voxels()).sum())
+            .map(|phase| {
+                let per_level: usize = phase.blocks.iter().map(|block| block.source.voxels()).sum();
+                per_level * (1 + phase.source_levels.len())
+            })
             .collect()
     }
 
@@ -426,6 +547,14 @@ impl Decomposition {
             phase.grid.block().hash(&mut hasher);
             if let Some(dtype) = phase.dtype {
                 dtype.numpy_name().hash(&mut hasher);
+            }
+            // Hashed only where it is used, on exactly `dtype`'s argument: a
+            // phase that reads no second level contributes nothing, so every
+            // plan built before source leaves existed fingerprints as it did.
+            // Which level an arm reads changes voxels, so a plan that uses one
+            // must not collide with a plan that reads another.
+            if !phase.source_levels.is_empty() {
+                phase.source_levels.hash(&mut hasher);
             }
             for block in &phase.blocks {
                 block.index.hash(&mut hasher);
@@ -966,6 +1095,143 @@ pub fn check_block_constraints(chain: &Chain, decomposition: &Decomposition) -> 
         )?;
     }
     Ok(())
+}
+
+/// Every source leaf in `chain` names a level its phase can actually read, and
+/// the plan records which ones.
+///
+/// **The guard that cannot live in [`Decomposition::check`]**, on exactly
+/// [`check_block_constraints`]' argument: a plan records op names, not
+/// implementations, so the plan alone cannot see the leaves. The executor is
+/// the first place holding both halves, and it runs this before the first
+/// block — a forward reference is a fact about the plan, and a plan that is not
+/// a plan should be refused as one rather than survive until some block asks
+/// for a level nothing has written.
+///
+/// Four things are checked, and each of them is a way for a well-formed,
+/// complete, wrong volume to come out otherwise:
+///
+/// * **the level exists.** An index past the end is not a reference to
+///   anything.
+/// * **it is not a forward reference.** Phases run `0..n`, so level `s` is
+///   written by phase `s - 1` and is only there for a phase that runs after it:
+///   `s <= p` for phase `p`, which reads level `p`. Refused *by name*, saying
+///   which phase writes the level and which reads it. (`s == p` is the phase's
+///   own input read a second time — degenerate, harmless, and not worth a
+///   special case that would then have to be right.)
+/// * **it is on the same lattice.** A source leaf has reach 0 and reads the
+///   block's own fetch region, so the level it reads has to be in the same
+///   coordinate space as the level the phase reads. A different volume would
+///   make the same integers mean different voxels, which is the failure this
+///   crate exists to prevent rather than one to price.
+/// * **the declared element type is the level's.** The leaf carries a `Dtype`
+///   because `Chain::produces` has nothing else to answer with, and every fold
+///   of the chain was built from that answer; here it meets the plan, which is
+///   the only thing that knows what the level holds.
+///
+/// Finally the recorded `source_levels` must be exactly what the slots name —
+/// a plan whose record disagrees with its chain would read one level and price
+/// another, and the whole reason the field exists is that it is parity-visible.
+pub fn check_source_levels(chain: &Chain, decomposition: &Decomposition) -> Result<()> {
+    let slots = chain.slots();
+    for (phase_index, phase) in decomposition.phases.iter().enumerate() {
+        if phase.slots.iter().any(|&slot| slot >= slots.len()) {
+            // Out of range is caught, with a better message, by the executor's
+            // own slot-order check.
+            continue;
+        }
+        let mut named: Vec<usize> = phase
+            .slots
+            .iter()
+            .flat_map(|&slot| slots[slot].source_levels())
+            .collect();
+        named.sort_unstable();
+        named.dedup();
+        if named != phase.source_levels {
+            return Err(Error::InvalidArgument(format!(
+                "decomposition phase {phase_index} ({}) records that it also reads level(s) \
+                 {:?}, and its slots name {:?}. The recorded list is what the executor reads and \
+                 what the fingerprint hashes, so a plan whose record disagrees with its chain \
+                 would price one level and read another.",
+                phase.names.join(">"),
+                phase.source_levels,
+                named
+            )));
+        }
+        for &level in &named {
+            if level >= decomposition.n_levels() {
+                return Err(Error::InvalidArgument(format!(
+                    "decomposition phase {phase_index} ({}) reads level {level} through a source \
+                     leaf, and this plan has {} level(s), numbered 0 to {}.",
+                    phase.names.join(">"),
+                    decomposition.n_levels(),
+                    decomposition.n_levels() - 1
+                )));
+            }
+            if level > phase_index {
+                return Err(Error::InvalidArgument(format!(
+                    "decomposition phase {phase_index} ({}) reads level {level} through a source \
+                     leaf, but level {level} is written by phase {}, which runs after it. Phases \
+                     run in order, so a source leaf may only name a level at or below the one its \
+                     phase is handed — level {phase_index} here.",
+                    phase.names.join(">"),
+                    level - 1
+                )));
+            }
+            let read = decomposition.volume_at(phase_index);
+            let stored = decomposition.volume_at(level);
+            if stored != read {
+                return Err(Error::InvalidArgument(format!(
+                    "decomposition phase {phase_index} ({}) reads level {level}, which is \
+                     {stored:?}, beside level {phase_index}, which is {read:?}. A source leaf has \
+                     reach 0 and is read at the block's own fetch region, so the two levels have \
+                     to be in one coordinate space; across grids the same integers would name \
+                     different voxels.",
+                    phase.names.join(">")
+                )));
+            }
+        }
+        for &slot in &phase.slots {
+            check_declared_source_dtypes(slots[slot], phase_index, phase, decomposition)?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk one slot's source leaves and compare each declaration against the level.
+fn check_declared_source_dtypes(
+    node: &Chain,
+    phase_index: usize,
+    phase: &PhaseDecomposition,
+    decomposition: &Decomposition,
+) -> Result<()> {
+    match node {
+        Chain::Op(_) => Ok(()),
+        Chain::Source { level, dtype } => {
+            let held = decomposition.dtype_at(*level);
+            if held != *dtype {
+                return Err(Error::InvalidArgument(format!(
+                    "decomposition phase {phase_index} ({}) has a source leaf declaring level \
+                     {level} holds {}, and the plan folds that level to {}. Every fold of the \
+                     chain — what the combine accepts, what the phase writes — was built from \
+                     the declaration, so it has to be the level's own element type.",
+                    phase.names.join(">"),
+                    dtype.numpy_name(),
+                    held.numpy_name()
+                )));
+            }
+            Ok(())
+        }
+        Chain::Sequence(children)
+        | Chain::Alternative {
+            branches: children, ..
+        }
+        | Chain::Parallel {
+            branches: children, ..
+        } => children.iter().try_for_each(|child| {
+            check_declared_source_dtypes(child, phase_index, phase, decomposition)
+        }),
+    }
 }
 
 /// Every phase of `decomposition` writes the element type its ops produce.

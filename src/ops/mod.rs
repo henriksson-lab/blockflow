@@ -27,6 +27,7 @@
 // | `fill` | hole filling, as two `FragmentOp` phases | the first operation here that **no halo can express**: reachability is transitive over the whole volume, so it is a fragment-and-join rather than a `BlockOp` at all |
 // | `regional` | the maxima of a greyscale volume, as the same two phases | the **second** op of that shape, which is what turned one op's internals into `components`: the same program with a different per-label fact, and a seam meeting that compares before it joins |
 // | `components` | the union-find, the six-face geometry and the seam walk | nothing on its own — it is the part of `fill` and `regional` that is the *program* rather than the question |
+// | `detect` | one point per connected region of a mask, at its centroid | the **producer** the point world had none of, and the first phase pair here that writes no level at all: a `fragments -> fragments` merge whose accumulators are integers, so a component split across four blocks totals *exactly* rather than nearly |
 // | `voxelize` | scattered points into a dense volume | a `fragments -> volume` op whose reach is in **blocks** as well as voxels, and an accumulation order that has to be a function of the data rather than of the gather |
 // | `reconstruct` | grey reconstruction, and the h-maxima transform over it | the first `IterativeOp` here: a **fixed point** whose substage count is a function of the data, reached at the external reach of *one* substage — the third answer to transitivity, beside a wide halo and a fragment-and-join |
 //
@@ -109,6 +110,7 @@ pub mod background;
 pub mod components;
 pub mod cost;
 pub mod deconvolve;
+pub mod detect;
 pub mod element;
 pub mod fill;
 pub mod local;
@@ -124,6 +126,11 @@ pub mod smooth;
 pub mod voxelize;
 pub mod voxelwise;
 
+pub use detect::{
+    centroid_points, detect_phases, detect_regions, label_regions_into, merge_moments,
+    moments_of_labels, owner_of, points_owned_by, LabelRegionsOp, Moments, RegionMoments,
+    RegionPointsOp,
+};
 pub use element::{select_nth, ElementShape, Rank, StructuringElement, Total};
 pub use fill::{fill_phases, FillHolesOp, LabelBackgroundOp};
 pub use local::{

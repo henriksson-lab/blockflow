@@ -103,6 +103,18 @@ pub enum Operand {
     /// Today every `Fixed` operand is a view of the same array, because a phase
     /// has one input level. When levels become a DAG this variant is where the
     /// level number goes, and nothing else about the interface moves.
+    ///
+    /// **A second level is now expressible, and this variant has not moved to
+    /// it.** [`Chain::Source`](crate::op::Chain::Source) is a leaf that reads a
+    /// stored level at the block's read extent, and a phase records which levels
+    /// it reads in `PhaseDecomposition::source_levels`. That is the general
+    /// form of what this variant does narrowly — but an iterative phase owns no
+    /// chain slot, so it has no leaf to carry the number and would need the
+    /// level on `SubstageOperand` instead. Adding it is a change to this enum
+    /// and to `run_iterative_phase`'s operand gathering, and nothing else; it is
+    /// left undone rather than guessed at, because no op has asked for it yet
+    /// and an untested variant of a two-array iteration is exactly the kind of
+    /// plausible thing that would be wrong.
     Fixed,
 }
 

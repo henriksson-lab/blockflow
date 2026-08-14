@@ -52,7 +52,7 @@ use serde_json::Value;
 use crate::decomposition::Decomposition;
 use crate::error::{Error, Result};
 use crate::export::event_from_json;
-use crate::graph::TaskGraph;
+use crate::graph::{Task, TaskGraph};
 use crate::log::{Event, ExecutionLog};
 
 use super::cache_model::{ChunkGrid, ModelledCache};
@@ -195,7 +195,7 @@ impl Job {
         graph
             .dependencies_cover_reads(&decomposition)
             .map_err(Error::InvalidArgument)?;
-        let remaining_deps: Vec<usize> = graph.tasks.iter().map(|task| task.deps.len()).collect();
+        let remaining_deps: Vec<usize> = graph.tasks.iter().map(Task::n_dependencies).collect();
         let dependents = graph.dependents();
         let n = graph.len();
         let chunks = ChunkGrid::new(decomposition.volume, spec.workflow.chunk);

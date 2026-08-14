@@ -239,6 +239,27 @@ impl BlockOp for VoxelwiseMapOp {
 /// The operand is in **volume** coordinates and is sliced at the anchor, so this
 /// op is position-dependent in the one way that matters: it must know where its
 /// buffer sits to know which part of the operand to combine it with.
+///
+/// **Bounded to volumes that fit in memory, and there is now a form that is
+/// not.** The operand is an `Arc<Voxels>` of the *whole* volume — asserted equal
+/// to `at.volume` on every block — so this op costs one full copy of the second
+/// array, resident for the length of the run, at the sizes an out-of-core
+/// framework exists for. The out-of-core form is
+/// [`Chain::Source`](crate::op::Chain::Source): a leaf that reads a stored level
+/// at the block's own read extent, so that
+///
+/// ```text
+/// Chain::parallel(
+///     vec![computed_arm, Chain::source(level, dtype)],
+///     Box::new(LogicCombine::new("and", Logic::And)),
+/// )
+/// ```
+///
+/// is the same answer with the second operand read a block at a time. Prefer it
+/// wherever the second array is a level of the run. This one stays for the case
+/// it is honestly good at — a small operand a caller already holds, combined
+/// against a chain that has no plan around it yet — and it is not a worse
+/// `LogicCombine`; it is a different arrangement of the same kernels.
 pub struct CombineOp {
     name: &'static str,
     logic: Logic,

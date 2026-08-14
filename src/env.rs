@@ -53,7 +53,20 @@ use crate::voxels::{SideBuf, Voxels};
 
 use super::decomposition::Decomposition;
 use super::geometry::{chunks_touched, region_within};
-use super::op::{Anchor, Chain, Output, SideBlock};
+use super::op::{Anchor, Chain, Output, SideBlock, SourceInputs};
+
+/// Unwrap the executor's `(level, buffer)` list into the `(level, &Voxels)` form
+/// [`SourceInputs`] holds.
+///
+/// A free function rather than a method on `SourceInputs` because the borrow has
+/// to outlive the call: the `Vec` it returns owns the references, and the caller
+/// keeps it alive for as long as it holds the `SourceInputs`.
+pub(crate) fn as_source_arrays(sources: &[(usize, BlockBuf)]) -> Result<Vec<(usize, &Voxels)>> {
+    sources
+        .iter()
+        .map(|(level, buf)| Ok((*level, buf.as_array()?)))
+        .collect()
+}
 
 /// A block's worth of data, or a stand-in for one.
 ///
@@ -254,7 +267,27 @@ pub trait Environment: Sync {
     /// is the read extent it just asked for) and the op may need it; see
     /// [`Anchor`]. It is threaded rather than recomputed so the two cannot
     /// disagree.
-    fn apply(&self, slot: &Chain, input: &BlockBuf, at: &Anchor) -> Result<BlockBuf>;
+    ///
+    /// `sources` is the same arrangement for the levels the slot's
+    /// [`Chain::Source`] leaves read: one `(level, buffer)` per level in
+    /// `PhaseDecomposition::source_levels`, each holding **the same extent as
+    /// `input`**, read by the executor through [`Self::read`] so that its bytes
+    /// are counted exactly where every other read's are. Empty for every slot
+    /// with no source leaf, which is every slot this crate shipped before they
+    /// existed.
+    ///
+    /// **A parameter rather than a second method.** A defaulted
+    /// `apply_with_sources` would leave the four existing implementations
+    /// silently ignoring the operands, and "silently ignoring an operand" is the
+    /// precise shape of the wrong answer this whole change exists to remove —
+    /// a complete, well-formed volume combined against nothing.
+    fn apply(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Anchor,
+    ) -> Result<BlockBuf>;
 
     /// Write the sub-box `within` of `buf` to absolute position `valid`.
     fn write(&self, level: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()>;
@@ -977,8 +1010,15 @@ impl Environment for ArrayEnvironment {
         Ok(BlockBuf::Array(array))
     }
 
-    fn apply(&self, slot: &Chain, input: &BlockBuf, at: &Anchor) -> Result<BlockBuf> {
+    fn apply(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Anchor,
+    ) -> Result<BlockBuf> {
         let array = input.as_array()?;
+        let stored = as_source_arrays(sources)?;
         // Allocated from what the chain **declares**, not from what it was
         // handed. That one line is the difference between a phase that may
         // translate its read and a phase that may resize it.
@@ -986,7 +1026,7 @@ impl Environment for ArrayEnvironment {
             slot.produces(array.dtype())?,
             slot.output_shape(array.shape())?,
         )?;
-        slot.apply(array, &mut out, at)?;
+        slot.apply_with(array, SourceInputs::new(&stored), &mut out, at)?;
         self.counters.ops_applied.fetch_add(1, Ordering::SeqCst);
         self.counters.estimated_work.fetch_add(
             (array.len() as f64 * slot.cost_per_voxel()) as u64,
@@ -1330,7 +1370,20 @@ impl Environment for AccountingEnvironment {
         })
     }
 
-    fn apply(&self, slot: &Chain, input: &BlockBuf, _at: &Anchor) -> Result<BlockBuf> {
+    /// **`sources` is ignored, and that is the honest answer here.** A simulated
+    /// run holds no data, so a stored operand has nothing to contribute to a
+    /// result that is itself an extent and an element type. Its *cost* is not
+    /// lost: the executor reads it through [`Environment::read`], which is where
+    /// this environment counts every byte it is asked for, and where a source
+    /// arm's reads have to be counted for the simulation to be of the right
+    /// plan.
+    fn apply(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        _sources: &[(usize, BlockBuf)],
+        _at: &Anchor,
+    ) -> Result<BlockBuf> {
         let BlockBuf::Accounted {
             region,
             dtype,
@@ -1470,6 +1523,7 @@ mod tests {
             .apply(
                 &Chain::op(AffineOp::new("d", 2.0, 1.0, [0, 0, 0])),
                 &buf,
+                &[],
                 &Anchor::whole([4, 4, 4]),
             )
             .unwrap();
@@ -1491,6 +1545,7 @@ mod tests {
         sim.apply(
             &Chain::op(IdentityOp::new("noop", [0, 0, 0])),
             &buf,
+            &[],
             &Anchor::whole([2094, 13316, 3369]),
         )
         .unwrap();

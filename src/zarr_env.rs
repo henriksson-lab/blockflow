@@ -186,7 +186,7 @@ use crate::dtype::Dtype;
 use crate::env::{block_shape, BlockBuf, EnvCounters, Environment};
 use crate::error::{Error, Result};
 use crate::geometry::{chunks_touched, region_within};
-use crate::op::{Anchor, Chain, Output};
+use crate::op::{Anchor, Chain, Output, SourceInputs};
 use crate::region::Region;
 use crate::sidecar::{FileSidecars, Sidecars};
 use crate::voxels::{SideBuf, VoxelElement, Voxels};
@@ -1442,13 +1442,20 @@ impl Environment for ZarrEnvironment {
     /// Identical to `ArrayEnvironment::apply`, and identical on purpose: where
     /// the bytes live has nothing to do with what an op computes, and the moment
     /// this diverges the byte-identity claim stops being about storage.
-    fn apply(&self, slot: &Chain, input: &BlockBuf, at: &Anchor) -> Result<BlockBuf> {
+    fn apply(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Anchor,
+    ) -> Result<BlockBuf> {
         let array = input.as_array()?;
+        let stored = crate::env::as_source_arrays(sources)?;
         let mut out = Voxels::zeros(
             slot.produces(array.dtype())?,
             slot.output_shape(array.shape())?,
         )?;
-        slot.apply(array, &mut out, at)?;
+        slot.apply_with(array, SourceInputs::new(&stored), &mut out, at)?;
         self.counters.ops_applied.fetch_add(1, Ordering::SeqCst);
         self.counters.estimated_work.fetch_add(
             (array.len() as f64 * slot.cost_per_voxel()) as u64,

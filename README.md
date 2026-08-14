@@ -179,6 +179,49 @@ what shape it produces, what a constant folds to — is a question about a *list
 Branch results need not agree with each other on element type; they must be
 acceptable to the combine, which is checked when the plan is made.
 
+### Two arrays: a branch that reads instead of computing
+
+A phase reads the level it is handed. An operation needing a *second* array —
+measuring one array against another, masking, seeding a reconstruction from
+somewhere other than its own mask — used to get it by holding it whole
+(`CombineOp`), which is one full copy of the array resident for the length of
+the run.
+
+`Chain::Source` is a leaf that reads a stored level instead of computing one,
+so the second arm of a fan-in can be an array in storage:
+
+```rust
+Chain::parallel(
+    vec![computed_arm, Chain::source(level, Dtype::F64)],
+    Box::new(LogicCombine::new("xor", Logic::Xor)),
+)?
+```
+
+It reuses the fan-in machinery entirely: one buffer per branch, joined by the
+combine, with every fold above applying unchanged. Three things are new, and
+none of them is assumed:
+
+* **reach 0**, exactly. It reads the block's own read extent and nothing
+  around it, so it never widens the halo of the arm beside it.
+* **the level is in the plan.** Which level an arm reads changes voxels, so it
+  is recorded in `PhaseDecomposition::source_levels`, fingerprinted, and sent
+  over the wire. `check_source_levels` compares it against the chain and
+  refuses, *by name and when the plan is made*, a level that does not exist, a
+  forward reference to one a later phase writes, one on a different lattice,
+  and one whose element type is not what the leaf declared.
+* **a level dies after its last reader.** A level with a second reader is not
+  freed when the first one finishes. `Decomposition::readers_of_level` is the
+  refcount; with no source leaf it answers one phase and the old rule falls out
+  of the new one unchanged.
+
+Level 0 is the case of this that always existed: a level with no producing
+phase. `Chain::source(0, dtype)` says so explicitly — and it is the one form
+that is valid under *every* partition, because level 0 is below every phase
+whatever the planner does with the chain. A leaf naming an intermediate names a
+level number, so it constrains where the phase boundaries may fall; the shipped
+planners do not yet place a boundary to satisfy one, they are refused by
+`check_source_levels` if they do not.
+
 ## Reach: what an op reads, and in what units
 
 `BlockOp::reach(axis, volume_len) -> usize` is the statement most ops want and
