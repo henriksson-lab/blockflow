@@ -1062,6 +1062,124 @@ impl BlockOp for DecimateOp {
     }
 }
 
+// ------------------------------------------------------- an iteration --
+
+/// The probe for [`crate::iterate`]: a step whose answer depends on **two**
+/// operands, one of which is fixed for the whole loop.
+///
+/// `g <- min(spread(g), f)`, where `spread` is the neighbourhood maximum along
+/// axis 0 and `f` is the phase's input read pointwise. The running estimate
+/// starts as the input thresholded at `seed_above`, so a high value spreads
+/// outward one voxel per substage and is capped everywhere by `f` — which stops
+/// it dead wherever `f` is zero. Two properties make it the right probe, and
+/// neither is available from a one-operand op:
+///
+/// * **the substage count is a function of the data.** It is the distance the
+///   value has to travel plus two, so the same plan over two inputs runs a
+///   different number of substages and gives the right answer for each. Nothing
+///   about the plan changes, which is the design's whole claim about where the
+///   count does and does not belong.
+/// * **the fixed operand matters at every substage, not only the first.** If it
+///   were supplied once and the running estimate handed in its place afterwards,
+///   the step would become `min(spread(g), g) = g` and the iteration would freeze
+///   at the seed — a complete, well-formed, wrong volume, which is exactly the
+///   failure mode `ops/deconvolve.rs`'s header warns about and which
+///   `tests/iterative_phase.rs` provokes deliberately.
+///
+/// Reach one on axis 0 and nothing on the others, **per substage**. A forty-
+/// substage run of it has the reach of a one-substage run, which is the property
+/// the whole shape exists for.
+///
+/// `seed_above` is a parameter with no default, on the crate's own rule: a value
+/// that exists only because one caller needs it is a leak.
+pub struct CappedSpreadOp {
+    name: &'static str,
+    seed_above: f64,
+    limit: crate::iterate::SubstageLimit,
+}
+
+impl CappedSpreadOp {
+    /// `limit` is the runaway guard and is the caller's to derive. This op
+    /// spreads one voxel per substage along axis 0, so the extent of that axis
+    /// plus two bounds it — which is a bound rather than a guess, and is a
+    /// different number from the one a peeling op would state.
+    pub fn new(name: &'static str, seed_above: f64, limit: crate::iterate::SubstageLimit) -> Self {
+        Self {
+            name,
+            seed_above,
+            limit,
+        }
+    }
+
+    /// The bound this op's own behaviour gives over `volume`: one voxel of axis 0
+    /// per substage, plus the seeding substage and the one that observes the
+    /// fixed point.
+    pub fn bound_for(volume: [usize; 3]) -> crate::iterate::SubstageLimit {
+        crate::iterate::SubstageLimit::of(volume[0] + 2).expect("a volume has at least one voxel")
+    }
+}
+
+impl crate::iterate::IterativeOp for CappedSpreadOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn operands(&self) -> Vec<crate::iterate::SubstageOperand> {
+        vec![
+            crate::iterate::SubstageOperand::running([1, 0, 0]),
+            crate::iterate::SubstageOperand::fixed([0, 0, 0]),
+        ]
+    }
+
+    fn limit(&self) -> crate::iterate::SubstageLimit {
+        self.limit
+    }
+
+    fn substage(&self, at: &crate::iterate::Substage<'_>, out: &mut Voxels) -> Result<()> {
+        let running = at.operand(0)?.view::<f64>()?;
+        let cap = at.operand(1)?.view::<f64>()?;
+        let shape = out.shape();
+        let mut target = out.view_mut::<f64>()?;
+        for i in 0..shape[0] {
+            for j in 0..shape[1] {
+                for k in 0..shape[2] {
+                    // Substage 0 seeds the running estimate from the level it was
+                    // handed. That is what "the running operand of substage 0 is
+                    // the phase's input" is *for*: an iteration whose starting
+                    // estimate is a function of its input needs no second entry
+                    // point.
+                    target[[i, j, k]] = if at.index() == 0 {
+                        let value = running[[i, j, k]];
+                        if value >= self.seed_above {
+                            value
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        // Clamped at the buffer, which is this module's
+                        // convention: an interior block's clamp lands in its halo
+                        // and is discarded with it, and a block at a volume edge
+                        // clamps where the whole volume does.
+                        let mut best = running[[i, j, k]];
+                        if i > 0 {
+                            best = best.max(running[[i - 1, j, k]]);
+                        }
+                        if i + 1 < shape[0] {
+                            best = best.max(running[[i + 1, j, k]]);
+                        }
+                        best.min(cap[[i, j, k]])
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        3.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

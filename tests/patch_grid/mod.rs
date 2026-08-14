@@ -56,7 +56,7 @@ use std::sync::Mutex;
 use blockflow::env::EnvCounters;
 use blockflow::{
     AccountingEnvironment, Anchor, BlockBuf, BlockGrid, BlockOp, Chain, Decomposition, Dtype,
-    Environment, Error, Lifecycle, PhaseDecomposition, Region, Result, Voxels,
+    Environment, Error, Lifecycle, PhaseDecomposition, Reach, Region, Result, Voxels,
 };
 use ndarray::ArrayD;
 
@@ -259,6 +259,10 @@ impl PatchGeometry {
 pub struct CountedOp {
     name: &'static str,
     reach: [usize; 3],
+    /// What the op really depends on, when that is something the symmetric
+    /// triple above cannot say. `reach` stays a bound on it, which the chain
+    /// checks.
+    spec: Option<Reach>,
     cost: f64,
     order: Option<[usize; 3]>,
 }
@@ -268,9 +272,16 @@ impl CountedOp {
         Self {
             name,
             reach,
+            spec: None,
             cost: 1.0,
             order: None,
         }
+    }
+
+    /// State the dependency exactly, rather than as the widest side of it.
+    pub fn with_reach(mut self, spec: Reach) -> Self {
+        self.spec = Some(spec);
+        self
     }
 
     pub fn with_cost(mut self, cost: f64) -> Self {
@@ -291,6 +302,14 @@ impl BlockOp for CountedOp {
 
     fn reach(&self, axis: usize, _volume_len: usize) -> usize {
         self.reach[axis]
+    }
+
+    fn reach_spec(&self, volume: [usize; 3]) -> Reach {
+        let _ = volume;
+        match &self.spec {
+            Some(spec) => spec.clone(),
+            None => Reach::symmetric(self.reach),
+        }
     }
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
@@ -582,11 +601,13 @@ pub fn one_phase(
     volume: [usize; 3],
     dtype: Dtype,
     grid: BlockGrid,
-    reach: [usize; 3],
-    halo: [usize; 3],
+    reach: impl Into<Reach>,
+    halo: impl Into<Reach>,
 ) -> Decomposition {
     let slots = chain.slots();
     let names = slots.iter().map(|slot| slot.display_name()).collect();
+    let reach = reach.into();
+    let chain_reach = reach.bound(volume);
     Decomposition {
         volume,
         dtype,
@@ -597,7 +618,7 @@ pub fn one_phase(
             halo,
             grid,
         )],
-        chain_reach: reach,
+        chain_reach,
     }
 }
 

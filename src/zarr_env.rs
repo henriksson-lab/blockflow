@@ -76,12 +76,46 @@
 // against another that touches an overlapping set.
 //
 // The alternative was to require block writes to be chunk-disjoint. It was
-// rejected because it is not this layer's decision to make: the block grid comes
-// from the plan and the chunk grid from the storage, and refusing every plan
-// whose blocks straddle a chunk would refuse most plans. What is kept from that
-// idea is the accounting — [`ZarrEnvironment::serialised_writes`] says how often
-// the slow path was taken, so a caller who *can* align their blocks can see that
-// it worked.
+// rejected because it looked like this layer imposing the storage's grid on the
+// plan's — and then reconsidered, because the dependency runs the other way:
+// see "Chunk-exclusive writing" below. The locks stay regardless, for the
+// reasons stated there.
+//
+// Chunk-exclusive writing, and why it is a mandate now
+// ----------------------------------------------------
+// **Every chunk of a level is written by exactly one task.** That is a
+// system-wide invariant, not an optimisation, and
+// [`check_chunk_exclusive_writes`] refuses a plan that breaks it —
+// [`Environment::prepare`] is where it runs, because that is the first place
+// that holds both the plan and the chunk shapes.
+//
+// It is nearly free, because for a level nobody outside the run reads, *the
+// chunk shape is ours to choose*: derive it from the writing phase's block grid
+// ([`chunk_for_block`]) and the invariant holds by construction. The dependency
+// only runs the other way — block grid quantised to the chunk grid — where a
+// caller dictates a layout for downstream consumers, which is the output level
+// and nothing else ([`ZarrEnvironment::with_output_chunk`]).
+//
+// What that leaves the locks doing. Two things, and neither is the hazard the
+// invariant removed:
+//
+// * **side outputs.** An `Output` is addressed by name and by a region of its
+//   own; nothing in the plan tiles it, several phases may contribute to one, and
+//   `side_chunk` picks its chunking from its extent. No invariant covers those
+//   writes, so they are the case the guard now exists for.
+// * **anything outside `prepare`.** Level 0 is written by `create` before a plan
+//   exists, and a caller may write a level directly. The guard is a property of
+//   the store's write path rather than a consequence of the planner, which is
+//   what keeps it true for callers the planner never saw.
+//
+// [`ZarrEnvironment::serialised_writes`] therefore stops meaning "your blocks
+// straddle chunks" — under the invariant they cannot — and starts meaning "this
+// write read-modify-wrote a chunk", which for a conforming plan happens only
+// where a chunk **overhangs the volume's far edge**: `zarrs` compares a subset
+// against the *unclipped* chunk extent, so the last chunk on an axis whose
+// extent is not a multiple of the chunk's takes the slow path. That is a cost
+// with no hazard behind it — the overhang holds no voxel anybody else can write
+// — and it is zero for a plan whose volume the chunk shape divides.
 //
 // **What the guard does not cover**, stated rather than implied: a read
 // concurrent with a write of the same array. Reads take no locks. The contract
@@ -131,7 +165,7 @@
 // through a compressed store, an uncompressed store and `ArrayEnvironment` agree
 // voxel for voxel, which is the only claim compression is allowed to make.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
@@ -145,8 +179,9 @@ use zarrs::array::{
     Array as ZarrArray, ArrayBuilder, ArraySubset, DataType, Element, ElementOwned, FillValue,
 };
 use zarrs::filesystem::FilesystemStore;
+use zarrs::storage::{StorePrefix, WritableStorageTraits};
 
-use crate::decomposition::Decomposition;
+use crate::decomposition::{check_chunk_exclusive_writes, Decomposition, Visibility};
 use crate::dtype::Dtype;
 use crate::env::{block_shape, BlockBuf, EnvCounters, Environment};
 use crate::error::{Error, Result};
@@ -274,27 +309,62 @@ impl Compression {
     /// | `uint8`…`int64` | `Gzip(1)` | images and label volumes: bounded range, spatial correlation, and — for labels — long runs. |
     /// | `float32`, `float64` | `None` | an IEEE mantissa over continuous data is close to incompressible byte-wise, and deflate charges full price to discover that. |
     ///
-    /// The evidence, in three parts and in increasing order of how much it
-    /// should be trusted:
+    /// **The evidence.** `compression_pays_for_bool_and_not_for_float` in
+    /// `tests/zarr_env.rs` runs a chain over a 64³ `synthetic::Scene` through
+    /// this environment under six policies and prints stored bytes and elapsed
+    /// time per level. A release build, one run, chunk 32³:
     ///
-    /// 1. **The shape of the data.** `bool` is the only element type here that
-    ///    is *guaranteed* to waste seven eighths of every byte, and a mask is
-    ///    runs by construction. Nothing about a `float64` intermediate is
-    ///    similarly guaranteed.
-    /// 2. **This crate's own prior measurement**, recorded when the block cache
-    ///    was designed: **19.7x** on `bool` intermediates and **2.09x** on raw
-    ///    `uint16`, deflate, on real volumes. `cache::DeflateCodec` was chosen
-    ///    on those numbers and defaults to level 1 on the same argument this
-    ///    does — past level 1 the extra ratio on run-heavy data is small and the
-    ///    CPU cost is not.
-    /// 3. **The measurement in this crate's own tests.**
-    ///    `compression_pays_for_bool_and_not_for_float` in `tests/zarr_env.rs`
-    ///    writes a `synthetic::Scene` volume and its threshold through this
-    ///    environment and prints stored bytes and elapsed time per level, both
-    ///    ways. It asserts the direction of each default rather than a ratio: a
-    ///    number is a fact about one volume, but "the `bool` level shrinks a
-    ///    great deal and the `float64` level barely moves" is the claim the
-    ///    defaults are actually making.
+    /// | policy | level 0 (`float64`) | level 1 (`bool`) | run | break-even |
+    /// |---|---|---|---|---|
+    /// | no compression | 2 097 152 B | 262 144 B | 7 ms | — |
+    /// | `gzip1` everywhere | 1 978 908 B (1.06x) | 22 845 B (11.5x) | 42 ms | 10.4 MB/s |
+    /// | `gzip9` everywhere | 1 982 399 B (1.06x) | 10 188 B (25.7x) | 92 ms | 4.3 MB/s |
+    /// | **derived (this function)** | 2 097 152 B (1.00x) | 22 845 B (11.5x) | **11 ms** | **73.7 MB/s** |
+    /// | derived, `bool` at `gzip6` | 2 097 152 B | 10 685 B (24.5x) | 25 ms | 14.5 MB/s |
+    /// | derived, `bool` at `gzip9` | 2 097 152 B | 10 188 B (25.7x) | 64 ms | 4.5 MB/s |
+    ///
+    /// **break-even** is the number the defaults are actually chosen on: bytes
+    /// saved divided by CPU seconds spent saving them, which is the store
+    /// throughput below which compressing is faster end to end. Read it as *"do
+    /// this if your store is slower than X"*. Three readings, and each one is a
+    /// default:
+    ///
+    /// * **Compressing `float64` costs 31 ms to save 118 kB** — the step from
+    ///   the derived row to `gzip1` everywhere, a break-even of **3.8 MB/s**,
+    ///   which no store this framework will ever be pointed at is slower than.
+    ///   That is why the floats default to [`Compression::None`], and at a 20x
+    ///   margin against even a slow spinning disk it is not a close call.
+    /// * **Compressing `bool` costs 4 ms to save 239 kB** — the step from no
+    ///   compression to the derived row, **73.7 MB/s**, which most network
+    ///   stores, most shared filesystems and any disk under concurrent load are
+    ///   slower than. It is close to free, and 11.5x is a great deal of space
+    ///   not to be holding.
+    /// * **Turning `bool` up from level 1 to level 6** doubles the ratio again
+    ///   (11.5x to 24.5x) but the *incremental* trade is 12 kB for 14 ms — 0.9
+    ///   MB/s, worse than the `float64` case it just refused. So level 1, not
+    ///   because higher levels do not compress but because past level 1 this
+    ///   data is already mostly runs and deflate is only working harder to find
+    ///   the same ones. `cache::DeflateCodec` defaults to 1 on the identical
+    ///   argument.
+    ///
+    /// The integers are the weakest of the three and are stated as such. The
+    /// same test writes a twelve-bit quantisation of the same scene as `uint16`:
+    /// **1.36x at `gzip1`**, 5 ms for 139 kB, a break-even of ~28 MB/s — and
+    /// higher gzip levels are *worse* on it, at 1.34x. That is a good trade on
+    /// network storage and roughly a wash on a fast local NVMe. Two things
+    /// decide it in favour of compressing anyway: this crate's own earlier
+    /// measurement on **real** acquisitions, **2.09x** on raw `uint16` (against
+    /// **19.7x** on `bool`, the pair `cache::DeflateCodec` was chosen on), where
+    /// the ratio is better than synthetic noise gives; and that stored bytes are
+    /// a standing cost while CPU seconds are paid once. A caller who disagrees
+    /// says [`CompressionPolicy::uniform`] with [`Compression::None`] and is
+    /// done.
+    ///
+    /// One free win that is *not* compression and should not be credited to it:
+    /// a chunk every element of which equals the fill value is not written at
+    /// all. On a `bool` level whose fill value is `true`, an entirely-`true`
+    /// region costs nothing whatever the codec. The test above thresholds before
+    /// masking precisely so that this does not flatter the numbers above.
     ///
     /// The float refusal is the one that surprises people, so: it is not that
     /// floats never compress — a float volume that is mostly one value
@@ -406,7 +476,9 @@ impl CompressionPolicy {
     pub fn at(&self, level: usize, dtype: Dtype) -> Compression {
         match self.at_level.get(&level) {
             Some(&explicit) => explicit,
-            None => self.everywhere.unwrap_or_else(|| Compression::for_dtype(dtype)),
+            None => self
+                .everywhere
+                .unwrap_or_else(|| Compression::for_dtype(dtype)),
         }
     }
 
@@ -737,10 +809,29 @@ pub struct ZarrEnvironment {
     root: PathBuf,
     store: Arc<Store>,
     volume: [usize; 3],
-    chunk: [usize; 3],
+    /// **Level 0's chunking, and nothing else's.**
+    ///
+    /// Level 0 is the workflow input: somebody else's array, arriving with the
+    /// layout it already has, read by this run and written by nobody. It is the
+    /// one level the chunk-exclusive invariant says nothing about, which is why
+    /// a caller states it and every other level derives one.
+    input_chunk: [usize; 3],
+    /// A layout dictated for the **output** level, when a caller has downstream
+    /// consumers to satisfy.
+    ///
+    /// `None` — the default — means the output level is chunked like every other
+    /// level a phase writes: derived from the block grid that writes it. Saying
+    /// otherwise is a real constraint and is treated as one: the block grid then
+    /// has to be a whole multiple of it, and a plan where it is not is refused by
+    /// `prepare` rather than quietly given straddling writes.
+    output_chunk: Option<[usize; 3]>,
     /// Level `l` at index `l`. Level 0 exists from construction; `prepare` adds
     /// the rest, because only the plan knows their shapes and element types.
     levels: RwLock<Vec<Arc<StoredArray>>>,
+    /// Levels erased from the store by `discard_level`. Held separately from
+    /// `levels` because the fact worth recording is "this was freed", and an
+    /// absent handle would be indistinguishable from one `prepare` never made.
+    discarded: RwLock<BTreeSet<usize>>,
     /// The arrays ops write beside their primary result, by declared name.
     ///
     /// A `BTreeMap` rather than a `HashMap` so that iteration is declaration
@@ -750,9 +841,9 @@ pub struct ZarrEnvironment {
     /// where every level but level 0 is created.
     compression: CompressionPolicy,
     locks: ChunkLocks,
-    /// Writes that had to serialise on at least one chunk, and reads that could
-    /// not be served by whole-chunk decodes. Diagnostics, not correctness: both
-    /// are zero for a decomposition whose blocks land on the chunk grid.
+    /// Writes that had to read-modify-write at least one chunk, and reads that
+    /// could not be served by whole-chunk decodes. Diagnostics, not correctness:
+    /// both are zero for a decomposition whose blocks land on the chunk grid.
     serialised_writes: AtomicU64,
     unaligned_reads: AtomicU64,
     counters: EnvCounters,
@@ -766,8 +857,13 @@ impl ZarrEnvironment {
     ///
     /// `root` is created if it does not exist. The remaining levels are not
     /// created here — [`Environment::prepare`] does that, from the plan, because
-    /// a phase owns its volume and its element type and this constructor knows
-    /// neither.
+    /// a phase owns its volume, its element type **and its chunking** and this
+    /// constructor knows none of the three.
+    ///
+    /// `chunk` is level 0's, and level 0's only. It used to be every level's,
+    /// which made the storage's grid an input to every write the plan made; see
+    /// [`chunk_for_block`] for what replaced it and [`Self::with_output_chunk`]
+    /// for the one case where a caller still dictates one.
     ///
     /// Compression is [`CompressionPolicy::derived`]: every level is stored as
     /// [`Compression::for_dtype`] of its own element type. See
@@ -815,9 +911,11 @@ impl ZarrEnvironment {
             root,
             store,
             volume,
-            chunk,
+            input_chunk: chunk,
+            output_chunk: None,
             levels: RwLock::new(vec![Arc::new(level0)]),
             side: RwLock::new(BTreeMap::new()),
+            discarded: RwLock::new(BTreeSet::new()),
             compression,
             locks,
             serialised_writes: AtomicU64::new(0),
@@ -832,12 +930,68 @@ impl ZarrEnvironment {
         &self.root
     }
 
-    /// How many writes had to serialise on at least one chunk.
+    /// Dictate the **output** level's chunking, for a consumer outside the run.
     ///
-    /// Zero says every write landed on the chunk grid and took the lock-free
-    /// path. A large number says the block grid and the chunk grid disagree,
-    /// which is a *performance* fact about the plan — the answer is the same
-    /// either way, which is the whole design of this layer.
+    /// This is the one place a chunk grid is allowed to constrain a block grid
+    /// rather than the other way round, and it is stated as a builder call so
+    /// that a plan carrying the constraint is visible in a grep. The cost is
+    /// real: the last phase's blocks must then be whole multiples of `chunk` on
+    /// every axis, and [`Environment::prepare`] refuses the plan if they are
+    /// not, naming the chunk and the two blocks that would share it.
+    ///
+    /// There is deliberately no equivalent for an internal level. Nobody outside
+    /// the run reads one, so a layout for it could only be a preference, and a
+    /// preference that can make a plan illegal is worse than no knob.
+    #[must_use]
+    pub fn with_output_chunk(mut self, chunk: [usize; 3]) -> Self {
+        self.output_chunk = Some(chunk);
+        self
+    }
+
+    /// The chunk shape this environment will give each level of `decomposition`,
+    /// indexed by level.
+    ///
+    /// Public so that a caller can check a plan **before** running it: pair it
+    /// with [`check_chunk_exclusive_writes`] and the refusal `prepare` would
+    /// have raised is available while there is still time to choose another
+    /// block grid.
+    pub fn chunk_plan(&self, decomposition: &Decomposition) -> Vec<[usize; 3]> {
+        let mut chunks = Vec::with_capacity(decomposition.n_levels());
+        chunks.push(self.input_chunk);
+        for level in 1..decomposition.n_levels() {
+            let phase = &decomposition.phases[level - 1];
+            let derived = chunk_for_block(phase.grid.block(), decomposition.dtype_at(level));
+            chunks.push(match decomposition.level_visibility(level) {
+                // Nobody outside the run reads it, so its layout is ours and the
+                // invariant is free.
+                Visibility::Internal => derived,
+                // The output. Dictated only if a caller said so; otherwise it is
+                // derived like any other level a phase writes.
+                Visibility::Published => self.output_chunk.unwrap_or(derived),
+            });
+        }
+        chunks
+    }
+
+    /// What one level's chunks are actually shaped, read off the array rather
+    /// than recomputed — so it answers what was built, not what would be built
+    /// now. The same argument as [`Self::compression_at`].
+    pub fn chunk_at(&self, level: usize) -> Result<[usize; 3]> {
+        let array = self.level_array(level)?;
+        block_shape(&Region::whole(&array.chunk))
+    }
+
+    /// How many writes had to read-modify-write at least one chunk.
+    ///
+    /// Zero says every write covered its chunks from edge to edge and took the
+    /// lock-free path. Since the chunk-exclusive invariant makes a *shared*
+    /// chunk impossible for a level, what is left for this to count is the
+    /// chunk that **overhangs the volume's far edge** — `zarrs` compares against
+    /// the unclipped chunk extent, so a volume the chunk shape does not divide
+    /// pays a decode and re-encode on its last chunk per axis. That is a cost
+    /// with no hazard behind it, and it is a *performance* fact about the plan:
+    /// the answer is the same either way, which is the whole design of this
+    /// layer.
     pub fn serialised_writes(&self) -> u64 {
         self.serialised_writes.load(Ordering::SeqCst)
     }
@@ -863,7 +1017,22 @@ impl ZarrEnvironment {
     /// — which is what an `ok_or_else` closure that reaches for the length
     /// again would do — is a recursive read, and `std` is explicit that a
     /// recursive read may deadlock against a waiting writer.
+    /// Whether `level` has been erased from the store.
+    pub fn is_discarded(&self, level: usize) -> bool {
+        self.discarded
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&level)
+    }
+
     fn level_array(&self, level: usize) -> Result<Arc<StoredArray>> {
+        if self.is_discarded(level) {
+            return Err(Error::InvalidArgument(format!(
+                "level {level} was discarded — the phase that reads it finished, so the plan \
+                 says nothing wants it again, and its arrays are gone from the store. Pin it \
+                 with `Hints::keep_levels` if something does."
+            )));
+        }
         let levels = self.levels_guard();
         match levels.get(level) {
             Some(array) => Ok(array.clone()),
@@ -986,6 +1155,50 @@ impl ZarrEnvironment {
     fn aligned(&self, region: &Region, chunk: &[usize]) -> bool {
         partly_covered_chunks(region, chunk).is_empty()
     }
+
+    /// Add to a chunk-exclusivity refusal the thing only this environment knows:
+    /// whether the caller's **dictated** output layout is what made the plan
+    /// illegal, and therefore which of the two grids they can move.
+    ///
+    /// Established by asking the guard again with that one level derived instead
+    /// of dictated, rather than by reading the message it already produced. A
+    /// refusal that says "drop this and the plan is legal" should have checked
+    /// that it is, or it is advice that may be false — and the plan is refused
+    /// either way, so the check costs nothing anybody is waiting on.
+    fn blame_the_dictated_layout(
+        &self,
+        err: Error,
+        decomposition: &Decomposition,
+        chunks: &[[usize; 3]],
+    ) -> Error {
+        let Some(dictated) = self.output_chunk else {
+            return err;
+        };
+        let output = decomposition.n_levels() - 1;
+        if output == 0 {
+            return err;
+        }
+        let mut derived = chunks.to_vec();
+        derived[output] = chunk_for_block(
+            decomposition.phases[output - 1].grid.block(),
+            decomposition.dtype_at(output),
+        );
+        if check_chunk_exclusive_writes(decomposition, &derived).is_err() {
+            // Something other than the dictate is wrong — an internal level
+            // whose valid regions are not its phase's cores. Blaming the caller
+            // for that would send them to fix the one thing that is fine.
+            return err;
+        }
+        Error::InvalidArgument(format!(
+            "{err} This plan is legal with the output level chunked {:?}, derived from the blocks \
+             that write it; it is illegal only because {dictated:?} was dictated for it \
+             (`with_output_chunk`). So it is the **block grid** that has to give here — and if that \
+             phase's block extent is itself mandated by one of its ops (`BlockConstraint::Extent`, \
+             a fixed input window), the two are hard constraints in direct collision and no \
+             re-blocking resolves it: one of them must be dropped.",
+            derived[output]
+        ))
+    }
 }
 
 /// Every chunk file under `at`, added up.
@@ -1024,6 +1237,105 @@ fn side_path(name: &str) -> String {
     format!("/side/{name}")
 }
 
+// ------------------------------------------------------ derived chunking --
+
+/// The largest chunk that is still a sensible unit to encode, decode and cache.
+///
+/// A chunk is the quantum of every one of those, so an oversized one is paid
+/// three times over: a halo read that wants a face of it decompresses the whole
+/// thing, the cache tiers cannot hold a working set of them, and a write that
+/// touches part of one re-encodes all of it. Four megabytes is roughly where a
+/// single chunk is still one sequential read on any store this is pointed at.
+const MAX_CHUNK_BYTES: u128 = 4 << 20;
+
+/// The size below which a chunk stops being worth splitting further.
+///
+/// Under this, the per-chunk costs — a file, a key, a codec header, an index
+/// entry — start to rival the payload, and deflate has too little context to
+/// find anything. So [`chunk_for_block`] will leave a chunk *above*
+/// [`MAX_CHUNK_BYTES`] rather than take it below this: the byte range is a
+/// preference, and the divisor lattice does not always contain a member of it.
+const MIN_CHUNK_BYTES: u128 = 256 << 10;
+
+/// **The chunk shape for a level, derived from the block grid that writes it.**
+///
+/// The rule, and why it is this one:
+///
+/// 1. **Start at the block extent.** The block grid's cores start at multiples
+///    of it and its valid regions are those cores, so a chunk shape that divides
+///    it exactly cannot be cut by a valid-region boundary — which is
+///    [`check_chunk_exclusive_writes`] satisfied by construction rather than by
+///    luck.
+/// 2. **Divide it down, never off it.** A block is chosen for a memory budget
+///    and is usually far too large to be one compression unit. So the extent is
+///    reduced by replacing an axis with its **largest proper divisor** — a halve
+///    where the extent is even, whatever the divisor lattice allows where it is
+///    not — which keeps the exact-divisor property at every step, since a
+///    divisor of a divisor of the block is a divisor of the block.
+/// 3. **Longest axis first**, ties to the lowest axis. A chunk near cubic
+///    minimises the surface a halo read has to cross, and the tie rule is there
+///    so that the answer is a function of the block and not of iteration order.
+/// 4. **Stop at the byte range.** Reduce while the chunk is over
+///    [`MAX_CHUNK_BYTES`]; never make a reduction that would take it under
+///    [`MIN_CHUNK_BYTES`]. A prime block extent has only itself and 1, so a
+///    plan can land outside the range on an axis; that costs bytes moved, and
+///    the alternative — a chunk that is not a divisor — costs correctness.
+///
+/// The element type is a term because the range is in bytes: one block holding
+/// `bool` and the same block holding `float64` differ eightfold in what a chunk
+/// of them costs to move, so a rule stated in voxels would be calibrated for one
+/// element type and wrong for the other ten.
+pub fn chunk_for_block(block: [usize; 3], dtype: Dtype) -> [usize; 3] {
+    let element = dtype.size_of().max(1) as u128;
+    let bytes =
+        |chunk: &[usize; 3]| chunk.iter().map(|&edge| edge as u128).product::<u128>() * element;
+    let mut chunk = [block[0].max(1), block[1].max(1), block[2].max(1)];
+    while bytes(&chunk) > MAX_CHUNK_BYTES {
+        let mut order = [0usize, 1, 2];
+        // Stable, so equal extents keep their axis order.
+        order.sort_by_key(|&axis| std::cmp::Reverse(chunk[axis]));
+        let mut reduced = false;
+        for axis in order {
+            let smaller = largest_proper_divisor(chunk[axis]);
+            if smaller == chunk[axis] {
+                continue;
+            }
+            let mut candidate = chunk;
+            candidate[axis] = smaller;
+            if bytes(&candidate) < MIN_CHUNK_BYTES {
+                continue;
+            }
+            chunk = candidate;
+            reduced = true;
+            break;
+        }
+        if !reduced {
+            break;
+        }
+    }
+    chunk
+}
+
+/// `n / smallest prime factor of n`, or `n` itself when there is no smaller
+/// divisor to move to.
+///
+/// Trial division: the numbers here are block extents, so the loop runs a few
+/// dozen times at most and is paid once per level per run.
+fn largest_proper_divisor(n: usize) -> usize {
+    if n <= 1 {
+        return n;
+    }
+    let mut factor = 2;
+    while factor * factor <= n {
+        if n % factor == 0 {
+            return n / factor;
+        }
+        factor += 1;
+    }
+    // Prime: the only proper divisor is 1.
+    1
+}
+
 /// A chunk shape for an array of arbitrary rank.
 ///
 /// A side output's rank and extent are its own — one row per object, one score
@@ -1040,12 +1352,19 @@ impl Environment for ZarrEnvironment {
         self.volume
     }
 
-    /// Create levels 1..=n at the plan's per-phase volume and element type, and
-    /// check that level 0 is what the plan says it read.
+    /// Create levels 1..=n at the plan's per-phase volume, element type **and
+    /// chunking**, and check that level 0 is what the plan says it read.
     ///
     /// Idempotent in the only sense that matters: called twice with the same
     /// plan it rebuilds the same arrays over the same metadata. It is called
     /// once, before any task.
+    ///
+    /// **This is where the chunk-exclusive invariant is enforced**, and it is
+    /// here for the reason `check_dtypes` runs in the executor rather than in
+    /// `Decomposition::check`: the plan does not know how a level is chunked and
+    /// this is the first place that holds both halves. A caller who wants the
+    /// answer earlier has [`Self::chunk_plan`] and
+    /// [`check_chunk_exclusive_writes`].
     fn prepare(&self, decomposition: &Decomposition) -> Result<()> {
         let held = self.level_shape(0)?;
         let wanted = decomposition.volume_at(0);
@@ -1064,6 +1383,11 @@ impl Environment for ZarrEnvironment {
                 wanted.numpy_name()
             )));
         }
+        let chunks = self.chunk_plan(decomposition);
+        if let Err(err) = check_chunk_exclusive_writes(decomposition, &chunks) {
+            return Err(self.blame_the_dictated_layout(err, decomposition, &chunks));
+        }
+
         let mut levels = Vec::with_capacity(decomposition.n_levels());
         levels.push(self.level_array(0)?);
         for level in 1..decomposition.n_levels() {
@@ -1079,7 +1403,7 @@ impl Environment for ZarrEnvironment {
                 level as u64,
                 dtype,
                 &decomposition.volume_at(level),
-                &self.chunk,
+                &chunks[level],
                 self.compression.at(level, dtype),
             )?));
         }
@@ -1104,9 +1428,13 @@ impl Environment for ZarrEnvironment {
         self.counters
             .read_bytes
             .fetch_add(block.bytes(), Ordering::SeqCst);
+        // The level's own chunk shape, not the environment's: since a level
+        // derives its chunking from the phase that writes it, charging every
+        // read against level 0's grid would price most of them against a grid
+        // they never touch.
         self.counters
             .chunks_read
-            .fetch_add(chunks_touched(region, &self.chunk), Ordering::SeqCst);
+            .fetch_add(chunks_touched(region, &array.chunk), Ordering::SeqCst);
         self.counters.add_resident(block.bytes());
         Ok(BlockBuf::Array(block))
     }
@@ -1296,6 +1624,35 @@ impl Environment for ZarrEnvironment {
     /// still an override point rather than an omission: a store with a write-back
     /// cache would need one, and a caller must be able to write the barrier
     /// without knowing which store it has.
+    /// Erase the level's arrays from the store.
+    ///
+    /// **This is where the saving is measured in disk rather than in memory.**
+    /// An `N`-phase chain over a real volume writes `N` full copies of it; only
+    /// two are ever live, and until now every one of them survived to the end of
+    /// the run.
+    ///
+    /// The prefix is erased rather than the chunks enumerated: a level is a Zarr
+    /// group of its own (`/levelN`), so its metadata document goes with its
+    /// chunks and what is left behind is nothing rather than an array with no
+    /// data — which a reader would otherwise find and read as fill values.
+    fn discard_level(&self, level: usize) -> Result<()> {
+        let mut discarded = self
+            .discarded
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !discarded.insert(level) {
+            return Ok(());
+        }
+        drop(discarded);
+        let prefix = StorePrefix::new(format!("level{level}/")).map_err(Error::backend)?;
+        self.store.erase_prefix(&prefix).map_err(Error::backend)?;
+        // The handle in `levels` stays where it is. Removing it would shift
+        // every index above it, and `level_array` consults `discarded` first
+        // anyway — so a read of a freed level fails with a message about the
+        // plan rather than with whatever the store says about a missing key.
+        Ok(())
+    }
+
     fn finish(&self, _level: usize) -> Result<()> {
         Ok(())
     }
@@ -1304,8 +1661,15 @@ impl Environment for ZarrEnvironment {
         &self.counters
     }
 
+    /// Level 0's chunk shape.
+    ///
+    /// The trait has room for one triple and levels no longer share one, so this
+    /// answers for the level every plan reads and no plan writes. It feeds the
+    /// per-task `chunks` figure in the observability record, which is an
+    /// estimate of IO granularity rather than an input to anything;
+    /// [`Self::chunk_at`] is the exact answer, per level.
     fn chunk_shape(&self) -> [usize; 3] {
-        self.chunk
+        self.input_chunk
     }
 
     fn sidecars(&self) -> Option<&Sidecars> {
@@ -1484,10 +1848,8 @@ mod tests {
     /// truth about the bytes beside it.
     #[test]
     fn the_stored_metadata_names_the_codec_and_omits_it_when_there_is_none() {
-        for (compression, expect_gzip) in [
-            (Compression::None, false),
-            (Compression::Gzip(4), true),
-        ] {
+        for (compression, expect_gzip) in [(Compression::None, false), (Compression::Gzip(4), true)]
+        {
             let root = scratch("metadata");
             let input = ramp(Dtype::U16, [4, 4, 4]);
             ZarrEnvironment::create_with_compression(
@@ -1568,40 +1930,44 @@ mod tests {
         let shape = [8, 6, 10];
         for dtype in EVERY_TYPE {
             for chunk in [[8, 6, 10], [4, 3, 5], [2, 2, 2], [3, 4, 7], [16, 16, 16]] {
-                for compression in [Compression::None, Compression::Gzip(1), Compression::Gzip(9)] {
-                let root = scratch("round-trip");
-                let input = ramp(dtype, shape);
-                let env = ZarrEnvironment::create_with_compression(
-                    &root,
-                    &input,
-                    chunk,
-                    CompressionPolicy::uniform(compression),
-                )
-                .unwrap();
-                assert_eq!(env.compression_at(0).unwrap(), compression);
-
-                // The whole volume, which is chunk-aligned by construction.
-                let whole = env.level(0).unwrap();
-                assert_eq!(whole, input, "{dtype:?} at chunk {chunk:?}");
-
-                // A read that lands on the grid where the grid divides it, and a
-                // read chosen to straddle chunks on every axis.
-                for region in [
-                    Region::new(&[0, 0, 0], &[4, 3, 5]),
-                    Region::new(&[1, 1, 1], &[5, 4, 7]),
-                    Region::new(&[3, 2, 4], &[1, 1, 1]),
-                    Region::new(&[7, 5, 9], &[1, 1, 1]),
+                for compression in [
+                    Compression::None,
+                    Compression::Gzip(1),
+                    Compression::Gzip(9),
                 ] {
-                    let got = env.read(0, &region).unwrap();
-                    let want = input.slice_region(&region).unwrap();
-                    assert_eq!(
-                        got.as_array().unwrap(),
-                        &want,
-                        "{dtype:?} at chunk {chunk:?}, region {region:?}, {}",
-                        compression.name()
-                    );
-                }
-                let _ = std::fs::remove_dir_all(&root);
+                    let root = scratch("round-trip");
+                    let input = ramp(dtype, shape);
+                    let env = ZarrEnvironment::create_with_compression(
+                        &root,
+                        &input,
+                        chunk,
+                        CompressionPolicy::uniform(compression),
+                    )
+                    .unwrap();
+                    assert_eq!(env.compression_at(0).unwrap(), compression);
+
+                    // The whole volume, which is chunk-aligned by construction.
+                    let whole = env.level(0).unwrap();
+                    assert_eq!(whole, input, "{dtype:?} at chunk {chunk:?}");
+
+                    // A read that lands on the grid where the grid divides it, and a
+                    // read chosen to straddle chunks on every axis.
+                    for region in [
+                        Region::new(&[0, 0, 0], &[4, 3, 5]),
+                        Region::new(&[1, 1, 1], &[5, 4, 7]),
+                        Region::new(&[3, 2, 4], &[1, 1, 1]),
+                        Region::new(&[7, 5, 9], &[1, 1, 1]),
+                    ] {
+                        let got = env.read(0, &region).unwrap();
+                        let want = input.slice_region(&region).unwrap();
+                        assert_eq!(
+                            got.as_array().unwrap(),
+                            &want,
+                            "{dtype:?} at chunk {chunk:?}, region {region:?}, {}",
+                            compression.name()
+                        );
+                    }
+                    let _ = std::fs::remove_dir_all(&root);
                 }
             }
         }
@@ -1666,6 +2032,140 @@ mod tests {
             .unwrap()
             .iter()
             .all(|value| value.is_nan()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ------------------------------------------------ derived chunking --
+
+    /// **The property the invariant rests on**: the derived chunk divides the
+    /// block extent exactly, on every axis, for every block grid and every
+    /// element type.
+    ///
+    /// This is what makes `check_chunk_exclusive_writes` pass by construction
+    /// rather than by luck — cores start at multiples of the block extent, so a
+    /// chunk that divides it cannot be cut by one of their boundaries. Asserted
+    /// over blocks chosen for what they break: powers of two, primes (whose only
+    /// proper divisor is 1), a prime multiple, and blocks large enough that the
+    /// reduction really runs.
+    #[test]
+    fn the_derived_chunk_divides_the_block_extent_exactly_on_every_axis() {
+        let blocks = [
+            [1, 1, 1],
+            [4, 4, 4],
+            [7, 7, 7],
+            [12, 12, 12],
+            [16, 24, 20],
+            [64, 64, 64],
+            [128, 96, 100],
+            [256, 256, 256],
+            [512, 512, 512],
+            [1024, 7, 13],
+            [1000, 1000, 1000],
+            [97, 512, 33],
+        ];
+        for block in blocks {
+            for dtype in EVERY_TYPE {
+                let chunk = chunk_for_block(block, dtype);
+                for axis in 0..3 {
+                    assert!(chunk[axis] > 0, "{block:?} {dtype:?} axis {axis}");
+                    assert_eq!(
+                        block[axis] % chunk[axis],
+                        0,
+                        "chunk {chunk:?} does not divide block {block:?} on axis {axis} \
+                         ({dtype:?}); the chunk-exclusive invariant depends on it doing so"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The byte range is a preference and the divisor lattice is the mandate,
+    /// which is exactly what this asserts in both directions.
+    ///
+    /// A block that is already small is left alone whole — splitting it would
+    /// buy nothing and cost files. A large one is brought under the ceiling. And
+    /// a block whose extents are all prime has a divisor lattice with **no**
+    /// member inside the range, so it lands outside it rather than shattering to
+    /// a chunk of one voxel: that case is the one a rule stated as "always fit
+    /// the range" would get wrong.
+    #[test]
+    fn the_derived_chunk_lands_in_the_byte_range_wherever_the_divisors_allow() {
+        let bytes = |chunk: [usize; 3], dtype: Dtype| {
+            chunk.iter().map(|&edge| edge as u128).product::<u128>() * dtype.size_of() as u128
+        };
+        // Small enough to be one chunk: nothing to gain by cutting it.
+        assert_eq!(chunk_for_block([16, 24, 20], Dtype::F64), [16, 24, 20]);
+        // 512³ of float64 is a gigabyte; the reduction takes the longest axis
+        // first, so what comes back is near cubic and inside the range.
+        let chunk = chunk_for_block([512, 512, 512], Dtype::F64);
+        assert!(
+            bytes(chunk, Dtype::F64) <= MAX_CHUNK_BYTES
+                && bytes(chunk, Dtype::F64) >= MIN_CHUNK_BYTES,
+            "{chunk:?}"
+        );
+        assert!(chunk.iter().all(|&edge| 512 % edge == 0), "{chunk:?}");
+        // The same block holding `bool` is an eighth of the data, so it stops
+        // eight times earlier — the rule is in bytes and not in voxels.
+        assert!(
+            chunk_for_block([512, 512, 512], Dtype::Bool)
+                .iter()
+                .product::<usize>()
+                > chunk.iter().product::<usize>()
+        );
+        // Prime extents: every step of the lattice is a factor of 1009, so no
+        // chunk of this block is inside the range at all. What must not happen
+        // is a collapse to a chunk of a few bytes, and it does not — the floor
+        // stops the second reduction, leaving one over the ceiling rather than
+        // one below the floor.
+        let prime = chunk_for_block([1009, 1009, 1009], Dtype::F64);
+        assert!(prime.iter().all(|&edge| 1009 % edge == 0), "{prime:?}");
+        assert!(bytes(prime, Dtype::F64) > MAX_CHUNK_BYTES, "{prime:?}");
+        assert!(bytes(prime, Dtype::F64) >= MIN_CHUNK_BYTES, "{prime:?}");
+        // A block small enough to be one chunk is one chunk however prime it is.
+        assert_eq!(chunk_for_block([7, 7, 7], Dtype::F64), [7, 7, 7]);
+    }
+
+    /// A level's chunking follows the phase that writes it; level 0 keeps
+    /// whatever the caller's array already had; and a dictated output layout is
+    /// heard only for the output.
+    #[test]
+    fn the_chunk_plan_derives_every_level_a_phase_writes() {
+        use crate::decomposition::PhaseDecomposition;
+        use crate::geometry::BlockGrid;
+
+        let root = scratch("chunk-plan");
+        let volume = [32, 24, 20];
+        let input = Voxels::zeros(Dtype::F64, volume).unwrap();
+        let env = ZarrEnvironment::create(&root, &input, [5, 5, 5]).unwrap();
+        let phases: Vec<PhaseDecomposition> = [8usize, 4]
+            .into_iter()
+            .map(|edge| {
+                PhaseDecomposition::derive(
+                    vec![0],
+                    vec!["op".to_string()],
+                    [0, 0, 0],
+                    [0, 0, 0],
+                    BlockGrid::along(volume, &[0, 1, 2], edge).unwrap(),
+                )
+            })
+            .collect();
+        let plan = Decomposition {
+            volume,
+            dtype: Dtype::F64,
+            phases,
+            chain_reach: [0, 0, 0],
+        };
+        assert_eq!(
+            env.chunk_plan(&plan),
+            vec![[5, 5, 5], [8, 8, 8], [4, 4, 4]],
+            "level 0 keeps the caller's layout; each other level takes its phase's block"
+        );
+        let dictated = env.with_output_chunk([2, 2, 2]);
+        assert_eq!(
+            dictated.chunk_plan(&plan),
+            vec![[5, 5, 5], [8, 8, 8], [2, 2, 2]],
+            "a dictated layout speaks for the output level and for nothing else"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

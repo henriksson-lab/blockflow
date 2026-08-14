@@ -62,9 +62,10 @@ fn main() -> Result<()> {
     let phases: Vec<PhaseDecomposition> = groups_for(0b11, slots.len())
         .iter()
         .map(|group| {
-            let (reach, _, names, _) = summarise_slots(&slots, group, shape);
+            let (reach, _, names, _) =
+                summarise_slots(&slots, group, shape).expect("one coordinate space per phase");
             let grid = BlockGrid::along(shape, &[1, 2], 64).unwrap();
-            PhaseDecomposition::derive(group.clone(), names, reach, reach, grid)
+            PhaseDecomposition::derive(group.clone(), names, reach.clone(), reach, grid)
         })
         .collect();
     let decomposition = Decomposition {

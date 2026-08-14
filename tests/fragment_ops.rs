@@ -442,7 +442,7 @@ fn the_cost_model_prices_a_full_reach_phase_towards_one_block() {
     let mut costs = Vec::new();
     for edge in [8usize, 16, 32] {
         let lattice = BlockGrid::along(VOLUME, &[0], edge).expect("a lattice");
-        let cost = price_phase(&lattice, VOLUME, 1.0, 1, false, 8.0, &model, 1.0);
+        let cost = price_phase(&lattice, &VOLUME.into(), 1.0, 1, false, 8.0, &model, 1.0);
         costs.push((
             edge,
             lattice.n_blocks(),
@@ -493,7 +493,7 @@ fn what_the_planner_does_with_a_full_reach_op_in_a_chain() {
         plan.n_phases(),
         plan.phases
             .iter()
-            .map(|phase| (phase.names.clone(), phase.grid.block(), phase.reach))
+            .map(|phase| (phase.names.clone(), phase.grid.block(), phase.reach.clone()))
             .collect::<Vec<_>>()
     );
     // The planner segments here. It did not when this test was written: it

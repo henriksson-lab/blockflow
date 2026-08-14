@@ -38,6 +38,7 @@
 // | `wire` | JSON for the messages and for a `Decomposition`, which is the one binding thing that travels. |
 // | `coordinator` | The job registry, the claim table, the handout, the merged event stream. Both lifetimes, one implementation. |
 // | `handout` | Which unclaimed task goes to which worker: seeded far apart, then nearest-first. |
+// | `placement` | Which *worker* gets a task when there are fewer tasks than workers. A barrier phase is one block, so that is the only placement decision it has. |
 // | `cache_model` | What the coordinator *believes* each worker holds, derived from assignments and never reported. |
 // | `spec` | What a job is on the wire, and the factory seam that turns one back into a chain and an environment. |
 // | `rendezvous` | Four ways to find the coordinator, behind one trait. |
@@ -61,6 +62,7 @@ pub mod client;
 pub mod coordinator;
 pub mod handout;
 pub mod local;
+pub mod placement;
 pub mod protocol;
 pub mod rendezvous;
 #[cfg(feature = "distributed")]
@@ -83,6 +85,7 @@ pub use client::Client;
 pub use coordinator::{Coordinator, Job, DEFAULT_LEASE_MS, DEFAULT_LINGER_MS};
 pub use handout::HandoutPolicy;
 pub use local::{Binaries, LocalOptions, LocalRun};
+pub use placement::Residency;
 pub use protocol::{Assignment, Handout, JobStatus, Joined, PROTOCOL_VERSION};
 pub use rendezvous::{
     DirectRendezvous, DirectoryObjects, EnvRendezvous, FileRendezvous, ObjectRendezvous,

@@ -99,7 +99,7 @@ learn what a block is.
 | `region` | `Region`, `RegionSource`, `RegionSink`, and the in-memory implementations. |
 | `tiling` | The exact-tiling predicate the whole design's correctness guard rests on. |
 | `budget` | One byte-denominated pool. `Reserved` compute may wait; `Opportunistic` cache and prefetch may not. |
-| `op` | `BlockOp` and `Chain`. Reach, execution, traversal preference, constant algebra. |
+| `op` | `BlockOp`, `Combine` and `Chain`. Reach, execution, traversal preference, constant algebra; sequences, exclusive alternatives, and a fan-in whose branches all run. |
 | `fragment` | `FragmentOp`: the shapes `region -> region` cannot express — `volume -> fragments`, `fragments -> fragments`, `fragments -> volume`. One executor, and a coverage guard on the fragment side. |
 | `geometry` | Read extent, trustworthy extent, `valid = core ∩ trustworthy`. |
 | `decomposition` | The binding plan — parity-visible, deterministic, data-blind, hashable — and its cost model. |
@@ -120,7 +120,104 @@ learn what a block is.
 | `net` | One bind policy, shared by both servers, and how a coordinator decides what address to publish. |
 | `distributed` | A coordinator, workers that pull, four rendezvous backends, and a local multi-node mode that runs all of it as separate processes. |
 | `gui` | *(feature `gui`)* An HTTP server over the progress listener, and the browser view it feeds. |
-| `zarr_env` | *(feature `zarr`)* Levels as Zarr v3 arrays on a filesystem store — the `Environment` that actually moves bytes. |
+| `zarr_env` | *(feature `zarr`)* Levels as Zarr v3 arrays on a filesystem store — the `Environment` that actually moves bytes. Compression is per level and derived from the level's own element type. |
+
+## Branching: three shapes, and why `max` is not enough
+
+A `Chain` is `Sequence`, `Alternative` and `Parallel`.
+
+```rust
+Chain::sequence(vec![
+    Chain::op(median),
+    Chain::parallel(
+        vec![arm_a, arm_b],                        // both run, same input
+        Box::new(LogicCombine::new("or", Logic::Or)),
+    )?,
+])
+```
+
+`Alternative` is a choice — reaches take the **max**, one branch runs.
+`Parallel` is a fan-in — reaches take the **max and the combine's adds**, and
+**every** branch runs. Those two fold reach identically, which is not a
+coincidence and is worth stating plainly, because it is how a real diamond was
+once modelled as an alternation and passed 903 reach comparisons: *the max is
+the correct budget whether one branch runs or all of them.* Reach cannot tell
+them apart.
+
+What tells them apart is what executes and what is produced, and there the two
+are opposites:
+
+| fold | `Alternative` | `Parallel` |
+|---|---|---|
+| `reach` | max | max, plus the combine's |
+| `apply` | the live branch | every branch, then the combine |
+| `side_outputs` | the live branch's | **the union** |
+| `cost_per_voxel` | max | sum, plus the combine's |
+| `constant_maps_to` | the live branch's | every branch's, then the combine's |
+
+The `side_outputs` row is the one that cannot go wrong quietly. Over-declaring
+an *output* is not safe the way over-declaring a *reach* is: a reach that is too
+large costs reads, an output that is not produced is a hole that fails the
+coverage guard. So an alternation declares only what its live branch writes, and
+a fan-in declares every branch's — and structurally it has no choice, since the
+variant carries no "which branch" to consult.
+
+Two things a `Parallel` deliberately does not do:
+
+* **It does not become several phases.** It is one indivisible slot. A phase
+  reads one level and writes one level, so a cut between the branches and the
+  combine would need a level per branch and a phase with several inputs, neither
+  of which a `Decomposition` can state. Branch results are transient buffers
+  inside one task — allocated where a `Sequence`'s intermediates are — so they
+  add no task, no DAG edge and no materialisation.
+* **It is not a merge.** A merge is a reduction over blocks, which a full reach
+  already expresses; see the bullet under *Output that is not an image*.
+
+`Combine` is a second trait rather than a wider `BlockOp` because the arity is
+the difference: every question a combine answers — which element types it takes,
+what shape it produces, what a constant folds to — is a question about a *list*.
+Branch results need not agree with each other on element type; they must be
+acceptable to the combine, which is checked when the plan is made.
+
+## Reach: what an op reads, and in what units
+
+`BlockOp::reach(axis, volume_len) -> usize` is the statement most ops want and
+it has not changed: symmetric, the same for every block, in the phase's own
+voxels. It is required and has no default, because it is the one number a silent
+zero would turn into a complete, well-formed, wrong volume.
+
+`BlockOp::reach_spec(volume) -> Reach` is the full statement, defaulted to
+lifting the above, so an op that has nothing more to say says nothing more. Four
+things it can say that a triple cannot, each of which was costing something
+measurable:
+
+| form | says |
+|---|---|
+| `Bounded { lo, hi }` | asymmetric — a one-sided dependency declared on both sides fetched **3.27x** what was needed |
+| `PerBlock(table)` | one `(lo, hi)` per block index along the axis, for a lattice whose voxel footprint differs per block |
+| `All` | the whole axis, so a **planning barrier is a type** rather than a comparison somebody has to remember to make |
+| `Space` | which volume the numbers are measured against, in what unit, in which axis order |
+
+`Space` is the one that caused most of the loss: the same dependency is `2` in a
+lattice's index space and `255` in voxels. It carries a **frame** (this phase's
+volume, or the level below's — which decides whether a read clamped at the
+phase's own edge may be trusted), a **unit** (voxels, whole blocks of this
+phase's lattice, or steps of the level below's lattice) and an **axis order**.
+Conversion happens in `PhaseDecomposition::derive`, the first place a grid
+exists; before that a reach stays symbolic, because the planner is comparing
+candidate grids and a reach that changed with the grid could not be compared
+against anything.
+
+The same type is the **halo**, because a halo is a granted reach and the guard
+this crate is built on is the comparison between the two. That the halo may
+differ per block and per side is what lets an op mandate an input extent *and*
+reach: the cores are cut `extent - (lo + hi)` wide and the window slides inward
+at the volume's ends rather than being clipped, so every block is handed the
+extent it asked for (`Reach::window`, `BlockConstraint::lattice`).
+
+A symmetric triple converts into a `Reach`, compares equal to one, **hashes as
+one** and is the same three numbers on the wire, so a plan that says nothing new
+is the plan it always was — fingerprint included.
 
 ## Storage
 
@@ -155,6 +252,76 @@ overwrite with nothing to lose, so a chunk-aligned write takes no locks at all.
 caller who can align their blocks to the chunk grid can see that it worked. The
 answer is the same either way, which is this crate's founding principle applied
 to the write side: *a mistake about chunks costs performance, never correctness.*
+
+### Compression, chosen per level and derived from the element type
+
+An out-of-core framework writes and re-reads its intermediates constantly, and
+one of them is a `bool` mask that should cost almost nothing to keep. So a level
+carries a codec, and — because the levels of one plan are not one kind of data —
+**it is chosen per level, not per run**:
+
+```rust
+// The default. Every level gets `Compression::for_dtype` of its own type.
+let env = ZarrEnvironment::create(root, &input, [64, 64, 64])?;
+
+// Or say it. `uniform` speaks for the run; `with_level` overrides one level.
+let policy = CompressionPolicy::derived()
+    .with_level(2, Compression::Gzip(6));      // the mask, harder
+let env = ZarrEnvironment::create_with_compression(root, &input, chunk, policy)?;
+
+env.compression_at(2)?;      // what was built, read off the array
+env.stored_bytes(2)?;        // and what it cost on the disk
+```
+
+The default is *derived* rather than configured: levels already carry their own
+element type (`Decomposition::dtype_at`), and the element type is the best single
+predictor of whether deflate will pay. **`bool` and the integers compress at
+level 1; `float32` and `float64` are left raw.**
+
+The evidence is a test, not a claim — `compression_pays_for_bool_and_not_for_float`
+prints this table on every run. A 64³ `synthetic::Scene`, chunk 32³, release
+build, level 0 `float64` and level 1 a `bool` mask:
+
+| policy | level 0 (`float64`) | level 1 (`bool`) | run | break-even |
+|---|---|---|---|---|
+| no compression | 2 097 152 B | 262 144 B | 7 ms | — |
+| `gzip1` everywhere | 1 978 908 B (1.06x) | 22 845 B (11.5x) | 42 ms | 10.4 MB/s |
+| `gzip9` everywhere | 1 982 399 B (1.06x) | 10 188 B (25.7x) | 92 ms | 4.3 MB/s |
+| **derived (the default)** | 2 097 152 B (1.00x) | 22 845 B (11.5x) | **11 ms** | **73.7 MB/s** |
+| derived, `bool` at `gzip6` | 2 097 152 B | 10 685 B (24.5x) | 25 ms | 14.5 MB/s |
+| derived, `bool` at `gzip9` | 2 097 152 B | 10 188 B (25.7x) | 64 ms | 4.5 MB/s |
+
+**break-even** is bytes saved over CPU seconds spent saving them: the store speed
+below which compressing is faster end to end. It is the number the defaults are
+picked on. Compressing the `float64` level — the step from the derived row to
+`gzip1` everywhere — costs 31 ms to save 118 kB, a break-even of **3.8 MB/s**,
+slower than any store this will meet, so the floats are left alone. Compressing
+the `bool` level costs 4 ms to save 239 kB — **73.7 MB/s**, which most network and
+shared storage is slower than. Turning `bool` up to level 6 doubles the ratio
+again, but the *incremental* trade is 12 kB for 14 ms — 0.9 MB/s, worse than the
+`float64` case just refused, which is why the default is level 1 and the higher
+levels are a caller's decision. `uint16` is the weakest of the three and is
+stated as such: 1.36x here, against **2.09x** measured on real acquisitions and
+**19.7x** on real `bool` intermediates, the pair `cache::DeflateCodec` was
+chosen on.
+
+`gzip` is the only codec offered, and the reason is the dependency graph rather
+than the ratio: `zarrs`'s `gzip` feature is exactly `dep:flate2`, and `flate2` is
+already here for `cache::DeflateCodec`, so enabling it adds **no package** — the
+`zarr` feature costs the same as it did. `zstd` and `blosc` would each add crates
+and a C build to buy a ratio, and the place the ratio matters most is `bool`
+data, where deflate is already near the ceiling.
+
+**What compression does to the guard above**, because it changes a trade and not
+just a constant. A fully covered chunk is still a blind overwrite with no lock,
+but the write is now an *encode*. A partly covered chunk was decode-patch-encode
+and is now **decompress-patch-recompress, inside the lock** — the serialised
+section becomes the dominant cost of such a write rather than a rounding error on
+it. That does not weaken the guard; it makes the alignment advice matter more,
+and `serialised_writes` / `unaligned_reads` still point at exactly the writes and
+reads that are paying for it. The race test runs both ways and the compressed arm
+loses *more* without the guard than the raw one does — a longer critical section
+is an easier one to lose data in — and zero with it.
 
 ## Output that is not an image
 
@@ -195,8 +362,9 @@ Three things it deliberately does not do:
 * **A full-reach op is a planning barrier**, and both planners segment there
   rather than fusing across it: per-block cost stops being local, so the
   infinite-grid cost model has no standing to trade the cut away. The predicate
-  is `decomposition::is_planning_barrier` — an exact `reach >= extent`, never a
-  threshold, because a *bounded* reach is not a barrier however large it is.
+  is `decomposition::is_planning_barrier` — `AxisReach::All` by type, or an
+  exact `reach >= extent` for an op that states a number, never a threshold,
+  because a *bounded* reach is not a barrier however large it is.
 
 ## Ops that are not `region -> region`
 

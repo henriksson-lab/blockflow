@@ -20,20 +20,44 @@
 // `XY_BLOCK_SPLITTING.md` records this as the reason two axes of a real pipeline
 // cannot be cut at all.
 //
-// The fix, and where it lives
-// ---------------------------
-// The lattice is a function of the **volume** and the spacing, and of nothing
-// else. [`SampleLattice::for_volume`] is the only constructor, it takes the
-// global extent, and [`LocalStatistic::evaluate_into`] builds it from
-// `Anchor::volume` — the extent the executor supplies — rather than from the
-// shape of the buffer. A block then evaluates *the same lattice points* the
-// whole volume would, at the same global coordinates, over the same clamped
-// windows, gathered in the same order; the sums are therefore identical
-// floating-point sums and the output is identical bit for bit.
+// Four grids, and only one of them belongs to this operation
+// -----------------------------------------------------------
+// The defect above is what happens when two of these are confused, so they are
+// named here and kept apart by construction:
+//
+// | grid | whose | what it decides |
+// |---|---|---|
+// | the **sample lattice** | *this operation's* | where the statistic is evaluated. A parameter of the op, in volume coordinates, fixed before any decomposition exists. |
+// | the **block decomposition** | the planner's | how the work is cut into tasks. Chosen for memory and parallelism, and free to change between runs of the same pipeline. |
+// | the **chunk grid** | the storage's | how bytes are grouped on disk. An IO and compression concern; `chunks_touched` prices it and nothing else reads it. |
+// | the originating tool's **own blocks** | nobody's, here | a fact about how some other implementation happened to run. |
+//
+// Only the first is an input to the answer. The other three must not be able to
+// change a voxel's value, and the way that is guaranteed is that **the lattice
+// is materialised as an explicit set of positions in volume coordinates** — see
+// [`Sampling`] and [`SampleLattice`] — before anything is cut. A block then
+// evaluates *the same lattice points* the whole volume would, at the same global
+// coordinates, over the same clamped windows, gathered in the same order; the
+// sums are therefore identical floating-point sums and the output is identical
+// bit for bit.
+//
+// The fourth row is worth its own sentence, because it is where the defect came
+// from. The established implementations of this technique lay the grid out
+// relative to the array they are handed, so under their own block processing the
+// grid becomes a function of *their* block size. That is a defect and not a
+// specification, and it has been measured downstream rather than argued: a
+// re-anchored run is byte-identical to a single whole-volume run at all 22
+// compared stages, while the block-relative run differs by thousands of voxels
+// and raising the block overlap does not reduce the difference at all. So
+// another tool's block size is never something to reproduce here; the
+// whole-volume lattice is the algorithm, correctly placed.
+//
+// A tool's *layout convention* is a different matter, and that one is worth
+// matching exactly — so it is a parameter, [`Sampling`], and not a constant.
 //
 // There is no unanchored path in this file to fall back to. The kernel does not
-// take a shape; it takes an `Anchor`, and an `Anchor` cannot describe a lattice
-// laid out relative to a block.
+// take a shape; it takes an `Anchor` and a lattice, and neither can describe
+// something laid out relative to a block.
 //
 // What the reach has to cover, and why it is bigger than the window
 // -----------------------------------------------------------------
@@ -55,7 +79,9 @@
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::error::{Error, Result};
+use crate::geometry::BlockGrid;
 use crate::op::{Anchor, BlockOp};
+use crate::reach::{AxisReach, Reach};
 use crate::voxels::Voxels;
 
 use super::element::{select_nth, Rank, StructuringElement, Total};
@@ -64,78 +90,217 @@ use super::voxelwise::combine_into;
 
 // ------------------------------------------------------------- lattice --
 
-/// Where the samples sit, in **volume** coordinates.
+/// How the sample positions are chosen along each axis.
 ///
-/// Centred: the lattice is laid out so that the unsampled margins at the two
-/// ends of an axis are equal to within a voxel. That is a choice, and it is
-/// recorded here rather than in each op, because two ops that centred
-/// differently would interpolate differently and a chain of them would be
-/// unreproducible for reasons nobody could see.
+/// **The convention is a parameter, not a constant.** Two tools that lay out a
+/// grid differently are two values of this enum rather than two code paths, and
+/// a caller that needs to match one says which. Nothing downstream branches on
+/// it: everything reads the positions [`Self::positions`] produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sampling {
+    /// Every `spacing` voxels, **centred**: the unsampled margins at the two
+    /// ends of an axis are equal to within a voxel.
+    ///
+    /// A spacing of one samples every voxel, which is the no-lattice case and a
+    /// legitimate parameter rather than a special one.
+    Centred { spacing: [usize; 3] },
+    /// `count` samples with the first on voxel `0` and the last on the last
+    /// voxel, spread as evenly as integer positions allow.
+    ///
+    /// This is `scipy.ndimage.zoom`'s convention — its coordinate map is
+    /// `i * (src - 1) / (dst - 1)`, which pins both endpoints — and it is here
+    /// because a caller matching a tool built on `zoom` needs it. It is *not*
+    /// the same lattice as [`Self::Centred`] and the two give different numbers.
+    Endpoints { count: [usize; 3] },
+    /// Stated positions, in volume coordinates, per axis.
+    ///
+    /// The escape hatch, and the reason the other two are not an exhaustive
+    /// list: an irregular lattice is expressible, its reach is computed from the
+    /// positions like every other, and nothing needs to know how it was chosen.
+    At { positions: [Vec<usize>; 3] },
+}
+
+impl Sampling {
+    /// Every `spacing` voxels on every axis.
+    pub fn every(spacing: [usize; 3]) -> Self {
+        Sampling::Centred { spacing }
+    }
+
+    /// The sample positions along `axis` of an axis `volume_len` voxels long.
+    ///
+    /// **Per axis, because the lattice is separable**, which is what lets
+    /// [`Self::max_distance`] answer `BlockOp::reach`'s one-axis question at all.
+    pub fn positions(&self, axis: usize, volume_len: usize) -> Result<Vec<usize>> {
+        if volume_len == 0 {
+            return Err(Error::InvalidArgument(
+                "a sample lattice needs a non-empty axis".to_string(),
+            ));
+        }
+        match self {
+            Sampling::Centred { spacing } => {
+                let spacing = spacing[axis];
+                if spacing == 0 {
+                    return Err(Error::InvalidArgument(format!(
+                        "a sample spacing must be at least one voxel; got {spacing}"
+                    )));
+                }
+                let count = (volume_len / spacing).max(1);
+                let first = (volume_len - (count - 1) * spacing) / 2;
+                Ok((0..count).map(|index| first + index * spacing).collect())
+            }
+            Sampling::Endpoints { count } => {
+                let count = count[axis];
+                if count == 0 {
+                    return Err(Error::InvalidArgument(
+                        "an endpoint lattice needs at least one sample".to_string(),
+                    ));
+                }
+                if count == 1 || volume_len == 1 {
+                    return Ok(vec![0]);
+                }
+                let last = (volume_len - 1) as f64;
+                let steps = (count - 1) as f64;
+                let mut positions: Vec<usize> = (0..count)
+                    .map(|index| (index as f64 * last / steps).round() as usize)
+                    .collect();
+                positions.dedup();
+                Ok(positions)
+            }
+            Sampling::At { positions } => Ok(positions[axis].clone()),
+        }
+    }
+
+    /// The interpolation term of the reach along `axis`; see
+    /// [`SampleLattice::max_distance`], which is where it is computed.
+    pub fn max_distance(&self, axis: usize, volume_len: usize) -> usize {
+        self.positions(axis, volume_len)
+            .map(|positions| span_max_distance(&positions, volume_len))
+            .unwrap_or(0)
+    }
+
+    /// Samples per voxel, where it is knowable without a volume.
+    ///
+    /// `Some` only for [`Self::Centred`], whose density is `1 / prod(spacing)`
+    /// however long the axes are. The other two need the extent, and
+    /// `cost_per_voxel` is not given one — so they answer `None` and the cost
+    /// model charges the window at full density, which **over**-prices them.
+    /// That is the safe direction (a planner isolates an op it thinks is dear),
+    /// it is stated rather than hidden, and `LocalStatisticOp::with_cost` is the
+    /// override for a caller who knows better.
+    pub fn samples_per_voxel(&self) -> Option<f64> {
+        match self {
+            Sampling::Centred { spacing } => {
+                Some(1.0 / (spacing[0] as f64 * spacing[1] as f64 * spacing[2] as f64).max(1.0))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Where the samples sit, in **volume** coordinates: an explicit, materialised
+/// set of positions.
+///
+/// **Explicit is the point.** The type holds positions rather than a rule for
+/// generating them, so once a lattice exists there is nothing left that could
+/// re-derive it from a smaller array. That is what makes the operation
+/// independent of every decomposition rather than carefully consistent with one:
+/// a block does not compute *its* lattice, it looks up which of these positions
+/// it needs.
+///
+/// It is also what admits an irregular lattice at no extra cost — the reach is
+/// the widest gap rather than a spacing, and every consumer already reads
+/// positions.
+///
+/// The positions are strictly increasing and inside the volume. Both are checked
+/// at construction, because every consumer below assumes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SampleLattice {
     volume: [usize; 3],
-    spacing: [usize; 3],
-    first: [usize; 3],
-    count: [usize; 3],
+    positions: [Vec<usize>; 3],
 }
 
 impl SampleLattice {
-    /// The lattice for a whole volume.
+    /// Materialise the lattice a [`Sampling`] describes over `volume`.
     ///
-    /// **The only constructor**, and it takes the global extent. There is
-    /// deliberately no way to build one from a block's shape: that is the defect
-    /// this type exists to make unwritable.
-    pub fn for_volume(volume: [usize; 3], spacing: [usize; 3]) -> Result<Self> {
-        let mut first = [0usize; 3];
-        let mut count = [0usize; 3];
+    /// **This is where a convention becomes a set of numbers**, and it happens
+    /// once, before any decomposition exists.
+    pub fn of(sampling: &Sampling, volume: [usize; 3]) -> Result<Self> {
+        let positions = [
+            sampling.positions(0, volume[0])?,
+            sampling.positions(1, volume[1])?,
+            sampling.positions(2, volume[2])?,
+        ];
+        Self::at(volume, positions)
+    }
+
+    /// The centred lattice of a given spacing — [`Sampling::Centred`], named for
+    /// the callers that want exactly it.
+    pub fn centred(volume: [usize; 3], spacing: [usize; 3]) -> Result<Self> {
+        Self::of(&Sampling::Centred { spacing }, volume)
+    }
+
+    /// Stated positions, validated.
+    pub fn at(volume: [usize; 3], positions: [Vec<usize>; 3]) -> Result<Self> {
         for axis in 0..3 {
             if volume[axis] == 0 {
                 return Err(Error::InvalidArgument(format!(
                     "a sample lattice needs a non-empty volume; got {volume:?}"
                 )));
             }
-            if spacing[axis] == 0 {
+            let axis_positions = &positions[axis];
+            if axis_positions.is_empty() {
                 return Err(Error::InvalidArgument(format!(
-                    "a sample spacing must be at least one voxel; got {spacing:?}"
+                    "axis {axis} has no sample positions; there would be nothing to \
+                     interpolate from"
                 )));
             }
-            let (axis_first, axis_count) = axis_layout(volume[axis], spacing[axis]);
-            first[axis] = axis_first;
-            count[axis] = axis_count;
+            if axis_positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(Error::InvalidArgument(format!(
+                    "the sample positions on axis {axis} are not strictly increasing: \
+                     {axis_positions:?}. Every lookup below is a search over them, and a \
+                     repeated position is a bracket of width zero."
+                )));
+            }
+            if let Some(&last) = axis_positions.last() {
+                if last >= volume[axis] {
+                    return Err(Error::InvalidArgument(format!(
+                        "axis {axis} has a sample at {last} in a volume of {}. A sample \
+                         outside the volume has no window to gather.",
+                        volume[axis]
+                    )));
+                }
+            }
         }
-        Ok(Self {
-            volume,
-            spacing,
-            first,
-            count,
-        })
+        Ok(Self { volume, positions })
     }
 
     pub fn volume(&self) -> [usize; 3] {
         self.volume
     }
 
-    pub fn spacing(&self) -> [usize; 3] {
-        self.spacing
+    /// The sample positions along `axis`, in volume coordinates.
+    pub fn positions(&self, axis: usize) -> &[usize] {
+        &self.positions[axis]
     }
 
     /// How many samples along `axis`. At least one.
     pub fn count(&self, axis: usize) -> usize {
-        self.count[axis]
+        self.positions[axis].len()
     }
 
     /// The volume coordinate of sample `index` along `axis`.
     pub fn centre(&self, axis: usize, index: usize) -> usize {
-        self.first[axis] + index.min(self.count[axis] - 1) * self.spacing[axis]
+        let positions = &self.positions[axis];
+        positions[index.min(positions.len() - 1)]
     }
 
     /// The greatest sample index whose centre is at or below `coordinate`,
     /// clamped into range at both ends.
     pub fn index_below(&self, axis: usize, coordinate: usize) -> usize {
-        if coordinate <= self.first[axis] {
-            return 0;
-        }
-        ((coordinate - self.first[axis]) / self.spacing[axis]).min(self.count[axis] - 1)
+        let positions = &self.positions[axis];
+        positions
+            .partition_point(|&position| position <= coordinate)
+            .saturating_sub(1)
     }
 
     /// The sample indices the interpolation reads at `coordinate`, and how far
@@ -150,70 +315,71 @@ impl SampleLattice {
     /// declare `constant_maps_to` and having to withhold it.
     ///
     /// **A sample whose weight would be zero is not returned at all.** At a
-    /// coordinate sitting exactly on a sample there is a second sample one
-    /// spacing away that a naive bracket would hand back with weight zero — and
-    /// then the op would *read* a voxel a full spacing out while its answer did
-    /// not depend on it. `reach` would have to cover that read or under-declare,
-    /// and an under-declared reach is the failure this crate exists to remove.
+    /// coordinate sitting exactly on a sample there is a second sample a gap
+    /// away that a naive bracket would hand back with weight zero — and then the
+    /// op would *read* a voxel a full gap out while its answer did not depend on
+    /// it. `reach` would have to cover that read or under-declare, and an
+    /// under-declared reach is the failure this crate exists to remove.
     /// Returning the degenerate bracket instead makes the two agree: the op
     /// reads what it declares and declares what it reads.
     pub fn bracket(&self, axis: usize, coordinate: usize) -> (usize, usize, f64) {
+        let positions = &self.positions[axis];
         let low = self.index_below(axis, coordinate);
-        let centre = self.centre(axis, low);
-        let high = (low + 1).min(self.count[axis] - 1);
+        let centre = positions[low];
+        let high = (low + 1).min(positions.len() - 1);
         if high == low || coordinate <= centre {
             return (low, low, 0.0);
         }
-        (
-            low,
-            high,
-            (coordinate - centre) as f64 / self.spacing[axis] as f64,
-        )
+        let gap = positions[high] - centre;
+        (low, high, (coordinate - centre) as f64 / gap as f64)
     }
 
     /// The furthest a voxel's interpolation reaches for a sample, along `axis`.
     ///
     /// This is the first of the two terms of the reach, and it is computed from
-    /// the same layout the interpolation uses, so it cannot describe a different
-    /// lattice from the one that runs.
+    /// the **positions the interpolation actually uses**, so it cannot describe
+    /// a different lattice from the one that runs. An irregular lattice is
+    /// therefore priced by its widest gap and not by an average.
     pub fn max_distance(&self, axis: usize) -> usize {
-        axis_max_distance(self.volume[axis], self.spacing[axis])
+        span_max_distance(&self.positions[axis], self.volume[axis])
     }
 }
 
-fn axis_layout(volume_len: usize, spacing: usize) -> (usize, usize) {
-    let count = (volume_len / spacing).max(1);
-    let span = (count - 1) * spacing;
-    let first = (volume_len - span) / 2;
-    (first, count)
-}
-
-/// The interpolation term of the reach, along one axis.
+/// The interpolation term of the reach, from a list of positions.
 ///
 /// Three cases, and the maximum of them:
 ///
 /// * a voxel before the first sample reads that sample, `first` away;
 /// * a voxel after the last reads that one, `volume - 1 - last` away;
 /// * a voxel strictly between two samples reads both, and the further of the
-///   pair is `spacing - 1` away at worst. It is not `spacing`: a voxel sitting
-///   exactly on a sample gets the degenerate bracket, so the sample one full
-///   spacing away is never read. See [`SampleLattice::bracket`], which is where
-///   that is arranged and where it has to stay arranged for this number to be
-///   true.
+///   pair is `gap - 1` away at worst. It is not `gap`: a voxel sitting exactly
+///   on a sample gets the degenerate bracket, so the sample a full gap away is
+///   never read. See [`SampleLattice::bracket`], which is where that is arranged
+///   and where it has to stay arranged for this number to be true.
 ///
-/// A spacing of one therefore contributes nothing at all, which is right —
-/// every voxel is its own sample and there is no interpolation to reach for.
+/// A lattice of every voxel therefore contributes nothing at all, which is right
+/// — every voxel is its own sample and there is no interpolation to reach for.
+fn span_max_distance(positions: &[usize], volume_len: usize) -> usize {
+    let (Some(&first), Some(&last)) = (positions.first(), positions.last()) else {
+        return 0;
+    };
+    let mut distance = first.max(volume_len.saturating_sub(1).saturating_sub(last));
+    for pair in positions.windows(2) {
+        distance = distance.max(pair[1] - pair[0] - 1);
+    }
+    distance
+}
+
+/// The interpolation term of the reach for a **centred** lattice, along one
+/// axis. See [`span_max_distance`] for the derivation.
 pub fn axis_max_distance(volume_len: usize, spacing: usize) -> usize {
     if volume_len == 0 || spacing == 0 {
         return 0;
     }
-    let (first, count) = axis_layout(volume_len, spacing);
-    let last = first + (count - 1) * spacing;
-    let mut distance = first.max(volume_len - 1 - last);
-    if count >= 2 {
-        distance = distance.max(spacing - 1);
+    Sampling::Centred {
+        spacing: [spacing; 3],
     }
-    distance
+    .max_distance(0, volume_len)
 }
 
 // ------------------------------------------------------------- kernels --
@@ -458,16 +624,24 @@ impl From<Total> for f64 {
     }
 }
 
-/// A statistic, a window and a sample spacing: everything the lattice
-/// construction needs except the volume, which comes from the anchor.
+/// A statistic, a window and a [`Sampling`]: everything the lattice needs except
+/// the volume, which comes from the anchor.
+///
+/// The sampling is held as a **convention**, not as a materialised lattice,
+/// because a `LocalStatistic` is built before any volume is known — it is a
+/// parameter of a chain, and a chain outlives the array it runs on. The lattice
+/// itself is materialised once per call from `Anchor::volume`, which is the
+/// global extent, and never from the buffer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalStatistic {
     element: StructuringElement,
-    spacing: [usize; 3],
+    sampling: Sampling,
     statistic: Statistic,
 }
 
 impl LocalStatistic {
+    /// The centred lattice of a given spacing, which is the ordinary case.
+    ///
     /// `spacing` of `[1, 1, 1]` samples every voxel, which is the no-lattice
     /// case and is a legitimate parameter rather than a special one.
     pub fn new(
@@ -475,19 +649,30 @@ impl LocalStatistic {
         spacing: [usize; 3],
         statistic: Statistic,
     ) -> Result<Self> {
-        if spacing.contains(&0) {
-            return Err(Error::InvalidArgument(format!(
-                "a sample spacing must be at least one voxel; got {spacing:?}"
-            )));
-        }
+        Self::sampled(element, Sampling::Centred { spacing }, statistic)
+    }
+
+    /// The same, with the sampling convention stated.
+    pub fn sampled(
+        element: StructuringElement,
+        sampling: Sampling,
+        statistic: Statistic,
+    ) -> Result<Self> {
         if element.is_empty() {
             return Err(Error::InvalidArgument(
                 "a local statistic needs a non-empty window".to_string(),
             ));
         }
+        // Materialised once here, over a nominal extent, so that a sampling that
+        // cannot produce positions is refused when it is *stated* rather than at
+        // the first block. The positions themselves are discarded: the real ones
+        // come from the anchor.
+        for axis in 0..3 {
+            sampling.positions(axis, 1)?;
+        }
         Ok(Self {
             element,
-            spacing,
+            sampling,
             statistic,
         })
     }
@@ -496,8 +681,8 @@ impl LocalStatistic {
         &self.element
     }
 
-    pub fn spacing(&self) -> [usize; 3] {
-        self.spacing
+    pub fn sampling(&self) -> &Sampling {
+        &self.sampling
     }
 
     pub fn statistic(&self) -> Statistic {
@@ -506,8 +691,74 @@ impl LocalStatistic {
 
     /// The two terms: how far the interpolation reaches for a sample, plus how
     /// far that sample's window reaches beyond it.
+    ///
+    /// **The worst case over the volume**, which is what a symmetric per-axis
+    /// integer can say. A globally anchored lattice does not line up with block
+    /// boundaries — that is the whole point of it — so the samples a *particular*
+    /// block needs sit at a different distance outside its core for every block,
+    /// and most blocks reach less than this. See `LocalStatisticOp::reach_spec`,
+    /// which says the tighter thing.
     pub fn reach(&self, axis: usize, volume_len: usize) -> usize {
-        axis_max_distance(volume_len, self.spacing[axis]) + self.element.reach(axis)
+        self.sampling.max_distance(axis, volume_len) + self.element.reach(axis)
+    }
+
+    /// The halo each block actually needs, as a table.
+    ///
+    /// **This is the consequence of global anchoring, priced.** The lattice is
+    /// fixed in volume coordinates and knows nothing about the decomposition, so
+    /// its points do not line up with block boundaries — a block may hold three
+    /// samples or four, and the nearest sample outside its core may be one voxel
+    /// away or a whole gap away. `reach` has to be the **worst** case over every
+    /// block, because it is a symmetric per-axis integer; most blocks need less,
+    /// and this says how much less for each.
+    ///
+    /// Derived per block from the brackets its own voxels take: the lowest
+    /// sample the first voxel of the core interpolates from, the highest the last
+    /// voxel does, each widened by the window's radius. Where every entry agrees
+    /// it collapses to the uniform form, so a plan that does not need a table
+    /// does not carry one.
+    ///
+    /// This is a **granted** halo and is deliberately not what [`Self::reach`]
+    /// returns — `Resample::halo` draws the same line for the same reason.
+    /// `reach` comes from [`Sampling::max_distance`], which never sees a grid;
+    /// deriving one from the other would make the tiling guard compare a number
+    /// against itself.
+    pub fn halo(&self, grid: &BlockGrid) -> Result<Reach> {
+        let volume = grid.volume();
+        let block = grid.block();
+        let counts = grid.blocks_per_axis();
+        let lattice = SampleLattice::of(&self.sampling, volume)?;
+        let mut axes = [AxisReach::none(), AxisReach::none(), AxisReach::none()];
+        for axis in 0..3 {
+            let window = self.element.reach(axis);
+            let mut table = Vec::with_capacity(counts[axis]);
+            for index in 0..counts[axis] {
+                let core_lo = index * block[axis];
+                let core_hi = (core_lo + block[axis]).min(volume[axis]);
+                if core_hi <= core_lo {
+                    table.push((0, 0));
+                    continue;
+                }
+                let (low, _, _) = lattice.bracket(axis, core_lo);
+                let (_, high, _) = lattice.bracket(axis, core_hi - 1);
+                let lowest = lattice.centre(axis, low).saturating_sub(window);
+                let highest = lattice.centre(axis, high) + window;
+                table.push((
+                    core_lo.saturating_sub(lowest),
+                    highest.saturating_sub(core_hi - 1),
+                ));
+            }
+            let first = table[0];
+            axes[axis] = if table.iter().all(|entry| *entry == first) {
+                AxisReach::Bounded {
+                    lo: first.0,
+                    hi: first.1,
+                }
+            } else {
+                AxisReach::PerBlock(table)
+            };
+        }
+        Ok(Reach::per_axis(axes))
     }
 
     /// Evaluate over a `f64` buffer.
@@ -521,7 +772,7 @@ impl LocalStatistic {
         at: &Anchor,
         out: ArrayViewMut3<'_, f64>,
     ) -> Result<()> {
-        let lattice = SampleLattice::for_volume(at.volume, self.spacing)?;
+        let lattice = SampleLattice::of(&self.sampling, at.volume)?;
         let ordered = input.mapv(Total);
         let statistic = self.statistic;
         let full = self.element.len();
@@ -704,9 +955,10 @@ impl BlockOp for AdaptiveThresholdOp {
 /// per voxel, so the per-voxel cost falls with the cube of the spacing. The
 /// interpolation is the term that does not, and it is charged flat.
 pub(super) fn cost_for(statistic: &LocalStatistic) -> f64 {
-    let spacing = statistic.spacing();
-    let samples_per_voxel =
-        1.0 / (spacing[0] as f64 * spacing[1] as f64 * spacing[2] as f64).max(1.0);
+    // `None` means the density needs a volume this function is not given; see
+    // `Sampling::samples_per_voxel`. Charging full density over-prices, which is
+    // the safe direction.
+    let samples_per_voxel = statistic.sampling().samples_per_voxel().unwrap_or(1.0);
     SAMPLE_COST_PER_ELEMENT_VOXEL * statistic.element().len() as f64 * samples_per_voxel
         + INTERPOLATION_COST
 }
@@ -724,7 +976,7 @@ mod tests {
     /// The layout is centred, and it is a function of the volume alone.
     #[test]
     fn the_lattice_is_centred_and_derived_from_the_volume() {
-        let lattice = SampleLattice::for_volume([10, 10, 10], [4, 4, 4]).unwrap();
+        let lattice = SampleLattice::centred([10, 10, 10], [4, 4, 4]).unwrap();
         assert_eq!(lattice.count(0), 2);
         assert_eq!(lattice.centre(0, 0), 3);
         assert_eq!(lattice.centre(0, 1), 7);
@@ -734,7 +986,7 @@ mod tests {
 
     #[test]
     fn an_axis_shorter_than_a_spacing_still_has_one_sample() {
-        let lattice = SampleLattice::for_volume([3, 3, 3], [8, 8, 8]).unwrap();
+        let lattice = SampleLattice::centred([3, 3, 3], [8, 8, 8]).unwrap();
         assert_eq!(lattice.count(0), 1);
         assert_eq!(lattice.centre(0, 0), 1);
         assert_eq!(lattice.bracket(0, 2), (0, 0, 0.0));
@@ -767,7 +1019,7 @@ mod tests {
 
         // The defect: a lattice laid out over the array handed in.
         let unanchored_sample = |offset: usize, len: usize| {
-            let block = SampleLattice::for_volume([len, volume[1], volume[2]], spacing).unwrap();
+            let block = SampleLattice::centred([len, volume[1], volume[2]], spacing).unwrap();
             offset + block.centre(0, block.index_below(0, voxel[0] - offset))
         };
         assert_ne!(
@@ -830,8 +1082,7 @@ mod tests {
     fn no_voxel_reads_a_sample_further_than_the_declared_distance() {
         for volume_len in [1usize, 2, 7, 16, 17, 64, 65] {
             for spacing in [1usize, 2, 3, 5, 8, 13, 100] {
-                let lattice =
-                    SampleLattice::for_volume([volume_len, 4, 4], [spacing, 1, 1]).unwrap();
+                let lattice = SampleLattice::centred([volume_len, 4, 4], [spacing, 1, 1]).unwrap();
                 let bound = axis_max_distance(volume_len, spacing);
                 for coordinate in 0..volume_len {
                     let (low, high, t) = lattice.bracket(0, coordinate);
@@ -1011,5 +1262,182 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not fit a volume"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod lattice_tests {
+    use super::*;
+    use crate::ops::element::ElementShape;
+
+    /// The lattice is a set of positions in **volume** coordinates, so cutting
+    /// the volume differently cannot move a sample. Two decompositions see the
+    /// same points; what differs is only which of them each block holds.
+    #[test]
+    fn the_positions_are_the_same_whatever_the_blocks_are() {
+        let sampling = Sampling::every([7, 7, 7]);
+        let lattice = SampleLattice::of(&sampling, [64, 64, 64]).unwrap();
+        // count = 64/7 = 9, span = 56, first = (64 - 56)/2 = 4
+        assert_eq!(lattice.positions(0), &[4, 11, 18, 25, 32, 39, 46, 53, 60]);
+
+        // the same lattice, however the volume is later cut
+        for block in [[64, 64, 64], [8, 64, 64], [13, 20, 5], [7, 7, 7]] {
+            let grid = BlockGrid::new([64, 64, 64], block).unwrap();
+            assert_eq!(
+                SampleLattice::of(&sampling, grid.volume()).unwrap(),
+                lattice,
+                "block {block:?} changed the lattice"
+            );
+        }
+    }
+
+    /// ...and the samples therefore land at a **different local offset in every
+    /// block**, which is the consequence worth seeing written down.
+    ///
+    /// A spacing of 7 cut into blocks of 8 drifts by one voxel per block — local
+    /// 4, then 3, then 2, then 1 — and then a block holds **two** samples where
+    /// each of its neighbours holds one. Nothing about a block's own geometry
+    /// predicts either. That is what "the lattice is independent of the
+    /// decomposition" costs and buys: the answer is the same under every cut,
+    /// and no block can assume where its samples are.
+    #[test]
+    fn a_global_lattice_lands_differently_inside_every_block() {
+        let lattice = SampleLattice::centred([64, 64, 64], [7, 7, 7]).unwrap();
+        let grid = BlockGrid::new([64, 64, 64], [8, 64, 64]).unwrap();
+
+        let mut per_block = Vec::new();
+        for index in 0..grid.blocks_per_axis()[0] {
+            let core_lo = index * 8;
+            let core_hi = (core_lo + 8).min(64);
+            let local: Vec<usize> = lattice
+                .positions(0)
+                .iter()
+                .filter(|&&position| position >= core_lo && position < core_hi)
+                .map(|&position| position - core_lo)
+                .collect();
+            per_block.push(local);
+        }
+        assert_eq!(
+            per_block,
+            vec![
+                vec![4],
+                vec![3],
+                vec![2],
+                vec![1],
+                vec![0, 7],
+                vec![6],
+                vec![5],
+                vec![4],
+            ],
+            "the samples do not line up with the blocks, and must not"
+        );
+        // and the counts genuinely differ, which is what makes the per-block
+        // halo below a table rather than one number
+        assert!(per_block.iter().any(|block| block.len() == 2));
+        assert!(per_block.iter().any(|block| block.len() == 1));
+    }
+
+    /// The granted halo is a table, is tighter than the symmetric requirement
+    /// for at least one block, and covers what every block actually reads.
+    #[test]
+    fn the_granted_halo_is_per_block_and_never_short() {
+        let element = StructuringElement::from_radius(ElementShape::Box, [2, 1, 1]);
+        let statistic = LocalStatistic::new(element.clone(), [7, 7, 7], Statistic::Mean).unwrap();
+        let volume = [40usize, 40, 40];
+        let grid = BlockGrid::new(volume, [8, 40, 40]).unwrap();
+        let halo = statistic.halo(&grid).unwrap();
+
+        let AxisReach::PerBlock(table) = halo.axis(0) else {
+            panic!(
+                "an unevenly landing lattice must produce a table, got {:?}",
+                halo.axis(0)
+            );
+        };
+        let first = table[0];
+        assert!(
+            table.iter().any(|entry| *entry != first),
+            "a table whose entries all agree should have collapsed to the uniform form"
+        );
+
+        // never wider than the worst case the requirement states...
+        let worst = statistic.reach(0, volume[0]);
+        for (index, &(lo, hi)) in table.iter().enumerate() {
+            assert!(
+                lo <= worst && hi <= worst,
+                "block {index} exceeds the requirement"
+            );
+        }
+        // ...and at least one block genuinely needs less, which is the saving
+        assert!(table.iter().any(|&(lo, hi)| lo < worst || hi < worst));
+
+        // and never short: every sample a block's own voxels bracket, plus that
+        // sample's window, is inside the granted read.
+        let lattice = SampleLattice::centred(volume, [7, 7, 7]).unwrap();
+        for (index, &(lo, hi)) in table.iter().enumerate() {
+            let core_lo = index * 8;
+            let core_hi = (core_lo + 8).min(volume[0]);
+            let read_lo = core_lo.saturating_sub(lo);
+            let read_hi = (core_hi - 1 + hi).min(volume[0] - 1);
+            for voxel in core_lo..core_hi {
+                let (a, b, _) = lattice.bracket(0, voxel);
+                for sample in [a, b] {
+                    let centre = lattice.centre(0, sample);
+                    assert!(
+                        centre.saturating_sub(element.reach(0)) >= read_lo
+                            || centre < element.reach(0),
+                        "block {index} would read below its granted halo"
+                    );
+                    assert!(
+                        centre + element.reach(0) <= read_hi
+                            || centre + element.reach(0) >= volume[0],
+                        "block {index} would read above its granted halo"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two shipped conventions are different lattices, and the endpoint one
+    /// pins both ends. A caller matching a tool built on `ndimage.zoom` needs the
+    /// second; a caller who wants equal margins needs the first.
+    #[test]
+    fn the_two_conventions_disagree_and_each_is_what_it_says() {
+        let centred = SampleLattice::of(&Sampling::every([4, 4, 4]), [16, 16, 16]).unwrap();
+        assert_eq!(centred.positions(0), &[2, 6, 10, 14]);
+
+        let ends =
+            SampleLattice::of(&Sampling::Endpoints { count: [4, 4, 4] }, [16, 16, 16]).unwrap();
+        assert_eq!(ends.positions(0), &[0, 5, 10, 15]);
+        assert_ne!(centred, ends);
+
+        // the endpoint convention reaches nothing at the ends, because a sample
+        // sits on the first and last voxel
+        assert_eq!(ends.max_distance(0), 4);
+        assert_eq!(centred.max_distance(0), 3);
+    }
+
+    /// An irregular lattice is expressible, and its reach is the **widest gap**
+    /// rather than an average — which is the property a spacing could not state.
+    #[test]
+    fn an_irregular_lattice_is_priced_by_its_widest_gap() {
+        let positions = [vec![0, 1, 2, 20], vec![0], vec![0]];
+        let lattice = SampleLattice::at([32, 4, 4], positions).unwrap();
+        assert_eq!(lattice.count(0), 4);
+        // the 0..1 and 1..2 gaps contribute nothing; the 2..20 gap contributes
+        // 17, and the tail past the last sample contributes 31 - 20 = 11
+        assert_eq!(lattice.max_distance(0), 17);
+    }
+
+    /// Every way of stating a lattice that cannot be interpolated from is
+    /// refused where it is stated.
+    #[test]
+    fn a_lattice_that_could_not_be_interpolated_from_is_refused() {
+        assert!(SampleLattice::at([8, 8, 8], [vec![], vec![0], vec![0]]).is_err());
+        assert!(SampleLattice::at([8, 8, 8], [vec![0, 0], vec![0], vec![0]]).is_err());
+        assert!(SampleLattice::at([8, 8, 8], [vec![4, 2], vec![0], vec![0]]).is_err());
+        assert!(SampleLattice::at([8, 8, 8], [vec![0, 8], vec![0], vec![0]]).is_err());
+        assert!(SampleLattice::at([0, 8, 8], [vec![0], vec![0], vec![0]]).is_err());
+        assert!(SampleLattice::centred([8, 8, 8], [0, 1, 1]).is_err());
+        assert!(SampleLattice::at([8, 8, 8], [vec![0, 4], vec![0], vec![0]]).is_ok());
     }
 }

@@ -37,8 +37,9 @@ use blockflow::env::ArrayEnvironment;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain};
 use blockflow::ops::{
-    AdaptiveThresholdOp, CombineOp, ElementShape, LocalStatistic, LocalStatisticOp, Logic,
-    Morphology, MorphologyOp, Rank, RankFilterOp, Statistic, StructuringElement, VoxelwiseMapOp,
+    AdaptiveThresholdOp, CombineOp, ElementShape, Gaussian, LocalStatistic, LocalStatisticOp,
+    Logic, Morphology, MorphologyOp, Rank, RankFilterOp, SmoothOp, Statistic, StructuringElement,
+    VoxelwiseMapOp,
 };
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
@@ -265,6 +266,31 @@ fn cases(input: &Array3<f64>) -> Vec<(&'static str, Chain, Array3<f64>, [usize; 
             )),
             input.clone(),
             [4, 5, 4],
+        ),
+        // Anisotropic on purpose. A smoothing is the first op here whose reach
+        // is a *different* number on each axis for a reason other than an
+        // element's shape, and `ceil(3 * 1.5) = 5` against `ceil(3 * 0.6) = 2`
+        // is exactly the case a per-axis bug survives when every axis is equal.
+        (
+            "gaussian smooth, anisotropic",
+            Chain::op(SmoothOp::new(
+                "smooth",
+                Gaussian::new([1.0, 1.5, 0.6], 3.0).unwrap(),
+            )),
+            input.clone(),
+            [3, 5, 2],
+        ),
+        (
+            "a chain: smooth then threshold",
+            Chain::sequence(vec![
+                Chain::op(SmoothOp::new(
+                    "smooth",
+                    Gaussian::isotropic(1.0, 3.0).unwrap(),
+                )),
+                Chain::op(VoxelwiseMapOp::threshold("threshold", 0.4, 1.0, 0.0)),
+            ]),
+            input.clone(),
+            [3, 3, 3],
         ),
         (
             "adaptive threshold against a local mean",

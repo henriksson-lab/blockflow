@@ -33,6 +33,7 @@
 // wolf on every correct run, which is how guards get deleted.
 
 use crate::error::{Error, Result};
+use crate::reach::Reach;
 use crate::region::Region;
 
 /// A grid of block cores over a 3-D volume.
@@ -202,36 +203,72 @@ pub struct BlockGeometry {
 }
 
 impl BlockGeometry {
+    /// The symmetric form: one integer per axis for the halo and one for the
+    /// reach, in the phase's own voxels.
+    ///
+    /// Kept as the name every call site uses, because that is what most of them
+    /// mean. It is [`Self::derive_with`] over the same numbers lifted into
+    /// [`Reach`], not a second implementation — a guard with two derivations
+    /// behind it is a guard that can be right in one of them.
     pub fn derive(
         core: &BlockCore,
         volume: [usize; 3],
         halo: [usize; 3],
         reach: [usize; 3],
     ) -> Self {
+        Self::derive_with(core, volume, &Reach::from(halo), &Reach::from(reach))
+    }
+
+    /// The general form: a halo and a reach that may be asymmetric, per-block,
+    /// whole-axis, and stated in a named coordinate space.
+    ///
+    /// Both must already be in the phase's own voxels — `Reach::in_voxels`
+    /// converts, and `PhaseDecomposition::derive` is where that happens, because
+    /// it is the first place a grid exists to convert with.
+    ///
+    /// **Which side of the block each number applies to.** To produce the voxel
+    /// at `v` the operation reads `v - lo ..= v + hi`; a block reads
+    /// `core_lo - halo_lo .. core_hi + halo_hi`. So the trustworthy extent is
+    /// the read shrunk by `lo` at the bottom and `hi` at the top — the same
+    /// inversion this module has always done, with the two sides no longer
+    /// forced to be one number.
+    ///
+    /// **The clamp exception is now conditional on the space.** A read clamped
+    /// at the phase's own volume edge is trustworthy when that edge is a real
+    /// edge of the array; a phase that crops or regrids has edges that are
+    /// interior positions of the level below, and a reach stated in that frame
+    /// (`Frame::Source`) is therefore not granted the exception. That is the
+    /// direction of error the crate accepts: a seam that might be real is
+    /// treated as real, so the guard fires rather than trusting a voxel whose
+    /// context was never fetched.
+    pub fn derive_with(core: &BlockCore, volume: [usize; 3], halo: &Reach, reach: &Reach) -> Self {
         let mut read_start = [0usize; 3];
         let mut read_shape = [0usize; 3];
         let mut valid_start = [0usize; 3];
         let mut valid_shape = [0usize; 3];
         let mut degenerate = false;
+        let trust_the_edge = reach.space().clamp_is_an_edge();
 
         for axis in 0..3 {
             let core_lo = core.core.start[axis];
             let core_hi = core_lo + core.core.shape[axis];
+            let (halo_lo, halo_hi) = halo.at(axis, core.index[axis], volume[axis]);
+            let (reach_lo, reach_hi) = reach.at(axis, core.index[axis], volume[axis]);
 
-            let read_lo = core_lo.saturating_sub(halo[axis]);
-            let read_hi = (core_hi + halo[axis]).min(volume[axis]);
+            let read_lo = core_lo.saturating_sub(halo_lo);
+            let read_hi = (core_hi + halo_hi).min(volume[axis]);
             read_start[axis] = read_lo;
             read_shape[axis] = read_hi - read_lo;
 
-            let trust_lo = if read_lo == 0 {
+            let trust_lo = if read_lo == 0 && trust_the_edge {
                 0
             } else {
-                read_lo + reach[axis]
+                read_lo + reach_lo
             };
-            let trust_hi = if read_hi == volume[axis] {
+            let trust_hi = if read_hi == volume[axis] && trust_the_edge {
                 volume[axis]
             } else {
-                read_hi.saturating_sub(reach[axis])
+                read_hi.saturating_sub(reach_hi)
             };
 
             let lo = core_lo.max(trust_lo);

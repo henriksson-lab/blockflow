@@ -209,8 +209,17 @@ fn the_planner_segments_at_a_full_reach_op_rather_than_fusing_across_it() {
     let model = CostModel::default();
     let whole = BlockGrid::whole(volume).unwrap();
     let price = |reach: [usize; 3], compute: f64, materialised: bool| {
-        super::decomposition::price_phase(&whole, reach, compute, 1, materialised, 8.0, &model, 1.0)
-            .cost_per_block
+        super::decomposition::price_phase(
+            &whole,
+            &reach.into(),
+            compute,
+            1,
+            materialised,
+            8.0,
+            &model,
+            1.0,
+        )
+        .cost_per_block
     };
     let fused = price(volume, 3.0, false);
     let segmented =
@@ -440,8 +449,9 @@ fn the_cost_model_never_predicts_fewer_reads_than_the_run_performs() {
         .iter()
         .map(|phase| {
             let mut redundancy = 1.0;
+            let reach = phase.reach.bound(phase.volume());
             for &axis in phase.grid.split_axes() {
-                redundancy *= (phase.grid.block()[axis] as f64 + 2.0 * phase.reach[axis] as f64)
+                redundancy *= (phase.grid.block()[axis] as f64 + 2.0 * reach[axis] as f64)
                     / phase.grid.block()[axis] as f64;
             }
             phase.grid.core_voxels() * redundancy * phase.grid.n_blocks() as f64
@@ -498,6 +508,7 @@ fn identity_ops_reproduce_the_input_exactly_across_the_whole_sweep() {
                                     priority,
                                     concurrency,
                                     prefetch_depth: 0,
+                                    ..Hints::default()
                                 };
                                 let stats =
                                     execute("sweep", &workflow, &decomposition, &hints, &env)
@@ -539,9 +550,10 @@ fn manual_partition(
     let phases = groups
         .iter()
         .map(|group| {
-            let (reach, _, names, _) = super::decomposition::summarise_slots(&slots, group, volume);
+            let (reach, _, names, _) =
+                super::decomposition::summarise_slots(&slots, group, volume).unwrap();
             let grid = BlockGrid::along(volume, split_axes, block).unwrap();
-            PhaseDecomposition::derive(group.clone(), names, reach, reach, grid)
+            PhaseDecomposition::derive(group.clone(), names, reach.clone(), reach, grid)
         })
         .collect();
     let decomposition = Decomposition {
@@ -759,7 +771,7 @@ fn the_tiling_guard_fires_on_the_phase_that_changed_the_volume() {
     let shape = [32, 6, 5];
     let mut plan = crop_plan(shape, 12, 8, 4);
     // give the second phase a reach, then a halo that cannot cover it
-    plan.phases[1].reach = [3, 0, 0];
+    plan.phases[1].reach = [3, 0, 0].into();
     let short = plan.with_forced_halo([1, 0, 0]);
     let message = short.check().unwrap_err().to_string();
     assert!(
@@ -1341,6 +1353,7 @@ fn the_same_decomposition_under_different_schedules_gives_the_same_output() {
                         priority,
                         concurrency,
                         prefetch_depth: 0,
+                        ..Hints::default()
                     },
                     &env,
                 )

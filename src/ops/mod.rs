@@ -10,8 +10,11 @@
 // they cannot do is be used, and this module is what a caller composes a chain
 // out of.
 //
-// Five families, and what each contributes beyond its arithmetic
-// --------------------------------------------------------------
+// The families, and what each contributes beyond its arithmetic
+// -------------------------------------------------------------
+// Read down the right-hand column rather than the left: each row is here
+// because it was the first thing that could not be said with what came before
+// it, and the bottom two rows are where the `BlockOp` shape itself ran out.
 // | module | ops | what it makes expressible |
 // |---|---|---|
 // | `voxelwise` | a general map, and the connectives over two inputs | the **sink of a diamond**: reach 0, two operands, which nothing here could express |
@@ -19,6 +22,13 @@
 // | `morphology` | erode, dilate, open, close | a reach that is **twice** the element, because two of the four are compositions |
 // | `local` | windowed mean, deviation and rank on a sample lattice | a reach with **two terms**, and the globally anchored lattice that makes it decomposition-invariant at all |
 // | `local` | thresholding against a local statistic | a threshold that varies with position, and inherits every property above |
+// | `smooth` | a separable Gaussian | a cost that is **linear in the sum** of the kernel lengths rather than in their product, which the model had no reason to distinguish before |
+// | `skeleton` | one thinning sub-iteration, and the sequence of them | an answer that depends on **where** the block is (the parity class is a fact about position), and a `Sequence` whose reach is the fold rather than a declaration |
+// | `fill` | hole filling, as two `FragmentOp` phases | the first operation here that **no halo can express**: reachability is transitive over the whole volume, so it is a fragment-and-join rather than a `BlockOp` at all |
+// | `regional` | the maxima of a greyscale volume, as the same two phases | the **second** op of that shape, which is what turned one op's internals into `components`: the same program with a different per-label fact, and a seam meeting that compares before it joins |
+// | `components` | the union-find, the six-face geometry and the seam walk | nothing on its own — it is the part of `fill` and `regional` that is the *program* rather than the question |
+// | `voxelize` | scattered points into a dense volume | a `fragments -> volume` op whose reach is in **blocks** as well as voxels, and an accumulation order that has to be a function of the data rather than of the gather |
+// | `reconstruct` | grey reconstruction, and the h-maxima transform over it | the first `IterativeOp` here: a **fixed point** whose substage count is a function of the data, reached at the external reach of *one* substage — the third answer to transitivity, beside a wide halo and a fragment-and-join |
 //
 // The shape every op in here has, and why
 // ---------------------------------------
@@ -27,6 +37,14 @@
 // comparison over `PartialOrd`, a voxelwise map over nothing at all — with a
 // thin `BlockOp` implementation on top that adapts the buffer it is handed to
 // it.
+//
+// The shell is a `BlockOp` for most of them, a `FragmentOp` for the global two
+// and an `IterativeOp` for `reconstruct`. The rule is the same in all three
+// cases and it is the rule rather than the trait that matters: the algorithm is
+// a free function over the narrowest bound it can be written under, and the
+// implementation is an adapter that decides which buffer the free function is
+// handed. `reconstruct` is the sharpest case, because its shell is a *step* and
+// the loop around it belongs to the framework.
 //
 // That split is not stylistic, and it has now been cashed in. Change 5 of
 // `docs/design/BLOCK_OPS.md` §"The combined pass" made the element type a tag
@@ -74,23 +92,68 @@
 // -----
 // See `COST_MEASUREMENT`. Every `cost_per_voxel` in this module is a
 // measurement, taken by `ops::cost::measure`, which is runnable.
+//
+// Three ops measure themselves instead, in their own files, and say so where
+// their constants are: `ridge`, `skeleton` and `reconstruct`. `ops::cost::
+// measure` builds one shared `f64` ramp for every case and consumes the result
+// as `f64`, so it can neither feed nor read an op whose input and output are
+// masks — and a thinning pass over a ramp does almost nothing, which is a
+// measurement of the wrong program rather than a noisy measurement of the right
+// one. `reconstruct` is out for a different reason and a harder one: the harness
+// prices `Box<dyn BlockOp>` and an iterative op is not a `BlockOp` at all, so
+// there is no signature to hand it through.
 
 use crate::error::{Error, Result};
 
+pub mod background;
+pub mod components;
 pub mod cost;
+pub mod deconvolve;
 pub mod element;
+pub mod fill;
 pub mod local;
 pub mod morphology;
+pub mod normalise;
 pub mod rank;
+pub mod reconstruct;
+pub mod regional;
+pub mod resample;
+pub mod ridge;
+pub mod skeleton;
+pub mod smooth;
+pub mod voxelize;
 pub mod voxelwise;
 
 pub use element::{select_nth, ElementShape, Rank, StructuringElement, Total};
+pub use fill::{fill_phases, FillHolesOp, LabelBackgroundOp};
 pub use local::{
     axis_max_distance, local_statistic_into, threshold_against_into, AdaptiveThresholdOp,
-    LocalStatistic, LocalStatisticOp, SampleLattice, Statistic,
+    LocalStatistic, LocalStatisticOp, SampleLattice, Sampling, Statistic,
 };
 pub use morphology::{close_into, dilate_into, erode_into, open_into, Morphology, MorphologyOp};
+pub use normalise::{
+    normalise_against_into, normalise_value, LevelCorrectionOp, LocalContrastOp, Removal,
+};
 pub use rank::{rank_filter_f64_into, rank_filter_into, RankFilterOp};
+pub use reconstruct::{
+    flooding_bound, h_extrema, reconstruct_step_into, reconstruct_to_fixed_point, HExtremaOp,
+    Reconstruction,
+};
+pub use regional::{
+    ascending_neighbours, label_plateaux_into, maxima_from_labels_into, regional_maxima,
+    regional_phases, LabelPlateauxOp, RegionalMaximaOp,
+};
+pub use resample::{
+    resample_linear_into, resample_nearest_into, resample_phase, Interpolation, Ratio, Resample,
+    ResampleOp,
+};
+pub use ridge::{
+    gaussian_radius, gaussian_smooth_into, gaussian_weights, hessian_at, ridge_response_into,
+    symmetric_eigenvalues, Polarity, RidgeFilterOp, RidgeResponse, ScaleSpace,
+};
+pub use skeleton::{thin, thinning_pass, thinning_reach, ThinningOp};
+pub use smooth::{Gaussian, SmoothOp};
+pub use voxelize::{decode_points, encode_points, Point, VoxelizeOp};
 pub use voxelwise::{
     combine_into, from_set, is_set, logic_into, map_into, not_into, CombineOp, Logic, LogicCombine,
     VoxelwiseMapOp,

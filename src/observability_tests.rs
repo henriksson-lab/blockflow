@@ -104,9 +104,10 @@ fn manual_partition(
     let phases = super::decomposition::groups_for(mask, slots.len())
         .iter()
         .map(|group| {
-            let (reach, _, names, _) = super::decomposition::summarise_slots(&slots, group, volume);
+            let (reach, _, names, _) =
+                super::decomposition::summarise_slots(&slots, group, volume).unwrap();
             let grid = BlockGrid::along(volume, split_axes, block).unwrap();
-            PhaseDecomposition::derive(group.clone(), names, reach, reach, grid)
+            PhaseDecomposition::derive(group.clone(), names, reach.clone(), reach, grid)
         })
         .collect();
     let decomposition = Decomposition {

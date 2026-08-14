@@ -27,7 +27,7 @@ use super::cache_model::ChunkGrid;
 use super::coordinator::Job;
 use super::handout::HandoutPolicy;
 use super::protocol::Handout;
-use super::spec::{probe_job, ChainSpec, ProbeWorkflows, WorkflowFactory};
+use super::spec::{probe_job, ChainSpec, OpSpec, ProbeWorkflows, WorkflowFactory};
 
 // ------------------------------------------------- the protocol is insulated --
 
@@ -304,6 +304,304 @@ fn the_handout_policy_changes_who_does_what_and_never_what_is_done() {
             decomposition.n_tasks()
         );
     }
+}
+
+// -------------------------------------------------- placing a barrier phase --
+
+/// What one barrier phase cost, and what it could have cost.
+///
+/// A full-reach op is a planning barrier and resolves to a **single block**, so
+/// a barrier phase is one task: one worker does it and the rest of the cluster
+/// idles through it. Which worker gets it is therefore the only placement
+/// decision the phase has, and it is worth the whole phase's read cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BarrierPlacement {
+    /// Distinct chunks the barrier task reads. The whole of its level.
+    read_chunks: usize,
+    /// Per worker, how many of those it had **not** had through its hands when
+    /// the barrier became ready — what the phase would have cost had it landed
+    /// there.
+    costs: Vec<usize>,
+    /// Which worker got it, and how many blocks of the previous phase each ran.
+    worker: usize,
+    shares: Vec<usize>,
+}
+
+impl BarrierPlacement {
+    /// What the placement actually cost.
+    fn refetched(&self) -> usize {
+        self.costs[self.worker]
+    }
+
+    fn best(&self) -> usize {
+        self.costs.iter().copied().min().expect("a worker")
+    }
+
+    fn worst(&self) -> usize {
+        self.costs.iter().copied().max().expect("a worker")
+    }
+
+    /// What an *arbitrary* worker costs, which is what "whichever worker happens
+    /// to claim it" is: the handout without this rule is a race between poll
+    /// timers, and no worker is favoured by it. Reported as a mean rather than as
+    /// one particular draw, because a single draw of a race is not a measurement.
+    fn mean(&self) -> f64 {
+        self.costs.iter().sum::<usize>() as f64 / self.costs.len() as f64
+    }
+}
+
+/// Run a job whose last phase is a barrier, and see where the barrier landed.
+///
+/// `weights` is how many pulls each worker attempts per round — an **unequal**
+/// cluster, which is the ordinary case rather than a contrived one: the design
+/// records that 37-41 % of blocks are empty and that empty regions *cluster*, so
+/// two workers over one volume do unequal amounts of work whatever the handout
+/// does. All-ones is the balanced cluster, and it is measured too because the
+/// answer there is the interesting negative.
+fn place_barrier(
+    policy: HandoutPolicy,
+    weights: &[usize],
+    blocks: usize,
+    scarce_placement: bool,
+) -> BarrierPlacement {
+    let workers = weights.len();
+    let shape = [8 * blocks, 8, 8];
+    // A second op reaching the whole of every axis. `is_planning_barrier` is an
+    // exact `reach >= extent`, so this decomposes to N blocks and then one.
+    let chain = ChainSpec(vec![
+        OpSpec::new("identity", "first", [2, 0, 0]),
+        OpSpec::new("identity", "merge", shape),
+    ]);
+    let (mut spec, decomposition) = probe_job(blocks, 2, chain);
+    spec.policy = policy;
+    let chunk = spec.workflow.chunk;
+    let volume = spec.workflow.shape;
+    let chain = ProbeWorkflows.chain(&spec.workflow).expect("a probe chain");
+    let mut job = Job::new(spec, decomposition.clone())
+        .expect("a valid job")
+        .with_scarce_placement(scarce_placement);
+    let chunks = ChunkGrid::new(volume, chunk);
+
+    let last = decomposition.n_phases() - 1;
+    assert_eq!(
+        decomposition.phases[last].blocks.len(),
+        1,
+        "the point of this measurement is a phase of one block"
+    );
+
+    let environments: Vec<AccountingEnvironment> = (0..workers)
+        .map(|_| AccountingEnvironment::new(volume, chunk, 8))
+        .collect();
+    for environment in &environments {
+        environment.prepare(&decomposition).expect("prepared");
+    }
+
+    // Ground truth, not the coordinator's model: what each worker has actually
+    // had through its hands, read or written. The model is asserted against this
+    // rather than trusted to be it.
+    let mut held: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); workers];
+    let mut shares = vec![0usize; workers];
+    let mut placement: Option<BarrierPlacement> = None;
+    let mut idle = 0usize;
+    let mut round = 0usize;
+    loop {
+        let mut progressed = false;
+        // Rotate who asks first. Without this the heaviest worker is also
+        // always the first to ask after a phase boundary, which would hand the
+        // baseline the right answer for a reason that has nothing to do with
+        // locality — the harness would be measuring itself.
+        for step in 0..workers {
+            let index = (step + round) % workers;
+            let environment = &environments[index];
+            let name = format!("worker-{index}");
+            for _ in 0..weights[index] {
+                let Handout::Task(assignment) = job.pull(&name) else {
+                    continue;
+                };
+                if assignment.phase == last {
+                    let keys = chunks.keys(assignment.phase, &assignment.read);
+                    placement = Some(BarrierPlacement {
+                        read_chunks: keys.len(),
+                        costs: held
+                            .iter()
+                            .map(|set| keys.iter().filter(|key| !set.contains(key)).count())
+                            .collect(),
+                        worker: index,
+                        shares: shares.clone(),
+                    });
+                } else {
+                    shares[index] += 1;
+                }
+                held[index].extend(chunks.keys(assignment.phase, &assignment.read));
+                held[index].extend(chunks.keys(assignment.phase + 1, &assignment.valid));
+                let task = &job.graph().tasks[assignment.task];
+                execute_task(&chain, &decomposition, task, environment, &[])
+                    .expect("a probe task runs");
+                job.completed(&name, assignment.task).expect("completed");
+                progressed = true;
+            }
+        }
+        round += 1;
+        if job.finished() {
+            break;
+        }
+        if !progressed {
+            idle += 1;
+            assert!(idle < 1000, "the job stopped making progress");
+        }
+    }
+    placement.expect("the barrier phase ran")
+}
+
+/// The measurement this was built for: **what the barrier phase re-reads**, with
+/// and without locality-aware selection, over the same job.
+///
+/// Reported the way the 62-vs-6 locality figure is — the ordering asserted, the
+/// magnitudes printed, because the magnitude depends on the decomposition and
+/// the claim is about the direction.
+#[test]
+fn locality_aware_selection_cuts_what_a_barrier_phase_re_reads() {
+    // An unequal cluster: worker 0 gets three pulls a round to the others' one.
+    let weights = [3usize, 1, 1, 1];
+    let blocks = 32;
+    let without = place_barrier(HandoutPolicy::NearestFirst, &weights, blocks, false);
+    let with = place_barrier(HandoutPolicy::NearestFirst, &weights, blocks, true);
+
+    assert_eq!(without.read_chunks, with.read_chunks);
+    assert_eq!(
+        with.refetched(),
+        with.best(),
+        "the selection should land the barrier on the best-placed worker; costs {:?}, \
+         it went to {}",
+        with.costs,
+        with.worker
+    );
+    assert!(
+        (with.refetched() as f64) < without.mean(),
+        "locality-aware {} against an arbitrary worker's {:.1}",
+        with.refetched(),
+        without.mean()
+    );
+    // Each run is scored against its own spread, because the rule also fires on
+    // the *tail* of the ordinary phase — where fewer tasks remain than there are
+    // workers — so the shares the barrier then chooses between are themselves
+    // slightly different. Comparing one run's outcome with the other run's best
+    // would be comparing two different jobs.
+    println!(
+        "barrier over {} chunks, {} workers:\n  \
+         claim order     worker {} re-read {:3}; an arbitrary worker {:5.1} \
+         (best {}, worst {}, shares {:?})\n  \
+         locality-aware  worker {} re-read {:3}; an arbitrary worker {:5.1} \
+         (best {}, worst {}, shares {:?})",
+        with.read_chunks,
+        weights.len(),
+        without.worker,
+        without.refetched(),
+        without.mean(),
+        without.best(),
+        without.worst(),
+        without.shares,
+        with.worker,
+        with.refetched(),
+        with.mean(),
+        with.best(),
+        with.worst(),
+        with.shares,
+    );
+}
+
+/// How the saving moves with the cluster size, since one number over one
+/// decomposition is a data point rather than a result.
+#[test]
+fn the_barrier_saving_holds_across_cluster_sizes() {
+    for workers in [2usize, 4, 8] {
+        let mut weights = vec![1usize; workers];
+        weights[0] = 3;
+        let without = place_barrier(HandoutPolicy::NearestFirst, &weights, 32, false);
+        let with = place_barrier(HandoutPolicy::NearestFirst, &weights, 32, true);
+        assert_eq!(with.refetched(), with.best());
+        assert!(
+            (with.refetched() as f64) <= without.mean(),
+            "{workers} workers: {} against {:.1}",
+            with.refetched(),
+            without.mean()
+        );
+        println!(
+            "{workers} workers, shares {:?}: barrier re-reads {} of {} \
+             (an arbitrary worker {:.1}, worst {})",
+            with.shares,
+            with.refetched(),
+            with.read_chunks,
+            without.mean(),
+            without.worst()
+        );
+    }
+}
+
+/// The negative, stated rather than hidden: on a **balanced** cluster the
+/// selection buys nothing.
+///
+/// Every worker ran the same number of blocks of the previous phase, so every
+/// worker holds the same share of the level the barrier reads, no worker is
+/// strictly better than any other, and the rule declines to have an opinion —
+/// which is the same fallback a cold start takes. The saving is real only where
+/// the shares are unequal, and it is worth having only because they usually are.
+#[test]
+fn on_a_balanced_cluster_the_selection_has_nothing_to_choose_between() {
+    let weights = [1usize, 1, 1, 1];
+    let without = place_barrier(HandoutPolicy::NearestFirst, &weights, 32, false);
+    let with = place_barrier(HandoutPolicy::NearestFirst, &weights, 32, true);
+    assert_eq!(
+        with.refetched(),
+        without.refetched(),
+        "shares {:?} against {:?}",
+        with.shares,
+        without.shares
+    );
+    assert_eq!(with.best(), with.worst(), "no worker is better placed");
+    println!(
+        "balanced cluster, shares {:?}: barrier re-reads {} of {} either way, and every \
+         worker would have cost the same ({}..{})",
+        with.shares,
+        with.refetched(),
+        with.read_chunks,
+        with.best(),
+        with.worst()
+    );
+}
+
+/// Whatever else it does, it must not stall. Every worker count from one to
+/// eight, and every policy, over a job with a barrier in it.
+#[test]
+fn a_barrier_phase_is_always_claimed_by_somebody() {
+    for workers in 1..=8usize {
+        for policy in [
+            HandoutPolicy::Naive,
+            HandoutPolicy::NearestFirst,
+            HandoutPolicy::CacheModelled,
+        ] {
+            let weights = vec![1usize; workers];
+            let placed = place_barrier(policy, &weights, 8, true);
+            assert!(placed.refetched() <= placed.read_chunks);
+            assert_eq!(placed.shares.iter().sum::<usize>(), 8);
+        }
+    }
+}
+
+/// The coordinator's model of a worker's overlap must agree with what that
+/// worker actually had through its hands, or the selection is choosing on
+/// fiction. It is an *estimate* by design, so this is asserted where the
+/// estimate should be exact: a budget nothing is evicted from and every
+/// assignment honoured.
+#[test]
+fn the_modelled_overlap_matches_what_the_worker_really_holds() {
+    let placed = place_barrier(HandoutPolicy::CacheModelled, &[3, 1, 1, 1], 32, true);
+    assert_eq!(
+        placed.refetched(),
+        placed.best(),
+        "the model picked a worker the ground truth disagrees with; costs {:?}",
+        placed.costs
+    );
 }
 
 /// Coverage, from a merged stream, with several workers and no network.

@@ -781,7 +781,7 @@ fn split_every_op(workflow: &Workflow, constraints: &Constraints) -> Result<Deco
     let slots = workflow.chain.slots();
     let mut phases = Vec::with_capacity(slots.len());
     for slot in 0..slots.len() {
-        let (reach, _, names, _) = summarise_slots(&slots, &[slot], workflow.shape);
+        let (reach, _, names, _) = summarise_slots(&slots, &[slot], workflow.shape)?;
         let grid = BlockGrid::along(
             workflow.shape,
             &constraints.split_axes,
@@ -790,7 +790,7 @@ fn split_every_op(workflow: &Workflow, constraints: &Constraints) -> Result<Deco
         phases.push(PhaseDecomposition::derive(
             vec![slot],
             names,
-            reach,
+            reach.clone(),
             reach,
             grid,
         ));

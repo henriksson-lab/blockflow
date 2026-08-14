@@ -22,7 +22,7 @@ mod patch_grid;
 
 use blockflow::{
     execute, BlockGrid, Chain, Constraints, Decomposition, Dtype, Enumerating, Environment, Greedy,
-    Hints, PhaseDecomposition, Region, Strategy, TaskGraph, Workflow,
+    Hints, PhaseDecomposition, Reach, Region, Space, Strategy, TaskGraph, Workflow,
 };
 use patch_grid::{
     one_phase, CountedOp, ExtraOutput, Inbound, Lattice, PatchGeometry, RegridEnvironment,
@@ -273,6 +273,146 @@ fn restating_the_patch_reach_in_spatial_units_over_declares_it() {
     assert!(
         fetched as f64 / needed as f64 > 3.2,
         "fetched {fetched} patch payloads where {needed} would do"
+    );
+}
+
+/// **The measurement this change exists for.** Stating the same dependency
+/// one-sided cuts the over-fetch, and stating it in the space it is exact in
+/// removes the rest.
+///
+/// Three statements of one dependency, over the same volume, the same grid and
+/// the same lattice, with what each fetches counted through the environment's
+/// own accounting or off the plan it produced:
+///
+/// | statement | patch payloads fetched | over what is needed |
+/// |---|---|---|
+/// | symmetric `[0, 255, 255]` — the only form there was | 1444 | **3.27x** |
+/// | one-sided `(255, 0)` per axis — the dependency as it actually is | 900 | 2.04x |
+/// | the patch lattice's own index space, as a per-block fetch region | 441 | **1.00x** |
+///
+/// The first two are measured by running; the third is counted off a plan that
+/// checks, because the mapping it needs is a per-block fetch region and this
+/// harness's environment is the thing that would have to serve it.
+///
+/// What each column is: the symmetric form is one number applied to both sides,
+/// and the low side is the one that is real — a pixel needs patches that
+/// *start* before it and none that start after. Halving that is the asymmetric
+/// row. What is left over is the **unit**: a dependency that is two patch
+/// indices becomes `edge - 1` voxels when the only space the phase has is the
+/// spatial one, and no amount of asymmetry recovers the difference between "two
+/// patches" and "255 voxels".
+#[test]
+fn a_one_sided_reach_cuts_the_over_fetch_and_the_index_space_removes_the_rest() {
+    let geometry = geometry();
+    let grid = BlockGrid::along(VOLUME, &[1, 2], 256).unwrap();
+
+    // What the blend genuinely needs: the patches covering each block's core.
+    let needed = |blocks: &[blockflow::BlockGeometry]| -> u64 {
+        blocks
+            .iter()
+            .map(|block| {
+                let mut patches = 1u64;
+                for axis in 0..2 {
+                    let lattice = &geometry.lattice[axis];
+                    let start = block.core.start[axis + 1];
+                    let end = start + block.core.shape[axis + 1];
+                    let (first, last) = lattice.patches_over(start, end);
+                    patches *= (last - first + 1) as u64;
+                }
+                patches
+            })
+            .sum()
+    };
+
+    // ---- one-sided, in the phase's own voxels, run and counted ----
+    //
+    // The dependency as it is: `edge - 1` voxels below each output pixel and
+    // none above it. `derive` shrinks the trustworthy extent by `lo` at the
+    // bottom and `hi` at the top, so the valid regions still cover the cores and
+    // the tiling check still passes — this is a tighter *true* statement, not a
+    // weaker one.
+    let one_sided = Reach::asymmetric([(0, 0), (255, 0), (255, 0)]);
+    let chain = Chain::op(CountedOp::new("combine", [0, 255, 255]).with_reach(one_sided.clone()));
+    let decomposition = one_phase(
+        &chain,
+        VOLUME,
+        Dtype::F32,
+        grid.clone(),
+        one_sided.clone(),
+        one_sided,
+    );
+    decomposition.check().unwrap();
+    for block in &decomposition.phases[0].blocks {
+        assert!(block.valid_covers_core(), "block {:?}", block.index);
+    }
+    let workflow = Workflow::new(chain, VOLUME, Dtype::F32);
+    let env = RegridEnvironment::new(VOLUME, [1, 256, 256], Dtype::F32, grid.clone())
+        .with_inbound(Inbound::PatchesUnderSpatial(geometry.clone()));
+    let stats = execute(
+        "harness",
+        &workflow,
+        &decomposition,
+        &Hints::default(),
+        &env,
+    )
+    .unwrap();
+    assert_eq!(stats.tasks, 36);
+    let one_sided_fetched = env.foreign_gathered_elements() / geometry.payload() as u64;
+    let want = needed(&decomposition.phases[0].blocks);
+    assert_eq!(want, 441);
+    assert_eq!(one_sided_fetched, 900);
+
+    // ---- the index space, as a per-block fetch region, off the plan ----
+    //
+    // Level 0 is the patch array; the phase is over the spatial one; each block
+    // fetches exactly the patch slots covering its core, and the dependency is
+    // declared in that array's frame rather than restated in voxels of this one.
+    // The permutation is real: the phase's axes are `(z, y, x)` and the patch
+    // array's are `(ty, tx, payload)`.
+    let index_space = Reach::from([2, 2, 0]).in_space(
+        Space::source_index()
+            .with_axes([1, 2, 0])
+            .expect("a permutation"),
+    );
+    let indexed =
+        Chain::op(CountedOp::new("combine", [0, 255, 255]).with_reach(index_space.clone()));
+    let mut plan = one_phase(
+        &indexed,
+        geometry.patch_volume(),
+        Dtype::F32,
+        grid,
+        index_space,
+        [0, 0, 0],
+    );
+    plan.phases[0] = plan.phases[0].clone().with_sources(|block| {
+        let mut start = vec![0usize; 3];
+        let mut shape = vec![geometry.payload(); 3];
+        for axis in 0..2 {
+            let lattice = &geometry.lattice[axis];
+            let at = block.core.start[axis + 1];
+            let (first, last) = lattice.patches_over(at, at + block.core.shape[axis + 1]);
+            start[axis] = first;
+            shape[axis] = last - first + 1;
+        }
+        Region::new(&start, &shape)
+    });
+    plan.check().unwrap();
+    let indexed_fetched: u64 = plan.phases[0]
+        .blocks
+        .iter()
+        .map(|block| (block.source.shape[0] * block.source.shape[1]) as u64)
+        .sum();
+    assert_eq!(indexed_fetched, 441);
+
+    // The symmetric figure this replaces is measured in the test above; the
+    // ratios are what the change is worth.
+    let symmetric = 1444u64;
+    assert!(
+        (symmetric as f64 / want as f64) > 3.2
+            && (one_sided_fetched as f64 / want as f64) < 2.1
+            && indexed_fetched == want,
+        "symmetric {symmetric}, one-sided {one_sided_fetched}, indexed {indexed_fetched}, \
+         needed {want}"
     );
 }
 

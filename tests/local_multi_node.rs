@@ -38,8 +38,8 @@ use blockflow::decomposition::Decomposition;
 use blockflow::distributed::local::{self, Binaries, LocalOptions, LocalRun};
 use blockflow::distributed::shared_volume::SharedVolumes;
 use blockflow::distributed::spec::{
-    probe_job_over, read_task_fragment, ChainSpec, FragmentPhaseSpec, JobSpec, ProbeWorkflows,
-    SidecarSpec, StoreSpec,
+    probe_job_over, read_task_fragment, ChainSpec, FragmentPhaseSpec, JobSpec, OpSpec,
+    ProbeWorkflows, SidecarSpec, StoreSpec,
 };
 use blockflow::distributed::{HandoutPolicy, WorkflowFactory};
 use blockflow::env::Environment;
@@ -245,6 +245,131 @@ fn n_workers_produce_byte_identical_output_to_a_single_node_run() {
         );
         println!(
             "{workers} worker(s): {} tasks, {} events, {:?} — byte-identical",
+            run.status.done, run.status.events, run.elapsed
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    std::fs::remove_dir_all(&reference_dir).ok();
+}
+
+/// The same, across a **barrier** — a full-reach op, which resolves to a single
+/// block, so one worker reads the whole of a level every other worker helped
+/// write.
+///
+/// This is the phase locality-aware placement exists for, and it is the phase in
+/// which placement can be *wrong*: the coordinator withholds the task from a
+/// worker it models as badly placed, and the whole rule rests on that costing a
+/// re-read and never a result. Asserted over processes rather than argued,
+/// across the same worker counts as the headline, because a rule that changes
+/// who runs the only task in a phase is exactly the kind of change that could
+/// deadlock a run or seam it differently and pass every in-process test.
+#[test]
+fn a_barrier_phase_lands_on_one_worker_and_the_output_is_still_byte_identical() {
+    // identity, then `2x + 1`, then an op reaching the whole of every axis.
+    // `is_planning_barrier` is an exact `reach >= extent`, so the last op cannot
+    // be fused with the others and its phase cannot be split.
+    let chain = |shape: [usize; 3]| {
+        let mut ops = ChainSpec::identity().0;
+        ops.push(OpSpec::new("identity", "merge", shape));
+        ChainSpec(ops)
+    };
+    let shape = [8 * BLOCKS, 8, 8];
+
+    let reference_dir = scratch("barrier-reference");
+    let (spec, decomposition) = probe_job_over(
+        BLOCKS,
+        1,
+        chain(shape),
+        StoreSpec::Files {
+            dir: reference_dir.join("volumes"),
+        },
+    );
+    let last = decomposition.n_phases() - 1;
+    assert_eq!(
+        decomposition.phases[last].blocks.len(),
+        1,
+        "a full-reach op should decompose to one block; got {:?}",
+        decomposition
+            .phases
+            .iter()
+            .map(|phase| phase.blocks.len())
+            .collect::<Vec<_>>()
+    );
+    let reference = single_node(&reference_dir, &spec, &decomposition);
+    // The barrier op is an identity, so the answer is still knowable outright.
+    let expected: Vec<u8> = ramp(spec.workflow.shape)
+        .iter()
+        .flat_map(|value| (2.0 * value + 1.0).to_le_bytes())
+        .collect();
+    assert_eq!(reference, expected, "the single-node reference is wrong");
+
+    for workers in [1usize, 2, 3, 5] {
+        let dir = scratch(&format!("barrier-workers-{workers}"));
+        let volumes = dir.join("volumes");
+        let (mut spec, decomposition) = probe_job_over(
+            BLOCKS,
+            1,
+            chain(shape),
+            StoreSpec::Files {
+                dir: volumes.clone(),
+            },
+        );
+        spec.policy = HandoutPolicy::NearestFirst;
+        let store = SharedVolumes::create(
+            &volumes,
+            spec.workflow.shape,
+            spec.workflow.chunk,
+            decomposition.n_phases(),
+        )
+        .expect("level files");
+        store
+            .write_level(0, &ramp(spec.workflow.shape))
+            .expect("an input");
+        drop(store);
+
+        let run = local::run(&options(&dir, workers), &spec, &decomposition)
+            .unwrap_or_else(|error| panic!("{workers} workers over a barrier: {error}"));
+        assert_eq!(
+            run.status.done, run.status.tasks,
+            "{workers} workers: {} of {} tasks — a barrier that nobody claimed would \
+             show up exactly here",
+            run.status.done, run.status.tasks
+        );
+        let produced = output_bytes(&dir, &spec, &decomposition);
+        assert!(
+            produced == reference,
+            "{workers} workers produced {} differing bytes across a barrier",
+            produced
+                .chunks(8)
+                .zip(reference.chunks(8))
+                .filter(|(left, right)| left != right)
+                .count()
+        );
+        // Not `check_coverage_and_order`: that check takes **one** block count
+        // for the whole run, and a barrier phase has a lattice of its own — one
+        // block against the sixteen of the phase before it. It refuses a barrier
+        // job whatever the worker count, single-node included, which is a
+        // property of the check rather than of this run. What is asserted
+        // instead is the part that is about distribution: the merged stream
+        // shows the barrier op applied to its one block, exactly once, with
+        // nobody having died.
+        let log = merged_log(&run);
+        let applications = log
+            .op_sequence_per_block()
+            .values()
+            .flat_map(|sequence| sequence.iter())
+            .filter(|(_, name)| name == "merge")
+            .count();
+        assert_eq!(
+            applications, 1,
+            "{workers} workers: the barrier op was applied {applications} times"
+        );
+        assert!(
+            log.duplicate_applications().is_empty(),
+            "{workers} workers: a block ran twice with nobody dying"
+        );
+        println!(
+            "{workers} worker(s) over a barrier: {} tasks, {} events, {:?} — byte-identical",
             run.status.done, run.status.events, run.elapsed
         );
         std::fs::remove_dir_all(&dir).ok();

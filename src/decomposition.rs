@@ -46,6 +46,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
+use crate::reach::Reach;
 use crate::region::Region;
 use crate::tiling::boxes_tile_exactly;
 
@@ -64,11 +65,24 @@ pub struct PhaseDecomposition {
     pub slots: Vec<usize>,
     pub names: Vec<String>,
     /// Sum of the slots' reaches: what must be shrunk off `read` to get `valid`.
-    pub reach: [usize; 3],
+    ///
+    /// A [`Reach`] rather than a triple, so that the *required* dependency can be
+    /// one-sided, per-block, whole-axis or stated in another coordinate space.
+    /// `[usize; 3]` converts into one and compares equal to one, so every caller
+    /// that means the symmetric form still says it that way.
+    pub reach: Reach,
     /// What to actually fetch. A **hint** in the design's sense — the planner
     /// sets it equal to `reach`, and it lives in the binding half only because
     /// a wrong value must be *detectable*, which requires it to be recorded.
-    pub halo: [usize; 3],
+    ///
+    /// The same type as `reach` because it is the same shape of quantity — how
+    /// far outside its core a block reaches, per side, per axis — and the guard
+    /// this crate is built on is the comparison between the two. It is *not* the
+    /// same number: a granted halo may be wider, and where an operation mandates
+    /// an input extent it must differ per block ([`Reach::window`]), which is
+    /// what lets "the extent I accept" and "the extent I need around it" stop
+    /// being one number.
+    pub halo: Reach,
     /// Per-phase block grid. A phase boundary is already a materialisation, so
     /// re-blocking there is free.
     ///
@@ -89,18 +103,34 @@ pub struct PhaseDecomposition {
 
 impl PhaseDecomposition {
     /// Derive the geometry for one phase.
+    ///
+    /// `reach` and `halo` are anything that converts into a [`Reach`], which a
+    /// symmetric `[usize; 3]` does — so this keeps the arity and the spelling it
+    /// has always had, and a caller with something richer to say passes the
+    /// richer value.
+    ///
+    /// **This is where a coordinate space becomes a distance.** A reach in whole
+    /// blocks, or in a permuted axis order, is symbolic until a grid exists: the
+    /// planner compares candidate grids, and a reach that changed with the grid
+    /// under consideration could not be compared against anything. So the
+    /// conversion happens exactly here, once the grid is settled, and the
+    /// geometry below sees voxels in the geometry's own axis order.
     pub fn derive(
         slots: Vec<usize>,
         names: Vec<String>,
-        reach: [usize; 3],
-        halo: [usize; 3],
+        reach: impl Into<Reach>,
+        halo: impl Into<Reach>,
         grid: BlockGrid,
     ) -> Self {
         let volume = grid.volume();
+        let reach = reach.into();
+        let halo = halo.into();
+        let reach_voxels = reach.in_voxels(grid.block());
+        let halo_voxels = halo.in_voxels(grid.block());
         let blocks = grid
             .cores()
             .iter()
-            .map(|core| BlockGeometry::derive(core, volume, halo, reach))
+            .map(|core| BlockGeometry::derive_with(core, volume, &halo_voxels, &reach_voxels))
             .collect();
         Self {
             slots,
@@ -173,6 +203,21 @@ impl PhaseDecomposition {
             .map(|block| block.index)
             .collect()
     }
+}
+
+/// Whether a level survives the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Visibility {
+    /// Level 0 and the workflow output. Somebody outside the run reads these,
+    /// so they exist when it ends.
+    Published,
+    /// Written by one phase, read by exactly one phase, then dead.
+    ///
+    /// The reason this is worth naming: today every level of an `N`-phase plan
+    /// is allocated at full volume for the whole run, so a twenty-stage chain
+    /// holds twenty-one copies of the data at once. Only ever two of them are
+    /// live. Saying which are which is what lets the environment free the rest.
+    Internal,
 }
 
 /// The binding plan: what must be reproduced exactly for output to match.
@@ -251,6 +296,28 @@ impl Decomposition {
             dtype = phase.dtype.unwrap_or(dtype);
         }
         dtype
+    }
+
+    /// Whether a level survives the run, or exists only to get from one phase
+    /// to the next.
+    ///
+    /// **Derived, not recorded.** Level 0 is the input and the last level is the
+    /// output; everything between them is written by one phase, read by exactly
+    /// one phase, and then dead. Nothing in the plan needs to say so, and a
+    /// field that could disagree with the arithmetic would be a field that
+    /// eventually does.
+    ///
+    /// This is deliberately **not** part of the binding half of the plan.
+    /// Discarding an intermediate cannot change a voxel of the output, so
+    /// keeping one is a decision about debuggability rather than about the
+    /// answer — it belongs in `Hints`, next to every other advisory value, and
+    /// the fingerprint is unchanged by it.
+    pub fn level_visibility(&self, level: usize) -> Visibility {
+        if level == 0 || level + 1 >= self.n_levels() {
+            Visibility::Published
+        } else {
+            Visibility::Internal
+        }
     }
 
     /// The shape of the workflow's output: the last phase's volume.
@@ -408,6 +475,34 @@ impl Decomposition {
         for (index, phase) in self.phases.iter().enumerate() {
             let volume = phase.volume();
             let source_volume = self.volume_at(index);
+            // A per-block reach is a table indexed by the block index, so a
+            // table that does not match the lattice is a plan nobody can
+            // reproduce. Checked here as well as where it is built, because a
+            // plan may arrive from any strategy or off a wire.
+            let blocks = phase.grid.blocks_per_axis();
+            phase
+                .reach
+                .check_lattice(blocks, &format!("decomposition phase {index} reach"))?;
+            phase
+                .halo
+                .check_lattice(blocks, &format!("decomposition phase {index} halo"))?;
+            // A reach in the level below's own lattice is satisfied by the fetch
+            // region and by nothing else — there is no factor turning a step of
+            // that lattice into a voxel of this one, so it contributes nothing to
+            // the halo. A phase that declares one and then fetches its own read
+            // extent has declared a dependency it has no way to meet, and that is
+            // exactly the shape of the zero somebody writes to get past a guard.
+            if !phase.reach.space().converts_to_voxels() && !phase.reads_across_grids() {
+                return Err(Error::InvalidArgument(format!(
+                    "decomposition phase {index} ({}) states its reach as {} — steps of the level \
+                     below's own lattice — and every block fetches its own read extent. A \
+                     dependency in that space is met by where a block reads, not by how wide its \
+                     halo is, so the plan has to say where each block reads \
+                     (`PhaseDecomposition::with_sources`).",
+                    phase.names.join(">"),
+                    phase.reach
+                )));
+            }
             for block in &phase.blocks {
                 if !block.reads_across_grids() && source_volume == volume {
                     // The common case: the fetch is the read extent, derived
@@ -433,7 +528,7 @@ impl Decomposition {
                 let short = phase.blocks_missing_valid_core();
                 Error::InvalidArgument(format!(
                     "decomposition phase {index} ({}): {err}. \
-                     reach {:?}, halo {:?}; {} block(s) lost part of their core, first {:?}. \
+                     reach {}, halo {}; {} block(s) lost part of their core, first {:?}. \
                      A halo below the phase reach is the usual cause.",
                     phase.names.join(">"),
                     phase.reach,
@@ -459,7 +554,8 @@ impl Decomposition {
     /// block rather than of the halo and is copied across by index. Losing them
     /// here would make this an unfaithful copy of the plan, and a provocation
     /// that changes two things at once proves nothing about either.
-    pub fn with_forced_halo(&self, halo: [usize; 3]) -> Self {
+    pub fn with_forced_halo(&self, halo: impl Into<Reach>) -> Self {
+        let halo = halo.into();
         let phases = self
             .phases
             .iter()
@@ -467,8 +563,8 @@ impl Decomposition {
                 let mut rebuilt = PhaseDecomposition::derive(
                     phase.slots.clone(),
                     phase.names.clone(),
-                    phase.reach,
-                    halo,
+                    phase.reach.clone(),
+                    halo.clone(),
                     phase.grid.clone(),
                 );
                 rebuilt.dtype = phase.dtype;
@@ -607,14 +703,13 @@ impl Default for Constraints {
 /// not want it. "Full" is a property of the reach *relative to the volume*, not
 /// a size and not a flag someone sets.
 ///
-/// **Why detected rather than declared.** `BlockOp::reach` returns a `usize`, so
-/// nothing distinguishes "reaches 4096" from "reaches everything" and the only
-/// available test is against the extent. That signature is owned by the pending
-/// reach-representation pass (asymmetric, per-block, `All`, and which coordinate
-/// space the number is in), which is where an explicit `All` belongs. What is
-/// done here instead is to give the comparison **one name**, called from the
-/// pricing and from both planners, so that pass has a single site to change
-/// rather than a scatter of `>= volume[axis]` tests.
+/// **Declared where it can be, detected where it cannot.** An op that means
+/// "everything" now says so — `AxisReach::All` — and [`Reach::is_whole_axis`]
+/// keys off the variant. An op that states a number keeps being compared against
+/// the extent, because a number that happens to equal the volume is a full reach
+/// whether or not anybody noticed. The two live behind this one name, called
+/// from the pricing and from both planners, so there is no scatter of
+/// `>= volume[axis]` tests to keep in step.
 ///
 /// An axis of extent 1 is excluded. Reaching across it is trivially true, costs
 /// nothing and forbids no blocking — every block already spans it — so counting
@@ -632,8 +727,16 @@ pub fn reaches_whole_axis(reach: usize, extent: usize) -> bool {
 /// Planning across one is planning across a reboot. Both planners therefore
 /// segment here **structurally** — the cost model gets a vote on where else to
 /// cut, not on this.
+///
+/// A slot whose reaches are stated in two coordinate spaces cannot be folded
+/// into one reach at all; it is treated as a barrier, which is the conservative
+/// answer and is also the right one — a change of coordinate space is a phase
+/// boundary by construction.
 pub fn is_planning_barrier(slot: &Chain, volume: [usize; 3]) -> bool {
-    (0..3).any(|axis| reaches_whole_axis(slot.reach(axis, volume[axis]), volume[axis]))
+    match slot.reach_spec(volume) {
+        Ok(reach) => reach.is_barrier(volume),
+        Err(_) => true,
+    }
 }
 
 /// The axes a phase with this reach may still be cut on.
@@ -645,11 +748,11 @@ pub fn is_planning_barrier(slot: &Chain, volume: [usize; 3]) -> bool {
 /// from the choice rather than left for the cost model to dislike. Every other
 /// axis stays cuttable: a reach that is full on one axis says nothing about the
 /// others, and dropping them would be the over-firing the design warns against.
-pub fn splittable_axes(split_axes: &[usize], reach: [usize; 3], volume: [usize; 3]) -> Vec<usize> {
+pub fn splittable_axes(split_axes: &[usize], reach: &Reach, volume: [usize; 3]) -> Vec<usize> {
     split_axes
         .iter()
         .copied()
-        .filter(|&axis| axis >= 3 || !reaches_whole_axis(reach[axis], volume[axis]))
+        .filter(|&axis| axis >= 3 || !reach.is_whole_axis(axis, volume[axis]))
         .collect()
 }
 
@@ -699,10 +802,15 @@ pub struct PhaseCost {
 /// direction; `working_set_bytes_per_block` feeds the *budget*, where
 /// over-charging invents infeasibility, so it is computed from the clamped read
 /// extent and can never exceed the volume.
+///
+/// **The two sides are charged separately**, which is the whole point of an
+/// asymmetric reach reaching the price: a dependency that is one-sided grows the
+/// read by `lo + hi` and not by twice the wider of them. For a symmetric reach
+/// that is `2r` exactly, so no plan built from one moves.
 #[allow(clippy::too_many_arguments)]
 pub fn price_phase(
     grid: &BlockGrid,
-    reach: [usize; 3],
+    reach: &Reach,
     compute_per_voxel: f64,
     distinct_orders: usize,
     is_materialised: bool,
@@ -713,12 +821,16 @@ pub fn price_phase(
     let core_voxels = grid.core_voxels();
     let block = grid.block();
     let volume = grid.volume();
+    let reach = reach.in_voxels(block);
     let mut redundancy = 1.0_f64;
     let mut resident_voxels = 1.0_f64;
     for axis in 0..3 {
-        let grown = block[axis] as f64 + 2.0 * reach[axis] as f64;
-        let charged =
-            grid.split_axes().contains(&axis) || reaches_whole_axis(reach[axis], volume[axis]);
+        // The widest block, because the price is per block and the model is
+        // stated on the infinite grid: a per-block reach is charged at its worst
+        // block, the same direction of error a generous halo has.
+        let (lo, hi) = reach.axis(axis).bound(volume[axis]);
+        let grown = block[axis] as f64 + lo as f64 + hi as f64;
+        let charged = grid.split_axes().contains(&axis) || reach.is_whole_axis(axis, volume[axis]);
         if charged {
             redundancy *= grown / block[axis] as f64;
         }
@@ -749,20 +861,35 @@ pub fn price_phase(
 }
 
 /// Reach, compute and traversal preferences of a contiguous run of slots.
+///
+/// **Fallible, on the same argument as [`constraint_for`].** Reaches stated in
+/// two coordinate spaces cannot be added — converting between them needs the
+/// grid this function is called before choosing — so a group containing both is
+/// refused, and a planner turns that into "this partition is infeasible" and
+/// keeps searching. The alternative, folding them anyway under some assumed
+/// conversion, would put a number in the binding half of the plan that nobody
+/// stated.
+#[allow(clippy::type_complexity)]
 pub fn summarise_slots(
     slots: &[&Chain],
     group: &[usize],
     volume: [usize; 3],
-) -> ([usize; 3], f64, Vec<String>, Vec<[usize; 3]>) {
-    let mut reach = [0usize; 3];
+) -> Result<(Reach, f64, Vec<String>, Vec<[usize; 3]>)> {
+    // The first slot's space is the group's; `Reach::none()` would impose the
+    // default one on a group that states another, and then adding the first
+    // slot's own reach would be refused for disagreeing with a value nobody
+    // wrote.
+    let mut reach: Option<Reach> = None;
     let mut compute = 0.0_f64;
     let mut names = Vec::with_capacity(group.len());
     let mut orders: Vec<[usize; 3]> = Vec::new();
     for &slot in group {
         let chain = slots[slot];
-        for (axis, reach_axis) in reach.iter_mut().enumerate() {
-            *reach_axis += chain.reach(axis, volume[axis]);
-        }
+        let stated = chain.reach_spec(volume)?;
+        reach = Some(match reach {
+            Some(so_far) => so_far.add(&stated)?,
+            None => stated,
+        });
         compute += chain.cost_per_voxel();
         names.push(chain.display_name());
         for order in chain.preferred_iterations() {
@@ -771,7 +898,7 @@ pub fn summarise_slots(
             }
         }
     }
-    (reach, compute, names, orders)
+    Ok((reach.unwrap_or_default(), compute, names, orders))
 }
 
 /// What a contiguous run of slots requires of the blocks it is handed.
@@ -856,10 +983,58 @@ pub fn check_block_constraints(chain: &Chain, decomposition: &Decomposition) -> 
 ///   cannot run at all rather than a plan that is merely wrong;
 /// * a phase whose level is allocated at one type while its ops write another —
 ///   the message names the level, because that *is* the plan being wrong.
-pub fn check_dtypes(chain: &Chain, decomposition: &Decomposition) -> Result<()> {
+pub fn check_dtypes(
+    chain: &Chain,
+    decomposition: &Decomposition,
+    work: &[crate::fragment::PhaseWork<'_>],
+) -> Result<()> {
     let slots = chain.slots();
     let mut current = decomposition.dtype;
     for (index, phase) in decomposition.phases.iter().enumerate() {
+        // A fragment phase owns no slot, so the fold above has nothing to fold
+        // and the op is the only thing that knows what it writes. Before this
+        // arm existed, a `volume -> fragments` op that widened its level — a
+        // labelling writing `u32` over a `bool` mask — was refused by a message
+        // about ops the phase does not have.
+        if let Some(crate::fragment::PhaseWork::Fragments(op)) = work.get(index) {
+            if !op.writes_pixels() {
+                // Terminal as far as levels go; there is no level to be wrong.
+                continue;
+            }
+            let produced = op.produces(current);
+            let declared = decomposition.dtype_at(index + 1);
+            if declared != produced {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index} runs fragment op {:?}, which reads {} and writes {}, but \
+                     the plan allocates level {} as {}. A phase that changes the element type \
+                     says so in its own `dtype`.",
+                    op.name(),
+                    current.numpy_name(),
+                    produced.numpy_name(),
+                    index + 1,
+                    declared.numpy_name()
+                )));
+            }
+            current = produced;
+            continue;
+        }
+        // An iterative phase owns no slot, so the fold below would silently pass
+        // it through and never ask the op whether it can work in this width. It
+        // *does* hand the type on unchanged — the running operand of one substage
+        // is the previous substage's output, so a step that retyped could not be
+        // iterated — and that is asserted rather than assumed by the shared
+        // comparison at the end.
+        if let Some(crate::fragment::PhaseWork::Iterate(op)) = work.get(index) {
+            if !op.accepts(current) {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index} runs iterative op {:?}, which does not accept {}. An op that \
+                     cannot work in the width it is handed is refused when the plan is made, not \
+                     discovered when a block reaches it.",
+                    op.name(),
+                    current.numpy_name()
+                )));
+            }
+        }
         if phase.slots.iter().any(|&slot| slot >= slots.len()) {
             // A slot index out of range is caught, with a better message, by the
             // executor's own slot-order check. Nothing to say here.
@@ -883,6 +1058,157 @@ pub fn check_dtypes(chain: &Chain, decomposition: &Decomposition) -> Result<()> 
         }
     }
     Ok(())
+}
+
+/// **Every chunk of a level is written by exactly one task.**
+///
+/// The third guard that cannot live in [`Decomposition::check`], for the same
+/// reason [`check_block_constraints`] and [`check_dtypes`] cannot: a plan says
+/// nothing about how a level is chunked, so the plan alone cannot answer this.
+/// The chunk shapes come from whatever holds the storage, and the first place
+/// that holds both halves is the environment's `prepare`.
+///
+/// Precisely: for phase `p`, which writes level `p+1`, every chunk of level
+/// `p+1` must lie inside exactly one of phase `p`'s **valid regions**. The valid
+/// regions already tile the phase's volume exactly — that is what
+/// [`Decomposition::check`] asserts — so "exactly one" reduces to "no chunk is
+/// cut by a valid-region boundary", which is what this checks, per axis, per
+/// block, in linear time.
+///
+/// **Why the invariant is a mandate rather than an aspiration**, since a reader
+/// meeting this function will want to know what it buys:
+///
+/// * a chunk with two writers is a lost-update hazard in any store whose partial
+///   writes are read-modify-write, which is most of them, and is why the Zarr
+///   environment carries per-chunk locks at all;
+/// * a chunk with one writer has a lifetime and an invalidation point; a chunk
+///   with several needs write-combining, cross-task invalidation and a notion of
+///   "partly valid" that no cache tier wants to carry.
+///
+/// **It constrains writes, not reads.** Reads may straddle chunks freely — that
+/// is what a halo is — so `chunks[0]` is never looked at: level 0 is nobody's
+/// output. It is still taken, so that the argument is "the chunk shape of every
+/// level" and a caller does not have to remember an off-by-one.
+///
+/// A chunk overhanging the volume's far edge is not a violation. It holds no
+/// voxel outside the array, so the one valid region that meets it owns every
+/// voxel it can hold — which is exactly the ownership this asserts.
+pub fn check_chunk_exclusive_writes(
+    decomposition: &Decomposition,
+    chunks: &[[usize; 3]],
+) -> Result<()> {
+    if chunks.len() != decomposition.n_levels() {
+        return Err(Error::InvalidArgument(format!(
+            "chunk-exclusive check: this plan has {} level(s) and {} chunk shape(s) were given. \
+             The argument is one shape per level, level 0 included, so that the index is the \
+             level number.",
+            decomposition.n_levels(),
+            chunks.len()
+        )));
+    }
+    for (index, phase) in decomposition.phases.iter().enumerate() {
+        let level = index + 1;
+        let chunk = chunks[level];
+        let volume = phase.volume();
+        for axis in 0..3 {
+            if chunk[axis] == 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "chunk-exclusive check: level {level} is chunked {chunk:?}, and a chunk of \
+                     zero extent on axis {axis} tiles nothing"
+                )));
+            }
+        }
+        for block in &phase.blocks {
+            if block.valid.voxels() == 0 {
+                // A block with no trustworthy voxel writes nothing and owns
+                // nothing. The hole it leaves is `check`'s to report.
+                continue;
+            }
+            for axis in 0..3 {
+                let start = block.valid.start[axis];
+                let end = start + block.valid.shape[axis];
+                // A boundary interior to the volume that is not on the chunk
+                // grid is a chunk with a writer on each side of it. The volume's
+                // own far edge is not such a boundary: nothing lies beyond it.
+                let cut = if start % chunk[axis] != 0 {
+                    start
+                } else if end % chunk[axis] != 0 && end != volume[axis] {
+                    end
+                } else {
+                    continue;
+                };
+                let mut chunk_index = [0usize; 3];
+                for other in 0..3 {
+                    chunk_index[other] = block.valid.start[other] / chunk[other];
+                }
+                chunk_index[axis] = cut / chunk[axis];
+                return Err(shared_chunk_error(
+                    index,
+                    level,
+                    phase,
+                    &chunk_index,
+                    &chunk,
+                    &volume,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The message [`check_chunk_exclusive_writes`] fires with: the phase, the
+/// chunk, and the valid regions that share it.
+///
+/// Naming the sharers costs a scan of the phase's blocks, which is paid once and
+/// only on the failure path. It is worth it: "some chunk is shared" sends a
+/// reader hunting, and "block A writes this and block B writes that" tells them
+/// whether the block grid or the chunk grid is the thing to move.
+fn shared_chunk_error(
+    index: usize,
+    level: usize,
+    phase: &PhaseDecomposition,
+    chunk_index: &[usize; 3],
+    chunk: &[usize; 3],
+    volume: &[usize; 3],
+) -> Error {
+    let mut lo = [0usize; 3];
+    let mut hi = [0usize; 3];
+    for axis in 0..3 {
+        lo[axis] = chunk_index[axis] * chunk[axis];
+        hi[axis] = (lo[axis] + chunk[axis]).min(volume[axis]);
+    }
+    let sharers: Vec<String> = phase
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.valid.voxels() > 0
+                && (0..3).all(|axis| {
+                    let start = block.valid.start[axis];
+                    start < hi[axis] && lo[axis] < start + block.valid.shape[axis]
+                })
+        })
+        .map(|block| {
+            format!(
+                "block {:?} writes {:?}..{:?}",
+                block.index,
+                block.valid.start,
+                block.valid.end()
+            )
+        })
+        .collect();
+    Error::InvalidArgument(format!(
+        "decomposition phase {index} ({}) writes level {level}, which is chunked {chunk:?}: chunk \
+         {chunk_index:?} spans {lo:?}..{hi:?} and {} of this phase's valid regions land in it — \
+         {}. Every chunk of a level must be written by exactly one task: two writers of one chunk \
+         lose each other's bytes in any store whose partial write is a read-modify-write, and a \
+         chunk with no single owner has no lifetime a cache can hold it by. Either the block grid \
+         must be a whole multiple of the chunk shape, or — for a level whose layout nobody outside \
+         the run has asked for — the chunk shape should be derived from the block grid, which \
+         satisfies this at no cost.",
+        phase.names.join(">"),
+        sharers.len(),
+        sharers.join("; ")
+    ))
 }
 
 /// Bit `i` of `mask` set means "cut between slot `i` and slot `i+1`".
@@ -946,6 +1272,58 @@ mod tests {
         assert!(message.contains("halo [2, 0, 0]"), "got: {message}");
     }
 
+    // ------------------------------------------- chunk-exclusive writing --
+
+    /// A chunk shape that divides the block extent is exclusive; the volume's
+    /// far edge is not a boundary and a chunk overhanging it is nobody's second
+    /// owner.
+    #[test]
+    fn a_chunk_grid_the_blocks_are_a_multiple_of_is_exclusive() {
+        let plan = decomposition([4, 0, 0], [4, 0, 0]);
+        // Blocks are [16, 8, 8] over [64, 8, 8].
+        for chunk in [[16, 8, 8], [8, 8, 8], [4, 4, 4], [2, 8, 1], [1, 1, 1]] {
+            check_chunk_exclusive_writes(&plan, &[[9, 9, 9], chunk]).unwrap();
+        }
+        // 5 divides neither 16 nor 8, but on the axes the grid does not cut —
+        // one block spans them — there is no interior boundary to land on, so
+        // only the overhang past the volume edge is left and that is legal.
+        check_chunk_exclusive_writes(&plan, &[[9, 9, 9], [16, 5, 5]]).unwrap();
+    }
+
+    /// **The guard, watched firing**, naming the phase, the chunk and both
+    /// blocks that would write into it.
+    #[test]
+    fn a_chunk_two_blocks_would_write_is_refused_and_names_them() {
+        let plan = decomposition([4, 0, 0], [4, 0, 0]);
+        let err = check_chunk_exclusive_writes(&plan, &[[9, 9, 9], [6, 8, 8]])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("phase 0"), "got: {err}");
+        // Block 1's valid region starts at 16, which sits inside chunk 2
+        // (12..18) — shared with block 0, which writes 0..16.
+        assert!(err.contains("chunk [2, 0, 0]"), "got: {err}");
+        assert!(err.contains("[12, 0, 0]..[18, 8, 8]"), "got: {err}");
+        assert!(err.contains("block [0, 0, 0]") && err.contains("block [1, 0, 0]"));
+        assert!(err.contains("exactly one task"), "got: {err}");
+    }
+
+    /// One shape per level, level 0 included, so that the index is the level
+    /// number — and a caller who gets that wrong is told rather than checked
+    /// against the wrong grid.
+    #[test]
+    fn the_chunk_check_wants_one_shape_per_level() {
+        let plan = decomposition([4, 0, 0], [4, 0, 0]);
+        let err = check_chunk_exclusive_writes(&plan, &[[8, 8, 8]])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2 level(s)") && err.contains("1 chunk shape"),
+            "got: {err}"
+        );
+        // Level 0 is read-only, so whatever it is chunked as says nothing.
+        check_chunk_exclusive_writes(&plan, &[[7, 3, 5], [8, 8, 8]]).unwrap();
+    }
+
     #[test]
     fn the_fingerprint_is_stable_and_distinguishes_decompositions() {
         let a = decomposition([4, 0, 0], [4, 0, 0]);
@@ -979,7 +1357,17 @@ mod tests {
         let grid = BlockGrid::along([1024, 64, 64], &[0], 64).unwrap();
         let model = CostModel::default();
         let price = |reach: [usize; 3], compute: f64, materialised: bool| {
-            price_phase(&grid, reach, compute, 1, materialised, 8.0, &model, 1.0).cost_per_block
+            price_phase(
+                &grid,
+                &reach.into(),
+                compute,
+                1,
+                materialised,
+                8.0,
+                &model,
+                1.0,
+            )
+            .cost_per_block
         };
 
         // neighbours cost 5 units per voxel each
@@ -1040,13 +1428,16 @@ mod tests {
     fn only_the_full_reach_axis_is_removed_from_the_choice_of_cuts() {
         let volume = [1024, 64, 64];
         assert_eq!(
-            splittable_axes(&[0, 1, 2], [8, 8, 8], volume),
+            splittable_axes(&[0, 1, 2], &[8, 8, 8].into(), volume),
             vec![0, 1, 2]
         );
-        assert_eq!(splittable_axes(&[0, 1, 2], [8, 64, 8], volume), vec![0, 2]);
-        assert!(splittable_axes(&[0], [1024, 0, 0], volume).is_empty());
+        assert_eq!(
+            splittable_axes(&[0, 1, 2], &[8, 64, 8].into(), volume),
+            vec![0, 2]
+        );
+        assert!(splittable_axes(&[0], &[1024, 0, 0].into(), volume).is_empty());
         // an axis nobody asked to cut is not added by being full
-        assert_eq!(splittable_axes(&[0], [0, 64, 64], volume), vec![0]);
+        assert_eq!(splittable_axes(&[0], &[0, 64, 64].into(), volume), vec![0]);
     }
 
     /// The defect this file carried: `split_axes` drops an axis when the block
@@ -1059,7 +1450,7 @@ mod tests {
         let grid = BlockGrid::whole(volume).unwrap();
         assert!(grid.split_axes().is_empty());
         let model = CostModel::default();
-        let cost = price_phase(&grid, volume, 1.0, 1, false, 8.0, &model, 1.0);
+        let cost = price_phase(&grid, &volume.into(), 1.0, 1, false, 8.0, &model, 1.0);
         assert!(
             cost.redundancy > 1.0,
             "a phase whose every voxel depends on the whole volume priced at \
@@ -1069,7 +1460,7 @@ mod tests {
 
         // and a bounded reach on an axis the block spans is still free, because
         // there the clamp is exact: the read cannot leave the volume
-        let bounded = price_phase(&grid, [4, 0, 0], 1.0, 1, false, 8.0, &model, 1.0);
+        let bounded = price_phase(&grid, &[4, 0, 0].into(), 1.0, 1, false, 8.0, &model, 1.0);
         assert_eq!(bounded.redundancy, 1.0);
     }
 
@@ -1084,7 +1475,16 @@ mod tests {
         let volume = [64, 8, 8];
         let grid = BlockGrid::along(volume, &[0], 32).unwrap();
         let model = CostModel::default();
-        let cost = price_phase(&grid, [512, 512, 512], 1.0, 1, false, 8.0, &model, 1.0);
+        let cost = price_phase(
+            &grid,
+            &[512, 512, 512].into(),
+            1.0,
+            1,
+            false,
+            8.0,
+            &model,
+            1.0,
+        );
         let whole_volume_bytes = (volume.iter().product::<usize>() * 8 * 2) as f64;
         assert!(
             cost.working_set_bytes_per_block <= whole_volume_bytes,
@@ -1259,7 +1659,8 @@ mod tests {
             Chain::op(IdentityOp::new("b", [4, 0, 0]).with_cost(2.5)),
         ]);
         let slots = chain.slots();
-        let (reach, compute, names, orders) = summarise_slots(&slots, &[0, 1], [100, 100, 100]);
+        let (reach, compute, names, orders) =
+            summarise_slots(&slots, &[0, 1], [100, 100, 100]).unwrap();
         assert_eq!(reach, [5, 2, 3]);
         assert_eq!(compute, 3.5);
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);

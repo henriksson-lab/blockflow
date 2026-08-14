@@ -53,6 +53,7 @@
 // | `tiling` | The exact-tiling predicate the correctness argument rests on. |
 // | `op` | `BlockOp` and `Chain`. Reach, execution, output shape, element type, traversal preference and constant algebra on one type, folded over one tree. |
 // | `fragment` | `FragmentOp`: the shapes `region -> region` cannot express — `volume -> fragments`, `fragments -> fragments`, `fragments -> volume`. A separate trait, one executor, and a coverage guard on the fragment side because the tiling guard cannot reach it. |
+// | `points` | A set of positions, written per block and read by region. Two states, one query method, two interchangeable indexes, and an order that is a function of the point set rather than of the cut. |
 // | `geometry` | The inversion: read extent, trustworthy extent, `valid = core ∩ trustworthy`. |
 // | `decomposition` | The **binding** plan — parity-visible, deterministic, data-blind, hashable — plus the cost model used to choose it. |
 // | `graph` | `(block, phase)` tasks with explicit dependencies. Thousands of nodes, never per-voxel. |
@@ -107,6 +108,14 @@ pub mod graph;
 /// is unchanged and pulls no extra dependency.
 #[cfg(feature = "gui")]
 pub mod gui;
+/// One phase that runs an unknown number of substages, with more than one
+/// operand available at every substage. The shape an iteration takes when its
+/// step depends on both a running estimate and something fixed — which
+/// `Chain::Sequence` cannot express, because a sequence hands each step only its
+/// predecessor's output. The phase's external reach is **one substage's**, and
+/// live storage is two private buffers whatever the substage count turns out to
+/// be.
+pub mod iterate;
 pub mod listener;
 pub mod log;
 pub mod net;
@@ -118,8 +127,16 @@ pub mod op;
 /// type as far as its algorithm allows, with a thin `BlockOp` over it; every
 /// `reach` is derived from the op's own parameters and none can be configured.
 pub mod ops;
+/// A set of positions, written per block and read by region. The one node whose
+/// partitioning would otherwise be "whichever block emitted it", which is a fact
+/// about the run rather than about the data; this stores by position instead,
+/// with a canonical order that is a function of the point set alone.
+pub mod points;
 pub mod prefetch;
 pub mod probes;
+/// What an operation reads beyond what it writes, and in which coordinate
+/// space it is counted. See [`reach::Reach`].
+pub mod reach;
 pub mod region;
 /// Block-keyed output that is not a pixel region: `(stream, phase, block) ->
 /// bytes`, on the environment beside the region writes. Storage only; what
@@ -157,8 +174,8 @@ pub use cache::{
     ChunkKey, Codec, DeflateCodec, RegionSourceFetcher, Tier,
 };
 pub use decomposition::{
-    check_block_constraints, constraint_for, is_planning_barrier, reaches_whole_axis,
-    splittable_axes, Constraints, CostModel, Decomposition, PhaseDecomposition,
+    check_block_constraints, check_chunk_exclusive_writes, constraint_for, is_planning_barrier,
+    reaches_whole_axis, splittable_axes, Constraints, CostModel, Decomposition, PhaseDecomposition,
 };
 pub use distributed::{
     Assignment, ChunkGrid, Coordinator, Handout, HandoutPolicy, JobSpec, JobStatus, ModelledCache,
@@ -177,15 +194,24 @@ pub use fragment::{
 };
 pub use geometry::{BlockCore, BlockGeometry, BlockGrid};
 pub use graph::{Task, TaskGraph};
+pub use iterate::{
+    check_iterative, iterative_phase, substage_reach, IterativeOp, Operand, Substage,
+    SubstageLimit, SubstageOperand,
+};
 pub use listener::{BlockProgress, EventListener, LatestOpPerChunk, OrderLog, ProgressKind};
 pub use log::{Event, ExecutionLog, Stats};
 pub use observed_io::{ObservedSink, ObservedSource};
 pub use op::{Anchor, BlockConstraint, BlockOp, Chain, Combine, Output, SideBlock};
+pub use points::{
+    decode_points, encode_points, Layout, Point, PointIndex, PointStore, State, WORDS_PER_POINT,
+};
 pub use prefetch::{AccessPlan, BlockPlan, PlanHandle, PrefetchStats, Prefetcher, RegionRequest};
 pub use probes::{
-    AffineOp, BlockSummaryOp, DecimateOp, FragmentReduceOp, IdentityOp, MandatedExtentOp,
-    NeighbourFoldOp, NonZeroOp, OpaqueOp, SideOutputOp, SpreadLatticeOp, WindowSumOp,
+    AffineOp, BlockSummaryOp, CappedSpreadOp, DecimateOp, FragmentReduceOp, IdentityOp,
+    MandatedExtentOp, NeighbourFoldOp, NonZeroOp, OpaqueOp, SideOutputOp, SpreadLatticeOp,
+    WindowSumOp,
 };
+pub use reach::{AxisReach, Frame, Reach, Space, Units};
 pub use region::{ArrayRegionSink, ArrayRegionSource, Region, RegionSink, RegionSource};
 pub use sidecar::{
     Discarded, FileSidecars, FragmentKey, Lifecycle, MemorySidecars, SidecarBackend, Sidecars,
@@ -201,4 +227,4 @@ pub use synthetic::{
 pub use tiling::boxes_tile_exactly;
 pub use voxels::{SideBuf, VoxelElement, Voxels};
 #[cfg(feature = "zarr")]
-pub use zarr_env::{zarr_data_type, ZarrEnvironment};
+pub use zarr_env::{chunk_for_block, zarr_data_type, ZarrEnvironment};

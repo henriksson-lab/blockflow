@@ -114,15 +114,19 @@ fn the_oracle_refuses_a_mandate_it_cannot_meet() {
     );
 }
 
-/// A mandate no grid over this volume satisfies is refused at planning by both
-/// planners, and the refusal says which constraint did it.
+/// A volume the mandated extent does not divide is **planned**, by sliding the
+/// edge blocks' windows inward instead of clipping them.
 ///
-/// `[4, 4, 12]` over `[11, 11, 12]` tiles with ragged edge blocks, so three
-/// blocks in each row are handed something smaller than the mandate. That is a
-/// property of the *volume*, not of the candidate list, so no amount of
-/// searching finds a plan and the planner must say so.
+/// This is the case that used to be refused, and the refusal was honest at the
+/// time: `[4, 4, 12]` over `[11, 11, 12]` tiles with ragged edge blocks, and a
+/// halo that was one symmetric integer could only clip, so three blocks in each
+/// row were handed something smaller than the mandate. A halo that may differ
+/// **per block and per side** can move the window instead. Each edge block is
+/// handed exactly `[4, 4, 12]`, overlapping its neighbour's read, and writes
+/// only its own core — so nothing is written twice and the tiling check is
+/// untouched.
 #[test]
-fn a_mandate_the_volume_cannot_satisfy_is_refused_at_planning() {
+fn a_ragged_volume_is_planned_by_sliding_the_window_rather_than_clipping_it() {
     let workflow = Workflow::new(
         Chain::op(MandatedExtentOp::new("gather", [4, 4, 12])),
         PATCHES,
@@ -130,20 +134,66 @@ fn a_mandate_the_volume_cannot_satisfy_is_refused_at_planning() {
     );
     let constraints = candidates_without_the_mandate();
 
-    let message = Enumerating::default()
-        .decompose(&workflow, &constraints)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("accepts exactly [4, 4, 12]") && message.contains("not the budget"),
-        "{message}"
-    );
+    for plan in [
+        Enumerating::default()
+            .decompose(&workflow, &constraints)
+            .unwrap(),
+        Greedy::default()
+            .decompose(&workflow, &constraints)
+            .unwrap(),
+    ] {
+        plan.check().unwrap();
+        check_block_constraints(&workflow.chain, &plan).unwrap();
+        let phase = &plan.phases[0];
+        assert_eq!(phase.grid.block(), [4, 4, 12]);
+        for block in &phase.blocks {
+            assert_eq!(
+                block.source.shape,
+                vec![4, 4, 12],
+                "block {:?}",
+                block.index
+            );
+            assert!(block.valid_covers_core(), "block {:?}", block.index);
+        }
+        // The edge blocks are the ones that moved: their read starts before
+        // their core and the overlap is exactly what the clipping used to lose.
+        let ragged = phase
+            .blocks
+            .iter()
+            .filter(|block| block.read.start != block.core.start)
+            .count();
+        assert_eq!(ragged, 5);
+    }
+}
 
-    let message = Greedy::default()
-        .decompose(&workflow, &constraints)
+/// What is still impossible is still refused, and the refusal names the reason.
+///
+/// Two of them, and neither is about the candidate list: an extent larger than
+/// the volume it must lie inside, and an extent entirely consumed by the reach,
+/// which leaves no voxel the operation could be trusted for.
+#[test]
+fn a_mandate_no_window_can_meet_is_refused_at_planning() {
+    let too_large = Workflow::new(
+        Chain::op(MandatedExtentOp::new("gather", [64, 4, 12])),
+        PATCHES,
+        Dtype::F32,
+    );
+    let message = Enumerating::default()
+        .decompose(&too_large, &candidates_without_the_mandate())
         .unwrap_err()
         .to_string();
-    assert!(message.contains("accepts exactly [4, 4, 12]"), "{message}");
+    assert!(message.contains("does not fit in a volume"), "{message}");
+
+    let all_halo = Workflow::new(
+        Chain::op(ReachingMandateOp::new([4, 4, 4], [2, 0, 0])),
+        [12, 4, 4],
+        Dtype::F64,
+    );
+    let message = Greedy::default()
+        .decompose(&all_halo, &Constraints::default())
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("leaves no voxel"), "{message}");
 }
 
 /// Two ops that mandate different blocks are cut into two phases rather than
@@ -346,18 +396,19 @@ fn the_only_plan_that_satisfies_it_carries_the_lattice_as_a_fetch_region() {
     );
 }
 
-// ------------------------------------------------- what is still in tension --
+// ------------------------------------------- what was in tension, resolved --
 
-/// A mandated extent and a halo cannot both be satisfied, and the planner says
-/// so rather than producing a plan whose edge blocks are the wrong shape.
-///
-/// The op is handed `core` grown by the halo and clamped at the volume, so a
-/// single extent cannot hold for both an interior block and an edge one. This is
-/// the coordinate-space problem `docs/design/BLOCK_OPS.md` reserves for the reach
-/// representation: until a reach carries the space it is stated in, "the extent I
-/// accept" and "the extent I need around it" are the same number and cannot both
-/// be honoured.
-struct ReachingMandateOp;
+/// An op that mandates an extent **and** reaches, which used to be unplannable.
+struct ReachingMandateOp {
+    extent: [usize; 3],
+    reach: [usize; 3],
+}
+
+impl ReachingMandateOp {
+    fn new(extent: [usize; 3], reach: [usize; 3]) -> Self {
+        Self { extent, reach }
+    }
+}
 
 impl BlockOp for ReachingMandateOp {
     fn name(&self) -> &'static str {
@@ -365,7 +416,7 @@ impl BlockOp for ReachingMandateOp {
     }
 
     fn reach(&self, axis: usize, _volume_len: usize) -> usize {
-        usize::from(axis == 0)
+        self.reach[axis]
     }
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> blockflow::Result<()> {
@@ -373,22 +424,59 @@ impl BlockOp for ReachingMandateOp {
     }
 
     fn block_constraint(&self, _volume: [usize; 3]) -> Option<BlockConstraint> {
-        Some(BlockConstraint::Extent([4, 4, 4]))
+        Some(BlockConstraint::Extent(self.extent))
     }
 }
 
+/// A mandated extent and a halo **are** jointly satisfiable, once the two are
+/// separate quantities.
+///
+/// The recorded defect: "the extent I accept" and "the extent I need around it"
+/// were the same number, so an op that stated both could not be planned at all.
+/// They are separate now — the cores are cut `extent - (lo + hi)` wide so an
+/// interior block's read is the extent exactly, and the halo is a per-block
+/// window that slides inward at the ends rather than being clipped. Every block
+/// is handed `[4, 4, 4]`, every block's valid region covers its core, and the
+/// reach is still stated independently of the halo, which is what keeps the
+/// guard able to fire.
 #[test]
-fn a_mandated_extent_and_a_halo_are_not_jointly_satisfiable() {
+fn a_mandated_extent_and_a_halo_are_jointly_satisfiable() {
     let volume = [12, 4, 4];
-    let workflow = Workflow::new(Chain::op(ReachingMandateOp), volume, Dtype::F64);
-    let message = Enumerating::default()
-        .decompose(&workflow, &Constraints::default())
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("accepts exactly [4, 4, 4]"), "{message}");
+    let workflow = Workflow::new(
+        Chain::op(ReachingMandateOp::new([4, 4, 4], [1, 0, 0])),
+        volume,
+        Dtype::F64,
+    );
+    for plan in [
+        Enumerating::default()
+            .decompose(&workflow, &Constraints::default())
+            .unwrap(),
+        Greedy::default()
+            .decompose(&workflow, &Constraints::default())
+            .unwrap(),
+    ] {
+        plan.check().unwrap();
+        check_block_constraints(&workflow.chain, &plan).unwrap();
+        let phase = &plan.phases[0];
+        // The block is the extent less what the reach takes from each side.
+        assert_eq!(phase.grid.block(), [2, 4, 4]);
+        assert_eq!(phase.reach, [1, 0, 0], "the reach is still the op's own");
+        assert_ne!(
+            phase.halo,
+            [1, 0, 0],
+            "the halo is a window, which is the whole point"
+        );
+        for block in &phase.blocks {
+            assert_eq!(block.source.shape, vec![4, 4, 4], "block {:?}", block.index);
+            assert!(block.valid_covers_core(), "block {:?}", block.index);
+        }
+        // and the two ends slid rather than clipped
+        assert_eq!(phase.blocks[0].read.start, vec![0, 0, 0]);
+        assert_eq!(phase.blocks[5].read.start, vec![8, 0, 0]);
+    }
 
-    // The unconstrained op beside it plans as it always did, so the refusal is
-    // about the mandate and not about the volume.
+    // The unconstrained op beside it plans as it always did, so nothing here is
+    // about the volume.
     let plain = Workflow::new(
         Chain::op(IdentityOp::new("plain", [1, 0, 0])),
         volume,
@@ -397,4 +485,25 @@ fn a_mandated_extent_and_a_halo_are_not_jointly_satisfiable() {
     Enumerating::default()
         .decompose(&plain, &Constraints::default())
         .unwrap();
+}
+
+/// And the guard still fires on the plan that window produced.
+///
+/// A window one voxel short on both sides is still a halo below the phase's
+/// reach, so the valid regions shrink below their cores and the tiling check
+/// reports the hole. The mandate being satisfied does not buy a pass.
+#[test]
+fn the_halo_guard_fires_on_a_windowed_phase_whose_window_is_short() {
+    let workflow = Workflow::new(
+        Chain::op(ReachingMandateOp::new([4, 4, 4], [1, 0, 0])),
+        [12, 4, 4],
+        Dtype::F64,
+    );
+    let plan = Enumerating::default()
+        .decompose(&workflow, &Constraints::default())
+        .unwrap();
+    plan.check().unwrap();
+    let short = plan.with_forced_halo([0, 0, 0]);
+    let message = short.check().unwrap_err().to_string();
+    assert!(message.contains("halo [0, 0, 0]"), "{message}");
 }

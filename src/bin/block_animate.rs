@@ -248,14 +248,14 @@ fn run() -> Result<()> {
     let phases: Vec<PhaseDecomposition> = groups_for(0b11, slots.len())
         .iter()
         .map(|group| {
-            let (reach, _, names, _) = summarise_slots(&slots, group, shape);
+            let (reach, _, names, _) = summarise_slots(&slots, group, shape)?;
             // Split on all three axes: a lattice one block deep is a picture
             // that would have been better drawn flat.
             let grid = BlockGrid::along(shape, &[0, 1, 2], options.block)?;
             Ok(PhaseDecomposition::derive(
                 group.clone(),
                 names,
-                reach,
+                reach.clone(),
                 reach,
                 grid,
             ))

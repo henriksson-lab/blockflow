@@ -40,7 +40,7 @@
 // materialisation?" a comparison rather than a flag.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use ndarray::{ArrayD, Axis, IxDyn, Slice};
@@ -416,8 +416,175 @@ pub trait Environment: Sync {
     /// Release a buffer's accounted residency.
     fn release(&self, buf: &BlockBuf);
 
+    // ------------------------------------------------ buffer arithmetic --
+    //
+    // Three operations on buffers the *executor* holds, rather than on levels.
+    // They exist for the iterative phase (`crate::iterate`), whose two private
+    // ping-pong buffers are whole-volume blocks the executor allocates through
+    // `constant` and owns for the length of the phase — never levels, because
+    // nothing outside the phase can see them and the plan allocates no level for
+    // them.
+    //
+    // They are on this trait, and not free functions over `BlockBuf`, for the
+    // reason `apply` is: a simulated run must skip the arithmetic while the
+    // executor stays byte-identical, and residency must be booked the way the
+    // environment books it. Each is a **default** that dispatches on what the
+    // buffer actually holds rather than on which environment it is, so an
+    // environment that wraps another inherits the right behaviour instead of a
+    // plausible one — the same arrangement `apply_side` uses.
+    //
+    // Every region here is stated in the **volume's** coordinates, with the
+    // buffer saying which part of that volume it holds. Absolute throughout, so
+    // there is one origin to get wrong instead of two.
+
+    /// The part of `buf` — which holds `holds` — covering `region`.
+    fn slice(&self, buf: &BlockBuf, holds: &Region, region: &Region) -> Result<BlockBuf> {
+        let within = relative(region, holds, "buffer slice")?;
+        match buf {
+            BlockBuf::Array(array) => {
+                let taken = array.slice_region(&within)?;
+                self.counters().add_resident(taken.bytes());
+                Ok(BlockBuf::Array(taken))
+            }
+            BlockBuf::Accounted { dtype, .. } => {
+                self.counters()
+                    .add_resident(region.voxels() as u64 * dtype.size_of() as u64);
+                Ok(BlockBuf::Accounted {
+                    region: region.clone(),
+                    dtype: *dtype,
+                    // Nothing is claimed about a sub-box of a buffer whose
+                    // uniformity was a property of the whole. `None` disables the
+                    // short circuit, which is the safe default everywhere else in
+                    // this file too.
+                    uniform: None,
+                })
+            }
+        }
+    }
+
+    /// Copy `source`, which covers `region`, into `target`, which holds `holds`.
+    ///
+    /// `&mut` rather than interior mutability because the executor owns these
+    /// buffers outright. **This is where a distributed run needs a barrier**: the
+    /// blocks of one substage write disjoint cores and could run concurrently,
+    /// but every block of substage `k+1` reads cores its neighbours wrote at `k`,
+    /// so the substage boundary is a real exchange point. In one process that is
+    /// the end of a loop body; across processes it is a barrier and a shared
+    /// private buffer, and neither is built here.
+    fn place(
+        &self,
+        target: &mut BlockBuf,
+        holds: &Region,
+        region: &Region,
+        source: &BlockBuf,
+    ) -> Result<()> {
+        let within = relative(region, holds, "buffer placement")?;
+        match target {
+            BlockBuf::Array(array) => array.assign_region(&within, source.as_array()?),
+            // Nothing to move, and nothing to charge: a write into a buffer that
+            // holds no data is the simulated case, and the *cost* of it was
+            // already booked when the buffer was allocated.
+            BlockBuf::Accounted { .. } => Ok(()),
+        }
+    }
+
+    /// Do these two buffers hold the same values?
+    ///
+    /// `None` means the environment cannot tell, which is the honest answer for
+    /// one that holds no data — and the reason an iterative phase refuses to run
+    /// under such an environment rather than guessing a substage count. See
+    /// `crate::iterate`.
+    ///
+    /// Equality is the element type's own, so **a NaN never equals itself** and an
+    /// iteration that produces one never converges. That is the behaviour worth
+    /// having: it ends at the runaway limit, naming the op, rather than settling
+    /// on a volume with a hole in it.
+    fn same(&self, left: &BlockBuf, right: &BlockBuf) -> Option<bool> {
+        match (left, right) {
+            (BlockBuf::Array(left), BlockBuf::Array(right)) => Some(left == right),
+            _ => None,
+        }
+    }
+
+    /// Run one substage of an iterative op over one block.
+    ///
+    /// Routed through the environment for exactly [`Self::apply`]'s reason. The
+    /// output is the operands' shape and element type: an iterative phase neither
+    /// resizes nor retypes, because the running operand of substage `k+1` is the
+    /// output of substage `k` and a step that changed either could not be
+    /// iterated.
+    fn apply_substage(
+        &self,
+        op: &dyn crate::iterate::IterativeOp,
+        index: usize,
+        operands: &[BlockBuf],
+        at: &Anchor,
+    ) -> Result<BlockBuf> {
+        let first = operands.first().ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "iterative op {:?} was run with no operands; `check_iterative` refuses such an \
+                 op when the plan is built",
+                op.name()
+            ))
+        })?;
+        self.counters().ops_applied.fetch_add(1, Ordering::SeqCst);
+        self.counters().estimated_work.fetch_add(
+            (first.voxels() as f64 * op.cost_per_voxel()) as u64,
+            Ordering::SeqCst,
+        );
+        let arrays: Option<Vec<&Voxels>> = operands
+            .iter()
+            .map(|buf| match buf {
+                BlockBuf::Array(array) => Some(array),
+                BlockBuf::Accounted { .. } => None,
+            })
+            .collect();
+        let Some(arrays) = arrays else {
+            // Simulated: the shape and the width are what a run would have cost,
+            // and there is no value to compute.
+            let BlockBuf::Accounted { region, dtype, .. } = first else {
+                return Err(Error::InvalidArgument(format!(
+                    "iterative op {:?} was handed a mixture of real and simulated operands",
+                    op.name()
+                )));
+            };
+            self.counters()
+                .add_resident(region.voxels() as u64 * dtype.size_of() as u64);
+            return Ok(BlockBuf::Accounted {
+                region: region.clone(),
+                dtype: *dtype,
+                uniform: None,
+            });
+        };
+        let mut out = Voxels::zeros(arrays[0].dtype(), arrays[0].shape())?;
+        op.substage(&crate::iterate::Substage::new(index, &arrays, at), &mut out)?;
+        self.counters().add_resident(out.bytes());
+        Ok(BlockBuf::Array(out))
+    }
+
     /// Stage barrier: everything written to `level` is durable.
     fn finish(&self, level: usize) -> Result<()>;
+
+    /// This level is dead: nothing will read it again, so free it.
+    ///
+    /// **The default is to keep it**, which is what every environment did before
+    /// this existed. Freeing is an optimisation and forgetting to free costs
+    /// space; freeing something still wanted costs an answer, so the safe
+    /// default is the one that does nothing.
+    ///
+    /// Called by the executor when the phase that reads `level` has finished
+    /// every one of its tasks, and only for a level the plan calls
+    /// [`Visibility::Internal`](crate::decomposition::Visibility::Internal) and
+    /// the caller has not pinned. A level is read by exactly one phase, so that
+    /// moment is unambiguous.
+    ///
+    /// Reading a discarded level afterwards must **fail**, not return zeros. A
+    /// freed level that reads as data is the same class of defect as an
+    /// unwritten level that reads as zeros, and this crate fills those with NaN
+    /// for the same reason.
+    fn discard_level(&self, _level: usize) -> Result<()> {
+        Ok(())
+    }
 
     fn counters(&self) -> &EnvCounters;
 
@@ -549,6 +716,11 @@ pub trait Environment: Sync {
 pub struct ArrayEnvironment {
     volume: [usize; 3],
     levels: Vec<RwLock<Voxels>>,
+    /// Set when a level has been discarded. Kept beside the levels rather than
+    /// inferred from a placeholder's shape, because "this was freed" and "this
+    /// happens to be small" are different facts and only one of them is an
+    /// error to read.
+    discarded: Vec<AtomicBool>,
     chunk: [usize; 3],
     /// The arrays ops write beside their primary result, by declared name.
     ///
@@ -586,6 +758,7 @@ impl ArrayEnvironment {
             levels.push(RwLock::new(Voxels::unwritten(dtype, volume)?));
         }
         Ok(Self {
+            discarded: (0..levels.len()).map(|_| AtomicBool::new(false)).collect(),
             volume,
             levels,
             chunk,
@@ -634,6 +807,7 @@ impl ArrayEnvironment {
             )?));
         }
         Ok(Self {
+            discarded: (0..levels.len()).map(|_| AtomicBool::new(false)).collect(),
             volume,
             levels,
             chunk,
@@ -641,6 +815,35 @@ impl ArrayEnvironment {
             counters: EnvCounters::default(),
             sidecars: Sidecars::in_memory(),
         })
+    }
+
+    /// Whether `level` has been freed.
+    pub fn is_discarded(&self, level: usize) -> bool {
+        self.discarded
+            .get(level)
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    /// How many levels still hold their data.
+    ///
+    /// The measurable form of the whole point: a twenty-phase chain used to end
+    /// with twenty-one of these and now ends with three.
+    pub fn resident_levels(&self) -> usize {
+        (0..self.levels.len())
+            .filter(|&level| !self.is_discarded(level))
+            .count()
+    }
+
+    fn refuse_if_discarded(&self, level: usize, what: &str) -> Result<()> {
+        if self.is_discarded(level) {
+            return Err(Error::InvalidArgument(format!(
+                "{what}: level {level} was discarded — the phase that reads it finished, so \
+                 the plan says nothing wants it again. Pin it with `Hints::keep_levels` if \
+                 something does."
+            )));
+        }
+        Ok(())
     }
 
     fn level_guard(&self, level: usize) -> std::sync::RwLockReadGuard<'_, Voxels> {
@@ -742,10 +945,22 @@ impl Environment for ArrayEnvironment {
                 )));
             }
         }
+        // **`check_chunk_exclusive_writes` is deliberately not called here**,
+        // and its absence is a decision rather than an oversight. That invariant
+        // exists for two storage reasons — a store that loses bytes when two
+        // tasks read-modify-write one chunk, and a cache that cannot give a
+        // shared chunk a lifetime — and this environment has neither. Its
+        // `chunk` is an accounting fiction, used by `chunks_touched` to price IO
+        // that is not happening; a level here is one `Array3` and a write is a
+        // slice assignment into disjoint indices, which no chunk grid mediates.
+        // Enforcing it would refuse plans that are perfectly well defined in
+        // memory, for a hazard that is not present, and would make the in-memory
+        // oracle less general than the storage it is the oracle for.
         Ok(())
     }
 
     fn read(&self, level: usize, region: &Region) -> Result<BlockBuf> {
+        self.refuse_if_discarded(level, "block-op read")?;
         region_within(region, &self.level_shape(level), "block-op read")?;
         let array = self.level_guard(level).slice_region(region)?;
         self.counters.reads.fetch_add(1, Ordering::SeqCst);
@@ -783,6 +998,7 @@ impl Environment for ArrayEnvironment {
     }
 
     fn write(&self, level: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
+        self.refuse_if_discarded(level, "block-op write")?;
         let array = buf.as_array()?;
         region_within(valid, &self.level_shape(level), "block-op write")?;
         if valid.voxels() == 0 {
@@ -896,6 +1112,29 @@ impl Environment for ArrayEnvironment {
         Ok(())
     }
 
+    /// Free the array and remember that it was freed.
+    ///
+    /// The placeholder is one voxel rather than none: a zero-extent array is a
+    /// shape other code would have to special-case, and the flag is what carries
+    /// the meaning anyway.
+    fn discard_level(&self, level: usize) -> Result<()> {
+        let Some(flag) = self.discarded.get(level) else {
+            return Err(Error::InvalidArgument(format!(
+                "cannot discard level {level}; this environment holds {}",
+                self.levels.len()
+            )));
+        };
+        if flag.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut guard = self.levels[level]
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dtype = guard.dtype();
+        *guard = Voxels::zeros(dtype, [1, 1, 1])?;
+        Ok(())
+    }
+
     fn counters(&self) -> &EnvCounters {
         &self.counters
     }
@@ -907,6 +1146,41 @@ impl Environment for ArrayEnvironment {
     fn sidecars(&self) -> Option<&Sidecars> {
         Some(&self.sidecars)
     }
+}
+
+/// `region`, restated in `holds`'s own coordinates.
+///
+/// Both are in the volume's coordinates; a buffer holding `holds` indexes from
+/// its own lower corner, and this is the one place that subtraction happens. It
+/// fails rather than saturating: a region outside the buffer is a caller that has
+/// the wrong buffer, and a clamped answer would be a well-formed wrong one.
+pub(crate) fn relative(region: &Region, holds: &Region, what: &str) -> Result<Region> {
+    if region.ndim() != holds.ndim() {
+        return Err(Error::InvalidArgument(format!(
+            "{what}: a region of rank {} against a buffer of rank {}",
+            region.ndim(),
+            holds.ndim()
+        )));
+    }
+    let mut start = vec![0usize; region.ndim()];
+    for axis in 0..region.ndim() {
+        let lo = region.start[axis]
+            .checked_sub(holds.start[axis])
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "{what}: {:?}+{:?} starts before the buffer, which holds {:?}+{:?}",
+                    region.start, region.shape, holds.start, holds.shape
+                ))
+            })?;
+        if lo + region.shape[axis] > holds.shape[axis] {
+            return Err(Error::InvalidArgument(format!(
+                "{what}: {:?}+{:?} leaves the buffer, which holds {:?}+{:?}",
+                region.start, region.shape, holds.start, holds.shape
+            )));
+        }
+        start[axis] = lo;
+    }
+    Ok(Region::new(&start, &region.shape))
 }
 
 /// A level region's extent as the rank-3 array it is, or an error saying so.

@@ -462,6 +462,26 @@ pub trait FragmentOp: Send + Sync {
         false
     }
 
+    /// What element type this op writes, given the one it reads.
+    ///
+    /// The counterpart of [`BlockOp::produces`](crate::op::BlockOp::produces),
+    /// and it exists for the same reason: `check_dtypes` folds a plan's element
+    /// types from level 0 and refuses a level allocated at a width its producer
+    /// does not write. That fold runs over the *chain*, and a fragment phase owns
+    /// no slot of the chain — so before this method existed there was nothing to
+    /// fold and a fragment op that changed the width was refused with a message
+    /// about ops it does not have.
+    ///
+    /// The default hands the type on unchanged, which is right for every
+    /// fragment op this crate shipped before the method existed and is the safe
+    /// default in the same way `BlockOp`'s is: an op that says nothing keeps
+    /// exactly the contract it already had. Only consulted when
+    /// [`Self::writes_pixels`] is true; a phase that writes no level has no
+    /// level whose width could be wrong.
+    fn produces(&self, input: Dtype) -> Dtype {
+        input
+    }
+
     /// Fragment streams this op reads, with the phase they were written by and
     /// the reach in blocks. Empty is the `volume -> fragments` case.
     fn inputs(&self) -> Vec<FragmentInput> {
@@ -506,6 +526,15 @@ pub enum PhaseWork<'a> {
     Pixels,
     /// A fragment op. The phase must own no chain slots.
     Fragments(&'a dyn FragmentOp),
+    /// An iteration run to a fixed point inside this one phase. The phase must
+    /// own no chain slots.
+    ///
+    /// `region -> region` like `Pixels`, and it reads and writes a level the same
+    /// way; what differs is that a block of it is visited an unknown number of
+    /// times before the level is written, and that every visit is handed more
+    /// than one operand. See `crate::iterate` for why that cannot be a
+    /// `Chain::sequence`.
+    Iterate(&'a dyn crate::iterate::IterativeOp),
 }
 
 impl PhaseWork<'_> {
@@ -513,10 +542,14 @@ impl PhaseWork<'_> {
         matches!(self, PhaseWork::Fragments(_))
     }
 
+    pub fn is_iterative(&self) -> bool {
+        matches!(self, PhaseWork::Iterate(_))
+    }
+
     /// Whether this phase produces the level after it.
     pub fn writes_a_level(&self) -> bool {
         match self {
-            PhaseWork::Pixels => true,
+            PhaseWork::Pixels | PhaseWork::Iterate(_) => true,
             PhaseWork::Fragments(op) => op.writes_pixels(),
         }
     }
@@ -524,7 +557,7 @@ impl PhaseWork<'_> {
     /// Whether this phase reads the level before it.
     pub fn reads_a_level(&self) -> bool {
         match self {
-            PhaseWork::Pixels => true,
+            PhaseWork::Pixels | PhaseWork::Iterate(_) => true,
             PhaseWork::Fragments(op) => op.reads_pixels(),
         }
     }
@@ -534,6 +567,7 @@ impl PhaseWork<'_> {
         match self {
             PhaseWork::Pixels => "pixels".to_string(),
             PhaseWork::Fragments(op) => format!("fragments({})", op.name()),
+            PhaseWork::Iterate(op) => format!("iterate({})", op.name()),
         }
     }
 }
@@ -724,6 +758,37 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
         if entry.writes_a_level() {
             level_written[index + 1] = Some(index);
         }
+        if let PhaseWork::Iterate(op) = entry {
+            // Re-run when the plan is *used*, not only when it is built, on
+            // exactly `check_block_constraints`' argument: a plan may arrive from
+            // any strategy or off a wire.
+            crate::iterate::check_iterative(*op)?;
+            if !phase.slots.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index} runs iterative op {:?} but the decomposition gives it chain \
+                     slots {:?}. An iterative phase owns no slot of the chain — see \
+                     `iterate::iterative_phase`, which builds one.",
+                    op.name(),
+                    phase.slots
+                )));
+            }
+            // The private ping-pong buffers are the phase's own volume, and the
+            // running operand of substage 0 is the level below read through the
+            // same block geometry. A phase that resized or re-gridded between the
+            // two would be handing substage 1 an operand of a different shape
+            // than substage 0 produced, so the iteration would not close.
+            let below = plan.volume_at(index);
+            if phase.volume() != below || phase.reads_across_grids() {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index} runs iterative op {:?} and reads a {below:?} level to write a \
+                     {:?} one. An iteration feeds its own output back in, so its substages must \
+                     agree on one extent and one lattice; a phase that changes either is a \
+                     transformation and belongs before or after the iteration, not inside it.",
+                    op.name(),
+                    phase.volume()
+                )));
+            }
+        }
         let PhaseWork::Fragments(op) = entry else {
             continue;
         };
@@ -793,13 +858,20 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                     edge
                 )));
             }
+            // The narrowest side granted on the worst block, because the
+            // question is whether every task can see its neighbours' fragments —
+            // a halo that is generous somewhere else does not answer it.
+            let granted = phase
+                .halo
+                .in_voxels(edge)
+                .granted_everywhere(phase.grid.volume());
             for axis in 0..3 {
                 let counts = phase.grid.blocks_per_axis()[axis];
                 let blocks = input.reach[axis].min(counts.saturating_sub(1));
                 let wanted = blocks
                     .saturating_mul(edge[axis])
                     .min(phase.grid.volume()[axis]);
-                if phase.halo[axis] < wanted {
+                if granted[axis] < wanted {
                     return Err(Error::InvalidArgument(format!(
                         "phase {index}: fragment op {:?} reaches {} block(s) on axis {axis} \
                          for stream {:?}, which is {wanted} voxel(s), but the phase halo is \
@@ -809,7 +881,7 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                         op.name(),
                         input.reach[axis],
                         input.stream,
-                        phase.halo[axis]
+                        granted[axis]
                     )));
                 }
             }

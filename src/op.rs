@@ -27,6 +27,7 @@ use ndarray::ArrayD;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::geometry::BlockGeometry;
+use crate::reach::Reach;
 use crate::region::Region;
 use crate::voxels::Voxels;
 
@@ -212,6 +213,59 @@ impl BlockConstraint {
         }
     }
 
+    /// The grid **and the halo** that satisfy this constraint over `volume` for
+    /// an operation that also reaches.
+    ///
+    /// **This is where "the extent I accept" stops being "the extent I need
+    /// around it".** With one symmetric integer per axis they were the same
+    /// number and the two demands were not jointly satisfiable: a block at a
+    /// volume edge had its read clamped and was handed something narrower than
+    /// an interior block, and a block in the middle was handed its core plus
+    /// twice the reach rather than the extent asked for. Both are fixed by
+    /// separating the two quantities:
+    ///
+    /// * the **cores** are cut small enough to leave room — `extent` less what
+    ///   the reach needs on each side — so an interior block's read is the
+    ///   extent exactly;
+    /// * the **halo** is a per-block window ([`Reach::window`]) that slides
+    ///   inward at the ends instead of being clipped, so an edge block is handed
+    ///   the extent too. It writes only its own core, so nothing is written
+    ///   twice and the tiling check is unaffected.
+    ///
+    /// `Ok(None)` says no `BlockGrid` can produce these blocks, which is a fact
+    /// about the constraint rather than a failure to try. `Err` says the extent
+    /// cannot be met over this volume at all.
+    pub fn lattice(
+        &self,
+        volume: [usize; 3],
+        reach: &Reach,
+    ) -> Result<Option<(crate::geometry::BlockGrid, Reach)>> {
+        match self {
+            Self::Regions(_) => Ok(None),
+            Self::Extent(extent) => {
+                let reach = reach.in_voxels(*extent);
+                let mut block = [0usize; 3];
+                for axis in 0..3 {
+                    let (lo, hi) = reach.axis(axis).bound(volume[axis]);
+                    block[axis] = extent[axis]
+                        .checked_sub(lo + hi)
+                        .filter(|&edge| edge > 0)
+                        .ok_or_else(|| {
+                            Error::InvalidArgument(format!(
+                                "this op accepts exactly {extent:?} and reaches {lo}+{hi} on axis \
+                                 {axis}, which leaves no voxel it could be trusted for. An \
+                                 operation that reads its whole input to produce nothing is not a \
+                                 block operation.",
+                            ))
+                        })?;
+                }
+                let grid = crate::geometry::BlockGrid::new(volume, block)?;
+                let halo = Reach::window(&grid, *extent)?;
+                Ok(Some((grid, halo)))
+            }
+        }
+    }
+
     /// Are these the blocks the op accepts?
     ///
     /// `what` names the plan under test, so a refusal says which phase of which
@@ -280,7 +334,38 @@ pub trait BlockOp: Send + Sync {
     /// This must be computed *independently of the configured halo*. If the
     /// plan's halo feeds the reach, the guard in `decomposition.rs` compares a number
     /// against itself and cannot fire.
+    ///
+    /// This is the **degenerate** statement — symmetric, the same for every
+    /// block, in the phase's own voxels — and it has no default for the reason
+    /// above: it is the one place a silent zero would produce a complete,
+    /// well-formed, wrong volume. An operation with something more exact to say
+    /// says it in [`Self::reach_spec`], and that is what the plan uses.
     fn reach(&self, axis: usize, volume_len: usize) -> usize;
+
+    /// The full statement of what this operation reads: one-sided, per-block,
+    /// whole-axis, and in a named coordinate space.
+    ///
+    /// **Defaulted, and the default is what [`Self::reach`] says.** Most
+    /// operations mean exactly the symmetric per-axis integer — `src/ops/`
+    /// derives several of them tight to a single voxel from the element they are
+    /// stated over — and none of them changed when this method appeared. What
+    /// changes is what an operation *can* say when the symmetric integer is a
+    /// lie in the safe direction: a lattice dependency that is one-sided costs
+    /// **3.27x** in fetches when it is declared on both sides, an unevenly
+    /// spread lattice has a different voxel footprint per block, and "reaches
+    /// everything" was indistinguishable from "reaches 4096".
+    ///
+    /// An implementation that overrides this must keep [`Self::reach`] a valid
+    /// symmetric bound on it; `Chain::reach_spec` checks that rather than
+    /// trusting it, because two statements of one quantity are two statements
+    /// that can drift.
+    fn reach_spec(&self, volume: [usize; 3]) -> Reach {
+        Reach::symmetric([
+            self.reach(0, volume[0]),
+            self.reach(1, volume[1]),
+            self.reach(2, volume[2]),
+        ])
+    }
 
     /// Compute the op over the whole of `input`, writing into `out`.
     ///
@@ -487,6 +572,18 @@ pub trait Combine: Send + Sync {
     /// produce a complete, well-formed, wrong volume. A voxelwise combine
     /// answers `0` and says so.
     fn reach(&self, axis: usize, volume_len: usize) -> usize;
+
+    /// The full statement, on exactly [`BlockOp::reach_spec`]'s argument and
+    /// with the same default: a combine that says one integer per axis means the
+    /// symmetric form, and the vast majority do, because a combine that is
+    /// voxelwise reaches nothing at all.
+    fn reach_spec(&self, volume: [usize; 3]) -> Reach {
+        Reach::symmetric([
+            self.reach(0, volume[0]),
+            self.reach(1, volume[1]),
+            self.reach(2, volume[2]),
+        ])
+    }
 
     /// Can this combine be handed branch results of exactly these element
     /// types, in branch order?
@@ -720,13 +817,72 @@ impl Chain {
         }
     }
 
-    /// Reach on every axis of a 3-D volume.
+    /// Reach on every axis of a 3-D volume, as the symmetric triple.
     pub fn reach3(&self, volume: &[usize]) -> [usize; 3] {
         [
             self.reach(0, volume[0]),
             self.reach(1, volume[1]),
             self.reach(2, volume[2]),
         ]
+    }
+
+    /// The full statement of the whole subtree's reach, folded over the same
+    /// tree [`Self::reach`] walks and by the same rules — sequential reaches
+    /// **add**, exclusive and concurrent branches take the **wider**, a
+    /// combine's own reach adds on top — now per side, per block and per
+    /// coordinate space.
+    ///
+    /// **This is what the plan is built from.** `Chain::reach` remains the
+    /// symmetric bound, and is what a caller holding one integer per axis must
+    /// use; everything that derives geometry uses this.
+    ///
+    /// Two ways it can fail, and both are facts about the chain rather than
+    /// about the caller:
+    ///
+    /// * two ops state their reaches in **different coordinate spaces**, which
+    ///   cannot be folded without a grid to convert with. A planner turns that
+    ///   into "these two cannot share a phase", which is the right answer: a
+    ///   change of coordinate space is a phase boundary.
+    /// * an op's `reach_spec` is **wider than its own `reach`**. The two are one
+    ///   quantity stated twice, and the whole crate is arranged so that a
+    ///   quantity stated twice is checked rather than assumed. The bound is the
+    ///   one the halo used to be derived from, so an op that quietly widened
+    ///   past it would be under-halo'd by every plan built before it changed.
+    pub fn reach_spec(&self, volume: [usize; 3]) -> Result<Reach> {
+        let spec = self.fold_reach_spec(volume)?;
+        for axis in 0..3 {
+            let bound = self.reach(axis, volume[axis]);
+            let (lo, hi) = spec.axis(axis).bound(volume[axis]);
+            let widest = if spec.is_whole_axis(axis, volume[axis]) && bound >= volume[axis] {
+                // `All` and "a number at least the extent" agree; the bound is
+                // met by construction and the numbers need not.
+                bound
+            } else {
+                lo.max(hi)
+            };
+            if widest > bound {
+                return Err(Error::InvalidArgument(format!(
+                    "{}: its full reach says {widest} on axis {axis} and its symmetric reach says \
+                     {bound}. The two are one quantity stated twice, and the symmetric one is \
+                     what every plan built before the full form existed derived its halo from, so \
+                     it has to remain a bound on it.",
+                    self.display_name()
+                )));
+            }
+        }
+        Ok(spec)
+    }
+
+    fn fold_reach_spec(&self, volume: [usize; 3]) -> Result<Reach> {
+        match self {
+            Chain::Op(op) => Ok(op.reach_spec(volume)),
+            Chain::Sequence(children) => fold_specs(children, volume, Reach::add),
+            Chain::Alternative { branches, .. } => fold_specs(branches, volume, Reach::max),
+            Chain::Parallel { branches, combine } => {
+                let widest = fold_specs(branches, volume, Reach::max)?;
+                widest.add(&combine.reach_spec(volume))
+            }
+        }
     }
 
     /// What the subtree writes, given what it reads, or an error naming the op
@@ -1292,6 +1448,28 @@ impl Chain {
     }
 }
 
+/// Fold a list of branches' full reaches with `combine`, which is `Reach::add`
+/// for a sequence and `Reach::max` for branches.
+///
+/// An empty list folds to nothing read, which is what an empty subtree does; the
+/// constructors already refuse an empty `Alternative` or `Parallel`, so this is
+/// reachable only through `Chain::Sequence(vec![])`.
+fn fold_specs(
+    branches: &[Chain],
+    volume: [usize; 3],
+    combine: impl Fn(&Reach, &Reach) -> Result<Reach>,
+) -> Result<Reach> {
+    let mut folded: Option<Reach> = None;
+    for branch in branches {
+        let stated = branch.fold_reach_spec(volume)?;
+        folded = Some(match folded {
+            Some(so_far) => combine(&so_far, &stated)?,
+            None => stated,
+        });
+    }
+    Ok(folded.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1519,10 +1697,7 @@ mod tests {
                 Chain::op(IdentityOp::new("right", [0, 0, 0]).with_cost(5.0)),
             ]
         };
-        assert_eq!(
-            Chain::alternative(arms(), 1).unwrap().cost_per_voxel(),
-            5.0
-        );
+        assert_eq!(Chain::alternative(arms(), 1).unwrap().cost_per_voxel(), 5.0);
         // 3 + 5 branches, plus one pair's worth of combine at the measured
         // 0.49.
         assert_eq!(
@@ -1609,7 +1784,10 @@ mod tests {
         )
         .unwrap();
         let err = chain.produces(Dtype::F64).unwrap_err().to_string();
-        assert!(err.contains("does not accept [bool, float64]"), "got: {err}");
+        assert!(
+            err.contains("does not accept [bool, float64]"),
+            "got: {err}"
+        );
 
         // and `apply` cannot get past it either, because it asks the same
         // question first

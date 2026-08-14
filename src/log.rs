@@ -509,6 +509,17 @@ pub struct Stats {
     pub blocks_visited: usize,
     /// Writes whose destination is an intermediate, not the workflow output.
     pub materialisations: usize,
+    /// Substages each phase ran, and zero for every phase that is not an
+    /// iteration.
+    ///
+    /// **The one figure of a run that is a function of the data**, and therefore
+    /// the one that is reported rather than planned: an iterative phase runs to
+    /// convergence, so its count appears in no reach, no level allocation and no
+    /// phase structure. Two runs of one plan over two datasets may differ here
+    /// and agree everywhere else, which is why `same_work_as` does not compare
+    /// it — a strategy that honoured a foreign decomposition did the same
+    /// *planned* work whatever the data made it iterate.
+    pub substages: Vec<usize>,
     /// Calls into the environment's loader, and what they moved. A plan
     /// predicting N reads against a run performing 3N is a planner bug the log
     /// shows and output equality never would.

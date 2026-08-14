@@ -20,6 +20,7 @@ use crate::decomposition::{Decomposition, PhaseDecomposition};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::geometry::BlockGrid;
+use crate::reach::Reach;
 use crate::region::Region;
 
 // ------------------------------------------------------------- reading --
@@ -189,8 +190,8 @@ pub fn decomposition_json(decomposition: &Decomposition) -> Result<Value> {
             let mut entry = json!({
                 "slots": phase.slots,
                 "names": phase.names,
-                "reach": phase.reach,
-                "halo": phase.halo,
+                "reach": phase.reach.to_json(),
+                "halo": phase.halo.to_json(),
                 "block": phase.grid.block(),
             });
             // Written only when the phase changes it, so a plan over one volume
@@ -229,11 +230,14 @@ pub fn decomposition_from_json(value: &Value) -> Result<Decomposition> {
             Some(_) => triple(phase, "volume")?,
             None => volume,
         };
+        // A reach is a triple on the wire when a triple is all it says, and an
+        // object when it says more. `Reach::from_json` reads both, so a
+        // document written before the richer forms existed rebuilds unchanged.
         let mut rebuilt = PhaseDecomposition::derive(
             counts(phase, "slots")?,
             strings(phase, "names")?,
-            triple(phase, "reach")?,
-            triple(phase, "halo")?,
+            Reach::from_json(get(phase, "reach")?)?,
+            Reach::from_json(get(phase, "halo")?)?,
             BlockGrid::new(phase_volume, block)?,
         );
         if phase.get("dtype").is_some() {

@@ -42,7 +42,7 @@
 // it.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -56,12 +56,14 @@ use crate::tiling::boxes_tile_exactly;
 use super::decomposition::{
     check_block_constraints, check_dtypes, constraint_for, groups_for, is_planning_barrier,
     price_phase, region_to_ranges, splittable_axes, Constraints, Decomposition, PhaseDecomposition,
+    Visibility,
 };
 use super::env::block_shape;
 use super::env::Environment;
 use super::fragment::{check_phase_work, neighbourhood, BlockView, PhaseWork};
 use super::geometry::{chunks_touched, BlockGrid};
 use super::graph::TaskGraph;
+use super::iterate::{IterativeOp, Operand};
 use super::listener::{Dispatch, EventListener};
 use super::log::{Event, Stats};
 use super::op::{Anchor, Chain, Output};
@@ -144,6 +146,22 @@ pub struct Hints {
     /// Reserved for `MULTISLAB_IO.md` §4's hint-driven prefetcher. Recorded so
     /// a strategy can express it before there is a prefetcher to consume it.
     pub prefetch_depth: usize,
+    /// Internal levels to keep rather than free when their reader finishes.
+    ///
+    /// **Advisory, and it belongs here rather than in the plan for one reason:
+    /// keeping an intermediate cannot change a voxel.** It changes what is on
+    /// disk when the run ends, which is a debugging decision, so it sits with
+    /// every other value a strategy may get wrong at no cost to the answer.
+    ///
+    /// Empty means "free every internal level as soon as its reader is done",
+    /// which is the behaviour worth having by default: an `N`-phase chain then
+    /// holds three levels at once instead of `N + 1`. Naming a level here is how
+    /// a caller says "I want to look at that one" — the same choice the sidecar
+    /// store spells `Lifecycle::Persistent`.
+    ///
+    /// Naming level 0 or the output level is harmless and does nothing; neither
+    /// is ever freed.
+    pub keep_levels: BTreeSet<usize>,
 }
 
 impl Default for Hints {
@@ -153,6 +171,7 @@ impl Default for Hints {
             priority: SchedulePriority::PhaseMajor,
             concurrency: 1,
             prefetch_depth: 0,
+            keep_levels: BTreeSet::new(),
         }
     }
 }
@@ -307,7 +326,7 @@ pub fn execute_phases(
     // The same arrangement for the element type: declared by the op, folded by
     // the chain, and re-checked here because a plan whose levels are the wrong
     // width would otherwise be discovered one block at a time.
-    check_dtypes(&workflow.chain, decomposition)?;
+    check_dtypes(&workflow.chain, decomposition, work)?;
     env.prepare(decomposition)?;
     // Once, before any task, and by the executor rather than by each op: a
     // stream must exist before a block writes to it, and a declaration inside
@@ -349,14 +368,37 @@ pub fn execute_phases(
 
     let mut indegree: Vec<usize> = graph.tasks.iter().map(|task| task.deps.len()).collect();
     let dependents = graph.dependents();
+    // An iterative phase runs as a whole, so its tasks never enter the ready
+    // heap: every block of substage `k+1` reads cores its neighbours wrote at
+    // `k`, so the blocks advance in lockstep and there is nothing to interleave.
+    // What is tracked instead is how many of the phase's tasks have become ready,
+    // and the phase runs when all of them have.
+    //
+    // **This cannot deadlock.** A task of phase `p` waits only on phase `p-1`, so
+    // holding phase `p`'s tasks back blocks nothing that phase `p`'s tasks need;
+    // phase 0's tasks are ready from the start, and the property carries forward.
+    let iterative: Vec<bool> = work.iter().map(|entry| entry.is_iterative()).collect();
+    let mut iterative_ready: Vec<usize> = vec![0; n_phases];
+    let mut iterative_run: Vec<bool> = vec![false; n_phases];
     // A heap rather than a sorted vector: the ready set is re-ranked on every
     // wave, and re-sorting it was O(waves x ready x log ready) — around 3 x 10^8
     // comparisons at full scale, which would have made the *scheduler* the
     // bottleneck of a simulation whose whole point is to be free.
-    let mut ready: BinaryHeap<Reverse<([usize; 5], usize)>> = (0..graph.len())
-        .filter(|&id| indegree[id] == 0)
-        .map(|id| Reverse((priority_key(&graph.tasks[id], hints), id)))
-        .collect();
+    let mut ready: BinaryHeap<Reverse<([usize; 5], usize)>> = BinaryHeap::new();
+    for id in 0..graph.len() {
+        if indegree[id] == 0 {
+            admit(
+                &graph.tasks[id],
+                hints,
+                &iterative,
+                &mut ready,
+                &mut iterative_ready,
+            );
+        }
+    }
+    // How many substages each phase ran. Zero for every phase that is not an
+    // iteration, which is what a phase with no loop in it took.
+    let mut substages: Vec<usize> = vec![0; n_phases];
     let mut phase_remaining: Vec<usize> = (0..n_phases)
         .map(|phase| graph.tasks_in_phase(phase).len())
         .collect();
@@ -374,48 +416,89 @@ pub fn execute_phases(
     let mut short_circuited = 0usize;
 
     while done < graph.len() {
-        if ready.is_empty() {
-            return Err(Error::InvalidArgument(format!(
-                "task graph stalled after {done} of {} tasks; this is a dependency cycle, \
-                 which a phase-layered DAG cannot have unless the graph was built wrongly",
-                graph.len()
-            )));
-        }
-        let take = concurrency.min(ready.len());
-        let wave: Vec<usize> = (0..take)
-            .map(|_| ready.pop().expect("checked non-empty").0 .1)
-            .collect();
-
-        for &id in &wave {
-            let phase = graph.tasks[id].phase;
-            if !phase_started[phase] {
-                phase_started[phase] = true;
-                events.emit(Event::PhaseStarted { phase });
+        // An iterative phase whose every task is ready runs now, as a whole,
+        // before anything is popped: it is a barrier by construction and there is
+        // no benefit to interleaving other work around it in a serial executor.
+        let pending = (0..n_phases).find(|&phase| {
+            iterative[phase]
+                && !iterative_run[phase]
+                && iterative_ready[phase] == graph.tasks_in_phase(phase).len()
+        });
+        let completed: Vec<(usize, TaskOutcome)> = match pending {
+            Some(phase) => {
+                iterative_run[phase] = true;
+                if !phase_started[phase] {
+                    phase_started[phase] = true;
+                    events.emit(Event::PhaseStarted { phase });
+                }
+                for task in graph.tasks_in_phase(phase) {
+                    events.emit(Event::TaskAdmitted {
+                        phase,
+                        index: task.index,
+                    });
+                }
+                let PhaseWork::Iterate(op) = &work[phase] else {
+                    unreachable!("`iterative` is derived from `work`");
+                };
+                let (ran, outcomes) =
+                    run_iterative_phase(&graph, phase, decomposition, *op, env, &events, n_phases)?;
+                substages[phase] = ran;
+                graph
+                    .tasks_in_phase(phase)
+                    .iter()
+                    .map(|task| task.id)
+                    .zip(outcomes)
+                    .collect()
             }
-            events.emit(Event::TaskAdmitted {
-                phase,
-                index: graph.tasks[id].index,
-            });
-        }
+            None => {
+                if ready.is_empty() {
+                    return Err(Error::InvalidArgument(format!(
+                        "task graph stalled after {done} of {} tasks; this is a dependency cycle, \
+                         which a phase-layered DAG cannot have unless the graph was built wrongly",
+                        graph.len()
+                    )));
+                }
+                let take = concurrency.min(ready.len());
+                let wave: Vec<usize> = (0..take)
+                    .map(|_| ready.pop().expect("checked non-empty").0 .1)
+                    .collect();
 
-        let run = |id: usize| {
-            run_task(
-                &graph.tasks[id],
-                decomposition,
-                &slots,
-                &work[graph.tasks[id].phase],
-                env,
-                &events,
-                n_phases,
-            )
-        };
-        let outcomes: Vec<Result<TaskOutcome>> = match &pool {
-            None => wave.iter().map(|&id| run(id)).collect(),
-            Some(pool) => pool.install(|| wave.par_iter().map(|&id| run(id)).collect()),
+                for &id in &wave {
+                    let phase = graph.tasks[id].phase;
+                    if !phase_started[phase] {
+                        phase_started[phase] = true;
+                        events.emit(Event::PhaseStarted { phase });
+                    }
+                    events.emit(Event::TaskAdmitted {
+                        phase,
+                        index: graph.tasks[id].index,
+                    });
+                }
+
+                let run = |id: usize| {
+                    run_task(
+                        &graph.tasks[id],
+                        decomposition,
+                        &slots,
+                        &work[graph.tasks[id].phase],
+                        env,
+                        &events,
+                        n_phases,
+                    )
+                };
+                let outcomes: Vec<Result<TaskOutcome>> = match &pool {
+                    None => wave.iter().map(|&id| run(id)).collect(),
+                    Some(pool) => pool.install(|| wave.par_iter().map(|&id| run(id)).collect()),
+                };
+                let mut gathered = Vec::with_capacity(wave.len());
+                for (&id, outcome) in wave.iter().zip(outcomes) {
+                    gathered.push((id, outcome?));
+                }
+                gathered
+            }
         };
 
-        for (&id, outcome) in wave.iter().zip(outcomes) {
-            let outcome = outcome?;
+        for (id, outcome) in completed {
             let phase = graph.tasks[id].phase;
             for (name, region) in &outcome.side_written {
                 side_written
@@ -431,6 +514,19 @@ pub fn execute_phases(
             }
             phase_remaining[phase] -= 1;
             if phase_remaining[phase] == 0 {
+                // The level this phase *read* is now dead. Exactly one phase
+                // reads a level, and this one has finished every task of it, so
+                // there is no later reader to be wrong about — which is what
+                // makes this the unambiguous moment rather than a heuristic.
+                //
+                // The saving is the whole point of `Visibility`: without this an
+                // `N`-phase chain holds `N + 1` full levels for the length of
+                // the run, and only ever two of them are live.
+                if decomposition.level_visibility(phase) == Visibility::Internal
+                    && !hints.keep_levels.contains(&phase)
+                {
+                    env.discard_level(phase)?;
+                }
                 if work[phase].writes_a_level() {
                     // A phase that wrote no level has nothing to flush and
                     // nothing to materialise, and saying otherwise would put a
@@ -454,7 +550,13 @@ pub fn execute_phases(
             for &next in &dependents[id] {
                 indegree[next] -= 1;
                 if indegree[next] == 0 {
-                    ready.push(Reverse((priority_key(&graph.tasks[next], hints), next)));
+                    admit(
+                        &graph.tasks[next],
+                        hints,
+                        &iterative,
+                        &mut ready,
+                        &mut iterative_ready,
+                    );
                 }
             }
             done += 1;
@@ -515,6 +617,7 @@ pub fn execute_phases(
             .take(n_phases.saturating_sub(1))
             .map(|boxes| boxes.len())
             .sum(),
+        substages,
         reads,
         writes,
         read_voxels,
@@ -527,6 +630,27 @@ pub fn execute_phases(
         listener_faults,
         log,
     })
+}
+
+/// A task whose dependencies are all done joins the ready heap — unless its
+/// phase is an iteration, in which case it is counted instead.
+///
+/// One function rather than the same three lines at the two places a task
+/// becomes ready, because the two are exactly the same decision and a scheduler
+/// that admitted an iterative task in one of them would run one block of a
+/// lockstep phase on its own.
+fn admit(
+    task: &super::graph::Task,
+    hints: &Hints,
+    iterative: &[bool],
+    ready: &mut BinaryHeap<Reverse<([usize; 5], usize)>>,
+    iterative_ready: &mut [usize],
+) {
+    if iterative[task.phase] {
+        iterative_ready[task.phase] += 1;
+    } else {
+        ready.push(Reverse((priority_key(task, hints), task.id)));
+    }
 }
 
 /// Worker pools, shared per thread count.
@@ -662,6 +786,23 @@ fn run_task(
 ) -> Result<TaskOutcome> {
     if let PhaseWork::Fragments(op) = work {
         return run_fragment_task(task, decomposition, *op, env, events, n_phases);
+    }
+    if let PhaseWork::Iterate(op) = work {
+        // Refused rather than fallen through. An iterative phase owns no chain
+        // slot, so the `Pixels` path below would apply nothing and copy the input
+        // to the output — a complete, well-formed volume that is not the fixed
+        // point. The scheduler keeps such a task out of the ready heap so that
+        // the whole phase runs in lockstep; this is the guard that says so if
+        // some other caller hands one over anyway.
+        return Err(Error::InvalidArgument(format!(
+            "task (phase {}, block {:?}) belongs to iterative op {:?}, which cannot be run one \
+             block at a time: every block of substage k+1 reads cores its neighbours wrote at \
+             substage k, so the phase advances in lockstep and `execute_phases` runs all of it \
+             at once.",
+            task.phase,
+            task.index,
+            op.name()
+        )));
     }
     let phase = &decomposition.phases[task.phase];
     // Two regions, in two coordinate spaces, and which is which is the whole
@@ -1010,6 +1151,221 @@ fn run_fragment_task(
     })
 }
 
+/// One iterative phase: every block, every substage, until nothing changes.
+///
+/// Returns the substage count and one outcome per block, in the phase's block
+/// order, so the caller's bookkeeping — the tiling guard, the byte counts, the
+/// level lifetime, the dependents — is the same code that runs for every other
+/// kind of phase.
+///
+/// **The trivial form, on purpose.** Every block runs every substage, and the
+/// convergence test is "did any block's core come out different from what it went
+/// in as". No per-block skip, no dirty set, no frontier: those are the
+/// optimisation, and a trivial executor is correct by design, which is what makes
+/// it the oracle they will be tested against.
+///
+/// **What a distributed run would need, and does not have here.** One barrier per
+/// substage, and the two private buffers shared across workers rather than owned
+/// by this function. The blocks of a single substage are independent — they read
+/// `current` and write disjoint cores of `next` — so the parallelism is available;
+/// it is the substage boundary that is a real exchange point, because every block
+/// of substage `k+1` reads cores its neighbours wrote at `k`. Left unbuilt, and
+/// this is the sentence that says where it goes.
+#[allow(clippy::too_many_arguments)]
+fn run_iterative_phase(
+    graph: &TaskGraph,
+    phase_index: usize,
+    decomposition: &Decomposition,
+    op: &dyn IterativeOp,
+    env: &dyn Environment,
+    events: &Dispatch,
+    n_phases: usize,
+) -> Result<(usize, Vec<TaskOutcome>)> {
+    let phase = &decomposition.phases[phase_index];
+    let tasks = graph.tasks_in_phase(phase_index);
+    let volume = phase.volume();
+    let dtype = decomposition.dtype_at(phase_index);
+    let bytes_per_voxel = dtype.size_of() as u64;
+    let whole = Region::whole(&volume);
+    let operands = op.operands();
+    let running_at = operands
+        .iter()
+        .position(|operand| operand.operand == Operand::Running)
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "iterative op {:?} declares no running operand; `check_iterative` refuses such \
+                 an op when the plan is built and again when it is run",
+                op.name()
+            ))
+        })?;
+
+    // **Two private buffers, whatever the substage count turns out to be.** The
+    // buffer written at substage `k` already holds substage `k-2`'s output, which
+    // nothing will read again, so live storage is `O(1)` in the substage count —
+    // and a forty-substage phase costs exactly what a two-substage one costs. They
+    // are allocated through the environment so that residency is booked the way it
+    // books it, and owned here rather than by the environment because nothing
+    // outside this phase can see them: the plan allocates no level for them and
+    // `Visibility` has nothing to say about them.
+    //
+    // The fill value is never read. Every block writes its core at substage 0 and
+    // the cores tile the volume, so the whole buffer is real data from the first
+    // substage onwards.
+    let mut current = env.constant(dtype, &whole, f64::NAN)?;
+    let mut next = env.constant(dtype, &whole, f64::NAN)?;
+
+    // Everything that can fail runs inside here, so the two buffers are released
+    // on the way out however it ends. A failed run's residency counters are not
+    // load-bearing, but a partial release would be a number that quietly means
+    // nothing.
+    let produced = (|| -> Result<(usize, Vec<TaskOutcome>)> {
+        let limit = op.limit().substages();
+        let mut ran = 0usize;
+        loop {
+            if ran == limit {
+                return Err(Error::InvalidArgument(format!(
+                    "iterative op {:?} did not converge in {limit} substage(s) over a {volume:?} \
+                     volume. Either the limit is below what this data needs — raise it, from \
+                     whatever bound the op's own behaviour gives — or the iteration does not \
+                     converge at all, which would be a defect in the step rather than in the \
+                     data. The partially converged volume is deliberately not written: it is a \
+                     plausible, well-formed, wrong answer.",
+                    op.name()
+                )));
+            }
+            let mut changed = false;
+            for task in tasks {
+                let fetch = &task.geometry.source;
+                let read = &task.geometry.read;
+                let at = Anchor::of_region(fetch, decomposition.volume_at(phase_index))?;
+                // One buffer per declared operand, every one of them over the
+                // block's read extent — see `iterate::Substage` for why they share
+                // an extent rather than each getting its own.
+                let mut buffers = Vec::with_capacity(operands.len());
+                for operand in &operands {
+                    // The running operand comes off the level only at substage 0;
+                    // after that it is what the previous substage wrote, and it is
+                    // the neighbours' *cores* of that which make the reach stay at
+                    // one substage's worth. A fixed operand comes off the level
+                    // every time, which is the whole point of declaring it.
+                    let from_level = operand.operand == Operand::Fixed || ran == 0;
+                    if from_level {
+                        let started = Instant::now();
+                        let buf = env.read(phase_index, fetch)?;
+                        let read_ns = started.elapsed().as_nanos() as u64;
+                        let chunks = chunks_touched(fetch, &env.chunk_shape());
+                        events.emit(Event::RegionRead {
+                            source: format!("level {phase_index}"),
+                            level: phase_index,
+                            index: Some(task.index),
+                            region: fetch.clone(),
+                            voxels: fetch.voxels(),
+                            bytes: fetch.voxels() as u64 * bytes_per_voxel,
+                            chunks,
+                            duration_ns: read_ns,
+                        });
+                        events.emit(Event::BlockRead {
+                            phase: phase_index,
+                            index: task.index,
+                            region: fetch.clone(),
+                            voxels: fetch.voxels(),
+                            chunks,
+                        });
+                        buffers.push(buf);
+                    } else {
+                        // A private buffer is not a level: no `RegionRead`, because
+                        // nothing was fetched from storage. The residency is still
+                        // booked, because the block is still resident.
+                        buffers.push(env.slice(&current, &whole, fetch)?);
+                    }
+                }
+
+                let result = env.apply_substage(op, ran, &buffers, &at)?;
+                let valid = &task.geometry.valid;
+                let core = env.slice(&result, read, valid)?;
+                // The convergence test, and it is the whole predicate: did this
+                // block's core come out different from what it went in as. Against
+                // the *running* operand, because that is what the next substage
+                // will be handed.
+                let before = env.slice(&buffers[running_at], fetch, valid)?;
+                match env.same(&core, &before) {
+                    Some(false) => changed = true,
+                    Some(true) => {}
+                    None => {
+                        return Err(Error::InvalidArgument(format!(
+                            "iterative op {:?} cannot be run under an environment that holds no \
+                             data: an iteration runs to convergence, and whether anything \
+                             changed is a question about values. Simulating one needs a stated \
+                             substage count, which is a different thing from the count a real \
+                             run discovers and is deliberately not invented here.",
+                            op.name()
+                        )));
+                    }
+                }
+                env.place(&mut next, &whole, valid, &core)?;
+
+                env.release(&before);
+                env.release(&core);
+                env.release(&result);
+                for buf in &buffers {
+                    env.release(buf);
+                }
+            }
+            // The exchange point. Everything below reads `current`, so the swap is
+            // the barrier; see this function's header for the distributed shape.
+            std::mem::swap(&mut current, &mut next);
+            ran += 1;
+            if !changed {
+                break;
+            }
+        }
+
+        // The fixed point, written out block by block. This is the only write the
+        // phase makes to a level, which is what makes the substage count invisible
+        // to everything downstream.
+        let mut outcomes = Vec::with_capacity(tasks.len());
+        let write_bytes_per_voxel = decomposition.dtype_at(phase_index + 1).size_of() as u64;
+        for task in tasks {
+            let valid = &task.geometry.valid;
+            let piece = env.slice(&current, &whole, valid)?;
+            let within = Region::new(&[0, 0, 0], &valid.shape);
+            let started = Instant::now();
+            env.write(phase_index + 1, &within, valid, &piece)?;
+            let write_ns = started.elapsed().as_nanos() as u64;
+            env.release(&piece);
+            events.emit(Event::RegionWritten {
+                sink: format!("level {}", phase_index + 1),
+                level: phase_index + 1,
+                index: Some(task.index),
+                region: valid.clone(),
+                voxels: valid.voxels(),
+                bytes: valid.voxels() as u64 * write_bytes_per_voxel,
+                chunks: chunks_touched(valid, &env.chunk_shape()),
+                duration_ns: write_ns,
+            });
+            events.emit(Event::BlockWritten {
+                phase: phase_index,
+                index: task.index,
+                valid: valid.clone(),
+                materialised: phase_index + 1 < n_phases,
+            });
+            outcomes.push(TaskOutcome {
+                valid: valid.clone(),
+                short_circuited: false,
+                // An iterative phase applies no slot of the chain, so it writes no
+                // side output — the same position a fragment phase is in.
+                side_written: Vec::new(),
+                listener_faults: 0,
+            });
+        }
+        Ok((ran, outcomes))
+    })();
+
+    env.release(&current);
+    env.release(&next);
+    produced
+}
+
 /// The extent one phase turns `input` into, folding its slots in order.
 ///
 /// The counterpart of [`fold_constant`] for shape, and the reason `run_task` can
@@ -1148,7 +1504,8 @@ impl Strategy for Trivial {
     fn decompose(&self, workflow: &Workflow, _constraints: &Constraints) -> Result<Decomposition> {
         let grid = BlockGrid::whole(workflow.shape)?;
         let slots = workflow.chain.slots();
-        let reach = workflow.chain.reach3(&workflow.shape);
+        let reach = workflow.chain.reach_spec(workflow.shape)?;
+        let chain_reach = reach.bound(workflow.shape);
         let names = slots.iter().map(|slot| slot.display_name()).collect();
         let mut decomposition = Decomposition {
             volume: workflow.shape,
@@ -1160,7 +1517,7 @@ impl Strategy for Trivial {
                 [0, 0, 0],
                 grid,
             )],
-            chain_reach: reach,
+            chain_reach,
         };
         decomposition.declare_dtypes(&workflow.chain)?;
         decomposition.check()?;
@@ -1179,6 +1536,7 @@ impl Strategy for Trivial {
             priority: SchedulePriority::PhaseMajor,
             concurrency: 1,
             prefetch_depth: 0,
+            keep_levels: BTreeSet::new(),
         }
     }
 }
@@ -1261,8 +1619,19 @@ impl Strategy for Enumerating {
             let mut feasible = true;
 
             for (position, group) in groups.iter().enumerate() {
+                // Reaches in two coordinate spaces cannot be folded without a
+                // grid, so a group containing both is infeasible *as a group* —
+                // the same shape of answer a block-shape conflict gives, and it
+                // drops the partition rather than the plan.
                 let (reach, compute, names, orders) =
-                    super::decomposition::summarise_slots(&slots, group, volume);
+                    match super::decomposition::summarise_slots(&slots, group, volume) {
+                        Ok(summary) => summary,
+                        Err(err) => {
+                            constraint_note.get_or_insert_with(|| err.to_string());
+                            feasible = false;
+                            break;
+                        }
+                    };
                 let is_materialised = position + 1 < groups.len();
                 // What the ops in this group will accept. A conflict is a fact
                 // about *this partition* — the same two ops in two phases are
@@ -1278,7 +1647,7 @@ impl Strategy for Enumerating {
                 let price = |grid: &BlockGrid| {
                     price_phase(
                         grid,
-                        reach,
+                        &reach,
                         compute,
                         orders.len(),
                         is_materialised,
@@ -1295,6 +1664,11 @@ impl Strategy for Enumerating {
                     })
                 };
                 let mut chosen: Option<(f64, usize, BlockGrid)> = None;
+                // The halo this phase grants. Equal to the reach unless an op
+                // mandates an input extent, in which case it is the per-block
+                // window that hands every block that extent — see
+                // `BlockConstraint::lattice`.
+                let mut halo = reach.clone();
                 if let Some(constraint) = &mandated {
                     // A mandate replaces the candidate list rather than filtering
                     // it: `block_candidates` is a list of scalar edges and a
@@ -1302,15 +1676,16 @@ impl Strategy for Enumerating {
                     // expressible as a candidate at all. The budget still binds —
                     // a block that does not fit does not fit — but there is
                     // nothing to choose between.
-                    match constraint.grid(volume) {
-                        Some(grid) => {
+                    match constraint.lattice(volume, &reach) {
+                        Ok(Some((grid, window))) => {
                             let cost = price(&grid);
                             if affordable(&cost) {
+                                halo = window;
                                 chosen =
                                     Some((cost.cost_per_block * grid.n_blocks() as f64, 0, grid));
                             }
                         }
-                        None => {
+                        Ok(None) => {
                             constraint_note.get_or_insert_with(|| {
                                 format!(
                                     "the ops of phase {position} mandate {constraint:?}, which \
@@ -1320,9 +1695,12 @@ impl Strategy for Enumerating {
                                 )
                             });
                         }
+                        Err(err) => {
+                            constraint_note.get_or_insert_with(|| err.to_string());
+                        }
                     }
                 } else {
-                    let axes = splittable_axes(&constraints.split_axes, reach, volume);
+                    let axes = splittable_axes(&constraints.split_axes, &reach, volume);
                     for &edge in &constraints.block_candidates {
                         let grid = match BlockGrid::along(volume, &axes, edge) {
                             Ok(grid) => grid,
@@ -1350,7 +1728,7 @@ impl Strategy for Enumerating {
                     feasible = false;
                     break;
                 };
-                let phase = PhaseDecomposition::derive(group.clone(), names, reach, reach, grid);
+                let phase = PhaseDecomposition::derive(group.clone(), names, reach, halo, grid);
                 // The same check `execute` will run, run here: a mandated extent
                 // and a non-zero reach are not jointly satisfiable, and the place
                 // to discover that is the planner rather than the run.
@@ -1417,6 +1795,9 @@ impl Strategy for Enumerating {
             priority: self.priority,
             concurrency: self.concurrency,
             prefetch_depth: 1,
+            // Nothing kept: a strategy advising on speed has no reason to want
+            // an intermediate afterwards. A caller who does overrides it.
+            keep_levels: BTreeSet::new(),
         }
     }
 }
@@ -1496,15 +1877,16 @@ impl Strategy for Greedy {
         let mut phases = Vec::with_capacity(groups.len());
         for (position, group) in groups.iter().enumerate() {
             let (reach, compute, names, orders) =
-                super::decomposition::summarise_slots(&slots, group, volume);
+                super::decomposition::summarise_slots(&slots, group, volume)?;
             let is_materialised = position + 1 < groups.len();
             let mandated = constraint_for(&slots, group, volume)?;
             let mut grid = None;
+            let mut halo = reach.clone();
             if let Some(constraint) = &mandated {
                 // Mandated, so there is nothing to choose between; the budget
                 // still binds. See `Enumerating` for why the candidate list is
                 // replaced rather than filtered.
-                let candidate = constraint.grid(volume).ok_or_else(|| {
+                let (candidate, window) = constraint.lattice(volume, &reach)?.ok_or_else(|| {
                     Error::InvalidArgument(format!(
                         "greedy: phase {position} mandates {constraint:?}, which no block grid \
                          produces — a grid's cores are `index * block`, evenly strided and \
@@ -1512,9 +1894,10 @@ impl Strategy for Greedy {
                          explicitly, which this strategy does not do."
                     ))
                 })?;
+                halo = window;
                 let cost = price_phase(
                     &candidate,
-                    reach,
+                    &reach,
                     compute,
                     orders.len(),
                     is_materialised,
@@ -1534,14 +1917,14 @@ impl Strategy for Greedy {
                 // largest candidate that fits
                 let mut candidates = constraints.block_candidates.clone();
                 candidates.sort_unstable_by(|a, b| b.cmp(a));
-                let axes = splittable_axes(&constraints.split_axes, reach, volume);
+                let axes = splittable_axes(&constraints.split_axes, &reach, volume);
                 for edge in candidates {
                     let Ok(candidate) = BlockGrid::along(volume, &axes, edge) else {
                         continue;
                     };
                     let cost = price_phase(
                         &candidate,
-                        reach,
+                        &reach,
                         compute,
                         orders.len(),
                         is_materialised,
@@ -1563,11 +1946,11 @@ impl Strategy for Greedy {
             let grid = grid.ok_or_else(|| {
                 Error::InvalidArgument(format!(
                     "greedy: no block candidate in {:?} fits the {:?} byte budget for phase \
-                     {position} (reach {reach:?})",
+                     {position} (reach {reach})",
                     constraints.block_candidates, constraints.budget_bytes
                 ))
             })?;
-            let phase = PhaseDecomposition::derive(group.clone(), names, reach, reach, grid);
+            let phase = PhaseDecomposition::derive(group.clone(), names, reach, halo, grid);
             if let Some(constraint) = &mandated {
                 constraint.check(&phase.blocks, &format!("greedy: phase {position}"))?;
             }
@@ -1591,6 +1974,7 @@ impl Strategy for Greedy {
             priority: SchedulePriority::BlockMajor,
             concurrency: self.concurrency,
             prefetch_depth: 2,
+            keep_levels: BTreeSet::new(),
         }
     }
 }

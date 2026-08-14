@@ -54,10 +54,10 @@ use serde_json::json;
 use crate::decomposition::Decomposition;
 use crate::error::{Error, Result};
 use crate::export::event_json;
+use crate::fragment::{check_phase_work, PhaseWork};
 use crate::graph::TaskGraph;
 use crate::listener::EventListener;
 use crate::log::Event;
-use crate::fragment::{check_phase_work, PhaseWork};
 use crate::strategy::execute_task_of;
 
 use super::client::Client;

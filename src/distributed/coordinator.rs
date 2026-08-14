@@ -56,7 +56,8 @@ use crate::graph::TaskGraph;
 use crate::log::{Event, ExecutionLog};
 
 use super::cache_model::{ChunkGrid, ModelledCache};
-use super::handout::{self, WorkerView};
+use super::handout::{self, HandoutPolicy, WorkerView};
+use super::placement::{self, Residency};
 use super::protocol::{Assignment, Handout, JobStatus, Joined, PROTOCOL_VERSION};
 use super::spec::JobSpec;
 
@@ -81,6 +82,19 @@ pub const DEFAULT_LEASE_MS: u64 = 30_000;
 pub const DEFAULT_LINGER_MS: u64 = 250;
 /// How long a worker is told to wait when everything ready is claimed.
 const WAIT_MS: u64 = 20;
+/// How recently a worker must have been heard from to count as a **contender**
+/// for a scarce task — see `placement`.
+///
+/// Not a new synchronisation point and not a scheduling timer: it is the
+/// coordinator's answer to "could I hand this to somebody else *instead*", and
+/// the only cost of getting it wrong is that a task waits this long for a worker
+/// that has died. An idle worker polls every [`WAIT_MS`], so this is twenty-five
+/// poll intervals — generous enough that a scheduler hiccup does not disqualify
+/// a live worker, short enough that a dead one stops holding a barrier back
+/// almost immediately. A worker that is *busy* is excluded regardless of when it
+/// was last seen, because it cannot take the task now however well it would suit
+/// it.
+const CONTENDER_SEEN_WITHIN_MS: u64 = WAIT_MS * 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskState {
@@ -110,6 +124,25 @@ struct WorkerModel {
     /// from where they have got to.
     seed: Option<[f64; 3]>,
     cache: ModelledCache,
+    /// Chunks this worker **wrote**, modelled the same way and for the same
+    /// reason: it is derived from assignments and never reported.
+    ///
+    /// A second tier rather than more entries in `cache`, because it is a claim
+    /// about a different thing and the two must not be confused. `cache` models
+    /// this crate's own chunk cache, which holds what was *read*. `produced`
+    /// models whatever on the node holds what was recently *written* — the page
+    /// cache under a filesystem store, a local scratch tier, a write-back cache
+    /// if one is ever added — none of which this crate owns. It is kept separate
+    /// so that the handout's own scoring, and the numbers already measured for
+    /// it, are untouched; only `placement` reads it.
+    ///
+    /// It exists because without it the barrier case is unanswerable. Phase `p`
+    /// reads level `p` and writes level `p + 1`, so the level a barrier at phase
+    /// `p` reads is one that only ever got written — every worker misses all of
+    /// it under a read-only model, no worker is better than any other, and the
+    /// placement rule correctly declines to have an opinion. Being wrong about
+    /// this costs a re-read, which is what the read would have cost anyway.
+    produced: ModelledCache,
     assigned: usize,
     completed: usize,
     last_seen: Instant,
@@ -127,6 +160,10 @@ pub struct Job {
     pub decomposition: Decomposition,
     graph: TaskGraph,
     chunks: ChunkGrid,
+    /// How many tasks each phase has. The *plan's* shape rather than what is
+    /// left, and the only thing `placement` treats as scarce — see rule 1 there,
+    /// and the measurement that made the distinction necessary.
+    phase_tasks: Vec<usize>,
     state: Vec<TaskState>,
     attempts: Vec<u32>,
     remaining_deps: Vec<usize>,
@@ -144,6 +181,11 @@ pub struct Job {
     failed: usize,
     started: Instant,
     last_event: Instant,
+    /// Whether a scarce task may be withheld from a worker with a better-placed
+    /// idle peer. On, because a barrier phase is the only placement decision in
+    /// its phase; off is here so the two can be measured against each other over
+    /// the same job, which is the only way "it helps" means anything.
+    scarce_placement: bool,
 }
 
 impl Job {
@@ -157,11 +199,18 @@ impl Job {
         let dependents = graph.dependents();
         let n = graph.len();
         let chunks = ChunkGrid::new(decomposition.volume, spec.workflow.chunk);
+        let mut phase_tasks = vec![0usize; decomposition.n_phases()];
+        for task in &graph.tasks {
+            if let Some(count) = phase_tasks.get_mut(task.phase) {
+                *count += 1;
+            }
+        }
         Ok(Self {
             spec,
             decomposition,
             graph,
             chunks,
+            phase_tasks,
             state: vec![TaskState::Pending; n],
             attempts: vec![0; n],
             remaining_deps,
@@ -175,7 +224,26 @@ impl Job {
             failed: 0,
             started: Instant::now(),
             last_event: Instant::now(),
+            scarce_placement: true,
         })
+    }
+
+    /// Turn locality-aware placement of scarce tasks off — the baseline the
+    /// barrier measurement is taken against. See `placement`.
+    pub fn with_scarce_placement(mut self, on: bool) -> Self {
+        self.scarce_placement = on;
+        self
+    }
+
+    /// Chunks of `task`'s read set the coordinator models `worker` as already
+    /// holding, out of how many the read touches.
+    ///
+    /// Diagnostic, and what the barrier measurement is taken from. The model is
+    /// never authoritative about anything, this included.
+    pub fn modelled_overlap(&self, worker: &str, task: usize) -> Option<(usize, usize)> {
+        let model = self.workers.get(worker)?;
+        let keys = placement::read_keys(&self.graph, &self.chunks, task);
+        Some((self.residency(model).overlap(&keys), keys.len()))
     }
 
     pub fn graph(&self) -> &TaskGraph {
@@ -231,6 +299,12 @@ impl Job {
                 anchor: None,
                 seed: None,
                 cache: ModelledCache::new(budget, chunk_bytes),
+                // The same budget, because it is the only figure there is: the
+                // node's write-side residency is not this crate's to size, and
+                // an invented second number would be worse than a reused one.
+                // Over-estimating it costs a re-read; under-estimating it costs
+                // the placement rule an opinion it could have had.
+                produced: ModelledCache::new(budget, chunk_bytes),
                 assigned: 0,
                 completed: 0,
                 last_seen: Instant::now(),
@@ -277,6 +351,51 @@ impl Job {
             .collect()
     }
 
+    fn residency<'a>(&self, model: &'a WorkerModel) -> Residency<'a> {
+        Residency {
+            id: &model.id,
+            resident: Some(&model.cache),
+            produced: Some(&model.produced),
+        }
+    }
+
+    /// The workers this task could be handed to **instead** of the one asking.
+    ///
+    /// Derived entirely from state the coordinator already has, so building this
+    /// asks nobody anything and waits for nothing. Three filters, each of which
+    /// is about whether a handout to that worker could happen *now*:
+    ///
+    /// * not the asker;
+    /// * **idle** — a worker holding a claim cannot take this task now, however
+    ///   well its cache would suit it, and counting it would let a busy worker
+    ///   hold a barrier away from an idle one indefinitely;
+    /// * **recently seen** — see [`CONTENDER_SEEN_WITHIN_MS`]. This is what
+    ///   bounds the deferral: a worker that has died stops being a contender, so
+    ///   the task stops being withheld, with no timer of its own.
+    ///
+    /// Empty under [`HandoutPolicy::Naive`], which is defined as ignoring who is
+    /// asking; declining a worker on the strength of what it holds is the
+    /// strongest form of not ignoring it. That keeps the baseline the other
+    /// policies are measured against exactly what it was.
+    fn contenders(&self, worker: &str) -> Vec<Residency<'_>> {
+        if self.spec.policy == HandoutPolicy::Naive || !self.scarce_placement {
+            return Vec::new();
+        }
+        let busy: std::collections::BTreeSet<&str> = self
+            .claims
+            .values()
+            .map(|claim| claim.worker.as_str())
+            .collect();
+        let fresh = Duration::from_millis(CONTENDER_SEEN_WITHIN_MS);
+        self.workers
+            .values()
+            .filter(|model| model.id != worker)
+            .filter(|model| !busy.contains(model.id.as_str()))
+            .filter(|model| model.last_seen.elapsed() <= fresh)
+            .map(|model| self.residency(model))
+            .collect()
+    }
+
     /// Hand one task to one worker.
     ///
     /// One block per handout: at the planned block sizes a whole run is under
@@ -301,6 +420,23 @@ impl Job {
             .filter(|model| model.id != worker)
             .filter_map(|model| model.position())
             .collect();
+        // The placement pipeline: `ready -> entitled -> choose`. Each stage
+        // narrows the same set of task ids, which is the seam a **capability**
+        // filter — which classes of node may run this op at all — would be added
+        // to, in front of the locality score rather than tangled into it. See
+        // `placement` for what that would need.
+        let contenders = self.contenders(worker);
+        let entitled = {
+            let model = self.workers.get(worker).expect("admitted above");
+            placement::entitled(
+                &ready,
+                &self.graph,
+                &self.chunks,
+                &self.phase_tasks,
+                &self.residency(model),
+                &contenders,
+            )
+        };
         let view = {
             let model = self.workers.get(worker).expect("admitted above");
             WorkerView {
@@ -310,12 +446,15 @@ impl Job {
         };
         let Some(task) = handout::choose(
             self.spec.policy,
-            &ready,
+            &entitled,
             &self.graph,
             &self.chunks,
             &view,
             &seeds,
         ) else {
+            // Either nothing is ready or everything ready has a better owner
+            // that is idle and asking. Both are the same answer to this worker,
+            // and it is answered immediately — a refused pull never blocks.
             return Handout::Wait {
                 after_ms: WAIT_MS,
                 remaining: self.graph.len() - self.done,
@@ -350,9 +489,18 @@ impl Job {
         // The cache model is updated **here**, from the assignment, and never
         // from anything a worker says. See `cache_model`.
         let keys = self.chunks.keys(phase, &read);
+        // What this task will write, on the same terms. Phase `p` writes level
+        // `p + 1`, over the block's *valid* region — the part it owns, which is
+        // what tiles the level exactly. Recorded at assignment rather than at
+        // completion for the same reason the read is: the coordinator is
+        // modelling what it caused, and a task that never finishes leaves the
+        // model claiming residency the node does not have, which costs a
+        // re-read.
+        let written = self.chunks.keys(phase + 1, &assignment.valid);
         if let Some(model) = self.workers.get_mut(worker) {
             model.assigned += 1;
             model.cache.note_assigned(&keys);
+            model.produced.note_assigned(&written);
             if model.seed.is_none() {
                 model.seed = Some(placed);
             }
@@ -867,5 +1015,144 @@ mod tests {
         job.report(&serde_json::json!({"type": "phase_started", "phase": 0}));
         assert_eq!(job.unknown_events(), 1);
         assert_eq!(job.log().len(), 1);
+    }
+
+    // ------------------------------------------- placing a scarce task ------
+
+    /// A job of eight blocks and then one that reads all of them.
+    fn barrier_job() -> Job {
+        let shape = [8 * 8, 8, 8];
+        let chain = crate::distributed::spec::ChainSpec(vec![
+            crate::distributed::spec::OpSpec::new("identity", "first", [0, 0, 0]),
+            crate::distributed::spec::OpSpec::new("identity", "merge", shape),
+        ]);
+        let (spec, decomposition) = probe_job(8, 2, chain);
+        let last = decomposition.n_phases() - 1;
+        assert_eq!(decomposition.phases[last].blocks.len(), 1);
+        Job::new(spec, decomposition).unwrap()
+    }
+
+    /// Give `heavy` most of the first phase and `light` the rest, and stop just
+    /// before the barrier is handed out.
+    fn run_up_to_the_barrier(job: &mut Job, heavy: &str, light: &str) -> usize {
+        let blocks = job.graph().tasks_in_phase(0).len();
+        for at in 0..blocks {
+            let worker = if at + 1 < blocks { heavy } else { light };
+            let Handout::Task(assignment) = job.pull(worker) else {
+                panic!("expected work")
+            };
+            job.completed(worker, assignment.task).unwrap();
+        }
+        let ready: Vec<usize> = (0..job.graph().len())
+            .filter(|&task| job.state[task] == TaskState::Pending)
+            .collect();
+        assert_eq!(ready.len(), 1, "the barrier should be the only task left");
+        ready[0]
+    }
+
+    /// The rule, at the coordinator: the worker that produced most of the level
+    /// gets the barrier, whoever asks first.
+    #[test]
+    fn a_barrier_is_withheld_from_a_worker_a_better_placed_peer_could_take() {
+        let mut job = barrier_job();
+        let barrier = run_up_to_the_barrier(&mut job, "heavy", "light");
+        let (heavy_overlap, total) = job.modelled_overlap("heavy", barrier).unwrap();
+        let (light_overlap, _) = job.modelled_overlap("light", barrier).unwrap();
+        assert!(
+            heavy_overlap > light_overlap,
+            "the fixture did not make an unequal cluster: {heavy_overlap} against \
+             {light_overlap} of {total}"
+        );
+        assert!(
+            matches!(job.pull("light"), Handout::Wait { .. }),
+            "the barrier went to the worker holding less of it"
+        );
+        let Handout::Task(assignment) = job.pull("heavy") else {
+            panic!("the best-placed worker must be able to take it")
+        };
+        assert_eq!(assignment.task, barrier);
+    }
+
+    /// The same, with the rule off: first come, first served. This is the
+    /// baseline the measurement in `distributed::tests` is taken against, and it
+    /// is asserted here so that "with and without" names two different
+    /// behaviours rather than one.
+    #[test]
+    fn without_the_rule_the_barrier_goes_to_whoever_asks() {
+        let mut job = barrier_job().with_scarce_placement(false);
+        let barrier = run_up_to_the_barrier(&mut job, "heavy", "light");
+        let Handout::Task(assignment) = job.pull("light") else {
+            panic!("claim order should have given it to the first asker")
+        };
+        assert_eq!(assignment.task, barrier);
+    }
+
+    /// A better-placed worker that is **busy** must not hold a scarce task away
+    /// from an idle one. It cannot take the task now however well it would suit
+    /// it, and counting it would trade a re-read for an idle cluster.
+    ///
+    /// Asserted on the filter itself rather than through a scenario, because the
+    /// scenario is hard to stage honestly: a barrier is ready only once every
+    /// task before it is *done*, so a peer holding a claim and a ready barrier
+    /// rarely coexist. The filter is what has to be right, and it is what is
+    /// relied on by the phase *before* the barrier, where the last few tasks are
+    /// scarce while workers are still busy.
+    #[test]
+    fn a_busy_peer_is_not_a_contender() {
+        let mut job = barrier_job();
+        // "heavy" takes a block and does not report it.
+        let Handout::Task(_) = job.pull("heavy") else {
+            panic!("expected work")
+        };
+        // "light" takes one and finishes, so it is idle and has been seen.
+        let Handout::Task(assignment) = job.pull("light") else {
+            panic!("expected work")
+        };
+        job.completed("light", assignment.task).unwrap();
+        let names: Vec<&str> = job.contenders("light").iter().map(|one| one.id).collect();
+        assert!(
+            !names.contains(&"heavy"),
+            "a worker holding a claim was offered as an alternative owner: {names:?}"
+        );
+        let names: Vec<&str> = job.contenders("heavy").iter().map(|one| one.id).collect();
+        assert_eq!(names, vec!["light"], "an idle peer should be a contender");
+    }
+
+    /// Under the baseline policy the coordinator has no contenders at all, so a
+    /// task can never be withheld — which is what keeps `Naive` the thing the
+    /// other policies are measured against.
+    #[test]
+    fn the_naive_policy_offers_no_alternative_owner() {
+        let (mut spec, decomposition) = probe_job(8, 2, ChainSpec::identity());
+        spec.policy = HandoutPolicy::Naive;
+        let mut job = Job::new(spec, decomposition).unwrap();
+        let Handout::Task(assignment) = job.pull("a") else {
+            panic!("expected work")
+        };
+        job.completed("a", assignment.task).unwrap();
+        assert!(job.contenders("b").is_empty());
+    }
+
+    /// The liveness bound, which is **not** a timer of its own: a worker stops
+    /// being a contender when it stops looking alive, so a barrier withheld for
+    /// a worker that has died is handed out once that worker goes stale.
+    ///
+    /// The wait is the cost of getting this wrong, and it is bounded by
+    /// [`CONTENDER_SEEN_WITHIN_MS`] rather than by a lease or by anything a
+    /// worker has to say.
+    #[test]
+    fn a_worker_that_stops_looking_alive_stops_holding_a_barrier_back() {
+        let mut job = barrier_job();
+        let barrier = run_up_to_the_barrier(&mut job, "heavy", "light");
+        assert!(
+            matches!(job.pull("light"), Handout::Wait { .. }),
+            "the better-placed worker should be preferred while it looks alive"
+        );
+        // "heavy" is now killed: it never pulls, never completes, never reports.
+        std::thread::sleep(Duration::from_millis(CONTENDER_SEEN_WITHIN_MS + 50));
+        let Handout::Task(assignment) = job.pull("light") else {
+            panic!("a dead worker held the barrier back indefinitely")
+        };
+        assert_eq!(assignment.task, barrier);
     }
 }

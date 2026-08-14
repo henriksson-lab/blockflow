@@ -38,6 +38,7 @@ use super::element::{ElementShape, Rank, StructuringElement};
 use super::local::{AdaptiveThresholdOp, LocalStatistic, LocalStatisticOp, Statistic};
 use super::morphology::{Morphology, MorphologyOp};
 use super::rank::RankFilterOp;
+use super::smooth::{Gaussian, SmoothOp};
 use super::voxelwise::{CombineOp, Logic, VoxelwiseMapOp};
 
 /// One measured op.
@@ -65,6 +66,8 @@ pub fn measure(shape: [usize; 3], repetitions: usize) -> Vec<Sample> {
     let box27 = StructuringElement::from_size(ElementShape::Box, [3, 3, 3]).unwrap();
     let window = StructuringElement::from_size(ElementShape::Box, [9, 9, 9]).unwrap();
     let median = Rank::median(&box27);
+    let narrow = Gaussian::isotropic(1.0, 3.0).unwrap();
+    let wide = Gaussian::isotropic(2.0, 3.0).unwrap();
 
     let cases: Vec<(String, Box<dyn BlockOp>, f64)> = vec![
         (
@@ -128,6 +131,26 @@ pub fn measure(shape: [usize; 3], repetitions: usize) -> Vec<Sample> {
                 0.0,
             )),
             window.len() as f64 / 512.0,
+        ),
+        // Two smoothings rather than one, because the whole question about a
+        // separable convolution's cost is whether it scales with the sum of the
+        // kernel lengths or with their product, and one sample cannot answer it.
+        // The divisor is the tap count, so the `per element` column is the
+        // per-tap figure `smooth.rs` stores — and if the two rows disagree
+        // badly, the model is the wrong shape rather than the constant being
+        // slightly off.
+        (
+            format!(
+                "gaussian smooth, sigma 1 truncate 3 ({} taps)",
+                narrow.taps()
+            ),
+            Box::new(SmoothOp::new("smooth", narrow.clone())),
+            narrow.taps() as f64,
+        ),
+        (
+            format!("gaussian smooth, sigma 2 truncate 3 ({} taps)", wide.taps()),
+            Box::new(SmoothOp::new("smooth", wide.clone())),
+            wide.taps() as f64,
         ),
     ];
 
@@ -229,7 +252,18 @@ mod tests {
         // and a bigger element costs more, which is why the constant is per
         // element voxel rather than per op
         let bigger = StructuringElement::from_size(ElementShape::Box, [7, 7, 7]).unwrap();
-        assert!(RankFilterOp::median("median", bigger).cost_per_voxel() > rank.cost_per_voxel());
+        assert!(
+            RankFilterOp::median("median", bigger.clone()).cost_per_voxel() > rank.cost_per_voxel()
+        );
+
+        // Separability, as an ordering the measurement found and the constants
+        // must keep: a Gaussian reaching three voxels touches 21 taps where a
+        // 7x7x7 rank filter touches 343, and it must be priced far below it. A
+        // model that had charged the kernel's volume would invert this.
+        let smooth = SmoothOp::new("smooth", Gaussian::isotropic(1.0, 3.0).unwrap());
+        let dense = RankFilterOp::median("median", bigger);
+        assert_eq!(smooth.reach(0, 1000), 3);
+        assert!(smooth.cost_per_voxel() < dense.cost_per_voxel() / 8.0);
     }
 
     /// A lattice divides the window's cost: sampling every eighth voxel on each

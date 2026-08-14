@@ -280,7 +280,10 @@ fn both_arms_of_a_diamond_run_once_per_block_and_both_reach_the_sink() {
     assert!(blocks > 1, "one block cannot show a per-block count");
     assert_eq!(run(&workflow, &decomposition, &input), both);
     assert_eq!(
-        (calls_a.load(Ordering::SeqCst), calls_b.load(Ordering::SeqCst)),
+        (
+            calls_a.load(Ordering::SeqCst),
+            calls_b.load(Ordering::SeqCst)
+        ),
         (blocks, blocks),
         "each arm must be applied exactly once per block; this is the \
          observation that distinguishes a fan-in from an alternation"
@@ -389,15 +392,21 @@ fn a_diamond_writes_the_side_outputs_of_every_arm() {
             Chain::parallel(
                 vec![
                     Chain::sequence(vec![
-                        Chain::op(
-                            SideOutputOp::new("a", [0, 0, 0]).with_side("m", Dtype::F32, 0, 1),
-                        ),
+                        Chain::op(SideOutputOp::new("a", [0, 0, 0]).with_side(
+                            "m",
+                            Dtype::F32,
+                            0,
+                            1,
+                        )),
                         arm_a(None),
                     ]),
                     Chain::sequence(vec![
-                        Chain::op(
-                            SideOutputOp::new("b", [0, 0, 0]).with_side("m", Dtype::F32, 0, 1),
-                        ),
+                        Chain::op(SideOutputOp::new("b", [0, 0, 0]).with_side(
+                            "m",
+                            Dtype::F32,
+                            0,
+                            1,
+                        )),
                         arm_b(None),
                     ]),
                 ],
