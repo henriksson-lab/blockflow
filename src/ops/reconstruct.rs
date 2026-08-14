@@ -82,6 +82,12 @@
 // `element.reach(axis)` and there is no field that could be set to something
 // else, on `super`'s first rule.
 //
+// `reach` and not `sides`, and that is a **deliberate over-declaration**: a
+// `SubstageOperand` carries one integer per axis, so an element with no centre
+// voxel is declared here at its wider side and costs one plane per axis per
+// substage more than it reads. See `HExtremaOp::operands` for why that was
+// preferred to refusing such an element outright.
+//
 // Termination
 // -----------
 // **It terminates, and the argument is short.** Under dilation `g` is
@@ -131,6 +137,13 @@
 // An axis the element cannot move along at all — `r_a == 0`, a flat element —
 // contributes **zero** rather than its length, because the flood provably never
 // changes that coordinate.
+//
+// Where the element has no centre voxel its two sides differ, and `r_a` above is
+// the **narrower** of the two travelling sides: the flood crosses the axis at the
+// speed of its slower direction, and dividing by the faster one would put the
+// limit below what a correct run needs. A side of zero is not slow — it is a
+// direction the flood never travels — so it is skipped rather than minimised
+// over. See [`flooding_bound`].
 //
 // **What this bound assumes, stated because it is an assumption.** It is the
 // length of a *shortest* path, and a mask can force a detour: a serpentine
@@ -464,20 +477,35 @@ pub fn h_extrema(
 /// axis so the three add, and the two extra are the substage that derives the
 /// seed and the substage that observes that nothing moved.
 ///
+/// `r_a` is the **narrower travelling side** where the element has two; see the
+/// comment on the loop for why the wider one would give a limit below what a
+/// correct run needs.
+///
 /// **Not `PassLimit::for_volume`.** That is half the shortest axis, which bounds
 /// an op that peels inward from the surface and is far *below* what an op that
 /// floods along paths needs; a guard set from it would refuse correct runs.
 pub fn flooding_bound(volume: [usize; 3], element: &StructuringElement) -> SubstageLimit {
     let mut crossing = 0usize;
     for axis in 0..3 {
-        let reach = element.reach(axis);
-        // A flat axis is not a short axis: with reach zero the flood provably
-        // never changes that coordinate, so it contributes nothing rather than
-        // its length.
-        if reach == 0 || volume[axis] <= 1 {
+        let (lo, hi) = element.sides(axis);
+        // **The narrower travelling side, not the wider one.** The flood moves
+        // `hi` voxels up the axis and `lo` down it per substage, so crossing it
+        // in the slower direction is what bounds the count; taking the wider
+        // side would divide by too much and produce a limit *below* the number
+        // of substages a correct run needs, which turns a guard into a refusal
+        // of correct work. A side of zero is not slow, it is a direction the
+        // flood provably never travels — with `hi = 0` a seed never rises at
+        // all — so it is skipped rather than treated as an infinite crossing,
+        // and an axis both of whose sides are zero contributes nothing.
+        let travel = match (lo, hi) {
+            (0, 0) => continue,
+            (0, side) | (side, 0) => side,
+            (lo, hi) => lo.min(hi),
+        };
+        if volume[axis] <= 1 {
             continue;
         }
-        crossing += (volume[axis] - 1).div_ceil(reach);
+        crossing += (volume[axis] - 1).div_ceil(travel);
     }
     SubstageLimit::of(crossing + 2).expect("a sum plus two is positive")
 }
@@ -610,6 +638,19 @@ impl IterativeOp for HExtremaOp {
     /// pointwise — and `crate::iterate::substage_reach` takes the max, so a
     /// wrong zero here would be invisible while a wrong zero on the running
     /// operand would not.
+    ///
+    /// **The wider side, deliberately, and it costs a plane.** A
+    /// `SubstageOperand` carries one integer per axis and cannot say `lo != hi`,
+    /// so an element with an even extent — which reads one voxel further below
+    /// the anchor than above it — is declared symmetric at its wider side here.
+    /// That over-fetches by one plane per axis per substage and never
+    /// under-fetches, so it is safe in the direction that matters; what it is
+    /// not is *tight*, and the alternative was to refuse such an element from
+    /// this op entirely. Over-declaring was chosen because a reconstruction is
+    /// the one op here whose halo is already paid per substage rather than once,
+    /// so a caller who cares can pass a symmetric element and get the tight
+    /// number, whereas a refusal would leave them with no way to run at all.
+    /// Making it tight is a change to `SubstageOperand`, not to this op.
     fn operands(&self) -> Vec<SubstageOperand> {
         vec![
             SubstageOperand::running([
@@ -1081,6 +1122,35 @@ mod tests {
 
         // and a single voxel needs the two substages nothing can avoid
         assert_eq!(flooding_bound([1, 1, 1], &unit).substages(), 2);
+    }
+
+    /// An element with no centre voxel travels at the speed of its **slower**
+    /// direction, and the bound has to follow that side rather than the wider
+    /// one.
+    ///
+    /// The failure this pins is not a wasteful bound but a wrong one: dividing
+    /// the crossing by the wider side puts the limit *below* the substages a
+    /// correct run needs, and exceeding the limit is an error rather than a
+    /// truncation — so the op would refuse work it was doing correctly.
+    #[test]
+    fn an_off_centre_element_is_bounded_by_its_slower_direction() {
+        // sides (2, 1) on axis 0: one substage advances two voxels downward and
+        // one upward, so crossing 47 takes ceil(47 / 1), not ceil(47 / 2)
+        let even = StructuringElement::from_size(ElementShape::Box, [4, 1, 1]).unwrap();
+        assert_eq!(even.sides(0), (2, 1));
+        assert_eq!(flooding_bound([48, 1, 1], &even).substages(), 47 + 2);
+        let wider = StructuringElement::from_radius(ElementShape::Box, [2, 0, 0]);
+        assert_eq!(
+            flooding_bound([48, 1, 1], &wider).substages(),
+            24 + 2,
+            "the symmetric element of the same widest side needs half as many, \
+             which is exactly the number the off-centre one must not be given"
+        );
+
+        // a side of zero is a direction the flood never travels, not a slow one:
+        // it is skipped, and the other side sets the pace
+        let one_way = StructuringElement::from_sides(ElementShape::Box, [3, 0, 0], [0, 0, 0]);
+        assert_eq!(flooding_bound([48, 1, 1], &one_way).substages(), 16 + 2);
     }
 
     /// What can be asserted about a measured cost without measuring: the

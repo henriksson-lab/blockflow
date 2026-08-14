@@ -471,6 +471,22 @@ impl FragmentOp for VoxelizeOp {
     /// The kernel's radius, clamped to the volume — beyond the volume there is
     /// nothing to read, so claiming more would only make the halo wider.
     /// Derived from the element, and there is no field that could set it.
+    ///
+    /// **The wider side, and the direction is reversed from every other op
+    /// here.** This op *deposits*: a point at `p` writes into `p + o` for every
+    /// offset `o` of the kernel, so the points a window needs are the ones the
+    /// **reflected** kernel reaches — an element reading five below the anchor
+    /// and four above pulls points from four below the window and five above it.
+    /// The exact statement is therefore `(hi, lo)`, the element's own pair
+    /// exchanged, and `max(lo, hi)` is a bound on it in both directions.
+    ///
+    /// The wider side is declared rather than the pair because this signature
+    /// and [`FragmentInput::with_reach`] hold one integer per axis, and because
+    /// the over-declaration is charged in **whole blocks**: `block_reach`
+    /// converts to lattice steps, where a one-voxel difference usually rounds to
+    /// the same number of neighbours and at worst costs one more. Getting the
+    /// *direction* wrong would be the real failure, so it is written down here
+    /// rather than left to be rediscovered by whoever makes this per-side.
     fn reach(&self, axis: usize, volume_len: usize) -> usize {
         self.element.reach(axis).min(volume_len)
     }

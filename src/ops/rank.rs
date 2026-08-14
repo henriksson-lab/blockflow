@@ -26,6 +26,7 @@ use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::op::{Anchor, BlockOp};
+use crate::reach::Reach;
 use crate::voxels::{VoxelElement, Voxels};
 
 use super::element::{select_nth, Rank, StructuringElement, Total};
@@ -153,11 +154,21 @@ impl BlockOp for RankFilterOp {
         self.name
     }
 
-    /// The element's radius. **Derived, with nothing to configure it** — an
+    /// The element's wider side. **Derived, with nothing to configure it** — an
     /// element of size 7 reaches 3 and there is no field that could say
     /// otherwise.
+    ///
+    /// The bound; [`Self::reach_spec`] is the exact statement.
     fn reach(&self, axis: usize, _volume_len: usize) -> usize {
         self.element.reach(axis)
+    }
+
+    /// The element's two sides, per axis, which is what the window actually
+    /// reads. An element of size 10 reads five below the anchor and four above,
+    /// and declaring five on both would fetch a plane per block that no voxel
+    /// of the answer depends on.
+    fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+        self.element.reach_spec()
     }
 
     /// Every ordered element type, and the two floats through the total order.

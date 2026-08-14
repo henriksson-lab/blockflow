@@ -35,7 +35,7 @@ use ndarray::Array3;
 use crate::op::{Anchor, BlockOp};
 
 use super::element::{ElementShape, Rank, StructuringElement};
-use super::local::{AdaptiveThresholdOp, LocalStatistic, LocalStatisticOp, Statistic};
+use super::local::{AdaptiveThresholdOp, Isodata, LocalStatistic, LocalStatisticOp, Statistic};
 use super::morphology::{Morphology, MorphologyOp};
 use super::rank::RankFilterOp;
 use super::smooth::{Gaussian, SmoothOp};
@@ -131,6 +131,70 @@ pub fn measure(shape: [usize; 3], repetitions: usize) -> Vec<Sample> {
                 0.0,
             )),
             window.len() as f64 / 512.0,
+        ),
+        // Isodata at two bin counts and two window sizes, and a mean beside
+        // each, for the same reason as the two smoothings below: the question
+        // about this reducer's cost is whether it scales with the window or
+        // with the bin count, and the answer is **both** — it walks the window
+        // three times to bin it and the histogram twice more. One sample could
+        // not have told them apart. Each isodata row is read against the mean
+        // row with the same window and lattice, because the difference between
+        // the two is exactly the reducer, the gather being identical.
+        (
+            format!("local mean, {}-voxel window, spacing 8", box27.len()),
+            Box::new(LocalStatisticOp::new(
+                "mean",
+                LocalStatistic::new(box27.clone(), [8, 8, 8], Statistic::Mean).unwrap(),
+            )),
+            box27.len() as f64 / 512.0,
+        ),
+        (
+            format!(
+                "local isodata, {}-voxel window, 256 bins, spacing 8",
+                box27.len()
+            ),
+            Box::new(LocalStatisticOp::new(
+                "isodata",
+                LocalStatistic::new(
+                    box27.clone(),
+                    [8, 8, 8],
+                    Statistic::Isodata(Isodata::new(256, 1.0).unwrap()),
+                )
+                .unwrap(),
+            )),
+            256.0 / 512.0,
+        ),
+        (
+            format!(
+                "local isodata, {}-voxel window, 64 bins, spacing 8",
+                window.len()
+            ),
+            Box::new(LocalStatisticOp::new(
+                "isodata",
+                LocalStatistic::new(
+                    window.clone(),
+                    [8, 8, 8],
+                    Statistic::Isodata(Isodata::new(64, 1.0).unwrap()),
+                )
+                .unwrap(),
+            )),
+            64.0 / 512.0,
+        ),
+        (
+            format!(
+                "local isodata, {}-voxel window, 256 bins, spacing 8",
+                window.len()
+            ),
+            Box::new(LocalStatisticOp::new(
+                "isodata",
+                LocalStatistic::new(
+                    window.clone(),
+                    [8, 8, 8],
+                    Statistic::Isodata(Isodata::new(256, 1.0).unwrap()),
+                )
+                .unwrap(),
+            )),
+            256.0 / 512.0,
         ),
         // Two smoothings rather than one, because the whole question about a
         // separable convolution's cost is whether it scales with the sum of the

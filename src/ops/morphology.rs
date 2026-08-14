@@ -34,6 +34,7 @@ use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::op::{Anchor, BlockOp};
+use crate::reach::Reach;
 use crate::voxels::Voxels;
 
 use super::element::StructuringElement;
@@ -206,10 +207,36 @@ impl BlockOp for MorphologyOp {
         self.name
     }
 
-    /// The element's radius times the number of passes. Nothing configures it,
-    /// and an opening reports twice what its element does.
+    /// The element's wider side times the number of passes. Nothing configures
+    /// it, and an opening reports twice what its element does.
+    ///
+    /// The **bound**; [`Self::reach_spec`] is the exact statement, and for an
+    /// element with a centre voxel the two are the same number.
     fn reach(&self, axis: usize, _volume_len: usize) -> usize {
         self.element.reach(axis) * self.kind.reach_factor()
+    }
+
+    /// What the composition actually reads, per side.
+    ///
+    /// **This is the case the doubled reach gets subtly wrong when it is
+    /// assumed symmetric.** `sweep` applies the element as written for both
+    /// erosion and dilation — it does not reflect it between the two passes —
+    /// so composing them gives offsets `o + o'` with both drawn from the same
+    /// element, whose extremes are twice each side: an element reading five
+    /// below and four above makes an opening that reads ten below and eight
+    /// above. A symmetric assumption would either fetch ten on both sides,
+    /// which wastes two planes per block on the narrow side, or — the failure
+    /// worth naming — take one side and apply it to the other, which
+    /// under-fetches by two on the wide side and produces a plausible, wrong
+    /// volume at every seam.
+    ///
+    /// If `sweep`'s dilation is ever reflected, this becomes `lo + hi` on both
+    /// sides and [`StructuringElement::reach_spec_after`] stops being the right
+    /// method to call; that method says so at its own definition, because the
+    /// two are one derivation and it must not be possible to change one of them
+    /// alone.
+    fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+        self.element.reach_spec_after(self.kind.reach_factor())
     }
 
     /// A mask, held as a mask or held as `f64`.

@@ -53,7 +53,8 @@
 // | `tiling` | The exact-tiling predicate the correctness argument rests on. |
 // | `op` | `BlockOp` and `Chain`. Reach, execution, output shape, element type, traversal preference and constant algebra on one type, folded over one tree. |
 // | `fragment` | `FragmentOp`: the shapes `region -> region` cannot express — `volume -> fragments`, `fragments -> fragments`, `fragments -> volume`. A separate trait, one executor, and a coverage guard on the fragment side because the tiling guard cannot reach it. |
-// | `points` | A set of positions, written per block and read by region. Two states, one query method, two interchangeable indexes, and an order that is a function of the point set rather than of the cut. |
+// | `table` | A row store keyed by position, with typed columns. Two states, one query method, two interchangeable indexes, and an order that is a function of the row set rather than of the cut. |
+// | `points` | The four-column case of `table`: a position and one weight. Keeps the point's type and its headerless encoding; the store is `table`'s. |
 // | `geometry` | The inversion: read extent, trustworthy extent, `valid = core ∩ trustworthy`. |
 // | `decomposition` | The **binding** plan — parity-visible, deterministic, data-blind, hashable — plus the cost model used to choose it. |
 // | `assemble` | Writing one down: a slot cursor, the names, the per-phase reach, the element type a fragment phase writes, what each phase runs, and the source levels. Assembly only — it decides nothing the plan records, and hands back handles so a phase is never addressed by a literal. |
@@ -155,6 +156,10 @@ pub mod strategy;
 /// placed in global coordinates and rendered by region, so a block and the whole
 /// volume agree bit for bit.
 pub mod synthetic;
+/// A row per object, keyed by position, with typed columns — a size, a total, a
+/// measure — written per block and read by region. The node kind a point set
+/// was a one-column special case of; `points` is now exactly that special case.
+pub mod table;
 pub mod tiling;
 /// A block's data: rank 3, element type carried as a tag. Also the
 /// dynamic-rank buffer a side output goes to, which is a different question and
@@ -232,6 +237,9 @@ pub use strategy::{
 };
 pub use synthetic::{
     IntensitySource, LabelSource, Object, ObjectRecord, Rendered, Scene, SceneSpec,
+};
+pub use table::{
+    encoded_schema, Column, ColumnType, Row, RowBuilder, Schema, Table, TableIndex, Value,
 };
 pub use tiling::boxes_tile_exactly;
 pub use voxels::{SideBuf, VoxelElement, Voxels};

@@ -26,9 +26,17 @@
 // 3. **Decompose.** The three eigenvalues of that symmetric 3x3, in closed form.
 //    See [`symmetric_eigenvalues`] for what "closed form" costs and what is done
 //    about it.
-// 4. **Combine.** [`RidgeResponse`] folds the eigenvalues, ordered by magnitude,
-//    into one number: the two shape ratios that separate a line from a sheet and
-//    from a blob, times a term that suppresses the near-flat background.
+// 4. **Combine.** A [`Response`] folds the eigenvalues into one number. There
+//    are two of them and they answer differently, which is why the choice is a
+//    parameter rather than a constant:
+//    * [`RidgeResponse`] orders the eigenvalues by magnitude and multiplies
+//      three saturating terms — the two shape ratios that separate a line from a
+//      sheet and from a blob, times a term that suppresses the near-flat
+//      background. Bounded by one.
+//    * [`RatioResponse`] takes them in algebraic order and carries the largest
+//      curvature's **magnitude** through two power-law terms. Unbounded, and in
+//      the units of the input's own second derivative. See its documentation for
+//      why no setting of the first is the second.
 //
 // The multi-scale form runs 1-4 at each scale in the list and keeps the largest
 // response, which is what makes the filter answer for structures of a range of
@@ -120,8 +128,10 @@ use super::shapes_agree;
 /// number describes — which is the reach and the arithmetic disagreeing, the
 /// failure this crate is arranged against.
 ///
-/// Zero only for a zero sigma, which [`ScaleSpace`] refuses; every real scale
-/// therefore reaches at least one voxel.
+/// Zero for a zero sigma, which is the **axis this blur does not touch** — see
+/// [`gaussian_weights`]. [`ScaleSpace`] still refuses one, because a ridge
+/// filter differentiates the smoothed field on every axis and has its own reason
+/// to want all three positive.
 pub fn gaussian_radius(sigma: f64, truncate: f64) -> usize {
     if !(sigma > 0.0) || !(truncate > 0.0) || !sigma.is_finite() || !truncate.is_finite() {
         return 0;
@@ -135,11 +145,30 @@ pub fn gaussian_radius(sigma: f64, truncate: f64) -> usize {
 /// the tap at `-k` and the tap at `+k` are the same bits, not merely the same
 /// number to within a rounding. That matters for the second-difference stencil
 /// above it, whose whole business is cancellation.
+///
+/// **A sigma of zero is the identity on that axis**, and returns the one-tap
+/// kernel `[1.0]`. It is not a degenerate case to be refused: it is how a caller
+/// says *this axis is not blurred*, which is what a blur flat on one axis — a
+/// plane-by-plane smoothing of a volume — consists of.
+///
+/// It was refused until a caller needed exactly that and found it could not be
+/// **constructed**, while `StructuringElement::from_radius` had always accepted a
+/// zero radius for the same meaning. One concept answered two ways is a cost
+/// that keeps being paid, so the two now agree.
+///
+/// The zero case is returned before the loop rather than falling out of it,
+/// because the loop divides by `sigma`: at zero the single tap would be
+/// `0.0 / 0.0`, and `NaN.exp()` is `NaN`. A special case that produces the
+/// obviously right answer is better than arithmetic that produces a quiet one.
 pub fn gaussian_weights(sigma: f64, truncate: f64) -> Result<Vec<f64>> {
-    if !(sigma > 0.0) || !sigma.is_finite() {
+    if sigma < 0.0 || !sigma.is_finite() {
         return Err(Error::InvalidArgument(format!(
-            "a smoothing scale must be a positive, finite number of voxels; got {sigma}"
+            "a smoothing scale must be a non-negative, finite number of voxels; got {sigma}. \
+             Zero is legitimate and means the axis is not blurred."
         )));
+    }
+    if sigma == 0.0 {
+        return Ok(vec![1.0]);
     }
     if !(truncate > 0.0) || !truncate.is_finite() {
         return Err(Error::InvalidArgument(format!(
@@ -486,6 +515,223 @@ impl RidgeResponse {
     }
 }
 
+/// The **second** response, and a different question from the first rather than
+/// a re-parameterisation of it.
+///
+/// Over the same three eigenvalues in the same descending algebraic order, and
+/// with `high >= middle >= low`:
+///
+/// ```text
+/// zero unless both middle and low have the polarity's sign
+/// |low| * (middle / low)^cross * along^along_power
+/// where along = 1 + high / |middle|            if high has the polarity's sign or is zero
+///               1 - opposed * |high| / |middle| if it has the opposite sign, and zero if that is negative
+/// ```
+///
+/// **No setting of [`RidgeResponse`]'s three sensitivities is this, and the
+/// difference is structural rather than a matter of tuning.** Three ways:
+///
+/// * **The magnitude is carried, not saturated.** `|low|` appears as a factor,
+///   so the response is in the units of the input's own second derivative and is
+///   unbounded above. `RidgeResponse`'s corresponding term is
+///   `1 - exp(-|e|^2 / 2c^2)`, which is bounded by one and saturates: past a few
+///   `strength` it stops distinguishing a strong ridge from an overwhelming one.
+///   Which is wanted depends on what reads the number — a comparison against a
+///   fixed level wants the first, a product of shape terms wants the second.
+/// * **The cross-section term is a power, not a Gaussian.** `(middle / low)` is
+///   in `(0, 1]` and is raised to `cross`; `RidgeResponse` puts the same ratio
+///   through `1 - exp(-r^2 / 2a^2)`. At `cross = 0` the term is exactly one and
+///   the response stops distinguishing a line from a sheet at all, which is a
+///   configuration the exponential form cannot reach for any positive `line`.
+/// * **The along-axis term is signed and one-sided.** A curvature along the
+///   structure that has the *same* sign as the two across it reduces the
+///   response linearly towards zero; one of the opposite sign reduces it at
+///   `opposed` times the rate and cuts it to zero outright once it dominates.
+///   `RidgeResponse` folds the same eigenvalue through `|small| / sqrt(|middle
+///   low|)` and an exponential, which is even in the sign it discards.
+///
+/// The three parameters
+/// --------------------
+/// | parameter | what it weights |
+/// |---|---|
+/// | `cross` | the exponent on the ratio of the two curvatures across the structure. `0` ignores the cross-section's shape, larger values punish a flat one harder |
+/// | `along_power` | the exponent on the along-axis term |
+/// | `opposed` | how hard a curvature of the *wrong* sign along the structure is punished, relative to one of the right sign |
+///
+/// None has a default here, for [`RidgeResponse`]'s reason: they trade against
+/// each other and against the data, and a value baked in would be this crate
+/// knowing something about a caller's images.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RatioResponse {
+    cross: f64,
+    along_power: f64,
+    opposed: f64,
+    polarity: Polarity,
+}
+
+impl RatioResponse {
+    pub fn new(cross: f64, along_power: f64, opposed: f64, polarity: Polarity) -> Result<Self> {
+        for (what, value) in [
+            ("cross", cross),
+            ("along_power", along_power),
+            ("opposed", opposed),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(Error::InvalidArgument(format!(
+                    "the {what} weight must be finite and not negative; got {value}. The two \
+                     exponents are applied to bases in [0, 1], where a negative exponent sends \
+                     a base of zero to an infinity; a negative {what} would make a flatter \
+                     cross-section or a stronger opposing curvature respond *more*, which \
+                     inverts what this response is."
+                )));
+            }
+        }
+        Ok(Self {
+            cross,
+            along_power,
+            opposed,
+            polarity,
+        })
+    }
+
+    pub fn polarity(&self) -> Polarity {
+        self.polarity
+    }
+
+    /// Fold eigenvalues in **descending algebraic order** — what
+    /// [`symmetric_eigenvalues`] returns — into the response.
+    ///
+    /// [`Polarity::Valley`] is served by negating the triple, which reverses the
+    /// order, and evaluating the ridge form on it. That is exact rather than
+    /// approximate: negation of a finite `f64` is a sign-bit flip and every
+    /// quantity below is a ratio or a magnitude of the negated values, so a
+    /// valley of a volume answers bit-for-bit what a ridge of its negation
+    /// does.
+    ///
+    /// **What the eigenvalues' own conditioning costs here**, since this reads
+    /// them as ratios rather than through an exponential. `symmetric_
+    /// eigenvalues` keeps only about `sqrt(eps)` at a repeated root — see its
+    /// note, which measures it — and `middle / low` is exactly the ratio that is
+    /// near one there. So the cross-section term is accurate to about `1e-8`
+    /// precisely where it is closest to its maximum, and its *derivative* with
+    /// respect to the shape is smallest there too, which is the fortunate
+    /// direction: an error of `1e-8` in a ratio that the response is flat in
+    /// moves the answer by less than that. The along-axis term divides by
+    /// `|middle|`, which is the well-conditioned root of the pair unless all
+    /// three coincide — and all three coinciding is a sphere, where the response
+    /// is near zero for any parameters. Neither is a case this crate can improve
+    /// without a different solver; both are stated so that a caller reading
+    /// `1e-8` differences between two runs knows where they came from.
+    pub fn evaluate(&self, eigenvalues: [f64; 3]) -> f64 {
+        let [high, middle, low] = match self.polarity {
+            Polarity::Ridge => eigenvalues,
+            Polarity::Valley => [-eigenvalues[2], -eigenvalues[1], -eigenvalues[0]],
+        };
+        // Both curvatures across the structure must be strictly negative. Not
+        // `<= 0`: a zero `low` would make the ratio below `0 / 0`, and a
+        // structure with no curvature across it is not this structure.
+        if !(middle < 0.0 && low < 0.0) {
+            return 0.0;
+        }
+        let cross = (middle / low).powf(self.cross);
+        let along = if high <= 0.0 {
+            // `high` is between `middle` and zero, so this is in `[0, 1]` and
+            // is one exactly where there is no curvature along the structure.
+            1.0 + high / middle.abs()
+        } else {
+            let opposed = self.opposed * high / middle.abs();
+            // Stated as `!(x < 1)` rather than `x >= 1` so that a `NaN` — which
+            // this cannot produce from finite eigenvalues, but a caller passing
+            // eigenvalues from elsewhere could — takes the zero exit instead of
+            // being carried into the product.
+            if !(opposed < 1.0) {
+                // The opposing curvature dominates. Returned here rather than
+                // letting `(1 - opposed)` go negative and be raised to a
+                // fractional power, which is a `NaN`.
+                return 0.0;
+            }
+            1.0 - opposed
+        };
+        low.abs() * cross * along.powf(self.along_power)
+    }
+}
+
+/// Which of the two responses a filter folds its eigenvalues with.
+///
+/// An enum rather than a trait object because there are two of them and both are
+/// small `Copy` structs: the whole point of [`EigenResponse`] below is that the
+/// kernel can be generic and pay nothing, and a `Box<dyn>` per voxel would undo
+/// that.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Response {
+    /// [`RidgeResponse`]: three saturating shape terms multiplied, bounded by
+    /// one.
+    Saturating(RidgeResponse),
+    /// [`RatioResponse`]: the largest curvature's magnitude scaled by two
+    /// powers, unbounded.
+    Ratio(RatioResponse),
+}
+
+impl Response {
+    pub fn polarity(&self) -> Polarity {
+        match self {
+            Response::Saturating(response) => response.polarity(),
+            Response::Ratio(response) => response.polarity(),
+        }
+    }
+}
+
+impl From<RidgeResponse> for Response {
+    fn from(response: RidgeResponse) -> Self {
+        Response::Saturating(response)
+    }
+}
+
+impl From<RatioResponse> for Response {
+    fn from(response: RatioResponse) -> Self {
+        Response::Ratio(response)
+    }
+}
+
+/// Anything that folds three eigenvalues into one number.
+///
+/// It exists so that [`ridge_response_into`] is generic over the fold rather
+/// than naming one of them, which is what lets a second response be added
+/// **without touching the first**: `RidgeResponse` gains an impl and loses
+/// nothing, and a caller who was passing one keeps passing one.
+///
+/// Deliberately not a hook for arbitrary caller-supplied folds — it is a
+/// vocabulary this file's two implementations share and the [`Response`] enum
+/// closes over. A caller who has a third fold is welcome to implement it and
+/// call the kernel; what they cannot do is put it in a [`RidgeFilterOp`], which
+/// is a limit worth having until there is a third.
+pub trait EigenResponse {
+    /// The eigenvalues arrive in **descending algebraic order**, which is what
+    /// [`symmetric_eigenvalues`] produces.
+    fn evaluate(&self, eigenvalues: [f64; 3]) -> f64;
+}
+
+impl EigenResponse for RidgeResponse {
+    fn evaluate(&self, eigenvalues: [f64; 3]) -> f64 {
+        RidgeResponse::evaluate(self, eigenvalues)
+    }
+}
+
+impl EigenResponse for RatioResponse {
+    fn evaluate(&self, eigenvalues: [f64; 3]) -> f64 {
+        RatioResponse::evaluate(self, eigenvalues)
+    }
+}
+
+impl EigenResponse for Response {
+    fn evaluate(&self, eigenvalues: [f64; 3]) -> f64 {
+        match self {
+            Response::Saturating(response) => response.evaluate(eigenvalues),
+            Response::Ratio(response) => response.evaluate(eigenvalues),
+        }
+    }
+}
+
 // --------------------------------------------------------- scale space --
 
 /// The scales the filter is evaluated at, and everything the smoothing and the
@@ -658,15 +904,16 @@ fn normalise(hessian: [f64; 6], factor: [f64; 3]) -> [f64; 6] {
 /// Ties go to the earlier scale, by comparing strictly. That is a decision and
 /// not an accident: it makes the answer a function of the parameters rather than
 /// of the iteration order.
-pub fn ridge_response_into<T>(
+pub fn ridge_response_into<T, R>(
     input: ArrayView3<'_, T>,
     scales: &ScaleSpace,
-    response: &RidgeResponse,
+    response: &R,
     mut out: ArrayViewMut3<'_, f64>,
     mut chosen: Option<ArrayViewMut3<'_, f64>>,
 ) -> Result<()>
 where
     T: Copy + Into<f64>,
+    R: EigenResponse + ?Sized,
 {
     shapes_agree(input.shape(), out.shape(), "ridge_response_into")?;
     if let Some(chosen) = chosen.as_ref() {
@@ -710,18 +957,22 @@ where
 pub struct RidgeFilterOp {
     name: &'static str,
     scales: ScaleSpace,
-    response: RidgeResponse,
+    response: Response,
     scale_map: Option<&'static str>,
     cost: f64,
 }
 
 impl RidgeFilterOp {
-    pub fn new(name: &'static str, scales: ScaleSpace, response: RidgeResponse) -> Self {
+    /// `response` is either of the two folds — see [`Response`] — and is taken
+    /// as `impl Into<Response>` so that handing it a [`RidgeResponse`] directly,
+    /// which is what every caller of this op did before there was a second
+    /// fold, still says what it always said.
+    pub fn new(name: &'static str, scales: ScaleSpace, response: impl Into<Response>) -> Self {
         let cost = cost_for(&scales);
         Self {
             name,
             scales,
-            response,
+            response: response.into(),
             scale_map: None,
             cost,
         }
@@ -745,7 +996,7 @@ impl RidgeFilterOp {
         &self.scales
     }
 
-    pub fn response(&self) -> &RidgeResponse {
+    pub fn response(&self) -> &Response {
         &self.response
     }
 
@@ -852,8 +1103,17 @@ impl BlockOp for RidgeFilterOp {
     /// cancels. The test `a_constant_block_is_exactly_zero_and_not_nearly_zero`
     /// checks the bits over a range of constants rather than trusting this
     /// paragraph.
+    ///
+    /// **The last step is asked rather than assumed.** What is exactly true is
+    /// that the eigenvalues are `[0, 0, 0]`; what that *becomes* is the
+    /// response's business, so the declaration evaluates the response on that
+    /// triple instead of writing its answer down. Both folds return zero there
+    /// — one takes its "largest magnitude is zero" exit, the other its "no
+    /// curvature across the structure" exit — so the number is unchanged, but a
+    /// third fold that did something else would be declared correctly rather
+    /// than wrongly.
     fn constant_maps_to(&self, _value: f64) -> Option<f64> {
-        Some(0.0)
+        Some(self.response.evaluate([0.0, 0.0, 0.0]))
     }
 
     fn side_outputs(&self, volume: [usize; 3]) -> Vec<Output> {
@@ -1329,6 +1589,132 @@ mod tests {
         assert!(RidgeResponse::new(0.0, 0.5, 1.0, Polarity::Ridge).is_err());
         assert!(RidgeResponse::new(0.5, -0.5, 1.0, Polarity::Ridge).is_err());
         assert!(RidgeResponse::new(0.5, 0.5, f64::INFINITY, Polarity::Ridge).is_err());
+    }
+
+    // -------------------------------------------------- ratio response --
+
+    fn ratio() -> RatioResponse {
+        RatioResponse::new(0.5, 1.0, 0.25, Polarity::Ridge).unwrap()
+    }
+
+    #[test]
+    fn the_ratio_weights_must_be_finite_and_not_negative() {
+        assert!(RatioResponse::new(-1.0, 1.0, 0.25, Polarity::Ridge).is_err());
+        assert!(RatioResponse::new(0.5, -1.0, 0.25, Polarity::Ridge).is_err());
+        assert!(RatioResponse::new(0.5, 1.0, -0.25, Polarity::Ridge).is_err());
+        assert!(RatioResponse::new(f64::NAN, 1.0, 0.25, Polarity::Ridge).is_err());
+        // zero is legitimate for all three and is a meaningful setting: it turns
+        // the term it weights off
+        assert!(RatioResponse::new(0.0, 0.0, 0.0, Polarity::Ridge).is_ok());
+    }
+
+    /// The same ranking the first response is asked for, over the same triples,
+    /// so that the two are known to be answering the same *question* even though
+    /// they are not the same function.
+    #[test]
+    fn the_ratio_response_also_ranks_a_line_above_a_sheet_and_a_blob() {
+        let response = RatioResponse::new(1.0, 1.0, 0.25, Polarity::Ridge).unwrap();
+        let line = response.evaluate([0.0, -10.0, -10.0]);
+        let sheet = response.evaluate([0.0, 0.0, -10.0]);
+        let blob = response.evaluate([-10.0, -10.0, -10.0]);
+        assert!(line > sheet, "line {line}, sheet {sheet}");
+        assert!(line > blob, "line {line}, blob {blob}");
+        assert_eq!(sheet, 0.0, "a sheet has no second negative curvature");
+        assert_eq!(
+            blob, 0.0,
+            "curvature along the structure cancels it exactly"
+        );
+
+        // the other polarity of the same structure is not this structure...
+        assert_eq!(response.evaluate([10.0, 10.0, 0.0]), 0.0);
+        // ...and is exactly this one on the negated triple
+        let valley = RatioResponse::new(1.0, 1.0, 0.25, Polarity::Valley).unwrap();
+        assert_eq!(valley.evaluate([10.0, 10.0, 0.0]), line);
+    }
+
+    /// The two exits that keep a division or a fractional power from producing
+    /// a `NaN`, and the one that is a modelling decision rather than a guard.
+    #[test]
+    fn the_ratio_response_has_no_nan_and_cuts_a_dominating_opposed_curvature() {
+        let response = RatioResponse::new(0.5, 0.5, 0.25, Polarity::Ridge).unwrap();
+        assert_eq!(response.evaluate([0.0, 0.0, 0.0]), 0.0);
+        assert_eq!(response.evaluate([0.0, 0.0, -3.0]), 0.0);
+        // opposed * e1 / |e2| >= 1 cuts the response to zero rather than raising
+        // a negative base to a fractional power
+        assert_eq!(response.evaluate([40.0, -1.0, -10.0]), 0.0);
+        // and just short of the cut it is positive, and less than the same
+        // structure with no opposing curvature at all
+        let just_short = response.evaluate([3.0, -1.0, -10.0]);
+        let unopposed = response.evaluate([0.0, -1.0, -10.0]);
+        assert!(
+            just_short > 0.0 && just_short < unopposed,
+            "{just_short} against {unopposed}"
+        );
+    }
+
+    /// The response is **unbounded**, which is the property no setting of
+    /// [`RidgeResponse`] has: it carries the largest curvature's magnitude.
+    #[test]
+    fn the_ratio_response_carries_the_magnitude_rather_than_saturating_it() {
+        let response = RatioResponse::new(1.0, 1.0, 0.25, Polarity::Ridge).unwrap();
+        let weak = response.evaluate([0.0, -1.0, -1.0]);
+        let strong = response.evaluate([0.0, -1000.0, -1000.0]);
+        assert_eq!(weak, 1.0);
+        assert_eq!(strong, 1000.0);
+        for strength in [0.01f64, 1.0, 1e6] {
+            let existing = RidgeResponse::new(0.5, 0.5, strength, Polarity::Ridge).unwrap();
+            assert!(existing.evaluate([0.0, -1000.0, -1000.0]) <= 1.0);
+        }
+    }
+
+    /// A constant block is exactly zero for this fold too, and the op's
+    /// declaration is the fold's own answer rather than a number written down
+    /// beside it.
+    #[test]
+    fn a_constant_block_is_exactly_zero_for_the_ratio_response_as_well() {
+        let op = RidgeFilterOp::new("ratio", scales(), ratio());
+        for constant in [0.0, 0.1, -7.5, 1e12] {
+            let input: Voxels = Array3::from_elem((9, 8, 7), constant).into();
+            let mut out = Voxels::zeros(Dtype::F64, [9, 8, 7]).unwrap();
+            op.apply(&input, &mut out, &Anchor::whole([9, 8, 7]))
+                .unwrap();
+            assert!(out.view::<f64>().unwrap().iter().all(|&value| value == 0.0));
+            assert_eq!(op.constant_maps_to(constant), Some(0.0));
+        }
+    }
+
+    /// The op takes either fold, and the choice changes the answer rather than
+    /// merely the type: on the same volume the two produce different numbers.
+    #[test]
+    fn the_filter_takes_either_fold_and_the_two_do_not_agree() {
+        let dim = (5usize, 15, 15);
+        let field = Array3::from_shape_fn(dim, |(_, j, k)| {
+            let (dy, dz) = (j as f64 - 7.0, k as f64 - 7.0);
+            if dy * dy + dz * dz <= 4.0 {
+                1.0
+            } else {
+                0.0
+            }
+        });
+        let run = |op: RidgeFilterOp| {
+            let input: Voxels = field.clone().into();
+            let mut out = Voxels::zeros(Dtype::F64, [dim.0, dim.1, dim.2]).unwrap();
+            op.apply(&input, &mut out, &Anchor::whole([dim.0, dim.1, dim.2]))
+                .unwrap();
+            out.view::<f64>().unwrap().to_owned()
+        };
+        let saturating = run(RidgeFilterOp::new("saturating", scales(), response()));
+        let ratios = run(RidgeFilterOp::new("ratio", scales(), ratio()));
+        assert!(saturating.iter().all(|&value| value <= 1.0));
+        assert!(
+            ratios.iter().any(|&value| value > 0.0),
+            "the ratio fold answered nothing at all"
+        );
+        assert_ne!(saturating, ratios);
+        // both find the structure, which is what makes them two answers to one
+        // question rather than one answer and one accident
+        assert!(saturating[[2, 7, 7]] > saturating[[2, 1, 1]]);
+        assert!(ratios[[2, 7, 7]] > ratios[[2, 1, 1]]);
     }
 
     // ---------------------------------------------------------- kernel --

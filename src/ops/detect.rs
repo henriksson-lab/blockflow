@@ -92,6 +92,92 @@
 // and that is the definition rather than a defect. A caller who needs a point on
 // the object wants a different operation.
 //
+// One point per region, or one row
+// --------------------------------
+// A point is a position and one number. That is enough for "there is something
+// here and it is this big" and it is not enough for anything that wants to
+// *filter* on what was found — which is what a consumer of this op does next.
+// So the op can emit a `crate::table` row per component instead, under
+// [`measurement_schema`], and the choice is a parameter: [`Emission`].
+//
+// **The default is the point form and it is byte-identical to what this op has
+// always written.** Same stream, same headerless four-word encoding, same order,
+// same bytes. That was chosen over the alternative — always emit the row, and
+// project back to points for `ops::voxelize` — for two reasons:
+//
+// * `ops::voxelize` reads a point blob and holds **no schema**. Feeding it a
+//   table would mean either teaching it to find a weight column by name, turning
+//   a fixed four-word layout into a run-time lookup that can fail, or writing two
+//   streams from this phase — which doubles the output and makes the lifecycle
+//   and coverage decisions for a stream half the callers do not want;
+// * a row is about a hundred and four bytes per component against a point's
+//   thirty-two. A caller who wants a density render should not pay three times
+//   over in the run's persistent output for columns it will not read.
+//
+// There is a second, smaller cost with a sharper edge, and it is worth naming
+// because it is the one that scales the wrong way. A table blob carries its
+// schema, and this schema is ten named columns — about **two hundred and
+// seventy bytes of header, per blob**. The output stream declares
+// `Coverage::EveryBlock`, so every block writes one whether or not it owns a
+// component, and a block that owns none writes a header and no rows where the
+// point form writes nothing at all. On a large lattice over a sparse mask that
+// is a fixed charge per block rather than per object. It buys the thing the
+// self-description is for — a consumer handed the wrong stream is told which
+// column disagrees — and it is a fair trade for a run that wanted the columns;
+// it is not a fair trade for a run that did not, which is the third reason the
+// default is the point form.
+//
+// What it costs, and it is a real cost: **the two forms are not distinguishable
+// from the bytes alone in the direction that matters.** A table blob announces
+// itself — it has a magic word and its schema in front — so a reader handed one
+// where it expected points refuses it. A point blob does not: any four-word blob
+// is a valid point set, so a reader expecting rows and handed points refuses it
+// by the magic, but a reader expecting *points* and handed a truncated anything
+// is on its own. That asymmetry was already there and this does not add to it;
+// the mitigation is that the op knows which it wrote and the plan is where it is
+// wired.
+//
+// [`points_of_measurements`] is the projection back, for a caller who asked for
+// rows and still wants to render them.
+//
+// What the columns are, and why not more
+// --------------------------------------
+// Ten, all `U64`, all merged by an associative and commutative operation:
+// `count` and `sum_0..2` by addition, `min_0..2` and `max_0..2` by minimum and
+// maximum. [`measurement_schema`] is the table and the argument for each.
+//
+// **The constraint that decided the set is the merge.** A column here is a
+// merged accumulator, and a quantity that cannot be folded exactly across a seam
+// makes the answer a function of where the volume was cut — which is the one
+// defect this crate exists to prevent. That rules out, concretely:
+//
+// * **anything accumulated in `f64`.** A running mean, a running variance, a
+//   normalised moment. Floating-point addition does not associate, so the seam
+//   merge would stop being exact and start being nearly exact, and "nearly" is
+//   the decomposition-dependent answer the integer accumulators exist to rule
+//   out. The derived quantity is the caller's to compute from exact integers,
+//   once, after the merge — which is what the sums are for;
+// * **second moments**, which are a closer call and are left out on a different
+//   ground. `sum(x^2)` merges by addition and is exactly as associative as
+//   `sum(x)`, so a radius of gyration or an anisotropy could be carried here
+//   honestly. What stops it is the range: the first moment of a cubic volume of
+//   edge `L` is about `L^4 / 2` and the second is about `L^5 / 3`, so a `u64`
+//   carries the first to `L` of about 65536 and the second only to about 1800 —
+//   a volume this crate is routinely pointed past, where every row would be a
+//   refusal. Six more columns that stop working at a tenth of the volume the
+//   other ten survive is not a trade worth making before a consumer asks for it,
+//   and none does;
+// * **a surface area, or any count of exposed faces.** It looks associative and
+//   is not: phase 0 is halo-free, so a voxel on a block boundary cannot tell a
+//   neighbour that is outside the volume from one that is outside the *block*,
+//   and would count a face that is not there. Making it right needs a halo of
+//   one and a rule about which side of a seam owns the face — that is a design,
+//   not a field, and it is not this op's;
+// * **anything needing a second input array** — an intensity total, a weighted
+//   centroid, a background-corrected maximum. A `FragmentOp` reads one level and
+//   this op reads the mask. See "The weighted centroid, which is not here"
+//   below, which is where that hook goes.
+//
 // What a point carries, and why it is the count
 // ---------------------------------------------
 // `Point::weight` is the component's **voxel count**, as an `f64` — exact, since
@@ -171,6 +257,7 @@
 // pixels — the same shape, for the same reason.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
@@ -184,7 +271,9 @@ use crate::fragment::{
 };
 use crate::geometry::BlockGrid;
 use crate::points::{encode_points, Point};
+use crate::region::Region;
 use crate::sidecar::Lifecycle;
+use crate::table::{Column, RowBuilder, Schema, Table, Value, POSITION_WORDS};
 
 use super::components::{
     bytes_to_words, empty_planes, expect_end, label_members_into, planes_of, push_planes,
@@ -196,14 +285,16 @@ use super::shapes_agree;
 
 // ------------------------------------------------------------ the moments --
 
-/// What a component contributes to its own centroid: how many voxels it has and
-/// where they are.
+/// What a component contributes to its own row: how many voxels it has, where
+/// they are, and how far they reach.
 ///
-/// The zeroth and first moments, and nothing else — a centroid needs no more,
-/// and anything else in here would be a field that has to be merged correctly
-/// for no reason. Both fields are exact integers and both merge by addition; the
-/// module header is where that is argued for and where the bound is stated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// **Every field is an exact integer under an associative, commutative merge**
+/// — `+` for the count and the sums, `min` and `max` for the corners — and that
+/// is the entry condition rather than a description. A quantity that cannot be
+/// folded that way makes a component's answer a function of where the volume was
+/// cut, and there is no field here that is not. The module header is where the
+/// argument is made and where the bounds are stated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Moments {
     /// Voxels in the component.
     pub count: u64,
@@ -211,41 +302,78 @@ pub struct Moments {
     /// **volume** coordinates. Block-local ones would make the merge a function
     /// of where the blocks were, which is the whole thing being avoided.
     pub sums: [u64; 3],
+    /// Per axis, the smallest coordinate the component occupies, in volume
+    /// coordinates. `u64::MAX` when there are no voxels, which is `min`'s
+    /// identity and not a coordinate — read it through [`Moments::bounds`],
+    /// which returns `None` instead.
+    pub min: [u64; 3],
+    /// Per axis, the **largest** coordinate the component occupies — inclusive,
+    /// so the extent along an axis is `max - min + 1`.
+    ///
+    /// Inclusive rather than half-open, against the rest of the crate's
+    /// convention, and the reason is that this is not a region anybody asked
+    /// for: it is a voxel the component actually contains, and a column holding
+    /// one-past-it would report a coordinate that is not in the object. The
+    /// convention exists for query extents, and this is a measurement.
+    pub max: [u64; 3],
+}
+
+/// The identity, which is what a default accumulator has to be.
+///
+/// Spelled out rather than derived: `min`'s identity is `u64::MAX` and a derived
+/// `Default` would give `0`, which is a *valid coordinate* and would therefore
+/// pin every component's low corner to the origin. That is the failure mode an
+/// all-zero identity hides, so the derive is refused here.
+impl Default for Moments {
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 impl Moments {
-    /// The identity of the merge: no voxels, and therefore no centroid.
+    /// The identity of the merge: no voxels, and therefore no centroid and no
+    /// bounds. The corners are each monoid's identity — `u64::MAX` for the
+    /// minimum, `0` for the maximum — so merging an empty accumulator in is a
+    /// no-op on every field.
     pub const EMPTY: Self = Self {
         count: 0,
         sums: [0, 0, 0],
+        min: [u64::MAX; 3],
+        max: [0, 0, 0],
     };
 
     /// Add one voxel, at a **volume** coordinate.
     ///
-    /// Checked rather than wrapping. An overflowing sum is not a slightly wrong
-    /// centroid, it is an arbitrary one, and a silently arbitrary answer is the
-    /// failure mode this crate is arranged against. The header says how far the
-    /// accumulator carries before this can fire: a cubic volume of about 65536 on
-    /// a side, which is 2.8e14 voxels.
+    /// Checked rather than wrapping, for the sums. An overflowing sum is not a
+    /// slightly wrong centroid, it is an arbitrary one, and a silently arbitrary
+    /// answer is the failure mode this crate is arranged against. The header says
+    /// how far the accumulator carries before this can fire: a cubic volume of
+    /// about 65536 on a side, which is 2.8e14 voxels. The corners need no such
+    /// check — `min` and `max` of coordinates are coordinates.
     pub fn add(&mut self, at: [usize; 3]) -> Result<()> {
         self.count = self
             .count
             .checked_add(1)
             .ok_or_else(|| overflowed("count"))?;
         for axis in 0..3 {
+            let coordinate = at[axis] as u64;
             self.sums[axis] = self.sums[axis]
-                .checked_add(at[axis] as u64)
+                .checked_add(coordinate)
                 .ok_or_else(|| overflowed("position sum"))?;
+            self.min[axis] = self.min[axis].min(coordinate);
+            self.max[axis] = self.max[axis].max(coordinate);
         }
         Ok(())
     }
 
     /// Fold another partial accumulation into this one.
     ///
-    /// **This is the whole of the seam.** Addition is associative and
-    /// commutative, so a component cut into any number of pieces gives the same
-    /// totals as the same component seen whole, whatever order the pieces arrive
-    /// in — which is why a centroid across a seam is *exact* rather than close.
+    /// **This is the whole of the seam.** Every field's operation is associative
+    /// and commutative — addition for the count and the sums, `min` and `max`
+    /// for the corners — so a component cut into any number of pieces gives the
+    /// same totals as the same component seen whole, whatever order the pieces
+    /// arrive in. That is why a row across a seam is *exact* rather than close,
+    /// and it is the reason nothing else is allowed in this struct.
     pub fn merge(&mut self, other: &Self) -> Result<()> {
         self.count = self
             .count
@@ -255,12 +383,34 @@ impl Moments {
             self.sums[axis] = self.sums[axis]
                 .checked_add(other.sums[axis])
                 .ok_or_else(|| overflowed("position sum"))?;
+            self.min[axis] = self.min[axis].min(other.min[axis]);
+            self.max[axis] = self.max[axis].max(other.max[axis]);
         }
         Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// The component's bounding box, as an **inclusive** pair of corners, or
+    /// `None` for a component with no voxels in it.
+    ///
+    /// `None` rather than the identity pair, for [`Moments::centroid`]'s reason:
+    /// `(u64::MAX, 0)` is a well-formed identity and an absurd box, and handing
+    /// it out would put the burden of noticing on every caller.
+    pub fn bounds(&self) -> Option<([usize; 3], [usize; 3])> {
+        if self.count == 0 {
+            return None;
+        }
+        let mut low = [0usize; 3];
+        let mut high = [0usize; 3];
+        for axis in 0..3 {
+            // Both came from a `usize` in `add`, so neither can truncate.
+            low[axis] = self.min[axis] as usize;
+            high[axis] = self.max[axis] as usize;
+        }
+        Some((low, high))
     }
 
     /// The centroid, rounded to a voxel, or `None` for a component with no
@@ -388,10 +538,230 @@ pub fn centroid_points(components: &[Moments]) -> Vec<Point> {
 /// modelling difference rather than a decomposition bug. `pub` because the
 /// acceptance suite in `tests/` is a separate crate and needs exactly this.
 pub fn detect_regions(mask: ArrayView3<'_, bool>) -> Result<Vec<Point>> {
+    Ok(centroid_points(&region_moments(mask)?))
+}
+
+/// The whole-volume answer as **rows**: [`detect_regions`]'s blob, in the richer
+/// form.
+///
+/// Same kernels again, and for the same reason — the reference and the blocked
+/// path must differ only in how the volume was cut, or a disagreement stops
+/// being evidence of anything.
+pub fn detect_region_rows(mask: ArrayView3<'_, bool>) -> Result<Vec<u8>> {
+    encode_measurements(&region_moments(mask)?)
+}
+
+/// The accumulators of every component of a whole mask, unmerged because there
+/// is nothing to merge: one array, one labelling, one pass.
+pub fn region_moments(mask: ArrayView3<'_, bool>) -> Result<Vec<Moments>> {
     let mut labels = Array3::<u32>::zeros(mask.raw_dim());
     let count = label_regions_into(mask, labels.view_mut())?;
-    let moments = moments_of_labels(labels.view(), count, [0, 0, 0])?;
-    Ok(centroid_points(&moments))
+    moments_of_labels(labels.view(), count, [0, 0, 0])
+}
+
+// -------------------------------------------------------------- the table --
+
+/// What one component becomes when it is emitted.
+///
+/// **The default is [`Emission::Point`] and it is byte-identical to what this op
+/// has always written** — same stream, same headerless four-word encoding, same
+/// order. The richer form is opt-in. That choice is argued for in the module
+/// header under "One point per region, or one row"; the short version is that
+/// `ops::voxelize` reads point blobs and holds no schema, so making the rich form
+/// the default would have meant either teaching `voxelize` to find a weight
+/// column by name — a run-time lookup where it now has a fixed layout — or
+/// writing two streams from one op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Emission {
+    /// A [`Point`]: the rounded centroid, carrying the component's voxel count
+    /// as its weight. Thirty-two bytes per component, and what `ops::voxelize`
+    /// takes directly.
+    #[default]
+    Point,
+    /// A `crate::table` row: every measurement the mask alone determines, under
+    /// [`measurement_schema`]. About a hundred and four bytes per component
+    /// against a point's thirty-two, which is why it is not the default.
+    Measured,
+}
+
+impl Emission {
+    /// The schema a blob of this form carries, or `None` for the point form —
+    /// which is headerless and therefore has no schema *in the blob*, even
+    /// though its words are a row of `Schema::points()`.
+    pub fn schema(self) -> Option<Schema> {
+        match self {
+            Emission::Point => None,
+            Emission::Measured => Some(measurement_schema()),
+        }
+    }
+
+    /// The components of one block, in the canonical order, as the bytes that
+    /// block writes.
+    pub fn encode(self, components: &[Moments]) -> Result<Vec<u8>> {
+        match self {
+            Emission::Point => Ok(encode_points(&centroid_points(components))),
+            Emission::Measured => encode_measurements(components),
+        }
+    }
+}
+
+/// Column names, in schema order. `pub` so that a consumer can name a column
+/// without spelling the string, and so that a rename is one edit.
+pub const COUNT: &str = "count";
+/// Per-axis first-moment columns: `sum_0`, `sum_1`, `sum_2`.
+pub const SUM: [&str; 3] = ["sum_0", "sum_1", "sum_2"];
+/// Per-axis bounding-box low corner: `min_0`, `min_1`, `min_2`.
+pub const MIN: [&str; 3] = ["min_0", "min_1", "min_2"];
+/// Per-axis bounding-box high corner, **inclusive**: `max_0`, `max_1`, `max_2`.
+pub const MAX: [&str; 3] = ["max_0", "max_1", "max_2"];
+
+/// The schema [`Emission::Measured`] writes: ten `U64` columns, and nothing else.
+///
+/// **Every column is `U64`, and that is the entry condition rather than a
+/// preference.** A column here is a merged accumulator, and `crate::table`'s
+/// header says what an `F64` column can and cannot promise: the bits round trip,
+/// and a partial fold merged across a seam is not the same number as the whole
+/// fold. This op's whole claim is that it *is* the same number, so a float
+/// column would be a place for the claim to stop being true.
+///
+/// | column | what it is | how it merges |
+/// |---|---|---|
+/// | `count` | voxels in the component | `+` |
+/// | `sum_0..2` | per-axis sum of coordinates, volume-relative | `+` |
+/// | `min_0..2` | per-axis smallest coordinate occupied | `min` |
+/// | `max_0..2` | per-axis largest coordinate occupied, inclusive | `max` |
+///
+/// **Why the sums are here and not just the centroid.** The row's *position* is
+/// the rounded centroid, which is a voxel; `sums / count` is the rational the
+/// rounding threw away. A consumer that wants the sub-voxel centre — which is
+/// what a reference implementation of this operation reports, in floating point
+/// — recovers it exactly from these four numbers and cannot recover it from the
+/// position. They also make the row **closed under merging**: two rows for the
+/// same component, from two runs or two halves of a lattice, can be added, and
+/// a row holding only a derived centroid cannot be.
+///
+/// **Why the corners.** They are the one further measurement a mask alone
+/// determines that merges exactly, and they are what separates a compact
+/// component from a long thin one of the same `count` — the extent along an axis
+/// is `max - min + 1`. A consumer filtering on size alone cannot tell those
+/// apart.
+///
+/// **What is deliberately absent** is anything needing a second input array — an
+/// intensity, a weighted centroid, a background-corrected total. A `FragmentOp`
+/// reads one level and this op reads the mask; the module header says what that
+/// would take and why it is not a hook.
+pub fn measurement_schema() -> Schema {
+    let mut columns = vec![Column::u64(COUNT)];
+    for group in [&SUM, &MIN, &MAX] {
+        for name in group {
+            columns.push(Column::u64(*name));
+        }
+    }
+    // Ten distinct, non-empty names, so this cannot fail; expressed as a
+    // `Result` internally and unwrapped here rather than making every caller
+    // handle an impossibility.
+    Schema::new(columns).expect("the measurement schema names ten distinct columns")
+}
+
+/// Words a measured row occupies: the three positions and the ten columns.
+const MEASURED_WORDS: usize = POSITION_WORDS + 10;
+
+/// One component's row, as the words it is stored and ordered by, or `None` for
+/// a component with no voxels.
+///
+/// The words rather than a struct, because **this array is the canonical sort
+/// key**: `crate::table` orders rows by their own words, positions first and
+/// then the payload in schema order, so sorting these arrays is the canonical
+/// order by construction rather than by a comparator that has to be kept in step
+/// with the schema. Every column is `U64`, whose bits order the way its values
+/// do, so there is no place for the two to disagree.
+fn measured_row(moments: &Moments) -> Option<[u64; MEASURED_WORDS]> {
+    let at = moments.centroid()?;
+    let (low, high) = moments.bounds()?;
+    let mut words = [0u64; MEASURED_WORDS];
+    for axis in 0..3 {
+        words[axis] = at[axis] as u64;
+    }
+    words[POSITION_WORDS] = moments.count;
+    for axis in 0..3 {
+        words[POSITION_WORDS + 1 + axis] = moments.sums[axis];
+        words[POSITION_WORDS + 4 + axis] = low[axis] as u64;
+        words[POSITION_WORDS + 7 + axis] = high[axis] as u64;
+    }
+    Some(words)
+}
+
+/// A set of components as a table blob, in the canonical order.
+///
+/// Components with no voxels are dropped rather than turned into a row at the
+/// origin, for [`centroid_points`]'s reason: an empty accumulator is a
+/// `(block, label)` slot that no voxel was found for, which is a thing that
+/// exists in the flat numbering and not in the volume.
+///
+/// Sorted here so that a block's blob is a function of the component set and not
+/// of the order the union-find happened to produce its roots in — the same
+/// property `centroid_points` establishes for the point form, and it has to hold
+/// for both or the two forms would be reproducible to different degrees.
+pub fn encode_measurements(components: &[Moments]) -> Result<Vec<u8>> {
+    let mut rows: Vec<[u64; MEASURED_WORDS]> = components.iter().filter_map(measured_row).collect();
+    rows.sort_unstable();
+
+    let mut builder = RowBuilder::new(Arc::new(measurement_schema()));
+    for row in &rows {
+        let at = [row[0] as usize, row[1] as usize, row[2] as usize];
+        let values: Vec<Value> = row[POSITION_WORDS..]
+            .iter()
+            .copied()
+            .map(Value::U64)
+            .collect();
+        // Round-trips the words through the typed push rather than writing them
+        // straight into the buffer, so that a schema that grew a column without
+        // `measured_row` growing a word is refused here instead of producing
+        // rows that decode as something plausible.
+        builder.push(at, &values)?;
+    }
+    Ok(builder.encode())
+}
+
+/// The points of a measured blob: the projection back to what
+/// [`Emission::Point`] would have written.
+///
+/// Here so that a caller who asked for rows can still feed `ops::voxelize`
+/// without re-running anything, and so that "the two forms agree" is a statement
+/// with one implementation behind it —
+/// `the_two_emissions_describe_the_same_components` drives this against the
+/// point blob and compares bytes.
+///
+/// Refuses a blob that is not this schema, naming the column, because that is
+/// what carrying the schema in the blob is for. `volume` is the volume the rows
+/// were measured over — a row outside it is refused rather than projected, which
+/// is `Table::write`'s check and not a second one here.
+///
+/// The result is in the canonical point order and is **byte-identical** through
+/// `encode_points` to what the point form would have written for the same
+/// components: both sequences are the same multiset sorted on the position and
+/// then the count, and two entries that tie on both are the same four words.
+pub fn points_of_measurements(volume: [usize; 3], bytes: &[u8]) -> Result<Vec<Point>> {
+    let schema = measurement_schema();
+    let count = schema
+        .index_of(COUNT)
+        .expect("the measurement schema has a count column");
+    let mut table = Table::new(volume, schema)?;
+    table.write([0, 0, 0], bytes)?;
+    // Sealed so the scan is in the canonical order, which is what makes the
+    // byte-identity above a property rather than a coincidence of the blob's
+    // own order.
+    table.seal()?;
+    // A loop rather than a `collect` on the tail expression: the scan borrows
+    // the table, and a borrow in a function's final expression outlives the
+    // local it is taken from.
+    let mut points = Vec::with_capacity(table.len());
+    for row in table.scan(&Region::new(&[0, 0, 0], &volume))? {
+        // Exact: a count past 2^53 would need a volume of nine petavoxels,
+        // which is the same bound the point form's weight has always had.
+        points.push(Point::weighted(row.at(), row.u64(count)? as f64));
+    }
+    Ok(points)
 }
 
 // -------------------------------------------------------------- ownership --
@@ -417,20 +787,30 @@ pub fn owner_of(grid: &BlockGrid, at: [usize; 3]) -> [usize; 3] {
     index
 }
 
-/// The points of `components` that `block` owns, in the canonical order.
+/// The components of `components` that `block` owns.
 ///
-/// Exactly one block of the lattice returns any given point, because
-/// [`owner_of`] is a function and the centroid is a function of the component.
-pub fn points_owned_by(components: &[Moments], grid: &BlockGrid, block: [usize; 3]) -> Vec<Point> {
-    let mine: Vec<Moments> = components
+/// Exactly one block of the lattice returns any given component, because
+/// [`owner_of`] is a function and the centroid is a function of the component —
+/// so the ownership rule holds whatever the component is eventually emitted *as*,
+/// which is why the filter is here and not in either encoder.
+pub fn moments_owned_by(
+    components: &[Moments],
+    grid: &BlockGrid,
+    block: [usize; 3],
+) -> Vec<Moments> {
+    components
         .iter()
         .filter(|moments| match moments.centroid() {
             None => false,
             Some(at) => owner_of(grid, at) == block,
         })
         .copied()
-        .collect();
-    centroid_points(&mine)
+        .collect()
+}
+
+/// The points of `components` that `block` owns, in the canonical order.
+pub fn points_owned_by(components: &[Moments], grid: &BlockGrid, block: [usize; 3]) -> Vec<Point> {
+    centroid_points(&moments_owned_by(components, grid, block))
 }
 
 // --------------------------------------------------------------- fragment --
@@ -482,19 +862,31 @@ impl RegionMoments {
     }
 
     /// A self-describing byte form: little-endian `u32` throughout, with a magic
-    /// and a version in front, and each accumulator as four `u64`s — the count
-    /// and the three sums — low word first.
+    /// and a version in front, and each accumulator as ten `u64`s — the count,
+    /// the three sums and the two corners — low word first.
     ///
     /// The words rather than a float or a decimal, because the merge adds these
     /// and the whole claim of the op is that the addition is exact. A number that
     /// had been through a lossy encoding on the way to the merge would make the
     /// claim false in transit, where nothing would catch it.
+    ///
+    /// **The corners travel whether or not the run will emit them.** A fragment
+    /// whose payload depended on which [`Emission`] phase 1 was configured for
+    /// would be a second format, decoded by the same reader, distinguishable only
+    /// by a field the reader does not have — and the saving is six words per
+    /// *label* against six planes of labels, which is nothing. One format, always.
     pub fn encode(&self) -> Vec<u8> {
         let mut words: Vec<u32> = vec![MAGIC, VERSION, self.labels];
         for moments in &self.moments {
             push_u64(&mut words, moments.count);
             for axis in 0..3 {
                 push_u64(&mut words, moments.sums[axis]);
+            }
+            for axis in 0..3 {
+                push_u64(&mut words, moments.min[axis]);
+            }
+            for axis in 0..3 {
+                push_u64(&mut words, moments.max[axis]);
             }
         }
         push_planes(&self.faces, &mut words);
@@ -527,6 +919,16 @@ impl RegionMoments {
                     take_u64(record, 4),
                     take_u64(record, 6),
                 ],
+                min: [
+                    take_u64(record, 8),
+                    take_u64(record, 10),
+                    take_u64(record, 12),
+                ],
+                max: [
+                    take_u64(record, 14),
+                    take_u64(record, 16),
+                    take_u64(record, 18),
+                ],
             });
         }
         at += payload;
@@ -545,10 +947,18 @@ impl RegionMoments {
 /// point: three fragments in this crate are six planes and a per-label payload,
 /// so a stream name reused by two of them would otherwise decode one as another.
 const MAGIC: u32 = 0x4354_4544;
-const VERSION: u32 = 1;
 
-/// Four `u64`s — the count and the three sums — as eight `u32` words.
-const WORDS_PER_LABEL: usize = 8;
+/// Bumped from 1 when the accumulator grew its bounding box.
+///
+/// A version 1 blob is one word-count short per label, so a new reader would
+/// have refused it anyway — somewhere inside the face planes, with a message
+/// about the wrong thing. The bump makes the refusal say what actually happened,
+/// which is the only reason a version number is worth carrying.
+const VERSION: u32 = 2;
+
+/// Ten `u64`s — the count, the three sums and the two corners — as twenty `u32`
+/// words.
+const WORDS_PER_LABEL: usize = 20;
 
 fn push_u64(words: &mut Vec<u32>, value: u64) {
     words.push(value as u32);
@@ -702,6 +1112,11 @@ pub struct RegionPointsOp {
     points_stream: String,
     lifecycle: Lifecycle,
     lattice: [usize; 3],
+    /// What one component becomes. [`Emission::Point`] unless a caller said
+    /// otherwise, and that default is the whole of the compatibility story:
+    /// every existing constructor leaves it alone, so every existing caller gets
+    /// the bytes it always got.
+    emission: Emission,
 }
 
 impl RegionPointsOp {
@@ -727,6 +1142,7 @@ impl RegionPointsOp {
             points_stream: points_stream.into(),
             lifecycle,
             lattice: grid.blocks_per_axis(),
+            emission: Emission::Point,
         }
     }
 
@@ -752,6 +1168,25 @@ impl RegionPointsOp {
             lifecycle,
             grid,
         )
+    }
+
+    /// The same op, emitting rows instead of points.
+    ///
+    /// A consuming builder rather than a parameter on [`RegionPointsOp::new`],
+    /// so that the two existing constructors keep their signatures and every
+    /// call site that does not say this word is unchanged — which is the point
+    /// of defaulting rather than projecting. What a caller takes on by saying it
+    /// is that the output stream is now a `crate::table` blob and not a point
+    /// blob: `ops::voxelize` cannot read it directly, and
+    /// [`points_of_measurements`] is the projection back.
+    pub fn emitting(mut self, emission: Emission) -> Self {
+        self.emission = emission;
+        self
+    }
+
+    /// What one component becomes in this op's output.
+    pub fn emission(&self) -> Emission {
+        self.emission
     }
 
     /// The stream the points are written to.
@@ -822,10 +1257,13 @@ impl FragmentOp for RegionPointsOp {
             reports.insert(key.block, RegionMoments::decode(bytes)?);
         }
         let components = merge_moments(&reports, at.grid.blocks_per_axis())?;
-        let mine = points_owned_by(&components, at.grid, at.index);
+        // Ownership first, emission second: which block writes a component is a
+        // property of the component, so it must not be able to depend on the
+        // form it is written in.
+        let mine = moments_owned_by(&components, at.grid, at.index);
         Ok(BlockOutput::fragment(
             self.points_stream.clone(),
-            encode_points(&mine),
+            self.emission.encode(&mine)?,
         ))
     }
 }
@@ -887,6 +1325,31 @@ pub fn append_to(
     points_stream: impl Into<String>,
     points_lifecycle: Lifecycle,
 ) -> Result<Phase> {
+    append_emitting(
+        plan,
+        moments_stream,
+        moments_lifecycle,
+        points_stream,
+        points_lifecycle,
+        Emission::Point,
+    )
+}
+
+/// [`append_to`], with the output form said out loud.
+///
+/// The general one; `append_to` is this with [`Emission::Point`], which is the
+/// form the two phases have always written. Kept as two functions rather than
+/// one with a sixth argument so that no existing call site has to be edited to
+/// say what it was already doing — a mechanical edit across every caller is
+/// exactly the kind of change that gets one call site wrong.
+pub fn append_emitting(
+    plan: &mut PlanBuilder,
+    moments_stream: impl Into<String>,
+    moments_lifecycle: Lifecycle,
+    points_stream: impl Into<String>,
+    points_lifecycle: Lifecycle,
+    emission: Emission,
+) -> Result<Phase> {
     let moments_stream = moments_stream.into();
     let grid = plan.grid().clone();
     let moments = plan.fragments(LabelRegionsOp::new(
@@ -894,19 +1357,25 @@ pub fn append_to(
         moments_stream.clone(),
         moments_lifecycle,
     ))?;
-    plan.fragments(RegionPointsOp::reading(
-        "region points",
-        moments_stream,
-        moments,
-        points_stream,
-        points_lifecycle,
-        &grid,
-    ))
+    plan.fragments(
+        RegionPointsOp::reading(
+            "region points",
+            moments_stream,
+            moments,
+            points_stream,
+            points_lifecycle,
+            &grid,
+        )
+        .emitting(emission),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::points::decode_points;
+    use crate::table::ColumnType;
 
     /// A mask with the named voxels set.
     fn mask_of(shape: [usize; 3], set: &[[usize; 3]]) -> Array3<bool> {
@@ -1003,6 +1472,51 @@ mod tests {
         assert_eq!(Moments::EMPTY.point(), None);
     }
 
+    /// The identity is each field's own identity, and that is not all zeros.
+    ///
+    /// The one that matters is `min`: a derived `Default` would put `0` there,
+    /// which is a valid coordinate, so every component's low corner would be
+    /// pinned to the origin and no test of a *merged* answer would notice —
+    /// because merging in an identity with `min = 0` is what would break it.
+    #[test]
+    fn the_identity_is_a_no_op_on_every_field_including_the_corners() {
+        assert_eq!(Moments::default(), Moments::EMPTY);
+        assert_eq!(Moments::EMPTY.min, [u64::MAX; 3]);
+        assert_eq!(Moments::EMPTY.max, [0; 3]);
+        // and it has no box, rather than the absurd one its identities spell
+        assert_eq!(Moments::EMPTY.bounds(), None);
+
+        let mut real = Moments::EMPTY;
+        for at in [[4, 9, 2], [6, 9, 3]] {
+            real.add(at).unwrap();
+        }
+        assert_eq!(real.bounds(), Some(([4, 9, 2], [6, 9, 3])));
+
+        // Merging the identity in, on either side, changes nothing at all.
+        let mut left = real;
+        left.merge(&Moments::EMPTY).unwrap();
+        assert_eq!(left, real);
+        let mut right = Moments::EMPTY;
+        right.merge(&real).unwrap();
+        assert_eq!(right, real);
+    }
+
+    /// A single voxel is its own box, so a component of one has extent one on
+    /// every axis rather than zero. The corners are **inclusive** and this is
+    /// where that is pinned.
+    #[test]
+    fn one_voxel_is_its_own_box_and_the_corners_are_inclusive() {
+        let mut one = Moments::EMPTY;
+        one.add([7, 3, 1]).unwrap();
+        assert_eq!(one.bounds(), Some(([7, 3, 1], [7, 3, 1])));
+        let row = measured_row(&one).expect("a row");
+        for axis in 0..3 {
+            let low = row[POSITION_WORDS + 4 + axis];
+            let high = row[POSITION_WORDS + 7 + axis];
+            assert_eq!(high - low + 1, 1, "axis {axis} spans one voxel");
+        }
+    }
+
     /// **The property the whole op rests on**: the accumulators merge exactly, in
     /// any order, so a component cut into pieces gives the same centroid as the
     /// same component seen whole.
@@ -1039,6 +1553,88 @@ mod tests {
             }
         }
         assert_eq!(whole.centroid(), Some([4, 2, 5]));
+        assert_eq!(whole.bounds(), Some(([0, 2, 5], [8, 2, 5])));
+    }
+
+    /// **The exactness bar, at the row.** A component cut into four pieces gives
+    /// the same row as the same component seen whole, *for every column, bit for
+    /// bit*, in every one of the twenty-four orders the pieces can be merged in.
+    ///
+    /// Four rather than three because that is the number in the brief and, more
+    /// usefully, because four is the smallest count that puts a piece in the
+    /// interior on two axes at once — a component cut by a seam on x and a seam
+    /// on y, which is the case where a low corner and a high corner come from
+    /// *different* pieces on the same axis. A three-way cut of a line cannot
+    /// reach that.
+    #[test]
+    fn a_component_split_four_ways_gives_the_same_row_in_every_merge_order() {
+        // A 4 x 4 slab, cut by a seam at x = 2 and one at y = 2 into four
+        // quadrants of four voxels each. Deliberately not symmetric in what each
+        // quadrant holds: one voxel is dropped from one quadrant so that no
+        // column is the same in two pieces by accident.
+        let voxels: Vec<[usize; 3]> = (0..4)
+            .flat_map(|x| (0..4).map(move |y| [x + 5, y + 9, 3]))
+            .filter(|at| *at != [5, 9, 3])
+            .collect();
+        let mut whole = Moments::EMPTY;
+        for &at in &voxels {
+            whole.add(at).unwrap();
+        }
+
+        let mut quadrants = [Moments::EMPTY; 4];
+        for &at in &voxels {
+            let quadrant = usize::from(at[0] >= 7) * 2 + usize::from(at[1] >= 11);
+            quadrants[quadrant].add(at).unwrap();
+        }
+        for (index, part) in quadrants.iter().enumerate() {
+            assert!(!part.is_empty(), "quadrant {index} got no voxels");
+        }
+
+        let expected = measured_row(&whole).expect("a row");
+        for order in permutations() {
+            let mut merged = Moments::EMPTY;
+            for slot in order {
+                merged.merge(&quadrants[slot]).unwrap();
+            }
+            assert_eq!(merged, whole, "order {order:?}");
+            assert_eq!(
+                measured_row(&merged),
+                Some(expected),
+                "order {order:?} gave a different row"
+            );
+            // and through the blob, which is where a column could be written in
+            // the wrong slot without either of the above noticing
+            assert_eq!(
+                encode_measurements(&[merged]).unwrap(),
+                encode_measurements(&[whole]).unwrap(),
+                "order {order:?} encoded differently"
+            );
+        }
+    }
+
+    /// Every ordering of four things, by Heap's algorithm written out — a
+    /// dependency-free twenty-four, so the test above really does mean "every
+    /// order" rather than "three of them".
+    fn permutations() -> Vec<[usize; 4]> {
+        let mut all = Vec::new();
+        let mut current = [0usize, 1, 2, 3];
+        let mut counters = [0usize; 4];
+        all.push(current);
+        let mut at = 0;
+        while at < 4 {
+            if counters[at] < at {
+                let swap = if at % 2 == 0 { 0 } else { counters[at] };
+                current.swap(swap, at);
+                all.push(current);
+                counters[at] += 1;
+                at = 0;
+            } else {
+                counters[at] = 0;
+                at += 1;
+            }
+        }
+        assert_eq!(all.len(), 24);
+        all
     }
 
     /// An overflowing accumulator is refused rather than wrapped, because a
@@ -1048,6 +1644,7 @@ mod tests {
         let mut moments = Moments {
             count: 1,
             sums: [u64::MAX, 0, 0],
+            ..Moments::EMPTY
         };
         let error = moments.add([1, 0, 0]).unwrap_err().to_string();
         assert!(error.contains("position sum"), "{error}");
@@ -1056,11 +1653,13 @@ mod tests {
         let mut counting = Moments {
             count: u64::MAX,
             sums: [0, 0, 0],
+            ..Moments::EMPTY
         };
         assert!(counting
             .merge(&Moments {
                 count: 1,
-                sums: [0; 3]
+                sums: [0; 3],
+                ..Moments::EMPTY
             })
             .is_err());
     }
@@ -1167,6 +1766,8 @@ mod tests {
             moments: vec![Moments {
                 count: u64::MAX,
                 sums: [1, u64::MAX - 1, 1 << 53],
+                min: [0, 1, u64::MAX - 3],
+                max: [u64::MAX, 1 << 53, u64::MAX - 2],
             }],
             faces: empty_planes(),
         };
@@ -1215,6 +1816,8 @@ mod tests {
                 moments: vec![Moments {
                     count: 2,
                     sums: [1, 0, 0],
+                    min: [0, 0, 0],
+                    max: [1, 0, 0],
                 }],
                 faces: empty_planes(),
             };
@@ -1224,6 +1827,8 @@ mod tests {
                 moments: vec![Moments {
                     count: 2,
                     sums: [9, 0, 0],
+                    min: [4, 0, 0],
+                    max: [5, 0, 0],
                 }],
                 faces: empty_planes(),
             };
@@ -1238,6 +1843,9 @@ mod tests {
         assert_eq!(joined.len(), 1, "the two labels are one component");
         assert_eq!(joined[0].count, 4);
         assert_eq!(joined[0].sums, [10, 0, 0]);
+        // and the box is the union of the two, which is min and max rather than
+        // either side's alone
+        assert_eq!(joined[0].bounds(), Some(([0, 0, 0], [5, 0, 0])));
 
         // and with nothing labelled on the far face they stay two
         let apart: Vec<Moments> = build(false).into_iter().filter(|m| !m.is_empty()).collect();
@@ -1290,10 +1898,14 @@ mod tests {
             Moments {
                 count: 3,
                 sums: [3, 6, 9],
+                min: [0, 1, 2],
+                max: [2, 3, 4],
             },
             Moments {
                 count: 1,
                 sums: [15, 0, 0],
+                min: [15, 0, 0],
+                max: [15, 0, 0],
             },
             Moments::EMPTY,
         ];
@@ -1314,5 +1926,238 @@ mod tests {
         seen.sort_by_key(|point| point.at);
         assert_eq!(seen[0].at, [1, 2, 3]);
         assert_eq!(seen[1].at, [15, 0, 0]);
+    }
+
+    /// And the ownership rule does not know which form it is emitting: the same
+    /// components, under both, are written by the same blocks and counted once.
+    #[test]
+    fn the_emission_does_not_change_which_block_owns_a_component() {
+        let mask = mask_of(
+            [16, 16, 16],
+            &[[1, 1, 1], [1, 1, 2], [9, 3, 4], [2, 12, 5], [14, 14, 14]],
+        );
+        let components = region_moments(mask.view()).unwrap();
+        let grid = BlockGrid::new([16, 16, 16], [8, 8, 8]).unwrap();
+
+        let mut points = 0usize;
+        let mut rows = 0usize;
+        for core in grid.cores() {
+            let mine = moments_owned_by(&components, &grid, core.index);
+            points += decode_points(&Emission::Point.encode(&mine).unwrap())
+                .unwrap()
+                .len();
+            let measured = Emission::Measured.encode(&mine).unwrap();
+            let projected = points_of_measurements([16, 16, 16], &measured).unwrap();
+            rows += projected.len();
+            for point in &projected {
+                assert_eq!(
+                    owner_of(&grid, point.at),
+                    core.index,
+                    "a block emitted a row it does not own"
+                );
+            }
+        }
+        // Four regions: the pair at [1, 1, 1..=2] is one.
+        assert_eq!(points, 4);
+        assert_eq!(rows, points, "the two forms lose or duplicate differently");
+    }
+
+    // -------------------------------------------------------- the emission --
+
+    /// Every column is exact, and there are ten of them. Asserted against the
+    /// names because a consumer filters by name, so a rename is a break.
+    #[test]
+    fn the_measurement_schema_is_ten_exact_columns() {
+        let schema = measurement_schema();
+        assert_eq!(schema.len(), 10);
+        assert_eq!(schema.width(), MEASURED_WORDS);
+        let expected = [
+            "count", "sum_0", "sum_1", "sum_2", "min_0", "min_1", "min_2", "max_0", "max_1",
+            "max_2",
+        ];
+        for (index, column) in schema.columns().iter().enumerate() {
+            assert_eq!(column.name(), expected[index]);
+            assert_eq!(
+                column.kind(),
+                ColumnType::U64,
+                "column {:?} is a float; a float column does not merge exactly across a seam, \
+                 which is the one thing this op promises",
+                column.name()
+            );
+        }
+        assert_eq!(schema.index_of(COUNT), Some(0));
+    }
+
+    /// One component, every column, read back out of the blob by name.
+    ///
+    /// The arithmetic is worked out in the comment rather than recomputed from
+    /// the accumulator, so this is a check on the encoding and not on itself.
+    #[test]
+    fn a_measured_row_carries_every_column_through_the_blob() {
+        // An L in one plane, arms of five and three: voxels (0..=4, 0) and
+        // (4, 1..=2) at z = 6.
+        let mut moments = Moments::EMPTY;
+        for at in [
+            [0, 0, 6],
+            [1, 0, 6],
+            [2, 0, 6],
+            [3, 0, 6],
+            [4, 0, 6],
+            [4, 1, 6],
+            [4, 2, 6],
+        ] {
+            moments.add(at).unwrap();
+        }
+
+        let volume = [8, 8, 8];
+        let mut table = Table::new(volume, measurement_schema()).unwrap();
+        table
+            .write([0, 0, 0], &encode_measurements(&[moments]).unwrap())
+            .unwrap();
+        table.seal().unwrap();
+        let rows = table.query(&Region::new(&[0, 0, 0], &volume)).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        // sums: x = 0+1+2+3+4+4+4 = 18, y = 0+0+0+0+0+1+2 = 3, z = 7 * 6 = 42,
+        // over seven voxels, so the centroid rounds to [3, 0, 6].
+        assert_eq!(row.at(), [3, 0, 6]);
+        assert_eq!(row.by_name(COUNT).unwrap(), Value::U64(7));
+        for (axis, expected) in [18u64, 3, 42].into_iter().enumerate() {
+            assert_eq!(
+                row.by_name(SUM[axis]).unwrap(),
+                Value::U64(expected),
+                "sum on axis {axis}"
+            );
+        }
+        // The box is [0..=4] x [0..=2] x [6..=6] — which the *position* cannot
+        // tell you, and which separates this L from a compact blob of seven.
+        for (axis, expected) in [0u64, 0, 6].into_iter().enumerate() {
+            assert_eq!(row.by_name(MIN[axis]).unwrap(), Value::U64(expected));
+        }
+        for (axis, expected) in [4u64, 2, 6].into_iter().enumerate() {
+            assert_eq!(row.by_name(MAX[axis]).unwrap(), Value::U64(expected));
+        }
+    }
+
+    /// The two forms describe the same components: projecting a measured blob
+    /// back gives, byte for byte, the point blob the same components would have
+    /// produced.
+    ///
+    /// This is what lets a caller opt into rows without losing the pipe to
+    /// `ops::voxelize`, and it is the check that the richer form did not quietly
+    /// reorder or drop anything.
+    #[test]
+    fn the_two_emissions_describe_the_same_components() {
+        let volume = [20usize, 12, 9];
+        // Includes two components that share a rounded centroid on two axes, so
+        // the order's tiebreak is actually exercised rather than assumed away.
+        let mask = mask_of(
+            volume,
+            &[
+                [3, 3, 3],
+                [4, 3, 3],
+                [10, 5, 1],
+                [10, 5, 2],
+                [10, 5, 3],
+                [17, 9, 8],
+                [1, 11, 0],
+                [19, 0, 0],
+            ],
+        );
+        let components = region_moments(mask.view()).unwrap();
+
+        let points = Emission::Point.encode(&components).unwrap();
+        let measured = Emission::Measured.encode(&components).unwrap();
+        assert_ne!(points, measured, "the two forms are not the same bytes");
+
+        let projected = points_of_measurements(volume, &measured).unwrap();
+        assert_eq!(
+            encode_points(&projected),
+            points,
+            "the projection back is not what the point form writes"
+        );
+        assert_eq!(projected, decode_points(&points).unwrap());
+        // The richer form really is richer, and by about the factor claimed.
+        assert!(measured.len() > points.len() * 2);
+    }
+
+    /// A block's blob is a function of the component set and not of the order the
+    /// union-find produced its roots in — the same property `centroid_points`
+    /// establishes for points, which has to hold for both forms or the two would
+    /// be reproducible to different degrees.
+    #[test]
+    fn a_measured_blob_is_a_function_of_the_set_and_not_its_arrival_order() {
+        let volume = [24usize, 24, 24];
+        let mask = mask_of(
+            volume,
+            &[
+                [1, 1, 1],
+                [2, 1, 1],
+                [8, 8, 8],
+                [8, 8, 9],
+                [8, 9, 8],
+                [20, 3, 17],
+                [5, 22, 2],
+            ],
+        );
+        let components = region_moments(mask.view()).unwrap();
+        assert!(components.len() >= 4);
+        let expected = encode_measurements(&components).unwrap();
+
+        // Reversed, rotated, and back to front in pairs. Three orders rather
+        // than every one, because the sort is over the whole row and a sort that
+        // was order-dependent would fail on the first of them.
+        let mut reversed = components.clone();
+        reversed.reverse();
+        let mut rotated = components.clone();
+        rotated.rotate_left(1);
+        let mut swapped = components.clone();
+        for pair in swapped.chunks_exact_mut(2) {
+            pair.swap(0, 1);
+        }
+        for shuffled in [reversed, rotated, swapped] {
+            assert_eq!(encode_measurements(&shuffled).unwrap(), expected);
+        }
+    }
+
+    /// A measured blob announces itself, so a reader expecting something else
+    /// refuses it naming the column rather than reading the words as its own.
+    ///
+    /// The asymmetry the module header names is asserted in the other direction
+    /// too: a *point* blob is headerless, so a table asked to read one refuses it
+    /// on the magic word.
+    #[test]
+    fn a_measured_blob_is_refused_by_a_reader_that_wants_another_schema() {
+        let volume = [8usize, 8, 8];
+        let mut moments = Moments::EMPTY;
+        moments.add([2, 2, 2]).unwrap();
+        let measured = encode_measurements(&[moments]).unwrap();
+
+        let mut points = Table::new(volume, Schema::points()).unwrap();
+        let message = points.write([0, 0, 0], &measured).unwrap_err().to_string();
+        assert!(message.contains("column"), "{message}");
+
+        let mut measured_table = Table::new(volume, measurement_schema()).unwrap();
+        assert!(measured_table
+            .write([0, 0, 0], &encode_points(&[Point::unit([2, 2, 2])]))
+            .is_err());
+        // and the projection refuses the same thing, since it is that check
+        assert!(points_of_measurements(volume, &encode_points(&[Point::unit([2, 2, 2])])).is_err());
+    }
+
+    /// The whole-volume references agree with each other: `detect_region_rows`
+    /// is `detect_regions` with more columns and not a second labelling.
+    #[test]
+    fn the_two_whole_volume_references_see_the_same_regions() {
+        let volume = [9usize, 7, 5];
+        let mask = mask_of(
+            volume,
+            &[[0, 0, 0], [8, 6, 4], [4, 3, 2], [4, 3, 3], [4, 4, 3]],
+        );
+        let points = detect_regions(mask.view()).unwrap();
+        let rows = detect_region_rows(mask.view()).unwrap();
+        assert_eq!(points_of_measurements(volume, &rows).unwrap(), points);
+        assert_eq!(points.len(), 3);
     }
 }

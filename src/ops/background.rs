@@ -179,6 +179,7 @@ use ndarray::{ArrayView3, ArrayViewMut3};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::op::{Anchor, BlockOp, Chain, Combine};
+use crate::reach::Reach;
 use crate::voxels::Voxels;
 
 use super::element::{Rank, StructuringElement};
@@ -429,6 +430,20 @@ pub fn background_reach(element: &StructuringElement) -> [usize; 3] {
         element.reach(1) * passes,
         element.reach(2) * passes,
     ]
+}
+
+/// The same, per side.
+///
+/// [`background_reach`] is the symmetric **bound** — the element's wider side
+/// times the passes — and for an element with a centre voxel the two say the
+/// same thing. For an element with an even extent they do not: the two rank
+/// filters both read further below the anchor than above it, and the sequence
+/// adds side by side, so this is `(2 * lo, 2 * hi)` where the triple is
+/// `(2 * max, 2 * max)`. This is the one a plan is built from — `Chain::
+/// reach_spec` folds exactly it out of the two `RankFilterOp`s — and the test
+/// below asserts that, rather than the equality being assumed.
+pub fn background_reach_spec(element: &StructuringElement) -> Reach {
+    element.reach_spec_after(Morphology::Open.reach_factor())
 }
 
 // ---------------------------------------------------------------- costs --
@@ -700,6 +715,53 @@ mod tests {
                     declared,
                     "the sink reaches zero, so the fan-in reaches its widest arm"
                 );
+            }
+        }
+    }
+
+    /// The same pair of statements for an element with no centre voxel, where
+    /// the symmetric triple is a bound and the pair is the truth.
+    ///
+    /// The point of asserting the fold rather than the formula: the chain gets
+    /// its answer by adding two `RankFilterOp` specs side by side, and this file
+    /// gets its answer from the composition factor. If either drifted — a
+    /// sequence that took a max instead of a sum, or a factor that stopped being
+    /// two — the two would stop agreeing here rather than at a seam.
+    #[test]
+    fn the_per_side_reach_of_an_off_centre_element_is_twice_each_side() {
+        let volume = [64usize, 64, 64];
+        for shape in [
+            ElementShape::Box,
+            ElementShape::Ellipsoid,
+            ElementShape::ExtentEllipsoid,
+        ] {
+            for size in [[10, 5, 4], [6, 6, 6], [2, 9, 3]] {
+                let element = StructuringElement::from_size(shape, size).unwrap();
+                let declared = background_reach_spec(&element);
+                for axis in 0..3 {
+                    let (lo, hi) = element.sides(axis);
+                    assert_eq!(declared.at(axis, 0, volume[axis]), (2 * lo, 2 * hi));
+                }
+                assert_eq!(
+                    background_estimate(&element).reach_spec(volume).unwrap(),
+                    declared,
+                    "{shape:?} {size:?}"
+                );
+                assert_eq!(
+                    remove_background(&element)
+                        .unwrap()
+                        .reach_spec(volume)
+                        .unwrap(),
+                    declared,
+                    "the sink reaches zero, so the fan-in reaches its widest arm"
+                );
+                // and the triple stays a bound on it, which is what
+                // `Chain::reach_spec` checks rather than assumes
+                let bound = background_reach(&element);
+                for axis in 0..3 {
+                    let (lo, hi) = declared.at(axis, 0, volume[axis]);
+                    assert!(lo.max(hi) <= bound[axis], "{shape:?} {size:?} axis {axis}");
+                }
             }
         }
     }

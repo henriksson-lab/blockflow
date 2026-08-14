@@ -6,6 +6,23 @@
 //
 // **A point set, stored by position rather than by producer.**
 //
+// This module is now a **special case of [`crate::table`]**, and a thin one: a
+// `PointStore` is a `Table` over the schema `[weight: f64]`, and a `Point` is a
+// row of it read through that fixed schema. What is left here is the point's own
+// type, its encoding, and the store's surface. Everything structural — the two
+// states, the canonical order, the streaming `scan`, the two interchangeable
+// indexes and the k-way merge — lives in `table`, is argued for in its header,
+// and is shared rather than repeated. `table`'s header is also where the
+// decision to unify rather than to keep two stores is recorded, with what it
+// bought and what it risked.
+//
+// What did *not* change when that happened is worth saying plainly, because it
+// is the reason the move was cheap: a point blob is three coordinates and
+// `weight.to_bits()`, which is exactly a row of the point schema, so the
+// canonical order over rows is byte-for-byte the order over points. No answer
+// moved, and this module's suite — including its white-box tests of the index,
+// which now drive `table`'s — passes as it was written.
+//
 // The problem this removes
 // ------------------------
 // Every other node this crate materialises has a partitioning that is a
@@ -33,158 +50,64 @@
 // a producer obligation and becomes the sorter's problem**, which is the only
 // place it can be answered without knowing the run.
 //
-// Two states, and why reading early is an error rather than an emptiness
-// ---------------------------------------------------------------------
-// A store is [`State::Accumulating`] — blocks write, nobody reads — or
-// [`State::Sealed`] — nobody writes, anybody queries. There is no third.
+// What a point carries, and why it is one number
+// ----------------------------------------------
+// A point is a position and **one** `f64`. That is the shape `ops::voxelize`
+// consumes — a weight to deposit — and it is the shape `ops::detect` produces.
+// A consumer that wants a row per object, with a size and a total and a measure
+// of shape, wants a [`crate::table::Table`] with those columns and not a second
+// point set per column: point sets joined on a coordinate triple are correct
+// only while every one of them holds exactly the same positions, which is a
+// precondition nothing states and nothing can check.
 //
-// A query on an accumulating store **fails, naming the state**. It does not
-// return what has arrived so far, and it does not return nothing, because both
-// of those are answers: the first is a fact about which writers happened to have
-// finished, which is the decomposition showing through in the worst possible
-// place, and the second is indistinguishable from a region that is genuinely
-// empty. This crate fills an unwritten level with NaN rather than zeros for the
-// same reason — an absence must not be able to pass for a value.
-//
-// Making the states a *type* rather than a convention is what turns "every
-// writer must have finished" from something a caller has to remember into
-// something the store enforces. It is checked at run time rather than by a
-// typestate — `seal` transitions one value instead of consuming it and returning
-// another — for one reason, and it is a compromise rather than a preference:
-// whether every writer has finished is a *run-time* fact, known to whoever drove
-// the phase, and a store is reached through a shared handle by the tasks that
-// write it. A typestate would make the illegal call unwriteable, which is
-// strictly better where the caller owns the value, and would put the check
-// nowhere at all where it does not.
-//
-// The read interface is one method, and it streams
-// ------------------------------------------------
-// [`PointStore::scan`] takes a region and returns an **iterator** over the
-// points in it. That is the whole of it, and the granularity of whatever index
-// was built is invisible from the outside: nothing downstream can tell a flat
-// store from a gridded one except by timing it. Keeping the interface at one
-// method is not economy for its own sake — it is what makes that claim
-// checkable, because there is exactly one thing to check.
-//
-// It is an iterator rather than a `Vec` because the case this store exists for
-// is the one where the answer does not fit. A whole-volume query returning a
-// `Vec` allocates a second copy of the entire set, which is precisely what an
-// out-of-core structure must not do; a stream borrows the index and yields.
-// [`PointStore::query`] collects, and is kept because collecting is often what a
-// caller wants — but it is now a **choice visible at the call site** rather than
-// the only thing on offer.
-//
-// Half-open, like every other region in this crate: a point at `region.start` is
-// in the answer and a point at `region.start + region.shape` is not.
+// The weight is `f64` rather than something narrower because a consumer
+// accumulating in anything narrower would put its own disagreement at around
+// `1e-7` of the total, and it is per point rather than per set so that "count
+// the points" and "sum a quantity over the points" are the same operation with a
+// different column. It is a *float* column, and `table`'s header is explicit
+// about what that costs: a fold over it is reproducible under every
+// decomposition, because the store fixes the order, and it is not exact, because
+// nothing can make `+` associate. That is why `ops::detect` accumulates in
+// integers and converts once at the end, and why an op that needs an exact merge
+// across a seam wants a `u64` column in a table rather than a point weight.
 //
 // The canonical order, and why the tiebreak is the payload
-// -------------------------------------------------------
+// --------------------------------------------------------
 // Points come back sorted by **the coordinate triple, lexicographically, then by
-// the weight's bits**. Two properties depend on it and both are load-bearing:
+// the weight's bits** — which is `table`'s canonical order applied to this
+// schema, since a row's words are its position followed by its payload. The
+// tiebreak is intrinsic to the point: not the source block, and not the order of
+// insertion, both of which are facts about the run rather than about the data.
+// The store does not merely decline to record where a point came from; there is
+// nowhere in a row for it to go.
 //
-// * **the implementations are interchangeable.** If they returned the same set
-//   in different orders, "invisible downstream" would be false the first time
-//   somebody wrote the answer to a file or hashed it;
-// * **a consumer that folds in store order gets a function of the data.**
-//   Floating-point `+` does not associate, so a sum takes its value from the
-//   order it is taken in. In store order that value depends on the point set and
-//   on nothing else — not on the block grid, not on which worker finished first,
-//   not on whether the index was rebuilt. `ops::voxelize` re-derives exactly
-//   this order for exactly this reason; a consumer reading from here does not
-//   have to.
-//
-// Lexicographic on the coordinate triple, rather than Morton: it is the order
-// `voxelize` already sums in, so the two agree without a conversion; it makes a
-// query a contiguous run on the first axis, which is what the flat index binary
-// searches for; and it is readable in an error message, where a Morton code is
-// a number nobody can place. Morton would give a query better locality in three
-// dimensions and is the right answer if that ever dominates — it needs a fixed
-// bit budget per axis, which is a limit this has no need to take on yet.
-//
-// **The tiebreak is `weight.to_bits()`, which is intrinsic to the point.** Not
-// the source block, and not the order of insertion — both of those are facts
-// about the run rather than about the data, and either would make the answer
-// move when the cut moved. The store does not merely decline to use the source
-// block: it never records it, so a tiebreak on it is unrepresentable rather than
-// forbidden. Comparing bits is not comparing magnitudes (negative floats come
-// back reversed) and that is fine, because this is a tiebreak and not a sort by
-// weight: what is needed is a deterministic total order on the payload, and the
-// payload *is* those bits. Two points that are coincident **and** carry the same
-// bits are indistinguishable by any observation, so their relative order cannot
-// matter and is not fixed.
-//
-// Why the order is a property of the *storage* and not of the query
-// -----------------------------------------------------------------
-// The obvious way to guarantee a canonical order is to sort the answer on the
-// way out, in one place, so no implementation can get it wrong. **Streaming
-// forbids it**: sorting requires having the whole answer, which is the copy the
-// stream exists not to make. So one of three things has to give, and only one of
-// them is right:
-//
-// * *each index sorts its own output* — back to one obligation in as many places
-//   as there are indexes, and per call;
-// * *the stream is unordered and the caller sorts* — which hands the
-//   float-accumulation-order problem back to every consumer, and that problem is
-//   the reason this module exists;
-// * **each index stores its points already in the canonical order, so yielding
-//   them in it is free.** This is the one taken.
-//
-// The obligation does move back into the implementations, and that is worth
-// being clear about — but it changes shape on the way. It is no longer "return
-// sorted", which is a promise made afresh on every call and can be broken by any
-// one of them; it is "store sorted", which a constructor establishes once and a
-// query cannot undo. For [`Flat`] it is what the structure already was: a sorted
-// array, and a region query is a range scan that is in order because the array
-// is. For [`Gridded`] it means each bucket holds its points in order and a
-// multi-bucket region is answered by a **k-way merge** — a heap over one cursor
-// per live bucket, `O(log k)` per point, materialising nothing.
-//
-// The merge's working set is a *cross-section*, not the whole span
-// ---------------------------------------------------------------
-// A naive merge holds a cursor for every bucket the region touches, and for a
-// whole-volume query that is every bucket — which is a fraction of the point
-// count and therefore still proportional to the set. The lexicographic order
-// removes it: a point in a bucket at grid position `bx` on the first axis has
-// its first coordinate inside that bucket's range, so **every point of grid
-// plane `bx` precedes every point of plane `bx + 1`**, and planes cannot
-// interleave. The merge therefore runs one plane at a time and its heap holds at
-// most the buckets of one cross-section — `|second span| * |third span|`. For a
-// whole-volume query that is `O(buckets^(2/3))`, and it does not grow at all
-// when the set grows along the first axis. That is the property
-// `a_stream_holds_a_cross_section_and_not_the_set` asserts.
-//
-// Two indexes, and why the choice may not show
-// --------------------------------------------
-// | index | shape | right when |
-// |---|---|---|
-// | flat | one sorted array; binary search, then an in-order scan | there are few points |
-// | gridded | sorted buckets on a coarse grid; a k-way merge over the overlapping ones | there are many |
-//
-// [`PointStore::seal`] picks from the point count. The choice is *reportable* —
-// [`PointStore::layout`] says which was built, so a slow run can be explained —
-// and it is not *observable*: the same queries return the same bytes either way,
-// which is what `both_indexes_answer_every_query_identically` asserts directly.
-// That property is the whole design. If it ever fails, the abstraction is gone
-// and the two are not implementations of one thing but two things with a shared
-// name.
-//
-// Sealing is a barrier, and the distributed sort is a later problem
-// ----------------------------------------------------------------
-// `seal` sorts in one place, driven by the caller: **every writer must have
-// finished before it is called**, and nothing here enforces that beyond refusing
-// the writes that arrive afterwards. It is not wired into the executor's phase
-// machinery and it is not a distributed sort. A store larger than one node can
-// hold needs a sample-and-partition sort with the buckets as the partition, and
-// that is real work with its own decomposition-invariance argument — it is the
-// next problem and not this one. Naming it here so that the barrier is a stated
-// limit rather than a discovered one.
-
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+// Sealing is a barrier
+// --------------------
+// Every writer must have finished before [`PointStore::seal`] is called, and
+// nothing here enforces that beyond refusing the writes that arrive afterwards.
+// See `table`'s header for what a distributed sort over a set too large for one
+// node would take; it is the next problem and not this one.
 
 use crate::error::{Error, Result};
 use crate::fragment::{pack_u64, unpack_u64};
 use crate::region::Region;
+use crate::table::{RowBuffer, Schema, Table, Value};
+
+// The store's surface keeps these names, because they are what a caller of a
+// point store has always said. They are `table`'s types; a point store and a
+// table are in the same two states and choose between the same two indexes,
+// because they are the same store.
+pub use crate::table::{Layout, State, TableIndex as PointIndex};
+
+// The index's structural claims — the merge's cross-section residency, the
+// bucket occupancy the derivation aims at — are asserted in this module's suite
+// rather than in `table`'s, and deliberately: they are claims about the shared
+// index, and asserting them through the point payload is what demonstrates that
+// it *is* shared.
+#[cfg(test)]
+use crate::table::{bucket_counts, bucket_edge, Gridded, FLAT_LIMIT, TARGET_PER_BUCKET};
+#[cfg(test)]
+use std::cmp::Ordering;
 
 // ----------------------------------------------------------------- points --
 
@@ -218,6 +141,10 @@ impl Point {
 }
 
 /// `u64` words per encoded point: three coordinates and the weight's bits.
+///
+/// The same number as `Schema::points().width()`, and necessarily so — a point
+/// blob's words *are* a table row's words, which is what makes the point store
+/// the four-word case of `table` rather than something beside it.
 pub const WORDS_PER_POINT: usize = 4;
 
 /// Points as a blob.
@@ -228,6 +155,15 @@ pub const WORDS_PER_POINT: usize = 4;
 /// `f64::to_bits` rather than as a decimal or a fixed-point integer, so it round
 /// trips exactly — a store whose weights were rounded on the way through would
 /// have an order, and answers, that were reproducible only by accident.
+///
+/// **Headerless, unlike a table blob.** A table carries its schema in front so
+/// that a stream from the wrong producer is refused rather than read; a point
+/// blob cannot be from the wrong producer, because there is only one point
+/// schema and any four-word blob is a valid point set. The header would be a
+/// constant the reader already knows. That is also why this encoding is kept
+/// rather than replaced: it is the format `ops::detect` writes and
+/// `ops::voxelize` reads today, and changing it would be a parity-visible change
+/// to two ops for no property gained.
 pub fn encode_points(points: &[Point]) -> Vec<u8> {
     let mut words = Vec::with_capacity(points.len() * WORDS_PER_POINT);
     for point in points {
@@ -282,495 +218,47 @@ pub fn decode_points(bytes: &[u8]) -> Result<Vec<Point>> {
     Ok(points)
 }
 
+/// Points as rows, which is what they already were.
+///
+/// The words are identical to what [`encode_points`] writes, so this is a
+/// relabelling rather than a conversion. It exists so that an index can be built
+/// straight from a `Vec<Point>` — which is how this module's suite drives
+/// `table`'s index directly.
+impl From<Vec<Point>> for RowBuffer {
+    fn from(points: Vec<Point>) -> Self {
+        let mut words = Vec::with_capacity(points.len() * WORDS_PER_POINT);
+        for point in &points {
+            words.push(point.at[0] as u64);
+            words.push(point.at[1] as u64);
+            words.push(point.at[2] as u64);
+            words.push(point.weight.to_bits());
+        }
+        RowBuffer::from_words(std::sync::Arc::new(Schema::points()), words)
+    }
+}
+
 /// The canonical order, entire: the coordinate triple, then the weight's bits.
 ///
-/// Total on every pair of points that can be told apart; see the module header
-/// for why that is the right strength and why the tiebreak is the payload.
+/// Test-only, and written from the definition in the module header rather than
+/// by calling `table`'s comparison — an oracle that called the code it is
+/// checking would assert nothing.
+#[cfg(test)]
 fn canonical(left: &Point, right: &Point) -> Ordering {
     left.at
         .cmp(&right.at)
         .then_with(|| left.weight.to_bits().cmp(&right.weight.to_bits()))
 }
 
-/// Half-open containment, on all three axes.
-fn holds(region: &Region, at: [usize; 3]) -> bool {
-    (0..3).all(|axis| {
-        at[axis] >= region.start[axis] && at[axis] - region.start[axis] < region.shape[axis]
-    })
-}
-
-// ------------------------------------------------------------------ index --
-
-/// What an index has to be able to do, and nothing else.
-///
-/// One method, on purpose. Everything a caller could otherwise ask — how many
-/// buckets, how big they are, which one a point is in — is granularity, and
-/// granularity showing through is the failure this whole module is arranged
-/// against. The trait is small to *forbid* variety rather than to enable it.
-///
-/// **The stream is in the canonical order, and an implementation meets that by
-/// storing its points in it** rather than by sorting on the way out. The module
-/// header says why streaming forces this and why "store sorted" is a weaker
-/// thing to ask than "return sorted": a constructor establishes it once, where
-/// sorting on the way out would be a promise made afresh on every call.
-///
-/// **There is deliberately no way to hand a store a foreign index.** The trait
-/// is public because it is the contract every guarantee in this module is
-/// stated over, and a reader has to be able to see it; the two implementations
-/// are private and [`PointStore::seal`] chooses between them. Admitting a third
-/// from outside would turn "the choice is not observable" from something this
-/// module tests into a claim about somebody else's code — and a third index is
-/// a change to this file, where the agreement test is, rather than a plugin.
-pub trait PointIndex: Send + Sync {
-    /// Every point of the set that lies in `region`, in the canonical order,
-    /// **without materialising them**.
-    ///
-    /// The returned iterator borrows the index and the region; an implementation
-    /// that collected into a `Vec` and returned its `into_iter` would satisfy
-    /// the signature and defeat the point of it.
-    ///
-    /// `region` is rank 3 and inside the volume; [`PointStore::scan`] has
-    /// already checked both, so an implementation may assume them.
-    fn scan<'a>(&'a self, region: &'a Region) -> Box<dyn Iterator<Item = Point> + 'a>;
-}
-
-/// Which index a store was sealed with.
-///
-/// Reportable so that a run's speed can be explained; never observable in an
-/// answer. See the module header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Layout {
-    /// Everything in one array, sorted once. A scan is a binary search and a
-    /// walk, in order because the array is.
-    Flat,
-    /// Sorted buckets on a coarse grid. A scan reads only the overlapping ones,
-    /// merged.
-    Gridded,
-}
-
-impl Layout {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Layout::Flat => "flat",
-            Layout::Gridded => "gridded",
-        }
-    }
-}
-
-/// At or below this many points, [`PointStore::seal`] builds a [`Layout::Flat`]
-/// index.
-///
-/// A few thousand points is a few tens of kilobytes in one contiguous run,
-/// which a scan crosses about as fast as memory can supply it, and the bucket
-/// grid's own arrays plus the per-bucket bookkeeping cost more to build and walk
-/// than the scan they would save. The number is a threshold between two
-/// implementations that give the same answer, so choosing it badly costs time
-/// and can never cost correctness — which is exactly why it is a constant here
-/// rather than something a caller sets, and why no test asserts a query result
-/// against it.
-const FLAT_LIMIT: usize = 4_096;
-
-/// What the bucket-edge derivation aims for: points per bucket, on average over
-/// the volume.
-const TARGET_PER_BUCKET: usize = 64;
-
-// ------------------------------------------------------------------- flat --
-
-/// Everything in one array, in the canonical order.
-///
-/// The order is established by the constructor and nothing afterwards disturbs
-/// it, which is what makes a scan in that order cost nothing.
-struct Flat {
-    points: Vec<Point>,
-}
-
-impl Flat {
-    fn build(mut points: Vec<Point>) -> Self {
-        points.sort_by(canonical);
-        Self { points }
-    }
-}
-
-impl PointIndex for Flat {
-    fn scan<'a>(&'a self, region: &'a Region) -> Box<dyn Iterator<Item = Point> + 'a> {
-        // The canonical order is lexicographic, so every point of the answer
-        // lies in one contiguous run of the first axis. Find its start by
-        // binary search, stop when the axis leaves the region, and filter the
-        // other two as they go. Nothing here allocates and nothing here is
-        // reordered: the run is already in the order it has to be yielded in.
-        let lo = region.start[0];
-        let hi = lo + region.shape[0];
-        let from = self.points.partition_point(|point| point.at[0] < lo);
-        Box::new(
-            self.points[from..]
-                .iter()
-                .copied()
-                .take_while(move |point| point.at[0] < hi)
-                .filter(move |point| holds(region, point.at)),
-        )
-    }
-}
-
-// ---------------------------------------------------------------- gridded --
-
-/// Points bucketed on a coarse grid, stored as one array plus the offsets that
-/// cut it into buckets.
-///
-/// One allocation for the points and one for the offsets, rather than a map of
-/// vectors: the bucket count is derived to be a fraction of the point count, so
-/// the offsets are small, and a bucket's points being contiguous is what makes
-/// reading one a scan rather than a chase.
-///
-/// **Each bucket holds its points in the canonical order**, which is what lets a
-/// scan merge them rather than gather and sort them. The whole array is sorted
-/// bucket-major with the canonical order inside each bucket, so that property
-/// costs one sort at construction and nothing per query.
-struct Gridded {
-    edge: [usize; 3],
-    counts: [usize; 3],
-    /// `counts.product() + 1` offsets into `points`; bucket `b` is
-    /// `points[starts[b]..starts[b + 1]]`.
-    starts: Vec<usize>,
-    points: Vec<Point>,
-}
-
-/// The bucket edge, in voxels, for `points` points spread over `volume`.
-///
-/// **What it aims at.** A bucket should hold about [`TARGET_PER_BUCKET`] points.
-/// Fewer, and a query pays the per-bucket cost — a bounds computation and a
-/// fresh cache line — more often than it reads anything; more, and a query for a
-/// small region drags in a large multiple of what it returns, which is the whole
-/// reason not to use the flat index. So the edge is the cube root of "the volume
-/// one bucket's worth of points occupies at the average density":
-/// `cbrt(TARGET_PER_BUCKET * |volume| / |points|)`.
-///
-/// **Cubic, in voxels.** The shape of the regions that will be asked for is not
-/// known when the index is built, so no axis has earned a finer grid than
-/// another. An axis shorter than the derived edge is clamped to its own length,
-/// which is what makes a flat volume get a flat bucket rather than a grid one
-/// bucket wide.
-///
-/// **Then a guard: never more buckets than points.** The clamp above, and a
-/// volume that is mostly empty, can both leave the grid with more slots than
-/// entries — an index spending memory and a walk on emptiness. Doubling the edge
-/// until the count comes down is crude and terminates quickly (a big enough edge
-/// is one bucket), and it is a correction rather than a policy: for any point set
-/// dense enough to have been given this index in the first place, it does not
-/// fire.
-///
-/// Derived, with nothing a caller can set. A configurable bucket size would be a
-/// number that changes performance and not answers, which is precisely the kind
-/// of knob that gets set once, wrongly, and never revisited.
-fn bucket_edge(volume: [usize; 3], points: usize) -> [usize; 3] {
-    let extent = volume[0] as f64 * volume[1] as f64 * volume[2] as f64;
-    let wanted = (points / TARGET_PER_BUCKET).max(1);
-    let mut edge = (extent / wanted as f64).cbrt().max(1.0);
-    let cap = points.max(1);
-    // Bounded by construction: each pass doubles, and an edge past the longest
-    // axis leaves one bucket, which is under any cap.
-    for _ in 0..64 {
-        let candidate = clamp_edge(volume, edge);
-        match bucket_counts(volume, candidate) {
-            Some(counts)
-                if counts[0]
-                    .saturating_mul(counts[1])
-                    .saturating_mul(counts[2])
-                    <= cap =>
-            {
-                return candidate
-            }
-            _ => edge *= 2.0,
-        }
-    }
-    volume
-}
-
-fn clamp_edge(volume: [usize; 3], edge: f64) -> [usize; 3] {
-    let mut out = [1usize; 3];
-    for axis in 0..3 {
-        let rounded = if edge >= volume[axis] as f64 {
-            volume[axis]
-        } else {
-            edge.ceil() as usize
-        };
-        out[axis] = rounded.clamp(1, volume[axis].max(1));
-    }
-    out
-}
-
-/// Buckets per axis, or `None` if the product would not fit a `usize`.
-fn bucket_counts(volume: [usize; 3], edge: [usize; 3]) -> Option<[usize; 3]> {
-    let mut counts = [0usize; 3];
-    for axis in 0..3 {
-        counts[axis] = volume[axis].div_ceil(edge[axis].max(1)).max(1);
-    }
-    counts[0].checked_mul(counts[1])?.checked_mul(counts[2])?;
-    Some(counts)
-}
-
-impl Gridded {
-    fn build(volume: [usize; 3], mut points: Vec<Point>) -> Self {
-        let edge = bucket_edge(volume, points.len());
-        let counts = bucket_counts(volume, edge).unwrap_or([1, 1, 1]);
-        let total = counts[0] * counts[1] * counts[2];
-
-        // Bucket-major, canonical inside a bucket. The bucket triple compares
-        // lexicographically in the same order as its linear index, so one sort
-        // gives both.
-        points.sort_by(|left, right| {
-            bucket_of(left.at, edge)
-                .cmp(&bucket_of(right.at, edge))
-                .then_with(|| canonical(left, right))
-        });
-
-        let mut starts = vec![0usize; total + 1];
-        for point in &points {
-            let linear = linear_bucket(bucket_of(point.at, edge), counts);
-            starts[linear + 1] += 1;
-        }
-        for index in 1..starts.len() {
-            starts[index] += starts[index - 1];
-        }
-        Self {
-            edge,
-            counts,
-            starts,
-            points,
-        }
-    }
-
-    /// The inclusive bucket range `region` overlaps, or `None` for a region with
-    /// no voxels in it.
-    fn span(&self, region: &Region) -> Option<([usize; 3], [usize; 3])> {
-        let mut lo = [0usize; 3];
-        let mut hi = [0usize; 3];
-        for axis in 0..3 {
-            if region.shape[axis] == 0 {
-                return None;
-            }
-            lo[axis] = region.start[axis] / self.edge[axis];
-            hi[axis] = ((region.start[axis] + region.shape[axis] - 1) / self.edge[axis])
-                .min(self.counts[axis] - 1);
-            if lo[axis] > hi[axis] {
-                return None;
-            }
-        }
-        Some((lo, hi))
-    }
-
-    /// How many buckets a query for `region` would read.
-    ///
-    /// A measurement hook, and deliberately **not** on [`PointIndex`]: a caller
-    /// that could ask this could tell a gridded store from a flat one without
-    /// timing it, which is the property the module is arranged to keep. It is
-    /// visible to this module's tests, which is where the claim "a small region
-    /// reads a small part of the index" is asserted as a count rather than as a
-    /// duration. Compiled only for them, so that the escape hatch cannot be
-    /// reached from a build that is not the one measuring it.
-    #[cfg(test)]
-    fn buckets_touched(&self, region: &Region) -> usize {
-        match self.span(region) {
-            None => 0,
-            Some((lo, hi)) => (0..3).map(|axis| hi[axis] - lo[axis] + 1).product(),
-        }
-    }
-
-    /// How many buckets the derivation produced. Test-only, for the same reason
-    /// as [`Self::buckets_touched`].
-    #[cfg(test)]
-    fn buckets(&self) -> usize {
-        self.counts[0] * self.counts[1] * self.counts[2]
-    }
-}
-
-fn bucket_of(at: [usize; 3], edge: [usize; 3]) -> [usize; 3] {
-    [at[0] / edge[0], at[1] / edge[1], at[2] / edge[2]]
-}
-
-fn linear_bucket(bucket: [usize; 3], counts: [usize; 3]) -> usize {
-    (bucket[0] * counts[1] + bucket[1]) * counts[2] + bucket[2]
-}
-
-impl Gridded {
-    /// The merge itself, as its own type rather than behind the `dyn`.
-    ///
-    /// Split out so this module's tests can hold the concrete cursor and watch
-    /// the heap, which is where the residency claim is checked. `None` is a
-    /// region with no voxels in it.
-    fn merge<'a>(&'a self, region: &'a Region) -> Option<GriddedScan<'a>> {
-        let (lo, hi) = self.span(region)?;
-        Some(GriddedScan {
-            index: self,
-            region,
-            lo,
-            hi,
-            next_plane: lo[0],
-            heap: BinaryHeap::new(),
-        })
-    }
-}
-
-impl PointIndex for Gridded {
-    fn scan<'a>(&'a self, region: &'a Region) -> Box<dyn Iterator<Item = Point> + 'a> {
-        match self.merge(region) {
-            None => Box::new(std::iter::empty()),
-            Some(merge) => Box::new(merge),
-        }
-    }
-}
-
-/// One bucket's remaining points, with the next one that qualifies already
-/// found.
-///
-/// Ordered **backwards** on purpose: [`BinaryHeap`] is a max-heap and the merge
-/// wants the canonically smallest head, so the comparison is reversed here
-/// rather than every use being wrapped in `Reverse`.
-struct Head<'a> {
-    point: Point,
-    rest: &'a [Point],
-}
-
-impl<'a> Head<'a> {
-    /// The first point of `slice` that lies in `region`, and what follows it.
-    ///
-    /// Points that fail the region test are skipped here rather than filtered
-    /// out in advance: filtering in advance is a copy, and a copy of a bucket is
-    /// the materialisation this whole shape exists to avoid.
-    fn take(mut slice: &'a [Point], region: &Region) -> Option<Self> {
-        while let Some((first, rest)) = slice.split_first() {
-            if holds(region, first.at) {
-                return Some(Self {
-                    point: *first,
-                    rest,
-                });
-            }
-            slice = rest;
-        }
-        None
-    }
-}
-
-impl Ord for Head<'_> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        canonical(&other.point, &self.point)
-    }
-}
-
-impl PartialOrd for Head<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for Head<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for Head<'_> {}
-
-/// A k-way merge over the buckets a region touches, one grid plane at a time.
-///
-/// The plane at a time is the part that matters, and the module header derives
-/// it: the canonical order is lexicographic, so no point of grid plane `bx` can
-/// follow a point of plane `bx + 1`, and the two therefore never need to be live
-/// together. The heap holds one cursor per bucket of a single cross-section —
-/// `|second span| * |third span|` — rather than one per bucket of the span, so a
-/// whole-volume stream does not hold a structure proportional to the point set.
-struct GriddedScan<'a> {
-    index: &'a Gridded,
-    region: &'a Region,
-    lo: [usize; 3],
-    hi: [usize; 3],
-    /// The next grid plane on the first axis to load, once the heap runs dry.
-    next_plane: usize,
-    heap: BinaryHeap<Head<'a>>,
-}
-
-impl GriddedScan<'_> {
-    /// How many cursors a full cross-section needs, which is the bound the heap
-    /// never exceeds.
-    ///
-    /// Test-only, like the other measurement hooks on [`Gridded`]: a caller who
-    /// could ask this could tell a gridded store from a flat one without timing
-    /// it.
-    #[cfg(test)]
-    fn width(&self) -> usize {
-        (self.hi[1] - self.lo[1] + 1) * (self.hi[2] - self.lo[2] + 1)
-    }
-}
-
-impl Iterator for GriddedScan<'_> {
-    type Item = Point;
-
-    fn next(&mut self) -> Option<Point> {
-        loop {
-            if let Some(head) = self.heap.pop() {
-                if let Some(next) = Head::take(head.rest, self.region) {
-                    self.heap.push(next);
-                }
-                return Some(head.point);
-            }
-            // The plane is exhausted, so every point it held has been yielded
-            // and none of the next plane's could have come before them.
-            if self.next_plane > self.hi[0] {
-                return None;
-            }
-            let first = self.next_plane;
-            self.next_plane += 1;
-            for second in self.lo[1]..=self.hi[1] {
-                for third in self.lo[2]..=self.hi[2] {
-                    let linear = linear_bucket([first, second, third], self.index.counts);
-                    let bucket = &self.index.points
-                        [self.index.starts[linear]..self.index.starts[linear + 1]];
-                    if let Some(head) = Head::take(bucket, self.region) {
-                        self.heap.push(head);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ------------------------------------------------------------------ state --
-
-/// Which half of its life a store is in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    /// Blocks write; nobody may read. There is no partial answer, because a
-    /// partial answer is a fact about which writers happened to have finished.
-    Accumulating,
-    /// Nobody writes; anybody may query.
-    Sealed,
-}
-
-impl State {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            State::Accumulating => "accumulating",
-            State::Sealed => "sealed",
-        }
-    }
-}
-
 // ------------------------------------------------------------------ store --
 
 /// A point set, written per block and read by region.
 ///
-/// See the module header for the two states, the canonical order and why the
-/// index is not observable.
+/// A [`Table`] over the schema `[weight: f64]`, and nothing else: every method
+/// here is the table's, with the point's four words read back as a [`Point`].
+/// See `crate::table`'s header for the two states, the canonical order and why
+/// the index is not observable.
 pub struct PointStore {
-    volume: [usize; 3],
-    /// Held while accumulating; taken by [`Self::seal`]. Decoded on the way in
-    /// rather than at seal so that a malformed blob is refused while the block
-    /// that wrote it is still known.
-    pending: Vec<Point>,
-    index: Option<Box<dyn PointIndex>>,
-    layout: Option<Layout>,
-    /// Kept separately from `pending`, because `pending` is emptied by sealing
-    /// and "how many points does this store hold" must keep its answer.
-    count: usize,
+    table: Table,
 }
 
 impl PointStore {
@@ -780,46 +268,34 @@ impl PointStore {
     /// be inside it and no query could ever be answered; that is refused here
     /// rather than turned into a store that is silently always empty.
     pub fn new(volume: [usize; 3]) -> Result<Self> {
-        if volume.iter().any(|&length| length == 0) {
-            return Err(Error::invalid(format!(
-                "a point store over {volume:?} has no voxels for a point to be at, so every \
-                 write would be refused and every query would answer nothing. A volume with a \
-                 zero-length axis is a mistake upstream rather than an empty store."
-            )));
-        }
         Ok(Self {
-            volume,
-            pending: Vec::new(),
-            index: None,
-            layout: None,
-            count: 0,
+            // The noun is what the table calls itself in its own diagnostics.
+            // A caller who asked for a point store and never mentioned a table
+            // should not be told about one.
+            table: Table::named(volume, Schema::points(), "point store")?,
         })
     }
 
     pub fn volume(&self) -> [usize; 3] {
-        self.volume
+        self.table.volume()
     }
 
     pub fn state(&self) -> State {
-        if self.index.is_some() {
-            State::Sealed
-        } else {
-            State::Accumulating
-        }
+        self.table.state()
     }
 
     /// Which index was built, or `None` while accumulating.
     pub fn layout(&self) -> Option<Layout> {
-        self.layout
+        self.table.layout()
     }
 
     /// How many points have been written.
     pub fn len(&self) -> usize {
-        self.count
+        self.table.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.table.is_empty()
     }
 
     /// Take one block's blob.
@@ -840,8 +316,13 @@ impl PointStore {
     /// What *is* checked is the volume: a point outside it is at a coordinate no
     /// region of this store can name, so it would be held and never returned.
     /// That is the silent-loss shape, and it is refused.
+    ///
+    /// The blob is decoded here rather than handed to the table as bytes,
+    /// because a point blob is headerless where a table blob is not — see
+    /// [`encode_points`] — and because the diagnostics a point producer needs
+    /// name points and weights rather than rows and columns.
     pub fn write(&mut self, block: [usize; 3], bytes: &[u8]) -> Result<()> {
-        if self.index.is_some() {
+        if self.state() == State::Sealed {
             return Err(Error::invalid(format!(
                 "this point store is {}, so it takes no more points; block {block:?} tried to \
                  write {} byte(s). Sealing is a barrier: the index was built from everything \
@@ -856,22 +337,27 @@ impl PointStore {
                 "the blob written by block {block:?} is unusable: {err}"
             ))
         })?;
+        // Every point is checked before any is kept, so a refused write leaves
+        // nothing behind: "how many points does this store hold" must not become
+        // a fact about where in the blob the failure was.
+        let volume = self.volume();
         for (index, point) in points.iter().enumerate() {
             for axis in 0..3 {
-                if point.at[axis] >= self.volume[axis] {
+                if point.at[axis] >= volume[axis] {
                     return Err(Error::invalid(format!(
                         "point {index} of block {block:?} is at {:?}, which is outside this \
                          store's volume {:?} on axis {axis}. A point store does not care which \
                          block a point came from — that is the whole point of it — but a \
                          coordinate outside the volume is one no query can ever name, so it \
                          would be kept and never returned.",
-                        point.at, self.volume
+                        point.at, volume
                     )));
                 }
             }
         }
-        self.count += points.len();
-        self.pending.extend(points);
+        for point in &points {
+            self.table.push(point.at, &[Value::F64(point.weight)])?;
+        }
         Ok(())
     }
 
@@ -880,16 +366,9 @@ impl PointStore {
     ///
     /// **This is a barrier.** Every writer must have finished; nothing here can
     /// check that, and the most it does is refuse the writes that arrive
-    /// afterwards. The sort happens in one place, in this process — a
-    /// distributed sort over a set too large for one node is the later problem
-    /// and the module header says what it would take.
+    /// afterwards.
     pub fn seal(&mut self) -> Result<()> {
-        let layout = if self.count <= FLAT_LIMIT {
-            Layout::Flat
-        } else {
-            Layout::Gridded
-        };
-        self.seal_as(layout)
+        self.table.seal()
     }
 
     /// Seal with a named index rather than the derived one.
@@ -900,30 +379,15 @@ impl PointStore {
     /// only thing choosing differently from [`Self::seal`] can do is make a run
     /// slower.
     pub fn seal_as(&mut self, layout: Layout) -> Result<()> {
-        if self.index.is_some() {
-            return Err(Error::invalid(format!(
-                "this point store is already {}. Sealing twice would either discard the index \
-                 and rebuild it — work with no effect, since nothing can have been written \
-                 since — or quietly mean something different from what it says.",
-                State::Sealed.as_str()
-            )));
-        }
-        let points = std::mem::take(&mut self.pending);
-        let index: Box<dyn PointIndex> = match layout {
-            Layout::Flat => Box::new(Flat::build(points)),
-            Layout::Gridded => Box::new(Gridded::build(self.volume, points)),
-        };
-        self.index = Some(index);
-        self.layout = Some(layout);
-        Ok(())
+        self.table.seal_as(layout)
     }
 
     /// A stream of every point in `region`, in the canonical order.
     ///
-    /// **This is the read interface.** It borrows the store and the region and
-    /// yields as it goes; at no point is the answer held, which is what makes a
-    /// whole-volume read possible over a set that a second copy of would not
-    /// fit. [`Self::query`] collects it, and is a convenience rather than the
+    /// **This is the read interface.** It borrows the store and yields as it
+    /// goes; at no point is the answer held, which is what makes a whole-volume
+    /// read possible over a set that a second copy of would not fit.
+    /// [`Self::query`] collects it, and is a convenience rather than the
     /// primitive.
     ///
     /// Half-open: a point at `region.start` is in the answer, one at
@@ -933,27 +397,19 @@ impl PointStore {
     /// store's domain is the volume; a question about somewhere outside it has
     /// no answer, and "nothing there" is the answer a genuinely empty region
     /// gets, so returning it would make the two indistinguishable.
-    pub fn scan<'a>(&'a self, region: &'a Region) -> Result<Box<dyn Iterator<Item = Point> + 'a>> {
-        let Some(index) = self.index.as_ref() else {
-            return Err(Error::invalid(format!(
-                "this point store is {}, not {}, so it has no answer to give: {} point(s) have \
-                 been written and no index has been built. An answer now would be a fact about \
-                 which writers happened to have finished rather than about the point set, and \
-                 an empty one would be indistinguishable from a region that really is empty. \
-                 Call seal() once every writer has finished.",
-                State::Accumulating.as_str(),
-                State::Sealed.as_str(),
-                self.count
-            )));
-        };
-        if region.ndim() != 3 {
-            return Err(Error::invalid(format!(
-                "a point store is queried with a 3-D region, got rank {}",
-                region.ndim()
-            )));
-        }
-        region.check_within(&self.volume, "point store query region")?;
-        Ok(index.scan(region))
+    pub fn scan(&self, region: &Region) -> Result<Box<dyn Iterator<Item = Point> + '_>> {
+        Ok(Box::new(self.table.scan(region)?.map(|row| {
+            Point {
+                at: row.at(),
+                // Cannot fire: the schema is fixed by `new` and its only column is
+                // the weight. The alternative is to read the word directly, which
+                // would be this module reaching past the accessor that keeps the
+                // storage layout private.
+                weight: row
+                    .f64(0)
+                    .expect("a point store's schema has one column and it is the f64 weight"),
+            }
+        })))
     }
 
     /// [`Self::scan`], collected.
@@ -972,10 +428,10 @@ impl std::fmt::Debug for PointStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PointStore")
-            .field("volume", &self.volume)
+            .field("volume", &self.volume())
             .field("state", &self.state().as_str())
-            .field("points", &self.count)
-            .field("layout", &self.layout.map(Layout::as_str))
+            .field("points", &self.len())
+            .field("layout", &self.layout().map(Layout::as_str))
             .finish()
     }
 }

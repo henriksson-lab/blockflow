@@ -558,6 +558,16 @@ pub enum Statistic {
     Deviation,
     /// An order statistic, through the same [`Rank`] the rank filter uses.
     Rank(Rank),
+    /// The **isodata** threshold of the window's histogram: the value that is
+    /// its own two-class midpoint. See [`Isodata`], which holds the two
+    /// parameters and states the rule.
+    ///
+    /// This is not an approximation of any of the three above and is not
+    /// approximated by them. A mean answers "what is the level here"; this
+    /// answers "where does this window separate into two classes", and on a
+    /// bimodal window the two are far apart — the mean sits wherever the mass
+    /// is, the isodata threshold sits between the modes.
+    Isodata(Isodata),
 }
 
 impl Statistic {
@@ -567,6 +577,15 @@ impl Statistic {
     where
         T: Ord + Copy + Into<f64>,
     {
+        // `Isodata` is asked before the emptiness test rather than after,
+        // because it has an answer for an empty window that is a *parameter* —
+        // the value it falls back to when the histogram yields no threshold —
+        // and the shared `0.0` below would silently override it. The other
+        // three keep the exit they have always had: a mean of nothing is
+        // `0 / 0`, and zero is the answer this module has always given for it.
+        if let Statistic::Isodata(isodata) = *self {
+            return isodata.of(window.iter().map(|&value| value.into()));
+        }
         if window.is_empty() {
             return 0.0;
         }
@@ -587,6 +606,8 @@ impl Statistic {
                 let index = rank.resolve(full, window.len());
                 select_nth(window, index).map(Into::into).unwrap_or(0.0)
             }
+            // Answered above, before the emptiness test.
+            Statistic::Isodata(_) => unreachable!("answered before the emptiness test"),
         }
     }
 
@@ -605,11 +626,258 @@ impl Statistic {
     /// * A **deviation** is exact at zero for the same reason and, for the same
     ///   reason as the mean, is *not* exactly zero elsewhere: the mean it
     ///   subtracts is already off by an ulp, so the residuals are not zero.
+    /// * An **isodata** threshold of a constant window is that constant, and it
+    ///   is exact for a reason that is arithmetic rather than lucky: the
+    ///   histogram's bin width is `(max - min) / bins`, a constant window has
+    ///   `max == min`, and the rule returns the maximum without building a
+    ///   histogram at all. `max` over equal values is one of those values. See
+    ///   [`Isodata::of`], where that exit is. It is declared only for a
+    ///   **finite** constant, because a window of infinities or `NaN`s has no
+    ///   finite value to histogram and takes the fallback instead — which is a
+    ///   parameter and not the constant.
     pub fn constant_maps_to(&self, value: f64) -> Option<f64> {
         match self {
             Statistic::Rank(_) => Some(value),
+            Statistic::Isodata(_) => value.is_finite().then_some(value),
             Statistic::Mean | Statistic::Deviation => (value == 0.0).then_some(0.0),
         }
+    }
+
+    /// What this reducer costs per sample **beyond the gather**, over a window
+    /// of `window` voxels, relative to a voxelwise map.
+    ///
+    /// Zero for the three that walk the gathered window once and stop: their
+    /// whole cost is proportional to the window, which `cost_for` already
+    /// charges per element voxel at the gather's own rate. An isodata sweep is
+    /// the exception and it has **two** terms, which is what no existing
+    /// constant could have said: it walks the window again to bin it, and then
+    /// walks the histogram, and the second of those is a function of the bin
+    /// count alone. A 256-bin threshold over a 27-voxel window is dominated by
+    /// its bins; the same threshold over a 729-voxel window is not.
+    fn cost_per_sample(&self, window: usize) -> f64 {
+        match self {
+            Statistic::Isodata(isodata) => {
+                ISODATA_COST_PER_ELEMENT_VOXEL * window as f64
+                    + ISODATA_COST_PER_BIN * isodata.bins() as f64
+            }
+            Statistic::Mean | Statistic::Deviation | Statistic::Rank(_) => 0.0,
+        }
+    }
+}
+
+/// The isodata (Ridler-Calvard) threshold of a window's histogram, and the two
+/// things about it that have to be stated rather than assumed.
+///
+/// The rule
+/// --------
+/// Bin the window's finite values into `bins` equal-width bins spanning
+/// `[min, max]`, with centres at `min + (i + 0.5) * width`. Then a bin centre
+/// `c_i` is **a** threshold when the mean of everything at or below it and the
+/// mean of everything strictly above it average to a value that lands inside
+/// bin `i` itself:
+///
+/// ```text
+/// m = (mean of values in bins 0..=i  +  mean of values in bins i+1..) / 2
+/// c_i is a threshold  <=>  0 <= m - c_i < width
+/// ```
+///
+/// The answer is the **last** such centre. Three consequences worth having in
+/// front of you, because they are where two implementations of "isodata" differ:
+///
+/// * **It is not iterated to a fixed point.** The classical presentation starts
+///   from a guess, splits, re-averages and repeats. This is the direct form: it
+///   tests every bin for the fixed-point property in one pass and reports the
+///   ones that have it. Where the histogram admits several, an iteration would
+///   return whichever one its starting guess fell into; this returns the
+///   highest, always, whatever the data. That is a **tie rule**, not a detail —
+///   a bimodal window with a long bright tail can easily admit two.
+/// * **Bin `i` is compared with a half-open interval**, `>= 0` on one side and
+///   `< width` on the other. A midpoint landing exactly on `c_i` is a
+///   threshold; one landing exactly on `c_i + width` belongs to the next bin
+///   and is not.
+/// * **The top bin is never a threshold.** The loop stops one short, where
+///   everything strictly above is empty by construction; bins whose lower or
+///   upper class is empty are skipped for the same reason, since their class
+///   mean would be `0 / 0`.
+///
+/// The two parameters, and why neither has a default here
+/// ------------------------------------------------------
+/// **`bins`** is the resolution of the histogram, and the answer is a bin
+/// centre — so it is also the quantisation of the answer. It is a parameter
+/// because the implementations this rule is shared with choose it by inspecting
+/// the source array's *element type*: one bin per integer value for an integer
+/// array, a fixed count for a float one. A statistic in this module is handed
+/// `f64` on both sides (see [`LocalStatisticOp::apply`]) and cannot see an
+/// element type to dispatch on, and dispatching on whether the values *look*
+/// integral is a documented way to get this wrong — so the choice is stated by
+/// the caller instead. A caller reproducing the float-array behaviour of those
+/// implementations says `256`.
+///
+/// **`fallback`** is what to answer when the histogram admits no threshold at
+/// all — an empty window, a window with no finite value in it, or a histogram
+/// in which no bin has the property above. There is no value derivable from the
+/// data for that case: the rule genuinely has no answer, and the choice of what
+/// to say instead belongs to whoever will consume the number. It is a parameter
+/// for exactly that reason.
+#[derive(Debug, Clone, Copy)]
+pub struct Isodata {
+    bins: usize,
+    fallback: f64,
+}
+
+impl Isodata {
+    /// `bins` equal-width bins, and the value to answer where the rule has no
+    /// answer. Both are described on [`Isodata`].
+    ///
+    /// `bins` must be at least one and `fallback` must be finite. The finiteness
+    /// is not fussiness: a `NaN` fallback would make a window that took it
+    /// compare unequal to itself, and every byte-identity check downstream in
+    /// this crate would stop meaning anything.
+    pub fn new(bins: usize, fallback: f64) -> Result<Self> {
+        if bins == 0 {
+            return Err(Error::InvalidArgument(
+                "an isodata histogram needs at least one bin; with none there is nothing to \
+                 take a threshold from"
+                    .to_string(),
+            ));
+        }
+        if !fallback.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "an isodata fallback must be finite, got {fallback}. It is a value that can \
+                 end up in the output volume, and a NaN there compares unequal to itself — \
+                 which turns every decomposition check in this crate into a pass that means \
+                 nothing."
+            )));
+        }
+        // `-0.0` is normalised to `+0.0` so that the equality below agrees with
+        // the hash: the two compare equal as numbers and differ as bits, and a
+        // `Hash` taken over the bits would then break `Hash`'s contract with
+        // `Eq`. Normalising once here is cheaper than a hash that has to
+        // remember the exception.
+        let fallback = if fallback == 0.0 { 0.0 } else { fallback };
+        Ok(Self { bins, fallback })
+    }
+
+    pub fn bins(&self) -> usize {
+        self.bins
+    }
+
+    pub fn fallback(&self) -> f64 {
+        self.fallback
+    }
+
+    /// The rule, over whatever `values` yields. See [`Isodata`] for what it is.
+    ///
+    /// Non-finite values are dropped rather than binned: they have no bin, and
+    /// a `min` or a `max` taken over them would be either infinite (making every
+    /// bin width infinite) or `NaN`-poisoned.
+    ///
+    /// The iterator is consumed once and the finite values are collected,
+    /// because the rule needs three passes over them — the extremes, then the
+    /// counts — and a caller's iterator is not required to be cheap or
+    /// repeatable.
+    pub fn of<I>(&self, values: I) -> f64
+    where
+        I: Iterator<Item = f64>,
+    {
+        let values: Vec<f64> = values.filter(|value| value.is_finite()).collect();
+        if values.is_empty() {
+            return self.fallback;
+        }
+        let minimum = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+        let width = (maximum - minimum) / self.bins as f64;
+        if !(width > 0.0) {
+            // Every value is the same one. There is no histogram to build and
+            // no two classes to separate, and the answer is that value —
+            // **exactly**, because `max` returns one of its operands rather
+            // than computing anything. This is the exit `constant_maps_to`
+            // rests on, and it is also what a `bins` so large that the width
+            // underflows would take, which is the right answer for that too.
+            return maximum;
+        }
+
+        let mut counts = vec![0.0f64; self.bins];
+        for &value in &values {
+            // The cast truncates towards zero and the value is at or above the
+            // minimum, so the index is never negative; the clamp is for the
+            // maximum itself, whose exact quotient is `bins`.
+            let bin = (((value - minimum) / width) as usize).min(self.bins - 1);
+            counts[bin] += 1.0;
+        }
+        let centres: Vec<f64> = (0..self.bins)
+            .map(|index| minimum + (index as f64 + 0.5) * width)
+            .collect();
+        if self.bins == 1 {
+            return centres[0];
+        }
+
+        // Cumulative count and cumulative intensity, in bin order. Both are the
+        // "at or below" halves; the "strictly above" halves are the totals less
+        // these, which is what makes the whole sweep two passes rather than
+        // `bins` passes.
+        let mut below = Vec::with_capacity(self.bins);
+        let mut running = 0.0;
+        for count in &counts {
+            running += count;
+            below.push(running);
+        }
+        let total = running;
+        let mut intensity = Vec::with_capacity(self.bins);
+        let mut running = 0.0;
+        for (count, centre) in counts.iter().zip(&centres) {
+            running += count * centre;
+            intensity.push(running);
+        }
+        let total_intensity = running;
+
+        // The bin width is taken as the difference of two centres rather than
+        // as `width`: the comparison below is against the gap between the
+        // centres it is comparing, and recomputing it from the same subtraction
+        // the centres came from keeps the two exactly consistent where
+        // `minimum + 1.5 * width - (minimum + 0.5 * width)` is not exactly
+        // `width`.
+        let step = centres[1] - centres[0];
+        let mut found = self.fallback;
+        for index in 0..self.bins - 1 {
+            let above = total - below[index];
+            if below[index] == 0.0 || above == 0.0 {
+                continue;
+            }
+            let lower = intensity[index] / below[index];
+            let higher = (total_intensity - intensity[index]) / above;
+            let midpoint = (lower + higher) / 2.0;
+            let distance = midpoint - centres[index];
+            if distance >= 0.0 && distance < step {
+                // The last one wins; see [`Isodata`] on why that is the tie
+                // rule and not an artefact of the sweep's direction.
+                found = centres[index];
+            }
+        }
+        found
+    }
+}
+
+/// Equality by **bits** on the fallback, so that it agrees with [`Hash`].
+///
+/// The constructor refuses a non-finite fallback and normalises `-0.0`, so on
+/// every value that can exist here bitwise equality and numeric equality are the
+/// same relation — which is what makes deriving `Eq` legitimate at all for a
+/// type holding an `f64`, and it is worth having: [`Statistic`] is `Eq + Hash`
+/// and a variant that could not be would take that away from every caller.
+impl PartialEq for Isodata {
+    fn eq(&self, other: &Self) -> bool {
+        self.bins == other.bins && self.fallback.to_bits() == other.fallback.to_bits()
+    }
+}
+
+impl Eq for Isodata {}
+
+impl std::hash::Hash for Isodata {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bins.hash(state);
+        self.fallback.to_bits().hash(state);
     }
 }
 
@@ -696,10 +964,36 @@ impl LocalStatistic {
     /// integer can say. A globally anchored lattice does not line up with block
     /// boundaries — that is the whole point of it — so the samples a *particular*
     /// block needs sit at a different distance outside its core for every block,
-    /// and most blocks reach less than this. See `LocalStatisticOp::reach_spec`,
-    /// which says the tighter thing.
+    /// and most blocks reach less than this. Two things say tighter things:
+    /// [`Self::reach_sides`], which drops the symmetry an even window does not
+    /// have and is what `LocalStatisticOp::reach_spec` declares, and
+    /// [`Self::halo`], which drops the "over the volume" and is a table.
     pub fn reach(&self, axis: usize, volume_len: usize) -> usize {
-        self.sampling.max_distance(axis, volume_len) + self.element.reach(axis)
+        let (lo, hi) = self.reach_sides(axis, volume_len);
+        lo.max(hi)
+    }
+
+    /// The same two terms, per side.
+    ///
+    /// The lattice term is symmetric — a sample may be that far away in either
+    /// direction — and the window term is not, so an element with an even
+    /// extent makes the whole thing asymmetric by exactly the element's own
+    /// asymmetry. Stated here so that [`Self::halo`] and both op shells derive
+    /// it from one place; two derivations of one quantity is the arrangement
+    /// this crate keeps out of its geometry.
+    pub fn reach_sides(&self, axis: usize, volume_len: usize) -> (usize, usize) {
+        let distance = self.sampling.max_distance(axis, volume_len);
+        let (lo, hi) = self.element.sides(axis);
+        (distance + lo, distance + hi)
+    }
+
+    /// [`Self::reach_sides`] on every axis, as the crate's `Reach`.
+    pub fn reach_spec(&self, volume: [usize; 3]) -> Reach {
+        Reach::asymmetric([
+            self.reach_sides(0, volume[0]),
+            self.reach_sides(1, volume[1]),
+            self.reach_sides(2, volume[2]),
+        ])
     }
 
     /// The halo each block actually needs, as a table.
@@ -730,7 +1024,12 @@ impl LocalStatistic {
         let lattice = SampleLattice::of(&self.sampling, volume)?;
         let mut axes = [AxisReach::none(), AxisReach::none(), AxisReach::none()];
         for axis in 0..3 {
-            let window = self.element.reach(axis);
+            // Per side: the window below the lowest sample a core voxel reads
+            // from, and above the highest. An element with an even extent
+            // reaches one further below than above, and granting the wider side
+            // in both directions would hand every block a plane it never
+            // touches.
+            let (window_lo, window_hi) = self.element.sides(axis);
             let mut table = Vec::with_capacity(counts[axis]);
             for index in 0..counts[axis] {
                 let core_lo = index * block[axis];
@@ -741,8 +1040,8 @@ impl LocalStatistic {
                 }
                 let (low, _, _) = lattice.bracket(axis, core_lo);
                 let (_, high, _) = lattice.bracket(axis, core_hi - 1);
-                let lowest = lattice.centre(axis, low).saturating_sub(window);
-                let highest = lattice.centre(axis, high) + window;
+                let lowest = lattice.centre(axis, low).saturating_sub(window_lo);
+                let highest = lattice.centre(axis, high) + window_hi;
                 table.push((
                     core_lo.saturating_sub(lowest),
                     highest.saturating_sub(core_hi - 1),
@@ -822,9 +1121,15 @@ impl BlockOp for LocalStatisticOp {
     }
 
     /// Lattice distance plus window radius. Both terms come from the parameters;
-    /// neither is settable.
+    /// neither is settable. The bound; [`Self::reach_spec`] is exact.
     fn reach(&self, axis: usize, volume_len: usize) -> usize {
         self.statistic.reach(axis, volume_len)
+    }
+
+    /// The same two terms per side, so that a window with an even extent is
+    /// planned as the off-centre window it is.
+    fn reach_spec(&self, volume: [usize; 3]) -> Reach {
+        self.statistic.reach_spec(volume)
     }
 
     /// `f64`, and the reason is worth stating rather than assuming.
@@ -910,6 +1215,12 @@ impl BlockOp for AdaptiveThresholdOp {
         self.statistic.reach(axis, volume_len)
     }
 
+    /// The statistic's reach per side, for the same reason and by the same
+    /// derivation: a voxelwise comparison adds nothing on either side.
+    fn reach_spec(&self, volume: [usize; 3]) -> Reach {
+        self.statistic.reach_spec(volume)
+    }
+
     /// `f64`, for [`LocalStatisticOp::apply`]'s reason and one more of its own:
     /// the comparison is `T: PartialOrd` against a threshold **of the same
     /// type**, and the threshold is the statistic's `f64` output. A narrower
@@ -959,14 +1270,60 @@ pub(super) fn cost_for(statistic: &LocalStatistic) -> f64 {
     // `Sampling::samples_per_voxel`. Charging full density over-prices, which is
     // the safe direction.
     let samples_per_voxel = statistic.sampling().samples_per_voxel().unwrap_or(1.0);
-    SAMPLE_COST_PER_ELEMENT_VOXEL * statistic.element().len() as f64 * samples_per_voxel
-        + INTERPOLATION_COST
+    // Two terms per sample: the gather, which scales with the window, and
+    // whatever the reducer does afterwards that does *not*. Only one statistic
+    // has the second — a histogram sweep is a function of the bin count and not
+    // of how many values went into it — and it is zero for the other three, so
+    // this is bit-for-bit the expression it replaces wherever it was already
+    // right.
+    let window = statistic.element().len();
+    let per_sample = SAMPLE_COST_PER_ELEMENT_VOXEL * window as f64
+        + statistic.statistic().cost_per_sample(window);
+    per_sample * samples_per_voxel + INTERPOLATION_COST
 }
 
 /// Measured; see `super::COST_MEASUREMENT`.
 pub(super) const SAMPLE_COST_PER_ELEMENT_VOXEL: f64 = 1.96;
 /// Measured; see `super::COST_MEASUREMENT`.
 pub(super) const INTERPOLATION_COST: f64 = 2.7;
+/// Measured; see `super::COST_MEASUREMENT` and the table on
+/// [`ISODATA_COST_PER_BIN`]. The isodata rule's **second** walk over the
+/// gathered window, per value, relative to a voxelwise map: the collect, the two
+/// extreme folds and the binning division. It sits on top of
+/// [`SAMPLE_COST_PER_ELEMENT_VOXEL`], which prices the gather itself, and it is
+/// about the same size — which is the useful thing it says.
+pub(super) const ISODATA_COST_PER_ELEMENT_VOXEL: f64 = 1.87;
+/// Measured. One bin of an isodata sweep, per sample, relative to a voxelwise
+/// map — the passes the rule makes over the histogram (the cumulative count, the
+/// cumulative intensity, the midpoint test), which cost the same whether the
+/// window held twenty-seven values or a thousand.
+///
+/// **It is large**, and that is the figure a planner most needs: at 256 bins
+/// this term alone is over a thousand voxelwise maps per *sample*, so an isodata
+/// threshold on a dense lattice is an expensive op and on a coarse one is not. A
+/// model that priced it as "a windowed statistic" would be out by an order of
+/// magnitude in whichever direction the lattice happened to fall.
+///
+/// **The measurement.** `ops::cost::report([96, 64, 64], 5)`, `--release`, on
+/// the machine this crate was developed on. Each isodata row is read against the
+/// mean row with the same window and lattice, because the gather is identical
+/// between them and the difference is exactly this reducer; the figures below
+/// are that difference, multiplied by the 512 voxels per sample.
+///
+/// ```text
+/// window   bins   relative   mean at the same window   difference, per sample
+///     729     64       8.95                      5.52                    1756
+///     729    256      10.36                      5.52                    2478
+///      27    256       5.35                      2.76                    1326
+/// ```
+///
+/// The two constants are the least-squares fit of
+/// `per sample = element * window + bin * bins` over those three rows — two
+/// predictors and no intercept, because the model *is* the shape of the work:
+/// one pass over the window, one over the histogram. It reproduces all three to
+/// within 5%, which is the standard `docs/design/BLOCK_OPS.md` §"Simulating
+/// strategies" sets: trust "A beats B", distrust "A takes 40 minutes".
+pub(super) const ISODATA_COST_PER_BIN: f64 = 4.71;
 
 #[cfg(test)]
 mod tests {
@@ -1069,6 +1426,53 @@ mod tests {
         let dense = LocalStatistic::new(element, [1, 1, 1], Statistic::Mean).unwrap();
         assert_eq!(axis_max_distance(64, 1), 0);
         assert_eq!(dense.reach(0, 64), 2);
+    }
+
+    /// The lattice term is symmetric and the window term is not, so an even
+    /// window makes the whole reach asymmetric by exactly the window's own
+    /// asymmetry — and the halo table has to carry that through per side.
+    ///
+    /// The halo is what a block is actually handed; granting the wider side in
+    /// both directions would give every block a plane no voxel of its core
+    /// reads, on every block of the lattice, which is the cost this crate keeps
+    /// per-side reaches in order not to pay.
+    #[test]
+    fn an_even_window_makes_both_the_reach_and_the_halo_asymmetric() {
+        let element = StructuringElement::from_size(ElementShape::Box, [6, 5, 5]).unwrap();
+        assert_eq!(element.sides(0), (3, 2));
+        let statistic = LocalStatistic::new(element, [8, 8, 8], Statistic::Mean).unwrap();
+        assert_eq!(statistic.reach_sides(0, 64), (7 + 3, 7 + 2));
+        assert_eq!(statistic.reach(0, 64), 10, "the bound is the wider side");
+        assert_eq!(statistic.reach_spec([64, 64, 64]).at(0, 0, 64), (10, 9));
+
+        // And the granted halo, which is derived from the brackets rather than
+        // from the reach, is asymmetric on the same axis and by the same voxel.
+        //
+        // Taken on the **no-lattice** sampling and on the **interior** blocks,
+        // for two separate reasons. A spacing wide enough to bracket dominates
+        // the window on both sides — with samples eight apart the nearest one
+        // outside the core is far enough away that three and two below it round
+        // to the same halo — so a lattice term would hide the property rather
+        // than exercise it. And the first and last block have their halo
+        // clamped by the volume's own edge, where there is nothing beyond to
+        // fetch, so the asymmetry is a fact about seams.
+        let element = StructuringElement::from_size(ElementShape::Box, [6, 5, 5]).unwrap();
+        let dense = LocalStatistic::new(element, [1, 1, 1], Statistic::Mean).unwrap();
+        let grid = BlockGrid::new([64, 8, 8], [16, 8, 8]).unwrap();
+        let halo = dense.halo(&grid).unwrap();
+        assert_eq!(
+            halo.at(0, 0, 64),
+            (0, 2),
+            "clamped at the volume's own edge"
+        );
+        for index in 1..4 {
+            assert_eq!(
+                halo.at(0, index, 64),
+                (3, 2),
+                "block {index} must be granted the window's two sides and not its \
+                 bounding box"
+            );
+        }
     }
 
     /// The interpolation term is exactly what it claims: sweeping every voxel of
@@ -1245,6 +1649,98 @@ mod tests {
         // local median scaled by a half
         assert_eq!(ranked.constant_maps_to(3.0), Some(1.0));
         assert_eq!(ranked.constant_maps_to(0.0), Some(0.0));
+    }
+
+    // ------------------------------------------------------- isodata --
+
+    /// Everything that cannot produce a usable threshold is refused where it is
+    /// **stated**, rather than at the first window that reaches it.
+    #[test]
+    fn an_isodata_that_could_not_produce_a_threshold_is_refused_at_construction() {
+        assert!(Isodata::new(0, 1.0).is_err());
+        for fallback in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = Isodata::new(256, fallback).unwrap_err().to_string();
+            assert!(err.contains("must be finite"), "got: {err}");
+        }
+        assert!(Isodata::new(1, 0.0).is_ok());
+        assert!(Isodata::new(256, -3.5).is_ok());
+    }
+
+    /// The fallback is a **parameter**, and it is what an empty window and a
+    /// window with nothing finite in it get. Both of those are the same case —
+    /// there is no histogram — and neither is the crate's business to name.
+    #[test]
+    fn a_window_with_nothing_to_histogram_takes_the_stated_fallback() {
+        for fallback in [1.0f64, 0.0, -3.5, 1e12] {
+            let isodata = Isodata::new(256, fallback).unwrap();
+            assert_eq!(isodata.of(std::iter::empty()), fallback);
+            assert_eq!(
+                isodata.of([f64::NAN, f64::INFINITY, f64::NEG_INFINITY].into_iter()),
+                fallback
+            );
+            // and a window that *does* have values does not take it
+            assert_eq!(isodata.of([2.0, 2.0, 2.0].into_iter()), 2.0);
+        }
+    }
+
+    /// `Eq` and `Hash` agree, which is what makes holding an `f64` in a
+    /// `Statistic` legitimate. `-0.0` is the only value where the two could
+    /// disagree and the constructor normalises it.
+    #[test]
+    fn two_isodata_parameters_are_equal_exactly_when_they_hash_alike() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let hash = |value: &Isodata| {
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        };
+        let plus = Isodata::new(256, 0.0).unwrap();
+        let minus = Isodata::new(256, -0.0).unwrap();
+        assert_eq!(plus, minus);
+        assert_eq!(hash(&plus), hash(&minus));
+        assert_eq!(plus.fallback().to_bits(), 0.0f64.to_bits());
+
+        let other = Isodata::new(64, 0.0).unwrap();
+        assert_ne!(plus, other);
+        assert_eq!(
+            Statistic::Isodata(plus),
+            Statistic::Isodata(Isodata::new(256, 0.0).unwrap())
+        );
+        assert_ne!(Statistic::Isodata(plus), Statistic::Isodata(other));
+    }
+
+    /// A single bin has one centre and the rule returns it — the degenerate
+    /// case, stated so that it is a decision rather than an accident of the
+    /// loop bound below it.
+    #[test]
+    fn one_bin_answers_its_only_centre() {
+        let isodata = Isodata::new(1, 99.0).unwrap();
+        // centre of [0, 4] is 2
+        assert_eq!(isodata.of([0.0, 1.0, 4.0].into_iter()), 2.0);
+    }
+
+    /// The cost model sees the shape of this reducer's work: the bin count, not
+    /// the window.
+    #[test]
+    fn an_isodata_statistic_is_priced_by_its_bins_and_a_mean_is_not() {
+        let window = StructuringElement::from_size(ElementShape::Box, [3, 3, 3]).unwrap();
+        let of = |statistic| {
+            cost_for(&LocalStatistic::new(window.clone(), [1, 1, 1], statistic).unwrap())
+        };
+        let mean = of(Statistic::Mean);
+        let narrow = of(Statistic::Isodata(Isodata::new(64, 1.0).unwrap()));
+        let wide = of(Statistic::Isodata(Isodata::new(256, 1.0).unwrap()));
+        assert!(narrow > mean, "a histogram sweep is not free");
+        assert!(wide > narrow, "four times the bins is more work");
+        // and the three that were already here are unchanged, bit for bit
+        assert_eq!(
+            mean,
+            SAMPLE_COST_PER_ELEMENT_VOXEL * window.len() as f64 * 1.0 + INTERPOLATION_COST
+        );
+        assert_eq!(of(Statistic::Deviation), mean);
+        assert_eq!(of(Statistic::Rank(Rank::lowest())), mean);
     }
 
     #[test]

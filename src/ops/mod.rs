@@ -74,6 +74,14 @@
 // by the configured halo makes the guard compare a number against itself — and
 // the way to be sure of that is to have nothing to feed it with.
 //
+// An element of *even* size has no centre voxel, so its reach is asymmetric —
+// size 10 reads five below the anchor and four above — and the ops here state
+// that per side in `reach_spec` while `reach` stays the wider of the two, which
+// `Chain::reach_spec` checks remains a bound. Where a signature can hold only
+// one integer per axis (`SubstageOperand`, `FragmentInput`) the wider side is
+// declared and the over-fetch is written down at the declaration rather than
+// left for a reader to discover.
+//
 // **`constant_maps_to` is declared only where it is exactly true.** The default
 // is `None` and an op that says nothing is never skipped, so silence is safe and
 // a wrong declaration is not. That is why the local *mean* declares nothing
@@ -134,12 +142,13 @@ pub use detect::{
 pub use element::{select_nth, ElementShape, Rank, StructuringElement, Total};
 pub use fill::{fill_phases, FillHolesOp, LabelBackgroundOp};
 pub use local::{
-    axis_max_distance, local_statistic_into, threshold_against_into, AdaptiveThresholdOp,
+    axis_max_distance, local_statistic_into, threshold_against_into, AdaptiveThresholdOp, Isodata,
     LocalStatistic, LocalStatisticOp, SampleLattice, Sampling, Statistic,
 };
 pub use morphology::{close_into, dilate_into, erode_into, open_into, Morphology, MorphologyOp};
 pub use normalise::{
-    normalise_against_into, normalise_value, LevelCorrectionOp, LocalContrastOp, Removal,
+    bounded_gain_into, bounded_gain_value, normalise_against_into, normalise_value,
+    LevelCorrectionOp, LocalContrastOp, LocalGainOp, Removal,
 };
 pub use rank::{rank_filter_f64_into, rank_filter_into, RankFilterOp};
 pub use reconstruct::{
@@ -156,7 +165,8 @@ pub use resample::{
 };
 pub use ridge::{
     gaussian_radius, gaussian_smooth_into, gaussian_weights, hessian_at, ridge_response_into,
-    symmetric_eigenvalues, Polarity, RidgeFilterOp, RidgeResponse, ScaleSpace,
+    symmetric_eigenvalues, EigenResponse, Polarity, RatioResponse, Response, RidgeFilterOp,
+    RidgeResponse, ScaleSpace,
 };
 pub use skeleton::{thin, thinning_pass, thinning_reach, ThinningOp};
 pub use smooth::{Gaussian, SmoothOp};

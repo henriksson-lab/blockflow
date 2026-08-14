@@ -29,6 +29,7 @@
 // | [`AdaptiveThresholdOp`](super::local::AdaptiveThresholdOp) | one statistic | `value > scale * s + offset` |
 // | [`LevelCorrectionOp`] | one statistic | `value - s`, or `value / max(s, floor)` |
 // | [`LocalContrastOp`] | **two** statistics | `(value - c) / max(s, floor)` |
+// | [`LocalGainOp`] | **two** statistics | `value * g`, `g = 1 / max(l, floor)` capped so `h * g <= ceiling` |
 //
 // Why they are two ops and not one, and where they touch
 // ------------------------------------------------------
@@ -46,6 +47,19 @@
 // mandatory. A caller who wants the division alone asks for the division alone,
 // from the op whose parameterisation is about a level, and there is one
 // implementation of that arithmetic rather than two that can drift.
+//
+// [`LocalGainOp`] is the third op rather than a fourth `Removal` or a variant of
+// the contrast op, and the reason is that its two estimates play **different
+// roles**, which neither of the other parameterisations has anywhere to put.
+// `LevelCorrectionOp::Divide` holds one statistic and the cap needs a second;
+// `LocalContrastOp` holds two, but its second is a *spread* that goes in the
+// denominator beside the first, where this one is an upper estimate that appears
+// only in a comparison and only sometimes. A variant sharing a struct with
+// either would be sharing the name and nothing else: no field of the existing
+// two means what `ceiling` means, and `constant_maps_to` would have to branch on
+// which fields were live. So it is its own op, with its own arithmetic in its
+// own scalar function, and it reuses the estimator rather than the shell —
+// which is the reuse that was worth having.
 //
 // The anchoring, which is the whole hazard
 // ----------------------------------------
@@ -83,11 +97,12 @@
 // * [`LevelCorrectionOp`]: nothing. The combination is voxelwise — it reads the
 //   voxel it writes and the estimate at that voxel — so the reach is the
 //   statistic's, unchanged;
-// * [`LocalContrastOp`]: the **maximum** over its two statistics, per axis,
-//   because a voxel's answer depends on everything either estimate read. Not the
-//   sum: the two estimates are computed from the same buffer in parallel rather
-//   than composed, so the dependency cone is the union of two cones about the
-//   same voxel and its half-width is the larger of the two.
+// * [`LocalContrastOp`] and [`LocalGainOp`]: the **maximum** over their two
+//   statistics, per axis, because a voxel's answer depends on everything either
+//   estimate read. Not the sum: the two estimates are computed from the same
+//   buffer in parallel rather than composed, so the dependency cone is the union
+//   of two cones about the same voxel and its half-width is the larger of the
+//   two.
 //
 // The constant algebra, and why subtraction and division may declare more than
 // the mean underneath them can
@@ -215,6 +230,78 @@ where
             Ok(())
         }
     }
+}
+
+/// The bounded gain, as a scalar, in one place — [`normalise_value`]'s sibling
+/// and here for the same reason: the kernel evaluates it per voxel and
+/// [`BlockOp::constant_maps_to`] evaluates it once, and the declaration is only
+/// exactly true if the two evaluate the same expression.
+///
+/// ```text
+/// gain = 1 / max(low, floor)
+/// if high * gain > ceiling { gain = ceiling / high }
+/// value * gain
+/// ```
+///
+/// **Two things about this are not the obvious algebra, and both are
+/// deliberate.**
+///
+/// The cap is written as a *test and a replacement* rather than as
+/// `min(1 / max(low, floor), ceiling / high)`. On the ordinary data the two
+/// agree, and where they do not the difference is not a rounding: with a
+/// non-positive `high` — an upper estimate of zero over an empty region, or of a
+/// negative value over a volume that has them — `high * gain` cannot exceed a
+/// positive `ceiling`, so the test leaves the gain alone, while the `min` would
+/// take a zero or a negative `ceiling / high` and either annihilate the voxel or
+/// flip its sign. The test form is the one that treats the cap as a cap.
+///
+/// The floor bounds only the **divisor**, not the estimate: `max(low, floor)` is
+/// evaluated inside the reciprocal and nowhere else, so a `low` below the floor
+/// is prevented from producing an unbounded gain without being rewritten
+/// anywhere it would change the answer. That is [`normalise_value`]'s floor
+/// doing the same job in the same place, and the two ops therefore fail the same
+/// way on the same inputs, which is one behaviour to know rather than two.
+///
+/// `ceiling` and `floor` are both parameters, and neither has a value that is
+/// right for every caller: the floor is in the units of the estimate and the
+/// ceiling is in the units of the output.
+#[inline]
+pub fn bounded_gain_value(value: f64, low: f64, high: f64, floor: f64, ceiling: f64) -> f64 {
+    let mut gain = 1.0 / low.max(floor);
+    if high * gain > ceiling {
+        gain = ceiling / high;
+    }
+    value * gain
+}
+
+/// Apply the bounded gain to every voxel, against the estimates co-located with
+/// it.
+///
+/// Generic over the input element type, for [`normalise_against_into`]'s reason:
+/// the estimates are `f64` because [`LocalStatistic`] produces `f64`, and the
+/// product of a value and an `f64` gain is an `f64` whatever the value was.
+pub fn bounded_gain_into<T>(
+    input: ArrayView3<'_, T>,
+    low: ArrayView3<'_, f64>,
+    high: ArrayView3<'_, f64>,
+    floor: f64,
+    ceiling: f64,
+    mut out: ArrayViewMut3<'_, f64>,
+) -> Result<()>
+where
+    T: Copy + Into<f64>,
+{
+    shapes_agree(input.shape(), out.shape(), "bounded_gain_into")?;
+    shapes_agree(input.shape(), low.shape(), "bounded_gain_into low")?;
+    shapes_agree(input.shape(), high.shape(), "bounded_gain_into high")?;
+    Zip::from(&mut out)
+        .and(input)
+        .and(low)
+        .and(high)
+        .for_each(|slot, &value, &low, &high| {
+            *slot = bounded_gain_value(value.into(), low, high, floor, ceiling);
+        });
+    Ok(())
 }
 
 // ------------------------------------------------------------ parameters --
@@ -510,6 +597,153 @@ impl BlockOp for LocalContrastOp {
     }
 }
 
+/// Multiply every voxel by a locally estimated gain, capped so that a locally
+/// estimated **upper** value is not carried above a stated ceiling.
+///
+/// `value * gain`, with `gain = 1 / max(low, floor)` reduced to `ceiling / high`
+/// wherever the first would take `high` past the ceiling. [`bounded_gain_value`]
+/// is the arithmetic and states the two places it is not the obvious algebra.
+///
+/// **What it is for, and why the cap cannot be composed away.** The uncapped
+/// half alone is [`LevelCorrectionOp`]'s `Divide`: it makes a low estimate map
+/// to one, so that a fixed value means the same thing everywhere however dim
+/// the region is. What that does on a region whose low estimate is small and
+/// whose content is not is amplify everything in it, and the ceiling is the
+/// bound on that — expressed against a *second* estimate of the region rather
+/// than against the output, because a fixed output clamp would flatten the
+/// region's own structure while this rescales it. That is also why the cap has
+/// to live inside the op: it is a bound on the **gain**, chosen per voxel from
+/// an estimate, and a [`VoxelwiseMapOp`](super::voxelwise::VoxelwiseMapOp)
+/// composed after this one sees only the product and cannot recover it. The
+/// same argument the floor gets in [`LocalContrastOp`], for the same structural
+/// reason.
+///
+/// **Two statistics, two lattices, independently parameterised**, exactly as
+/// [`LocalContrastOp`]'s are. The usual pair is two order statistics of one
+/// window — a low and a high [`Rank`](super::element::Rank) — but nothing here
+/// requires that, and nothing requires them to share a lattice.
+#[derive(Debug)]
+pub struct LocalGainOp {
+    name: &'static str,
+    low: LocalStatistic,
+    high: LocalStatistic,
+    floor: f64,
+    ceiling: f64,
+    cost: f64,
+}
+
+impl LocalGainOp {
+    pub fn new(
+        name: &'static str,
+        low: LocalStatistic,
+        high: LocalStatistic,
+        floor: f64,
+        ceiling: f64,
+    ) -> Result<Self> {
+        check_floor(floor, name)?;
+        if !ceiling.is_finite() || ceiling <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "{name}: a gain ceiling must be finite and strictly positive, got {ceiling}. \
+                 It is the largest value the upper estimate may be carried to, so a \
+                 non-positive one does not bound the gain — it negates or annihilates every \
+                 voxel the cap applies to, which is a different operation wearing this one's \
+                 name."
+            )));
+        }
+        let cost = cost_for(&low) + cost_for(&high) + CONTRAST_COMBINE_COST;
+        Ok(Self {
+            name,
+            low,
+            high,
+            floor,
+            ceiling,
+            cost,
+        })
+    }
+
+    pub fn low(&self) -> &LocalStatistic {
+        &self.low
+    }
+
+    pub fn high(&self) -> &LocalStatistic {
+        &self.high
+    }
+
+    pub fn floor(&self) -> f64 {
+        self.floor
+    }
+
+    pub fn ceiling(&self) -> f64 {
+        self.ceiling
+    }
+
+    /// Override the composed cost. See [`cost_per_voxel`](BlockOp::cost_per_voxel).
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+impl BlockOp for LocalGainOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The **larger** of the two statistics' reaches, per axis, for
+    /// [`LocalContrastOp::reach`]'s reason: the two estimates are taken from the
+    /// same buffer rather than one from the other, so the dependency cone is a
+    /// union of two centred neighbourhoods and its half-width is the larger of
+    /// the two. Both terms of each come from the statistics' own parameters and
+    /// there is no field on this op that could widen or narrow either.
+    fn reach(&self, axis: usize, volume_len: usize) -> usize {
+        self.low
+            .reach(axis, volume_len)
+            .max(self.high.reach(axis, volume_len))
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
+        let input = input.view::<f64>()?;
+        let mut low = Array3::<f64>::zeros(input.dim());
+        let mut high = Array3::<f64>::zeros(input.dim());
+        self.low.evaluate_into(input, at, low.view_mut())?;
+        self.high.evaluate_into(input, at, high.view_mut())?;
+        bounded_gain_into(
+            input,
+            low.view(),
+            high.view(),
+            self.floor,
+            self.ceiling,
+            out.view_mut::<f64>()?,
+        )
+    }
+
+    /// Only where **both** statistics declare, and by evaluating the operation
+    /// rather than reasoning about it.
+    ///
+    /// Worth reading concretely, because the cap makes this less obvious than
+    /// its neighbours: over a constant volume the low and the high estimates are
+    /// the same number, so the gain is `1 / max(v, floor)` unless that would
+    /// carry `v` itself above the ceiling — which it does exactly when `v`
+    /// clears the floor and the ceiling is below one. The declaration is
+    /// whichever of the two [`bounded_gain_value`] computes, which is also what
+    /// every voxel of that block would compute.
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        let low = self.low.statistic().constant_maps_to(value)?;
+        let high = self.high.statistic().constant_maps_to(value)?;
+        Some(bounded_gain_value(
+            value,
+            low,
+            high,
+            self.floor,
+            self.ceiling,
+        ))
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+}
+
 /// Measured; see [`COST_MEASUREMENT`](super::COST_MEASUREMENT) for the method
 /// and `print_the_cost_of_these_ops` below for the run that takes it again.
 ///
@@ -537,6 +771,14 @@ impl BlockOp for LocalContrastOp {
 /// 5.44 = 1.21`. It is more than twice the two-operand figure because there are
 /// two whole `f64` estimate buffers to allocate, write and stream back rather
 /// than one, and at this arithmetic intensity that traffic is the cost.
+///
+/// [`LocalGainOp`] charges the same constant, and the reason is that same
+/// sentence: its combination is also three operands and two estimate buffers,
+/// and at this arithmetic intensity the traffic is what is being priced — a
+/// reciprocal, a comparison and a multiply against a subtraction, a `max` and a
+/// division is not a difference a cost model can see. Reusing the measured
+/// number is better than introducing a second one that would have to be
+/// remeasured beside it.
 pub(super) const CONTRAST_COMBINE_COST: f64 = 1.21;
 
 #[cfg(test)]
@@ -977,6 +1219,123 @@ mod tests {
             "if this ever becomes exact the declaration can be widened, but it must be \
              widened deliberately"
         );
+    }
+
+    // ---------------------------------------------------- the bounded gain --
+
+    #[test]
+    fn a_ceiling_that_could_not_bound_a_gain_is_refused_at_construction() {
+        let estimate = || statistic([4, 4, 4], Statistic::Rank(Rank::lowest()));
+        for ceiling in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let err = LocalGainOp::new("gain", estimate(), estimate(), 1.0, ceiling)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("ceiling must be finite"), "got: {err}");
+        }
+        // and the floor is refused by the same predicate the other two ops use
+        for floor in [0.0, -1.0, f64::NAN] {
+            let err = LocalGainOp::new("gain", estimate(), estimate(), floor, 1.5)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("finite and strictly positive"), "got: {err}");
+        }
+        assert!(LocalGainOp::new("gain", estimate(), estimate(), 1.0, 1.5).is_ok());
+    }
+
+    /// The arithmetic, on the cases that separate it from the algebra it is not.
+    #[test]
+    fn the_bounded_gain_is_the_arithmetic_it_says_it_is() {
+        // uncapped: 1 / max(low, floor)
+        assert_eq!(bounded_gain_value(4.0, 2.0, 2.0, 1.0, 10.0), 2.0);
+        // the floor, not the estimate, is what bounds the divisor
+        assert_eq!(bounded_gain_value(4.0, 0.5, 0.5, 1.0, 10.0), 4.0);
+        // capped: high would land above the ceiling, so the gain is reduced
+        assert_eq!(bounded_gain_value(4.0, 2.0, 100.0, 1.0, 10.0), 0.4);
+        // a non-positive upper estimate cannot exceed a positive ceiling, so the
+        // cap does not fire — where a `min` would have flipped the sign
+        assert_eq!(bounded_gain_value(-2.0, -4.0, -1.0, 1.0, 0.5), -2.0);
+        assert_eq!(bounded_gain_value(0.0, 0.0, 0.0, 1.0, 0.5), 0.0);
+    }
+
+    /// The reach is the larger of the two statistics' and never their sum, for
+    /// [`LocalContrastOp`]'s reason and by the same derivation.
+    #[test]
+    fn the_gains_reach_is_the_larger_of_its_two_estimates() {
+        let op = LocalGainOp::new(
+            "gain",
+            statistic([8, 8, 8], Statistic::Rank(Rank::lowest())),
+            statistic([3, 3, 3], Statistic::Mean),
+            1.0,
+            1.5,
+        )
+        .unwrap();
+        // 7 + 1 against 2 + 1
+        assert_eq!(op.reach(0, 64), 8);
+        assert_ne!(op.reach(0, 64), 11, "and never their sum");
+    }
+
+    /// The constant algebra, **including the cap**: a block that is uniformly
+    /// `value` takes the capped branch exactly when the uncapped gain would
+    /// carry `value` past the ceiling, and the declaration is the computed
+    /// number bit for bit either way.
+    #[test]
+    fn the_gains_declared_constant_is_the_computed_one_bit_for_bit() {
+        let volume = [9usize, 9, 9];
+        let element = box_element([1, 1, 1]);
+        let rank = |which| LocalStatistic::new(element.clone(), [3, 3, 3], which).unwrap();
+        for (value, ceiling) in [
+            (4.0f64, 10.0f64),
+            (4.0, 0.5),
+            (0.25, 2.0),
+            (0.0, 1.5),
+            (-3.0, 1.5),
+        ] {
+            let op = LocalGainOp::new(
+                "gain",
+                rank(Statistic::Rank(Rank::lowest())),
+                rank(Statistic::Rank(Rank::highest(&element))),
+                1.0,
+                ceiling,
+            )
+            .unwrap();
+            let declared = op
+                .constant_maps_to(value)
+                .expect("both estimates are order statistics, so both declare");
+            let input = Array3::from_elem((volume[0], volume[1], volume[2]), value);
+            let computed = apply(&op, &input, &Anchor::whole(volume));
+            assert!(
+                computed.iter().all(|&got| got == declared),
+                "value {value}, ceiling {ceiling}: declared {declared}, computed {:?}",
+                computed.iter().find(|&&got| got != declared)
+            );
+        }
+        // the concrete algebra, so that a change to it is visible: at 4.0 with a
+        // ceiling of 10 the gain is 1/4 and the answer is 1; with a ceiling of
+        // 0.5 the cap bites and the answer is the ceiling itself.
+        let op = |ceiling| {
+            LocalGainOp::new(
+                "gain",
+                rank(Statistic::Rank(Rank::lowest())),
+                rank(Statistic::Rank(Rank::highest(&element))),
+                1.0,
+                ceiling,
+            )
+            .unwrap()
+        };
+        assert_eq!(op(10.0).constant_maps_to(4.0), Some(1.0));
+        assert_eq!(op(0.5).constant_maps_to(4.0), Some(0.5));
+
+        // and a statistic that withholds withholds the pair
+        let mixed = LocalGainOp::new(
+            "gain",
+            statistic([4, 4, 4], Statistic::Rank(Rank::lowest())),
+            statistic([4, 4, 4], Statistic::Mean),
+            1.0,
+            1.5,
+        )
+        .unwrap();
+        assert_eq!(mixed.constant_maps_to(0.0), Some(0.0));
+        assert_eq!(mixed.constant_maps_to(0.1), None);
     }
 
     // ---------------------------------------------------------- the cost --

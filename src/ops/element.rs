@@ -17,13 +17,25 @@
 // *reproducible*, and reproducibility across decompositions is the property this
 // crate exists to defend.
 //
-// **The reach is the radius, and nothing configures it.** `reach` is derived
-// from the element; there is no field to set it to something else. A caller who
-// wants a wider halo sets the halo, which is a hint. That asymmetry is the whole
-// design: `docs/design/BLOCK_OPS.md` is explicit that a reach fed by the
-// configured halo makes the guard compare a number against itself.
+// **The reach is derived from the element, and nothing configures it.** There is
+// no field to set it to something else. A caller who wants a wider halo sets the
+// halo, which is a hint. That asymmetry is the whole design:
+// `docs/design/BLOCK_OPS.md` is explicit that a reach fed by the configured halo
+// makes the guard compare a number against itself.
+//
+// **The reach has two sides, because an element can have two.** An element of
+// even extent has no centre voxel, so its anchor is off centre and it reads one
+// voxel further on one side than the other. `sides` is the exact statement and
+// is what every op's `reach_spec` is built from; `reach` is the wider of the two
+// and is the symmetric bound `BlockOp::reach` has to keep reporting. Rounding
+// the short side up to the long one would be safe for the halo and *wrong for
+// the element* — a different set of voxels is a different filter — so the
+// asymmetry is carried rather than smoothed away, and `src/reach.rs` has had
+// `AxisReach::Bounded { lo, hi }` to carry it in for longer than this module has
+// been able to produce one.
 
 use crate::error::{Error, Result};
+use crate::reach::Reach;
 
 /// Which voxels of the bounding box belong to the neighbourhood.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,67 +46,237 @@ pub enum ElementShape {
     /// box, i.e. `sum (d_a / r_a)^2 <= 1`. An axis with radius zero admits only
     /// offset zero on that axis, so a flat element is a lower-dimensional
     /// ellipse rather than an empty set.
+    ///
+    /// Where the two sides of an axis differ — see [`StructuringElement::sides`]
+    /// — each offset is divided by **the side it is on**, so the surface still
+    /// passes through both poles and `reach` stays exact on both sides. That is
+    /// the only generalisation that keeps this shape's defining property (it is
+    /// inscribed in its bounding box and touches every face of it); dividing
+    /// both sides by the wider one would pull the short side inside its own
+    /// face, and by the narrower one would push the long side outside the box.
+    /// For a symmetric element the two sides are equal and this is the rule it
+    /// always was.
     Ellipsoid,
+    /// The ellipsoid a **different, common convention** describes: semi-axes of
+    /// `ceil(extent / 2)` rather than of the radius, measured from the box's
+    /// *continuous* centre rather than from a centre voxel, and **open** rather
+    /// than closed.
+    ///
+    /// Concretely, with `n_a` the extent of the bounding box on axis `a` and
+    /// `o_a` the offset from the anchor:
+    ///
+    /// ```text
+    /// sum_a ( (o_a + (lo_a - hi_a) / 2) / ceil(n_a / 2) )^2  <  1
+    /// ```
+    ///
+    /// The `(lo - hi) / 2` term is the anchor's displacement from the box's
+    /// continuous centre — zero for a centred element, a half voxel for one
+    /// built from an even extent, and whatever a hand-placed anchor makes it —
+    /// so the coordinate being tested is always the voxel's own centre measured
+    /// from the centre of the box, and the shape is symmetric under reflection
+    /// of the box whether or not a centre voxel exists.
+    ///
+    /// **Why this exists at all, given [`ElementShape::Ellipsoid`].** It is a
+    /// strictly larger set for an odd extent: `n = 2r + 1` normalises by `r + 1`
+    /// rather than by `r`, so a size-11 element admits every offset with
+    /// `d^2 < 36` where the inscribed ellipsoid keeps `d^2 <= 25`. Neither rule
+    /// is more correct — the inscribed one is the more defensible and stays the
+    /// default of this crate — but a caller reproducing another implementation's
+    /// numbers needs *that* implementation's set, voxel for voxel, and a
+    /// parameter space that cannot express it forces the caller to substitute a
+    /// different filter and call it the same one.
+    ///
+    /// `tests/element_reference_rule.rs` states the rule a second time, in the
+    /// arithmetic the implementation it came from states it in, and checks this
+    /// shape against it over a thousand sizes. That is where the derivation is
+    /// recorded and where a reader should go to check it; this crate takes no
+    /// dependency on the implementation itself, whose licence it could not carry.
+    ///
+    /// A zero-extent axis cannot occur — `lo + hi + 1 >= 1` — so the divisor is
+    /// never zero, and a flat axis (`lo = hi = 0`) contributes exactly zero to
+    /// the sum, which is the same degenerate behaviour the inscribed ellipsoid
+    /// has.
+    ExtentEllipsoid,
 }
 
-/// A neighbourhood, centred on the voxel it is evaluated at.
+/// A neighbourhood, anchored on the voxel it is evaluated at.
 ///
-/// Parameterised by shape and per-axis radius, and by nothing else — there is no
-/// default size anywhere in this crate, because a filter size is a property of
-/// the images being processed and therefore of the caller.
+/// Parameterised by shape and by a per-axis pair of one-sided extents, and by
+/// nothing else — there is no default size anywhere in this crate, because a
+/// filter size is a property of the images being processed and therefore of the
+/// caller.
+///
+/// **The two sides of an axis may differ**, which is what makes an even extent
+/// expressible: an even window has no centre voxel, so the anchor is off centre
+/// by construction and the element reads one voxel further on one side than on
+/// the other. See [`Self::from_size`] for which side, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuringElement {
     shape: ElementShape,
-    radius: [usize; 3],
+    /// Voxels the element reads **below** the anchor, per axis.
+    lo: [usize; 3],
+    /// Voxels the element reads **above** the anchor, per axis.
+    hi: [usize; 3],
     offsets: Vec<[isize; 3]>,
 }
 
 impl StructuringElement {
-    /// From a per-axis radius. The element spans `2 * radius + 1` on each axis.
+    /// From a per-axis radius. The element spans `2 * radius + 1` on each axis
+    /// and is symmetric, which is the case every op in this crate shipped with.
     pub fn from_radius(shape: ElementShape, radius: [usize; 3]) -> Self {
-        let offsets = generate(shape, radius);
+        Self::from_sides(shape, radius, radius)
+    }
+
+    /// From the two sides of each axis stated separately: `lo` voxels below the
+    /// anchor and `hi` above, so the bounding box spans `lo + hi + 1`.
+    ///
+    /// The general constructor. [`Self::from_radius`] is `lo == hi` and
+    /// [`Self::from_size`] derives the pair from an extent; this is here because
+    /// an anchor that is neither centred nor derived from an extent is a
+    /// legitimate thing to want, and because it is the form the rest of the type
+    /// is written against.
+    pub fn from_sides(shape: ElementShape, lo: [usize; 3], hi: [usize; 3]) -> Self {
+        let offsets = generate(shape, lo, hi);
         Self {
             shape,
-            radius,
+            lo,
+            hi,
             offsets,
         }
     }
 
-    /// From a per-axis size, which must be **odd** on every axis.
+    /// From a per-axis size, which must be non-zero on every axis.
     ///
-    /// An even size has no centre voxel, so "the neighbourhood of this voxel"
-    /// would have to pick a side, and the two choices differ by a shift of the
-    /// whole output. Rather than choose silently, refuse: a caller who wants the
-    /// shifted window can say which radius they mean.
+    /// **Where the anchor goes when the size is even, and why.** An even size
+    /// has no centre voxel, so the anchor is a decision rather than a
+    /// consequence. This crate puts it at index `size / 2`, which leaves
+    /// `size / 2` voxels below it and `size / 2 - 1` above: the element reads
+    /// **one voxel further below the anchor than above it**.
+    ///
+    /// Three reasons for that side rather than the other:
+    ///
+    /// * it is what the reference implementations a caller is likely to have to
+    ///   match do. The convention that an even footprint's origin sits at
+    ///   `floor(n / 2)` is the one the established array-filtering libraries
+    ///   use, and the element definition [`ElementShape::ExtentEllipsoid`] was
+    ///   derived from indexes its own mesh from `floor(n / 2)` for exactly the
+    ///   same reason — so an anchor on the other side would make that shape
+    ///   match the set it reproduces and not the *position* it reproduces it at,
+    ///   which is a parity that fails at every voxel by a shift of one;
+    /// * it makes the bounding box grow one voxel at a time in a fixed pattern —
+    ///   `size` to `size + 1` adds a plane below when the new size is even and
+    ///   above when it is odd — so an extent swept upward never jumps by two and
+    ///   never shifts the anchor backwards;
+    /// * whichever side is chosen, the answer is a shifted volume, and a
+    ///   *stated* shift can be undone by a caller who wanted the other one while
+    ///   a silent one cannot.
+    ///
+    /// The resulting reach is genuinely asymmetric — `lo != hi` on that axis —
+    /// and every op that derives geometry from an element says so per side. It
+    /// is deliberately **not** rounded up to a symmetric window: that would
+    /// fetch a voxel nobody reads on the narrow side, and, far worse, would make
+    /// the element a different *set* from the one asked for.
     pub fn from_size(shape: ElementShape, size: [usize; 3]) -> Result<Self> {
-        let mut radius = [0usize; 3];
+        let mut lo = [0usize; 3];
+        let mut hi = [0usize; 3];
         for axis in 0..3 {
-            if size[axis] == 0 || size[axis].is_multiple_of(2) {
+            if size[axis] == 0 {
                 return Err(Error::InvalidArgument(format!(
-                    "a centred element needs an odd size on every axis; got {size:?}"
+                    "an element needs a non-zero size on every axis; got {size:?}"
                 )));
             }
-            radius[axis] = size[axis] / 2;
+            lo[axis] = size[axis] / 2;
+            hi[axis] = size[axis] - 1 - lo[axis];
         }
-        Ok(Self::from_radius(shape, radius))
+        Ok(Self::from_sides(shape, lo, hi))
     }
 
     pub fn shape(&self) -> ElementShape {
         self.shape
     }
 
+    /// The per-axis radius, when there is one.
+    ///
+    /// Equal to [`Self::reach`] and, for an element with a centre voxel, to both
+    /// of its [`sides`](Self::sides). An element with an even extent has no
+    /// radius, and this reports the wider of its two sides; `sides` is the exact
+    /// statement and is what anything deriving geometry must use.
     pub fn radius(&self) -> [usize; 3] {
-        self.radius
+        [self.reach(0), self.reach(1), self.reach(2)]
     }
 
-    /// Voxels read beyond the centre, along `axis`. **This is what every op in
-    /// this module derives its `reach` from.**
+    /// The bounding box, per axis: `lo + hi + 1`.
+    pub fn size(&self) -> [usize; 3] {
+        [
+            self.lo[0] + self.hi[0] + 1,
+            self.lo[1] + self.hi[1] + 1,
+            self.lo[2] + self.hi[2] + 1,
+        ]
+    }
+
+    /// Voxels read **below** and **above** the anchor along `axis`.
+    ///
+    /// The exact statement of what this element reads, and the one every op that
+    /// derives a `Reach` from an element must use. [`Self::reach`] is the
+    /// symmetric bound on this pair, kept because `BlockOp::reach` is a single
+    /// integer per axis; the pair is what `BlockOp::reach_spec` carries.
+    pub fn sides(&self, axis: usize) -> (usize, usize) {
+        (self.lo[axis], self.hi[axis])
+    }
+
+    /// Whether every axis reads as far below the anchor as above it.
+    ///
+    /// The question to ask where a signature can hold only one integer per axis
+    /// and the choice is between over-declaring and refusing. Both places in
+    /// this crate that face it — `HExtremaOp::operands` and `VoxelizeOp::reach`
+    /// — over-declare and say so at the declaration; a caller who would rather
+    /// refuse than pay for the wider side asks this first.
+    pub fn is_symmetric(&self) -> bool {
+        self.lo == self.hi
+    }
+
+    /// What one pass of this element reads, per side and per axis.
+    ///
+    /// This is the honest statement; a composition of `passes` such passes reads
+    /// `passes` times it on each side, which is [`Self::reach_spec_after`].
+    pub fn reach_spec(&self) -> Reach {
+        self.reach_spec_after(1)
+    }
+
+    /// The same, for an operation that applies this element `passes` times in
+    /// sequence **without reflecting it** between passes.
+    ///
+    /// The reflection matters and is why this is stated here rather than
+    /// multiplied at each call site: composing `x -> x + o` with itself for
+    /// `o` in the element gives offsets `o + o'`, whose extremes are `passes`
+    /// times each side. Had the second pass used the *reflected* element — as a
+    /// textbook opening does — the extremes would be `lo + hi` on **both**
+    /// sides, which is a different number for an off-centre window and the same
+    /// one for a centred window. `src/ops/morphology.rs` composes without
+    /// reflecting, so this is the rule it needs; anything that starts reflecting
+    /// must stop using this method rather than quietly inherit it.
+    pub fn reach_spec_after(&self, passes: usize) -> Reach {
+        Reach::asymmetric([
+            (self.lo[0] * passes, self.hi[0] * passes),
+            (self.lo[1] * passes, self.hi[1] * passes),
+            (self.lo[2] * passes, self.hi[2] * passes),
+        ])
+    }
+
+    /// Voxels read beyond the anchor, along `axis`, **on the wider side**.
+    ///
+    /// The symmetric bound: what a caller that can only hold one integer per
+    /// axis must use, and what `BlockOp::reach` reports. It is a bound and not
+    /// the whole truth for an element with an even extent, which is why
+    /// [`Self::sides`] exists and why every op in `src/ops/` states its
+    /// `reach_spec` from that instead — over-declaring here costs reads, and
+    /// `Chain::reach_spec` checks that the exact form stays inside this bound.
     ///
     /// It is the radius even for an ellipsoid, because the ellipsoid still
     /// contains the two poles on each axis. A shape that excluded them would
     /// report less, which is why this asks the shape rather than assuming.
     pub fn reach(&self, axis: usize) -> usize {
-        self.radius[axis]
+        self.lo[axis].max(self.hi[axis])
     }
 
     /// How many voxels the element contains when nothing clamps it.
@@ -118,13 +300,12 @@ impl StructuringElement {
     }
 }
 
-fn generate(shape: ElementShape, radius: [usize; 3]) -> Vec<[isize; 3]> {
-    let bound = [radius[0] as isize, radius[1] as isize, radius[2] as isize];
+fn generate(shape: ElementShape, lo: [usize; 3], hi: [usize; 3]) -> Vec<[isize; 3]> {
     let mut offsets = Vec::new();
-    for a in -bound[0]..=bound[0] {
-        for b in -bound[1]..=bound[1] {
-            for c in -bound[2]..=bound[2] {
-                if member(shape, radius, [a, b, c]) {
+    for a in -(lo[0] as isize)..=hi[0] as isize {
+        for b in -(lo[1] as isize)..=hi[1] as isize {
+            for c in -(lo[2] as isize)..=hi[2] as isize {
+                if member(shape, lo, hi, [a, b, c]) {
                     offsets.push([a, b, c]);
                 }
             }
@@ -133,22 +314,49 @@ fn generate(shape: ElementShape, radius: [usize; 3]) -> Vec<[isize; 3]> {
     offsets
 }
 
-fn member(shape: ElementShape, radius: [usize; 3], offset: [isize; 3]) -> bool {
+fn member(shape: ElementShape, lo: [usize; 3], hi: [usize; 3], offset: [isize; 3]) -> bool {
     match shape {
         ElementShape::Box => true,
         ElementShape::Ellipsoid => {
             let mut total = 0.0_f64;
             for axis in 0..3 {
-                if radius[axis] == 0 {
+                // The side the offset is on is the one it is measured against,
+                // so the surface passes through both poles of an off-centre
+                // axis. See `ElementShape::Ellipsoid` for why not the other two
+                // candidates.
+                let side = if offset[axis] < 0 { lo[axis] } else { hi[axis] };
+                if side == 0 {
                     if offset[axis] != 0 {
                         return false;
                     }
                     continue;
                 }
-                let scaled = offset[axis] as f64 / radius[axis] as f64;
+                let scaled = offset[axis] as f64 / side as f64;
                 total += scaled * scaled;
             }
             total <= 1.0
+        }
+        // Transcribed from the rule stated on `ElementShape::ExtentEllipsoid`,
+        // and arranged so that the arithmetic is the arithmetic that rule
+        // describes: the shift is a half voxel or nothing, the divisor is the
+        // half-extent rounded up, and the comparison is strict. The sum runs
+        // over the axes in order because a sum of three `f64`s is not
+        // associative and this crate's elements are compared voxel for voxel.
+        ElementShape::ExtentEllipsoid => {
+            let mut total = 0.0_f64;
+            for axis in 0..3 {
+                // Half the difference between the sides: what moves the origin
+                // from the anchor to the box's continuous centre. Exactly zero
+                // for a centred element and exactly a half for one built from
+                // an even extent, and exact for any hand-placed anchor too —
+                // the difference of two integers halved is representable.
+                let shift = (lo[axis] as f64 - hi[axis] as f64) / 2.0;
+                // `ceil(n / 2)` with `n = lo + hi + 1`, so at least one.
+                let divisor = ((lo[axis] + hi[axis] + 2) / 2) as f64;
+                let scaled = (offset[axis] as f64 + shift) / divisor;
+                total += scaled * scaled;
+            }
+            total < 1.0
         }
     }
 }
@@ -290,10 +498,68 @@ mod tests {
         assert_eq!(element.len(), 7 * 7 * 7);
     }
 
+    /// Replaces `an_even_size_is_refused_rather_than_rounded`, which pinned the
+    /// refusal this module used to make. The refusal was not a fact about
+    /// geometry — an even window is a perfectly definite set — it was a refusal
+    /// to *choose an anchor*, and the choice is now made and stated. What has to
+    /// stay pinned is that the choice is a shift and never a rounding: a size of
+    /// four must span four, not five.
     #[test]
-    fn an_even_size_is_refused_rather_than_rounded() {
-        let err = StructuringElement::from_size(ElementShape::Box, [4, 3, 3]).unwrap_err();
-        assert!(err.to_string().contains("odd size"), "got: {err}");
+    fn an_even_size_is_anchored_below_centre_rather_than_rounded_up() {
+        let element = StructuringElement::from_size(ElementShape::Box, [4, 3, 3]).unwrap();
+        assert_eq!(element.sides(0), (2, 1), "one further below than above");
+        assert_eq!(element.sides(1), (1, 1));
+        assert_eq!(element.size(), [4, 3, 3]);
+        assert_eq!(element.len(), 4 * 3 * 3);
+        assert!(!element.is_symmetric());
+        // the offsets span exactly the four positions, not five
+        assert!(element.offsets().iter().all(|o| (-2..=1).contains(&o[0])));
+        assert!(element.offsets().contains(&[-2, 0, 0]));
+        assert!(!element.offsets().contains(&[2, 0, 0]));
+
+        // and a size of zero is still nothing this can build
+        let err = StructuringElement::from_size(ElementShape::Box, [0, 3, 3]).unwrap_err();
+        assert!(err.to_string().contains("non-zero size"), "got: {err}");
+    }
+
+    /// The whole point of the asymmetry: an even element's reach is not a
+    /// symmetric integer, and everything that derives geometry has to see the
+    /// pair. The symmetric bound is kept as a bound and marked as one.
+    #[test]
+    fn an_even_elements_reach_is_asymmetric_and_the_integer_is_only_a_bound() {
+        let element = StructuringElement::from_size(ElementShape::Box, [10, 7, 4]).unwrap();
+        assert_eq!(element.sides(0), (5, 4));
+        assert_eq!(element.sides(1), (3, 3));
+        assert_eq!(element.sides(2), (2, 1));
+        assert_eq!(element.reach(0), 5, "the wider side");
+        assert_eq!(element.radius(), [5, 3, 2]);
+
+        let spec = element.reach_spec();
+        assert_eq!(
+            spec.as_symmetric(),
+            None,
+            "it is not a triple and never was"
+        );
+        assert_eq!(spec.at(0, 0, 100), (5, 4));
+        assert_eq!(spec.at(2, 0, 100), (2, 1));
+        // two passes double each side; they do not become `lo + hi` on both,
+        // which is what a reflected composition would give
+        assert_eq!(element.reach_spec_after(2).at(0, 0, 100), (10, 8));
+    }
+
+    /// An odd size is exactly the element it was before even sizes existed —
+    /// same sides, same offsets, same length, for every shape that shipped.
+    #[test]
+    fn an_odd_size_is_unchanged_by_the_anchor_becoming_a_decision() {
+        for size in [[1, 1, 1], [3, 5, 7], [9, 3, 1], [11, 11, 11]] {
+            for shape in [ElementShape::Box, ElementShape::Ellipsoid] {
+                let element = StructuringElement::from_size(shape, size).unwrap();
+                let radius = [size[0] / 2, size[1] / 2, size[2] / 2];
+                assert_eq!(element, StructuringElement::from_radius(shape, radius));
+                assert!(element.is_symmetric());
+                assert_eq!(element.reach_spec(), Reach::from(radius));
+            }
+        }
     }
 
     #[test]
@@ -313,6 +579,65 @@ mod tests {
         }
         assert!(!element.offsets().contains(&[2, 2, 2]));
         assert_eq!(element.reach(2), 2);
+    }
+
+    /// The second ball rule, against the three things that make it a different
+    /// set from the inscribed one. Its agreement with the implementation it was
+    /// derived from, size by size and voxel by voxel, is
+    /// `tests/element_reference_rule.rs`; this pins the properties a reader
+    /// needs in order to choose between the two.
+    #[test]
+    fn the_extent_ellipsoid_normalises_by_the_half_extent_rounded_up() {
+        // odd: normalised by r + 1 = 6, so `d^2 < 36` rather than `d^2 <= 25`
+        let wide =
+            StructuringElement::from_size(ElementShape::ExtentEllipsoid, [11, 11, 11]).unwrap();
+        let inscribed =
+            StructuringElement::from_size(ElementShape::Ellipsoid, [11, 11, 11]).unwrap();
+        assert!(wide.len() > inscribed.len());
+        for offset in wide.offsets() {
+            let squared: isize = offset.iter().map(|d| d * d).sum();
+            assert!(squared < 36, "{offset:?} has d^2 = {squared}");
+        }
+        for offset in [[3, 3, 3], [5, 3, 0], [0, 4, 4]] {
+            assert!(wide.offsets().contains(&offset), "{offset:?} is inside 36");
+            assert!(!inscribed.offsets().contains(&offset));
+        }
+        // strictly open: the corner at exactly 36 is out
+        assert!(!wide.offsets().contains(&[4, 4, 2]));
+
+        // even: normalised by n / 2 = 5, measured from the box's continuous
+        // centre, so the whole 10-box is inside on one axis
+        let even =
+            StructuringElement::from_size(ElementShape::ExtentEllipsoid, [10, 1, 1]).unwrap();
+        assert_eq!(even.len(), 10, "|(o + 0.5) / 5| <= 0.9 for every o");
+        assert_eq!(even.sides(0), (5, 4));
+
+        // and the set is symmetric under reflection of the *box*, which is what
+        // the half-voxel shift is for: offset o and offset -1 - o agree.
+        let box_even =
+            StructuringElement::from_size(ElementShape::ExtentEllipsoid, [10, 10, 1]).unwrap();
+        for offset in box_even.offsets() {
+            let mirrored = [-1 - offset[0], -1 - offset[1], offset[2]];
+            assert!(
+                box_even.offsets().contains(&mirrored),
+                "{offset:?} is in but its mirror {mirrored:?} is not"
+            );
+        }
+    }
+
+    /// The inscribed ellipsoid over an off-centre axis still touches both faces
+    /// of its box, which is what keeps `reach` exact rather than optimistic.
+    #[test]
+    fn an_off_centre_ellipsoid_keeps_the_poles_on_both_sides() {
+        let element = StructuringElement::from_size(ElementShape::Ellipsoid, [10, 6, 1]).unwrap();
+        assert_eq!(element.sides(0), (5, 4));
+        assert_eq!(element.sides(1), (3, 2));
+        for pole in [[-5, 0, 0], [4, 0, 0], [0, -3, 0], [0, 2, 0]] {
+            assert!(element.offsets().contains(&pole), "missing pole {pole:?}");
+        }
+        assert!(!element.offsets().contains(&[-5, -3, 0]));
+        // so the reach on the wider side is real, and the pair is the truth
+        assert_eq!(element.reach_spec().at(0, 0, 64), (5, 4));
     }
 
     #[test]

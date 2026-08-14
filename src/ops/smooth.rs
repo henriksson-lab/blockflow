@@ -118,13 +118,24 @@ impl Gaussian {
     /// `truncate` is how many standard deviations the kernel is cut at. It is a
     /// parameter and has no default here: it trades reach against faithfulness,
     /// and which side of that a caller wants is the caller's knowledge.
+    ///
+    /// **A sigma of zero on an axis means that axis is not blurred**, and is the
+    /// way to state a plane-by-plane smoothing of a volume: `[s, s, 0.0]` blurs
+    /// within each plane and mixes none of them. The kernel there is the single
+    /// tap `[1.0]`, the reach is zero, and the cost falls accordingly, so
+    /// nothing downstream needs to know it is a special case.
+    ///
+    /// This is deliberately the same meaning `StructuringElement::from_radius`
+    /// has always given a zero radius. The two disagreed until a caller wanted a
+    /// blur flat on one axis and found it could not be constructed, which is the
+    /// kind of inconsistency that costs an entire feature rather than a line.
     pub fn new(sigma: [f64; 3], truncate: f64) -> Result<Self> {
         for axis in 0..3 {
-            if !(sigma[axis] > 0.0) || !sigma[axis].is_finite() {
+            if sigma[axis] < 0.0 || !sigma[axis].is_finite() {
                 return Err(Error::InvalidArgument(format!(
-                    "every axis of a smoothing scale must be a positive, finite number of \
-                     voxels; got {sigma:?}. An axis of extent one is not an exception — \
-                     smoothing it clamps to its single plane and costs nothing."
+                    "every axis of a smoothing scale must be a non-negative, finite number of \
+                     voxels; got {sigma:?}. Zero is legitimate and means the axis is not \
+                     blurred; a negative or non-finite scale has no kernel."
                 )));
             }
         }
@@ -591,7 +602,6 @@ mod tests {
     /// not at the first block.
     #[test]
     fn an_unusable_scale_is_refused_when_it_is_stated() {
-        assert!(Gaussian::new([0.0, 1.0, 1.0], 3.0).is_err());
         assert!(Gaussian::new([-1.0, 1.0, 1.0], 3.0).is_err());
         assert!(Gaussian::new([f64::NAN, 1.0, 1.0], 3.0).is_err());
         assert!(Gaussian::new([f64::INFINITY, 1.0, 1.0], 3.0).is_err());
@@ -600,6 +610,52 @@ mod tests {
         // and the saturating-cast bound
         assert!(Gaussian::isotropic(1e9, 3.0).is_err());
         assert!(Gaussian::isotropic(1.0, 3.0).is_ok());
+    }
+
+    /// A sigma of zero on an axis is the identity **on that axis**: the kernel is
+    /// one tap, the reach is zero, and the volume is blurred plane by plane.
+    ///
+    /// This is the case that could not be constructed at all until a caller
+    /// needed it, while a zero *radius* had always been accepted for a
+    /// structuring element. The test asserts the three things that make it a
+    /// real feature rather than a relaxed check: the reach really is zero on
+    /// that axis, planes really do not mix, and within a plane the answer is
+    /// exactly the two-dimensional blur.
+    #[test]
+    fn a_zero_sigma_is_the_identity_on_that_axis_and_blurs_the_others() {
+        let flat = Gaussian::new([1.0, 1.0, 0.0], 3.0).unwrap();
+        assert_eq!(flat.reach(0), 3);
+        assert_eq!(flat.reach(1), 3);
+        assert_eq!(flat.reach(2), 0, "a zero sigma reaches nothing");
+        assert_eq!(flat.kernels()[2], vec![1.0], "one tap, weight exactly one");
+
+        let op = SmoothOp::new("plane", flat);
+        assert_eq!(op.reach(2, 1000), 0);
+
+        // two planes that differ everywhere; neither may leak into the other
+        let mut input = Array3::<f64>::zeros((9, 9, 2));
+        input[[4, 4, 0]] = 1.0;
+        let out = smoothed(&op, &input.clone().into());
+        assert!(
+            out.slice(ndarray::s![.., .., 1])
+                .iter()
+                .all(|value| *value == 0.0),
+            "an impulse in plane 0 reached plane 1"
+        );
+        assert!(
+            out[[4, 4, 0]] > 0.0 && out[[3, 4, 0]] > 0.0,
+            "and it did blur in-plane"
+        );
+
+        // within a plane it is exactly the 2-D blur of that plane alone
+        let mut plane = Array3::<f64>::zeros((9, 9, 1));
+        plane[[4, 4, 0]] = 1.0;
+        let alone = smoothed(&op, &plane.into());
+        for i in 0..9 {
+            for j in 0..9 {
+                assert_eq!(out[[i, j, 0]], alone[[i, j, 0]]);
+            }
+        }
     }
 
     /// A smoothing is not a rank filter: it does not select a value that was
