@@ -82,6 +82,7 @@ use crate::error::{Error, Result};
 use crate::geometry::BlockGrid;
 use crate::op::{Anchor, BlockOp};
 use crate::reach::{AxisReach, Reach};
+use crate::region::Region;
 use crate::voxels::Voxels;
 
 use super::element::{select_nth, Rank, StructuringElement, Total};
@@ -343,6 +344,190 @@ impl SampleLattice {
     pub fn max_distance(&self, axis: usize) -> usize {
         span_max_distance(&self.positions[axis], self.volume[axis])
     }
+
+    // ------------------------------------------------------ as a grid --
+    //
+    // The lattice read as a *coordinate space of its own*, rather than as
+    // positions inside the fine volume. This is what lets the statistic be a
+    // phase whose output volume is the lattice, with the interpolation back to
+    // full resolution a separate phase reading it.
+    //
+    // **Why that separation is worth having**, since one fused op already
+    // computes both: the fused form's reach is `lattice distance + element
+    // radius` against the *fine* volume, and the two terms belong to different
+    // dependencies. Split, the statistic reaches the element and nothing more,
+    // and the interpolation reaches one *coarse* voxel. At a spacing of 25 the
+    // interpolation term is 25 fine voxels of halo per side per block that the
+    // fused form fetches and the split form does not.
+    //
+    // The blocks of such a phase are cut on **this** grid, not on the fine one,
+    // which is the arrangement `ResampleOp` already uses and the reason it is
+    // right: a phase's valid regions must tile its own output, and every chunk
+    // of that output must fall inside exactly one of them
+    // (`check_chunk_exclusive_writes`). Cutting the fine grid and deriving
+    // lattice counts would put block boundaries wherever the arithmetic landed
+    // and cut chunks; cutting this grid cannot. What varies instead is how much
+    // of the fine level each block reads, and that is stated per block in
+    // `BlockGeometry::source`, which exists for exactly this.
+
+    /// The shape of the coarse level this lattice defines: one voxel per sample.
+    pub fn lattice_volume(&self) -> [usize; 3] {
+        [self.count(0), self.count(1), self.count(2)]
+    }
+
+    /// The fine voxels that lattice points `start .. start + count` of `axis`
+    /// read, given a window reaching `lo` below and `hi` above each sample.
+    ///
+    /// Returned as a half-open range **clamped to the fine axis**, because the
+    /// window is clamped there too: a sample near the volume's edge reads what
+    /// is there and the whole-volume reference does the same, so a fetch wider
+    /// than the array would be asking for voxels no answer depends on.
+    ///
+    /// An empty `count` gives an empty range at `start`'s own position rather
+    /// than at zero, so a degenerate block does not silently claim the origin.
+    pub fn source_span(
+        &self,
+        axis: usize,
+        start: usize,
+        count: usize,
+        lo: usize,
+        hi: usize,
+    ) -> (usize, usize) {
+        let extent = self.volume[axis];
+        if count == 0 {
+            let at = self.positions[axis]
+                .get(start.min(self.count(axis).saturating_sub(1)))
+                .copied()
+                .unwrap_or(0)
+                .min(extent);
+            return (at, at);
+        }
+        let last = start + count - 1;
+        let low = self.centre(axis, start).saturating_sub(lo);
+        let high = (self.centre(axis, last) + hi + 1).min(extent);
+        (low, high.max(low))
+    }
+
+    /// The gap between samples on `axis`, if every gap is the same one.
+    ///
+    /// `None` says the lattice is irregular, and the caller that asks is
+    /// [`Self::source_window`] — which needs a constant width and therefore a
+    /// constant gap. A single sample has no gap and answers `Some(1)`: there is
+    /// nothing to be inconsistent about, and one is the value that makes the
+    /// width arithmetic below degenerate correctly.
+    pub fn uniform_gap(&self, axis: usize) -> Option<usize> {
+        let positions = &self.positions[axis];
+        if positions.len() <= 1 {
+            return Some(1);
+        }
+        let gap = positions[1].checked_sub(positions[0])?;
+        positions
+            .windows(2)
+            .all(|pair| pair[1].checked_sub(pair[0]) == Some(gap))
+            .then_some(gap)
+    }
+
+    /// [`Self::source_span`], widened to a **constant extent** and slid inward
+    /// at the volume's ends instead of being clipped.
+    ///
+    /// **Why a second span rather than a wider first one.** `source_span` says
+    /// what a block's samples actually read, which is what a coverage guard must
+    /// compare against. This says what the block should be *handed*, and the two
+    /// differ at the volume's ends on purpose: `BlockOp::output_shape` maps a
+    /// block's input shape to its output shape and sees nothing else, so a block
+    /// at the end holding the same number of samples as an interior one must be
+    /// handed the same number of voxels or its output count could not be derived
+    /// at all. Sliding inward keeps every sample's own window inside the buffer,
+    /// so the extra voxels are read and simply not needed — the same trade
+    /// `Reach::window` already makes for `BlockConstraint::Extent`.
+    ///
+    /// `None` when the lattice is irregular, because there is then no constant
+    /// width to slide, or when the volume is narrower than one block's span.
+    /// Both are facts about the arguments rather than failures to try, and a
+    /// caller that gets `None` has the fused `LocalStatisticOp`, which needs no
+    /// inversion because it writes at full resolution.
+    pub fn source_window(
+        &self,
+        axis: usize,
+        start: usize,
+        count: usize,
+        lo: usize,
+        hi: usize,
+    ) -> Option<(usize, usize)> {
+        if count == 0 {
+            return None;
+        }
+        let gap = self.uniform_gap(axis)?;
+        let extent = self.volume[axis];
+        let width = (count - 1).checked_mul(gap)?.checked_add(lo + hi + 1)?;
+        if width > extent {
+            return None;
+        }
+        let ideal = self.centre(axis, start).saturating_sub(lo);
+        // Slid, not clipped: pulled back just far enough that the full width
+        // fits, which leaves every sample of the block inside it.
+        let low = ideal.min(extent - width);
+        Some((low, low + width))
+    }
+
+    /// How many samples a block handed `extent` voxels on `axis` holds.
+    ///
+    /// The inverse of [`Self::source_window`]'s width, and the reason that
+    /// function insists on a constant one. `None` for an irregular lattice, or
+    /// for an extent that is not a whole number of gaps past the window.
+    pub fn samples_for_window(
+        &self,
+        axis: usize,
+        extent: usize,
+        lo: usize,
+        hi: usize,
+    ) -> Option<usize> {
+        let gap = self.uniform_gap(axis)?;
+        let window = lo + hi + 1;
+        let spanned = extent.checked_sub(window)?;
+        (gap > 0 && spanned % gap == 0).then(|| spanned / gap + 1)
+    }
+
+    /// [`Self::source_span`] on every axis: the fine region a block of the
+    /// coarse grid must be handed.
+    ///
+    /// `read` is stated in **lattice indices** — it is a region of
+    /// [`Self::lattice_volume`], which is what the phase's blocks are cut from —
+    /// and the region returned is in fine voxels. The two coordinate systems are
+    /// the whole reason this function exists, and mixing them up is the mistake
+    /// it is arranged to make impossible: neither argument nor result can be
+    /// passed for the other without the extents disagreeing.
+    pub fn source_region(&self, read: &Region, window: [(usize, usize); 3]) -> Result<Region> {
+        if read.start.len() != 3 || read.shape.len() != 3 {
+            return Err(Error::InvalidArgument(format!(
+                "a sample lattice is 3-D; this region has rank {}",
+                read.start.len()
+            )));
+        }
+        let mut start = [0usize; 3];
+        let mut shape = [0usize; 3];
+        for axis in 0..3 {
+            if read.start[axis] + read.shape[axis] > self.count(axis) {
+                return Err(Error::InvalidArgument(format!(
+                    "lattice region {:?}+{:?} runs past axis {axis} of the lattice, which holds \
+                     {} sample(s). This region is stated in lattice indices, not in voxels.",
+                    read.start,
+                    read.shape,
+                    self.count(axis)
+                )));
+            }
+            let (low, high) = self.source_span(
+                axis,
+                read.start[axis],
+                read.shape[axis],
+                window[axis].0,
+                window[axis].1,
+            );
+            start[axis] = low;
+            shape[axis] = high - low;
+        }
+        Ok(Region::new(&start, &shape))
+    }
 }
 
 /// The interpolation term of the reach, from a list of positions.
@@ -404,12 +589,16 @@ pub fn local_statistic_into<T, F>(
     at: &Anchor,
     element: &StructuringElement,
     lattice: &SampleLattice,
-    reduce: F,
+    mut reduce: F,
     mut out: ArrayViewMut3<'_, f64>,
 ) -> Result<()>
 where
     T: Copy,
-    F: Fn(&mut [T]) -> f64,
+    // `FnMut` rather than `Fn`, so the caller can hand in a closure holding a
+    // scratch buffer it reuses across lattice points. Nothing here calls
+    // `reduce` more than once per point or in any order but the lattice's, so
+    // the looser bound costs no guarantee.
+    F: FnMut(&mut [T]) -> f64,
 {
     shapes_agree(input.shape(), out.shape(), "local_statistic_into")?;
     if lattice.volume() != at.volume {
@@ -676,6 +865,33 @@ impl Statistic {
     where
         T: Ord + Copy + Into<f64>,
     {
+        let mut scratch = Vec::new();
+        self.reduce_with(window, full, &mut scratch)
+    }
+
+    /// [`Self::reduce`], over a scratch buffer the caller owns.
+    ///
+    /// **The buffer is the whole of the difference, and it only matters for a
+    /// custom reducer.** A [`Reducer`] is stated in `f64` — it has to be, since
+    /// a trait object cannot be generic over the element type, and being
+    /// injectable without recompiling this crate is the entire point of it — so
+    /// the gathered window is widened before the call. Done inside
+    /// [`Self::reduce`] that is an allocation per window; with a buffer that
+    /// lives outside the loop it is none, which is the same arrangement
+    /// `rank_filter_into` uses for the window it gathers.
+    ///
+    /// The virtual call itself is not worth avoiding here and the asymmetry with
+    /// `MapFn` is deliberate: a `MapFn` runs per voxel on about one arithmetic
+    /// operation, which is why it is generic and monomorphised, and a `Reducer`
+    /// runs once per *window* on `|element|` of them. Amortised over a window,
+    /// an indirect call is not measurable; the allocation was.
+    ///
+    /// The shipped variants take the generic path and touch `scratch` not at
+    /// all, so a caller using them pays nothing for its existence.
+    pub fn reduce_with<T>(&self, window: &mut [T], full: usize, scratch: &mut Vec<f64>) -> f64
+    where
+        T: Ord + Copy + Into<f64>,
+    {
         // `Isodata` is asked before the emptiness test rather than after,
         // because it has an answer for an empty window that is a *parameter* —
         // the value it falls back to when the histogram yields no threshold —
@@ -685,13 +901,10 @@ impl Statistic {
         if let Statistic::Isodata(isodata) = self {
             return isodata.of(window.iter().map(|&value| value.into()));
         }
-        // A custom reducer is stated in `f64`, so the window is widened for it.
-        // That is one allocation per lattice point and it is charged to the
-        // caller who chose a custom reduction: the shipped variants take the
-        // generic path below and allocate nothing.
         if let Statistic::Custom(reducer) = self {
-            let mut widened: Vec<f64> = window.iter().map(|&value| value.into()).collect();
-            return reducer.reduce(&mut widened, full);
+            scratch.clear();
+            scratch.extend(window.iter().map(|&value| value.into()));
+            return reducer.reduce(scratch, full);
         }
         if window.is_empty() {
             return 0.0;
@@ -1189,12 +1402,16 @@ impl LocalStatistic {
         let ordered = input.mapv(Total);
         let statistic = &self.statistic;
         let full = self.element.len();
+        // Lives across every lattice point of this buffer, so a custom reducer
+        // widens into the same allocation rather than a fresh one per point.
+        // Untouched by the shipped statistics; see `Statistic::reduce_with`.
+        let mut scratch: Vec<f64> = Vec::with_capacity(full);
         local_statistic_into(
             ordered.view(),
             at,
             &self.element,
             &lattice,
-            |window| statistic.reduce(window, full),
+            |window| statistic.reduce_with(window, full, &mut scratch),
             out,
         )
     }

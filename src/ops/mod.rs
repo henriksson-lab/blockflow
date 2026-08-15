@@ -160,7 +160,10 @@ pub use normalise::{
     bounded_gain_into, bounded_gain_value, normalise_against_into, normalise_value,
     LevelCorrectionOp, LocalContrastOp, LocalGainOp, Removal,
 };
-pub use rank::{rank_filter_f64_into, rank_filter_into, RankFilterOp};
+pub use rank::{
+    masked_rank_filter_into, rank_filter_f64_into, rank_filter_into, MaskedRankFilterOp,
+    RankFilterOp,
+};
 pub use reconstruct::{
     flooding_bound, h_extrema, reconstruct_step_into, reconstruct_to_fixed_point, HExtremaOp,
     Reconstruction,

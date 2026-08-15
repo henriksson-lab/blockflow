@@ -317,6 +317,195 @@ impl BlockConstraint {
     }
 }
 
+/// Where one block sits in **every** space it touches.
+///
+/// [`Anchor`] says where a buffer sits in the volume it was read from, which is
+/// all an op needs when its output grid is its input grid — every op this crate
+/// shipped before cross-grid phases existed. An op whose output lattice is
+/// neither its input's nor a fixed ratio of it knows which voxels it was handed
+/// and *not* which outputs it owns, and the executor holds both regions
+/// (`fetch` and `read`) while passing one.
+///
+/// This is three anchors rather than a new kind of thing, and that is
+/// deliberate: `input` **is** the `Anchor` an op would otherwise have been
+/// given, so an op that ignores the rest behaves exactly as it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    /// Where the buffer sits in the volume it was read from.
+    pub input: Anchor,
+    /// Where this block's output sits in the volume being written.
+    ///
+    /// Equal to `input` for every phase whose output grid is its input grid,
+    /// which is why nothing needed it until a lattice phase did.
+    pub output: Anchor,
+    /// Per source level, where that buffer sits in its own level.
+    pub sources: Vec<(usize, Anchor)>,
+}
+
+impl Placement {
+    /// The same region in both spaces and no source levels: the placement of
+    /// every phase whose output grid is its input grid.
+    pub fn same(at: Anchor) -> Self {
+        Self {
+            input: at.clone(),
+            output: at,
+            sources: Vec::new(),
+        }
+    }
+
+    pub fn new(input: Anchor, output: Anchor) -> Self {
+        Self {
+            input,
+            output,
+            sources: Vec::new(),
+        }
+    }
+
+    pub fn with_sources(mut self, sources: Vec<(usize, Anchor)>) -> Self {
+        self.sources = sources;
+        self
+    }
+
+    /// Where the buffer for `level` sits in its own level.
+    pub fn source(&self, level: usize) -> Option<&Anchor> {
+        self.sources
+            .iter()
+            .find(|(named, _)| *named == level)
+            .map(|(_, at)| at)
+    }
+}
+
+/// How a region of one input is derived from a region of the output.
+///
+/// **A closed set, and that is the point.** An open one — a callback per input —
+/// would be a second mechanism the moment anything downstream needed to inspect,
+/// hash or ship the dependency, which the plan, the fingerprint and the wire all
+/// do. `Table` is the escape hatch and it is *materialised*: by the time a plan
+/// leaves the planner it holds regions, never a closure, which is the property
+/// `PhaseDecomposition::with_sources` already has and the reason an escape hatch
+/// here cannot leak into the executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputMap {
+    /// The output region, grown per side. Every op in `src/ops` today, and the
+    /// reach each already states.
+    Stencil(Reach),
+    /// One region per block, resolved when the plan is built.
+    ///
+    /// Indexed by `BlockGeometry::flat`, so it is as long as the phase has
+    /// blocks and a plan carrying a different number is a plan for a different
+    /// decomposition.
+    Table(Vec<crate::region::Region>),
+}
+
+/// What an op's output space is, and what each input must supply to fill it.
+///
+/// The declaration the F sketch in `forme.md` argued for, in the shape that
+/// migration allows: [`Geometry::same`] is today's behaviour exactly, so the
+/// defaulted [`BlockOp::geometry`] leaves every shipped op correct with no edit,
+/// and the quantities that are currently declared twice — `reach` beside
+/// `reach_spec`, `output_shape` beside a source mapping — become derivable from
+/// one place rather than checked against each other.
+///
+/// **Nothing consumes it yet.** It lands with the default so that the step which
+/// changes no behaviour is separate from the step that moves a declaration onto
+/// it, because a step that changes nothing is a step whose failure is
+/// unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Geometry {
+    output_volume: [usize; 3],
+    inputs: Vec<InputMap>,
+}
+
+impl Geometry {
+    /// The output volume is the input volume and the one input is a stencil of
+    /// `reach`: what every op whose output grid is its input grid means.
+    pub fn stencil(volume: [usize; 3], reach: Reach) -> Self {
+        Self {
+            output_volume: volume,
+            inputs: vec![InputMap::Stencil(reach)],
+        }
+    }
+
+    /// The identity: same volume, reach nothing.
+    pub fn same(volume: [usize; 3]) -> Self {
+        Self::stencil(volume, Reach::none())
+    }
+
+    pub fn new(output_volume: [usize; 3], inputs: Vec<InputMap>) -> Self {
+        Self {
+            output_volume,
+            inputs,
+        }
+    }
+
+    pub fn output_volume(&self) -> [usize; 3] {
+        self.output_volume
+    }
+
+    pub fn inputs(&self) -> &[InputMap] {
+        &self.inputs
+    }
+
+    /// The reach of the primary input, when it is a stencil.
+    ///
+    /// `None` for a table, which has no single reach — that is what a table is
+    /// for — and for an op declaring no inputs at all.
+    pub fn primary_reach(&self) -> Option<&Reach> {
+        match self.inputs.first() {
+            Some(InputMap::Stencil(reach)) => Some(reach),
+            _ => None,
+        }
+    }
+}
+
+/// A stored level an op reads *besides* the input it is handed, and how far
+/// beyond the voxel it writes it reads that level.
+///
+/// **The reach is per input, and that is the whole point of the type.** Before
+/// it, the only way a second array reached a chain was `Chain::Source`, whose
+/// reach is fixed at zero: a source leaf produces the extent it was handed, so
+/// the buffer is exactly the block's own fetch. That is right for a voxelwise
+/// combine and wrong for anything with a window — a masked rank filter consults
+/// its mask at *every offset in the element*, so the mask it needs is the
+/// element's reach wider than the region it writes.
+///
+/// Per-input reach is not new here. [`SubstageOperand::reach`] states it per
+/// operand and [`FragmentInput::reach`] states it per stream, both for this
+/// reason and neither convertible into the other's units. `BlockOp` was the one
+/// trait carrying a single reach for everything it read, and this is that gap
+/// closed rather than a mechanism invented.
+///
+/// [`SubstageOperand::reach`]: crate::iterate::SubstageOperand::reach
+/// [`FragmentInput::reach`]: crate::fragment::FragmentInput::reach
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceInput {
+    /// The level read, in the same numbering `Chain::Source` and
+    /// `PhaseDecomposition::source_levels` use.
+    pub level: usize,
+    /// What this op reads of *that level*, beyond the voxel it writes.
+    ///
+    /// A [`Reach`] rather than a symmetric integer because the case that needs
+    /// the feature needs the asymmetry: an element with an even extent is
+    /// off-centre, and declaring its span symmetrically over-reads on one side
+    /// at every block seam.
+    pub reach: Reach,
+}
+
+impl SourceInput {
+    /// `level`, read at exactly the extent written — the `Chain::Source`
+    /// contract, stated as a declaration instead of assumed.
+    pub fn voxelwise(level: usize) -> Self {
+        Self {
+            level,
+            reach: Reach::none(),
+        }
+    }
+
+    pub fn new(level: usize, reach: Reach) -> Self {
+        Self { level, reach }
+    }
+}
+
 /// One operation in a block-processed chain.
 ///
 /// `Send + Sync` is required rather than incidental: the executor runs blocks
@@ -378,6 +567,72 @@ pub trait BlockOp: Send + Sync {
     /// `at` says where `input` sits in the volume; see [`Anchor`] for why it is
     /// an argument. A position-independent op ignores it.
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()>;
+
+    /// This op's output space, and what each input must supply to fill it.
+    ///
+    /// **Defaulted to exactly what [`Self::reach_spec`] already says**, so no
+    /// shipped op changes and nothing about a plan moves. See [`Geometry`] for
+    /// what this is for and `forme.md` for the migration it is step one of: the
+    /// quantities an op currently declares twice become derivable from here, and
+    /// an op whose output lattice is neither its input's nor a fixed ratio of it
+    /// gets somewhere to say so.
+    fn geometry(&self, input_volume: [usize; 3]) -> Geometry {
+        Geometry::stencil(input_volume, self.reach_spec(input_volume))
+    }
+
+    /// Stored levels this op reads besides `input`, each with its own reach.
+    ///
+    /// Empty by default, which is every op this crate shipped before the method
+    /// existed and is the honest answer for all of them: an op that says nothing
+    /// reads nothing but its input, and the plan then allocates, fetches and
+    /// prices exactly what it did before.
+    ///
+    /// `volume` is passed for the same reason [`Self::reach_spec`] takes it —
+    /// the reach of a lattice-derived window depends on the axis it is laid out
+    /// over — and it is the volume of the op's own anchoring space.
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        Vec::new()
+    }
+
+    /// [`Self::apply`], with the stored levels [`Self::source_inputs`] declared.
+    ///
+    /// Each buffer holds that input's **own** region: the block's core grown by
+    /// that input's reach, which is *not* in general the extent of `input`.
+    /// Reading a level at a different extent from the one being processed is the
+    /// point of the pair of methods.
+    ///
+    /// **The default refuses rather than falling through.** It hands off to
+    /// `apply` when nothing was declared — the case that must stay free — and
+    /// errors when something was, because `Environment::apply` already recorded
+    /// the argument this follows: *"silently ignoring an operand" is the precise
+    /// shape of the wrong answer this whole change exists to remove — a
+    /// complete, well-formed volume combined against nothing.* An op that
+    /// declares an operand and forgets the kernel is a bug, and a bug that
+    /// produces a plausible volume is the expensive kind.
+    fn apply_with(
+        &self,
+        input: &Voxels,
+        _sources: SourceInputs<'_>,
+        out: &mut Voxels,
+        at: &Anchor,
+    ) -> Result<()> {
+        let declared = self.source_inputs(at.volume);
+        if !declared.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "op {:?} declares {} source input(s) (level(s) {}) and does not override \
+                 `apply_with`, so the operands it asked the plan to fetch would be dropped on \
+                 the floor and the block would be computed from its input alone.",
+                self.name(),
+                declared.len(),
+                declared
+                    .iter()
+                    .map(|input| input.level.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        self.apply(input, out, at)
+    }
 
     // ------------------------------------------------- what it can handle --
     //
@@ -844,18 +1099,51 @@ impl Chain {
     /// `reach`'s reason: the level has to be *there* whichever branch is live,
     /// so it must be kept alive and read for all of them. Over-declaring costs
     /// a read; under-declaring is a branch with no operand.
-    pub fn source_levels(&self) -> Vec<usize> {
-        let mut seen = Vec::new();
-        self.collect_source_levels(&mut seen);
-        seen.sort_unstable();
-        seen.dedup();
-        seen
+    /// Every level this subtree reads besides its input, with the **widest**
+    /// reach any reader of it declared.
+    ///
+    /// One entry per level, matching [`SourceInputs`]: two readers of one level
+    /// are handed one buffer, so the buffer has to satisfy the hungrier of them.
+    /// Folding by max is the same rule `reach` folds an `Alternative` by, and it
+    /// is safe in the same direction — over-declaring costs voxels, and
+    /// under-declaring is a kernel reading past its operand.
+    pub fn source_inputs(&self, volume: [usize; 3]) -> Result<Vec<SourceInput>> {
+        let mut seen: Vec<SourceInput> = Vec::new();
+        self.collect_source_inputs(volume, &mut seen)?;
+        seen.sort_by_key(|input| input.level);
+        Ok(seen)
     }
 
-    fn collect_source_levels(&self, seen: &mut Vec<usize>) {
+    /// The levels of [`Self::source_inputs`], ascending and without repeats.
+    pub fn source_levels(&self, volume: [usize; 3]) -> Result<Vec<usize>> {
+        Ok(self
+            .source_inputs(volume)?
+            .into_iter()
+            .map(|input| input.level)
+            .collect())
+    }
+
+    fn collect_source_inputs(&self, volume: [usize; 3], seen: &mut Vec<SourceInput>) -> Result<()> {
+        let mut note = |declared: SourceInput| -> Result<()> {
+            match seen.iter_mut().find(|held| held.level == declared.level) {
+                Some(held) => {
+                    held.reach = held.reach.max(&declared.reach)?;
+                }
+                None => seen.push(declared),
+            }
+            Ok(())
+        };
         match self {
-            Chain::Op(_) => {}
-            Chain::Source { level, .. } => seen.push(*level),
+            // A source *leaf* is the reach-zero case stated as a declaration:
+            // it produces the extent it was handed, so what it needs is what
+            // the block already fetches.
+            Chain::Source { level, .. } => note(SourceInput::voxelwise(*level)),
+            Chain::Op(op) => {
+                for declared in op.source_inputs(volume) {
+                    note(declared)?;
+                }
+                Ok(())
+            }
             Chain::Sequence(children)
             | Chain::Alternative {
                 branches: children, ..
@@ -864,8 +1152,9 @@ impl Chain {
                 branches: children, ..
             } => {
                 for child in children {
-                    child.collect_source_levels(seen);
+                    child.collect_source_inputs(volume, seen)?;
                 }
+                Ok(())
             }
         }
     }
@@ -1275,7 +1564,7 @@ impl Chain {
             )));
         }
         match self {
-            Chain::Op(op) => op.apply(input, out, at),
+            Chain::Op(op) => op.apply_with(input, sources, out, at),
             // The one node that answers from something other than `input`. The
             // buffer holds the block's read extent of the level, so this is a
             // copy and not a slice: the executor already asked for exactly the

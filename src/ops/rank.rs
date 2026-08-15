@@ -54,13 +54,75 @@ pub fn rank_filter_into<T: Ord + Copy>(
     input: ArrayView3<'_, T>,
     element: &StructuringElement,
     rank: Rank,
-    mut out: ArrayViewMut3<'_, T>,
+    out: ArrayViewMut3<'_, T>,
 ) -> Result<()> {
-    shapes_agree(input.shape(), out.shape(), "rank_filter_into")?;
+    selecting(input, None, element, rank, out, "rank_filter_into")
+}
+
+/// [`rank_filter_into`], with `mask` deciding which voxels are in the window's
+/// **population**.
+///
+/// The mask is consulted at *every offset in the element*, not at the centre —
+/// that is the whole of the difference, and it is why this cannot be done as a
+/// voxelwise pre-step. **The obvious workaround does not work**: replacing
+/// excluded voxels with a sentinel and running the ordinary filter fails,
+/// because a rank is resolved against the count of surviving voxels and a
+/// sentinel keeps them in the count. It is worth stating because it is the
+/// first thing anyone tries.
+///
+/// `mask` covers the same buffer as `input`, so the caller reads it at the same
+/// region — see `BlockOp::source_inputs`, which is what makes the plan fetch it
+/// at the element's reach rather than at the voxel.
+///
+/// **When nothing survives**, the centre's own value is written. That is the
+/// only answer that keeps the filter's defining property — every value written
+/// is a value that was read — and it is stated here rather than left to the
+/// selection, which has no value to hand back at all. The caller should know
+/// that where the centre is *itself* excluded this returns a value the mask
+/// asked to leave out; a window with no population has no better answer, and
+/// pretending otherwise would be inventing one.
+pub fn masked_rank_filter_into<T: Ord + Copy>(
+    input: ArrayView3<'_, T>,
+    mask: ArrayView3<'_, bool>,
+    element: &StructuringElement,
+    rank: Rank,
+    out: ArrayViewMut3<'_, T>,
+) -> Result<()> {
+    shapes_agree(
+        input.shape(),
+        mask.shape(),
+        "masked_rank_filter_into (mask)",
+    )?;
+    selecting(
+        input,
+        Some(mask),
+        element,
+        rank,
+        out,
+        "masked_rank_filter_into",
+    )
+}
+
+/// The one selection kernel, masked or not.
+///
+/// One function rather than two so that the masked filter cannot drift from the
+/// plain one: the gather, the clamp at the buffer edge and
+/// [`Rank::resolve`]'s truncation rule are the same code, and masking is one
+/// more reason an offset does not join the window. The unmasked path is
+/// unchanged down to the error it raises.
+fn selecting<T: Ord + Copy>(
+    input: ArrayView3<'_, T>,
+    mask: Option<ArrayView3<'_, bool>>,
+    element: &StructuringElement,
+    rank: Rank,
+    mut out: ArrayViewMut3<'_, T>,
+    what: &str,
+) -> Result<()> {
+    shapes_agree(input.shape(), out.shape(), what)?;
     if element.is_empty() {
-        return Err(Error::InvalidArgument(
-            "rank_filter_into: an empty element selects nothing".to_string(),
-        ));
+        return Err(Error::InvalidArgument(format!(
+            "{what}: an empty element selects nothing"
+        )));
     }
     let extent = [
         input.shape()[0] as isize,
@@ -82,15 +144,28 @@ pub fn rank_filter_into<T: Ord + Copy>(
                     {
                         continue;
                     }
-                    window.push(input[[a as usize, b as usize, c as usize]]);
+                    let at = [a as usize, b as usize, c as usize];
+                    if let Some(mask) = mask.as_ref() {
+                        if !mask[at] {
+                            continue;
+                        }
+                    }
+                    window.push(input[at]);
                 }
                 let index = rank.resolve(full, window.len());
                 match select_nth(&mut window, index) {
                     Some(value) => out[[i, j, k]] = value,
+                    // Unmasked, an empty window means the element does not
+                    // contain its own centre, which is a malformed element and
+                    // an error. Masked, it means the mask excluded every
+                    // neighbour, which is ordinary data — see the header of
+                    // `masked_rank_filter_into` for why the centre is the
+                    // answer.
+                    None if mask.is_some() => out[[i, j, k]] = input[[i, j, k]],
                     None => {
-                        return Err(Error::InvalidArgument(
-                            "rank_filter_into: an element that misses its own centre".to_string(),
-                        ))
+                        return Err(Error::InvalidArgument(format!(
+                            "{what}: an element that misses its own centre"
+                        )))
                     }
                 }
             }
@@ -259,6 +334,228 @@ impl BlockOp for RankFilterOp {
         self.cost
     }
 }
+
+/// [`RankFilterOp`], with a stored level deciding which voxels count.
+///
+/// **The case it exists for** is a percentile taken over a window with
+/// background voxels removed from the population, so that the statistic
+/// describes the structure present rather than the proportion of the window it
+/// occupies. It is a `BlockOp` like any other; what is new is that it reads a
+/// *second* level over the same window it reads its input over, which is what
+/// [`BlockOp::source_inputs`] exists to declare.
+///
+/// **Why a stored mask rather than a predicate baked into the kernel.** Both
+/// are legitimate and the choice is a cost question, not a correctness one. The
+/// mask here is read `|element|` times — once per window covering it — which is
+/// the condition that favours computing it once and storing it. A predicate
+/// cheap enough to beat a byte of memory traffic (a bare comparison, say) is
+/// better fused into the gather, and that is a fusion of this op rather than a
+/// different op: it produces the same answer from the same declaration, which
+/// is exactly the property that lets a planner choose between them later.
+pub struct MaskedRankFilterOp {
+    name: &'static str,
+    element: StructuringElement,
+    rank: Rank,
+    mask: usize,
+    cost: f64,
+}
+
+impl MaskedRankFilterOp {
+    /// `mask` is the level holding the population, which must be a `Bool`
+    /// level — checked when the plan is made, by the same `check_dtypes` fold
+    /// that checks every other level.
+    pub fn new(
+        name: &'static str,
+        element: StructuringElement,
+        rank: Rank,
+        mask: impl Into<crate::assemble::Level>,
+    ) -> Self {
+        let cost = cost_for(&element) * MASK_COST_FACTOR;
+        Self {
+            name,
+            element,
+            rank,
+            mask: mask.into().index(),
+            cost,
+        }
+    }
+
+    /// The percentile form, which is the one the reference's arm needs.
+    pub fn percentile(
+        name: &'static str,
+        element: StructuringElement,
+        fraction: f64,
+        mask: impl Into<crate::assemble::Level>,
+    ) -> Result<Self> {
+        let rank = Rank::ceiling_percentile(fraction)?;
+        Ok(Self::new(name, element, rank, mask))
+    }
+
+    pub fn element(&self) -> &StructuringElement {
+        &self.element
+    }
+
+    /// The level this op reads its population from.
+    pub fn mask_level(&self) -> usize {
+        self.mask
+    }
+
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+impl BlockOp for MaskedRankFilterOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, axis: usize, _volume_len: usize) -> usize {
+        self.element.reach(axis)
+    }
+
+    fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+        self.element.reach_spec()
+    }
+
+    /// The mask, over **the same window** the input is read over.
+    ///
+    /// Equal to this op's own reach by construction rather than by arrangement:
+    /// the population is consulted at the element's offsets, so it is the
+    /// element that states both. That equality is also what keeps this op
+    /// inside what a plan can currently fetch — see `check_source_levels`.
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<crate::op::SourceInput> {
+        vec![crate::op::SourceInput::new(
+            self.mask,
+            self.element.reach_spec(),
+        )]
+    }
+
+    fn accepts(&self, dtype: Dtype) -> bool {
+        dtype != Dtype::F16
+    }
+
+    /// Refuses, and the refusal is the point: an op whose population comes from
+    /// a second array cannot be computed from one. See [`BlockOp::apply_with`].
+    fn apply(&self, _input: &Voxels, _out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        Err(Error::InvalidArgument(format!(
+            "{}: the population comes from level {}, so this op has no answer from its input \
+             alone. It is applied through `apply_with`.",
+            self.name, self.mask
+        )))
+    }
+
+    fn apply_with(
+        &self,
+        input: &Voxels,
+        sources: crate::op::SourceInputs<'_>,
+        out: &mut Voxels,
+        _at: &Anchor,
+    ) -> Result<()> {
+        let mask = sources.get(self.mask)?;
+        if mask.dtype() != Dtype::Bool {
+            return Err(Error::InvalidArgument(format!(
+                "{}: the population is read from level {}, which holds {}. A population is a \
+                 yes-or-no per voxel and is stored as one; a wider type would leave 'which \
+                 non-zero values count' to be decided somewhere this op cannot see.",
+                self.name,
+                self.mask,
+                mask.dtype().numpy_name()
+            )));
+        }
+        let mask = mask.view::<bool>()?;
+
+        fn ordered<T: VoxelElement + Ord>(
+            input: &Voxels,
+            mask: ArrayView3<'_, bool>,
+            out: &mut Voxels,
+            element: &StructuringElement,
+            rank: Rank,
+        ) -> Result<()> {
+            let source = input.view::<T>()?;
+            masked_rank_filter_into(source, mask, element, rank, out.view_mut::<T>()?)
+        }
+
+        /// The floating-point detour, shared by `f64` and `f32`: neither has a
+        /// total order, and the filter hands back a value it read, so the trip
+        /// through `Total` is exact in both directions.
+        fn through_total(
+            widened: ndarray::Array3<f64>,
+            mask: ArrayView3<'_, bool>,
+            element: &StructuringElement,
+            rank: Rank,
+        ) -> Result<Array3<f64>> {
+            let ordered = widened.mapv(Total);
+            let mut selected = Array3::from_elem(ordered.raw_dim(), Total(0.0));
+            masked_rank_filter_into(ordered.view(), mask, element, rank, selected.view_mut())?;
+            Ok(selected.mapv(|value| value.0))
+        }
+
+        match input.dtype() {
+            Dtype::Bool => ordered::<bool>(input, mask, out, &self.element, self.rank),
+            Dtype::U8 => ordered::<u8>(input, mask, out, &self.element, self.rank),
+            Dtype::U16 => ordered::<u16>(input, mask, out, &self.element, self.rank),
+            Dtype::U32 => ordered::<u32>(input, mask, out, &self.element, self.rank),
+            Dtype::U64 => ordered::<u64>(input, mask, out, &self.element, self.rank),
+            Dtype::I8 => ordered::<i8>(input, mask, out, &self.element, self.rank),
+            Dtype::I16 => ordered::<i16>(input, mask, out, &self.element, self.rank),
+            Dtype::I32 => ordered::<i32>(input, mask, out, &self.element, self.rank),
+            Dtype::I64 => ordered::<i64>(input, mask, out, &self.element, self.rank),
+            Dtype::F64 => {
+                let selected = through_total(
+                    input.view::<f64>()?.to_owned(),
+                    mask,
+                    &self.element,
+                    self.rank,
+                )?;
+                out.view_mut::<f64>()?.assign(&selected);
+                Ok(())
+            }
+            Dtype::F32 => {
+                let selected = through_total(
+                    input.view::<f32>()?.mapv(f64::from),
+                    mask,
+                    &self.element,
+                    self.rank,
+                )?;
+                let mut out = out.view_mut::<f32>()?;
+                ndarray::Zip::from(&mut out)
+                    .and(&selected)
+                    .for_each(|slot, &value| *slot = value as f32);
+                Ok(())
+            }
+            Dtype::F16 => Err(Error::InvalidArgument(format!(
+                "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
+                self.name
+            ))),
+        }
+    }
+
+    /// Exactly the constant, and **whatever the mask says**.
+    ///
+    /// Every value written is a value that was read: where the population is
+    /// non-empty the selection returns one of them, and where it is empty the
+    /// centre is written. On a constant block both are the constant, so this
+    /// holds bit for bit without the short circuit needing to know the mask —
+    /// which matters, because the mask is a level the short circuit has not
+    /// read.
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        Some(value)
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+}
+
+/// What consulting the population adds, as a multiple of the unmasked filter.
+///
+/// **A seed, in the sense `CostModel` means it** — it needs the ordering right
+/// and nothing more, because a run that records statistics replaces it with a
+/// measured coefficient for this op's family. One byte of a second array per
+/// offset visited, against the compare-and-select already there.
+const MASK_COST_FACTOR: f64 = 1.35;
 
 /// Measured; see `super::COST_MEASUREMENT`. The filter's work is proportional to
 /// the element it is given, so the cost is a function of the element rather than

@@ -472,13 +472,19 @@ impl Decomposition {
     /// did before the feature existed.
     pub fn declare_source_levels(&mut self, chain: &Chain) -> Result<()> {
         let slots = chain.slots();
-        for phase in &mut self.phases {
+        // Volumes first, because a source input's reach is stated over the
+        // phase's own anchoring volume and `self.phases` is about to be borrowed
+        // mutably. Two loops rather than a cell: the quantity is read-only.
+        let volumes: Vec<[usize; 3]> = (0..self.phases.len())
+            .map(|phase| self.volume_at(phase))
+            .collect();
+        for (index, phase) in self.phases.iter_mut().enumerate() {
             let mut levels = Vec::new();
             for &slot in &phase.slots {
                 let Some(node) = slots.get(slot) else {
                     continue;
                 };
-                levels.extend(node.source_levels());
+                levels.extend(node.source_levels(volumes[index])?);
             }
             levels.sort_unstable();
             levels.dedup();
@@ -1212,11 +1218,49 @@ pub fn check_source_levels(chain: &Chain, decomposition: &Decomposition) -> Resu
             // own slot-order check.
             continue;
         }
-        let mut named: Vec<usize> = phase
-            .slots
-            .iter()
-            .flat_map(|&slot| slots[slot].source_levels())
-            .collect();
+        let volume = decomposition.volume_at(phase_index);
+        let mut declared: Vec<crate::op::SourceInput> = Vec::new();
+        for &slot in &phase.slots {
+            for input in slots[slot].source_inputs(volume)? {
+                match declared.iter_mut().find(|held| held.level == input.level) {
+                    Some(held) => held.reach = held.reach.max(&input.reach)?,
+                    None => declared.push(input),
+                }
+            }
+        }
+        declared.sort_by_key(|input| input.level);
+
+        // **The equal-reach limit, stated where it is checkable.** The executor
+        // reads a source level at the block's own fetch region, so an operand
+        // wanting *more* than the phase already fetches would be handed a buffer
+        // narrower than its kernel walks. Per-input halos are what would lift
+        // this, and nothing shipped needs them yet — the masked-window case that
+        // motivated per-input reach reads its operand over the same element it
+        // reads its input over, so the two are equal by construction. Refused by
+        // name rather than planned and discovered as an out-of-bounds read.
+        let block = phase.grid.block();
+        let granted = phase.halo.in_voxels(block);
+        for input in &declared {
+            let wanted = input.reach.in_voxels(block);
+            for axis in 0..3 {
+                let (want_lo, want_hi) = wanted.axis(axis).bound(volume[axis]);
+                let (have_lo, have_hi) = granted.axis(axis).bound(volume[axis]);
+                if want_lo > have_lo || want_hi > have_hi {
+                    return Err(Error::InvalidArgument(format!(
+                        "decomposition phase {phase_index} ({}) reads level {} with a reach of \
+                         {want_lo}+{want_hi} on axis {axis}, and the phase is granted a halo of \
+                         {have_lo}+{have_hi} there. A source level is read at the block's own \
+                         fetch region, so an operand reaching further than the phase does would \
+                         be handed a buffer its kernel walks past the end of. Widening only this \
+                         input needs a per-input halo, which this plan cannot express.",
+                        phase.names.join(">"),
+                        input.level
+                    )));
+                }
+            }
+        }
+
+        let mut named: Vec<usize> = declared.iter().map(|input| input.level).collect();
         named.sort_unstable();
         named.dedup();
         if named != phase.source_levels {
