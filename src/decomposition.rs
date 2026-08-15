@@ -733,6 +733,24 @@ pub(crate) fn region_to_ranges(region: &Region) -> Vec<(usize, usize)> {
 /// attribution that moved wall clock 0-6 %. So the defaults are declared
 /// placeholders, not measurements.
 ///
+/// **The defaults are a seed, and they are not apologised for.** There may be
+/// no first run — a cold planner has to plan *something* — so `1.0` everywhere
+/// is what the planner starts from, and it is the right thing to start from
+/// whatever its absolute accuracy: what a cold planner needs is that a median
+/// costs more than a map and an opening more than the erosion inside it, and
+/// `ops`' constants have that ordering right even where their scale is out by
+/// 2.7x. Nobody should "fix" these by chasing precision that measurement will
+/// supply anyway. [`crate::statistics`] is where the measurement goes: it
+/// accumulates nanoseconds per unit of *declared* cost from real runs and hands
+/// back a calibrated `CostModel`, so the seeds are displaced by evidence about
+/// the machine that will do the work rather than by a better guess.
+///
+/// The unit is therefore whatever the caller's weights are denominated in.
+/// Untouched, that is "one voxelwise map's worth of work per voxel". Calibrated
+/// by a `statistics::Snapshot`, it is **nanoseconds** — a wholesale change of
+/// unit, which is why calibration replaces all four weights together rather
+/// than any one of them.
+///
 /// Two consequences of that honesty are built in:
 ///
 /// * `order_conflict_penalty` defaults to **zero**, so an unmeasured intuition
@@ -987,6 +1005,60 @@ pub fn price_phase(
             + core_voxels * write
             + conflict,
     }
+}
+
+/// What a plan *predicts* it will cost, under `model`.
+///
+/// The same arithmetic the planner searched with — [`price_phase`] per phase,
+/// times the phase's block count — pointed at the plan that was chosen rather
+/// than at the candidates that were not. It exists because a prediction nobody
+/// can read back is a prediction nobody can check: the whole claim of
+/// [`crate::statistics`] is that a measured coefficient predicts better than a
+/// stale constant, and that claim is only assertable if the prediction is a
+/// number.
+///
+/// The units are the model's. With `CostModel::default` that is voxelwise maps;
+/// with a model calibrated from a snapshot it is **nanoseconds**, directly
+/// comparable with `statistics::observed_nanos` over a run's log.
+///
+/// It reads the plan's *stated* reach rather than re-deriving it from the
+/// chain, on the principle the file is built on: the decomposition is the
+/// binding half, and a second derivation that disagreed with it would be a
+/// second planner. The chain is still needed, for what each slot declared it
+/// would cost — that is the one thing a plan records only as a name.
+pub fn predicted_cost(
+    chain: &Chain,
+    decomposition: &Decomposition,
+    model: &CostModel,
+) -> Result<f64> {
+    let slots = chain.slots();
+    let mut total = 0.0_f64;
+    for (index, phase) in decomposition.phases.iter().enumerate() {
+        if phase.slots.iter().any(|&slot| slot >= slots.len()) {
+            return Err(Error::InvalidArgument(format!(
+                "predicted_cost: phase {index} names slot {:?}, and the chain has {}",
+                phase.slots.iter().max(),
+                slots.len()
+            )));
+        }
+        let volume = decomposition.volume_at(index);
+        let (_, compute, _, orders) = summarise_slots(&slots, &phase.slots, volume)?;
+        // The last phase writes the workflow's output; every other writes an
+        // intermediate. Exactly the test the enumeration makes.
+        let is_materialised = index + 1 < decomposition.phases.len();
+        let cost = price_phase(
+            &phase.grid,
+            &phase.reach,
+            compute,
+            orders.len(),
+            is_materialised,
+            decomposition.dtype_at(index).size_of() as f64,
+            model,
+            model.materialise_cost_per_voxel,
+        );
+        total += cost.cost_per_block * phase.grid.n_blocks() as f64;
+    }
+    Ok(total)
 }
 
 /// Reach, compute and traversal preferences of a contiguous run of slots.

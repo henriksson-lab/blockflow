@@ -741,7 +741,7 @@ fn a_sampled_op_is_invariant_at_every_spacing_and_not_merely_at_one() {
         ] {
             let chain = Chain::op(LocalStatisticOp::new(
                 "sampled",
-                LocalStatistic::new(window.clone(), spacing, statistic).unwrap(),
+                LocalStatistic::new(window.clone(), spacing, statistic.clone()).unwrap(),
             ));
             let reach = chain.reach3(&VOLUME);
             if (0..3).any(|axis| reach[axis] >= VOLUME[axis]) {

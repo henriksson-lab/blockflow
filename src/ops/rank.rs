@@ -16,10 +16,20 @@
 // beyond — and that is precisely what makes a short halo diverge instead of
 // passing quietly. The clamp is not a fallback; it is the detector.
 //
-// What clamping does *not* do is change which statistic is taken. A rank is a
-// relative position in the sorted window, so a truncated window rescales it
-// rather than clipping it — see `Rank::resolve`, and the test there for what
-// clipping would have done to a median at every face of the volume.
+// What clamping does *not* do is decide which statistic is taken; the `Rank`
+// does, and it carries **two conventions** for a truncated window because there
+// are two defensible ones. `Rank::Nth` rescales the rank to the surviving
+// population and `Rank::CeilingPercentile` states the statistic against that
+// population directly; they agree at a half over an odd population and differ
+// elsewhere, including on the untruncated window. See `Rank::resolve` for the
+// arithmetic and `tests/rank_truncation_rule.rs` for both halves of that,
+// pinned. What neither does is *clip* the rank, which would turn a median into
+// a maximum wherever the element is truncated.
+//
+// The window is the element's offsets, so an element that is **stepped** —
+// `StructuringElement::from_size_stepped` — simply gathers fewer of them, and
+// every number this file derives from `element.len()` follows without a second
+// path: the cost below, and the rank a `median` constructor names.
 
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 

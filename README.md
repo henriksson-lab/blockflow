@@ -132,6 +132,7 @@ learn what a block is.
 | `sidecar` | Per-block output that is **not** a pixel region: `(stream, phase, block) -> bytes`, plain objects, a declared lifecycle, a deletion that reports itself. |
 | `strategy` | One `Strategy` trait, and the single executor every strategy shares. |
 | `log` | The `Event` stream and the log the acceptance criterion is asserted from. |
+| `statistics` | Measured cost coefficients, accumulated from real runs and persisted. Nanoseconds per unit of *declared* cost, keyed by machine; an absent store leaves the shipped constants exactly where they are. |
 | `listener` | `EventListener`, the dispatch set, and the built-in listeners. |
 | `observed_io` | Source/sink decorators, so IO outside the executor emits through the same trait. |
 | `export` | The order log as JSON, with a cross-language schema. |

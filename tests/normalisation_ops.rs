@@ -411,7 +411,7 @@ fn a_block_derived_lattice_moves_and_these_ops_are_asserted_against_that() {
             let chain = Chain::op(
                 LevelCorrectionOp::new(
                     "level",
-                    LocalStatistic::new(element([1, 1, 1]), spacing, statistic).unwrap(),
+                    LocalStatistic::new(element([1, 1, 1]), spacing, statistic.clone()).unwrap(),
                     removal,
                 )
                 .unwrap(),

@@ -150,6 +150,11 @@ pub mod region;
 /// bytes`, on the environment beside the region writes. Storage only; what
 /// produces and consumes fragments is `fragment`.
 pub mod sidecar;
+/// Measured cost coefficients, accumulated from real runs and fed back into
+/// planning. Nanoseconds per unit of *declared* cost, keyed by machine and
+/// persisted across runs; an absent or empty store leaves the shipped constants
+/// — which are a seed, not a fallback — exactly where they are.
+pub mod statistics;
 pub mod strategy;
 /// A generated volume whose answer is known by construction: intensities, an
 /// exact label volume and an object table, from a seed and a shape. Objects are
@@ -188,8 +193,8 @@ pub use cache::{
 };
 pub use decomposition::{
     check_block_constraints, check_chunk_exclusive_writes, check_source_levels, constraint_for,
-    is_planning_barrier, reaches_whole_axis, splittable_axes, Constraints, CostModel,
-    Decomposition, PhaseDecomposition,
+    is_planning_barrier, predicted_cost, reaches_whole_axis, splittable_axes, Constraints,
+    CostModel, Decomposition, PhaseDecomposition,
 };
 pub use distributed::{
     Assignment, ChunkGrid, Coordinator, Handout, HandoutPolicy, JobSpec, JobStatus, ModelledCache,
@@ -230,6 +235,10 @@ pub use region::{ArrayRegionSink, ArrayRegionSource, Region, RegionSink, RegionS
 pub use sidecar::{
     Discarded, FileSidecars, FragmentKey, Lifecycle, MemorySidecars, SidecarBackend, Sidecars,
     StreamRemoval,
+};
+pub use statistics::{
+    observed_nanos, Coefficient, MachineKey, Observed, PlanIdentity, Provenance, Recorder,
+    RunObservations, Snapshot, Statistics, Term,
 };
 pub use strategy::{
     execute, execute_observed, execute_phases, execute_task, execute_task_of, ArrayRef,

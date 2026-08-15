@@ -102,15 +102,25 @@
 // See `COST_MEASUREMENT`. Every `cost_per_voxel` in this module is a
 // measurement, taken by `ops::cost::measure`, which is runnable.
 //
-// Three ops measure themselves instead, in their own files, and say so where
-// their constants are: `ridge`, `skeleton` and `reconstruct`. `ops::cost::
-// measure` builds one shared `f64` ramp for every case and consumes the result
-// as `f64`, so it can neither feed nor read an op whose input and output are
-// masks — and a thinning pass over a ramp does almost nothing, which is a
-// measurement of the wrong program rather than a noisy measurement of the right
-// one. `reconstruct` is out for a different reason and a harder one: the harness
-// prices `Box<dyn BlockOp>` and an iterative op is not a `BlockOp` at all, so
-// there is no signature to hand it through.
+// Four ops measure themselves instead, in their own files, and say so where
+// their constants are: `ridge`, `skeleton`, `reconstruct` and `voxelwise`.
+// `ops::cost::measure` builds one shared `f64` ramp for every case and consumes
+// the result as `f64`, so it can neither feed nor read an op whose input and
+// output are masks — and a thinning pass over a ramp does almost nothing, which
+// is a measurement of the wrong program rather than a noisy measurement of the
+// right one. `reconstruct` is out for a different reason and a harder one: the
+// harness prices `Box<dyn BlockOp>` and an iterative op is not a `BlockOp` at
+// all, so there is no signature to hand it through.
+//
+// `voxelwise` is out for a third reason, and it is a warning about this file's
+// numbers rather than about that op. Its cases were first added to
+// `cost::measure`'s list, and doing so moved the `gaussian smooth` row from 55
+// to 73 ns/voxel with `smooth.rs` untouched; rebuilding both at
+// `-C codegen-units=1` made them agree at 78. So the neighbourhood rows here
+// swing by a third with codegen-unit partitioning, and *any* edit to
+// `ops::cost` reshuffles the table four modules' constants were read off.
+// `ops::voxelwise::cost_report` therefore has its own case list, and new cases
+// anywhere should ask whether they are worth perturbing the old ones.
 
 use crate::error::{Error, Result};
 
@@ -139,7 +149,7 @@ pub use detect::{
     moments_of_labels, owner_of, points_owned_by, LabelRegionsOp, Moments, RegionMoments,
     RegionPointsOp,
 };
-pub use element::{select_nth, ElementShape, Rank, StructuringElement, Total};
+pub use element::{select_nth, ElementShape, Percentile, Rank, StructuringElement, Total};
 pub use fill::{fill_phases, FillHolesOp, LabelBackgroundOp};
 pub use local::{
     axis_max_distance, local_statistic_into, threshold_against_into, AdaptiveThresholdOp, Isodata,
@@ -172,8 +182,9 @@ pub use skeleton::{thin, thinning_pass, thinning_reach, ThinningOp};
 pub use smooth::{Gaussian, SmoothOp};
 pub use voxelize::{decode_points, encode_points, Point, VoxelizeOp};
 pub use voxelwise::{
-    combine_into, from_set, is_set, logic_into, map_into, not_into, CombineOp, Logic, LogicCombine,
-    VoxelwiseMapOp,
+    combine_into, from_set, is_set, logic_into, map_into, not_into, CombineOp, Compose, Identity,
+    Logic, LogicCombine, MapFn, Not, Threshold, ThresholdTest, VoxelwiseMapOp, IDENTITY_COST,
+    MAP_COST,
 };
 
 /// How the costs in this module were obtained, and what they are relative to.
@@ -207,6 +218,23 @@ pub use voxelwise::{
 /// *ratios*, which is what the planner uses them for and what survives a change
 /// of machine better than any absolute figure — `docs/design/BLOCK_OPS.md`
 /// §"Simulating strategies": trust "A beats B", distrust "A takes 40 minutes".
+///
+/// **These constants are a seed, and nobody should try to make them precise.**
+/// There may be no first run, so a cold planner has to start somewhere, and
+/// this table is where it starts. It does not have to be accurate to do that
+/// job — it has to have the *ordering* right, which it does. Its absolute scale
+/// is known to be wrong: the `MAP_COST`-denominated family understates by about
+/// 2.7x since the voxelwise map stopped going through a boxed closure, and the
+/// neighbourhood rows swing by about a third on codegen-unit partitioning
+/// alone, which is why the paragraph above this one exists. Rescaling them
+/// would be chasing a number to a precision the measurement cannot support, and
+/// it is unnecessary: [`crate::statistics`] accumulates *nanoseconds per unit of
+/// declared cost* from real runs and calibrates the whole model at once, so a
+/// systematic factor here is absorbed by evidence from the machine that will do
+/// the work rather than corrected by a better guess on the machine that will
+/// not. What a wrong constant here still costs is the *relative* weighting
+/// between op families, since `CostModel` has one `compute_scale` for all of
+/// them — see `statistics::Snapshot::family_spread`, which measures it.
 pub const COST_MEASUREMENT: &str = "ops::cost::report";
 
 pub(crate) fn shapes_agree(input: &[usize], out: &[usize], what: &str) -> Result<()> {

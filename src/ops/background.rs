@@ -24,7 +24,7 @@
 // | piece | what it is | where it comes from |
 // |---|---|---|
 // | the estimate | a grey opening: the minimum over the element, then the maximum | [`RankFilterOp`] twice, at [`Rank::lowest`] and [`Rank::highest`] — **no new kernel** |
-// | the original | an identity | [`VoxelwiseMapOp`] over `|value| value` — **no new kernel** |
+// | the original | an identity | [`VoxelwiseMapOp`] over [`Identity`](super::voxelwise::Identity) — **no new kernel** |
 // | the shape | one input, two arms, one sink: a **diamond** | [`Chain::Parallel`] |
 // | the sink | a voxelwise subtraction | [`combine_into`] existed; a [`Combine`] over it did not. **This is the new code, and it is one `-`.** |
 //
@@ -146,7 +146,7 @@
 // is a property of one arrangement of two branches, not of the sink.)
 //
 // The **assembled chain** is `f64` only, because the identity arm is a
-// [`VoxelwiseMapOp`], which holds an `f64 -> f64` closure and says so. A caller
+// [`VoxelwiseMapOp`], which holds an `f64 -> f64` map and says so. A caller
 // wanting the `f32` path today builds the diamond with an identity of their own;
 // nothing in this file would change.
 //
@@ -404,7 +404,7 @@ pub fn background_estimate(element: &StructuringElement) -> Chain {
 pub fn remove_background(element: &StructuringElement) -> Result<Chain> {
     Chain::parallel(
         vec![
-            Chain::op(VoxelwiseMapOp::new(ORIGINAL, |value| value)),
+            Chain::op(VoxelwiseMapOp::identity(ORIGINAL)),
             background_estimate(element),
         ],
         Box::new(DifferenceCombine::new(DIFFERENCE)),
@@ -778,7 +778,7 @@ mod tests {
             &Chain::parallel(
                 vec![
                     background_estimate(&element),
-                    Chain::op(VoxelwiseMapOp::new(ORIGINAL, |value| value)),
+                    Chain::op(VoxelwiseMapOp::identity(ORIGINAL)),
                 ],
                 Box::new(DifferenceCombine::new(DIFFERENCE)),
             )

@@ -33,6 +33,20 @@
 // asymmetry is carried rather than smoothed away, and `src/reach.rs` has had
 // `AxisReach::Bounded { lo, hi }` to carry it in for longer than this module has
 // been able to produce one.
+//
+// **The two sides are read back off the offsets, not off the box asked for.**
+// They used to be the constructor's arguments, which was the same number for
+// every shape that shipped — a box and both ball rules contain the poles of
+// their own bounding box, so the widest member offset *was* the argument. A
+// [stepped](StructuringElement::from_size_stepped) element breaks that: a
+// 200-wide axis stepped by two has its last surviving offset at 98, not at 99,
+// and an element that declared 99 would fetch a plane no voxel of the answer
+// depends on and, worse, would state a dependency it does not have. Deriving
+// them from the generated offsets keeps `reach` a *consequence* of the element
+// under every parameterisation, which is the invariant the whole module is
+// arranged around; there is still nothing that could set it independently.
+
+use std::hash::{Hash, Hasher};
 
 use crate::error::{Error, Result};
 use crate::reach::Reach;
@@ -112,11 +126,25 @@ pub enum ElementShape {
 /// the other. See [`Self::from_size`] for which side, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuringElement {
-    shape: ElementShape,
-    /// Voxels the element reads **below** the anchor, per axis.
+    /// Which named shape generated the offsets, or `None` for an element built
+    /// from an explicit list.
+    ///
+    /// Descriptive only — nothing derives geometry, cost or membership from it
+    /// after construction, which is why an element with no name is a perfectly
+    /// ordinary element rather than a second kind of thing.
+    shape: Option<ElementShape>,
+    /// Voxels the element reads **below** the anchor, per axis. Derived from
+    /// `offsets` — the widest surviving member on that side — and not from the
+    /// box the constructor was handed. See the module header.
     lo: [usize; 3],
-    /// Voxels the element reads **above** the anchor, per axis.
+    /// Voxels the element reads **above** the anchor, per axis. Derived, as
+    /// `lo` is.
     hi: [usize; 3],
+    /// The decimation applied to the bounding box while generating `offsets`;
+    /// `[1, 1, 1]` for every element that is not stepped. Carried so that the
+    /// element can describe itself, never to compute a reach from — the reach
+    /// comes from the offsets that survived it.
+    step: [usize; 3],
     offsets: Vec<[isize; 3]>,
 }
 
@@ -136,11 +164,152 @@ impl StructuringElement {
     /// legitimate thing to want, and because it is the form the rest of the type
     /// is written against.
     pub fn from_sides(shape: ElementShape, lo: [usize; 3], hi: [usize; 3]) -> Self {
-        let offsets = generate(shape, lo, hi);
-        Self {
-            shape,
+        Self::build(shape, lo, hi, [1, 1, 1])
+    }
+
+    /// From an explicit list of offsets — the constructor for a shape this
+    /// crate does not name.
+    ///
+    /// **This is the extension point, and it is a constructor rather than a
+    /// trait for a reason.** [`ElementShape`]'s membership test runs once per
+    /// candidate offset *at construction* and never again, so opening it as a
+    /// trait would buy a caller nothing at run time and would put a generic
+    /// parameter on a type that is stored, cloned and compared everywhere. What
+    /// a caller actually cannot do today is hand over a set of offsets, and that
+    /// is what this fixes.
+    ///
+    /// Three properties are established here rather than trusted, because every
+    /// one of them is something the rest of the crate assumes:
+    ///
+    /// * **the offsets are sorted**, ascending on axis 0, then 1, then 2 — the
+    ///   order [`from_sides`](Self::from_sides) generates. A gathered window is
+    ///   summed in offset order and floating-point addition does not associate,
+    ///   so the answer depends on it: sorting makes the element a function of
+    ///   the *set* a caller meant rather than of the order they happened to
+    ///   write it in, and makes two callers who meant the same element get the
+    ///   same numbers;
+    /// * **duplicates are refused**, naming the repeat. A duplicate offset is
+    ///   gathered twice, so it doubles that voxel's weight in a mean and shifts
+    ///   every rank — a silent change to the filter rather than to the window;
+    /// * **an empty list is refused**, for the reason every constructor here
+    ///   refuses one: an element with no members selects nothing, and every op
+    ///   that reduces over it has no value to write.
+    ///
+    /// The reach is derived from the offsets given, exactly as it is for a
+    /// generated element — see [`Self::sides`]. There is no way to state it
+    /// separately and therefore nothing that can drift from the arithmetic.
+    pub fn from_offsets(offsets: impl IntoIterator<Item = [isize; 3]>) -> Result<Self> {
+        let mut offsets: Vec<[isize; 3]> = offsets.into_iter().collect();
+        if offsets.is_empty() {
+            return Err(Error::InvalidArgument(
+                "a structuring element needs at least one offset; an empty element selects \
+                 nothing and every op that reduces over one has no value to write"
+                    .to_string(),
+            ));
+        }
+        offsets.sort_unstable();
+        if let Some(pair) = offsets.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(Error::InvalidArgument(format!(
+                "the offset {:?} appears more than once. A repeated offset is gathered twice, \
+                 so it doubles that voxel's weight in a mean and shifts every rank — which is \
+                 a change to the filter rather than to the window, and is refused rather than \
+                 quietly folded away.",
+                pair[0]
+            )));
+        }
+        let (lo, hi) = spanned_sides(&offsets);
+        Ok(Self {
+            shape: None,
             lo,
             hi,
+            step: [1, 1, 1],
+            offsets,
+        })
+    }
+
+    /// The general constructor with a **step**: only every `step[axis]`-th
+    /// offset along each axis is a member.
+    ///
+    /// **What this is, and what it is not.** It decimates the *element* — the
+    /// window still spans the box `lo + hi + 1` asked for, but holds a fraction
+    /// `1 / (step[0] * step[1] * step[2])` of the offsets inside it, and
+    /// [`Self::len`] is the count that survived. It is **not** a coarser grid of
+    /// sampling positions: the filter is still evaluated at every voxel. The
+    /// crate has that separately, as `ops::local`'s `SampleLattice`, and the two
+    /// are composable and not interchangeable — a lattice makes the *answer*
+    /// coarse and interpolates it back, while a step makes the *window* sparse
+    /// and leaves the answer at full resolution.
+    ///
+    /// **Why a caller wants it.** The cost of a rank filter is its element, and
+    /// the elements that dominate a chain are the large flat ones — a
+    /// `200 x 200 x 1` window is 40 000 values to gather and select from at
+    /// every voxel. Decimating it by two on each of the wide axes leaves 10 000,
+    /// a quarter of the cost, and for a statistic that describes a smooth
+    /// low-frequency field the two answers are close. `cost_per_voxel` follows
+    /// automatically, because it is a function of `len`.
+    ///
+    /// **The phase, and what it costs at a low boundary.** The surviving offsets
+    /// are counted from the **low** end of the box: `-lo`, `-lo + step`, … up to
+    /// `hi`. The anchor itself is a member only when `lo` is a multiple of
+    /// `step`, which is a property of the element and is stated rather than
+    /// patched. Because the offsets are fixed, a window truncated at a boundary
+    /// keeps exactly the members that still land inside — the phase does not
+    /// shift. An implementation that instead slices the *clipped* range with a
+    /// stride (`a[max(0, c - lo) : min(c + hi, n) : step]`, which is what the
+    /// obvious array expression does) re-phases the decimation wherever
+    /// `(lo - c) % step != 0`, so at the low face it reads a different set of
+    /// voxels for every centre. This crate does not do that: a fixed offset set
+    /// is what makes the element the same filter everywhere, which is what makes
+    /// a block and a whole volume agree.
+    ///
+    /// The shape's membership test is applied to the surviving offset's **true**
+    /// position, so a stepped ellipsoid is the ellipsoid's offsets decimated and
+    /// not a decimated index space reinterpreted as an ellipsoid.
+    ///
+    /// Every `step[axis]` must be non-zero; `1` is the ordinary element and is
+    /// exactly [`Self::from_sides`].
+    pub fn from_sides_stepped(
+        shape: ElementShape,
+        lo: [usize; 3],
+        hi: [usize; 3],
+        step: [usize; 3],
+    ) -> Result<Self> {
+        for axis in 0..3 {
+            if step[axis] == 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "an element's step must be non-zero on every axis; got {step:?}. A step of \
+                     zero names no offsets at all, which is an empty window rather than a \
+                     cheaper one."
+                )));
+            }
+        }
+        let element = Self::build(shape, lo, hi, step);
+        // A step can strand a shape entirely: a radius-3 ball stepped by nine
+        // keeps only the offset `[-3, -3, -3]`, which is outside its own
+        // surface, and the element comes out empty. Unstepped elements cannot
+        // do this — a box is never empty and both ball rules contain the anchor
+        // — so this is the one constructor that has to say so. Refused rather
+        // than returned, because an empty element is not a cheaper filter: it is
+        // a window with nothing in it, and every consumer downstream would have
+        // to invent an answer for a rank over no values.
+        if element.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "a step of {step:?} leaves no offset inside a {:?} element of sides {lo:?}/{hi:?}; \
+                 the decimation is coarser than the shape it decimates",
+                shape
+            )));
+        }
+        Ok(element)
+    }
+
+    fn build(shape: ElementShape, lo: [usize; 3], hi: [usize; 3], step: [usize; 3]) -> Self {
+        let offsets = generate(shape, lo, hi, step);
+        let (lo, hi) = spanned_sides(&offsets);
+        Self {
+            shape: Some(shape),
+            lo,
+            hi,
+            step,
             offsets,
         }
     }
@@ -177,6 +346,22 @@ impl StructuringElement {
     /// fetch a voxel nobody reads on the narrow side, and, far worse, would make
     /// the element a different *set* from the one asked for.
     pub fn from_size(shape: ElementShape, size: [usize; 3]) -> Result<Self> {
+        Self::from_size_stepped(shape, size, [1, 1, 1])
+    }
+
+    /// [`Self::from_size`] with the step of [`Self::from_sides_stepped`], which
+    /// is where both rules are stated.
+    ///
+    /// The anchor is placed from the **full** extent, exactly as it is without a
+    /// step — a `200 x 200 x 1` box anchors at `(100, 99)` on each wide axis
+    /// whether or not it is then decimated — so a caller who steps an element
+    /// gets the same window position and a sparser sample of it, rather than a
+    /// window that also moved.
+    pub fn from_size_stepped(
+        shape: ElementShape,
+        size: [usize; 3],
+        step: [usize; 3],
+    ) -> Result<Self> {
         let mut lo = [0usize; 3];
         let mut hi = [0usize; 3];
         for axis in 0..3 {
@@ -188,11 +373,23 @@ impl StructuringElement {
             lo[axis] = size[axis] / 2;
             hi[axis] = size[axis] - 1 - lo[axis];
         }
-        Ok(Self::from_sides(shape, lo, hi))
+        Self::from_sides_stepped(shape, lo, hi, step)
     }
 
-    pub fn shape(&self) -> ElementShape {
+    /// Which named shape generated this element, or `None` if it was built from
+    /// an explicit offset list. Descriptive only.
+    pub fn shape(&self) -> Option<ElementShape> {
         self.shape
+    }
+
+    /// The decimation this element was built with; `[1, 1, 1]` unless it came
+    /// from one of the stepped constructors.
+    ///
+    /// Descriptive only. Nothing in this crate derives geometry or cost from it
+    /// — those come from the offsets and from [`Self::len`], which already
+    /// account for it.
+    pub fn step(&self) -> [usize; 3] {
+        self.step
     }
 
     /// The per-axis radius, when there is one.
@@ -205,7 +402,15 @@ impl StructuringElement {
         [self.reach(0), self.reach(1), self.reach(2)]
     }
 
-    /// The bounding box, per axis: `lo + hi + 1`.
+    /// The bounding box of what the element actually reads, per axis:
+    /// `lo + hi + 1`, with `lo` and `hi` the widest surviving offsets.
+    ///
+    /// For an unstepped box or ball this is the size it was built from, because
+    /// those contain the poles of their own box. For a stepped element it is the
+    /// span the survivors reach: a 200-wide axis stepped by two spans
+    /// `-100 ..= 98`, so 199. Deriving it rather than storing the requested
+    /// extent is the same decision `sides` makes and for the same reason —
+    /// there is one description of the window and it is the offsets.
     pub fn size(&self) -> [usize; 3] {
         [
             self.lo[0] + self.hi[0] + 1,
@@ -300,11 +505,24 @@ impl StructuringElement {
     }
 }
 
-fn generate(shape: ElementShape, lo: [usize; 3], hi: [usize; 3]) -> Vec<[isize; 3]> {
+fn generate(
+    shape: ElementShape,
+    lo: [usize; 3],
+    hi: [usize; 3],
+    step: [usize; 3],
+) -> Vec<[isize; 3]> {
+    let along: Vec<Vec<isize>> = (0..3)
+        .map(|axis| axis_offsets(lo[axis], hi[axis], step[axis]))
+        .collect();
     let mut offsets = Vec::new();
-    for a in -(lo[0] as isize)..=hi[0] as isize {
-        for b in -(lo[1] as isize)..=hi[1] as isize {
-            for c in -(lo[2] as isize)..=hi[2] as isize {
+    for &a in &along[0] {
+        for &b in &along[1] {
+            for &c in &along[2] {
+                // The membership test sees the *true* offset, so a decimated
+                // ball is the ball's members thinned out rather than a smaller
+                // ball drawn in the decimated index space. The two differ: the
+                // second would round the surface inwards on every axis it
+                // stepped.
                 if member(shape, lo, hi, [a, b, c]) {
                     offsets.push([a, b, c]);
                 }
@@ -312,6 +530,48 @@ fn generate(shape: ElementShape, lo: [usize; 3], hi: [usize; 3]) -> Vec<[isize; 
         }
     }
     offsets
+}
+
+/// The surviving offsets along one axis: `-lo`, `-lo + step`, … up to `hi`.
+///
+/// Counted from the low end, which is where [`StructuringElement::from_sides_stepped`]
+/// says the phase is anchored. `step == 1` gives the whole range back and is the
+/// unstepped case, unchanged.
+fn axis_offsets(lo: usize, hi: usize, step: usize) -> Vec<isize> {
+    let mut offsets = Vec::new();
+    let mut offset = -(lo as isize);
+    while offset <= hi as isize {
+        offsets.push(offset);
+        offset += step as isize;
+    }
+    offsets
+}
+
+/// The two sides each axis actually reaches, read off the offsets.
+///
+/// The zero floor is not a clamp of something that could be negative — it is the
+/// statement that a side reaching *no further than the anchor* reaches zero.
+/// `Reach` counts voxels beyond the anchor and cannot express "not even the
+/// anchor plane", so zero is the tightest truth available for an element whose
+/// offsets all fall on one side; over-declaring by that one plane costs a plane
+/// of halo and never costs correctness.
+fn spanned_sides(offsets: &[[isize; 3]]) -> ([usize; 3], [usize; 3]) {
+    let mut lo = [0isize; 3];
+    let mut hi = [0isize; 3];
+    for offset in offsets {
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(offset[axis]);
+            hi[axis] = hi[axis].max(offset[axis]);
+        }
+    }
+    (
+        [
+            lo[0].unsigned_abs(),
+            lo[1].unsigned_abs(),
+            lo[2].unsigned_abs(),
+        ],
+        [hi[0] as usize, hi[1] as usize, hi[2] as usize],
+    )
 }
 
 fn member(shape: ElementShape, lo: [usize; 3], hi: [usize; 3], offset: [isize; 3]) -> bool {
@@ -361,21 +621,124 @@ fn member(shape: ElementShape, lo: [usize; 3], hi: [usize; 3], offset: [isize; 3
     }
 }
 
+/// A fraction of the way up a sorted window, validated once.
+///
+/// Exists so that [`Rank`] can carry a percentile and still be `Eq + Hash` —
+/// `Statistic` in `ops::local` derives both and holds a `Rank`. The validation
+/// is what makes the derives sound rather than merely available: no `NaN` (a
+/// window that compared unequal to itself would turn every byte-identity check
+/// downstream into a pass that means nothing), and `-0.0` normalised to `+0.0`
+/// so that the hash agrees with the equality. `Isodata` in `ops::local` carries
+/// its `f64` under exactly the same rules, for the same reason.
+///
+/// Out-of-range is refused rather than clamped, which is the opposite of
+/// [`Rank::percentile`]'s convention and is deliberate: that constructor takes a
+/// fraction as a convenience for naming a rank and has a defensible reading for
+/// anything outside `[0, 1]`, while this one *is* the parameter of a filter, and
+/// a caller who asked for the 130th percentile has made an arithmetic mistake
+/// that a silent clamp would carry into the output.
+#[derive(Debug, Clone, Copy)]
+pub struct Percentile(f64);
+
+impl Percentile {
+    /// A fraction in `[0, 1]`: `0.0` the lowest value, `1.0` the highest.
+    pub fn new(fraction: f64) -> Result<Self> {
+        if !(0.0..=1.0).contains(&fraction) {
+            return Err(Error::InvalidArgument(format!(
+                "a percentile is a fraction in [0, 1], got {fraction}"
+            )));
+        }
+        // `-0.0` and `+0.0` are the same fraction and different bit patterns;
+        // normalising here is cheaper than a `Hash` that has to remember the
+        // exception, and keeps `Hash`'s contract with `Eq`.
+        let fraction = if fraction == 0.0 { 0.0 } else { fraction };
+        Ok(Self(fraction))
+    }
+
+    pub fn fraction(&self) -> f64 {
+        self.0
+    }
+}
+
+impl PartialEq for Percentile {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for Percentile {}
+
+impl Hash for Percentile {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
 /// Which order statistic of a neighbourhood to select.
 ///
-/// One variant, deliberately. **The median is the `k = n / 2` case, not a
-/// separate implementation** — it is a constructor, and every rank goes through
-/// the same selection.
+/// **The median is the `k = n / 2` case, not a separate implementation** — it is
+/// a constructor, and every rank goes through the same selection. There is one
+/// selection in this crate and both variants below reach it.
+///
+/// The two variants, and why the second one exists
+/// -----------------------------------------------
+/// They are not two statistics. They are two **truncation conventions**: two
+/// answers to the question a window clipped at a volume boundary asks, where the
+/// element holds `n` offsets but only `m < n` of them landed inside. Both are
+/// defensible general policies, both are in wide use, and they disagree, so the
+/// choice is a parameter rather than a decision this crate makes on a caller's
+/// behalf.
+///
+/// * [`Rank::Nth`] — **proportional rescaling of the rank.** The statistic is
+///   named as a position `k` in the full element's `n`, and a truncated window
+///   moves it to the same relative position among the `m` values that exist:
+///   `round(k * (m - 1) / (n - 1))`. The median of a half-window stays its
+///   median.
+/// * [`Rank::CeilingPercentile`] — **a ceiling percentile over the surviving
+///   population.** The statistic is named as a fraction `p`, and the answer is
+///   the `ceil(p * m)`-th smallest of the `m` values actually read, one-based.
+///   The full element never enters the arithmetic at all.
+///
+/// **Where they agree, and where they do not.** At `p = 0.5` the proportional
+/// rule reduces to `floor(m / 2)` for every `m` and every `n` — the upper of the
+/// two middles — and the ceiling rule gives `ceil(m / 2) - 1`. Those are the
+/// same index for **odd** `m` and differ by one for even `m`. Away from a half
+/// they differ generally, and they differ on the *untruncated* window too:
+/// `Rank::percentile(e, 0.25)` on a 27-voxel element is `Nth(7)` where the
+/// ceiling rule is `6`, because `round(p * (n - 1))` and `ceil(p * n) - 1` are
+/// not the same map. `tests/rank_truncation_rule.rs` sweeps both and pins both
+/// halves of that.
+///
+/// [`Rank::Nth`] is the default in the sense that matters — it is what every
+/// constructor in this type produces, so nothing changes for a caller who does
+/// not ask for the other one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rank {
     /// The `k`-th smallest value, counting from zero, of the **full** element's
-    /// `n` values.
+    /// `n` values, **rescaled proportionally** where the window is truncated.
     ///
     /// Where the element is truncated — at a real volume boundary, where there
     /// is nothing beyond to read — only `m < n` values exist, and `k` is
     /// rescaled to the values that do: `round(k * (m - 1) / (n - 1))`. See
     /// [`Rank::resolve`] for why that is the right rule rather than clamping.
     Nth(usize),
+    /// The `ceil(p * m)`-th smallest, one-based, of the `m` values actually
+    /// read — **a ceiling percentile over the surviving population**.
+    ///
+    /// Truncation needs no rule here, because the population is already the
+    /// truncated one: the statistic is defined against what was read rather than
+    /// against what the element would have held. That is the whole difference,
+    /// and it is why this variant carries a fraction where the other carries a
+    /// position — the fraction cannot be recovered from a position, so a policy
+    /// that could only re-interpret a `k` would be a different rule again.
+    ///
+    /// `p = 0` selects the window minimum. An implementation that walks a
+    /// histogram from its first bin answers the *first bin index* instead —
+    /// zero, occupied or not — and this crate does not reproduce that: a rank
+    /// filter here writes a value it read, which is what makes
+    /// `constant_maps_to` exact at every truncation, and a literal zero from an
+    /// empty bin is not one of the values read.
+    CeilingPercentile(Percentile),
 }
 
 impl Rank {
@@ -412,16 +775,32 @@ impl Rank {
         Rank::Nth(position.round() as usize)
     }
 
+    /// The other truncation convention: the `ceil(fraction * m)`-th smallest,
+    /// one-based, of the `m` values a window actually read.
+    ///
+    /// Takes no element, which is the point — the rule is stated against the
+    /// surviving population and never consults the full one. See
+    /// [`Rank::CeilingPercentile`] for how it differs from the proportional
+    /// rule, and where the two coincide.
+    pub fn ceiling_percentile(fraction: f64) -> Result<Self> {
+        Ok(Rank::CeilingPercentile(Percentile::new(fraction)?))
+    }
+
     /// Where in the `available` values actually read this rank lands, given that
     /// the element holds `full` when nothing clamps it.
     ///
-    /// **Why rescale rather than clamp.** Clamping `k` to `available - 1` would
-    /// turn a median into a maximum wherever the element is truncated, so every
-    /// face of the volume would get a systematically different filter from the
-    /// interior. Rescaling keeps the *relative position* in the sorted window,
-    /// which is what a rank means: the median of a half-window is still its
-    /// median. The arithmetic is integer and rounds half up, so it is exactly
-    /// reproducible.
+    /// **Why [`Rank::Nth`] rescales rather than clamps.** Clamping `k` to
+    /// `available - 1` would turn a median into a maximum wherever the element
+    /// is truncated, so every face of the volume would get a systematically
+    /// different filter from the interior. Rescaling keeps the *relative
+    /// position* in the sorted window, which is what a rank means: the median of
+    /// a half-window is still its median. The arithmetic is integer and rounds
+    /// half up, so it is exactly reproducible.
+    ///
+    /// [`Rank::CeilingPercentile`] does not rescale, because there is nothing to
+    /// rescale from: its rule is already written against `available`, and `full`
+    /// is unused for it. That is the substance of the two conventions and not an
+    /// implementation detail of this method.
     pub fn resolve(&self, full: usize, available: usize) -> usize {
         if available <= 1 {
             return 0;
@@ -434,6 +813,24 @@ impl Rank {
                 let k = k.min(full - 1);
                 let denominator = full - 1;
                 (k * (available - 1) + denominator / 2) / denominator
+            }
+            Rank::CeilingPercentile(percentile) => {
+                // One-based `ceil(p * m)`, taken to a zero-based index. The
+                // `ceil` is exact: `p * m` is a single rounded product and
+                // `f64::ceil` is exact on it, so two runs on the same inputs
+                // cannot land in different bins.
+                //
+                // `p * m` is at most `m`, so the index is at most `m - 1`; the
+                // `min` is belt and braces against a product that rounded up
+                // past `m` and costs one comparison per voxel. The floor at zero
+                // is `p = 0`, where the ceiling is zero and the one-based rank
+                // would be the value before the first.
+                let position = (percentile.fraction() * available as f64).ceil();
+                if position < 1.0 {
+                    0
+                } else {
+                    (position as usize - 1).min(available - 1)
+                }
             }
         }
     }
@@ -488,6 +885,89 @@ impl Ord for Total {
 
 #[cfg(test)]
 mod tests {
+
+    /// The extension point: an element this crate has no name for, built from a
+    /// hand-written offset list.
+    ///
+    /// Asserts the three properties `from_offsets` establishes rather than
+    /// trusts — sorted, no duplicates, non-empty — plus the one that matters
+    /// most: the reach is **derived from the offsets given**, so a caller cannot
+    /// state it and cannot get it wrong.
+    #[test]
+    fn an_element_from_an_explicit_offset_list_derives_everything_it_needs() {
+        // A shape no `ElementShape` produces: a diagonal cross, asymmetric on
+        // axis 0, offered out of order to prove the sort.
+        let raw = vec![[2, 0, 0], [0, 0, 0], [-1, 1, 0], [0, -1, 1], [-1, -1, 0]];
+        let element = StructuringElement::from_offsets(raw).unwrap();
+
+        assert_eq!(element.len(), 5);
+        assert_eq!(element.shape(), None, "it is not one of the named shapes");
+        assert_eq!(
+            element.offsets(),
+            &[[-1, -1, 0], [-1, 1, 0], [0, -1, 1], [0, 0, 0], [2, 0, 0]],
+            "sorted ascending on axis 0, then 1, then 2 — the order `from_sides` generates"
+        );
+
+        // Derived, per side, from the widest surviving offset. Axis 0 reaches 1
+        // below and 2 above; a symmetric reading would report 2 on both and
+        // fetch a plane nothing depends on.
+        assert_eq!(element.sides(0), (1, 2));
+        assert_eq!(element.sides(1), (1, 1));
+        assert_eq!(element.sides(2), (0, 1));
+        assert_eq!(element.reach(0), 2, "the symmetric bound is the wider side");
+
+        // brute force against the offsets themselves, which is the statement
+        // the derivation is supposed to make
+        for axis in 0..3 {
+            let widest_below = element
+                .offsets()
+                .iter()
+                .map(|offset| (-offset[axis]).max(0) as usize)
+                .max()
+                .unwrap();
+            let widest_above = element
+                .offsets()
+                .iter()
+                .map(|offset| offset[axis].max(0) as usize)
+                .max()
+                .unwrap();
+            assert_eq!(element.sides(axis), (widest_below, widest_above));
+        }
+    }
+
+    #[test]
+    fn an_offset_list_that_cannot_be_an_element_is_refused_where_it_is_stated() {
+        let empty: Vec<[isize; 3]> = Vec::new();
+        assert!(StructuringElement::from_offsets(empty).is_err());
+
+        let repeated = StructuringElement::from_offsets(vec![[0, 0, 0], [1, 0, 0], [0, 0, 0]]);
+        let message = repeated.unwrap_err().to_string();
+        assert!(message.contains("[0, 0, 0]"), "{message}");
+        assert!(message.contains("more than once"), "{message}");
+
+        // one offset is enough, and it need not be the origin
+        assert!(StructuringElement::from_offsets(vec![[3, 0, 0]]).is_ok());
+    }
+
+    /// A hand-built element that reproduces a named one must *be* it — same
+    /// offsets, same sides, same length. If it were not, the two constructors
+    /// would be two different notions of an element.
+    #[test]
+    fn an_explicit_list_of_a_named_shape_s_offsets_rebuilds_that_element() {
+        for named in [
+            StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]),
+            StructuringElement::from_radius(ElementShape::Ellipsoid, [2, 1, 0]),
+            StructuringElement::from_size(ElementShape::ExtentEllipsoid, [4, 4, 1]).unwrap(),
+        ] {
+            let rebuilt = StructuringElement::from_offsets(named.offsets().to_vec()).unwrap();
+            assert_eq!(rebuilt.offsets(), named.offsets());
+            assert_eq!(rebuilt.len(), named.len());
+            for axis in 0..3 {
+                assert_eq!(rebuilt.sides(axis), named.sides(axis));
+                assert_eq!(rebuilt.reach(axis), named.reach(axis));
+            }
+        }
+    }
     use super::*;
 
     #[test]
@@ -691,6 +1171,245 @@ mod tests {
         }
         let element = StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]);
         assert_eq!(Rank::percentile(&element, 0.25), Rank::Nth(7));
+    }
+
+    /// A step subsamples the **offsets**, and everything derived from the
+    /// element follows the survivors rather than the box that was asked for.
+    #[test]
+    fn a_step_decimates_the_offsets_and_the_reach_follows_the_survivors() {
+        let plain = StructuringElement::from_size(ElementShape::Box, [200, 200, 1]).unwrap();
+        assert_eq!(plain.len(), 200 * 200);
+        assert_eq!(plain.sides(0), (100, 99));
+        assert_eq!(plain.step(), [1, 1, 1]);
+
+        let stepped =
+            StructuringElement::from_size_stepped(ElementShape::Box, [200, 200, 1], [2, 2, 1])
+                .unwrap();
+        assert_eq!(stepped.step(), [2, 2, 1]);
+        // a quarter of the members, which is what every cost and every rank
+        // built from `len` will now see
+        assert_eq!(stepped.len(), 100 * 100);
+        assert_eq!(Rank::median(&stepped), Rank::Nth(5000));
+
+        // the surviving offsets are the low-anchored lattice, and the last one
+        // above the anchor is 98 rather than the 99 the box reaches
+        let along: Vec<isize> = stepped
+            .offsets()
+            .iter()
+            .filter(|offset| offset[1] == -100 && offset[2] == 0)
+            .map(|offset| offset[0])
+            .collect();
+        assert_eq!(along.first(), Some(&-100));
+        assert_eq!(along.last(), Some(&98));
+        assert!(along.iter().all(|offset| offset % 2 == 0));
+
+        // and the reach is that widest surviving offset, on both sides, with
+        // the bounding box saying the same thing
+        assert_eq!(stepped.sides(0), (100, 98));
+        assert_eq!(stepped.sides(1), (100, 98));
+        assert_eq!(stepped.sides(2), (0, 0));
+        assert_eq!(stepped.reach(0), 100);
+        assert_eq!(stepped.size(), [199, 199, 1]);
+        assert_eq!(stepped.reach_spec().at(0, 0, 1000), (100, 98));
+
+        // a step of one is exactly the unstepped element, not a near copy
+        assert_eq!(
+            StructuringElement::from_size_stepped(ElementShape::Box, [200, 200, 1], [1, 1, 1])
+                .unwrap(),
+            plain
+        );
+
+        // a step of zero names no offsets and is refused rather than emptied
+        let err = StructuringElement::from_size_stepped(ElementShape::Box, [7, 7, 7], [2, 0, 1])
+            .unwrap_err();
+        assert!(err.to_string().contains("non-zero"), "got: {err}");
+
+        // and a step coarser than the shape it decimates is refused too: a
+        // radius-3 ball stepped by nine keeps only `[-3, -3, -3]`, which is
+        // outside its own surface. A box of the same size survives, so this is
+        // a fact about the shape and not about the step alone.
+        let err =
+            StructuringElement::from_size_stepped(ElementShape::Ellipsoid, [7, 7, 7], [9, 9, 9])
+                .unwrap_err();
+        assert!(err.to_string().contains("leaves no offset"), "got: {err}");
+        assert_eq!(
+            StructuringElement::from_size_stepped(ElementShape::Box, [7, 7, 7], [9, 9, 9])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The reach is read off the offsets, so a step that strands the far pole
+    /// shortens it — checked against a brute-force scan of the offsets so that
+    /// the assertion is not the implementation restated.
+    #[test]
+    fn the_reach_is_the_widest_surviving_offset_whatever_the_step() {
+        for shape in [
+            ElementShape::Box,
+            ElementShape::Ellipsoid,
+            ElementShape::ExtentEllipsoid,
+        ] {
+            for size in [[7usize, 7, 7], [9, 4, 1], [10, 6, 3], [13, 13, 5]] {
+                for step in [[1usize, 1, 1], [2, 2, 1], [3, 1, 2], [4, 5, 3], [9, 9, 9]] {
+                    // A step coarser than the shape empties it, which is
+                    // refused; the sweep includes such a case on purpose and
+                    // the refusal is the assertion for it.
+                    let element = match StructuringElement::from_size_stepped(shape, size, step) {
+                        Ok(element) => element,
+                        Err(err) => {
+                            assert!(
+                                err.to_string().contains("leaves no offset"),
+                                "{shape:?} {size:?} {step:?}: {err}"
+                            );
+                            continue;
+                        }
+                    };
+                    for axis in 0..3 {
+                        let widest_below = element
+                            .offsets()
+                            .iter()
+                            .map(|offset| (-offset[axis]).max(0) as usize)
+                            .max()
+                            .unwrap();
+                        let widest_above = element
+                            .offsets()
+                            .iter()
+                            .map(|offset| offset[axis].max(0) as usize)
+                            .max()
+                            .unwrap();
+                        assert_eq!(
+                            element.sides(axis),
+                            (widest_below, widest_above),
+                            "{shape:?} size {size:?} step {step:?} axis {axis}"
+                        );
+                        assert_eq!(element.reach(axis), widest_below.max(widest_above));
+                    }
+                    // and the count is the count, which is what a cost and a
+                    // median are both built from
+                    assert_eq!(element.len(), element.offsets().len());
+                }
+            }
+        }
+    }
+
+    /// The shape's surface is tested against the true offset, so a stepped
+    /// element is a subset of the unstepped one and never a redrawn shape.
+    #[test]
+    fn a_stepped_element_is_a_subset_of_the_element_it_decimates() {
+        for shape in [
+            ElementShape::Box,
+            ElementShape::Ellipsoid,
+            ElementShape::ExtentEllipsoid,
+        ] {
+            for size in [[11usize, 11, 11], [10, 6, 4], [15, 15, 1]] {
+                let whole = StructuringElement::from_size(shape, size).unwrap();
+                for step in [[2usize, 2, 1], [3, 2, 1], [2, 1, 2]] {
+                    let stepped = StructuringElement::from_size_stepped(shape, size, step).unwrap();
+                    for offset in stepped.offsets() {
+                        assert!(
+                            whole.offsets().contains(offset),
+                            "{shape:?} {size:?} step {step:?}: {offset:?} is not in the \
+                             element it decimates"
+                        );
+                    }
+                    assert!(stepped.len() <= whole.len());
+                    // every surviving offset is on the low-anchored lattice
+                    for offset in stepped.offsets() {
+                        for axis in 0..3 {
+                            let from_low = offset[axis] + whole.sides(axis).0 as isize;
+                            assert_eq!(from_low % step[axis] as isize, 0, "{offset:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The two truncation conventions, side by side: **equal at a half over an
+    /// odd surviving population, and unequal everywhere else**.
+    ///
+    /// Both halves are asserted, because either one alone is a test that passes
+    /// for the wrong reason — the equivalence alone would be satisfied by two
+    /// conventions that were secretly the same rule, and the divergence alone
+    /// would be satisfied by one that was simply wrong at a half too.
+    #[test]
+    fn the_two_truncation_conventions_agree_at_a_half_over_an_odd_population() {
+        let half = Rank::ceiling_percentile(0.5).unwrap();
+        for full in [8usize, 27, 26, 125, 100] {
+            let proportional = Rank::Nth(full / 2);
+            for available in 1..=full {
+                let ours = proportional.resolve(full, available);
+                let theirs = half.resolve(full, available);
+                // the proportional rule at a half is `floor(m / 2)`, for every
+                // `m` and every `n` — this is the identity that made a median
+                // filter agree with a population-based one at every face
+                assert_eq!(
+                    ours,
+                    available / 2,
+                    "proportional half: full {full}, available {available}"
+                );
+                // the ceiling rule is `ceil(m / 2) - 1`
+                assert_eq!(theirs, available.div_ceil(2) - 1);
+                if available % 2 == 1 {
+                    assert_eq!(ours, theirs, "odd {available} must agree");
+                } else {
+                    assert_eq!(
+                        ours,
+                        theirs + 1,
+                        "even {available} must differ by exactly one"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Away from a half the two diverge on the untruncated window as well,
+    /// which is the part that makes them different *filters* and not merely
+    /// different boundary treatments.
+    #[test]
+    fn the_two_conventions_differ_away_from_a_half_and_at_full_population() {
+        let element = StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]);
+        assert_eq!(element.len(), 27);
+
+        let proportional = Rank::percentile(&element, 0.25);
+        let ceiling = Rank::ceiling_percentile(0.25).unwrap();
+        assert_eq!(proportional, Rank::Nth(7), "round(0.25 * 26) = 7");
+        // the full window, unclamped: 7 against 6
+        assert_eq!(proportional.resolve(27, 27), 7);
+        assert_eq!(ceiling.resolve(27, 27), 6, "ceil(0.25 * 27) - 1 = 6");
+
+        // a face, an edge and a corner of a 3x3x3 window
+        for (available, ours, theirs) in [(18usize, 5usize, 4usize), (12, 3, 2), (8, 2, 1)] {
+            assert_eq!(proportional.resolve(27, available), ours, "m = {available}");
+            assert_eq!(ceiling.resolve(27, available), theirs, "m = {available}");
+        }
+
+        // the extremes are the extremes under both, which is what keeps an
+        // erosion an erosion however it is named
+        assert_eq!(Rank::ceiling_percentile(1.0).unwrap().resolve(27, 8), 7);
+        assert_eq!(Rank::highest(&element).resolve(27, 8), 7);
+        // `p = 0` is the minimum here, not a histogram's first bin
+        assert_eq!(Rank::ceiling_percentile(0.0).unwrap().resolve(27, 8), 0);
+        assert_eq!(Rank::lowest().resolve(27, 8), 0);
+    }
+
+    /// The fraction is validated once, so that `Rank` can stay `Eq + Hash`.
+    #[test]
+    fn a_percentile_refuses_what_it_could_not_hash() {
+        assert!(Percentile::new(f64::NAN).is_err());
+        assert!(Percentile::new(1.5).is_err());
+        assert!(Percentile::new(-0.5).is_err());
+        assert!(Rank::ceiling_percentile(2.0).is_err());
+        // `-0.0` is accepted and normalised, so equality and hashing agree
+        assert_eq!(
+            Percentile::new(-0.0).unwrap(),
+            Percentile::new(0.0).unwrap()
+        );
+        let mut set = std::collections::HashSet::new();
+        set.insert(Rank::ceiling_percentile(-0.0).unwrap());
+        assert!(set.contains(&Rank::ceiling_percentile(0.0).unwrap()));
+        assert!(!set.contains(&Rank::ceiling_percentile(0.5).unwrap()));
     }
 
     #[test]

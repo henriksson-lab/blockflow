@@ -548,8 +548,65 @@ where
 
 // ---------------------------------------------------------- statistics --
 
+/// A reduction over a gathered window, implementable **outside this crate**.
+///
+/// This is the extension point for a windowed statistic the crate does not
+/// ship. `Statistic` is otherwise a closed enum, and a closed enum is the wrong
+/// shape for something a caller may reasonably need to extend — `Isodata` had to
+/// be added *inside* the crate for exactly that reason.
+///
+/// **Why a trait object here, when `MapFn` is a type parameter.** A voxelwise
+/// map runs once per voxel, so an indirect call there is the whole cost and
+/// `ops::voxelwise` is generic to avoid it. A reduction runs once per **lattice
+/// point**, after a gather of the window — 27 to 729 voxels for the elements
+/// this crate is used with — so one virtual call is amortised by that factor and
+/// costs nothing measurable. Paying a generic parameter on a type that is
+/// stored, cloned, compared and hashed everywhere would buy nothing back.
+///
+/// **Why `f64` rather than generic.** A trait with a generic method is not
+/// object-safe. Nothing is lost: `LocalStatistic::evaluate_into` is stated in
+/// `f64` on both sides already, so the op path never had another element type to
+/// offer. The genericity of [`Statistic::reduce`] survives for the shipped
+/// variants and for direct callers of the kernel.
+pub trait Reducer: Send + Sync + 'static {
+    /// Reduce the gathered window to one value.
+    ///
+    /// `window` is in the element's canonical order and may be reordered — a
+    /// selection is allowed to permute it. `full` is the element's size before
+    /// any clamping at a volume boundary, so a rank-like reduction can tell a
+    /// truncated window from a whole one; `window.len()` is what actually landed
+    /// inside.
+    fn reduce(&self, window: &mut [f64], full: usize) -> f64;
+
+    /// What this gives for a window that is uniformly `value`, where that is
+    /// **exactly** true.
+    ///
+    /// `None` is the default and is always safe: it disables the short circuit,
+    /// so a block is computed rather than assumed. Declaring something wrong
+    /// here is not safe, which is why silence is the default — see `ops/mod.rs`.
+    fn constant_maps_to(&self, _value: f64) -> Option<f64> {
+        None
+    }
+
+    /// Cost of one evaluation over a window of `window` voxels, in the units of
+    /// `ops::cost` — beyond the gather itself, which the caller already charges.
+    fn cost_per_sample(&self, _window: usize) -> f64 {
+        0.0
+    }
+
+    /// A stable identity, so that a `Statistic` holding this can still be
+    /// compared and hashed.
+    ///
+    /// `Statistic` is `Eq + Hash` because plans are compared and fingerprinted,
+    /// and a trait object has no derivable identity. Two reducers that would
+    /// compute the same answer must return the same key; two that would not,
+    /// must not. Returning a constant makes every instance of your type equal,
+    /// which is right for a parameterless reducer and wrong for one with fields.
+    fn key(&self) -> (&'static str, u64);
+}
+
 /// What to reduce a window to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum Statistic {
     /// The arithmetic mean.
     Mean,
@@ -568,6 +625,48 @@ pub enum Statistic {
     /// bimodal window the two are far apart — the mean sits wherever the mass
     /// is, the isodata threshold sits between the modes.
     Isodata(Isodata),
+    /// A reduction supplied by the caller. See [`Reducer`].
+    ///
+    /// `Arc` rather than `Box` so that `Statistic` stays `Clone`, which
+    /// `LocalStatistic` and every op holding one rely on.
+    Custom(std::sync::Arc<dyn Reducer>),
+}
+
+/// Compared and hashed **by identity, not by behaviour**, because a trait object
+/// has no derivable equality. The shipped variants compare structurally as they
+/// always did; a custom one compares by the key its [`Reducer`] states.
+impl PartialEq for Statistic {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Statistic::Mean, Statistic::Mean) => true,
+            (Statistic::Deviation, Statistic::Deviation) => true,
+            (Statistic::Rank(left), Statistic::Rank(right)) => left == right,
+            (Statistic::Isodata(left), Statistic::Isodata(right)) => left == right,
+            (Statistic::Custom(left), Statistic::Custom(right)) => left.key() == right.key(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Statistic {}
+
+impl std::hash::Hash for Statistic {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Statistic::Mean | Statistic::Deviation => {}
+            Statistic::Rank(rank) => rank.hash(state),
+            Statistic::Isodata(isodata) => isodata.hash(state),
+            Statistic::Custom(reducer) => reducer.key().hash(state),
+        }
+    }
+}
+
+impl std::fmt::Debug for dyn Reducer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, tag) = self.key();
+        write!(f, "Reducer({name}#{tag})")
+    }
 }
 
 impl Statistic {
@@ -583,13 +682,21 @@ impl Statistic {
         // and the shared `0.0` below would silently override it. The other
         // three keep the exit they have always had: a mean of nothing is
         // `0 / 0`, and zero is the answer this module has always given for it.
-        if let Statistic::Isodata(isodata) = *self {
+        if let Statistic::Isodata(isodata) = self {
             return isodata.of(window.iter().map(|&value| value.into()));
+        }
+        // A custom reducer is stated in `f64`, so the window is widened for it.
+        // That is one allocation per lattice point and it is charged to the
+        // caller who chose a custom reduction: the shipped variants take the
+        // generic path below and allocate nothing.
+        if let Statistic::Custom(reducer) = self {
+            let mut widened: Vec<f64> = window.iter().map(|&value| value.into()).collect();
+            return reducer.reduce(&mut widened, full);
         }
         if window.is_empty() {
             return 0.0;
         }
-        match *self {
+        match self {
             Statistic::Mean => mean_of(window),
             Statistic::Deviation => {
                 let mean = mean_of(window);
@@ -606,8 +713,10 @@ impl Statistic {
                 let index = rank.resolve(full, window.len());
                 select_nth(window, index).map(Into::into).unwrap_or(0.0)
             }
-            // Answered above, before the emptiness test.
-            Statistic::Isodata(_) => unreachable!("answered before the emptiness test"),
+            // Both answered above, before the emptiness test.
+            Statistic::Isodata(_) | Statistic::Custom(_) => {
+                unreachable!("answered before the emptiness test")
+            }
         }
     }
 
@@ -640,6 +749,7 @@ impl Statistic {
             Statistic::Rank(_) => Some(value),
             Statistic::Isodata(_) => value.is_finite().then_some(value),
             Statistic::Mean | Statistic::Deviation => (value == 0.0).then_some(0.0),
+            Statistic::Custom(reducer) => reducer.constant_maps_to(value),
         }
     }
 
@@ -660,6 +770,7 @@ impl Statistic {
                 ISODATA_COST_PER_ELEMENT_VOXEL * window as f64
                     + ISODATA_COST_PER_BIN * isodata.bins() as f64
             }
+            Statistic::Custom(reducer) => reducer.cost_per_sample(window),
             Statistic::Mean | Statistic::Deviation | Statistic::Rank(_) => 0.0,
         }
     }
@@ -953,8 +1064,11 @@ impl LocalStatistic {
         &self.sampling
     }
 
+    /// Cloned rather than borrowed so that every existing caller keeps
+    /// compiling; a `Statistic` is a small enum or an `Arc` bump, and this is
+    /// called once per `evaluate_into` rather than per voxel.
     pub fn statistic(&self) -> Statistic {
-        self.statistic
+        self.statistic.clone()
     }
 
     /// The two terms: how far the interpolation reaches for a sample, plus how
@@ -1073,7 +1187,7 @@ impl LocalStatistic {
     ) -> Result<()> {
         let lattice = SampleLattice::of(&self.sampling, at.volume)?;
         let ordered = input.mapv(Total);
-        let statistic = self.statistic;
+        let statistic = &self.statistic;
         let full = self.element.len();
         local_statistic_into(
             ordered.view(),
@@ -1541,7 +1655,8 @@ mod tests {
                 Statistic::Deviation,
                 Statistic::Rank(Rank::median(&element)),
             ] {
-                let local = LocalStatistic::new(element.clone(), spacing, statistic).unwrap();
+                let local =
+                    LocalStatistic::new(element.clone(), spacing, statistic.clone()).unwrap();
                 let mut whole = Array3::zeros((volume[0], volume[1], volume[2]));
                 local
                     .evaluate_into(input.view(), &Anchor::whole(volume), whole.view_mut())
