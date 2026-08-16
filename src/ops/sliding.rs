@@ -995,6 +995,31 @@ impl BlockOp for SlidingHistogramOp {
     fn cost_per_voxel(&self) -> f64 {
         self.cost
     }
+
+    /// [`Self::cost_per_voxel`] with the term [`cost_for`] says it cannot state:
+    /// the **per-line priming gather**.
+    ///
+    /// It is `|element|` per scan line and therefore `|element| / line length`
+    /// per voxel, and the line length is a block extent — which is why this
+    /// belongs on the method that is handed one rather than on the one that is
+    /// not. Without it a planner choosing between this traversal and the dense
+    /// gather sees only the steady state, which is right at a block long enough
+    /// to reach one and wrong at a block that is not: at a line of one voxel
+    /// every window is primed and this op *is* the dense gather, and the
+    /// arithmetic here says so.
+    ///
+    /// The line is measured on the **block** rather than on the read extent,
+    /// which under-states it by the halo and so over-states the cost. That is
+    /// the direction the cost model is stated to be safe in, and it is also the
+    /// direction that keeps the general path when the two are close.
+    ///
+    /// The gather is priced at the dense filter's own per-element-voxel rate,
+    /// because it is the same work: `super::rank`'s constant, not a second seed
+    /// for one operation measured twice.
+    fn cost_per_voxel_in(&self, block: [usize; 3]) -> f64 {
+        let line = block[self.plan.axis()].max(1) as f64;
+        self.cost + super::rank::RANK_COST_PER_ELEMENT_VOXEL * self.element.len() as f64 / line
+    }
 }
 
 /// A seed, in the sense `super::COST_MEASUREMENT` means it.

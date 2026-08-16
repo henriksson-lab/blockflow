@@ -36,7 +36,8 @@ use super::log::Event;
 use super::op::Chain;
 use super::probes::{AffineOp, IdentityOp, OpaqueOp, WindowSumOp};
 use super::strategy::{
-    execute, Enumerating, Greedy, Hints, SchedulePriority, Strategy, Trivial, Workflow,
+    execute, Enumerating, Greedy, Hints, PartitionSearch, SchedulePriority, Strategy, Trivial,
+    Workflow,
 };
 
 // ------------------------------------------------------------- fixtures --
@@ -1174,10 +1175,15 @@ fn every_strategy_reproduces_the_trivial_strategys_output() {
         Box::new(Enumerating {
             concurrency: 3,
             priority: SchedulePriority::PhaseMajor,
+            ..Enumerating::default()
         }),
+        // and the exhaustive search, which must plan the same chain the same
+        // way — the conformance suite is the coarse end of what
+        // `tests/partition_search.rs` asserts partition for partition.
         Box::new(Enumerating {
             concurrency: 1,
             priority: SchedulePriority::BlockMajor,
+            search: PartitionSearch::Exhaustive,
         }),
         Box::new(Greedy { concurrency: 4 }),
     ];
@@ -1288,6 +1294,7 @@ fn every_strategy_agrees_on_a_chain_that_contains_a_barrier() {
         Box::new(Enumerating {
             concurrency: 3,
             priority: SchedulePriority::BlockMajor,
+            search: PartitionSearch::Exhaustive,
         }),
         Box::new(Greedy { concurrency: 4 }),
     ];

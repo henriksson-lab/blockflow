@@ -192,9 +192,9 @@ pub use cache::{
     ChunkKey, Codec, DeflateCodec, RegionSourceFetcher, Tier,
 };
 pub use decomposition::{
-    check_block_constraints, check_chunk_exclusive_writes, check_source_levels, constraint_for,
-    is_planning_barrier, predicted_cost, reaches_whole_axis, splittable_axes, Constraints,
-    CostModel, Decomposition, PhaseDecomposition,
+    check_block_constraints, check_chunk_exclusive_writes, check_output_shapes,
+    check_source_levels, constraint_for, cuttable_axes, is_planning_barrier, predicted_cost,
+    reaches_whole_axis, splittable_axes, Constraints, CostModel, Decomposition, PhaseDecomposition,
 };
 pub use distributed::{
     Assignment, ChunkGrid, Coordinator, Handout, HandoutPolicy, JobSpec, JobStatus, ModelledCache,
@@ -245,7 +245,8 @@ pub use statistics::{
 };
 pub use strategy::{
     execute, execute_observed, execute_phases, execute_task, execute_task_of, ArrayRef,
-    Enumerating, Greedy, Hints, Plan, SchedulePriority, Strategy, TaskOutcome, Trivial, Workflow,
+    Enumerating, Greedy, Hints, PartitionSearch, Plan, SchedulePriority, Strategy, TaskOutcome,
+    Trivial, Workflow,
 };
 pub use synthetic::{
     IntensitySource, LabelSource, Object, ObjectRecord, Rendered, Scene, SceneSpec,

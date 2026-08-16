@@ -108,6 +108,14 @@
 // -----
 // Measured; see [`cost_report`], which is runnable and prints the table the two
 // constants at the bottom of this file were read off.
+//
+// The smoothing's *own* speed has a second measurement of its own,
+// [`SMOOTHING_MEASUREMENT`], because the separable pass is not only this filter's
+// first step — it is what `ops::smooth` and `ops::deconvolve` are made of, and it
+// is the one piece here whose inner loop has been rewritten for speed rather than
+// written for clarity. That measurement times the rewritten walk against the
+// one-voxel-at-a-time form it replaced, and checks in the same run that the two
+// still agree on every bit.
 
 use ndarray::{Array3, ArrayD, ArrayView3, ArrayViewMut3, Axis, Slice};
 
@@ -301,7 +309,41 @@ impl Boundary {
 /// reference applies the same one; at a block seam it is a truncation the whole
 /// volume would not have made, which is what the halo is for and what the guard
 /// exists to catch.
+///
+/// **Two implementations of one sum**, and the choice between them is a property
+/// of the memory and never of the arithmetic. [`convolve_axis_packed`] runs when
+/// both arrays are contiguous in the standard order, which is what every array
+/// this crate allocates is and what every caller in `ops` hands over;
+/// [`convolve_axis_strided`] is the statement of what the fast path has to
+/// reproduce and the fallback for a view that is neither. They agree **bit for
+/// bit** — see `the_packed_and_strided_walks_agree_on_every_bit`, which is what
+/// makes this a rewrite of the walk rather than a second convolution.
 fn convolve_axis<T>(
+    src: ArrayView3<'_, T>,
+    axis: usize,
+    kernel: &[f64],
+    boundary: Boundary,
+    mut dst: ArrayViewMut3<'_, f64>,
+) where
+    T: Copy + Into<f64>,
+{
+    let shape = [src.shape()[0], src.shape()[1], src.shape()[2]];
+    if src.as_slice().is_some() && dst.as_slice().is_some() {
+        let source = src.as_slice().expect("just checked");
+        let target = dst.as_slice_mut().expect("just checked");
+        convolve_axis_packed(source, shape, axis, kernel, boundary, target);
+        return;
+    }
+    convolve_axis_strided(src, axis, kernel, boundary, dst);
+}
+
+/// [`convolve_axis`] written out one voxel at a time.
+///
+/// This is the **definition**: for each output voxel, the taps in ascending
+/// order, each resolved against the array by `boundary`. Every faster form here
+/// is a re-association of these loops that leaves each output voxel's own sum in
+/// this order, and the test that says so compares the bits.
+fn convolve_axis_strided<T>(
     src: ArrayView3<'_, T>,
     axis: usize,
     kernel: &[f64],
@@ -330,6 +372,247 @@ fn convolve_axis<T>(
                 dst[here] = total;
             }
         }
+    }
+}
+
+/// [`convolve_axis`] over two flat buffers in the standard order.
+///
+/// **Same sum, same order, different loop nest.** Both forms give the output at
+/// `v` the value `((0 + w0 x0) + w1 x1) + ...` with the taps ascending; what
+/// changes is *when* each of those additions happens. Swapping the tap loop
+/// outside the loop over the positions that share a tap index does not reorder
+/// any one voxel's sum — it only interleaves the sums of voxels that never
+/// interact — so the transformation is exact rather than approximate, and the
+/// `+ 0.0` the accumulator starts from is kept rather than folded away because
+/// `0.0 + (-0.0)` is `+0.0` and `-0.0` is not.
+///
+/// What that buys, in the order the profile ranked it:
+///
+/// * **The boundary fold leaves the inner loop.** [`Boundary::Reflect`] costs an
+///   integer division, and at a radius of forty it was **62% of the whole pass**
+///   — more than the multiply and the add together, measured as the difference
+///   between the two conventions, which are otherwise the same walk. Resolved
+///   once per (position, tap) instead of once per (voxel, tap), it is amortised
+///   over every voxel that shares the index, which is the length of the trailing
+///   axes. ([`convolve_innermost_packed`] has no trailing axes to amortise over
+///   and gets rid of it a different way.)
+/// * **The accumulation vectorises.** One voxel's sum is a chain of dependent
+///   `add`s and nothing can overlap them; a *row* of voxels sharing one tap is
+///   as many independent chains as the row is long, which is a contiguous read,
+///   a broadcast weight, and as many lanes at once as the target has.
+/// * **The subscript becomes a slice.** No per-tap stride dot product, no three
+///   bounds checks, and no `[usize; 3]` spilled to the stack and reloaded
+///   because `axis` is a runtime value. This was the *obvious* candidate and the
+///   profile put it third: about 12% between the two of them, against the fold's
+///   62%.
+///
+/// `dst` is the accumulator. It is a different buffer from `src` in every caller
+/// — a separable pass that read and wrote one array would already be wrong,
+/// tap-hoisted or not.
+fn convolve_axis_packed<T>(
+    src: &[T],
+    shape: [usize; 3],
+    axis: usize,
+    kernel: &[f64],
+    boundary: Boundary,
+    dst: &mut [f64],
+) where
+    T: Copy + Into<f64>,
+{
+    let extent = shape[axis];
+    if shape[0] == 0 || shape[1] == 0 || shape[2] == 0 {
+        return;
+    }
+    // How many voxels share one position on `axis`, and how many independent
+    // slabs of those there are. The two are the whole of the layout: the voxel
+    // at position `a` of slab `o`, offset `b` along the trailing axes, lives at
+    // `(o * extent + a) * inner + b`.
+    let inner: usize = shape[axis + 1..].iter().product();
+    let outer: usize = shape[..axis].iter().product();
+    if inner == 1 {
+        convolve_innermost_packed(src, outer, extent, kernel, boundary, dst);
+        return;
+    }
+    let radius = (kernel.len() / 2) as isize;
+    // Which sample each (position, tap) reads. **Built once for the whole axis**,
+    // not once per slab: the fold does not depend on where along the leading axes
+    // the row is. So the boundary convention costs `extent * taps` divisions for
+    // an array of any size, rather than that many per slab.
+    //
+    // Measured neutral at 64 x 64 x 64, where there are only sixty-four slabs and
+    // the per-slab form was already amortised past the point of mattering; kept
+    // because what it removes grows with the leading axes and what it costs does
+    // not, so the shape where it would show is exactly the shape nobody times.
+    let table: Vec<usize> = (0..extent)
+        .flat_map(|position| {
+            (0..kernel.len())
+                .map(move |step| position as isize + step as isize - radius)
+                .map(|at| boundary.index(at, extent))
+        })
+        .collect();
+    for slab in 0..outer {
+        let base = slab * extent * inner;
+        for position in 0..extent {
+            let taps = &table[position * kernel.len()..(position + 1) * kernel.len()];
+            let out_row = &mut dst[base + position * inner..base + (position + 1) * inner];
+            accumulate_row(src, base, inner, taps, kernel, out_row);
+        }
+    }
+}
+
+/// How many output voxels one pass over the taps carries at a time.
+///
+/// The accumulator for that many is small enough to live in registers for the
+/// whole run over the kernel, which is what makes the difference: written to
+/// memory, every tap costs a load of the partial sum and a store of it back, and
+/// at eighty-one taps that is two memory operations per useful multiply-add.
+///
+/// It also shortens the reuse distance. The taps of one output position read
+/// `taps.len()` runs of this many elements rather than of the whole trailing
+/// extent, so the working set of the innermost loop is a few hundred bytes
+/// wherever the array's trailing axes are large.
+///
+/// **Sixteen, measured rather than reasoned.** Four, eight, twelve, sixteen,
+/// twenty-four and thirty-two were all tried at a radius of forty. Four is
+/// 1.4x worse than sixteen on the two-axis blur and 1.7x on the three-axis one —
+/// too few output voxels in flight to cover the multiply's latency — eight is
+/// about 1.1x worse, and thirty-two is level with sixteen and no better. The
+/// width of the machine's vector registers does not by itself say where that
+/// curve turns over, which is why the number is a measurement and not a
+/// derivation, and why the sweep is written down rather than the conclusion
+/// alone.
+const ROW_TILE: usize = 16;
+
+/// One output row's worth of the accumulation in [`convolve_axis_packed`]:
+/// `out[b] = sum over taps of weight * src[base + tap * stride + b]`, taps
+/// ascending, `b` running over the length of `out_row`.
+///
+/// **There is deliberately no `inline` attribute here, and that is a
+/// measurement.** `inline(never)` was worth about 13% at a radius of forty while
+/// this was the only caller's inner loop — the register allocator, having to
+/// keep that caller's slab and position bookkeeping live, was spilling the tile
+/// [`ROW_TILE`] exists to hold. Once [`convolve_innermost_packed`] became a
+/// second caller the attribute measured **neutral to marginally negative** over
+/// four repetitions of the table each way, so it was taken out rather than left
+/// in as a charm. A hint that used to pay is not the same thing as a hint that
+/// pays.
+fn accumulate_row<T>(
+    src: &[T],
+    base: usize,
+    stride: usize,
+    taps: &[usize],
+    kernel: &[f64],
+    out_row: &mut [f64],
+) where
+    T: Copy + Into<f64>,
+{
+    let width = out_row.len();
+    let mut start = 0;
+    while start + ROW_TILE <= width {
+        let mut total = [0.0f64; ROW_TILE];
+        for (&tap, &weight) in taps.iter().zip(kernel) {
+            let at = base + tap * stride + start;
+            let values = &src[at..at + ROW_TILE];
+            for (slot, value) in total.iter_mut().zip(values) {
+                *slot += weight * (*value).into();
+            }
+        }
+        out_row[start..start + ROW_TILE].copy_from_slice(&total);
+        start += ROW_TILE;
+    }
+    if start < width {
+        let tail = &mut out_row[start..];
+        let rest = width - start;
+        tail.fill(0.0);
+        for (&tap, &weight) in taps.iter().zip(kernel) {
+            let at = base + tap * stride + start;
+            for (slot, value) in tail.iter_mut().zip(&src[at..at + rest]) {
+                *slot += weight * (*value).into();
+            }
+        }
+    }
+}
+
+/// [`convolve_axis_packed`] for a pass with **nothing after it to accumulate
+/// over**, where every tap of a row reads that same row, shifted.
+///
+/// That is the innermost axis of any array, and also either of the other two
+/// when the axes after it are one voxel wide — which is not a curiosity, it is
+/// what a one-voxel-deep volume is.
+///
+/// There is no trailing extent to accumulate over here — `inner` is one — so the
+/// trick that pays for the other two axes has nothing to spread the boundary
+/// fold over, and a row narrower than the kernel is *entirely* boundary. So the
+/// edge is dealt with **once, ahead of the arithmetic**, by copying each row into
+/// a buffer already extended by the kernel's reach at both ends: `padded[j]` is
+/// the sample the tap at `j - radius` reads, whichever convention resolves it.
+/// The output at `a` is then `sum over t of w[t] * padded[a + t]` with no
+/// condition in it at all, which is the same shape of sum
+/// [`accumulate_row`] already does — so it is that function, called with a stride
+/// of one and the taps in their natural order.
+///
+/// Two things fall out. The fold is computed `extent + taps - 1` times **for the
+/// whole axis** rather than once per (voxel, tap): the index table is built once
+/// and every row reuses it. And the conversion into `f64` happens once per
+/// padded sample rather than once per tap, which for a wide kernel is eighty
+/// conversions saved for every one kept.
+///
+/// The extension costs a copy of about `extent + 2 * radius` values per row
+/// against `extent * taps` multiply-adds, which at any kernel worth optimising is
+/// a few percent. It is also the reason this form has no special case for an
+/// axis narrower than the kernel: the table folds repeatedly if it has to, once,
+/// and the arithmetic never learns that it did.
+fn convolve_innermost_packed<T>(
+    src: &[T],
+    rows: usize,
+    extent: usize,
+    kernel: &[f64],
+    boundary: Boundary,
+    dst: &mut [f64],
+) where
+    T: Copy + Into<f64>,
+{
+    let radius = (kernel.len() / 2) as isize;
+    let span = extent + kernel.len().saturating_sub(1);
+    // The taps of the extended row are consecutive, by construction.
+    let consecutive: Vec<usize> = (0..kernel.len()).collect();
+    if span == extent {
+        // A kernel of one tap reaches nowhere, so the row is already its own
+        // extension and copying it would be the whole of the work. This is the
+        // **axis a zero sigma does not blur**, and a plane-by-plane smoothing of
+        // a volume is exactly one wide pass, one wide pass and this.
+        for row in 0..rows {
+            let base = row * extent;
+            accumulate_row(
+                src,
+                base,
+                1,
+                &consecutive,
+                kernel,
+                &mut dst[base..base + extent],
+            );
+        }
+        return;
+    }
+    // Which sample each position of the extended row reads. Built once for the
+    // axis; this is the whole of the boundary convention's cost.
+    let table: Vec<usize> = (0..span)
+        .map(|at| boundary.index(at as isize - radius, extent))
+        .collect();
+    let mut padded = vec![0.0f64; span];
+    for row in 0..rows {
+        let base = row * extent;
+        for (slot, &at) in padded.iter_mut().zip(&table) {
+            *slot = src[base + at].into();
+        }
+        accumulate_row(
+            &padded,
+            0,
+            1,
+            &consecutive,
+            kernel,
+            &mut dst[base..base + extent],
+        );
     }
 }
 
@@ -1457,6 +1740,130 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
     out
 }
 
+/// What the walk in [`convolve_axis_packed`] is worth, as a number rather than a
+/// claim.
+///
+/// `--release`, one thread, 64 x 64 x 64, best of several repetitions, on the
+/// machine this crate was developed on. Rebuild it with [`smoothing_report`];
+/// the columns are the two walks that [`convolve_axis`] chooses between, so the
+/// row is a before and an after of the same arithmetic on the same data.
+///
+/// ```text
+/// smoothing walk, 64x64x64, best of 5
+/// case                            taps  strided/vx   packed/vx    speed-up
+/// sigma 1, flat, Clamp              19       56.45        6.81        8.28
+/// sigma 1, flat, Reflect            19      113.52        6.79       16.73
+/// sigma 2, flat, Clamp              35      103.03       13.70        7.52
+/// sigma 2, flat, Reflect            35      212.04       12.00       17.67
+/// sigma 4, flat, Clamp              67      186.74       22.81        8.19
+/// sigma 4, flat, Reflect            67      410.34       22.91       17.91
+/// sigma 10, flat, Clamp            163      470.59       59.16        7.95
+/// sigma 10, flat, Reflect          163     1112.24       62.42       17.82
+/// sigma 4, isotropic, Reflect       99      602.69       32.28       18.67
+/// sigma 10, isotropic, Reflect     243     1669.63       85.94       19.43
+/// ```
+///
+/// Two things in it are worth reading rather than skimming. **The `Reflect` rows
+/// used to cost about 2.4x the `Clamp` ones and now cost about 1.1x**: the fold
+/// is an integer division and it was the single largest term in the old walk, so
+/// moving it out of the inner loop is most of the difference between the two
+/// columns and nearly all of the difference between the two conventions. And the
+/// **`flat` rows are the shipped shape** — a wide blur on two axes and the
+/// one-tap kernel on the third — where at the widest radius the walk is 17x
+/// faster for the same bits.
+///
+/// The figures are per voxel of the array handed to one call and say nothing
+/// about how many times a decomposed run hands over the same voxel. A block
+/// whose halo is wide relative to its core is smoothed at every block that
+/// reaches it, and that multiplier belongs to the decomposition rather than to
+/// this walk: it is set by the block size against the reach, and it is unchanged
+/// by anything here.
+pub const SMOOTHING_MEASUREMENT: &str = "ops::ridge::smoothing_report";
+
+/// Retake the measurement in [`SMOOTHING_MEASUREMENT`].
+///
+/// Times the two walks [`convolve_axis`] dispatches between, over the same
+/// input, at each of several kernel widths and under both edge conventions. The
+/// **best** of `repetitions`, for `cost_report`'s reason: contention on a shared
+/// machine is one-sided, so a mean over such samples measures the machine and not
+/// the code.
+///
+/// `flat` is a wide kernel on two axes and the one-tap kernel on the third,
+/// which is a plane-by-plane blur and the shape the widest caller uses;
+/// `isotropic` is the same sigma on all three, which is what a scale space asks
+/// for. Both are reported because the two exercise different halves of the
+/// packed walk — a pass along the innermost axis has no trailing extent to
+/// accumulate over and takes its own form.
+pub fn smoothing_report(shape: [usize; 3], repetitions: usize) -> String {
+    use std::time::Instant;
+
+    let dim = (shape[0], shape[1], shape[2]);
+    let voxels = (shape[0] * shape[1] * shape[2]) as f64;
+    let mut input = Array3::<f64>::zeros(dim);
+    for (flat, value) in input.iter_mut().enumerate() {
+        *value = ((flat * 7919) % 1013) as f64;
+    }
+
+    let mut cases: Vec<(String, [Vec<f64>; 3], Boundary)> = Vec::new();
+    for sigma in [1.0f64, 2.0, 4.0, 10.0] {
+        // the truncation that reproduces the widest shipped radius
+        let truncate = 3.95;
+        let wide = gaussian_weights(sigma, truncate).unwrap();
+        let single = gaussian_weights(0.0, truncate).unwrap();
+        for boundary in [Boundary::Clamp, Boundary::Reflect] {
+            cases.push((
+                format!("sigma {sigma}, flat, {boundary:?}"),
+                [wide.clone(), wide.clone(), single.clone()],
+                boundary,
+            ));
+        }
+    }
+    for sigma in [4.0f64, 10.0] {
+        let wide = gaussian_weights(sigma, 3.95).unwrap();
+        cases.push((
+            format!("sigma {sigma}, isotropic, Reflect"),
+            [wide.clone(), wide.clone(), wide],
+            Boundary::Reflect,
+        ));
+    }
+
+    let mut out = format!(
+        "smoothing walk, {}x{}x{}, best of {repetitions}\n{:<30} {:>5} {:>11} {:>11} {:>11}\n",
+        shape[0], shape[1], shape[2], "case", "taps", "strided/vx", "packed/vx", "speed-up"
+    );
+    let mut strided = Array3::<f64>::zeros(dim);
+    let mut scratch = Array3::<f64>::zeros(dim);
+    let mut packed = Array3::<f64>::zeros(dim);
+    for (name, kernels, boundary) in cases {
+        let taps: usize = kernels.iter().map(|kernel| kernel.len()).sum();
+        let mut slow = f64::INFINITY;
+        let mut fast = f64::INFINITY;
+        for _ in 0..repetitions.max(1) {
+            let started = Instant::now();
+            convolve_axis_strided(input.view(), 0, &kernels[0], boundary, scratch.view_mut());
+            convolve_axis_strided(scratch.view(), 1, &kernels[1], boundary, strided.view_mut());
+            convolve_axis_strided(strided.view(), 2, &kernels[2], boundary, scratch.view_mut());
+            slow = slow.min(started.elapsed().as_secs_f64() * 1e9 / voxels);
+            std::hint::black_box(scratch[[0, 0, 0]]);
+
+            let started = Instant::now();
+            gaussian_smooth_into_with(input.view(), &kernels, boundary, packed.view_mut()).unwrap();
+            fast = fast.min(started.elapsed().as_secs_f64() * 1e9 / voxels);
+            std::hint::black_box(packed[[0, 0, 0]]);
+        }
+        // the same bits out of both walks, or the row above is a comparison of
+        // two different answers
+        for (a, b) in scratch.iter().zip(packed.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "{name}: the walks disagree");
+        }
+        out.push_str(&format!(
+            "{name:<30} {taps:>5} {slow:>11.2} {fast:>11.2} {:>11.2}\n",
+            slow / fast
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1620,6 +2027,190 @@ mod tests {
     }
 
     // ------------------------------------------------------- smoothing --
+
+    /// The three passes done by the definition — [`convolve_axis_strided`],
+    /// which is the one-voxel-at-a-time form — so that the packed walk has
+    /// something to be equal to.
+    fn smooth_by_definition<T>(
+        input: ArrayView3<'_, T>,
+        kernels: &[Vec<f64>; 3],
+        boundary: Boundary,
+    ) -> Array3<f64>
+    where
+        T: Copy + Into<f64>,
+    {
+        let dim = (input.shape()[0], input.shape()[1], input.shape()[2]);
+        let mut first = Array3::<f64>::zeros(dim);
+        convolve_axis_strided(input, 0, &kernels[0], boundary, first.view_mut());
+        let mut second = Array3::<f64>::zeros(dim);
+        convolve_axis_strided(first.view(), 1, &kernels[1], boundary, second.view_mut());
+        let mut third = Array3::<f64>::zeros(dim);
+        convolve_axis_strided(second.view(), 2, &kernels[2], boundary, third.view_mut());
+        third
+    }
+
+    /// The kernels the identity is checked over: wide and narrow, symmetric and
+    /// not, even-length as well as odd, and the one-tap kernel a zero sigma
+    /// gives — which is how a caller says *this axis is not blurred*.
+    fn kernels_to_check() -> Vec<Vec<f64>> {
+        vec![
+            gaussian_weights(0.0, 3.0).unwrap(),
+            vec![0.3, 0.7],
+            vec![0.125, 0.25, 0.625],
+            gaussian_weights(1.0, 3.0).unwrap(),
+            gaussian_weights(2.5, 4.0).unwrap(),
+            gaussian_weights(10.0, 3.95).unwrap(),
+        ]
+    }
+
+    /// **The packed walk and the strided one agree on every bit.**
+    ///
+    /// This is the assertion the rewrite of the walk stands on. Hoisting the tap
+    /// out of the loop over the voxels that share it does not reorder any one
+    /// voxel's sum — but "does not" is a claim about floating point, where the
+    /// order *is* the answer, so it is checked rather than argued: `to_bits`,
+    /// not `==`, so that a `-0.0` that had become a `+0.0` would fail and two
+    /// `NaN`s would not silently pass.
+    ///
+    /// The shapes are chosen for the cases the packed form has to get right:
+    /// axes of one voxel, an axis **narrower than the kernel** so the reflection
+    /// folds repeatedly, and shapes where the innermost axis is and is not the
+    /// one being convolved. The six kernels are rotated through the three axes,
+    /// so each of them is the wide one, the narrow one and the one-tap one in
+    /// turn, and every shape is run under both conventions.
+    #[test]
+    fn the_packed_and_strided_walks_agree_on_every_bit() {
+        let choices = kernels_to_check();
+        let mut compared = 0usize;
+        for dim in [
+            (1usize, 1usize, 1usize),
+            (1, 5, 7),
+            (3, 3, 3),
+            (2, 41, 3),
+            (7, 11, 13),
+            (17, 4, 9),
+        ] {
+            let mut field = ramp(dim);
+            // a negative zero somewhere, because `0.0 + (-0.0)` is `+0.0` and
+            // the accumulator this form starts from has to be the one the
+            // definition starts from
+            if let Some(slot) = field.iter_mut().next() {
+                *slot = -0.0;
+            }
+            for boundary in [Boundary::Clamp, Boundary::Reflect] {
+                for rotation in 0..choices.len() {
+                    let kernels = [
+                        choices[rotation].clone(),
+                        choices[(rotation + 1) % choices.len()].clone(),
+                        choices[(rotation + 2) % choices.len()].clone(),
+                    ];
+                    let want = smooth_by_definition(field.view(), &kernels, boundary);
+                    let mut got = Array3::<f64>::zeros(dim);
+                    gaussian_smooth_into_with(field.view(), &kernels, boundary, got.view_mut())
+                        .unwrap();
+                    for (a, b) in want.iter().zip(got.iter()) {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "the packed walk moved a bit at {dim:?} under {boundary:?}"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        // stated rather than felt: the identity is asserted on this many voxels
+        assert_eq!(compared, 23_064);
+    }
+
+    /// The same identity for the element types a caller actually hands over,
+    /// where the conversion into `f64` happens inside the inner loop.
+    #[test]
+    fn the_packed_walk_agrees_on_every_bit_for_a_narrow_element_type() {
+        let dim = (9usize, 7usize, 11usize);
+        let mut narrow = Array3::<u8>::zeros(dim);
+        for (flat, value) in narrow.iter_mut().enumerate() {
+            *value = ((flat * 7919) % 251) as u8;
+        }
+        let mut signed = Array3::<i16>::zeros(dim);
+        for (flat, value) in signed.iter_mut().enumerate() {
+            *value = (((flat * 7919) % 2003) as i16) - 1001;
+        }
+        let kernels = [
+            gaussian_weights(2.0, 3.0).unwrap(),
+            vec![0.125, 0.25, 0.625],
+            gaussian_weights(1.0, 3.0).unwrap(),
+        ];
+        for boundary in [Boundary::Clamp, Boundary::Reflect] {
+            let want = smooth_by_definition(narrow.view(), &kernels, boundary);
+            let mut got = Array3::<f64>::zeros(dim);
+            gaussian_smooth_into_with(narrow.view(), &kernels, boundary, got.view_mut()).unwrap();
+            for (a, b) in want.iter().zip(got.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+            let want = smooth_by_definition(signed.view(), &kernels, boundary);
+            let mut got = Array3::<f64>::zeros(dim);
+            gaussian_smooth_into_with(signed.view(), &kernels, boundary, got.view_mut()).unwrap();
+            for (a, b) in want.iter().zip(got.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
+    }
+
+    /// **The fast walk is the walk a block actually takes.**
+    ///
+    /// [`convolve_axis`] picks the packed form only when both arrays hand back a
+    /// slice, and a buffer this crate hands an op is an owned `Array3` in the
+    /// standard order, so it always does. That is a property of `Voxels` rather
+    /// than of this file, which is exactly why it is worth asserting here: a
+    /// change over there that started handing ops a *view of* a larger buffer
+    /// would silently put every smoothing back on the slow walk, and nothing else
+    /// in the suite would notice, because the answer would not move by one bit.
+    #[test]
+    fn the_buffer_an_op_is_handed_takes_the_packed_walk() {
+        for dtype in [Dtype::U8, Dtype::U16, Dtype::F32, Dtype::F64] {
+            let block = Voxels::zeros(dtype, [5, 6, 7]).unwrap();
+            let contiguous = match dtype {
+                Dtype::U8 => block.view::<u8>().unwrap().as_slice().is_some(),
+                Dtype::U16 => block.view::<u16>().unwrap().as_slice().is_some(),
+                Dtype::F32 => block.view::<f32>().unwrap().as_slice().is_some(),
+                _ => block.view::<f64>().unwrap().as_slice().is_some(),
+            };
+            assert!(contiguous, "{dtype:?} was handed over strided");
+            let mut out = Voxels::zeros(Dtype::F64, [5, 6, 7]).unwrap();
+            assert!(out.view_mut::<f64>().unwrap().as_slice().is_some());
+        }
+    }
+
+    /// A view that is **not** contiguous takes the strided walk, and gets the
+    /// same bits the packed walk gives the same numbers laid out contiguously.
+    ///
+    /// Without this the fallback would be a branch nothing exercised, and the
+    /// first caller to hand over a slice of a larger array would be the test.
+    #[test]
+    fn a_non_contiguous_view_is_convolved_to_the_same_bits() {
+        let large = ramp((14, 9, 22));
+        let strided = large.slice(ndarray::s![2..12;2, .., 1..21;2]);
+        assert!(strided.as_slice().is_none(), "the view has to be strided");
+        let dim = (strided.shape()[0], strided.shape()[1], strided.shape()[2]);
+        let packed = strided.to_owned();
+        assert!(packed.as_slice().is_some());
+        let kernels = [
+            gaussian_weights(1.5, 3.0).unwrap(),
+            gaussian_weights(0.0, 3.0).unwrap(),
+            vec![0.3, 0.7],
+        ];
+        for boundary in [Boundary::Clamp, Boundary::Reflect] {
+            let mut from_view = Array3::<f64>::zeros(dim);
+            gaussian_smooth_into_with(strided, &kernels, boundary, from_view.view_mut()).unwrap();
+            let mut from_packed = Array3::<f64>::zeros(dim);
+            gaussian_smooth_into_with(packed.view(), &kernels, boundary, from_packed.view_mut())
+                .unwrap();
+            for (a, b) in from_view.iter().zip(from_packed.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
+    }
 
     #[test]
     fn the_kernel_is_normalised_symmetric_and_as_wide_as_the_radius_says() {
@@ -2235,5 +2826,17 @@ mod tests {
     #[ignore = "a measurement, not an assertion"]
     fn print_the_cost_table() {
         println!("{}", cost_report([48, 32, 32], 3));
+    }
+
+    /// Retaking the before and after of the walk, on the same command as the
+    /// cost table. This is the one that says whether the packed form is still
+    /// worth what [`SMOOTHING_MEASUREMENT`] claims; it also asserts, inside the
+    /// timing loop, that the two walks are still giving the same bits, so a
+    /// speed-up that had been bought by changing the answer would fail here
+    /// rather than be printed.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn print_the_smoothing_table() {
+        println!("{}", smoothing_report([64, 64, 64], 5));
     }
 }

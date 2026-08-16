@@ -54,9 +54,9 @@ use crate::region::Region;
 use crate::tiling::boxes_tile_exactly;
 
 use super::decomposition::{
-    check_block_constraints, check_dtypes, check_source_levels, constraint_for, groups_for,
-    is_planning_barrier, price_phase, region_to_ranges, splittable_axes, Constraints,
-    Decomposition, PhaseDecomposition, Visibility,
+    check_block_constraints, check_dtypes, check_output_shapes, check_source_levels,
+    compute_per_voxel, constraint_for, groups_for, is_planning_barrier, price_phase,
+    region_to_ranges, splittable_axes, Constraints, Decomposition, PhaseDecomposition, Visibility,
 };
 use super::env::{block_shape, BlockBuf, Environment};
 use super::fragment::{check_phase_work, neighbourhood, BlockView, PhaseWork};
@@ -66,6 +66,7 @@ use super::iterate::{IterativeOp, Operand};
 use super::listener::{Dispatch, EventListener};
 use super::log::{Event, Stats};
 use super::op::{place_parts, Anchor, Chain, Output, Placement};
+use super::reach::Reach;
 
 /// Names an array the injected `Environment` resolves.
 ///
@@ -326,6 +327,12 @@ pub fn execute_phases(
     // the chain, and re-checked here because a plan whose levels are the wrong
     // width would otherwise be discovered one block at a time.
     check_dtypes(&workflow.chain, decomposition, work)?;
+    // And the same arrangement for the extent. It is not the per-block
+    // comparison `run_task` makes — that one an op may answer out of the plan,
+    // by taking `Placement::writes` — it is the same question at whole-volume
+    // scale with the plan's answer withheld, which is the one form of it no op
+    // can answer from the plan. See `check_output_shapes`.
+    check_output_shapes(&workflow.chain, decomposition, work)?;
     // And the same arrangement for the levels a phase reads besides its own
     // input. **Before `prepare` and before the graph**: a forward reference is
     // a plan that is not a plan, and it is refused by name here rather than
@@ -870,7 +877,21 @@ fn run_task(
         &placement,
         block_shape(fetch)?,
     );
-    let produced = phase_output_shape(slots, &phase.slots, &places, block_shape(fetch)?)?;
+    // The same fold `place_parts` above feeds, through the one derivation both
+    // this and `check_output_shapes` use. **This comparison is the one an op may
+    // answer out of the plan**: `placement` carries the read extent, so a slot
+    // taking `Placement::writes` makes the two sides one number. That is what
+    // the whole-volume guard is there to make non-silent; see
+    // `decomposition::check_output_shapes`.
+    let produced = crate::op::parts_output_shape(
+        &phase
+            .slots
+            .iter()
+            .map(|&slot| slots[slot])
+            .collect::<Vec<_>>(),
+        &placement,
+        block_shape(fetch)?,
+    )?;
     if produced != block_shape(read)? {
         return Err(Error::InvalidArgument(format!(
             "phase {} block {:?} fetches {:?}, its ops turn that into {produced:?}, and the \
@@ -1443,24 +1464,6 @@ fn run_iterative_phase(
     produced
 }
 
-/// The extent one phase turns `input` into, folding its slots in order.
-///
-/// The counterpart of [`fold_constant`] for shape, and the reason `run_task` can
-/// now check a resizing phase instead of refusing every one: the answer comes
-/// from what the ops *declared* rather than from what the buffer happened to be.
-fn phase_output_shape(
-    slots: &[&Chain],
-    group: &[usize],
-    places: &[Placement],
-    input: [usize; 3],
-) -> Result<[usize; 3]> {
-    let mut current = input;
-    for (&slot, place) in group.iter().zip(places) {
-        current = slots[slot].placed_output_shape(current, place)?;
-    }
-    Ok(current)
-}
-
 fn fold_constant(phase: &PhaseDecomposition, slots: &[&Chain], value: f64) -> Option<f64> {
     // A phase with a side output is never short-circuited. The short circuit is
     // licensed by `constant_maps_to`, which is an algebra over the *primary*
@@ -1568,6 +1571,163 @@ fn priority_key(task: &super::graph::Task, hints: &Hints) -> [usize; 5] {
     }
 }
 
+// ------------------------------------------------- choosing between paths --
+
+/// The block edge a phase running `chain` over `volume` would be given under
+/// `constraints`: the largest candidate that fits, cut only on the axes the
+/// reach admits.
+///
+/// The same arithmetic [`Greedy`] does, extracted so that a decision taken
+/// *before* the partition — which of several ways of computing one result to
+/// run — can be priced at the block the run will actually use rather than at a
+/// block nobody chose. It is the whole chain's reach rather than a phase's,
+/// because the partition is not known yet; that over-states the halo, which is
+/// the direction the cost model is stated to be safe in.
+pub fn planned_block(
+    chain: &Chain,
+    volume: [usize; 3],
+    dtype: Dtype,
+    constraints: &Constraints,
+) -> Result<[usize; 3]> {
+    let reach = chain.reach_spec(volume)?;
+    let mut candidates = constraints.block_candidates.clone();
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    for edge in candidates {
+        let axes = splittable_axes(&constraints.split_axes, &reach, volume);
+        let Ok(grid) = BlockGrid::along(volume, &axes, edge) else {
+            continue;
+        };
+        let cost = price_phase(
+            &grid,
+            &reach,
+            chain.cost_per_voxel_in(grid.block()),
+            1,
+            false,
+            dtype.size_of() as f64,
+            &constraints.model,
+            constraints.model.materialise_cost_per_voxel,
+        );
+        let fits = constraints.budget_bytes.is_none_or(|budget| {
+            cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
+                <= budget as f64
+        });
+        if fits {
+            return Ok(grid.block());
+        }
+    }
+    // Nothing fits, and saying so is `decompose`'s job with `decompose`'s
+    // message. The whole volume is the block a caller pricing a branch should
+    // use in the meantime: it is the one grid that always exists.
+    Ok(volume)
+}
+
+/// Resolve every [`Chain::Alternative`] in `chain` to its **cheapest** branch,
+/// priced at `block`.
+///
+/// **This is a planning decision, and it is the one planning decision that could
+/// not be taken until now.** `Chain::Alternative` has always been the way to say
+/// "two ways of computing the same thing" — its own documentation puts it as
+/// *reach is budgeted for every branch, execution runs one* — but `taken` was
+/// whatever the chain's author wrote, so a chain carrying a fast path and a
+/// general one ran whichever was named. The declarations needed to choose
+/// between them are [`BlockOp::cost_per_voxel`] and, for a path whose advantage
+/// depends on the block it is given, [`BlockOp::cost_per_voxel_in`]. Both are
+/// declared by the op; nothing here knows what any branch does.
+///
+/// **Why choosing is safe, in the two senses that matter.**
+///
+/// * *It cannot invalidate a plan.* Every fold a plan is built from treats an
+///   `Alternative` as the max over branches — reach, cost, and therefore the
+///   halo, the valid regions and the budget — so a plan built for one branch is
+///   a plan for every branch. That is not a coincidence, it is what `taken`
+///   being an index into equally-planned branches means.
+/// * *It cannot change an answer.* Branches of an `Alternative` are candidates
+///   for one level: [`Chain::produces`] already refuses branches that write
+///   different element types, and [`Chain::placed_output_shape`] already refuses
+///   branches that write different extents. That the values agree is the chain
+///   author's claim, exactly as it was before anything chose between them — what
+///   changes here is *which* path computes, never what a path computes.
+///
+/// **The ordering, stated because it is a compromise.** The branch is chosen
+/// before the partition, and the partition is what fixes the block; so `block`
+/// is the block the *whole chain* would be given ([`planned_block`]) rather than
+/// the block the phase this slot lands in will get. The two differ only when the
+/// partition changes the reach enough to change the candidate, and the direction
+/// of the error is known: a whole-chain reach is at least a phase's, so the
+/// block is at most the phase's, so a path whose advantage grows with the block
+/// is under-sold. Under-selling the fast path is the safe mistake — it keeps the
+/// general one, which is the branch that is always correct.
+///
+/// A nested `Alternative` inside a chosen branch is resolved too, and one inside
+/// a branch that is not chosen is left as it was: it is not going to run, and
+/// rewriting it would put a decision in the plan about work that will not happen.
+pub fn choose_branches(chain: Chain, block: [usize; 3]) -> Chain {
+    match chain {
+        Chain::Alternative { branches, taken } => {
+            let mut chosen = taken;
+            let mut best = f64::INFINITY;
+            for (index, branch) in branches.iter().enumerate() {
+                let cost = branch.cost_per_voxel_in(block);
+                // Strictly cheaper, so ties keep the lower index and the choice
+                // is a function of the branches rather than of their order in a
+                // sort. A planner that is not deterministic is not a planner.
+                if cost < best {
+                    best = cost;
+                    chosen = index;
+                }
+            }
+            let branches: Vec<Chain> = branches
+                .into_iter()
+                .enumerate()
+                .map(|(index, branch)| {
+                    if index == chosen {
+                        choose_branches(branch, block)
+                    } else {
+                        branch
+                    }
+                })
+                .collect();
+            Chain::Alternative {
+                branches,
+                taken: chosen,
+            }
+        }
+        Chain::Sequence(children) => Chain::Sequence(
+            children
+                .into_iter()
+                .map(|child| choose_branches(child, block))
+                .collect(),
+        ),
+        Chain::Parallel { branches, combine } => Chain::Parallel {
+            branches: branches
+                .into_iter()
+                .map(|branch| choose_branches(branch, block))
+                .collect(),
+            combine,
+        },
+        leaf => leaf,
+    }
+}
+
+/// [`choose_branches`] at the block [`planned_block`] derives, which is the call
+/// a caller who has a `Constraints` and no reason to name a block wants.
+///
+/// It is a free function rather than a step inside [`Strategy::decompose`]
+/// because the chain belongs to the `Workflow` and `decompose` is handed it by
+/// reference: the decision is recorded *in the chain*, where `taken` lives and
+/// where the executor reads it, rather than in the `Decomposition`, which
+/// records op names and not implementations. A plan carrying a branch index
+/// would be a plan whose meaning depended on a chain it does not hold.
+pub fn choose_paths(
+    chain: Chain,
+    volume: [usize; 3],
+    dtype: Dtype,
+    constraints: &Constraints,
+) -> Result<Chain> {
+    let block = planned_block(&chain, volume, dtype, constraints)?;
+    Ok(choose_branches(chain, block))
+}
+
 // ------------------------------------------------------------ strategies --
 
 /// The oracle: one block, no seams, one phase, serial.
@@ -1624,23 +1784,21 @@ impl Strategy for Trivial {
     }
 }
 
-/// Brute force over the `2^(n-1)` partitions, with the block size for each
-/// phase chosen independently.
-///
-/// Enumeration rather than the `O(n^2)` DP because a chain is 5-8 ops, so
-/// `2^(n-1) <= 128`: simpler to write, simpler to verify, and fast enough that
-/// the schedule is recomputed whenever a parameter changes rather than cached
-/// and trusted. The DP is the right structure if a chain ever gets long, and
-/// `MAX_SLOTS` refuses rather than quietly taking minutes.
+/// Choose the cuts by the `O(n^2)` dynamic program, with the block size for
+/// each phase chosen independently. The `2^(n-1)` enumeration is retained and
+/// selectable — see [`PartitionSearch`].
 ///
 /// Per-phase block sizes are separable given the partition — the total is
 /// `sum over phases of n_blocks_p x cost_per_block_p` and the budget binds each
-/// phase independently — so choosing them costs `partitions x candidates`, not
-/// `partitions x candidates^phases`.
+/// phase independently — so choosing them is an inner loop over candidates
+/// rather than a `candidates^phases` product.
 #[derive(Debug, Clone)]
 pub struct Enumerating {
     pub concurrency: usize,
     pub priority: SchedulePriority,
+    /// Which search over contiguous partitions picks the cuts. Both give the
+    /// same plan; see [`PartitionSearch`].
+    pub search: PartitionSearch,
 }
 
 impl Default for Enumerating {
@@ -1648,12 +1806,613 @@ impl Default for Enumerating {
         Self {
             concurrency: 1,
             priority: SchedulePriority::PhaseMajor,
+            search: PartitionSearch::default(),
         }
     }
 }
 
-/// Enumeration is `2^(n-1)`. Past this, reach for the DP.
-pub const MAX_SLOTS: usize = 20;
+/// How [`Enumerating`] searches the space of contiguous partitions.
+///
+/// The two answer the same question, and where the precondition below holds
+/// they return the **same partition** — not merely one of equal cost, which
+/// matters because a plan's phase boundaries are asserted all over this crate.
+/// `tests/partition_search.rs` sweeps random chains asserting exact agreement.
+///
+/// # The precondition is additivity
+///
+/// The dynamic program is licensed by exactly one property, and it is worth
+/// writing as an equation rather than carrying as an intuition:
+///
+/// ```text
+/// cost(partition) = sum over its groups of price(group)
+/// ```
+///
+/// with `price(j..i)` a function of that group's slots and nothing else. It
+/// holds here, and each clause of it is checkable:
+///
+/// * [`price_phase`] is charged per phase and the totals are summed — the same
+///   arithmetic [`crate::decomposition::predicted_cost`] re-does over a
+///   finished plan, one phase at a time;
+/// * [`crate::decomposition::summarise_slots`] and [`constraint_for`] fold over
+///   the group alone, so the reach, the traversal preferences and the mandate
+///   are the group's own;
+/// * [`compute_per_voxel`] is asked at the grid *this* phase chose, and the
+///   budget is checked against that phase's own working set — so the block edge
+///   is an inner loop, not a coupling between phases;
+/// * and the one term that looks positional — `is_materialised`, "this phase
+///   writes an intermediate rather than the workflow's output" — is `i < n`. It
+///   depends on where the group *ends* and on nothing about the other groups.
+///
+/// # What would break it
+///
+/// This list is the specification for the heuristics that would have to replace
+/// the DP, and the reason the enumeration is kept rather than deleted. Any one
+/// of these makes `price` depend on more than its own group, at which point
+/// `Exhaustive` is the correct search and the DP is not:
+///
+/// 1. **A materialisation charge that knows its consumer.** Today an
+///    intermediate costs `materialise_cost_per_voxel` per core voxel whoever
+///    reads it. Charge the *reader's* halo — the redundant re-read of a
+///    boundary — and the price of group `j..i` depends on group `i..k`.
+/// 2. **A cost of changing the block edge between phases.** Per-phase edges are
+///    free of each other now. A rechunk penalty, or a cache that only survives
+///    a boundary when the grids agree, couples adjacent phases. (Recoverable:
+///    carry the chosen edge in the DP state, at `O(B^2 n^2)`.)
+/// 3. **A budget that is global rather than per phase.** `budget_bytes` binds
+///    one phase's working set at a time. A budget over the intermediates *alive
+///    at once*, or a cap on total intermediate storage, is a knapsack across
+///    groups and no prefix cost summarises it.
+/// 4. **Any non-linear function of the phase count.** A fixed per-phase
+///    overhead is additive and fine; a term in `n_phases^2`, or a hard cap on
+///    phases, is not — though a cap is recoverable by adding the count to the
+///    DP state.
+/// 5. **Data-dependent savings priced at plan time.** The empty-block short
+///    circuit fires only when *every remaining op* declares
+///    `constant_maps_to`, which is a property of the whole suffix. Pricing it
+///    would make a group's cost depend on every group after it.
+/// 6. **Cost that is not a sum over a linear chain at all** — a fan-in whose
+///    branches must be cut consistently, or fusing non-adjacent ops. Then the
+///    plan is not a 1-D contiguous partition and neither search here applies.
+/// 7. **A per-phase quantity folded from the phases before it.** The planner
+///    prices every phase at `workflow.dtype` and at `workflow.shape`; an op
+///    that changes the element type or the volume is priced as if it had not.
+///    Were that fixed by folding the declared types and shapes, the folded
+///    value would still be a function of the cut point `j` alone, so the DP
+///    would survive — but only because the fold runs over a *prefix*. A fold
+///    that depended on where the earlier cuts fell would not.
+///
+/// Note what is *not* on this list. Forced barrier cuts, budget-infeasible
+/// groups and mandate conflicts are all local facts about one group, so they
+/// are edges the DP simply does not take.
+///
+/// # A separate fact, for whoever prunes the inner scan: `price` is **not**
+/// monotone
+///
+/// The obvious way to make the DP near-linear is an early exit: for a fixed
+/// right end `i`, scan `j` leftwards and stop once `price(j..i)` alone exceeds
+/// the best candidate already found for `i` — sound if prices are non-negative
+/// (so `best[j] + price >= price`) **and** `price(j..i)` never falls as the
+/// group widens. The first half holds. The second does not, and the
+/// counterexample is a configuration this crate already has a test for.
+///
+/// Three ops each reaching 200 voxels on a 512-voxel axis, `split_axes = [0]`,
+/// one candidate edge of 64:
+///
+/// ```text
+/// slots 0..1   reach 200   splittable [0]   8 blocks   redundancy  7.25    507904
+/// slots 0..2   reach 400   splittable [0]   8 blocks   redundancy 13.5    1359872
+/// slots 0..3   reach 600   splittable  []   1 block    redundancy  3.34     471040
+/// ```
+///
+/// The third widening is **cheaper than either of the first two, and cheaper
+/// than the single slot**. Nothing has gone wrong: at a folded reach of 600 the
+/// dependency spans the axis, [`splittable_axes`] stops offering to cut it, the
+/// grid collapses to one block, and the amplification falls from 13.5x to
+/// 3.3x. No forced cut prevents this group either — `barrier_cuts` fires on
+/// slots that are *individually* full-reach, and none of these three is.
+///
+/// So the sources of non-monotonicity, all of them the same shape — **widening
+/// changed which grid was chosen**:
+///
+/// * **[`splittable_axes`] dropping an axis** once the folded reach spans it,
+///   as above. This is the big one, and it can cut the price by a factor.
+/// * **A mandating op joining the group.** Its extent replaces the candidate
+///   list entirely ([`crate::op::BlockConstraint::lattice`]), so the new grid
+///   bears no relation to the old one and the price may go either way.
+/// * **[`compute_per_voxel`] at a changed block**, for an op whose cost has a
+///   block extent in its denominator.
+///
+/// And two conditions the argument quietly assumes: every model coefficient and
+/// every `cost_per_voxel` is non-negative (a negative one breaks both halves at
+/// once), and the exit must compare **strictly** greater — the DP's key is the
+/// lexicographic triple, so a wider group whose price merely *equals* the
+/// running best can still win on the phase count or the cut mask.
+///
+/// What *is* safe: hold the grid fixed and the price is monotone. The folded
+/// reach only grows ([`crate::reach::Reach::add`] sums per side, and `All`
+/// absorbs), so redundancy only grows; `distinct_orders` only grows;
+/// infeasibility is absorbing in this direction, because the working set only
+/// grows and a mandate or space conflict cannot be undone by adding a member.
+/// A budget that forces a *smaller* edge raises the total too, since the read is
+/// `volume x prod((B + lo + hi) / B)` and that falls with `B`. And the concern
+/// that a wider group swallows a phase boundary and its write does **not**
+/// apply: `is_materialised` is `i < n`, so for a fixed `i` it is the same for
+/// every `j`, and the saved boundary is priced in `best[j]`, outside this term.
+///
+/// An exact prune is therefore still available — it has to restart its bound
+/// whenever the chosen grid changes, which happens at most a few times per axis
+/// as the reach grows. That is design work, not a one-line guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PartitionSearch {
+    /// `best[i] = min over j < i of best[j] + price(j..i)`, at `O(n^2)` priced
+    /// groups. The default.
+    #[default]
+    Dp,
+    /// Every one of the `2^(n-1)` contiguous partitions, priced whole.
+    ///
+    /// Kept because the DP's licence is the additivity above, and a cost model
+    /// that breaks it needs a search that never assumed it. It is also the
+    /// oracle the DP is tested against.
+    Exhaustive,
+}
+
+/// The longest chain the `O(n^2)` DP will plan.
+///
+/// What bounds it is not the search — `O(n^2)` priced groups at `n = 32` is 528
+/// of them — but the **cut mask**, a `u32` in which bit `i` means "cut between
+/// slot `i` and slot `i + 1`". `barrier_cuts`, `groups_for` and the tie-break
+/// key all read that mask, so a chain needs `n - 1 <= 32` bits to state its own
+/// boundaries. Widening the mask is the change that raises this, and it is a
+/// mechanical one.
+pub const MAX_SLOTS: usize = 32;
+
+/// The longest chain [`PartitionSearch::Exhaustive`] will plan.
+///
+/// Enumeration is `2^(n-1)` partitions — 524288 at `n = 20` — and past this it
+/// refuses rather than quietly taking minutes. This is the limit the DP exists
+/// to lift, and it is the only thing `Exhaustive` costs.
+pub const MAX_EXHAUSTIVE_SLOTS: usize = 20;
+
+// -- one contiguous run of slots, folded, priced, and searched over ---------
+
+/// One contiguous run of slots, folded a slot at a time.
+///
+/// The incremental fold is what keeps the DP at `O(n^2)` group prices: for a
+/// fixed start the run grows by one slot per step, and the reach, the names and
+/// the traversal preferences grow with it, so extending `j..i` to `j..i+1`
+/// costs one slot's work rather than the run's.
+///
+/// It reproduces [`crate::decomposition::summarise_slots`] exactly, *including*
+/// which slot a refused fold blames: that function stops at the first slot that
+/// cannot join, and so does this, so every longer run from the same start
+/// reports the same message. `tests/partition_search.rs` asserts the agreement
+/// over every contiguous run of randomly generated chains.
+#[derive(Debug, Clone)]
+struct GroupFold {
+    start: usize,
+    end: usize,
+    reach: Option<Reach>,
+    names: Vec<String>,
+    orders: Vec<[usize; 3]>,
+    /// The first slot that could not join, in `summarise_slots`' own words.
+    refusal: Option<String>,
+}
+
+impl GroupFold {
+    fn new(start: usize) -> Self {
+        Self {
+            start,
+            end: start,
+            reach: None,
+            names: Vec::new(),
+            orders: Vec::new(),
+            refusal: None,
+        }
+    }
+
+    /// Take in the next slot, so the fold covers `start..end + 1`.
+    fn extend(&mut self, slots: &[&Chain], volume: [usize; 3]) {
+        let chain = slots[self.end];
+        self.end += 1;
+        self.names.push(chain.display_name());
+        for order in chain.preferred_iterations() {
+            if !self.orders.contains(&order) {
+                self.orders.push(order);
+            }
+        }
+        if self.refusal.is_some() {
+            return;
+        }
+        // The first slot's space is the run's; see `summarise_slots` for why
+        // this is not `Reach::none()` plus an addition.
+        let stated = match chain.reach_spec(volume) {
+            Ok(stated) => stated,
+            Err(err) => {
+                self.refusal = Some(err.to_string());
+                return;
+            }
+        };
+        self.reach = match self.reach.take() {
+            None => Some(stated),
+            Some(so_far) => match so_far.add(&stated) {
+                Ok(folded) => Some(folded),
+                Err(err) => {
+                    self.refusal = Some(err.to_string());
+                    return;
+                }
+            },
+        };
+    }
+}
+
+/// A contiguous run of slots, priced at the block edge it chose.
+///
+/// The derived [`PhaseDecomposition`] is deliberately **not** held. Deriving one
+/// materialises a `BlockGeometry` per block, and the search prices `O(n^2)` runs
+/// of which it keeps one partition's worth; the parts a phase is derived *from*
+/// are a grid, two reaches and a list of names, so the search carries those and
+/// derives once, for the plan it returns.
+#[derive(Debug, Clone)]
+struct PricedGroup {
+    total: f64,
+    reach: Reach,
+    halo: Reach,
+    names: Vec<String>,
+    grid: BlockGrid,
+}
+
+impl PricedGroup {
+    fn into_phase(self, start: usize, end: usize) -> PhaseDecomposition {
+        PhaseDecomposition::derive(
+            (start..end).collect(),
+            self.names,
+            self.reach,
+            self.halo,
+            self.grid,
+        )
+    }
+}
+
+/// What pricing one contiguous run came to.
+#[derive(Debug, Clone)]
+enum GroupPrice {
+    Priced(PricedGroup),
+    /// Not usable as a phase. The string, when there is one, is a reason that is
+    /// **not** the budget — two ops that cannot share a block, a reach in two
+    /// coordinate spaces, a mandate no grid meets — kept so a final refusal can
+    /// name it instead of blaming a budget that was never the problem.
+    ///
+    /// It is carried beside the price rather than raised, because *which*
+    /// refusal a caller reports depends on the order it visits runs in, and the
+    /// two searches visit in different orders.
+    Refused(Option<String>),
+}
+
+/// Everything needed to price one contiguous run of slots.
+struct PhasePricer<'a> {
+    slots: &'a [&'a Chain],
+    volume: [usize; 3],
+    bytes: f64,
+    constraints: &'a Constraints,
+}
+
+impl PhasePricer<'_> {
+    /// Price the run `fold` covers, choosing its block edge.
+    ///
+    /// `is_materialised` is the whole of this function's dependence on the rest
+    /// of the partition, and it is `fold.end < slots.len()` — see
+    /// [`PartitionSearch`] on why that is what makes the DP legitimate.
+    fn price(&self, fold: &GroupFold, is_materialised: bool) -> GroupPrice {
+        // Reaches in two coordinate spaces cannot be folded without a grid, so a
+        // run containing both is infeasible *as a run* — the same shape of
+        // answer a block-shape conflict gives, and it drops the partition rather
+        // than the plan.
+        if let Some(refusal) = &fold.refusal {
+            return GroupPrice::Refused(Some(refusal.clone()));
+        }
+        let group: Vec<usize> = (fold.start..fold.end).collect();
+        let reach = fold.reach.clone().unwrap_or_default();
+        // What the ops in this run will accept. A conflict is a fact about
+        // *this partition* — the same two ops in two phases are fine — so it
+        // drops the partition and the search goes on.
+        let mandated = match constraint_for(self.slots, &group, self.volume) {
+            Ok(found) => found,
+            Err(err) => return GroupPrice::Refused(Some(err.to_string())),
+        };
+        // The compute figure is re-asked per candidate rather than taken from
+        // the fold, because an op may declare a term whose denominator is a
+        // block extent — see `decomposition::compute_per_voxel`. For every op
+        // that does not, this is the same number by the same route.
+        let price = |grid: &BlockGrid| {
+            price_phase(
+                grid,
+                &reach,
+                compute_per_voxel(self.slots, &group, grid.block()),
+                fold.orders.len(),
+                is_materialised,
+                self.bytes,
+                &self.constraints.model,
+                self.constraints.model.materialise_cost_per_voxel,
+            )
+        };
+        let affordable = |cost: &super::decomposition::PhaseCost| {
+            self.constraints.budget_bytes.is_none_or(|budget| {
+                cost.working_set_bytes_per_block
+                    * self.constraints.expected_concurrency.max(1) as f64
+                    <= budget as f64
+            })
+        };
+        let mut chosen: Option<(f64, usize, BlockGrid)> = None;
+        // The halo this phase grants. Equal to the reach unless an op mandates
+        // an input extent, in which case it is the per-block window that hands
+        // every block that extent — see `BlockConstraint::lattice`.
+        let mut halo = reach.clone();
+        let mut note: Option<String> = None;
+        if let Some(constraint) = &mandated {
+            // A mandate replaces the candidate list rather than filtering it:
+            // `block_candidates` is a list of scalar edges and a mandated shape
+            // is anisotropic in general, so it is not expressible as a candidate
+            // at all. The budget still binds — a block that does not fit does
+            // not fit — but there is nothing to choose between.
+            match constraint.lattice(self.volume, &reach) {
+                Ok(Some((grid, window))) => {
+                    let cost = price(&grid);
+                    if affordable(&cost) {
+                        halo = window;
+                        chosen = Some((cost.cost_per_block * grid.n_blocks() as f64, 0, grid));
+                    }
+                }
+                Ok(None) => {
+                    note = Some(format!(
+                        "the ops of phase {}..{} mandate {constraint:?}, which no block grid \
+                         produces: a grid's cores are `index * block`, evenly strided and \
+                         disjoint. A plan for it has to state each block's fetch region \
+                         explicitly.",
+                        fold.start, fold.end
+                    ));
+                }
+                Err(err) => note = Some(err.to_string()),
+            }
+        } else {
+            // NOTE: `cuttable_axes` — the reach-derived floor — is deliberately
+            // **not** called here. See its own docs for what it would change and
+            // why that is a decision rather than a fix.
+            let axes = splittable_axes(&self.constraints.split_axes, &reach, self.volume);
+            for &edge in &self.constraints.block_candidates {
+                let grid = match BlockGrid::along(self.volume, &axes, edge) {
+                    Ok(grid) => grid,
+                    Err(_) => continue,
+                };
+                let cost = price(&grid);
+                if !affordable(&cost) {
+                    continue;
+                }
+                let phase_total = cost.cost_per_block * grid.n_blocks() as f64;
+                // deterministic: lower cost, then the larger block edge
+                let better = match &chosen {
+                    None => true,
+                    Some((best_cost, best_edge, _)) => {
+                        (phase_total, std::cmp::Reverse(edge))
+                            < (*best_cost, std::cmp::Reverse(*best_edge))
+                    }
+                };
+                if better {
+                    chosen = Some((phase_total, edge, grid));
+                }
+            }
+        }
+        let Some((total, _, grid)) = chosen else {
+            return GroupPrice::Refused(note);
+        };
+        let priced = PricedGroup {
+            total,
+            reach,
+            halo,
+            names: fold.names.clone(),
+            grid,
+        };
+        // The same check `execute` will run, run here: a mandated extent and a
+        // non-zero reach are not jointly satisfiable, and the place to discover
+        // that is the planner rather than the run.
+        if let Some(constraint) = &mandated {
+            let phase = priced.clone().into_phase(fold.start, fold.end);
+            let label = format!("phase {}..{}", fold.start, fold.end);
+            if let Err(err) = constraint.check(&phase.blocks, &label) {
+                return GroupPrice::Refused(Some(err.to_string()));
+            }
+        }
+        GroupPrice::Priced(priced)
+    }
+}
+
+/// Every contiguous run of slots either search is allowed to make a phase of,
+/// priced once.
+///
+/// This is the whole of the `O(2^n)` to `O(n^2)` change: the enumeration used to
+/// re-price a run once per partition that contained it, and `n^2 / 2` runs is
+/// the number of *distinct* things there are to price. The exhaustive search
+/// reads the same table, so it is now `O(2^n)` table lookups rather than
+/// `O(2^n)` pricings, and neither search can disagree with the other about what
+/// a run costs.
+struct PriceTable {
+    /// `runs[start][end - start - 1]` is the run `start..end`. Rows are short
+    /// where a forced cut stops them: a run may not span a barrier, and every
+    /// longer run from the same start spans it too.
+    runs: Vec<Vec<GroupPrice>>,
+    n: usize,
+}
+
+impl PriceTable {
+    fn build(pricer: &PhasePricer, forced_cuts: u32) -> Self {
+        let n = pricer.slots.len();
+        let mut runs = Vec::with_capacity(n);
+        for start in 0..n {
+            let mut row = Vec::new();
+            let mut fold = GroupFold::new(start);
+            for end in start + 1..=n {
+                // Growing to `end` crosses the boundary between slots `end - 2`
+                // and `end - 1`, which is cut mask bit `end - 2`. A forced cut
+                // there ends the row: neither this run nor any longer one from
+                // this start is a legal phase.
+                if end >= start + 2 && forced_cuts & (1u32 << (end - 2)) != 0 {
+                    break;
+                }
+                fold.extend(pricer.slots, pricer.volume);
+                row.push(pricer.price(&fold, end < n));
+            }
+            runs.push(row);
+        }
+        Self { runs, n }
+    }
+
+    /// The price of `start..end`, or `None` where a forced cut forbids the run.
+    fn get(&self, start: usize, end: usize) -> Option<&GroupPrice> {
+        self.runs.get(start)?.get(end.checked_sub(start + 1)?)
+    }
+
+    /// How many priced runs were refused, out of how many were priced, and the
+    /// first reason that was not the budget — in `(start, end)` order, which is
+    /// the DP's own.
+    fn refusals(&self) -> (usize, usize, Option<String>) {
+        let mut refused = 0;
+        let mut priced = 0;
+        let mut note = None;
+        for row in &self.runs {
+            for entry in row {
+                priced += 1;
+                if let GroupPrice::Refused(reason) = entry {
+                    refused += 1;
+                    if note.is_none() {
+                        note.clone_from(reason);
+                    }
+                }
+            }
+        }
+        (refused, priced, note)
+    }
+}
+
+/// `best[i] = min over j < i of best[j] + price(j..i)`, in `O(n^2)`.
+///
+/// **The tie-break is the enumeration's, reproduced rather than reinvented.**
+/// The enumeration keeps the candidate minimising `(total, n_phases, mask)`
+/// lexicographically — it iterates masks upwards and compares that triple — and
+/// all three components are additive over the groups of a partition: the total
+/// by construction, the phase count as `+1` per group, and the mask because the
+/// cuts of `0..j` occupy bits `0..j-1` while the run `j..i` contributes exactly
+/// bit `j-1`, so prefix bits and suffix bits are disjoint and lower. A
+/// lexicographic order on an additive triple is translation-invariant, so
+/// minimising it over prefixes minimises it over whole partitions, and the DP
+/// picks the same partition — not merely one of the same cost.
+///
+/// **The sum is accumulated in the same order too.** `best[j] + price(j..i)`
+/// adds groups left to right, exactly as the enumeration's `total += ...` does,
+/// so for any one partition the two produce the bit-identical `f64`. The one
+/// place they could still part is a floating-point one: two prefixes whose costs
+/// differ by less than an ulp of the eventual total compare `<` here and `==`
+/// there, and the enumeration would then break the tie on the phase count. No
+/// generated chain has produced it; it is stated because it is the only known
+/// gap.
+fn search_dp(table: &PriceTable) -> Option<Vec<(usize, usize)>> {
+    let n = table.n;
+    // (cost, phases, cut mask, the cut this state came from)
+    let mut best: Vec<Option<(f64, usize, u32, usize)>> = vec![None; n + 1];
+    best[0] = Some((0.0, 0, 0, 0));
+    for end in 1..=n {
+        for start in 0..end {
+            let Some((prefix_cost, prefix_phases, prefix_mask, _)) = best[start] else {
+                continue;
+            };
+            let Some(GroupPrice::Priced(priced)) = table.get(start, end) else {
+                continue;
+            };
+            let cost = prefix_cost + priced.total;
+            let phases = prefix_phases + 1;
+            let mask = prefix_mask | if start == 0 { 0 } else { 1u32 << (start - 1) };
+            let better = match best[end] {
+                None => true,
+                Some((best_cost, best_phases, best_mask, _)) => {
+                    (cost, phases, mask) < (best_cost, best_phases, best_mask)
+                }
+            };
+            if better {
+                best[end] = Some((cost, phases, mask, start));
+            }
+        }
+    }
+    best[n]?;
+    let mut spans = Vec::new();
+    let mut end = n;
+    while end > 0 {
+        let (_, _, _, start) = best[end].expect("a reachable state names a reachable predecessor");
+        spans.push((start, end));
+        end = start;
+    }
+    spans.reverse();
+    Some(spans)
+}
+
+/// Every contiguous partition, priced whole and compared as a triple.
+///
+/// Unchanged in what it chooses: the mask order, the forced-cut filter, the
+/// `(total, n_phases, mask)` comparison and the order refusals are recorded in
+/// are all what they were. What moved is that a run's price now comes from
+/// [`PriceTable`] instead of being recomputed for every partition containing it.
+fn search_exhaustive(
+    table: &PriceTable,
+    forced_cuts: u32,
+    note: &mut Option<String>,
+    refusals: &mut usize,
+) -> Option<Vec<(usize, usize)>> {
+    let n = table.n;
+    let mut best: Option<(f64, usize, u32, Vec<(usize, usize)>)> = None;
+    for mask in 0u32..(1u32 << (n - 1)) {
+        if mask & forced_cuts != forced_cuts {
+            continue;
+        }
+        let mut total = 0.0_f64;
+        let mut spans = Vec::new();
+        let mut feasible = true;
+        for group in groups_for(mask, n) {
+            let start = group[0];
+            let end = group[group.len() - 1] + 1;
+            match table.get(start, end) {
+                Some(GroupPrice::Priced(priced)) => {
+                    total += priced.total;
+                    spans.push((start, end));
+                }
+                Some(GroupPrice::Refused(reason)) => {
+                    if let Some(reason) = reason {
+                        note.get_or_insert_with(|| reason.clone());
+                    }
+                    feasible = false;
+                    break;
+                }
+                // Unreachable while the mask honours the forced cuts, which the
+                // filter above guarantees; treated as infeasible rather than
+                // asserted, because a partition is a candidate and not a claim.
+                None => {
+                    feasible = false;
+                    break;
+                }
+            }
+        }
+        if !feasible {
+            *refusals += 1;
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((best_cost, best_phases, best_mask, _)) => {
+                (total, spans.len(), mask) < (*best_cost, *best_phases, *best_mask)
+            }
+        };
+        if better {
+            best = Some((total, spans.len(), mask, spans));
+        }
+    }
+    best.map(|(_, _, _, spans)| spans)
+}
 
 impl Strategy for Enumerating {
     fn name(&self) -> &'static str {
@@ -1667,12 +2426,25 @@ impl Strategy for Enumerating {
                 "enumerating: the chain has no ops".to_string(),
             ));
         }
-        if slots.len() > MAX_SLOTS {
-            return Err(Error::InvalidArgument(format!(
-                "enumerating: {} slots exceeds the enumeration limit of {MAX_SLOTS}; this is \
-                 the case docs/design/BLOCK_OPS.md reserves the O(n^2) DP for",
-                slots.len()
-            )));
+        let limit = match self.search {
+            PartitionSearch::Dp => MAX_SLOTS,
+            PartitionSearch::Exhaustive => MAX_EXHAUSTIVE_SLOTS,
+        };
+        if slots.len() > limit {
+            return Err(Error::InvalidArgument(match self.search {
+                PartitionSearch::Dp => format!(
+                    "enumerating: {} slots exceeds the {MAX_SLOTS} the O(n^2) DP admits. The \
+                     search is not what bounds it — the cut mask a plan is chosen by is a \
+                     `u32`, and a chain this long cannot state its own boundaries in one.",
+                    slots.len()
+                ),
+                PartitionSearch::Exhaustive => format!(
+                    "enumerating: {} slots exceeds the exhaustive search's limit of \
+                     {MAX_EXHAUSTIVE_SLOTS}; this is the case docs/design/BLOCK_OPS.md reserves \
+                     the O(n^2) DP for, and `PartitionSearch::Dp` — the default — is it",
+                    slots.len()
+                ),
+            }));
         }
         if constraints.block_candidates.is_empty() {
             return Err(Error::InvalidArgument(
@@ -1680,186 +2452,75 @@ impl Strategy for Enumerating {
             ));
         }
         let volume = workflow.shape;
-        let bytes = workflow.dtype.size_of() as f64;
-        let mut best: Option<(f64, usize, u32, Vec<PhaseDecomposition>)> = None;
-        let mut budget_failures = 0usize;
+        // Cuts neither search is free to skip: a full-reach op is a planning
+        // barrier, so it is its own phase whatever the cost model thinks. See
+        // `is_planning_barrier`.
+        let forced_cuts = barrier_cuts(&slots, volume);
+        let pricer = PhasePricer {
+            slots: &slots,
+            volume,
+            bytes: workflow.dtype.size_of() as f64,
+            constraints,
+        };
+        let table = PriceTable::build(&pricer, forced_cuts);
+
         // Why a partition was dropped for a reason that is not the budget. Kept
         // so the final refusal can say "these two ops mandate different blocks"
         // rather than blaming a budget that was never the problem.
         let mut constraint_note: Option<String> = None;
-        // Cuts the enumeration is not free to skip: a full-reach op is a
-        // planning barrier, so it is its own phase whatever the cost model
-        // thinks. See `is_planning_barrier`.
-        let forced_cuts = barrier_cuts(&slots, volume);
-
-        for mask in 0u32..(1u32 << (slots.len() - 1)) {
-            if mask & forced_cuts != forced_cuts {
-                continue;
-            }
-            let groups = groups_for(mask, slots.len());
-            let mut total = 0.0_f64;
-            let mut phases = Vec::with_capacity(groups.len());
-            let mut feasible = true;
-
-            for (position, group) in groups.iter().enumerate() {
-                // Reaches in two coordinate spaces cannot be folded without a
-                // grid, so a group containing both is infeasible *as a group* —
-                // the same shape of answer a block-shape conflict gives, and it
-                // drops the partition rather than the plan.
-                let (reach, compute, names, orders) =
-                    match super::decomposition::summarise_slots(&slots, group, volume) {
-                        Ok(summary) => summary,
-                        Err(err) => {
-                            constraint_note.get_or_insert_with(|| err.to_string());
-                            feasible = false;
-                            break;
-                        }
-                    };
-                let is_materialised = position + 1 < groups.len();
-                // What the ops in this group will accept. A conflict is a fact
-                // about *this partition* — the same two ops in two phases are
-                // fine — so it drops the partition and the search goes on.
-                let mandated = match constraint_for(&slots, group, volume) {
-                    Ok(found) => found,
-                    Err(err) => {
-                        constraint_note.get_or_insert_with(|| err.to_string());
-                        feasible = false;
-                        break;
-                    }
-                };
-                let price = |grid: &BlockGrid| {
-                    price_phase(
-                        grid,
-                        &reach,
-                        compute,
-                        orders.len(),
-                        is_materialised,
-                        bytes,
-                        &constraints.model,
-                        constraints.model.materialise_cost_per_voxel,
-                    )
-                };
-                let affordable = |cost: &super::decomposition::PhaseCost| {
-                    constraints.budget_bytes.is_none_or(|budget| {
-                        cost.working_set_bytes_per_block
-                            * constraints.expected_concurrency.max(1) as f64
-                            <= budget as f64
-                    })
-                };
-                let mut chosen: Option<(f64, usize, BlockGrid)> = None;
-                // The halo this phase grants. Equal to the reach unless an op
-                // mandates an input extent, in which case it is the per-block
-                // window that hands every block that extent — see
-                // `BlockConstraint::lattice`.
-                let mut halo = reach.clone();
-                if let Some(constraint) = &mandated {
-                    // A mandate replaces the candidate list rather than filtering
-                    // it: `block_candidates` is a list of scalar edges and a
-                    // mandated shape is anisotropic in general, so it is not
-                    // expressible as a candidate at all. The budget still binds —
-                    // a block that does not fit does not fit — but there is
-                    // nothing to choose between.
-                    match constraint.lattice(volume, &reach) {
-                        Ok(Some((grid, window))) => {
-                            let cost = price(&grid);
-                            if affordable(&cost) {
-                                halo = window;
-                                chosen =
-                                    Some((cost.cost_per_block * grid.n_blocks() as f64, 0, grid));
-                            }
-                        }
-                        Ok(None) => {
-                            constraint_note.get_or_insert_with(|| {
-                                format!(
-                                    "the ops of phase {position} mandate {constraint:?}, which \
-                                     no block grid produces: a grid's cores are `index * \
-                                     block`, evenly strided and disjoint. A plan for it has to \
-                                     state each block's fetch region explicitly."
-                                )
-                            });
-                        }
-                        Err(err) => {
-                            constraint_note.get_or_insert_with(|| err.to_string());
-                        }
-                    }
-                } else {
-                    let axes = splittable_axes(&constraints.split_axes, &reach, volume);
-                    for &edge in &constraints.block_candidates {
-                        let grid = match BlockGrid::along(volume, &axes, edge) {
-                            Ok(grid) => grid,
-                            Err(_) => continue,
-                        };
-                        let cost = price(&grid);
-                        if !affordable(&cost) {
-                            continue;
-                        }
-                        let phase_total = cost.cost_per_block * grid.n_blocks() as f64;
-                        // deterministic: lower cost, then the larger block edge
-                        let better = match &chosen {
-                            None => true,
-                            Some((best_cost, best_edge, _)) => {
-                                (phase_total, std::cmp::Reverse(edge))
-                                    < (*best_cost, std::cmp::Reverse(*best_edge))
-                            }
-                        };
-                        if better {
-                            chosen = Some((phase_total, edge, grid));
-                        }
-                    }
-                }
-                let Some((phase_total, _, grid)) = chosen else {
-                    feasible = false;
-                    break;
-                };
-                let phase = PhaseDecomposition::derive(group.clone(), names, reach, halo, grid);
-                // The same check `execute` will run, run here: a mandated extent
-                // and a non-zero reach are not jointly satisfiable, and the place
-                // to discover that is the planner rather than the run.
-                if let Some(constraint) = &mandated {
-                    if let Err(err) = constraint.check(&phase.blocks, &format!("phase {position}"))
-                    {
-                        constraint_note.get_or_insert_with(|| err.to_string());
-                        feasible = false;
-                        break;
-                    }
-                }
-                total += phase_total;
-                phases.push(phase);
-            }
-
-            if !feasible {
-                budget_failures += 1;
-                continue;
-            }
-            let better = match &best {
-                None => true,
-                Some((best_cost, best_phases, best_mask, _)) => {
-                    (total, phases.len(), mask) < (*best_cost, *best_phases, *best_mask)
-                }
+        let mut budget_failures = 0usize;
+        let spans = match self.search {
+            PartitionSearch::Dp => search_dp(&table),
+            PartitionSearch::Exhaustive => search_exhaustive(
+                &table,
+                forced_cuts,
+                &mut constraint_note,
+                &mut budget_failures,
+            ),
+        };
+        let spans = spans.ok_or_else(|| {
+            let reason = |note: &Option<String>| match note {
+                None => String::new(),
+                Some(note) => format!(
+                    " At least one partition was dropped for a reason that is not the budget: \
+                     {note}"
+                ),
             };
-            if better {
-                best = Some((total, phases.len(), mask, phases));
-            }
-        }
-
-        let (_, _, _, phases) = best.ok_or_else(|| {
-            Error::InvalidArgument(format!(
-                "enumerating: none of the {} partitions fits the {:?} byte budget at \
-                 concurrency {} with block candidates {:?}. Reduce the concurrency, add a \
-                 smaller block candidate, or raise the budget.{}",
-                budget_failures,
-                constraints.budget_bytes,
-                constraints.expected_concurrency,
-                constraints.block_candidates,
-                match &constraint_note {
-                    None => String::new(),
-                    Some(note) => format!(
-                        " At least one partition was dropped for a reason that is not the \
-                         budget: {note}"
-                    ),
+            Error::InvalidArgument(match self.search {
+                PartitionSearch::Exhaustive => format!(
+                    "enumerating: none of the {} partitions fits the {:?} byte budget at \
+                     concurrency {} with block candidates {:?}. Reduce the concurrency, add a \
+                     smaller block candidate, or raise the budget.{}",
+                    budget_failures,
+                    constraints.budget_bytes,
+                    constraints.expected_concurrency,
+                    constraints.block_candidates,
+                    reason(&constraint_note),
+                ),
+                PartitionSearch::Dp => {
+                    let (refused, priced, note) = table.refusals();
+                    format!(
+                        "enumerating: no partition of the {} slots fits the {:?} byte budget at \
+                         concurrency {} with block candidates {:?} — {refused} of the {priced} \
+                         contiguous slot runs the O(n^2) search priced could not be a phase. \
+                         Reduce the concurrency, add a smaller block candidate, or raise the \
+                         budget.{}",
+                        slots.len(),
+                        constraints.budget_bytes,
+                        constraints.expected_concurrency,
+                        constraints.block_candidates,
+                        reason(&note),
+                    )
                 }
-            ))
+            })
         })?;
+        let phases: Vec<PhaseDecomposition> = spans
+            .into_iter()
+            .map(|(start, end)| match table.get(start, end) {
+                Some(GroupPrice::Priced(priced)) => priced.clone().into_phase(start, end),
+                _ => unreachable!("the search returns only runs it priced"),
+            })
+            .collect();
 
         let mut decomposition = Decomposition {
             volume,
@@ -1960,7 +2621,9 @@ impl Strategy for Greedy {
 
         let mut phases = Vec::with_capacity(groups.len());
         for (position, group) in groups.iter().enumerate() {
-            let (reach, compute, names, orders) =
+            // `compute` is dropped here and re-asked per candidate grid; see
+            // `decomposition::compute_per_voxel`.
+            let (reach, _compute, names, orders) =
                 super::decomposition::summarise_slots(&slots, group, volume)?;
             let is_materialised = position + 1 < groups.len();
             let mandated = constraint_for(&slots, group, volume)?;
@@ -1982,7 +2645,7 @@ impl Strategy for Greedy {
                 let cost = price_phase(
                     &candidate,
                     &reach,
-                    compute,
+                    compute_per_voxel(&slots, group, candidate.block()),
                     orders.len(),
                     is_materialised,
                     bytes,
@@ -2001,6 +2664,7 @@ impl Strategy for Greedy {
                 // largest candidate that fits
                 let mut candidates = constraints.block_candidates.clone();
                 candidates.sort_unstable_by(|a, b| b.cmp(a));
+                // As in `Enumerating`: the reach-derived floor is not wired.
                 let axes = splittable_axes(&constraints.split_axes, &reach, volume);
                 for edge in candidates {
                     let Ok(candidate) = BlockGrid::along(volume, &axes, edge) else {
@@ -2009,7 +2673,7 @@ impl Strategy for Greedy {
                     let cost = price_phase(
                         &candidate,
                         &reach,
-                        compute,
+                        compute_per_voxel(&slots, group, candidate.block()),
                         orders.len(),
                         is_materialised,
                         bytes,
@@ -2133,5 +2797,289 @@ mod tests {
         let env = super::super::env::AccountingEnvironment::new([8, 4, 4], [4, 4, 4], 8);
         let err = execute("test", &workflow, &decomposition, &Hints::default(), &env).unwrap_err();
         assert!(err.to_string().contains("never reorder or drop an op"));
+    }
+}
+
+#[cfg(test)]
+mod block_floor_tests {
+    use super::*;
+    use crate::decomposition::{cuttable_axes, splittable_axes, CostModel};
+    use crate::env::ArrayEnvironment;
+    use crate::probes::WindowSumOp;
+    use crate::reach::Reach;
+    use crate::voxels::Voxels;
+
+    /// The measured case, at the numbers it was measured at: a 716-offset
+    /// element whose reach is 15 on a `[24, 20, 16]` volume.
+    const VOLUME: [usize; 3] = [24, 20, 16];
+    const RADIUS: [usize; 3] = [15, 15, 0];
+
+    fn ramp(shape: [usize; 3]) -> Voxels {
+        let n = shape[0] * shape[1] * shape[2];
+        let data: Vec<f64> = (0..n).map(|i| (i % 37) as f64).collect();
+        ndarray::Array3::from_shape_vec(shape, data).unwrap().into()
+    }
+
+    /// Total voxels fetched over the run, divided by the voxels in the volume.
+    ///
+    /// The number `forme.md` names as the one that justifies the floor: a
+    /// small-reach stencil sits near `1.0`, and the distance from `1.0` *is* the
+    /// cost of the decomposition.
+    fn amplification(plan: &Decomposition) -> f64 {
+        let read: usize = plan.exact_read_voxels().iter().sum();
+        let volume: usize = VOLUME.iter().product();
+        read as f64 / volume as f64
+    }
+
+    /// **What the floor is a floor against**, stated as arithmetic rather than
+    /// as a claim: without it, the axes whose reach covers the volume are cut
+    /// anyway, and every one of the resulting blocks reads all of them.
+    #[test]
+    fn cutting_an_axis_the_reach_already_spans_multiplies_the_read_and_saves_nothing() {
+        let reach = Reach::from(RADIUS);
+        let unfloored = splittable_axes(&[0, 1, 2], &reach, VOLUME);
+        assert_eq!(unfloored, vec![0, 1, 2], "the old rule cuts all three");
+        let grid = BlockGrid::along(VOLUME, &unfloored, 3).unwrap();
+        assert_eq!(grid.n_blocks(), 336, "the plan that ran past 15 minutes");
+        for axis in 0..2 {
+            let (lo, hi) = reach.axis(axis).bound(VOLUME[axis]);
+            assert!(
+                3 + lo + hi >= VOLUME[axis],
+                "axis {axis}: the read is clamped to the whole axis whatever the block edge is"
+            );
+        }
+
+        // The floor keeps the one axis where a cut narrows the read and drops
+        // the two where it does not. Not a refusal: a plan is still offered.
+        let floored = cuttable_axes(&[0, 1, 2], &reach, VOLUME, 3);
+        assert_eq!(floored, vec![2]);
+        assert_eq!(
+            BlockGrid::along(VOLUME, &floored, 3).unwrap().block(),
+            [24, 20, 3]
+        );
+    }
+
+    /// What the floor would buy, measured on the two plans it chooses between.
+    ///
+    /// **Not asserted through a planner**, because the floor is not wired into
+    /// one; see `cuttable_axes`. What is asserted is the arithmetic the decision
+    /// would rest on, so that whoever takes that decision has the number rather
+    /// than the argument: 336 blocks reading **48.9x** the volume, against six
+    /// reading 1.125x of it, for the same answer.
+    ///
+    /// The figure is `forme.md`'s *touched voxels / volume voxels* — the
+    /// distance from `1.0` being the cost of the decomposition — taken from
+    /// `Decomposition::exact_read_voxels`, which is the clamped geometry rather
+    /// than the model's infinite-grid redundancy. 48.9 rather than 336 because
+    /// axis 2's reach is zero, so the one axis a cut does narrow is narrowed.
+    #[test]
+    fn the_floor_would_take_the_amplification_from_49_to_1_125() {
+        let reach = Reach::from(RADIUS);
+        let phase = |axes: &[usize], edge: usize| {
+            let plan = Decomposition {
+                volume: VOLUME,
+                dtype: Dtype::F64,
+                phases: vec![PhaseDecomposition::derive(
+                    vec![0],
+                    vec!["w".to_string()],
+                    reach.clone(),
+                    reach.clone(),
+                    BlockGrid::along(VOLUME, axes, edge).unwrap(),
+                )],
+                chain_reach: RADIUS,
+            };
+            (plan.phases[0].grid.n_blocks(), amplification(&plan))
+        };
+
+        let (blocks, amplified) = phase(&splittable_axes(&[0, 1, 2], &reach, VOLUME), 3);
+        assert_eq!(blocks, 336);
+        assert!(
+            (amplified - 48.9375).abs() < 1e-9,
+            "the number the decision rests on moved: {amplified}"
+        );
+
+        let (blocks, amplified) = phase(&cuttable_axes(&[0, 1, 2], &reach, VOLUME, 3), 3);
+        assert_eq!(blocks, 6);
+        assert!(amplified < 1.2, "{amplified}");
+    }
+
+    /// **And it changes no voxel.** The floored plan, the unfloored one it
+    /// replaced, and the single-block oracle all produce the same volume, byte
+    /// for byte. A block grid is how the answer is cut up, never what it is —
+    /// which is what makes the floor a cost decision that is safe to take.
+    #[test]
+    fn the_floor_moves_the_grid_and_not_the_answer() {
+        let workflow = Workflow::new(Chain::op(WindowSumOp::new("w", RADIUS)), VOLUME, Dtype::F64);
+        let input = ramp(VOLUME);
+
+        let run = |plan: &Decomposition| -> Voxels {
+            let env = ArrayEnvironment::for_decomposition(input.clone(), plan, [4, 4, 4]).unwrap();
+            execute("floor", &workflow, plan, &Hints::default(), &env).unwrap();
+            env.level(plan.n_phases())
+        };
+
+        let oracle = run(&Trivial
+            .decompose(&workflow, &Constraints::default())
+            .unwrap());
+
+        let reach = Reach::from(RADIUS);
+        let plan = |axes: &[usize]| Decomposition {
+            volume: VOLUME,
+            dtype: Dtype::F64,
+            phases: vec![PhaseDecomposition::derive(
+                vec![0],
+                vec!["w".to_string()],
+                reach.clone(),
+                reach.clone(),
+                BlockGrid::along(VOLUME, axes, 3).unwrap(),
+            )],
+            chain_reach: RADIUS,
+        };
+        assert_eq!(
+            run(&plan(&splittable_axes(&[0, 1, 2], &reach, VOLUME))),
+            oracle,
+            "the 336-block plan the floor would remove"
+        );
+        assert_eq!(
+            run(&plan(&cuttable_axes(&[0, 1, 2], &reach, VOLUME, 3))),
+            oracle,
+            "the plan the floor would leave"
+        );
+    }
+
+    /// It cannot make a plan infeasible: the resident set on a dropped axis was
+    /// already clamped to the volume, so the budget sees the same number.
+    #[test]
+    fn the_floor_never_turns_an_affordable_plan_into_an_unaffordable_one() {
+        let workflow = Workflow::new(Chain::op(WindowSumOp::new("w", RADIUS)), VOLUME, Dtype::F64);
+        let reach = workflow.chain.reach_spec(VOLUME).unwrap();
+        for edge in [1usize, 2, 3, 4, 8, 16, 32] {
+            let before =
+                BlockGrid::along(VOLUME, &splittable_axes(&[0, 1, 2], &reach, VOLUME), edge)
+                    .unwrap();
+            let after = BlockGrid::along(
+                VOLUME,
+                &cuttable_axes(&[0, 1, 2], &reach, VOLUME, edge),
+                edge,
+            )
+            .unwrap();
+            let price = |grid: &BlockGrid| {
+                price_phase(grid, &reach, 1.0, 1, false, 8.0, &CostModel::default(), 1.0)
+                    .working_set_bytes_per_block
+            };
+            assert!(
+                price(&after) <= price(&before),
+                "edge {edge}: the floor raised the resident set"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+    use crate::decomposition::summarise_slots;
+    use crate::op::BlockOp;
+    use crate::probes::{IdentityOp, WindowSumOp};
+    use crate::reach::{AxisReach, Space};
+    use crate::voxels::Voxels;
+
+    /// An op that states whatever reach the test wants, including forms the
+    /// shipped probes cannot: one-sided, whole-axis, and in another coordinate
+    /// space.
+    struct Stated {
+        name: &'static str,
+        reach: Reach,
+    }
+
+    impl BlockOp for Stated {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        /// Derived from the full statement, because `Chain::reach_spec` checks
+        /// that this is a bound on it rather than trusting that it is.
+        fn reach(&self, axis: usize, volume_len: usize) -> usize {
+            match self.reach.axis(axis) {
+                AxisReach::Bounded { lo, hi } => *lo.max(hi),
+                _ => volume_len,
+            }
+        }
+
+        fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+            self.reach.clone()
+        }
+
+        fn accepts(&self, _dtype: Dtype) -> bool {
+            true
+        }
+
+        fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+            out.assign(input)
+        }
+    }
+
+    /// [`GroupFold`] is [`summarise_slots`], incrementally — including which
+    /// slot it blames.
+    ///
+    /// This assertion is not redundant with `tests/partition_search.rs`. Both
+    /// searches read the fold, so a fold that diverged from `summarise_slots`
+    /// would move the DP's plan and the enumeration's plan *together* and the
+    /// agreement sweep would see nothing. This is the check that the refactor
+    /// kept the enumeration's own answer, rather than only that the two searches
+    /// still agree with each other.
+    #[test]
+    fn folding_a_run_of_slots_matches_summarising_it() {
+        let volume = [32, 16, 8];
+        let chain = Chain::sequence(vec![
+            Chain::op(IdentityOp::new("a", [2, 0, 0]).with_order([0, 1, 2])),
+            Chain::op(WindowSumOp::new("b", [1, 1, 0])),
+            Chain::op(Stated {
+                name: "c",
+                reach: Reach::asymmetric([(3, 1), (0, 2), (0, 0)]),
+            }),
+            // A reach in another space: it cannot be folded with the ones above
+            // it, so every run that spans it is refused — by both, in the same
+            // words.
+            Chain::op(Stated {
+                name: "d",
+                reach: Reach::none().in_space(Space::source_index()),
+            }),
+            Chain::op(IdentityOp::new("e", [0, 0, 4]).with_order([2, 1, 0])),
+            Chain::op(Stated {
+                name: "f",
+                reach: Reach::per_axis([AxisReach::All, AxisReach::none(), AxisReach::none()]),
+            }),
+        ]);
+        let slots = chain.slots();
+        let mut refusals = 0;
+        for start in 0..slots.len() {
+            let mut fold = GroupFold::new(start);
+            for end in start + 1..=slots.len() {
+                fold.extend(&slots, volume);
+                let group: Vec<usize> = (start..end).collect();
+                match summarise_slots(&slots, &group, volume) {
+                    Ok((reach, _compute, names, orders)) => {
+                        assert!(fold.refusal.is_none(), "{start}..{end}: {:?}", fold.refusal);
+                        assert_eq!(
+                            fold.reach.clone().unwrap_or_default(),
+                            reach,
+                            "{start}..{end}"
+                        );
+                        assert_eq!(fold.names, names, "{start}..{end}");
+                        assert_eq!(fold.orders, orders, "{start}..{end}");
+                    }
+                    Err(err) => {
+                        refusals += 1;
+                        assert_eq!(
+                            fold.refusal.as_deref(),
+                            Some(err.to_string().as_str()),
+                            "{start}..{end}: the fold and the summary must refuse alike"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(refusals >= 6, "the refusing runs were not exercised");
     }
 }

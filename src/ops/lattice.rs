@@ -664,6 +664,13 @@ fn check_fetch_is_unambiguous(op: &LatticeStatisticOp, sources: &[Region]) -> Re
 
 // -------------------------------------------------------- interpolation --
 
+/// Re-exported at the path it was first published under.
+///
+/// The type itself sits beside `SampleLattice`, in `local`, because it is a rule
+/// about that lattice and both this module and the fused op in `local` ask it
+/// the same question. Two callers, one rule: see [`Alignment::bracket`].
+pub use super::local::Alignment;
+
 /// Interpolate a lattice-shaped volume back to full resolution.
 ///
 /// The other half of the split: it reads the coarse level
@@ -676,17 +683,33 @@ fn check_fetch_is_unambiguous(op: &LatticeStatisticOp, sources: &[Region]) -> Re
 /// `SampleLattice::bracket` is documented against: where the two samples agree
 /// it returns their value **exactly**, whatever the weight, which is what makes
 /// `constant_maps_to` exactly true rather than nearly true.
-#[derive(Debug)]
+///
+/// **Which samples a voxel blends is a declared parameter**, not a property of
+/// the lattice: see [`Alignment`], and [`Self::with_alignment`] for how
+/// a caller states it. It is held here rather than in the `SampleLattice`
+/// because it is not a fact about where the samples are — the statistic half
+/// shares the same lattice and has no interpolation to have a convention about.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LatticeInterpolateOp {
     name: &'static str,
     lattice: SampleLattice,
+    alignment: Alignment,
     cost: f64,
 }
 
 impl LatticeInterpolateOp {
-    /// Bind to a lattice. The same lattice the statistic was bound to, or the
-    /// two phases do not compose — checked in [`lattice_interpolate_phase`],
-    /// which is where both volumes are in scope.
+    /// Bind to a lattice, at [`Alignment::default`]. The same lattice the
+    /// statistic was bound to, or the two phases do not compose — checked in
+    /// [`lattice_interpolate_phase`], which is where both volumes are in scope.
+    ///
+    /// **The evenness this insists on is wider than one convention needs.**
+    /// [`Alignment::PinnedEnds`] reads how many samples there are and never
+    /// where they sit, so an unevenly spread lattice would interpolate under it
+    /// perfectly well. The check stays on the constructor anyway, because a
+    /// constructor has one contract and the convention is chosen after it — and
+    /// because an uneven lattice is refused by [`interpolate_block_edge`] and by
+    /// the statistic half regardless, so accepting it here would buy a caller an
+    /// op it could not plan.
     pub fn new(name: &'static str, lattice: SampleLattice) -> Result<Self> {
         for axis in 0..3 {
             if lattice.uniform_gap(axis).is_none() {
@@ -702,12 +725,40 @@ impl LatticeInterpolateOp {
         Ok(Self {
             name,
             lattice,
+            alignment: Alignment::default(),
             cost: INTERPOLATE_COST,
         })
     }
 
     pub fn lattice(&self) -> &SampleLattice {
         &self.lattice
+    }
+
+    /// The convention this op maps a fine voxel back to the lattice by.
+    ///
+    /// A builder rather than an argument to [`Self::new`], for
+    /// `ops::ridge::Boundary`'s reason: it has a default that is right for every
+    /// caller who has not been asked to match something else, and putting it in
+    /// the constructor would make every existing caller state it. The choice is
+    /// part of what this op *is* — two ops differing only in it are not equal,
+    /// and they compute different numbers from the same samples — so it is held
+    /// in the struct and compared by its `PartialEq` rather than passed per
+    /// call, where two blocks of one phase could be given different answers.
+    ///
+    /// It changes the op's fetch regions, and it changes them everywhere at
+    /// once: `fetch_axis` is the single place they are derived, so the plan
+    /// [`lattice_interpolate_phase`] builds and the samples
+    /// [`BlockOp::apply_placed`] reads cannot come apart.
+    ///
+    /// It changes **no** output volume, no `reach_spec`, and no cost: the same
+    /// trilinear blend over a differently chosen pair.
+    pub fn with_alignment(mut self, alignment: Alignment) -> Self {
+        self.alignment = alignment;
+        self
+    }
+
+    pub fn alignment(&self) -> Alignment {
+        self.alignment
     }
 
     pub fn with_cost(mut self, cost: f64) -> Self {
@@ -733,18 +784,25 @@ impl LatticeInterpolateOp {
     /// reads. `bracket` is monotone in the coordinate, so the endpoints bound
     /// every voxel between them.
     ///
+    /// **Which samples those are depends on this op's [`Alignment`]**, and this
+    /// is the only place it is asked — so the fetch a plan states and the
+    /// samples the kernel reads move together by construction rather than by two
+    /// call sites agreeing. The two conventions give genuinely different
+    /// answers here for the same block: they read different source positions,
+    /// which is the whole of what the parameter does.
+    ///
     /// [`Placement`]: crate::op::Placement
     fn fetch_axis(&self, axis: usize, start: usize, extent: usize) -> Option<(usize, usize)> {
         if start >= self.lattice.volume()[axis] {
             return None;
         }
         if extent == 0 {
-            let at = self.lattice.bracket(axis, start).0;
+            let at = self.alignment.bracket(&self.lattice, axis, start).0;
             return Some((at, at));
         }
         let last = (start + extent - 1).min(self.lattice.volume()[axis] - 1);
-        let low = self.lattice.bracket(axis, start).0;
-        let high = self.lattice.bracket(axis, last).1;
+        let low = self.alignment.bracket(&self.lattice, axis, start).0;
+        let high = self.alignment.bracket(&self.lattice, axis, last).1;
         Some((low, high + 1))
     }
 
@@ -858,6 +916,19 @@ impl BlockOp for LatticeInterpolateOp {
         self.output_shape(input)
     }
 
+    /// The waiver, stated. This op's two extents are not a function of each
+    /// other — see [`Self::placed_output_shape`] — and the check it owes in
+    /// exchange is in [`Self::apply_placed`]: every voxel written must bracket
+    /// between samples the buffer actually holds.
+    ///
+    /// Without this the plan is refused by
+    /// [`check_output_shapes`](crate::decomposition::check_output_shapes),
+    /// which is the point: it is the framework noticing that an op answered out
+    /// of the plan, rather than an op being trusted not to.
+    fn takes_extent_from_placement(&self) -> bool {
+        true
+    }
+
     /// Interpolate the block's own fine voxels from the samples it was handed.
     ///
     /// **Both ends of the map come from the placement**, and neither is derived
@@ -903,10 +974,10 @@ impl BlockOp for LatticeInterpolateOp {
             if written[axis] == 0 || held[axis] == 0 {
                 continue;
             }
-            let low = self.lattice.bracket(axis, origin[axis]).0;
+            let low = self.alignment.bracket(&self.lattice, axis, origin[axis]).0;
             let high = self
-                .lattice
-                .bracket(axis, origin[axis] + written[axis] - 1)
+                .alignment
+                .bracket(&self.lattice, axis, origin[axis] + written[axis] - 1)
                 .1;
             if low < offset[axis] || high >= offset[axis] + held[axis] {
                 return Err(Error::InvalidArgument(format!(
@@ -924,7 +995,7 @@ impl BlockOp for LatticeInterpolateOp {
             }
         }
         let out = out.view_mut::<f64>()?;
-        lattice_interpolate_into(view, offset, origin, &self.lattice, out)
+        lattice_interpolate_into_with(view, offset, origin, &self.lattice, self.alignment, out)
     }
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
@@ -948,7 +1019,14 @@ impl BlockOp for LatticeInterpolateOp {
                 self.name, at.offset
             )));
         }
-        lattice_interpolate_into(input, at.offset, [0, 0, 0], &self.lattice, out)
+        lattice_interpolate_into_with(
+            input,
+            at.offset,
+            [0, 0, 0],
+            &self.lattice,
+            self.alignment,
+            out,
+        )
     }
 
     /// Exactly, and by the arithmetic rather than by an argument: every tap is
@@ -981,6 +1059,28 @@ pub fn lattice_interpolate_into(
     offset: [usize; 3],
     origin: [usize; 3],
     lattice: &SampleLattice,
+    out: ArrayViewMut3<'_, f64>,
+) -> Result<()> {
+    lattice_interpolate_into_with(input, offset, origin, lattice, Alignment::default(), out)
+}
+
+/// [`lattice_interpolate_into`], with the convention stated.
+///
+/// The general form; the one above is this at [`Alignment::default`], which
+/// is what every caller meant before there was a choice — so nothing moves by
+/// adding this and no existing call site has to say anything.
+///
+/// The convention is applied to a **global** fine coordinate, `origin + step`,
+/// and the sample indices it answers are then shifted by `offset` into the
+/// buffer. That order is the whole reason this is decomposition-invariant: the
+/// coordinate a voxel maps to is a function of the volume and the voxel, and a
+/// block never enters the arithmetic.
+pub fn lattice_interpolate_into_with(
+    input: ArrayView3<'_, f64>,
+    offset: [usize; 3],
+    origin: [usize; 3],
+    lattice: &SampleLattice,
+    alignment: Alignment,
     mut out: ArrayViewMut3<'_, f64>,
 ) -> Result<()> {
     let held = [input.shape()[0], input.shape()[1], input.shape()[2]];
@@ -1003,7 +1103,7 @@ pub fn lattice_interpolate_into(
         .map(|axis| {
             (0..shape[axis])
                 .map(|step| {
-                    let (a, b, t) = lattice.bracket(axis, origin[axis] + step);
+                    let (a, b, t) = alignment.bracket(lattice, axis, origin[axis] + step);
                     let last = held[axis] - 1;
                     (
                         a.saturating_sub(offset[axis]).min(last),

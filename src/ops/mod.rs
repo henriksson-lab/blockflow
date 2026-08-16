@@ -163,13 +163,15 @@ pub use detect::{
 pub use element::{select_nth, ElementShape, Percentile, Rank, StructuringElement, Total};
 pub use fill::{fill_phases, FillHolesOp, LabelBackgroundOp};
 pub use lattice::{
-    interpolate_block_edge, lattice_interpolate_into, lattice_interpolate_phase,
-    lattice_statistic_into, lattice_statistic_phase, statistic_block_edge, LatticeInterpolateOp,
-    LatticeStatisticOp,
+    interpolate_block_edge, lattice_interpolate_into, lattice_interpolate_into_with,
+    lattice_interpolate_phase, lattice_statistic_into, lattice_statistic_phase,
+    statistic_block_edge, LatticeInterpolateOp, LatticeStatisticOp,
 };
 pub use local::{
-    axis_max_distance, local_statistic_into, threshold_against_into, AdaptiveThresholdOp, Isodata,
-    LocalStatistic, LocalStatisticOp, SampleLattice, Sampling, Statistic,
+    axis_max_distance, local_statistic_into, local_statistic_into_with,
+    masked_local_statistic_into, masked_local_statistic_into_with, threshold_against_into,
+    AdaptiveThresholdOp, Alignment, EmptyPopulation, Isodata, LocalStatistic, LocalStatisticOp,
+    Population, SampleLattice, Sampling, Statistic,
 };
 pub use morphology::{close_into, dilate_into, erode_into, open_into, Morphology, MorphologyOp};
 pub use normalise::{

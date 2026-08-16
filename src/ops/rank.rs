@@ -737,7 +737,11 @@ impl BlockOp for MaskedRankFilterOp {
 /// and nothing more, because a run that records statistics replaces it with a
 /// measured coefficient for this op's family. One byte of a second array per
 /// offset visited, against the compare-and-select already there.
-const MASK_COST_FACTOR: f64 = 1.35;
+///
+/// `pub(super)` because the lattice statistic charges the same thing for the
+/// same reason — one byte of a second array per offset visited — and a second
+/// copy of the number is a second thing to re-measure.
+pub(super) const MASK_COST_FACTOR: f64 = 1.35;
 
 /// Measured; see `super::COST_MEASUREMENT`. The filter's work is proportional to
 /// the element it is given, so the cost is a function of the element rather than

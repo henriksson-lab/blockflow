@@ -718,8 +718,51 @@ pub trait BlockOp: Send + Sync {
     /// its kernel, against the buffer it was actually handed — which is a
     /// stronger check than the one it replaced, because it is against data
     /// rather than against a declaration.
+    ///
+    /// **What the framework requires rather than hopes for.** "The op owes a
+    /// check" is a sentence in a doc comment, and an op may take the escape, pay
+    /// nothing and say nothing. [`crate::decomposition::check_output_shapes`] is
+    /// what stops it saying nothing: it asks this method twice per block, once
+    /// with the placement the executor will really pass and once with
+    /// [`Placement::writes`] stripped out of it, and an op whose two answers
+    /// differ has demonstrably answered out of the plan. That is allowed, and it
+    /// must be declared — see [`Self::takes_extent_from_placement`].
     fn placed_output_shape(&self, input: [usize; 3], _at: &Placement) -> [usize; 3] {
         self.output_shape(input)
+    }
+
+    /// Whether this op takes its write extent from [`Placement::writes`] rather
+    /// than deriving it from what it reads.
+    ///
+    /// **`false`, which is the answer for every op whose two extents are a
+    /// function of each other** — every op this crate ships but one. Saying
+    /// nothing therefore keeps the executor's per-block comparison of declared
+    /// shape against derived read extent exactly as strong as it was.
+    ///
+    /// `true` is a *waiver*, and the two halves of it are:
+    ///
+    /// * what it buys — [`Self::placed_output_shape`] may answer out of the
+    ///   plan, which is the only thing an op can do when its write extent is not
+    ///   derivable from its read extent at all. `LatticeInterpolateOp` is the
+    ///   case: a lattice's first sample sits half a gap into the volume and the
+    ///   volume is not a whole number of gaps, so two blocks fetching the same
+    ///   samples write different spans, and no shape-to-shape function exists.
+    /// * what it costs — the executor's comparison becomes the plan against
+    ///   itself, so the op owes a check of its own, in its kernel, against the
+    ///   buffer it was actually handed. That check is *stronger* than the one it
+    ///   replaces, being against data rather than against a declaration; what it
+    ///   is not is automatic.
+    ///
+    /// **Why a declaration rather than an inference.** The framework can see
+    /// that an op answered out of the plan — it asks twice and compares — but not
+    /// whether the op meant to, and the two cases want opposite treatment: one is
+    /// a design that has no inverse, the other is an `output_shape` nobody
+    /// maintains behind an override that hides it. Only the op can say which. It
+    /// is also the property that makes the obligation reviewable: the waiver is
+    /// one grep, and every op holding it can be checked for the kernel-side
+    /// replacement it owes.
+    fn takes_extent_from_placement(&self) -> bool {
+        false
     }
 
     // ------------------------------------------------- what it can handle --
@@ -799,6 +842,33 @@ pub trait BlockOp: Send + Sync {
     /// of work", not a measurement.
     fn cost_per_voxel(&self) -> f64 {
         1.0
+    }
+
+    /// [`Self::cost_per_voxel`], for an op whose per-voxel cost is **not**
+    /// independent of the block it is handed.
+    ///
+    /// **Defaulted to the figure that has no block in it**, which is the honest
+    /// answer for every op whose work is a fixed amount per voxel — every op
+    /// this crate shipped before a traversal carried state across voxels.
+    ///
+    /// An op that overrides it has a term whose denominator is a block extent,
+    /// and the case is a traversal primed once per line and then carried: the
+    /// priming is `O(window)` per line and therefore `O(window / line)` per
+    /// voxel, so a short line pays a cost a per-voxel constant cannot state.
+    /// Left unsaid, such an op declares the cost of its steady state and the
+    /// planner believes it at every block size, including the ones where the
+    /// steady state is never reached. This is the one declaration that lets the
+    /// planner see that, and it is why the choice between two ways of computing
+    /// the same thing and the floor under the block size are one decision rather
+    /// than two: both are the op's reach and window against the block.
+    ///
+    /// It must agree with [`Self::cost_per_voxel`] in the limit — a block that
+    /// spans the volume has nothing left for a per-block term to say — because
+    /// the two are compared against each other by the calibration in
+    /// [`crate::statistics`], which measures nanoseconds per unit of *declared*
+    /// cost and has one denominator per op.
+    fn cost_per_voxel_in(&self, _block: [usize; 3]) -> f64 {
+        self.cost_per_voxel()
     }
 
     // ------------------------------------------------- several outputs --
@@ -1736,6 +1806,32 @@ impl Chain {
         }
     }
 
+    /// Whether any live part of this subtree takes its write extent from the
+    /// placement.
+    ///
+    /// **Folded as "any", and `Alternative` consults `taken`.** The waiver is a
+    /// statement about what will run: a `Sequence` or a `Parallel` runs all of
+    /// its members, so one member holding it makes the run's extent
+    /// plan-derived, while an `Alternative` runs one and the branches that do
+    /// not run have waived nothing. That is the same reading `constant_maps_to`
+    /// and `side_outputs` take of the same variant, and for the same reason —
+    /// this is a selection, not a union.
+    pub fn takes_extent_from_placement(&self) -> bool {
+        match self {
+            Chain::Op(op) => op.takes_extent_from_placement(),
+            Chain::Source { .. } => false,
+            Chain::Sequence(children)
+            | Chain::Parallel {
+                branches: children, ..
+            } => children
+                .iter()
+                .any(|child| child.takes_extent_from_placement()),
+            Chain::Alternative { branches, taken } => {
+                branches[*taken].takes_extent_from_placement()
+            }
+        }
+    }
+
     /// The same walk as `reach`, over the same tree, for a subtree that reads
     /// nothing but its input.
     ///
@@ -2140,6 +2236,33 @@ impl Chain {
         }
     }
 
+    /// [`Self::cost_per_voxel`] at one block shape, folded by the same rules.
+    ///
+    /// The same walk over the same tree, so a chain of ops that all default
+    /// [`BlockOp::cost_per_voxel_in`] answers exactly what [`Self::cost_per_voxel`]
+    /// does. **`Alternative` still folds by max**, which is what the *plan* has
+    /// to be budgeted for; choosing between the branches is a different question
+    /// and asks each branch on its own — see
+    /// [`crate::strategy::choose_branches`].
+    pub fn cost_per_voxel_in(&self, block: [usize; 3]) -> f64 {
+        match self {
+            Chain::Op(op) => op.cost_per_voxel_in(block),
+            Chain::Source { .. } => 0.0,
+            Chain::Sequence(children) => children.iter().map(|c| c.cost_per_voxel_in(block)).sum(),
+            Chain::Alternative { branches, .. } => branches
+                .iter()
+                .map(|b| b.cost_per_voxel_in(block))
+                .fold(0.0_f64, f64::max),
+            Chain::Parallel { branches, combine } => {
+                branches
+                    .iter()
+                    .map(|b| b.cost_per_voxel_in(block))
+                    .sum::<f64>()
+                    + combine.cost_per_voxel(branches.len())
+            }
+        }
+    }
+
     /// Fold `constant_maps_to` down the subtree: sequential ops compose, and a
     /// single `None` anywhere collapses the whole subtree to `None`.
     ///
@@ -2308,6 +2431,33 @@ fn fold_specs(
 /// this cannot make a chain that worked stop working; an op that genuinely needs
 /// a placement it was not given sees an anchor that is not in its own space and
 /// refuses by name, which is the arrangement `LatticeInterpolateOp` already has.
+/// The extent a run of chains turns `input_shape` into, at `at`.
+///
+/// The fold [`place_parts`] exists to feed, in one place rather than in each of
+/// its callers: derive a placement per member, then hand each member the extent
+/// the one before produced. The executor asks this of a phase's slots and
+/// [`crate::decomposition::check_output_shapes`] asks it of the same slots at
+/// whole-volume scale, and a guard whose subject is derived twice is a guard
+/// that can be right in one derivation and wrong in the other.
+///
+/// **What `at` carries decides which question this is.** A placement holding a
+/// [`Placement::writes`] lets a member answer out of the plan; a placement
+/// without one does not, because there is nothing there to answer out of. That
+/// is the whole mechanism the plan-independent guard is built on — see
+/// [`BlockOp::placed_output_shape`].
+pub fn parts_output_shape(
+    parts: &[&Chain],
+    at: &Placement,
+    input_shape: [usize; 3],
+) -> Result<[usize; 3]> {
+    let places = place_parts(parts, at, input_shape);
+    let mut current = input_shape;
+    for (part, place) in parts.iter().zip(&places) {
+        current = part.placed_output_shape(current, place)?;
+    }
+    Ok(current)
+}
+
 pub fn place_parts(parts: &[&Chain], at: &Placement, input_shape: [usize; 3]) -> Vec<Placement> {
     let n = parts.len();
     let mut anchors: Vec<Option<Anchor>> = vec![None; n + 1];

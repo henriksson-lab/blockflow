@@ -51,7 +51,7 @@ use crate::region::Region;
 use crate::tiling::boxes_tile_exactly;
 
 use super::geometry::{region_within, BlockGeometry, BlockGrid};
-use super::op::{BlockConstraint, Chain};
+use super::op::{Anchor, BlockConstraint, Chain, Placement};
 
 /// One fused run of slots: read once with a halo sized to **this phase's**
 /// reach, apply the slots back to back, write the valid region.
@@ -909,6 +909,94 @@ pub fn splittable_axes(split_axes: &[usize], reach: &Reach, volume: [usize; 3]) 
         .collect()
 }
 
+/// [`splittable_axes`], with the **floor derived from the reach** applied at one
+/// candidate block edge.
+///
+/// **The planner has a ceiling from memory and needed a floor from reach.** A
+/// block reads `min(edge + lo + hi, volume)` on an axis. Once `lo + hi` reaches
+/// the extent that is the whole axis *for every edge*, so cutting the axis gives
+/// `n` blocks each reading all of it: the total read goes from `volume` to
+/// `n x volume` and the resident set does not move, because it was already
+/// clamped. A measured case is on record — a 716-offset element whose reach was
+/// 15 on a `24 x 20` volume, cut into 336 blocks, running past 15 minutes where
+/// one block would have read the volume once. `O(volume)` became
+/// `O(blocks x volume)`, and nothing in the plan said so.
+///
+/// So a cut is admitted **only where it narrows what a block reads**. That is
+/// the whole rule, it is exact arithmetic on quantities the plan already holds —
+/// the declared reach and the volume — and it contains no threshold to tune. An
+/// edge that fails it on some axis does not lose the candidate: the axis is
+/// simply not cut, the block spans it, and the read that was going to be the
+/// whole axis happens once instead of once per block. That is the strictly
+/// dominating plan by both terms at once, which is why this is structural rather
+/// than a weight — the same argument [`is_planning_barrier`] and
+/// [`splittable_axes`] already make, and this is the sharper form of the second
+/// of them: a full reach (`r >= extent`) is the special case of `lo + hi >=
+/// extent` where one side already covers the volume, and everything between
+/// `extent / 2` and `extent` was being cut for nothing.
+///
+/// **It cannot make a plan infeasible.** The budget is checked against
+/// [`PhaseCost::working_set_bytes_per_block`], which is computed from the
+/// *clamped* read extent; on an axis this drops, the clamp was already at the
+/// volume, so the resident figure is the number it already was. A candidate that
+/// fitted still fits.
+///
+/// **It cannot change a voxel.** A block grid is not an answer, it is how the
+/// answer is cut up; every strategy's output is asserted against `Trivial`'s
+/// single block. What moves is which plan a planner offers, and the one it stops
+/// offering is one that computes the same volume by reading it `n` times.
+///
+/// # Nothing calls this yet, and that is a decision rather than an oversight
+///
+/// Wiring it into [`crate::strategy::Enumerating`] and
+/// [`crate::strategy::Greedy`] costs one line each and makes the measured case
+/// plan six blocks instead of 336. It also **contradicts a stated and tested
+/// position of this crate**, so it is landed and left unwired for whoever settles
+/// that:
+///
+/// * `tests::a_large_but_bounded_reach_is_not_a_barrier_and_still_fuses` asserts
+///   that a reach of `volume - 1` leaves its phase *cuttable* — "priced out of
+///   fusing, but not **forbidden** from it, which is the whole difference from a
+///   barrier". At that reach `lo + hi` is nearly twice the volume, so this rule
+///   forbids the cut. The two cannot both hold.
+/// * [`reaches_whole_axis`] argues the same thing from the other side: the
+///   barrier predicate is an exact comparison *because* any rule of the form
+///   "large means full" would segment a real chain in four places that do not
+///   want it. This is not a threshold — it is exact arithmetic on the declared
+///   reach — but it is a rule under which a large bounded reach stops behaving
+///   like a bounded one for the purpose of cutting.
+/// * and there is a second-order effect that must move with it: [`price_phase`]
+///   charges an axis on the infinite grid when the grid cut it *or* the reach is
+///   whole. Dropping such an axis from the grid without extending that condition
+///   hands the phase the clamp discount and prices it at redundancy `1.0` — the
+///   exact hole `price_phase`'s own doc records having closed for full reaches.
+///   Wired without that, the measured case's partition collapses and the plan
+///   fuses where it used to segment.
+///
+/// The number the decision rests on is in
+/// `strategy::block_floor_tests::the_floor_would_take_the_amplification_from_49_to_1_125`.
+pub fn cuttable_axes(
+    split_axes: &[usize],
+    reach: &Reach,
+    volume: [usize; 3],
+    edge: usize,
+) -> Vec<usize> {
+    splittable_axes(split_axes, reach, volume)
+        .into_iter()
+        .filter(|&axis| {
+            if axis >= 3 {
+                // Out of bounds, and `BlockGrid::along` is where that is said.
+                return true;
+            }
+            // The widest halo over every block, which is what the read extent is
+            // sized by. Saturating because a reach may exceed the volume, which
+            // is exactly the case this exists for.
+            let (lo, hi) = reach.axis(axis).bound(volume[axis]);
+            edge.saturating_add(lo).saturating_add(hi) < volume[axis]
+        })
+        .collect()
+}
+
 /// The infinite-grid per-block cost of one phase.
 ///
 /// `total = n_blocks x per_block_cost(B, partition)`, with no boundary term.
@@ -1048,7 +1136,10 @@ pub fn predicted_cost(
             )));
         }
         let volume = decomposition.volume_at(index);
-        let (_, compute, _, orders) = summarise_slots(&slots, &phase.slots, volume)?;
+        let (_, _, _, orders) = summarise_slots(&slots, &phase.slots, volume)?;
+        // At the grid the plan actually holds, which is the same figure the
+        // search priced this candidate with. See `compute_per_voxel`.
+        let compute = compute_per_voxel(&slots, &phase.slots, phase.grid.block());
         // The last phase writes the workflow's output; every other writes an
         // intermediate. Exactly the test the enumeration makes.
         let is_materialised = index + 1 < decomposition.phases.len();
@@ -1065,6 +1156,23 @@ pub fn predicted_cost(
         total += cost.cost_per_block * phase.grid.n_blocks() as f64;
     }
     Ok(total)
+}
+
+/// The compute figure [`price_phase`] wants, at one candidate block shape.
+///
+/// [`summarise_slots`] answers the same question with no block in hand, because
+/// it is asked *before* a grid exists — its result is what the reach and the
+/// traversal preferences are folded from, and those choose the grid. The compute
+/// term is the one quantity in that tuple that a block can move
+/// ([`crate::op::BlockOp::cost_per_voxel_in`]), so a planner comparing candidates
+/// re-asks it per candidate rather than pricing every grid with the figure from
+/// no grid. For every op that takes the default this is the same number by the
+/// same route, so no plan built before it existed moves.
+pub fn compute_per_voxel(slots: &[&Chain], group: &[usize], block: [usize; 3]) -> f64 {
+    group
+        .iter()
+        .map(|&slot| slots[slot].cost_per_voxel_in(block))
+        .sum()
 }
 
 /// Reach, compute and traversal preferences of a contiguous run of slots.
@@ -1442,9 +1550,145 @@ pub fn check_dtypes(
     Ok(())
 }
 
+/// **An op's write extent must be derivable without the plan, or the op must
+/// say that it is not.**
+///
+/// The fourth guard that cannot live in [`Decomposition::check`], for the reason
+/// [`check_block_constraints`] and [`check_dtypes`] cannot: a plan records op
+/// *names*, not implementations, so the plan alone cannot ask an op anything.
+///
+/// **What went missing.** The executor compares what a phase's ops declare they
+/// produce against the read extent the plan derived (`strategy::run_task`). That
+/// is a real check only while the two sides are derived independently, and
+/// [`BlockOp::placed_output_shape`] opened a door out of it: an op whose write
+/// extent is not a function of its read extent may take the extent from
+/// [`Placement::writes`], which *is* the read extent, and the comparison then
+/// compares the plan with itself. One op does that legitimately and pays for it
+/// with a check of its own against the buffer it was handed. Nothing required
+/// the payment, so any op could take the door and say nothing — which is the
+/// hazard `env.rs`' argument for `apply_with` is about, in its second instance.
+///
+/// **Exact tiling is not the replacement**, and it is worth saying why here
+/// rather than leaving the next reader to re-derive it:
+///
+/// * it already holds, twice. [`Decomposition::check`] runs
+///   [`boxes_tile_exactly`] over each phase's valid regions, and `execute_phases`
+///   runs it again over the regions the executor *actually wrote* — the same
+///   statement about the run rather than about the plan.
+/// * it could not catch this even if it did not hold. The region a task writes is
+///   [`BlockGeometry::valid`], which comes from the plan, and `Placement::writes`
+///   is handed *to* the op by the executor and is the plan's own read extent. An
+///   op influences neither, so it cannot make the union of written regions gap or
+///   overlap. Taking the plan's extent is a wrong-*value* hazard — a kernel
+///   filling a correctly shaped, correctly placed buffer out of a fetch that
+///   could not support it — and no statement about coverage can see one.
+///
+/// **What this asks instead.** [`Placement::writes`] is the only channel by which
+/// the plan's answer reaches an op, so a placement carrying none is a question
+/// the plan cannot answer on the op's behalf. Every block is therefore priced
+/// twice: once with the placement the executor will really pass, and once with
+/// `writes` stripped from it.
+///
+/// * **The two agree.** The op's own arithmetic reproduces the plan's extent, so
+///   the executor's per-block comparison is a real check whatever the op does
+///   with the placement internally. This is every op that takes the default —
+///   which ignores the placement entirely, so the answers cannot differ — and
+///   also an op that reads `writes` while keeping the `output_shape` behind it
+///   maintained. Nothing is owed.
+/// * **They differ.** The op answered out of the plan, the per-block comparison
+///   has gone vacuous, and that is allowed — but only if the op
+///   [`declares`](BlockOp::takes_extent_from_placement) it. An op that has not is
+///   refused by name, here, before a block is read.
+///
+/// The declaration is not a formality: it is what makes the obligation in
+/// `placed_output_shape`'s doc — *the op then owes a check of its own, in its
+/// kernel* — attach to a greppable set of ops rather than to every op that might
+/// one day override the method. It does not verify that the kernel check exists;
+/// nothing the framework can ask would. What it removes is the *silence*.
+///
+/// **A phase whose volume changes is not by itself a case for this.** A crop or
+/// a regrid can be stated entirely in the plan — every block fetches a translated
+/// region and writes its own read extent — with an op that does not resize at
+/// all. Both askings then return the read extent and the phase passes, which is
+/// right: nothing was traded away there.
+///
+/// **Phases with no slots are skipped**, not defaulted: a fragment or iterative
+/// phase owns no chain slot, so there is nothing to ask. The same arrangement
+/// [`check_dtypes`] has.
+///
+/// [`BlockOp::placed_output_shape`]: crate::op::BlockOp::placed_output_shape
+/// [`BlockOp::takes_extent_from_placement`]: crate::op::BlockOp::takes_extent_from_placement
+/// [`Placement::writes`]: crate::op::Placement::writes
+/// [`BlockGeometry::valid`]: crate::geometry::BlockGeometry::valid
+pub fn check_output_shapes(
+    chain: &Chain,
+    decomposition: &Decomposition,
+    work: &[crate::fragment::PhaseWork<'_>],
+) -> Result<()> {
+    let slots = chain.slots();
+    for (index, phase) in decomposition.phases.iter().enumerate() {
+        match work.get(index) {
+            None | Some(crate::fragment::PhaseWork::Pixels) => {}
+            // Owns no chain slot; see the note above.
+            Some(_) => continue,
+        }
+        if phase.slots.iter().any(|&slot| slot >= slots.len()) {
+            // A slot index out of range is caught, with a better message, by the
+            // executor's own slot-order check. Nothing to say here.
+            continue;
+        }
+        let parts: Vec<&Chain> = phase.slots.iter().map(|&slot| slots[slot]).collect();
+        // Asked once per phase rather than once per block: the declaration is a
+        // property of the op, so a phase that has it is exempt whatever its
+        // blocks look like, and a phase that has it not is checked at all of
+        // them.
+        if parts.iter().any(|part| part.takes_extent_from_placement()) {
+            continue;
+        }
+        let reads = decomposition.volume_at(index);
+        let writes = decomposition.volume_at(index + 1);
+        for block in &phase.blocks {
+            let fetched = block_extent(&block.source);
+            let taken = Placement::new(
+                Anchor::of_region(&block.source, reads)?,
+                Anchor::of_region(&block.read, writes)?,
+            )
+            .writing(block_extent(&block.read));
+            // The same placement with the one field the plan speaks through
+            // removed. `place_parts` may still derive an extent for an inner
+            // boundary from a member's own `keeps_grid`, and that is wanted: it
+            // is the ops' declaration, not the plan's.
+            let unaided = Placement::new(taken.input.clone(), taken.output.clone());
+            let with_plan = crate::op::parts_output_shape(&parts, &taken, fetched)?;
+            let without_plan = crate::op::parts_output_shape(&parts, &unaided, fetched)?;
+            if with_plan != without_plan {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index} ({}) block {:?} fetches {fetched:?}: asked what it writes with \
+                     the plan's extent in hand its ops answer {with_plan:?}, and asked with \
+                     `op::Placement::writes` withheld they answer {without_plan:?}. An op is \
+                     entitled to take its write extent from the plan — its two extents need not \
+                     be a function of each other — but it has to say so, because the executor's \
+                     own comparison of the declared shape against the derived read extent then \
+                     compares the plan with itself and stops being a check. Declare it with \
+                     `BlockOp::takes_extent_from_placement`, and owe the check that replaces it: \
+                     against the buffer the block was actually handed, in the kernel.",
+                    phase.names.join(">"),
+                    block.index
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A region's extent as the triple the op traits speak in.
+fn block_extent(region: &Region) -> [usize; 3] {
+    [region.shape[0], region.shape[1], region.shape[2]]
+}
+
 /// **Every chunk of a level is written by exactly one task.**
 ///
-/// The third guard that cannot live in [`Decomposition::check`], for the same
+/// The fifth guard that cannot live in [`Decomposition::check`], for the same
 /// reason [`check_block_constraints`] and [`check_dtypes`] cannot: a plan says
 /// nothing about how a level is chunked, so the plan alone cannot answer this.
 /// The chunk shapes come from whatever holds the storage, and the first place
@@ -1687,6 +1931,254 @@ mod tests {
         assert!(err.contains("[12, 0, 0]..[18, 8, 8]"), "got: {err}");
         assert!(err.contains("block [0, 0, 0]") && err.contains("block [1, 0, 0]"));
         assert!(err.contains("exactly one task"), "got: {err}");
+    }
+
+    // ------------------------------------- taking the plan's write extent --
+    //
+    // `check_output_shapes`, watched passing and firing, on a pair of ops that
+    // differ in exactly one thing: whether the arithmetic behind the extent they
+    // take from the plan says the same thing the plan does.
+
+    /// A decimation that answers [`crate::op::BlockOp::placed_output_shape`] out
+    /// of [`crate::op::Placement::writes`] — the door
+    /// `LatticeInterpolateOp` walks through legitimately.
+    ///
+    /// `honest` decides whether the `output_shape` behind that answer is
+    /// maintained. Both halve axis 0 when they run; the dishonest one *says* it
+    /// keeps the extent, which is the shape of the mistake an op makes by
+    /// overriding `placed_output_shape` and then never exercising the method it
+    /// bypassed.
+    #[derive(Debug)]
+    struct PlanFedDecimateOp {
+        honest: bool,
+    }
+
+    impl crate::op::BlockOp for PlanFedDecimateOp {
+        fn name(&self) -> &'static str {
+            "plan-fed-decimate"
+        }
+
+        fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+            0
+        }
+
+        fn accepts(&self, _dtype: Dtype) -> bool {
+            true
+        }
+
+        /// Honestly halving, on **both** ops: the geometry is not where the lie
+        /// is. An op that declared it kept its grid would be caught by
+        /// `place_parts` propagating the input extent forward, which is a
+        /// different mistake and not the one under test.
+        fn geometry(&self, input_volume: [usize; 3]) -> crate::op::Geometry {
+            crate::op::Geometry::new(
+                [input_volume[0] / 2, input_volume[1], input_volume[2]],
+                vec![crate::op::InputMap::Stencil(Reach::none())],
+            )
+        }
+
+        fn output_shape(&self, input: [usize; 3]) -> [usize; 3] {
+            if self.honest {
+                [input[0] / 2, input[1], input[2]]
+            } else {
+                input
+            }
+        }
+
+        /// The plan's extent, when the plan states one. Verbatim the pattern the
+        /// migration made available to every op.
+        fn placed_output_shape(&self, input: [usize; 3], at: &Placement) -> [usize; 3] {
+            at.writes().unwrap_or_else(|| self.output_shape(input))
+        }
+
+        fn apply(
+            &self,
+            _input: &crate::voxels::Voxels,
+            _out: &mut crate::voxels::Voxels,
+            _at: &Anchor,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The same broken arithmetic, with the waiver declared. Stands in for the
+    /// op that legitimately has no inverse.
+    #[derive(Debug)]
+    struct WaivedDecimateOp;
+
+    impl crate::op::BlockOp for WaivedDecimateOp {
+        fn name(&self) -> &'static str {
+            "waived-decimate"
+        }
+
+        fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+            0
+        }
+
+        fn accepts(&self, _dtype: Dtype) -> bool {
+            true
+        }
+
+        fn geometry(&self, input_volume: [usize; 3]) -> crate::op::Geometry {
+            crate::op::Geometry::new(
+                [input_volume[0] / 2, input_volume[1], input_volume[2]],
+                vec![crate::op::InputMap::Stencil(Reach::none())],
+            )
+        }
+
+        fn output_shape(&self, input: [usize; 3]) -> [usize; 3] {
+            input
+        }
+
+        fn placed_output_shape(&self, input: [usize; 3], at: &Placement) -> [usize; 3] {
+            at.writes().unwrap_or_else(|| self.output_shape(input))
+        }
+
+        fn takes_extent_from_placement(&self) -> bool {
+            true
+        }
+
+        fn apply(
+            &self,
+            _input: &crate::voxels::Voxels,
+            _out: &mut crate::voxels::Voxels,
+            _at: &Anchor,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Level 0 is `[16, 4, 4]`, the phase writes `[8, 4, 4]`, and each block
+    /// fetches twice its read extent from the level below.
+    fn decimating_plan() -> Decomposition {
+        let grid = BlockGrid::new([8, 4, 4], [4, 4, 4]).unwrap();
+        let phase = PhaseDecomposition::derive(
+            vec![0],
+            vec!["halve".to_string()],
+            [0, 0, 0],
+            [0, 0, 0],
+            grid,
+        )
+        .with_sources(|block| {
+            Region::new(
+                &[block.read.start[0] * 2, 0, 0],
+                &[block.read.shape[0] * 2, 4, 4],
+            )
+        });
+        Decomposition {
+            volume: [16, 4, 4],
+            dtype: Dtype::F64,
+            phases: vec![phase],
+            chain_reach: [0, 0, 0],
+        }
+    }
+
+    /// **The check that was lost, watched being vacuous.**
+    ///
+    /// The executor compares what a phase's ops declare against the read extent
+    /// the plan derived. Both ops here answer that comparison out of the plan, so
+    /// it passes for the one whose arithmetic is wrong exactly as it does for the
+    /// one whose arithmetic is right. Nothing about this is a bug in either op —
+    /// it is the comparison having become the plan against itself, and it is why
+    /// a second, independent question has to be asked somewhere.
+    #[test]
+    fn the_per_block_comparison_passes_for_a_wrong_op_and_a_right_one_alike() {
+        let plan = decimating_plan();
+        let block = &plan.phases[0].blocks[0];
+        for honest in [true, false] {
+            let op = Chain::op(PlanFedDecimateOp { honest });
+            let at = Placement::new(
+                Anchor::of_region(&block.source, plan.volume_at(0)).unwrap(),
+                Anchor::of_region(&block.read, plan.volume_at(1)).unwrap(),
+            )
+            .writing(block_extent(&block.read));
+            let produced =
+                crate::op::parts_output_shape(&[&op], &at, block_extent(&block.source)).unwrap();
+            assert_eq!(
+                produced,
+                block_extent(&block.read),
+                "the per-block comparison should be satisfied by construction, honest = {honest}"
+            );
+        }
+    }
+
+    /// The guard, on the same pair, asked the one way the plan cannot answer for
+    /// them: the same block again with `Placement::writes` withheld.
+    ///
+    /// The honest op's own arithmetic reproduces the plan's extent, so its two
+    /// answers agree and nothing is owed even though it reads `writes`. The
+    /// wrong one's do not agree, and it has not declared the waiver.
+    #[test]
+    fn the_withheld_question_separates_the_wrong_op_from_the_right_one() {
+        let plan = decimating_plan();
+        let work = vec![crate::fragment::PhaseWork::Pixels];
+
+        let honest = Chain::op(PlanFedDecimateOp { honest: true });
+        check_output_shapes(&honest, &plan, &work).unwrap();
+
+        let wrong = Chain::op(PlanFedDecimateOp { honest: false });
+        let err = check_output_shapes(&wrong, &plan, &work)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("phase 0 (halve)"), "got: {err}");
+        // The extent it answered with the plan in hand, and the one it answered
+        // without — the two things this compares.
+        assert!(
+            err.contains("[4, 4, 4]") && err.contains("[8, 4, 4]"),
+            "got: {err}"
+        );
+        assert!(err.contains("withheld"), "got: {err}");
+        assert!(
+            err.contains("takes_extent_from_placement"),
+            "the refusal has to name the way out of it, got: {err}"
+        );
+    }
+
+    /// And the waiver, taken: the same wrong arithmetic is admitted once the op
+    /// says it answers from the plan.
+    ///
+    /// This is the guard's honest limit, asserted rather than left implicit. It
+    /// removes the *silence*, not the possibility: an op that declares the waiver
+    /// owes a check against the buffer it was handed, in its kernel, and no
+    /// question the framework can ask verifies that the check is there.
+    #[test]
+    fn a_declared_waiver_is_admitted_and_that_is_the_limit() {
+        let plan = decimating_plan();
+        let work = vec![crate::fragment::PhaseWork::Pixels];
+        let waived = Chain::op(WaivedDecimateOp);
+        check_output_shapes(&waived, &plan, &work).unwrap();
+    }
+
+    /// And through the executor, which is where a plan off a wire arrives.
+    ///
+    /// The guard fires before `prepare` and before a block is touched, which is
+    /// the whole point of it being a guard on the plan rather than a check inside
+    /// a kernel — so the honest arm gets as far as running and the dishonest one
+    /// does not get as far as allocating.
+    #[test]
+    fn the_executor_refuses_a_plan_whose_ops_do_not_add_up_to_it() {
+        let plan = decimating_plan();
+        let hints = crate::strategy::Hints::default();
+        for (honest, expected) in [(true, true), (false, false)] {
+            let input = crate::voxels::Voxels::zeros(Dtype::F64, [16, 4, 4]).unwrap();
+            let env =
+                crate::env::ArrayEnvironment::for_decomposition(input, &plan, [4, 4, 4]).unwrap();
+            let workflow = crate::strategy::Workflow::new(
+                Chain::op(PlanFedDecimateOp { honest }),
+                [16, 4, 4],
+                Dtype::F64,
+            );
+            let outcome = crate::strategy::execute("test", &workflow, &plan, &hints, &env);
+            assert_eq!(
+                outcome.is_ok(),
+                expected,
+                "honest = {honest}, got {:?}",
+                outcome.err().map(|err| err.to_string())
+            );
+            if let Err(err) = outcome {
+                assert!(err.to_string().contains("withheld"), "got: {err}");
+            }
+        }
     }
 
     /// One shape per level, level 0 included, so that the index is the level
