@@ -29,6 +29,7 @@
 // | `components` | the union-find, the six-face geometry and the seam walk | nothing on its own — it is the part of `fill` and `regional` that is the *program* rather than the question |
 // | `detect` | one point per connected region of a mask, at its centroid | the **producer** the point world had none of, and the first phase pair here that writes no level at all: a `fragments -> fragments` merge whose accumulators are integers, so a component split across four blocks totals *exactly* rather than nearly |
 // | `voxelize` | scattered points into a dense volume | a `fragments -> volume` op whose reach is in **blocks** as well as voxels, and an accumulation order that has to be a function of the data rather than of the gather |
+// | `sliding` | a windowed statistic over a histogram carried along a scan line | the first op whose kernel has **state between voxels**, so the answer depends on the order voxels are visited in — and the first with a stated *element type* constraint, since a histogram needs a bounded integer domain and refuses a float rather than binning it |
 // | `reconstruct` | grey reconstruction, and the h-maxima transform over it | the first `IterativeOp` here: a **fixed point** whose substage count is a function of the data, reached at the external reach of *one* substage — the third answer to transitivity, beside a wide halo and a fragment-and-join |
 //
 // The shape every op in here has, and why
@@ -91,11 +92,19 @@
 // exact, and says so.
 //
 // **Edge behaviour is defined, and it is defined at the volume boundary.** Every
-// neighbourhood here is clamped to the array it is handed. At a real volume
-// boundary that is the whole story: there is nothing beyond to read, and the
-// whole-volume reference clamps identically. At a block seam the clamp is
-// *wrong*, deliberately, because a silent wrong answer is what the halo guard
-// exists to convert into a loud one.
+// neighbourhood here is resolved against the array it is handed, by default by
+// clamping to it. At a real volume boundary that is the whole story: there is
+// nothing beyond to read, and the whole-volume reference resolves it identically.
+// At a block seam it is *wrong*, deliberately, because a silent wrong answer is
+// what the halo guard exists to convert into a loud one.
+//
+// The separable convolution is the one place where that rule is a **parameter**
+// rather than a constant: `ridge::Boundary` names the convention and
+// `smooth::Gaussian` and `ridge::ScaleSpace` carry it. Clamping is its default,
+// so nothing that predates the choice moved. It is a parameter there and nowhere
+// else because that is the only op whose neighbourhood is wide enough for the
+// answer at the volume's face to be dominated by what the convention invents —
+// a stencil that reaches one voxel gets the same index from both.
 //
 // Costs
 // -----
@@ -131,6 +140,7 @@ pub mod deconvolve;
 pub mod detect;
 pub mod element;
 pub mod fill;
+pub mod lattice;
 pub mod local;
 pub mod morphology;
 pub mod normalise;
@@ -140,6 +150,7 @@ pub mod regional;
 pub mod resample;
 pub mod ridge;
 pub mod skeleton;
+pub mod sliding;
 pub mod smooth;
 pub mod voxelize;
 pub mod voxelwise;
@@ -151,6 +162,11 @@ pub use detect::{
 };
 pub use element::{select_nth, ElementShape, Percentile, Rank, StructuringElement, Total};
 pub use fill::{fill_phases, FillHolesOp, LabelBackgroundOp};
+pub use lattice::{
+    interpolate_block_edge, lattice_interpolate_into, lattice_interpolate_phase,
+    lattice_statistic_into, lattice_statistic_phase, statistic_block_edge, LatticeInterpolateOp,
+    LatticeStatisticOp,
+};
 pub use local::{
     axis_max_distance, local_statistic_into, threshold_against_into, AdaptiveThresholdOp, Isodata,
     LocalStatistic, LocalStatisticOp, SampleLattice, Sampling, Statistic,
@@ -161,8 +177,8 @@ pub use normalise::{
     LevelCorrectionOp, LocalContrastOp, LocalGainOp, Removal,
 };
 pub use rank::{
-    masked_rank_filter_into, rank_filter_f64_into, rank_filter_into, MaskedRankFilterOp,
-    RankFilterOp,
+    masked_rank_filter_into, masked_rank_filter_into_with, rank_filter_f64_into, rank_filter_into,
+    ExcludedCentre, MaskedRankFilterOp, RankFilterOp,
 };
 pub use reconstruct::{
     flooding_bound, h_extrema, reconstruct_step_into, reconstruct_to_fixed_point, HExtremaOp,
@@ -177,17 +193,21 @@ pub use resample::{
     ResampleOp,
 };
 pub use ridge::{
-    gaussian_radius, gaussian_smooth_into, gaussian_weights, hessian_at, ridge_response_into,
-    symmetric_eigenvalues, EigenResponse, Polarity, RatioResponse, Response, RidgeFilterOp,
-    RidgeResponse, ScaleSpace,
+    gaussian_radius, gaussian_smooth_into, gaussian_smooth_into_with, gaussian_weights, hessian_at,
+    ridge_response_into, symmetric_eigenvalues, Boundary, EigenResponse, Polarity, RatioResponse,
+    Response, RidgeFilterOp, RidgeResponse, ScaleSpace,
 };
 pub use skeleton::{thin, thinning_pass, thinning_reach, ThinningOp};
+pub use sliding::{
+    sliding_histogram_into, sliding_histogram_with_plan, BinnedElement, Domain, HistogramQuery,
+    RankQuery, ScanPlan, SlidingHistogramOp,
+};
 pub use smooth::{Gaussian, SmoothOp};
 pub use voxelize::{decode_points, encode_points, Point, VoxelizeOp};
 pub use voxelwise::{
     combine_into, from_set, is_set, logic_into, map_into, not_into, CombineOp, Compose, Identity,
-    Logic, LogicCombine, MapFn, Not, Threshold, ThresholdTest, VoxelwiseMapOp, IDENTITY_COST,
-    MAP_COST,
+    Logic, LogicCombine, MapFn, Not, Threshold, ThresholdTest, VoxelwiseMapOp, WidenOp,
+    IDENTITY_COST, MAP_COST,
 };
 
 /// How the costs in this module were obtained, and what they are relative to.

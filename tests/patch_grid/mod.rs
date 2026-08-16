@@ -56,7 +56,7 @@ use std::sync::Mutex;
 use blockflow::env::EnvCounters;
 use blockflow::{
     AccountingEnvironment, Anchor, BlockBuf, BlockGrid, BlockOp, Chain, Decomposition, Dtype,
-    Environment, Error, Lifecycle, PhaseDecomposition, Reach, Region, Result, Voxels,
+    Environment, Error, Lifecycle, PhaseDecomposition, Placement, Reach, Region, Result, Voxels,
 };
 use ndarray::ArrayD;
 
@@ -530,7 +530,7 @@ impl Environment for RegridEnvironment {
         slot: &Chain,
         input: &BlockBuf,
         sources: &[(usize, BlockBuf)],
-        at: &Anchor,
+        at: &Placement,
     ) -> Result<BlockBuf> {
         self.inner.apply(slot, input, sources, at)
     }

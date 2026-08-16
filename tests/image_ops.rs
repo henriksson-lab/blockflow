@@ -37,9 +37,9 @@ use blockflow::env::ArrayEnvironment;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain};
 use blockflow::ops::{
-    AdaptiveThresholdOp, CombineOp, ElementShape, Gaussian, LocalStatistic, LocalStatisticOp,
-    Logic, Morphology, MorphologyOp, Rank, RankFilterOp, SmoothOp, Statistic, StructuringElement,
-    VoxelwiseMapOp,
+    AdaptiveThresholdOp, Boundary, CombineOp, ElementShape, Gaussian, LocalStatistic,
+    LocalStatisticOp, Logic, Morphology, MorphologyOp, Rank, RankFilterOp, SmoothOp, Statistic,
+    StructuringElement, VoxelwiseMapOp,
 };
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
@@ -280,6 +280,23 @@ fn cases(input: &Array3<f64>) -> Vec<(&'static str, Chain, Array3<f64>, [usize; 
             input.clone(),
             [3, 5, 2],
         ),
+        // The same op with the other boundary convention, because a rule about
+        // what lies outside the array is exactly the kind of thing that is right
+        // whole-volume and wrong under decomposition: the convention belongs to
+        // the *volume's* face, and a block whose read extent was not clipped
+        // there would apply it at a seam instead. The reach is the same reach,
+        // which is a claim this list also checks.
+        (
+            "gaussian smooth, reflected boundary",
+            Chain::op(SmoothOp::new(
+                "smooth",
+                Gaussian::new([1.0, 1.5, 0.6], 3.0)
+                    .unwrap()
+                    .with_boundary(Boundary::Reflect),
+            )),
+            input.clone(),
+            [3, 5, 2],
+        ),
         (
             "a chain: smooth then threshold",
             Chain::sequence(vec![
@@ -402,6 +419,123 @@ fn no_two_decompositions_disagree() {
                     run(&workflow, &plan(&workflow, block, &split_axes), &source),
                     first,
                     "{name}: block {block}, axes {split_axes:?}"
+                );
+            }
+        }
+    }
+}
+
+/// **A boundary convention belongs to the volume's face, not to a block's.**
+///
+/// The sweep above already asserts byte-identity for the reflected smoothing, so
+/// this test exists to say what that identity *means* and to show it is not
+/// vacuous. Three things, in order:
+///
+/// 1. the two conventions really do disagree, and disagree at the faces and
+///    nowhere else — so a run that reflected where it should have clamped would
+///    be caught by a comparison of values rather than only of code;
+/// 2. reflecting about a **block's** edge would give a different answer, shown
+///    by taking the same op over an interior cut of the volume and watching its
+///    own new faces produce values the whole-volume run does not have;
+/// 3. and the decomposed run has the whole-volume values at every voxel of every
+///    face, at block sizes small enough that the faces fall in several different
+///    blocks.
+///
+/// The third is the property; the first two are what stop it from being provable
+/// by an op that ignored the parameter.
+#[test]
+fn a_boundary_convention_is_applied_at_the_volumes_face_and_not_at_a_blocks() {
+    fn apply_whole(op: &SmoothOp, input: &Array3<f64>) -> Array3<f64> {
+        let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+        let source: Voxels = input.clone().into();
+        let mut out = Voxels::zeros(Dtype::F64, shape).unwrap();
+        op.apply(&source, &mut out, &Anchor::whole(shape))
+            .expect("the whole-array reference must run");
+        out.view::<f64>().unwrap().to_owned()
+    }
+
+    let input = intensities();
+    let sigma = [1.0, 1.5, 0.6];
+    let radius = [3usize, 5, 2];
+    let clamped = SmoothOp::new("clamp", Gaussian::new(sigma, 3.0).unwrap());
+    let reflected = SmoothOp::new(
+        "reflect",
+        Gaussian::new(sigma, 3.0)
+            .unwrap()
+            .with_boundary(Boundary::Reflect),
+    );
+    for axis in 0..3 {
+        assert_eq!(
+            clamped.reach(axis, VOLUME[axis]),
+            reflected.reach(axis, VOLUME[axis]),
+            "the convention must not move the reach"
+        );
+    }
+
+    // 1. they differ, at the faces, and only there
+    let under_clamp = apply_whole(&clamped, &input);
+    let under_reflect = apply_whole(&reflected, &input);
+    let mut differing = 0;
+    for i in 0..VOLUME[0] {
+        for j in 0..VOLUME[1] {
+            for k in 0..VOLUME[2] {
+                let at = [i, j, k];
+                let interior = (0..3)
+                    .all(|axis| at[axis] >= radius[axis] && at[axis] + radius[axis] < VOLUME[axis]);
+                if interior {
+                    assert_eq!(
+                        under_clamp[at].to_bits(),
+                        under_reflect[at].to_bits(),
+                        "at {at:?} no tap leaves the volume, so the convention cannot show"
+                    );
+                } else if under_clamp[at] != under_reflect[at] {
+                    differing += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        differing > 1000,
+        "only {differing} voxels moved; a convention nothing reads would also pass \
+         the identity below"
+    );
+
+    // 2. the same op over an interior cut invents samples at its *own* new
+    // faces, and they are not the volume's values
+    let cut = input.slice(ndarray::s![8..24, .., ..]).to_owned();
+    let over_cut = apply_whole(&reflected, &cut);
+    let mut wrong_at_the_cut = 0;
+    for j in 0..VOLUME[1] {
+        for k in 0..VOLUME[2] {
+            if over_cut[[0, j, k]] != under_reflect[[8, j, k]] {
+                wrong_at_the_cut += 1;
+            }
+        }
+    }
+    assert!(
+        wrong_at_the_cut > 0,
+        "reflecting about an interior edge must give a different answer, or this \
+         test is asserting nothing about where the reflection happens"
+    );
+
+    // 3. and every decomposition has the volume's answer, faces included
+    for op in [&clamped, &reflected] {
+        let workflow = workflow(Chain::op(SmoothOp::new(op.name(), op.gaussian().clone())));
+        let want = if op.name() == "clamp" {
+            &under_clamp
+        } else {
+            &under_reflect
+        };
+        for block in [3usize, 5, 7, 16] {
+            for split_axes in [vec![0], vec![1], vec![2], vec![0, 1, 2]] {
+                let decomposition = plan(&workflow, block, &split_axes);
+                decomposition.check().unwrap();
+                let got = run(&workflow, &decomposition, &input);
+                assert_eq!(
+                    &got,
+                    want,
+                    "{}: block {block}, axes {split_axes:?} reflected about the wrong edge",
+                    op.name()
                 );
             }
         }

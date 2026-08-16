@@ -194,6 +194,100 @@ pub fn gaussian_weights(sigma: f64, truncate: f64) -> Result<Vec<f64>> {
     Ok(weights)
 }
 
+/// What a neighbourhood reads when it runs off the end of the array it was
+/// handed.
+///
+/// A convolution of radius `r` asks for the sample at `v - r` even when `v` is
+/// the first voxel of an axis, and no arithmetic answers that question — it is a
+/// **convention**, and the only honest thing to do with a convention is to name
+/// it and let the caller state which one they meant. Every reference
+/// implementation of a separable filter carries such a parameter; this is that
+/// parameter, in the one place a neighbourhood turns an offset into an index.
+///
+/// The two differ **only** where the offset leaves the array. Inside, they are
+/// the same index and therefore the same bits, which is why a mode is free to
+/// add: no interior voxel moves.
+///
+/// **A boundary rule is about the array's own edge**, so what it means depends
+/// entirely on whether that edge is real. This crate hands a block its core
+/// grown by the halo and *clipped at the volume*, so the array's edge is the
+/// volume's face exactly when the volume has a face there, and is otherwise
+/// interior — where the halo guarantees no tap of a core voxel reaches it. Both
+/// modes therefore reproduce the whole-volume answer under decomposition, and
+/// they reproduce it at the volume's face rather than at a block's seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum Boundary {
+    /// The nearest sample inside the array is repeated outwards:
+    /// `a a a a | a b c d | d d d d`.
+    ///
+    /// The default, and the convention every neighbourhood in `ops` used before
+    /// there was a choice. It is the one that leaves a constant field constant
+    /// at a face, because every invented sample is a sample that was really
+    /// there.
+    #[default]
+    Clamp,
+    /// The array is mirrored about the position **half a sample outside** each
+    /// end, so the edge sample is repeated once and the run then reverses:
+    /// `d c b a | a b c d | d c b a`.
+    ///
+    /// In indices: `-1` reads `0`, `-2` reads `1`, and at the top `n` reads
+    /// `n - 1` and `n + 1` reads `n - 2`. There is no fixed point at the edge —
+    /// the mirror sits *between* `-1` and `0` — which is what distinguishes it
+    /// from the other reflection in common use, the one whose mirror lands *on*
+    /// the edge sample so that `-1` reads `1`. The two differ in every boundary
+    /// voxel and the choice here is the first, which is the more usual default.
+    ///
+    /// This also leaves a constant field constant, and unlike [`Self::Clamp`] it
+    /// leaves a *linear ramp* looking like a ramp reversed rather than like a
+    /// plateau, which is the reason to want it.
+    Reflect,
+}
+
+impl Boundary {
+    /// The sample `position` names, as an index into an axis of `extent`.
+    ///
+    /// `position` is signed and unbounded on purpose: it is `centre + offset`
+    /// and both ends can leave the axis, on the same call, when the kernel is
+    /// wider than the array. That is not a corner case to be assumed away — a
+    /// radius of forty against an axis of three voxels is an ordinary thing to
+    /// ask of a wide blur on a thin volume — so [`Self::Reflect`] folds
+    /// **repeatedly**, by the periodicity rather than by a single mirror. A
+    /// one-fold reflection would answer `-38` with `37`, which is not an index
+    /// of a three-voxel axis at all.
+    ///
+    /// The period is `2 * extent`: one traversal outwards and one back, with no
+    /// sample shared between them, which is the counting that makes the mirror
+    /// sit half a sample outside the edge. Written as a remainder rather than a
+    /// loop so the cost does not grow with how far outside the position is.
+    ///
+    /// An axis of one voxel has one answer under both conventions, and an empty
+    /// axis has none — it is never sampled, because the smoothing returns before
+    /// its loop when any extent is zero. Both are folded into the same early
+    /// return, which also keeps `Clamp`'s `clamp(0, extent - 1)` away from the
+    /// empty axis's inverted range.
+    pub fn index(self, position: isize, extent: usize) -> usize {
+        if extent <= 1 {
+            return 0;
+        }
+        let extent = extent as isize;
+        match self {
+            Boundary::Clamp => position.clamp(0, extent - 1) as usize,
+            Boundary::Reflect => {
+                let period = 2 * extent;
+                let mut folded = position % period;
+                if folded < 0 {
+                    folded += period;
+                }
+                if folded >= extent {
+                    (period - folded - 1) as usize
+                } else {
+                    folded as usize
+                }
+            }
+        }
+    }
+}
+
 /// One separable pass: convolve `src` along `axis` with `kernel` into `dst`.
 ///
 /// **Generic over the element type**, which is as far as the algorithm allows: a
@@ -201,21 +295,24 @@ pub fn gaussian_weights(sigma: f64, truncate: f64) -> Result<Vec<f64>> {
 /// three passes of a smoothing therefore share one function — the first reads the
 /// caller's element type with no copy, the second and third read `f64`.
 ///
-/// The neighbourhood is **clamped** to the array handed in. At a real volume
-/// boundary that is the whole story and the whole-volume reference clamps
-/// identically; at a block seam it is a truncation the whole volume would not
-/// have made, which is what the halo is for and what the guard exists to catch.
+/// The neighbourhood is resolved against the array handed in by `boundary`, and
+/// that is the **only** place this file decides what lies outside an array. At a
+/// real volume boundary the convention is the whole story and the whole-volume
+/// reference applies the same one; at a block seam it is a truncation the whole
+/// volume would not have made, which is what the halo is for and what the guard
+/// exists to catch.
 fn convolve_axis<T>(
     src: ArrayView3<'_, T>,
     axis: usize,
     kernel: &[f64],
+    boundary: Boundary,
     mut dst: ArrayViewMut3<'_, f64>,
 ) where
     T: Copy + Into<f64>,
 {
     let shape = [src.shape()[0], src.shape()[1], src.shape()[2]];
     let radius = (kernel.len() / 2) as isize;
-    let last = shape[axis] as isize - 1;
+    let extent = shape[axis];
     for i in 0..shape[0] {
         for j in 0..shape[1] {
             for k in 0..shape[2] {
@@ -227,7 +324,7 @@ fn convolve_axis<T>(
                 // orders would disagree in the last bit.
                 for (step, &weight) in kernel.iter().enumerate() {
                     let mut index = here;
-                    index[axis] = (centre + step as isize - radius).clamp(0, last) as usize;
+                    index[axis] = boundary.index(centre + step as isize - radius, extent);
                     total += weight * src[index].into();
                 }
                 dst[here] = total;
@@ -236,7 +333,8 @@ fn convolve_axis<T>(
     }
 }
 
-/// Smooth `input` with a separable Gaussian, one kernel per axis.
+/// Smooth `input` with a separable Gaussian, one kernel per axis, resolving the
+/// array's edge by [`Boundary::Clamp`].
 ///
 /// The passes run in axis order 0, 1, 2. That is a choice and it is fixed here
 /// rather than left to the caller, because two callers that ordered them
@@ -244,6 +342,31 @@ fn convolve_axis<T>(
 pub fn gaussian_smooth_into<T>(
     input: ArrayView3<'_, T>,
     kernels: &[Vec<f64>; 3],
+    out: ArrayViewMut3<'_, f64>,
+) -> Result<()>
+where
+    T: Copy + Into<f64>,
+{
+    gaussian_smooth_into_with(input, kernels, Boundary::Clamp, out)
+}
+
+/// The same smoothing with the edge convention stated.
+///
+/// [`gaussian_smooth_into`] is this at [`Boundary::Clamp`], which is the
+/// convention it had before there was a second one — the shorter name keeps the
+/// default where every existing caller already is, and this one exists for the
+/// caller who needs to say something else.
+///
+/// **The convention is applied on every pass and only at the array's edge**, so
+/// the reach is exactly the reach the clamped form declares: the taps of the
+/// voxel at `v` land on positions in `[v - r, v + r]` whichever mode resolves
+/// them, because a reflection maps an offset that left the array back to a
+/// position *nearer* the edge it left by, never further out. A boundary rule
+/// changes which sample a tap reads, never how far the op reaches.
+pub fn gaussian_smooth_into_with<T>(
+    input: ArrayView3<'_, T>,
+    kernels: &[Vec<f64>; 3],
+    boundary: Boundary,
     mut out: ArrayViewMut3<'_, f64>,
 ) -> Result<()>
 where
@@ -255,10 +378,10 @@ where
         return Ok(());
     }
     let mut scratch = Array3::<f64>::zeros(dim);
-    convolve_axis(input, 0, &kernels[0], scratch.view_mut());
+    convolve_axis(input, 0, &kernels[0], boundary, scratch.view_mut());
     let mut second = Array3::<f64>::zeros(dim);
-    convolve_axis(scratch.view(), 1, &kernels[1], second.view_mut());
-    convolve_axis(second.view(), 2, &kernels[2], out.view_mut());
+    convolve_axis(scratch.view(), 1, &kernels[1], boundary, second.view_mut());
+    convolve_axis(second.view(), 2, &kernels[2], boundary, out.view_mut());
     Ok(())
 }
 
@@ -271,6 +394,15 @@ where
 /// the quarter four-corner difference off it. Sampling is clamped to `field`,
 /// for the smoothing's reason and with the same consequence at a seam: right at
 /// a real volume boundary, deliberately wrong short of a sufficient halo.
+///
+/// **This stencil takes no [`Boundary`], and does not need one.** It reaches
+/// exactly one voxel per axis, and at that distance the two conventions are the
+/// same function: `-1` resolves to `0` and `n` to `n - 1` under both. So a
+/// caller who asks [`ScaleSpace`] for a different convention gets it applied to
+/// the smoothing, which is the only step where the choice is observable, and the
+/// filter stays one convention throughout rather than two. There is a test that
+/// says so, so that a mode which *did* differ at one voxel could not be added
+/// here without noticing this.
 ///
 /// **The expression order is load-bearing.** `plus - 2 * mid + minus` is
 /// evaluated left to right, so on a field that is constant it is
@@ -745,6 +877,7 @@ pub struct ScaleSpace {
     scales: Vec<[f64; 3]>,
     truncate: f64,
     gamma: f64,
+    boundary: Boundary,
 }
 
 impl ScaleSpace {
@@ -804,7 +937,25 @@ impl ScaleSpace {
             scales,
             truncate,
             gamma,
+            boundary: Boundary::default(),
         })
+    }
+
+    /// The convention the smoothing resolves the array's edge by.
+    ///
+    /// A builder rather than an argument to [`Self::new`], because it has a
+    /// default that is right for almost everyone and adding it to the
+    /// constructor would make every caller state it. It reaches the Gaussian and
+    /// nothing else — see [`hessian_at`] for why the second difference needs no
+    /// say in it — and it changes no reach, which [`Self::reach`] is free to
+    /// stay silent about for that reason.
+    pub fn with_boundary(mut self, boundary: Boundary) -> Self {
+        self.boundary = boundary;
+        self
+    }
+
+    pub fn boundary(&self) -> Boundary {
+        self.boundary
     }
 
     /// The same sigma on every axis, one scale per entry.
@@ -931,7 +1082,7 @@ where
     let mut smoothed = Array3::<f64>::zeros(dim);
     for which in 0..scales.scales().len() {
         let kernels = scales.kernels(which)?;
-        gaussian_smooth_into(input, &kernels, smoothed.view_mut())?;
+        gaussian_smooth_into_with(input, &kernels, scales.boundary(), smoothed.view_mut())?;
         let factor = scales.normalisation(which);
         for i in 0..dim.0 {
             for j in 0..dim.1 {
@@ -1326,6 +1477,148 @@ mod tests {
         RidgeResponse::new(0.5, 0.5, 5.0, Polarity::Ridge).unwrap()
     }
 
+    // -------------------------------------------------------- boundary --
+
+    /// The reflection folded the slow, obvious way: mirror once, and keep
+    /// mirroring until the position lands inside the axis.
+    ///
+    /// This is the *definition* the closed form is checked against, and it is
+    /// written here rather than reused from the implementation on purpose — a
+    /// test that called `Boundary::index` to compute what `Boundary::index`
+    /// should have said would agree with any bug at all. The mirror sits half a
+    /// sample outside each end, so `-1` folds to `0` (`-p - 1`) and `n` folds to
+    /// `n - 1` (`2n - 1 - p`), and neither fold has a fixed point.
+    fn folded(position: isize, extent: usize) -> usize {
+        let extent = extent as isize;
+        let mut position = position;
+        loop {
+            if position < 0 {
+                position = -position - 1;
+            } else if position >= extent {
+                position = 2 * extent - 1 - position;
+            } else {
+                return position as usize;
+            }
+        }
+    }
+
+    /// The rule, written out at the two ends of a small axis rather than
+    /// described. `d c b a | a b c d | d c b a`: the edge sample is repeated
+    /// once and the run then reverses.
+    #[test]
+    fn the_reflection_repeats_the_edge_sample_and_then_runs_backwards() {
+        // an axis of four: 0 1 2 3
+        let want = [
+            (-4, 3),
+            (-3, 2),
+            (-2, 1),
+            (-1, 0),
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 3),
+            (5, 2),
+            (6, 1),
+            (7, 0),
+        ];
+        for (position, expected) in want {
+            assert_eq!(
+                Boundary::Reflect.index(position, 4),
+                expected,
+                "reflecting {position} into an axis of four"
+            );
+        }
+
+        // and the other reflection — the one whose mirror lands *on* the edge
+        // sample, so that -1 reads 1 — is emphatically not what this is
+        assert_ne!(Boundary::Reflect.index(-1, 4), 1);
+    }
+
+    /// Clamping is untouched, stated as its own table so that a change to the
+    /// shared index function cannot move it silently.
+    #[test]
+    fn clamping_repeats_the_edge_sample_forever() {
+        for position in -8..0 {
+            assert_eq!(Boundary::Clamp.index(position, 4), 0);
+        }
+        for position in 4..12 {
+            assert_eq!(Boundary::Clamp.index(position, 4), 3);
+        }
+        for position in 0..4 {
+            assert_eq!(Boundary::Clamp.index(position, 4), position as usize);
+        }
+        assert_eq!(Boundary::default(), Boundary::Clamp);
+    }
+
+    /// **The case a single fold gets wrong.** A radius of forty against an axis
+    /// of three voxels is not hypothetical — a wide blur on a thin volume asks
+    /// for exactly that — and the position `-38` has to fold five times before
+    /// it lands. Checked against the repeated-fold definition over a range far
+    /// wider than the axis, and separately checked to be *in range*, which is
+    /// the property a one-fold reflection breaks outright.
+    #[test]
+    fn the_reflection_folds_repeatedly_when_it_is_wider_than_the_axis() {
+        for extent in 1..=7usize {
+            for position in -100isize..=100 {
+                let got = Boundary::Reflect.index(position, extent);
+                assert!(
+                    got < extent,
+                    "reflecting {position} into an axis of {extent} left the axis at {got}"
+                );
+                assert_eq!(
+                    got,
+                    folded(position, extent),
+                    "reflecting {position} into an axis of {extent}"
+                );
+            }
+        }
+
+        // the specific shape the wide-kernel case has: radius forty, axis three.
+        // A single mirror would have answered -38 with 37 and 42 with -37,
+        // neither of them an index of a three-voxel axis at all.
+        assert_eq!(Boundary::Reflect.index(-38, 3), 1);
+        assert_eq!(folded(-38, 3), 1);
+        assert_eq!(Boundary::Reflect.index(42, 3), 0);
+        assert_eq!(folded(42, 3), 0);
+    }
+
+    /// An axis of one has one answer whatever the convention, and an axis of
+    /// none is never sampled. Both matter because the clamped form's own
+    /// `clamp(0, extent - 1)` has an inverted range at an extent of zero.
+    #[test]
+    fn a_degenerate_axis_has_one_index_or_none() {
+        for boundary in [Boundary::Clamp, Boundary::Reflect] {
+            for position in -5isize..=5 {
+                assert_eq!(boundary.index(position, 1), 0);
+                assert_eq!(boundary.index(position, 0), 0);
+            }
+        }
+    }
+
+    /// **Why [`hessian_at`] takes no convention.** At one voxel out, the two
+    /// agree exactly: both send `-1` to `0` and `n` to `n - 1`. So the second
+    /// difference is the same stencil under either, and a filter that reflects
+    /// its smoothing is still one convention throughout.
+    ///
+    /// If a third mode were ever added that *did* differ at one voxel, this is
+    /// what would fail, and the stencil would have to grow the parameter.
+    #[test]
+    fn the_two_conventions_agree_one_voxel_outside_which_is_what_frees_the_stencil() {
+        for extent in 2..=9usize {
+            for position in [-1isize, extent as isize] {
+                assert_eq!(
+                    Boundary::Clamp.index(position, extent),
+                    Boundary::Reflect.index(position, extent),
+                    "extent {extent} at {position}"
+                );
+            }
+        }
+        // and they part company at two voxels out, so the agreement above is a
+        // fact about the stencil's width rather than about the modes
+        assert_ne!(Boundary::Clamp.index(-2, 5), Boundary::Reflect.index(-2, 5));
+    }
+
     // ------------------------------------------------------- smoothing --
 
     #[test]
@@ -1377,6 +1670,63 @@ mod tests {
         // and it does not depend on the volume, which is what makes it a local
         // op rather than a planning barrier
         assert_eq!(op.reach(0, 12), 10);
+    }
+
+    /// The scale space carries the convention, it defaults to the one that was
+    /// there before, it changes **no reach**, and it does reach the answer.
+    ///
+    /// The last of those is the half that a "the parameter is stored" test would
+    /// miss: a builder that set a field nothing read would pass every other
+    /// assertion here.
+    #[test]
+    fn a_scale_space_carries_the_convention_without_moving_the_reach() {
+        let clamped = ScaleSpace::isotropic(&[1.0, 2.0], 3.0, 1.0).unwrap();
+        assert_eq!(
+            clamped.boundary(),
+            Boundary::Clamp,
+            "the default is additive"
+        );
+        let reflected = clamped.clone().with_boundary(Boundary::Reflect);
+        assert_eq!(reflected.boundary(), Boundary::Reflect);
+
+        for axis in 0..3 {
+            assert_eq!(
+                clamped.reach(axis),
+                reflected.reach(axis),
+                "a boundary convention decides which sample a tap reads, not how far \
+                 the op reaches"
+            );
+            assert_eq!(clamped.radius(1, axis), reflected.radius(1, axis));
+        }
+        assert_eq!(clamped.kernels(0).unwrap(), reflected.kernels(0).unwrap());
+
+        // and the two answers differ, near a face, on a field that is not
+        // symmetric about it — so the parameter is read and not merely held
+        // wide enough that the centre is further from every face than the
+        // reach, which is 7 here
+        let field = ramp((21, 21, 21));
+        let mut under_clamp = Array3::<f64>::zeros((21, 21, 21));
+        let mut under_reflect = Array3::<f64>::zeros((21, 21, 21));
+        ridge_response_into(
+            field.view(),
+            &clamped,
+            &response(),
+            under_clamp.view_mut(),
+            None,
+        )
+        .unwrap();
+        ridge_response_into(
+            field.view(),
+            &reflected,
+            &response(),
+            under_reflect.view_mut(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(under_clamp[[0, 10, 10]], under_reflect[[0, 10, 10]]);
+        // deep enough inside, nothing the convention invents is read, so the
+        // two are the same bits
+        assert_eq!(under_clamp[[10, 10, 10]], under_reflect[[10, 10, 10]]);
     }
 
     // --------------------------------------------------------- Hessian --

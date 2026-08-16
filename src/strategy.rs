@@ -65,7 +65,7 @@ use super::graph::{Task, TaskGraph};
 use super::iterate::{IterativeOp, Operand};
 use super::listener::{Dispatch, EventListener};
 use super::log::{Event, Stats};
-use super::op::{Anchor, Chain, Output};
+use super::op::{place_parts, Anchor, Chain, Output, Placement};
 
 /// Names an array the injected `Environment` resolves.
 ///
@@ -840,7 +840,37 @@ fn run_task(
     // upsampling phase is now a plan that either checks or is told exactly which
     // two extents disagree. For every phase whose ops keep their extent this
     // reduces to the old comparison, unchanged.
-    let produced = phase_output_shape(slots, &phase.slots, block_shape(fetch)?)?;
+    // Where this block sits in **every** space the phase touches, which is two
+    // regions the executor has had all along and passed one of: `fetch` is in
+    // the level that was read, `read` is in the level being written. They are
+    // the same region in the same volume for every phase whose output grid is
+    // its input grid, which is why one anchor sufficed until a lattice phase
+    // needed both. See `op::Placement`.
+    //
+    // The buffer holds `fetch`, so that is where the ops read from, and the
+    // volume is the one `fetch` is a region of — the level that was read. An op
+    // is handed the *volume* it belongs to, not the block, which is what keeps a
+    // globally-anchored sample grid from moving with the block.
+    //
+    // `place_parts` then derives one placement **per slot** rather than handing
+    // every slot the phase's own: a slot whose output grid is not its input grid
+    // moves the space the slots after it are anchored in, and passing one anchor
+    // to all of them was right only while no slot did that.
+    let placement = Placement::new(
+        Anchor::of_region(fetch, decomposition.volume_at(task.phase))?,
+        Anchor::of_region(read, decomposition.volume_at(task.phase + 1))?,
+    )
+    .writing(block_shape(read)?);
+    let places = place_parts(
+        &phase
+            .slots
+            .iter()
+            .map(|&slot| slots[slot])
+            .collect::<Vec<_>>(),
+        &placement,
+        block_shape(fetch)?,
+    );
+    let produced = phase_output_shape(slots, &phase.slots, &places, block_shape(fetch)?)?;
     if produced != block_shape(read)? {
         return Err(Error::InvalidArgument(format!(
             "phase {} block {:?} fetches {:?}, its ops turn that into {produced:?}, and the \
@@ -907,12 +937,6 @@ fn run_task(
 
     let mut side_written: Vec<(String, Region)> = Vec::new();
     if !short_circuited {
-        // The buffer holds `fetch`, so that is where the ops are anchored, and
-        // the volume is the one `fetch` is a region of — the level that was
-        // read. The op is handed the *volume* it belongs to, not the block,
-        // which is what keeps a globally-anchored sample grid from moving with
-        // the block.
-        let at = Anchor::of_region(fetch, decomposition.volume_at(task.phase))?;
         // The levels this phase's source leaves read, at **the same region**:
         // a source leaf has reach 0, so what it reads is what the block already
         // fetches, and `check_source_levels` is what makes those the same
@@ -945,9 +969,9 @@ fn run_task(
             });
             sources.push((level, stored));
         }
-        for &slot in &phase.slots {
+        for (&slot, place) in phase.slots.iter().zip(&places) {
             let started = Instant::now();
-            let next = env.apply(slots[slot], &buf, &sources, &at)?;
+            let next = env.apply(slots[slot], &buf, &sources, place)?;
             let duration_ns = started.elapsed().as_nanos() as u64;
             // Side outputs, before the input buffer is released, because the op
             // is handed both what it read and what it produced. The regions come
@@ -964,7 +988,7 @@ fn run_task(
                     .collect::<Result<Vec<Region>>>()?;
                 let within = task.geometry.valid_within_read();
                 let block = super::op::SideBlock {
-                    at: &at,
+                    at: &place.input,
                     within: &within,
                     regions: &regions,
                 };
@@ -1424,10 +1448,15 @@ fn run_iterative_phase(
 /// The counterpart of [`fold_constant`] for shape, and the reason `run_task` can
 /// now check a resizing phase instead of refusing every one: the answer comes
 /// from what the ops *declared* rather than from what the buffer happened to be.
-fn phase_output_shape(slots: &[&Chain], group: &[usize], input: [usize; 3]) -> Result<[usize; 3]> {
+fn phase_output_shape(
+    slots: &[&Chain],
+    group: &[usize],
+    places: &[Placement],
+    input: [usize; 3],
+) -> Result<[usize; 3]> {
     let mut current = input;
-    for &slot in group {
-        current = slots[slot].output_shape(current)?;
+    for (&slot, place) in group.iter().zip(places) {
+        current = slots[slot].placed_output_shape(current, place)?;
     }
     Ok(current)
 }

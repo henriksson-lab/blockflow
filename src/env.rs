@@ -53,7 +53,7 @@ use crate::voxels::{SideBuf, Voxels};
 
 use super::decomposition::Decomposition;
 use super::geometry::{chunks_touched, region_within};
-use super::op::{Anchor, Chain, Output, SideBlock, SourceInputs};
+use super::op::{Anchor, Chain, Output, Placement, SideBlock, SourceInputs};
 
 /// Unwrap the executor's `(level, buffer)` list into the `(level, &Voxels)` form
 /// [`SourceInputs`] holds.
@@ -286,7 +286,7 @@ pub trait Environment: Sync {
         slot: &Chain,
         input: &BlockBuf,
         sources: &[(usize, BlockBuf)],
-        at: &Anchor,
+        at: &Placement,
     ) -> Result<BlockBuf>;
 
     /// Write the sub-box `within` of `buf` to absolute position `valid`.
@@ -1087,7 +1087,7 @@ impl Environment for ArrayEnvironment {
         slot: &Chain,
         input: &BlockBuf,
         sources: &[(usize, BlockBuf)],
-        at: &Anchor,
+        at: &Placement,
     ) -> Result<BlockBuf> {
         let array = input.as_array()?;
         let stored = as_source_arrays(sources)?;
@@ -1096,9 +1096,9 @@ impl Environment for ArrayEnvironment {
         // translate its read and a phase that may resize it.
         let mut out = Voxels::zeros(
             slot.produces(array.dtype())?,
-            slot.output_shape(array.shape())?,
+            slot.placed_output_shape(array.shape(), at)?,
         )?;
-        slot.apply_with(array, SourceInputs::new(&stored), &mut out, at)?;
+        slot.apply_placed(array, SourceInputs::new(&stored), &mut out, at)?;
         self.counters.ops_applied.fetch_add(1, Ordering::SeqCst);
         self.counters.estimated_work.fetch_add(
             (array.len() as f64 * slot.cost_per_voxel()) as u64,
@@ -1468,7 +1468,7 @@ impl Environment for AccountingEnvironment {
         slot: &Chain,
         input: &BlockBuf,
         _sources: &[(usize, BlockBuf)],
-        _at: &Anchor,
+        at: &Placement,
     ) -> Result<BlockBuf> {
         let BlockBuf::Accounted {
             region,
@@ -1490,7 +1490,7 @@ impl Environment for AccountingEnvironment {
         // run of a resizing phase must count the resized block, or it is
         // simulating a different plan. The region's *start* is kept because
         // nothing here reads it; only its extent is priced.
-        let produced = slot.output_shape(block_shape(region)?)?;
+        let produced = slot.placed_output_shape(block_shape(region)?, at)?;
         let region = Region::new(&region.start, &produced);
         let dtype = slot.produces(*dtype)?;
         // The only thing a data-free run can say about the output's uniformity
@@ -1610,7 +1610,7 @@ mod tests {
                 &Chain::op(AffineOp::new("d", 2.0, 1.0, [0, 0, 0])),
                 &buf,
                 &[],
-                &Anchor::whole([4, 4, 4]),
+                &Placement::same(Anchor::whole([4, 4, 4])),
             )
             .unwrap();
         assert_eq!(sim.uniform(&doubled), Some(1.0));
@@ -1632,7 +1632,7 @@ mod tests {
             &Chain::op(IdentityOp::new("noop", [0, 0, 0])),
             &buf,
             &[],
-            &Anchor::whole([2094, 13316, 3369]),
+            &Placement::same(Anchor::whole([2094, 13316, 3369])),
         )
         .unwrap();
     }

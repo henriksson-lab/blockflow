@@ -26,6 +26,16 @@
 //    and a second input read over a window is the obvious way to break it.
 // 6. **The declaration is checked**: a mask level that does not hold `Bool` is
 //    refused by name, and the op refuses to run without its operand at all.
+// 7. **The policy at an excluded centre**, which is a parameter rather than a
+//    rule: filter there anyway, or write a stated value. Asserted with masks
+//    that are *not* all-true — a mask that keeps everything makes the parameter
+//    invisible, which is exactly why the question went unasked for so long — and
+//    with an element that does **not** contain its own centre, where "the centre
+//    is excluded" and "the window came out empty" stop implying one another.
+// 8. **Decomposition invariance for that policy too**: whether a centre is
+//    excluded is a fact about the volume's population, and a run that decided it
+//    from the block's own view would be wrong in a way no single block size
+//    reveals.
 //
 // No assertion here is on wall-clock time.
 
@@ -37,8 +47,8 @@ use blockflow::error::{Error, Result};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain, SourceInputs};
 use blockflow::ops::{
-    masked_rank_filter_into, rank_filter_into, ElementShape, MaskedRankFilterOp, Rank,
-    StructuringElement, Total,
+    masked_rank_filter_into, masked_rank_filter_into_with, rank_filter_into, ElementShape,
+    ExcludedCentre, MaskedRankFilterOp, Rank, StructuringElement, Total,
 };
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
@@ -387,6 +397,303 @@ fn a_constant_block_maps_to_the_constant() {
         out.iter().all(|value| value.0 == 3.5),
         "an empty population on a constant block is still the constant"
     );
+}
+
+// --------------------------------------- 7. the policy at the centre --
+
+/// The element the two conditions come apart on: **it does not contain its own
+/// centre.** Six faces and nothing in the middle.
+///
+/// Every test above uses a box that holds its centre, where "the centre is out
+/// of the population" and "the window came out empty" imply one another in the
+/// direction that matters. With this element a centre can be *in* the population
+/// and still have an empty window, and a centre can be *out* of it while the
+/// window is full. That is why it is here.
+fn hollow() -> StructuringElement {
+    StructuringElement::from_offsets([
+        [-1, 0, 0],
+        [1, 0, 0],
+        [0, -1, 0],
+        [0, 1, 0],
+        [0, 0, -1],
+        [0, 0, 1],
+    ])
+    .unwrap()
+}
+
+fn filtered(
+    image: &Array3<f64>,
+    mask: &Array3<bool>,
+    element: &StructuringElement,
+    centre: ExcludedCentre<f64>,
+) -> Array3<f64> {
+    let ordered = image.mapv(Total);
+    let mut out = Array3::from_elem(ordered.raw_dim(), Total(0.0));
+    masked_rank_filter_into_with(
+        ordered.view(),
+        mask.view(),
+        element,
+        rank(),
+        centre.map(Total),
+        out.view_mut(),
+    )
+    .unwrap();
+    out.mapv(|value| value.0)
+}
+
+/// **A centre the population excludes, with neighbours it does not.**
+///
+/// The two policies must give different answers here, and each must give the
+/// answer it names: `Select` filters from the surviving neighbours, `Fill`
+/// writes the stated value without reading them. A single small volume with one
+/// hole punched in the mask is enough to separate them, and the hole is placed
+/// in the interior so nothing about the array's edge is involved.
+#[test]
+fn an_excluded_centre_is_filtered_anyway_or_filled_as_the_caller_says() {
+    let image = image();
+    let mut mask = Array3::from_elem(image.raw_dim(), true);
+    let hole = [5usize, 5, 5];
+    mask[hole] = false;
+
+    let selected = filtered(&image, &mask, &element(), ExcludedCentre::Select);
+    let filled = filtered(&image, &mask, &element(), ExcludedCentre::Fill(-1.0));
+
+    // the excluded centre, and only it, moved
+    assert_eq!(filled[hole], -1.0, "the caller's value, written verbatim");
+    assert_ne!(
+        selected[hole], -1.0,
+        "under Select the neighbours still have a statistic to give"
+    );
+    // the centre's own value is in the window under Select and not the answer
+    // the fill gives, so the two policies are genuinely different filters
+    let mut differing = 0;
+    for (a, b) in selected.iter().zip(filled.iter()) {
+        if a != b {
+            differing += 1;
+        }
+    }
+    assert_eq!(
+        differing, 1,
+        "exactly the one excluded centre may differ; a policy that leaked into \
+         its neighbours' windows would move more"
+    );
+
+    // and the fill is the caller's, not a hardcoded zero
+    let zeroed = filtered(&image, &mask, &element(), ExcludedCentre::Fill(0.0));
+    assert_eq!(zeroed[hole], 0.0);
+    assert_ne!(zeroed[hole], filled[hole]);
+}
+
+/// **The mirror case: the centre is in the population and its neighbours are
+/// not.** No policy may touch this voxel — it is not an excluded centre — and
+/// the answer is the centre's own value under both, because the centre is the
+/// whole of the surviving window.
+#[test]
+fn a_centre_in_the_population_is_untouched_by_either_policy() {
+    let image = image();
+    let mut mask = Array3::from_elem(image.raw_dim(), false);
+    let lone = [5usize, 5, 5];
+    mask[lone] = true;
+
+    let selected = filtered(&image, &mask, &element(), ExcludedCentre::Select);
+    let filled = filtered(&image, &mask, &element(), ExcludedCentre::Fill(-1.0));
+    assert_eq!(
+        selected[lone], image[lone],
+        "the only survivor of the window is the answer whatever the rank"
+    );
+    assert_eq!(
+        filled[lone], image[lone],
+        "a policy for excluded centres must not fire at a centre that is included"
+    );
+    // everywhere else the centre is excluded, so the fill is everywhere else
+    let elsewhere = filled.iter().filter(|value| **value == -1.0).count();
+    assert_eq!(elsewhere, image.len() - 1);
+}
+
+/// **An all-false population.** Every centre is excluded, so `Fill` is the whole
+/// volume and `Select` is the input carried through unchanged — which is the
+/// existing behaviour, restated here against the policy that could have
+/// disturbed it.
+#[test]
+fn an_empty_population_is_the_input_or_the_fill_throughout() {
+    let image = image();
+    let none = Array3::from_elem(image.raw_dim(), false);
+
+    assert_eq!(
+        filtered(&image, &none, &element(), ExcludedCentre::Select),
+        image,
+        "with nothing to select from, the value written is the value at the centre"
+    );
+    assert_eq!(
+        filtered(&image, &none, &element(), ExcludedCentre::Fill(7.5)),
+        Array3::from_elem(image.raw_dim(), 7.5)
+    );
+}
+
+/// **Where the two conditions come apart**, which is the reason the policy is
+/// keyed on the centre's own bit rather than on the window turning out empty.
+///
+/// With an element that misses its own centre:
+///
+/// * a centre **in** the population whose six neighbours are all out has an
+///   empty window and is *not* an excluded centre — so `Fill` must leave it to
+///   the empty-window rule, which carries the centre's value;
+/// * a centre **out** of the population whose neighbours are all in has a full
+///   window and *is* an excluded centre — so `Fill` must fire there even though
+///   there was a perfectly good statistic to take.
+///
+/// A policy that had been keyed on the empty window would get both of these
+/// backwards, and no test using a box element could tell.
+#[test]
+fn the_policy_follows_the_centres_own_bit_and_not_an_empty_window() {
+    let image = image();
+
+    // a centre in the population, every neighbour out of it
+    let mut lone = Array3::from_elem(image.raw_dim(), false);
+    let at = [5usize, 5, 5];
+    lone[at] = true;
+    let filled = filtered(&image, &lone, &hollow(), ExcludedCentre::Fill(-1.0));
+    assert_eq!(
+        filled[at], image[at],
+        "an included centre with an empty window is the empty-window rule's case, \
+         not the excluded centre's, and the two must not have been collapsed"
+    );
+    assert_eq!(
+        filled[[5, 5, 6]],
+        -1.0,
+        "its neighbours are excluded centres and do get the fill"
+    );
+
+    // a centre out of the population, every neighbour in it
+    let mut hole = Array3::from_elem(image.raw_dim(), true);
+    hole[at] = false;
+    let selected = filtered(&image, &hole, &hollow(), ExcludedCentre::Select);
+    let filled = filtered(&image, &hole, &hollow(), ExcludedCentre::Fill(-1.0));
+    assert_eq!(
+        filled[at], -1.0,
+        "an excluded centre gets the fill even where the window was full"
+    );
+    assert_ne!(
+        selected[at], -1.0,
+        "and Select takes the statistic that was there"
+    );
+    // the hollow element never reads its own centre, so under Select this voxel
+    // is decided entirely by six neighbours the mask kept
+    assert!(selected[at] >= 0.0);
+}
+
+/// The two policies agree everywhere the population keeps the centre, so a mask
+/// that keeps everything makes the parameter invisible. That is the statement
+/// that the change is **additive** rather than a new filter.
+#[test]
+fn a_population_that_keeps_every_centre_makes_the_policy_invisible() {
+    let image = image();
+    let all = Array3::from_elem(image.raw_dim(), true);
+    for element in [element(), hollow()] {
+        assert_eq!(
+            filtered(&image, &all, &element, ExcludedCentre::Select),
+            filtered(&image, &all, &element, ExcludedCentre::Fill(-1.0)),
+        );
+    }
+    // and the default really is the old behaviour, through the op as well as
+    // through the kernel
+    let op = MaskedRankFilterOp::new("masked", element(), rank(), MASK);
+    assert_eq!(op.excluded_centre(), ExcludedCentre::Select);
+    assert_eq!(
+        MaskedRankFilterOp::new("masked", element(), rank(), MASK)
+            .filling_excluded_centres(0.0)
+            .excluded_centre(),
+        ExcludedCentre::Fill(0.0)
+    );
+}
+
+/// **The short circuit's declaration follows the policy**, because under a fill
+/// the output of a constant block is no longer constant — it is the constant
+/// where the mask keeps the centre and the fill where it does not, and the
+/// short circuit has not read the mask.
+#[test]
+fn a_fill_that_is_not_the_constant_withdraws_the_short_circuit() {
+    let plain = MaskedRankFilterOp::new("masked", element(), rank(), MASK);
+    assert_eq!(plain.constant_maps_to(3.5), Some(3.5));
+
+    let filling =
+        MaskedRankFilterOp::new("masked", element(), rank(), MASK).filling_excluded_centres(0.0);
+    assert_eq!(
+        filling.constant_maps_to(3.5),
+        None,
+        "a block of 3.5 comes out part 3.5 and part 0.0, and which is which is a \
+         fact about a level the short circuit never read"
+    );
+    assert_eq!(
+        filling.constant_maps_to(0.0),
+        Some(0.0),
+        "where the fill is the constant the answer does not depend on the mask, \
+         and the declaration is exactly true again"
+    );
+
+    // the values behind the declaration, so it is checked rather than reasoned
+    let constant = Array3::from_elem((6, 6, 6), 3.5);
+    let mut mask = Array3::from_elem(constant.raw_dim(), true);
+    mask[[3, 3, 3]] = false;
+    let out = filtered(&constant, &mask, &element(), ExcludedCentre::Fill(0.0));
+    assert_eq!(out[[3, 3, 3]], 0.0);
+    assert_eq!(out[[2, 2, 2]], 3.5);
+}
+
+// ------------------- 8. decomposition invariance, under the new policy --
+
+/// The population is read over the element's window and the *centre's* bit is
+/// read at the voxel, so the policy adds no reach — but a fill that fired on the
+/// block's own idea of the mask rather than the volume's would still be a
+/// silently wrong volume, and the only thing that says otherwise is the sweep.
+fn chain_filling(fill: f64) -> Chain {
+    Chain::sequence(vec![
+        Chain::op(Binarize),
+        Chain::source(0usize, Dtype::F64),
+        Chain::op(
+            MaskedRankFilterOp::new("masked-percentile", element(), rank(), MASK)
+                .filling_excluded_centres(fill),
+        ),
+    ])
+}
+
+#[test]
+fn a_filled_centre_is_decided_by_the_volumes_population_at_every_block_size() {
+    const FILL: f64 = -1.0;
+    let image = image();
+    let mask = mask_of(&image);
+    let expected = filtered(&image, &mask, &element(), ExcludedCentre::Fill(FILL));
+
+    // non-vacuity: the fill really does land somewhere, and not everywhere
+    let filled = expected.iter().filter(|value| **value == FILL).count();
+    assert!(
+        filled > 0 && filled < expected.len(),
+        "{filled} of {} voxels were filled; a sweep over a volume that is all \
+         fill or no fill asserts nothing",
+        expected.len()
+    );
+    assert_ne!(
+        expected,
+        reference(),
+        "and the policy changed the answer, or this is the old test again"
+    );
+
+    for grid in grids() {
+        let chain = chain_filling(FILL);
+        let decomposition = plan(&chain, &grid);
+        let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
+        let env =
+            ArrayEnvironment::for_decomposition(image.clone().into(), &decomposition, [4, 4, 4])
+                .unwrap();
+        execute("filled", &workflow, &decomposition, &Hints::default(), &env).expect("a run");
+        assert_eq!(
+            env.output().view::<f64>().unwrap().to_owned(),
+            expected,
+            "block {:?}: a centre's exclusion is a fact about the volume's \
+             population, not about which block the voxel landed in",
+            grid.block()
+        );
+    }
 }
 
 /// A mask view of the wrong shape is refused rather than read out of bounds.

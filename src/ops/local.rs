@@ -977,7 +977,7 @@ impl Statistic {
     /// walks the histogram, and the second of those is a function of the bin
     /// count alone. A 256-bin threshold over a 27-voxel window is dominated by
     /// its bins; the same threshold over a 729-voxel window is not.
-    fn cost_per_sample(&self, window: usize) -> f64 {
+    pub(super) fn cost_per_sample(&self, window: usize) -> f64 {
         match self {
             Statistic::Isodata(isodata) => {
                 ISODATA_COST_PER_ELEMENT_VOXEL * window as f64

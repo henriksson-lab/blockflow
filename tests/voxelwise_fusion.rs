@@ -215,3 +215,79 @@ fn every_way_of_splitting_one_map_gives_the_same_volume() {
         identical(&run(chain, 7, &[0, 1, 2], &input), &want, what);
     }
 }
+
+// ------------------------------------------------------------- widening --
+//
+// `WidenOp` is the step that was missing between a level held at the width its
+// producer wrote and a kernel stated in `f64`. Without it a chain whose median
+// runs at `u16` — the reference's own width — cannot be followed by any local
+// statistic, and the plan simply refuses to assemble.
+
+#[test]
+fn widening_declares_f64_whatever_it_reads() {
+    use blockflow::op::BlockOp;
+    use blockflow::ops::WidenOp;
+    let op = WidenOp::new("widen");
+    for dtype in [
+        Dtype::Bool,
+        Dtype::U8,
+        Dtype::U16,
+        Dtype::U32,
+        Dtype::I8,
+        Dtype::I16,
+        Dtype::I32,
+        Dtype::F32,
+        Dtype::F64,
+    ] {
+        assert!(op.accepts(dtype), "{dtype:?}");
+        assert_eq!(op.produces(dtype), Dtype::F64, "{dtype:?}");
+    }
+    assert!(!op.accepts(Dtype::F16), "no buffer holds half-precision");
+    assert_eq!(op.reach(0, 64), 0, "a widening reads the voxel it writes");
+}
+
+#[test]
+fn widening_preserves_every_value() {
+    use blockflow::op::{Anchor, BlockOp};
+    use blockflow::ops::WidenOp;
+    use blockflow::voxels::Voxels;
+
+    let shape = [4usize, 3, 2];
+    let mut input = Voxels::zeros(Dtype::U16, shape).unwrap();
+    {
+        let mut view = input.view_mut::<u16>().unwrap();
+        for (index, slot) in view.iter_mut().enumerate() {
+            // Spread over the width, well past what a `u8` could hold, so a
+            // widening that truncated would be visible — and inside `u16`, which
+            // the multiplication has to stay in.
+            *slot = (index as u16) * 2000;
+        }
+    }
+    let mut out = Voxels::zeros(Dtype::F64, shape).unwrap();
+    WidenOp::new("widen")
+        .apply(&input, &mut out, &Anchor::whole(shape))
+        .unwrap();
+
+    let source = input.view::<u16>().unwrap();
+    let widened = out.view::<f64>().unwrap();
+    for (from, to) in source.iter().zip(widened.iter()) {
+        assert_eq!(f64::from(*from), *to);
+    }
+    // And it is not vacuous: something in there needed more than eight bits.
+    assert!(source.iter().any(|&value| value > 255));
+}
+
+/// A chain that could not previously be assembled: a `u16` level read by an op
+/// whose kernel is `f64`.
+#[test]
+fn widening_lets_a_narrow_level_feed_an_f64_kernel() {
+    use blockflow::op::Chain;
+    use blockflow::ops::{ElementShape, Rank, RankFilterOp, StructuringElement, WidenOp};
+
+    let element = StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]);
+    let narrow = Chain::op(RankFilterOp::new("median", element, Rank::Nth(13)));
+    // Without the widening this fold is `u16` into an `f64`-only op.
+    let chain = Chain::sequence(vec![narrow, Chain::op(WidenOp::new("widen"))]);
+    assert_eq!(chain.produces(Dtype::U16).unwrap(), Dtype::F64);
+    assert_eq!(chain.reach(0, 64), 1, "the widening adds no reach");
+}

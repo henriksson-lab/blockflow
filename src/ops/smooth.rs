@@ -42,6 +42,25 @@
 // weight, so the answer at `v` genuinely depends on the input at `v ± radius`,
 // and understating it by one voxel changes the output. There is a test.
 //
+// The one thing outside the array
+// -------------------------------
+// A kernel of radius `r` asks for the sample at `v - r` when `v` is the first
+// voxel of an axis, and nothing computes that — it is a convention, and
+// `ridge::Boundary` is where this crate names it. `Gaussian::with_boundary`
+// states it and defaults to the clamp that was the only behaviour before the
+// choice existed, so a caller who does not care is untouched down to the last
+// bit.
+//
+// Two things about it are worth having in the preamble rather than only at the
+// method. It **changes no reach**: whichever convention resolves a tap, the
+// position it lands on is inside `[v - r, v + r]`, because a reflection folds an
+// offset that left the array back towards the edge it left by. And it is a rule
+// about the **array's own edge**, which under decomposition is the volume's face
+// where the volume has one and is otherwise an interior position the halo keeps
+// every core voxel's taps away from — so a decomposed run reflects about the
+// volume and not about the block, which is the property the acceptance suite
+// asserts rather than assumes.
+//
 // What it produces, and why not the type it was given
 // ---------------------------------------------------
 // **`f64`, whatever it read.** A weighted mean of integers is not an integer,
@@ -92,7 +111,7 @@ use crate::error::{Error, Result};
 use crate::op::{Anchor, BlockOp};
 use crate::voxels::Voxels;
 
-use super::ridge::{gaussian_radius, gaussian_smooth_into, gaussian_weights};
+use super::ridge::{gaussian_radius, gaussian_smooth_into_with, gaussian_weights, Boundary};
 
 /// One Gaussian: a per-axis sigma, a truncation, and the three kernels they
 /// determine.
@@ -111,6 +130,7 @@ use super::ridge::{gaussian_radius, gaussian_smooth_into, gaussian_weights};
 pub struct Gaussian {
     sigma: [f64; 3],
     truncate: f64,
+    boundary: Boundary,
     kernels: [Vec<f64>; 3],
 }
 
@@ -167,6 +187,7 @@ impl Gaussian {
         Ok(Self {
             sigma,
             truncate,
+            boundary: Boundary::default(),
             kernels,
         })
     }
@@ -176,12 +197,33 @@ impl Gaussian {
         Self::new([sigma; 3], truncate)
     }
 
+    /// State how the convolution resolves the array's own edge.
+    ///
+    /// **A builder rather than a third argument to [`Self::new`]**, and that is
+    /// the whole of why this is additive: the convention has a default that was
+    /// the only behaviour before it was a choice, so every caller that does not
+    /// care keeps its call, its answer and its last bit, and the one that does
+    /// care says one thing more.
+    ///
+    /// It changes no kernel, no radius and no [`Self::reach`] — see
+    /// [`Boundary`], and the test that checks the claim rather than repeating
+    /// it. The taps are the same taps; what changes is which sample a tap that
+    /// left the array reads.
+    pub fn with_boundary(mut self, boundary: Boundary) -> Self {
+        self.boundary = boundary;
+        self
+    }
+
     pub fn sigma(&self) -> [f64; 3] {
         self.sigma
     }
 
     pub fn truncate(&self) -> f64 {
         self.truncate
+    }
+
+    pub fn boundary(&self) -> Boundary {
+        self.boundary
     }
 
     pub fn kernels(&self) -> &[Vec<f64>; 3] {
@@ -245,9 +287,15 @@ impl SmoothOp {
     /// conversion the kernel would have to invent; and `f16` is refused before a
     /// run starts, by `accepts`, because no buffer holds one.
     fn evaluate(&self, input: &Voxels, out: ArrayViewMut3<'_, f64>) -> Result<()> {
+        let boundary = self.gaussian.boundary();
         macro_rules! direct {
             ($type:ty) => {
-                gaussian_smooth_into(input.view::<$type>()?, self.gaussian.kernels(), out)
+                gaussian_smooth_into_with(
+                    input.view::<$type>()?,
+                    self.gaussian.kernels(),
+                    boundary,
+                    out,
+                )
             };
         }
         match input.dtype() {
@@ -261,7 +309,7 @@ impl SmoothOp {
             Dtype::F64 => direct!(f64),
             Dtype::Bool | Dtype::U64 | Dtype::I64 => {
                 let widened = input.widened();
-                gaussian_smooth_into(widened.view(), self.gaussian.kernels(), out)
+                gaussian_smooth_into_with(widened.view(), self.gaussian.kernels(), boundary, out)
             }
             Dtype::F16 => Err(Error::InvalidArgument(format!(
                 "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
@@ -513,6 +561,208 @@ mod tests {
         }
 
         assert!(!op.accepts(Dtype::F16));
+    }
+
+    /// **The reflected answer against arithmetic done by hand**, not against a
+    /// second call to the same code.
+    ///
+    /// One axis, one kernel, five voxels, and the expected value written as the
+    /// literal sum of taps times samples with the reflected indices spelled out.
+    /// That is what pins the convention: an implementation that mirrored about
+    /// the edge sample instead — `-1` reading `1` — passes every symmetry and
+    /// constancy check in this file and fails this one.
+    #[test]
+    fn the_reflected_answer_is_the_hand_written_sum_of_taps() {
+        // ceil(3 * 0.4) = 2, so the kernel is five taps and both ends of it
+        // leave a five-voxel axis at the faces
+        let gaussian = Gaussian::new([0.4, 0.0, 0.0], 3.0)
+            .unwrap()
+            .with_boundary(Boundary::Reflect);
+        assert_eq!(gaussian.reach(0), 2, "ceil(3 * 0.4)");
+        let taps = gaussian.kernels()[0].clone();
+        assert_eq!(taps.len(), 5);
+
+        let samples = [2.0f64, 3.0, 5.0, 7.0, 11.0];
+        let source = || -> Voxels {
+            let mut input = Array3::<f64>::zeros((5, 1, 1));
+            for (index, value) in samples.iter().enumerate() {
+                input[[index, 0, 0]] = *value;
+            }
+            input.into()
+        };
+        let out = smoothed(&SmoothOp::new("reflect", gaussian), &source());
+
+        // At voxel 0 the taps land on -2, -1, 0, 1, 2. Reflected, that reads
+        // samples 1, 0, 0, 1, 2 — the edge sample repeated once and the run
+        // then reversed. Summed lowest offset first, as the kernel is.
+        let want = ((((taps[0] * samples[1] + taps[1] * samples[0]) + taps[2] * samples[0])
+            + taps[3] * samples[1])
+            + taps[4] * samples[2]);
+        assert_eq!(
+            out[[0, 0, 0]].to_bits(),
+            want.to_bits(),
+            "the reflected sum must agree in every bit, summation order included"
+        );
+
+        // and at the far face: taps on 2, 3, 4, 5, 6 read samples 2, 3, 4, 4, 3
+        let want = ((((taps[0] * samples[2] + taps[1] * samples[3]) + taps[2] * samples[4])
+            + taps[3] * samples[4])
+            + taps[4] * samples[3]);
+        assert_eq!(out[[4, 0, 0]].to_bits(), want.to_bits());
+
+        // the clamped answer at the same voxel is a different number, which is
+        // what makes the choice worth having
+        let clamped = smoothed(
+            &SmoothOp::new("clamp", Gaussian::new([0.4, 0.0, 0.0], 3.0).unwrap()),
+            &source(),
+        );
+        assert_ne!(clamped[[0, 0, 0]], out[[0, 0, 0]]);
+        // and the middle voxel, whose taps never leave the array, is identical
+        assert_eq!(clamped[[2, 0, 0]].to_bits(), out[[2, 0, 0]].to_bits());
+    }
+
+    /// **A kernel wider than the axis it runs along.** A sigma of ten truncated
+    /// at four reaches forty voxels, and an axis of three is thirteen folds
+    /// short of containing it — which is an ordinary thing to ask of a wide blur
+    /// on a thin volume, and the case a reflection that mirrors only once gets
+    /// wrong by indexing outside the array altogether.
+    ///
+    /// Checked against the sum written out over the whole kernel with the
+    /// indices folded by hand, so nothing here rests on the implementation
+    /// being right about the fold.
+    #[test]
+    fn a_kernel_far_wider_than_the_axis_still_reflects_into_it() {
+        let gaussian = Gaussian::new([10.0, 0.0, 0.0], 4.0)
+            .unwrap()
+            .with_boundary(Boundary::Reflect);
+        assert_eq!(gaussian.reach(0), 40, "ceil(4 * 10)");
+        let taps = gaussian.kernels()[0].clone();
+        assert_eq!(taps.len(), 81);
+
+        let samples = [2.0f64, 3.0, 5.0];
+        let mut input = Array3::<f64>::zeros((3, 1, 1));
+        for (index, value) in samples.iter().enumerate() {
+            input[[index, 0, 0]] = *value;
+        }
+        let out = smoothed(&SmoothOp::new("wide", gaussian), &input.into());
+
+        // fold by mirroring until the position is inside, which is the
+        // definition the closed form has to match
+        fn fold(mut position: isize, extent: isize) -> usize {
+            loop {
+                if position < 0 {
+                    position = -position - 1;
+                } else if position >= extent {
+                    position = 2 * extent - 1 - position;
+                } else {
+                    return position as usize;
+                }
+            }
+        }
+
+        for centre in 0..3isize {
+            let mut want = 0.0f64;
+            for (step, weight) in taps.iter().enumerate() {
+                want += weight * samples[fold(centre + step as isize - 40, 3)];
+            }
+            assert_eq!(
+                out[[centre as usize, 0, 0]].to_bits(),
+                want.to_bits(),
+                "voxel {centre} of a three-voxel axis under a radius-forty kernel"
+            );
+        }
+
+        // every answer is finite and inside the range of the samples, which a
+        // fold that escaped the array could not have managed
+        for value in out.iter() {
+            assert!(
+                value.is_finite() && *value >= 2.0 && *value <= 5.0,
+                "{value}"
+            );
+        }
+    }
+
+    /// The convention changes **no reach**, which is the claim the module makes
+    /// and this is the check of it rather than a restatement.
+    ///
+    /// Both halves matter. The declared number is the same — that is arithmetic
+    /// on the sigma and could hardly be otherwise. The number is also still
+    /// *sufficient and tight* under the reflected convention: the answer moves
+    /// when the input at exactly the radius moves, and does not when the input
+    /// beyond it does. The second is the one that could have gone wrong, because
+    /// a reflection reads positions the caller never named.
+    #[test]
+    fn the_reflected_convention_declares_and_needs_the_same_reach() {
+        let clamped = Gaussian::new([1.0, 1.5, 0.6], 3.0).unwrap();
+        let reflected = clamped.clone().with_boundary(Boundary::Reflect);
+        assert_eq!(
+            clamped.boundary(),
+            Boundary::Clamp,
+            "the default is additive"
+        );
+        for axis in 0..3 {
+            assert_eq!(clamped.reach(axis), reflected.reach(axis));
+        }
+        assert_eq!(clamped.kernels(), reflected.kernels());
+        assert_eq!(clamped.taps(), reflected.taps());
+        assert_eq!(
+            SmoothOp::new("a", clamped).cost_per_voxel(),
+            SmoothOp::new("b", reflected).cost_per_voxel()
+        );
+
+        let op = SmoothOp::new(
+            "reflect",
+            Gaussian::isotropic(1.5, 3.0)
+                .unwrap()
+                .with_boundary(Boundary::Reflect),
+        );
+        let radius = op.reach(0, 1000);
+        assert_eq!(radius, 5);
+
+        let centre = radius + 3;
+        let extent = 2 * centre + 1;
+        let shape = (extent, 3, 3);
+
+        let base = Array3::<f64>::zeros(shape);
+        let quiet = smoothed(&op, &base.clone().into());
+
+        let mut poked = base.clone();
+        poked[[centre - radius, 1, 1]] = 1.0;
+        let loud = smoothed(&op, &poked.into());
+        assert_ne!(
+            quiet[[centre, 1, 1]],
+            loud[[centre, 1, 1]],
+            "the tap at the declared radius carries weight under either convention"
+        );
+
+        let mut far = base;
+        far[[centre - radius - 1, 1, 1]] = 1.0;
+        let unheard = smoothed(&op, &far.into());
+        assert_eq!(
+            quiet[[centre, 1, 1]],
+            unheard[[centre, 1, 1]],
+            "a reflection folds an offset back towards the edge it left by, never \
+             further out, so nothing beyond the truncation contributes"
+        );
+    }
+
+    /// A reflection is still a weighted mean of samples that were really there,
+    /// so it keeps a constant constant — the property that separates it from a
+    /// convention that invents zeros outside the array.
+    #[test]
+    fn the_reflected_convention_also_keeps_a_constant_constant_at_the_faces() {
+        let op = SmoothOp::new(
+            "reflect",
+            Gaussian::isotropic(2.0, 3.0)
+                .unwrap()
+                .with_boundary(Boundary::Reflect),
+        );
+        let input: Voxels = Array3::from_elem((5, 5, 5), 3.0).into();
+        let out = smoothed(&op, &input);
+        for value in out.iter() {
+            assert!((value - 3.0).abs() < 1e-12, "{value}");
+        }
+        assert_eq!(op.constant_maps_to(0.0), Some(0.0));
     }
 
     /// The clamp is at the array's own edge, which is right at a volume boundary

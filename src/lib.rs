@@ -220,7 +220,10 @@ pub use iterate::{
 pub use listener::{BlockProgress, EventListener, LatestOpPerChunk, OrderLog, ProgressKind};
 pub use log::{Event, ExecutionLog, Stats};
 pub use observed_io::{ObservedSink, ObservedSource};
-pub use op::{Anchor, BlockConstraint, BlockOp, Chain, Combine, Output, SideBlock, SourceInputs};
+pub use op::{
+    Anchor, BlockConstraint, BlockOp, Chain, Combine, Geometry, InputMap, Output, Placement,
+    SideBlock, SourceInputs,
+};
 pub use points::{
     decode_points, encode_points, Layout, Point, PointIndex, PointStore, State, WORDS_PER_POINT,
 };

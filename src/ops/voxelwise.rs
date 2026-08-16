@@ -1508,3 +1508,74 @@ mod tests {
         println!("{}", cost_report([96, 64, 64], 40));
     }
 }
+
+/// Widen any element type to `f64`, value for value.
+///
+/// **The op that was missing between a level and a kernel stated in `f64`.**
+/// `Voxels::widened` has always existed; nothing exposed it as a step of a
+/// chain, so a phase writing `u16` — a median run at the reference's own width,
+/// say — could not be read by an op whose kernel is `f64`, and the chain simply
+/// could not be assembled.
+///
+/// **Widening only, and the name says so.** Narrowing is not the inverse of
+/// this: it has to decide rounding, saturation and what a negative value means
+/// in an unsigned type, and each of those is a decision a caller should make
+/// explicitly rather than inherit from an op called `cast`. Every type a buffer
+/// can hold is exactly representable in `f64` except `u64` and `i64` beyond 2^53
+/// — stated here because it is the one lossy corner, and it is the same corner
+/// `Voxels::widened` already has.
+pub struct WidenOp {
+    name: &'static str,
+}
+
+impl WidenOp {
+    pub fn new(name: &'static str) -> Self {
+        Self { name }
+    }
+}
+
+impl BlockOp for WidenOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Nothing: a widening reads the voxel it writes and no other.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    /// Every type a buffer holds, `f64` included — widening an `f64` is the
+    /// identity and is a legitimate thing for a chain to contain rather than a
+    /// case to refuse, since which arm of a parameterised chain is live is not
+    /// this op's business.
+    fn accepts(&self, dtype: Dtype) -> bool {
+        dtype != Dtype::F16
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::F64
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        if input.dtype() == Dtype::F16 {
+            return Err(Error::InvalidArgument(format!(
+                "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
+                self.name
+            )));
+        }
+        let widened = input.widened();
+        out.view_mut::<f64>()?.assign(&widened);
+        Ok(())
+    }
+
+    /// A constant widens to itself. Exact for every type this accepts, because
+    /// the short circuit's constant is already an `f64` and widening is the
+    /// identity on it.
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        Some(value)
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        MAP_COST
+    }
+}

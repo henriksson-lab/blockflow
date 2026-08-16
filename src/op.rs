@@ -329,6 +329,17 @@ impl BlockConstraint {
 /// This is three anchors rather than a new kind of thing, and that is
 /// deliberate: `input` **is** the `Anchor` an op would otherwise have been
 /// given, so an op that ignores the rest behaves exactly as it did.
+///
+/// **Three anchors were not quite enough, and the fourth field says why.** An
+/// `Anchor` answers *where*, and the case this type exists for also needs *how
+/// much*: [`BlockOp::output_shape`] derives a write extent from a read extent,
+/// and an op whose two extents are not a function of each other has nothing to
+/// derive it from. The plan does know — it is the block's own read region — so
+/// [`Self::writes`] carries it, and [`BlockOp::placed_output_shape`] is where an
+/// op may take the plan's answer instead of computing one. It is an `Option`
+/// rather than a field every construction must fill because the two entry points
+/// differ honestly: the executor always knows the extent, and a caller applying
+/// a chain to a whole array by hand does not have a plan to have got it from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     /// Where the buffer sits in the volume it was read from.
@@ -340,6 +351,8 @@ pub struct Placement {
     pub output: Anchor,
     /// Per source level, where that buffer sits in its own level.
     pub sources: Vec<(usize, Anchor)>,
+    /// The extent of the block written, when the plan states one.
+    writes: Option<[usize; 3]>,
 }
 
 impl Placement {
@@ -350,6 +363,7 @@ impl Placement {
             input: at.clone(),
             output: at,
             sources: Vec::new(),
+            writes: None,
         }
     }
 
@@ -358,12 +372,27 @@ impl Placement {
             input,
             output,
             sources: Vec::new(),
+            writes: None,
         }
     }
 
     pub fn with_sources(mut self, sources: Vec<(usize, Anchor)>) -> Self {
         self.sources = sources;
         self
+    }
+
+    /// State the extent of the block being written.
+    pub fn writing(mut self, extent: [usize; 3]) -> Self {
+        self.writes = Some(extent);
+        self
+    }
+
+    /// The extent of the block being written, when the plan states one.
+    ///
+    /// `None` says nothing but the op's own [`BlockOp::output_shape`] knows it,
+    /// which is the answer for every caller that is not an executor.
+    pub fn writes(&self) -> Option<[usize; 3]> {
+        self.writes
     }
 
     /// Where the buffer for `level` sits in its own level.
@@ -389,6 +418,23 @@ pub enum InputMap {
     /// The output region, grown per side. Every op in `src/ops` today, and the
     /// reach each already states.
     Stencil(Reach),
+    /// The output index scaled by a rational factor, then grown per side.
+    ///
+    /// `up` and `down` are held as plain integers rather than as
+    /// `ops::resample::Ratio` so that this module stays below `ops` in the
+    /// layering; a `Ratio` converts into them exactly, being a reduced pair.
+    ///
+    /// **The ratio moves the output extent, not the reach.** Where an output
+    /// voxel reads is a function of the factor; how far *around* that position
+    /// it reads is the interpolation's own window, which is what `window`
+    /// carries and what a halo has to cover. Keeping the two separate is what
+    /// lets a decimating phase declare a large factor and a small halo, which is
+    /// the whole reason a resampling phase is cheap.
+    Affine {
+        up: [usize; 3],
+        down: [usize; 3],
+        window: Reach,
+    },
     /// One region per block, resolved when the plan is built.
     ///
     /// Indexed by `BlockGeometry::flat`, so it is as long as the phase has
@@ -453,6 +499,9 @@ impl Geometry {
     pub fn primary_reach(&self) -> Option<&Reach> {
         match self.inputs.first() {
             Some(InputMap::Stencil(reach)) => Some(reach),
+            // The factor is in the output volume; what a halo must cover is the
+            // interpolation's window. See [`InputMap::Affine`].
+            Some(InputMap::Affine { window, .. }) => Some(window),
             _ => None,
         }
     }
@@ -632,6 +681,45 @@ pub trait BlockOp: Send + Sync {
             )));
         }
         self.apply(input, out, at)
+    }
+
+    /// [`Self::apply_with`], told where this block sits in **every** space it
+    /// touches rather than only in the one it read from.
+    ///
+    /// **Defaulted to the anchor it would have had**, which is the whole reason
+    /// this is a separate method: `at.input` *is* the `Anchor` the executor used
+    /// to pass, so an op that does not care about placement says nothing and
+    /// behaves exactly as it did. What an op gains by overriding it is the one
+    /// fact an `Anchor` cannot carry — which outputs this block owns — and the
+    /// case that needs it is an op whose output lattice is neither its input's
+    /// nor a fixed ratio of it. See [`Placement`].
+    fn apply_placed(
+        &self,
+        input: &Voxels,
+        sources: SourceInputs<'_>,
+        out: &mut Voxels,
+        at: &Placement,
+    ) -> Result<()> {
+        self.apply_with(input, sources, out, &at.input)
+    }
+
+    /// [`Self::output_shape`], told where the block sits.
+    ///
+    /// **Defaulted to [`Self::output_shape`]**, so an op whose write extent is a
+    /// function of its read extent — every op this crate ships but one — says
+    /// nothing and is asked exactly what it was asked before.
+    ///
+    /// An op that overrides this is saying its two extents are *not* a function
+    /// of each other, and it takes the extent from [`Placement::writes`]
+    /// instead. That trades one check away and it should be paid for: the
+    /// executor compares the shape a phase declares against the read extent its
+    /// plan derived, and an op answering from the plan makes that comparison
+    /// compare the plan against itself. The op then owes a check of its own, in
+    /// its kernel, against the buffer it was actually handed — which is a
+    /// stronger check than the one it replaced, because it is against data
+    /// rather than against a declaration.
+    fn placed_output_shape(&self, input: [usize; 3], _at: &Placement) -> [usize; 3] {
+        self.output_shape(input)
     }
 
     // ------------------------------------------------- what it can handle --
@@ -1341,9 +1429,85 @@ impl Chain {
         Ok(spec)
     }
 
+    /// The reach a [`Geometry`] implies for the phase's **own** space.
+    ///
+    /// A [`InputMap::Stencil`] is one directly. A [`InputMap::Table`] is not a
+    /// reach at all and must not be flattened into one: its dependency is stated
+    /// per block, in the level below's coordinates, and there is no factor a
+    /// `BlockGrid` could supply that would turn it into a distance in this
+    /// phase's voxels. So it answers **nothing, in
+    /// [`Space::source_index`]** — which is not a silent zero but a marked one:
+    /// the space is carried into the plan, `converts_to_voxels` is false for it,
+    /// and a phase declaring it without per-block fetch regions is refused by
+    /// name rather than planned as though it reached nothing.
+    ///
+    /// An op declaring no inputs reaches nothing, in the ordinary space: an op
+    /// that reads no array has no dependency to state.
+    fn reach_of(geometry: &Geometry, name: &str) -> Result<Reach> {
+        match geometry.inputs().first() {
+            None => Ok(Reach::none()),
+            Some(InputMap::Stencil(reach)) | Some(InputMap::Affine { window: reach, .. }) => {
+                Ok(reach.clone())
+            }
+            Some(InputMap::Table(regions)) => {
+                if regions.is_empty() {
+                    return Err(Error::InvalidArgument(format!(
+                        "{name} declares a per-block input map holding no regions, so no block \
+                         would have anything to read. A table map states one region per block."
+                    )));
+                }
+                Ok(Reach::none().in_space(crate::reach::Space::source_index()))
+            }
+        }
+    }
+
+    /// Whether this subtree writes on the grid it reads: the same offsets, in
+    /// the same volume, so that a block's output placement **is** its input
+    /// placement.
+    ///
+    /// Read off [`Geometry`] rather than declared beside it, which is the point
+    /// of step two of the migration: an op that keeps its grid says so by
+    /// declaring an output volume equal to the one it was asked about and a
+    /// stencil whose reach is in a space that converts to voxels. An
+    /// [`InputMap::Affine`] does not keep its grid (its offsets scale), and a
+    /// stencil stated in [`crate::reach::Space::source_index`] does not either —
+    /// that space exists to say the dependency is in another level's lattice,
+    /// which is exactly the case where an offset does not carry across.
+    fn keeps_grid(&self, volume: [usize; 3]) -> bool {
+        match self {
+            Chain::Op(op) => {
+                let geometry = op.geometry(volume);
+                if geometry.output_volume() != volume {
+                    return false;
+                }
+                match geometry.inputs().first() {
+                    None => true,
+                    Some(InputMap::Stencil(reach)) => reach.space().converts_to_voxels(),
+                    Some(_) => false,
+                }
+            }
+            // The extent it was asked for, at the place it was asked for it.
+            Chain::Source { .. } => true,
+            Chain::Sequence(children) => children.iter().all(|child| child.keeps_grid(volume)),
+            Chain::Alternative { branches, taken } => branches[*taken].keeps_grid(volume),
+            Chain::Parallel { branches, .. } => {
+                branches.iter().all(|branch| branch.keeps_grid(volume))
+            }
+        }
+    }
+
     fn fold_reach_spec(&self, volume: [usize; 3]) -> Result<Reach> {
         match self {
-            Chain::Op(op) => Ok(op.reach_spec(volume)),
+            // **Through `geometry`, not through `reach_spec`.** Step two of the
+            // migration in `forme.md`: the declaration becomes the one an op
+            // makes, and the reach becomes something derived from it. Today
+            // `BlockOp::geometry` defaults to `stencil(volume,
+            // self.reach_spec(volume))`, so for every shipped op this is the
+            // same number by the same route — which is the property that makes
+            // this step's failure unambiguous. What it buys is that an op which
+            // *does* state a map has that map honoured here rather than needing
+            // a second declaration beside it.
+            Chain::Op(op) => Self::reach_of(&op.geometry(volume), op.name()),
             Chain::Source { .. } => Ok(Reach::none()),
             Chain::Sequence(children) => fold_specs(children, volume, Reach::add),
             Chain::Alternative { branches, .. } => fold_specs(branches, volume, Reach::max),
@@ -1518,6 +1682,60 @@ impl Chain {
         }
     }
 
+    /// [`Self::output_shape`], told where the block sits.
+    ///
+    /// The same walk, with the one difference that a `Sequence` derives a
+    /// placement per child ([`place_parts`]) instead of handing every child the
+    /// one it was given. For a chain of ops that all default
+    /// [`BlockOp::placed_output_shape`] — which is every op this crate ships but
+    /// one — this answers exactly what [`Self::output_shape`] does, by the same
+    /// route.
+    pub fn placed_output_shape(&self, input: [usize; 3], at: &Placement) -> Result<[usize; 3]> {
+        match self {
+            Chain::Op(op) => Ok(op.placed_output_shape(input, at)),
+            Chain::Source { .. } => Ok(input),
+            Chain::Sequence(children) => {
+                let parts: Vec<&Chain> = children.iter().collect();
+                let places = place_parts(&parts, at, input);
+                let mut current = input;
+                for (child, place) in children.iter().zip(&places) {
+                    current = child.placed_output_shape(current, place)?;
+                }
+                Ok(current)
+            }
+            Chain::Alternative { branches, .. } => {
+                let mut agreed: Option<[usize; 3]> = None;
+                for branch in branches {
+                    let produced = branch.placed_output_shape(input, at)?;
+                    match agreed {
+                        None => agreed = Some(produced),
+                        Some(existing) if existing == produced => {}
+                        Some(existing) => {
+                            return Err(Error::InvalidArgument(format!(
+                                "{:?} produces {existing:?} on one branch and {produced:?} on \
+                                 another from an input of {input:?}. The level's extent is in the \
+                                 plan, and the plan does not know which branch is live.",
+                                self.display_name()
+                            )))
+                        }
+                    }
+                }
+                agreed.ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "Chain::alternative needs at least one branch".to_string(),
+                    )
+                })
+            }
+            Chain::Parallel { branches, combine } => {
+                let produced = branches
+                    .iter()
+                    .map(|branch| branch.placed_output_shape(input, at))
+                    .collect::<Result<Vec<[usize; 3]>>>()?;
+                combine.output_shape(&produced)
+            }
+        }
+    }
+
     /// The same walk as `reach`, over the same tree, for a subtree that reads
     /// nothing but its input.
     ///
@@ -1546,7 +1764,26 @@ impl Chain {
         out: &mut Voxels,
         at: &Anchor,
     ) -> Result<()> {
-        let wanted_shape = self.output_shape(input.shape())?;
+        self.apply_placed(input, sources, out, &Placement::same(at.clone()))
+    }
+
+    /// [`Self::apply_with`], told where the block sits in **every** space it
+    /// touches.
+    ///
+    /// The one structural difference from the anchor form is `Sequence`: each
+    /// child is handed the placement [`place_parts`] derives for it rather than
+    /// the one the sequence was given. Every other node passes the placement
+    /// down unchanged, exactly as it passed the anchor down unchanged, and for
+    /// the same reason — a leaf deep inside a `Parallel` branch must see the
+    /// position it actually has.
+    pub fn apply_placed(
+        &self,
+        input: &Voxels,
+        sources: SourceInputs<'_>,
+        out: &mut Voxels,
+        at: &Placement,
+    ) -> Result<()> {
+        let wanted_shape = self.placed_output_shape(input.shape(), at)?;
         let wanted_dtype = self.produces(input.dtype())?;
         if out.shape() != wanted_shape {
             return Err(Error::ShapeMismatch {
@@ -1564,7 +1801,7 @@ impl Chain {
             )));
         }
         match self {
-            Chain::Op(op) => op.apply_with(input, sources, out, at),
+            Chain::Op(op) => op.apply_placed(input, sources, out, at),
             // The one node that answers from something other than `input`. The
             // buffer holds the block's read extent of the level, so this is a
             // copy and not a slice: the executor already asked for exactly the
@@ -1590,7 +1827,7 @@ impl Chain {
                 out.assign(stored)
             }
             Chain::Alternative { branches, taken } => {
-                branches[*taken].apply_with(input, sources, out, at)
+                branches[*taken].apply_placed(input, sources, out, at)
             }
             // Every branch, over the **same** buffer at the **same** anchor,
             // then the combine over all of their results. The shared input is
@@ -1609,27 +1846,35 @@ impl Chain {
                 for branch in branches {
                     let mut result = Voxels::zeros(
                         branch.produces(input.dtype())?,
-                        branch.output_shape(input.shape())?,
+                        branch.placed_output_shape(input.shape(), at)?,
                     )?;
-                    branch.apply_with(input, sources, &mut result, at)?;
+                    branch.apply_placed(input, sources, &mut result, at)?;
                     results.push(result);
                 }
-                combine.apply(&results, out, at)
+                // The combine writes this node's output, so it is anchored where
+                // that output sits. For every fan-in this crate can build the two
+                // anchors are the same value — a `Parallel` reads and writes one
+                // grid — so this is a statement of which one is meant rather than
+                // a change of behaviour.
+                combine.apply(&results, out, &at.output)
             }
             Chain::Sequence(children) => match children.len() {
                 0 => out.assign(input),
-                1 => children[0].apply_with(input, sources, out, at),
+                1 => children[0].apply_placed(input, sources, out, at),
                 n => {
+                    let parts: Vec<&Chain> = children.iter().collect();
+                    let places = place_parts(&parts, at, input.shape());
                     let mut current = input.clone();
                     for (position, child) in children.iter().enumerate() {
+                        let place = &places[position];
                         if position + 1 == n {
-                            return child.apply_with(&current, sources, out, at);
+                            return child.apply_placed(&current, sources, out, place);
                         }
                         let mut next = Voxels::zeros(
                             child.produces(current.dtype())?,
-                            child.output_shape(current.shape())?,
+                            child.placed_output_shape(current.shape(), place)?,
                         )?;
-                        child.apply_with(&current, sources, &mut next, at)?;
+                        child.apply_placed(&current, sources, &mut next, place)?;
                         current = next;
                     }
                     Ok(())
@@ -2034,6 +2279,87 @@ fn fold_specs(
         });
     }
     Ok(folded.unwrap_or_default())
+}
+
+/// Where each part of a run of chains sits, given where the run does.
+///
+/// **This is the fold the executor was missing.** A phase's slots and a
+/// `Sequence`'s children are the same shape of thing — a run of chains, each
+/// handed what the one before produced — and both were given one `Anchor`, the
+/// same one, for every member. That is right exactly as long as no member
+/// changes the grid, and the moment one does the members after it are anchored
+/// in a space they are not in.
+///
+/// The derivation has two known ends and one rule. `at.input` is where the run's
+/// first member reads and `at.output` is where its last member writes; both come
+/// from the plan, which holds the fetch region and the read region in their own
+/// spaces. Between them, a member that [`Chain::keeps_grid`] has its output
+/// placement equal to its input placement, so a placement propagates across it
+/// in either direction. Running that forward from the input and backward from
+/// the output resolves every boundary of a run containing at most one
+/// grid-changing member — including the two orders that matter, where the
+/// cross-grid member is first (its output comes from the backward pass) and
+/// where it is last (its input comes from the forward pass).
+///
+/// **A boundary that neither pass reaches keeps today's answer rather than
+/// failing.** Two grid-changing members in one run leave the boundary between
+/// them underivable, and what it falls back to — the run's own anchor, for both
+/// ends — is exactly what every member was handed before this fold existed. So
+/// this cannot make a chain that worked stop working; an op that genuinely needs
+/// a placement it was not given sees an anchor that is not in its own space and
+/// refuses by name, which is the arrangement `LatticeInterpolateOp` already has.
+pub fn place_parts(parts: &[&Chain], at: &Placement, input_shape: [usize; 3]) -> Vec<Placement> {
+    let n = parts.len();
+    let mut anchors: Vec<Option<Anchor>> = vec![None; n + 1];
+    let mut extents: Vec<Option<[usize; 3]>> = vec![None; n + 1];
+    anchors[0] = Some(at.input.clone());
+    extents[0] = Some(input_shape);
+    anchors[n] = Some(at.output.clone());
+    extents[n] = at.writes();
+
+    // The volume to ask `keeps_grid` about is whichever end of the member is
+    // known; for a member that keeps its grid the two are the same volume, and
+    // for one that does not the answer is `false` from either.
+    let keeps = |i: usize, anchors: &[Option<Anchor>]| match anchors[i]
+        .as_ref()
+        .or(anchors[i + 1].as_ref())
+    {
+        Some(anchor) => parts[i].keeps_grid(anchor.volume),
+        None => false,
+    };
+
+    for i in 0..n {
+        if keeps(i, &anchors) {
+            if anchors[i + 1].is_none() {
+                anchors[i + 1] = anchors[i].clone();
+            }
+            if extents[i + 1].is_none() {
+                extents[i + 1] = extents[i];
+            }
+        }
+    }
+    for i in (0..n).rev() {
+        if keeps(i, &anchors) {
+            if anchors[i].is_none() {
+                anchors[i] = anchors[i + 1].clone();
+            }
+            if extents[i].is_none() {
+                extents[i] = extents[i + 1];
+            }
+        }
+    }
+
+    (0..n)
+        .map(|i| {
+            let input = anchors[i].clone().unwrap_or_else(|| at.input.clone());
+            let output = anchors[i + 1].clone().unwrap_or_else(|| at.output.clone());
+            let placed = Placement::new(input, output).with_sources(at.sources.clone());
+            match extents[i + 1] {
+                Some(extent) => placed.writing(extent),
+                None => placed,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

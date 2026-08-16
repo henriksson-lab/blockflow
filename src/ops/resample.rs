@@ -153,7 +153,7 @@ use crate::decomposition::PhaseDecomposition;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::geometry::BlockGrid;
-use crate::op::{Anchor, BlockOp};
+use crate::op::{Anchor, BlockOp, Geometry, InputMap};
 use crate::reach::{AxisReach, Reach};
 use crate::region::Region;
 use crate::voxels::{VoxelElement, Voxels};
@@ -900,6 +900,37 @@ impl BlockOp for ResampleOp {
     /// mean: `f16` is held by nothing, and `bool` has no midpoint.
     fn accepts(&self, dtype: Dtype) -> bool {
         self.resample.interpolation().accepts(dtype)
+    }
+
+    /// **The first op to state a map rather than a reach.**
+    ///
+    /// The two halves it separates are already separate in `Resample` and were
+    /// merely reported through two methods: the factor decides the output
+    /// volume, and the interpolation's taps decide what a halo has to cover.
+    /// `Geometry` says both in one place, and `Chain` derives the reach from it
+    /// rather than asking a second time.
+    ///
+    /// Per-axis rather than through `output_volume`, which is fallible: an
+    /// extent is a number this op can always produce, and a resampling of a
+    /// volume that cannot be represented is caught where the plan is built.
+    fn geometry(&self, input_volume: [usize; 3]) -> Geometry {
+        let mut up = [0usize; 3];
+        let mut down = [0usize; 3];
+        let mut output = [0usize; 3];
+        for axis in 0..3 {
+            let ratio = self.resample.ratio(axis);
+            up[axis] = ratio.up();
+            down[axis] = ratio.down();
+            output[axis] = self.resample.output_extent(axis, input_volume[axis]);
+        }
+        Geometry::new(
+            output,
+            vec![InputMap::Affine {
+                up,
+                down,
+                window: self.resample.reach_spec(),
+            }],
+        )
     }
 
     /// The declaration a resizing phase exists on: `floor(n * up / down)` per

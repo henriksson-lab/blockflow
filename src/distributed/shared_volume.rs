@@ -69,7 +69,7 @@ use crate::dtype::Dtype;
 use crate::env::{BlockBuf, EnvCounters, Environment};
 use crate::error::{Error, Result};
 use crate::geometry::chunks_touched;
-use crate::op::{Anchor, Chain, SourceInputs};
+use crate::op::{Chain, Placement, SourceInputs};
 use crate::region::Region;
 use crate::sidecar::{FileSidecars, Sidecars};
 use crate::voxels::Voxels;
@@ -368,15 +368,15 @@ impl Environment for SharedVolumes {
         slot: &Chain,
         input: &BlockBuf,
         sources: &[(usize, BlockBuf)],
-        at: &Anchor,
+        at: &Placement,
     ) -> Result<BlockBuf> {
         let array = input.as_array()?;
         let stored = crate::env::as_source_arrays(sources)?;
         let mut out = Voxels::zeros(
             slot.produces(array.dtype())?,
-            slot.output_shape(array.shape())?,
+            slot.placed_output_shape(array.shape(), at)?,
         )?;
-        slot.apply_with(array, SourceInputs::new(&stored), &mut out, at)?;
+        slot.apply_placed(array, SourceInputs::new(&stored), &mut out, at)?;
         self.counters.ops_applied.fetch_add(1, Ordering::SeqCst);
         self.counters.estimated_work.fetch_add(
             (array.len() as f64 * slot.cost_per_voxel()) as u64,
