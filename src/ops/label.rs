@@ -112,6 +112,51 @@
 // margin around it is left at zero, because a voxel out there may have a
 // contributor beyond the gathered neighbourhood and an unmarked voxel is a
 // smaller lie than a wrong label.
+//
+// A stamp is a gather's transpose, so it asks the element the same question
+// -------------------------------------------------------------------------
+// The kernel is a [`StructuringElement`], and one of those can be built from
+// [`super::element::StepOrigin::ClippedStart`], whose members are **not one
+// set**: a decimation counted from the clipped start of the window re-phases
+// wherever the window meets a low face of the volume. Every op that *gathers* a
+// window asks [`StructuringElement::offsets_at`] for the members at the voxel it
+// is evaluating. This op does not gather — it **stamps**, placing the element
+// around a point and writing — and it asks the same method for a reason worth
+// writing down rather than inheriting.
+//
+// A gather is `out[c] = f({ in[c + o] : o in K(c) })`, so its incidence matrix
+// has `M[c, c + o] != 0` for `o` in `K(c)`. The transpose of that is a
+// **scatter**: for each source index `p`, write into `p + o` for every `o` in
+// `K(p)` — the kernel read at the *source*, which here is the point. So the
+// stamp below is exactly `M^T` when, and only when, it evaluates the element at
+// the point's own position. Asking at any other position would be a different
+// operator, not a different spelling of this one.
+//
+// That is the structural half. The substantive half is what `ClippedStart`
+// actually names: it is a property of a **(position, volume)** pair, stated by
+// the array expression `a[max(0, c - lo) : min(c + hi + 1, n) : step]`, and that
+// expression says nothing about reading or writing. A gather puts it on the
+// right of the assignment and a stamp puts it on the left; the slice is the same
+// slice. The step that makes the two agree exactly is that this op's source
+// space and destination space are **the same volume** — a point must lie in a
+// core and cores tile the volume, so `n` is `grid.volume()` on both sides. Were
+// a stamp ever to deposit into a differently-sized array, "the window at the
+// point" and "the window at the voxel" would clip against different extents and
+// the two questions would come apart; here they cannot.
+//
+// So this op **honours** the origin, at the point's position in the volume. What
+// it costs is one regeneration per *point* rather than per voxel, which is the
+// cheapest place in the crate this question is asked; what it costs an anchored
+// element is nothing, because `offsets_at` hands that element its own slice back
+// and the lift below keeps even that out of the loop.
+//
+// **A re-phased window can hold a count the element does not.** Fewer where a
+// face truncates it, and for a shaped element occasionally *more* — a ball of
+// radius two stepped by two keeps seven offsets in the interior and eight at the
+// phase reached from `[1, 1, 1]`. Nothing here is sized from
+// [`StructuringElement::len`]: the loop walks the slice it was handed, `min` has
+// no arity, and the collision rule does not count. So a surprising count changes
+// which voxels are marked and nothing else, which is what it should change.
 
 use ndarray::{Array3, ArrayViewMut3, Axis, Slice};
 
@@ -124,7 +169,7 @@ use crate::region::Region;
 use crate::sidecar::check_stream_name;
 use crate::voxels::Voxels;
 
-use super::element::StructuringElement;
+use super::element::{StepOrigin, StructuringElement};
 use super::voxelize::block_reach;
 
 // ----------------------------------------------------------------- labels --
@@ -290,6 +335,13 @@ pub fn labelled_points(
 /// function needs no sort and its answer does not depend on the order of
 /// `fragments`, of the points inside one fragment, or of the kernel's offsets.
 ///
+/// The kernel is placed at each point's position **in the volume**, through
+/// [`StructuringElement::offsets_at`], which is what makes an element whose
+/// members re-phase near a low face stamp the window it names there. The point's
+/// coordinate is already a volume coordinate and `volume` is `grid`'s, so the
+/// window a block stamps is the window the whole-volume run stamps — a block
+/// seam is not a face and nothing here can mistake one for the other.
+///
 /// Free function first, `FragmentOp` shell on top, for this module's usual
 /// reason: a test can permute this function's argument and cannot permute what
 /// the executor gathers.
@@ -317,8 +369,29 @@ pub fn label_points_into(
         });
     }
 
+    // The element's members **at one point**, for the one element that has more
+    // than one set of them. Owned out here so that a point pays no allocation for
+    // it, and untouched by every other element.
+    let mut scratch: Vec<[isize; 3]> = Vec::new();
+    // **The one member set, where there is one**, lifted out of the loop rather
+    // than asked for at every point. `offsets_at` hands back exactly this slice
+    // for an anchored element, so the two are the same answer; the lift keeps the
+    // path that has nothing to ask about — every element without a step, which is
+    // every kernel this op has ever been given — a slice walk and nothing else.
+    let fixed = (element.origin() == StepOrigin::Anchor).then(|| element.offsets());
     for (label, at) in labelled_points(fragments, grid, ceiling)? {
-        for offset in element.offsets() {
+        // The transpose of a gather reads the kernel at the **source**, and the
+        // source of a stamp is the point. See the module header for why that is
+        // the same question a gathering op asks and not merely a similar one.
+        let stamped = match fixed {
+            Some(offsets) => offsets,
+            None => element.offsets_at(
+                [at[0] as isize, at[1] as isize, at[2] as isize],
+                volume,
+                &mut scratch,
+            ),
+        };
+        for offset in stamped {
             let mut inside = true;
             let mut local = [0usize; 3];
             for axis in 0..3 {
@@ -616,6 +689,7 @@ fn store(labels: &Array3<u64>, at: [usize; 3], into: &mut Voxels) -> Result<()> 
 mod tests {
     use super::*;
     use crate::fragment::fragment_phase;
+    use crate::ops::element::ElementShape;
     use crate::ops::voxelize::{ball, single_voxel};
 
     fn window_of(volume: [usize; 3]) -> Region {
@@ -1095,5 +1169,284 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ------------------------------------------- a kernel that re-phases --
+
+    /// The reference rule, written out in the arithmetic it is stated in:
+    /// `a[max(0, c - lo) : min(c + hi + 1, n) : step]`, as a list of coordinates.
+    ///
+    /// Independent of `StructuringElement` on purpose — every assertion below
+    /// that says which voxels a point stamps is compared against this and not
+    /// against `offsets_at`, so the op and the element cannot agree with each
+    /// other and both be wrong.
+    fn reference_window(centre: usize, lo: usize, hi: usize, step: usize, n: usize) -> Vec<usize> {
+        (centre.saturating_sub(lo)..(centre + hi + 1).min(n))
+            .step_by(step)
+            .collect()
+    }
+
+    /// A flat `size`-wide box on axis 0, decimated by `step`, at either origin.
+    fn flat(size: usize, step: usize, origin: StepOrigin) -> StructuringElement {
+        StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            [size, 1, 1],
+            [step, 1, 1],
+            origin,
+        )
+        .unwrap()
+    }
+
+    fn marked(stamped: &Array3<u64>) -> Vec<usize> {
+        (0..stamped.shape()[0])
+            .filter(|&i| stamped[[i, 0, 0]] != 0)
+            .collect()
+    }
+
+    /// **The stamp places the window the origin names at the point's own
+    /// position**, which is the transpose of the gather the same element gives —
+    /// see the module header for why those are one question and not two.
+    ///
+    /// The point sits inside `lo` of the low face, which is the only place the
+    /// two origins differ, and the expected set is the reference array expression
+    /// written out rather than `offsets_at` asked twice.
+    #[test]
+    fn a_re_phasing_kernel_stamps_the_window_at_the_points_own_position() {
+        let volume = [24usize, 1, 1];
+        let element = flat(11, 2, StepOrigin::ClippedStart);
+        let (lo, hi) = (5usize, 5usize);
+        for centre in [0usize, 1, 2, 3, 4, 5, 12] {
+            let stamped = whole(volume, &element, &[Point::weighted([centre, 0, 0], 7.0)]).unwrap();
+            assert_eq!(
+                marked(&stamped),
+                reference_window(centre, lo, hi, 2, volume[0]),
+                "a point at {centre} did not stamp the window the reference expression names"
+            );
+        }
+    }
+
+    /// **The negative control**: the same program with the origin changed stamps
+    /// a different volume, so the assertion above is about the origin rather than
+    /// about an element whose two readings happen to agree.
+    ///
+    /// At `centre = 2` the two sets are not merely different, they are
+    /// **disjoint** — `{0, 2, 4, 6}` against `{1, 3, 5, 7}` — which is as far
+    /// apart as two windows of one element can be.
+    #[test]
+    fn the_two_origins_stamp_different_volumes() {
+        let volume = [24usize, 1, 1];
+        let clipped = flat(11, 2, StepOrigin::ClippedStart);
+        let anchored = flat(11, 2, StepOrigin::Anchor);
+        assert_ne!(clipped, anchored);
+
+        let point = [Point::weighted([2, 0, 0], 7.0)];
+        let left = marked(&whole(volume, &clipped, &point).unwrap());
+        let right = marked(&whole(volume, &anchored, &point).unwrap());
+        assert_eq!(left, vec![0, 2, 4, 6]);
+        assert_eq!(right, vec![1, 3, 5, 7]);
+        assert!(
+            left.iter().all(|at| !right.contains(at)),
+            "the two origins must be telling apart here"
+        );
+
+        // and deep in the interior they agree, which is why this is only ever
+        // visible near a low face
+        let deep = [Point::weighted([12, 0, 0], 7.0)];
+        assert_eq!(
+            marked(&whole(volume, &clipped, &deep).unwrap()),
+            marked(&whole(volume, &anchored, &deep).unwrap())
+        );
+    }
+
+    /// **The anchored kernel cannot see where it is.** Its members are one set,
+    /// so what it stamps at a point is that set translated to the point and
+    /// clipped at the volume — the same picture everywhere, and never a function
+    /// of how near a face the point sits. Swept over *every* position of a
+    /// volume, against the translate-and-clip model written out here rather than
+    /// asked of the element.
+    ///
+    /// This is what every existing caller depends on, because an unstepped
+    /// element normalises to [`StepOrigin::Anchor`]: every kernel this op has
+    /// been given until now is on the unchanged side of this assertion.
+    ///
+    /// The second half is what keeps the first from being a tautology: the
+    /// re-phasing element is swept the same way and **fails** that model, at a
+    /// position the assertion names.
+    #[test]
+    fn an_anchored_kernel_stamps_its_own_members_translated_at_every_position() {
+        let volume = [24usize, 1, 1];
+        // the model: the element's own offsets, moved to the point and clipped
+        let translated = |element: &StructuringElement, centre: usize| -> Vec<usize> {
+            element
+                .offsets()
+                .iter()
+                .filter_map(|offset| {
+                    let at = centre as isize + offset[0];
+                    (at >= 0 && (at as usize) < volume[0]).then_some(at as usize)
+                })
+                .collect()
+        };
+
+        for element in [
+            flat(11, 2, StepOrigin::Anchor),
+            flat(8, 3, StepOrigin::Anchor),
+            ball([2, 0, 0]),
+            single_voxel(),
+        ] {
+            for centre in 0..volume[0] {
+                let stamped =
+                    whole(volume, &element, &[Point::weighted([centre, 0, 0], 7.0)]).unwrap();
+                assert_eq!(
+                    marked(&stamped),
+                    translated(&element, centre),
+                    "an anchored kernel of {:?} saw where it was placed, at {centre}",
+                    element.size()
+                );
+            }
+        }
+
+        // and the re-phasing one does not satisfy that model — near a low face it
+        // stamps a set the translation does not name, which is the whole content
+        // of the assertion above
+        let clipped = flat(11, 2, StepOrigin::ClippedStart);
+        let disagreeing: Vec<usize> = (0..volume[0])
+            .filter(|&centre| {
+                let stamped =
+                    whole(volume, &clipped, &[Point::weighted([centre, 0, 0], 7.0)]).unwrap();
+                marked(&stamped) != translated(&clipped, centre)
+            })
+            .collect();
+        // `lo` is 5 and the stride is 2, so the anchored lattice sits on the odd
+        // residue class of the offsets. A point at an odd `c` inside the face has
+        // its clipped start at `-c`, which is that same class, and the two rules
+        // land on one another; at an even `c` they land on opposite classes and
+        // the sets are disjoint. So the disagreement is `{0, 2, 4}` and not all of
+        // `0..5` — a fact about residues, and the reason this is written out.
+        assert_eq!(
+            disagreeing,
+            vec![0, 2, 4],
+            "the re-phasing kernel must leave the translate-and-clip model where the window meets \
+             the low face on a different residue class, and nowhere else"
+        );
+    }
+
+    /// **A re-phased window can hold more members than the element does**, and
+    /// the stamp writes every one of them: nothing here is sized from
+    /// [`StructuringElement::len`].
+    ///
+    /// A ball of radius two stepped by two keeps seven offsets in the interior —
+    /// the centre and the six poles — and eight at the phase reached from
+    /// `[1, 1, 1]`, where the stride lands on `-1` and `+1` on every axis and all
+    /// eight corners of that cube are inside the ball's surface. The counts are
+    /// derived here from the shape's own rule rather than taken from a run.
+    #[test]
+    fn a_re_phased_window_can_hold_more_members_than_the_element_does() {
+        let volume = [9usize, 9, 9];
+        let element = StructuringElement::from_sides_stepped_at(
+            ElementShape::Ellipsoid,
+            [2, 2, 2],
+            [2, 2, 2],
+            [2, 2, 2],
+            StepOrigin::ClippedStart,
+        )
+        .unwrap();
+        // the interior set: the centre and the six poles, `sum (d / 2)^2 <= 1`
+        assert_eq!(element.len(), 7);
+
+        let mut scratch = Vec::new();
+        let window = element.offsets_at([1, 1, 1], volume, &mut scratch).to_vec();
+        // the phase from `[1, 1, 1]`: `-1` and `+1` on each axis, `3 * (1/2)^2`
+        // being `0.75`, so every corner of that cube is a member
+        assert_eq!(window.len(), 8);
+        assert!(window.len() > element.len());
+
+        let stamped = whole(volume, &element, &[Point::weighted([1, 1, 1], 5.0)]).unwrap();
+        assert_eq!(
+            stamped.iter().filter(|&&value| value == 5).count(),
+            8,
+            "the stamp wrote a count taken from the element rather than from the window"
+        );
+        for offset in &window {
+            let at = [
+                (1 + offset[0]) as usize,
+                (1 + offset[1]) as usize,
+                (1 + offset[2]) as usize,
+            ];
+            assert_eq!(stamped[at], 5, "member {offset:?} was not stamped");
+        }
+
+        // and the interior point stamps the seven the element names, so the two
+        // counts are genuinely both live in one run
+        let deep = whole(volume, &element, &[Point::weighted([4, 4, 4], 5.0)]).unwrap();
+        assert_eq!(deep.iter().filter(|&&value| value == 5).count(), 7);
+    }
+
+    /// **Decomposition invariance for a kernel whose window depends on where it
+    /// is placed**: every cut of the same point set stamps the same volume, byte
+    /// for byte.
+    ///
+    /// It holds by construction here — a point's coordinate is a volume
+    /// coordinate and `grid.volume()` is the volume under every cut — and it is
+    /// measured anyway, because "by construction" is an argument about the code
+    /// as it stands and this is the property the crate exists to defend. The
+    /// volume is **narrower on axis 2 than the window**, so every point re-phases
+    /// there and no block holds only interior voxels.
+    #[test]
+    fn every_cut_of_the_same_points_stamps_the_same_volume_for_a_re_phasing_kernel() {
+        let volume = [16usize, 12, 4];
+        let element = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            [11, 3, 9],
+            [2, 1, 3],
+            StepOrigin::ClippedStart,
+        )
+        .unwrap();
+        assert!(
+            element.sides(2).0 >= volume[2],
+            "the window must be wider than axis 2 of the volume, so every point re-phases there"
+        );
+        let points = [
+            Point::weighted([3, 3, 1], 40.0),
+            Point::weighted([8, 6, 2], 5.0),
+            Point::weighted([7, 6, 2], 31.0),
+            Point::weighted([12, 9, 1], 2.0),
+            Point::weighted([15, 11, 3], 900.0),
+            Point::weighted([0, 0, 0], 60.0),
+        ];
+        let reference = whole(volume, &element, &points).unwrap();
+        assert!(reference.iter().any(|&value| value == 5));
+        assert!(reference.iter().any(|&value| value == 0));
+
+        for block in [
+            [16usize, 12, 4],
+            [8, 6, 4],
+            [5, 5, 2],
+            [3, 12, 1],
+            [16, 5, 3],
+        ] {
+            let grid = BlockGrid::new(volume, block).unwrap();
+            let mut out = Array3::<u64>::zeros((volume[0], volume[1], volume[2]));
+            label_points_into(
+                &split(&grid, &points),
+                &grid,
+                &element,
+                &window_of(volume),
+                MAX_EXACT_LABEL,
+                out.view_mut(),
+            )
+            .unwrap();
+            assert_eq!(out, reference, "cut into {block:?}");
+        }
+
+        // the negative control, through the same sweep: the anchored element is a
+        // different answer, so the invariance above is invariance of *this* rule
+        let anchored = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            [11, 3, 9],
+            [2, 1, 3],
+            StepOrigin::Anchor,
+        )
+        .unwrap();
+        assert_ne!(whole(volume, &anchored, &points).unwrap(), reference);
     }
 }

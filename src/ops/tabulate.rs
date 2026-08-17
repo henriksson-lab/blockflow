@@ -23,12 +23,44 @@
 // | `min` | the smallest finite value, **as it was read** | `min` |
 // | `max` | the largest finite value, **as it was read** | `max` |
 // | `sum_0..2` | per-axis sum of the voxels' coordinates | `+` |
+// | `moment_0..2_q{n}` | fixed-point sum of value times coordinate | `+` |
 //
 // and positioned at the region's rounded centroid, which is what `sum_0..2` and
 // `count` say exactly and the position says to a voxel. Every combine in that
 // right-hand column is associative and commutative **in the type it is
 // performed in**, and that is the whole design; the rest of this header is why
 // it had to be.
+//
+// The first moment, which is the one column that is not a reading of the others
+// ----------------------------------------------------------------------------
+// `moment_0..2_q{n}` is `sum_i (q(v_i) * x_i[a])` — the **cross moment** of value
+// against position, per axis. It is here because it is the one per-region
+// quantity a consumer cannot derive from the columns beside it: `sum_q{n}` and
+// `sum_0..2` do not determine it, since two regions with the same voxel count,
+// the same total value and the same coordinate totals can hold their value
+// differently over their voxels and have different first moments. A caller
+// wanting it from the other columns would have to re-walk the volume; here it is
+// three more words folded by `+` in an accumulator that already holds both arrays
+// and already visits every voxel once.
+//
+// The **weighted centroid** is its quotient, `moment_a / sum`, and the scale is
+// not in it: both are integers at the same `2^n`, so the `2^n` cancels exactly
+// and the ratio is a pure number. That is why the moment is quantised on the
+// *value* alone and multiplied by the coordinate as the exact integer it already
+// is — the coordinate needs no scale, and giving it one would only narrow the
+// range. `RegionValues::weighted_centroid` is the quotient, taken once, at the
+// end, on two integers that are each already decomposition-invariant.
+//
+// **It is taken over the finite voxels**, exactly as `sum` is, because it is a
+// quotient of two of them and a numerator over one voxel set and a denominator
+// over another would not be a centroid of anything. A region's `nonfinite` count
+// is therefore as much a caveat on its weighted centroid as on its sum.
+//
+// **It is not where the row sits.** The row's position stays the *geometric*
+// centroid, and that is not an omission: block ownership is decided from the
+// position — see [`MergeTabulationOp`] — and a weighted centroid over signed
+// values need not be inside the region, inside its bounding box, or inside the
+// volume at all. A position that could leave the lattice is not a position.
 //
 // Why it is not `ops::detect`
 // ---------------------------
@@ -95,19 +127,42 @@
 // are `FixedPoint::resolution` and `FixedPoint::limit`, so they can be asserted
 // rather than believed.
 //
+// **The first moment is the column the range binds on first, and by a known
+// factor.** `moment_a` is a sum of `q(v) * x[a]`, so it is the sum's own bound
+// multiplied by the largest coordinate on that axis — `extent[a] - 1`. Its
+// column is the same signed 64-bit word, so the same `+/- 2^(63-n)` applies to
+// it, and a run whose *sum* clears the range by less than that factor will be
+// refused on a moment rather than on the sum. That is stated rather than
+// discovered: the refusal names the moment and says which axis it was.
+//
 // A caller with no scale in mind can **derive** one rather than pick one: a
 // region holds at most every voxel of the volume, each finite value is at most
-// the array's own peak magnitude, and quantising moves each of them at most half
-// a step further from zero, so no total can exceed `voxels * (magnitude + 0.5)`.
-// The largest `n` whose `FixedPoint::limit` exceeds that bound is the finest
-// scale the range admits, and it is an arithmetic bound on the answer rather
-// than a measurement of it — which is what makes it a derivation and not a value
-// chosen because it happened to pass.
+// the array's own peak magnitude, quantising moves each of them at most half a
+// step further from zero, and each contributes to a moment at most its own
+// magnitude times the largest coordinate on that axis. So no total can exceed
+//
+//     voxels * (magnitude + 0.5) * max(1, extent[0] - 1, extent[1] - 1, extent[2] - 1)
+//
+// — the trailing factor being what the moment adds and `1` being what it is when
+// the sum is the only thing bounded. The largest `n` whose `FixedPoint::limit`
+// exceeds that bound is the finest scale the range admits, and it is an
+// arithmetic bound on the answer rather than a measurement of it — which is what
+// makes it a derivation and not a value chosen because it happened to pass.
+//
+// At the default of twenty bits the moment's `+/- 8.8e12` covers, for instance, a
+// region of a million voxels whose values are of magnitude up to 4096 on an axis
+// a thousand voxels long only just — `4.1e12` — so a caller with regions and
+// extents of that size is one of the callers the parameter exists for, and trades
+// bits down. A caller with values of order one on an extent of a few hundred has
+// four orders of magnitude of headroom and need not think about it.
 //
 // The scale is not carried in the blob as data — it is carried in the **column
-// name**, `sum_q20`. That is deliberate: two tabulations at different scales are
-// not the same schema, and `Table::write` checks the schema in the blob against
-// its own, so mixing them is refused rather than silently averaged.
+// names**, `sum_q20` and `moment_0..2_q20`. That is deliberate: two tabulations
+// at different scales are not the same schema, and `Table::write` checks the
+// schema in the blob against its own, so mixing them is refused rather than
+// silently averaged. The moment carries the suffix for the same reason the sum
+// does and not by analogy with it: a moment at four bits and a moment at twenty
+// are different integers standing for the same quantity.
 //
 // Why the selection carries no scale
 // ----------------------------------
@@ -145,7 +200,21 @@
 //   column's unsigned bits still order the way its signed values do — and a
 //   value array that straddles zero therefore sums to the same number whatever
 //   order the pieces arrive in. Nothing here takes an absolute value or assumes
-//   a sign.
+//   a sign. The moments are the same accumulator with the same guarantee.
+// * **A signed value array makes the weighted centroid a ratio and not a point,
+//   and this op admits that rather than constraining it.** With every value of
+//   one sign the quotient is a convex combination of the region's coordinates
+//   and therefore lies inside its bounding box. Let the values straddle zero and
+//   it need not: the denominator can be small while the numerator is not, and the
+//   answer then sits outside the region, outside the volume, or at any distance
+//   at all. That is the *correct* value of `sum(v*x)/sum(v)` and not a defect in
+//   computing it, so it is neither clamped nor refused. Refusing would be worse
+//   than useless here: the sign of an array is not knowable at construction, a
+//   refusal at the voxel would throw away every other region for one negative
+//   value — the argument the non-finite rule already makes — and a refusal at the
+//   end would throw away the run for one region. A caller who needs the quotient
+//   to be a point in the region is asking for a weight and should give the op a
+//   non-negative one; the op reports what it was handed.
 // * **`NaN` and `+/-inf` are excluded from `sum`, `min` and `max`, and counted
 //   in `nonfinite`.** Neither refusing the run nor folding them in is right.
 //   Folding them in destroys the row: a single `NaN` anywhere in a region makes
@@ -182,6 +251,26 @@
 // * **Label `0`** is background and is never a row. A negative, fractional or
 //   non-finite label is refused by name — a label volume's convention has no
 //   negative half, and rounding a fraction would invent a region.
+// * **A region whose finite values total exactly zero** has no weighted
+//   centroid: `moment_a / sum` is `0/0` when the region held nothing but zeros,
+//   and `k/0` when its values cancelled. The *moment columns are still exact and
+//   still written* — `sum(v*x)` is defined whatever `sum(v)` is — and it is only
+//   the quotient that does not exist, so the absence is reported where the
+//   quotient is: [`RegionValues::weighted_centroid`] is an `Option` and is `None`
+//   exactly when `sum_fixed == 0`.
+//
+//   Three things it deliberately is not. Not a `NaN`: `Table::write` refuses a
+//   non-finite `F64` column, and a `NaN` a caller has to test for is a value that
+//   propagates silently through everything that does not. Not the unweighted
+//   centroid: that is a different measurement, and substituting it would make a
+//   region with no weight indistinguishable from one whose weight happened to be
+//   uniform. And not [`super::local::EmptyPopulation`], which was the obvious
+//   vocabulary to reach for and does not fit — its two answers are "ask the
+//   statistic", which here is the `0/0` that has no answer, and "take the sample
+//   centre's own value", which needs a centre voxel that a region does not have.
+//   `Option` is the vocabulary that fits, and it is the one [`Tally::centroid`]
+//   and [`Tally::min`] already use for a quantity that is absent rather than
+//   zero.
 //
 // The shape, and why it is two phases
 // -----------------------------------
@@ -209,7 +298,7 @@
 // whole-lattice fragment reach, so on `N` blocks it moves `N` partials to each of
 // `N` blocks and runs the same fold `N` times — the price of ending a run in a
 // fragment phase, the same one `ops::fill` and `ops::detect` pay. A partial is
-// ten words per label *present in that block*, not per label in the volume.
+// sixteen words per label *present in that block*, not per label in the volume.
 //
 // `SeamFold::Unordered` adds one more application of the merge per block, and —
 // because the merge streams rather than gathers — one more pass of fragment
@@ -408,23 +497,28 @@ pub const SUM: &str = "sum";
 pub const MIN: &str = "min";
 /// The largest finite value in the region. See [`MIN`].
 pub const MAX: &str = "max";
+/// Stems of the three first-moment columns: `sum_i (v_i * x_i[a])` per axis, in
+/// the same fixed point the sum is in, so the whole names are these followed by
+/// [`FixedPoint::suffix`]. A stem rather than a whole name, and for exactly
+/// [`SUM`]'s reason: a moment is an accumulation and an accumulation has a scale.
+pub const MOMENT: [&str; 3] = ["moment_0", "moment_1", "moment_2"];
 
 /// Payload columns a tabulated row has.
-pub const COLUMNS: usize = 9;
+pub const COLUMNS: usize = 12;
 
 /// Words a tabulated row occupies: the three positions and the nine columns.
 pub const ROW_WORDS: usize = POSITION_WORDS + COLUMNS;
 
 /// The schema this op writes, at `fixed`.
 ///
-/// **Seven `U64` columns and two `F64` ones, and the split is the whole of what
+/// **Ten `U64` columns and two `F64` ones, and the split is the whole of what
 /// this op decided.** The entry condition `ops::detect::measurement_schema`
 /// states — that a column here is a merged accumulator, and an `F64` column
 /// merged across a seam is not the same number as the whole fold — is an
 /// argument about an *accumulation*, and it is right about every accumulation
-/// here: the counts, the coordinate sums and `sum_q{n}` are `U64` for exactly
-/// that reason, and `sum_q{n}` is offset-binary fixed point on top of it, see
-/// [`FixedPoint::to_column`].
+/// here: the counts, the coordinate sums, `sum_q{n}` and `moment_0..2_q{n}` are
+/// `U64` for exactly that reason, and the four signed ones are offset-binary
+/// fixed point on top of it, see [`FixedPoint::to_column`].
 ///
 /// `min` and `max` accumulate nothing. They select one of the values they were
 /// handed, which is associative, commutative and idempotent in `f64` under a
@@ -433,10 +527,17 @@ pub const ROW_WORDS: usize = POSITION_WORDS + COLUMNS;
 /// column would report `round(v * 2^n) / 2^n` where the question was which value
 /// a voxel held. The module header carries the argument in full.
 ///
-/// The scale is in one name, `sum_q{n}`, so a blob written at one scale cannot
-/// be written into a table built at another: `Table::write` compares the blob's
-/// schema against its own and refuses. The two selection columns are the same at
-/// every scale, because they have none.
+/// The scale is in the four accumulated-value names — `sum_q{n}` and
+/// `moment_0..2_q{n}` — so a blob written at one scale cannot be written into a
+/// table built at another: `Table::write` compares the blob's schema against its
+/// own and refuses. The two selection columns and the three coordinate sums are
+/// the same at every scale, because they have none: a selection is a value that
+/// was never scaled and a coordinate is an integer that never needed to be.
+///
+/// **The moments are appended rather than placed beside the sum**, so that every
+/// column that existed before this one keeps the index it had. A consumer reading
+/// by index is reading the same column, and a consumer reading by name was never
+/// affected either way.
 pub fn tabulation_schema(fixed: FixedPoint) -> Schema {
     let suffix = fixed.suffix();
     let columns = vec![
@@ -449,11 +550,14 @@ pub fn tabulation_schema(fixed: FixedPoint) -> Schema {
         Column::u64(POSITION_SUM[0]),
         Column::u64(POSITION_SUM[1]),
         Column::u64(POSITION_SUM[2]),
+        Column::u64(format!("{}{suffix}", MOMENT[0])),
+        Column::u64(format!("{}{suffix}", MOMENT[1])),
+        Column::u64(format!("{}{suffix}", MOMENT[2])),
     ];
-    // Nine distinct, non-empty names, so this cannot fail; expressed as a
+    // Twelve distinct, non-empty names, so this cannot fail; expressed as a
     // `Result` internally and unwrapped here rather than making every caller
     // handle an impossibility.
-    Schema::new(columns).expect("the tabulation schema names nine distinct columns")
+    Schema::new(columns).expect("the tabulation schema names twelve distinct columns")
 }
 
 // ------------------------------------------------------------------ tally --
@@ -484,6 +588,19 @@ pub struct Tally {
     pub max: Option<f64>,
     /// Per-axis sum of the voxels' coordinates, over every voxel of the label.
     pub position: [u64; 3],
+    /// Per-axis fixed-point **first moment** of value against position:
+    /// `sum_i (q(v_i) * x_i[a])`, over the **finite** voxels only, at the same
+    /// scale as [`Self::sum`].
+    ///
+    /// Only the value is quantised; the coordinate enters as the exact integer it
+    /// already is. So the product is exact, the fold is integer `+`, and the
+    /// weighted centroid — [`Self::weighted_centroid`] — is `moment[a] / sum`
+    /// with the `2^n` cancelling rather than being divided out.
+    ///
+    /// Over the finite voxels only, because it is the numerator of a quotient
+    /// whose denominator is [`Self::sum`]: a numerator taken over one voxel set
+    /// and a denominator over another would not be a centroid of either.
+    pub moment: [i128; 3],
 }
 
 /// A selection's bits, which is what two tallies are compared on.
@@ -502,6 +619,7 @@ impl PartialEq for Tally {
             && self.nonfinite == other.nonfinite
             && self.sum == other.sum
             && self.position == other.position
+            && self.moment == other.moment
             && selection_bits(self.min) == selection_bits(other.min)
             && selection_bits(self.max) == selection_bits(other.max)
     }
@@ -550,6 +668,7 @@ impl Tally {
             min: None,
             max: None,
             position: [0; 3],
+            moment: [0; 3],
         }
     }
 
@@ -589,6 +708,19 @@ impl Tally {
                     .sum
                     .checked_add(quantised)
                     .ok_or_else(|| overflowed("the fixed-point sum"))?;
+                // The first moment, on the same voxel and the same quantisation
+                // as the sum — one `quantise` call, so the two cannot come to
+                // disagree about which voxels were finite. The coordinate is not
+                // quantised: it is already an integer, and scaling it would only
+                // spend range.
+                for (axis, moment) in self.moment.iter_mut().enumerate() {
+                    let term = quantised
+                        .checked_mul(at[axis] as i128)
+                        .ok_or_else(|| overflowed("a fixed-point first moment"))?;
+                    *moment = moment
+                        .checked_add(term)
+                        .ok_or_else(|| overflowed("a fixed-point first moment"))?;
+                }
                 self.min = Some(self.min.map_or(value, |seen| least(seen, value)));
                 self.max = Some(self.max.map_or(value, |seen| greatest(seen, value)));
             }
@@ -637,6 +769,9 @@ impl Tally {
             self.position[axis] = self.position[axis]
                 .checked_add(other.position[axis])
                 .ok_or_else(|| overflowed("a coordinate sum"))?;
+            self.moment[axis] = self.moment[axis]
+                .checked_add(other.moment[axis])
+                .ok_or_else(|| overflowed("a fixed-point first moment"))?;
         }
         Ok(())
     }
@@ -661,7 +796,39 @@ impl Tally {
         Some(at)
     }
 
-    /// The row's twelve words: the position, then the payload in schema order.
+    /// `moment[a] / sum` per axis — the **weighted centroid** — or `None` when
+    /// the finite values totalled exactly zero and the quotient does not exist.
+    ///
+    /// `None` rather than a `NaN` and rather than [`Self::centroid`]. A `NaN`
+    /// propagates silently through everything that does not test for it, and
+    /// `Table::write` will not carry one in an `F64` column anyway; the
+    /// unweighted centroid is a *different measurement*, and substituting it
+    /// would make a region with no weight indistinguishable from one whose
+    /// weight was uniform. `None` is the same vocabulary [`Self::min`] uses for
+    /// the region that held no finite value at all, and for the same reason: the
+    /// quantity is absent, not zero.
+    ///
+    /// **The scale is not in this.** Numerator and denominator are integers at
+    /// the same `2^n`, so it cancels exactly and the quotient is a pure ratio of
+    /// two decomposition-invariant integers. The `as f64` on each is the only
+    /// rounding on the whole path and it happens once, at the end, on numbers
+    /// that are already the same under every cut — so the quotient is too.
+    ///
+    /// Over the **finite** voxels only, both halves. And not necessarily inside
+    /// the region: see the module header on signed values.
+    pub fn weighted_centroid(&self) -> Option<[f64; 3]> {
+        if self.sum == 0 {
+            return None;
+        }
+        let mass = self.sum as f64;
+        let mut at = [0.0f64; 3];
+        for (axis, coordinate) in at.iter_mut().enumerate() {
+            *coordinate = self.moment[axis] as f64 / mass;
+        }
+        Some(at)
+    }
+
+    /// The row's fifteen words: the position, then the payload in schema order.
     ///
     /// The words rather than a struct, because **this array is the canonical
     /// sort key** — `crate::table` orders rows by their own words, so sorting
@@ -689,6 +856,18 @@ impl Tally {
         words[POSITION_WORDS + 5] = self.max.unwrap_or(0.0).to_bits();
         for axis in 0..3 {
             words[POSITION_WORDS + 6 + axis] = self.position[axis];
+            // The moment narrows to a column here and nowhere earlier, exactly as
+            // the sum does: the fold has no range limit of its own, so a run
+            // whose merged moment fits reports it even where a partial ordering
+            // of the products would not have. The refusal names the axis.
+            words[POSITION_WORDS + 9 + axis] =
+                fixed.to_column(self.moment[axis]).map_err(|failed| {
+                    Error::invalid(format!(
+                        "{failed} This is the first moment on axis {axis} — `sum(value * \
+                         coordinate)` — whose range is the sum's divided by the largest \
+                         coordinate on that axis, so it is the column that binds first."
+                    ))
+                })?;
         }
         Ok(Some(words))
     }
@@ -705,16 +884,21 @@ fn overflowed(what: &str) -> Error {
 // -------------------------------------------------------- the wire format --
 
 /// Words one label occupies in a **partial**: the label, the two counts, the
-/// `i128` sum as a word pair, the two selections as one word each, and the three
-/// coordinate sums.
+/// `i128` sum as a word pair, the two selections as one word each, the three
+/// coordinate sums, and the three `i128` first moments as a word pair each.
 ///
-/// The sum is wider here than in a row on purpose. A partial is folded, not
-/// read, so it carries the accumulator's own type — `i128`, which has no range
-/// limit worth stating — and the narrowing to a column happens once, at the end,
-/// where the limit is stated. A partial that narrowed early would refuse a run
-/// whose answer fits. The selections are one word because they are already the
-/// type they end in: nothing widens an `f64` that is only ever compared.
-const PARTIAL_WORDS: usize = 10;
+/// The sum and the moments are wider here than in a row on purpose. A partial is
+/// folded, not read, so it carries the accumulator's own type — `i128`, which has
+/// no range limit worth stating — and the narrowing to a column happens once, at
+/// the end, where the limit is stated. A partial that narrowed early would refuse
+/// a run whose answer fits, and that matters most for the moments: a moment can
+/// be large in one block and cancel in the merge. The selections are one word
+/// because they are already the type they end in: nothing widens an `f64` that is
+/// only ever compared.
+///
+/// The moments are appended rather than placed beside the sum, so the entry's
+/// leading words are the ones they always were.
+const PARTIAL_WORDS: usize = 16;
 
 fn put_i128(words: &mut Vec<u64>, value: i128) {
     let bits = value as u128;
@@ -761,6 +945,9 @@ pub fn encode_partial(tallies: &BTreeMap<u64, Tally>) -> Vec<u8> {
         for axis in 0..3 {
             words.push(tally.position[axis]);
         }
+        for axis in 0..3 {
+            put_i128(&mut words, tally.moment[axis]);
+        }
     }
     pack_u64(&words)
 }
@@ -786,6 +973,11 @@ pub fn decode_partial(bytes: &[u8]) -> Result<Vec<Tally>> {
             min: get_selection(entry[5]),
             max: get_selection(entry[6]),
             position: [entry[7], entry[8], entry[9]],
+            moment: [
+                get_i128(entry[10], entry[11]),
+                get_i128(entry[12], entry[13]),
+                get_i128(entry[14], entry[15]),
+            ],
         });
     }
     Ok(found)
@@ -1284,11 +1476,35 @@ pub struct RegionValues {
     pub max: f64,
     /// The sub-voxel centre, which `at` rounds. Exact from the coordinate sums.
     pub centroid: [f64; 3],
+    /// The per-axis **first moment** `sum_i (v_i * x_i[a])` over the finite
+    /// voxels, in the fixed point's own integers — which is the form the
+    /// decomposition-invariance claim is about, so it is offered beside the
+    /// `f64` rather than behind it. See [`Self::sum_fixed`].
+    pub moment_fixed: [i64; 3],
+    /// The same, in the value array's units.
+    pub moment: [f64; 3],
+    /// **The weighted centroid**, `moment[a] / sum` — the one quantity in this
+    /// row that no arrangement of the others determines.
+    ///
+    /// `None` exactly when `sum_fixed == 0`, which is the region whose finite
+    /// values totalled zero: the quotient does not exist and this says so rather
+    /// than reporting a `NaN` or quietly substituting [`Self::centroid`]. The
+    /// moments themselves are exact and present in either case.
+    ///
+    /// Over the finite voxels, so a region with a non-zero `nonfinite` has a
+    /// weighted centroid of the voxels that had a value. And not necessarily
+    /// inside the region: with values of both signs the denominator can be small
+    /// where the numerator is not, and the ratio is then outside the bounding box
+    /// or outside the volume. That is what `sum(v*x)/sum(v)` is, and this op
+    /// reports it rather than constraining it.
+    pub weighted_centroid: Option<[f64; 3]>,
 }
 
 impl RegionValues {
     /// Whether every voxel of this region held a non-finite value, in which case
-    /// `sum`, `min` and `max` are all zero because there was nothing to reduce.
+    /// `sum`, `min`, `max` and the moments are all zero because there was
+    /// nothing to reduce — and [`Self::weighted_centroid`] is `None`, since a
+    /// zero sum is a zero denominator.
     pub fn all_nonfinite(&self) -> bool {
         self.nonfinite == self.count
     }
@@ -1307,6 +1523,26 @@ pub fn region_values(row: &Row<'_>, fixed: FixedPoint) -> Result<RegionValues> {
             row.u64(6 + axis)? as f64 / count as f64
         };
     }
+    let mut moment_fixed = [0i64; 3];
+    let mut moment = [0.0f64; 3];
+    for axis in 0..3 {
+        moment_fixed[axis] = fixed.from_column(row.u64(9 + axis)?);
+        moment[axis] = fixed.value_of(moment_fixed[axis]);
+    }
+    // The quotient of the two integers, not of the two `f64`s: the scale is the
+    // same in both, so it cancels rather than being divided out twice, and the
+    // rounding is the one `as f64` on each side. `Tally::weighted_centroid` is
+    // the same arithmetic on the same numbers before they narrowed, and the
+    // narrowing is lossless — `to_column` refuses anything it would not be — so
+    // the two agree bit for bit.
+    let weighted_centroid = (sum_fixed != 0).then(|| {
+        let mass = sum_fixed as f64;
+        [
+            moment_fixed[0] as f64 / mass,
+            moment_fixed[1] as f64 / mass,
+            moment_fixed[2] as f64 / mass,
+        ]
+    });
     Ok(RegionValues {
         label: row.u64(0)?,
         at,
@@ -1314,6 +1550,9 @@ pub fn region_values(row: &Row<'_>, fixed: FixedPoint) -> Result<RegionValues> {
         nonfinite: row.u64(2)?,
         sum_fixed,
         sum: fixed.value_of(sum_fixed),
+        moment_fixed,
+        moment,
+        weighted_centroid,
         // Read as floats, so a schema whose selection columns were integers
         // again is a refusal here naming the column rather than a `u64` reported
         // as an enormous float.
@@ -1527,6 +1766,131 @@ mod tests {
         // this asserts is that the *bits* survived the permutations above.
         assert_eq!(reference.min.map(f64::to_bits), Some((-1e9f64).to_bits()));
         assert_eq!(reference.max.map(f64::to_bits), Some(1e9f64.to_bits()));
+        // The first moment folded the same way, and it is the *whole* moment:
+        // `sum(v * z)` over the five voxels at z = 0..5.
+        let expected_moment: i128 = [(0usize, 1.0f64), (1, -2.5), (2, 1e9), (3, -1e9), (4, 0.25)]
+            .into_iter()
+            .map(|(voxel, value)| {
+                fixed.quantise(value).unwrap().unwrap() * i128::try_from(voxel).unwrap()
+            })
+            .sum();
+        assert_eq!(reference.moment[0], expected_moment);
+        // and the two axes that hold no coordinate hold no moment either
+        assert_eq!(reference.moment[1], 0);
+        assert_eq!(reference.moment[2], 0);
+    }
+
+    /// **The weighted centroid is not a reading of the columns beside it**, and
+    /// this is the assertion rather than the claim: two tallies with the *same*
+    /// `count`, the same `sum` and the same `position` — so the same unweighted
+    /// centroid, exactly — whose weighted centroids differ.
+    ///
+    /// Two voxels at `z = 0` and `z = 4`. One region puts `3` at the near voxel
+    /// and `1` at the far one, the other the reverse. Both total `4` over two
+    /// voxels whose coordinates total `4`, so every existing column agrees; the
+    /// moments are `0*3 + 4*1 = 4` and `0*1 + 4*3 = 12`, and the centres are
+    /// `4/4 = 1` and `12/4 = 3`.
+    #[test]
+    // Both moments are written as `value * coordinate` for **both** voxels, so
+    // the two lines read as each other's mirror and a reader can check the cross
+    // moment term by term. Collapsing the `* 0` and the `1 *` — which is what
+    // clippy asks for — would delete exactly the halves that make the pair
+    // comparable, so the lint is refused here rather than obeyed.
+    #[allow(clippy::erasing_op, clippy::identity_op)]
+    fn the_weighted_centroid_is_not_determined_by_the_count_the_sum_and_the_positions() {
+        let fixed = FixedPoint::default();
+        let mut near_heavy = Tally::new(1);
+        near_heavy.add([0, 0, 0], 3.0, fixed).unwrap();
+        near_heavy.add([4, 0, 0], 1.0, fixed).unwrap();
+        let mut far_heavy = Tally::new(1);
+        far_heavy.add([0, 0, 0], 1.0, fixed).unwrap();
+        far_heavy.add([4, 0, 0], 3.0, fixed).unwrap();
+
+        // Everything the op reported before this column is identical.
+        assert_eq!(near_heavy.count, far_heavy.count);
+        assert_eq!(near_heavy.sum, far_heavy.sum);
+        assert_eq!(near_heavy.position, far_heavy.position);
+        assert_eq!(near_heavy.centroid(), far_heavy.centroid());
+        assert_eq!(near_heavy.min, far_heavy.min);
+        assert_eq!(near_heavy.max, far_heavy.max);
+
+        // And the new column is not. The arithmetic is written out rather than
+        // taken from the code: one unit of value is `2^20` fixed-point steps.
+        let one = 1i128 << 20;
+        assert_eq!(near_heavy.moment[0], 3 * one * 0 + 1 * one * 4);
+        assert_eq!(far_heavy.moment[0], 1 * one * 0 + 3 * one * 4);
+        assert_eq!(near_heavy.weighted_centroid(), Some([1.0, 0.0, 0.0]));
+        assert_eq!(far_heavy.weighted_centroid(), Some([3.0, 0.0, 0.0]));
+        // neither of which is the unweighted centre of the same two voxels
+        assert_eq!(near_heavy.centroid(), Some([2, 0, 0]));
+    }
+
+    /// The degenerate denominator, both ways it arises, pinned to `None`.
+    ///
+    /// A region of zeros and a region whose values cancelled are the same fact —
+    /// `sum == 0`, so `moment / sum` does not exist — and they are reported the
+    /// same way. The moments themselves stay exact and stay written: `sum(v*x)`
+    /// is defined whatever `sum(v)` is, and the cancelling region's is not even
+    /// zero.
+    #[test]
+    fn a_region_whose_values_total_zero_has_no_weighted_centroid_and_says_so() {
+        let fixed = FixedPoint::default();
+        let one = 1i128 << 20;
+
+        // Nothing but zeros: `0/0`.
+        let mut zeros = Tally::new(1);
+        zeros.add([1, 0, 0], 0.0, fixed).unwrap();
+        zeros.add([2, 0, 0], 0.0, fixed).unwrap();
+        assert_eq!(zeros.sum, 0);
+        assert_eq!(zeros.moment, [0, 0, 0]);
+        assert_eq!(zeros.weighted_centroid(), None);
+        // and the unweighted one is still there, which is what makes the absence
+        // an absence rather than a failure of the row
+        assert_eq!(zeros.centroid(), Some([2, 0, 0]));
+
+        // Values that cancelled: `k/0`, with `k` non-zero. The numerator is a
+        // real number and the quotient still does not exist.
+        let mut cancelling = Tally::new(2);
+        cancelling.add([1, 0, 0], 5.0, fixed).unwrap();
+        cancelling.add([3, 0, 0], -5.0, fixed).unwrap();
+        assert_eq!(cancelling.sum, 0);
+        assert_eq!(cancelling.moment[0], 5 * one - 15 * one);
+        assert_ne!(cancelling.moment[0], 0, "the numerator is not zero");
+        assert_eq!(cancelling.weighted_centroid(), None);
+
+        // Every value non-finite is the same denominator by a different road.
+        let mut nothing = Tally::new(3);
+        nothing.add([1, 0, 0], f64::NAN, fixed).unwrap();
+        assert_eq!(nothing.sum, 0);
+        assert_eq!(nothing.moment, [0, 0, 0]);
+        assert_eq!(nothing.weighted_centroid(), None);
+    }
+
+    /// **Signed values put the quotient outside the region, and that is the
+    /// answer rather than a defect.** Two voxels at `z = 10` and `z = 11` whose
+    /// values are `1` and `-0.5`: the sum is `0.5`, the moment is `10 - 5.5 =
+    /// 4.5`, and the centre is `9`, which is not between the two voxels.
+    ///
+    /// Pinned, because the alternatives — clamping it into the bounding box,
+    /// refusing a value array that straddles zero — would each report a different
+    /// quantity from the one the column names.
+    #[test]
+    fn a_weighted_centroid_over_signed_values_may_fall_outside_the_region() {
+        let fixed = FixedPoint::default();
+        let mut tally = Tally::new(1);
+        tally.add([10, 0, 0], 1.0, fixed).unwrap();
+        tally.add([11, 0, 0], -0.5, fixed).unwrap();
+        let one = 1i128 << 20;
+        assert_eq!(tally.sum, one / 2);
+        assert_eq!(tally.moment[0], 10 * one - 11 * one / 2);
+        let centre = tally.weighted_centroid().expect("a non-zero denominator");
+        assert_eq!(centre[0], 9.0);
+        assert!(
+            centre[0] < 10.0,
+            "the fixture was supposed to leave the region"
+        );
+        // and the geometric centre did not leave it
+        assert_eq!(tally.centroid(), Some([11, 0, 0]));
     }
 
     /// The selection is a **semilattice in `f64`**, and the one pair that could
@@ -1642,6 +2006,16 @@ mod tests {
         // so the absence is reported by `nonfinite == count` and by nothing else.
         assert_eq!(words[POSITION_WORDS + 4], 0.0f64.to_bits());
         assert_eq!(words[POSITION_WORDS + 5], 0.0f64.to_bits());
+        // The moments are the fixed-point zero on the same terms — nothing
+        // finite reached them — and the weighted centroid is `None` rather than
+        // a point, because a zero sum is a zero denominator.
+        for axis in 0..3 {
+            assert_eq!(
+                words[POSITION_WORDS + 9 + axis],
+                fixed.to_column(0).unwrap()
+            );
+        }
+        assert_eq!(tally.weighted_centroid(), None);
     }
 
     #[test]
@@ -1696,7 +2070,7 @@ mod tests {
     // ------------------------------------------------------------ the schema --
 
     #[test]
-    fn the_schema_is_nine_columns_and_only_the_sum_carries_a_scale() {
+    fn the_schema_is_twelve_columns_and_the_accumulated_values_carry_the_scale() {
         let schema = tabulation_schema(FixedPoint::default());
         assert_eq!(schema.len(), COLUMNS);
         assert_eq!(schema.width(), ROW_WORDS);
@@ -1710,6 +2084,9 @@ mod tests {
             ("sum_0", ColumnType::U64),
             ("sum_1", ColumnType::U64),
             ("sum_2", ColumnType::U64),
+            ("moment_0_q20", ColumnType::U64),
+            ("moment_1_q20", ColumnType::U64),
+            ("moment_2_q20", ColumnType::U64),
         ];
         for (index, column) in schema.columns().iter().enumerate() {
             assert_eq!(column.name(), expected[index].0);
@@ -1717,9 +2094,28 @@ mod tests {
         }
         // Every accumulated column is `U64` — that entry condition has not
         // moved. What moved is which columns accumulate.
-        for name in ["label", "count", "nonfinite", "sum_q20", "sum_0"] {
+        for name in [
+            "label",
+            "count",
+            "nonfinite",
+            "sum_q20",
+            "sum_0",
+            "moment_0_q20",
+        ] {
             let index = schema.index_of(name).expect("a named column");
             assert_eq!(schema.columns()[index].kind(), ColumnType::U64);
+        }
+        // The nine columns that existed before the moments kept their indices,
+        // which is what "appended" means and is the only reason it matters where
+        // they went.
+        for (index, name) in ["label", "count", "nonfinite", "sum_q20", "min", "max"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(schema.index_of(name), Some(index));
+        }
+        for (axis, name) in POSITION_SUM.into_iter().enumerate() {
+            assert_eq!(schema.index_of(name), Some(6 + axis));
         }
 
         // a different scale is a different schema, which is what stops two
@@ -1727,12 +2123,48 @@ mod tests {
         let other = tabulation_schema(FixedPoint::bits(8).unwrap());
         assert_ne!(other, schema);
         // and the selection columns are the same in both, because they have no
-        // scale to differ in
-        for name in [MIN, MAX] {
+        // scale to differ in — as are the coordinate sums, which are integers
+        // that never needed one
+        for name in [MIN, MAX, POSITION_SUM[0], POSITION_SUM[1], POSITION_SUM[2]] {
             assert!(
                 other.index_of(name).is_some(),
                 "{name} moved with the scale"
             );
         }
+        // The moments did move with it, because a moment is an accumulation.
+        for stem in MOMENT {
+            assert!(schema.index_of(&format!("{stem}_q20")).is_some());
+            assert!(other.index_of(&format!("{stem}_q8")).is_some());
+            assert!(
+                other.index_of(&format!("{stem}_q20")).is_none(),
+                "{stem} did not move with the scale"
+            );
+        }
+    }
+
+    /// The moment narrows to its column at the same boundary the sum does, and
+    /// the refusal **names the axis** — because the moment's range is the sum's
+    /// divided by the largest coordinate, so it is the column a run hits first
+    /// and a message that did not say which one would send a caller to the wrong
+    /// number.
+    #[test]
+    fn a_first_moment_too_large_for_its_column_is_refused_naming_the_axis() {
+        // 62 fraction bits leaves +/- 2 of range. A value of 1 at coordinate 3
+        // on axis 1 fits the sum — one unit — and gives a moment of three, which
+        // does not.
+        let fixed = FixedPoint::bits(62).expect("62 bits");
+        let mut tally = Tally::new(1);
+        tally.add([0, 3, 0], 1.0, fixed).unwrap();
+        assert_eq!(tally.sum, 1i128 << 62);
+        assert_eq!(tally.moment[1], 3 * (1i128 << 62));
+        // the sum on its own is representable
+        assert!(fixed.to_column(tally.sum).is_ok());
+        let failed = tally
+            .row_words(fixed)
+            .expect_err("three units at 62 fraction bits is 3 * 2^62")
+            .to_string();
+        assert!(failed.contains("first moment on axis 1"), "{failed}");
+        assert!(failed.contains("binds first"), "{failed}");
+        assert!(failed.contains("fewer fraction bits"), "{failed}");
     }
 }

@@ -49,11 +49,15 @@
 // That is the point of naming it — a file whose subject moved because a default
 // moved is a file that stops testing what it says it does.
 //
-// The one thing this file gains is `the_rank_filter_gathers_the_anchored_window`
-// at the end, which measures what the per-voxel ops do with the *other* origin.
-// They read `StructuringElement::offsets` and therefore compute the anchored
-// window whatever the element says, and that gap is pinned here rather than left
-// to be discovered by someone comparing two arms of a chain.
+// The one thing this file gains is
+// `the_rank_filter_gathers_the_window_the_origin_names` at the end, which
+// measures what the rank filter does with the *other* origin. It used to be the
+// opposite measurement — the filter read `StructuringElement::offsets` and
+// therefore computed the anchored window whatever the element said, and that gap
+// was pinned here rather than left to be discovered by someone comparing two arms
+// of a chain. The gap is closed: the filter asks `offsets_at` per voxel, so the
+// assertion is inverted rather than deleted, and it now says which window is
+// gathered instead of which one is not.
 
 use ndarray::Array3;
 
@@ -424,28 +428,24 @@ fn a_halo_short_of_the_derived_reach_is_refused_and_the_derived_one_is_not() {
 
 // ------------------------------------ the other origin, through this op --
 
-/// **What the per-voxel ops do with `StepOrigin::ClippedStart`**, measured
-/// rather than assumed: they gather the *anchored* window.
+/// **What the rank filter does with `StepOrigin::ClippedStart`**, measured
+/// rather than assumed: it gathers the window the origin names.
 ///
-/// The rank filter reads `StructuringElement::offsets`, which is one set, and it
-/// reads the same set at every voxel. An element whose step counts from the
-/// clipped start has a second set at every anchor inside `lo` of a low face, and
-/// this op does not compute it — so a chain that puts such an element through a
-/// rank filter gets the anchored filter, at the re-phasing element's own
-/// (slightly wider) reach.
+/// This assertion used to run the other way. The filter read
+/// `StructuringElement::offsets` — one set, the same set at every voxel — so an
+/// element whose step counts from the clipped start got the *anchored* filter at
+/// the re-phasing element's own (slightly wider) reach, and the measurement
+/// pinned that gap so it could not become an unexamined assumption in either
+/// direction. The filter now asks `offsets_at` at each voxel's position in the
+/// volume, so the measurement is inverted: it says which window is gathered, and
+/// it fails if the filter ever goes back to gathering the other one.
 ///
-/// That is a gap and it is pinned here for two reasons. It is the assumption a
-/// reader comparing two arms of a chain would otherwise make wrongly in either
-/// direction; and if the rank filter ever does honour the origin, this test
-/// fails and says so, rather than the change landing silently in a filter
-/// somebody was matching against another implementation.
-///
-/// `ops::local`'s sampled statistic *does* honour it —
-/// `tests/stepped_element_clipped_start.rs` is that measurement — so the two are
-/// asserted to differ here, which is what makes this a statement about this op
-/// rather than about the element.
+/// Two halves, and the second is what keeps the first from being a statement
+/// about the element rather than about the op. The filter's answer *is* the
+/// clipped rule, written out here from `offsets_at`; and it is not the anchored
+/// rule, which on this volume is a different filter.
 #[test]
-fn the_rank_filter_gathers_the_anchored_window() {
+fn the_rank_filter_gathers_the_window_the_origin_names() {
     let input = intensities();
     let size = [8, 8, 1];
     let step = [2, 2, 1];
@@ -464,20 +464,59 @@ fn the_rank_filter_gathers_the_anchored_window() {
     assert_eq!(clipped.sides(0), (4, 3));
     assert_ne!(anchored, clipped);
 
-    // and the filter is the same filter anyway, bit for bit
     let filtered = |element: StructuringElement| -> Array3<f64> {
         reference(&Chain::op(RankFilterOp::median("median", element)), &input)
     };
-    let with_anchored = filtered(anchored);
-    let with_clipped = filtered(clipped);
+    let with_anchored = filtered(anchored.clone());
+    let with_clipped = filtered(clipped.clone());
+
+    assert_eq!(
+        with_clipped,
+        by_definition_at(&input, &clipped, Rank::median(&clipped)),
+        "the filter must gather the set the element names at each anchor"
+    );
+
     let differing = with_anchored
         .iter()
         .zip(with_clipped.iter())
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
-    assert_eq!(
-        differing, 0,
-        "the rank filter gathers `offsets`, so the origin cannot reach it; {differing} voxels \
-         differed, which means it now does and this file has to say what it computes instead"
+    assert!(
+        differing > 0,
+        "the two origins are two filters on this volume, so a filter that honours the origin \
+         must produce two answers; {differing} voxels differed, which means the origin has \
+         stopped reaching the gather"
     );
+}
+
+/// The filter's definition at a stated anchor, written out. Not a second
+/// implementation for production — a statement of what an element whose offsets
+/// depend on where they are evaluated *means* when a filter gathers it.
+fn by_definition_at(input: &Array3<f64>, element: &StructuringElement, rank: Rank) -> Array3<f64> {
+    let mut out = Array3::zeros(input.dim());
+    let mut scratch = Vec::new();
+    for i in 0..VOLUME[0] {
+        for j in 0..VOLUME[1] {
+            for k in 0..VOLUME[2] {
+                let centre = [i as isize, j as isize, k as isize];
+                let mut window = Vec::new();
+                for offset in element.offsets_at(centre, VOLUME, &mut scratch) {
+                    let a = centre[0] + offset[0];
+                    let b = centre[1] + offset[1];
+                    let c = centre[2] + offset[2];
+                    if a < 0 || b < 0 || c < 0 {
+                        continue;
+                    }
+                    let (a, b, c) = (a as usize, b as usize, c as usize);
+                    if a >= VOLUME[0] || b >= VOLUME[1] || c >= VOLUME[2] {
+                        continue;
+                    }
+                    window.push(input[[a, b, c]]);
+                }
+                window.sort_by(|left, right| left.total_cmp(right));
+                out[[i, j, k]] = window[rank.resolve(element.len(), window.len())];
+            }
+        }
+    }
+    out
 }

@@ -57,6 +57,21 @@
 // is the oracle a decomposed run is checked against, and it is the **only** way
 // to reconstruct from an externally supplied seed today — see below.
 //
+// The step asks the element what it reads, rather than assuming
+// -------------------------------------------------------------
+// One element in this crate has more than one offset set: a step counted from
+// `StepOrigin::ClippedStart` re-phases where the window is clipped at a low face
+// of the **volume**. So the step gathers `offsets_at` and asks it at the voxel's
+// position in the volume — `Substage::at` is where that comes from, and a block
+// seam is not a face, so nothing re-phases at one. For every other element
+// `offsets_at` hands back the element's own slice and the loop is unchanged, in
+// order and in bytes.
+//
+// A flood is the operation with most to lose here. Each substage's output at a
+// voxel would otherwise depend on which block the voxel landed in, and a fixed
+// point reached from decomposition-dependent steps is not a fixed point of
+// anything nameable.
+//
 // The seed is derived inside substage 0, and that is a constraint rather than a
 // preference
 // ----------------------------------------------------------------------------
@@ -206,9 +221,10 @@ use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::iterate::{IterativeOp, Substage, SubstageLimit, SubstageOperand};
+use crate::op::Anchor;
 use crate::voxels::Voxels;
 
-use super::element::StructuringElement;
+use super::element::{StepOrigin, StructuringElement};
 use super::shapes_agree;
 
 // ------------------------------------------------------------- the kernel --
@@ -304,8 +320,41 @@ impl Reconstruction {
 /// story and the whole-volume reference clamps identically; at a block seam it
 /// is deliberately *wrong*, which is what makes a short halo loud instead of
 /// silent.
+///
+/// **`running` is read as the whole volume**, which is what a caller handing over
+/// bare arrays is saying. [`reconstruct_step_into_at`] is the form that says
+/// where the buffers sit in a larger volume, and the two differ for exactly one
+/// element — one whose step counts from
+/// [`StepOrigin::ClippedStart`](super::StepOrigin::ClippedStart), whose window
+/// re-phases at a low face.
 pub fn reconstruct_step_into<T: Copy + PartialOrd>(
     running: ArrayView3<'_, T>,
+    mask: ArrayView3<'_, T>,
+    element: &StructuringElement,
+    method: Reconstruction,
+    out: ArrayViewMut3<'_, T>,
+) -> Result<()> {
+    let shape = running.shape();
+    let at = Anchor::whole([shape[0], shape[1], shape[2]]);
+    reconstruct_step_into_at(running, &at, mask, element, method, out)
+}
+
+/// [`reconstruct_step_into`] with the buffers' place in their volume stated.
+///
+/// `at` decides where the element's low faces are and therefore what a
+/// re-phasing element reads at each voxel; see
+/// [`StructuringElement::offsets_at`]. It changes nothing for an element whose
+/// offsets are one set, which is every element without a step — and it is what
+/// keeps a substage's answer the answer the whole-volume loop would have written,
+/// which is the property this op's whole shape is arranged around.
+///
+/// Honouring the origin also makes [`flooding_bound`] more nearly tight rather
+/// than less: that bound divides by the sides the element *declares*, which under
+/// a re-phasing origin are the widest phase's, and it is the widest phase that a
+/// step near a low face now actually travels.
+pub fn reconstruct_step_into_at<T: Copy + PartialOrd>(
+    running: ArrayView3<'_, T>,
+    at: &Anchor,
     mask: ArrayView3<'_, T>,
     element: &StructuringElement,
     method: Reconstruction,
@@ -325,11 +374,48 @@ pub fn reconstruct_step_into<T: Copy + PartialOrd>(
         running.shape()[1] as isize,
         running.shape()[2] as isize,
     ];
+    // Checked only where the anchor decides anything, which is where the element
+    // re-phases; the same argument `ops::rank` makes at greater length.
+    if element.origin() == StepOrigin::ClippedStart {
+        for axis in 0..3 {
+            if at.offset[axis] + extent[axis] as usize > at.volume[axis] {
+                return Err(Error::InvalidArgument(format!(
+                    "reconstruct_step_into: a buffer of {:?} at {:?} does not fit a volume of \
+                     {:?}, and this element's step counts from the clipped start of the window, \
+                     so where the buffer sits in the volume is part of the step",
+                    running.shape(),
+                    at.offset,
+                    at.volume
+                )));
+            }
+        }
+    }
+    // The element's offsets at one voxel, for the one element that has more than
+    // one set of them; untouched by every other element.
+    let mut offsets: Vec<[isize; 3]> = Vec::new();
+    // The one offset set, where there is one, lifted out of the loop — the same
+    // slice `offsets_at` would hand back, and `ops::rank` gives the argument for
+    // lifting it at greater length.
+    let fixed = (element.origin() == StepOrigin::Anchor).then(|| element.offsets());
     for i in 0..running.shape()[0] {
         for j in 0..running.shape()[1] {
             for k in 0..running.shape()[2] {
                 let mut extreme = running[[i, j, k]];
-                for offset in element.offsets() {
+                let gathered = match fixed {
+                    Some(offsets) => offsets,
+                    // The voxel's position in the volume, which is where the
+                    // element is asked; the array is still read at the buffer's
+                    // own indices.
+                    None => {
+                        let placed = [
+                            i as isize + at.offset[0] as isize,
+                            j as isize + at.offset[1] as isize,
+                            k as isize + at.offset[2] as isize,
+                        ];
+                        element.offsets_at(placed, at.volume, &mut offsets)
+                    }
+                };
+                for offset in gathered {
                     let a = i as isize + offset[0];
                     let b = j as isize + offset[1];
                     let c = k as isize + offset[2];
@@ -713,8 +799,13 @@ impl IterativeOp for HExtremaOp {
             return Ok(());
         }
         let running = at.operand(RUNNING)?.view::<f64>()?;
-        reconstruct_step_into(
+        // `at.at()` and not `Anchor::whole`: a substage holds a block, and where
+        // that block sits is what decides which of the volume's faces it can see.
+        // Only a re-phasing element reads it, and for that element it is the
+        // difference between one filter and one per decomposition.
+        reconstruct_step_into_at(
             running,
+            at.at(),
             mask,
             &self.element,
             self.method,
@@ -951,6 +1042,120 @@ mod tests {
         assert_eq!(
             out.iter().copied().collect::<Vec<_>>(),
             vec![1.0, 5.0, 9.0, 9.0]
+        );
+    }
+
+    /// **The step gathers the window the element names, and names it against the
+    /// volume.** Three claims, in the order they depend on each other.
+    ///
+    /// One: an element whose offsets are one set — every element without a step
+    /// — cannot see the anchor, so stating one changes nothing at all and the
+    /// step is byte-identical to what it was. Two: an element whose step counts
+    /// from the clipped start reads a different window near a low face, and the
+    /// step run on a block at its own place in the volume writes what the
+    /// whole-volume step wrote there. Three: the same buffer read as a volume of
+    /// its own is a *different* answer, so the second claim is not a tautology
+    /// and a rule keyed on a buffer's edge would be caught here.
+    #[test]
+    fn the_step_asks_the_element_at_the_volumes_faces() {
+        let volume = [20usize, 1, 1];
+        let values: Vec<f64> = (0..volume[0]).map(|i| ((i * 5) % 7) as f64).collect();
+        let mask = Array3::from_shape_vec((volume[0], 1, 1), values).unwrap();
+        let seed = mask.mapv(|value| value - 3.0);
+
+        // an element with one offset set: the anchor is inert
+        let plain = StructuringElement::from_radius(ElementShape::Box, [2, 0, 0]);
+        let mut without = Array3::<f64>::zeros(mask.raw_dim());
+        reconstruct_step_into(
+            seed.view(),
+            mask.view(),
+            &plain,
+            Reconstruction::ByDilation,
+            without.view_mut(),
+        )
+        .unwrap();
+        let mut with = Array3::<f64>::zeros(mask.raw_dim());
+        reconstruct_step_into_at(
+            seed.view(),
+            &Anchor::new([50, 20, 10], [200, 100, 60]),
+            mask.view(),
+            &plain,
+            Reconstruction::ByDilation,
+            with.view_mut(),
+        )
+        .unwrap();
+        assert_eq!(without, with, "an anchored element cannot see the anchor");
+
+        // and one that re-phases, at `lo = hi = 4` on a twenty-voxel axis
+        let element = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            [9, 1, 1],
+            [2, 1, 1],
+            StepOrigin::ClippedStart,
+        )
+        .unwrap();
+        let (low_side, _) = element.sides(0);
+        assert_eq!(low_side, 4);
+        let mut whole = Array3::<f64>::zeros(mask.raw_dim());
+        reconstruct_step_into(
+            seed.view(),
+            mask.view(),
+            &element,
+            Reconstruction::ByDilation,
+            whole.view_mut(),
+        )
+        .unwrap();
+
+        // a buffer holding the far end of the same volume, with its own place
+        // stated, and an offset of at least the element's low side — an honest
+        // halo. The window is still clamped to the buffer, so the comparison is
+        // over the voxels that halo covers: `low_side` voxels in from the
+        // buffer's low edge, and up to the volume's own high face, which both
+        // runs clamp at identically.
+        let offset = 6usize;
+        let held = seed.slice(ndarray::s![offset.., .., ..]).to_owned();
+        let held_mask = mask.slice(ndarray::s![offset.., .., ..]).to_owned();
+        let mut blocked = Array3::<f64>::zeros(held.raw_dim());
+        reconstruct_step_into_at(
+            held.view(),
+            &Anchor::new([offset, 0, 0], volume),
+            held_mask.view(),
+            &element,
+            Reconstruction::ByDilation,
+            blocked.view_mut(),
+        )
+        .unwrap();
+
+        for i in low_side..blocked.shape()[0] {
+            assert_eq!(
+                blocked[[i, 0, 0]].to_bits(),
+                whole[[i + offset, 0, 0]].to_bits(),
+                "buffer voxel {i}, volume voxel {}",
+                i + offset
+            );
+        }
+
+        // The negative control, and it lands exactly where the theorem says it
+        // must: read as a volume of its own, the buffer re-phases at *its* low
+        // edge, and the two readings differ over the first `low_side` voxels —
+        // which is the halo, and is the region a decomposed run discards. So the
+        // agreement above is a property of asking the volume, not an indifference
+        // to which extent was asked.
+        let mut as_its_own = Array3::<f64>::zeros(held.raw_dim());
+        reconstruct_step_into(
+            held.view(),
+            held_mask.view(),
+            &element,
+            Reconstruction::ByDilation,
+            as_its_own.view_mut(),
+        )
+        .unwrap();
+        let differing = (0..blocked.shape()[0])
+            .filter(|&i| as_its_own[[i, 0, 0]].to_bits() != blocked[[i, 0, 0]].to_bits())
+            .collect::<Vec<_>>();
+        assert!(
+            !differing.is_empty() && differing.iter().all(|&i| i < low_side),
+            "the two readings must differ, and only inside the halo; differed at {differing:?}"
         );
     }
 

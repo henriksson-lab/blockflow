@@ -7,7 +7,7 @@
 // every property here is being asserted for the first time on a plan whose two
 // levels are different sizes.
 //
-// Seven things, and each catches something the others cannot
+// Eight things, and each catches something the others cannot
 // ----------------------------------------------------------
 // 1. **Byte identity with the whole-volume reference** — the same kernel called
 //    once — at several factors, several block edges and several split-axis
@@ -31,6 +31,12 @@
 //    workload that exercises that path with two different shapes.
 // 7. **Label data survives** a nearest resampling through the executor, which is
 //    the case a general library is asked for and the one linear cannot serve.
+// 8. **An output extent the caller states** rather than derives from the factor:
+//    that the factor-exact default is byte-unchanged, that a stated extent is
+//    byte identical to the whole-volume answer across block sizes including a
+//    one-voxel block, that it cuts where the factor's period is the whole output
+//    axis and by how much the fetch drops, and that the check the extent waiver
+//    owes is seen to fire on a short fetch.
 
 use blockflow::decomposition::Decomposition;
 use blockflow::env::ArrayEnvironment;
@@ -738,4 +744,307 @@ fn a_label_volume_survives_a_nearest_resampling_through_the_executor() {
             .iter()
             .all(|value| source.iter().any(|had| had == value)));
     }
+}
+
+// ------------------------------------- 8. an output extent the caller states --
+//
+// `Resample::to_extent` takes the two extents and derives the factor, instead of
+// taking the factor and deriving the output extent. Three things have to hold
+// and each is asserted below rather than argued:
+//
+// * the **default is byte-unchanged** — every quantity the factor path declares,
+//   and the voxels themselves, are what they were;
+// * a stated extent **plans at any cut**, and the blocked answer is byte
+//   identical to the whole-volume one, at block edges that divide the extent and
+//   at edges that do not, down to one voxel;
+// * the waiver is paid for: the check `placed_output_shape` traded away is in
+//   `apply_placed` and is **seen to fire**.
+
+/// The extents an axis of 24, 18 and 14 gets under the two rules at one factor.
+///
+/// `ceil` and `floor` of the same product, so the fixture discriminates the two
+/// conventions on every axis rather than on one: `24 * 13/80 = 3.9`, `18 * 13/80
+/// = 2.925`, `14 * 13/80 = 2.275`.
+const STATED: [usize; 3] = [4, 3, 3];
+const FACTORED: [usize; 3] = [3, 2, 2];
+
+fn stated_ratios() -> [Ratio; 3] {
+    ratios([(13, 80), (13, 80), (13, 80)])
+}
+
+/// The two rules disagree about the extent on **every axis of this fixture**,
+/// which is what makes everything below a discriminating test rather than a
+/// tautology. A fixture where they agreed would pass whichever rule was wired.
+#[test]
+fn the_stated_and_the_factored_extent_differ_on_every_axis_here() {
+    let factored = Resample::new(stated_ratios(), Interpolation::Linear);
+    assert_eq!(factored.output_volume(VOLUME).unwrap(), FACTORED);
+    let stated = Resample::to_extent(VOLUME, STATED, Interpolation::Linear).unwrap();
+    assert_eq!(stated.output_volume(VOLUME).unwrap(), STATED);
+    for axis in 0..3 {
+        assert_ne!(
+            STATED[axis], FACTORED[axis],
+            "axis {axis} does not discriminate the two rules"
+        );
+    }
+    // And the sample map really is the stated one: the scale is `n/out` and not
+    // `down/up`, so the two spellings put the last output voxel in different
+    // places.
+    assert_eq!(stated.ratio(0), Ratio::new(4, 24).unwrap());
+    assert_eq!(factored.ratio(0), Ratio::new(13, 80).unwrap());
+    // A stated extent is bound to the volume it was stated against, and being
+    // asked about another is refused rather than answered by the factor.
+    let message = stated.output_volume([25, 18, 14]).unwrap_err().to_string();
+    assert!(message.contains("bound to the volume"), "{message}");
+}
+
+/// **The factor-exact default is byte-unchanged**, asserted rather than assumed.
+///
+/// Every quantity the factor arm declares, at a factor whose extent divides
+/// nothing evenly, plus the voxels through the executor. A change to the shared
+/// arithmetic that moved the default fails here, and the whole of the rest of
+/// this file fails with it.
+#[test]
+fn the_factor_exact_default_is_unmoved_by_the_stated_extent() {
+    let input: Voxels = texture(VOLUME).into();
+    for interpolation in [Interpolation::Nearest, Interpolation::Linear] {
+        for specs in [
+            [(1usize, 5usize), (1, 5), (1, 5)],
+            [(3, 2), (3, 2), (3, 2)],
+            [(13, 80), (13, 80), (13, 80)],
+        ] {
+            let resample = Resample::new(ratios(specs), interpolation);
+            assert_eq!(
+                resample.extent(),
+                blockflow::ops::OutputExtent::Factor,
+                "the default arm moved"
+            );
+            for axis in 0..3 {
+                // the extent rule
+                assert_eq!(
+                    resample.output_extent(axis, VOLUME[axis]),
+                    VOLUME[axis] * specs[axis].0 / specs[axis].1
+                );
+                // the alignment is the factor's period, not 1
+                assert_eq!(resample.alignment()[axis], resample.ratio(axis).up());
+                // and the reach is the interpolation's, not zero
+                assert_eq!(
+                    resample.reach(axis),
+                    (0..1)
+                        .map(|_| Resample::uniform(resample.ratio(axis), interpolation).reach(0))
+                        .next()
+                        .unwrap()
+                );
+            }
+            let op = ResampleOp::new("resample", resample);
+            assert!(
+                !blockflow::op::BlockOp::takes_extent_from_placement(&op),
+                "the default must not take its extent from the plan"
+            );
+            let want = reference(&input, &resample);
+            let decomposition = plan(&resample, VOLUME, 3, &[0, 1, 2]);
+            decomposition.check().unwrap();
+            assert_eq!(run(&resample, &input, &decomposition), want);
+        }
+    }
+}
+
+/// **The payoff**: the blocked path is byte identical to the whole-volume
+/// answer, at a stated extent, across block sizes.
+///
+/// The edges include ones that divide the extent, ones that do not, and **one
+/// voxel** — which is the cut the factor path cannot make at all here, because
+/// `Ratio::new(4, 24)` reduces to `1/6` and `Ratio::new(3, 14)` does not reduce
+/// at all, so the factor path's period is the whole axis on two of the three.
+#[test]
+fn every_stated_extent_decomposition_reproduces_the_whole_volume_answer() {
+    let input: Voxels = texture(VOLUME).into();
+    for interpolation in [Interpolation::Nearest, Interpolation::Linear] {
+        for output in [STATED, [7, 5, 29], [23, 19, 13], [1, 3, 2], [37, 41, 43]] {
+            let resample = Resample::to_extent(VOLUME, output, interpolation).unwrap();
+            let want = reference(&input, &resample);
+            assert_eq!(want.shape(), output);
+            assert!(
+                want.uniform().is_none(),
+                "the reference is constant, so it discriminates nothing"
+            );
+            // The one-voxel cut is on one axis rather than three, and only
+            // where the extent is small: `[37, 41, 43]` cut to single voxels on
+            // every axis is 65 231 blocks of one voxel each, which measures the
+            // executor's per-block cost and not this op's arithmetic. What the
+            // one-voxel cut is here to show — a block whose read extent is one
+            // output voxel and whose fetch is the two source voxels it brackets
+            // — is shown by cutting one axis.
+            let cases: Vec<(usize, Vec<usize>)> = vec![
+                (1, vec![0]),
+                (2, vec![0]),
+                (3, vec![1, 2]),
+                (5, vec![0, 1, 2]),
+                (7, vec![0, 1, 2]),
+                (64, vec![0, 1, 2]),
+            ];
+            for (edge, split_axes) in cases {
+                let decomposition = plan(&resample, VOLUME, edge, &split_axes);
+                decomposition.check().unwrap();
+                assert_eq!(decomposition.output_volume(), output);
+                let got = run(&resample, &input, &decomposition);
+                assert_eq!(
+                    got, want,
+                    "{output:?} {interpolation:?}, edge {edge}, axes {split_axes:?}"
+                );
+            }
+        }
+    }
+}
+
+/// What the stated extent buys, as a number: the same map and the same answer,
+/// with the fetch dropping from the **whole axis** to each block's own span.
+///
+/// `Ratio::new(7, 24)` is in lowest terms, so the factor path's alignment period
+/// is 7 — the entire output axis — and every block's halo snaps its read out to
+/// cover all of it. The plan is legal and it is not a decomposition: each of the
+/// three blocks fetches all 24 input voxels. Stated, the same three blocks —
+/// output 0..3, 3..6 and 6..7 — fetch 9, 9 and 2.
+#[test]
+fn a_stated_extent_cuts_where_the_factor_period_is_the_whole_axis() {
+    let input: Voxels = texture(VOLUME).into();
+    let factored = Resample::new(
+        [
+            Ratio::new(7, 24).unwrap(),
+            Ratio::identity(),
+            Ratio::identity(),
+        ],
+        Interpolation::Linear,
+    );
+    assert_eq!(factored.output_volume(VOLUME).unwrap(), [7, 18, 14]);
+    assert_eq!(factored.alignment()[0], 7, "the period is the whole axis");
+    let stated = Resample::to_extent(VOLUME, [7, 18, 14], Interpolation::Linear).unwrap();
+    assert_eq!(stated.alignment(), [1, 1, 1]);
+
+    let factored_plan = plan(&factored, VOLUME, 3, &[0]);
+    let stated_plan = plan(&stated, VOLUME, 3, &[0]);
+    let fetched = |decomposition: &Decomposition| -> Vec<usize> {
+        decomposition.phases[0]
+            .blocks
+            .iter()
+            .map(|block| block.source.shape[0])
+            .collect()
+    };
+    assert_eq!(fetched(&factored_plan), vec![24, 24, 24]);
+    assert_eq!(fetched(&stated_plan), vec![9, 9, 2]);
+
+    // The same answer both ways, which is what makes the fetch a saving rather
+    // than a different computation: at this factor the two extent rules agree
+    // (`floor(24 * 7/24) == 7`), so the voxels have to be identical.
+    let want = reference(&input, &factored);
+    assert_eq!(reference(&input, &stated), want);
+    assert_eq!(run(&factored, &input, &factored_plan), want);
+    assert_eq!(run(&stated, &input, &stated_plan), want);
+}
+
+/// The op declares the waiver, and the framework's own check is satisfied rather
+/// than bypassed.
+#[test]
+fn a_stated_extent_declares_that_it_takes_its_extent_from_the_plan() {
+    use blockflow::op::BlockOp;
+
+    let stated = Resample::to_extent(VOLUME, STATED, Interpolation::Linear).unwrap();
+    let op = ResampleOp::new("resample", stated);
+    assert!(op.takes_extent_from_placement());
+    // `output_shape` has no answer for anything but the whole volume, and says
+    // so by returning a shape the executor rejects rather than an arithmetic
+    // that is right for the interior blocks.
+    assert_eq!(op.output_shape(VOLUME), STATED);
+    assert_eq!(op.output_shape([12, 9, 7]), [12, 9, 7]);
+    // The plan the framework checks, checked.
+    let decomposition = plan(&stated, VOLUME, 2, &[0, 1, 2]);
+    decomposition.check().unwrap();
+    let chain = Chain::op(ResampleOp::new("resample", stated));
+    blockflow::decomposition::check_output_shapes(&chain, &decomposition, &[]).unwrap();
+}
+
+/// **The check the waiver owes, seen to fire.** A fetch one voxel short of what
+/// the block's output voxels bracket is refused by name, rather than clamped to
+/// the buffer's edge and returned as a plausible volume.
+///
+/// This is the replacement for the executor's own comparison of declared shape
+/// against derived read extent, which an op answering out of the plan makes
+/// vacuous. It is the stronger of the two because it is against the buffer the
+/// block was handed rather than against a declaration.
+#[test]
+fn a_short_fetch_under_a_stated_extent_is_refused_rather_than_clamped() {
+    use blockflow::op::{Anchor, BlockOp, Placement, SourceInputs};
+    use blockflow::region::Region;
+
+    let stated = Resample::to_extent(VOLUME, [7, 18, 14], Interpolation::Linear).unwrap();
+    let op = ResampleOp::new("resample", stated);
+    let input: Voxels = texture(VOLUME).into();
+    // The middle block of the cut above: output 3..6, whose voxels bracket
+    // source 11..20 and nothing else.
+    let read = Region::new(&[3, 0, 0], &[3, 18, 14]);
+    let fetch = stated.source_region(&read, VOLUME).unwrap();
+    assert_eq!((fetch.start[0], fetch.shape[0]), (11, 9));
+
+    let slice = |start: usize, len: usize| -> Voxels {
+        let full = input.view::<f64>().unwrap();
+        full.slice(ndarray::s![start..start + len, .., ..])
+            .to_owned()
+            .into()
+    };
+    let placed = |start: usize| {
+        Placement::new(
+            Anchor::new([start, 0, 0], VOLUME),
+            Anchor::new([3, 0, 0], [7, 18, 14]),
+        )
+        .writing([3, 18, 14])
+    };
+
+    // The honest fetch computes, and its voxels are the whole-volume answer.
+    let mut out = Voxels::zeros(Dtype::F64, [3, 18, 14]).unwrap();
+    op.apply_placed(
+        &slice(fetch.start[0], fetch.shape[0]),
+        SourceInputs::new(&[]),
+        &mut out,
+        &placed(fetch.start[0]),
+    )
+    .unwrap();
+    let whole = reference(&input, &stated);
+    let want = whole
+        .view::<f64>()
+        .unwrap()
+        .slice(ndarray::s![3..6, .., ..])
+        .to_owned();
+    assert_eq!(out.view::<f64>().unwrap(), want.view());
+
+    // One voxel short on the far side, which is where a clamp would be silent.
+    let mut out = Voxels::zeros(Dtype::F64, [3, 18, 14]).unwrap();
+    let message = op
+        .apply_placed(
+            &slice(fetch.start[0], fetch.shape[0] - 1),
+            SourceInputs::new(&[]),
+            &mut out,
+            &placed(fetch.start[0]),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("reads source") && message.contains("was handed source"),
+        "{message}"
+    );
+    // And one voxel short on the near side, which is the other end of the same
+    // interval and would clamp just as quietly.
+    let mut out = Voxels::zeros(Dtype::F64, [3, 18, 14]).unwrap();
+    let message = op
+        .apply_placed(
+            &slice(fetch.start[0] + 1, fetch.shape[0] - 1),
+            SourceInputs::new(&[]),
+            &mut out,
+            &placed(fetch.start[0] + 1),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("bracket between source voxels"),
+        "{message}"
+    );
 }

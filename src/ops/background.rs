@@ -83,6 +83,20 @@
 // `Sequence` in order to keep. If that trade ever wants making, it is one op in a
 // new file and nothing here changes.
 //
+// What this file does about the element's step origin: nothing, and that is
+// the answer rather than an omission
+// ------------------------------------------------------------------------
+// An element whose step counts from `StepOrigin::ClippedStart` reads a different
+// set of offsets where the window is clipped at a low face of the volume, so an
+// op that gathered one offset set would compute a filter other than the one it
+// names. There is no gather here to get that wrong: both arms of the estimate
+// **are** [`RankFilterOp`], which asks the element what it reads at each voxel's
+// position in the volume, and the sink is voxelwise. So the origin is honoured
+// by construction, at whatever the rank filter honours it at, and a second
+// statement of the rule in this file would be a second thing to keep in step.
+// `the_estimate_honours_the_step_origin_through_the_filter_it_is_made_of` is
+// that composition asserted rather than assumed.
+//
 // The reach
 // ---------
 // `2 * radius` per axis, and **nothing here writes a 2**. The estimate is a
@@ -644,6 +658,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The origin of the element's step reaches the estimate, and nothing here
+    /// carries it.**
+    ///
+    /// An element whose step counts from `StepOrigin::ClippedStart` reads a
+    /// different set of offsets where the window is clipped at a low face of the
+    /// volume. This file has no gather, so there is nothing here that could get
+    /// that right or wrong — both arms are `RankFilterOp`, which asks the element
+    /// what it reads at each voxel's position in the volume. The definition below
+    /// is written out with `offsets_at` for that reason: it states what the
+    /// composed operation means and lets the composition be checked against it.
+    ///
+    /// The second half is what keeps the first from being vacuous. Under the
+    /// other origin the same box is a different opening on this volume, so the
+    /// comparison above is over a case where the two rules disagree.
+    #[test]
+    fn the_estimate_honours_the_step_origin_through_the_filter_it_is_made_of() {
+        use super::super::element::StepOrigin;
+
+        let input = speckle();
+        let at = Anchor::whole(SHAPE);
+        let size = [9, 5, 1];
+        let step = [2, 2, 1];
+        let clipped = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            size,
+            step,
+            StepOrigin::ClippedStart,
+        )
+        .unwrap();
+        let anchored = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            size,
+            step,
+            StepOrigin::Anchor,
+        )
+        .unwrap();
+
+        let got = applied(&remove_background(&clipped).unwrap(), &input);
+        assert_eq!(got, by_definition_at(&input, &at, &clipped));
+        assert_ne!(
+            got,
+            by_definition(&input, &clipped),
+            "the anchored gather must be a different top-hat here, or the comparison above \
+             is a comparison of one rule with itself"
+        );
+        assert_ne!(
+            got,
+            applied(&remove_background(&anchored).unwrap(), &input),
+            "and the two origins must be two operations through the composition too"
+        );
+    }
+
+    /// [`by_definition`] with the window asked of the element **at each voxel's
+    /// position in the volume**, which is what the operation means for an element
+    /// whose offsets are not one set. Identical to it for every other element.
+    fn by_definition_at(
+        input: &Array3<f64>,
+        at: &Anchor,
+        element: &StructuringElement,
+    ) -> Array3<f64> {
+        let shape = input.dim();
+        let sweep = |source: &Array3<f64>, take_max: bool| {
+            let mut scratch = Vec::new();
+            let mut out = Array3::zeros(shape);
+            for i in 0..shape.0 {
+                for j in 0..shape.1 {
+                    for k in 0..shape.2 {
+                        let placed = [
+                            (i + at.offset[0]) as isize,
+                            (j + at.offset[1]) as isize,
+                            (k + at.offset[2]) as isize,
+                        ];
+                        let mut chosen: Option<f64> = None;
+                        for offset in element.offsets_at(placed, at.volume, &mut scratch) {
+                            let a = i as isize + offset[0];
+                            let b = j as isize + offset[1];
+                            let c = k as isize + offset[2];
+                            if a < 0 || b < 0 || c < 0 {
+                                continue;
+                            }
+                            let (a, b, c) = (a as usize, b as usize, c as usize);
+                            if a >= shape.0 || b >= shape.1 || c >= shape.2 {
+                                continue;
+                            }
+                            let value = source[[a, b, c]];
+                            chosen = Some(match chosen {
+                                None => value,
+                                Some(best) if take_max => best.max(value),
+                                Some(best) => best.min(value),
+                            });
+                        }
+                        out[[i, j, k]] = chosen.expect("a window that met the volume");
+                    }
+                }
+            }
+            out
+        };
+        let opened = sweep(&sweep(input, false), true);
+        Array3::from_shape_fn(shape, |(i, j, k)| input[[i, j, k]] - opened[[i, j, k]])
     }
 
     /// The property that makes the difference a *residual* rather than a signed

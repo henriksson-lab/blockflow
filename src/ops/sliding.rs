@@ -51,6 +51,33 @@
 // and asserts that it came back to zero exactly, which is the standing proof
 // that admission and retirement agree about what is in the window.
 //
+// One element is refused, by name, for the same reason
+// -----------------------------------------------------
+// The step rule above is a statement about **one** window. `L` and `J` are
+// computed once from the element and reused at every voxel of every line, which
+// is the whole of the saving; they exist only because the window at `v + 1` is
+// the window at `v` translated. An element whose step counts from
+// `StepOrigin::ClippedStart` breaks that premise at the root: near a low face of
+// the volume the decimation re-phases, so consecutive centres read **different
+// residue classes** and the two windows overlap in nothing the step rule can
+// name. `|L| = |J| = |E|` there, and the traversal is a dense gather wearing a
+// histogram's clothes.
+//
+// So this op refuses such an element rather than computing the anchored window
+// under its name — which is what reading `offsets` would do, silently, and
+// exactly where `ops::rank` (which does honour the origin, per voxel) would
+// disagree with it. The two are documented as byte-identical, and that claim now
+// holds over every element this op accepts rather than over most of them. A
+// caller who wants that filter has the dense one; a caller who wants this
+// traversal has `StepOrigin::Anchor`, which is the same element everywhere and
+// is what `from_size_stepped_at` is for.
+//
+// The refusal is at the kernel and therefore at `apply`, not at the op's
+// constructor, because `SlidingHistogramOp::new` returns a `Self` that a caller
+// composes into a `Chain` — making it fallible would change a signature every
+// consumer of this crate writes. The kernel is the first fallible point in the
+// op's life and every path through the file passes it.
+//
 // The bounded-domain constraint is stated, not worked around
 // ----------------------------------------------------------
 // A histogram needs somewhere to put a value, so this traversal applies to
@@ -71,7 +98,7 @@ use crate::op::{Anchor, BlockOp, SourceInput, SourceInputs};
 use crate::reach::Reach;
 use crate::voxels::{VoxelElement, Voxels};
 
-use super::element::{Rank, StructuringElement};
+use super::element::{Rank, StepOrigin, StructuringElement};
 use super::rank::ExcludedCentre;
 use super::shapes_agree;
 
@@ -479,6 +506,13 @@ impl ScanPlan {
 /// same treatment of a mask and of an [`ExcludedCentre`]. What differs is only
 /// how the window's contents are reached.
 ///
+/// **An element whose step counts from
+/// [`StepOrigin::ClippedStart`](super::StepOrigin::ClippedStart) is refused**,
+/// and the refusal is what keeps the sentence above true rather than mostly
+/// true: that element is a different window at every phase, a carried histogram
+/// is a decomposition of one window, and the dense filter honours the origin.
+/// See the module header.
+///
 /// `mask`, where given, decides membership **at every offset**, exactly as
 /// `masked_rank_filter_into` states it; `centre` decides what is written at a
 /// voxel the mask excludes at its own position and is meaningful only alongside
@@ -535,6 +569,24 @@ pub fn sliding_histogram_with_plan<T: BinnedElement>(
     if element.is_empty() {
         return Err(Error::InvalidArgument(format!(
             "{what}: an empty element selects nothing"
+        )));
+    }
+    // **The one element this traversal cannot express**, refused rather than
+    // approximated. See the module header: the step rule reuses one pair of
+    // leaver and joiner sets at every voxel, which is only a decomposition of the
+    // window while the window is one window.
+    if element.origin() == StepOrigin::ClippedStart {
+        return Err(Error::InvalidArgument(format!(
+            "{what}: this element's step counts from the clipped start of the window \
+             (`StepOrigin::ClippedStart`), so its members change where the window is clipped at a \
+             low face of the volume. A histogram carried along a scan line is a decomposition of \
+             one window into what a step of one retires and admits, and there is no such \
+             decomposition of a window that re-phases — consecutive centres read different \
+             residue classes. Gathering this element's interior offsets at every voxel would \
+             compute the anchored filter under the other one's name, so it is refused instead: \
+             the dense `ops::rank` filter honours this origin per voxel, and \
+             `StructuringElement::from_size_stepped_at(.., StepOrigin::Anchor)` is the element \
+             this traversal can carry."
         )));
     }
     let extent = [input.shape()[0], input.shape()[1], input.shape()[2]];
@@ -802,6 +854,14 @@ fn resolve_offset(
 /// over the same window, exactly as `MaskedRankFilterOp` reads it. One op rather
 /// than two, because the mask is one more reason an offset does not join the
 /// window and not a second traversal.
+///
+/// **This op refuses an element whose step counts from
+/// [`StepOrigin::ClippedStart`](super::StepOrigin::ClippedStart)**, and refuses
+/// it when the kernel runs rather than when the op is built: the constructors
+/// below return a `Self` a caller composes into a `Chain`, so there is nowhere
+/// earlier to say it without changing a signature every consumer writes. The
+/// message names the origin and names the two ops that can take such an element
+/// — see the module header for why this traversal cannot.
 pub struct SlidingHistogramOp {
     name: &'static str,
     element: StructuringElement,
@@ -1094,6 +1154,68 @@ mod tests {
         assert!(!op.accepts(Dtype::F32));
         assert!(!op.accepts(Dtype::I16));
         assert!(op.accepts(Dtype::U16));
+    }
+
+    /// **The element this traversal cannot express is refused by name**, and the
+    /// refusal names the origin, this op's own limitation and the two ways to get
+    /// the filter anyway. Silently gathering the interior offsets would compute
+    /// the anchored filter where the element says otherwise, which is the one
+    /// answer not available here.
+    #[test]
+    fn an_element_whose_step_re_phases_is_refused_by_name() {
+        let input = ramp((7, 5, 1), 256);
+        let clipped = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            [9, 3, 1],
+            [2, 1, 1],
+            StepOrigin::ClippedStart,
+        )
+        .unwrap();
+        let mut out = Array3::<u16>::zeros(input.dim());
+        let query = RankQuery::new(Rank::median(&clipped), &clipped);
+        let mut refused = |element: &StructuringElement| {
+            let mut out = out.view_mut();
+            sliding_histogram_into(
+                input.view(),
+                None,
+                element,
+                Domain::of_size(256).unwrap(),
+                &query,
+                ExcludedCentre::Select,
+                out.view_mut(),
+            )
+        };
+        let error = refused(&clipped).unwrap_err().to_string();
+        assert!(error.contains("ClippedStart"), "{error}");
+        assert!(error.contains("re-phases"), "{error}");
+        assert!(error.contains("ops::rank"), "{error}");
+
+        // and the same element under the origin this traversal can carry runs,
+        // so the refusal is about the origin and not about the step
+        let anchored = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            [9, 3, 1],
+            [2, 1, 1],
+            StepOrigin::Anchor,
+        )
+        .unwrap();
+        refused(&anchored).expect("an anchored element is one window and slides");
+
+        // the op refuses it too, through the same gate, since that is the first
+        // fallible point in its life
+        let op = SlidingHistogramOp::rank(
+            "sliding",
+            clipped,
+            Rank::lowest(),
+            Domain::of_size(256).unwrap(),
+        );
+        let source: Voxels = input.clone().into();
+        let mut target = Voxels::zeros(Dtype::U16, [7, 5, 1]).unwrap();
+        let error = op
+            .apply(&source, &mut target, &Anchor::whole([7, 5, 1]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ClippedStart"), "{error}");
     }
 
     #[test]

@@ -28,6 +28,23 @@
 // away" convention, it is right at a real volume boundary, and — as for the rank
 // filter — it is deliberately *wrong* at a block seam, which is what makes a
 // short halo visible instead of silent.
+//
+// Which offsets, and where they are asked for
+// -------------------------------------------
+// `sweep` asks the element what it reads **at each voxel's position in the
+// volume**, through `StructuringElement::offsets_at`, rather than gathering one
+// offset set everywhere. That matters for one element and one only: a step
+// counted from `StepOrigin::ClippedStart` re-phases where the window is clipped
+// at a low face of the volume, so a filter that read `offsets` there would
+// compute the anchored window under a name that says otherwise. For every other
+// element `offsets_at` hands back the element's own slice, so the loop is the
+// loop it was and the answer is byte-identical.
+//
+// This is not a courtesy to the element type. `ops::rank`'s extreme ranks *are*
+// this file's two primitives over the same element — the test below pins that
+// equality, and `ops::background` builds a grey opening out of the rank filter
+// on the strength of it — so an origin honoured on one side of that equality and
+// not the other would be two filters wearing one name.
 
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
@@ -37,26 +54,60 @@ use crate::op::{Anchor, BlockOp};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
 
-use super::element::StructuringElement;
+use super::element::{StepOrigin, StructuringElement};
 use super::shapes_agree;
 use super::voxelwise::{from_set, is_set};
 
 /// The conjunction of the element around every voxel.
+///
+/// **`input` is read as the whole volume**, which is what a caller handing over
+/// a bare array is saying; [`erode_into_at`] is the form that says where the
+/// array sits in a larger one. The two differ for exactly one element — see the
+/// module header — and are the same call for every other.
 pub fn erode_into(
     input: ArrayView3<'_, bool>,
     element: &StructuringElement,
     out: ArrayViewMut3<'_, bool>,
 ) -> Result<()> {
-    sweep(input, element, out, false, "erode_into")
+    let at = whole(input.shape());
+    erode_into_at(input, &at, element, out)
+}
+
+/// [`erode_into`] with the buffer's place in its volume stated.
+///
+/// `at` decides where the element's low faces are, and therefore what a
+/// re-phasing element reads; see the module header. It changes nothing for an
+/// element whose offsets are one set, which is every element without a step.
+pub fn erode_into_at(
+    input: ArrayView3<'_, bool>,
+    at: &Anchor,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
+    sweep(input, at, element, out, false, "erode_into")
 }
 
 /// The disjunction of the element around every voxel.
+///
+/// Reads `input` as the whole volume; [`dilate_into_at`] is the anchored form.
 pub fn dilate_into(
     input: ArrayView3<'_, bool>,
     element: &StructuringElement,
     out: ArrayViewMut3<'_, bool>,
 ) -> Result<()> {
-    sweep(input, element, out, true, "dilate_into")
+    let at = whole(input.shape());
+    dilate_into_at(input, &at, element, out)
+}
+
+/// [`dilate_into`] with the buffer's place in its volume stated; see
+/// [`erode_into_at`].
+pub fn dilate_into_at(
+    input: ArrayView3<'_, bool>,
+    at: &Anchor,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
+    sweep(input, at, element, out, true, "dilate_into")
 }
 
 /// An erosion followed by a dilation. **Reaches twice the element's radius.**
@@ -65,9 +116,25 @@ pub fn open_into(
     element: &StructuringElement,
     out: ArrayViewMut3<'_, bool>,
 ) -> Result<()> {
+    let at = whole(input.shape());
+    open_into_at(input, &at, element, out)
+}
+
+/// [`open_into`] with the buffer's place in its volume stated.
+///
+/// **The same anchor for both passes**, and it has to be: the intermediate
+/// covers the same buffer at the same place, so the second pass's low faces are
+/// the first pass's and the composition is the composition of the two filters
+/// the volume names.
+pub fn open_into_at(
+    input: ArrayView3<'_, bool>,
+    at: &Anchor,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
     let mut between = Array3::from_elem(input.raw_dim(), false);
-    erode_into(input, element, between.view_mut())?;
-    dilate_into(between.view(), element, out)
+    erode_into_at(input, at, element, between.view_mut())?;
+    dilate_into_at(between.view(), at, element, out)
 }
 
 /// A dilation followed by an erosion. **Reaches twice the element's radius.**
@@ -76,9 +143,28 @@ pub fn close_into(
     element: &StructuringElement,
     out: ArrayViewMut3<'_, bool>,
 ) -> Result<()> {
+    let at = whole(input.shape());
+    close_into_at(input, &at, element, out)
+}
+
+/// [`close_into`] with the buffer's place in its volume stated; see
+/// [`open_into_at`].
+pub fn close_into_at(
+    input: ArrayView3<'_, bool>,
+    at: &Anchor,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
     let mut between = Array3::from_elem(input.raw_dim(), false);
-    dilate_into(input, element, between.view_mut())?;
-    erode_into(between.view(), element, out)
+    dilate_into_at(input, at, element, between.view_mut())?;
+    erode_into_at(between.view(), at, element, out)
+}
+
+/// The anchor a caller who handed over a bare array is stating: this array is
+/// the volume. One function rather than four call sites, so that the reading
+/// every anchor-free entry point here takes is one statement.
+fn whole(shape: &[usize]) -> Anchor {
+    Anchor::whole([shape[0], shape[1], shape[2]])
 }
 
 /// The one loop both primitives use.
@@ -90,6 +176,7 @@ pub fn close_into(
 /// guarantee that they clamp the same way.
 fn sweep(
     input: ArrayView3<'_, bool>,
+    at: &Anchor,
     element: &StructuringElement,
     mut out: ArrayViewMut3<'_, bool>,
     hit: bool,
@@ -106,12 +193,52 @@ fn sweep(
         input.shape()[1] as isize,
         input.shape()[2] as isize,
     ];
+    // Checked only where the anchor decides anything, which is where the element
+    // re-phases; see the same argument, at greater length, in `ops::rank`. An
+    // element that reads one offset set everywhere cannot tell a wrong anchor
+    // from a right one, so demanding a right one would refuse calls that were
+    // always correct.
+    if element.origin() == StepOrigin::ClippedStart {
+        for axis in 0..3 {
+            if at.offset[axis] + extent[axis] as usize > at.volume[axis] {
+                return Err(Error::InvalidArgument(format!(
+                    "{what}: a buffer of {:?} at {:?} does not fit a volume of {:?}, and this \
+                     element's step counts from the clipped start of the window, so where the \
+                     buffer sits in the volume is part of the operation",
+                    input.shape(),
+                    at.offset,
+                    at.volume
+                )));
+            }
+        }
+    }
+    // The element's offsets at one voxel, for the one element that has more than
+    // one set of them. Owned out here so that a voxel pays no allocation, and
+    // untouched by every other element.
+    let mut offsets: Vec<[isize; 3]> = Vec::new();
+    // The one offset set, where there is one, lifted out of the loop — the same
+    // slice `offsets_at` would hand back, and `ops::rank` gives the argument for
+    // lifting it at greater length.
+    let fixed = (element.origin() == StepOrigin::Anchor).then(|| element.offsets());
     for i in 0..input.shape()[0] {
         for j in 0..input.shape()[1] {
             for k in 0..input.shape()[2] {
                 let centre = [i as isize, j as isize, k as isize];
+                let gathered = match fixed {
+                    Some(offsets) => offsets,
+                    // The same voxel in the volume's coordinates: the element is
+                    // asked there, the array is read here.
+                    None => {
+                        let placed = [
+                            centre[0] + at.offset[0] as isize,
+                            centre[1] + at.offset[1] as isize,
+                            centre[2] + at.offset[2] as isize,
+                        ];
+                        element.offsets_at(placed, at.volume, &mut offsets)
+                    }
+                };
                 let mut answer = !hit;
-                for offset in element.offsets() {
+                for offset in gathered {
                     let a = centre[0] + offset[0];
                     let b = centre[1] + offset[1];
                     let c = centre[2] + offset[2];
@@ -160,11 +287,24 @@ impl Morphology {
         element: &StructuringElement,
         out: ArrayViewMut3<'_, bool>,
     ) -> Result<()> {
+        let at = whole(input.shape());
+        self.apply_into_at(input, &at, element, out)
+    }
+
+    /// [`Self::apply_into`] with the buffer's place in its volume stated; see
+    /// [`erode_into_at`].
+    pub fn apply_into_at(
+        self,
+        input: ArrayView3<'_, bool>,
+        at: &Anchor,
+        element: &StructuringElement,
+        out: ArrayViewMut3<'_, bool>,
+    ) -> Result<()> {
         match self {
-            Morphology::Erode => erode_into(input, element, out),
-            Morphology::Dilate => dilate_into(input, element, out),
-            Morphology::Open => open_into(input, element, out),
-            Morphology::Close => close_into(input, element, out),
+            Morphology::Erode => erode_into_at(input, at, element, out),
+            Morphology::Dilate => dilate_into_at(input, at, element, out),
+            Morphology::Open => open_into_at(input, at, element, out),
+            Morphology::Close => close_into_at(input, at, element, out),
         }
     }
 }
@@ -252,12 +392,17 @@ impl BlockOp for MorphologyOp {
         matches!(dtype, Dtype::Bool | Dtype::F64)
     }
 
-    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+    /// **`at` is read rather than ignored**, so that an element whose step counts
+    /// from the clipped start re-phases at the volume's faces and not at a block
+    /// seam. Every other element reads the same offsets everywhere and cannot
+    /// tell the difference.
+    fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
         match input.dtype() {
             // No conversion and no intermediate: the kernel is a `bool` kernel
             // and the buffer is a `bool` buffer.
-            Dtype::Bool => self.kind.apply_into(
+            Dtype::Bool => self.kind.apply_into_at(
                 input.view::<bool>()?,
+                at,
                 &self.element,
                 out.view_mut::<bool>()?,
             ),
@@ -265,7 +410,7 @@ impl BlockOp for MorphologyOp {
                 let mask = input.view::<f64>()?.mapv(is_set);
                 let mut result = Array3::from_elem(mask.raw_dim(), false);
                 self.kind
-                    .apply_into(mask.view(), &self.element, result.view_mut())?;
+                    .apply_into_at(mask.view(), at, &self.element, result.view_mut())?;
                 let mut out = out.view_mut::<f64>()?;
                 ndarray::Zip::from(&mut out)
                     .and(&result)
@@ -336,6 +481,124 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(dilated, highest, "dilate {shape:?} {radius:?}");
+            }
+        }
+    }
+
+    /// The same equality, over the one element whose window depends on where it
+    /// is evaluated — and at a buffer that is not the whole volume, which is the
+    /// only place the two could disagree.
+    ///
+    /// **This is the assertion that fails if either side stops honouring the
+    /// step's origin.** `ops::rank` gathers `offsets_at` in its own loop and this
+    /// file gathers it in another; they must gather the same set at the same
+    /// voxel or the crate has two filters under one name, and `ops::background`
+    /// builds a grey opening out of the rank filter on the strength of exactly
+    /// this equality.
+    #[test]
+    fn the_extreme_ranks_agree_over_a_re_phasing_element_too() {
+        use super::super::element::StepOrigin;
+        use super::super::rank::rank_filter_into_at;
+
+        // A comb along axis 0: set on the odd coordinates and clear on the even
+        // ones. A decimation by two either lands on the teeth or between them, so
+        // the two origins are as far apart as a `bool` volume can put them —
+        // which is what makes the last assertion below say something.
+        let input = Array3::from_shape_fn((7, 6, 1), |(i, j, _)| i % 2 == 1 || j == 4);
+        let size = [9, 3, 1];
+        let step = [2, 1, 1];
+        let clipped = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            size,
+            step,
+            StepOrigin::ClippedStart,
+        )
+        .unwrap();
+        let anchored = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            size,
+            step,
+            StepOrigin::Anchor,
+        )
+        .unwrap();
+
+        let mut differences = 0usize;
+        // the whole volume, and a buffer holding the far end of a longer one —
+        // the second is where a rule keyed on the buffer's edge would show
+        for at in [Anchor::whole([7, 6, 1]), Anchor::new([3, 0, 0], [10, 6, 1])] {
+            let mut eroded = Array3::from_elem(input.raw_dim(), false);
+            erode_into_at(input.view(), &at, &clipped, eroded.view_mut()).unwrap();
+            let mut lowest = Array3::from_elem(input.raw_dim(), false);
+            rank_filter_into_at(
+                input.view(),
+                &at,
+                &clipped,
+                Rank::lowest(),
+                lowest.view_mut(),
+            )
+            .unwrap();
+            assert_eq!(eroded, lowest, "erode at {at:?}");
+
+            let mut dilated = Array3::from_elem(input.raw_dim(), false);
+            dilate_into_at(input.view(), &at, &clipped, dilated.view_mut()).unwrap();
+            let mut highest = Array3::from_elem(input.raw_dim(), false);
+            rank_filter_into_at(
+                input.view(),
+                &at,
+                &clipped,
+                Rank::highest(&clipped),
+                highest.view_mut(),
+            )
+            .unwrap();
+            assert_eq!(dilated, highest, "dilate at {at:?}");
+
+            // and the origin is really reaching the sweep: the other origin over
+            // the same box is a different erosion here
+            let mut other = Array3::from_elem(input.raw_dim(), false);
+            erode_into_at(input.view(), &at, &anchored, other.view_mut()).unwrap();
+            differences += eroded
+                .iter()
+                .zip(other.iter())
+                .filter(|(left, right)| left != right)
+                .count();
+        }
+        assert!(
+            differences > 0,
+            "the two origins must be two erosions here, or the equalities above are an \
+             equality of the anchored gather with itself"
+        );
+    }
+
+    /// **The anchored sweep did not move**, which every element in this crate's
+    /// history is and which an unstepped element normalises to: an element that
+    /// reads one offset set everywhere cannot tell where its buffer sits, so
+    /// stating an anchor changes nothing at all.
+    #[test]
+    fn the_anchored_sweep_is_byte_unchanged() {
+        let input = speckle((7, 6, 5));
+        for element in [
+            StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]),
+            StructuringElement::from_radius(ElementShape::Ellipsoid, [2, 1, 0]),
+            StructuringElement::from_size(ElementShape::Box, [4, 3, 2]).unwrap(),
+        ] {
+            for kind in [
+                Morphology::Erode,
+                Morphology::Dilate,
+                Morphology::Open,
+                Morphology::Close,
+            ] {
+                let mut plain = Array3::from_elem(input.raw_dim(), false);
+                kind.apply_into(input.view(), &element, plain.view_mut())
+                    .unwrap();
+                let mut placed = Array3::from_elem(input.raw_dim(), false);
+                kind.apply_into_at(
+                    input.view(),
+                    &Anchor::new([40, 30, 20], [100, 90, 80]),
+                    &element,
+                    placed.view_mut(),
+                )
+                .unwrap();
+                assert_eq!(plain, placed, "{kind:?}");
             }
         }
     }

@@ -49,17 +49,36 @@
 // every number this file derives from `element.len()` follows without a second
 // path: the cost below, and the rank a `median` constructor names.
 //
-// **And it is `offsets`, not `offsets_at`**, which is a statement about one
-// element and is made here rather than left to be discovered. A step counted
-// from `StepOrigin::ClippedStart` re-phases where the window is clipped at a low
-// face of the volume, and this file gathers the same offsets at every voxel — so
-// a rank filter over such an element computes the *anchored* window there, which
-// is a different set from the one the element describes. Honouring it would mean
-// regenerating the offsets per voxel, which is a cost every unstepped element
-// would carry the branch for; the element's declared reach already covers the
-// wider phase, so the halo is right and only the membership is the anchored one.
-// `tests/stepped_element.rs` pins that gap by measurement so that it cannot
-// become an unexamined assumption in either direction.
+// **And it is `offsets_at`, not `offsets`**, which is this file's answer to the
+// one element whose members are not a single set. A step counted from
+// `StepOrigin::ClippedStart` re-phases where the window is clipped at a low face
+// of the **volume**, so what it reads is a function of the anchor and of the
+// volume's extent — both decomposition invariants, neither of them a property of
+// the buffer in hand. `selecting` therefore asks the element what it reads at
+// each voxel instead of assuming one answer for all of them, and asks it at the
+// voxel's position *in the volume*: that is what the `Anchor` every `BlockOp`
+// is handed is carried this far down for, and it is why a block seam — which is
+// not a face — cannot re-phase anything. `rank_filter_into` and its siblings
+// keep their signatures and read the array they are given as the whole volume,
+// which is what a caller who hands over a bare array is saying.
+//
+// **What honouring it costs, and what it does not.** `offsets_at` hands back the
+// element's own slice, with no copy and no allocation, for every element whose
+// origin is `StepOrigin::Anchor` — which is every unstepped element, since a
+// stride of one makes the two rules the same rule. `selecting` lifts that slice
+// out of the voxel loop where there is one, so the anchored path is the field
+// load and the slice walk it always was, and it is byte-identical to what it was:
+// `the_anchored_window_is_byte_unchanged` is that measurement rather than that
+// claim, and `the_cost_of_asking_the_element_per_voxel` is the other half of it.
+//
+// **Two counts stop being one count**, and both are safe. `element.len()` is the
+// interior population, and a re-phased window can hold a different number —
+// fewer where a face truncates it, and for a shaped element occasionally more,
+// since a phase that lands nearer the centre of a ball keeps a wider
+// cross-section of it. `Rank::resolve(full, available)` is already written for
+// `available != full`, that being the truncation rule, and it never returns an
+// index past `available - 1` at either sign; the window buffer is sized from
+// `full` as a hint and grows once if a phase exceeds it.
 
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
@@ -69,7 +88,7 @@ use crate::op::{Anchor, BlockOp};
 use crate::reach::Reach;
 use crate::voxels::{VoxelElement, Voxels};
 
-use super::element::{select_nth, Rank, StructuringElement, Total};
+use super::element::{select_nth, Rank, StepOrigin, StructuringElement, Total};
 use super::shapes_agree;
 
 /// Select `rank` of `element` around every voxel of `input`.
@@ -80,14 +99,47 @@ use super::shapes_agree;
 ///
 /// `out` may not alias `input` — the filter is not in-place, because a rank read
 /// from a partially overwritten array is a different filter.
+///
+/// **`input` is read as the whole volume**, which is what a caller handing over a
+/// bare array is saying. That matters for exactly one element — one whose step
+/// counts from [`StepOrigin::ClippedStart`](super::StepOrigin::ClippedStart),
+/// whose window re-phases at a low face — and [`rank_filter_into_at`] is the form
+/// that says where the array sits in a larger volume. For every other element the
+/// two are the same call.
 pub fn rank_filter_into<T: Ord + Copy>(
     input: ArrayView3<'_, T>,
     element: &StructuringElement,
     rank: Rank,
     out: ArrayViewMut3<'_, T>,
 ) -> Result<()> {
+    let at = whole(input.shape());
+    rank_filter_into_at(input, &at, element, rank, out)
+}
+
+/// [`rank_filter_into`] with the buffer's place in its volume stated.
+///
+/// `at` is not decoration, and it is not decoration for the same reason it is
+/// not in `ops::local`: an element whose decimation counts from
+/// [`StepOrigin::ClippedStart`](super::StepOrigin::ClippedStart) reads a
+/// different set of offsets where the window is clipped at a **low face of the
+/// volume**, and a block holding the middle of a volume has no such face. Asking
+/// the element at `at.offset + voxel` inside `at.volume` is what makes a block's
+/// answer the answer the whole-volume run would have written there.
+///
+/// The window is still clamped to the buffer, which at a real face is the global
+/// clamp and short of a sufficient halo is the truncation that makes a short halo
+/// visible. That is unchanged and is a separate question from which offsets are
+/// gathered.
+pub fn rank_filter_into_at<T: Ord + Copy>(
+    input: ArrayView3<'_, T>,
+    at: &Anchor,
+    element: &StructuringElement,
+    rank: Rank,
+    out: ArrayViewMut3<'_, T>,
+) -> Result<()> {
     selecting(
         input,
+        at,
         None,
         element,
         rank,
@@ -95,6 +147,18 @@ pub fn rank_filter_into<T: Ord + Copy>(
         out,
         "rank_filter_into",
     )
+}
+
+/// The anchor a caller who handed over a bare array is stating: this array is
+/// the volume.
+///
+/// One function rather than four call sites, so that the reading every
+/// anchor-free entry point in this file takes is one statement. `Anchor::whole`
+/// puts the offset at the origin, so an element that re-phases at a low face
+/// re-phases at *this array's* low face — which is the whole volume's, because
+/// the caller said so.
+fn whole(shape: &[usize]) -> Anchor {
+    Anchor::whole([shape[0], shape[1], shape[2]])
 }
 
 /// What the masked filter writes at a voxel the population excludes **at its
@@ -205,6 +269,23 @@ pub fn masked_rank_filter_into_with<T: Ord + Copy>(
     centre: ExcludedCentre<T>,
     out: ArrayViewMut3<'_, T>,
 ) -> Result<()> {
+    let at = whole(input.shape());
+    masked_rank_filter_into_at(input, &at, mask, element, rank, centre, out)
+}
+
+/// [`masked_rank_filter_into_with`] with the buffer's place in its volume
+/// stated; see [`rank_filter_into_at`] for what `at` decides and for the one
+/// element it decides anything for.
+#[allow(clippy::too_many_arguments)]
+pub fn masked_rank_filter_into_at<T: Ord + Copy>(
+    input: ArrayView3<'_, T>,
+    at: &Anchor,
+    mask: ArrayView3<'_, bool>,
+    element: &StructuringElement,
+    rank: Rank,
+    centre: ExcludedCentre<T>,
+    out: ArrayViewMut3<'_, T>,
+) -> Result<()> {
     shapes_agree(
         input.shape(),
         mask.shape(),
@@ -212,6 +293,7 @@ pub fn masked_rank_filter_into_with<T: Ord + Copy>(
     )?;
     selecting(
         input,
+        at,
         Some(mask),
         element,
         rank,
@@ -232,8 +314,10 @@ pub fn masked_rank_filter_into_with<T: Ord + Copy>(
 /// `centre` is meaningful only where there is a mask to be excluded by; the
 /// unmasked callers pass [`ExcludedCentre::Select`], which is also what makes
 /// the arm below `if let`-shaped rather than a second branch of the loop.
+#[allow(clippy::too_many_arguments)]
 fn selecting<T: Ord + Copy>(
     input: ArrayView3<'_, T>,
+    at: &Anchor,
     mask: Option<ArrayView3<'_, bool>>,
     element: &StructuringElement,
     rank: Rank,
@@ -252,8 +336,44 @@ fn selecting<T: Ord + Copy>(
         input.shape()[1] as isize,
         input.shape()[2] as isize,
     ];
+    // **Where the anchor becomes load-bearing, and only there.** An element whose
+    // origin is `StepOrigin::Anchor` reads the same offsets wherever it is
+    // evaluated, so a wrong `at` could not change its answer and checking one
+    // would refuse calls that were always correct. A re-phasing element reads the
+    // volume's low faces, so a buffer that claims to sit outside its own volume
+    // would ask `offsets_at` a question with no answer — and get an empty window,
+    // which this kernel would report as an element that misses its own centre.
+    // Said here instead, once per call.
+    if element.origin() == StepOrigin::ClippedStart {
+        for axis in 0..3 {
+            if at.offset[axis] + extent[axis] as usize > at.volume[axis] {
+                return Err(Error::InvalidArgument(format!(
+                    "{what}: a buffer of {:?} at {:?} does not fit a volume of {:?}, and this \
+                     element's step counts from the clipped start of the window, so where the \
+                     buffer sits in the volume is part of the filter",
+                    input.shape(),
+                    at.offset,
+                    at.volume
+                )));
+            }
+        }
+    }
     let full = element.len();
     let mut window: Vec<T> = Vec::with_capacity(full);
+    // The element's offsets **at one voxel**, for the one element that has more
+    // than one set of them. Owned out here so that a voxel pays no allocation for
+    // it, and untouched by every other element.
+    let mut offsets: Vec<[isize; 3]> = Vec::new();
+    // **The one offset set, where there is one**, lifted out of the loop rather
+    // than asked for at every voxel. `offsets_at` hands back exactly this slice
+    // for an anchored element, so the two are the same answer; the lift is what
+    // keeps the path that has nothing to ask about — every element without a
+    // step, and therefore almost every call this kernel gets — a field load and a
+    // slice walk, which is what it was before this file honoured anything.
+    // `the_cost_of_asking_the_element_per_voxel` prices all three arrangements
+    // and could not separate them above the noise of the machine it ran on, so
+    // this is the shape of the thing rather than a measured saving.
+    let fixed = (element.origin() == StepOrigin::Anchor).then(|| element.offsets());
     for i in 0..input.shape()[0] {
         for j in 0..input.shape()[1] {
             for k in 0..input.shape()[2] {
@@ -270,7 +390,24 @@ fn selecting<T: Ord + Copy>(
                 }
                 window.clear();
                 let anchor = [i as isize, j as isize, k as isize];
-                for offset in element.offsets() {
+                let gathered = match fixed {
+                    Some(offsets) => offsets,
+                    // The same voxel, in the volume's coordinates. The element is
+                    // asked there and the array is read here: which offsets are
+                    // gathered is the volume's business — its low faces are the
+                    // same faces from inside every block — and the clamp below is
+                    // the buffer's, which is the global clamp intersected with
+                    // what is held.
+                    None => {
+                        let placed = [
+                            anchor[0] + at.offset[0] as isize,
+                            anchor[1] + at.offset[1] as isize,
+                            anchor[2] + at.offset[2] as isize,
+                        ];
+                        element.offsets_at(placed, at.volume, &mut offsets)
+                    }
+                };
+                for offset in gathered {
                     let a = anchor[0] + offset[0];
                     let b = anchor[1] + offset[1];
                     let c = anchor[2] + offset[2];
@@ -321,12 +458,25 @@ pub fn rank_filter_f64_into(
     input: ArrayView3<'_, f64>,
     element: &StructuringElement,
     rank: Rank,
+    out: ArrayViewMut3<'_, f64>,
+) -> Result<()> {
+    let at = whole(input.shape());
+    rank_filter_f64_into_at(input, &at, element, rank, out)
+}
+
+/// [`rank_filter_f64_into`] with the buffer's place in its volume stated; see
+/// [`rank_filter_into_at`].
+pub fn rank_filter_f64_into_at(
+    input: ArrayView3<'_, f64>,
+    at: &Anchor,
+    element: &StructuringElement,
+    rank: Rank,
     mut out: ArrayViewMut3<'_, f64>,
 ) -> Result<()> {
     shapes_agree(input.shape(), out.shape(), "rank_filter_f64_into")?;
     let ordered = input.mapv(Total);
     let mut selected = Array3::from_elem(ordered.raw_dim(), Total(0.0));
-    rank_filter_into(ordered.view(), element, rank, selected.view_mut())?;
+    rank_filter_into_at(ordered.view(), at, element, rank, selected.view_mut())?;
     ndarray::Zip::from(&mut out)
         .and(&selected)
         .for_each(|slot, value| *slot = value.0);
@@ -401,34 +551,41 @@ impl BlockOp for RankFilterOp {
         dtype != Dtype::F16
     }
 
-    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+    /// **`at` is read rather than ignored**, which is what lets an element whose
+    /// step counts from the clipped start be the same filter under every
+    /// decomposition: the window re-phases at the volume's low faces, and only
+    /// the anchor says where those are from inside a block. Every other element
+    /// reads the same offsets everywhere and cannot tell the difference.
+    fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
         /// The integer and `bool` case: straight into the kernel, no copy.
         fn ordered<T: VoxelElement + Ord>(
             input: &Voxels,
+            at: &Anchor,
             out: &mut Voxels,
             element: &StructuringElement,
             rank: Rank,
         ) -> Result<()> {
             let source = input.view::<T>()?;
-            rank_filter_into(source, element, rank, out.view_mut::<T>()?)
+            rank_filter_into_at(source, at, element, rank, out.view_mut::<T>()?)
         }
 
         match input.dtype() {
-            Dtype::Bool => ordered::<bool>(input, out, &self.element, self.rank),
-            Dtype::U8 => ordered::<u8>(input, out, &self.element, self.rank),
-            Dtype::U16 => ordered::<u16>(input, out, &self.element, self.rank),
-            Dtype::U32 => ordered::<u32>(input, out, &self.element, self.rank),
-            Dtype::U64 => ordered::<u64>(input, out, &self.element, self.rank),
-            Dtype::I8 => ordered::<i8>(input, out, &self.element, self.rank),
-            Dtype::I16 => ordered::<i16>(input, out, &self.element, self.rank),
-            Dtype::I32 => ordered::<i32>(input, out, &self.element, self.rank),
-            Dtype::I64 => ordered::<i64>(input, out, &self.element, self.rank),
+            Dtype::Bool => ordered::<bool>(input, at, out, &self.element, self.rank),
+            Dtype::U8 => ordered::<u8>(input, at, out, &self.element, self.rank),
+            Dtype::U16 => ordered::<u16>(input, at, out, &self.element, self.rank),
+            Dtype::U32 => ordered::<u32>(input, at, out, &self.element, self.rank),
+            Dtype::U64 => ordered::<u64>(input, at, out, &self.element, self.rank),
+            Dtype::I8 => ordered::<i8>(input, at, out, &self.element, self.rank),
+            Dtype::I16 => ordered::<i16>(input, at, out, &self.element, self.rank),
+            Dtype::I32 => ordered::<i32>(input, at, out, &self.element, self.rank),
+            Dtype::I64 => ordered::<i64>(input, at, out, &self.element, self.rank),
             // The floats have no total order of their own, so they take the
             // `Total` detour. `f32` widens to `f64` on the way in and back on
             // the way out, which is exact both ways because the filter selects a
             // value it read rather than combining two.
-            Dtype::F64 => rank_filter_f64_into(
+            Dtype::F64 => rank_filter_f64_into_at(
                 input.view::<f64>()?,
+                at,
                 &self.element,
                 self.rank,
                 out.view_mut::<f64>()?,
@@ -436,8 +593,9 @@ impl BlockOp for RankFilterOp {
             Dtype::F32 => {
                 let widened = input.view::<f32>()?.mapv(f64::from);
                 let mut selected = Array3::zeros(widened.raw_dim());
-                rank_filter_f64_into(
+                rank_filter_f64_into_at(
                     widened.view(),
+                    at,
                     &self.element,
                     self.rank,
                     selected.view_mut(),
@@ -608,12 +766,13 @@ impl BlockOp for MaskedRankFilterOp {
         )))
     }
 
+    /// `at` is read, for the reason [`RankFilterOp::apply`] gives.
     fn apply_with(
         &self,
         input: &Voxels,
         sources: crate::op::SourceInputs<'_>,
         out: &mut Voxels,
-        _at: &Anchor,
+        at: &Anchor,
     ) -> Result<()> {
         let mask = sources.get(self.mask)?;
         if mask.dtype() != Dtype::Bool {
@@ -628,8 +787,10 @@ impl BlockOp for MaskedRankFilterOp {
         }
         let mask = mask.view::<bool>()?;
 
+        #[allow(clippy::too_many_arguments)]
         fn ordered<T: VoxelElement + Ord>(
             input: &Voxels,
+            at: &Anchor,
             mask: ArrayView3<'_, bool>,
             out: &mut Voxels,
             element: &StructuringElement,
@@ -637,8 +798,9 @@ impl BlockOp for MaskedRankFilterOp {
             centre: ExcludedCentre<f64>,
         ) -> Result<()> {
             let source = input.view::<T>()?;
-            masked_rank_filter_into_with(
+            masked_rank_filter_into_at(
                 source,
+                at,
                 mask,
                 element,
                 rank,
@@ -652,6 +814,7 @@ impl BlockOp for MaskedRankFilterOp {
         /// through `Total` is exact in both directions.
         fn through_total(
             widened: ndarray::Array3<f64>,
+            at: &Anchor,
             mask: ArrayView3<'_, bool>,
             element: &StructuringElement,
             rank: Rank,
@@ -659,8 +822,9 @@ impl BlockOp for MaskedRankFilterOp {
         ) -> Result<Array3<f64>> {
             let ordered = widened.mapv(Total);
             let mut selected = Array3::from_elem(ordered.raw_dim(), Total(0.0));
-            masked_rank_filter_into_with(
+            masked_rank_filter_into_at(
                 ordered.view(),
+                at,
                 mask,
                 element,
                 rank,
@@ -672,18 +836,19 @@ impl BlockOp for MaskedRankFilterOp {
 
         let centre = self.centre;
         match input.dtype() {
-            Dtype::Bool => ordered::<bool>(input, mask, out, &self.element, self.rank, centre),
-            Dtype::U8 => ordered::<u8>(input, mask, out, &self.element, self.rank, centre),
-            Dtype::U16 => ordered::<u16>(input, mask, out, &self.element, self.rank, centre),
-            Dtype::U32 => ordered::<u32>(input, mask, out, &self.element, self.rank, centre),
-            Dtype::U64 => ordered::<u64>(input, mask, out, &self.element, self.rank, centre),
-            Dtype::I8 => ordered::<i8>(input, mask, out, &self.element, self.rank, centre),
-            Dtype::I16 => ordered::<i16>(input, mask, out, &self.element, self.rank, centre),
-            Dtype::I32 => ordered::<i32>(input, mask, out, &self.element, self.rank, centre),
-            Dtype::I64 => ordered::<i64>(input, mask, out, &self.element, self.rank, centre),
+            Dtype::Bool => ordered::<bool>(input, at, mask, out, &self.element, self.rank, centre),
+            Dtype::U8 => ordered::<u8>(input, at, mask, out, &self.element, self.rank, centre),
+            Dtype::U16 => ordered::<u16>(input, at, mask, out, &self.element, self.rank, centre),
+            Dtype::U32 => ordered::<u32>(input, at, mask, out, &self.element, self.rank, centre),
+            Dtype::U64 => ordered::<u64>(input, at, mask, out, &self.element, self.rank, centre),
+            Dtype::I8 => ordered::<i8>(input, at, mask, out, &self.element, self.rank, centre),
+            Dtype::I16 => ordered::<i16>(input, at, mask, out, &self.element, self.rank, centre),
+            Dtype::I32 => ordered::<i32>(input, at, mask, out, &self.element, self.rank, centre),
+            Dtype::I64 => ordered::<i64>(input, at, mask, out, &self.element, self.rank, centre),
             Dtype::F64 => {
                 let selected = through_total(
                     input.view::<f64>()?.to_owned(),
+                    at,
                     mask,
                     &self.element,
                     self.rank,
@@ -695,6 +860,7 @@ impl BlockOp for MaskedRankFilterOp {
             Dtype::F32 => {
                 let selected = through_total(
                     input.view::<f32>()?.mapv(f64::from),
+                    at,
                     mask,
                     &self.element,
                     self.rank,
@@ -887,6 +1053,380 @@ mod tests {
         )
         .unwrap();
         assert!(out.iter().all(|&value| value == -3.5));
+    }
+
+    /// The same definition asked **at a stated anchor inside a stated volume**,
+    /// which is the whole of what honouring the origin means: the element is
+    /// asked what it reads there rather than assumed to read one set everywhere.
+    ///
+    /// Written out with `offsets_at` for the same reason `by_definition` is
+    /// written out with `offsets` — it is a statement of the operation, not a
+    /// second implementation of it.
+    fn by_definition_at(
+        input: &Array3<f64>,
+        at: &Anchor,
+        element: &StructuringElement,
+        rank: Rank,
+    ) -> Array3<f64> {
+        let shape = input.dim();
+        let mut out = Array3::zeros(shape);
+        let mut scratch = Vec::new();
+        for i in 0..shape.0 {
+            for j in 0..shape.1 {
+                for k in 0..shape.2 {
+                    let placed = [
+                        (i + at.offset[0]) as isize,
+                        (j + at.offset[1]) as isize,
+                        (k + at.offset[2]) as isize,
+                    ];
+                    let mut window = Vec::new();
+                    for offset in element.offsets_at(placed, at.volume, &mut scratch) {
+                        let a = i as isize + offset[0];
+                        let b = j as isize + offset[1];
+                        let c = k as isize + offset[2];
+                        if a < 0 || b < 0 || c < 0 {
+                            continue;
+                        }
+                        let (a, b, c) = (a as usize, b as usize, c as usize);
+                        if a >= shape.0 || b >= shape.1 || c >= shape.2 {
+                            continue;
+                        }
+                        window.push(input[[a, b, c]]);
+                    }
+                    window.sort_by(|left, right| left.total_cmp(right));
+                    let index = rank.resolve(element.len(), window.len());
+                    out[[i, j, k]] = window[index];
+                }
+            }
+        }
+        out
+    }
+
+    /// A step counted **from the anchor**, which is every element without a step
+    /// and every element that names that origin.
+    fn anchored(size: [usize; 3], step: [usize; 3]) -> StructuringElement {
+        StructuringElement::from_size_stepped_at(ElementShape::Box, size, step, StepOrigin::Anchor)
+            .unwrap()
+    }
+
+    fn clipped(shape: ElementShape, size: [usize; 3], step: [usize; 3]) -> StructuringElement {
+        StructuringElement::from_size_stepped_at(shape, size, step, StepOrigin::ClippedStart)
+            .unwrap()
+    }
+
+    /// **The anchored window did not move**, which every existing caller depends
+    /// on and which an unstepped element normalises to, so it is most of the
+    /// crate's elements and all of its history.
+    ///
+    /// Two halves. The filter still is the `offsets` definition, bit for bit;
+    /// and an anchored element **cannot see the anchor** — the same array filtered
+    /// as the whole volume and as a buffer claiming to sit deep inside a larger
+    /// one gives the identical answer, because there is nothing about its window
+    /// for a face to change.
+    #[test]
+    fn the_anchored_window_is_byte_unchanged() {
+        let input = ramp((9, 7, 6));
+        let elements = [
+            StructuringElement::from_radius(ElementShape::Box, [2, 1, 1]),
+            StructuringElement::from_size(ElementShape::Ellipsoid, [5, 5, 3]).unwrap(),
+            anchored([8, 8, 1], [2, 2, 1]),
+            anchored([9, 7, 3], [2, 2, 1]),
+        ];
+        for element in elements {
+            assert_eq!(
+                element.origin(),
+                StepOrigin::Anchor,
+                "the subject of this test"
+            );
+            for rank in [
+                Rank::lowest(),
+                Rank::median(&element),
+                Rank::highest(&element),
+                Rank::ceiling_percentile(0.25).unwrap(),
+            ] {
+                let mut whole_volume = Array3::zeros(input.dim());
+                rank_filter_f64_into(input.view(), &element, rank, whole_volume.view_mut())
+                    .unwrap();
+                assert_eq!(
+                    whole_volume,
+                    by_definition(&input, &element, rank),
+                    "{element:?} {rank:?}"
+                );
+
+                let inside = Anchor::new([40, 30, 20], [100, 90, 80]);
+                let mut placed = Array3::zeros(input.dim());
+                rank_filter_f64_into_at(input.view(), &inside, &element, rank, placed.view_mut())
+                    .unwrap();
+                assert_eq!(
+                    placed, whole_volume,
+                    "an anchored element reads the same offsets everywhere"
+                );
+            }
+        }
+    }
+
+    /// **The re-phasing element gathers the window it names**, which is the gap
+    /// this file used to have and used to say so.
+    ///
+    /// Against `offsets_at` written out, and — the half that keeps it from being
+    /// a tautology — asserted to differ from the anchored gather, so that the
+    /// first comparison is over a case where the two rules disagree.
+    #[test]
+    fn a_clipped_start_element_gathers_the_window_it_names() {
+        // A window wider than the volume on axis 0, so that *every* anchor there
+        // is inside `lo` of the low face and the phase moves at every voxel.
+        let input = ramp((7, 5, 1));
+        let at = Anchor::whole([7, 5, 1]);
+        let mut differed = 0usize;
+        for element in [
+            clipped(ElementShape::Box, [9, 3, 1], [2, 1, 1]),
+            clipped(ElementShape::Box, [8, 4, 1], [2, 2, 1]),
+            clipped(ElementShape::Ellipsoid, [9, 5, 1], [2, 2, 1]),
+        ] {
+            assert_eq!(element.origin(), StepOrigin::ClippedStart);
+            for rank in [
+                Rank::median(&element),
+                Rank::ceiling_percentile(0.4).unwrap(),
+            ] {
+                let mut got = Array3::zeros(input.dim());
+                rank_filter_f64_into(input.view(), &element, rank, got.view_mut()).unwrap();
+                assert_eq!(
+                    got,
+                    by_definition_at(&input, &at, &element, rank),
+                    "{element:?} {rank:?}"
+                );
+                differed += got
+                    .iter()
+                    .zip(by_definition(&input, &element, rank).iter())
+                    .filter(|(left, right)| left.to_bits() != right.to_bits())
+                    .count();
+            }
+        }
+        assert!(
+            differed > 0,
+            "the two rules must disagree somewhere on this volume, or the comparison above is \
+             a comparison of one rule with itself"
+        );
+    }
+
+    /// **The phase is keyed on the volume's face, not the buffer's.** A buffer
+    /// that holds the middle of a volume has no low face, and every voxel of it
+    /// far enough from its own edges must get the whole-volume answer.
+    ///
+    /// The margin is the element's own reach: the window is still clamped to the
+    /// buffer, so a voxel within a side of the buffer's edge is reading a
+    /// truncated window and is the halo the caller is expected to discard. That
+    /// is the existing clamp convention and is a separate question from which
+    /// offsets are gathered.
+    #[test]
+    fn the_phase_is_keyed_on_the_volumes_face_and_not_the_buffers() {
+        let volume = [12usize, 9, 1];
+        let input = ramp((volume[0], volume[1], volume[2]));
+        let element = clipped(ElementShape::Box, [9, 5, 1], [2, 2, 1]);
+        let rank = Rank::median(&element);
+        let mut whole_volume = Array3::zeros(input.dim());
+        rank_filter_f64_into(input.view(), &element, rank, whole_volume.view_mut()).unwrap();
+
+        // a buffer holding the upper part of axis 0, halo included
+        let offset = [4usize, 0, 0];
+        let extent = [volume[0] - offset[0], volume[1], volume[2]];
+        let buffer = input
+            .slice(ndarray::s![
+                offset[0]..offset[0] + extent[0],
+                0..extent[1],
+                0..extent[2]
+            ])
+            .to_owned();
+        let at = Anchor::new(offset, volume);
+        let mut blocked = Array3::zeros(buffer.dim());
+        rank_filter_f64_into_at(buffer.view(), &at, &element, rank, blocked.view_mut()).unwrap();
+
+        let (lo, _) = element.sides(0);
+        let mut compared = 0usize;
+        for i in lo..extent[0] {
+            for j in 0..extent[1] {
+                for k in 0..extent[2] {
+                    assert_eq!(
+                        blocked[[i, j, k]].to_bits(),
+                        whole_volume[[i + offset[0], j, k]].to_bits(),
+                        "at {:?}",
+                        [i + offset[0], j, k]
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 0);
+
+        // and the negative control: the same buffer read as a volume of its own
+        // re-phases at its own low face and is a different answer there, so the
+        // comparison above is not one an indifferent implementation would pass
+        let mut as_its_own_volume = Array3::zeros(buffer.dim());
+        rank_filter_f64_into(buffer.view(), &element, rank, as_its_own_volume.view_mut()).unwrap();
+        assert_ne!(
+            as_its_own_volume, blocked,
+            "a buffer's own edge must not be a face, and here the two readings differ"
+        );
+    }
+
+    /// A buffer that claims to sit outside its own volume is refused, and only
+    /// for the element the claim could change. See `selecting`.
+    #[test]
+    fn a_buffer_outside_its_volume_is_refused_where_the_element_re_phases() {
+        let input = ramp((6, 4, 1));
+        let outside = Anchor::new([4, 0, 0], [6, 4, 1]);
+        let element = clipped(ElementShape::Box, [7, 3, 1], [2, 1, 1]);
+        let mut out = Array3::zeros(input.dim());
+        let failed = rank_filter_f64_into_at(
+            input.view(),
+            &outside,
+            &element,
+            Rank::median(&element),
+            out.view_mut(),
+        );
+        let message = failed
+            .expect_err("a buffer that does not fit is refused")
+            .to_string();
+        assert!(message.contains("does not fit"), "{message}");
+        assert!(message.contains("clipped start"), "{message}");
+
+        // the same anchor with an element that reads one offset set everywhere is
+        // accepted, because nothing about that element's window depends on it
+        let anchored = StructuringElement::from_radius(ElementShape::Box, [1, 1, 0]);
+        rank_filter_f64_into_at(
+            input.view(),
+            &outside,
+            &anchored,
+            Rank::median(&anchored),
+            out.view_mut(),
+        )
+        .expect("an anchored element cannot be affected by the anchor, so it is not asked about");
+    }
+
+    /// **What asking the element per voxel costs**, on the path that does not
+    /// need to be asked — every anchored element, which is every element without
+    /// a step.
+    ///
+    /// Three loops, written out here rather than called, and identical in every
+    /// line but the one being priced — a wrapper around any of them would price
+    /// the wrapper, and the difference is a handful of instructions.
+    ///
+    /// * `fixed`, the gather this kernel had: `element.offsets()`, one set;
+    /// * `lifted`, the gather it has: the one set taken out of the loop into an
+    ///   `Option` and matched per voxel, which is what `selecting`'s `let fixed`
+    ///   is;
+    /// * `asked`, the gather it would have if it asked `offsets_at` at every
+    ///   voxel — the same answer for an anchored element, and what the lift
+    ///   exists so that the path with nothing to ask about does not do.
+    ///
+    /// **What it measured**, on the machine this was written on and over four
+    /// runs: the three sit within a few per cent of each other and of the run to
+    /// run spread, which was itself large enough to invert the ordering once. So
+    /// the honest reading is that honouring the origin costs the anchored path
+    /// **nothing separable from noise**, and that the lift is worth keeping for
+    /// the narrower reason that it makes that path a field load and a slice walk,
+    /// exactly as it was, rather than for a number. A quieter machine could
+    /// separate them; this one could not, and saying so is better than quoting
+    /// the one figure that came out of it.
+    ///
+    /// Ignored, because it is a measurement and not an assertion — `super`'s
+    /// convention for every cost figure in this module. Run it with
+    /// `cargo test --release -- --ignored the_cost_of_asking`.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn the_cost_of_asking_the_element_per_voxel() {
+        use std::time::Instant;
+
+        let values = ramp((60, 60, 12)).mapv(Total);
+        let shape = values.dim();
+        let voxels = values.len() as f64;
+        let at = Anchor::whole([shape.0, shape.1, shape.2]);
+        for size in [[5, 5, 3], [15, 15, 1]] {
+            let element = StructuringElement::from_size(ElementShape::Box, size).unwrap();
+            let rank = Rank::median(&element);
+            let full = element.len();
+            let lift = (element.origin() == StepOrigin::Anchor).then(|| element.offsets());
+            let mut out = Array3::from_elem(values.raw_dim(), Total(0.0));
+            let mut window: Vec<Total> = Vec::with_capacity(full);
+            let mut scratch: Vec<[isize; 3]> = Vec::new();
+
+            // The body all three share, as a macro rather than a closure so that
+            // the gather is inlined into it exactly as it is in the kernel and
+            // nothing is being priced through an indirect call.
+            macro_rules! sweep {
+                ($anchor:ident, $gather:expr) => {{
+                    let started = Instant::now();
+                    for i in 0..shape.0 {
+                        for j in 0..shape.1 {
+                            for k in 0..shape.2 {
+                                window.clear();
+                                let $anchor = [i as isize, j as isize, k as isize];
+                                for offset in $gather {
+                                    let a = $anchor[0] + offset[0];
+                                    let b = $anchor[1] + offset[1];
+                                    let c = $anchor[2] + offset[2];
+                                    if a < 0
+                                        || b < 0
+                                        || c < 0
+                                        || a as usize >= shape.0
+                                        || b as usize >= shape.1
+                                        || c as usize >= shape.2
+                                    {
+                                        continue;
+                                    }
+                                    window.push(values[[a as usize, b as usize, c as usize]]);
+                                }
+                                let index = rank.resolve(full, window.len());
+                                out[[i, j, k]] = select_nth(&mut window, index).unwrap();
+                            }
+                        }
+                    }
+                    started.elapsed().as_secs_f64() * 1e9 / voxels
+                }};
+            }
+
+            let mut best = [f64::INFINITY; 3];
+            for repeat in 0..10 {
+                let fixed = sweep!(anchor, element.offsets());
+                let lifted = sweep!(
+                    anchor,
+                    match lift {
+                        Some(offsets) => offsets,
+                        None => {
+                            let centre = [
+                                anchor[0] + at.offset[0] as isize,
+                                anchor[1] + at.offset[1] as isize,
+                                anchor[2] + at.offset[2] as isize,
+                            ];
+                            element.offsets_at(centre, at.volume, &mut scratch)
+                        }
+                    }
+                );
+                let asked = sweep!(anchor, {
+                    let centre = [
+                        anchor[0] + at.offset[0] as isize,
+                        anchor[1] + at.offset[1] as isize,
+                        anchor[2] + at.offset[2] as isize,
+                    ];
+                    element.offsets_at(centre, at.volume, &mut scratch)
+                });
+                // the first pass pays for a cold output array
+                if repeat > 0 {
+                    for (slot, measured) in best.iter_mut().zip([fixed, lifted, asked]) {
+                        *slot = slot.min(measured);
+                    }
+                }
+            }
+            println!(
+                "{size:?} ({full} offsets): fixed {:.3}, lifted {:.3} ({:+.1}%), \
+                 asked {:.3} ({:+.1}%) ns/voxel",
+                best[0],
+                best[1],
+                (best[1] / best[0] - 1.0) * 100.0,
+                best[2],
+                (best[2] / best[0] - 1.0) * 100.0
+            );
+        }
     }
 
     /// A rank filter on integers needs no wrapper at all, which is the point of

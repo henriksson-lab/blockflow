@@ -35,6 +35,7 @@
 // | `reconstruct` | grey reconstruction, and the h-maxima transform over it | the first `IterativeOp` here: a **fixed point** whose substage count is a function of the data, reached at the external reach of *one* substage — the third answer to transitivity, beside a wide halo and a fragment-and-join |
 // | `configuration` | a mask rewritten by a table indexed on the 3x3x3 neighbourhood | the first op whose rule is **data rather than code** — 2^27 entries the caller supplies — and the first written as *both* shells over one kernel, so what a stated pass count and a fixed point cost differently is a comparison rather than an argument |
 // | `watershed` | a cost volume partitioned into one basin per seed | the first op that **declares itself a planning barrier** rather than being one by arithmetic: its answer is a function of one global queue's pop order, so `AxisReach::All` is the honest reach and the cost of saying so is written down as memory per voxel rather than as an adjective |
+// | `fft` | a real plane's Fourier transform, and a squared-difference landscape over integer lags through the correlation theorem | the first thing here that is **not an op at all**, and could not be: two inputs of different extents, an output indexed by *lag* rather than by position, and a complex intermediate `Voxels` cannot hold. `watershed` declares the barrier and still fits the shape; this one does not fit the shape, so it is free functions and a plan, and the absent `BlockOp` is the statement |
 //
 // The shape every op in here has, and why
 // ---------------------------------------
@@ -147,6 +148,12 @@ pub mod deconvolve;
 pub mod detect;
 pub mod directional;
 pub mod element;
+/// **Not a `BlockOp`, and deliberately.** A Fourier coefficient is a sum over
+/// every element of its input, so there is no halo that makes one and no
+/// block-local form that approaches one. That module's header says what shape it
+/// took instead and why the three obvious ways of wrapping it in this crate's
+/// lattice do not exist.
+pub mod fft;
 pub mod fill;
 pub mod label;
 pub mod lattice;
@@ -213,6 +220,11 @@ pub use directional::{
 pub use element::{
     select_nth, ElementShape, Percentile, Rank, StepOrigin, StructuringElement, Total,
 };
+pub use fft::{
+    correlate_direct, minimal_wrap_free_length, next_smooth_length, spectrum_width,
+    squared_difference_direct, Complex, Correlation2, Landscape, Padding, RealTransform2,
+    ShiftWindow, Spectrum, SquaredDifference,
+};
 pub use fill::{
     agree_on_connectivity, fill_phases, label_background_into_with, merge_faces_with, FillHolesOp,
     LabelBackgroundOp,
@@ -232,18 +244,22 @@ pub use local::{
     EmptyPopulation, Isodata, LatticeNarrowing, LocalStatistic, LocalStatisticOp, Narrowing,
     Population, Rounding, SampleLattice, Sampling, Statistic,
 };
-pub use morphology::{close_into, dilate_into, erode_into, open_into, Morphology, MorphologyOp};
+pub use morphology::{
+    close_into, close_into_at, dilate_into, dilate_into_at, erode_into, erode_into_at, open_into,
+    open_into_at, Morphology, MorphologyOp,
+};
 pub use normalise::{
     bounded_gain_into, bounded_gain_value, normalise_against_into, normalise_value,
     LevelCorrectionOp, LocalContrastOp, LocalGainOp, Removal,
 };
 pub use rank::{
-    masked_rank_filter_into, masked_rank_filter_into_with, rank_filter_f64_into, rank_filter_into,
+    masked_rank_filter_into, masked_rank_filter_into_at, masked_rank_filter_into_with,
+    rank_filter_f64_into, rank_filter_f64_into_at, rank_filter_into, rank_filter_into_at,
     ExcludedCentre, MaskedRankFilterOp, RankFilterOp,
 };
 pub use reconstruct::{
-    flooding_bound, h_extrema, reconstruct_step_into, reconstruct_to_fixed_point, HExtremaOp,
-    Reconstruction,
+    flooding_bound, h_extrema, reconstruct_step_into, reconstruct_step_into_at,
+    reconstruct_to_fixed_point, HExtremaOp, Reconstruction,
 };
 pub use regional::{
     ascending_neighbours, ascending_neighbours_with, label_plateaux_into, label_plateaux_into_with,
@@ -251,7 +267,8 @@ pub use regional::{
     regional_phases, LabelPlateauxOp, RegionalMaximaOp,
 };
 pub use resample::{
-    resample_linear_into, resample_nearest_into, resample_phase, Interpolation, Ratio, Resample,
+    resample_linear_into, resample_linear_into_with, resample_nearest_into,
+    resample_nearest_into_with, resample_phase, Interpolation, OutputExtent, Ratio, Resample,
     ResampleOp,
 };
 pub use ridge::{

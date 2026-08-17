@@ -585,6 +585,10 @@ where
         return Ok(());
     }
     let mut window: Vec<T> = Vec::with_capacity(element.len());
+    // Hoisted so a `ClippedStart` element regenerates its offsets per sample
+    // without allocating per sample. An anchored element hands back its own
+    // slice and never touches this.
+    let mut scratch: Vec<[isize; 3]> = Vec::new();
     for p in 0..counts[0] {
         for q in 0..counts[1] {
             for r in 0..counts[2] {
@@ -594,7 +598,11 @@ where
                     lattice.centre(2, start[2] + r) as isize,
                 ];
                 window.clear();
-                for step in element.offsets() {
+                // `centre` is already in volume coordinates and the lattice
+                // knows the volume, so the phase a `ClippedStart` element
+                // re-takes at a low face is the **volume's** face and not the
+                // block's — which is what makes this decomposition-invariant.
+                for step in element.offsets_at(centre, lattice.volume(), &mut scratch) {
                     let mut index = [0usize; 3];
                     let mut inside = true;
                     for axis in 0..3 {

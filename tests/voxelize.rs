@@ -30,6 +30,11 @@
 //   `under_declaring_the_block_reach_is_wrong_and_no_framework_guard_sees_it`.
 // * **The cost of the declaration, measured.** No pixel is read, and the number
 //   of fragments fetched is the analytic neighbourhood size and not one more.
+// * **A kernel whose members re-phase.** `StepOrigin::ClippedStart` makes the
+//   deposited window a function of where the point sits relative to the volume's
+//   low faces, which is a rule a block could get wrong in a way no other fixture
+//   here would see — and a negative control beside it, so the sweep is known to
+//   be telling the two origins apart.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -45,7 +50,7 @@ use blockflow::fragment::{
 use blockflow::geometry::BlockGrid;
 use blockflow::log::{Event, ExecutionLog};
 use blockflow::op::Chain;
-use blockflow::ops::element::StructuringElement;
+use blockflow::ops::element::{ElementShape, StepOrigin, StructuringElement};
 use blockflow::ops::voxelize::{
     ball, encode_points, single_voxel, Point, VoxelizeOp, WORDS_PER_POINT,
 };
@@ -190,10 +195,22 @@ fn identical(left: &[f64], right: &[f64], what: &str) {
 
 /// The mass a point set deposits, from the definition: one weight per kernel
 /// member that lands inside the volume.
+///
+/// The kernel is asked for its members **at the point's own position in the
+/// volume**, which is the whole of what a deposit asks an element — see the op's
+/// module header on why a deposit is the gather's transpose and therefore asks
+/// the same question. For every kernel without a step that is the element's own
+/// offset list and this reads exactly as it always did.
 fn expected_mass(volume: [usize; 3], element: &StructuringElement, points: &[Point]) -> f64 {
     let mut total = 0.0;
+    let mut scratch = Vec::new();
     for point in points {
-        for offset in element.offsets() {
+        let at = [
+            point.at[0] as isize,
+            point.at[1] as isize,
+            point.at[2] as isize,
+        ];
+        for offset in element.offsets_at(at, volume, &mut scratch) {
             let inside = (0..3).all(|axis| {
                 let position = point.at[axis] as isize + offset[axis];
                 position >= 0 && (position as usize) < volume[axis]
@@ -254,6 +271,78 @@ fn the_same_points_render_the_same_volume_under_every_decomposition() {
             "axis {axis} has no partial block"
         );
     }
+}
+
+/// **A kernel whose members depend on where it is placed, through the
+/// executor**: four cuts, one volume, bit for bit.
+///
+/// `StepOrigin::ClippedStart` makes the deposited window a function of the
+/// point's position *and of the volume's low faces*. The op keys it on the
+/// point's coordinate in the volume and on `grid.volume()`, both of which are the
+/// same numbers under every cut — but the argument is about the code as it stands
+/// and this is the property the crate exists to defend, so it is measured.
+///
+/// The window is **wider on axis 2 than the volume is**, so every point re-phases
+/// there and no block holds only interior voxels; the fixture carries a point at
+/// the origin, where the low faces of all three axes meet, and an overlapping
+/// pair, where the accumulation order is observable.
+///
+/// The last assertion is the negative control: the same program with the origin
+/// changed is a different volume, so the sweep above is not an invariance sweep
+/// over an element that quietly behaves like the anchored one.
+#[test]
+fn a_re_phasing_kernel_renders_the_same_volume_under_every_decomposition() {
+    let volume = [20usize, 12, 6];
+    let element = StructuringElement::from_size_stepped_at(
+        ElementShape::Box,
+        [11, 3, 13],
+        [2, 1, 3],
+        StepOrigin::ClippedStart,
+    )
+    .expect("an element");
+    assert!(
+        element.sides(2).0 >= volume[2],
+        "the window must be wider than axis 2 of the volume, so every point re-phases there"
+    );
+    let points = vec![
+        Point::unit([4, 4, 2]),
+        Point::unit([8, 3, 3]),
+        Point::weighted([9, 8, 2], 2.0),
+        Point::weighted([15, 6, 3], 0.5),
+        // a pair whose kernels overlap, so some voxel takes two contributions
+        Point::unit([11, 6, 2]),
+        Point::unit([12, 6, 2]),
+        // the corner where all three low faces meet
+        Point::weighted([0, 0, 0], 3.0),
+    ];
+
+    let whole = render(volume, volume, &element, &points);
+    assert_eq!(
+        whole.iter().sum::<f64>(),
+        expected_mass(volume, &element, &points),
+        "the single-block answer does not hold the mass the definition says"
+    );
+
+    for block in [[8usize, 4, 3], [20, 12, 3], [7, 5, 4], [4, 12, 6]] {
+        let rendered = render(volume, block, &element, &points);
+        identical(&whole, &rendered, &format!("cut into {block:?}"));
+    }
+
+    let anchored = StructuringElement::from_size_stepped_at(
+        ElementShape::Box,
+        [11, 3, 13],
+        [2, 1, 3],
+        StepOrigin::Anchor,
+    )
+    .expect("an element");
+    let other = render(volume, [7, 5, 4], &anchored, &points);
+    assert!(
+        other
+            .iter()
+            .zip(whole.iter())
+            .any(|(left, right)| left.to_bits() != right.to_bits()),
+        "the two origins gave the same volume, so the sweep above tells them apart at nothing"
+    );
 }
 
 /// A point exactly on a seam belongs to exactly one core, so the total is the

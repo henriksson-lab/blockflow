@@ -41,10 +41,26 @@
 //   place, which must be refused. Without it, "the reversal check passed" could
 //   mean the check never ran;
 // * and the selection's fixture holds a value the fixed point cannot represent
-//   at **any** scale the run admits — 51 accepted and 12 refused across the 63,
+//   at **any** scale the run admits — 50 accepted and 13 refused across the 63,
 //   and every accepted one quantises it inexactly — so "the column is exact" is
 //   a statement that could have come back false rather than one the scale was
 //   chosen to make true.
+//
+// The first moment, and the fixture built to separate it
+// ------------------------------------------------------
+// `moment_0..2_q{n}` is `sum(value * coordinate)` per axis, and its quotient by
+// `sum_q{n}` is the **weighted centroid** — the one per-region quantity the
+// other columns do not determine. It is the same kind of accumulator as the sum,
+// on the same fixed point, so it is accepted on the same terms; section 5 is
+// what it takes for those terms to mean something for *this* column.
+//
+// A symmetric arrangement cannot tell a weighted centre from an unweighted one,
+// so a fixture built out of one would pass an implementation that never read the
+// value array. `separating_labels` and `separating_value_at` are built the other
+// way: a weight that rises steeply and independently on all three axes, from a
+// base that is not a dyadic rational, over two regions that every cut puts
+// across a seam. The two centres then differ by at least a quarter of a voxel on
+// every axis of every region, which is the assertion the byte-identity rests on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -63,7 +79,8 @@ use blockflow::op::{Anchor, BlockOp, Chain};
 use blockflow::ops::tabulate::{
     append_tabulate_phases, collect_tabulation, decode_partial, region_values, tabulation_schema,
     FixedPoint, MergeTabulationOp, RegionValues, TabulateValuesOp, Tally, DEFAULT_FRACTION_BITS,
-    MAX as MAX_COLUMN, MAX_FRACTION_BITS, MIN as MIN_COLUMN, SUM as SUM_COLUMN,
+    MAX as MAX_COLUMN, MAX_FRACTION_BITS, MIN as MIN_COLUMN, MOMENT as MOMENT_COLUMN,
+    SUM as SUM_COLUMN,
 };
 use blockflow::region::Region;
 use blockflow::sidecar::Lifecycle;
@@ -316,24 +333,37 @@ fn try_run(
 /// oracle, so that "every block size agrees" is not "every block size is wrong
 /// the same way".
 fn reference(volume: [usize; 3], point: FixedPoint) -> Vec<Tally> {
+    reference_with(volume, point, label_at, value_at)
+        .into_values()
+        .collect()
+}
+
+/// [`reference`] over a named fixture, keyed by label — which is how the oracle
+/// is looked up, since the table's canonical order is on the row's *position*.
+fn reference_with(
+    volume: [usize; 3],
+    point: FixedPoint,
+    of_label: fn([usize; 3]) -> u64,
+    of_value: fn([usize; 3]) -> f64,
+) -> BTreeMap<u64, Tally> {
     let mut totals: BTreeMap<u64, Tally> = BTreeMap::new();
     for z in 0..volume[0] {
         for y in 0..volume[1] {
             for x in 0..volume[2] {
                 let at = [z, y, x];
-                let label = label_at(at);
+                let label = of_label(at);
                 if label == 0 {
                     continue;
                 }
                 totals
                     .entry(label)
                     .or_insert_with(|| Tally::new(label))
-                    .add(at, value_at(at), point)
+                    .add(at, of_value(at), point)
                     .expect("no overflow");
             }
         }
     }
-    totals.into_values().collect()
+    totals
 }
 
 fn row_for(rows: &[RegionValues], label: u64) -> RegionValues {
@@ -427,6 +457,25 @@ fn a_per_region_reduction_is_byte_identical_across_block_sizes() {
                 row.label
             );
             assert_eq!(Some(row.at), tally.centroid());
+            // The first moments, on the integers, which is the form the
+            // invariance claim is about — and the quotient they derive, on its
+            // bits, so that a division that moved with the cut would show.
+            for axis in 0..3 {
+                assert_eq!(
+                    i128::from(row.moment_fixed[axis]),
+                    tally.moment[axis],
+                    "block {block:?}: label {} on axis {axis}",
+                    row.label
+                );
+            }
+            assert_eq!(
+                row.weighted_centroid.map(|centre| centre.map(f64::to_bits)),
+                tally
+                    .weighted_centroid()
+                    .map(|centre| centre.map(f64::to_bits)),
+                "block {block:?}: label {}",
+                row.label
+            );
         }
 
         answers.push((format!("{block:?}"), run.words));
@@ -453,6 +502,12 @@ fn a_per_region_reduction_is_byte_identical_across_block_sizes() {
 struct DriftingMergeOp {
     lattice: [usize; 3],
     fold: SeamFold,
+    /// Which accumulator to drift: the sum, or the **first moment**. Two
+    /// controls rather than one, because they are two accumulators and "the
+    /// check catches an `f64` sum" does not say it catches an `f64` moment — the
+    /// moment's terms are the sum's multiplied by a coordinate, so its
+    /// order-dependence is a different arrangement of bits.
+    moment: bool,
 }
 
 impl FragmentOp for DriftingMergeOp {
@@ -480,7 +535,11 @@ impl FragmentOp for DriftingMergeOp {
         let mut total = 0.0f64;
         for (_, bytes) in at.fragments("partials") {
             for tally in decode_partial(bytes)? {
-                total += tally.sum as f64;
+                total += if self.moment {
+                    tally.moment[0] as f64
+                } else {
+                    tally.sum as f64
+                };
             }
         }
         Ok(BlockOutput::fragment(
@@ -493,6 +552,10 @@ impl FragmentOp for DriftingMergeOp {
 /// Four voxels of one label, whose values are `1 + 1 + 2^60 - 2^60`: `0` added
 /// one at a time and `2` when the large pair goes first. One block per voxel, so
 /// the merge sees four fragments and the order is a real thing.
+///
+/// Its **first moment** is `1*0 + 1*1 + 2^60*2 - 2^60*3`, whose exact total is
+/// `1 - 2^60` — a number that needs 61 significant bits and so is not an `f64` at
+/// all. The integer accumulator reports it; an `f64` one cannot.
 fn wide_value_at(at: [usize; 3]) -> f64 {
     match at[0] {
         0 | 1 => 1.0,
@@ -501,11 +564,39 @@ fn wide_value_at(at: [usize; 3]) -> f64 {
     }
 }
 
+/// The same four blocks, arranged so that the **first moment** is the
+/// accumulator whose `f64` fold depends on the order.
+///
+/// A separate fixture and not a reuse of [`wide_value_at`], because that one
+/// does not do this job: its moments are `0, 1, 2^61, -3*2^60`, and an `f64`
+/// fold loses the `1` at the same step whichever end it starts from, so both
+/// orders agree on `-2^60` and the reversal check has nothing to catch. That is
+/// the whole reason the moment needs a control of its own — it is a *different*
+/// arrangement of bits from the sum's, and a fixture that breaks one need not
+/// break the other.
+///
+/// Here the moments are `0, 1, 3*2^59, -3*2^59`. Forwards the `1` is absorbed
+/// into `3*2^59` and the pair then cancels to `0`; backwards the pair cancels
+/// first and the `1` survives. `0` against `1`, and the exact answer is `1`.
+fn drifting_moment_value_at(at: [usize; 3]) -> f64 {
+    match at[0] {
+        0 => 0.0,
+        1 => 1.0,
+        // 3 * 2^58 at coordinate 2, so the moment term is 3 * 2^59
+        2 => 3.0 * (1u64 << 58) as f64,
+        // -2^59 at coordinate 3, so the moment term is -3 * 2^59
+        _ => -((1u64 << 59) as f64),
+    }
+}
+
 fn one_label(_at: [usize; 3]) -> u64 {
     1
 }
 
-fn run_wide(fold: Option<SeamFold>) -> Result<Vec<([usize; 3], Vec<u8>)>> {
+fn run_wide(
+    fold: Option<(SeamFold, bool)>,
+    of_value: fn([usize; 3]) -> f64,
+) -> Result<Vec<([usize; 3], Vec<u8>)>> {
     // Zero fraction bits, so the range is +/- 2^63 and `2^60` fits. The
     // resolution is then 1.0, which is exactly what a caller trades away to
     // reduce values this large — and it is `FixedPoint`'s whole point that the
@@ -525,7 +616,11 @@ fn run_wide(fold: Option<SeamFold>) -> Result<Vec<([usize; 3], Vec<u8>)>> {
         "rows",
         Lifecycle::Persistent,
     );
-    let drifting = fold.map(|fold| DriftingMergeOp { lattice, fold });
+    let drifting = fold.map(|(fold, moment)| DriftingMergeOp {
+        lattice,
+        fold,
+        moment,
+    });
 
     let (plan, rows_phase) = append_tabulate_phases(base, &tabulate, &honest)?;
     let env = ArrayEnvironment::new(labels(volume, one_label), plan.n_phases(), [1, 1, 1])?;
@@ -535,7 +630,7 @@ fn run_wide(fold: Option<SeamFold>) -> Result<Vec<([usize; 3], Vec<u8>)>> {
     };
     execute_phases(
         "wide",
-        &values_workflow(volume, wide_value_at),
+        &values_workflow(volume, of_value),
         &plan,
         &Hints::default(),
         &env,
@@ -565,7 +660,7 @@ fn run_wide(fold: Option<SeamFold>) -> Result<Vec<([usize; 3], Vec<u8>)>> {
 fn the_fixed_point_merge_passes_the_reversal_check_on_the_fixture_that_breaks_f64() {
     // The honest merge, over four fragments whose `f64` sum is order-dependent.
     // It runs, and the executor applied every block twice to establish that.
-    let blobs = run_wide(None).expect("an integer fold is order-independent");
+    let blobs = run_wide(None, wide_value_at).expect("an integer fold is order-independent");
     let point = FixedPoint::bits(0).unwrap();
     let mut table = Table::new([4, 1, 1], tabulation_schema(point)).unwrap();
     assert_eq!(blobs.len(), 4, "one blob per block, even the empty ones");
@@ -586,11 +681,78 @@ fn the_fixed_point_merge_passes_the_reversal_check_on_the_fixture_that_breaks_f6
     // check has just compared four times over.
     assert_eq!(rows[0].max.to_bits(), ((1u64 << 60) as f64).to_bits());
     assert_eq!(rows[0].min.to_bits(), (-((1u64 << 60) as f64)).to_bits());
+
+    // **The first moment came through the same check.** `1*0 + 1*1 + 2^60*2 -
+    // 2^60*3` is `1 - 2^60` exactly, which is not an `f64`: the accumulator is
+    // integer, so the answer is the integer and the reversal check just compared
+    // its bytes four times over. At zero fraction bits the scale is 1, so the
+    // column word is the moment itself.
+    assert_eq!(rows[0].moment_fixed[0], 1 - (1i64 << 60));
+    assert_eq!(rows[0].moment_fixed[1], 0, "the volume is one voxel wide");
+    assert_eq!(rows[0].moment_fixed[2], 0);
+
+    // And the quotient, which is where the signed-value rule becomes visible:
+    // `(1 - 2^60) / 2` is nowhere near the four voxels it was measured over.
+    let centre = rows[0]
+        .weighted_centroid
+        .expect("the denominator is 2, not 0");
+    assert_eq!(centre[0], (1.0 - (1u64 << 60) as f64) / 2.0);
+    assert!(
+        centre[0] < 0.0,
+        "the weighted centre is {} and the region is z in 0..4 — a signed value array makes this \
+         a ratio and not a point, which is the stated behaviour",
+        centre[0]
+    );
+    // while the geometric centre stayed where the voxels are
+    assert_eq!(rows[0].at, [2, 0, 0]);
+}
+
+/// The same claim on the fixture built to break an `f64` **moment** — see
+/// [`drifting_moment_value_at`] — so that the moment's passing the reversal
+/// check is a fact about a fold that had somewhere to drift to.
+#[test]
+fn the_fixed_point_moment_passes_the_reversal_check_on_the_fixture_that_breaks_f64() {
+    let blobs = run_wide(None, drifting_moment_value_at)
+        .expect("an integer moment fold is order-independent");
+    let point = FixedPoint::bits(0).unwrap();
+    let mut table = Table::new([4, 1, 1], tabulation_schema(point)).unwrap();
+    for (block, bytes) in &blobs {
+        table.write(*block, bytes).unwrap();
+    }
+    table.seal().unwrap();
+    let rows: Vec<RegionValues> = table
+        .scan(&Region::whole(&[4usize, 1, 1]))
+        .unwrap()
+        .map(|row| region_values(&row, point).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].count, 4);
+    // `0 + 1 + 3*2^59 - 3*2^59` is 1, exactly, in every order. In `f64` it is
+    // `0` one way round and `1` the other.
+    assert_eq!(rows[0].moment_fixed[0], 1);
+    assert_eq!(
+        1.0f64 + 3.0 * (1u64 << 59) as f64 - 3.0 * (1u64 << 59) as f64,
+        0.0,
+        "the fixture was supposed to lose the one when the large pair goes last"
+    );
+    assert_eq!(
+        -3.0 * (1u64 << 59) as f64 + 3.0 * (1u64 << 59) as f64 + 1.0,
+        1.0,
+        "and to keep it when the large pair goes first"
+    );
+    // The sum is `1 + 2^58` and the quotient is a tiny fraction of a voxel — a
+    // weighted centre pulled almost all the way to the origin by the one voxel
+    // whose value did not cancel.
+    assert_eq!(rows[0].sum_fixed, 1 + (1i64 << 58));
+    assert_eq!(
+        rows[0].weighted_centroid,
+        Some([1.0 / (1.0 + (1u64 << 58) as f64), 0.0, 0.0])
+    );
 }
 
 #[test]
 fn an_f64_fold_in_the_same_place_claiming_unordered_is_refused_by_name() {
-    let failed = run_wide(Some(SeamFold::Unordered))
+    let failed = run_wide(Some((SeamFold::Unordered, false)), wide_value_at)
         .expect_err("an `f64` sum over four fragments is not order-independent")
         .to_string();
     assert!(failed.contains("drifting-merge"), "{failed}");
@@ -598,9 +760,29 @@ fn an_f64_fold_in_the_same_place_claiming_unordered_is_refused_by_name() {
     assert!(failed.contains("opposite order"), "{failed}");
     assert!(failed.contains("fixed-point"), "{failed}");
 
-    // And declared honestly it runs — which is what makes the refusal above a
-    // statement about the accumulator rather than about the plan shape.
-    run_wide(Some(SeamFold::OrderDependent)).expect("an order-dependent fold is admitted");
+    // The same control on the **first moment**, which is a different arrangement
+    // of bits and therefore a different fact: an `f64` moment over these four
+    // fragments is order-dependent too, and the check catches that as well.
+    // Without this, "the reversal check passed for the moment" would rest on the
+    // check having been observed to run for the sum.
+    let moment_failed = run_wide(Some((SeamFold::Unordered, true)), drifting_moment_value_at)
+        .expect_err("an `f64` first moment over four fragments is not order-independent")
+        .to_string();
+    assert!(moment_failed.contains("drifting-merge"), "{moment_failed}");
+    assert!(
+        moment_failed.contains("SeamFold::Unordered"),
+        "{moment_failed}"
+    );
+
+    // And declared honestly they run — which is what makes the refusals above a
+    // statement about the accumulators rather than about the plan shape.
+    run_wide(Some((SeamFold::OrderDependent, false)), wide_value_at)
+        .expect("an order-dependent sum fold is admitted");
+    run_wide(
+        Some((SeamFold::OrderDependent, true)),
+        drifting_moment_value_at,
+    )
+    .expect("an order-dependent moment fold is admitted");
 }
 
 // ------------------------------------------------------ 3. ground truth --
@@ -928,7 +1110,303 @@ fn a_block_can_be_tallied_without_a_run() {
     );
 }
 
-// ------------------------------- 5. the selection carries no fixed point --
+// ------------------------------------------- 5. the first moment, which is
+// ---------------------------------- the one column the others do not give --
+
+/// **The separating fixture, built for this and for nothing else.**
+///
+/// A symmetric arrangement cannot tell a weighted centroid from an unweighted
+/// one — put the same weight on every voxel, or arrange the weights evenly about
+/// the centre, and the two coincide, so an implementation that ignored the value
+/// array entirely would pass. Every choice below is there to stop that:
+///
+/// * the weight is a **product of a per-axis exponential**, so it rises steeply
+///   and *independently* on all three axes and the two centres separate on each
+///   of them. An implementation that dropped an axis, permuted them, or divided
+///   by `count` rather than by `sum` moves the answer on at least one;
+/// * `1.7` is **not a dyadic rational**, so `1.7^z` is not on the fixed point's
+///   lattice and the moment is a sum of genuinely quantised terms rather than of
+///   integers that happened to be exact;
+/// * every value is **positive**, so each region's weighted centre is a convex
+///   combination of its own coordinates and therefore a point inside its
+///   bounding box — which is what makes "it differs from the unweighted centre
+///   by 0.25 or more on every axis" a statement about the weighting rather than
+///   about a denominator near zero;
+/// * the two regions split axis 1 and are whole on axes 0 and 2, so **every cut
+///   on axis 0 or axis 2 puts both of them across a seam** and the merge is
+///   doing real work in every run but the single-block one.
+///
+/// The separation it buys is a quarter of a voxel on the narrowest axis and four
+/// voxels on the widest; the assertion asks for a fifth, which is under the
+/// former by enough that the quantisation cannot close it and over zero by
+/// enough that it is not asking whether two floats happen to be unequal.
+const SEPARATING_VOLUME: [usize; 3] = [12, 4, 4];
+
+fn separating_labels(at: [usize; 3]) -> u64 {
+    if at[1] < 2 {
+        1
+    } else {
+        2
+    }
+}
+
+fn separating_value_at(at: [usize; 3]) -> f64 {
+    let [z, y, x] = at;
+    1.7f64.powi(z as i32) * 3.0f64.powi(y as i32) * 2.5f64.powi(x as i32)
+}
+
+/// **The acceptance criterion for the new column**, on a fixture where a broken
+/// implementation has somewhere to be wrong.
+///
+/// Byte-identical against a whole-volume reference across five block sizes, with
+/// the weighted and unweighted centres required to *differ* on every axis of
+/// every region — so five runs that all reported the geometric centroid would
+/// agree with each other perfectly and fail here on the first assertion.
+#[test]
+fn the_weighted_centroid_is_byte_identical_across_block_sizes_where_it_differs_from_the_unweighted()
+{
+    let point = fixed();
+    let sizes: [[usize; 3]; 5] = [[12, 4, 4], [6, 4, 4], [4, 2, 4], [3, 4, 2], [2, 2, 2]];
+    let mut answers: Vec<(String, Vec<u64>)> = Vec::new();
+
+    for block in sizes {
+        let run = try_run(
+            SEPARATING_VOLUME,
+            block,
+            point,
+            separating_labels,
+            separating_value_at,
+        )
+        .expect("twenty fraction bits holds this fixture");
+
+        // Which labels were cut. Without this the byte-identity below could be
+        // the identity of five runs that never merged a moment.
+        let mut contributors: BTreeMap<u64, BTreeSet<[usize; 3]>> = BTreeMap::new();
+        for (index, bytes) in &run.partials {
+            for tally in decode_partial(bytes).expect("a partial") {
+                contributors.entry(tally.label).or_default().insert(*index);
+            }
+        }
+        let straddled: Vec<u64> = contributors
+            .iter()
+            .filter(|(_, who)| who.len() > 1)
+            .map(|(label, _)| *label)
+            .collect();
+        if block == [12, 4, 4] {
+            assert!(
+                straddled.is_empty(),
+                "the one-block lattice cannot straddle anything"
+            );
+        } else {
+            assert_eq!(
+                straddled,
+                vec![1, 2],
+                "block {block:?} left a region inside one block, so this run merges less than the \
+                 fixture was built to make it merge"
+            );
+        }
+
+        let expected = reference_with(
+            SEPARATING_VOLUME,
+            point,
+            separating_labels,
+            separating_value_at,
+        );
+        assert_eq!(run.rows.len(), 2, "block {block:?}");
+        for row in &run.rows {
+            let tally = expected
+                .get(&row.label)
+                .unwrap_or_else(|| panic!("block {block:?} invented label {}", row.label));
+
+            // The moments, on the integers — the form the invariance claim is
+            // about, since the quotient is taken from them and not the reverse.
+            for axis in 0..3 {
+                assert_eq!(
+                    i128::from(row.moment_fixed[axis]),
+                    tally.moment[axis],
+                    "block {block:?}: label {} on axis {axis}",
+                    row.label
+                );
+            }
+            // And the quotient, on its bits.
+            let weighted = row
+                .weighted_centroid
+                .expect("every value in this fixture is positive, so the denominator is not zero");
+            assert_eq!(
+                weighted.map(f64::to_bits),
+                tally
+                    .weighted_centroid()
+                    .expect("the oracle agrees there is one")
+                    .map(f64::to_bits),
+                "block {block:?}: label {}",
+                row.label
+            );
+
+            // The unweighted centre is the box centre, exactly — the regions are
+            // solid boxes — so the two quantities are here side by side and the
+            // separation below is between two numbers a reader can check.
+            let box_centre = [5.5, if row.label == 1 { 0.5 } else { 2.5 }, 1.5];
+            assert_eq!(row.centroid, box_centre, "label {}", row.label);
+            for axis in 0..3 {
+                assert!(
+                    (weighted[axis] - box_centre[axis]).abs() > 0.2,
+                    "block {block:?}: label {} has weighted centre {} and box centre {} on axis \
+                     {axis}. They have to differ, or this fixture cannot tell the two apart and \
+                     would pass an implementation that never read the value array.",
+                    row.label,
+                    weighted[axis],
+                    box_centre[axis]
+                );
+                // and the weight being positive keeps it a point in the region
+                assert!(
+                    weighted[axis] >= 0.0 && weighted[axis] <= (SEPARATING_VOLUME[axis] - 1) as f64,
+                    "label {} left the volume on axis {axis} under a positive weight",
+                    row.label
+                );
+            }
+            // The weight rises with every coordinate, so the weighted centre is
+            // on the far side of the box centre on every axis and not merely a
+            // different number from it.
+            for axis in 0..3 {
+                assert!(
+                    weighted[axis] > box_centre[axis],
+                    "label {} on axis {axis}: a weight increasing in the coordinate has to pull \
+                     the centre up",
+                    row.label
+                );
+            }
+        }
+
+        answers.push((format!("{block:?}"), run.words));
+    }
+
+    let (first_name, first) = &answers[0];
+    for (name, words) in &answers[1..] {
+        assert_eq!(
+            words, first,
+            "the weighted centroid differs between block {first_name} and block {name}; a cross \
+             moment of value against position must not be a function of the plan"
+        );
+    }
+}
+
+/// One region of four voxels, through a real run of four blocks, with **the
+/// arithmetic written out** rather than taken from a helper.
+///
+/// Values `1, 1, 1, 5` at `z = 0, 1, 2, 3`, all dyadic and so exact at twenty
+/// fraction bits:
+///
+/// * `sum = 1 + 1 + 1 + 5 = 8`;
+/// * `moment_0 = 1*0 + 1*1 + 1*2 + 5*3 = 18`;
+/// * weighted centre `= 18 / 8 = 2.25`;
+/// * unweighted centre `= (0 + 1 + 2 + 3) / 4 = 1.5`, and the row sits at `2`,
+///   which is that rounded half up.
+///
+/// The two differ by `0.75`, which is the whole point of writing them both down.
+fn hand_value_at(at: [usize; 3]) -> f64 {
+    if at[0] == 3 {
+        5.0
+    } else {
+        1.0
+    }
+}
+
+#[test]
+fn a_hand_computed_region_reports_the_weighted_centre_the_arithmetic_says() {
+    let point = fixed();
+    let run = try_run(AWKWARD_VOLUME, [1, 1, 1], point, one_label, hand_value_at)
+        .expect("a run of four blocks");
+    assert_eq!(
+        run.partials.len(),
+        4,
+        "four fragments, so the merge is real"
+    );
+    let region = row_for(&run.rows, 1);
+
+    let one = 1i64 << 20; // one unit of value, in fixed-point steps
+    assert_eq!(region.count, 4);
+    assert_eq!(region.sum_fixed, 8 * one);
+    assert_eq!(region.sum, 8.0);
+    assert_eq!(region.moment_fixed[0], 18 * one);
+    assert_eq!(region.moment[0], 18.0);
+    assert_eq!(region.moment_fixed[1], 0);
+    assert_eq!(region.moment_fixed[2], 0);
+
+    assert_eq!(region.weighted_centroid, Some([2.25, 0.0, 0.0]));
+    assert_eq!(region.centroid, [1.5, 0.0, 0.0]);
+    assert_eq!(region.at, [2, 0, 0]);
+    // 18/8 against 6/4: the two are different numbers over the same four voxels,
+    // and no arrangement of `count`, `sum` and `sum_0` gives the first.
+    assert_eq!(
+        region.weighted_centroid.unwrap()[0] - region.centroid[0],
+        0.75
+    );
+}
+
+/// The degenerate denominator, through a run rather than on a tally: a region
+/// whose finite values cancel has **no** weighted centroid, and the row says so
+/// by carrying `None` — not a `NaN`, not the unweighted centre.
+///
+/// Two regions in one run, so the answer is a property of the region and not of
+/// the table: the second has a perfectly good weighted centre in the same rows.
+fn cancelling_value_at(at: [usize; 3]) -> f64 {
+    match at[0] {
+        0 => 3.0,
+        1 => -3.0,
+        _ => 1.0,
+    }
+}
+
+#[test]
+fn a_region_whose_values_cancel_reports_no_weighted_centroid_at_all() {
+    let point = fixed();
+    let run = try_run(
+        AWKWARD_VOLUME,
+        [1, 1, 1],
+        point,
+        two_region_labels,
+        cancelling_value_at,
+    )
+    .expect("a run of four blocks");
+    let one = 1i64 << 20;
+
+    // Region 1 is `+3` at z = 0 and `-3` at z = 1.
+    let cancelled = row_for(&run.rows, 1);
+    assert_eq!(cancelled.count, 2);
+    assert_eq!(cancelled.nonfinite, 0, "both values are finite");
+    assert_eq!(cancelled.sum_fixed, 0, "the denominator is exactly zero");
+    // The numerator is still exact, still written, and is not zero: `3*0 - 3*1`.
+    assert_eq!(cancelled.moment_fixed[0], -3 * one);
+    assert_eq!(cancelled.moment[0], -3.0);
+    // So the quotient does not exist, and that is what the row carries.
+    assert_eq!(
+        cancelled.weighted_centroid, None,
+        "a zero denominator has no quotient; reporting one would be inventing it"
+    );
+    // The geometric centre is unaffected — the absence is of one quantity, not
+    // of the row.
+    assert_eq!(cancelled.centroid, [0.5, 0.0, 0.0]);
+    assert_eq!(cancelled.count, 2);
+
+    // Region 2 is `1` at z = 2 and z = 3, in the same table, and has one.
+    let ordinary = row_for(&run.rows, 2);
+    assert_eq!(ordinary.sum_fixed, 2 * one);
+    assert_eq!(ordinary.moment_fixed[0], 5 * one, "1*2 + 1*3");
+    assert_eq!(ordinary.weighted_centroid, Some([2.5, 0.0, 0.0]));
+
+    // And a region of nothing but zeros is the same fact by the other road:
+    // `0/0` rather than `k/0`, and the same `None`.
+    let zeros = try_run(AWKWARD_VOLUME, [2, 1, 1], point, one_label, |_| 0.0)
+        .expect("a run over a zero array");
+    let flat = row_for(&zeros.rows, 1);
+    assert_eq!(flat.count, 4);
+    assert_eq!(flat.sum_fixed, 0);
+    assert_eq!(flat.moment_fixed, [0, 0, 0]);
+    assert_eq!(flat.weighted_centroid, None);
+    assert_eq!(flat.centroid, [1.5, 0.0, 0.0]);
+}
+
+// ------------------------------- 6. the selection carries no fixed point --
 
 /// A value the fixed point **cannot hold at any scale this fixture admits**.
 ///
@@ -1134,11 +1612,15 @@ fn a_signed_zero_survives_the_reversal_check_and_keeps_its_sign() {
     assert_eq!(region.sum_fixed, 0);
 }
 
-/// The schema says which column carries a scale and which does not, and it says
-/// it in the names — which is the fact a consumer reads to know what it is
-/// holding.
+/// The schema says which columns carry a scale and which do not, and it says it
+/// in the names — which is the fact a consumer reads to know what it is holding.
+///
+/// **The scale is on the accumulated *values* and on nothing else**: the sum and
+/// the three first moments. Not on the selections, which are values that were
+/// never scaled, and not on the coordinate sums, which are integers that never
+/// needed to be.
 #[test]
-fn the_scale_is_in_the_sums_name_and_nowhere_else() {
+fn the_scale_is_on_the_accumulated_values_and_nowhere_else() {
     for bits in [0u32, 4, DEFAULT_FRACTION_BITS, MAX_FRACTION_BITS] {
         let point = FixedPoint::bits(bits).expect("in range");
         let schema = tabulation_schema(point);
@@ -1149,9 +1631,12 @@ fn the_scale_is_in_the_sums_name_and_nowhere_else() {
             .map(|column| column.name())
             .filter(|name| name.ends_with(&suffix))
             .collect();
+        let expected: Vec<String> = std::iter::once(format!("{SUM_COLUMN}{suffix}"))
+            .chain(MOMENT_COLUMN.iter().map(|stem| format!("{stem}{suffix}")))
+            .collect();
         assert_eq!(
             scaled,
-            vec![format!("{SUM_COLUMN}{suffix}").as_str()],
+            expected.iter().map(String::as_str).collect::<Vec<&str>>(),
             "at {bits} fraction bits the scale is on {scaled:?}"
         );
         assert!(schema.index_of(MIN_COLUMN).is_some());
@@ -1159,7 +1644,7 @@ fn the_scale_is_in_the_sums_name_and_nowhere_else() {
     }
 }
 
-// ---------------------------------------- 6. the sum, which did not move --
+// ---------------------------------------- 7. the sum, which did not move --
 
 /// Every finite voxel of `label`, quantised at `point` and added as integers:
 /// the sum column's definition, written out, and not the op's code.
@@ -1215,7 +1700,14 @@ fn the_fixed_point_sum_is_unchanged_and_is_still_the_quantised_total() {
 /// The scale a caller with no scale in mind can **derive** rather than pick, run
 /// rather than described: a region holds at most every voxel, each finite value
 /// is at most the array's peak magnitude, and quantising moves each at most half
-/// a step further from zero, so no total exceeds `voxels * (magnitude + 0.5)`.
+/// a step further from zero, so no *sum* exceeds `voxels * (magnitude + 0.5)`.
+///
+/// **And the first moment multiplies that by the largest coordinate**, since
+/// each term is a value times a coordinate — so the bound the range has to cover
+/// is the sum's times `max(extent) - 1`, and the derived scale is coarser than
+/// the sum alone would have asked for. That factor is the whole of what the new
+/// column costs a caller who derives rather than picks, and it is stated here
+/// because a derivation that covered only the sum would be refused on a moment.
 fn derived_scale(volume: [usize; 3], of: fn([usize; 3]) -> f64) -> (FixedPoint, f64) {
     let mut magnitude = 0.0f64;
     for z in 0..volume[0] {
@@ -1229,7 +1721,13 @@ fn derived_scale(volume: [usize; 3], of: fn([usize; 3]) -> f64) -> (FixedPoint, 
         }
     }
     let voxels = (volume[0] * volume[1] * volume[2]) as f64;
-    let bound = voxels * (magnitude + 0.5);
+    let reach = volume
+        .iter()
+        .map(|extent| extent.saturating_sub(1))
+        .max()
+        .expect("three axes")
+        .max(1) as f64;
+    let bound = voxels * (magnitude + 0.5) * reach;
     let mut best = FixedPoint::bits(0).expect("zero bits");
     for bits in 0..=MAX_FRACTION_BITS {
         let candidate = FixedPoint::bits(bits).expect("in range");
@@ -1268,6 +1766,7 @@ fn the_sum_runs_at_a_derived_scale_and_the_selection_does_not_care_which() {
     );
 
     let derived = run_at(VOLUME, [3, 2, 2], point);
+    let oracle = reference_with(VOLUME, point, label_at, value_at);
     for row in &derived.rows {
         assert_eq!(
             i128::from(row.sum_fixed),
@@ -1276,6 +1775,17 @@ fn the_sum_runs_at_a_derived_scale_and_the_selection_does_not_care_which() {
             row.label,
             point.fraction_bits()
         );
+        // The moments fit at the derived scale too, which is the half of the
+        // derivation the trailing factor exists for.
+        for axis in 0..3 {
+            assert_eq!(
+                i128::from(row.moment_fixed[axis]),
+                oracle[&row.label].moment[axis],
+                "label {} on axis {axis} at the derived {} fraction bits",
+                row.label,
+                point.fraction_bits()
+            );
+        }
     }
 
     // The sum moved with the scale — it is a different integer in a differently
@@ -1334,6 +1844,33 @@ fn the_sums_out_of_range_refusals_are_both_still_named() {
     assert!(by_total.contains("fixed-point total"), "{by_total}");
     assert!(by_total.contains("above"), "{by_total}");
     assert!(by_total.contains("fewer fraction bits"), "{by_total}");
+
+    // And at 50 the **moment** is the one that does not fit, which is the range
+    // edge the new column brings with it: the two voxels of 2048 sit at z = 2 and
+    // z = 3, so the sum is `2 * 2^61 = 2^62` and fits, while the moment is
+    // `5 * 2^61` and does not. A run refused here on the sum's message would be
+    // sending a caller to the wrong number.
+    let by_moment = try_run(
+        AWKWARD_VOLUME,
+        [1, 1, 1],
+        FixedPoint::bits(50).expect("50 bits"),
+        two_region_labels,
+        awkward_value_at,
+    )
+    .expect_err("5 * 2^61 is above what a signed 64-bit column holds")
+    .to_string();
+    assert!(by_moment.contains("first moment on axis 0"), "{by_moment}");
+    assert!(by_moment.contains("binds first"), "{by_moment}");
+    // and one bit coarser everything fits, so 50 really is the edge and not a
+    // scale that was failing for some other reason
+    try_run(
+        AWKWARD_VOLUME,
+        [1, 1, 1],
+        FixedPoint::bits(49).expect("49 bits"),
+        two_region_labels,
+        awkward_value_at,
+    )
+    .expect("5 * 2^60 fits");
 }
 
 /// The one thing `Arc` is doing here: an op is shared across workers, so it is

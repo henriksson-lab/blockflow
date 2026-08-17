@@ -254,11 +254,12 @@
 // the columns that exist.
 //
 // It is a small different accumulator — three more fixed-point words, folded by
-// `+` like the ones beside them — and when it is wanted it belongs where the
-// label volume and the value array are already in one place, which is
-// `ops::tabulate` and not here. This op labels a mask; a caller who wants a
-// weighted centre labels with `ops::label` and tabulates. Nothing is built for it
-// on spec, and this paragraph is the whole of the design note.
+// `+` like the ones beside them — and it lives where the label volume and the
+// value array are already in one place, which is `ops::tabulate` and not here:
+// its `moment_0..2_q{n}` columns are that accumulator and
+// `RegionValues::weighted_centroid` is their quotient. This op labels a mask; a
+// caller who wants a weighted centre labels with `ops::label` and tabulates.
+// Nothing is added here for it, and this paragraph is the whole of the note.
 //
 // Connectivity: one choice, and it is the **foreground's**
 // ---------------------------------------------------------

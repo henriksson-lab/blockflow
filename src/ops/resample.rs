@@ -10,10 +10,16 @@
 // What is resampled, and by what map
 // ----------------------------------
 // The factor is an **exact rational per axis**, `up / down`, reduced. The output
-// extent of an axis is `floor(in * up / down)` and never anything else; a factor
-// that does not divide the extent evenly drops the remainder rather than
-// producing a partial voxel, and the dropped voxels are named in
-// [`Resample::unsampled_tail`] rather than left for a reader to derive.
+// extent of an axis is `floor(in * up / down)` by default; a factor that does not
+// divide the extent evenly drops the remainder rather than producing a partial
+// voxel, and the dropped voxels are named in [`Resample::unsampled_tail`] rather
+// than left for a reader to derive.
+//
+// **By default, and not always** — see "An output extent the caller states"
+// below. `floor` is the honest reading of *"resize by this ratio"* and stays what
+// [`Resample::new`] means; it is not the only extent a caller may want from the
+// same operation, and the alternative is a statement rather than a second
+// rounding rule.
 //
 // The map from an output index to a source coordinate is the **centred**
 // ("half-voxel") one:
@@ -98,6 +104,46 @@
 // sampling frequency surviving into the output as a constant, and left where the
 // remedy is.
 //
+// An output extent the caller states
+// ----------------------------------
+// [`Resample::to_extent`] takes the two extents — the input volume and the
+// output volume — and derives the factor from them, instead of taking the factor
+// and deriving the output volume from it. The sample map does not change and is
+// not a second convention: `Ratio::new(out, in)` is `in/out` as an exact
+// rational, and `x(o) = (o + 0.5) * in/out - 0.5` is the same centred map with
+// the same clamp. What changes is which of the two numbers is the input to the
+// arithmetic and which is derived from it.
+//
+// **Why the facility is needed at all, rather than being spelled `Ratio`.** It
+// can be spelled `Ratio` — for the *whole volume*. `Ratio::new(out, in)` reduces,
+// and `outputs(in)` of the reduced pair is exactly `out`, so a resident call
+// needs nothing here. What cannot be spelled that way is the **decomposition**.
+// The fetch mapping below rests on `up` being the period of the sampling lattice
+// in output space, and an extent-derived ratio is essentially always in lowest
+// terms — `348/2137` and `249/3823` both have `gcd = 1` — so the period is the
+// whole axis and the only legal cut is no cut. That is a fact about the ratio and
+// not a defect of the mapping, and the way past it is not a smaller period but a
+// different kind of declaration.
+//
+// So under a stated extent this op takes the shape it writes from the **plan**
+// ([`BlockOp::placed_output_shape`]) and states its fetch as a region per block,
+// exactly as `lattice.rs` does and for the identical reason: two blocks fetching
+// the same number of source voxels write different numbers of output voxels, so
+// no shape-to-shape function exists to invert. The waiver is declared
+// ([`BlockOp::takes_extent_from_placement`]) and the check it owes is in
+// [`ResampleOp::apply_placed`] — every output voxel written must bracket between
+// source voxels the buffer actually holds, refused by name rather than clamped to
+// the buffer's edge. Nothing else about the op moves: the alignment, the halo and
+// the reach all become *nothing* under a stated extent, because there is no
+// lattice left to snap a fetch onto and the dependency is carried by the fetch
+// region rather than by a distance in this phase's own voxels.
+//
+// **The default is byte-unchanged**, and that is asserted rather than assumed:
+// `the_factor_exact_default_is_unmoved_by_the_stated_extent` below runs every
+// factor-path quantity — extent, reach, alignment, halo, fetch and the voxels
+// themselves — through both spellings of a factor whose extent divides evenly, so
+// a change to the shared arithmetic that moved the default would fail there.
+//
 // What this op reads beyond what it writes
 // ----------------------------------------
 // A resampling phase's blocks live in **two coordinate spaces**: its grid is cut
@@ -153,8 +199,8 @@ use crate::decomposition::PhaseDecomposition;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::geometry::BlockGrid;
-use crate::op::{Anchor, BlockOp, Geometry, InputMap};
-use crate::reach::{AxisReach, Reach};
+use crate::op::{Anchor, BlockOp, Geometry, InputMap, Placement as OpPlacement};
+use crate::reach::{AxisReach, Reach, Space};
 use crate::region::Region;
 use crate::voxels::{VoxelElement, Voxels};
 
@@ -362,12 +408,38 @@ impl Interpolation {
     }
 }
 
-/// A factor per axis and one interpolation: everything the resampling geometry
-/// needs except the extent, which comes from the volume.
+/// What decides an axis's output extent.
+///
+/// **Two values rather than a `bool` or an `Option<[usize; 3]>`**, because the
+/// second arm carries the input volume it was stated against and the first arm
+/// carries nothing at all. A resampling that knows the extent it writes also
+/// knows the extent it was told to write it *from* — the pair is what makes the
+/// factor exact — and an arm holding only the output would be an extent whose
+/// scale a reader has to go and find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputExtent {
+    /// `floor(n * up / down)` per axis, a function of the factor and the extent
+    /// handed in. What [`Resample::new`] means, and what every caller that
+    /// existed before this enum did meant.
+    Factor,
+    /// The extent stated by the caller, against the one input volume it was
+    /// stated for.
+    ///
+    /// The factor is `Ratio::new(output[axis], input[axis])` and is therefore
+    /// *derived* from this rather than checked against it, which is what keeps
+    /// the two from disagreeing. See [`Resample::to_extent`].
+    Stated {
+        input: [usize; 3],
+        output: [usize; 3],
+    },
+}
+
+/// A factor per axis, one interpolation, and what decides the output extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Resample {
     ratios: [Ratio; 3],
     interpolation: Interpolation,
+    extent: OutputExtent,
 }
 
 impl Resample {
@@ -375,12 +447,56 @@ impl Resample {
         Self {
             ratios,
             interpolation,
+            extent: OutputExtent::Factor,
         }
     }
 
     /// The same factor on every axis.
     pub fn uniform(ratio: Ratio, interpolation: Interpolation) -> Self {
         Self::new([ratio; 3], interpolation)
+    }
+
+    /// **The two extents, with the factor derived from them** — the other way
+    /// round from [`Resample::new`].
+    ///
+    /// The sample map is unchanged and is not a second convention: the factor is
+    /// `Ratio::new(output[axis], input[axis])`, so the scale is `input/output`
+    /// exactly and `x(o) = (o + 0.5) * input/output - 0.5` is the same centred
+    /// map with the same clamp. Reduction cannot move it — `bracket` evaluates
+    /// the fraction `((2o + 1) * down - up) / (2 * up)`, and dividing both terms
+    /// by a common factor is the same rational and the same correctly-rounded
+    /// `f64`.
+    ///
+    /// What it buys is the *decomposition*, and the module header is where the
+    /// argument is: an extent-derived ratio is essentially always in lowest
+    /// terms, so [`Resample::alignment`]'s period is the whole output axis and
+    /// the factor path can only plan one block. Under a stated extent the write
+    /// extent comes from the plan and the fetch is a region per block, so any cut
+    /// plans.
+    ///
+    /// Refuses an extent of zero on either side, by [`Ratio::new`]'s refusal: a
+    /// scale with a zero in it has no meaning to fall back on.
+    pub fn to_extent(
+        input: [usize; 3],
+        output: [usize; 3],
+        interpolation: Interpolation,
+    ) -> Result<Self> {
+        let mut ratios = [Ratio::identity(); 3];
+        for axis in 0..3 {
+            ratios[axis] = Ratio::new(output[axis], input[axis]).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "resampling axis {axis} from {} voxels to {}: an extent of zero on either side \
+                     has no scale, so there is no map from an output index to a source coordinate \
+                     to state.",
+                    input[axis], output[axis]
+                ))
+            })?;
+        }
+        Ok(Self {
+            ratios,
+            interpolation,
+            extent: OutputExtent::Stated { input, output },
+        })
     }
 
     pub fn ratio(&self, axis: usize) -> Ratio {
@@ -391,7 +507,31 @@ impl Resample {
         self.interpolation
     }
 
-    /// The extent this produces from `inputs` on `axis`.
+    /// What decides this resampling's output extent.
+    pub fn extent(&self) -> OutputExtent {
+        self.extent
+    }
+
+    /// The input and output volumes a stated extent was stated against, or
+    /// `None` for the factor-exact default.
+    fn stated(&self) -> Option<([usize; 3], [usize; 3])> {
+        match self.extent {
+            OutputExtent::Factor => None,
+            OutputExtent::Stated { input, output } => Some((input, output)),
+        }
+    }
+
+    /// The extent this produces from `inputs` on `axis`, by the factor.
+    ///
+    /// **The same function under both arms of [`OutputExtent`], and that is a
+    /// result rather than an oversight.** For a stated extent the factor is
+    /// `reduce(out, n)`, and `floor(n * (out/g) / (n/g))` is `out` exactly — so
+    /// asked about the volume it was stated for, this returns the stated extent
+    /// and no branch is needed. Asked about anything else under a stated extent
+    /// the answer is the factor's, which is right for an interior block and
+    /// wrong for the two at the ends; [`BlockOp::output_shape`] is where that is
+    /// refused rather than papered over, and it is exactly why the stated arm
+    /// takes its write extent from the plan.
     pub fn output_extent(&self, axis: usize, inputs: usize) -> usize {
         self.ratios[axis].outputs(inputs)
     }
@@ -402,7 +542,23 @@ impl Resample {
     /// of 8 is zero output voxels, and a level of zero extent is not a level.
     /// That is a fact about the request, so it is refused by name rather than
     /// rounded up to one.
+    /// A stated extent is bound to one input volume, and asking it about another
+    /// is refused rather than answered by the factor. The factor is only exact
+    /// *at* the volume it was derived from — `348/2137` applied to 2000 voxels is
+    /// `floor(2000 * 348/2137) = 325`, which is a number and not the answer to
+    /// any question the caller asked.
     pub fn output_volume(&self, input: [usize; 3]) -> Result<[usize; 3]> {
+        if let Some((stated_input, stated_output)) = self.stated() {
+            if input != stated_input {
+                return Err(Error::InvalidArgument(format!(
+                    "this resampling states an output extent of {stated_output:?} for an input \
+                     volume of {stated_input:?}, and was asked about {input:?}. A stated extent is \
+                     bound to the volume it was stated against; the factor derived from it is \
+                     exact only there."
+                )));
+            }
+            return Ok(stated_output);
+        }
         let mut volume = [0usize; 3];
         for axis in 0..3 {
             volume[axis] = self.output_extent(axis, input[axis]);
@@ -437,7 +593,20 @@ impl Resample {
 
     /// What an output voxel reads outside the image of its own read extent, per
     /// side, in this phase's own (output) voxels. See [`Ratio::reach`].
+    ///
+    /// **`(0, 0)` under a stated extent, and it is not the reach-0 evasion.**
+    /// The quantity this method names is a distance measured against *the image
+    /// of the read extent under the factor*, and under a stated extent there is
+    /// no such image: what a block fetches is its own tight source span, stated
+    /// per block by [`Resample::source_region`], and every output voxel of the
+    /// read extent reads inside it by construction. The dependency has not gone
+    /// anywhere — it has moved from a distance to a region, which is what
+    /// [`Resample::reach_spec`]'s `Units::SourceIndex` tag says and what
+    /// `ResampleOp::apply_placed`'s own check is against.
     pub fn reach(&self, axis: usize) -> (usize, usize) {
+        if self.stated().is_some() {
+            return (0, 0);
+        }
         self.ratios[axis].reach(self.interpolation)
     }
 
@@ -452,7 +621,16 @@ impl Resample {
     /// output voxel wants beyond it do not exist for the whole-volume reference
     /// either. The claim is checked rather than asserted: the acceptance suite
     /// compares every voxel, edges included, against that reference.
+    /// **Under a stated extent this is `Units::SourceIndex` instead**, which is
+    /// `lattice.rs`'s statement and is made for its reason: the dependency is a
+    /// region of the level below, named per block, and there is no factor
+    /// converting it into a voxel of this phase — `Space::converts_to_voxels` is
+    /// `false` for exactly that, so a plan cannot mistake the zero for a distance
+    /// it may grow a halo by.
     pub fn reach_spec(&self) -> Reach {
+        if self.stated().is_some() {
+            return Reach::none().in_space(Space::source_index());
+        }
         let mut axes = [AxisReach::none(), AxisReach::none(), AxisReach::none()];
         for axis in 0..3 {
             let (lo, hi) = self.reach(axis);
@@ -466,7 +644,16 @@ impl Resample {
     /// A fetch region is the image of a read extent under `down/up`, so a read
     /// boundary that is not a multiple of `up` has no image on the source
     /// lattice. This is the number the halo snaps to.
+    /// **`[1, 1, 1]` under a stated extent**: every output boundary is a legal
+    /// fetch boundary there, because a fetch is no longer required to be the
+    /// image of a read extent under the factor. That requirement existed to let
+    /// [`BlockOp::output_shape`] invert the fetch, and a stated extent does not
+    /// invert it at all — it takes the extent from the plan. So the constraint
+    /// that made the period matter is the one that has gone, not the period.
     pub fn alignment(&self) -> [usize; 3] {
+        if self.stated().is_some() {
+            return [1, 1, 1];
+        }
         [
             self.ratios[0].up(),
             self.ratios[1].up(),
@@ -492,7 +679,16 @@ impl Resample {
     /// [`Resample::reach_spec`] returns. The two are the quantities the tiling
     /// guard compares; deriving one from the other would make the guard compare a
     /// number against itself.
+    ///
+    /// **Nothing under a stated extent**, and for the same reason `lattice.rs`
+    /// grants nothing: every output voxel is written by exactly one block, and
+    /// what a block needs beyond its own core is in the level below and is stated
+    /// as a fetch region rather than as a distance in this phase's voxels. There
+    /// is no lattice to snap to and no reach to cover.
     pub fn halo(&self, grid: &BlockGrid) -> Reach {
+        if self.stated().is_some() {
+            return Reach::none();
+        }
         let counts = grid.blocks_per_axis();
         let block = grid.block();
         let volume = grid.volume();
@@ -578,6 +774,34 @@ impl Resample {
             )));
         }
         let output_volume = self.output_volume(input_volume)?;
+        // **The tight span, under a stated extent**, rather than an aligned
+        // superset of it. There is nothing to align to: `alignment` is `[1, 1, 1]`
+        // there, the write extent comes from the plan rather than from an
+        // inversion of the fetch, and so the honest fetch is exactly what the
+        // block's own output voxels bracket. `source_span` is that interval and
+        // is already public for the callers that wanted to price the alignment
+        // against it; here it *is* the answer.
+        if self.stated().is_some() {
+            let mut start = [0usize; 3];
+            let mut shape = [0usize; 3];
+            for axis in 0..3 {
+                let low = read.start[axis];
+                let len = read.shape[axis];
+                if low + len > output_volume[axis] {
+                    return Err(Error::InvalidArgument(format!(
+                        "resampling: a block reading {low}..{} on axis {axis} runs past this \
+                         phase's output volume of {}",
+                        low + len,
+                        output_volume[axis]
+                    )));
+                }
+                let (source_low, source_high) =
+                    self.source_span(axis, low, len, input_volume[axis]);
+                start[axis] = source_low;
+                shape[axis] = source_high - source_low;
+            }
+            return Ok(Region::new(&start, &shape));
+        }
         let mut start = [0usize; 3];
         let mut shape = [0usize; 3];
         for axis in 0..3 {
@@ -704,6 +928,37 @@ fn placements(
     Ok(placements)
 }
 
+/// The same three placements from the two positions **stated** rather than one
+/// derived from the other.
+///
+/// This is the arrangement `lattice_interpolate_into_with` has and it exists for
+/// the same reason: under a stated output extent the block's first output voxel
+/// is not a function of where its buffer starts, so the two ends of the map are
+/// two facts and the plan holds both. The factor path keeps deriving one from the
+/// other — `placements` above — so nothing it computes moves.
+fn placements_at(
+    input: [usize; 3],
+    source_start: [usize; 3],
+    output_start: [usize; 3],
+    out: [usize; 3],
+) -> [Placement; 3] {
+    let mut placements = [Placement {
+        source_start: 0,
+        source_len: 0,
+        output_start: 0,
+        outputs: 0,
+    }; 3];
+    for axis in 0..3 {
+        placements[axis] = Placement {
+            source_start: source_start[axis],
+            source_len: input[axis],
+            output_start: output_start[axis],
+            outputs: out[axis],
+        };
+    }
+    placements
+}
+
 /// Every output voxel's samples on one axis, in buffer indices.
 ///
 /// **The clamp is to the buffer**, which at a real volume boundary is the global
@@ -757,12 +1012,42 @@ pub fn resample_nearest_into<T: Copy>(
     input: ArrayView3<'_, T>,
     at: &Anchor,
     ratios: &[Ratio; 3],
-    mut out: ArrayViewMut3<'_, T>,
+    out: ArrayViewMut3<'_, T>,
 ) -> Result<()> {
     let shape = shape_of(&input);
     let target = [out.shape()[0], out.shape()[1], out.shape()[2]];
     let resample = Resample::new(*ratios, Interpolation::Nearest);
     let placements = placements(shape, at, &resample, target)?;
+    nearest_core(input, &placements, ratios, out)
+}
+
+/// [`resample_nearest_into`] with **both** positions stated: where the buffer
+/// sits in the level below, and which output voxel the block's first output is.
+///
+/// The pair is what an [`Anchor`] cannot carry and what a stated output extent
+/// needs — see [`Resample::to_extent`]. Nothing else differs: the same taps, the
+/// same clamp to the buffer, the same values.
+pub fn resample_nearest_into_with<T: Copy>(
+    input: ArrayView3<'_, T>,
+    source_start: [usize; 3],
+    output_start: [usize; 3],
+    ratios: &[Ratio; 3],
+    out: ArrayViewMut3<'_, T>,
+) -> Result<()> {
+    let shape = shape_of(&input);
+    let target = [out.shape()[0], out.shape()[1], out.shape()[2]];
+    let placements = placements_at(shape, source_start, output_start, target);
+    nearest_core(input, &placements, ratios, out)
+}
+
+fn nearest_core<T: Copy>(
+    input: ArrayView3<'_, T>,
+    placements: &[Placement; 3],
+    ratios: &[Ratio; 3],
+    mut out: ArrayViewMut3<'_, T>,
+) -> Result<()> {
+    let shape = shape_of(&input);
+    let target = [out.shape()[0], out.shape()[1], out.shape()[2]];
     if shape.contains(&0) || target.contains(&0) {
         return Ok(());
     }
@@ -800,12 +1085,38 @@ pub fn resample_linear_into<T: VoxelElement>(
     input: ArrayView3<'_, T>,
     at: &Anchor,
     ratios: &[Ratio; 3],
-    mut out: ArrayViewMut3<'_, T>,
+    out: ArrayViewMut3<'_, T>,
 ) -> Result<()> {
     let shape = shape_of(&input);
     let target = [out.shape()[0], out.shape()[1], out.shape()[2]];
     let resample = Resample::new(*ratios, Interpolation::Linear);
     let placements = placements(shape, at, &resample, target)?;
+    linear_core(input, &placements, ratios, out)
+}
+
+/// [`resample_linear_into`] with **both** positions stated. See
+/// [`resample_nearest_into_with`].
+pub fn resample_linear_into_with<T: VoxelElement>(
+    input: ArrayView3<'_, T>,
+    source_start: [usize; 3],
+    output_start: [usize; 3],
+    ratios: &[Ratio; 3],
+    out: ArrayViewMut3<'_, T>,
+) -> Result<()> {
+    let shape = shape_of(&input);
+    let target = [out.shape()[0], out.shape()[1], out.shape()[2]];
+    let placements = placements_at(shape, source_start, output_start, target);
+    linear_core(input, &placements, ratios, out)
+}
+
+fn linear_core<T: VoxelElement>(
+    input: ArrayView3<'_, T>,
+    placements: &[Placement; 3],
+    ratios: &[Ratio; 3],
+    mut out: ArrayViewMut3<'_, T>,
+) -> Result<()> {
+    let shape = shape_of(&input);
+    let target = [out.shape()[0], out.shape()[1], out.shape()[2]];
     if shape.contains(&0) || target.contains(&0) {
         return Ok(());
     }
@@ -875,6 +1186,102 @@ impl ResampleOp {
         self.cost = cost;
         self
     }
+
+    /// The element-type dispatch, for both entry points.
+    ///
+    /// One match rather than two, because the two entry points differ in exactly
+    /// one thing — where the block's first output voxel is — and duplicating
+    /// twenty-two arms to say that would be twenty-two places for the two paths
+    /// to drift apart in.
+    fn dispatch(&self, input: &Voxels, out: &mut Voxels, at: &Placed<'_>) -> Result<()> {
+        let ratios = &[
+            self.resample.ratio(0),
+            self.resample.ratio(1),
+            self.resample.ratio(2),
+        ];
+
+        /// The nearest case: straight into the kernel, no copy and no widening,
+        /// for every type the enum holds.
+        fn nearest<T: VoxelElement>(
+            input: &Voxels,
+            out: &mut Voxels,
+            r: &[Ratio; 3],
+            at: &Placed<'_>,
+        ) -> Result<()> {
+            let view = input.view::<T>()?;
+            let target = out.view_mut::<T>()?;
+            match at {
+                Placed::Anchored(anchor) => resample_nearest_into(view, anchor, r, target),
+                Placed::At { source, output } => {
+                    resample_nearest_into_with(view, *source, *output, r, target)
+                }
+            }
+        }
+
+        fn linear<T: VoxelElement>(
+            input: &Voxels,
+            out: &mut Voxels,
+            r: &[Ratio; 3],
+            at: &Placed<'_>,
+        ) -> Result<()> {
+            let view = input.view::<T>()?;
+            let target = out.view_mut::<T>()?;
+            match at {
+                Placed::Anchored(anchor) => resample_linear_into(view, anchor, r, target),
+                Placed::At { source, output } => {
+                    resample_linear_into_with(view, *source, *output, r, target)
+                }
+            }
+        }
+
+        match (self.resample.interpolation(), input.dtype()) {
+            (_, Dtype::F16) => Err(Error::InvalidArgument(format!(
+                "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
+                self.name
+            ))),
+            (Interpolation::Linear, Dtype::Bool) => Err(Error::InvalidArgument(format!(
+                "{}: a linear blend of a mask is not a mask — every non-zero weight would round \
+                 to `true`, which is a dilation nobody asked for. `accepts` refuses this before a \
+                 run starts; nearest is the resampling a mask has.",
+                self.name
+            ))),
+            (Interpolation::Nearest, Dtype::Bool) => nearest::<bool>(input, out, ratios, at),
+            (Interpolation::Nearest, Dtype::U8) => nearest::<u8>(input, out, ratios, at),
+            (Interpolation::Nearest, Dtype::U16) => nearest::<u16>(input, out, ratios, at),
+            (Interpolation::Nearest, Dtype::U32) => nearest::<u32>(input, out, ratios, at),
+            (Interpolation::Nearest, Dtype::U64) => nearest::<u64>(input, out, ratios, at),
+            (Interpolation::Nearest, Dtype::I8) => nearest::<i8>(input, out, ratios, at),
+            (Interpolation::Nearest, Dtype::I16) => nearest::<i16>(input, out, ratios, at),
+            (Interpolation::Nearest, Dtype::I32) => nearest::<i32>(input, out, ratios, at),
+            (Interpolation::Nearest, Dtype::I64) => nearest::<i64>(input, out, ratios, at),
+            (Interpolation::Nearest, Dtype::F32) => nearest::<f32>(input, out, ratios, at),
+            (Interpolation::Nearest, Dtype::F64) => nearest::<f64>(input, out, ratios, at),
+            (Interpolation::Linear, Dtype::U8) => linear::<u8>(input, out, ratios, at),
+            (Interpolation::Linear, Dtype::U16) => linear::<u16>(input, out, ratios, at),
+            (Interpolation::Linear, Dtype::U32) => linear::<u32>(input, out, ratios, at),
+            (Interpolation::Linear, Dtype::U64) => linear::<u64>(input, out, ratios, at),
+            (Interpolation::Linear, Dtype::I8) => linear::<i8>(input, out, ratios, at),
+            (Interpolation::Linear, Dtype::I16) => linear::<i16>(input, out, ratios, at),
+            (Interpolation::Linear, Dtype::I32) => linear::<i32>(input, out, ratios, at),
+            (Interpolation::Linear, Dtype::I64) => linear::<i64>(input, out, ratios, at),
+            (Interpolation::Linear, Dtype::F32) => linear::<f32>(input, out, ratios, at),
+            (Interpolation::Linear, Dtype::F64) => linear::<f64>(input, out, ratios, at),
+        }
+    }
+}
+
+/// Where a block sits, in whichever of the two forms its caller has.
+///
+/// The factor path derives the output position from the buffer's own — the
+/// fetch is the image of the read extent, so one number states both — and the
+/// stated-extent path cannot, so it carries the pair. Private, because it is the
+/// seam between the two entry points and not a third contract.
+enum Placed<'a> {
+    Anchored(&'a Anchor),
+    At {
+        source: [usize; 3],
+        output: [usize; 3],
+    },
 }
 
 impl BlockOp for ResampleOp {
@@ -913,7 +1320,18 @@ impl BlockOp for ResampleOp {
     /// Per-axis rather than through `output_volume`, which is fallible: an
     /// extent is a number this op can always produce, and a resampling of a
     /// volume that cannot be represented is caught where the plan is built.
+    ///
+    /// **Under a stated extent the map is a stencil in `Units::SourceIndex`**,
+    /// which is `lattice.rs`'s declaration and says the honest thing: an
+    /// `InputMap::Affine` would name a factor a halo could be grown by, and the
+    /// dependency here is a region stated per block. The output volume is the
+    /// stated one, whatever `input_volume` is — the op is bound to the volume it
+    /// was stated for, and `output_volume` is where being asked about another is
+    /// refused.
     fn geometry(&self, input_volume: [usize; 3]) -> Geometry {
+        if let Some((_, output)) = self.resample.stated() {
+            return Geometry::new(output, vec![InputMap::Stencil(self.resample.reach_spec())]);
+        }
         let mut up = [0usize; 3];
         let mut down = [0usize; 3];
         let mut output = [0usize; 3];
@@ -935,7 +1353,22 @@ impl BlockOp for ResampleOp {
 
     /// The declaration a resizing phase exists on: `floor(n * up / down)` per
     /// axis, a function of the shape and nothing else.
+    ///
+    /// **Under a stated extent it is a function of the shape only for the whole
+    /// volume**, and the honest answer for anything else is that the question has
+    /// no answer — [`Self::placed_output_shape`] is where it is asked of
+    /// something that can answer it. The input's own shape is returned instead,
+    /// which is deliberately a shape the executor will reject if it ever reaches
+    /// it, rather than an arithmetic that would be right for the interior blocks
+    /// and quietly wrong for the two at the ends. `lattice.rs` makes the same
+    /// move for the same reason.
     fn output_shape(&self, input: [usize; 3]) -> [usize; 3] {
+        if let Some((stated_input, stated_output)) = self.resample.stated() {
+            if input == stated_input {
+                return stated_output;
+            }
+            return input;
+        }
         [
             self.resample.output_extent(0, input[0]),
             self.resample.output_extent(1, input[1]),
@@ -944,65 +1377,126 @@ impl BlockOp for ResampleOp {
     }
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
-        let ratios = &[
-            self.resample.ratio(0),
-            self.resample.ratio(1),
-            self.resample.ratio(2),
-        ];
+        self.dispatch(input, out, &Placed::Anchored(at))
+    }
 
-        /// The nearest case: straight into the kernel, no copy and no widening,
-        /// for every type the enum holds.
-        fn nearest<T: VoxelElement>(
-            input: &Voxels,
-            out: &mut Voxels,
-            r: &[Ratio; 3],
-            at: &Anchor,
-        ) -> Result<()> {
-            resample_nearest_into(input.view::<T>()?, at, r, out.view_mut::<T>()?)
-        }
+    /// **The waiver, stated.** Under a stated output extent this op's write
+    /// extent is not a function of its read extent — two blocks fetching the
+    /// same number of source voxels write different numbers of output voxels,
+    /// because the sampling scale is `n/out` and `out` divides nothing — so
+    /// [`Self::placed_output_shape`] answers out of the plan, and
+    /// [`crate::decomposition::check_output_shapes`] would refuse the plan
+    /// without this.
+    ///
+    /// `false` under the factor-exact default, where `output_shape` inverts the
+    /// fetch at every block and the executor's own comparison is a real check.
+    /// The check this buys instead is in [`Self::apply_placed`].
+    fn takes_extent_from_placement(&self) -> bool {
+        matches!(self.resample.extent(), OutputExtent::Stated { .. })
+    }
 
-        fn linear<T: VoxelElement>(
-            input: &Voxels,
-            out: &mut Voxels,
-            r: &[Ratio; 3],
-            at: &Anchor,
-        ) -> Result<()> {
-            resample_linear_into(input.view::<T>()?, at, r, out.view_mut::<T>()?)
+    /// The extent the **plan** states for this block, under a stated output
+    /// extent, and [`Self::output_shape`] otherwise.
+    ///
+    /// A [`OpPlacement`] whose output anchor is in this op's own output space is
+    /// a placement from an executor running this phase, and its `writes` is the
+    /// block's read region — cut from the output volume, which is what this
+    /// phase's grid is cut from. Anything else is a caller applying the chain by
+    /// hand, and falls through.
+    fn placed_output_shape(&self, input: [usize; 3], at: &OpPlacement) -> [usize; 3] {
+        if let OutputExtent::Stated { output, .. } = self.resample.extent() {
+            if at.output.volume == output {
+                if let Some(extent) = at.writes() {
+                    return extent;
+                }
+            }
         }
+        self.output_shape(input)
+    }
 
-        match (self.resample.interpolation(), input.dtype()) {
-            (_, Dtype::F16) => Err(Error::InvalidArgument(format!(
-                "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
-                self.name
-            ))),
-            (Interpolation::Linear, Dtype::Bool) => Err(Error::InvalidArgument(format!(
-                "{}: a linear blend of a mask is not a mask — every non-zero weight would round \
-                 to `true`, which is a dilation nobody asked for. `accepts` refuses this before a \
-                 run starts; nearest is the resampling a mask has.",
-                self.name
-            ))),
-            (Interpolation::Nearest, Dtype::Bool) => nearest::<bool>(input, out, ratios, at),
-            (Interpolation::Nearest, Dtype::U8) => nearest::<u8>(input, out, ratios, at),
-            (Interpolation::Nearest, Dtype::U16) => nearest::<u16>(input, out, ratios, at),
-            (Interpolation::Nearest, Dtype::U32) => nearest::<u32>(input, out, ratios, at),
-            (Interpolation::Nearest, Dtype::U64) => nearest::<u64>(input, out, ratios, at),
-            (Interpolation::Nearest, Dtype::I8) => nearest::<i8>(input, out, ratios, at),
-            (Interpolation::Nearest, Dtype::I16) => nearest::<i16>(input, out, ratios, at),
-            (Interpolation::Nearest, Dtype::I32) => nearest::<i32>(input, out, ratios, at),
-            (Interpolation::Nearest, Dtype::I64) => nearest::<i64>(input, out, ratios, at),
-            (Interpolation::Nearest, Dtype::F32) => nearest::<f32>(input, out, ratios, at),
-            (Interpolation::Nearest, Dtype::F64) => nearest::<f64>(input, out, ratios, at),
-            (Interpolation::Linear, Dtype::U8) => linear::<u8>(input, out, ratios, at),
-            (Interpolation::Linear, Dtype::U16) => linear::<u16>(input, out, ratios, at),
-            (Interpolation::Linear, Dtype::U32) => linear::<u32>(input, out, ratios, at),
-            (Interpolation::Linear, Dtype::U64) => linear::<u64>(input, out, ratios, at),
-            (Interpolation::Linear, Dtype::I8) => linear::<i8>(input, out, ratios, at),
-            (Interpolation::Linear, Dtype::I16) => linear::<i16>(input, out, ratios, at),
-            (Interpolation::Linear, Dtype::I32) => linear::<i32>(input, out, ratios, at),
-            (Interpolation::Linear, Dtype::I64) => linear::<i64>(input, out, ratios, at),
-            (Interpolation::Linear, Dtype::F32) => linear::<f32>(input, out, ratios, at),
-            (Interpolation::Linear, Dtype::F64) => linear::<f64>(input, out, ratios, at),
+    /// Resample the block's own output voxels from the source voxels it was
+    /// handed, with **both** positions taken from the placement.
+    ///
+    /// The factor path is untouched: it has no second position to use, so it
+    /// falls through to [`Self::apply`] exactly as the default would.
+    ///
+    /// **The check [`Self::placed_output_shape`] traded away** is the block of
+    /// code below, and it is the stronger of the two because it is against the
+    /// buffer rather than against a declaration: every output voxel this block
+    /// writes has to bracket between source voxels the buffer actually holds.
+    /// `bracket` is monotone in the coordinate, so the first and last output
+    /// voxel bound the rest and [`Resample::source_span`] is exactly that
+    /// interval. A short fetch is refused here by name; clamping to the buffer's
+    /// edge instead — which is what [`axis_taps`] would do, deliberately, one
+    /// line later — would produce a plausible volume that the whole-volume answer
+    /// does not agree with.
+    fn apply_placed(
+        &self,
+        input: &Voxels,
+        sources: crate::op::SourceInputs<'_>,
+        out: &mut Voxels,
+        at: &OpPlacement,
+    ) -> Result<()> {
+        let Some((stated_input, stated_output)) = self.resample.stated() else {
+            return self.apply_with(input, sources, out, &at.input);
+        };
+        if at.output.volume != stated_output {
+            // Not a placement in this op's own output space, so there is no
+            // second position to use: the anchor path states what it can and
+            // names what is missing.
+            return self.apply_with(input, sources, out, &at.input);
         }
+        if at.input.volume != stated_input {
+            return Err(Error::InvalidArgument(format!(
+                "op {:?}: this resampling states {stated_output:?} from an input volume of \
+                 {stated_input:?}, and the placement says the level being read is {:?}",
+                self.name, at.input.volume
+            )));
+        }
+        let written = out.shape();
+        let held = input.shape();
+        let offset = at.input.offset;
+        let origin = at.output.offset;
+        for axis in 0..3 {
+            if written[axis] == 0 || held[axis] == 0 {
+                continue;
+            }
+            if origin[axis] + written[axis] > stated_output[axis] {
+                return Err(Error::InvalidArgument(format!(
+                    "op {:?}: a block writing output voxels {}..{} of axis {axis} runs past this \
+                     phase's output volume of {}",
+                    self.name,
+                    origin[axis],
+                    origin[axis] + written[axis],
+                    stated_output[axis]
+                )));
+            }
+            let (low, high) =
+                self.resample
+                    .source_span(axis, origin[axis], written[axis], stated_input[axis]);
+            if low < offset[axis] || high > offset[axis] + held[axis] {
+                return Err(Error::InvalidArgument(format!(
+                    "op {:?}: a block writing output voxels {}..{} of axis {axis} reads source \
+                     {low}..{high} and was handed source {}..{}. Every voxel this block writes has \
+                     to bracket between source voxels the buffer holds; clamping to the buffer's \
+                     edge instead would produce a plausible volume that the whole-volume answer \
+                     does not agree with.",
+                    self.name,
+                    origin[axis],
+                    origin[axis] + written[axis],
+                    offset[axis],
+                    offset[axis] + held[axis]
+                )));
+            }
+        }
+        self.dispatch(
+            input,
+            out,
+            &Placed::At {
+                source: offset,
+                output: origin,
+            },
+        )
     }
 
     /// Exactly the constant, for both interpolations — and the two halves are
@@ -1078,6 +1572,14 @@ pub(super) const LINEAR_COST: f64 = 1.58;
 ///
 /// `grid` is over the output volume and any block edge is allowed: the halo,
 /// not the caller, buys the alignment the fetch needs.
+///
+/// **Under a stated output extent it buys nothing, because there is nothing to
+/// buy.** The halo is `Reach::none()`, the reach is `Units::SourceIndex` zero,
+/// and each block's fetch is its own tight source span — so `valid` is `core` at
+/// every block, any edge plans, and the cost of an edge is zero rather than the
+/// 1.00x-2.01x the factor path's alignment measures. What pays for that is the
+/// waiver: the write extent comes from the plan and
+/// [`ResampleOp::apply_placed`] owes the check against the buffer.
 pub fn resample_phase(
     slots: Vec<usize>,
     names: Vec<String>,

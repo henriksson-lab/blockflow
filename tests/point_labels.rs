@@ -28,6 +28,11 @@
 //   drop such a point quietly.
 // * **The cost of the declaration.** No pixel is read: this phase's input is
 //   the fragment stream and nothing else.
+// * **A kernel whose members re-phase.** `StepOrigin::ClippedStart` makes the
+//   stamped window a function of where the point sits relative to the volume's
+//   low faces, which is a rule a block could get wrong in a way no other fixture
+//   here would see — and a negative control beside it, so the sweep is known to
+//   be telling the two origins apart.
 
 use std::collections::BTreeMap;
 
@@ -40,7 +45,7 @@ use blockflow::fragment::{
 };
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
-use blockflow::ops::element::StructuringElement;
+use blockflow::ops::element::{ElementShape, StepOrigin, StructuringElement};
 use blockflow::ops::label::LabelPointsOp;
 use blockflow::ops::voxelize::{ball, encode_points, single_voxel, Point};
 use blockflow::sidecar::Lifecycle;
@@ -190,11 +195,23 @@ fn stamped(
 /// The answer the definition gives, computed here rather than taken from a run
 /// of the code under test: every voxel holds the smallest label whose kernel
 /// covers it, and zero where none does.
+///
+/// The kernel is asked for its members **at the point's own position in the
+/// volume**, which is the whole of what a stamp asks an element — see the op's
+/// module header on why a stamp is the gather's transpose and therefore asks the
+/// same question. For every element without a step that is the element's own
+/// offset list and this reads exactly as it always did.
 fn expected(volume: [usize; 3], element: &StructuringElement, points: &[Point]) -> Vec<u32> {
     let mut out = vec![0u32; volume[0] * volume[1] * volume[2]];
+    let mut scratch = Vec::new();
     for point in points {
         let label = point.weight as u32;
-        for offset in element.offsets() {
+        let at = [
+            point.at[0] as isize,
+            point.at[1] as isize,
+            point.at[2] as isize,
+        ];
+        for offset in element.offsets_at(at, volume, &mut scratch) {
             let mut at = [0usize; 3];
             let mut inside = true;
             for axis in 0..3 {
@@ -413,6 +430,67 @@ fn the_declared_block_reach_is_the_kernel_over_the_block_edge() {
     assert!(op.writes_pixels());
     assert!(op.gathers());
     assert_eq!(op.inputs().len(), 1);
+}
+
+/// **A kernel whose members depend on where it is placed, through the
+/// executor**: five cuts, one volume, byte for byte.
+///
+/// `StepOrigin::ClippedStart` makes the stamped window a function of the point's
+/// position *and of the volume's low faces*. The op keys it on the point's
+/// coordinate in the volume and on `grid.volume()`, both of which are the same
+/// numbers under every cut — but the argument is about the code as it stands and
+/// this is the property the crate exists to defend, so it is measured.
+///
+/// The window is **wider on axis 2 than the volume is**, so every point re-phases
+/// there and no block holds only interior voxels; and the fixture carries a point
+/// at the origin, where the low faces of all three axes meet.
+///
+/// The last assertion is the negative control: the same program with the origin
+/// changed is a different volume, so the sweep above is not an invariance sweep
+/// over an element that quietly behaves like the anchored one.
+#[test]
+fn a_re_phasing_kernel_labels_the_same_volume_under_every_decomposition() {
+    let element = StructuringElement::from_size_stepped_at(
+        ElementShape::Box,
+        [11, 3, 9],
+        [2, 1, 3],
+        StepOrigin::ClippedStart,
+    )
+    .expect("an element");
+    assert!(
+        element.sides(2).0 >= VOLUME[2],
+        "the window must be wider than axis 2 of the volume, so every point re-phases there"
+    );
+    let points = vec![
+        Point::weighted([3, 3, 1], 40.0),
+        Point::weighted([8, 6, 2], 5.0),
+        Point::weighted([7, 6, 2], 31.0),
+        Point::weighted([12, 9, 1], 2.0),
+        Point::weighted([15, 11, 3], 900.0),
+        Point::weighted([0, 0, 0], 60.0),
+    ];
+
+    let want = expected(VOLUME, &element, &points);
+    assert!(want.contains(&5), "the low label must survive somewhere");
+    assert!(want.contains(&0), "and some voxel is unmarked");
+
+    for block in CUTS {
+        let got = stamped(VOLUME, block, &element, &points);
+        assert_eq!(got, want, "cut into {block:?}");
+    }
+
+    let anchored = StructuringElement::from_size_stepped_at(
+        ElementShape::Box,
+        [11, 3, 9],
+        [2, 1, 3],
+        StepOrigin::Anchor,
+    )
+    .expect("an element");
+    assert_ne!(
+        stamped(VOLUME, [5, 5, 2], &anchored, &points),
+        want,
+        "the two origins gave the same volume, so the sweep above tells them apart at nothing"
+    );
 }
 
 /// Every cut in `CUTS` is a real cut of the volume, so that none of the tests

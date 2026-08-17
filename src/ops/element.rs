@@ -703,12 +703,43 @@ impl StructuringElement {
     /// a face emptied — the same condition an all-denied population produces —
     /// and this is that condition and not a new one.
     ///
-    /// **Which ops ask this.** `ops::local`'s sampled statistic, which is the one
-    /// that evaluates an element at stated positions inside a stated volume. The
-    /// per-voxel neighbourhood ops — the rank filter, morphology, the sliding
-    /// histogram — read [`Self::offsets`] and therefore compute the anchored
-    /// element whatever the origin says; that gap is measured and pinned in
-    /// `tests/stepped_element.rs` rather than left to be discovered.
+    /// **Which ops ask this.** Every op in this crate that places an element
+    /// somewhere, bar one.
+    ///
+    /// * the ones that **gather** a window around a voxel — `ops::rank`,
+    ///   `ops::morphology`, `ops::reconstruct`'s step — each asking at the
+    ///   voxel's position in the **volume** rather than in its buffer;
+    ///   `ops::background` asks by composition, being made of rank filters;
+    /// * the ones that evaluate it at **stated positions**: `ops::local`'s
+    ///   sampled statistic and `ops::lattice`'s windowed statistic, each asking
+    ///   at the sample's position in the volume;
+    /// * the ones that **stamp** — `ops::label`'s labelled kernel and
+    ///   `ops::voxelize`'s deposit — asking at the *point's* position in the
+    ///   volume. Those two write an element around a point rather than reading
+    ///   one around a voxel, and they ask this method because a stamp is a
+    ///   gather's **transpose**: the transpose of `out[c] = f({in[c + o] : o in
+    ///   K(c)})` scatters into `p + o` for `o` in `K(p)`, the kernel read at the
+    ///   source index, which for those ops is the point. Underneath that, the
+    ///   rule this method computes is a property of a *(position, volume)* pair
+    ///   and not of a direction of data flow, and both ops write into the same
+    ///   volume their points live in — so `volume` is one number on both sides
+    ///   and the two readings cannot come apart. Each op's module header carries
+    ///   the argument in full.
+    ///
+    /// `ops::sliding` **refuses** a `ClippedStart` element by name: a carried
+    /// histogram is a decomposition of *one* window into leavers and joiners, and
+    /// a window that re-phases has no such decomposition — consecutive centres
+    /// read different residue classes, so the traversal degenerates into the
+    /// dense gather it exists to avoid.
+    ///
+    /// So the list is complete: every op that places an element either asks this
+    /// method or refuses the element that needs it. `ops::sliding` is the one
+    /// left reading [`Self::offsets`] for its members, and it may, because the
+    /// refusal above means the only elements it ever sees are the ones for which
+    /// `offsets` *is* the whole truth. That is measured rather than asserted, in
+    /// `tests/clipped_start_through_the_gathering_ops.rs`, which takes a
+    /// re-phasing element through every op above and states the refusal beside
+    /// them.
     pub fn offsets_at<'a>(
         &'a self,
         anchor: [isize; 3],

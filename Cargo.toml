@@ -16,9 +16,69 @@ description = "Out-of-core block processing: op chains, reach-derived valid regi
 # The encoded tier needs *a* compressor. Which one is a parameter (`cache::Codec`);
 # this is the built-in default, chosen for being pure Rust and unsurprising.
 flate2 = "1"
-ndarray = "0.16"
+ndarray = "0.17"
 rayon = "1"
 serde_json = "1"
+# `ops::fft` only, and the one exception to the rule stated at the top of this
+# block: an FFT is not the framework's own machinery, it is what one op needs.
+# It is here rather than in a consumer because the rule that decides *which*
+# crate is the rule this block already states — anything an individual op needs
+# belongs in the crate that supplies the op — and a discrete Fourier transform is
+# general image processing rather than domain knowledge. The consumer's own
+# `Cargo.toml` says it adds no packages at all, so "put it in the application"
+# was never an option that existed.
+#
+# Two crates, and `realfft` is not redundant with `rustfft`: the input is real,
+# and a real-input transform is about **1.6x** the throughput of the complex one at
+# these sizes — measured at `128 x 1350`, forward `1.09 ms` against `1.72 ms`.
+# `realfft` depends on `rustfft` and nothing else, so it is one package for that.
+#
+# **Not behind a feature, and the numbers are why.** Measured as
+# `cargo tree -e normal --prefix none | sed 's/ (\*)$//' | sort -u | wc -l`,
+# which is stated because the older figures in the `zarr` note below were taken a
+# different way and the two are not comparable. The two crates take the graph from
+# **24 packages to 29** — the five are `rustfft`, `realfft`, `primal-check`,
+# `strength_reduce` and `transpose`; `num-complex`, `num-integer`, `num-traits`
+# and `autocfg` were all already there under `ndarray` — add **no build script**
+# (`-e normal,build` goes 25 to 30, and the one build-script crate in it,
+# `autocfg`, was already present), need no C toolchain, and cost **4.5 s** of
+# release compile time, of which `rustfft` is 3.7 s.
+#
+# That is not the `zarrs` situation — a hundred-odd packages, a `libz-sys` build
+# script and a C compiler — which is what a feature gate is for here. And a
+# feature would cost something real in exchange: an op behind a `cfg` is an op the
+# default `cargo test` does not compile, and this crate's whole position is that
+# the no-feature configuration is the one everything else is measured against.
+#
+# **Three alternatives were measured rather than argued about.** All at the
+# padded geometry `ops::fft` actually chooses for the consumer's case,
+# `128 x 1350`, `--release`, one thread, best of 50, forward transform:
+#
+# | | forward | why not |
+# |---|---|---|
+# | `rustfft` + `realfft` | `1.09 ms` | taken |
+# | `ndrustfft` 0.6.2 | `0.98 ms` | **a wrapper over `rustfft`** — its dependency list is `rustfft`, `realfft`, `rustdct`, `ndarray`, `num-traits` — so it cannot be faster at the transform, and the measurement says so: 10% on a hand-rolled lane loop that was worth tuning anyway (see `LANE_BLOCK`). It is also on `ndarray ^0.17` against this crate's 0.16, which is a second `ndarray` and a **copy at every boundary crossing** for a kernel whose reason to exist is throughput. 10% does not buy that. *If this crate moves to 0.17 the type-level half of that objection goes away and only the wrapper fact remains, which is still enough.* |
+# | `fftw` 0.8 (FFTW 3.3.8) | `0.87 ms` | **1.25x**, for a C library. It links a system `libfftw3` when one is installed — it was on the machine this was measured on — and otherwise builds FFTW from source, so a consumer without the system library gets a C toolchain requirement and a multi-minute first build out of a dependency they did not ask for. It also pulls a third `ndarray` (0.15) and a proc-macro chain for its error type. `FFTW_MEASURE` costs 0.4-1.1 s of planning and bought 0-25% over `FFTW_ESTIMATE` here, so the gap does not widen. |
+#
+# The measurement that mattered was **not** the library. Choosing the padded
+# length well — `128 x 1350` rather than the consumer's own `157 x 1335`, where
+# `157` is prime — is worth **5.9x** on the same transform with the same crate,
+# and **4.6x** on a whole landscape end to end, which is more than the whole
+# spread of the table above put together. `ops::fft`'s header has that table and
+# the rule that produces it.
+#
+# Two constraints were lifted while this was being chosen and neither changed the
+# answer, so both are recorded rather than left implicit. A **second `ndarray`**
+# was allowed: that removes half the `ndrustfft` objection and leaves the wrapper
+# fact, which is still enough at 10%. (The question then went away entirely — all
+# three crates moved to 0.17, so `ndrustfft` would no longer be a second
+# `ndarray` at all, and the wrapper fact is the whole of what is left.)
+# **Licensing** was ruled out as a criterion:
+# FFTW is GPL-2.0-or-later against this crate's MIT, and that is *not* why it was
+# declined — the reason is the row above, a C library and a source build for a
+# consumer who did not ask for one, in exchange for 1.25x.
+rustfft = "6.4.1"
+realfft = "3.5.0"
 # The `gui` feature only. A blocking HTTP server on ordinary threads: four small
 # transitive crates and no async runtime, for four JSON endpoints and a static
 # directory. See `src/gui/server.rs` for why not axum.
@@ -28,11 +88,16 @@ tiny_http = { version = "0.12", optional = true }
 # live somewhere, and everything before it was proven against arrays in memory.
 #
 # `default-features = false` and two features back on, deliberately. The
-# defaults add blosc (which builds C), zstd, sharding, transpose, crc32c and **a
-# second `ndarray`** — `zarrs` is on 0.17 and this crate on 0.16, so its ndarray
-# bridge would hand back arrays of a type nothing here can hold. `zarr_env`
-# therefore reads and writes through the element API (`Vec<T>`), which needs none
-# of it.
+# defaults add blosc (which builds C), zstd, sharding, transpose and crc32c, none
+# of which `zarr_env` asks for — it reads and writes through the element API
+# (`Vec<T>`).
+#
+# They used to add **a second `ndarray`** as well, and that was the sharpest of
+# these reasons: `zarrs` was on 0.17 against this crate's 0.16, so its ndarray
+# bridge would have handed back arrays of a type nothing here could hold. **That
+# is no longer true** — all three crates and `zarrs` are on 0.17 together, so the
+# bridge is now merely unused rather than unusable. The flag stays off for the
+# other five, which are unchanged.
 #
 # The two that are asked for:
 #
