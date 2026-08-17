@@ -117,6 +117,29 @@ pub struct PhaseDecomposition {
     /// verified against it by [`check_source_levels`], the same split
     /// `declare_dtypes` and `check_dtypes` have.
     pub source_levels: Vec<usize>,
+    /// Whether this phase reads the level it is handed — level `p`, the one
+    /// below it — at all.
+    ///
+    /// `true` for every phase that owns a slot, because a chain reads its input
+    /// by construction, and `true` is therefore the derived default. It is
+    /// `false` only for a fragment phase whose op declares
+    /// `FragmentOp::reads_pixels() == false`: such a phase is handed a level and
+    /// never touches it, and `fragment::fragment_phase` is what records that
+    /// here.
+    ///
+    /// **It exists for the accounting and for nothing else.**
+    /// [`Decomposition::exact_read_voxels`] is compared against a run's counter
+    /// to the voxel, and the run — `strategy::run_fragment_task` — skips the
+    /// input read entirely when the op declares it reads no pixels. Without this
+    /// field the plan had no way to know that and charged for a fetch that never
+    /// happened, which is the one failure mode that figure exists to catch, in
+    /// the plan rather than in the execution.
+    ///
+    /// It changes no voxel and constrains nothing: `check` does not consult it,
+    /// because what it describes is a property of the op and the op is not in
+    /// the plan. A plan that arrives with it wrong is a plan whose read figure
+    /// is wrong, which is exactly the fault it is here to make visible.
+    pub reads_input_level: bool,
     /// Cores, read extents and valid regions, derived and recorded.
     pub blocks: Vec<BlockGeometry>,
 }
@@ -160,6 +183,7 @@ impl PhaseDecomposition {
             grid,
             dtype: None,
             source_levels: Vec::new(),
+            reads_input_level: true,
             blocks,
         }
     }
@@ -195,6 +219,15 @@ impl PhaseDecomposition {
         levels.sort_unstable();
         levels.dedup();
         self.source_levels = levels;
+        self
+    }
+
+    /// Say whether this phase reads the level it is handed.
+    ///
+    /// Only a fragment phase ever passes `false`; see
+    /// [`PhaseDecomposition::reads_input_level`].
+    pub fn reading_input_level(mut self, reads: bool) -> Self {
+        self.reads_input_level = reads;
         self
     }
 
@@ -479,6 +512,16 @@ impl Decomposition {
             .map(|phase| self.volume_at(phase))
             .collect();
         for (index, phase) in self.phases.iter_mut().enumerate() {
+            // **A phase that owns no slot is left alone rather than emptied.**
+            // This derives from the chain, and a phase with no slot of the chain
+            // has nothing in the chain that could say what it reads — a fragment
+            // phase's second level is declared by its op and recorded by
+            // `fragment::fragment_phase`, which is the only thing holding the
+            // op. Overwriting it here would silently drop it, and the run would
+            // then fetch nothing while the op asked for something.
+            if phase.slots.is_empty() {
+                continue;
+            }
             let mut levels = Vec::new();
             for &slot in &phase.slots {
                 let Some(node) = slots.get(slot) else {
@@ -507,16 +550,35 @@ impl Decomposition {
     ///
     /// **Once per level read, and a phase with source leaves reads more than
     /// one.** Each one is fetched at the same region as the input — reach 0 —
-    /// so the multiplier is exactly `1 + source_levels.len()`. A figure that
-    /// counted only the input would be under by that factor for precisely the
-    /// plans this number is most worth checking, and it is compared against a
-    /// run's counter to the voxel.
+    /// so the multiplier is the number of levels the phase actually reads. A
+    /// figure that counted only the input would be under by that factor for
+    /// precisely the plans this number is most worth checking, and it is
+    /// compared against a run's counter to the voxel.
+    ///
+    /// **The input level is one of them only when the phase reads it.** A
+    /// fragment phase whose op declares `reads_pixels() == false` is handed
+    /// level `p` and never fetches it — `strategy::run_fragment_task` skips the
+    /// read outright — so the multiplier is `source_levels.len()` and not one
+    /// more. This used to be `1 + source_levels.len()` unconditionally, which
+    /// charged such a phase for a fetch that does not happen. It was invisible
+    /// while the only non-reading fragment phases had no source levels either
+    /// and thus no `Environment::read` to be compared against; it stopped being
+    /// invisible when phases appeared that read a second array and not their
+    /// own, and it was over by one whole halo-inflated level each.
+    ///
+    /// A phase that reads neither its input nor any source level scores zero,
+    /// and that is the right answer rather than a degenerate one:
+    /// `fragments -> fragments` merges move no voxels at all, only sidecar
+    /// bytes, and this function has never counted those — its own header calls
+    /// itself the figure to compare against what a run counted, and a run
+    /// counts a fragment gather through the sidecar, not through `read`.
     pub fn exact_read_voxels(&self) -> Vec<usize> {
         self.phases
             .iter()
             .map(|phase| {
                 let per_level: usize = phase.blocks.iter().map(|block| block.source.voxels()).sum();
-                per_level * (1 + phase.source_levels.len())
+                let levels = usize::from(phase.reads_input_level) + phase.source_levels.len();
+                per_level * levels
             })
             .collect()
     }
@@ -562,6 +624,16 @@ impl Decomposition {
             if !phase.source_levels.is_empty() {
                 phase.source_levels.hash(&mut hasher);
             }
+            // `reads_input_level` is deliberately **not** hashed. Every other
+            // field here can change a voxel: which levels an arm reads, what
+            // type a phase writes, where a block fetches from. That one cannot
+            // — it says a phase does not touch a level it was never going to
+            // use, so the same plan with it right and with it wrong produces
+            // identical output and differs only in a *predicted* read count.
+            // Hashing it would renumber the plans of every fragment op that
+            // declines its own level, breaking the frozen fingerprints those
+            // ops are pinned by, in exchange for discriminating between two
+            // plans that cannot disagree about a voxel.
             for block in &phase.blocks {
                 block.index.hash(&mut hasher);
                 block.core.start.hash(&mut hasher);
@@ -703,6 +775,8 @@ impl Decomposition {
                     phase.grid.clone(),
                 );
                 rebuilt.dtype = phase.dtype;
+                rebuilt.source_levels = phase.source_levels.clone();
+                rebuilt.reads_input_level = phase.reads_input_level;
                 if phase.reads_across_grids() {
                     for (block, original) in rebuilt.blocks.iter_mut().zip(&phase.blocks) {
                         block.source = original.source.clone();
@@ -867,8 +941,48 @@ impl Default for Constraints {
 /// An axis of extent 1 is excluded. Reaching across it is trivially true, costs
 /// nothing and forbids no blocking — every block already spans it — so counting
 /// it would make every op on a flat volume a barrier.
+///
+/// **What this predicate is not about.** It decides *segmentation* — whether a
+/// slot forces a phase boundary — and the measurement above is an argument about
+/// segmentation only. It says nothing about which axes a phase's grid may be cut
+/// on, which is [`splittable_axes`] and [`cuttable_axes`]; those two answer a
+/// different question with a different consequence, and the same "large is not
+/// full" caution does not transfer to them unexamined. See [`cuttable_axes`],
+/// which does examine it — including the measurement above, which turns out to
+/// leave the cutting rule untouched on the very chain it was taken from.
+///
+/// The paraphrase above is also a little stronger than its source. `§6.5.1` of
+/// `GRAPH_MIGRATION.md` has four of the seven steps *cheap* rather than four
+/// wrongly segmented: an exact predicate segments at every whole-volume step, and
+/// what a threshold rule would break is the two steps that reach a single voxel,
+/// plus the pricing of the cheap ones. The conclusion is unchanged — exact, not a
+/// threshold — but the "four" counts cheapness, not segments.
 pub fn reaches_whole_axis(reach: usize, extent: usize) -> bool {
     extent > 1 && reach >= extent
+}
+
+/// Does the reach's **halo alone** cover an axis of extent `extent`?
+///
+/// The two-sided form of [`reaches_whole_axis`], and the same kind of statement:
+/// exact arithmetic on the declared reach against the extent, no threshold. Where
+/// `reaches_whole_axis` asks whether one side already covers the axis, this asks
+/// whether the two together do — `lo + hi >= extent`, which is precisely the
+/// condition under which `edge + lo + hi >= extent` holds **for every edge**, so
+/// no block on the axis can be interior and no cut on it can narrow a read.
+///
+/// It is what [`cuttable_axes`] is a per-candidate application of, and what
+/// [`price_phase`] charges a **single-block** phase on: a phase the reach has
+/// left with no cut anywhere is not blocked, not streamed and not interior, so
+/// the clamp discount is not exact for it. A phase still cut on some other axis
+/// keeps the discount and it is still exact there — the block spans this axis, so
+/// the read is the volume, once — which is why that condition carries the block
+/// count and this predicate does not.
+///
+/// An axis of extent 1 is excluded for the reason [`reaches_whole_axis`] excludes
+/// it: every block already spans it, so it forbids nothing and costs nothing.
+pub fn halo_spans_axis(reach: &Reach, axis: usize, extent: usize) -> bool {
+    let (lo, hi) = reach.axis(axis).bound(extent);
+    extent > 1 && lo.saturating_add(hi) >= extent
 }
 
 /// Whether a run of slots is a **planning barrier**: it reaches across the whole
@@ -946,35 +1060,53 @@ pub fn splittable_axes(split_axes: &[usize], reach: &Reach, volume: [usize; 3]) 
 /// single block. What moves is which plan a planner offers, and the one it stops
 /// offering is one that computes the same volume by reading it `n` times.
 ///
-/// # Nothing calls this yet, and that is a decision rather than an oversight
+/// # Wired, and what had to be settled first
 ///
-/// Wiring it into [`crate::strategy::Enumerating`] and
-/// [`crate::strategy::Greedy`] costs one line each and makes the measured case
-/// plan six blocks instead of 336. It also **contradicts a stated and tested
-/// position of this crate**, so it is landed and left unwired for whoever settles
-/// that:
+/// This was landed unwired because it contradicted a stated and tested position
+/// of the crate. Both planners call it now, and the contradiction was resolved by
+/// **moving the position**, not by weakening its test:
 ///
-/// * `tests::a_large_but_bounded_reach_is_not_a_barrier_and_still_fuses` asserts
-///   that a reach of `volume - 1` leaves its phase *cuttable* — "priced out of
+/// * `tests::a_large_but_bounded_reach_is_not_a_barrier_and_still_fuses` asserted
+///   that a reach of `volume - 1` left its phase *cuttable* — "priced out of
 ///   fusing, but not **forbidden** from it, which is the whole difference from a
 ///   barrier". At that reach `lo + hi` is nearly twice the volume, so this rule
-///   forbids the cut. The two cannot both hold.
-/// * [`reaches_whole_axis`] argues the same thing from the other side: the
-///   barrier predicate is an exact comparison *because* any rule of the form
-///   "large means full" would segment a real chain in four places that do not
-///   want it. This is not a threshold — it is exact arithmetic on the declared
-///   reach — but it is a rule under which a large bounded reach stops behaving
-///   like a bounded one for the purpose of cutting.
-/// * and there is a second-order effect that must move with it: [`price_phase`]
-///   charges an axis on the infinite grid when the grid cut it *or* the reach is
-///   whole. Dropping such an axis from the grid without extending that condition
-///   hands the phase the clamp discount and prices it at redundancy `1.0` — the
-///   exact hole `price_phase`'s own doc records having closed for full reaches.
-///   Wired without that, the measured case's partition collapses and the plan
-///   fuses where it used to segment.
+///   forbids the cut, and the two could not both hold. The test now asserts the
+///   narrower claim that survives, and it is the claim that was doing the work:
+///   a bounded reach is not a **barrier** — it forces no phase boundary, its
+///   neighbours may still fuse into it, and every other axis stays cuttable —
+///   while whether *this* axis is worth cutting is a question about the grid,
+///   which the arithmetic here answers and a barrier never asked.
+/// * [`reaches_whole_axis`] argues from the other side that the barrier predicate
+///   is exact *because* a "large means full" rule would segment a real chain
+///   where nothing wants a segment. That argument survives and does not reach
+///   here, for two reasons that were checked rather than assumed. It is an
+///   argument about **segmentation**, and this rule adds no forced cut and
+///   removes no fusion; and on the chain it is measured on it makes no difference
+///   at all — the five whole-volume merge steps have already lost those axes to
+///   [`splittable_axes`], and the two that reach a single voxel keep every axis
+///   here at every candidate edge, since `edge + 1 + 1 < extent` for any edge
+///   that cuts anything. (Worth recording while passing: the "four places that do
+///   not want it" in [`reaches_whole_axis`]'s own note overstates its source.
+///   `GRAPH_MIGRATION.md` §6.5.1 has four of the seven *cheap*, not four wrongly
+///   segmented — an exact predicate segments at all five whole-volume steps too,
+///   and the objection to a threshold rule is that it would catch the two
+///   1-voxel ones and price the cheap ones as expensive.) See
+///   `strategy::block_floor_tests::the_floor_changes_nothing_on_the_chain_the_barrier_rule_was_measured_on`.
+///   What does *not* transfer is any claim that the grid is therefore untouched
+///   by fusion: the grid a phase is given changes its price, and price chooses
+///   the partition — which is the next point.
+/// * the second-order effect that had to move with it: [`price_phase`] charged an
+///   axis on the infinite grid when the grid cut it *or* the reach was whole.
+///   Dropping an axis here without extending that condition hands the phase the
+///   clamp discount and prices it at redundancy `1.0` — the exact hole
+///   `price_phase`'s own doc records having closed for full reaches — and the
+///   partition collapses. The condition is now stated over
+///   [`halo_spans_axis`] as well, which is this rule's own edge-independent form.
 ///
 /// The number the decision rests on is in
-/// `strategy::block_floor_tests::the_floor_would_take_the_amplification_from_49_to_1_125`.
+/// `strategy::block_floor_tests::the_floor_takes_the_amplification_from_49_to_1`,
+/// and `strategy::block_floor_tests` also asserts through the planners that the
+/// partition survives the pricing change.
 pub fn cuttable_axes(
     split_axes: &[usize],
     reach: &Reach,
@@ -1038,6 +1170,53 @@ pub struct PhaseCost {
 /// a phase that cannot be blocked, streamed or fused across. So a full-reach
 /// axis is charged on the infinite grid whether or not the grid cut it.
 ///
+/// It is not exact either **on a single-block phase whose halo spans the axis**
+/// ([`halo_spans_axis`]) — which is what [`cuttable_axes`] leaves behind when the
+/// reach denies every cut. The same sentence applies word for word: no block is
+/// interior, because every output voxel's window covers the extent before the
+/// clamp touches it; the clamp is the whole behaviour rather than a boundary
+/// effect; and the phase cannot be blocked or streamed at all. Without this the
+/// floor is self-defeating — it turns the phase into one block and the discount
+/// then prices that block at redundancy **1.0**, cheaper than any phase that is
+/// still cut, so the search fuses the chain into it. Measured on a seven-slot
+/// chain in `crate::strategy::block_floor_tests`: the discount gives one phase of
+/// seven slots in one whole-volume block, and this charge gives back the three
+/// phases the chain had before the floor.
+///
+/// **Two conditions, deliberately not one.** The full-reach clause is per axis
+/// and does not care how many blocks the grid has; this one fires only when the
+/// grid has a single block. An axis the grid did not cut while it was still
+/// cutting some *other* axis is a phase that is blocked, streamed and priced per
+/// block, and there the clamp discount is exact whatever the halo does — the read
+/// on that axis is the volume, once, because the block spans it. Charging it
+/// would invent traffic that no plan can incur, and it changes partitions of
+/// chains the floor never touched: measured, it flips
+/// `tests::a_memory_budget_forces_cuts_the_cost_model_would_not_choose` from the
+/// one fused phase the model prefers to three, on a chain where fusing really is
+/// 2.4x cheaper in bytes.
+///
+/// **Where this charge is known to cost something, stated rather than found
+/// later.** When *every* candidate edge is at least the volume, every phase is a
+/// single block whatever any rule says, and this clause then charges each of them
+/// — so the search prefers to segment a chain whose phases would each have read
+/// the volume exactly once either way. Measured on the five-op chain of
+/// `crate::strategy::chain_floor_measurement` over a `24 x 20 x 16` volume at a
+/// candidate edge of 32: two phases reading `2.0x` become four reading `4.0x`.
+/// Nothing is unrunnable and no voxel moves; the model simply buys a
+/// materialisation it did not need. It is the same over-charge the full-reach
+/// clause has always made in the same situation, in the direction the model is
+/// declared safe in, and separating it out needs `price_phase` to know which axes
+/// the planner *offered* to cut — which it cannot be told without making the
+/// price a function of the search rather than of the plan, and
+/// [`predicted_cost`] reads plans back with no search in hand.
+///
+/// **A bounded reach is still not a barrier, in the price as well as the
+/// structure.** The charge on a dropped axis is `(extent + lo + hi) / extent`; a
+/// bounded reach has `lo + hi < 2 * extent` by definition, so it is charged
+/// strictly under 3, while `AxisReach::All` has `lo + hi = 2 * extent` and is
+/// charged exactly 3. The barrier remains the more expensive of the two at the
+/// same grid, which is what the distinction costs out to once neither is cut.
+///
 /// The charge is deliberately kept out of the residency figure. `read_voxels`
 /// feeds the *choice*, where over-charging is the design's declared safe
 /// direction; `working_set_bytes_per_block` feeds the *budget*, where
@@ -1071,7 +1250,9 @@ pub fn price_phase(
         // block, the same direction of error a generous halo has.
         let (lo, hi) = reach.axis(axis).bound(volume[axis]);
         let grown = block[axis] as f64 + lo as f64 + hi as f64;
-        let charged = grid.split_axes().contains(&axis) || reach.is_whole_axis(axis, volume[axis]);
+        let charged = grid.split_axes().contains(&axis)
+            || reach.is_whole_axis(axis, volume[axis])
+            || (grid.n_blocks() == 1 && halo_spans_axis(&reach, axis, volume[axis]));
         if charged {
             redundancy *= grown / block[axis] as f64;
         }
@@ -1324,6 +1505,16 @@ pub fn check_source_levels(chain: &Chain, decomposition: &Decomposition) -> Resu
         if phase.slots.iter().any(|&slot| slot >= slots.len()) {
             // Out of range is caught, with a better message, by the executor's
             // own slot-order check.
+            continue;
+        }
+        // **A phase with no slot is not this guard's to speak for.** It folds
+        // the chain, and a phase owning no part of the chain has nothing here
+        // that could name a level: a fragment op declares its second level on
+        // itself, and only the `(plan, work)` pair holds the op. That half is
+        // `fragment::check_phase_work`, which makes every assertion below and
+        // two more the chain has no way to need. Asserting `source_levels` is
+        // empty here would refuse exactly the plans that guard exists to check.
+        if phase.slots.is_empty() {
             continue;
         }
         let volume = decomposition.volume_at(phase_index);
@@ -1855,6 +2046,7 @@ pub fn groups_for(mask: u32, n_slots: usize) -> Vec<Vec<usize>> {
 mod tests {
     use super::*;
     use crate::probes::IdentityOp;
+    use crate::reach::AxisReach;
 
     #[test]
     fn cut_masks_enumerate_every_contiguous_partition() {
@@ -2338,6 +2530,76 @@ mod tests {
         assert_eq!(bounded.redundancy, 1.0);
     }
 
+    /// The same defect, in the form [`cuttable_axes`] creates: a phase the reach
+    /// has left with no cut anywhere is not an interior block either.
+    ///
+    /// And the line the second condition holds. An axis is charged for it only
+    /// when the grid has a *single block*; an uncut axis beside a cut one is a
+    /// phase that is still blocked and streamed, and there the clamp discount is
+    /// exact whatever the halo does. Charging that would invent traffic no plan
+    /// can incur — measured, it moves partitions of chains the floor never
+    /// touches.
+    #[test]
+    fn a_single_block_phase_whose_halo_spans_an_axis_is_not_priced_as_free_either() {
+        let volume = [4096, 4, 4];
+        let model = CostModel::default();
+        let nearly: Reach = [4095, 0, 0].into();
+        assert!(
+            !nearly.is_whole_axis(0, volume[0]),
+            "bounded, not a barrier"
+        );
+        assert!(halo_spans_axis(&nearly, 0, volume[0]), "lo + hi >= extent");
+
+        let single = BlockGrid::whole(volume).unwrap();
+        let charged = price_phase(&single, &nearly, 1.0, 1, false, 8.0, &model, 1.0).redundancy;
+        assert!(charged > 1.0, "priced at the clamp discount: {charged}");
+        // strictly under a barrier's charge at the same grid: `lo + hi` is under
+        // `2 * extent` for a bounded reach and exactly `2 * extent` for `All`
+        let barrier = price_phase(
+            &single,
+            &Reach::per_axis([AxisReach::All, AxisReach::none(), AxisReach::none()]),
+            1.0,
+            1,
+            false,
+            8.0,
+            &model,
+            1.0,
+        )
+        .redundancy;
+        assert_eq!(barrier, 3.0);
+        assert!(charged < barrier, "{charged} against {barrier}");
+
+        // an uncut axis beside a cut one keeps the discount, and it is exact:
+        // the block spans the axis, so the read is the volume, once
+        let volume = [1024, 32, 32];
+        let cut = BlockGrid::along(volume, &[0], 128).unwrap();
+        let spanning: Reach = [24, 24, 24].into();
+        assert!(halo_spans_axis(&spanning, 1, volume[1]));
+        let cost = price_phase(&cut, &spanning, 1.0, 1, false, 8.0, &model, 1.0).redundancy;
+        assert_eq!(cost, (128.0 + 48.0) / 128.0, "axis 0 only, and no other");
+    }
+
+    /// The two-sided form of the barrier predicate, and exact like it.
+    #[test]
+    fn the_halo_spans_an_axis_when_its_two_sides_together_cover_the_extent() {
+        let bounded: Reach = [2048, 0, 0].into();
+        assert!(halo_spans_axis(&bounded, 0, 4096), "2048 + 2048 == 4096");
+        assert!(!halo_spans_axis(&bounded, 0, 4097));
+        // a one-sided reach is measured on the side it has, not on twice it
+        let one_sided = Reach::asymmetric([(4096, 0), (0, 0), (0, 0)]);
+        assert!(halo_spans_axis(&one_sided, 0, 4096));
+        assert!(!halo_spans_axis(&one_sided, 0, 4097));
+        // and an axis of extent 1 is excluded, for the reason
+        // `reaches_whole_axis` excludes it: every block already spans it
+        assert!(!halo_spans_axis(&bounded, 0, 1));
+        // a full reach is the case where one side already suffices
+        assert!(halo_spans_axis(
+            &Reach::per_axis([AxisReach::All, AxisReach::none(), AxisReach::none()]),
+            0,
+            4096
+        ));
+    }
+
     /// Residency is physical, so it is clamped even though the cost is not.
     ///
     /// Measured consequence: over a `[64, 8, 8]` volume — 32 kB at 8 bytes —
@@ -2416,6 +2678,48 @@ mod tests {
         assert_eq!(plan.uniform_volume(), None);
         // and what it fetches is what the plan says will be read
         assert_eq!(plan.exact_read_voxels(), vec![16 * 4 * 4, 8 * 4 * 4]);
+    }
+
+    /// The read figure counts levels the phase reads, and no others.
+    ///
+    /// Four cases, and the third is the one this test was written for: a phase
+    /// that reads a second array and *not* the level it was handed — a fragment
+    /// op declaring `reads_pixels() == false` alongside `source_inputs` — used
+    /// to be charged for two arrays and reads one. The over-count was a whole
+    /// halo-inflated level, on exactly the plans the figure is checked against a
+    /// run for.
+    #[test]
+    fn a_phase_is_charged_for_the_levels_it_reads_and_not_for_the_one_it_declines() {
+        let base = PhaseDecomposition::derive(
+            vec![0],
+            vec!["only".to_string()],
+            [0, 0, 0],
+            [0, 0, 0],
+            BlockGrid::new([16, 4, 4], [8, 4, 4]).unwrap(),
+        );
+        let voxels = 16 * 4 * 4;
+        let plan = |phase: PhaseDecomposition| Decomposition {
+            volume: [16, 4, 4],
+            dtype: Dtype::F64,
+            phases: vec![phase],
+            chain_reach: [0, 0, 0],
+        };
+
+        // its own level, which is every chain phase
+        assert!(base.reads_input_level);
+        assert_eq!(plan(base.clone()).exact_read_voxels(), vec![voxels]);
+        // its own level and one more
+        let with_source = base.clone().with_source_levels([0]);
+        assert_eq!(
+            plan(with_source.clone()).exact_read_voxels(),
+            vec![2 * voxels]
+        );
+        // one other level and not its own
+        let source_only = with_source.reading_input_level(false);
+        assert_eq!(plan(source_only).exact_read_voxels(), vec![voxels]);
+        // and neither: a fragments-to-fragments phase moves no voxels at all
+        let neither = base.reading_input_level(false);
+        assert_eq!(plan(neither).exact_read_voxels(), vec![0]);
     }
 
     /// The guard, on the phase that changed the volume.

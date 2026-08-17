@@ -30,6 +30,8 @@
 //   reach**, so a short halo diverges at block edges. An identity op cannot
 //   show that, because it never reads its halo.
 
+use std::collections::BTreeMap;
+
 use ndarray::{ArrayD, Axis};
 
 use crate::dtype::Dtype;
@@ -635,6 +637,384 @@ impl crate::fragment::FragmentOp for FragmentReduceOp {
             return Err(err);
         }
         Ok(crate::fragment::BlockOutput::nothing().with_pixels(at.output_buffer(total as f64)?))
+    }
+}
+
+// ------------------------------------------------ a second array, and the --
+// ----------------------------------------------------------- seam it has --
+//
+// Three ops that together are the shape `crate::fragment`'s second-array
+// support exists for, and the shape `ops/detect.rs` deferred: reduce a quantity
+// **per region**, where the regions are not the blocks and a region may straddle
+// a seam.
+//
+// * `RegionSumOp` reads a second array and emits one partial per block —
+//   `SeamFold::PerBlock`, because a partial is a function of its own block;
+// * `RegionMergeOp` folds every block's partials into the whole answer —
+//   `SeamFold::Unordered`, in `u64`, so the fold associates and the answer is
+//   the same however the volume was cut;
+// * `DriftingSumOp` is the same fold in `f64`, and it is here to be *caught*.
+//
+// The regions are a function of the global coordinate rather than of the data,
+// so a test can put a seam through one on purpose and know it did.
+
+/// Which region a global coordinate belongs to, on a lattice of `edge`-sized
+/// regions, flattened row-major over the volume.
+///
+/// A function of the coordinate alone: it does not depend on the block, so two
+/// decompositions agree about it by construction and any disagreement in the
+/// answer is the *fold*, which is what the probe is for.
+pub fn region_of(at: [usize; 3], edge: usize, volume: [usize; 3]) -> u64 {
+    let counts = [
+        volume[0].div_ceil(edge),
+        volume[1].div_ceil(edge),
+        volume[2].div_ceil(edge),
+    ];
+    let index = [at[0] / edge, at[1] / edge, at[2] / edge];
+    ((index[0] * counts[1] + index[1]) * counts[2] + index[2]) as u64
+}
+
+/// `(volume, second array) -> fragments`. One partial per region per block.
+///
+/// **The op the second-array support exists for**, in its smallest honest form.
+/// It declares [`crate::fragment::FragmentOp::source_inputs`] and reads its
+/// quantity out of *that* level, not out of the level the phase is handed —
+/// `reads_pixels()` is `false`, so a run of it moves exactly one array's worth
+/// of voxels and the counters say which array.
+///
+/// The payload is `[region, voxels, sum]` per region touched by this block's
+/// core, ascending by region, as `u64` words. **The sum is an integer**, which
+/// is the whole point: the values are read as `f64` and accumulated as `u64`, so
+/// the merge that adds two blocks' partials is adding integers and associates.
+/// A probe that accumulated in `f64` would be [`DriftingSumOp`], and it is here
+/// too so that the difference is demonstrated rather than asserted.
+///
+/// Only the block's **core** is counted, so every voxel is counted exactly once
+/// however wide a halo the plan granted.
+pub struct RegionSumOp {
+    name: &'static str,
+    level: usize,
+    edge: usize,
+    stream: String,
+    lifecycle: crate::sidecar::Lifecycle,
+}
+
+impl RegionSumOp {
+    pub fn new(
+        name: &'static str,
+        level: usize,
+        edge: usize,
+        stream: impl Into<String>,
+        lifecycle: crate::sidecar::Lifecycle,
+    ) -> Self {
+        Self {
+            name,
+            level,
+            edge,
+            stream: stream.into(),
+            lifecycle,
+        }
+    }
+
+    /// `(region, voxels, sum)` triples, ascending by region.
+    pub fn read(bytes: &[u8]) -> Result<Vec<(u64, u64, u64)>> {
+        let values = crate::fragment::unpack_u64(bytes)?;
+        if values.len() % 3 != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "a per-region partial is a whole number of triples; this one is {} word(s)",
+                values.len()
+            )));
+        }
+        Ok(values
+            .chunks_exact(3)
+            .map(|triple| (triple[0], triple[1], triple[2]))
+            .collect())
+    }
+}
+
+impl crate::fragment::FragmentOp for RegionSumOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<crate::op::SourceInput> {
+        vec![crate::op::SourceInput::voxelwise(self.level)]
+    }
+
+    fn seam_fold(&self) -> Option<crate::fragment::SeamFold> {
+        // A partial is a function of this block's core and of nothing else. The
+        // fold across the seam is the *merge*'s, and it declares its own.
+        Some(crate::fragment::SeamFold::PerBlock)
+    }
+
+    fn outputs(&self) -> Vec<crate::fragment::FragmentOutput> {
+        vec![crate::fragment::FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            crate::fragment::Coverage::EveryBlock,
+        )]
+    }
+
+    fn apply(&self, _at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
+        Err(Error::InvalidArgument(
+            "a per-region sum reads a second array and cannot be computed without it. It is \
+             applied through `apply_with`."
+                .to_string(),
+        ))
+    }
+
+    fn apply_with(
+        &self,
+        at: &crate::fragment::BlockView<'_>,
+        sources: crate::fragment::SourceBlocks<'_>,
+    ) -> Result<crate::fragment::BlockOutput> {
+        let volume = at.volume();
+        let offset = at.at.offset;
+        let mut totals: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        match sources.get(self.level)? {
+            crate::env::BlockBuf::Array(array) => {
+                let values = array.widened();
+                for (index, value) in values.indexed_iter() {
+                    let global = [
+                        offset[0] + index.0,
+                        offset[1] + index.1,
+                        offset[2] + index.2,
+                    ];
+                    if !holds(at.core, global) {
+                        continue;
+                    }
+                    let entry = totals
+                        .entry(region_of(global, self.edge, volume))
+                        .or_insert((0, 0));
+                    entry.0 += 1;
+                    entry.1 += *value as u64;
+                }
+            }
+            // A simulated run holds no array. The voxel counts are still exact,
+            // which is the part a data-free run can honestly assert; the sums
+            // are zero and say so by being zero.
+            crate::env::BlockBuf::Accounted { .. } => {
+                for i in 0..at.core.shape[0] {
+                    for j in 0..at.core.shape[1] {
+                        for k in 0..at.core.shape[2] {
+                            let global = [
+                                at.core.start[0] + i,
+                                at.core.start[1] + j,
+                                at.core.start[2] + k,
+                            ];
+                            totals
+                                .entry(region_of(global, self.edge, volume))
+                                .or_insert((0, 0))
+                                .0 += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut words = Vec::with_capacity(totals.len() * 3);
+        for (region, (voxels, sum)) in totals {
+            words.push(region);
+            words.push(voxels);
+            words.push(sum);
+        }
+        Ok(crate::fragment::BlockOutput::fragment(
+            self.stream.clone(),
+            crate::fragment::pack_u64(&words),
+        ))
+    }
+}
+
+/// Whether `at` is inside `region`.
+fn holds(region: &crate::region::Region, at: [usize; 3]) -> bool {
+    (0..3).all(|axis| {
+        at[axis] >= region.start[axis] && at[axis] < region.start[axis] + region.shape[axis]
+    })
+}
+
+/// `fragments -> fragments`. Every block's per-region partials, folded into the
+/// whole answer, **in `u64`**.
+///
+/// Declares a whole-lattice reach, so every block computes the same totals and
+/// any block's fragment is the answer — the same arrangement `ops/fill.rs` uses
+/// for a global merge, and the reason a fragment phase can end a run.
+///
+/// [`crate::fragment::SeamFold::Unordered`], which the executor checks by
+/// applying the block a second time with the neighbourhood reversed. Integer
+/// addition associates, so it passes; [`DriftingSumOp`] is the same op over
+/// `f64` and does not.
+pub struct RegionMergeOp {
+    name: &'static str,
+    input: String,
+    input_phase: usize,
+    lattice: [usize; 3],
+    stream: String,
+    lifecycle: crate::sidecar::Lifecycle,
+}
+
+impl RegionMergeOp {
+    pub fn new(
+        name: &'static str,
+        input: impl Into<String>,
+        input_phase: usize,
+        lattice: [usize; 3],
+        stream: impl Into<String>,
+        lifecycle: crate::sidecar::Lifecycle,
+    ) -> Self {
+        Self {
+            name,
+            input: input.into(),
+            input_phase,
+            lattice,
+            stream: stream.into(),
+            lifecycle,
+        }
+    }
+
+    /// `(region, voxels, sum)` triples, ascending by region. The same encoding
+    /// [`RegionSumOp`] writes, because a merge of partials is a partial.
+    pub fn read(bytes: &[u8]) -> Result<Vec<(u64, u64, u64)>> {
+        RegionSumOp::read(bytes)
+    }
+}
+
+impl crate::fragment::FragmentOp for RegionMergeOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn inputs(&self) -> Vec<crate::fragment::FragmentInput> {
+        vec![
+            crate::fragment::FragmentInput::own(self.input.clone(), self.input_phase)
+                .with_reach(self.lattice),
+        ]
+    }
+
+    fn seam_fold(&self) -> Option<crate::fragment::SeamFold> {
+        Some(crate::fragment::SeamFold::Unordered)
+    }
+
+    fn outputs(&self) -> Vec<crate::fragment::FragmentOutput> {
+        vec![crate::fragment::FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            crate::fragment::Coverage::EveryBlock,
+        )]
+    }
+
+    fn apply(&self, at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
+        let mut totals: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        for (_, bytes) in at.fragments(&self.input) {
+            for (region, voxels, sum) in RegionSumOp::read(bytes)? {
+                let entry = totals.entry(region).or_insert((0, 0));
+                entry.0 += voxels;
+                entry.1 += sum;
+            }
+        }
+        let mut words = Vec::with_capacity(totals.len() * 3);
+        for (region, (voxels, sum)) in totals {
+            words.push(region);
+            words.push(voxels);
+            words.push(sum);
+        }
+        Ok(crate::fragment::BlockOutput::fragment(
+            self.stream.clone(),
+            crate::fragment::pack_u64(&words),
+        ))
+    }
+}
+
+/// [`RegionMergeOp`]'s fold, in `f64`. **The op that must not pass silently.**
+///
+/// It sums the `sum` field of a [`BlockSummaryOp`] stream as a float, in the
+/// order the executor hands the fragments over. `f64` addition does not
+/// associate, so on three or more fragments with a wide magnitude gap the total
+/// depends on that order — and therefore on how the volume was cut, which is the
+/// decomposition-dependent answer `ops/detect.rs` refused to ship.
+///
+/// `fold` says which claim the instance makes, so one probe demonstrates both
+/// outcomes: with [`crate::fragment::SeamFold::Unordered`] the executor applies
+/// the block twice, sees different bytes and refuses the run by name; with
+/// [`crate::fragment::SeamFold::OrderDependent`] the run proceeds and the answer
+/// is a property of the plan — which is exactly what that variant forbids anyone
+/// from assuming it is not.
+pub struct DriftingSumOp {
+    name: &'static str,
+    input: String,
+    input_phase: usize,
+    lattice: [usize; 3],
+    stream: String,
+    lifecycle: crate::sidecar::Lifecycle,
+    fold: crate::fragment::SeamFold,
+}
+
+impl DriftingSumOp {
+    pub fn new(
+        name: &'static str,
+        input: impl Into<String>,
+        input_phase: usize,
+        lattice: [usize; 3],
+        stream: impl Into<String>,
+        lifecycle: crate::sidecar::Lifecycle,
+        fold: crate::fragment::SeamFold,
+    ) -> Self {
+        Self {
+            name,
+            input: input.into(),
+            input_phase,
+            lattice,
+            stream: stream.into(),
+            lifecycle,
+            fold,
+        }
+    }
+
+    /// The total, as it was accumulated.
+    pub fn read(bytes: &[u8]) -> Result<f64> {
+        let values = crate::fragment::unpack_u64(bytes)?;
+        if values.len() != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "a drifting sum is one word; this one is {}",
+                values.len()
+            )));
+        }
+        Ok(f64::from_bits(values[0]))
+    }
+}
+
+impl crate::fragment::FragmentOp for DriftingSumOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn inputs(&self) -> Vec<crate::fragment::FragmentInput> {
+        vec![
+            crate::fragment::FragmentInput::own(self.input.clone(), self.input_phase)
+                .with_reach(self.lattice),
+        ]
+    }
+
+    fn seam_fold(&self) -> Option<crate::fragment::SeamFold> {
+        Some(self.fold)
+    }
+
+    fn outputs(&self) -> Vec<crate::fragment::FragmentOutput> {
+        vec![crate::fragment::FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            crate::fragment::Coverage::EveryBlock,
+        )]
+    }
+
+    fn apply(&self, at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
+        let mut total = 0.0f64;
+        for (_, bytes) in at.fragments(&self.input) {
+            let (_, _, sum, _) = BlockSummaryOp::read(bytes)?;
+            total += sum;
+        }
+        Ok(crate::fragment::BlockOutput::fragment(
+            self.stream.clone(),
+            crate::fragment::pack_u64(&[total.to_bits()]),
+        ))
     }
 }
 

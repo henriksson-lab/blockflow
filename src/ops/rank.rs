@@ -48,6 +48,18 @@
 // `StructuringElement::from_size_stepped` — simply gathers fewer of them, and
 // every number this file derives from `element.len()` follows without a second
 // path: the cost below, and the rank a `median` constructor names.
+//
+// **And it is `offsets`, not `offsets_at`**, which is a statement about one
+// element and is made here rather than left to be discovered. A step counted
+// from `StepOrigin::ClippedStart` re-phases where the window is clipped at a low
+// face of the volume, and this file gathers the same offsets at every voxel — so
+// a rank filter over such an element computes the *anchored* window there, which
+// is a different set from the one the element describes. Honouring it would mean
+// regenerating the offsets per voxel, which is a cost every unstepped element
+// would carry the branch for; the element's declared reach already covers the
+// wider phase, so the halo is right and only the membership is the anchored one.
+// `tests/stepped_element.rs` pins that gap by measurement so that it cannot
+// become an unexamined assumption in either direction.
 
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 

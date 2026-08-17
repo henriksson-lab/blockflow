@@ -55,11 +55,13 @@ use crate::tiling::boxes_tile_exactly;
 
 use super::decomposition::{
     check_block_constraints, check_dtypes, check_output_shapes, check_source_levels,
-    compute_per_voxel, constraint_for, groups_for, is_planning_barrier, price_phase,
-    region_to_ranges, splittable_axes, Constraints, Decomposition, PhaseDecomposition, Visibility,
+    compute_per_voxel, constraint_for, cuttable_axes, groups_for, is_planning_barrier, price_phase,
+    region_to_ranges, Constraints, Decomposition, PhaseDecomposition, Visibility,
 };
 use super::env::{block_shape, BlockBuf, Environment};
-use super::fragment::{check_phase_work, neighbourhood, BlockView, PhaseWork};
+use super::fragment::{
+    check_phase_work, neighbourhood, BlockOutput, BlockView, PhaseWork, SeamFold, SourceBlocks,
+};
 use super::geometry::{chunks_touched, BlockGrid};
 use super::graph::{Task, TaskGraph};
 use super::iterate::{IterativeOp, Operand};
@@ -1077,6 +1079,38 @@ fn run_task(
     })
 }
 
+/// What differs between two applications of one block, or `None` if nothing
+/// does.
+///
+/// Compares what the executor would go on to *store*: the fragments, stream by
+/// stream and byte for byte, and the pixel block when the run holds one. A
+/// simulated run holds no array, so the pixel comparison is skipped there rather
+/// than passing vacuously; the fragments are where a partial accumulator lives
+/// and they are compared in both kinds of run.
+fn order_disagreement(first: &BlockOutput, second: &BlockOutput) -> Option<String> {
+    if first.fragments.len() != second.fragments.len() {
+        return Some(format!(
+            "{} fragment(s) rather than {}",
+            second.fragments.len(),
+            first.fragments.len()
+        ));
+    }
+    for ((stream, bytes), (other, other_bytes)) in first.fragments.iter().zip(&second.fragments) {
+        if stream != other {
+            return Some(format!("stream {other:?} rather than {stream:?}"));
+        }
+        if bytes != other_bytes {
+            return Some(format!("different bytes for stream {stream:?}"));
+        }
+    }
+    match (&first.pixels, &second.pixels) {
+        (Some(BlockBuf::Array(one)), Some(BlockBuf::Array(two))) if one != two => {
+            Some("a different pixel block".to_string())
+        }
+        _ => None,
+    }
+}
+
 /// One `(block, phase)` of a phase that runs a fragment op.
 ///
 /// The shape of the body is deliberately the same as `run_task`'s — read, work,
@@ -1136,6 +1170,37 @@ fn run_fragment_task(
         None
     };
 
+    // The levels this op declared besides the one it is handed, at the block's
+    // **own fetch region** — the same arrangement `run_task` has for a chain's
+    // source leaves, through the same event, so a fragment phase that reads two
+    // arrays reports two arrays' worth of bytes. A second arm that cost nothing
+    // in the counters would make every measurement of this feature a measurement
+    // of the wrong plan.
+    //
+    // Read whether or not the op reads its own level: `reads_pixels` is about
+    // level `p` and `source_inputs` is about every other level, so an op that
+    // consults a stored array without wanting its own input pays for one array
+    // rather than two.
+    let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_levels.len());
+    for &level in &phase.source_levels {
+        let started = Instant::now();
+        let stored = env.read(level, fetch)?;
+        let read_ns = started.elapsed().as_nanos() as u64;
+        events.emit(Event::RegionRead {
+            source: format!("level {level}"),
+            level,
+            index: Some(task.index),
+            region: fetch.clone(),
+            voxels: fetch.voxels(),
+            bytes: fetch.voxels() as u64 * decomposition.dtype_at(level).size_of() as u64,
+            chunks: chunks_touched(fetch, &env.chunk_shape()),
+            duration_ns: read_ns,
+        });
+        sources.push((level, stored));
+    }
+    let borrowed: Vec<(usize, &BlockBuf)> =
+        sources.iter().map(|(level, buf)| (*level, buf)).collect();
+
     let counts = phase.grid.blocks_per_axis();
     let mut wanted = BTreeMap::new();
     let mut gathered = BTreeMap::new();
@@ -1156,6 +1221,46 @@ fn run_fragment_task(
         wanted.insert(input.stream.clone(), (input.phase, blocks));
     }
 
+    // **`SeamFold::Unordered` is checked, not believed.** The claim is that this
+    // block's output is a function of the *set* of fragments it was handed and
+    // not of their order, so the way to test it is to hand them over twice in
+    // opposite orders and compare the bytes. An `f64` accumulation over three or
+    // more fragments fails it, which is the hazard the variant exists to catch;
+    // an integer one cannot.
+    //
+    // Skipped when the neighbourhood holds at most one fragment, because a
+    // one-element sequence has no order and the second application would cost a
+    // block's work to assert nothing.
+    //
+    // The reversal is applied to `wanted` as well as to `gathered`, so it
+    // reaches an op that declared `gathers() == false` and pulls with
+    // `BlockView::stream_fragments` — that op pays a second pass of sidecar
+    // reads, and the counters show it.
+    let ordered: usize = wanted.values().map(|(_, blocks)| blocks.len()).sum();
+    let verify_order = op.seam_fold() == Some(SeamFold::Unordered) && ordered > 1;
+    let (reversed_wanted, reversed_gathered) = if verify_order {
+        (
+            wanted
+                .iter()
+                .map(|(stream, (phase, blocks))| {
+                    let mut blocks = blocks.clone();
+                    blocks.reverse();
+                    (stream.clone(), (*phase, blocks))
+                })
+                .collect::<BTreeMap<_, _>>(),
+            gathered
+                .iter()
+                .map(|(stream, found)| {
+                    let mut found = found.clone();
+                    found.reverse();
+                    (stream.clone(), found)
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )
+    } else {
+        (BTreeMap::new(), BTreeMap::new())
+    };
+
     let at = Anchor::of_region(fetch, decomposition.volume_at(task.phase))?;
     let produced = {
         let view = BlockView::new(
@@ -1165,15 +1270,73 @@ fn run_fragment_task(
             &task.geometry.core,
             read,
             &task.geometry.valid,
-            at,
+            at.clone(),
             decomposition.dtype_at(task.phase + 1),
             env,
             pixels.as_ref(),
             wanted,
             gathered,
         );
-        op.apply(&view)?
+        op.apply_with(&view, SourceBlocks::new(&borrowed))?
     };
+    if verify_order {
+        let again = {
+            let view = BlockView::new(
+                task.phase,
+                task.index,
+                &phase.grid,
+                &task.geometry.core,
+                read,
+                &task.geometry.valid,
+                at,
+                decomposition.dtype_at(task.phase + 1),
+                env,
+                pixels.as_ref(),
+                reversed_wanted,
+                reversed_gathered,
+            );
+            op.apply_with(&view, SourceBlocks::new(&borrowed))?
+        };
+        let disagreement = order_disagreement(&produced, &again);
+        // Everything the second application allocated, and everything this block
+        // holds, released before the refusal rather than after it: a run that
+        // ends here still has to leave the residency counters meaning what they
+        // say.
+        if let Some(buf) = &again.pixels {
+            env.release(buf);
+        }
+        if disagreement.is_some() {
+            for (_, stored) in &sources {
+                env.release(stored);
+            }
+            if let Some(buf) = &pixels {
+                env.release(buf);
+            }
+            if let Some(buf) = &produced.pixels {
+                env.release(buf);
+            }
+        }
+        if let Some(what) = disagreement {
+            return Err(Error::InvalidArgument(format!(
+                "fragment op {:?} declares `SeamFold::Unordered` — that its output is a \
+                 function of the set of fragments it is handed and not of their order — and \
+                 block {:?} of phase {} produced {what} when the same {ordered} fragment(s) \
+                 were handed over in the opposite order. That is a non-associative \
+                 accumulator, and `f64` addition is the one that exists: a region straddling \
+                 a seam would then be summed differently depending on how the volume was cut, \
+                 so the answer is a property of the plan rather than of the data. Accumulate \
+                 in a type where the combine associates — an integer or a fixed-point sum — \
+                 or declare `SeamFold::OrderDependent` and give up decomposition invariance \
+                 out loud.",
+                op.name(),
+                task.index,
+                task.phase
+            )));
+        }
+    }
+    for (_, stored) in &sources {
+        env.release(stored);
+    }
     if let Some(buf) = &pixels {
         env.release(buf);
     }
@@ -1593,7 +1756,10 @@ pub fn planned_block(
     let mut candidates = constraints.block_candidates.clone();
     candidates.sort_unstable_by(|a, b| b.cmp(a));
     for edge in candidates {
-        let axes = splittable_axes(&constraints.split_axes, &reach, volume);
+        // The same floor `Greedy` applies, so that a branch is priced at the
+        // block the run will really use rather than at one the planner would
+        // have refused to cut.
+        let axes = cuttable_axes(&constraints.split_axes, &reach, volume, edge);
         let Ok(grid) = BlockGrid::along(volume, &axes, edge) else {
             continue;
         };
@@ -2174,11 +2340,11 @@ impl PhasePricer<'_> {
                 Err(err) => note = Some(err.to_string()),
             }
         } else {
-            // NOTE: `cuttable_axes` — the reach-derived floor — is deliberately
-            // **not** called here. See its own docs for what it would change and
-            // why that is a decision rather than a fix.
-            let axes = splittable_axes(&self.constraints.split_axes, &reach, self.volume);
             for &edge in &self.constraints.block_candidates {
+                // The reach-derived floor, per candidate: an axis is cut only
+                // where the cut narrows what a block reads, which depends on the
+                // edge and so cannot be hoisted out of this loop.
+                let axes = cuttable_axes(&self.constraints.split_axes, &reach, self.volume, edge);
                 let grid = match BlockGrid::along(self.volume, &axes, edge) {
                     Ok(grid) => grid,
                     Err(_) => continue,
@@ -2621,88 +2787,17 @@ impl Strategy for Greedy {
 
         let mut phases = Vec::with_capacity(groups.len());
         for (position, group) in groups.iter().enumerate() {
-            // `compute` is dropped here and re-asked per candidate grid; see
-            // `decomposition::compute_per_voxel`.
-            let (reach, _compute, names, orders) =
-                super::decomposition::summarise_slots(&slots, group, volume)?;
             let is_materialised = position + 1 < groups.len();
-            let mandated = constraint_for(&slots, group, volume)?;
-            let mut grid = None;
-            let mut halo = reach.clone();
-            if let Some(constraint) = &mandated {
-                // Mandated, so there is nothing to choose between; the budget
-                // still binds. See `Enumerating` for why the candidate list is
-                // replaced rather than filtered.
-                let (candidate, window) = constraint.lattice(volume, &reach)?.ok_or_else(|| {
-                    Error::InvalidArgument(format!(
-                        "greedy: phase {position} mandates {constraint:?}, which no block grid \
-                         produces — a grid's cores are `index * block`, evenly strided and \
-                         disjoint. A plan for it has to state each block's fetch region \
-                         explicitly, which this strategy does not do."
-                    ))
-                })?;
-                halo = window;
-                let cost = price_phase(
-                    &candidate,
-                    &reach,
-                    compute_per_voxel(&slots, group, candidate.block()),
-                    orders.len(),
-                    is_materialised,
-                    bytes,
-                    &constraints.model,
-                    constraints.model.materialise_cost_per_voxel,
-                );
-                let fits = constraints.budget_bytes.is_none_or(|budget| {
-                    cost.working_set_bytes_per_block
-                        * constraints.expected_concurrency.max(1) as f64
-                        <= budget as f64
-                });
-                if fits {
-                    grid = Some(candidate);
-                }
-            } else {
-                // largest candidate that fits
-                let mut candidates = constraints.block_candidates.clone();
-                candidates.sort_unstable_by(|a, b| b.cmp(a));
-                // As in `Enumerating`: the reach-derived floor is not wired.
-                let axes = splittable_axes(&constraints.split_axes, &reach, volume);
-                for edge in candidates {
-                    let Ok(candidate) = BlockGrid::along(volume, &axes, edge) else {
-                        continue;
-                    };
-                    let cost = price_phase(
-                        &candidate,
-                        &reach,
-                        compute_per_voxel(&slots, group, candidate.block()),
-                        orders.len(),
-                        is_materialised,
-                        bytes,
-                        &constraints.model,
-                        constraints.model.materialise_cost_per_voxel,
-                    );
-                    let fits = constraints.budget_bytes.is_none_or(|budget| {
-                        cost.working_set_bytes_per_block
-                            * constraints.expected_concurrency.max(1) as f64
-                            <= budget as f64
-                    });
-                    if fits {
-                        grid = Some(candidate);
-                        break;
-                    }
-                }
-            }
-            let grid = grid.ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "greedy: no block candidate in {:?} fits the {:?} byte budget for phase \
-                     {position} (reach {reach})",
-                    constraints.block_candidates, constraints.budget_bytes
-                ))
-            })?;
-            let phase = PhaseDecomposition::derive(group.clone(), names, reach, halo, grid);
-            if let Some(constraint) = &mandated {
-                constraint.check(&phase.blocks, &format!("greedy: phase {position}"))?;
-            }
-            phases.push(phase);
+            phases.push(phase_for_group(
+                &slots,
+                group,
+                volume,
+                bytes,
+                is_materialised,
+                constraints,
+                "greedy",
+                position,
+            )?);
         }
 
         let mut decomposition = Decomposition {
@@ -2725,6 +2820,273 @@ impl Strategy for Greedy {
             prefetch_depth: 2,
             keep_levels: BTreeSet::new(),
         }
+    }
+}
+
+/// The phase a contiguous run of slots gets: its reach, its halo, and the
+/// largest block grid the budget admits — or the one a mandate names.
+///
+/// Extracted because [`Greedy`] and [`Materialising`] differ in *where the cuts
+/// go* and in nothing else once a group is in hand. Keeping one copy is not
+/// tidiness: the budget test, the reach-derived floor and the mandate's lattice
+/// are three places a second copy could drift, and a planner that prices a
+/// candidate differently from its sibling makes the two incomparable, which is
+/// exactly what a baseline exists to prevent.
+///
+/// `who` and `position` appear only in refusals, so each caller's message reads
+/// as its own rather than as a shared internal's.
+#[allow(clippy::too_many_arguments)]
+fn phase_for_group(
+    slots: &[&Chain],
+    group: &[usize],
+    volume: [usize; 3],
+    bytes: f64,
+    is_materialised: bool,
+    constraints: &Constraints,
+    who: &str,
+    position: usize,
+) -> Result<PhaseDecomposition> {
+    // `compute` is dropped here and re-asked per candidate grid; see
+    // `decomposition::compute_per_voxel`.
+    let (reach, _compute, names, orders) =
+        super::decomposition::summarise_slots(slots, group, volume)?;
+    let mandated = constraint_for(slots, group, volume)?;
+    let mut grid = None;
+    let mut halo = reach.clone();
+    if let Some(constraint) = &mandated {
+        // Mandated, so there is nothing to choose between; the budget still
+        // binds. See `Enumerating` for why the candidate list is replaced
+        // rather than filtered.
+        let (candidate, window) = constraint.lattice(volume, &reach)?.ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "{who}: phase {position} mandates {constraint:?}, which no block grid produces — \
+                 a grid's cores are `index * block`, evenly strided and disjoint. A plan for it \
+                 has to state each block's fetch region explicitly, which this strategy does not \
+                 do."
+            ))
+        })?;
+        halo = window;
+        let cost = price_phase(
+            &candidate,
+            &reach,
+            compute_per_voxel(slots, group, candidate.block()),
+            orders.len(),
+            is_materialised,
+            bytes,
+            &constraints.model,
+            constraints.model.materialise_cost_per_voxel,
+        );
+        let fits = constraints.budget_bytes.is_none_or(|budget| {
+            cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
+                <= budget as f64
+        });
+        if fits {
+            grid = Some(candidate);
+        }
+    } else {
+        // largest candidate that fits
+        let mut candidates = constraints.block_candidates.clone();
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        for edge in candidates {
+            // As in `Enumerating`: the reach-derived floor, asked per candidate
+            // because it is a question about this edge.
+            let axes = cuttable_axes(&constraints.split_axes, &reach, volume, edge);
+            let Ok(candidate) = BlockGrid::along(volume, &axes, edge) else {
+                continue;
+            };
+            let cost = price_phase(
+                &candidate,
+                &reach,
+                compute_per_voxel(slots, group, candidate.block()),
+                orders.len(),
+                is_materialised,
+                bytes,
+                &constraints.model,
+                constraints.model.materialise_cost_per_voxel,
+            );
+            let fits = constraints.budget_bytes.is_none_or(|budget| {
+                cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
+                    <= budget as f64
+            });
+            if fits {
+                grid = Some(candidate);
+                break;
+            }
+        }
+    }
+    let grid = grid.ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "{who}: no block candidate in {:?} fits the {:?} byte budget for phase {position} \
+             (reach {reach})",
+            constraints.block_candidates, constraints.budget_bytes
+        ))
+    })?;
+    let phase = PhaseDecomposition::derive(group.to_vec(), names, reach, halo, grid);
+    if let Some(constraint) = &mandated {
+        constraint.check(&phase.blocks, &format!("{who}: phase {position}"))?;
+    }
+    Ok(phase)
+}
+
+/// One phase per slot: materialise everything, fuse nothing.
+///
+/// The missing corner of the strategy table. [`Trivial`] is maximally *fused*
+/// and unblocked — one block, one phase — so it has no halo to re-read and
+/// nothing to time separately. [`Greedy`] and [`Enumerating`] both fuse, by
+/// heuristic and by search. Nothing ran the opposite extreme with real blocking
+/// until this, and it is worth having for three reasons at once.
+///
+/// **1. It is the pessimistic baseline.** With nothing measured to trust,
+/// materialising every stage is the conservative plan: no fusion, so no halo
+/// recomputation beyond each op's own reach, and every intermediate paid for in
+/// full. A fused plan that cannot beat it has bought nothing.
+///
+/// **2. It is the measurement instrument, which is the main point.** Per-op cost
+/// attribution has exactly one obstacle: `Chain::Parallel` is a single `apply`
+/// and a fused `Sequence` hides its members inside one phase, so *the measurable
+/// unit is the slot*. Under this strategy every op **is** its own phase, so
+/// `Event::OpApplied` times each one on its own and `statistics::Recorder`'s
+/// per-slot attribution is exact — with no fusion that has to be broken in order
+/// to measure it. That is how [`crate::decomposition::CostModel`] gets
+/// *calibrated* rather than seeded.
+///
+/// **3. It is a free incumbent.** Its cost is `O(n)` in the slots — one phase
+/// each, one candidate sweep each — and it is feasible whenever anything is, so
+/// [`Materialising::incumbent_cost`] bounds a future pruned search from above
+/// before that search starts. A partial partition already dearer than this
+/// cannot be completed into a better plan.
+///
+/// **Why it is always feasible when anything is.** Fusing slots into one phase
+/// can only *grow* a phase's reach, and a grown reach can only shrink the set of
+/// cuttable axes and grow the resident set at a given block edge. So if the
+/// singleton phase for slot `i` fits no candidate, no phase containing slot `i`
+/// fits one either, and no partition at all is affordable. The refusal this
+/// strategy gives is therefore the honest one and not an artefact of refusing to
+/// fuse.
+///
+/// **Barriers fall out.** A full-reach op is a planning barrier and must be
+/// alone in its phase; one phase per slot satisfies that without a special case,
+/// and `barriers_do_not_merge_with_a_neighbour` in `tests/materialising.rs`
+/// asserts that it is not merely an accident of the group-building loop.
+///
+/// **What it is not.** It is not a strategy to run production work with — it
+/// writes every intermediate to a level and reads it back — and it does not
+/// claim to be cheap. It claims to be *legible*.
+#[derive(Debug, Clone)]
+pub struct Materialising {
+    pub concurrency: usize,
+    pub priority: SchedulePriority,
+}
+
+impl Default for Materialising {
+    /// **Serial and phase-major, and that is a measurement decision.** Two
+    /// blocks in flight would overlap two ops' wall clocks, and the per-slot
+    /// nanoseconds `Event::OpApplied` reports would then sum to more than the
+    /// run took. At concurrency 1 the sum is a partition of the run's time and
+    /// the accounted fraction means what it says. A caller wanting the baseline
+    /// as a *plan* rather than as an instrument raises `concurrency` and loses
+    /// nothing but the attribution.
+    fn default() -> Self {
+        Self {
+            concurrency: 1,
+            priority: SchedulePriority::PhaseMajor,
+        }
+    }
+}
+
+impl Strategy for Materialising {
+    fn name(&self) -> &'static str {
+        "materialising"
+    }
+
+    fn decompose(&self, workflow: &Workflow, constraints: &Constraints) -> Result<Decomposition> {
+        let slots = workflow.chain.slots();
+        if slots.is_empty() {
+            return Err(Error::InvalidArgument(
+                "materialising: the chain has no ops".to_string(),
+            ));
+        }
+        let volume = workflow.shape;
+
+        let mut phases = Vec::with_capacity(slots.len());
+        // The element type the phase **reads**, folded slot by slot exactly as
+        // `Decomposition::declare_dtypes` folds it and as
+        // `decomposition::predicted_cost` reads it back with `dtype_at`.
+        //
+        // `Greedy` and `Enumerating` both hand `workflow.dtype` to every phase,
+        // which prices a chain that binarizes halfway through as if the second
+        // half still moved 8 bytes a voxel. That is one of the mispricings this
+        // strategy exists to expose, and it is fixed *here* rather than in
+        // `price_phase` because it is an argument a planner chooses, not
+        // arithmetic the pricer does. One phase per slot is also where it bites
+        // hardest: every dtype change is a phase boundary, so there is no fusion
+        // hiding the discrepancy.
+        //
+        // It moves no voxel — `bytes` reaches only `working_set_bytes_per_block`,
+        // which is a budget test.
+        let mut reads = workflow.dtype;
+        for position in 0..slots.len() {
+            // Every phase but the last writes an intermediate. That is the whole
+            // of "materialise everything": the test is the same one
+            // `predicted_cost` makes, applied to a partition of singletons.
+            let is_materialised = position + 1 < slots.len();
+            phases.push(phase_for_group(
+                &slots,
+                &[position],
+                volume,
+                reads.size_of() as f64,
+                is_materialised,
+                constraints,
+                "materialising",
+                position,
+            )?);
+            reads = slots[position].produces(reads)?;
+        }
+
+        let mut decomposition = Decomposition {
+            volume,
+            dtype: workflow.dtype,
+            phases,
+            chain_reach: workflow.chain.reach3(&volume),
+        };
+        decomposition.declare_dtypes(&workflow.chain)?;
+        decomposition.declare_source_levels(&workflow.chain)?;
+        decomposition.check()?;
+        Ok(decomposition)
+    }
+
+    fn hints(&self, workflow: &Workflow, decomposition: &Decomposition) -> Hints {
+        Hints {
+            visit_order: consensus_order(workflow, decomposition),
+            priority: self.priority,
+            concurrency: self.concurrency,
+            prefetch_depth: 1,
+            keep_levels: BTreeSet::new(),
+        }
+    }
+}
+
+impl Materialising {
+    /// What the fully materialised plan costs under `constraints.model`.
+    ///
+    /// **The incumbent bound, and it is free.** A branch-and-bound search over
+    /// partitions needs an upper bound to prune against before it has explored
+    /// anything, and this is one that is always available and always feasible —
+    /// see the type's note on why refusing here means refusing everywhere. A
+    /// partial partition whose priced prefix already exceeds this cannot be
+    /// completed into a plan worth having.
+    ///
+    /// `O(n)` in the slots: one `phase_for_group` per slot, each a sweep over a
+    /// candidate list that `Constraints` documents as short. No partition is
+    /// enumerated and no table is built.
+    ///
+    /// It is deliberately **not** cached on the type. The cost is a function of
+    /// the workflow and the constraints, neither of which this value holds, and a
+    /// planner that memoised against the wrong one would be a planner whose
+    /// answer depended on its history.
+    pub fn incumbent_cost(&self, workflow: &Workflow, constraints: &Constraints) -> Result<f64> {
+        let decomposition = self.decompose(workflow, constraints)?;
+        super::decomposition::predicted_cost(&workflow.chain, &decomposition, &constraints.model)
     }
 }
 
@@ -2859,13 +3221,13 @@ mod block_floor_tests {
         );
     }
 
-    /// What the floor would buy, measured on the two plans it chooses between.
+    /// What the floor buys, measured on the two plans it chooses between.
     ///
-    /// **Not asserted through a planner**, because the floor is not wired into
-    /// one; see `cuttable_axes`. What is asserted is the arithmetic the decision
-    /// would rest on, so that whoever takes that decision has the number rather
-    /// than the argument: 336 blocks reading **48.9x** the volume, against six
-    /// reading 1.125x of it, for the same answer.
+    /// The arithmetic underneath
+    /// `both_planners_take_the_measured_case_from_336_blocks_to_6`, kept separate
+    /// from it so that a planner change and a floor change fail different tests:
+    /// 336 blocks reading **48.9x** the volume, against six reading it once, for
+    /// the same answer.
     ///
     /// The figure is `forme.md`'s *touched voxels / volume voxels* — the
     /// distance from `1.0` being the cost of the decomposition — taken from
@@ -2873,7 +3235,7 @@ mod block_floor_tests {
     /// than the model's infinite-grid redundancy. 48.9 rather than 336 because
     /// axis 2's reach is zero, so the one axis a cut does narrow is narrowed.
     #[test]
-    fn the_floor_would_take_the_amplification_from_49_to_1_125() {
+    fn the_floor_takes_the_amplification_from_49_to_1() {
         let reach = Reach::from(RADIUS);
         let phase = |axes: &[usize], edge: usize| {
             let plan = Decomposition {
@@ -2900,13 +3262,18 @@ mod block_floor_tests {
 
         let (blocks, amplified) = phase(&cuttable_axes(&[0, 1, 2], &reach, VOLUME, 3), 3);
         assert_eq!(blocks, 6);
-        assert!(amplified < 1.2, "{amplified}");
+        // exactly once: the one axis still cut carries no reach, so there is no
+        // halo left to re-read. The `1.125` the motivating note recorded was
+        // never asserted and does not reproduce.
+        assert_eq!(amplified, 1.0);
     }
 
     /// **And it changes no voxel.** The floored plan, the unfloored one it
     /// replaced, and the single-block oracle all produce the same volume, byte
     /// for byte. A block grid is how the answer is cut up, never what it is —
-    /// which is what makes the floor a cost decision that is safe to take.
+    /// which is what makes the floor a cost decision that is safe to take. The
+    /// same claim through the planners themselves is
+    /// `neither_planner_moved_a_voxel_by_taking_the_floor`.
     #[test]
     fn the_floor_moves_the_grid_and_not_the_answer() {
         let workflow = Workflow::new(Chain::op(WindowSumOp::new("w", RADIUS)), VOLUME, Dtype::F64);
@@ -2938,12 +3305,12 @@ mod block_floor_tests {
         assert_eq!(
             run(&plan(&splittable_axes(&[0, 1, 2], &reach, VOLUME))),
             oracle,
-            "the 336-block plan the floor would remove"
+            "the 336-block plan the floor removes"
         );
         assert_eq!(
             run(&plan(&cuttable_axes(&[0, 1, 2], &reach, VOLUME, 3))),
             oracle,
-            "the plan the floor would leave"
+            "the plan the floor leaves"
         );
     }
 
@@ -2972,6 +3339,219 @@ mod block_floor_tests {
                 "edge {edge}: the floor raised the resident set"
             );
         }
+    }
+
+    // ------------------------------------------------ through the planners --
+
+    /// The floor, through the two planners that now call it.
+    ///
+    /// The measured case at the edge it was measured at: both searches used to
+    /// offer 336 blocks reading **48.9x** the volume and now offer 6 reading it
+    /// **once**, for the same answer. The 336-block grid is still constructed
+    /// here, from `splittable_axes`, so the comparison is the two plans and not
+    /// two recollections.
+    ///
+    /// One recorded figure is corrected in passing: the note that motivated this
+    /// put the floored plan at `1.125x`. It is exactly `1.0` — axis 2 carries no
+    /// reach at all, so the one axis still cut has no halo to re-read, and the
+    /// only assertion that had been made on it was `< 1.2`.
+    #[test]
+    fn both_planners_take_the_measured_case_from_336_blocks_to_6() {
+        let workflow = Workflow::new(Chain::op(WindowSumOp::new("w", RADIUS)), VOLUME, Dtype::F64);
+        let constraints = Constraints {
+            budget_bytes: None,
+            expected_concurrency: 1,
+            model: CostModel::default(),
+            block_candidates: vec![3],
+            split_axes: vec![0, 1, 2],
+        };
+        let reach = Reach::from(RADIUS);
+        let unfloored = Decomposition {
+            volume: VOLUME,
+            dtype: Dtype::F64,
+            phases: vec![PhaseDecomposition::derive(
+                vec![0],
+                vec!["w".to_string()],
+                reach.clone(),
+                reach.clone(),
+                BlockGrid::along(VOLUME, &splittable_axes(&[0, 1, 2], &reach, VOLUME), 3).unwrap(),
+            )],
+            chain_reach: RADIUS,
+        };
+        assert_eq!(unfloored.phases[0].grid.n_blocks(), 336);
+        assert_eq!(amplification(&unfloored), 48.9375);
+
+        for (name, plan) in [
+            (
+                "enumerating",
+                Enumerating::default()
+                    .decompose(&workflow, &constraints)
+                    .unwrap(),
+            ),
+            (
+                "greedy",
+                Greedy::default()
+                    .decompose(&workflow, &constraints)
+                    .unwrap(),
+            ),
+        ] {
+            assert_eq!(plan.phases[0].grid.block(), [24, 20, 3], "{name}");
+            assert_eq!(plan.phases[0].grid.n_blocks(), 6, "{name}");
+            assert_eq!(amplification(&plan), 1.0, "{name}");
+            plan.check().unwrap();
+        }
+    }
+
+    /// **And the planners' own plans compute the same volume.** The grid moved,
+    /// so this is the assertion that matters: the floored plan, the 336-block one
+    /// it replaced and the single-block oracle agree byte for byte.
+    #[test]
+    fn neither_planner_moved_a_voxel_by_taking_the_floor() {
+        let workflow = Workflow::new(Chain::op(WindowSumOp::new("w", RADIUS)), VOLUME, Dtype::F64);
+        let input = ramp(VOLUME);
+        let run = |plan: &Decomposition| -> Voxels {
+            let env = ArrayEnvironment::for_decomposition(input.clone(), plan, [4, 4, 4]).unwrap();
+            execute("floor", &workflow, plan, &Hints::default(), &env).unwrap();
+            env.level(plan.n_phases())
+        };
+        let oracle = run(&Trivial
+            .decompose(&workflow, &Constraints::default())
+            .unwrap());
+        let constraints = Constraints {
+            budget_bytes: None,
+            expected_concurrency: 1,
+            model: CostModel::default(),
+            block_candidates: vec![3],
+            split_axes: vec![0, 1, 2],
+        };
+        assert_eq!(
+            run(&Enumerating::default()
+                .decompose(&workflow, &constraints)
+                .unwrap()),
+            oracle
+        );
+        assert_eq!(
+            run(&Greedy::default()
+                .decompose(&workflow, &constraints)
+                .unwrap()),
+            oracle
+        );
+    }
+
+    /// **The floor is not the "large means full" rule the barrier predicate was
+    /// measured against**, and the way to show it is to run it over the chain
+    /// that measurement was taken on.
+    ///
+    /// `docs/design/GRAPH_MIGRATION.md` §6.5.1 tabulates seven merge steps: four
+    /// reduce over the whole volume, two reach a single voxel, and one is
+    /// unbounded. `reaches_whole_axis` is an exact comparison rather than a
+    /// threshold because of them. The floor changes **nothing** on any of the
+    /// seven, and for two separate reasons that are worth keeping apart:
+    ///
+    /// * on the five whole-volume steps `splittable_axes` has already taken the
+    ///   axis away, so there is nothing left for the floor to refuse;
+    /// * on the two 1-voxel steps `edge + 1 + 1 < extent` at every candidate that
+    ///   cuts anything at all, so every axis stays.
+    ///
+    /// So the earlier argument does not defeat this one by measurement either,
+    /// and not only by the difference between segmenting and cutting.
+    #[test]
+    fn the_floor_changes_nothing_on_the_chain_the_barrier_rule_was_measured_on() {
+        let volume = [512usize, 512, 256];
+        let steps: [(&str, Reach); 7] = [
+            ("prefix_sum", Reach::all()),
+            ("publish_shells", Reach::symmetric([1, 1, 1])),
+            ("prefix_sum_kept", Reach::all()),
+            ("kept_shells", Reach::symmetric([1, 1, 1])),
+            ("centre_id_of", Reach::all()),
+            ("join_fragments", Reach::all()),
+            ("coordinate_gather", Reach::all()),
+        ];
+        for (name, reach) in steps {
+            for edge in [16usize, 32, 64, 128] {
+                assert_eq!(
+                    cuttable_axes(&[0, 1, 2], &reach, volume, edge),
+                    splittable_axes(&[0, 1, 2], &reach, volume),
+                    "{name} at edge {edge}: the floor took an axis the barrier rule left"
+                );
+            }
+        }
+    }
+
+    /// **The partition survives the floor, and it is the pricing that saves it.**
+    ///
+    /// The floor turns a near-full-reach phase into a single block. Left with the
+    /// clamp discount that block prices at redundancy `1.0` — cheaper than any
+    /// phase that is still cut — and the search fuses the whole chain into it:
+    /// seven slots, one phase, one block over the volume, which is the plan with
+    /// no parallelism and the largest resident set there is. Charging it on the
+    /// infinite grid instead gives back the three phases the chain had before the
+    /// floor, with the flanking runs still cut into blocks.
+    ///
+    /// Both halves are asserted: the partition, and the price that produces it.
+    /// The discount would be `1.0` and the charge is strictly above it.
+    #[test]
+    fn the_partition_survives_the_floor_because_the_dropped_axis_is_still_charged() {
+        use crate::probes::IdentityOp;
+        let volume = [4096usize, 4, 4];
+        let noop = |name: &'static str| Chain::op(IdentityOp::new(name, [0, 0, 0]).with_cost(1.0));
+        let chain = Chain::sequence(vec![
+            noop("b0"),
+            noop("b1"),
+            noop("b2"),
+            Chain::op(IdentityOp::new("wide", [volume[0] - 1, 0, 0]).with_cost(1.0)),
+            noop("a0"),
+            noop("a1"),
+            noop("a2"),
+        ]);
+        let constraints = Constraints {
+            budget_bytes: None,
+            expected_concurrency: 1,
+            model: CostModel::default(),
+            block_candidates: vec![1024],
+            split_axes: vec![0],
+        };
+        let plan = Enumerating::default()
+            .decompose(&Workflow::new(chain, volume, Dtype::F64), &constraints)
+            .unwrap();
+        assert_eq!(
+            plan.phases
+                .iter()
+                .map(|phase| phase.slots.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 1, 2], vec![3], vec![4, 5, 6]],
+            "the chain fused into the phase the floor left uncut"
+        );
+        // the flanking phases keep the grid they had: only the phase whose reach
+        // denies the cut loses it
+        assert_eq!(plan.phases[0].grid.n_blocks(), 4);
+        assert_eq!(plan.phases[1].grid.n_blocks(), 1);
+        assert_eq!(plan.phases[2].grid.n_blocks(), 4);
+
+        // and the price that keeps it there, in the model's own number
+        let single = BlockGrid::along(volume, &[], 1024).unwrap();
+        assert_eq!(single.n_blocks(), 1);
+        let charged = price_phase(
+            &single,
+            &Reach::symmetric([volume[0] - 1, 0, 0]),
+            1.0,
+            1,
+            false,
+            8.0,
+            &CostModel::default(),
+            1.0,
+        )
+        .redundancy;
+        assert!(
+            charged > 1.0,
+            "the axis the floor dropped was given the clamp discount: {charged}"
+        );
+        // a bounded reach is charged strictly under a barrier's 3, whatever its
+        // size — `lo + hi < 2 * extent` by definition of bounded
+        assert!(
+            charged < 3.0,
+            "a bounded reach priced as a barrier: {charged}"
+        );
     }
 }
 
@@ -3081,5 +3661,107 @@ mod fold_tests {
             }
         }
         assert!(refusals >= 6, "the refusing runs were not exercised");
+    }
+}
+
+/// What the floor does to a chain of several ops, rather than to one op.
+///
+/// **This is where the number comes from, and it is bigger than the one-op case
+/// suggests, because fusion adds reaches.** Five ops whose radii are transcribed
+/// from the per-op measurement — 0, 1, 9, 5, and a disc of radius 15 across two
+/// axes — fuse into one phase with a two-sided halo of 60 on two axes of a
+/// 64-cube. That halo covers those axes at the benchmark's own block edge of 32,
+/// so before the floor the planner cut all three anyway.
+///
+/// Measured through `Enumerating`, at `split_axes = [0, 1, 2]` and one candidate
+/// edge, comparing the whole plan before wiring against the whole plan after —
+/// *total blocks over every phase*, and `exact_read_voxels` summed over every
+/// phase divided by the volume:
+///
+/// | volume | edge | before | after |
+/// |---|---|---|---|
+/// | `64^3` | 32 | 4 phases, 32 blocks, **6.90x** | 1 phase, 2 blocks, **1.47x** |
+/// | `64^3` | 8 | 4 phases, 2048 blocks, **52.8x** | 2 phases, 520 blocks, **5.69x** |
+/// | `64^3` | 3 | 5 phases, 53240 blocks, 451.8x | unchanged |
+/// | `24 x 20 x 16` | 8 | 4 phases, 72 blocks, **28.1x** | 4 phases, 30 blocks, **7.15x** |
+/// | `24 x 20 x 16` | 3 | 3 phases, 678 blocks, **11.1x** | 4 phases, 679 blocks, **7.12x** |
+///
+/// The third row is the floor declining to fire: at edge 3 no phase's halo covers
+/// a 64 axis, every cut still narrows a read, and the plan is left alone. That is
+/// the shape of the rule — it removes cuts that buy nothing and does not have an
+/// opinion about the rest.
+///
+/// The row this test pins is the first, because it is the one at the blocking the
+/// timing was taken at. It is asserted against the eight-block grid the same
+/// phase would have been given, so the comparison is two grids and not a
+/// recollection.
+#[cfg(test)]
+mod chain_floor_measurement {
+    use super::*;
+    use crate::decomposition::{splittable_axes, CostModel};
+    use crate::probes::WindowSumOp;
+
+    #[test]
+    fn a_five_op_chain_reads_the_64_cube_1_47_times_where_it_read_it_6_9_times() {
+        const VOLUME: [usize; 3] = [64, 64, 64];
+        let radii: [(&str, [usize; 3]); 5] = [
+            ("clip", [0, 0, 0]),
+            ("median", [1, 1, 1]),
+            ("deconvolve", [9, 9, 9]),
+            ("adaptive", [5, 5, 5]),
+            ("tubeness", [15, 15, 0]),
+        ];
+        let chain = Chain::sequence(
+            radii
+                .iter()
+                .map(|(name, radius)| Chain::op(WindowSumOp::new(name, *radius)))
+                .collect(),
+        );
+        let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
+        let constraints = Constraints {
+            budget_bytes: None,
+            expected_concurrency: 1,
+            model: CostModel::default(),
+            block_candidates: vec![32],
+            split_axes: vec![0, 1, 2],
+        };
+        let amplification = |plan: &Decomposition| {
+            let read: usize = plan.exact_read_voxels().iter().sum();
+            read as f64 / VOLUME.iter().product::<usize>() as f64
+        };
+
+        let plan = Enumerating::default()
+            .decompose(&workflow, &constraints)
+            .unwrap();
+        assert_eq!(plan.n_phases(), 1, "the chain fuses");
+        assert_eq!(plan.phases[0].grid.block(), [64, 64, 32]);
+        assert_eq!(plan.phases[0].grid.n_blocks(), 2);
+        assert!(
+            (amplification(&plan) - 1.469).abs() < 5e-4,
+            "{}",
+            amplification(&plan)
+        );
+
+        // the grid the same phase would have been given without the floor: the
+        // fused halo is 60 on two axes of 64, so cutting them re-reads them
+        let reach = &plan.phases[0].reach;
+        let unfloored = Decomposition {
+            volume: VOLUME,
+            dtype: Dtype::F64,
+            phases: vec![PhaseDecomposition::derive(
+                plan.phases[0].slots.clone(),
+                plan.phases[0].names.clone(),
+                reach.clone(),
+                plan.phases[0].halo.clone(),
+                BlockGrid::along(VOLUME, &splittable_axes(&[0, 1, 2], reach, VOLUME), 32).unwrap(),
+            )],
+            chain_reach: plan.chain_reach,
+        };
+        assert_eq!(unfloored.phases[0].grid.n_blocks(), 8);
+        assert!(
+            (amplification(&unfloored) - 5.514).abs() < 5e-4,
+            "{}",
+            amplification(&unfloored)
+        );
     }
 }

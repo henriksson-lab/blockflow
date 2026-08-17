@@ -23,10 +23,8 @@
 //
 // 1. **Decomposition invariance.** Every block size and split, byte-identical to
 //    a whole-volume run. A sparse window is not exempt from the property the
-//    crate exists for, and it is the property that would break first if the
-//    decimation's phase were anchored to anything but the element — an
-//    implementation that strided the *clipped* range would re-phase itself at
-//    every seam.
+//    crate exists for, and for this origin it is the easy case: one offset set,
+//    the same filter at every voxel, nothing that could know a seam was there.
 // 2. **The reach is the widest surviving offset.** A step can strand the far
 //    pole: an 8-wide axis anchored at `(4, 3)` and stepped by two keeps
 //    `-4, -2, 0, 2`, so it reads four below the anchor and **two** above, not
@@ -36,26 +34,26 @@
 //    unstepped element wearing a step, and (2) would be pinning a number nobody
 //    depends on.
 //
-// One difference from an implementation that strides a slice, stated
-// -------------------------------------------------------------------
-// The rule was read off an implementation that expresses the same idea as
-// `a[max(0, c - lo) : min(c + hi, n) : step]`, and that expression is not quite
-// a fixed offset set: the stride is counted from the **clipped** start, so at a
-// low boundary the decimation re-phases by `(lo - c) mod step` and a centre one
-// voxel along reads a different parity of the volume. Compared outside this
-// crate on a `24 x 18 x 1` volume with a `9 x 7 x 1` box stepped by `(2, 2, 1)`,
-// evaluated per voxel: the fixed-offset element agreed with that implementation
-// at every one of the 300 voxels outside the low margin and differed at 80 of
-// the 132 inside it, and a transcription of the re-phasing rule accounted for
-// all 432. The same comparison against the *undecimated* element differed at
-// 281–308 of 432, which is what settles that a step decimates the element rather
-// than sampling the positions.
+// Which of the two origins this file is about
+// -------------------------------------------
+// **`StepOrigin::Anchor`**, and it says so at every constructor rather than
+// taking the default. The other origin — `StepOrigin::ClippedStart`, where the
+// stride is counted from the clipped start of the window and therefore re-phases
+// at a low face of the volume — is a different element with a different reach
+// and its own invariance to establish, and it has its own file:
+// `tests/stepped_element_clipped_start.rs`.
 //
-// This crate keeps the fixed offsets. A window whose membership depends on how
-// close the anchor is to a boundary is not one element, and property (1) above
-// is exactly what it would cost: a block seam is not a volume boundary, so an
-// implementation that re-phased at clipped starts would have to know which of
-// the two it was looking at.
+// Every element below was written before that parameter existed and is
+// unchanged by it: the constructors here name the origin these assertions were
+// always about, and every number in this file is byte-for-byte the one it was.
+// That is the point of naming it — a file whose subject moved because a default
+// moved is a file that stops testing what it says it does.
+//
+// The one thing this file gains is `the_rank_filter_gathers_the_anchored_window`
+// at the end, which measures what the per-voxel ops do with the *other* origin.
+// They read `StructuringElement::offsets` and therefore compute the anchored
+// window whatever the element says, and that gap is pinned here rather than left
+// to be discovered by someone comparing two arms of a chain.
 
 use ndarray::Array3;
 
@@ -63,7 +61,7 @@ use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::ArrayEnvironment;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain};
-use blockflow::ops::{ElementShape, Rank, RankFilterOp, StructuringElement};
+use blockflow::ops::{ElementShape, Rank, RankFilterOp, StepOrigin, StructuringElement};
 use blockflow::reach::Reach;
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
@@ -95,6 +93,12 @@ fn intensities() -> Array3<f64> {
     array
 }
 
+/// A decimated element whose step counts **from the anchor** — the subject of
+/// this file, named rather than defaulted to. See the header.
+fn anchored(shape: ElementShape, size: [usize; 3], step: [usize; 3]) -> StructuringElement {
+    StructuringElement::from_size_stepped_at(shape, size, step, StepOrigin::Anchor).unwrap()
+}
+
 /// The elements under test. Odd and even extents, a step that divides the
 /// half-extent and one that does not, a flat axis, and both a box and a ball —
 /// so that nothing here rests on one arithmetic coincidence.
@@ -105,24 +109,22 @@ fn elements() -> Vec<(&'static str, StructuringElement)> {
             // volume a test can run: a wide flat window decimated on both wide
             // axes and left alone on the thin one
             "box 9x7x1 step 2,2,1",
-            StructuringElement::from_size_stepped(ElementShape::Box, [9, 7, 1], [2, 2, 1]).unwrap(),
+            anchored(ElementShape::Box, [9, 7, 1], [2, 2, 1]),
         ),
         (
             // an even extent, where the anchor is off centre *and* the step
             // strands the far pole
             "box 8x8x1 step 2,2,1",
-            StructuringElement::from_size_stepped(ElementShape::Box, [8, 8, 1], [2, 2, 1]).unwrap(),
+            anchored(ElementShape::Box, [8, 8, 1], [2, 2, 1]),
         ),
         (
             // a step that does not divide the half-extent on any axis
             "box 10x7x4 step 3,2,1",
-            StructuringElement::from_size_stepped(ElementShape::Box, [10, 7, 4], [3, 2, 1])
-                .unwrap(),
+            anchored(ElementShape::Box, [10, 7, 4], [3, 2, 1]),
         ),
         (
             "inscribed ellipsoid 9x9x5 step 2,2,2",
-            StructuringElement::from_size_stepped(ElementShape::Ellipsoid, [9, 9, 5], [2, 2, 2])
-                .unwrap(),
+            anchored(ElementShape::Ellipsoid, [9, 9, 5], [2, 2, 2]),
         ),
     ]
 }
@@ -215,8 +217,7 @@ fn run(workflow: &Workflow, decomposition: &Decomposition, input: &Array3<f64>) 
 /// have — a plane fetched into every block that no voxel of the answer reads.
 #[test]
 fn a_stepped_elements_reach_is_its_widest_surviving_offset() {
-    let element =
-        StructuringElement::from_size_stepped(ElementShape::Box, [8, 8, 1], [2, 2, 1]).unwrap();
+    let element = anchored(ElementShape::Box, [8, 8, 1], [2, 2, 1]);
     assert_eq!(element.step(), [2, 2, 1]);
     assert_eq!(
         element.len(),
@@ -273,8 +274,7 @@ fn a_stepped_elements_reach_is_its_widest_surviving_offset() {
 #[test]
 fn the_length_is_the_surviving_count_and_the_cost_follows_it() {
     let whole = StructuringElement::from_size(ElementShape::Box, [9, 7, 1]).unwrap();
-    let stepped =
-        StructuringElement::from_size_stepped(ElementShape::Box, [9, 7, 1], [2, 2, 1]).unwrap();
+    let stepped = anchored(ElementShape::Box, [9, 7, 1], [2, 2, 1]);
     assert_eq!(whole.len(), 63);
     assert_eq!(stepped.len(), 5 * 4);
 
@@ -309,9 +309,7 @@ fn a_stepped_element_is_not_the_element_it_decimates_nor_a_smaller_dense_one() {
     };
 
     let dense = filtered(StructuringElement::from_size(ElementShape::Box, [9, 7, 1]).unwrap());
-    let sparse = filtered(
-        StructuringElement::from_size_stepped(ElementShape::Box, [9, 7, 1], [2, 2, 1]).unwrap(),
-    );
+    let sparse = filtered(anchored(ElementShape::Box, [9, 7, 1], [2, 2, 1]));
     // 20 voxels, like the sparse window, but gathered from a 5x4 neighbourhood
     // instead of a 9x7 one
     let small = filtered(StructuringElement::from_size(ElementShape::Box, [5, 4, 1]).unwrap());
@@ -376,8 +374,7 @@ fn a_stepped_element_is_decomposition_invariant() {
 #[test]
 fn a_halo_short_of_the_derived_reach_is_refused_and_the_derived_one_is_not() {
     let input = intensities();
-    let element =
-        StructuringElement::from_size_stepped(ElementShape::Box, [8, 8, 1], [2, 2, 1]).unwrap();
+    let element = anchored(ElementShape::Box, [8, 8, 1], [2, 2, 1]);
     let workflow = workflow(Chain::op(RankFilterOp::median("median", element)));
     let reach = workflow.chain.reach_spec(VOLUME).unwrap();
     assert_eq!(reach.at(0, 0, VOLUME[0]), (4, 2));
@@ -422,5 +419,65 @@ fn a_halo_short_of_the_derived_reach_is_refused_and_the_derived_one_is_not() {
         run(&workflow, &plan, &input),
         want,
         "the offset at +2 is really read, so understating it must change the answer"
+    );
+}
+
+// ------------------------------------ the other origin, through this op --
+
+/// **What the per-voxel ops do with `StepOrigin::ClippedStart`**, measured
+/// rather than assumed: they gather the *anchored* window.
+///
+/// The rank filter reads `StructuringElement::offsets`, which is one set, and it
+/// reads the same set at every voxel. An element whose step counts from the
+/// clipped start has a second set at every anchor inside `lo` of a low face, and
+/// this op does not compute it — so a chain that puts such an element through a
+/// rank filter gets the anchored filter, at the re-phasing element's own
+/// (slightly wider) reach.
+///
+/// That is a gap and it is pinned here for two reasons. It is the assumption a
+/// reader comparing two arms of a chain would otherwise make wrongly in either
+/// direction; and if the rank filter ever does honour the origin, this test
+/// fails and says so, rather than the change landing silently in a filter
+/// somebody was matching against another implementation.
+///
+/// `ops::local`'s sampled statistic *does* honour it —
+/// `tests/stepped_element_clipped_start.rs` is that measurement — so the two are
+/// asserted to differ here, which is what makes this a statement about this op
+/// rather than about the element.
+#[test]
+fn the_rank_filter_gathers_the_anchored_window() {
+    let input = intensities();
+    let size = [8, 8, 1];
+    let step = [2, 2, 1];
+    let anchored = anchored(ElementShape::Box, size, step);
+    let clipped = StructuringElement::from_size_stepped_at(
+        ElementShape::Box,
+        size,
+        step,
+        StepOrigin::ClippedStart,
+    )
+    .unwrap();
+
+    // The elements are not the same element: one plane wider on the high side,
+    // because the re-phased window can land on the far pole.
+    assert_eq!(anchored.sides(0), (4, 2));
+    assert_eq!(clipped.sides(0), (4, 3));
+    assert_ne!(anchored, clipped);
+
+    // and the filter is the same filter anyway, bit for bit
+    let filtered = |element: StructuringElement| -> Array3<f64> {
+        reference(&Chain::op(RankFilterOp::median("median", element)), &input)
+    };
+    let with_anchored = filtered(anchored);
+    let with_clipped = filtered(clipped);
+    let differing = with_anchored
+        .iter()
+        .zip(with_clipped.iter())
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differing, 0,
+        "the rank filter gathers `offsets`, so the origin cannot reach it; {differing} voxels \
+         differed, which means it now does and this file has to say what it computes instead"
     );
 }

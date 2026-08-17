@@ -54,7 +54,7 @@ use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain};
 use blockflow::ops::{
     masked_rank_filter_into_with, rank_filter_into, sliding_histogram_with_plan, Domain,
-    ElementShape, ExcludedCentre, Rank, RankQuery, ScanPlan, SlidingHistogramOp,
+    ElementShape, ExcludedCentre, Rank, RankQuery, ScanPlan, SlidingHistogramOp, StepOrigin,
     StructuringElement,
 };
 use blockflow::strategy::{execute, Hints, Workflow};
@@ -137,8 +137,18 @@ fn elements() -> Vec<(&'static str, StructuringElement)> {
             StructuringElement::from_size(ElementShape::Box, [4, 6, 2]).unwrap(),
         ),
         (
+            // `StepOrigin::Anchor`, named rather than defaulted to: this op
+            // gathers `StructuringElement::offsets`, which is one set at every
+            // voxel, so the anchored origin is the one it can honour. See
+            // `tests/stepped_element.rs`.
             "stepped 7x7x3 by 2",
-            StructuringElement::from_size_stepped(ElementShape::Box, [7, 7, 3], [2, 2, 2]).unwrap(),
+            StructuringElement::from_size_stepped_at(
+                ElementShape::Box,
+                [7, 7, 3],
+                [2, 2, 2],
+                StepOrigin::Anchor,
+            )
+            .unwrap(),
         ),
         (
             "disc r3",

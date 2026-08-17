@@ -90,15 +90,58 @@
 // the second, and it *streams*: one fragment resident at a time, by key.
 // `Environment::sidecar_fragments` materialises a whole stream and is the wrong
 // tool for anything at scale.
+//
+// The second array, and where the operand is needed
+// -------------------------------------------------
+// A `volume -> fragments` op summarising one array against *another* — per
+// region of a label array, a quantity read out of an intensity array — had no
+// way to say so: a fragment op read the one level it was handed. `BlockOp`
+// already had the shape for it ([`BlockOp::source_inputs`] plus
+// [`BlockOp::apply_with`]), so this file takes that shape rather than inventing
+// a second one, down to the defaulted `apply_with` **erroring** when an operand
+// was declared. `env.rs`' argument for that is the whole reason it exists:
+// *silently ignoring an operand is the precise shape of the wrong answer this
+// change exists to remove.*
+//
+// **The emit path needs it; the merge path does not, and is not refused one.**
+// A `volume -> fragments` op reads pixels, so a second pixel array is the same
+// kind of thing at the same block extent. A `fragments -> fragments` merge has
+// no pixel array at either end — that is what `reads_pixels() == false` buys —
+// so it has nothing to combine an operand against. It is not *forbidden* one,
+// because the two declarations are independent (`reads_pixels` is about level
+// `p`, `source_inputs` is about every other level, and each is read and counted
+// on its own), and a merge that genuinely wants to look at a stored array can
+// say so without also paying for a level it does not want. What it may not do
+// is take one silently.
+//
+// The seam, which is the part that is not plumbing
+// ------------------------------------------------
+// A per-region reduction over a second array *straddles seams*: a region cut by
+// a block boundary is summed in pieces and the pieces are added in the merge.
+// If the accumulator is `f64`, that addition does not associate, so the answer
+// depends on the order the blocks merged in — and a plan cut differently gives a
+// different number. `ops/detect.rs` deferred a weighted centroid on exactly
+// this, and named the honest answers: a fixed-point accumulator, or a stated
+// tolerance.
+//
+// This file does not pick one. What it removes is the *silence*: [`SeamFold`]
+// has no default, an op that reads a second array (or that folds fragments
+// derived from one) must state which of the three it is, and the one that claims
+// order-independence is **checked** rather than believed — the executor applies
+// the block a second time with the neighbourhood reversed and requires the same
+// bytes. See [`SeamFold`] for what each variant forbids.
+//
+// [`BlockOp::source_inputs`]: crate::op::BlockOp::source_inputs
+// [`BlockOp::apply_with`]: crate::op::BlockOp::apply_with
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::decomposition::{Decomposition, PhaseDecomposition};
 use crate::dtype::Dtype;
 use crate::env::{BlockBuf, Environment};
 use crate::error::{Error, Result};
 use crate::geometry::BlockGrid;
-use crate::op::Anchor;
+use crate::op::{Anchor, SourceInput};
 use crate::region::Region;
 use crate::sidecar::{check_stream_name, FragmentKey, Lifecycle};
 
@@ -342,6 +385,13 @@ impl<'a> BlockView<'a> {
         self.pixels.is_some()
     }
 
+    /// The volume this block is anchored in — the phase's own coordinate space,
+    /// and the one [`FragmentOp::reach`] and [`FragmentOp::source_inputs`] state
+    /// their answers over.
+    pub fn volume(&self) -> [usize; 3] {
+        self.at.volume
+    }
+
     /// A buffer shaped like this block's read extent, filled with `value`.
     ///
     /// Routed through the environment on purpose: it is the one construction an
@@ -419,6 +469,131 @@ impl<'a> BlockView<'a> {
             }
         }
         Ok(seen)
+    }
+}
+
+/// The stored levels a fragment op declared, keyed by level.
+///
+/// The fragment side of [`SourceInputs`](crate::op::SourceInputs), with the same
+/// contract: one entry per level rather than one per declaration, each holding
+/// **the extent the block was read at**, and [`Self::get`] erroring rather than
+/// returning an `Option` — a missing operand is a block that would compute
+/// against nothing, which is the class of quiet wrong answer this crate is
+/// arranged against.
+///
+/// **A second type rather than the same one**, and for one reason: a fragment op
+/// is handed [`BlockBuf`], not `Voxels`. [`BlockView::pixels`] already is,
+/// because a simulated run holds no array at all and a fragment op that could
+/// not be simulated would be a phase the planner cannot price. Nothing else
+/// about it differs, and nothing about it is a second *mechanism* — the
+/// declaration is `BlockOp`'s [`SourceInput`], the plan record is the same
+/// `PhaseDecomposition::source_levels`, and the executor reads it through the
+/// same `Environment::read`.
+#[derive(Clone, Copy)]
+pub struct SourceBlocks<'a> {
+    entries: &'a [(usize, &'a BlockBuf)],
+}
+
+impl<'a> SourceBlocks<'a> {
+    /// Nothing stored: what an op declaring no source input is applied with.
+    pub const fn none() -> Self {
+        Self { entries: &[] }
+    }
+
+    pub fn new(entries: &'a [(usize, &'a BlockBuf)]) -> Self {
+        Self { entries }
+    }
+
+    /// The levels supplied, in the order the executor read them.
+    pub fn levels(&self) -> Vec<usize> {
+        self.entries.iter().map(|(level, _)| *level).collect()
+    }
+
+    /// The block of `level`, or an error naming what was supplied.
+    pub fn get(&self, level: usize) -> Result<&'a BlockBuf> {
+        self.entries
+            .iter()
+            .find(|(named, _)| *named == level)
+            .map(|(_, buf)| *buf)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "a fragment op reads level {level} and the executor supplied [{}]. The \
+                     levels a phase reads besides its own input are recorded in the plan \
+                     (`PhaseDecomposition::source_levels`) and read there; an op naming one \
+                     the plan does not list has nothing to be handed.",
+                    self.entries
+                        .iter()
+                        .map(|(named, _)| named.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
+    }
+}
+
+/// What an op does with values that straddle a block seam, and therefore
+/// whether its answer is a function of the decomposition.
+///
+/// **There is no default, on [`Coverage`]'s argument.** A per-region reduction
+/// over a second array is summed in pieces — one per block the region touches —
+/// and the pieces are combined in a merge. Combine them with `f64` addition and
+/// the result depends on the order the blocks merged in, so the same data cut
+/// two ways gives two answers, neither of them wrong-looking. `ops/detect.rs`
+/// deferred a weighted centroid on precisely this. A silent default here would
+/// be a promise nobody made, about the one property this crate exists to keep.
+///
+/// So the obligation is stated, and it is stated **where the values come from**:
+/// [`check_phase_work`] requires a declaration from any fragment op that reads a
+/// second array, and from any op that folds — with a non-zero fragment reach —
+/// a stream carrying values that came from one. The obligation follows the
+/// operand through the fragment graph rather than stopping at the op that read
+/// it, because the op that reads the array is usually not the op that adds
+/// across the seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeamFold {
+    /// **Nothing crosses a seam here.** This block's fragment is a function of
+    /// this block alone, so there is no order to depend on. What an emitting
+    /// `volume -> fragments` op says.
+    ///
+    /// Checked, not believed: an op declaring this may not declare a fragment
+    /// input with a non-zero reach, because a non-zero reach *is* a fold over
+    /// more than one block's values.
+    PerBlock,
+    /// **A function of the set of fragments, not of their order.** Integer
+    /// addition, min, max, bitwise or, a fixed-point accumulator, a union-find
+    /// over labels — anything associative and commutative in the type it is
+    /// accumulated in.
+    ///
+    /// Checked, not believed: the executor applies the block a second time with
+    /// the declared neighbourhood **reversed** and requires byte-identical
+    /// output. An `f64` sum over three or more fragments fails that, which is
+    /// the hazard this variant exists to catch.
+    ///
+    /// What it costs: one extra application of the op per block, and — for an
+    /// op that declared `gathers() == false` and streams — one extra pass of
+    /// sidecar reads, which the counters show. What it forbids is claiming
+    /// order-independence for free.
+    Unordered,
+    /// **The fold is order-dependent, and the op says so.** Allowed, and it is
+    /// the honest declaration for a real `f64` accumulation.
+    ///
+    /// What it forbids is the assumption everything else in this crate is
+    /// arranged around: a phase declaring this is **not decomposition-invariant**
+    /// — the same volume cut into different blocks may give a different answer,
+    /// within the rounding of the accumulator — so its output must not be
+    /// compared byte-for-byte across plans, and a run of it is reproducible only
+    /// against a fixed decomposition. Nothing is checked, because there is
+    /// nothing to check; what is bought is that a reader of the op can see it.
+    OrderDependent,
+}
+
+impl SeamFold {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeamFold::PerBlock => "per-block",
+            SeamFold::Unordered => "unordered",
+            SeamFold::OrderDependent => "order-dependent",
+        }
     }
 }
 
@@ -505,11 +680,84 @@ pub trait FragmentOp: Send + Sync {
         true
     }
 
+    /// Stored levels this op reads **besides** the level it is handed, each with
+    /// its own reach.
+    ///
+    /// The same declaration [`BlockOp::source_inputs`] makes, in the same units,
+    /// recorded in the same `PhaseDecomposition::source_levels` and read by the
+    /// executor through the same `Environment::read`. Empty by default, which is
+    /// every fragment op this crate shipped before the method existed and is the
+    /// honest answer for all of them.
+    ///
+    /// **Independent of [`Self::reads_pixels`].** That method is about level
+    /// `p`, the one the phase is handed; this is about every other level. An op
+    /// may read a second array without reading its own input — a merge that
+    /// consults a stored array says so here and still declares
+    /// `reads_pixels() == false`, and pays for one array rather than two.
+    ///
+    /// `volume` is the phase's own anchoring volume, the same one
+    /// [`Self::reach`] is given an axis of.
+    ///
+    /// [`BlockOp::source_inputs`]: crate::op::BlockOp::source_inputs
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        Vec::new()
+    }
+
+    /// What this op does with values that straddle a seam. See [`SeamFold`].
+    ///
+    /// `None` means "has not said", and it is the default so that nothing that
+    /// shipped before this method changes. It is not a licence: an op that reads
+    /// a second array, or that folds fragments carrying a second array's values
+    /// over a non-zero reach, is refused by name at plan time until it answers.
+    fn seam_fold(&self) -> Option<SeamFold> {
+        None
+    }
+
     /// Produce this block's output.
     ///
     /// Returning no fragment at all is legitimate — a block with nothing to say
     /// writes nothing, which is exactly what an absent key means to a reader.
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput>;
+
+    /// [`Self::apply`], with the stored levels [`Self::source_inputs`] declared.
+    ///
+    /// Each buffer holds that level over the **block's own fetch region** — the
+    /// same extent [`BlockView::pixels`] would be, and the same extent
+    /// `Chain::Source` leaves are handed — because that is what the plan
+    /// records and the executor reads.
+    ///
+    /// **The default refuses rather than falling through**, exactly as
+    /// [`BlockOp::apply_with`] does, and for the reason `env.rs:279` gives for
+    /// it: *silently ignoring an operand is the precise shape of the wrong
+    /// answer this whole change exists to remove — a complete, well-formed
+    /// volume combined against nothing.* An op that declares an operand and
+    /// forgets to override this would emit a fragment summarising one array
+    /// while claiming to summarise two, which is a plausible number and
+    /// therefore the expensive kind of wrong.
+    ///
+    /// It hands off to [`Self::apply`] when nothing was declared, which is the
+    /// case that must stay free.
+    ///
+    /// [`BlockOp::apply_with`]: crate::op::BlockOp::apply_with
+    fn apply_with(&self, at: &BlockView<'_>, _sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let declared = self.source_inputs(at.volume());
+        if !declared.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "fragment op {:?} declares {} source input(s) (level(s) {}) and does not \
+                 override `apply_with`, so the operands it asked the plan to fetch would be \
+                 dropped on the floor and the block would be summarised from one array while \
+                 claiming to summarise two.",
+                self.name(),
+                declared.len(),
+                declared
+                    .iter()
+                    .map(|input| input.level.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        self.apply(at)
+    }
 }
 
 /// What a phase runs.
@@ -615,11 +863,33 @@ pub fn neighbourhood_size(index: [usize; 3], reach: [usize; 3], counts: [usize; 
 
 /// The decomposition phase a fragment op runs as.
 ///
-/// The halo is the widest of the op's own reach and every input's fragment
-/// reach converted to voxels. Where the op's reach is smaller than the halo the
+/// The halo is the widest of three things: the op's own reach, every fragment
+/// input's reach converted to voxels, and every [`FragmentOp::source_inputs`]
+/// reach. Where the op's reach is smaller than the halo the
 /// valid regions equal the cores and tile the volume; where it is the whole
 /// volume, only `halo == volume` survives the tiling check, which is the
 /// module header's point about a global step.
+///
+/// **The source reach widens the halo and not the reach**, which is the same
+/// arrangement a fragment input's reach already has. The halo is what is
+/// *fetched*, so an operand consulted over a window needs it; the reach is what
+/// is *shrunk off the read extent to get the trusted region*, and a fragment is
+/// emitted for the block's core whatever window the operand was read over. An op
+/// whose **pixel** output at a voxel depends on the operand's window is making a
+/// statement about trust and says it in [`FragmentOp::reach`]; nothing here can
+/// say it on its behalf.
+///
+/// The levels the source inputs name are recorded on the phase, which is what
+/// makes the executor fetch them, the DAG depend on their producers, the level
+/// lifetimes keep them alive, `exact_read_voxels` count them and the fingerprint
+/// hash them. A fragment phase built any other way would read a second array off
+/// the books.
+///
+/// The op's [`FragmentOp::reads_pixels`] is recorded too, for the other half of
+/// the same books: an op that declines its own level is not charged for it by
+/// `Decomposition::exact_read_voxels`, because `strategy::run_fragment_task`
+/// does not fetch it. A phase reading a second array and not its own then
+/// predicts one array's worth rather than two, which is what the run performs.
 ///
 /// `names` is left empty on purpose: `Decomposition::op_names_in_order` pairs
 /// with `slot_order`, which the acceptance criterion is asserted against, and a
@@ -650,13 +920,20 @@ pub fn fragment_phase(op: &dyn FragmentOp, grid: BlockGrid) -> Result<PhaseDecom
     for output in op.outputs() {
         check_stream_name(&output.stream)?;
     }
-    Ok(PhaseDecomposition::derive(
-        Vec::new(),
-        Vec::new(),
-        reach,
-        halo,
-        grid,
-    ))
+    let mut levels = Vec::new();
+    for input in op.source_inputs(volume) {
+        let wanted = input.reach.in_voxels(edge);
+        for (axis, value) in halo.iter_mut().enumerate() {
+            let (lo, hi) = wanted.axis(axis).bound(volume[axis]);
+            *value = (*value).max(lo).max(hi);
+        }
+        levels.push(input.level);
+    }
+    Ok(
+        PhaseDecomposition::derive(Vec::new(), Vec::new(), reach, halo, grid)
+            .with_source_levels(levels)
+            .reading_input_level(op.reads_pixels()),
+    )
 }
 
 /// Add a fragment phase to the end of a decomposition, on the last phase's
@@ -744,6 +1021,17 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
     // Level 0 is the workflow input and always exists; level p+1 exists iff
     // phase p wrote it. A phase that reads no pixels needs neither.
     let mut level_written: Vec<Option<usize>> = vec![None; work.len() + 1];
+    // Streams holding values that came out of a **second array**, addressed the
+    // way a `FragmentInput` addresses them: `(stream, the phase that wrote it)`.
+    //
+    // The obligation to state a [`SeamFold`] follows the operand along these
+    // edges rather than stopping at the op that read the array, because the op
+    // that reads the array is not in general the op that adds across the seam:
+    // an emitting op produces one partial per block and a later merge combines
+    // them, and it is the *merge* whose accumulator decides whether the answer
+    // is decomposition-invariant. A plan with no source input anywhere never
+    // marks a stream, so nothing that shipped before this is asked anything.
+    let mut carries_operand: BTreeSet<(String, usize)> = BTreeSet::new();
     for (index, entry) in work.iter().enumerate() {
         let phase = &plan.phases[index];
         if entry.reads_a_level() && index > 0 && level_written[index].is_none() {
@@ -789,6 +1077,26 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                 )));
             }
         }
+        // **The half of `check_source_levels` a chain cannot make.** That guard
+        // folds the *slots* of a phase, so it can only speak for a phase that
+        // owns some, and it skips the ones that do not. The two kinds that own
+        // none are the two here: a `Pixels` phase with an empty slot list reads
+        // nothing besides its input, and an iterative phase's second operand is
+        // `Operand::Fixed`, which is its own input level and not a second one.
+        // Either recording a source level is a plan that would fetch an array
+        // nothing consumes, and be priced for it.
+        if phase.slots.is_empty() && !entry.is_fragments() && !phase.source_levels.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "decomposition phase {index} ({}) owns no chain slot and records that it also \
+                 reads level(s) {:?}. Only a fragment op can read a second level without a \
+                 chain slot to say so, and this phase runs {}. The recorded list is what the \
+                 executor fetches and what the fingerprint hashes, so an entry nothing reads \
+                 is a plan priced for an array no block consumes.",
+                phase.names.join(">"),
+                phase.source_levels,
+                entry.describe()
+            )));
+        }
         let PhaseWork::Fragments(op) = entry else {
             continue;
         };
@@ -830,6 +1138,183 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
             )));
         }
         let edge = phase.grid.block();
+
+        // ------------------------------------------------ the second array --
+        //
+        // Everything `check_source_levels` asserts about a chain's source
+        // leaves, asserted here about a fragment op's, because this is the only
+        // place holding both the plan and the op. The list is deliberately the
+        // same list, in the same order, so that the two guards cannot drift into
+        // meaning different things about one field.
+        let read_volume = plan.volume_at(index);
+        let declared_sources = op.source_inputs(read_volume);
+        if !declared_sources.is_empty()
+            && (phase.volume() != read_volume || phase.reads_across_grids())
+        {
+            return Err(Error::InvalidArgument(format!(
+                "phase {index}: fragment op {:?} reads a second level and the phase reads a \
+                 {read_volume:?} level to work in {:?}. A source level is fetched at the \
+                 block's own fetch region, so an op that reads one must be on one lattice in \
+                 one coordinate space; across grids the same integers name different voxels, \
+                 and the op is asked for its declaration in a volume that is not the one it \
+                 would be handed.",
+                op.name(),
+                phase.volume()
+            )));
+        }
+        {
+            let granted = phase.halo.in_voxels(edge);
+            for input in &declared_sources {
+                // **The equal-reach limit binds here too, and is not loosened.**
+                // The executor reads a source level at the block's own fetch
+                // region, so an operand wanting more than the phase fetches
+                // would be handed a buffer narrower than its kernel walks. What
+                // differs from the chain case is only who widens the halo:
+                // `fragment_phase` folds this reach into it, so a phase built
+                // that way satisfies the limit by construction and this check is
+                // for the plan that arrived from somewhere else.
+                let wanted = input.reach.in_voxels(edge);
+                for axis in 0..3 {
+                    let (want_lo, want_hi) = wanted.axis(axis).bound(read_volume[axis]);
+                    let (have_lo, have_hi) = granted.axis(axis).bound(read_volume[axis]);
+                    if want_lo > have_lo || want_hi > have_hi {
+                        return Err(Error::InvalidArgument(format!(
+                            "phase {index}: fragment op {:?} reads level {} with a reach of \
+                             {want_lo}+{want_hi} on axis {axis}, and the phase is granted a \
+                             halo of {have_lo}+{have_hi} there. A source level is read at the \
+                             block's own fetch region, so an operand reaching further than the \
+                             phase does would be handed a buffer its kernel walks past the end \
+                             of. Build the phase with `fragment_phase`, which folds this reach \
+                             into the halo.",
+                            op.name(),
+                            input.level
+                        )));
+                    }
+                }
+            }
+            let mut named: Vec<usize> = declared_sources.iter().map(|input| input.level).collect();
+            named.sort_unstable();
+            named.dedup();
+            if named != phase.source_levels {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index}: fragment op {:?} reads level(s) {named:?} besides its own, \
+                     and the decomposition records {:?}. The recorded list is what the executor \
+                     fetches, what the DAG takes its edges from and what the fingerprint \
+                     hashes, so a plan whose record disagrees with its op would price one level \
+                     and read another.",
+                    op.name(),
+                    phase.source_levels
+                )));
+            }
+            for &level in &named {
+                if level >= plan.n_levels() {
+                    return Err(Error::InvalidArgument(format!(
+                        "phase {index}: fragment op {:?} reads level {level}, and this plan has \
+                         {} level(s), numbered 0 to {}.",
+                        op.name(),
+                        plan.n_levels(),
+                        plan.n_levels() - 1
+                    )));
+                }
+                if level > index {
+                    return Err(Error::InvalidArgument(format!(
+                        "phase {index}: fragment op {:?} reads level {level}, but level {level} \
+                         is written by phase {}, which runs after it. Phases run in order, so a \
+                         second level may only be one at or below the level this phase is \
+                         handed — level {index} here.",
+                        op.name(),
+                        level - 1
+                    )));
+                }
+                // **The check the chain half has no way to need.** Every phase
+                // of a pixel plan writes the level above it, so a level at or
+                // below the current one exists by construction. A fragment phase
+                // writes one only if it says `writes_pixels`, so a plan can
+                // name a level that no phase ever wrote — an array with no
+                // producer, which the executor would read as whatever `prepare`
+                // left behind.
+                if level > 0 && level_written[level].is_none() {
+                    return Err(Error::InvalidArgument(format!(
+                        "phase {index}: fragment op {:?} reads level {level}, which phase {} \
+                         did not write: it runs a fragment op that declares `writes_pixels() \
+                         == false`. A level nothing wrote is not a second array, it is whatever \
+                         `prepare` allocated.",
+                        op.name(),
+                        level - 1
+                    )));
+                }
+                let stored = plan.volume_at(level);
+                if stored != read_volume {
+                    return Err(Error::InvalidArgument(format!(
+                        "phase {index}: fragment op {:?} reads level {level}, which is \
+                         {stored:?}, beside level {index}, which is {read_volume:?}. A source \
+                         level is read at the block's own fetch region, so the two levels have \
+                         to be in one coordinate space; across grids the same integers would \
+                         name different voxels.",
+                        op.name()
+                    )));
+                }
+            }
+        }
+
+        // ------------------------------------------------------- the seam --
+        //
+        // See `SeamFold`. The obligation is on any op that reads a second array,
+        // and on any op that folds — over a non-zero fragment reach, which is
+        // what makes a value cross a seam — a stream carrying such an array's
+        // values.
+        let inputs = op.inputs();
+        let reads_operand = inputs
+            .iter()
+            .any(|input| carries_operand.contains(&(input.stream.clone(), input.phase)));
+        let folds_operand = inputs.iter().any(|input| {
+            input.reach != [0, 0, 0]
+                && carries_operand.contains(&(input.stream.clone(), input.phase))
+        });
+        if !declared_sources.is_empty() || reads_operand {
+            for output in op.outputs() {
+                carries_operand.insert((output.stream, index));
+            }
+        }
+        match op.seam_fold() {
+            None if !declared_sources.is_empty() || folds_operand => {
+                let because = if declared_sources.is_empty() {
+                    "folds fragments carrying a second array's values over a non-zero reach"
+                } else {
+                    "reads a second array"
+                };
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index}: fragment op {:?} {because} and does not say what it does \
+                     with values that straddle a seam. A region cut by a block boundary is \
+                     summed in pieces and the pieces are combined in a merge; combine them \
+                     with `f64` addition and the answer depends on the order the blocks merged \
+                     in, so the same data cut two ways gives two numbers and neither looks \
+                     wrong. Override `seam_fold` with `SeamFold::PerBlock` (nothing crosses a \
+                     seam here), `SeamFold::Unordered` (the fold is associative in the type it \
+                     accumulates in — the executor checks it) or `SeamFold::OrderDependent` \
+                     (it is not, and this phase is therefore not decomposition-invariant). \
+                     There is no default, for `Coverage`'s reason.",
+                    op.name()
+                )));
+            }
+            Some(SeamFold::PerBlock) if inputs.iter().any(|input| input.reach != [0, 0, 0]) => {
+                let (stream, reach) = inputs
+                    .iter()
+                    .find(|input| input.reach != [0, 0, 0])
+                    .map(|input| (input.stream.clone(), input.reach))
+                    .expect("just found one");
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index}: fragment op {:?} declares `SeamFold::PerBlock` — this \
+                     block's fragment is a function of this block alone — and reaches {reach:?} \
+                     block(s) for stream {stream:?}. A non-zero fragment reach *is* a fold over \
+                     more than one block's values, so the two statements cannot both be true. \
+                     An op that folds says `Unordered` or `OrderDependent`.",
+                    op.name()
+                )));
+            }
+            _ => {}
+        }
+
         for input in op.inputs() {
             check_stream_name(&input.stream)?;
             if input.phase >= index {

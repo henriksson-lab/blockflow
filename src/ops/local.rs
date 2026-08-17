@@ -825,6 +825,244 @@ pub fn axis_max_distance(volume_len: usize, spacing: usize) -> usize {
     .max_distance(0, volume_len)
 }
 
+// ----------------------------------------------------------- narrowing --
+
+/// How a value is taken to a whole number on the way into a narrower type.
+///
+/// **Two rules, because a value crossing into a narrower type crosses twice in
+/// this family and the two crossings do not use the same rule.** See
+/// [`LatticeNarrowing`], which is where the pair is stated and where the reason
+/// it is a pair rather than a constant is written out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum Rounding {
+    /// Toward zero: the fractional part is dropped whatever its size, so `2.9`
+    /// becomes `2` and `-2.9` becomes `-2`.
+    ///
+    /// The default, because it is what a cast to an integer type does on its
+    /// own — so a caller who states an element type and nothing else gets the
+    /// rule the cast would have applied anyway rather than a second one layered
+    /// on top of it.
+    #[default]
+    TowardZero,
+    /// To the nearest whole number, **halves away from zero**: `2.5` becomes `3`
+    /// and `-2.5` becomes `-3`.
+    ///
+    /// Not half-to-even, which sends `2.5` to `2` and is a different rule with
+    /// the same short name. The difference is one unit on exactly the values a
+    /// midpoint interpolation produces most often, so it is named rather than
+    /// left to be inferred.
+    ToNearest,
+}
+
+impl Rounding {
+    /// The whole number this rule takes `value` to. A non-finite value is
+    /// returned unchanged; what the element type then does with it is
+    /// [`Narrowing::apply`]'s business.
+    pub fn of(self, value: f64) -> f64 {
+        match self {
+            Rounding::TowardZero => value.trunc(),
+            Rounding::ToNearest => value.round(),
+        }
+    }
+}
+
+/// A **narrower element type a value passes through**, and the rounding rule
+/// that takes it there.
+///
+/// The value comes back as an `f64` — this is a narrowing of the *value*, not
+/// of the buffer it is stored in. Nothing about a level's declared type changes:
+/// a narrowed value held in an `f64` buffer is the same number it would be in a
+/// buffer of `element`, and holding it in the wider one costs bytes and no
+/// precision.
+///
+/// **Why that is the useful shape.** The thing being reproduced is a chain that
+/// evaluates a statistic in full precision and then keeps it somewhere narrow —
+/// so the narrowing is a step of the computation, at a stated place inside it,
+/// and not a fact about where the answer is eventually written. An op that
+/// narrowed by declaring a narrower output type would put the quantisation at
+/// the *end* of the op, which is one of the two places it can go and not the one
+/// that matters; see [`LatticeNarrowing`].
+///
+/// Out of range saturates and `NaN` goes to zero, which is
+/// `VoxelElement::from_f64`'s rule and therefore the rule every other narrowing
+/// in this crate already uses. It is stated here because the alternative — the
+/// wrapping a C cast performs — is what some of the tools this reproduces do,
+/// and a caller reaching a value that far out of range should know which of the
+/// two they got. Saturation is the safer of the two and it is the one this
+/// crate can be consistent about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Narrowing {
+    element: Dtype,
+    rounding: Rounding,
+}
+
+impl Narrowing {
+    /// Narrow to `element`, taking values to whole numbers by `rounding`.
+    ///
+    /// Two element types are refused, and both for the same reason — there is no
+    /// value in them for a rounding rule to produce. A two-valued type is a
+    /// comparison and not a narrowing ([`threshold_against_into`] is where a
+    /// comparison lives), and no buffer in this crate holds half precision.
+    ///
+    /// A **float** element type is accepted and the rounding still applies:
+    /// `Narrowing::new(Dtype::F32, Rounding::ToNearest)` is "to the nearest
+    /// whole number, then to `f32`", which is one rule for every type rather
+    /// than a rule with an exception in it. A caller who wants `f32`'s own
+    /// resolution and no whole-number step is asking for something this
+    /// parameter does not express, and should say so rather than discover it.
+    pub fn new(element: Dtype, rounding: Rounding) -> Result<Self> {
+        match element {
+            Dtype::Bool => Err(Error::InvalidArgument(
+                "a narrowing to a two-valued type has no rounding rule to apply: every finite \
+                 value lands on one of two, which is a comparison rather than a narrowing. \
+                 `threshold_against_into` is where a comparison against a level lives."
+                    .to_string(),
+            )),
+            Dtype::F16 => Err(Error::InvalidArgument(
+                "no buffer in this crate holds half precision, so a value narrowed to it could \
+                 not be stored or compared against anything"
+                    .to_string(),
+            )),
+            _ => Ok(Self { element, rounding }),
+        }
+    }
+
+    /// Narrow to `element` by dropping the fractional part, which is
+    /// [`Rounding::TowardZero`] and what a cast alone would do.
+    pub fn to(element: Dtype) -> Result<Self> {
+        Self::new(element, Rounding::TowardZero)
+    }
+
+    pub fn element(&self) -> Dtype {
+        self.element
+    }
+
+    pub fn rounding(&self) -> Rounding {
+        self.rounding
+    }
+
+    /// `value`, rounded and then taken to `element`'s range and resolution.
+    ///
+    /// The cast is the crate's own `VoxelElement::from_f64` — Rust's `as`, which
+    /// saturates at the type's ends and sends `NaN` to zero — so a value that
+    /// passes through here and a value written into a buffer of the same type
+    /// land on the same number.
+    pub fn apply(self, value: f64) -> f64 {
+        let rounded = self.rounding.of(value);
+        match self.element {
+            Dtype::U8 => rounded as u8 as f64,
+            Dtype::U16 => rounded as u16 as f64,
+            Dtype::U32 => rounded as u32 as f64,
+            Dtype::U64 => rounded as u64 as f64,
+            Dtype::I8 => rounded as i8 as f64,
+            Dtype::I16 => rounded as i16 as f64,
+            Dtype::I32 => rounded as i32 as f64,
+            Dtype::I64 => rounded as i64 as f64,
+            Dtype::F32 => rounded as f32 as f64,
+            Dtype::F64 => rounded,
+            // Refused by `new`, which is the only way one is built.
+            Dtype::Bool | Dtype::F16 => rounded,
+        }
+    }
+}
+
+/// The narrowings a lattice-sampled statistic passes through: one **at the
+/// sample grid** and one **after the interpolation**.
+///
+/// **Two sites, not one, and that is the whole point of this type.** A statistic
+/// on a lattice is two steps — evaluate at the samples, then blend the samples
+/// back to every voxel — and a value can be narrowed after either. The two are
+/// not interchangeable and they are not even close to interchangeable:
+///
+/// * narrowing **at the samples** changes the numbers that are *interpolated
+///   between*, so it moves every voxel in the gap and not only the ones near a
+///   sample. On a lattice of a few samples per axis it is the dominant effect.
+/// * narrowing **after the interpolation** changes only the last step, and a
+///   value that was already whole survives it untouched.
+///
+/// Get one and miss the other and the answer is close everywhere and equal
+/// almost nowhere — which is the failure mode worth naming, because "close" is
+/// what a comparison against a wrong reference looks like too.
+///
+/// **The default is neither.** `LatticeNarrowing::default()` narrows at no site
+/// at all, so every caller who states nothing computes what it computed before
+/// this parameter existed, bit for bit.
+///
+/// **Why the two rounding rules differ in [`Self::through`].** A value assigned
+/// into an array of an integer type keeps its whole part and drops the rest; a
+/// blend written *out* into an array of an integer type is rounded to the
+/// nearest. Those are two different operations and there is no derivation that
+/// produces both from one rule — so the pair is stated, once, in the one
+/// constructor that names it, and a caller needing a different pair builds the
+/// two [`Narrowing`]s directly.
+///
+/// **It is not priced.** One rounding and one cast per sample, and one per
+/// voxel, against an interpolation charged at [`INTERPOLATION_COST`]; the
+/// difference is below what `ops::cost` can measure, and charging a term that
+/// cannot be measured would move every existing plan's predicted cost for a
+/// parameter most of them do not set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LatticeNarrowing {
+    /// Applied to every sample of the grid **before anything is interpolated**,
+    /// including the values a [`Population`] writes there rather than reduces —
+    /// the grid holds one type and every value in it is of that type.
+    pub at_samples: Option<Narrowing>,
+    /// Applied to every voxel **after the interpolation** and before anything
+    /// downstream sees it. On the fused path that is the op's own output; on the
+    /// split pair it is [`LatticeInterpolateOp`]'s.
+    ///
+    /// [`LatticeInterpolateOp`]: super::lattice::LatticeInterpolateOp
+    pub after_interpolation: Option<Narrowing>,
+}
+
+impl LatticeNarrowing {
+    /// Neither site. The default, and what every caller had before there was a
+    /// choice.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A grid held in `element` and interpolated into an output held in
+    /// `element`: **toward zero at the samples, to the nearest afterwards**.
+    ///
+    /// The asymmetry is not a preference and it is not derivable — see
+    /// [`LatticeNarrowing`], where it is written out. It is here as one
+    /// constructor rather than as two calls a caller has to get right
+    /// separately, because getting one of the two right is exactly the mistake
+    /// that produces an answer close enough to be believed.
+    pub fn through(element: Dtype) -> Result<Self> {
+        Ok(Self {
+            at_samples: Some(Narrowing::new(element, Rounding::TowardZero)?),
+            after_interpolation: Some(Narrowing::new(element, Rounding::ToNearest)?),
+        })
+    }
+
+    /// Whether this narrows at all. `true` for [`Self::none`], and the guard
+    /// every consumer takes so that an unset narrowing costs no pass.
+    pub fn is_identity(&self) -> bool {
+        self.at_samples.is_none() && self.after_interpolation.is_none()
+    }
+
+    /// What a **constant** grid comes out as: both sites in order.
+    ///
+    /// Exact rather than approximate, and that is what makes it usable in a
+    /// `constant_maps_to`: the interpolation between two equal samples returns
+    /// that sample bit for bit (see [`SampleLattice::bracket`]), so a uniform
+    /// block's every voxel really is the second narrowing of the first
+    /// narrowing of the statistic's own answer, with nothing in between that
+    /// could differ in the last bit.
+    pub fn applied(&self, value: f64) -> f64 {
+        let sampled = match self.at_samples {
+            Some(narrowing) => narrowing.apply(value),
+            None => value,
+        };
+        match self.after_interpolation {
+            Some(narrowing) => narrowing.apply(sampled),
+            None => sampled,
+        }
+    }
+}
+
 // ------------------------------------------------------------- kernels --
 
 /// What the statistic writes at a sample whose window kept **nothing**.
@@ -940,8 +1178,9 @@ where
     )
 }
 
-/// The general form; the one above is this at [`Alignment::default`], which is
-/// the convention this kernel had before there was a choice.
+/// The form with the mapping-back convention stated; [`local_statistic_into`]
+/// is this at [`Alignment::default`], which is the convention this kernel had
+/// before there was a choice.
 ///
 /// The convention decides **which** samples a voxel is blended from, and
 /// nothing else: the same lattice points are evaluated, over the same windows,
@@ -960,6 +1199,44 @@ where
     T: Copy,
     F: FnMut(&mut [T]) -> f64,
 {
+    local_statistic_into_narrowed(
+        input,
+        at,
+        element,
+        lattice,
+        alignment,
+        LatticeNarrowing::none(),
+        reduce,
+        out,
+    )
+}
+
+/// The general form: the convention *and* the two narrowings stated.
+///
+/// [`local_statistic_into_with`] is this at [`LatticeNarrowing::none`], so
+/// nothing moves by adding it and no existing call site has to say anything.
+///
+/// **Where the narrowing sits is the whole of what this adds**, and it is two
+/// places rather than one: `narrowing.at_samples` is applied to the sample grid
+/// after every sample has been evaluated and *before* any voxel is blended, and
+/// `narrowing.after_interpolation` is applied to each blended voxel. See
+/// [`LatticeNarrowing`], which is where the difference between the two is
+/// argued.
+#[allow(clippy::too_many_arguments)]
+pub fn local_statistic_into_narrowed<T, F>(
+    input: ArrayView3<'_, T>,
+    at: &Anchor,
+    element: &StructuringElement,
+    lattice: &SampleLattice,
+    alignment: Alignment,
+    narrowing: LatticeNarrowing,
+    reduce: F,
+    out: ArrayViewMut3<'_, f64>,
+) -> Result<()>
+where
+    T: Copy,
+    F: FnMut(&mut [T]) -> f64,
+{
     sampled_statistic_into(
         input,
         None,
@@ -967,6 +1244,7 @@ where
         element,
         lattice,
         alignment,
+        narrowing,
         Population::new(),
         // Never called: a centre's value is read only under a mask, and there
         // is none. Stated as a closure rather than as an `Option` so that the
@@ -1031,10 +1309,10 @@ where
     )
 }
 
-/// The general form; the one above is this at [`Alignment::default`]. See
-/// [`local_statistic_into_with`], which states the same parameter for the
-/// unmasked path — a population changes which voxels join a window and nothing
-/// about how a voxel is mapped back to the samples.
+/// The form with the convention stated; the one above is this at
+/// [`Alignment::default`]. See [`local_statistic_into_with`], which states the
+/// same parameter for the unmasked path — a population changes which voxels
+/// join a window and nothing about how a voxel is mapped back to the samples.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_local_statistic_into_with<T, F>(
     input: ArrayView3<'_, T>,
@@ -1051,6 +1329,46 @@ where
     T: Copy + Into<f64>,
     F: FnMut(&mut [T]) -> f64,
 {
+    masked_local_statistic_into_narrowed(
+        input,
+        mask,
+        at,
+        element,
+        lattice,
+        alignment,
+        LatticeNarrowing::none(),
+        population,
+        reduce,
+        out,
+    )
+}
+
+/// The general masked form, with the two narrowings stated as well; see
+/// [`local_statistic_into_narrowed`], which says where each of them sits.
+///
+/// **A population does not exempt a sample from the narrowing.** The value
+/// [`ExcludedCentre::Fill`] writes and the centre's own value
+/// [`EmptyPopulation::Centre`] carries are values *of the grid*, so they are
+/// narrowed with every other sample — the grid holds one type, and a sample that
+/// escaped the narrowing because of how it was chosen would be the one value in
+/// it that is not of that type.
+#[allow(clippy::too_many_arguments)]
+pub fn masked_local_statistic_into_narrowed<T, F>(
+    input: ArrayView3<'_, T>,
+    mask: ArrayView3<'_, bool>,
+    at: &Anchor,
+    element: &StructuringElement,
+    lattice: &SampleLattice,
+    alignment: Alignment,
+    narrowing: LatticeNarrowing,
+    population: Population,
+    reduce: F,
+    out: ArrayViewMut3<'_, f64>,
+) -> Result<()>
+where
+    T: Copy + Into<f64>,
+    F: FnMut(&mut [T]) -> f64,
+{
     sampled_statistic_into(
         input,
         Some(mask),
@@ -1058,6 +1376,7 @@ where
         element,
         lattice,
         alignment,
+        narrowing,
         population,
         |value: T| value.into(),
         reduce,
@@ -1081,6 +1400,7 @@ fn sampled_statistic_into<T, F, W>(
     element: &StructuringElement,
     lattice: &SampleLattice,
     alignment: Alignment,
+    narrowing: LatticeNarrowing,
     population: Population,
     widen: W,
     mut reduce: F,
@@ -1140,6 +1460,13 @@ where
     );
     let mut grid = Array3::<f64>::zeros(grid_shape);
     let mut window: Vec<T> = Vec::with_capacity(element.len());
+    // The element's offsets **at one sample centre**, for the one element that
+    // has more than one set of them: a decimation counted from
+    // `StepOrigin::ClippedStart` re-phases where the window is clipped at a low
+    // face of the volume. Owned out here so a sample pays no allocation for it,
+    // and untouched by every other element — `offsets_at` hands back the
+    // element's own slice when there is nothing to re-phase.
+    let mut offsets: Vec<[isize; 3]> = Vec::with_capacity(element.len());
     // Whether the sample centre's *own* voxel has to be looked up at all. Under
     // the defaults it does not, so the unmasked path is the loop it always was
     // and pays nothing for the branch that is not taken.
@@ -1193,7 +1520,13 @@ where
                     }
                 }
                 window.clear();
-                for offset in element.offsets() {
+                // Asked at the sample's own position in the **volume** — not in
+                // this buffer — because that is what makes the answer the same
+                // under every decomposition: the volume's faces are the same
+                // faces from inside every block, and a block seam is not one.
+                // The clamp below is still the buffer's, and still the global
+                // clamp intersected with what is held.
+                for offset in element.offsets_at(centre, at.volume, &mut offsets) {
                     let mut index = [0usize; 3];
                     let mut inside = true;
                     for axis in 0..3 {
@@ -1231,6 +1564,21 @@ where
         }
     }
 
+    // **The first of the two narrowing sites**, and it is here rather than a
+    // few lines up on purpose: every value that reaches the grid passes through
+    // it — the reduced ones, the fill a denied centre gets, the centre's own
+    // value an empty window carries — because the grid holds one element type
+    // and all three are values of it. Done as one sweep over the grid rather
+    // than at each of the three writes so that there is one place a later
+    // fourth way of filling a sample cannot be added without.
+    //
+    // It is *before* the interpolation, which is the load-bearing half: these
+    // are the numbers the blend below reads, so narrowing them moves every voxel
+    // in the gaps and not only the ones sitting on a sample.
+    if let Some(narrowing) = narrowing.at_samples {
+        grid.map_inplace(|value| *value = narrowing.apply(*value));
+    }
+
     // Interpolate back. The brackets are per axis, so they are computed once per
     // plane rather than once per voxel.
     let brackets: Vec<Vec<(usize, usize, f64)>> = (0..3)
@@ -1255,6 +1603,14 @@ where
                 out[[i, j, k]] = lerp(at_face(a0), at_face(b0), t0);
             }
         }
+    }
+
+    // **The second narrowing site**, after the blend and not instead of it. A
+    // separate pass rather than a branch inside the loop above, so that a caller
+    // who narrows at neither site pays nothing at all for the parameter's
+    // existence — which is what keeps the default byte-identical *and* free.
+    if let Some(narrowing) = narrowing.after_interpolation {
+        out.map_inplace(|value| *value = narrowing.apply(*value));
     }
     Ok(())
 }
@@ -1817,11 +2173,24 @@ impl From<Total> for f64 {
 /// samples laid down at a fixed spacing with an unsampled margin at each end,
 /// mapped back by [`Alignment::PinnedEnds`], which does not consult those
 /// positions at all.
+///
+/// **The narrowing is the third convention and it is held here for the same
+/// reason as the other two.** [`LatticeNarrowing`] says what element type the
+/// values pass through at the sample grid and after the interpolation, and both
+/// of those sites are inside this type's own `evaluate_into` — the fused form
+/// evaluates and blends in one pass, so an op holding this could not apply the
+/// first of them at all. It also has to travel with the sampling and the
+/// alignment rather than beside them: all three are read by
+/// `constant_maps_to`, and a narrowing kept one level up would leave that
+/// declaration stating the un-narrowed value while the kernel wrote the
+/// narrowed one, which is a short-circuited block computing a number no run
+/// would produce.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalStatistic {
     element: StructuringElement,
     sampling: Sampling,
     alignment: Alignment,
+    narrowing: LatticeNarrowing,
     statistic: Statistic,
 }
 
@@ -1860,6 +2229,7 @@ impl LocalStatistic {
             element,
             sampling,
             alignment: Alignment::default(),
+            narrowing: LatticeNarrowing::none(),
             statistic,
         })
     }
@@ -1893,6 +2263,30 @@ impl LocalStatistic {
 
     pub fn alignment(&self) -> Alignment {
         self.alignment
+    }
+
+    /// The element type the values pass through at the sample grid and after the
+    /// interpolation; see [`LatticeNarrowing`], which is where both sites are.
+    ///
+    /// A builder rather than an argument to a constructor, for
+    /// [`Self::with_alignment`]'s reason: the choice is additive, and
+    /// [`LatticeNarrowing::none`] — no narrowing at either site — is what every
+    /// caller had before there was one.
+    ///
+    /// It is part of what the statistic **is**: two statistics differing only in
+    /// it compute different numbers from the same windows, and its `PartialEq`
+    /// says so. It changes no output volume and no cost, and — unlike
+    /// [`Alignment`], which does — it changes **no reach**. Rounding a value is
+    /// not reading a different one: the samples evaluated, the windows gathered
+    /// and the brackets blended are all the same, and every narrowing in this
+    /// type is applied to a value already in hand.
+    pub fn narrowed(mut self, narrowing: LatticeNarrowing) -> Self {
+        self.narrowing = narrowing;
+        self
+    }
+
+    pub fn narrowing(&self) -> LatticeNarrowing {
+        self.narrowing
     }
 
     /// Cloned rather than borrowed so that every existing caller keeps
@@ -2049,12 +2443,13 @@ impl LocalStatistic {
         // widens into the same allocation rather than a fresh one per point.
         // Untouched by the shipped statistics; see `Statistic::reduce_with`.
         let mut scratch: Vec<f64> = Vec::with_capacity(full);
-        local_statistic_into_with(
+        local_statistic_into_narrowed(
             ordered.view(),
             at,
             &self.element,
             &lattice,
             self.alignment,
+            self.narrowing,
             |window| statistic.reduce_with(window, full, &mut scratch),
             out,
         )
@@ -2082,16 +2477,37 @@ impl LocalStatistic {
         let statistic = &self.statistic;
         let full = self.element.len();
         let mut scratch: Vec<f64> = Vec::with_capacity(full);
-        masked_local_statistic_into_with(
+        masked_local_statistic_into_narrowed(
             ordered.view(),
             mask,
             at,
             &self.element,
             &lattice,
             self.alignment,
+            self.narrowing,
             population,
             |window| statistic.reduce_with(window, full, &mut scratch),
             out,
+        )
+    }
+
+    /// What this statistic writes over a uniformly `value` block with nothing
+    /// masked, where that is **exactly** what it writes.
+    ///
+    /// The statistic's own declaration, **taken through both narrowing sites**.
+    /// That composition is exact rather than nearly so, and for a reason that is
+    /// arithmetic: a uniform block gives a uniform grid, the grid's narrowing is
+    /// a function of one value, and the blend between two equal samples returns
+    /// that sample bit for bit — so there is nothing between the two narrowings
+    /// that could differ in the last bit. See [`LatticeNarrowing::applied`].
+    ///
+    /// Stated here rather than at each op shell so that an op cannot declare the
+    /// un-narrowed value while its kernel writes the narrowed one, which is a
+    /// short-circuited block filled with a number no run would have produced.
+    pub fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        Some(
+            self.narrowing
+                .applied(self.statistic.constant_maps_to(value)?),
         )
     }
 
@@ -2122,6 +2538,14 @@ impl LocalStatistic {
     /// last bit is still a block skipped into a value it would not have
     /// computed, and two `NaN`s that compare unequal withdraw, which is the safe
     /// direction.
+    ///
+    /// **The narrowing is applied last and the comparisons are made before it**,
+    /// which is the order the kernel runs in: every one of these values is
+    /// written into the grid and the grid is narrowed as a whole, so what has to
+    /// agree is what is written, not what it narrows to. Two values that differ
+    /// before the narrowing and coincide after it withdraw the declaration
+    /// anyway, which is the safe direction and the one this method has always
+    /// taken.
     pub fn masked_constant_maps_to(&self, value: f64, population: Population) -> Option<f64> {
         let answer = self.statistic.constant_maps_to(value)?;
         if let ExcludedCentre::Fill(fill) = population.centre {
@@ -2129,13 +2553,13 @@ impl LocalStatistic {
                 return None;
             }
         }
-        match population.empty {
-            EmptyPopulation::Centre => (value.to_bits() == answer.to_bits()).then_some(answer),
+        let survives = match population.empty {
+            EmptyPopulation::Centre => value.to_bits() == answer.to_bits(),
             EmptyPopulation::Reduce => {
-                let empty = self.statistic.empty_maps_to(self.element.len());
-                (empty.to_bits() == answer.to_bits()).then_some(answer)
+                self.statistic.empty_maps_to(self.element.len()).to_bits() == answer.to_bits()
             }
-        }
+        };
+        survives.then(|| self.narrowing.applied(answer))
     }
 }
 
@@ -2210,6 +2634,23 @@ impl LocalStatisticOp {
         self
     }
 
+    /// The element type the sample values pass through; see
+    /// [`LatticeNarrowing`], and [`LocalStatistic::narrowed`], which is where it
+    /// is held and why.
+    ///
+    /// Forwarded rather than stored beside the statistic, exactly as
+    /// [`Self::with_alignment`] is: this op evaluates the samples and
+    /// interpolates them in **one pass** and both narrowing sites are inside it,
+    /// so a second copy of the parameter would be a second thing to keep in
+    /// step. A caller matching the *split* pair states the two halves on
+    /// `LatticeStatisticOp::narrowed_to` and
+    /// `LatticeInterpolateOp::narrowed_to`, and the two paths then compute the
+    /// same numbers.
+    pub fn narrowed(mut self, narrowing: LatticeNarrowing) -> Self {
+        self.statistic = self.statistic.narrowed(narrowing);
+        self
+    }
+
     /// The level this op reads its population from, where it reads one.
     pub fn mask_level(&self) -> Option<usize> {
         self.mask
@@ -2221,6 +2662,10 @@ impl LocalStatisticOp {
 
     pub fn alignment(&self) -> Alignment {
         self.statistic.alignment()
+    }
+
+    pub fn narrowing(&self) -> LatticeNarrowing {
+        self.statistic.narrowing()
     }
 
     pub fn statistic(&self) -> &LocalStatistic {
@@ -2310,9 +2755,14 @@ impl BlockOp for LocalStatisticOp {
 
     /// The statistic's declaration where nothing is masked, and the narrower one
     /// [`LocalStatistic::masked_constant_maps_to`] states where something is.
+    ///
+    /// Both come from the [`LocalStatistic`], which is where the narrowing lives
+    /// — asking the bare [`Statistic`] instead would declare the value before the
+    /// two narrowings and fill a skipped block with a number the kernel would
+    /// not have written.
     fn constant_maps_to(&self, value: f64) -> Option<f64> {
         match self.mask {
-            None => self.statistic.statistic().constant_maps_to(value),
+            None => self.statistic.constant_maps_to(value),
             Some(_) => self
                 .statistic
                 .masked_constant_maps_to(value, self.population),
@@ -2406,6 +2856,21 @@ impl AdaptiveThresholdOp {
         self
     }
 
+    /// The element type the threshold level's values pass through before the
+    /// affine adjustment and the comparison; see [`LatticeNarrowing`] and
+    /// [`LocalStatisticOp::narrowed`], which states the same thing for the same
+    /// reason.
+    ///
+    /// The order is worth stating because it is the only one that is a
+    /// composition rather than a rewrite: the narrowing belongs to the
+    /// *statistic*, so it happens where the statistic ends, and `scale` and
+    /// `offset` are then applied to the narrowed level. A caller wanting the
+    /// adjusted level narrowed instead is asking for a different op.
+    pub fn narrowed(mut self, narrowing: LatticeNarrowing) -> Self {
+        self.statistic = self.statistic.narrowed(narrowing);
+        self
+    }
+
     /// The level this op reads its population from, where it reads one.
     pub fn mask_level(&self) -> Option<usize> {
         self.mask
@@ -2417,6 +2882,10 @@ impl AdaptiveThresholdOp {
 
     pub fn alignment(&self) -> Alignment {
         self.statistic.alignment()
+    }
+
+    pub fn narrowing(&self) -> LatticeNarrowing {
+        self.statistic.narrowing()
     }
 
     /// What to write on each side of the comparison. `1.0` / `0.0` by default,
@@ -2533,7 +3002,7 @@ impl BlockOp for AdaptiveThresholdOp {
     /// by a second judgement.
     fn constant_maps_to(&self, value: f64) -> Option<f64> {
         let statistic = match self.mask {
-            None => self.statistic.statistic().constant_maps_to(value)?,
+            None => self.statistic.constant_maps_to(value)?,
             Some(_) => self
                 .statistic
                 .masked_constant_maps_to(value, self.population)?,

@@ -43,24 +43,47 @@
 // decompositions — including one where the block count is 1, which is the case
 // with no seams at all.
 //
-// Connectivity: six for the background, and why not twenty-six
-// ------------------------------------------------------------
-// A hole is a background component under **face** connectivity. Two decisions
-// hide in that sentence and both are made here rather than left to a caller:
+// Connectivity: one choice, and it is the **background's**
+// ---------------------------------------------------------
+// A hole is a background component. Two decisions hide in that sentence, and
+// they are not the same kind of decision:
 //
-// * **Background rather than foreground.** Hole filling is a statement about the
-//   complement, so the labelling runs on the complement.
-// * **Face rather than full.** Under 6-connectivity two background voxels are in
-//   the same component only if they share a face, so a component crosses a block
-//   seam only through the shared *plane*, and the fragment is six planes. Under
-//   26-connectivity it can also cross through an edge or a corner, and the
-//   fragment would need the twelve edge lines and eight corner voxels as well —
-//   a different fragment shape, three times the encoding, and a merge with three
-//   kinds of adjacency instead of one. Six is also the conservative choice for
-//   the operation itself: a cavity that leaks only diagonally is treated as
-//   closed, so a hole is filled unless it drains through a face.
+// * **Background rather than foreground** is fixed here and is not a parameter.
+//   Hole filling is a statement about the complement, so the labelling runs on
+//   the complement, and an op that labelled the foreground would be a different
+//   operation. `ops::detect` is that operation.
+// * **Which neighbours join** is a [`Connectivity`], stated by the caller, and
+//   [`Connectivity::Faces`] unless one is. It is genuinely a choice — a caller
+//   who wants a cavity that leaks only diagonally treated as closed asks for
+//   `Faces`, and one who wants it drained asks for `FacesEdgesAndCorners` — and
+//   the two are both right about different questions.
 //
-// This is a limit and it is stated as one. It is not a limit of the framework.
+// **There is exactly one connectivity here, and it is the background's**, because
+// the background is the only thing this op labels. That is worth saying because
+// the literature carries a second number beside it: the *complementary pair*
+// convention, under which a 6-connected foreground is analysed against a
+// 26-connected background and vice versa, so that a surface separates what it
+// looks like it separates. This op cannot honour that pairing on a caller's
+// behalf, because it never sees a foreground connectivity — nothing here labels
+// the foreground. A plan that fills holes and then runs `ops::detect` over the
+// result is where the pair becomes visible, and choosing `Faces` for the fill and
+// `FacesEdgesAndCorners` for the detection is the caller's to do. Both ops take
+// the parameter separately for exactly that reason.
+//
+// **The fragment did not have to change.** The obvious guess is that a wider
+// connectivity needs the twelve edge lines and the eight corner voxels beside the
+// six face planes. It does not: a voxel with any neighbour outside its block lies
+// on a *face* of that block, so the six planes already are the whole boundary
+// shell, and the edge lines and corner voxels are rows and single entries of
+// them. `components`'s header is where that is argued; what widened is the seam
+// walk's inputs and nothing about the bytes.
+//
+// **Both phases carry the choice and [`fill_phases`] refuses a pair that
+// disagrees.** Phase 0's flood and phase 1's seam walk are two halves of one
+// equivalence relation, so a plan that labelled at twenty-six and merged at six
+// would join inside a block what it kept apart across a seam — a
+// decomposition-dependent answer, which is the one defect this crate exists to
+// prevent, and it is refused at planning time rather than discovered.
 //
 // Two walls this op ran into, and what was done about each
 // --------------------------------------------------------
@@ -161,8 +184,8 @@ use crate::voxels::Voxels;
 
 use super::components::{
     bytes_to_words, core_within_read, empty_planes, expect_end, face_axes, label_members_into,
-    planes_of, push_planes, read_header, take_planes, walk_seams, words_to_bytes, FacePlanes,
-    LabelIndex, Union, UNLABELLED,
+    label_members_into_with, planes_of, push_planes, read_header, take_planes, walk_seams_with,
+    words_to_bytes, Connectivity, FacePlanes, LabelIndex, Union, UNLABELLED,
 };
 use super::shapes_agree;
 use super::voxelwise::is_set;
@@ -188,6 +211,9 @@ pub const FOREGROUND: u32 = UNLABELLED;
 /// when the mask leaves it clear. Everything that makes the labelling
 /// deterministic, iterative and six-connected is stated there, once, for the two
 /// ops that share it.
+///
+/// Six-connected because that is [`Connectivity`]'s default;
+/// [`label_background_into_with`] is the form that says which.
 pub fn label_background_into(
     mask: ArrayView3<'_, bool>,
     out: ArrayViewMut3<'_, u32>,
@@ -195,6 +221,22 @@ pub fn label_background_into(
     shapes_agree(mask.shape(), out.shape(), "label_background_into")?;
     let shape = [mask.shape()[0], mask.shape()[1], mask.shape()[2]];
     label_members_into(shape, |at| !mask[at], out)
+}
+
+/// [`label_background_into`] under a stated [`Connectivity`], which is the
+/// **background's** — see the module header for why there is only one here.
+///
+/// Everything that function promises holds: the membership test, the scan-order
+/// numbering, the iterative traversal. What widens is which background voxels one
+/// flood reaches, and a wider one leaves fewer, larger components.
+pub fn label_background_into_with(
+    mask: ArrayView3<'_, bool>,
+    connectivity: Connectivity,
+    out: ArrayViewMut3<'_, u32>,
+) -> Result<u32> {
+    shapes_agree(mask.shape(), out.shape(), "label_background_into_with")?;
+    let shape = [mask.shape()[0], mask.shape()[1], mask.shape()[2]];
+    label_members_into_with(shape, connectivity, |at| !mask[at], out)
 }
 
 /// Rewrite a label volume into the filled mask.
@@ -332,6 +374,22 @@ pub fn merge_faces(
     reports: &BTreeMap<[usize; 3], BlockFaces>,
     counts: [usize; 3],
 ) -> Result<BTreeMap<[usize; 3], Vec<bool>>> {
+    merge_faces_with(reports, counts, Connectivity::Faces)
+}
+
+/// [`merge_faces`] under a stated [`Connectivity`].
+///
+/// **It must be the one the labelling ran under.** The flood inside a block and
+/// the walk across a seam generate one equivalence relation between them, so two
+/// different choices would join within a block what they keep apart across a
+/// seam — an answer that depends on where the volume was cut. [`fill_phases`] and
+/// [`append_connected`] refuse a mismatched pair at planning time; a caller
+/// driving the kernels by hand is the one place the pairing is not checked.
+pub fn merge_faces_with(
+    reports: &BTreeMap<[usize; 3], BlockFaces>,
+    counts: [usize; 3],
+    connectivity: Connectivity,
+) -> Result<BTreeMap<[usize; 3], Vec<bool>>> {
     let index = LabelIndex::build(reports, counts, |report| report.labels)?;
     let escapes = index.gather(reports, |report| &report.touches_outside[..], false);
     let mut sets = Union::new(index.total());
@@ -340,10 +398,11 @@ pub fn merge_faces(
     // unconditionally.** There is nothing to compare: the labelling ran on the
     // complement of the mask, so both sides being labelled at all is already the
     // whole of the condition.
-    walk_seams(
+    walk_seams_with(
         reports,
         counts,
         &index,
+        connectivity,
         |report| &report.faces,
         |a, b| sets.union(a, b),
     )?;
@@ -365,6 +424,11 @@ pub struct LabelBackgroundOp {
     name: &'static str,
     stream: String,
     lifecycle: Lifecycle,
+    /// Which background voxels count as adjacent. [`Connectivity::Faces`] unless
+    /// a caller said otherwise, and that default is the whole of the
+    /// compatibility story: every existing constructor leaves it alone, so every
+    /// existing caller gets the labels it always got.
+    connectivity: Connectivity,
 }
 
 impl LabelBackgroundOp {
@@ -373,7 +437,28 @@ impl LabelBackgroundOp {
             name,
             stream: stream.into(),
             lifecycle,
+            connectivity: Connectivity::Faces,
         }
+    }
+
+    /// The same op, labelling the background under a stated [`Connectivity`].
+    ///
+    /// A consuming builder rather than a fourth argument to [`Self::new`], for
+    /// `detect::RegionPointsOp::emitting`'s reason: every call site that does not
+    /// say this word keeps its signature and its answer, and a mechanical edit
+    /// across every caller is exactly the change that gets one call site wrong.
+    ///
+    /// **The merge has to be told the same thing.** See
+    /// [`FillHolesOp::connecting`], and [`fill_phases`], which refuses a pair
+    /// that disagrees.
+    pub fn connecting(mut self, connectivity: Connectivity) -> Self {
+        self.connectivity = connectivity;
+        self
+    }
+
+    /// Which background voxels this op counts as adjacent.
+    pub fn connectivity(&self) -> Connectivity {
+        self.connectivity
     }
 
     pub fn stream(&self) -> &str {
@@ -432,7 +517,7 @@ impl FragmentOp for LabelBackgroundOp {
         };
         let count = {
             let labels = out.view_mut::<u32>()?;
-            label_background_into(mask.view(), labels)?
+            label_background_into_with(mask.view(), self.connectivity, labels)?
         };
 
         let labels = out.view::<u32>()?;
@@ -498,6 +583,10 @@ pub struct FillHolesOp {
     faces_phase: usize,
     filled: Dtype,
     lattice: [usize; 3],
+    /// Which background voxels count as adjacent **across a seam**, which has to
+    /// be what the labelling used within a block. [`Connectivity::Faces`] unless
+    /// a caller said otherwise.
+    connectivity: Connectivity,
 }
 
 impl FillHolesOp {
@@ -522,7 +611,26 @@ impl FillHolesOp {
             faces_phase,
             filled,
             lattice: grid.blocks_per_axis(),
+            connectivity: Connectivity::Faces,
         }
+    }
+
+    /// The same op, closing the components under a stated [`Connectivity`].
+    ///
+    /// **It must be the labelling's.** The two phases are one equivalence
+    /// relation split in half — the flood inside a block and the walk across a
+    /// seam — so a mismatched pair joins within a block what it keeps apart
+    /// across a seam, and the answer becomes a function of where the volume was
+    /// cut. [`fill_phases`] and [`append_connected`] check the pair; this builder
+    /// on its own cannot, because it can only see one of the two ops.
+    pub fn connecting(mut self, connectivity: Connectivity) -> Self {
+        self.connectivity = connectivity;
+        self
+    }
+
+    /// Which background voxels this op counts as adjacent.
+    pub fn connectivity(&self) -> Connectivity {
+        self.connectivity
     }
 
     /// The same op, addressed by a [`Phase`] handle instead of a number.
@@ -588,7 +696,7 @@ impl FragmentOp for FillHolesOp {
         for (key, bytes) in at.fragments(&self.stream) {
             reports.insert(key.block, BlockFaces::decode(bytes)?);
         }
-        let outside = merge_faces(&reports, at.grid.blocks_per_axis())?;
+        let outside = merge_faces_with(&reports, at.grid.blocks_per_axis(), self.connectivity)?;
         let mine = outside.get(&at.index).ok_or_else(|| {
             Error::InvalidArgument(format!(
                 "the merge produced no answer for block {:?}, which is the block asking",
@@ -641,12 +749,16 @@ impl FragmentOp for FillHolesOp {
 ///
 /// `mask_dtype` is the element type of the level the mask arrives in; the width
 /// of the answer comes from `fill`, which is where a caller states it.
+///
+/// **The two connectivities are checked here**, which is the only place both ops
+/// are in one hand. See [`agree_on_connectivity`].
 pub fn fill_phases(
     grid: BlockGrid,
     mask_dtype: Dtype,
     label: &LabelBackgroundOp,
     fill: &FillHolesOp,
 ) -> Result<Decomposition> {
+    agree_on_connectivity(label.connectivity(), fill.connectivity())?;
     let volume = grid.volume();
     let mut labelling = fragment_phase(label, grid.clone())?;
     labelling.dtype = Some(label.produces(mask_dtype));
@@ -677,20 +789,59 @@ pub fn append_to(
     lifecycle: Lifecycle,
     filled: Dtype,
 ) -> Result<Phase> {
+    append_connected(plan, stream, lifecycle, filled, Connectivity::Faces)
+}
+
+/// [`append_to`], with the background's [`Connectivity`] said out loud.
+///
+/// The general one; `append_to` is this at [`Connectivity::Faces`], which is what
+/// the two phases have always been. Kept as two functions rather than one with a
+/// fifth argument so that no existing call site has to be edited to say what it
+/// was already doing — `detect::append_emitting`'s reason.
+///
+/// **The choice goes to both phases from here**, which is what makes this the
+/// safe way to ask for a wider one: a caller building the two ops by hand has to
+/// remember to say it twice, and [`fill_phases`] is where that is caught.
+pub fn append_connected(
+    plan: &mut PlanBuilder,
+    stream: impl Into<String>,
+    lifecycle: Lifecycle,
+    filled: Dtype,
+    connectivity: Connectivity,
+) -> Result<Phase> {
     let stream = stream.into();
     let grid = plan.grid().clone();
-    let faces = plan.fragments(LabelBackgroundOp::new(
-        "background labelling",
-        stream.clone(),
-        lifecycle,
-    ))?;
-    plan.fragments(FillHolesOp::reading(
-        "hole filling",
-        stream,
-        faces,
-        filled,
-        &grid,
-    ))
+    let faces = plan.fragments(
+        LabelBackgroundOp::new("background labelling", stream.clone(), lifecycle)
+            .connecting(connectivity),
+    )?;
+    plan.fragments(
+        FillHolesOp::reading("hole filling", stream, faces, filled, &grid).connecting(connectivity),
+    )
+}
+
+/// The two phases' connectivities, refused unless they are one.
+///
+/// A block-local flood and a seam walk generate **one** equivalence relation
+/// between them. Two different choices make the relation depend on where the
+/// block boundary fell — voxels joined inside a block and kept apart across a
+/// seam — which is the one defect this crate exists to prevent, and it produces
+/// a plausible-looking answer rather than an error. So it is refused at planning
+/// time, before anything is scheduled.
+///
+/// `pub` because `ops::regional` and `ops::detect` have the same two halves and
+/// the same hazard, and one message is better than three.
+pub fn agree_on_connectivity(labelling: Connectivity, merge: Connectivity) -> Result<()> {
+    if labelling == merge {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "the labelling phase is {labelling:?}-connected and the merge phase is \
+         {merge:?}-connected. The flood inside a block and the walk across a seam are two \
+         halves of one adjacency relation, so a pair that disagrees joins voxels within a \
+         block that it keeps apart across a seam — which makes the answer depend on where the \
+         volume was cut. Give both phases the same connectivity."
+    )))
 }
 
 /// A block's pixels as a mask, whatever width they arrived in.
@@ -897,6 +1048,85 @@ mod tests {
         assert!(merge_faces(&reports, [2, 1, 1]).is_err());
         reports.insert([1, 0, 0], BlockFaces::empty());
         assert!(merge_faces(&reports, [2, 1, 1]).is_ok());
+    }
+
+    /// The parameter reaches the labelling, asked in the way that can tell.
+    ///
+    /// A cavity that opens on a corner only: face-connected it is a hole and
+    /// fills, corner-connected it drains and does not. A fixture whose opening
+    /// were a face would answer the same under every connectivity and would pass
+    /// with the parameter dropped on the floor.
+    #[test]
+    fn the_background_connectivity_reaches_the_answer_and_the_bare_form_is_faces() {
+        let mut mask = Array3::from_elem((7, 7, 7), false);
+        for i in 2..=4 {
+            for j in 2..=4 {
+                for k in 2..=4 {
+                    mask[[i, j, k]] = !(i == 3 && j == 3 && k == 3);
+                }
+            }
+        }
+        // remove one corner of the shell: the cavity now touches the outside
+        // diagonally, and only diagonally
+        mask[[2, 2, 2]] = false;
+
+        let count = |connectivity| {
+            let mut labels = Array3::<u32>::zeros(mask.raw_dim());
+            let found =
+                label_background_into_with(mask.view(), connectivity, labels.view_mut()).unwrap();
+            let flags = outside_flags(labels.view(), found, [0, 0, 0], [7, 7, 7], [7, 7, 7]);
+            let mut out = Array3::from_elem(mask.raw_dim(), false);
+            fill_from_labels_into(labels.view(), &flags, out.view_mut()).unwrap();
+            out[[3, 3, 3]]
+        };
+        assert!(
+            count(Connectivity::Faces),
+            "a corner opening is not a drain under six"
+        );
+        assert!(
+            count(Connectivity::FacesAndEdges),
+            "nor under eighteen: the opening is a corner step"
+        );
+        assert!(
+            !count(Connectivity::FacesEdgesAndCorners),
+            "under twenty-six it drains, so the cavity is not a hole"
+        );
+
+        // and the bare form is the face-connected one, byte for byte
+        let mut bare = Array3::<u32>::zeros(mask.raw_dim());
+        let mut stated = Array3::<u32>::zeros(mask.raw_dim());
+        assert_eq!(
+            label_background_into(mask.view(), bare.view_mut()).unwrap(),
+            label_background_into_with(mask.view(), Connectivity::Faces, stated.view_mut())
+                .unwrap()
+        );
+        assert_eq!(bare, stated);
+    }
+
+    /// The two phases are two halves of one relation, and a plan whose halves
+    /// disagree is refused **before** it is scheduled rather than answering
+    /// something that depends on where the volume was cut.
+    #[test]
+    fn a_plan_whose_two_phases_disagree_about_connectivity_is_refused() {
+        let grid = BlockGrid::new([8, 8, 8], [4, 4, 4]).unwrap();
+        let label = LabelBackgroundOp::new("label", "s", Lifecycle::DeleteOnExit)
+            .connecting(Connectivity::FacesEdgesAndCorners);
+        let merge = FillHolesOp::new("fill", "s", 0, Dtype::Bool, &grid);
+        let message = fill_phases(grid.clone(), Dtype::Bool, &label, &merge)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("same connectivity"), "{message}");
+
+        // and the matched pair plans, at both ends of the range
+        for connectivity in [Connectivity::Faces, Connectivity::FacesEdgesAndCorners] {
+            let label = LabelBackgroundOp::new("label", "s", Lifecycle::DeleteOnExit)
+                .connecting(connectivity);
+            let merge =
+                FillHolesOp::new("fill", "s", 0, Dtype::Bool, &grid).connecting(connectivity);
+            assert_eq!(label.connectivity(), connectivity);
+            assert_eq!(merge.connectivity(), connectivity);
+            assert!(fill_phases(grid.clone(), Dtype::Bool, &label, &merge).is_ok());
+        }
     }
 
     /// Two blocks whose faces are different shapes came from two different

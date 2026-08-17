@@ -219,12 +219,17 @@
 // ----------------------------------------
 // A centroid weighted by a per-voxel quantity — an intensity-weighted centre
 // rather than a geometric one — is the obvious extension and it is **not
-// implemented**. Two reasons, and the second is the one that would still hold if
-// the first were fixed:
+// implemented**. It used to be blocked on two things and is now blocked on one,
+// and the one is the one that always mattered:
 //
-// * it needs a **second input array** beside the mask, and a `FragmentOp` reads
-//   one level. That capability is being built; this op does not get to invent a
-//   second mechanism for it in the meantime;
+// * it needs a **second input array** beside the mask. **That capability is
+//   built.** A [`FragmentOp`] declares the other levels it reads with
+//   [`FragmentOp::source_inputs`], is handed them through
+//   [`FragmentOp::apply_with`], and states what its fold does across a seam with
+//   [`SeamFold`]; the phase records the levels, so the executor fetches them, the
+//   DAG orders them and `exact_read_voxels` counts them. `ops::tabulate` uses all
+//   three to reduce a second array over the regions of a label volume. Nothing is
+//   waiting on a mechanism any more;
 // * the tempting shortcut — take the weight from the mask level itself, since a
 //   mask may arrive as any width and `is_set` only asks whether a voxel is
 //   non-zero — would give up the exactness above. The weights would be arbitrary
@@ -233,18 +238,59 @@
 //   decomposition-dependent answer the integer accumulators exist to rule out. A
 //   weighted variant has to say what it does about that, and the honest answers
 //   are a fixed-point accumulator or a stated tolerance. Neither is a hook; both
-//   are a design.
+//   are a design. `ops::tabulate` took the first answer and its header argues it;
+//   this op has not made the choice, and until it does the accumulators here stay
+//   integer counts and integer coordinate sums.
 //
-// So the hook is left unbuilt rather than half-built, and this is where it goes.
+// **What `ops::tabulate` covers, and what it does not.** Over the regions of a
+// label volume it emits `count`, `nonfinite`, `sum`, `min` and `max` of a second
+// array, plus the per-axis coordinate sums `sum_0..2` — so the total of the
+// quantity and the *geometric* centroid both come out of it, exactly and
+// independently of the cut. A weighted centroid is neither of those and is not a
+// ratio of them: it is `sum(v_i * x_i) / sum(v_i)`, a **cross moment** of value
+// against position, and a sum of values and a sum of coordinates do not
+// determine it — the same two totals are produced by arrangements with different
+// weighted centres. So it is a different accumulator, not a different reading of
+// the columns that exist.
 //
-// Connectivity is six
-// -------------------
-// Regions are face-connected components of the set voxels, which is what
-// `ops::components` is built for and why: under 6-connectivity a component
-// crosses a seam only through the shared plane, so a block's whole contribution
-// to the merge is six planes. Two voxels touching only at an edge or a corner are
-// two regions and get two points. That is a limit and it is stated as one; it is
-// not a limit of the framework.
+// It is a small different accumulator — three more fixed-point words, folded by
+// `+` like the ones beside them — and when it is wanted it belongs where the
+// label volume and the value array are already in one place, which is
+// `ops::tabulate` and not here. This op labels a mask; a caller who wants a
+// weighted centre labels with `ops::label` and tabulates. Nothing is built for it
+// on spec, and this paragraph is the whole of the design note.
+//
+// Connectivity: one choice, and it is the **foreground's**
+// ---------------------------------------------------------
+// Regions are connected components of the **set** voxels, and which neighbours
+// count as connected is a [`Connectivity`] the caller states —
+// [`Connectivity::Faces`] unless one is. There is exactly one here, because the
+// set voxels are the only thing this op labels: two voxels touching only at a
+// corner are two regions and get two points under `Faces`, and one region and one
+// point under `FacesEdgesAndCorners`, and both answers are right about different
+// questions.
+//
+// **This is the foreground's connectivity, and `ops::fill`'s is the
+// background's.** They are separate parameters on separate ops rather than one
+// shared choice, and that is deliberate: the *complementary pair* convention in
+// the literature analyses a 6-connected foreground against a 26-connected
+// background and vice versa, so a plan that fills holes at `Faces` and then
+// detects regions at `FacesEdgesAndCorners` is the topologically consistent
+// combination. Neither op can make that choice on the other's behalf — each sees
+// one of the two sets — so each takes its own.
+//
+// **The fragment did not have to change.** A voxel with any neighbour outside its
+// block lies on a *face* of that block, so the six planes already are the whole
+// boundary shell, and the twelve edge lines and eight corner voxels a wider
+// connectivity meets across are rows and single entries of them. `components`'s
+// header argues it. What widened is the seam walk's inputs; the accumulators, the
+// ownership rule and the encoding are untouched, because a component is still the
+// transitive closure of an adjacency and only the pairs generating it grew.
+//
+// **Both phases carry the choice and [`detect_phases`] refuses a pair that
+// disagrees**, for `ops::fill`'s reason: a plan that labelled at twenty-six and
+// merged at six would join within a block what it kept apart across a seam, and
+// the centroids would depend on where the volume was cut.
 //
 // What this costs
 // ---------------
@@ -276,11 +322,11 @@ use crate::sidecar::Lifecycle;
 use crate::table::{Column, RowBuilder, Schema, Table, Value, POSITION_WORDS};
 
 use super::components::{
-    bytes_to_words, empty_planes, expect_end, label_members_into, planes_of, push_planes,
-    read_header, take_planes, walk_seams, words_to_bytes, FacePlanes, LabelIndex, Union,
-    UNLABELLED,
+    bytes_to_words, empty_planes, expect_end, label_members_into, label_members_into_with,
+    planes_of, push_planes, read_header, take_planes, walk_seams_with, words_to_bytes,
+    Connectivity, FacePlanes, LabelIndex, Union, UNLABELLED,
 };
-use super::fill::as_mask;
+use super::fill::{agree_on_connectivity, as_mask};
 use super::shapes_agree;
 
 // ------------------------------------------------------------ the moments --
@@ -469,10 +515,30 @@ fn overflowed(what: &str) -> Error {
 /// and the whole of what is said here is the membership test: a voxel belongs to
 /// a region exactly when the mask sets it. A clear voxel is left [`UNLABELLED`]
 /// and is in no region.
+///
+/// Six-connected because that is [`Connectivity`]'s default;
+/// [`label_regions_into_with`] is the form that says which.
 pub fn label_regions_into(mask: ArrayView3<'_, bool>, out: ArrayViewMut3<'_, u32>) -> Result<u32> {
     shapes_agree(mask.shape(), out.shape(), "label_regions_into")?;
     let shape = [mask.shape()[0], mask.shape()[1], mask.shape()[2]];
     label_members_into(shape, |at| mask[at], out)
+}
+
+/// [`label_regions_into`] under a stated [`Connectivity`], which is the
+/// **foreground's** — see the module header for why there is only one here and
+/// why it is not `ops::fill`'s.
+///
+/// Everything that function promises holds: the membership test, the scan-order
+/// numbering, the iterative traversal. A wider choice leaves fewer, larger
+/// regions and therefore fewer points.
+pub fn label_regions_into_with(
+    mask: ArrayView3<'_, bool>,
+    connectivity: Connectivity,
+    out: ArrayViewMut3<'_, u32>,
+) -> Result<u32> {
+    shapes_agree(mask.shape(), out.shape(), "label_regions_into_with")?;
+    let shape = [mask.shape()[0], mask.shape()[1], mask.shape()[2]];
+    label_members_into_with(shape, connectivity, |at| mask[at], out)
 }
 
 /// The moments of every label of `labels`, in label order, over an array whose
@@ -541,6 +607,15 @@ pub fn detect_regions(mask: ArrayView3<'_, bool>) -> Result<Vec<Point>> {
     Ok(centroid_points(&region_moments(mask)?))
 }
 
+/// [`detect_regions`] under a stated [`Connectivity`]: the whole-volume reference
+/// a blocked run at that choice is measured against.
+pub fn detect_regions_with(
+    mask: ArrayView3<'_, bool>,
+    connectivity: Connectivity,
+) -> Result<Vec<Point>> {
+    Ok(centroid_points(&region_moments_with(mask, connectivity)?))
+}
+
 /// The whole-volume answer as **rows**: [`detect_regions`]'s blob, in the richer
 /// form.
 ///
@@ -554,8 +629,16 @@ pub fn detect_region_rows(mask: ArrayView3<'_, bool>) -> Result<Vec<u8>> {
 /// The accumulators of every component of a whole mask, unmerged because there
 /// is nothing to merge: one array, one labelling, one pass.
 pub fn region_moments(mask: ArrayView3<'_, bool>) -> Result<Vec<Moments>> {
+    region_moments_with(mask, Connectivity::Faces)
+}
+
+/// [`region_moments`] under a stated [`Connectivity`].
+pub fn region_moments_with(
+    mask: ArrayView3<'_, bool>,
+    connectivity: Connectivity,
+) -> Result<Vec<Moments>> {
     let mut labels = Array3::<u32>::zeros(mask.raw_dim());
-    let count = label_regions_into(mask, labels.view_mut())?;
+    let count = label_regions_into_with(mask, connectivity, labels.view_mut())?;
     moments_of_labels(labels.view(), count, [0, 0, 0])
 }
 
@@ -992,14 +1075,29 @@ pub fn merge_moments(
     reports: &BTreeMap<[usize; 3], RegionMoments>,
     counts: [usize; 3],
 ) -> Result<Vec<Moments>> {
+    merge_moments_with(reports, counts, Connectivity::Faces)
+}
+
+/// [`merge_moments`] under a stated [`Connectivity`], which must be the one the
+/// regions were labelled under.
+///
+/// The accumulators are untouched by the choice — they are per `(block, label)`
+/// and the labels did not move. What the choice changes is which of them end up
+/// on one root, and addition does not care how many pieces it is handed.
+pub fn merge_moments_with(
+    reports: &BTreeMap<[usize; 3], RegionMoments>,
+    counts: [usize; 3],
+    connectivity: Connectivity,
+) -> Result<Vec<Moments>> {
     let index = LabelIndex::build(reports, counts, |report| report.labels)?;
     let parts = index.gather(reports, |report| &report.moments[..], Moments::EMPTY);
     let mut sets = Union::new(index.total());
 
-    walk_seams(
+    walk_seams_with(
         reports,
         counts,
         &index,
+        connectivity,
         |report| &report.faces,
         |a, b| sets.union(a, b),
     )?;
@@ -1033,6 +1131,10 @@ pub struct LabelRegionsOp {
     name: &'static str,
     stream: String,
     lifecycle: Lifecycle,
+    /// Which set voxels count as one region. [`Connectivity::Faces`] unless a
+    /// caller said otherwise, so every existing caller gets the points it always
+    /// got.
+    connectivity: Connectivity,
 }
 
 impl LabelRegionsOp {
@@ -1041,7 +1143,26 @@ impl LabelRegionsOp {
             name,
             stream: stream.into(),
             lifecycle,
+            connectivity: Connectivity::Faces,
         }
+    }
+
+    /// The same op, labelling the foreground under a stated [`Connectivity`].
+    ///
+    /// A consuming builder rather than a fourth argument to [`Self::new`], for
+    /// [`RegionPointsOp::emitting`]'s reason: every call site that does not say
+    /// this word keeps its signature and its answer.
+    ///
+    /// The merge has to be told the same thing; [`detect_phases`] refuses a pair
+    /// that disagrees.
+    pub fn connecting(mut self, connectivity: Connectivity) -> Self {
+        self.connectivity = connectivity;
+        self
+    }
+
+    /// Which set voxels this op counts as one region.
+    pub fn connectivity(&self) -> Connectivity {
+        self.connectivity
     }
 
     pub fn stream(&self) -> &str {
@@ -1086,7 +1207,7 @@ impl FragmentOp for LabelRegionsOp {
         let mask = as_mask(pixels)?;
 
         let mut labels = Array3::<u32>::zeros(mask.raw_dim());
-        let count = label_regions_into(mask.view(), labels.view_mut())?;
+        let count = label_regions_into_with(mask.view(), self.connectivity, labels.view_mut())?;
         // The read extent's corner, which is the core's here because this phase
         // has no halo — and the sums have to be in volume coordinates or the
         // merge would be adding numbers from three different origins.
@@ -1117,6 +1238,10 @@ pub struct RegionPointsOp {
     /// every existing constructor leaves it alone, so every existing caller gets
     /// the bytes it always got.
     emission: Emission,
+    /// Which set voxels count as one region **across a seam**, which has to be
+    /// what the labelling used within a block. [`Connectivity::Faces`] unless a
+    /// caller said otherwise.
+    connectivity: Connectivity,
 }
 
 impl RegionPointsOp {
@@ -1143,6 +1268,7 @@ impl RegionPointsOp {
             lifecycle,
             lattice: grid.blocks_per_axis(),
             emission: Emission::Point,
+            connectivity: Connectivity::Faces,
         }
     }
 
@@ -1187,6 +1313,26 @@ impl RegionPointsOp {
     /// What one component becomes in this op's output.
     pub fn emission(&self) -> Emission {
         self.emission
+    }
+
+    /// The same op, closing the components under a stated [`Connectivity`].
+    ///
+    /// **It must be the labelling's**, for `ops::fill::agree_on_connectivity`'s
+    /// reason: the flood inside a block and the walk across a seam are two halves
+    /// of one relation. [`detect_phases`] and [`append_connected`] check the
+    /// pair; this builder alone cannot, because it sees one of the two ops.
+    ///
+    /// Independent of [`Self::emitting`] and composable with it in either order:
+    /// which components exist is decided before what they are written as, which
+    /// is the same ordering `apply` uses.
+    pub fn connecting(mut self, connectivity: Connectivity) -> Self {
+        self.connectivity = connectivity;
+        self
+    }
+
+    /// Which set voxels this op counts as one region across a seam.
+    pub fn connectivity(&self) -> Connectivity {
+        self.connectivity
     }
 
     /// The stream the points are written to.
@@ -1256,7 +1402,8 @@ impl FragmentOp for RegionPointsOp {
         for (key, bytes) in at.fragments(&self.moments_stream) {
             reports.insert(key.block, RegionMoments::decode(bytes)?);
         }
-        let components = merge_moments(&reports, at.grid.blocks_per_axis())?;
+        let components =
+            merge_moments_with(&reports, at.grid.blocks_per_axis(), self.connectivity)?;
         // Ownership first, emission second: which block writes a component is a
         // property of the component, so it must not be able to depend on the
         // form it is written in.
@@ -1285,6 +1432,7 @@ pub fn detect_phases(
     label: &LabelRegionsOp,
     points: &RegionPointsOp,
 ) -> Result<Decomposition> {
+    agree_on_connectivity(label.connectivity(), points.connectivity())?;
     let volume = grid.volume();
     let labelling = fragment_phase(label, grid.clone())?;
     let detecting = fragment_phase(points, grid)?;
@@ -1350,13 +1498,46 @@ pub fn append_emitting(
     points_lifecycle: Lifecycle,
     emission: Emission,
 ) -> Result<Phase> {
+    append_connected(
+        plan,
+        moments_stream,
+        moments_lifecycle,
+        points_stream,
+        points_lifecycle,
+        emission,
+        Connectivity::Faces,
+    )
+}
+
+/// [`append_emitting`], with the foreground's [`Connectivity`] said out loud.
+///
+/// The most general of the three, and the other two are this at their defaults —
+/// which is why they are separate functions rather than one with two more
+/// arguments: no existing call site has to be edited to say what it was already
+/// doing.
+///
+/// **The choice goes to both phases from here**, which is what makes this the
+/// safe way to ask for a wider one: a caller building the two ops by hand has to
+/// remember to say it twice, and [`detect_phases`] is where that is caught.
+pub fn append_connected(
+    plan: &mut PlanBuilder,
+    moments_stream: impl Into<String>,
+    moments_lifecycle: Lifecycle,
+    points_stream: impl Into<String>,
+    points_lifecycle: Lifecycle,
+    emission: Emission,
+    connectivity: Connectivity,
+) -> Result<Phase> {
     let moments_stream = moments_stream.into();
     let grid = plan.grid().clone();
-    let moments = plan.fragments(LabelRegionsOp::new(
-        "region labelling",
-        moments_stream.clone(),
-        moments_lifecycle,
-    ))?;
+    let moments = plan.fragments(
+        LabelRegionsOp::new(
+            "region labelling",
+            moments_stream.clone(),
+            moments_lifecycle,
+        )
+        .connecting(connectivity),
+    )?;
     plan.fragments(
         RegionPointsOp::reading(
             "region points",
@@ -1366,7 +1547,8 @@ pub fn append_emitting(
             points_lifecycle,
             &grid,
         )
-        .emitting(emission),
+        .emitting(emission)
+        .connecting(connectivity),
     )
 }
 
@@ -1696,6 +1878,85 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].at, [2, 1, 1], "1.5 rounds up");
         assert_eq!(found[0].weight, 2.0);
+    }
+
+    /// The parameter reaches the answer, asked in the way that can tell: the
+    /// same corner-touching pair as above, under each connectivity.
+    ///
+    /// Two points at six and at eighteen, one at twenty-six — and the one is not
+    /// merely a count, it is a point at the pair's midpoint carrying both voxels'
+    /// weight, which is what says the *accumulators* were merged rather than one
+    /// of the two dropped.
+    #[test]
+    fn the_foreground_connectivity_reaches_the_points_and_the_bare_form_is_faces() {
+        let corner = mask_of([5, 5, 5], &[[1, 1, 1], [2, 2, 2]]);
+
+        let found = detect_regions_with(corner.view(), Connectivity::Faces).unwrap();
+        assert_eq!(found.len(), 2);
+        let edges = detect_regions_with(corner.view(), Connectivity::FacesAndEdges).unwrap();
+        assert_eq!(edges.len(), 2, "a corner step is two edges' worth");
+
+        let joined =
+            detect_regions_with(corner.view(), Connectivity::FacesEdgesAndCorners).unwrap();
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].at, [2, 2, 2], "1.5 rounds up on every axis");
+        assert_eq!(joined[0].weight, 2.0, "both voxels are in it");
+
+        // an edge-touching pair, which is what separates eighteen from six
+        let edge = mask_of([5, 5, 5], &[[1, 1, 1], [2, 2, 1]]);
+        assert_eq!(
+            detect_regions_with(edge.view(), Connectivity::Faces)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            detect_regions_with(edge.view(), Connectivity::FacesAndEdges)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // and the bare form is the face-connected one
+        assert_eq!(detect_regions(corner.view()).unwrap(), found);
+    }
+
+    /// The two phases are two halves of one relation, and a plan whose halves
+    /// disagree is refused before it is scheduled.
+    ///
+    /// Also that the two builders compose: an op can be told what to emit and
+    /// what counts as adjacent, in either order, and neither forgets.
+    #[test]
+    fn a_plan_whose_two_phases_disagree_about_connectivity_is_refused() {
+        let grid = BlockGrid::new([8, 8, 8], [4, 4, 4]).unwrap();
+        let label = LabelRegionsOp::new("label", "s", Lifecycle::DeleteOnExit)
+            .connecting(Connectivity::FacesEdgesAndCorners);
+        let points = RegionPointsOp::new("points", "s", 0, "p", Lifecycle::Persistent, &grid);
+        let message = detect_phases(grid.clone(), Dtype::Bool, &label, &points)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("same connectivity"), "{message}");
+
+        for connectivity in [
+            Connectivity::Faces,
+            Connectivity::FacesAndEdges,
+            Connectivity::FacesEdgesAndCorners,
+        ] {
+            let label =
+                LabelRegionsOp::new("label", "s", Lifecycle::DeleteOnExit).connecting(connectivity);
+            let points = RegionPointsOp::new("points", "s", 0, "p", Lifecycle::Persistent, &grid)
+                .connecting(connectivity)
+                .emitting(Emission::Measured);
+            assert_eq!(points.connectivity(), connectivity);
+            assert_eq!(points.emission(), Emission::Measured);
+            // and the other order forgets neither
+            let swapped = RegionPointsOp::new("points", "s", 0, "p", Lifecycle::Persistent, &grid)
+                .emitting(Emission::Measured)
+                .connecting(connectivity);
+            assert_eq!(swapped.connectivity(), connectivity);
+            assert_eq!(swapped.emission(), Emission::Measured);
+            assert!(detect_phases(grid.clone(), Dtype::Bool, &label, &points).is_ok());
+        }
     }
 
     /// Regions on the faces and in the corners of the volume are regions like any

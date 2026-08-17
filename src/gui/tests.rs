@@ -67,7 +67,8 @@ fn plan(side: usize) -> (Workflow, Decomposition, Vec<(usize, String)>) {
     let phases: Vec<PhaseDecomposition> = groups_for(0b11, slots.len())
         .iter()
         .map(|group| {
-            let (reach, _, names, _) = summarise_slots(&slots, group, shape)?;
+            let (reach, _, names, _) =
+                summarise_slots(&slots, group, shape).expect("the fixture chain's slots summarise");
             let grid = BlockGrid::along(shape, &[1, 2], 64).unwrap();
             PhaseDecomposition::derive(group.clone(), names, reach.clone(), reach, grid)
         })

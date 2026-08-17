@@ -85,6 +85,28 @@
 // at, and the fine offset the block owns. Neither is derivable from the other,
 // which is precisely what an `Anchor` could not say and a `Placement` can.
 //
+// Where a narrowing lands under the split
+// ---------------------------------------
+//
+// A lattice-sampled statistic can narrow its values to a stated element type at
+// **two** places — at the sample grid, before anything is interpolated, and
+// after the interpolation — and `local::LatticeNarrowing` is where the pair is
+// stated and argued. The fused op holds both because both sites are inside its
+// one pass. Split, they fall on either side of the phase boundary and each op
+// holds exactly the one it can apply: `LatticeStatisticOp::narrowed_to` is the
+// grid, `LatticeInterpolateOp::narrowed_to` is the output. Neither op could
+// apply the other's, which is the same reason the alignment sits on the
+// interpolation half alone.
+//
+// A caller holding the fused form's pair hands the same value to both halves
+// through `narrowing_of`, and the two paths then compute the same numbers. That
+// is one mechanism serving both forms rather than two that have to agree — the
+// arrangement this module already keeps for `Alignment`.
+//
+// The narrowing changes no geometry at either half: not the reach, not the fetch
+// regions, not the output volumes. Rounding a value in hand is not reading a
+// different one.
+//
 // One check moves with it. Taking the write extent from the plan makes the
 // executor's "declared shape against derived read extent" comparison compare the
 // plan with itself, so the op owes a check of its own: every voxel it writes
@@ -95,7 +117,7 @@
 use ndarray::{ArrayView3, ArrayViewMut3};
 
 use super::element::{StructuringElement, Total};
-use super::local::{SampleLattice, Sampling, Statistic};
+use super::local::{LatticeNarrowing, Narrowing, SampleLattice, Sampling, Statistic};
 use crate::decomposition::PhaseDecomposition;
 use crate::error::{Error, Result};
 use crate::geometry::BlockGrid;
@@ -131,12 +153,18 @@ fn lattice_reach() -> Reach {
 /// function of that volume.
 ///
 /// [`LocalStatisticOp`]: super::local::LocalStatisticOp
+///
+/// **The narrowing at the sample grid is this op's half of
+/// [`LatticeNarrowing`].** The fused form has both sites inside one pass; split,
+/// they land in different ops, and the one before the interpolation is the one
+/// that is here — see [`Self::narrowed_to`].
 #[derive(Debug)]
 pub struct LatticeStatisticOp {
     name: &'static str,
     element: StructuringElement,
     statistic: Statistic,
     lattice: SampleLattice,
+    narrowing: Option<Narrowing>,
     cost: f64,
 }
 
@@ -184,6 +212,7 @@ impl LatticeStatisticOp {
             element,
             statistic,
             lattice,
+            narrowing: None,
             cost,
         })
     }
@@ -194,6 +223,51 @@ impl LatticeStatisticOp {
 
     pub fn element(&self) -> &StructuringElement {
         &self.element
+    }
+
+    /// Narrow every sample this op writes, **before it is stored**.
+    ///
+    /// The first of [`LatticeNarrowing`]'s two sites, and the one this half of
+    /// the split owns: the values written here are what
+    /// [`LatticeInterpolateOp`] blends between, so narrowing them moves every
+    /// fine voxel in the gaps and not only the ones sitting on a sample.
+    ///
+    /// **The level's declared type does not change**, and that is deliberate. A
+    /// [`Narrowing`] is a narrowing of the *value*; the coarse level stays
+    /// `f64`, holds the same numbers a level of the narrower type would, and
+    /// costs bytes rather than precision. Declaring a narrower output type
+    /// instead would make the storage decide the arithmetic, and the two are not
+    /// the same question — a caller may well want a narrowed value written into
+    /// a wide level, which is exactly what the pair of ops this reproduces does.
+    ///
+    /// A builder rather than an argument to [`Self::new`], for
+    /// [`LatticeInterpolateOp::with_alignment`]'s reason: no narrowing is what
+    /// every existing caller had, and it stays what they get.
+    ///
+    /// A caller running the **fused** op instead states both sites at once with
+    /// `LocalStatisticOp::narrowed`, and the two paths compute the same numbers
+    /// when this op is given `narrowing.at_samples` and
+    /// [`LatticeInterpolateOp::narrowed_to`] is given
+    /// `narrowing.after_interpolation`.
+    pub fn narrowed_to(mut self, narrowing: Narrowing) -> Self {
+        self.narrowing = Some(narrowing);
+        self
+    }
+
+    /// The two sites split between this op and the interpolation half, stated as
+    /// one [`LatticeNarrowing`]: this op takes `at_samples` and ignores the
+    /// other, which is [`LatticeInterpolateOp::narrowing_of`]'s.
+    ///
+    /// Here so that a caller holding the fused form's parameter can hand the
+    /// same value to both halves rather than take it apart and risk giving one
+    /// of them the wrong half — the failure `LatticeNarrowing` exists to name.
+    pub fn narrowing_of(mut self, narrowing: LatticeNarrowing) -> Self {
+        self.narrowing = narrowing.at_samples;
+        self
+    }
+
+    pub fn narrowing(&self) -> Option<Narrowing> {
+        self.narrowing
     }
 
     pub fn with_cost(mut self, cost: f64) -> Self {
@@ -424,22 +498,39 @@ impl BlockOp for LatticeStatisticOp {
         let full = self.element.len();
         let mut scratch: Vec<f64> = Vec::with_capacity(full);
         let statistic = &self.statistic;
+        // Wrapped around the reduction rather than swept over the output
+        // afterwards, because here the two are the same thing: this op writes
+        // one value per sample and every one of them comes out of `reduce`. The
+        // fused kernel cannot do it this way — a population can put a value into
+        // its grid without reducing anything — which is why that one narrows the
+        // grid as a whole.
+        let narrowing = self.narrowing;
         lattice_statistic_into(
             ordered.view(),
             at.offset,
             &self.element,
             &self.lattice,
             start,
-            |window| statistic.reduce_with(window, full, &mut scratch),
+            |window| {
+                let value = statistic.reduce_with(window, full, &mut scratch);
+                match narrowing {
+                    Some(narrowing) => narrowing.apply(value),
+                    None => value,
+                }
+            },
             out,
         )
     }
 
-    /// Exactly the statistic's own mapping: a window of one value reduces to
-    /// whatever that statistic says, and no interpolation happens here to widen
-    /// or narrow the claim.
+    /// The statistic's own mapping, narrowed if this op narrows: a window of one
+    /// value reduces to whatever that statistic says, and there is no
+    /// interpolation here to widen or narrow the claim further.
     fn constant_maps_to(&self, value: f64) -> Option<f64> {
-        self.statistic.constant_maps_to(value)
+        let answer = self.statistic.constant_maps_to(value)?;
+        Some(match self.narrowing {
+            Some(narrowing) => narrowing.apply(answer),
+            None => answer,
+        })
     }
 
     /// Per **sample**, not per fine voxel, which is the arithmetic that makes a
@@ -689,11 +780,16 @@ pub use super::local::Alignment;
 /// a caller states it. It is held here rather than in the `SampleLattice`
 /// because it is not a fact about where the samples are — the statistic half
 /// shares the same lattice and has no interpolation to have a convention about.
+///
+/// **The narrowing after the interpolation is this op's half of
+/// [`LatticeNarrowing`]** — the second of its two sites, the first belonging to
+/// [`LatticeStatisticOp`]. See [`Self::narrowed_to`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct LatticeInterpolateOp {
     name: &'static str,
     lattice: SampleLattice,
     alignment: Alignment,
+    narrowing: Option<Narrowing>,
     cost: f64,
 }
 
@@ -726,12 +822,46 @@ impl LatticeInterpolateOp {
             name,
             lattice,
             alignment: Alignment::default(),
+            narrowing: None,
             cost: INTERPOLATE_COST,
         })
     }
 
     pub fn lattice(&self) -> &SampleLattice {
         &self.lattice
+    }
+
+    /// Narrow every fine voxel this op writes, **after the blend**.
+    ///
+    /// The second of [`LatticeNarrowing`]'s two sites and the one this half owns.
+    /// It is genuinely the smaller of the two: a value that was already whole
+    /// survives it untouched, so on its own it moves only the voxels strictly
+    /// between samples. Applied without
+    /// [`LatticeStatisticOp::narrowed_to`] it produces an answer that is close
+    /// to the narrowed one everywhere and equal to it almost nowhere, which is
+    /// why the two are named as a pair rather than offered separately with no
+    /// comment.
+    ///
+    /// It is part of what the op **is** — two ops differing only in it write
+    /// different numbers — so it is held in the struct and compared by its
+    /// `PartialEq` rather than passed per call. It changes no output volume, no
+    /// `reach_spec`, no fetch region and no cost: the same blend over the same
+    /// samples, with one rounding after it.
+    pub fn narrowed_to(mut self, narrowing: Narrowing) -> Self {
+        self.narrowing = Some(narrowing);
+        self
+    }
+
+    /// The two sites split between the statistic half and this one, stated as
+    /// one [`LatticeNarrowing`]: this op takes `after_interpolation` and ignores
+    /// the other, which is [`LatticeStatisticOp::narrowing_of`]'s.
+    pub fn narrowing_of(mut self, narrowing: LatticeNarrowing) -> Self {
+        self.narrowing = narrowing.after_interpolation;
+        self
+    }
+
+    pub fn narrowing(&self) -> Option<Narrowing> {
+        self.narrowing
     }
 
     /// The convention this op maps a fine voxel back to the lattice by.
@@ -759,6 +889,19 @@ impl LatticeInterpolateOp {
 
     pub fn alignment(&self) -> Alignment {
         self.alignment
+    }
+
+    /// The narrowing pass, over whatever this op has just written.
+    ///
+    /// One function for both entry points, so that a block placed by an executor
+    /// and a whole lattice applied by hand cannot narrow differently. A sweep
+    /// after the blend rather than a branch inside it, for the fused kernel's
+    /// reason: a caller who narrows at neither site pays nothing for the
+    /// parameter existing.
+    fn narrow(&self, mut out: ArrayViewMut3<'_, f64>) {
+        if let Some(narrowing) = self.narrowing {
+            out.map_inplace(|value| *value = narrowing.apply(*value));
+        }
     }
 
     pub fn with_cost(mut self, cost: f64) -> Self {
@@ -994,13 +1137,22 @@ impl BlockOp for LatticeInterpolateOp {
                 )));
             }
         }
-        let out = out.view_mut::<f64>()?;
-        lattice_interpolate_into_with(view, offset, origin, &self.lattice, self.alignment, out)
+        let mut out = out.view_mut::<f64>()?;
+        lattice_interpolate_into_with(
+            view,
+            offset,
+            origin,
+            &self.lattice,
+            self.alignment,
+            out.view_mut(),
+        )?;
+        self.narrow(out);
+        Ok(())
     }
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
         let input = input.view::<f64>()?;
-        let out = out.view_mut::<f64>()?;
+        let mut out = out.view_mut::<f64>()?;
         if self.lattice.lattice_volume() != at.volume {
             return Err(Error::InvalidArgument(format!(
                 "op {:?}: this lattice holds {:?} sample(s) and the anchor says the level being \
@@ -1025,14 +1177,21 @@ impl BlockOp for LatticeInterpolateOp {
             [0, 0, 0],
             &self.lattice,
             self.alignment,
-            out,
-        )
+            out.view_mut(),
+        )?;
+        self.narrow(out);
+        Ok(())
     }
 
     /// Exactly, and by the arithmetic rather than by an argument: every tap is
-    /// `a + t * (b - a)` with `a == b`, which is `a`.
+    /// `a + t * (b - a)` with `a == b`, which is `a` — and then the narrowing,
+    /// which is a function of that one value and is applied to every voxel this
+    /// op writes.
     fn constant_maps_to(&self, value: f64) -> Option<f64> {
-        Some(value)
+        Some(match self.narrowing {
+            Some(narrowing) => narrowing.apply(value),
+            None => value,
+        })
     }
 
     fn cost_per_voxel(&self) -> f64 {

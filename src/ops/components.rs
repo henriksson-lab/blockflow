@@ -44,18 +44,78 @@
 // fragment type, its magic, its public functions and its error messages are
 // where they were, and its tests are unchanged.
 //
-// Connectivity is six, here as well as there
-// ------------------------------------------
-// The face planes *are* the six-connectivity decision made structural. Under
-// face connectivity a component crosses a block seam only through the shared
-// plane, so a block's whole contribution to the merge is six planes. Under
-// 26-connectivity it can also cross an edge or a corner, so a fragment would
-// have to carry twelve edge lines and eight corner voxels as well, and the merge
-// would walk three kinds of adjacency instead of one. That is a different
-// fragment shape and a different merge, and it is not what this module is.
+// Connectivity is a parameter, and six is the default
+// ---------------------------------------------------
+// [`Connectivity`] names which of the twenty-six voxels around one count as
+// adjacent: the six that share a face, those plus the twelve that share an edge,
+// or all of them. It is a *choice* rather than a correction — a caller that
+// wants the face-connected answer and a caller that wants the full one are both
+// right — so every entry point here comes in two forms, the bare one that means
+// [`Connectivity::Faces`] and a `_with` one that takes the choice. Nothing that
+// predates the parameter moved: the bare forms are the parameterised ones at
+// their default, and the labels, the seam pairs and the bytes of a
+// face-connected run are what they were.
 //
-// Any op built on this is therefore six-connected, and says so in its own
-// header rather than leaving a reader to infer it from here.
+// **The fragment did not have to change, and the reason is worth stating**,
+// because the obvious guess is that it did. The guess goes: face connectivity
+// crosses a seam only through the shared plane, so six planes are a block's
+// whole contribution; wider connectivity also crosses edges and corners, so a
+// fragment would have to carry twelve edge lines and eight corner voxels as
+// well. The second half is wrong. A voxel with any neighbour outside its block
+// lies on a face of that block, so the block's six faces **are** its whole
+// boundary shell — and the twelve edge lines and the eight corner voxels are
+// slices of those faces rather than anything new. `planes_of` already sends
+// them; what was missing was a merge that reads them.
+//
+// So what changed is the *walk*, and only its inputs:
+//
+// | | face-connected | wider |
+// |---|---|---|
+// | fragment | six planes | six planes, unchanged |
+// | lattice neighbours | 3 forward, the axis steps | up to 13 forward, the axis steps plus the lattice's own edges and corners |
+// | pairs at one seam | voxel against the voxel opposite | voxel against a 3x3 window of them |
+// | the relation | transitive closure of those pairs | transitive closure of those pairs |
+//
+// The last row is the point. The union-find, [`LabelIndex`], [`Union::fold_or`]
+// and every op's per-label fact are untouched, because the equivalence relation
+// is the same relation — the transitive closure of an adjacency — and only the
+// set of pairs that generates it grew. That is why this is an addition to the
+// merge rather than a second merge.
+//
+// Eighteen is offered, and here is why. It is one entry in the offsets table
+// rather than a third code path: the walk is driven by the offset set, so the
+// middle case costs a line. It also earns its place as a *test*, which the
+// standing lesson about fixtures argues for directly — with only six and
+// twenty-six, the predicate that decides which offsets cross a seam is only ever
+// asked "exactly one step?" or "anything at all?", and is blind at its own
+// boundary. Eighteen is the case that can see it.
+//
+// Which ops take the choice, and how many each has
+// -------------------------------------------------
+// An op built on this states its own connectivity in its own header, because
+// what the relation is *about* is the op's. All three that exist take it from a
+// caller and default to [`Connectivity::Faces`], so nothing that predates the
+// parameter moved — and each has exactly one, for a different reason:
+//
+// | op | what its one connectivity names | why only one |
+// |---|---|---|
+// | `ops::fill` | the **background**'s | the background is the only thing it labels; the foreground's is `detect`'s and the caller pairs them |
+// | `ops::detect` | the **foreground**'s | likewise, from the other side |
+// | `ops::regional` | the plateau's **and** the ascent's | they are provably one relation; two would let a caller state something the definition does not admit |
+//
+// The pairing between the first two is worth naming because it is the one thing
+// a caller has to do by hand: the *complementary pair* convention analyses a
+// 6-connected foreground against a 26-connected background and vice versa, and
+// neither op can honour it on the other's behalf, because each sees one of the
+// two sets. `ops::fill`'s header is where that is spelt out.
+//
+// Every op that takes the choice takes it **twice** — once in the phase that
+// floods and once in the phase that walks the seams — and refuses a pair that
+// disagrees, at planning time. `ops::fill::agree_on_connectivity` is the one
+// check and the one message; the reason is that the flood and the walk generate
+// one equivalence relation between them, so a mismatched pair joins inside a
+// block what it keeps apart across a seam and answers differently depending on
+// where the volume was cut.
 
 use std::collections::BTreeMap;
 
@@ -81,6 +141,167 @@ pub const UNLABELLED: u32 = 0;
 pub const FACE_NEIGHBOURS: [(usize, isize); 6] =
     [(0, -1), (0, 1), (1, -1), (1, 1), (2, -1), (2, 1)];
 
+/// Which of the twenty-six voxels around one count as adjacent to it.
+///
+/// Named for what they touch rather than numbered, because the numbers are a
+/// fact about three dimensions and the names are not: the conventional 6, 18 and
+/// 26 are `Faces`, `FacesAndEdges` and `FacesEdgesAndCorners` here, and the
+/// conventional numbers are given in each variant's own documentation for
+/// whoever arrives looking for them.
+///
+/// The ordering is by strength — a `Faces` component is contained in the
+/// `FacesAndEdges` component it is part of, which is contained in the
+/// `FacesEdgesAndCorners` one — which is why the derive is here rather than
+/// omitted, and it is the same order the offsets table is grouped in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Connectivity {
+    /// The six voxels sharing a face. **The default**, and what every op in this
+    /// crate asks for; conventionally "6-connected".
+    #[default]
+    Faces,
+    /// The six faces and the twelve edges: conventionally "18-connected".
+    FacesAndEdges,
+    /// Every voxel of the 3x3x3 neighbourhood: the six faces, the twelve edges
+    /// and the eight corners, conventionally "26-connected".
+    FacesEdgesAndCorners,
+}
+
+/// The twenty-six neighbour offsets, **grouped by how many axes they step
+/// along**: six that step along one, twelve along two, eight along three.
+///
+/// One table rather than three, so that each connectivity's offsets are a prefix
+/// of it and there is a single place a typo could live. The first six are in
+/// [`FACE_NEIGHBOURS`]'s order, which is what keeps a face-connected traversal
+/// visiting neighbours in exactly the order it always did.
+const NEIGHBOUR_OFFSETS: [[isize; 3]; 26] = [
+    // one step: the faces
+    [-1, 0, 0],
+    [1, 0, 0],
+    [0, -1, 0],
+    [0, 1, 0],
+    [0, 0, -1],
+    [0, 0, 1],
+    // two steps: the edges
+    [-1, -1, 0],
+    [-1, 0, -1],
+    [-1, 0, 1],
+    [-1, 1, 0],
+    [0, -1, -1],
+    [0, -1, 1],
+    [0, 1, -1],
+    [0, 1, 1],
+    [1, -1, 0],
+    [1, 0, -1],
+    [1, 0, 1],
+    [1, 1, 0],
+    // three steps: the corners
+    [-1, -1, -1],
+    [-1, -1, 1],
+    [-1, 1, -1],
+    [-1, 1, 1],
+    [1, -1, -1],
+    [1, -1, 1],
+    [1, 1, -1],
+    [1, 1, 1],
+];
+
+/// The directions from a block to a lattice neighbour it can meet, each listed
+/// **once for the pair** — the first non-zero component is `+1`, so a seam is
+/// walked from the lower block and every meeting is seen once.
+///
+/// Grouped by steps like [`NEIGHBOUR_OFFSETS`] and for the same reason: the
+/// three axis steps, then the six lattice edges, then the four lattice corners,
+/// so each connectivity's directions are a prefix. A direction that steps along
+/// *n* axes can only be crossed by an offset that steps along at least those
+/// *n*, which is exactly why the two tables share a grouping.
+const FORWARD_DIRECTIONS: [[isize; 3]; 13] = [
+    // one step
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+    // two steps
+    [1, -1, 0],
+    [1, 0, -1],
+    [1, 0, 1],
+    [1, 1, 0],
+    [0, 1, -1],
+    [0, 1, 1],
+    // three steps
+    [1, -1, -1],
+    [1, -1, 1],
+    [1, 1, -1],
+    [1, 1, 1],
+];
+
+/// How many axes an offset steps along, which is what a connectivity is a bound
+/// on.
+pub fn steps_of(by: [isize; 3]) -> usize {
+    by.iter().filter(|&&step| step != 0).count()
+}
+
+impl Connectivity {
+    /// The most axes one step of this connectivity may move along.
+    pub fn steps(self) -> usize {
+        match self {
+            Self::Faces => 1,
+            Self::FacesAndEdges => 2,
+            Self::FacesEdgesAndCorners => 3,
+        }
+    }
+
+    /// Does this connectivity make two voxels `by` apart adjacent?
+    ///
+    /// A zero offset is **not** adjacency: a voxel is trivially in its own
+    /// component and the question here is about a pair.
+    pub fn joins(self, by: [isize; 3]) -> bool {
+        let steps = steps_of(by);
+        steps > 0 && steps <= self.steps()
+    }
+
+    /// The neighbour offsets, faces first, in a fixed order.
+    pub fn offsets(self) -> &'static [[isize; 3]] {
+        &NEIGHBOUR_OFFSETS[..match self {
+            Self::Faces => 6,
+            Self::FacesAndEdges => 18,
+            Self::FacesEdgesAndCorners => 26,
+        }]
+    }
+
+    /// The directions from one block to a lattice neighbour it can meet under
+    /// this connectivity, axis steps first and each listed **once for the
+    /// pair** — the first non-zero component is `+1`, so a seam is walked from
+    /// the lower block and every meeting is seen once.
+    ///
+    /// Three of them for faces, and thirteen for the widest: the three axis
+    /// steps, then the six ways two blocks share only a lattice edge, then the
+    /// four ways they share only a lattice corner.
+    pub fn directions(self) -> &'static [[isize; 3]] {
+        &FORWARD_DIRECTIONS[..match self {
+            Self::Faces => 3,
+            Self::FacesAndEdges => 9,
+            Self::FacesEdgesAndCorners => 13,
+        }]
+    }
+}
+
+/// `at` moved by `by`, or `None` if that leaves an array of `shape`.
+///
+/// Clamped by refusing rather than by saturating, for [`offset`]'s reason. Also
+/// the step from a block index to a neighbouring block's: a lattice is an array
+/// of blocks, and "outside the lattice" and "outside the block" are the same
+/// arithmetic.
+pub fn offset_by(at: [usize; 3], by: [isize; 3], shape: [usize; 3]) -> Option<[usize; 3]> {
+    let mut to = [0usize; 3];
+    for axis in 0..3 {
+        let moved = at[axis] as isize + by[axis];
+        if moved < 0 || moved >= shape[axis] as isize {
+            return None;
+        }
+        to[axis] = moved as usize;
+    }
+    Some(to)
+}
+
 /// `at` moved by `step` along `axis`, or `None` if that leaves the array.
 ///
 /// Clamped by refusing rather than by saturating: a neighbour outside the block
@@ -88,13 +309,9 @@ pub const FACE_NEIGHBOURS: [(usize, isize); 6] =
 /// saturating step would make every edge voxel its own neighbour and a plateau
 /// its own higher neighbour.
 pub fn offset(at: [usize; 3], axis: usize, step: isize, shape: [usize; 3]) -> Option<[usize; 3]> {
-    let moved = at[axis] as isize + step;
-    if moved < 0 || moved >= shape[axis] as isize {
-        return None;
-    }
-    let mut to = at;
-    to[axis] = moved as usize;
-    Some(to)
+    let mut by = [0isize; 3];
+    by[axis] = step;
+    offset_by(at, by, shape)
 }
 
 /// The face index for `axis` on the low (`side == 0`) or high side.
@@ -133,9 +350,38 @@ pub fn face_axes(axis: usize) -> [usize; 2] {
 pub fn label_members_into(
     shape: [usize; 3],
     member: impl Fn([usize; 3]) -> bool,
-    mut out: ArrayViewMut3<'_, u32>,
+    out: ArrayViewMut3<'_, u32>,
 ) -> Result<u32> {
     crate::ops::shapes_agree(&shape, out.shape(), "label_members_into")?;
+    label_into(shape, Connectivity::Faces, member, out)
+}
+
+/// [`label_members_into`] under a stated [`Connectivity`].
+///
+/// Everything that function promises holds here: the numbering, the
+/// determinism, the iterative traversal. What the connectivity changes is which
+/// voxels a flood reaches, and nothing else — the seeds are still met in
+/// row-major order and the *rule* is still that a component is numbered by
+/// where its lowest voxel sits. Widening does change the numbers, because
+/// merging two components leaves a shorter list, and it changes them by that
+/// rule rather than by traversal order.
+pub fn label_members_into_with(
+    shape: [usize; 3],
+    connectivity: Connectivity,
+    member: impl Fn([usize; 3]) -> bool,
+    out: ArrayViewMut3<'_, u32>,
+) -> Result<u32> {
+    crate::ops::shapes_agree(&shape, out.shape(), "label_members_into_with")?;
+    label_into(shape, connectivity, member, out)
+}
+
+/// The one traversal both forms above are, with the shape already checked.
+fn label_into(
+    shape: [usize; 3],
+    connectivity: Connectivity,
+    member: impl Fn([usize; 3]) -> bool,
+    mut out: ArrayViewMut3<'_, u32>,
+) -> Result<u32> {
     out.fill(UNLABELLED);
 
     let mut next = UNLABELLED;
@@ -151,8 +397,8 @@ pub fn label_members_into(
                 out[seed] = next;
                 stack.push(seed);
                 while let Some(at) = stack.pop() {
-                    for (axis, step) in FACE_NEIGHBOURS {
-                        let Some(to) = offset(at, axis, step, shape) else {
+                    for &by in connectivity.offsets() {
+                        let Some(to) = offset_by(at, by, shape) else {
                             continue;
                         };
                         if out[to] != UNLABELLED || !member(to) {
@@ -498,35 +744,153 @@ pub fn walk_seams<R>(
     counts: [usize; 3],
     index: &LabelIndex,
     planes_of: impl Fn(&R) -> &FacePlanes,
+    meet: impl FnMut(usize, usize),
+) -> Result<()> {
+    walk_seams_with(reports, counts, index, Connectivity::Faces, planes_of, meet)
+}
+
+/// [`walk_seams`] under a stated [`Connectivity`], which is the whole of what
+/// the wider connectivities needed.
+///
+/// **The fragment is the same six planes.** A voxel with a neighbour outside its
+/// block lies on one of that block's faces, so the six planes are its entire
+/// boundary shell; the edge lines and corner voxels a wider connectivity meets
+/// across are rows and single entries *of those planes*, not extra data. See the
+/// module header.
+///
+/// Three things generalise together, and each is one line of the table there:
+///
+/// * **which lattice neighbours are visited** — `connectivity.directions()`,
+///   three for faces and up to thirteen, the extra ones being the blocks that
+///   share only a lattice edge or only a lattice corner with this one;
+/// * **which face is read** — the direction's first stepped axis picks the
+///   plane, and the other stepped axes pin a row or a column of it, which is how
+///   an edge line and a corner voxel are addressed without being stored;
+/// * **which voxels of it pair** — an axis the direction does not step along is
+///   free, and a free axis pairs each index with the three around it rather than
+///   with itself. A pair costs one step per axis it shifts on, and the total,
+///   the direction's own steps included, must be within the connectivity.
+///
+/// `meet` sees each meeting once and never sees [`UNLABELLED`], exactly as in
+/// [`walk_seams`], and under [`Connectivity::Faces`] it sees precisely the pairs
+/// it saw before this parameter existed, in the same order.
+pub fn walk_seams_with<R>(
+    reports: &BTreeMap<[usize; 3], R>,
+    counts: [usize; 3],
+    index: &LabelIndex,
+    connectivity: Connectivity,
+    planes_of: impl Fn(&R) -> &FacePlanes,
     mut meet: impl FnMut(usize, usize),
 ) -> Result<()> {
+    let budget = connectivity.steps();
     for &block in index.order() {
-        for axis in 0..3 {
-            let mut ahead = block;
-            ahead[axis] += 1;
-            if ahead[axis] >= counts[axis] {
+        for &towards in connectivity.directions() {
+            let Some(ahead) = offset_by(block, towards, counts) else {
+                continue;
+            };
+            // The first stepped axis names the pair of faces that meet. It is
+            // always a `+1` step — that is what makes the direction table
+            // one-per-pair — so it is this block's high face against the next
+            // block's low one, the same two planes `walk_seams` always read.
+            let pivot = towards
+                .iter()
+                .position(|&step| step != 0)
+                .expect("a direction steps along at least one axis");
+            let here = &planes_of(&reports[&block])[face_index(pivot, 1)];
+            let there = &planes_of(&reports[&ahead])[face_index(pivot, 0)];
+            let span = face_axes(pivot);
+
+            // Checked before anything is skipped, so that a lattice mismatch is
+            // still refused when one of the two blocks reported nothing.
+            for slot in 0..2 {
+                if towards[span[slot]] == 0 && here.0[slot] != there.0[slot] {
+                    return Err(unequal_faces(block, ahead, towards, here.0, there.0));
+                }
+            }
+            if here.0.contains(&0) || there.0.contains(&0) {
                 continue;
             }
-            let here = &planes_of(&reports[&block])[face_index(axis, 1)];
-            let there = &planes_of(&reports[&ahead])[face_index(axis, 0)];
-            if here.0 != there.0 {
-                return Err(Error::InvalidArgument(format!(
-                    "blocks {block:?} and {ahead:?} share a seam on axis {axis} but their \
-                     faces are {:?} and {:?}. Two blocks adjacent on one axis have the same \
-                     extent on the other two, so unequal faces mean the fragments came from \
-                     two different lattices.",
-                    here.0, there.0
-                )));
-            }
-            for (&a, &b) in here.1.iter().zip(there.1.iter()) {
-                if a == UNLABELLED || b == UNLABELLED {
-                    continue;
+
+            // Per spanned axis, the index pairs that meet along it and what
+            // each costs. A stepped axis contributes one pinned pair and no
+            // extra cost — the step is already counted in the direction.
+            //
+            // A shift the budget cannot afford on its own is dropped here
+            // rather than in the loop below, which is what keeps the
+            // face-connected case building one pair per index instead of three
+            // and discarding two. Dropping strictly fewer than the loop would
+            // discard, so the survivors and their order are the same either way.
+            let base = steps_of(towards);
+            let mut along: [Vec<(usize, usize, usize)>; 2] = [Vec::new(), Vec::new()];
+            for slot in 0..2 {
+                let (mine, theirs) = (here.0[slot], there.0[slot]);
+                match towards[span[slot]] {
+                    0 => {
+                        for a in 0..mine {
+                            for shift in [-1isize, 0, 1] {
+                                let cost = usize::from(shift != 0);
+                                let b = a as isize + shift;
+                                if base + cost > budget || b < 0 || b >= theirs as isize {
+                                    continue;
+                                }
+                                along[slot].push((a, b as usize, cost));
+                            }
+                        }
+                    }
+                    step if step > 0 => along[slot].push((mine - 1, 0, 0)),
+                    _ => along[slot].push((0, theirs - 1, 0)),
                 }
-                meet(index.node(block, a), index.node(ahead, b));
+            }
+
+            for &(a_here, a_there, a_cost) in &along[0] {
+                for &(b_here, b_there, b_cost) in &along[1] {
+                    if base + a_cost + b_cost > budget {
+                        continue;
+                    }
+                    let a = here.1[a_here * here.0[1] + b_here];
+                    let b = there.1[a_there * there.0[1] + b_there];
+                    if a == UNLABELLED || b == UNLABELLED {
+                        continue;
+                    }
+                    meet(index.node(block, a), index.node(ahead, b));
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Two blocks whose shared extent disagrees, which means their fragments came
+/// from two different lattices.
+///
+/// Two messages because the single-axis case has one and it is the one a
+/// face-connected run has always produced; a diagonal meeting has no "the other
+/// two" to talk about.
+fn unequal_faces(
+    block: [usize; 3],
+    ahead: [usize; 3],
+    towards: [isize; 3],
+    here: [usize; 2],
+    there: [usize; 2],
+) -> Error {
+    if steps_of(towards) == 1 {
+        let axis = towards
+            .iter()
+            .position(|&step| step != 0)
+            .expect("one step is along some axis");
+        return Error::InvalidArgument(format!(
+            "blocks {block:?} and {ahead:?} share a seam on axis {axis} but their \
+             faces are {here:?} and {there:?}. Two blocks adjacent on one axis have the same \
+             extent on the other two, so unequal faces mean the fragments came from \
+             two different lattices."
+        ));
+    }
+    Error::InvalidArgument(format!(
+        "blocks {block:?} and {ahead:?} meet along {towards:?} but their faces are {here:?} \
+         and {there:?}. Two blocks differing only in the axes they step along have the same \
+         extent on the rest, so unequal faces mean the fragments came from two different \
+         lattices."
+    ))
 }
 
 // ----------------------------------------------------------- the rewrite --
@@ -642,6 +1006,160 @@ mod tests {
         // a mismatched output shape is refused rather than half-filled
         let mut wrong = Array3::<u32>::zeros((4, 5, 5));
         assert!(label_members_into(shape, |_| true, wrong.view_mut()).is_err());
+    }
+
+    /// The tables are data, and data is where a typo hides silently. So they are
+    /// checked against the definition rather than against themselves: the
+    /// twenty-six offsets must be exactly `{-1, 0, 1}^3` without the origin,
+    /// grouped by how many axes they step along, and each connectivity's prefix
+    /// must be exactly the offsets it says it joins.
+    #[test]
+    fn the_offsets_are_the_whole_neighbourhood_grouped_by_steps() {
+        let mut expected: Vec<[isize; 3]> = Vec::new();
+        for i in [-1isize, 0, 1] {
+            for j in [-1isize, 0, 1] {
+                for k in [-1isize, 0, 1] {
+                    if [i, j, k] != [0, 0, 0] {
+                        expected.push([i, j, k]);
+                    }
+                }
+            }
+        }
+        let mut sorted = NEIGHBOUR_OFFSETS.to_vec();
+        sorted.sort();
+        expected.sort();
+        assert_eq!(sorted, expected, "the table is the 3x3x3 neighbourhood");
+
+        // grouped, so that a prefix is a connectivity
+        let steps: Vec<usize> = NEIGHBOUR_OFFSETS.iter().map(|&by| steps_of(by)).collect();
+        assert!(steps.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(steps.iter().filter(|&&n| n == 1).count(), 6);
+        assert_eq!(steps.iter().filter(|&&n| n == 2).count(), 12);
+        assert_eq!(steps.iter().filter(|&&n| n == 3).count(), 8);
+
+        for connectivity in [
+            Connectivity::Faces,
+            Connectivity::FacesAndEdges,
+            Connectivity::FacesEdgesAndCorners,
+        ] {
+            let joined: Vec<[isize; 3]> = NEIGHBOUR_OFFSETS
+                .into_iter()
+                .filter(|&by| connectivity.joins(by))
+                .collect();
+            assert_eq!(
+                connectivity.offsets(),
+                joined,
+                "{connectivity:?}'s offsets are the ones it joins"
+            );
+            assert!(
+                !connectivity.joins([0, 0, 0]),
+                "a voxel is not its own pair"
+            );
+        }
+        assert_eq!(Connectivity::Faces.offsets().len(), 6);
+        assert_eq!(Connectivity::FacesAndEdges.offsets().len(), 18);
+        assert_eq!(Connectivity::FacesEdgesAndCorners.offsets().len(), 26);
+
+        // and the first six are `FACE_NEIGHBOURS`, which is what keeps a
+        // face-connected traversal visiting neighbours in the order it did.
+        for (slot, (axis, step)) in FACE_NEIGHBOURS.into_iter().enumerate() {
+            let mut by = [0isize; 3];
+            by[axis] = step;
+            assert_eq!(NEIGHBOUR_OFFSETS[slot], by);
+        }
+    }
+
+    /// Every lattice direction, checked to be one per pair and to cover every
+    /// way one block can meet another.
+    ///
+    /// The cover is the load-bearing half: if a direction were missing, a
+    /// component joined only across it would silently be two, and no fixture
+    /// that happens not to touch there would notice.
+    #[test]
+    fn the_directions_are_every_block_meeting_taken_from_one_side() {
+        for &towards in &FORWARD_DIRECTIONS {
+            let first = towards.iter().find(|&&step| step != 0);
+            assert_eq!(first, Some(&1), "{towards:?} is not taken from one side");
+        }
+        let mut seen: Vec<[isize; 3]> = Vec::new();
+        for &towards in &FORWARD_DIRECTIONS {
+            seen.push(towards);
+            seen.push([-towards[0], -towards[1], -towards[2]]);
+        }
+        seen.sort();
+        seen.dedup();
+        let mut expected = NEIGHBOUR_OFFSETS.to_vec();
+        expected.sort();
+        assert_eq!(
+            seen, expected,
+            "the directions and their opposites are every neighbouring block"
+        );
+
+        // and a direction stepping along n axes needs a connectivity of at
+        // least n, which is why the prefixes line up
+        for connectivity in [
+            Connectivity::Faces,
+            Connectivity::FacesAndEdges,
+            Connectivity::FacesEdgesAndCorners,
+        ] {
+            let reachable: Vec<[isize; 3]> = FORWARD_DIRECTIONS
+                .into_iter()
+                .filter(|&towards| steps_of(towards) <= connectivity.steps())
+                .collect();
+            assert_eq!(connectivity.directions(), reachable);
+        }
+        assert_eq!(Connectivity::Faces.directions().len(), 3);
+        assert_eq!(Connectivity::FacesAndEdges.directions().len(), 9);
+        assert_eq!(Connectivity::FacesEdgesAndCorners.directions().len(), 13);
+    }
+
+    /// The discriminating case, inside one block: two voxels that touch only at
+    /// a corner, and two that touch only along an edge.
+    ///
+    /// A fixture whose parts touch face to face answers the same under all
+    /// three and would pass with the connectivity ignored entirely, which is
+    /// exactly why this one does not touch that way.
+    #[test]
+    fn a_corner_join_needs_twenty_six_and_an_edge_join_needs_eighteen() {
+        let shape = [4usize, 4, 4];
+        let corner = [[1usize, 1, 1], [2, 2, 2]];
+        let edge = [[1usize, 1, 0], [2, 2, 0]];
+        let face = [[1usize, 1, 1], [1, 1, 2]];
+
+        let counts = |pair: [[usize; 3]; 2], connectivity| {
+            let mut out = Array3::<u32>::zeros((4, 4, 4));
+            label_members_into_with(
+                shape,
+                connectivity,
+                |at| at == pair[0] || at == pair[1],
+                out.view_mut(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(counts(corner, Connectivity::Faces), 2);
+        assert_eq!(counts(corner, Connectivity::FacesAndEdges), 2);
+        assert_eq!(counts(corner, Connectivity::FacesEdgesAndCorners), 1);
+
+        assert_eq!(counts(edge, Connectivity::Faces), 2);
+        assert_eq!(counts(edge, Connectivity::FacesAndEdges), 1);
+        assert_eq!(counts(edge, Connectivity::FacesEdgesAndCorners), 1);
+
+        // and the case that discriminates nothing, present to show it does not
+        assert_eq!(counts(face, Connectivity::Faces), 1);
+        assert_eq!(counts(face, Connectivity::FacesEdgesAndCorners), 1);
+
+        // the default form is the face-connected one
+        let mut bare = Array3::<u32>::zeros((4, 4, 4));
+        assert_eq!(
+            label_members_into(
+                shape,
+                |at| at == corner[0] || at == corner[1],
+                bare.view_mut()
+            )
+            .unwrap(),
+            2
+        );
     }
 
     #[test]

@@ -50,12 +50,48 @@
 // there is no second list to disagree — `Assembly::work` derives the borrowed
 // view on demand. That is the difference between a check and a shape.
 //
+// Asking a planner is not becoming one
+// ------------------------------------
+// [`PlanBuilder::pixels`] makes **one** phase of the chain it is handed, because
+// a caller who knows the phases must be able to say so. That left the partition
+// planner with no way in: `strategy::Strategy::decompose` takes a `Workflow` —
+// one chain, one input, one output, a linear pipeline — and a stage that needs
+// several levels has none of that to offer, so it grouped its own phases by
+// hand and the planner never got a vote. Every performance figure this crate
+// has for such a stage is therefore measured on a partition nobody chose.
+//
+// [`PlanBuilder::partition`] is the way in, and it stays on this module's side
+// of the line for one reason: **it decides nothing.** The caller names the
+// strategy and the [`crate::decomposition::Constraints`] it may spend; the
+// builder contributes the coordinate space the chain runs in and the slot
+// cursor to renumber the answer by. What comes back is as many phases as the
+// planner chose, which may be one. That is the same relationship this module
+// already has with `iterative_phase` and `fragment_phase` — the shape of the
+// phase is asked of the thing that knows it, and the bookkeeping around it is
+// what is removed here.
+//
+// What it does deliberately do
+// ----------------------------
+// * **Synthesise the `Workflow` per call**, over the sub-chain, the current
+//   level's volume and the element type the next phase reads. `decompose` reads
+//   exactly those three fields, so a chain in the middle of a level DAG can be
+//   priced without the planner learning about the DAG.
+// * **Renumber the slots.** The planner numbers a chain from zero; a plan under
+//   assembly is at whatever the cursor says.
+// * **Leave the source leaves alone.** [`crate::op::Chain::Source`] names an
+//   absolute level of the whole plan, and cutting a chain into phases never
+//   changes one — see [`PlanBuilder::partition`] for the argument.
+//
 // What it deliberately does not absorb
 // ------------------------------------
 // * **The block lattice.** A grid is a planning decision with a cost model
 //   behind it, so the caller supplies it; [`PlanBuilder::regrid`] is how a plan
 //   that changes lattice mid-way says so, and it is a statement rather than an
-//   inference.
+//   inference. A planned run of phases is cut on the lattices the *planner*
+//   chose, per phase, and the builder's own stays what the caller last said —
+//   [`Partition::grid`] hands back the last of them for a caller who wants to
+//   carry on where the planner left off, which is again a statement rather than
+//   an inference.
 // * **Per-block source regions** (`PhaseDecomposition::with_sources`). A
 //   cross-grid mapping is the operation, not bookkeeping about it.
 // * **Anything a `Hints` holds.** The builder produces the binding half only.
@@ -69,7 +105,8 @@
 // disagree, which was the failure this is here to remove.
 
 use crate::decomposition::{
-    check_block_constraints, check_dtypes, check_source_levels, Decomposition, PhaseDecomposition,
+    check_block_constraints, check_dtypes, check_source_levels, Constraints, Decomposition,
+    PhaseDecomposition,
 };
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
@@ -77,7 +114,7 @@ use crate::fragment::{check_phase_work, fragment_phase, FragmentOp, PhaseWork};
 use crate::geometry::BlockGrid;
 use crate::iterate::{iterative_phase, IterativeOp};
 use crate::op::Chain;
-use crate::strategy::Workflow;
+use crate::strategy::{Strategy, Workflow};
 
 /// A level of the plan: level 0 is the input, level `p + 1` is what phase `p`
 /// wrote.
@@ -161,6 +198,68 @@ impl Phase {
                 self.index + 1
             ))
         })
+    }
+}
+
+/// The phases one [`PlanBuilder::partition`] call made, in plan order.
+///
+/// **A run of phases is not a phase, and the difference is worth a type.** A
+/// caller carries on building from the *last* level a call produced, so that is
+/// what [`Self::level`] and [`Self::last`] answer; but "how many did the planner
+/// make" is the question the whole entry exists to be able to ask — a bridge
+/// that silently always made one would pass every other test — so the count is
+/// here rather than left to be inferred by subtracting two `n_phases()` readings
+/// around the call.
+///
+/// Never empty: a partition of a chain with at least one slot has at least one
+/// group, and a chain with no slots is refused before any of this.
+#[derive(Debug, Clone)]
+pub struct Partition {
+    phases: Vec<Phase>,
+    grid: BlockGrid,
+}
+
+impl Partition {
+    /// The last phase, which is the one a caller keeps building from.
+    pub fn last(&self) -> Phase {
+        *self
+            .phases
+            .last()
+            .expect("a partition holds at least one phase")
+    }
+
+    /// The level the last phase wrote.
+    ///
+    /// Infallible where [`Phase::level`] is not, and for a reason rather than
+    /// for convenience: every phase a partition holds is a `Pixels` phase over a
+    /// run of chain slots, and such a phase always writes the level below it
+    /// plus one. There is no fragment op here to answer otherwise.
+    pub fn level(&self) -> Level {
+        self.last()
+            .writes()
+            .expect("a pixel phase writes the level above it")
+    }
+
+    /// How many phases the planner made of the chain.
+    ///
+    /// One means it declined to cut, which is an answer and not a failure.
+    pub fn n_phases(&self) -> usize {
+        self.phases.len()
+    }
+
+    /// Every phase it made, in plan order.
+    pub fn phases(&self) -> &[Phase] {
+        &self.phases
+    }
+
+    /// The lattice the last phase was cut on.
+    ///
+    /// Offered because the planner chose it and the builder did not: a caller
+    /// who wants the phases it appends next to sit on the lattice the planner
+    /// settled on says [`PlanBuilder::regrid`] with this, and a caller who wants
+    /// its own lattice back does nothing. Neither is inferred.
+    pub fn grid(&self) -> &BlockGrid {
+        &self.grid
     }
 }
 
@@ -311,6 +410,123 @@ impl PlanBuilder {
         self.fragments.push(chain);
         self.reads = produced;
         Ok(self.push(phase, Work::Pixels, true))
+    }
+
+    /// Append **as many `Pixels` phases as `strategy` makes** of one chain.
+    ///
+    /// The counterpart of [`Self::pixels`], and the two are the two answers to
+    /// one question. `pixels` is for a caller who knows the phase; this is for a
+    /// caller who knows the *chain* and wants the partition priced. Both stay,
+    /// because "I want exactly this phase" and "choose for me" are different
+    /// statements and a builder that could only make one of them would be
+    /// deciding on the caller's behalf either way.
+    ///
+    /// # How a `Workflow`-shaped planner is reached from a level DAG
+    ///
+    /// `Strategy::decompose` takes a [`Workflow`], which is one chain over one
+    /// volume in one element type. It reads exactly those three fields, so the
+    /// workflow is **synthesised here, per call**, from the chain, from
+    /// `self.grid().volume()` — the space the level this chain reads lives in,
+    /// which is not `Decomposition::volume` once a phase has changed shape — and
+    /// from [`Self::reads`]. The `input` and `output` names it carries are the
+    /// defaults and mean nothing mid-plan; nothing in a partition search looks at
+    /// them. No narrower entry point into the search is needed for that.
+    ///
+    /// One term of the price *is* affected by the synthesis and cannot be fixed
+    /// from here: a group is charged `materialise_cost_per_voxel` when it is not
+    /// the last of the chain, and the last group of a mid-plan chain writes an
+    /// intermediate that this workflow has no way to mention. It is priced as an
+    /// output, so the final cut is very slightly under-charged. Both weights
+    /// default to `1.0`, where the distinction disappears.
+    ///
+    /// # What happens to the level a source leaf names
+    ///
+    /// Nothing, and that is the property to check rather than to assume.
+    /// [`Chain::source`] names a level of the *whole plan*; the planner never
+    /// sees a level number, only slots, so it cannot rewrite one. What cutting
+    /// changes is which phase a leaf ends up in: with one phase every slot sits
+    /// at phase `p` and reads level `p`, and with `k` phases a slot may sit as
+    /// late as `p + k - 1`. The rule
+    /// [`crate::decomposition::check_source_levels`] enforces is that a leaf's
+    /// level is at most its phase's own — so a leaf that was legal fused is
+    /// legal cut, because cutting only ever moves it later. The reverse is what
+    /// would be unsound, and the reverse is not a thing this can do.
+    ///
+    /// The one direction in which a cut can genuinely refuse is an op declaring
+    /// a *reach* over the level it sources: the granted halo is the phase's, and
+    /// a phase holding fewer slots may grant less than the fused one did. That
+    /// is refused by name at [`Self::finish`], with the level and both reaches
+    /// in the message, rather than run.
+    ///
+    /// # Where the numbers come from
+    ///
+    /// `constraints` is the caller's, whole. The block candidates in particular
+    /// are **not** taken from `self.grid()`: a grid is one lattice a caller
+    /// stated, and a candidate list is a set of scalar edges a cost model is to
+    /// choose between — the builder's lattice is not a candidate list with one
+    /// entry, it is a different kind of thing. What the builder contributes is
+    /// the volume, which is not a choice at all.
+    pub fn partition(
+        &mut self,
+        chain: Chain,
+        strategy: &dyn Strategy,
+        constraints: &Constraints,
+    ) -> Result<Partition> {
+        let slots = chain.slots();
+        if slots.is_empty() {
+            return Err(Error::InvalidArgument(
+                "a planned run of pixel phases with no chain slots: there is nothing to \
+                 partition. A phase that reads a level and writes it back unchanged is an \
+                 identity op, said out loud."
+                    .to_string(),
+            ));
+        }
+        let n = slots.len();
+        // The element type, folded over the whole chain by exactly the rule
+        // `pixels` folds it by. The planner declares it per phase from the same
+        // fold over the same slots, started at the same type, so the two agree
+        // phase by phase and this is only the value the *next* phase reads.
+        let mut produced = self.reads;
+        for slot in &slots {
+            produced = slot.produces(produced)?;
+        }
+        drop(slots);
+
+        let workflow = Workflow::new(chain, self.grid.volume(), self.reads);
+        let planned = strategy.decompose(&workflow, constraints)?;
+        // A decomposition may partition; it may never reorder or drop an op —
+        // the executor's own words, checked here because a strategy is an open
+        // trait and a plan that renumbered the chain would be renumbered again
+        // by the cursor below into something nobody could read back.
+        let order = planned.slot_order();
+        if order != (0..n).collect::<Vec<_>>() {
+            return Err(Error::InvalidArgument(format!(
+                "strategy {:?} partitioned a {n}-slot chain into slot order {order:?}, which is \
+                 not the chain's own order 0..{n}. A decomposition may partition; it may never \
+                 reorder or drop an op.",
+                strategy.name()
+            )));
+        }
+        let base = self.slots_used;
+        let mut phases = Vec::with_capacity(planned.phases.len());
+        let mut grid = self.grid.clone();
+        for mut phase in planned.phases {
+            // The one renumbering. The planner counted this chain's slots from
+            // zero; the plan under assembly is at the cursor. Everything else it
+            // recorded — the reach, the halo, the grid, the element type it
+            // declares — is a fact about the run of slots and travels unchanged,
+            // and `source_levels` is absolute already and is re-derived over the
+            // whole chain by `finish` in any case.
+            for slot in &mut phase.slots {
+                *slot += base;
+            }
+            grid = phase.grid.clone();
+            phases.push(self.push(phase, Work::Pixels, true));
+        }
+        self.slots_used += n;
+        self.fragments.push(workflow.chain);
+        self.reads = produced;
+        Ok(Partition { phases, grid })
     }
 
     /// Append an `Iterate` phase.
@@ -534,5 +750,457 @@ mod tests {
         let plan = PlanBuilder::new([16, 8, 8], Dtype::F64, grid());
         let message = plan.finish().err().expect("no phases").to_string();
         assert!(message.contains("no phases"), "{message}");
+    }
+}
+
+/// **What the bridge to the partition planner has to be true for.**
+///
+/// Four questions, and each of them is a way for this entry to look like it
+/// works while being useless or wrong:
+///
+/// * **the answer must not change.** A chain the planner cut into several
+///   phases has to compute what the same chain forced into one computes, bit
+///   for bit. `pixels` still exists, so both plans are buildable and the
+///   comparison is on voxels rather than on an argument;
+/// * **the planner must actually be consulted.** A bridge that quietly always
+///   made one phase would pass every other test here, so one chain is asserted
+///   to come back cut and one to come back whole;
+/// * **a source leaf must still name the level it meant.** This is the failure
+///   that is silent: a leaf reads a level *by index*, and an entry that renumbers
+///   levels under one would read real voxels from the wrong array;
+/// * **and the cut has to be worth making**, on the shape the gap was found on:
+///   a large-reach op with reach-0 work either side of it, which is what fusing
+///   makes expensive and what nobody was pricing.
+#[cfg(test)]
+mod planned_phases {
+    use super::*;
+    use crate::decomposition::{Constraints, CostModel};
+    use crate::env::ArrayEnvironment;
+    use crate::ops::background::DifferenceCombine;
+    use crate::ops::smooth::{Gaussian, SmoothOp};
+    use crate::ops::voxelwise::VoxelwiseMapOp;
+    use crate::strategy::{execute_phases, Enumerating, Greedy, Hints, Strategy};
+    use crate::voxels::Voxels;
+
+    /// Small enough to run every plan it appears in, and still large enough for
+    /// the blur's halo to be the thing that decides the block edge.
+    const VOLUME: [usize; 3] = [32, 32, 8];
+    /// A radius of 8 on x and y and nothing on z: the shape of the blur the
+    /// consumer fuses — flat on z, wide in plane — at a size a test can run.
+    const SIGMA: f64 = 2.0;
+    /// A volume the consumer's own scale is worth measuring at. Nothing runs at
+    /// this size; the plans are built and their geometry is read, which is where
+    /// a read amplification comes from anyway.
+    const WIDE: [usize; 3] = [128, 128, 32];
+    /// The scale the consumer ships, whose radius is 40.
+    const WIDE_SIGMA: f64 = 10.0;
+    const TRUNCATE: f64 = 4.0;
+    /// The fingerprint of the two-phase `pixels` plan below.
+    ///
+    /// A literal, and it is checkable rather than magic: the plan it belongs to
+    /// is the one `tests::two_pixel_phases_assemble_to_the_hand_built_decomposition`
+    /// builds a second time by hand and compares field for field, so the number
+    /// is pinned to a decomposition written out in full a few hundred lines
+    /// above rather than to whatever this module happens to produce.
+    const PIXELS_FINGERPRINT: u64 = 6813685505909348196;
+
+    /// The chain the gap was found on, at a size a test can run.
+    ///
+    /// A large-reach op between two reach-0 fan-ins, each of which reads a level
+    /// back through a source leaf. Both halves matter: the reach-0 work is what
+    /// pays the blur's halo when it is fused with it, and the source leaves are
+    /// what make that expensive twice over — a level a phase sources is fetched
+    /// at the block's own read extent, so a fused phase reads *three* levels at
+    /// the blur's halo where a cut one reads one.
+    fn arm(values: Level, sink: Level, sigma: f64) -> Chain {
+        Chain::sequence(vec![
+            Chain::parallel(
+                vec![
+                    Chain::op(VoxelwiseMapOp::new("masked", |value| value * 0.5)),
+                    Chain::source(values, Dtype::F64),
+                ],
+                Box::new(DifferenceCombine::new("masked source")),
+            )
+            .expect("a fan-in"),
+            Chain::op(SmoothOp::new(
+                "blur",
+                Gaussian::new([sigma, sigma, 0.0], TRUNCATE).expect("a kernel"),
+            )),
+            Chain::parallel(
+                vec![
+                    Chain::op(VoxelwiseMapOp::new("blurred", |value| value)),
+                    Chain::source(sink, Dtype::F64),
+                ],
+                Box::new(DifferenceCombine::new("residual")),
+            )
+            .expect("a fan-in"),
+        ])
+    }
+
+    /// A chain with nothing to gain from a cut: three reach-0 maps.
+    fn voxelwise_chain() -> Chain {
+        Chain::sequence(vec![
+            Chain::op(VoxelwiseMapOp::new("scale", |value| value * 2.0)),
+            Chain::op(VoxelwiseMapOp::new("floor", |value| value.max(0.0))),
+            Chain::op(VoxelwiseMapOp::new("shift", |value| value + 1.0)),
+        ])
+    }
+
+    /// A budget the blur's halo actually binds against, and a candidate list to
+    /// spend it on. The caller's, in full: see `PlanBuilder::partition`.
+    fn constraints(budget: u64, candidates: Vec<usize>) -> Constraints {
+        Constraints {
+            budget_bytes: Some(budget),
+            expected_concurrency: 1,
+            model: CostModel::default(),
+            block_candidates: candidates,
+            split_axes: vec![0, 1, 2],
+        }
+    }
+
+    fn small_constraints() -> Constraints {
+        constraints(64 << 10, vec![4, 8, 16, 32])
+    }
+
+    /// The two phases the arm reads back through its source leaves. Both plans
+    /// below start with these, so everything the comparison sees is the arm's.
+    fn preamble(plan: &mut PlanBuilder) -> (Level, Level) {
+        let values = plan
+            .pixels(Chain::op(VoxelwiseMapOp::new("values", |value| {
+                value + 1.0
+            })))
+            .expect("a pixel phase")
+            .level()
+            .expect("a level");
+        let sink = plan
+            .pixels(Chain::op(VoxelwiseMapOp::new("sink", |value| value * 0.25)))
+            .expect("a pixel phase")
+            .level()
+            .expect("a level");
+        (values, sink)
+    }
+
+    /// The plan a caller who groups its own phases builds: one `pixels` call for
+    /// the whole arm, on the largest block edge that fits the budget.
+    ///
+    /// The edge is `Greedy`'s rather than one this test picked, because "fuse
+    /// everything and take the largest block that fits" is exactly what a caller
+    /// grouping by hand is doing, and a number invented here would make the
+    /// comparison a statement about the number.
+    fn fused(volume: [usize; 3], sigma: f64, constraints: &Constraints) -> Assembly {
+        let mut plan = PlanBuilder::new(volume, Dtype::F64, whole(volume));
+        let (values, sink) = preamble(&mut plan);
+        let workflow = Workflow::new(arm(values, sink, sigma), volume, Dtype::F64);
+        let one = Greedy { concurrency: 1 }
+            .decompose(&workflow, constraints)
+            .expect("a fused plan");
+        assert_eq!(
+            one.n_phases(),
+            1,
+            "the fused baseline has to be fused, or it is measuring something else"
+        );
+        plan.regrid(one.phases[0].grid.clone());
+        plan.pixels(arm(values, sink, sigma))
+            .expect("one pixel phase");
+        plan.finish().expect("a plan")
+    }
+
+    /// The same arm, partitioned by the planner.
+    fn planned(volume: [usize; 3], sigma: f64, constraints: &Constraints) -> (Assembly, usize) {
+        let mut plan = PlanBuilder::new(volume, Dtype::F64, whole(volume));
+        let (values, sink) = preamble(&mut plan);
+        let made = plan
+            .partition(
+                arm(values, sink, sigma),
+                &Enumerating::default(),
+                constraints,
+            )
+            .expect("a planned run of phases");
+        let n = made.n_phases();
+        assert_eq!(made.last().index(), plan.n_phases() - 1);
+        (plan.finish().expect("a plan"), n)
+    }
+
+    /// The caller's own lattice for the two leading phases: one block, so that
+    /// nothing about them can be confused with what the planner chose.
+    fn whole(volume: [usize; 3]) -> BlockGrid {
+        BlockGrid::new(volume, volume).expect("a lattice")
+    }
+
+    fn input(volume: [usize; 3]) -> Voxels {
+        let n: usize = volume.iter().product();
+        let values: Vec<f64> = (0..n)
+            .map(|index| ((index * 37) % 101) as f64 / 101.0)
+            .collect();
+        ndarray::Array3::from_shape_vec(volume, values)
+            .expect("a volume")
+            .into()
+    }
+
+    /// Run a plan and hand back the level it wrote last.
+    fn run(assembly: &Assembly) -> Voxels {
+        let env = ArrayEnvironment::for_decomposition(
+            input(assembly.decomposition.volume),
+            &assembly.decomposition,
+            [8, 8, 8],
+        )
+        .expect("an environment");
+        execute_phases(
+            "partition",
+            &assembly.workflow,
+            &assembly.decomposition,
+            &Hints::default(),
+            &env,
+            &[],
+            &assembly.work(),
+        )
+        .expect("a run");
+        env.level(assembly.decomposition.n_phases())
+    }
+
+    /// Voxels read over the arm's phases only — the two leading phases are the
+    /// same in both plans and are not what is being compared.
+    fn arm_reads(assembly: &Assembly) -> usize {
+        assembly.decomposition.exact_read_voxels()[2..].iter().sum()
+    }
+
+    fn arm_blocks(assembly: &Assembly) -> Vec<usize> {
+        assembly.decomposition.phases[2..]
+            .iter()
+            .map(|phase| phase.grid.n_blocks())
+            .collect()
+    }
+
+    // ------------------------------------------------ one: the answer --
+
+    /// **The safety property, on bits.** A chain the planner cut computes what
+    /// the same chain forced into one computes.
+    ///
+    /// Not "close": every voxel's `f64` compared by its bit pattern, because a
+    /// halo one voxel short of the reach is worth about an ulp at the seams and
+    /// would pass any tolerance somebody chose.
+    #[test]
+    fn a_planned_run_of_phases_computes_what_the_fused_one_computes() {
+        let constraints = small_constraints();
+        let fused = fused(VOLUME, SIGMA, &constraints);
+        let (planned, phases) = planned(VOLUME, SIGMA, &constraints);
+        assert_eq!(fused.n_phases(), 3, "two leading phases and the fused arm");
+        assert!(
+            phases > 1,
+            "the planner declined to cut, so this proves nothing"
+        );
+
+        let from_fused = run(&fused);
+        let from_planned = run(&planned);
+        assert_eq!(from_fused.shape(), from_planned.shape());
+        let fused_view = from_fused.view::<f64>().expect("f64");
+        let planned_view = from_planned.view::<f64>().expect("f64");
+        let differing = fused_view
+            .iter()
+            .zip(planned_view.iter())
+            .filter(|(left, right)| left.to_bits() != right.to_bits())
+            .count();
+        assert_eq!(differing, 0, "{differing} voxels differ between the plans");
+        // and it is an answer rather than two empty volumes agreeing
+        assert!(
+            fused_view.iter().any(|value| *value != 0.0),
+            "the fixture computed nothing at all"
+        );
+    }
+
+    // --------------------------------------- two: the planner was asked --
+
+    /// The chain that wants cutting comes back cut, and the phases are the
+    /// planner's own — same count, same lattices, same slots, renumbered.
+    #[test]
+    fn the_planner_decides_how_many_phases_a_chain_becomes() {
+        let constraints = small_constraints();
+        let (assembly, phases) = planned(VOLUME, SIGMA, &constraints);
+        assert!(
+            phases > 1,
+            "the planner was not consulted: one call, one phase, every time"
+        );
+
+        // The same partition the planner returns when it is asked directly, so
+        // that what arrived in the plan is its answer and not a rounding of it.
+        let workflow = Workflow::new(arm(Level(1), Level(2), SIGMA), VOLUME, Dtype::F64);
+        let direct = Enumerating::default()
+            .decompose(&workflow, &constraints)
+            .expect("a plan");
+        assert_eq!(direct.n_phases(), phases);
+        for (index, phase) in direct.phases.iter().enumerate() {
+            let landed = &assembly.decomposition.phases[2 + index];
+            assert_eq!(landed.grid, phase.grid, "phase {index} lattice");
+            assert_eq!(landed.reach, phase.reach, "phase {index} reach");
+            assert_eq!(landed.halo, phase.halo, "phase {index} halo");
+            // renumbered by the cursor, and by nothing else
+            let shifted: Vec<usize> = phase.slots.iter().map(|slot| slot + 2).collect();
+            assert_eq!(landed.slots, shifted, "phase {index} slots");
+        }
+    }
+
+    /// And a chain with nothing to gain from a cut comes back whole. The other
+    /// half of the same assertion: an entry that always cut would be as wrong as
+    /// one that never did.
+    #[test]
+    fn a_chain_the_planner_will_not_cut_stays_one_phase() {
+        let constraints = small_constraints();
+        let mut plan = PlanBuilder::new(VOLUME, Dtype::F64, whole(VOLUME));
+        let made = plan
+            .partition(voxelwise_chain(), &Enumerating::default(), &constraints)
+            .expect("a planned run of phases");
+        assert_eq!(made.n_phases(), 1);
+        assert_eq!(made.level(), Level(1));
+        let assembly = plan.finish().expect("a plan");
+        assert_eq!(assembly.decomposition.n_phases(), 1);
+        assert_eq!(assembly.decomposition.phases[0].slots, vec![0, 1, 2]);
+    }
+
+    // ------------------------------------- three: the source leaf's level --
+
+    /// **The silent failure, checked.** A source leaf names a level of the whole
+    /// plan; cutting the chain around it must not move the level it means.
+    ///
+    /// Cutting can only ever move a slot *later*, and the rule is that a leaf's
+    /// level is at most its phase's own — so the direction cutting moves in is
+    /// the safe one. This asserts the outcome rather than the argument: the
+    /// levels recorded against the phases are the levels the chain named, in
+    /// both plans, whatever the partition did.
+    #[test]
+    fn cutting_a_chain_does_not_renumber_the_levels_its_source_leaves_name() {
+        let constraints = small_constraints();
+        let fused = fused(VOLUME, SIGMA, &constraints);
+        let (planned, phases) = planned(VOLUME, SIGMA, &constraints);
+        assert!(phases > 1);
+
+        // Fused: one phase, both leaves, both levels.
+        assert_eq!(fused.decomposition.phases[2].source_levels, vec![1, 2]);
+        // Cut: the same two levels, now in the phases the slots landed in, and
+        // every one of them at or below its own phase's input level.
+        let named: Vec<usize> = planned.decomposition.phases[2..]
+            .iter()
+            .flat_map(|phase| phase.source_levels.iter().copied())
+            .collect();
+        assert_eq!(named, vec![1, 2]);
+        for (index, phase) in planned.decomposition.phases.iter().enumerate() {
+            for &level in &phase.source_levels {
+                assert!(
+                    level <= index,
+                    "phase {index} sources level {level}, which it runs before"
+                );
+            }
+        }
+        // `finish` ran `check_source_levels` over both, which is the guard this
+        // is the readable form of.
+    }
+
+    // ------------------------------------------ four: the cut is worth it --
+
+    /// **The measurement, on the shape the gap was found on.** Reported as
+    /// exact voxels read — the clamped geometry, not a model — for the fused
+    /// plan and for the planned one.
+    #[test]
+    fn fusing_the_large_reach_op_with_its_neighbours_reads_the_volume_far_more_times() {
+        let constraints = small_constraints();
+        let fused = fused(VOLUME, SIGMA, &constraints);
+        let (planned, phases) = planned(VOLUME, SIGMA, &constraints);
+        let voxels: usize = VOLUME.iter().product();
+
+        let fused_reads = arm_reads(&fused);
+        let planned_reads = arm_reads(&planned);
+        println!(
+            "arm fused:   {:?} block(s), {fused_reads} voxels read, {:.3}x the volume",
+            arm_blocks(&fused),
+            fused_reads as f64 / voxels as f64
+        );
+        println!(
+            "arm planned: {:?} block(s), {planned_reads} voxels read, {:.3}x the volume",
+            arm_blocks(&planned),
+            planned_reads as f64 / voxels as f64
+        );
+        assert_eq!(phases, 3);
+        assert!(
+            planned_reads * 3 < fused_reads * 2,
+            "the planned partition has to be worth making: {planned_reads} against {fused_reads}"
+        );
+    }
+
+    /// The same measurement at the consumer's own numbers: a radius-40 blur on a
+    /// `[128, 128, 32]` volume against a 4 MiB block budget.
+    ///
+    /// Nothing is run here — a read amplification comes from the plan's clamped
+    /// geometry, which is the same figure whether or not anybody executes it —
+    /// so this is the size the gap was actually found at rather than the size a
+    /// test can afford to run.
+    #[test]
+    fn the_same_holds_at_the_radius_and_volume_the_gap_was_found_at() {
+        let constraints = constraints(4 << 20, vec![16, 32, 64, 128]);
+        let fused = fused(WIDE, WIDE_SIGMA, &constraints);
+        let (planned, phases) = planned(WIDE, WIDE_SIGMA, &constraints);
+        let voxels: usize = WIDE.iter().product();
+
+        let fused_reads = arm_reads(&fused);
+        let planned_reads = arm_reads(&planned);
+        println!(
+            "wide arm fused:   {:?} block(s), {fused_reads} voxels read, {:.3}x the volume",
+            arm_blocks(&fused),
+            fused_reads as f64 / voxels as f64
+        );
+        println!(
+            "wide arm planned: {:?} block(s), {planned_reads} voxels read, {:.3}x the volume",
+            arm_blocks(&planned),
+            planned_reads as f64 / voxels as f64
+        );
+        assert_eq!(phases, 3);
+        assert!(
+            planned_reads * 2 < fused_reads,
+            "{planned_reads} against {fused_reads}"
+        );
+    }
+
+    // ------------------------------------ and what the entry does not touch --
+
+    /// **`pixels` is untouched, and the fingerprint says so.**
+    ///
+    /// A pinned literal rather than a comparison against a plan built here,
+    /// because the thing worth catching is the whole assembly path moving under
+    /// a plan somebody already has a parity figure for. This is the number a
+    /// two-phase `pixels` plan has always had.
+    #[test]
+    fn a_plan_built_with_pixels_fingerprints_as_it_always_has() {
+        let volume = [16usize, 8, 8];
+        let grid = BlockGrid::new(volume, [8, 8, 8]).expect("a lattice");
+        let mut plan = PlanBuilder::new(volume, Dtype::F64, grid);
+        plan.pixels(Chain::op(crate::probes::IdentityOp::new(
+            "first",
+            [1, 0, 0],
+        )))
+        .expect("a pixel phase");
+        plan.pixels(Chain::op(crate::probes::AffineOp::new(
+            "second",
+            2.0,
+            1.0,
+            [0, 2, 0],
+        )))
+        .expect("a pixel phase");
+        let built = plan.finish().expect("a plan");
+        assert_eq!(built.decomposition.n_phases(), 2);
+        assert_eq!(built.decomposition.fingerprint(), PIXELS_FINGERPRINT);
+    }
+
+    /// A run of phases has to hold at least one, and a chain with no slots holds
+    /// none — refused where it is written, in the words `pixels` refuses it in.
+    #[test]
+    fn a_planned_run_over_a_chain_with_no_slots_is_refused() {
+        let mut plan = PlanBuilder::new(VOLUME, Dtype::F64, whole(VOLUME));
+        let message = plan
+            .partition(
+                Chain::sequence(Vec::new()),
+                &Enumerating::default(),
+                &small_constraints(),
+            )
+            .expect_err("no slots")
+            .to_string();
+        assert!(message.contains("nothing to partition"), "{message}");
     }
 }

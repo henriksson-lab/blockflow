@@ -246,6 +246,15 @@ fn the_planner_segments_at_a_full_reach_op_rather_than_fusing_across_it() {
 /// the fused phase's halo is real — and it would be wrong: fusing is 1.22x
 /// cheaper in the model, and the phase is still cut into blocks rather than
 /// forced to span the volume.
+///
+/// **Narrowed, and the reason is at the bottom of this test.** It also used to
+/// assert that a reach of `volume - 1` left its phase cuttable.
+/// `decomposition::cuttable_axes` is wired now and that cut is gone; what is
+/// asserted in its place is the claim cuttability was standing in for — a
+/// bounded reach forces no phase boundary — plus the price ordering that keeps
+/// it distinguishable from a barrier once neither is cut. The two arms below at
+/// reaches 1 and 512 are untouched: the floor admits their cuts at every
+/// candidate edge, because `1024 + 512 + 512 < 4096`.
 #[test]
 fn a_large_but_bounded_reach_is_not_a_barrier_and_still_fuses() {
     let volume = [4096usize, 4, 4];
@@ -297,9 +306,69 @@ fn a_large_but_bounded_reach_is_not_a_barrier_and_still_fuses() {
     let nearly = Enumerating::default()
         .decompose(&workflow(nearly, volume), &constraints(vec![0], vec![1024]))
         .unwrap();
-    // priced out of fusing, but not *forbidden* from it: the phase carrying it
-    // may still be cut, which is the whole difference from a barrier
-    assert_eq!(nearly.phases[1].grid.split_axes(), &[0]);
+    // **The claim that used to be made here, and the narrower one that survives.**
+    //
+    // This asserted that the phase carrying a `volume - 1` reach *may still be
+    // cut* — "priced out of fusing, but not forbidden from it, which is the whole
+    // difference from a barrier". `decomposition::cuttable_axes` is wired now and
+    // forbids that cut: at this reach `lo + hi` is nearly twice the volume, so a
+    // block of any edge reads the whole axis and cutting it multiplies the read
+    // by the block count for nothing. The claim as stated cannot hold.
+    //
+    // What it was really defending does hold, and holds more strongly. A barrier
+    // is a **forced cut**: `barrier_cuts` removes the partitions that fuse across
+    // one, so nothing may join it whatever the price says. A large bounded reach
+    // is still not that — no partition is removed, and here the search chooses to
+    // fuse the whole chain into it. Cuttability was a proxy for that freedom and
+    // it was a poor one: it is a fact about the *grid*, and a grid is chosen on
+    // price for one phase, where fusing is chosen on price across phases.
+    assert_eq!(
+        nearly.n_phases(),
+        1,
+        "a bounded reach forced a phase boundary, which is what a barrier does"
+    );
+    assert_eq!(nearly.phases[0].names.len(), 3);
+    // and the grid it fused into is the one the floor left: uncut on the axis the
+    // halo spans, cut on nothing else because nothing else was offered
+    assert!(nearly.phases[0].grid.split_axes().is_empty());
+    assert_eq!(nearly.phases[0].grid.n_blocks(), 1);
+
+    // **The price keeps the difference the structure no longer has to.** On the
+    // axis the floor dropped, `price_phase` charges the infinite grid rather than
+    // the clamp discount, and that charge is `(extent + lo + hi) / extent`. A
+    // bounded reach has `lo + hi < 2 * extent` by definition, so it is charged
+    // strictly less than **3**; a full reach is `AxisReach::All`, `lo + hi` is
+    // `2 * extent`, and it is charged exactly 3. The barrier is still the more
+    // expensive of the two at the same grid, which is what "not a barrier" costs
+    // out to once neither of them is cut.
+    let whole = BlockGrid::whole(volume).unwrap();
+    let charged = |reach: crate::reach::Reach| {
+        super::decomposition::price_phase(
+            &whole,
+            &reach,
+            1.0,
+            1,
+            false,
+            8.0,
+            &CostModel::default(),
+            1.0,
+        )
+        .redundancy
+    };
+    let bounded_charge = charged([volume[0] - 1, 0, 0].into());
+    let full_charge = charged(crate::reach::Reach::per_axis([
+        crate::reach::AxisReach::All,
+        crate::reach::AxisReach::none(),
+        crate::reach::AxisReach::none(),
+    ]));
+    assert!(
+        (1.0..3.0).contains(&bounded_charge),
+        "a bounded reach on a dropped axis priced {bounded_charge}"
+    );
+    assert!(
+        bounded_charge < full_charge,
+        "a bounded reach priced {bounded_charge} against a barrier's {full_charge}"
+    );
 }
 
 /// The second planner implements the same position, by its own route.

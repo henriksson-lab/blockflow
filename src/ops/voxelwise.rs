@@ -75,8 +75,9 @@ use ndarray::{ArrayView3, ArrayViewMut3};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::op::{Anchor, BlockOp, Combine};
-use crate::voxels::Voxels;
+use crate::voxels::{VoxelElement, Voxels};
 
+use super::local::Narrowing;
 use super::shapes_agree;
 
 /// Apply `map` to every voxel, writing into `out`.
@@ -1507,6 +1508,194 @@ mod tests {
     fn print_the_cost_table() {
         println!("{}", cost_report([96, 64, 64], 40));
     }
+
+    // ------------------------------------------------------ the width cast --
+
+    use super::super::local::Rounding;
+
+    fn narrowed(op: &NarrowOp, input: &Voxels) -> Voxels {
+        let mut out = Voxels::zeros(op.to(), input.shape()).unwrap();
+        op.apply(input, &mut out, &Anchor::whole(input.shape()))
+            .unwrap();
+        out
+    }
+
+    /// The gap, closed: a comparison computed in `f64` reaching a `bool` level.
+    ///
+    /// The fixture is a ramp with `-0.0` and two denormals in it, because the
+    /// mask convention is "non-zero", and `-0.0 != 0.0` is **false** while
+    /// `f64::MIN_POSITIVE != 0.0` is true. A convention written as `> 0.0` or as
+    /// `!= 0.0 && is_normal()` would differ from this one on exactly those
+    /// voxels.
+    #[test]
+    fn a_threshold_can_now_write_a_bool_level() {
+        let input: Voxels = ramp((7, 5, 3)).into();
+        let threshold = VoxelwiseMapOp::threshold("t", 0.0, 1.0, 0.0);
+        let compared = one(&threshold, &input);
+        let to_mask = NarrowOp::to_mask("mask");
+        assert_eq!(to_mask.produces(Dtype::F64), Dtype::Bool);
+        assert!(to_mask.accepts(Dtype::F64));
+        assert!(!to_mask.accepts(Dtype::U16), "the way in is `WidenOp`");
+
+        let mask = narrowed(&to_mask, &compared);
+        assert_eq!(mask.dtype(), Dtype::Bool);
+        let source = input.view::<f64>().unwrap();
+        let mask_view = mask.view::<bool>().unwrap();
+        for (value, &set) in source.iter().zip(mask_view.iter()) {
+            assert_eq!(set, *value > 0.0, "at {value}");
+        }
+        // and the whole point of the narrower level, in bytes
+        assert_eq!(compared.bytes(), mask.bytes() * 8);
+    }
+
+    /// The mask convention is `is_set` and nothing else: **non-zero is true**,
+    /// which puts a negative zero on `false` and a `NaN` on `true`.
+    ///
+    /// Written out per value rather than over a ramp, because these are the four
+    /// values a second convention would disagree about, and a ramp of ordinary
+    /// numbers would not tell the two apart.
+    #[test]
+    fn the_mask_convention_is_the_modules_own_and_is_stated_per_awkward_value() {
+        let op = NarrowOp::to_mask("mask");
+        for (value, want) in [
+            (0.0, false),
+            (-0.0, false),
+            (1.0, true),
+            (-1.0, true),
+            (f64::MIN_POSITIVE, true),
+            (f64::NAN, true),
+            (f64::INFINITY, true),
+        ] {
+            let input = Voxels::filled(Dtype::F64, [2, 2, 2], value).unwrap();
+            let mask = narrowed(&op, &input);
+            assert!(
+                mask.view::<bool>().unwrap().iter().all(|&set| set == want),
+                "{value} should be {want}"
+            );
+            // and what the op *declares* for that constant is the same answer,
+            // in the short circuit's `f64` currency
+            assert_eq!(op.constant_maps_to(value), Some(from_set(want)), "{value}");
+        }
+    }
+
+    /// The numeric targets use [`Narrowing`], which is this crate's one
+    /// narrowing rule — so the value a level receives is the value the same
+    /// narrowing would have produced inside a statistic, and there is no second
+    /// rounding rule to keep in step.
+    #[test]
+    fn a_numeric_target_is_the_crates_own_narrowing_and_not_a_second_rule() {
+        let values = [-1.7f64, -0.5, 0.0, 0.5, 2.4, 2.5, 300.0, f64::NAN];
+        for rounding in [Rounding::TowardZero, Rounding::ToNearest] {
+            let narrowing = Narrowing::new(Dtype::U8, rounding).unwrap();
+            let op = NarrowOp::new("narrow", narrowing);
+            assert_eq!(op.to(), Dtype::U8);
+            assert_eq!(op.narrowing(), Some(narrowing));
+            for value in values {
+                let input = Voxels::filled(Dtype::F64, [2, 2, 2], value).unwrap();
+                let out = narrowed(&op, &input);
+                let want = narrowing.apply(value) as u8;
+                assert!(
+                    out.view::<u8>().unwrap().iter().all(|&got| got == want),
+                    "{value} under {rounding:?} should be {want}"
+                );
+                assert_eq!(
+                    op.constant_maps_to(value),
+                    Some(narrowing.apply(value)),
+                    "{value} under {rounding:?}"
+                );
+            }
+        }
+        // out of range saturates rather than wrapping, and `NaN` goes to zero:
+        // `VoxelElement::from_f64`'s rule, stated by `Narrowing` and inherited
+        // here rather than re-decided
+        let op = NarrowOp::new("narrow", Narrowing::to(Dtype::U8).unwrap());
+        let input = Voxels::filled(Dtype::F64, [1, 1, 1], 4000.0).unwrap();
+        assert_eq!(narrowed(&op, &input).view::<u8>().unwrap()[[0, 0, 0]], 255);
+        let input = Voxels::filled(Dtype::F64, [1, 1, 1], f64::NAN).unwrap();
+        assert_eq!(narrowed(&op, &input).view::<u8>().unwrap()[[0, 0, 0]], 0);
+    }
+
+    /// A buffer of the wrong element type is refused by name rather than
+    /// written into the wrong arm.
+    #[test]
+    fn a_destination_of_the_wrong_element_type_is_refused() {
+        let op = NarrowOp::to_mask("mask");
+        let input = Voxels::filled(Dtype::F64, [2, 2, 2], 1.0).unwrap();
+        let mut out = Voxels::zeros(Dtype::U8, [2, 2, 2]).unwrap();
+        let error = op
+            .apply(&input, &mut out, &Anchor::whole([2, 2, 2]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("writes bool"), "{error}");
+    }
+
+    /// The two directions round trip where the narrowing is lossless, which is
+    /// what says [`WidenOp`] and [`NarrowOp`] are inverses on the values they
+    /// agree about — and only there.
+    #[test]
+    fn widening_a_narrowed_value_returns_it_where_the_narrowing_lost_nothing() {
+        let mut input = Array3::<f64>::zeros((4, 4, 2));
+        for (flat, value) in input.iter_mut().enumerate() {
+            *value = (flat % 250) as f64;
+        }
+        let input: Voxels = input.into();
+        let narrow = NarrowOp::new("narrow", Narrowing::to(Dtype::U8).unwrap());
+        let widen = WidenOp::new("widen");
+        let there = narrowed(&narrow, &input);
+        let mut back = Voxels::zeros(Dtype::F64, [4, 4, 2]).unwrap();
+        widen
+            .apply(&there, &mut back, &Anchor::whole([4, 4, 2]))
+            .unwrap();
+        identical(&back, &input, "u8 round trip");
+    }
+
+    /// **`VoxelwiseMapOp` is byte-unchanged by the arrival of a width cast.**
+    ///
+    /// The whole risk of gap 2 was that stating an output element type would be
+    /// done by teaching the existing map op to narrow, which would have moved
+    /// every existing chain's answer. Nothing was taught: the map op is still
+    /// `f64 -> f64`, still accepts and produces `f64`, and still gives the same
+    /// bits over a ramp with the awkward values in it.
+    #[test]
+    fn the_existing_voxelwise_map_still_produces_f64_and_the_same_bits() {
+        let input: Voxels = ramp((7, 5, 3)).into();
+        for op in [
+            Box::new(VoxelwiseMapOp::threshold("t", 0.0, 1.0, 0.0)) as Box<dyn BlockOp>,
+            Box::new(VoxelwiseMapOp::at_or_above("a", 0.0, 1.0, 0.0)),
+            Box::new(VoxelwiseMapOp::identity("i")),
+            Box::new(VoxelwiseMapOp::not("n")),
+        ] {
+            assert!(op.accepts(Dtype::F64), "{}", op.name());
+            assert!(!op.accepts(Dtype::Bool), "{}", op.name());
+            assert_eq!(op.produces(Dtype::F64), Dtype::F64, "{}", op.name());
+            // the reference is the definition, evaluated here, not a recorded
+            // output of this code
+            let computed = one(op.as_ref(), &input);
+            let computed = computed.view::<f64>().unwrap();
+            let source = input.view::<f64>().unwrap();
+            for (value, got) in source.iter().zip(computed.iter()) {
+                let want = match op.name() {
+                    "t" => {
+                        if *value > 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    "a" => {
+                        if *value >= 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    "i" => *value,
+                    _ => from_set(!is_set(*value)),
+                };
+                assert_eq!(got.to_bits(), want.to_bits(), "{} at {value}", op.name());
+            }
+        }
+    }
 }
 
 /// Widen any element type to `f64`, value for value.
@@ -1573,6 +1762,199 @@ impl BlockOp for WidenOp {
     /// identity on it.
     fn constant_maps_to(&self, value: f64) -> Option<f64> {
         Some(value)
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        MAP_COST
+    }
+}
+
+/// Take an `f64` buffer to a **stated** element type.
+///
+/// **The op that was missing in the other direction from [`WidenOp`].**
+/// `VoxelwiseMapOp` passes its input width straight through — it is an
+/// `f64 -> f64` map in an `f64` buffer — so a chain could compute
+/// `value > level` and had nowhere narrower to put the answer. A level of
+/// `bool` was therefore unreachable from inside a plan, whatever the plan
+/// computed, and so was every level of an integer type.
+///
+/// Two ops rather than one parameterised on a target type, and the asymmetry is
+/// real
+/// ------------------------------------------------------------------------
+/// The obvious unification is one `CastOp` with a target `Dtype`, of which
+/// widening is the `F64` case. It is not built, for the reason [`WidenOp`]'s own
+/// documentation already gives: **widening needs no policy and narrowing needs
+/// three.** Widening is total, exact for every type a buffer holds, and has one
+/// possible answer — there is nothing for a caller to state and nothing for the
+/// op to get wrong. Narrowing has to say what happens to a fractional part, what
+/// happens outside the target's range, and what happens to a `NaN`; a single op
+/// covering both would carry parameters that are meaningless on one of its two
+/// directions, and a caller writing `CastOp::new("to f64", Dtype::F64, rounding)`
+/// would be stating a rounding rule that cannot fire. Two names, each with
+/// exactly the parameters its direction has, is the honest shape.
+///
+/// Where the rules come from, and why none of them is new here
+/// ----------------------------------------------------------
+/// Both are rules this crate already states somewhere else, and this op
+/// **reaches for them rather than restating them**, which is what keeps the
+/// answer the same whether a value is narrowed on the way through a statistic or
+/// on the way into a level:
+///
+/// * to any type with numbers in it, [`Narrowing`] — the rounding rule is a
+///   parameter, out of range saturates, and `NaN` goes to zero, because that is
+///   `VoxelElement::from_f64`'s rule and therefore the one every other narrowing
+///   in this crate uses;
+/// * to `bool`, this module's mask convention — [`is_set`], **non-zero is
+///   true**. [`Narrowing::new`] refuses `Dtype::Bool` by name and says why: every
+///   finite value lands on one of two, which is a comparison rather than a
+///   rounding, and there is no rounding rule that produces it. So the two-valued
+///   target gets the convention it belongs to instead of a rounding rule that
+///   cannot say anything, and [`Self::to_mask`] is the constructor that names it.
+///
+/// A `NaN` therefore lands on `true` through [`Self::to_mask`] and on `0`
+/// through [`Self::narrowing`], and those two are not in conflict: they are
+/// `is_set` and `VoxelElement::from_f64`, each applied where it is already the
+/// crate's rule.
+///
+/// `f64` in, and only `f64`
+/// ------------------------
+/// The input side is not parameterised, because [`WidenOp`] is the way in and
+/// there is no reason for a second one. A chain narrowing a `u16` level to a
+/// `bool` one writes `WidenOp` then this, which is two passes over a block and
+/// **one** conversion rule to reason about rather than the hundred-odd pairs a
+/// type-to-type cast would have to define.
+pub struct NarrowOp {
+    name: &'static str,
+    to: Dtype,
+    narrowing: Option<Narrowing>,
+}
+
+impl NarrowOp {
+    /// Narrow to the element type `narrowing` states, by the rule it states.
+    ///
+    /// The target is `narrowing.element()`; `Dtype::Bool` and `Dtype::F16` are
+    /// already refused by [`Narrowing::new`], the first because it is a
+    /// comparison and not a rounding — see [`Self::to_mask`] — and the second
+    /// because no buffer in this crate holds half precision.
+    pub fn new(name: &'static str, narrowing: Narrowing) -> Self {
+        Self {
+            name,
+            to: narrowing.element(),
+            narrowing: Some(narrowing),
+        }
+    }
+
+    /// Write a `bool` level, under this module's mask convention: **non-zero is
+    /// true**.
+    ///
+    /// This is the constructor gap 2 exists for. `VoxelwiseMapOp::threshold`
+    /// computes `value > level` as `1.0` and `0.0` in an `f64` buffer; this puts
+    /// that answer in a `bool` one, at an eighth of the bytes, and it is exact
+    /// because the two conventions are the same convention — [`from_set`] writes
+    /// what [`is_set`] reads.
+    pub fn to_mask(name: &'static str) -> Self {
+        Self {
+            name,
+            to: Dtype::Bool,
+            narrowing: None,
+        }
+    }
+
+    /// The element type this op writes.
+    pub fn to(&self) -> Dtype {
+        self.to
+    }
+
+    /// The narrowing rule, or `None` for the mask convention.
+    pub fn narrowing(&self) -> Option<Narrowing> {
+        self.narrowing
+    }
+
+    /// The value one input voxel becomes, as an `f64`.
+    ///
+    /// One function for both the buffer and the short circuit, so that what the
+    /// op *declares* a constant block maps to cannot drift from what computing
+    /// that block gives — which is the contract
+    /// `what_a_map_declares_for_a_constant_is_what_computing_it_gives` checks
+    /// for every other map here.
+    fn value(&self, value: f64) -> f64 {
+        match self.narrowing {
+            Some(narrowing) => narrowing.apply(value),
+            None => from_set(is_set(value)),
+        }
+    }
+}
+
+impl BlockOp for NarrowOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Nothing: this reads the voxel it writes and no other.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    /// `f64` only. See the type's documentation: [`WidenOp`] is the way in, and
+    /// a type-to-type cast would have to define a rule per pair.
+    fn accepts(&self, dtype: Dtype) -> bool {
+        dtype == Dtype::F64
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        self.to
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        let input = input.view::<f64>()?;
+        if out.dtype() != self.to {
+            return Err(Error::InvalidArgument(format!(
+                "{}: this op writes {} and was handed a {} buffer",
+                self.name,
+                self.to.numpy_name(),
+                out.dtype().numpy_name()
+            )));
+        }
+        macro_rules! arm {
+            ($type:ty) => {{
+                let narrowing = self.narrowing.expect("a numeric target holds a narrowing");
+                map_into(input, out.view_mut::<$type>()?, |&value| {
+                    <$type>::from_f64(narrowing.apply(value))
+                })
+            }};
+        }
+        match self.to {
+            // The mask convention, applied once rather than through an `f64`
+            // round trip: `bool::from_f64` is `value != 0.0`, which is `is_set`.
+            Dtype::Bool => map_into(input, out.view_mut::<bool>()?, |&value| is_set(value)),
+            Dtype::U8 => arm!(u8),
+            Dtype::U16 => arm!(u16),
+            Dtype::U32 => arm!(u32),
+            Dtype::U64 => arm!(u64),
+            Dtype::I8 => arm!(i8),
+            Dtype::I16 => arm!(i16),
+            Dtype::I32 => arm!(i32),
+            Dtype::I64 => arm!(i64),
+            Dtype::F32 => arm!(f32),
+            Dtype::F64 => arm!(f64),
+            // `Narrowing::new` refuses it and `to_mask` does not produce it, so
+            // there is no way to build an op that reaches here.
+            Dtype::F16 => Err(Error::InvalidArgument(format!(
+                "{}: no buffer holds half-precision",
+                self.name
+            ))),
+        }
+    }
+
+    /// Exact, for both rules, because both are pure functions of the one value
+    /// and neither reads anything else.
+    ///
+    /// The answer is an `f64` whatever the target is, which is what the short
+    /// circuit's currency is: a `bool` level's constant is `1.0` or `0.0`, which
+    /// is `VoxelElement::into_f64` for `bool` and [`from_set`] here — one
+    /// convention, stated in both places and the same in both.
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        Some(self.value(value))
     }
 
     fn cost_per_voxel(&self) -> f64 {

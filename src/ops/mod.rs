@@ -24,13 +24,17 @@
 // | `local` | thresholding against a local statistic | a threshold that varies with position, and inherits every property above |
 // | `smooth` | a separable Gaussian | a cost that is **linear in the sum** of the kernel lengths rather than in their product, which the model had no reason to distinguish before |
 // | `skeleton` | one thinning sub-iteration, and the sequence of them | an answer that depends on **where** the block is (the parity class is a fact about position), and a `Sequence` whose reach is the fold rather than a declaration |
+// | `directional` | a whole thinning pass, as one op, and the sequence of them | the first op whose **sub-iteration cannot be a slot**: it reads a second array — the border set taken once per pass — that a `Sequence` has nowhere to thread, so the indivisible unit is the pass and the reach of twelve is a derivation the op has to state rather than a fold |
 // | `fill` | hole filling, as two `FragmentOp` phases | the first operation here that **no halo can express**: reachability is transitive over the whole volume, so it is a fragment-and-join rather than a `BlockOp` at all |
 // | `regional` | the maxima of a greyscale volume, as the same two phases | the **second** op of that shape, which is what turned one op's internals into `components`: the same program with a different per-label fact, and a seam meeting that compares before it joins |
-// | `components` | the union-find, the six-face geometry and the seam walk | nothing on its own — it is the part of `fill` and `regional` that is the *program* rather than the question |
+// | `components` | the union-find, the six-face geometry and the seam walk | nothing on its own — it is the part of `fill` and `regional` that is the *program* rather than the question. Its one *choice* is `Connectivity`, re-exported here: `fill`, `regional` and `detect` each take it and each defaults to face connectivity, so nothing that predates it moved, and the wider ones are the same program over more seam pairs |
 // | `detect` | one point per connected region of a mask, at its centroid | the **producer** the point world had none of, and the first phase pair here that writes no level at all: a `fragments -> fragments` merge whose accumulators are integers, so a component split across four blocks totals *exactly* rather than nearly |
 // | `voxelize` | scattered points into a dense volume | a `fragments -> volume` op whose reach is in **blocks** as well as voxels, and an accumulation order that has to be a function of the data rather than of the gather |
+// | `label` | scattered points into a volume as **names** rather than a sum | the same `fragments -> volume` shape as `voxelize` with a **stated collision rule** instead of an accumulation order: two points meeting on a voxel cannot be added, and `min` over the labels is invariant under every gather order by construction rather than by a sort |
 // | `sliding` | a windowed statistic over a histogram carried along a scan line | the first op whose kernel has **state between voxels**, so the answer depends on the order voxels are visited in — and the first with a stated *element type* constraint, since a histogram needs a bounded integer domain and refuses a float rather than binning it |
 // | `reconstruct` | grey reconstruction, and the h-maxima transform over it | the first `IterativeOp` here: a **fixed point** whose substage count is a function of the data, reached at the external reach of *one* substage — the third answer to transitivity, beside a wide halo and a fragment-and-join |
+// | `configuration` | a mask rewritten by a table indexed on the 3x3x3 neighbourhood | the first op whose rule is **data rather than code** — 2^27 entries the caller supplies — and the first written as *both* shells over one kernel, so what a stated pass count and a fixed point cost differently is a comparison rather than an argument |
+// | `watershed` | a cost volume partitioned into one basin per seed | the first op that **declares itself a planning barrier** rather than being one by arithmetic: its answer is a function of one global queue's pop order, so `AxisReach::All` is the honest reach and the cost of saying so is written down as memory per voxel rather than as an adjective |
 //
 // The shape every op in here has, and why
 // ---------------------------------------
@@ -133,13 +137,18 @@
 
 use crate::error::{Error, Result};
 
+pub mod adjacency;
 pub mod background;
 pub mod components;
+pub mod configuration;
+pub mod coordinates;
 pub mod cost;
 pub mod deconvolve;
 pub mod detect;
+pub mod directional;
 pub mod element;
 pub mod fill;
+pub mod label;
 pub mod lattice;
 pub mod local;
 pub mod morphology;
@@ -149,29 +158,79 @@ pub mod reconstruct;
 pub mod regional;
 pub mod resample;
 pub mod ridge;
+pub mod rows;
+/// **BSD-3-Clause, not this crate's MIT.** A translation of scikit-image's
+/// seeded watershed, kept in a file of its own so the notice travels with it;
+/// `watershed` is the MIT shell over it. See that file's header.
+pub mod scikitimage_watershed;
 pub mod skeleton;
 pub mod sliding;
 pub mod smooth;
+pub mod tabulate;
 pub mod voxelize;
 pub mod voxelwise;
+pub mod walk;
+pub mod watershed;
 
-pub use detect::{
-    centroid_points, detect_phases, detect_regions, label_regions_into, merge_moments,
-    moments_of_labels, owner_of, points_owned_by, LabelRegionsOp, Moments, RegionMoments,
-    RegionPointsOp,
+pub use adjacency::{
+    adjacent_pair_rows, adjacent_pairs, adjacent_pairs_into, adjacent_pairs_phase, collect_pairs,
+    empty_pairs, encode_adjacent_pairs, forward_offsets, merge_pairs, pair_schema,
+    walk_adjacent_pairs, AdjacentPairsOp, Pair, HIGHER_COLUMNS,
 };
-pub use element::{select_nth, ElementShape, Percentile, Rank, StructuringElement, Total};
-pub use fill::{fill_phases, FillHolesOp, LabelBackgroundOp};
+/// The only thing in `components` a *caller* chooses rather than a builder of
+/// ops uses. The rest of that module stays behind its own path, because it is
+/// machinery rather than surface.
+///
+/// `fill`, `regional` and `detect` each take one, through a `connecting` builder
+/// on both of their phases and through their `append_connected` shorthand, and
+/// each defaults to [`Connectivity::Faces`]. They are three separate choices and
+/// not one: `fill`'s names the **background**'s adjacency and `detect`'s the
+/// **foreground**'s, and the complementary-pair convention deliberately pairs a
+/// narrow one with a wide one. `components`'s own header has the table.
+pub use components::Connectivity;
+pub use configuration::{
+    configuration_bit, configuration_index_at, configuration_pass_into, configuration_passes_into,
+    configuration_to_fixed_point, cost_report as configuration_cost_report,
+    ConfigurationFixedPointOp, ConfigurationPassOp, ConfigurationTable, ConfigurationTemplate,
+    CENTRE_BIT, CONFIGURATION_BITS, CONFIGURATION_COUNT, PASS_COST,
+};
+pub use coordinates::{
+    block_base_indices, blocks_concatenate_in_order, collect_coordinates, coordinate_schema,
+    empty_coordinates, encode_set_voxels, merge_coordinates, set_voxel_rows, set_voxels,
+    set_voxels_into, set_voxels_phase, SetVoxelsOp,
+};
+pub use detect::{
+    centroid_points, detect_phases, detect_regions, detect_regions_with, label_regions_into,
+    label_regions_into_with, merge_moments, merge_moments_with, moments_of_labels, owner_of,
+    points_owned_by, LabelRegionsOp, Moments, RegionMoments, RegionPointsOp,
+};
+pub use directional::{
+    border_mask, clear_faces, directional_pass, directional_pass_into, directional_passes_into,
+    directional_reach, directional_sub_iteration_into, directional_thin,
+    directional_to_fixed_point, faces_are_clear, sub_iteration_sources, DirectionalPassOp,
+    DIRECTIONAL_PASS_COST, SUB_ITERATIONS,
+};
+pub use element::{
+    select_nth, ElementShape, Percentile, Rank, StepOrigin, StructuringElement, Total,
+};
+pub use fill::{
+    agree_on_connectivity, fill_phases, label_background_into_with, merge_faces_with, FillHolesOp,
+    LabelBackgroundOp,
+};
+pub use label::{
+    label_ceiling, label_of, label_points_into, labelled_points, LabelPointsOp, MAX_EXACT_LABEL,
+};
 pub use lattice::{
     interpolate_block_edge, lattice_interpolate_into, lattice_interpolate_into_with,
     lattice_interpolate_phase, lattice_statistic_into, lattice_statistic_phase,
     statistic_block_edge, LatticeInterpolateOp, LatticeStatisticOp,
 };
 pub use local::{
-    axis_max_distance, local_statistic_into, local_statistic_into_with,
-    masked_local_statistic_into, masked_local_statistic_into_with, threshold_against_into,
-    AdaptiveThresholdOp, Alignment, EmptyPopulation, Isodata, LocalStatistic, LocalStatisticOp,
-    Population, SampleLattice, Sampling, Statistic,
+    axis_max_distance, local_statistic_into, local_statistic_into_narrowed,
+    local_statistic_into_with, masked_local_statistic_into, masked_local_statistic_into_narrowed,
+    masked_local_statistic_into_with, threshold_against_into, AdaptiveThresholdOp, Alignment,
+    EmptyPopulation, Isodata, LatticeNarrowing, LocalStatistic, LocalStatisticOp, Narrowing,
+    Population, Rounding, SampleLattice, Sampling, Statistic,
 };
 pub use morphology::{close_into, dilate_into, erode_into, open_into, Morphology, MorphologyOp};
 pub use normalise::{
@@ -187,7 +246,8 @@ pub use reconstruct::{
     Reconstruction,
 };
 pub use regional::{
-    ascending_neighbours, label_plateaux_into, maxima_from_labels_into, regional_maxima,
+    ascending_neighbours, ascending_neighbours_with, label_plateaux_into, label_plateaux_into_with,
+    maxima_from_labels_into, merge_plateaux_with, regional_maxima, regional_maxima_with,
     regional_phases, LabelPlateauxOp, RegionalMaximaOp,
 };
 pub use resample::{
@@ -199,17 +259,35 @@ pub use ridge::{
     ridge_response_into, symmetric_eigenvalues, Boundary, EigenResponse, Polarity, RatioResponse,
     Response, RidgeFilterOp, RidgeResponse, ScaleSpace,
 };
+pub use rows::{
+    collect_rows, filter_blob, filter_into, gather_blob, gather_into, gathered_schema, merge_rows,
+    scale_blob, scale_into, scaled_at, scaled_bound, scaled_index, value_at, walk_rows, ColumnTest,
+    FilterRowsOp, GatherRowsOp, Limit, RowFilter, RowStreams, RowValues, ScaleRowsOp,
+};
 pub use skeleton::{thin, thinning_pass, thinning_reach, ThinningOp};
 pub use sliding::{
     sliding_histogram_into, sliding_histogram_with_plan, BinnedElement, Domain, HistogramQuery,
     RankQuery, ScanPlan, SlidingHistogramOp,
 };
 pub use smooth::{Gaussian, SmoothOp};
+pub use tabulate::{
+    append_tabulate_phases, collect_tabulation, decode_partial, encode_partial, merge_tabulation,
+    region_values, tabulate_phases, tabulation_schema, FixedPoint, MergeTabulationOp, RegionValues,
+    TabulateValuesOp, Tally,
+};
 pub use voxelize::{decode_points, encode_points, Point, VoxelizeOp};
 pub use voxelwise::{
     combine_into, from_set, is_set, logic_into, map_into, not_into, CombineOp, Compose, Identity,
-    Logic, LogicCombine, MapFn, Not, Threshold, ThresholdTest, VoxelwiseMapOp, WidenOp,
+    Logic, LogicCombine, MapFn, NarrowOp, Not, Threshold, ThresholdTest, VoxelwiseMapOp, WidenOp,
     IDENTITY_COST, MAP_COST,
+};
+pub use walk::{
+    walk_blob, walk_from, walk_into, walk_schema, walked_distance, OffsetSequence, OffsetWalkOp,
+};
+pub use watershed::{
+    cost_report as watershed_cost_report, seeded_watershed, seeded_watershed_into,
+    seeded_watershed_into_reporting_peak, SeededWatershedOp, Separation, WATERSHED_COST,
+    WATERSHED_LINE_COST,
 };
 
 /// How the costs in this module were obtained, and what they are relative to.

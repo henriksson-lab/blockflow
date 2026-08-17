@@ -44,42 +44,52 @@
 // halo, which is load-bearing because the halo is the dependency edge between
 // pipelined phases. The costs are `fill`'s costs, stated there.
 //
-// The two connectivities, which are two different relations
-// ---------------------------------------------------------
-// The definition names two adjacency relations and it is a mistake to conflate
-// them:
+// The two adjacencies, which are one relation and must stay one
+// --------------------------------------------------------------
+// The definition names two adjacency relations, and the first thing to say about
+// them is that they are the same one:
 //
 // * **the plateau connectivity** — which equal-valued voxels count as one
 //   component;
 // * **the ascent adjacency** — which neighbours are consulted for "is anything
 //   here strictly greater".
 //
-// Both are **face (6-) connectivity** here, and **they must agree**. The
-// definition is a statement about one neighbourhood graph `G`: a regional
-// maximum is a connected component of `G` restricted to equal values, out of
-// which no edge of `G` goes upward. Using two different graphs breaks it in a
-// way that is easy to make concrete. Suppose the plateau were 26-connected and
-// the ascent 6-connected. Take `v(0,0,0) = 5`, `v(1,1,1) = 5` — one plateau,
-// joined by a corner step — and `v(2,2,2) = 6`, which is a corner step from
-// `(1,1,1)` and 6-adjacent to nothing in the plateau. The plateau would be
-// reported as a maximum, and yet one can walk `(0,0,0) -> (1,1,1) -> (2,2,2)`
-// using exactly the steps the plateau connectivity itself permits. "A plateau
-// from which one cannot ascend" would be false of it. The mirrored mistake —
-// plateau narrower than ascent — is less dramatic but no better: a plateau would
-// be disqualified by a voxel it cannot itself step to.
+// **They must agree, so this op takes one [`Connectivity`] and not two.** The
+// definition is a statement about one neighbourhood graph `G`: a regional maximum
+// is a connected component of `G` restricted to equal values, out of which no
+// edge of `G` goes upward. Using two different graphs breaks it in a way that is
+// easy to make concrete. Suppose the plateau were 26-connected and the ascent
+// 6-connected. Take `v(0,0,0) = 5`, `v(1,1,1) = 5` — one plateau, joined by a
+// corner step — and `v(2,2,2) = 6`, which is a corner step from `(1,1,1)` and
+// 6-adjacent to nothing in the plateau. The plateau would be reported as a
+// maximum, and yet one can walk `(0,0,0) -> (1,1,1) -> (2,2,2)` using exactly the
+// steps the plateau connectivity itself permits. "A plateau from which one cannot
+// ascend" would be false of it. The mirrored mistake — plateau narrower than
+// ascent — is less dramatic but no better: a plateau would be disqualified by a
+// voxel it cannot itself step to.
 //
-// So there is one relation, and face connectivity is what it is. The cost is the
-// same one `fill` states and it is a cost in **fragment shape** rather than in
-// arithmetic: under 6-connectivity a component crosses a block seam only through
-// the shared plane, so a block's whole contribution to the merge is six planes.
-// Under 26-connectivity it can also cross an edge or a corner, so the fragment
-// would need the twelve edge lines and eight corner voxels as well, and the
-// merge would walk three kinds of adjacency instead of one. Six is also the
-// conservative choice for the operation itself: a higher voxel that touches a
-// plateau only diagonally does not disqualify it, so this reports *more* maxima
-// than a 26-connected ascent would, never fewer.
+// So the parameter is one parameter. Offering the pair separately would be
+// offering a way to state something the definition does not admit, and the
+// argument above is the reason the API does not have that shape. It is the one
+// place in this crate where a caller might reasonably expect two knobs and gets
+// one on purpose.
 //
-// This is a limit and it is stated as one. It is not a limit of the framework.
+// Which one it is, is the caller's, and [`Connectivity::Faces`] unless a caller
+// says. What widening costs is *maxima*: a higher voxel that touches a plateau
+// diagonally disqualifies it under twenty-six and does not under six, so six
+// reports **more** maxima, never fewer. Neither is a correction of the other.
+//
+// **The fragment did not have to change**, which is the thing that looks least
+// likely and is worth saying. A voxel with any neighbour outside its block lies
+// on a *face* of that block, so the six planes already are the block's whole
+// boundary shell, and the edge lines and corner voxels a wider connectivity meets
+// across are rows and single entries of them. `components`'s header argues it;
+// what widened is the seam walk's inputs and nothing about the bytes.
+//
+// **Both phases carry the choice and [`regional_phases`] refuses a pair that
+// disagrees**, for `ops::fill`'s reason: the flood inside a block and the walk
+// across a seam are two halves of one relation, and a mismatched pair makes the
+// answer depend on where the volume was cut.
 //
 // Equality of values, and what to do about NaN
 // ---------------------------------------------
@@ -160,10 +170,11 @@ use crate::sidecar::Lifecycle;
 use crate::voxels::Voxels;
 
 use super::components::{
-    bytes_to_words, core_within_read, empty_planes, expect_end, offset, planes_of, push_planes,
-    read_header, take_planes, walk_seams, words_to_bytes, FacePlanes, LabelIndex, Union,
-    FACE_NEIGHBOURS, UNLABELLED,
+    bytes_to_words, core_within_read, empty_planes, expect_end, offset_by, planes_of, push_planes,
+    read_header, take_planes, walk_seams_with, words_to_bytes, Connectivity, FacePlanes,
+    LabelIndex, Union, UNLABELLED,
 };
+use super::fill::agree_on_connectivity;
 use super::shapes_agree;
 
 // ------------------------------------------------------------- labelling --
@@ -184,6 +195,10 @@ fn unordered<T: PartialOrd>(value: &T) -> bool {
 /// Label the **plateaus** of `values` into `out`, six-connected, and return how
 /// many were found together with the value each one holds.
 ///
+/// Six-connected because that is [`Connectivity`]'s default;
+/// [`label_plateaux_into_with`] is the form that says which — and whichever it
+/// is, [`ascending_neighbours`] has to be asked the same thing.
+///
 /// A plateau is a face-connected component of voxels of equal value. Every voxel
 /// belongs to exactly one, *except* a voxel that is unordered with itself — a
 /// NaN — which belongs to none and is left [`UNLABELLED`]; see the module header
@@ -200,9 +215,37 @@ fn unordered<T: PartialOrd>(value: &T) -> bool {
 /// stack overflow rather than a slow answer.
 pub fn label_plateaux_into<T: Copy + PartialOrd>(
     values: ArrayView3<'_, T>,
-    mut out: ArrayViewMut3<'_, u32>,
+    out: ArrayViewMut3<'_, u32>,
 ) -> Result<(u32, Vec<T>)> {
     shapes_agree(values.shape(), out.shape(), "label_plateaux_into")?;
+    label_plateaux(values, Connectivity::Faces, out)
+}
+
+/// [`label_plateaux_into`] under a stated [`Connectivity`], which is **also the
+/// ascent's** — see the module header for why the two cannot differ.
+///
+/// Everything that function promises holds: the exact equality, the NaN rule, the
+/// scan-order numbering, the iterative traversal. What widens is which
+/// equal-valued voxels one flood reaches.
+///
+/// [`ascending_neighbours_with`] has to be given the same choice, and so does the
+/// merge; the ops in this file carry one field between them for exactly that
+/// reason.
+pub fn label_plateaux_into_with<T: Copy + PartialOrd>(
+    values: ArrayView3<'_, T>,
+    connectivity: Connectivity,
+    out: ArrayViewMut3<'_, u32>,
+) -> Result<(u32, Vec<T>)> {
+    shapes_agree(values.shape(), out.shape(), "label_plateaux_into_with")?;
+    label_plateaux(values, connectivity, out)
+}
+
+/// The one traversal both forms above are, with the shape already checked.
+fn label_plateaux<T: Copy + PartialOrd>(
+    values: ArrayView3<'_, T>,
+    connectivity: Connectivity,
+    mut out: ArrayViewMut3<'_, u32>,
+) -> Result<(u32, Vec<T>)> {
     let shape = [values.shape()[0], values.shape()[1], values.shape()[2]];
     out.fill(UNLABELLED);
 
@@ -222,8 +265,8 @@ pub fn label_plateaux_into<T: Copy + PartialOrd>(
                 out[seed] = next;
                 stack.push(seed);
                 while let Some(at) = stack.pop() {
-                    for (axis, step) in FACE_NEIGHBOURS {
-                        let Some(to) = offset(at, axis, step, shape) else {
+                    for &by in connectivity.offsets() {
+                        let Some(to) = offset_by(at, by, shape) else {
                             continue;
                         };
                         // Exact equality against the seed's value. Not a
@@ -264,6 +307,30 @@ pub fn ascending_neighbours<T: Copy + PartialOrd>(
     count: u32,
 ) -> Result<Vec<bool>> {
     shapes_agree(values.shape(), labels.shape(), "ascending_neighbours")?;
+    ascending(values, labels, count, Connectivity::Faces)
+}
+
+/// [`ascending_neighbours`] under a stated [`Connectivity`], which must be the
+/// one the plateaus were labelled under. The module header is where that is
+/// argued, and it is the reason this takes the parameter at all rather than
+/// staying face-connected while the labelling widened.
+pub fn ascending_neighbours_with<T: Copy + PartialOrd>(
+    values: ArrayView3<'_, T>,
+    labels: ArrayView3<'_, u32>,
+    count: u32,
+    connectivity: Connectivity,
+) -> Result<Vec<bool>> {
+    shapes_agree(values.shape(), labels.shape(), "ascending_neighbours_with")?;
+    ascending(values, labels, count, connectivity)
+}
+
+/// The one pass both forms above are, with the shape already checked.
+fn ascending<T: Copy + PartialOrd>(
+    values: ArrayView3<'_, T>,
+    labels: ArrayView3<'_, u32>,
+    count: u32,
+    connectivity: Connectivity,
+) -> Result<Vec<bool>> {
     let shape = [values.shape()[0], values.shape()[1], values.shape()[2]];
     let mut flags = vec![false; count as usize];
     for i in 0..shape[0] {
@@ -284,8 +351,8 @@ pub fn ascending_neighbours<T: Copy + PartialOrd>(
                     continue;
                 }
                 let mine = values[at];
-                for (axis, step) in FACE_NEIGHBOURS {
-                    let Some(to) = offset(at, axis, step, shape) else {
+                for &by in connectivity.offsets() {
+                    let Some(to) = offset_by(at, by, shape) else {
                         continue;
                     };
                     if values[to] > mine {
@@ -488,15 +555,32 @@ pub fn merge_plateaux(
     reports: &BTreeMap<[usize; 3], PlateauFaces>,
     counts: [usize; 3],
 ) -> Result<BTreeMap<[usize; 3], Vec<bool>>> {
+    merge_plateaux_with(reports, counts, Connectivity::Faces)
+}
+
+/// [`merge_plateaux`] under a stated [`Connectivity`], which must be the one the
+/// plateaus were labelled and the ascents taken under.
+///
+/// All three are the same relation, and the seam is where the third one becomes
+/// visible: a widened walk both joins more plateaus *and* finds more ascents,
+/// because a meeting whose values differ is an ascent for the lower side. Both
+/// come from the same pair set, so there is nothing here that could widen by
+/// halves.
+pub fn merge_plateaux_with(
+    reports: &BTreeMap<[usize; 3], PlateauFaces>,
+    counts: [usize; 3],
+    connectivity: Connectivity,
+) -> Result<BTreeMap<[usize; 3], Vec<bool>>> {
     let index = LabelIndex::build(reports, counts, |report| report.labels)?;
     let values = index.gather(reports, |report| &report.values[..], f64::NAN);
     let mut ascends = index.gather(reports, |report| &report.ascends[..], false);
     let mut sets = Union::new(index.total());
 
-    walk_seams(
+    walk_seams_with(
         reports,
         counts,
         &index,
+        connectivity,
         |report| &report.faces,
         |a, b| {
             let (here, there) = (values[a], values[b]);
@@ -549,6 +633,12 @@ pub struct LabelPlateauxOp {
     name: &'static str,
     stream: String,
     lifecycle: Lifecycle,
+    /// The one relation this op is defined over: which equal-valued voxels are
+    /// one plateau, and which neighbours are consulted for an ascent. One field
+    /// because it is one relation — the module header is where that is argued.
+    /// [`Connectivity::Faces`] unless a caller said otherwise, so every existing
+    /// caller gets the answer it always got.
+    connectivity: Connectivity,
 }
 
 impl LabelPlateauxOp {
@@ -557,7 +647,27 @@ impl LabelPlateauxOp {
             name,
             stream: stream.into(),
             lifecycle,
+            connectivity: Connectivity::Faces,
         }
+    }
+
+    /// The same op, over a stated [`Connectivity`] — **both** the plateau's and
+    /// the ascent's, which are one relation.
+    ///
+    /// A consuming builder rather than a fourth argument to [`Self::new`], for
+    /// `detect::RegionPointsOp::emitting`'s reason: every call site that does not
+    /// say this word keeps its signature and its answer.
+    ///
+    /// The merge has to be told the same thing; [`regional_phases`] refuses a
+    /// pair that disagrees.
+    pub fn connecting(mut self, connectivity: Connectivity) -> Self {
+        self.connectivity = connectivity;
+        self
+    }
+
+    /// The relation this op labels and measures ascents over.
+    pub fn connectivity(&self) -> Connectivity {
+        self.connectivity
     }
 
     pub fn stream(&self) -> &str {
@@ -622,11 +732,11 @@ impl FragmentOp for LabelPlateauxOp {
         };
         let (count, plateau_values) = {
             let labels = out.view_mut::<u32>()?;
-            label_plateaux_into(values.view(), labels)?
+            label_plateaux_into_with(values.view(), self.connectivity, labels)?
         };
 
         let labels = out.view::<u32>()?;
-        let ascends = ascending_neighbours(values.view(), labels, count)?;
+        let ascends = ascending_neighbours_with(values.view(), labels, count, self.connectivity)?;
         let faces = PlateauFaces::of(labels, count, plateau_values, ascends)?;
         let bytes = faces.encode();
         Ok(BlockOutput::fragment(self.stream.clone(), bytes).with_pixels(buffer))
@@ -644,6 +754,9 @@ pub struct RegionalMaximaOp {
     faces_phase: usize,
     mask: Dtype,
     lattice: [usize; 3],
+    /// The relation the seam is closed under, which has to be the one the
+    /// labelling used. [`Connectivity::Faces`] unless a caller said otherwise.
+    connectivity: Connectivity,
 }
 
 impl RegionalMaximaOp {
@@ -671,7 +784,24 @@ impl RegionalMaximaOp {
             faces_phase,
             mask,
             lattice: grid.blocks_per_axis(),
+            connectivity: Connectivity::Faces,
         }
+    }
+
+    /// The same op, closing the seams under a stated [`Connectivity`].
+    ///
+    /// **It must be the labelling's**, for `ops::fill::agree_on_connectivity`'s
+    /// reason: the flood inside a block and the walk across a seam are two halves
+    /// of one relation. [`regional_phases`] and [`append_connected`] check the
+    /// pair; this builder alone cannot, because it sees one of the two ops.
+    pub fn connecting(mut self, connectivity: Connectivity) -> Self {
+        self.connectivity = connectivity;
+        self
+    }
+
+    /// The relation this op closes the seams under.
+    pub fn connectivity(&self) -> Connectivity {
+        self.connectivity
     }
 
     /// The same op, addressed by a [`Phase`] handle instead of a number.
@@ -742,7 +872,7 @@ impl FragmentOp for RegionalMaximaOp {
         for (key, bytes) in at.fragments(&self.stream) {
             reports.insert(key.block, PlateauFaces::decode(bytes)?);
         }
-        let ascends = merge_plateaux(&reports, at.grid.blocks_per_axis())?;
+        let ascends = merge_plateaux_with(&reports, at.grid.blocks_per_axis(), self.connectivity)?;
         let mine = ascends.get(&at.index).ok_or_else(|| {
             Error::InvalidArgument(format!(
                 "the merge produced no answer for block {:?}, which is the block asking",
@@ -803,6 +933,7 @@ pub fn regional_phases(
     if !accepts(input_dtype) {
         return Err(refuse(input_dtype));
     }
+    agree_on_connectivity(label.connectivity(), maxima.connectivity())?;
     let volume = grid.volume();
     let mut labelling = fragment_phase(label, grid.clone())?;
     labelling.dtype = Some(label.produces(input_dtype));
@@ -841,24 +972,41 @@ pub fn append_to(
     lifecycle: Lifecycle,
     mask: Dtype,
 ) -> Result<Phase> {
+    append_connected(plan, stream, lifecycle, mask, Connectivity::Faces)
+}
+
+/// [`append_to`], with the [`Connectivity`] said out loud.
+///
+/// The general one; `append_to` is this at [`Connectivity::Faces`], which is what
+/// the two phases have always been. Kept as two functions rather than one with a
+/// fifth argument so that no existing call site has to be edited to say what it
+/// was already doing.
+///
+/// **One argument, because it is one relation** — the plateau's and the ascent's
+/// are the same graph and the module header says why they cannot differ. The
+/// choice goes to both phases from here, which is what makes this the safe way to
+/// ask for a wider one.
+pub fn append_connected(
+    plan: &mut PlanBuilder,
+    stream: impl Into<String>,
+    lifecycle: Lifecycle,
+    mask: Dtype,
+    connectivity: Connectivity,
+) -> Result<Phase> {
     let input_dtype = plan.reads();
     if !accepts(input_dtype) {
         return Err(refuse(input_dtype));
     }
     let stream = stream.into();
     let grid = plan.grid().clone();
-    let plateaux = plan.fragments(LabelPlateauxOp::new(
-        "plateau labelling",
-        stream.clone(),
-        lifecycle,
-    ))?;
-    plan.fragments(RegionalMaximaOp::reading(
-        "regional maxima",
-        stream,
-        plateaux,
-        mask,
-        &grid,
-    ))
+    let plateaux = plan.fragments(
+        LabelPlateauxOp::new("plateau labelling", stream.clone(), lifecycle)
+            .connecting(connectivity),
+    )?;
+    plan.fragments(
+        RegionalMaximaOp::reading("regional maxima", stream, plateaux, mask, &grid)
+            .connecting(connectivity),
+    )
 }
 
 /// The whole-volume answer: the same kernels, called once, over everything.
@@ -868,9 +1016,21 @@ pub fn append_to(
 /// modelling difference rather than a decomposition bug. It is `pub` because the
 /// acceptance suite in `tests/` is a separate crate and needs exactly this.
 pub fn regional_maxima(values: ArrayView3<'_, f64>) -> Result<Array3<bool>> {
+    regional_maxima_with(values, Connectivity::Faces)
+}
+
+/// [`regional_maxima`] under a stated [`Connectivity`].
+///
+/// The same three kernels at the same choice, which is what makes this a
+/// reference for a blocked run at that choice rather than a second
+/// implementation of one.
+pub fn regional_maxima_with(
+    values: ArrayView3<'_, f64>,
+    connectivity: Connectivity,
+) -> Result<Array3<bool>> {
     let mut labels = Array3::<u32>::zeros(values.raw_dim());
-    let (count, _) = label_plateaux_into(values, labels.view_mut())?;
-    let ascends = ascending_neighbours(values, labels.view(), count)?;
+    let (count, _) = label_plateaux_into_with(values, connectivity, labels.view_mut())?;
+    let ascends = ascending_neighbours_with(values, labels.view(), count, connectivity)?;
     let mut out = Array3::from_elem(values.raw_dim(), false);
     maxima_from_labels_into(labels.view(), &ascends, out.view_mut())?;
     Ok(out)
@@ -1011,6 +1171,64 @@ mod tests {
         face[[2, 2, 2]] = 0.0;
         face[[2, 1, 1]] = 9.0;
         assert!(!maxima(&face)[[1, 1, 1]]);
+    }
+
+    /// **The header's own counter-example, run.** The one fixture that separates
+    /// "one connectivity" from "two that happen to be equal".
+    ///
+    /// `v(0,0,0) = 5` and `v(1,1,1) = 5` are one plateau under twenty-six and two
+    /// under six. `v(2,2,2) = 6` is a corner step from `(1,1,1)` and 6-adjacent
+    /// to nothing. So:
+    ///
+    /// * at six — two plateaus of 5, neither with anything greater beside it, so
+    ///   both are maxima;
+    /// * at twenty-six — one plateau, and the 6 is adjacent to it, so it is not.
+    ///
+    /// And the mistake the header forbids is asserted to *be* a mistake: labelling
+    /// the plateau at twenty-six while taking the ascent at six reports the
+    /// plateau as a maximum, even though one can walk out of it upward using
+    /// exactly the steps that built it. That is the answer the single parameter
+    /// makes unreachable.
+    #[test]
+    fn the_plateau_and_the_ascent_widen_together_and_a_split_pair_would_be_wrong() {
+        let mut values = Array3::from_elem((4, 4, 4), 0.0);
+        values[[0, 0, 0]] = 5.0;
+        values[[1, 1, 1]] = 5.0;
+        values[[2, 2, 2]] = 6.0;
+
+        let six = regional_maxima_with(values.view(), Connectivity::Faces).unwrap();
+        assert!(
+            six[[0, 0, 0]] && six[[1, 1, 1]],
+            "two plateaus, both maxima"
+        );
+
+        let full = regional_maxima_with(values.view(), Connectivity::FacesEdgesAndCorners).unwrap();
+        assert!(
+            !full[[0, 0, 0]] && !full[[1, 1, 1]],
+            "one plateau, with a greater voxel a corner step away"
+        );
+        assert!(full[[2, 2, 2]], "and the voxel that disqualified it is one");
+
+        // the forbidden pairing, driven by hand: plateau at 26, ascent at 6
+        let mut labels = Array3::<u32>::zeros(values.raw_dim());
+        let (count, _) = label_plateaux_into_with(
+            values.view(),
+            Connectivity::FacesEdgesAndCorners,
+            labels.view_mut(),
+        )
+        .unwrap();
+        assert_eq!(labels[[0, 0, 0]], labels[[1, 1, 1]], "one plateau");
+        let split =
+            ascending_neighbours_with(values.view(), labels.view(), count, Connectivity::Faces)
+                .unwrap();
+        let mut wrong = Array3::from_elem(values.raw_dim(), false);
+        maxima_from_labels_into(labels.view(), &split, wrong.view_mut()).unwrap();
+        assert!(
+            wrong[[0, 0, 0]],
+            "the split pair calls it a maximum, which is the answer the definition \
+             forbids and the reason this op takes one connectivity rather than two"
+        );
+        assert_ne!(wrong, full, "so the split pair is a different answer");
     }
 
     /// Exact equality, with no tolerance: two values a hair apart are two
@@ -1236,6 +1454,36 @@ mod tests {
         let unordered = build(3.0, f64::NAN);
         assert_eq!(unordered[&[0, 0, 0]], vec![false]);
         assert_eq!(unordered[&[1, 0, 0]], vec![false]);
+    }
+
+    /// The two phases are two halves of one relation, and a plan whose halves
+    /// disagree is refused before it is scheduled.
+    #[test]
+    fn a_plan_whose_two_phases_disagree_about_connectivity_is_refused() {
+        use crate::geometry::BlockGrid;
+
+        let grid = BlockGrid::new([8, 8, 8], [4, 4, 4]).unwrap();
+        let label = LabelPlateauxOp::new("label", "s", Lifecycle::DeleteOnExit)
+            .connecting(Connectivity::FacesAndEdges);
+        let maxima = RegionalMaximaOp::new("maxima", "s", 0, Dtype::Bool, &grid);
+        let message = regional_phases(grid.clone(), Dtype::F64, &label, &maxima)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("same connectivity"), "{message}");
+
+        for connectivity in [
+            Connectivity::Faces,
+            Connectivity::FacesAndEdges,
+            Connectivity::FacesEdgesAndCorners,
+        ] {
+            let label = LabelPlateauxOp::new("label", "s", Lifecycle::DeleteOnExit)
+                .connecting(connectivity);
+            let maxima = RegionalMaximaOp::new("maxima", "s", 0, Dtype::Bool, &grid)
+                .connecting(connectivity);
+            assert_eq!(label.connectivity(), connectivity);
+            assert_eq!(maxima.connectivity(), connectivity);
+            assert!(regional_phases(grid.clone(), Dtype::F64, &label, &maxima).is_ok());
+        }
     }
 
     /// The element types the shell bridges, and the two it will not.

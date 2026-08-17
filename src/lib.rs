@@ -193,8 +193,9 @@ pub use cache::{
 };
 pub use decomposition::{
     check_block_constraints, check_chunk_exclusive_writes, check_output_shapes,
-    check_source_levels, constraint_for, cuttable_axes, is_planning_barrier, predicted_cost,
-    reaches_whole_axis, splittable_axes, Constraints, CostModel, Decomposition, PhaseDecomposition,
+    check_source_levels, constraint_for, cuttable_axes, halo_spans_axis, is_planning_barrier,
+    predicted_cost, reaches_whole_axis, splittable_axes, Constraints, CostModel, Decomposition,
+    PhaseDecomposition,
 };
 pub use distributed::{
     Assignment, ChunkGrid, Coordinator, Handout, HandoutPolicy, JobSpec, JobStatus, ModelledCache,
@@ -209,7 +210,8 @@ pub use export::{
 pub use fragment::{
     append_fragment_phase, check_fragment_coverage, check_phase_work, fold_fragments,
     fragment_only, fragment_phase, neighbourhood, neighbourhood_size, BlockOutput, BlockView,
-    Coverage, FragmentInput, FragmentOp, FragmentOutput, PhaseWork, StreamCoverage,
+    Coverage, FragmentInput, FragmentOp, FragmentOutput, PhaseWork, SeamFold, SourceBlocks,
+    StreamCoverage,
 };
 pub use geometry::{BlockCore, BlockGeometry, BlockGrid};
 pub use graph::{SourceDep, Task, TaskGraph};
@@ -229,9 +231,9 @@ pub use points::{
 };
 pub use prefetch::{AccessPlan, BlockPlan, PlanHandle, PrefetchStats, Prefetcher, RegionRequest};
 pub use probes::{
-    AffineOp, BlockSummaryOp, CappedSpreadOp, DecimateOp, FragmentReduceOp, IdentityOp,
-    MandatedExtentOp, NeighbourFoldOp, NonZeroOp, OpaqueOp, SideOutputOp, SpreadLatticeOp,
-    WindowSumOp,
+    region_of, AffineOp, BlockSummaryOp, CappedSpreadOp, DecimateOp, DriftingSumOp,
+    FragmentReduceOp, IdentityOp, MandatedExtentOp, NeighbourFoldOp, NonZeroOp, OpaqueOp,
+    RegionMergeOp, RegionSumOp, SideOutputOp, SpreadLatticeOp, WindowSumOp,
 };
 pub use reach::{AxisReach, Frame, Reach, Space, Units};
 pub use region::{ArrayRegionSink, ArrayRegionSource, Region, RegionSink, RegionSource};
@@ -245,8 +247,8 @@ pub use statistics::{
 };
 pub use strategy::{
     execute, execute_observed, execute_phases, execute_task, execute_task_of, ArrayRef,
-    Enumerating, Greedy, Hints, PartitionSearch, Plan, SchedulePriority, Strategy, TaskOutcome,
-    Trivial, Workflow,
+    Enumerating, Greedy, Hints, Materialising, PartitionSearch, Plan, SchedulePriority, Strategy,
+    TaskOutcome, Trivial, Workflow,
 };
 pub use synthetic::{
     IntensitySource, LabelSource, Object, ObjectRecord, Rendered, Scene, SceneSpec,
