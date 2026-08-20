@@ -43,6 +43,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -413,6 +414,9 @@ pub fn execute_phases(
     // How many substages each phase ran. Zero for every phase that is not an
     // iteration, which is what a phase with no loop in it took.
     let mut substages: Vec<usize> = vec![0; n_phases];
+    // And how much each of them changed. Empty for the same phases, and for a
+    // phase whose environment holds no values to difference; see `Stats`.
+    let mut substage_changes: Vec<Vec<u64>> = vec![Vec::new(); n_phases];
     let mut phase_remaining: Vec<usize> = (0..n_phases)
         .map(|phase| graph.tasks_in_phase(phase).len())
         .collect();
@@ -454,9 +458,18 @@ pub fn execute_phases(
                 let PhaseWork::Iterate(op) = &work[phase] else {
                     unreachable!("`iterative` is derived from `work`");
                 };
-                let (ran, outcomes) =
-                    run_iterative_phase(&graph, phase, decomposition, *op, env, &events, n_phases)?;
+                let (ran, changes, outcomes) = run_iterative_phase(
+                    &graph,
+                    phase,
+                    decomposition,
+                    *op,
+                    env,
+                    &events,
+                    n_phases,
+                    pool.as_deref(),
+                )?;
                 substages[phase] = ran;
+                substage_changes[phase] = changes;
                 graph
                     .tasks_in_phase(phase)
                     .iter()
@@ -643,6 +656,7 @@ pub fn execute_phases(
             .map(|boxes| boxes.len())
             .sum(),
         substages,
+        substage_changes,
         reads,
         writes,
         read_voxels,
@@ -1425,13 +1439,25 @@ fn run_fragment_task(
 /// optimisation, and a trivial executor is correct by design, which is what makes
 /// it the oracle they will be tested against.
 ///
-/// **What a distributed run would need, and does not have here.** One barrier per
-/// substage, and the two private buffers shared across workers rather than owned
-/// by this function. The blocks of a single substage are independent — they read
-/// `current` and write disjoint cores of `next` — so the parallelism is available;
-/// it is the substage boundary that is a real exchange point, because every block
-/// of substage `k+1` reads cores its neighbours wrote at `k`. Left unbuilt, and
-/// this is the sentence that says where it goes.
+/// **The blocks of one substage run together.** They are independent — each reads
+/// `current`, which nothing writes during the substage, and writes its own core of
+/// `next`, and the cores are disjoint by construction — so the wave is the same
+/// shape as the ready wave the rest of the executor runs, through the same pool at
+/// the same `Hints::concurrency`. What is *not* parallel is the substage boundary,
+/// and it must not be: every block of substage `k+1` reads cores its neighbours
+/// wrote at `k`, so the swap below is a barrier and the loop is serial in the
+/// substage index. That is the whole reason the depth is paid in private round
+/// trips rather than in halo.
+///
+/// `next` is behind a lock rather than split into disjoint views because the
+/// placement is a copy of a core and the substage around it is the arithmetic:
+/// blocks contend for the length of a `memcpy` each, once per block per substage.
+/// Splitting it would buy that back and needs an indexing scheme the private
+/// buffer does not otherwise have.
+///
+/// **What a distributed run would need, and does not have here.** The two private
+/// buffers shared across workers rather than owned by this function, and the
+/// barrier below made explicit rather than implied by the end of a loop body.
 #[allow(clippy::too_many_arguments)]
 fn run_iterative_phase(
     graph: &TaskGraph,
@@ -1441,7 +1467,8 @@ fn run_iterative_phase(
     env: &dyn Environment,
     events: &Dispatch,
     n_phases: usize,
-) -> Result<(usize, Vec<TaskOutcome>)> {
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<(usize, Vec<u64>, Vec<TaskOutcome>)> {
     let phase = &decomposition.phases[phase_index];
     let tasks = graph.tasks_in_phase(phase_index);
     let volume = phase.volume();
@@ -1479,9 +1506,10 @@ fn run_iterative_phase(
     // on the way out however it ends. A failed run's residency counters are not
     // load-bearing, but a partial release would be a number that quietly means
     // nothing.
-    let produced = (|| -> Result<(usize, Vec<TaskOutcome>)> {
+    let produced = (|| -> Result<(usize, Vec<u64>, Vec<TaskOutcome>)> {
         let limit = op.limit().substages();
         let mut ran = 0usize;
+        let mut changes: Vec<u64> = Vec::new();
         loop {
             if ran == limit {
                 return Err(Error::InvalidArgument(format!(
@@ -1494,66 +1522,85 @@ fn run_iterative_phase(
                     op.name()
                 )));
             }
-            let mut changed = false;
-            for task in tasks {
-                let fetch = &task.geometry.source;
-                let read = &task.geometry.read;
-                let at = Anchor::of_region(fetch, decomposition.volume_at(phase_index))?;
-                // One buffer per declared operand, every one of them over the
-                // block's read extent — see `iterate::Substage` for why they share
-                // an extent rather than each getting its own.
-                let mut buffers = Vec::with_capacity(operands.len());
-                for operand in &operands {
-                    // The running operand comes off the level only at substage 0;
-                    // after that it is what the previous substage wrote, and it is
-                    // the neighbours' *cores* of that which make the reach stay at
-                    // one substage's worth. A fixed operand comes off the level
-                    // every time, which is the whole point of declaring it.
-                    let from_level = operand.operand == Operand::Fixed || ran == 0;
-                    if from_level {
-                        let started = Instant::now();
-                        let buf = env.read(phase_index, fetch)?;
-                        let read_ns = started.elapsed().as_nanos() as u64;
-                        let chunks = chunks_touched(fetch, &env.chunk_shape());
-                        events.emit(Event::RegionRead {
-                            source: format!("level {phase_index}"),
-                            level: phase_index,
-                            index: Some(task.index),
-                            region: fetch.clone(),
-                            voxels: fetch.voxels(),
-                            bytes: fetch.voxels() as u64 * bytes_per_voxel,
-                            chunks,
-                            duration_ns: read_ns,
-                        });
-                        events.emit(Event::BlockRead {
-                            phase: phase_index,
-                            index: task.index,
-                            region: fetch.clone(),
-                            voxels: fetch.voxels(),
-                            chunks,
-                        });
-                        buffers.push(buf);
-                    } else {
-                        // A private buffer is not a level: no `RegionRead`, because
-                        // nothing was fetched from storage. The residency is still
-                        // booked, because the block is still resident.
-                        buffers.push(env.slice(&current, &whole, fetch)?);
+            // The three things the wave shares. `next` is written by every block
+            // and read by none of them until the swap below, so a lock over it is
+            // the whole of the coordination a substage needs; the two counters are
+            // a reduction over the blocks and are folded atomically for the same
+            // reason the ready wave's outcomes are gathered rather than merged.
+            let changed = AtomicBool::new(false);
+            let changed_voxels = AtomicU64::new(0);
+            {
+                let sink = Mutex::new(&mut next);
+                let one_block = |task: &Task| -> Result<()> {
+                    let fetch = &task.geometry.source;
+                    let read = &task.geometry.read;
+                    let at = Anchor::of_region(fetch, decomposition.volume_at(phase_index))?;
+                    // One buffer per declared operand, every one of them over the
+                    // block's read extent — see `iterate::Substage` for why they share
+                    // an extent rather than each getting its own.
+                    let mut buffers = Vec::with_capacity(operands.len());
+                    for operand in &operands {
+                        // The running operand comes off the level only at substage 0;
+                        // after that it is what the previous substage wrote, and it is
+                        // the neighbours' *cores* of that which make the reach stay at
+                        // one substage's worth. A fixed operand comes off the level
+                        // every time, which is the whole point of declaring it.
+                        let from_level = operand.operand == Operand::Fixed || ran == 0;
+                        if from_level {
+                            let started = Instant::now();
+                            let buf = env.read(phase_index, fetch)?;
+                            let read_ns = started.elapsed().as_nanos() as u64;
+                            let chunks = chunks_touched(fetch, &env.chunk_shape());
+                            events.emit(Event::RegionRead {
+                                source: format!("level {phase_index}"),
+                                level: phase_index,
+                                index: Some(task.index),
+                                region: fetch.clone(),
+                                voxels: fetch.voxels(),
+                                bytes: fetch.voxels() as u64 * bytes_per_voxel,
+                                chunks,
+                                duration_ns: read_ns,
+                            });
+                            events.emit(Event::BlockRead {
+                                phase: phase_index,
+                                index: task.index,
+                                region: fetch.clone(),
+                                voxels: fetch.voxels(),
+                                chunks,
+                            });
+                            buffers.push(buf);
+                        } else {
+                            // A private buffer is not a level: no `RegionRead`, because
+                            // nothing was fetched from storage. The residency is still
+                            // booked, because the block is still resident.
+                            buffers.push(env.slice(&current, &whole, fetch)?);
+                        }
                     }
-                }
 
-                let result = env.apply_substage(op, ran, &buffers, &at)?;
-                let valid = &task.geometry.valid;
-                let core = env.slice(&result, read, valid)?;
-                // The convergence test, and it is the whole predicate: did this
-                // block's core come out different from what it went in as. Against
-                // the *running* operand, because that is what the next substage
-                // will be handed.
-                let before = env.slice(&buffers[running_at], fetch, valid)?;
-                match env.same(&core, &before) {
-                    Some(false) => changed = true,
-                    Some(true) => {}
-                    None => {
-                        return Err(Error::InvalidArgument(format!(
+                    let result = env.apply_substage(op, ran, &buffers, &at)?;
+                    let valid = &task.geometry.valid;
+                    let core = env.slice(&result, read, valid)?;
+                    // The convergence test, and it is the whole predicate: did this
+                    // block's core come out different from what it went in as. Against
+                    // the *running* operand, because that is what the next substage
+                    // will be handed.
+                    let before = env.slice(&buffers[running_at], fetch, valid)?;
+                    match env.same(&core, &before) {
+                        Some(false) => {
+                            changed.store(true, Ordering::SeqCst);
+                            // Beside the decision and never in place of it: `same` is
+                            // the environment's own override point and stays the sole
+                            // thing that ends an iteration. This is the size of a
+                            // difference it has already reported, and it can only be
+                            // taken where `same` could answer at all.
+                            changed_voxels.fetch_add(
+                                differing_voxels(&core, &before).unwrap_or(0),
+                                Ordering::SeqCst,
+                            );
+                        }
+                        Some(true) => {}
+                        None => {
+                            return Err(Error::InvalidArgument(format!(
                             "iterative op {:?} cannot be run under an environment that holds no \
                              data: an iteration runs to convergence, and whether anything \
                              changed is a question about values. Simulating one needs a stated \
@@ -1561,22 +1608,32 @@ fn run_iterative_phase(
                              run discovers and is deliberately not invented here.",
                             op.name()
                         )));
+                        }
                     }
-                }
-                env.place(&mut next, &whole, valid, &core)?;
+                    {
+                        let mut held = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        env.place(&mut held, &whole, valid, &core)?;
+                    }
 
-                env.release(&before);
-                env.release(&core);
-                env.release(&result);
-                for buf in &buffers {
-                    env.release(buf);
+                    env.release(&before);
+                    env.release(&core);
+                    env.release(&result);
+                    for buf in &buffers {
+                        env.release(buf);
+                    }
+                    Ok(())
+                };
+                match pool {
+                    None => tasks.iter().try_for_each(&one_block)?,
+                    Some(pool) => pool.install(|| tasks.par_iter().try_for_each(&one_block))?,
                 }
             }
             // The exchange point. Everything below reads `current`, so the swap is
             // the barrier; see this function's header for the distributed shape.
             std::mem::swap(&mut current, &mut next);
             ran += 1;
-            if !changed {
+            changes.push(changed_voxels.load(Ordering::SeqCst));
+            if !changed.load(Ordering::SeqCst) {
                 break;
             }
         }
@@ -1619,12 +1676,63 @@ fn run_iterative_phase(
                 listener_faults: 0,
             });
         }
-        Ok((ran, outcomes))
+        Ok((ran, changes, outcomes))
     })();
 
     env.release(&current);
     env.release(&next);
     produced
+}
+
+/// How many voxels two buffers of one extent differ in, or `None` where there
+/// are no values to difference.
+///
+/// **Derived beside [`Environment::same`] and never in place of it.** That method
+/// is the environment's override point and stays the sole thing that decides an
+/// iteration has converged; this is the *size* of a difference it has already
+/// reported, which is what turns a substage count into a sequence a caller can
+/// read a rate off. It answers exactly where `same` answers — both need real
+/// arrays — so a run that can decide can also count, and one that cannot does
+/// neither.
+///
+/// A free function rather than a method for the same reason: an environment has
+/// nothing to say about it that it does not already say through `same`.
+fn differing_voxels(left: &BlockBuf, right: &BlockBuf) -> Option<u64> {
+    let (BlockBuf::Array(left), BlockBuf::Array(right)) = (left, right) else {
+        return None;
+    };
+    fn count<T: crate::voxels::VoxelElement>(
+        left: &crate::voxels::Voxels,
+        right: &crate::voxels::Voxels,
+    ) -> Option<u64> {
+        let left = left.view::<T>().ok()?;
+        let right = right.view::<T>().ok()?;
+        Some(
+            left.iter()
+                .zip(right.iter())
+                .filter(|(one, other)| one != other)
+                .count() as u64,
+        )
+    }
+    if left.dtype() != right.dtype() || left.shape() != right.shape() {
+        return None;
+    }
+    match left.dtype() {
+        Dtype::Bool => count::<bool>(left, right),
+        Dtype::U8 => count::<u8>(left, right),
+        Dtype::U16 => count::<u16>(left, right),
+        Dtype::U32 => count::<u32>(left, right),
+        Dtype::U64 => count::<u64>(left, right),
+        Dtype::I8 => count::<i8>(left, right),
+        Dtype::I16 => count::<i16>(left, right),
+        Dtype::I32 => count::<i32>(left, right),
+        Dtype::I64 => count::<i64>(left, right),
+        Dtype::F32 => count::<f32>(left, right),
+        Dtype::F64 => count::<f64>(left, right),
+        // No `Voxels` variant holds one, so there is nothing to view and
+        // nothing to count. `same` is in the same position.
+        Dtype::F16 => None,
+    }
 }
 
 fn fold_constant(phase: &PhaseDecomposition, slots: &[&Chain], value: f64) -> Option<f64> {

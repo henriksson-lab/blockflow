@@ -27,8 +27,13 @@
 // * **Every block executed exactly once**, asserted with the crate's existing
 //   `check_coverage_and_order` over the *merged* event stream. It needs real
 //   workers because the merge is the thing under test.
-// * **A worker dies and its task is reissued.** It needs a process, because the
-//   failure being modelled is a process disappearing.
+// * **A worker dies and the job aborts, naming what was lost.** The default;
+//   node loss is not recovered from. It needs a process, because the failure
+//   being modelled is a process disappearing — and because the *detector* is a
+//   process exit, seen by this runner, which started them.
+// * **A worker dies under an explicit lease and its task is reissued.** The
+//   same death with one field of the spec set. Opt-in since 2026-08-17; see the
+//   module header of `distributed`.
 // * **The work list stays ahead.** It needs real latency between the ask and the
 //   answer, which is the thing a function call does not have.
 
@@ -100,8 +105,9 @@ pub struct LocalOptions {
     pub dir: PathBuf,
     pub binaries: Binaries,
     /// Make worker `index` stop after `tasks` tasks, to demonstrate a death.
-    /// The process exits without reporting, so the coordinator finds out the
-    /// only way it can — the lease runs out.
+    /// The process exits without reporting, so the coordinator finds out from
+    /// the runner, which started it — or, if the job set a lease, from the
+    /// lease running out.
     pub stop_after: Vec<(usize, usize)>,
     /// **Kill** worker `index` once the job reports `done` tasks.
     ///
@@ -110,6 +116,10 @@ pub struct LocalOptions {
     /// block half-written and nothing reported. Triggered on observed progress
     /// rather than on a timer, so it is deterministic — a timer would race the
     /// job and the test would pass by luck.
+    ///
+    /// What happens next depends on the job, and that is the point: with no
+    /// lease — the default — the run **aborts**, because node loss is not
+    /// recovered from; with a lease, the claims are reissued.
     pub kill_at_progress: Vec<(usize, usize)>,
     pub timeout: Duration,
     pub inherit_output: bool,
@@ -283,6 +293,28 @@ pub fn run(
     let deadline = started + options.timeout;
     let mut watcher = (!options.kill_at_progress.is_empty()).then(|| Client::new(addr));
     let mut pending_kills = options.kill_at_progress.clone();
+    // Detecting a lost node, and why it is here rather than in the coordinator.
+    //
+    // **The runner started these processes, so the runner is what the operating
+    // system tells when one of them dies.** `try_wait` is that signal: a real
+    // event, delivered at the moment it happens, with an exit status attached.
+    // The coordinator has nothing equivalent — it did not fork them, its HTTP
+    // server hands it requests and not connections, and the only thing it could
+    // watch instead is *silence*, which is a timeout, which is the mechanism
+    // this design deliberately removed. So the party with the signal relays it,
+    // and the coordinator does the naming and the stopping.
+    //
+    // On a cluster this same role belongs to whatever launched the workers —
+    // `srun`, which kills the step when a task dies, or an orchestrator. The
+    // shape is the same and so is the decision: node loss ends the job.
+    //
+    // A job that **set a lease** is opting into reissue, which is a different
+    // belief about what a lost node costs, so a death is not fatal there and
+    // the runner leaves it to the lease. That is the one branch, and it reads
+    // off the spec rather than off an option nobody would keep in step.
+    let recovers_by_lease = spec.lease.is_some();
+    let mut lost: Option<String> = None;
+    let mut teller = Client::new(addr);
     let coordinator_exit = loop {
         if let Some(client) = watcher.as_mut() {
             if let Ok(value) = client.get(protocol::path::STATUS) {
@@ -299,6 +331,38 @@ pub fn run(
                 if pending_kills.is_empty() {
                     watcher = None;
                 }
+            }
+        }
+        if !recovers_by_lease && lost.is_none() {
+            for index in 0..options.workers {
+                let Some(child) = children.0.get_mut(index + 1) else {
+                    continue;
+                };
+                let Ok(Some(status)) = child.try_wait() else {
+                    continue;
+                };
+                // A worker that exited **after** the coordinator finished the
+                // job went home; that is the normal end of a run and is not a
+                // loss. Asked of the coordinator rather than assumed, because
+                // the two exits race by design.
+                let finished = teller
+                    .get(protocol::path::JOBS)
+                    .ok()
+                    .and_then(|value| value.get("all_finished").and_then(Value::as_bool))
+                    .unwrap_or(false);
+                if finished {
+                    break;
+                }
+                let worker = format!("worker-{index}");
+                let _ = teller.post(
+                    protocol::path::LOST,
+                    &serde_json::json!({
+                        "worker": worker,
+                        "why": format!("the process exited with {status} before the job finished"),
+                    }),
+                );
+                lost = Some(worker);
+                break;
             }
         }
         match children.0[0].try_wait() {
@@ -322,6 +386,19 @@ pub fn run(
         std::thread::sleep(Duration::from_millis(10));
     };
     if !coordinator_exit.success() {
+        // An aborted job exits non-zero on purpose, and its report — written
+        // before it left — says which worker went and what it was holding.
+        // Preferred over the exit status alone because "the coordinator exited
+        // with 1" is exactly the unreadable ending this is meant to replace.
+        if let Ok(report) = read_json(&report_path) {
+            if let Some(message) = report
+                .get("aborted")
+                .and_then(|aborted| aborted.get("message"))
+                .and_then(Value::as_str)
+            {
+                return Err(Error::backend(message.to_string()));
+            }
+        }
         return Err(Error::backend(format!(
             "the coordinator exited with {coordinator_exit}"
         )));

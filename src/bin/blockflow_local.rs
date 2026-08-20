@@ -44,11 +44,15 @@ blockflow-local — a coordinator and N workers, as separate processes, here.
   --ahead N         Tasks each worker keeps in hand. Default 2.
   --kill I:N        SIGKILL worker I once the job reports N tasks done. The
                     process is taken wherever it is — possibly inside a task,
-                    certainly holding the tasks its list was keeping ahead — so
-                    the coordinator finds out the only way it can: the lease runs
-                    out and the claims are reissued.
-  --lease-ms N      How long a claim survives without a completion. Default
-                    30000; lower it to see a reissue quickly.
+                    certainly holding the tasks its list was keeping ahead. With
+                    no --lease-ms the run aborts, naming the worker: node loss is
+                    not recovered from. With one, the claims are reissued
+                    instead.
+  --lease-ms N      Opt in to reissuing a claim that goes unreported for N
+                    milliseconds. **Off by default** — a claim is held until it
+                    completes. Must exceed (--ahead + 1) x task duration or it
+                    reissues work nobody lost; see `distributed`'s module
+                    header for why this is not a default.
   --dir PATH        Where to put the job, the volumes and the reports.
                     Default: a fresh directory under the system temporary one.
   --keep            Do not delete the directory afterwards.
@@ -114,11 +118,21 @@ fn go() -> Result<()> {
                 ));
             }
             "--lease-ms" => {
-                lease_ms = Some(
-                    value()?
-                        .parse()
-                        .map_err(|_| Error::invalid("--lease-ms takes a number".to_string()))?,
-                )
+                let ms: u64 = value()?
+                    .parse()
+                    .map_err(|_| Error::invalid("--lease-ms takes a number".to_string()))?;
+                // Zero is refused rather than treated as "no lease": a lease of
+                // zero milliseconds expires every claim at the instant it is
+                // made, so a reader who meant "off" and typed 0 would get the
+                // most destructive setting there is. "Off" is spelled by not
+                // passing the flag.
+                if ms == 0 {
+                    return Err(Error::invalid(
+                        "--lease-ms 0 would expire every claim the moment it was handed out.                          Omit --lease-ms for no expiry, which is the default."
+                            .to_string(),
+                    ));
+                }
+                lease_ms = Some(ms);
             }
             "--dir" => dir = Some(PathBuf::from(value()?)),
             "--keep" => keep = true,
@@ -143,9 +157,7 @@ fn go() -> Result<()> {
         },
     );
     spec.policy = policy;
-    if let Some(lease) = lease_ms {
-        spec.lease_ms = lease;
-    }
+    spec.lease = lease_ms.map(Duration::from_millis);
 
     // The input, written once, by whoever submits the job. On a cluster this is
     // an array that already exists; here it has to be made.

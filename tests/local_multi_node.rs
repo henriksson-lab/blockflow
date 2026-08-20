@@ -14,7 +14,7 @@
 // because the "network" was a function call. Every test in this file starts
 // real processes over real sockets against real shared files.
 //
-// The four claims, one test each
+// The five claims, one test each
 // ------------------------------
 // 1. **N workers produce byte-identical output to a single-node run**, swept
 //    over worker counts. The headline, and the one that would catch a wrong
@@ -23,13 +23,25 @@
 //    `check_coverage_and_order` over the merged event stream — no
 //    distribution-specific analysis, because a merged stream is an
 //    `ExecutionLog` like any other.
-// 3. **A worker dies and its task is reissued.** Demonstrated rather than
-//    asserted, because this is the property that justifies pull-based handout.
-// 4. **The work list stays at least one task ahead**, so a worker never blocks
+// 3. **A worker dies and the job stops, naming what was lost.** The default:
+//    node loss is not recovered from, and what to do about it is decided above
+//    this crate. What must not happen is a silent hang.
+// 4. **A worker dies under an explicit lease and its task is reissued.** The
+//    same death with one field set. Reissue is opt-in now — see the module
+//    header for the decision of 2026-08-17 — and this test is what keeps it
+//    compiled, exercised and honest.
+// 5. **The work list stays at least one task ahead**, so a worker never blocks
 //    except on its own pull. No single-node test would catch this regressing.
+//
+// A note on 3 and 4 together, because the pair is the load-bearing part. Each
+// is the other's counterexample: 4 alone cannot tell "expiry is off" from
+// "expiry is broken", and 3 alone cannot tell "no lease" from "no claims". Run
+// as a pair over the same fixture and the same death, they pin the default and
+// the opt-in against each other.
 
 #![cfg(feature = "distributed")]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +57,7 @@ use blockflow::distributed::{HandoutPolicy, WorkflowFactory};
 use blockflow::env::Environment;
 use blockflow::export::event_from_json;
 use blockflow::fragment::neighbourhood_size;
+use blockflow::graph::TaskGraph;
 use blockflow::log::ExecutionLog;
 use blockflow::probes::NeighbourFoldOp;
 use blockflow::sidecar::Lifecycle;
@@ -81,7 +94,7 @@ fn ramp(shape: [usize; 3]) -> Array3<f64> {
 }
 
 /// Build the job, lay down its input, and return everything needed to run it.
-fn prepare(dir: &Path, phases: usize, lease_ms: u64) -> (JobSpec, Decomposition) {
+fn prepare(dir: &Path, phases: usize, lease: Option<Duration>) -> (JobSpec, Decomposition) {
     let volumes = dir.join("volumes");
     let (mut spec, decomposition) = probe_job_over(
         BLOCKS,
@@ -92,7 +105,7 @@ fn prepare(dir: &Path, phases: usize, lease_ms: u64) -> (JobSpec, Decomposition)
         },
     );
     spec.policy = HandoutPolicy::NearestFirst;
-    spec.lease_ms = lease_ms;
+    spec.lease = lease;
     let store = SharedVolumes::create(
         &volumes,
         spec.workflow.shape,
@@ -215,7 +228,7 @@ fn n_workers_produce_byte_identical_output_to_a_single_node_run() {
 
     for workers in [1usize, 2, 3, 5] {
         let dir = scratch(&format!("workers-{workers}"));
-        let (spec, decomposition) = prepare(&dir, 1, 30_000);
+        let (spec, decomposition) = prepare(&dir, 1, None);
         let run = local::run(&options(&dir, workers), &spec, &decomposition)
             .unwrap_or_else(|error| panic!("{workers} workers: {error}"));
         assert_eq!(
@@ -398,7 +411,7 @@ fn several_workers_agree_with_one_node_across_a_phase_boundary() {
     let reference = single_node(&reference_dir, &spec, &decomposition);
 
     let dir = scratch("phases-distributed");
-    let (spec, decomposition) = prepare(&dir, 2, 30_000);
+    let (spec, decomposition) = prepare(&dir, 2, None);
     let run = local::run(&options(&dir, 4), &spec, &decomposition).expect("a four-worker run");
     assert_eq!(run.status.done, run.status.tasks);
     assert_eq!(
@@ -421,7 +434,7 @@ fn several_workers_agree_with_one_node_across_a_phase_boundary() {
 #[test]
 fn every_block_was_executed_exactly_once_across_the_merged_event_stream() {
     let dir = scratch("coverage");
-    let (spec, decomposition) = prepare(&dir, 2, 30_000);
+    let (spec, decomposition) = prepare(&dir, 2, None);
     let run = local::run(&options(&dir, 4), &spec, &decomposition).expect("a four-worker run");
 
     // The coordinator ran the criterion itself, over what it holds.
@@ -457,7 +470,67 @@ fn every_block_was_executed_exactly_once_across_the_merged_event_stream() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// -------------------------------------------------------- 3. a death --
+// ------------------------------------------- 3. a death, by default --
+
+/// Kill a worker mid-run, with the job exactly as a job comes: **no lease**.
+///
+/// The job must **stop**, and it must say what was lost. Not reissue the
+/// claims — this deployment is 10-20 cooperating nodes and a lost one may have
+/// held a great deal in memory, so re-running the tasks it had claimed restores
+/// the claim table and not the position. And not hang, which is the outcome
+/// this test exists to rule out: a run that never returns is the one failure
+/// nobody can act on.
+///
+/// The detection is a **signal, not a timeout**. `local::run` started these
+/// processes, so the operating system tells it when one dies; it relays that to
+/// the coordinator, which names the worker and its claims and gives up. See the
+/// `distributed` module header for why the coordinator cannot see this itself,
+/// and why a duration would be the wrong instrument even if it could.
+///
+/// Timed, because "eventually" is not the claim: the run has to end in the
+/// seconds after the kill, not at the harness timeout, and a hang that is
+/// merely slow would otherwise pass.
+#[test]
+fn a_worker_that_is_killed_mid_run_aborts_the_job_by_default_and_names_what_was_lost() {
+    let dir = scratch("loss");
+    let (spec, decomposition) = prepare(&dir, 1, None);
+    assert_eq!(spec.lease, None, "a job has no lease unless it asks");
+    let mut options = options(&dir, 3);
+    options.timeout = Duration::from_secs(60);
+    options.kill_at_progress = vec![(0, 2)];
+    let started = std::time::Instant::now();
+    let outcome = local::run(&options, &spec, &decomposition);
+    let took = started.elapsed();
+
+    let error = outcome.err().unwrap_or_else(|| {
+        panic!("a worker was killed and the run reported success; node loss is not recovered from")
+    });
+    let message = error.to_string();
+    assert!(
+        message.contains("worker-0"),
+        "the failure does not say which worker was lost: {message}"
+    );
+    assert!(
+        message.contains("aborting"),
+        "the failure does not say the job gave up: {message}"
+    );
+    assert!(
+        message.contains("does not recover"),
+        "the failure does not say why it gave up: {message}"
+    );
+    // The whole point is that it *ended*. Generous against a loaded machine and
+    // still nowhere near the timeout, which is what a hang would have cost.
+    assert!(
+        took < Duration::from_secs(45),
+        "the run took {took:?}, which is close enough to the {:?} timeout to be a hang \
+         rather than an abort",
+        options.timeout
+    );
+    println!("a worker was killed two tasks in and the job aborted after {took:?}: {message}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------- 4. a death, under a lease --
 
 /// Kill a worker mid-run and show the job completes with correct output.
 ///
@@ -467,11 +540,14 @@ fn every_block_was_executed_exactly_once_across_the_merged_event_stream() {
 /// a block part-written and nothing reported, and certainly holding the tasks
 /// its work list was keeping ahead.
 ///
-/// From the coordinator that is indistinguishable from a preemption, a spot
-/// reclamation or a segfault: a claim that stops being renewed. There is no
-/// failure detector and no membership protocol — the lease runs out and the
-/// task goes to somebody else, which is the whole of fault tolerance here and
-/// is why the handout is a pull.
+/// **Opt-in, and the explicit lease below is the documentation.** A job has no
+/// lease by default, and the default answer to the death above is to abort. A
+/// job that sets one is saying something different — that its tasks are cheap
+/// enough to re-run and that it would rather carry on — and from the
+/// coordinator the death then looks like what it always did: a claim that stops
+/// being renewed, indistinguishable from a preemption, a spot reclamation or a
+/// segfault. No failure detector and no membership protocol; the lease runs out
+/// and the task goes to somebody else.
 ///
 /// Any duplicate execution that follows is expected and harmless: both attempts
 /// write the same values to the same valid region, so a reissue costs work and
@@ -490,9 +566,13 @@ fn a_worker_that_is_killed_mid_run_has_its_tasks_reissued_and_the_output_is_stil
     let reference = single_node(&reference_dir, &spec, &decomposition);
 
     let dir = scratch("death");
-    // A short lease so the test does not sit out the thirty-second default.
-    // Everything else is exactly a normal run.
-    let (spec, decomposition) = prepare(&dir, 1, 400);
+    // A finite lease, **set explicitly**, because no job has one by default.
+    // That is the whole documentation value of this line: reissue is opt-in, a
+    // default run holds a claim until it completes, and this test is the one
+    // place in the suite that asks for the other thing. 400 ms so the test does
+    // not sit out a long one; see the header for what that costs when nobody
+    // has died.
+    let (spec, decomposition) = prepare(&dir, 1, Some(Duration::from_millis(400)));
     let mut options = options(&dir, 3);
     options.kill_at_progress = vec![(0, 2)];
     let run = local::run(&options, &spec, &decomposition).expect("the survivors finish the job");
@@ -515,32 +595,62 @@ fn a_worker_that_is_killed_mid_run_has_its_tasks_reissued_and_the_output_is_stil
     // Exactly the tasks that were reissued are the ones that appear twice —
     // which is what distinguishes "a block ran twice because a worker died"
     // from "a block ran twice because the coordinator lost track of it".
+    //
+    // Stated as a **subset**, not as a count. `duplicate_applications` is keyed
+    // on `(block, op slot)`, so one block that ran twice contributes one entry
+    // *per op in the chain*, while `reissued` is keyed on tasks; comparing the
+    // two lengths compares (blocks x ops) against tasks and is wrong by the
+    // chain length — with the two-op `identity` chain it demands that at least
+    // half of every death's reissues were claims the dead worker had not yet
+    // started, which is a property of how fast the machine happened to be and
+    // not a property of the design. The subset is what the design does
+    // guarantee, is independent of the chain length, and is strictly stronger:
+    // it fails on a single block that ran twice without a recorded reissue.
     let reissued = run.reissued();
     assert!(!reissued.is_empty(), "no task was handed out twice");
+    let graph = TaskGraph::build(&decomposition);
+    let attempts: BTreeMap<[usize; 3], u64> = reissued
+        .iter()
+        .map(|&(task, attempts)| (graph.tasks[task].index, attempts))
+        .collect();
     let log = merged_log(&run);
-    let duplicated: Vec<[usize; 3]> = log
-        .duplicate_applications()
-        .into_iter()
-        .map(|(index, _, _)| index)
+    let duplicated = log.duplicate_applications();
+    let unexplained: BTreeSet<[usize; 3]> = duplicated
+        .iter()
+        .map(|&(index, _, _)| index)
+        .filter(|index| !attempts.contains_key(index))
         .collect();
     assert!(
-        duplicated.len() <= reissued.len(),
-        "{} blocks ran twice but only {} tasks were reissued",
-        duplicated.len(),
-        reissued.len()
+        unexplained.is_empty(),
+        "block(s) {unexplained:?} were computed twice but their task was never handed out \
+         twice: the coordinator lost track of work rather than reissuing it. Reissued: \
+         {reissued:?}"
     );
+    // And no block ran more times than its task was handed out. This is the
+    // half that would catch a worker executing one assignment twice, which the
+    // subset alone cannot see.
+    for &(index, slot, count) in &duplicated {
+        let handouts = attempts[&index];
+        assert!(
+            count as u64 <= handouts,
+            "block {index:?} applied op {slot} {count} times on {handouts} handout(s)"
+        );
+    }
+    let blocks: BTreeSet<[usize; 3]> = duplicated.iter().map(|&(index, _, _)| index).collect();
     println!(
         "a worker was killed two tasks in: {} claim(s) reissued {:?}, {} block(s) computed \
-         twice, output byte-identical to a clean single-node run",
+         twice {:?}, every one of them a task the coordinator had reissued, output \
+         byte-identical to a clean single-node run",
         run.status.reissued,
         reissued,
-        duplicated.len()
+        blocks.len(),
+        blocks
     );
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&reference_dir).ok();
 }
 
-// ------------------------------------------------------- 4. no stalls --
+// ------------------------------------------------------- 5. no stalls --
 
 /// A worker never blocks except on its own pull, and its work list stays ahead.
 ///
@@ -553,7 +663,7 @@ fn a_worker_that_is_killed_mid_run_has_its_tasks_reissued_and_the_output_is_stil
 #[test]
 fn the_work_list_stays_at_least_one_task_ahead_of_what_is_being_computed() {
     let dir = scratch("pipeline");
-    let (spec, decomposition) = prepare(&dir, 1, 30_000);
+    let (spec, decomposition) = prepare(&dir, 1, None);
     let workers = 2;
     let run = local::run(&options(&dir, workers), &spec, &decomposition).expect("a run");
     assert_eq!(run.status.done, run.status.tasks);
@@ -589,6 +699,198 @@ fn the_work_list_stays_at_least_one_task_ahead_of_what_is_being_computed() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// How deep should a worker's work list be? A measurement, not an assertion.
+///
+/// `ahead = 2` — one task being computed, one in hand — was chosen while the
+/// coordinator was stamping a deadline on every claim, and under a lease a
+/// deeper list is actively dangerous: the third task in a list is a claim that
+/// has not been *started*, so it burns its lease sitting still, and the
+/// contract `lease > (ahead + 1) x task duration` gets harder to satisfy with
+/// every task added. **With no lease that constraint is gone**, and the depth
+/// can be chosen for pipelining alone. So the question is open, and the honest
+/// way to close it is to sweep it rather than to reason about it.
+///
+/// Two things make this measurable rather than merely printable.
+///
+/// **A noise control.** `ahead = 1` is not a configuration: the worker clamps
+/// with `ahead.max(2)`, because a list of one is the list that cannot be ahead
+/// of anything. So depth 1 and depth 2 run *identical code*, and the gap
+/// between their two timings is this fixture's noise floor, measured under
+/// exactly the conditions the rest of the sweep ran under. No difference
+/// smaller than that floor means anything, and the first version of this test
+/// reported a confident 40 % that was entirely inside it.
+///
+/// **Interleaving.** Depths are run round-robin within each repeat rather than
+/// one depth at a time, so a busy minute on a shared machine is spread across
+/// the whole curve instead of landing on whichever depth was unlucky.
+///
+/// What the numbers can and cannot say. This fixture is the friendliest
+/// possible case for a deeper list: 8 x 8 x 8 blocks of `f64` through an
+/// identity chain, so a task is microseconds of work behind a loopback round
+/// trip, and handout latency is as large a share of the run as it can ever be.
+/// If depth does not help *here* it will not help on real blocks, where a task
+/// is seconds. If it does help here, the honest reading is "up to this much,
+/// under this ratio", and not a new default.
+///
+/// What it said, 2026-08-17, `--release`, 40-core host, 9 interleaved runs per
+/// depth, 256 tasks over 4 workers. Medians, against `ahead = 2`:
+///
+/// | ahead | median (ms) | vs 2 | starved |
+/// |---|---|---|---|
+/// | 1 *(control)* | 6991 | -0.3 % | 0 |
+/// | 2 | 6968 | — | 0 |
+/// | 4 | 7103 | -1.9 % | 0 |
+/// | 8 | 7492 | -7.5 % | 0 |
+/// | 16 | 7422 | -6.5 % | 0 |
+/// | 32 | 7354 | -5.5 % | 0 |
+/// | 64 | 7911 | -13.5 % | 0 |
+///
+/// **Deeper is not better; it is mildly worse, and the default stays at 2.**
+/// The reason is in the last column and in `waited`: `starved` is already zero
+/// at depth 2 and the only waits left are the unavoidable ones — a worker's
+/// first task and a phase boundary — so there is no hunger for depth to feed.
+/// What depth does instead is let one worker *claim* work it has not started,
+/// which lengthens the tail: at 64 a worker can hold half a phase while another
+/// runs dry at the end. The pipeline was already full at 2 and the only thing
+/// left to move was the load balance, in the wrong direction.
+///
+/// Read it as a bound rather than a law: it is one fixture, and one whose tasks
+/// are microseconds. It rules out the thing worth ruling out — that `ahead = 2`
+/// was leaving pipelining on the table because a lease was watching — and it
+/// says the lever is elsewhere.
+///
+/// Run it:
+///
+///     cargo test --release --features distributed --test local_multi_node -- \
+///         --ignored --nocapture how_deep_the_work_list_should_be
+#[test]
+#[ignore = "a measurement, not an assertion; run with --release --ignored --nocapture"]
+fn how_deep_the_work_list_should_be() {
+    const BLOCKS_HERE: usize = 128;
+    const PHASES: usize = 2;
+    const WORKERS: usize = 4;
+    const REPEATS: usize = 9;
+    let depths = [1usize, 2, 4, 8, 16, 32, 64];
+
+    let mut millis: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    let mut ready: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut waited: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut starved: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut tasks = 0usize;
+
+    for repeat in 0..REPEATS {
+        for &ahead in &depths {
+            let dir = scratch(&format!("ahead-{ahead}-{repeat}"));
+            let volumes = dir.join("volumes");
+            let (mut spec, decomposition) = probe_job_over(
+                BLOCKS_HERE,
+                PHASES,
+                ChainSpec::identity(),
+                StoreSpec::Files {
+                    dir: volumes.clone(),
+                },
+            );
+            spec.policy = HandoutPolicy::NearestFirst;
+            let store = SharedVolumes::create(
+                &volumes,
+                spec.workflow.shape,
+                spec.workflow.chunk,
+                decomposition.n_phases(),
+            )
+            .expect("level files");
+            store
+                .write_level(0, &ramp(spec.workflow.shape))
+                .expect("an input");
+            let mut options = options(&dir, WORKERS);
+            options.ahead = ahead;
+            let run = local::run(&options, &spec, &decomposition).expect("a run");
+            assert_eq!(run.status.done, run.status.tasks);
+            // The coordinator's own clock, not the harness's: process spawn is
+            // a fixed cost of the fixture and would flatten every difference
+            // the sweep is looking for.
+            let elapsed = run
+                .report
+                .get("elapsed_ms")
+                .and_then(Value::as_u64)
+                .expect("the coordinator times its own job") as f64;
+            millis.entry(ahead).or_default().push(elapsed);
+            *ready.entry(ahead).or_default() += run.started_ready();
+            *waited.entry(ahead).or_default() += run
+                .workers
+                .iter()
+                .filter_map(|report| report.get("started_after_waiting").and_then(Value::as_u64))
+                .sum::<u64>();
+            *starved.entry(ahead).or_default() += run.starved();
+            tasks = run.status.tasks;
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    println!(
+        "\n{BLOCKS_HERE} blocks x {PHASES} phases = {tasks} tasks over {WORKERS} workers, \
+         {REPEATS} interleaved runs per depth, identity chain, 8x8x8 f64 blocks\n"
+    );
+    println!(
+        "{:>6}  {:>9}  {:>9}  {:>9}  {:>10}  {:>8}  {:>8}",
+        "ahead", "best (ms)", "med (ms)", "spread", "tasks/s", "waited", "starved"
+    );
+    let mut curve: Vec<(usize, f64, f64)> = Vec::new();
+    for &ahead in &depths {
+        let mut samples = millis[&ahead].clone();
+        samples.sort_by(f64::total_cmp);
+        let best = samples[0];
+        let median = samples[samples.len() / 2];
+        let worst = samples[samples.len() - 1];
+        println!(
+            "{ahead:>6}  {best:>9.0}  {median:>9.0}  {:>8.0} %  {:>10.0}  {:>8}  {:>8}",
+            (worst - best) / best * 100.0,
+            tasks as f64 / (median / 1000.0),
+            waited[&ahead],
+            starved[&ahead]
+        );
+        curve.push((ahead, median, best));
+    }
+
+    // The control, read out loud. Depth 1 and depth 2 are the same code, so
+    // this is the smallest difference this fixture can honestly resolve.
+    let one = curve[0].1;
+    let two = curve[1].1;
+    let floor = (one - two).abs() / two.max(one) * 100.0;
+    println!(
+        "\nnoise floor: ahead = 1 and ahead = 2 are the same configuration (the worker \
+         clamps with max(2)) and their medians differ by {floor:.1} %. Nothing below that \
+         is a result."
+    );
+    println!("\nagainst ahead = 2, on medians:");
+    for &(ahead, median, _) in &curve {
+        let change = (two - median) / two * 100.0;
+        let verdict = if change.abs() <= floor {
+            "inside the noise floor"
+        } else if change > 0.0 {
+            "faster"
+        } else {
+            "slower"
+        };
+        println!("  ahead = {ahead:>3}: {change:+6.1} %  ({verdict})");
+    }
+    // What a deeper list costs. The work list holds **descriptors, not data**:
+    // an `Assignment` is a job id, four small integers and three regions, and
+    // the block's voxels are read inside `execute_task_of` when the task runs,
+    // one task at a time. So depth costs bytes per queued task and not blocks
+    // per queued task — printed rather than asserted, because the number that
+    // matters is how small it is.
+    let assignment = std::mem::size_of::<blockflow::distributed::Assignment>();
+    println!(
+        "\nmemory: an Assignment is {assignment} bytes, so the deepest list swept ({}) costs \
+         {} bytes per worker and {} across {WORKERS}. The queue holds descriptors and never \
+         voxels — a block's inputs are read inside execute_task_of, one task at a time — so \
+         a deeper list does not hold a block open.",
+        depths[depths.len() - 1],
+        assignment * depths[depths.len() - 1],
+        assignment * depths[depths.len() - 1] * WORKERS,
+    );
+}
+
 /// Observation never blocks the thing it observes.
 ///
 /// The event stream is unbatched and sent as it happens, on its own connection,
@@ -599,7 +901,7 @@ fn the_work_list_stays_at_least_one_task_ahead_of_what_is_being_computed() {
 #[test]
 fn events_are_sent_as_they_happen_without_holding_the_work_up() {
     let dir = scratch("events");
-    let (spec, decomposition) = prepare(&dir, 1, 30_000);
+    let (spec, decomposition) = prepare(&dir, 1, None);
     let run = local::run(&options(&dir, 3), &spec, &decomposition).expect("a run");
     assert_eq!(run.status.done, run.status.tasks);
     // Every task emits exactly one `RegionRead`, one `BlockRead`, one
@@ -656,7 +958,7 @@ fn a_persistent_coordinator_accepts_a_job_over_http_and_outlives_it() {
     use blockflow::distributed::worker::{self, WorkerOptions};
 
     let dir = scratch("persistent");
-    let (spec, decomposition) = prepare(&dir, 1, 30_000);
+    let (spec, decomposition) = prepare(&dir, 1, None);
 
     let coordinator = Arc::new(Coordinator::new(false));
     let handle = server::serve(
@@ -700,7 +1002,7 @@ fn a_persistent_coordinator_accepts_a_job_over_http_and_outlives_it() {
     );
     // A second job on the same coordinator.
     let second_dir = scratch("persistent-second");
-    let (mut second, second_decomposition) = prepare(&second_dir, 1, 30_000);
+    let (mut second, second_decomposition) = prepare(&second_dir, 1, None);
     second.id = "second".to_string();
     client
         .post(
@@ -743,7 +1045,7 @@ fn a_coordinator_will_not_bind_a_public_address_by_accident() {
     assert!(error.contains("--allow-public"), "{error}");
 }
 
-// ------------------------------------------- 5. non-pixel per-block output --
+// ------------------------------------------- 6. non-pixel per-block output --
 //
 // The claim: **fragments written by N worker processes are all readable by one
 // merging reader.** It is the property that makes a block-keyed sidecar store
@@ -796,7 +1098,7 @@ fn fragments_written_by_several_worker_processes_are_readable_by_one_merging_rea
     const PHASES: usize = 2;
     for workers in [1usize, 3, 5] {
         let dir = scratch(&format!("sidecar-workers-{workers}"));
-        let (mut spec, decomposition) = prepare(&dir, PHASES, 30_000);
+        let (mut spec, decomposition) = prepare(&dir, PHASES, None);
         spec.workflow.sidecar = Some(SidecarSpec::new("fragments", Lifecycle::DeleteOnExit));
         let run = local::run(&options(&dir, workers), &spec, &decomposition)
             .unwrap_or_else(|error| panic!("{workers} workers: {error}"));
@@ -884,7 +1186,7 @@ fn fragments_written_by_several_worker_processes_are_readable_by_one_merging_rea
 #[test]
 fn a_persistent_sidecar_stream_survives_the_discard_that_removes_a_delete_on_exit_one() {
     let dir = scratch("sidecar-persistent");
-    let (mut spec, decomposition) = prepare(&dir, 1, 30_000);
+    let (mut spec, decomposition) = prepare(&dir, 1, None);
     spec.workflow.sidecar = Some(SidecarSpec::new("keepsake", Lifecycle::Persistent));
     let run = local::run(&options(&dir, 3), &spec, &decomposition).expect("a run");
     assert_eq!(run.status.done, run.status.tasks);
@@ -921,7 +1223,7 @@ fn a_persistent_sidecar_stream_survives_the_discard_that_removes_a_delete_on_exi
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// ------------------------------------------- 6. fragment ops across nodes --
+// ------------------------------------------- 7. fragment ops across nodes --
 //
 // The claim the sidecar store existed for but could not yet demonstrate: **a
 // fragment written by one worker process is read by another, because the plan
@@ -954,7 +1256,7 @@ fn fragment_job(dir: &Path, reach: [usize; 3]) -> (JobSpec, Decomposition) {
         },
     );
     spec.policy = HandoutPolicy::NearestFirst;
-    spec.lease_ms = 30_000;
+    spec.lease = None;
     let summary_phase = pixels_only.n_phases();
     spec.workflow.fragment_phases = vec![
         FragmentPhaseSpec::summary("summary", "fragments", Lifecycle::DeleteOnExit),

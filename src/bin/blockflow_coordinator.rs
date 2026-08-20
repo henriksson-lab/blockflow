@@ -199,6 +199,14 @@ fn go() -> Result<()> {
     if let (Some(path), Some(id)) = (&args.report, &job_id) {
         write_report(&coordinator, id, path)?;
     }
+    // An aborted job is a **failed** job, and the exit status has to say so:
+    // whatever started this — a batch script, an orchestrator — decides what
+    // happens next, and it decides on the status. The report is written first,
+    // so the record of how far the job got survives the failure.
+    if let Some(aborted) = coordinator.aborted() {
+        handle.shutdown();
+        return Err(Error::backend(aborted.message()));
+    }
     if let Some(id) = &job_id {
         let status = coordinator.status(Some(id))?;
         println!(
@@ -238,8 +246,22 @@ fn write_report(coordinator: &Coordinator, id: &str, path: &std::path::Path) -> 
             .into_iter()
             .map(|(task, attempts)| serde_json::json!({"task": task, "attempts": attempts}))
             .collect();
+        let aborted = job.aborted().map(|aborted| {
+            serde_json::json!({
+                "worker": aborted.worker,
+                "why": aborted.why,
+                "message": aborted.message(),
+                "held": aborted.held.iter().map(|claim| serde_json::json!({
+                    "task": claim.task,
+                    "phase": claim.phase,
+                    "index": claim.index,
+                    "held_ms": claim.held.as_millis() as u64,
+                })).collect::<Vec<_>>(),
+            })
+        });
         serde_json::json!({
             "status": status.to_json(),
+            "aborted": aborted,
             "reissued": reissued,
             "unknown_events": job.unknown_events(),
             "coverage_ok": job.check_coverage().is_ok(),

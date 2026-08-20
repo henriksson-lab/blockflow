@@ -1,5 +1,7 @@
 # blockflow
 
+**not yet ready to be used**
+
 This is an **experimental** crate for processing of large scale imaging data.
 Modern microscopes are able to churn out TB-scale datasets, making it impossible
 to load them into memory at once and using old bases. The solution is
@@ -30,6 +32,10 @@ This crate aims to resolve the problem using the following ingredients:
 * OME-Zarr is used to enable distributed computing on chunks of image data
 
 This crate is not yet ready for general consumption.
+
+
+
+**Below are ramblings for the LLM. info might not be accurate**
 
 ## Why it is its own crate
 
@@ -561,14 +567,23 @@ wait
 ```
 
 Not MPI, and the reason is not taste: there is no rank-to-rank transfer here to
-use collectives or RDMA on, so what MPI would add is a C dependency, a static
-rank model that fights a greedy adaptive scheduler, and fault intolerance — one
-rank dies, the job dies.
+use collectives or RDMA on, so what MPI would add is a C dependency and a static
+rank model that fights a greedy adaptive scheduler.
 
 **Pull rather than static assignment**, because a large and data-dependent
 fraction of blocks are empty, so a `block % N` split hands one worker a dense
-region and another a sparse one. Pull also gives fault tolerance for free: a
-claim unhonoured past its lease is reissued.
+region and another a sparse one.
+
+**Nodes do not die** (decided 2026-08-17). The deployment is 10-20 cooperating
+nodes on AWS and SLURM, where losing one is a major event and not a routine one
+— and where a lost node held blocks in memory, so re-running the tasks it had
+*claimed* restores the claim table and not the position. So a claim has **no
+expiry**: it is held until it completes. A worker that goes takes the job with
+it — the run aborts, naming the worker and every task it was holding, and what
+to do next is decided by the batch script or the orchestrator that started it.
+Detection is a signal and not a timeout: whoever launched the worker sees the
+process exit and says so. The reissue machinery is still there, still tested,
+and a job opts in by setting `JobSpec::lease`. See `src/distributed/mod.rs`.
 
 **Handout is locality-biased, not territorial.** Workers are seeded far apart
 and then take the nearest unclaimed task, so they grow compact regions towards
@@ -589,7 +604,8 @@ One command, a coordinator and N workers, **as separate processes**:
 ```
 cargo build --release --features distributed
 blockflow-local --workers 4 --blocks 32 --phases 2
-blockflow-local --workers 3 --kill 0:4 --lease-ms 400   # a worker is killed
+blockflow-local --workers 3 --kill 0:4                  # a worker dies: the job aborts
+blockflow-local --workers 3 --kill 0:4 --lease-ms 400   # opt in: the claims are reissued
 ```
 
 Processes rather than threads, deliberately: real HTTP, real separate caches and
@@ -601,9 +617,11 @@ list that only stays ahead because the "network" was a function call.
 This is how the distribution claims are checked (`tests/local_multi_node.rs`):
 N workers produce byte-identical output to a single-node run over several
 worker counts; the merged event stream satisfies the same
-`check_coverage_and_order` a single-node run is asserted with; a killed worker's
-claims are reissued and the output is still byte-identical; and no worker's work
-list ever runs empty while the coordinator has work.
+`check_coverage_and_order` a single-node run is asserted with; a killed worker
+aborts the job promptly with a message naming it and its claims; the same kill
+under an explicit lease has those claims reissued with the output still
+byte-identical; and no worker's work list ever runs empty while the coordinator
+has work.
 
 ### Finding each other
 

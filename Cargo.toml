@@ -79,6 +79,115 @@ serde_json = "1"
 # consumer who did not ask for one, in exchange for 1.25x.
 rustfft = "6.4.1"
 realfft = "3.5.0"
+# The `fftw` feature only, and the two crates above are **not** conditional on
+# it: with
+# `fftw` on, both backends are compiled and `ops::fft::TransformBackend` selects
+# between them. That is deliberate. A parity test that could only compare the two
+# across two processes would be comparing numbers somebody copied; compiled
+# together, `tests/fft_correlation.rs` measures the agreement between backends in
+# one run, on the fixtures the acceptance bar already uses, and prints it.
+#
+# **`fftw-sys` and not `fftw`.** The safe wrapper cannot express what this crate
+# needs from FFTW. Its `Plan` is `Send` but not `Sync` and its execute methods
+# take `&mut self`, so a plan cannot live behind an `Arc` — and sharing one plan
+# across cloned working sets is exactly what `RealTransform2::clone` promises and
+# what FFTW's own thread-safety rule permits (the new-array execute functions are
+# re-entrant; nothing else in FFTW is). Cloning would have to re-plan instead,
+# putting the one operation FFTW cannot do concurrently inside whatever loop the
+# caller cloned for. The sys crate is also the cheaper half of the same project:
+#
+# | | packages | what it adds |
+# |---|---|---|
+# | `fftw-sys` 0.8, `system` | **31** | `fftw-sys` and `libc` |
+# | `fftw` 0.8, `system` | 41 | those two, plus `fftw`, `bitflags`, `lazy_static`, `thiserror` with its proc-macro chain (`thiserror-impl`, `proc-macro2`, `quote`, `syn`, `unicode-ident`), and **a second `ndarray`** at 0.15.6 |
+#
+# Measured the way the counts above this block are, on two probe crates
+# identical but for that one line, and the `fftw-sys` one comes out at exactly
+# the 31 this crate has with `--features fftw`.
+#
+# `src/ops/fft.rs`'s `fftw_backend` module is the wrapper this needs instead:
+# two plans, one lock, one RAII buffer type, and every `unsafe` block with the
+# invariant it relies on written above it.
+#
+# **`system` and not `source`, and this is the load-bearing flag.** `fftw-sys`
+# defaults to `source`, which downloads and builds FFTW with a C toolchain — a
+# multi-minute first build, and a build script, for a consumer who asked for a
+# feature flag. `default-features = false` with `system` back on has **no build
+# script at all**: it is a `#[link(name = "fftw3")]` against the library the
+# machine already has. `libc` and `fftw-sys` together compile in **2 s**
+# (`--release`, measured on a fresh target directory) because they are bindings
+# and nothing else.
+#
+# The failure mode when there is no `libfftw3` is therefore a **link error at
+# build time**, not a silent fallback to the portable backend. On this toolchain
+# it reads
+#
+# ```text
+# error: linking with `cc` failed: exit status: 1
+#   = note: rust-lld: error: unable to find library -lfftw3
+# ```
+#
+# — demonstrated by linking a `#[link]` name that does not exist rather than by
+# removing the machine's FFTW. That is the right way round: a feature whose whole
+# purpose is to change which library does the arithmetic must not quietly decline
+# to do it. What it costs is that the message names the linker's problem rather
+# than cargo's, which is why it is written down here.
+#
+# **What it is worth, measured on this machine, and the answer is "nothing"**
+# (FFTW 3.3.8, `--release`, one thread, best of 50 on the transform and best of
+# 20 on the landscape, by `the_backends_are_measured_against_each_other` in
+# `tests/fft_correlation.rs`, best over seven repetitions of the whole test):
+#
+# | | `128 x 1350`, the shape the padding rule chooses | `157 x 1335`, the shape before it |
+# |---|---|---|
+# | forward `r2c`, portable | **`0.816 ms`** | **`5.851 ms`** |
+# | forward `r2c`, FFTW | `0.841 ms` | `6.834 ms` |
+# | | **0.97x — FFTW is slower** | **0.86x — FFTW is slower** |
+# | a whole landscape, portable | **`4.097 ms`** | |
+# | a whole landscape, FFTW | `4.262 ms` | |
+# | | **0.96x — FFTW is slower** | |
+#
+# **Read that table before believing any other.** On a loaded machine the same
+# test put the first row at `1.02 ms` against `0.87 ms` — a `1.17x` win for FFTW —
+# which is where the `1.25x` this decision was first argued from came from. It is
+# contention, not throughput: with the machine quiet the portable path drops to
+# `0.816 ms` and FFTW does not follow, and it is *consistently* a few percent
+# behind across every repetition rather than ahead on some.
+#
+# **Why the library that is faster loses anyway.** FFTW's raw two-dimensional
+# `r2c` really is quicker — about `0.72 ms` of the `0.841 ms` above. The rest is a
+# copy, and it is not an implementation detail that could be tidied away: a plan
+# may only be executed against buffers of the alignment it was planned with, so
+# the half-spectrum has to move between the caller's `ndarray` and an
+# `fftw_alloc` buffer at `0.118 ms` a time, three times per landscape (two
+# forwards and an inverse). A backend that owned the caller's spectrum would keep
+# that `1.13x`; `Spectrum` is a public `ndarray` type, and the alternative —
+# checking the caller's alignment and executing in place when it happens to match
+# — would make the answer depend on where malloc put a buffer, which is precisely
+# the determinism `a_cloned_plan_computes_the_same_answer_from_another_thread`
+# asserts.
+#
+# So the ceiling on this feature, if that copy were ever removed, is about `1.1x`
+# on a transform — against the `5.9x` that choosing the padded length well is
+# worth on the same transform and the `6.4x` that threads over plane pairs are
+# worth, neither of which it changes. **As it stands the feature is a small loss
+# at every geometry measured, and the recommendation that ships with it is to
+# leave it off.**
+#
+# `FFTW_MEASURE` does not change that: it costs `0.45-0.87 s` of planning and
+# bought `0-1%` here, and it would also make two clones of one plan disagree in
+# the last place, which the bit-identity test above asserts they do not.
+# `FFTW_ESTIMATE` it is — and even that plans a `128 x 1350` transform in
+# `11-13 ms` against `rustfft`'s `2.2 ms`, so the one thing the FFTW backend is
+# reliably worse at is the thing this API is shaped to do once.
+#
+# Licensing is **not** a criterion, and the paragraph above already settled that
+# when FFTW was declined as the default. FFTW being GPL-2.0-or-later against this
+# crate's MIT is a fact a consumer who turns the feature on has decided about; it
+# is not the reason the flag is off, and the row above is.
+fftw-sys = { version = "0.8", optional = true, default-features = false, features = [
+    "system",
+] }
 # The `gui` feature only. A blocking HTTP server on ordinary threads: four small
 # transitive crates and no async runtime, for four JSON endpoints and a static
 # directory. See `src/gui/server.rs` for why not axum.
@@ -138,6 +247,20 @@ gui = ["dep:tiny_http"]
 # only its filesystem store is asked for, not blosc, zstd, sharding, transpose,
 # crc32c or its own (different, second) `ndarray`.
 zarr = ["dep:zarrs"]
+# `ops::fft` on the system's FFTW 3 instead of `rustfft` + `realfft`. Off by
+# default, and off is the configuration everything else is measured against: with
+# `fftw` disabled the package graph is **29**, exactly what it was before this
+# feature existed, no build script appears, and every transform in the crate is
+# the pure-Rust one. On, the graph is **31** and both backends are compiled, so
+# `ops::fft::TransformBackend` — and the parity tests — can name either.
+#
+# It is a feature and not a swap because on this machine it is **slower at every
+# geometry measured** — `0.97x` on the forward transform at the padded shape,
+# `0.86x` at the shape before the padding rule, `0.96x` on a whole landscape — in
+# exchange for a C library, a link-time dependency on `libfftw3` and a GPL
+# transitive obligation. The dependency block above has the measurements, why the
+# faster library still loses, and the failure mode when `libfftw3` is missing.
+fftw = ["dep:fftw-sys"]
 # The distribution **server** and the three binaries. Deliberately narrow: the
 # protocol, the coordinator's whole state machine, the handout policy, the cache
 # model, the rendezvous backends, the HTTP client and the worker loop compile and

@@ -12,6 +12,7 @@
 // | item | what it is |
 // |---|---|
 // | [`RealTransform2`] | the transform: a real `rows x cols` plane to a half-spectrum and back, with the plans built once and reused |
+// | [`TransformBackend`] | which library does that transform. One variant by default; the `fftw` feature adds a second and this file's last section says what it is worth |
 // | [`Correlation2`] | `C(k) = sum_x a[x] b[x-k]` over a window of integer lags, through the correlation theorem |
 // | [`SquaredDifference`] | the landscape this was built for: a mean squared difference between two planes at every lag, normalised by the overlapping element count |
 // | [`correlate_direct`], [`squared_difference_direct`] | the same two answers computed by walking every lag. The oracle, and the reason the two above can be trusted |
@@ -122,6 +123,26 @@
 // is what a search over a bounded displacement does, gives very much less: two
 // `1304`-long extents with lags in `[-30, 30]` need `1334`, not `2607`.
 //
+// **The two constraints are one-sided, so where the window *sits* matters as much
+// as how wide it is — and an off-centre window is the normal case, not the odd
+// one.** `A - lo` is bound by the bottom of the window and `B + hi` by its top,
+// and neither is a function of the width alone. Two windows of width `61` over
+// two `96`-long extents:
+//
+// | window | `max(A, B, A - lo, B + hi)` | [`Padding::Smooth`] |
+// |---|---|---|
+// | `[-30, 30]`, centred | `126` | `128` |
+// | `[0, 60]`, off-centre | **`156`** | **`160`** |
+//
+// The worked example below is the centred one because it is easier to read, and
+// this table is here so that nobody mistakes it for the general shape. The first
+// consumer of this module has an off-centre row window of exactly `[0, 60]` — its
+// two cuts sit `30` apart in global coordinates, so the lags it wants are all
+// non-negative — and pads to `160 x 1350` rather than `128 x 1350`. Exploiting
+// that is the whole value of this rule over the sum-of-extents one: a rule that
+// only knew the width would have to assume the worst side and pad to `160`
+// either way.
+//
 // **And any longer length is also correct**, which is what makes
 // [`Padding::Smooth`] free. Rounding each axis up to the next `5`-smooth integer
 // — `2^a 3^b 5^c`, the sizes a mixed-radix transform has dedicated kernels for —
@@ -223,10 +244,69 @@
 // relative for centred data and `7.1e-12` for the same data with a mean of `50`
 // added, which is the whole of the difference this paragraph is about.
 //
+// The backend, and the feature that swaps it
+// -------------------------------------------
+// Everything above is arithmetic this file owns. The one thing it does not own
+// is the transform itself, and there is a [`TransformBackend`] for that:
+// [`TransformBackend::Portable`] is `rustfft` + `realfft` and is always
+// compiled, and the crate's optional `fftw` feature adds
+// [`TransformBackend::Fftw`], the system's FFTW 3, and makes *it* the default.
+// [`RealTransform2::with_backend`], [`Correlation2::with_backend`] and
+// [`SquaredDifference::with_backend`] name one explicitly; everything else takes
+// [`TransformBackend::default`].
+//
+// **With the feature off there is one variant and nothing else changes**: the
+// package graph is the same 29, no build script appears, and
+// `tests/fft_correlation.rs` prints the same agreement figures to the last
+// digit. With it on, **both** backends are compiled, which is what lets that
+// file measure the agreement *between* them in one process rather than across
+// two runs of it.
+//
+// **What the second backend is worth, and it is worth nothing here.** Same
+// protocol as the tables above — `--release`, one thread, best of 50 forward,
+// best of 20 landscape, `the_backends_are_measured_against_each_other`, best
+// over seven repetitions:
+//
+// | | forward `128 x 1350` | forward `157 x 1335` | a whole landscape |
+// |---|---|---|---|
+// | portable | **`0.816 ms`** | **`5.851 ms`** | **`4.097 ms`** |
+// | FFTW | `0.841 ms` | `6.834 ms` | `4.262 ms` |
+// | | 0.97x | 0.86x | **0.96x** |
+//
+// **FFTW is behind at every geometry measured**, including the one it was
+// expected to win. On a *loaded* machine the first column reads `1.02 ms`
+// against `0.87 ms` and FFTW looks `1.17x` ahead, which is what the earlier
+// estimate of this was built on; with the machine quiet the portable path drops
+// to `0.816 ms` and FFTW does not follow. Ratios taken while eight other builds
+// are running are not ratios.
+//
+// The reason the faster library loses is in `Cargo.toml` and it is structural:
+// an FFTW plan may only be executed against buffers of the alignment it was
+// planned with, so the half-spectrum is copied between the caller's [`Spectrum`]
+// and an `fftw_alloc` buffer three times per landscape at `0.118 ms` each —
+// `0.72 ms` of raw transform plus `0.118 ms` of copy is the `0.841 ms` above.
+//
+// Set against the `5.9x` that choosing the padded length well is worth and the
+// `6.4x` that threads over plane pairs are worth — both of which the FFTW
+// backend keeps and neither of which it improves — **this feature does not earn
+// its place, and the recommendation that ships with it is to leave it off.** It
+// is here, properly tested, for a consumer who measures their own geometry and
+// finds otherwise; the measurement is one `cargo test` away, and it is the same
+// test either way.
+//
+// Two things that do **not** change with the backend, because they were settled
+// on evidence that has nothing to do with the library. The padding rule is one:
+// `N >= max(A, B, A - lo, B + hi)` rounded up to a 5-smooth length, whichever
+// transform runs. `f64` is the other — the `f32` round trip is `3.0e-7` against
+// `f64`'s `8.9e-16`, five orders above the acceptance bar, and FFTW having a
+// single-precision half is not a reason to revisit a decision that was never
+// about speed.
+//
 // The dependency
 // --------------
 // `rustfft` and `realfft`, and `Cargo.toml` records what was measured against
-// what before they were chosen.
+// what before they were chosen — including FFTW, which is where the `fftw`
+// feature's `fftw-sys` line and its `system`-not-`source` flag are argued.
 
 use std::sync::Arc;
 
@@ -302,6 +382,67 @@ pub fn next_smooth_length(least: usize) -> usize {
 /// `1.16 ms`, `32` lanes `1.26 ms`.
 const LANE_BLOCK: usize = 8;
 
+/// Which arithmetic a [`RealTransform2`] runs.
+///
+/// [`Portable`](Self::Portable) is `rustfft` and `realfft`, is always compiled,
+/// and is what every number in this module's header was measured against.
+/// [`Fftw`](Self::Fftw) exists only when the crate's `fftw` feature is on, links
+/// the system's FFTW 3, and is [`Default`] when it is on — swapping the default
+/// is the whole of what the feature does.
+///
+/// **The enum has one variant in the default build**, and that is the point
+/// rather than an oversight to be tidied away: it lets a test say "run this bar
+/// over every backend this build has" and get exactly the old behaviour when
+/// there is only one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransformBackend {
+    /// `rustfft` and `realfft`: pure Rust, no C toolchain, no build script.
+    Portable,
+    /// The system's FFTW 3. The `fftw` feature only.
+    #[cfg(feature = "fftw")]
+    Fftw,
+}
+
+#[cfg(not(feature = "fftw"))]
+impl Default for TransformBackend {
+    fn default() -> Self {
+        Self::Portable
+    }
+}
+
+#[cfg(feature = "fftw")]
+impl Default for TransformBackend {
+    fn default() -> Self {
+        Self::Fftw
+    }
+}
+
+impl TransformBackend {
+    /// Every backend this build has, portable first and in a stable order.
+    ///
+    /// A test that runs its bar over this runs it over one backend by default
+    /// and over both with the feature on, without naming either.
+    #[cfg(not(feature = "fftw"))]
+    pub fn available() -> &'static [TransformBackend] {
+        &[TransformBackend::Portable]
+    }
+
+    /// Every backend this build has, portable first and in a stable order.
+    #[cfg(feature = "fftw")]
+    pub fn available() -> &'static [TransformBackend] {
+        &[TransformBackend::Portable, TransformBackend::Fftw]
+    }
+
+    /// A short name for a message or a printed table.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Portable => "portable",
+            #[cfg(feature = "fftw")]
+            Self::Fftw => "fftw",
+        }
+    }
+}
+
 /// A two-dimensional real-input discrete Fourier transform of a fixed shape,
 /// with its plans and its scratch built once.
 ///
@@ -311,9 +452,30 @@ const LANE_BLOCK: usize = 8;
 /// `Arc` and allocates fresh scratch, which is what makes one plan usable from
 /// several threads.
 ///
+/// Which arithmetic runs underneath is a [`TransformBackend`]; the shape checks,
+/// the padding rule and the normalisation are this type's and are the same
+/// whichever one it is.
+///
 /// See this module's header for the normalisation convention: **the forward
 /// direction is unnormalised and the inverse carries `1/N`**.
 pub struct RealTransform2 {
+    inner: Inner,
+}
+
+/// The transform itself, one variant per backend this build has.
+#[derive(Clone)]
+enum Inner {
+    Portable(Portable),
+    #[cfg(feature = "fftw")]
+    Fftw(fftw_backend::Transform),
+}
+
+/// The pure-Rust transform: `realfft` along each row, then `rustfft` along the
+/// first axis a block of lanes at a time.
+///
+/// Every argument here has already been checked by [`RealTransform2`], which is
+/// where the shape errors live and where they stay whatever the backend.
+struct Portable {
     rows: usize,
     cols: usize,
     row_forward: Arc<dyn RealToComplex<f64>>,
@@ -327,7 +489,7 @@ pub struct RealTransform2 {
     real_row: Vec<f64>,
 }
 
-impl Clone for RealTransform2 {
+impl Clone for Portable {
     /// Shares the plans and allocates fresh scratch, so a clone is a second
     /// working set over one set of twiddles rather than a second planning pass.
     fn clone(&self) -> Self {
@@ -347,59 +509,78 @@ impl Clone for RealTransform2 {
     }
 }
 
+impl Clone for RealTransform2 {
+    /// Shares the plans and allocates fresh scratch, whichever backend it is.
+    ///
+    /// For the FFTW backend that is load-bearing rather than merely thrifty:
+    /// FFTW's planner is not thread-safe, and a clone that re-planned would put
+    /// a plan creation inside whatever loop the caller cloned for.
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 impl std::fmt::Debug for RealTransform2 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RealTransform2")
-            .field("shape", &[self.rows, self.cols])
+            .field("shape", &self.shape())
+            .field("backend", &self.backend())
             .finish_non_exhaustive()
     }
 }
 
 impl RealTransform2 {
-    /// Plan a transform of `shape`. Both extents must be non-zero.
+    /// Plan a transform of `shape` on the default backend. Both extents must be
+    /// non-zero.
     pub fn new(shape: [usize; 2]) -> Result<Self> {
+        Self::with_backend(shape, TransformBackend::default())
+    }
+
+    /// Plan a transform of `shape` on a named backend.
+    ///
+    /// [`Self::new`] is this with [`TransformBackend::default`]. A caller that
+    /// wants a particular backend whatever the build's features are — a test
+    /// comparing the two, most obviously — says so here.
+    pub fn with_backend(shape: [usize; 2], backend: TransformBackend) -> Result<Self> {
         let [rows, cols] = shape;
         if rows == 0 || cols == 0 {
             return Err(Error::invalid(format!(
                 "a transform needs a non-empty shape, got {rows} x {cols}"
             )));
         }
-        let mut real = RealFftPlanner::<f64>::new();
-        let row_forward = real.plan_fft_forward(cols);
-        let row_inverse = real.plan_fft_inverse(cols);
-        let mut complex = FftPlanner::<f64>::new();
-        let column_forward = complex.plan_fft_forward(rows);
-        let column_inverse = complex.plan_fft_inverse(rows);
-        let column_scratch = vec![
-            Complex::new(0.0, 0.0);
-            column_forward
-                .get_inplace_scratch_len()
-                .max(column_inverse.get_inplace_scratch_len())
-        ];
-        Ok(Self {
-            rows,
-            cols,
-            row_forward_scratch: vec![Complex::new(0.0, 0.0); row_forward.get_scratch_len()],
-            row_inverse_scratch: vec![Complex::new(0.0, 0.0); row_inverse.get_scratch_len()],
-            column_scratch,
-            lanes: vec![Complex::new(0.0, 0.0); rows * LANE_BLOCK],
-            real_row: vec![0.0; cols],
-            row_forward,
-            row_inverse,
-            column_forward,
-            column_inverse,
-        })
+        let inner = match backend {
+            TransformBackend::Portable => Inner::Portable(Portable::new(rows, cols)),
+            #[cfg(feature = "fftw")]
+            TransformBackend::Fftw => Inner::Fftw(fftw_backend::Transform::new(rows, cols)?),
+        };
+        Ok(Self { inner })
+    }
+
+    /// Which backend this plan runs on.
+    pub fn backend(&self) -> TransformBackend {
+        match &self.inner {
+            Inner::Portable(_) => TransformBackend::Portable,
+            #[cfg(feature = "fftw")]
+            Inner::Fftw(_) => TransformBackend::Fftw,
+        }
     }
 
     /// The shape of the real plane this transforms.
     pub fn shape(&self) -> [usize; 2] {
-        [self.rows, self.cols]
+        match &self.inner {
+            Inner::Portable(portable) => [portable.rows, portable.cols],
+            #[cfg(feature = "fftw")]
+            Inner::Fftw(fftw) => fftw.shape(),
+        }
     }
 
     /// The shape of the half-spectrum: `[rows, cols / 2 + 1]`.
     pub fn spectrum_shape(&self) -> [usize; 2] {
-        [self.rows, spectrum_width(self.cols)]
+        let [rows, cols] = self.shape();
+        [rows, spectrum_width(cols)]
     }
 
     /// A zeroed spectrum of the right shape, for a caller that wants to allocate
@@ -411,9 +592,10 @@ impl RealTransform2 {
 
     /// Forward transform. `input` must be exactly [`Self::shape`].
     pub fn forward(&mut self, input: ArrayView2<f64>, out: &mut Spectrum) -> Result<()> {
-        if input.dim() != (self.rows, self.cols) {
+        let [rows, cols] = self.shape();
+        if input.dim() != (rows, cols) {
             return Err(Error::ShapeMismatch {
-                expected: vec![self.rows, self.cols],
+                expected: vec![rows, cols],
                 got: vec![input.dim().0, input.dim().1],
             });
         }
@@ -432,20 +614,104 @@ impl RealTransform2 {
         input: ArrayView2<f64>,
         out: &mut Spectrum,
     ) -> Result<()> {
+        let [rows, cols] = self.shape();
         let (input_rows, input_cols) = input.dim();
-        if input_rows > self.rows || input_cols > self.cols {
+        if input_rows > rows || input_cols > cols {
             return Err(Error::invalid(format!(
-                "an input of {input_rows} x {input_cols} does not fit a {} x {} transform",
-                self.rows, self.cols
+                "an input of {input_rows} x {input_cols} does not fit a {rows} x {cols} transform"
             )));
         }
-        let width = spectrum_width(self.cols);
-        if out.dim() != (self.rows, width) {
+        let width = spectrum_width(cols);
+        if out.dim() != (rows, width) {
             return Err(Error::ShapeMismatch {
-                expected: vec![self.rows, width],
+                expected: vec![rows, width],
                 got: vec![out.dim().0, out.dim().1],
             });
         }
+        let data = out
+            .as_slice_mut()
+            .ok_or_else(|| Error::invalid("the spectrum must be contiguous and row-major"))?;
+        match &mut self.inner {
+            Inner::Portable(portable) => portable.forward_zero_padded(input, data),
+            #[cfg(feature = "fftw")]
+            Inner::Fftw(fftw) => fftw.forward_zero_padded(input, data),
+        }
+    }
+
+    /// Inverse transform, carrying the `1/N` this convention puts on this side.
+    ///
+    /// `spectrum` is **not preserved**: what it holds afterwards is unspecified
+    /// and differs between backends — the portable one transforms it in place
+    /// along the first axis and consumes it row by row, and FFTW's
+    /// complex-to-real transform destroys a copy of it instead. That is stated
+    /// rather than hidden behind a copy on the portable side, because the caller
+    /// almost always has no further use for it and a copy of a spectrum is not
+    /// free.
+    pub fn inverse(&mut self, spectrum: &mut Spectrum, out: &mut Array2<f64>) -> Result<()> {
+        let [rows, cols] = self.shape();
+        let width = spectrum_width(cols);
+        if spectrum.dim() != (rows, width) {
+            return Err(Error::ShapeMismatch {
+                expected: vec![rows, width],
+                got: vec![spectrum.dim().0, spectrum.dim().1],
+            });
+        }
+        if out.dim() != (rows, cols) {
+            return Err(Error::ShapeMismatch {
+                expected: vec![rows, cols],
+                got: vec![out.dim().0, out.dim().1],
+            });
+        }
+        let data = spectrum
+            .as_slice_mut()
+            .ok_or_else(|| Error::invalid("the spectrum must be contiguous and row-major"))?;
+        match &mut self.inner {
+            Inner::Portable(portable) => portable.inverse(data, out),
+            #[cfg(feature = "fftw")]
+            Inner::Fftw(fftw) => fftw.inverse(data, out),
+        }
+    }
+}
+
+impl Portable {
+    /// Plan a transform of `rows x cols`, both already known to be non-zero.
+    fn new(rows: usize, cols: usize) -> Self {
+        let mut real = RealFftPlanner::<f64>::new();
+        let row_forward = real.plan_fft_forward(cols);
+        let row_inverse = real.plan_fft_inverse(cols);
+        let mut complex = FftPlanner::<f64>::new();
+        let column_forward = complex.plan_fft_forward(rows);
+        let column_inverse = complex.plan_fft_inverse(rows);
+        let column_scratch = vec![
+            Complex::new(0.0, 0.0);
+            column_forward
+                .get_inplace_scratch_len()
+                .max(column_inverse.get_inplace_scratch_len())
+        ];
+        Self {
+            rows,
+            cols,
+            row_forward_scratch: vec![Complex::new(0.0, 0.0); row_forward.get_scratch_len()],
+            row_inverse_scratch: vec![Complex::new(0.0, 0.0); row_inverse.get_scratch_len()],
+            column_scratch,
+            lanes: vec![Complex::new(0.0, 0.0); rows * LANE_BLOCK],
+            real_row: vec![0.0; cols],
+            row_forward,
+            row_inverse,
+            column_forward,
+            column_inverse,
+        }
+    }
+
+    /// Forward transform of `input` placed at the origin of a zeroed plane, into
+    /// the contiguous `rows x (cols / 2 + 1)` spectrum `data`.
+    fn forward_zero_padded(
+        &mut self,
+        input: ArrayView2<f64>,
+        data: &mut [Complex<f64>],
+    ) -> Result<()> {
+        let (input_rows, input_cols) = input.dim();
+        let width = spectrum_width(self.cols);
         let Self {
             row_forward,
             row_forward_scratch,
@@ -456,9 +722,6 @@ impl RealTransform2 {
             rows,
             ..
         } = self;
-        let data = out
-            .as_slice_mut()
-            .ok_or_else(|| Error::invalid("the spectrum must be contiguous and row-major"))?;
         for row in 0..*rows {
             if row < input_rows {
                 let source = input.row(row);
@@ -481,26 +744,11 @@ impl RealTransform2 {
         Ok(())
     }
 
-    /// Inverse transform, carrying the `1/N` this convention puts on this side.
-    ///
-    /// `spectrum` is **clobbered**: it is transformed in place along the first
-    /// axis and then consumed row by row. That is stated rather than hidden
-    /// behind a copy, because the caller almost always has no further use for it
-    /// and a copy of a spectrum is not free.
-    pub fn inverse(&mut self, spectrum: &mut Spectrum, out: &mut Array2<f64>) -> Result<()> {
+    /// Inverse transform of the contiguous spectrum `data`, carrying the `1/N`
+    /// this convention puts on this side. `data` is transformed in place along
+    /// the first axis and then consumed row by row.
+    fn inverse(&mut self, data: &mut [Complex<f64>], out: &mut Array2<f64>) -> Result<()> {
         let width = spectrum_width(self.cols);
-        if spectrum.dim() != (self.rows, width) {
-            return Err(Error::ShapeMismatch {
-                expected: vec![self.rows, width],
-                got: vec![spectrum.dim().0, spectrum.dim().1],
-            });
-        }
-        if out.dim() != (self.rows, self.cols) {
-            return Err(Error::ShapeMismatch {
-                expected: vec![self.rows, self.cols],
-                got: vec![out.dim().0, out.dim().1],
-            });
-        }
         let Self {
             row_inverse,
             row_inverse_scratch,
@@ -512,9 +760,6 @@ impl RealTransform2 {
             cols,
             ..
         } = self;
-        let data = spectrum
-            .as_slice_mut()
-            .ok_or_else(|| Error::invalid("the spectrum must be contiguous and row-major"))?;
         transform_lanes(data, *rows, width, &**column_inverse, lanes, column_scratch);
         let scale = 1.0 / (*rows as f64 * *cols as f64);
         let even = *cols % 2 == 0;
@@ -571,6 +816,408 @@ fn transform_lanes(
             }
         }
         base += width;
+    }
+}
+
+// -------------------------------------------------------- the other backend --
+
+/// The `fftw` feature's transform: the system's FFTW 3 through `fftw-sys`.
+///
+/// **What is different from the portable path, and why.** FFTW plans a whole
+/// two-dimensional transform at once, so this is one `r2c` plan and one `c2r`
+/// plan rather than a row pass and a hand-blocked lane pass. That is FFTW's own
+/// shape and the fair way to ask it for a number; a transcription of the
+/// two-pass structure onto FFTW would be measuring this file's loop rather than
+/// the library.
+///
+/// **Three hazards, each handled here rather than hoped about.**
+///
+/// 1. **The planner is not thread-safe.** FFTW documents *the new-array execute
+///    functions* as the only re-entrant entry points it has. Plan creation, plan
+///    destruction and `fftw_malloc`/`fftw_free` all touch global state, so every
+///    one of them in this module goes through [`planner`], a process-wide lock,
+///    and the execute calls — the only ones in the hot path — go through nothing
+///    at all. A shared plan executed from several threads at once is exactly
+///    what FFTW says is allowed, and it is what [`Transform::clone`] produces.
+/// 2. **New-array execute requires the same alignment.** A plan records the
+///    alignment of the arrays it was made with and is only valid for arrays that
+///    match; hand it something else and the answer is wrong rather than refused.
+///    Every buffer here comes from `fftw_alloc_*`, so they all agree by
+///    construction — and [`Plans::check`] asserts it anyway, because a silent
+///    wrong answer is the one failure mode this whole module must not have.
+/// 3. **`FFTW_MEASURE` would break determinism.** It picks an algorithm by
+///    timing, so two clones of one plan could disagree in the last place and
+///    `a_cloned_plan_computes_the_same_answer_from_another_thread` — which
+///    asserts bit-identity — would become flaky. `FFTW_ESTIMATE` is also what the
+///    measurements say to use: 0.4-1.1 s of planning for 0-25%, and this crate's
+///    parallelism is one plan shared by every thread, so that cost is paid once
+///    and cannot be amortised away.
+///
+/// FFTW's own threading (`fftw_plan_with_nthreads`) is deliberately not used:
+/// the consumer's parallelism is across plane pairs, and a parallel transform
+/// would take the same cores and win less. That is the same argument this
+/// module's header makes for the portable backend, and it does not change with
+/// the library.
+#[cfg(feature = "fftw")]
+mod fftw_backend {
+    use std::ffi::c_void;
+    use std::os::raw::c_int;
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    use fftw_sys as ffi;
+    use ndarray::{Array2, ArrayView2};
+
+    use super::{spectrum_width, Complex};
+    use crate::error::{Error, Result};
+
+    /// The planning flag, and see this module's header for why it is this one.
+    const FLAGS: u32 = ffi::FFTW_ESTIMATE;
+
+    /// The lock every FFTW call that is **not** an execute goes through.
+    ///
+    /// Process-wide, because what it guards is FFTW's process-wide state — its
+    /// planner, its wisdom and its allocator — rather than anything this crate
+    /// owns. Poisoning is recovered from rather than propagated: the data behind
+    /// the lock is `()`, the only panic that can happen under it is an allocation
+    /// failure that leaves FFTW's state exactly as it found it, and a poisoned
+    /// lock would otherwise mean one such panic stops this process from planning
+    /// a transform ever again.
+    fn planner() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A buffer from `fftw_alloc_*`: SIMD-aligned, and owned.
+    ///
+    /// Not a `Vec`, and the reason is hazard 2 in this module's header rather
+    /// than a preference: FFTW's alignment classes come from its own allocator,
+    /// and a `Vec`'s eight-byte alignment is not one a plan made with
+    /// `fftw_alloc_*` memory may be executed against.
+    struct Aligned<T> {
+        data: *mut T,
+        len: usize,
+    }
+
+    // SAFETY: an `Aligned` owns its allocation exclusively — it is created from
+    // a fresh `fftw_alloc_*`, never cloned, never handed out except through
+    // `&self`/`&mut self`, and freed exactly once in `Drop`. That makes moving
+    // one to another thread no more sharing than moving a `Vec` is.
+    unsafe impl<T: Send> Send for Aligned<T> {}
+
+    // SAFETY: shared access to an `Aligned` gives out `&[T]` and nothing else, so
+    // two threads holding one can only read. This is not tidiness: the portable
+    // backend's plans are `Send + Sync`, and a feature that quietly took `Sync`
+    // off `RealTransform2` would be changing the public API rather than the
+    // transform behind it. `the_plans_are_send_and_sync_whichever_backend_they_
+    // are_on` is where that is held to.
+    unsafe impl<T: Sync> Sync for Aligned<T> {}
+
+    impl Aligned<f64> {
+        fn real(len: usize) -> Self {
+            let _guard = planner();
+            // SAFETY: `fftw_alloc_real` is malloc with an alignment guarantee;
+            // `len` is non-zero because a transform of a non-empty shape is.
+            let data = unsafe { ffi::fftw_alloc_real(len) };
+            assert!(!data.is_null(), "fftw_alloc_real({len}) failed");
+            // SAFETY: `data` owns `len` freshly allocated `f64`s, and every
+            // slice handed out below promises they are initialised.
+            unsafe { std::ptr::write_bytes(data, 0, len) };
+            Self { data, len }
+        }
+    }
+
+    impl Aligned<Complex<f64>> {
+        fn complex(len: usize) -> Self {
+            let _guard = planner();
+            // SAFETY: as above. `fftw_complex` is `double[2]`, which is the
+            // layout of `num_complex::Complex<f64>` — a `#[repr(C)]` pair of
+            // `f64` — so one allocation serves both names for it. The cast is
+            // written out rather than relying on the two crates resolving to the
+            // same `num-complex`.
+            let data = unsafe { ffi::fftw_alloc_complex(len) }.cast::<Complex<f64>>();
+            assert!(!data.is_null(), "fftw_alloc_complex({len}) failed");
+            // SAFETY: as above.
+            unsafe { std::ptr::write_bytes(data, 0, len) };
+            Self { data, len }
+        }
+    }
+
+    impl<T> Aligned<T> {
+        fn as_slice(&self) -> &[T] {
+            // SAFETY: `data` points at `len` initialised, owned elements.
+            unsafe { std::slice::from_raw_parts(self.data, self.len) }
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [T] {
+            // SAFETY: as above, and `&mut self` makes the borrow exclusive.
+            unsafe { std::slice::from_raw_parts_mut(self.data, self.len) }
+        }
+    }
+
+    impl<T> Drop for Aligned<T> {
+        fn drop(&mut self) {
+            let _guard = planner();
+            // SAFETY: `data` came from `fftw_alloc_*` and is freed once.
+            unsafe { ffi::fftw_free(self.data.cast::<c_void>()) };
+        }
+    }
+
+    /// The two plans, and the alignment they were made against.
+    struct Plans {
+        forward: ffi::fftw_plan,
+        inverse: ffi::fftw_plan,
+        real_alignment: c_int,
+        spectrum_alignment: c_int,
+    }
+
+    // SAFETY: the pointers are FFTW plans, and after creation nothing in this
+    // module writes through them. The only calls that touch them outside the
+    // `planner` lock are `fftw_execute_dft_r2c` and `fftw_execute_dft_c2r`,
+    // which FFTW documents as thread-safe on a shared plan — that is the whole
+    // reason a plan can be behind an `Arc` here. Creation and destruction take
+    // the lock, and destruction happens once, when the last `Arc` goes.
+    unsafe impl Send for Plans {}
+    unsafe impl Sync for Plans {}
+
+    impl Plans {
+        fn new(
+            rows: usize,
+            cols: usize,
+            real: &mut Aligned<f64>,
+            spectrum: &mut Aligned<Complex<f64>>,
+        ) -> Result<Self> {
+            let extent = |value: usize| {
+                c_int::try_from(value).map_err(|_| {
+                    Error::invalid(format!("an extent of {value} is beyond what FFTW can plan"))
+                })
+            };
+            let (rows_c, cols_c) = (extent(rows)?, extent(cols)?);
+            let _guard = planner();
+            // SAFETY: both buffers are the sizes the two-dimensional real
+            // transform of `rows x cols` needs — `rows * cols` reals and
+            // `rows * (cols / 2 + 1)` complexes — and the lock makes this the
+            // only planning in flight. `FFTW_ESTIMATE` does not touch either
+            // array, so their contents survive.
+            let (forward, inverse) = unsafe {
+                (
+                    ffi::fftw_plan_dft_r2c_2d(
+                        rows_c,
+                        cols_c,
+                        real.data,
+                        spectrum.data.cast::<ffi::fftw_complex>(),
+                        FLAGS,
+                    ),
+                    ffi::fftw_plan_dft_c2r_2d(
+                        rows_c,
+                        cols_c,
+                        spectrum.data.cast::<ffi::fftw_complex>(),
+                        real.data,
+                        FLAGS,
+                    ),
+                )
+            };
+            if forward.is_null() || inverse.is_null() {
+                // SAFETY: each pointer is either null or a plan this call made,
+                // and the lock is still held.
+                unsafe {
+                    if !forward.is_null() {
+                        ffi::fftw_destroy_plan(forward);
+                    }
+                    if !inverse.is_null() {
+                        ffi::fftw_destroy_plan(inverse);
+                    }
+                }
+                return Err(Error::invalid(format!(
+                    "FFTW could not plan a {rows} x {cols} real transform"
+                )));
+            }
+            // SAFETY: both pointers are live allocations; `fftw_alignment_of`
+            // only reads the address.
+            let (real_alignment, spectrum_alignment) = unsafe {
+                (
+                    ffi::fftw_alignment_of(real.data),
+                    ffi::fftw_alignment_of(spectrum.data.cast::<f64>()),
+                )
+            };
+            Ok(Self {
+                forward,
+                inverse,
+                real_alignment,
+                spectrum_alignment,
+            })
+        }
+
+        /// Hazard 2, asserted: a plan may only be executed against arrays whose
+        /// alignment matches the ones it was planned with.
+        ///
+        /// Every buffer here comes from `fftw_alloc_*` so this holds by
+        /// construction, which is exactly why it is worth checking — a
+        /// construction that quietly stopped holding would produce wrong
+        /// numbers, not a crash.
+        fn check(&self, real: &Aligned<f64>, spectrum: &Aligned<Complex<f64>>) {
+            let (real_alignment, spectrum_alignment) = {
+                let _guard = planner();
+                // SAFETY: both pointers are live allocations and only their
+                // addresses are read. Under the lock like every other FFTW call
+                // that is not an execute, so the rule this module states about
+                // which calls are serialised has no exceptions to remember.
+                unsafe {
+                    (
+                        ffi::fftw_alignment_of(real.data),
+                        ffi::fftw_alignment_of(spectrum.data.cast::<f64>()),
+                    )
+                }
+            };
+            assert_eq!(
+                real_alignment, self.real_alignment,
+                "an FFTW plan may only be executed against arrays of the alignment \
+                 it was planned with, and this working set's real buffer is not"
+            );
+            assert_eq!(
+                spectrum_alignment, self.spectrum_alignment,
+                "an FFTW plan may only be executed against arrays of the alignment \
+                 it was planned with, and this working set's spectrum is not"
+            );
+        }
+    }
+
+    impl Drop for Plans {
+        fn drop(&mut self) {
+            let _guard = planner();
+            // SAFETY: both plans were made by `Plans::new`, this runs once when
+            // the last `Arc` goes, and the lock excludes any other FFTW call
+            // that is not an execute.
+            unsafe {
+                ffi::fftw_destroy_plan(self.forward);
+                ffi::fftw_destroy_plan(self.inverse);
+            }
+        }
+    }
+
+    /// One working set over a shared pair of plans.
+    pub(super) struct Transform {
+        rows: usize,
+        cols: usize,
+        plans: Arc<Plans>,
+        real: Aligned<f64>,
+        spectrum: Aligned<Complex<f64>>,
+    }
+
+    impl Clone for Transform {
+        /// The same bargain the portable backend's clone makes: share the plans,
+        /// allocate a fresh working set. Here it is also what keeps plan
+        /// creation — the part FFTW cannot do from two threads at once — out of
+        /// whatever loop the caller cloned for.
+        fn clone(&self) -> Self {
+            let real = Aligned::real(self.rows * self.cols);
+            let spectrum = Aligned::complex(self.rows * spectrum_width(self.cols));
+            self.plans.check(&real, &spectrum);
+            Self {
+                rows: self.rows,
+                cols: self.cols,
+                plans: Arc::clone(&self.plans),
+                real,
+                spectrum,
+            }
+        }
+    }
+
+    impl Transform {
+        pub(super) fn new(rows: usize, cols: usize) -> Result<Self> {
+            let mut real = Aligned::real(rows * cols);
+            let mut spectrum = Aligned::complex(rows * spectrum_width(cols));
+            let plans = Plans::new(rows, cols, &mut real, &mut spectrum)?;
+            Ok(Self {
+                rows,
+                cols,
+                plans: Arc::new(plans),
+                real,
+                spectrum,
+            })
+        }
+
+        pub(super) fn shape(&self) -> [usize; 2] {
+            [self.rows, self.cols]
+        }
+
+        /// Forward transform of `input` placed at the origin of a zeroed plane,
+        /// into the contiguous spectrum `data`.
+        ///
+        /// The zero padding is assembled into this working set's own aligned
+        /// buffer — which is what the portable backend does row by row anyway —
+        /// and the spectrum is copied out of the aligned one at the end. That
+        /// copy is the price of `Spectrum` being an `ndarray` type the caller
+        /// owns, and it is inside every measurement quoted for this backend.
+        pub(super) fn forward_zero_padded(
+            &mut self,
+            input: ArrayView2<f64>,
+            data: &mut [Complex<f64>],
+        ) -> Result<()> {
+            let (input_rows, input_cols) = input.dim();
+            let cols = self.cols;
+            let plane = self.real.as_mut_slice();
+            for row in 0..self.rows {
+                let target = &mut plane[row * cols..(row + 1) * cols];
+                if row < input_rows {
+                    for (slot, &value) in target.iter_mut().zip(input.row(row).iter()) {
+                        *slot = value;
+                    }
+                    target[input_cols..].fill(0.0);
+                } else {
+                    target.fill(0.0);
+                }
+            }
+            // SAFETY: the new-array execute functions are FFTW's documented
+            // thread-safe entry point; `&mut self` makes these two buffers
+            // exclusively ours; they are the shapes the plan was made for and,
+            // by `Plans::check`, of the alignment it was made against.
+            unsafe {
+                ffi::fftw_execute_dft_r2c(
+                    self.plans.forward,
+                    self.real.data,
+                    self.spectrum.data.cast::<ffi::fftw_complex>(),
+                )
+            };
+            data.copy_from_slice(self.spectrum.as_slice());
+            Ok(())
+        }
+
+        /// Inverse transform of the contiguous spectrum `data`, carrying the
+        /// `1/N`.
+        ///
+        /// FFTW's multi-dimensional complex-to-real transform destroys its
+        /// input, so `data` is copied into this working set's aligned spectrum
+        /// and *that* is destroyed. The zero and Nyquist bins need no fixing up
+        /// on this side — FFTW reads a half-spectrum as Hermitian by definition
+        /// and does not refuse an imaginary part of `1e-17` where the exact value
+        /// is real, which is the one thing `realfft` insists on.
+        pub(super) fn inverse(
+            &mut self,
+            data: &mut [Complex<f64>],
+            out: &mut Array2<f64>,
+        ) -> Result<()> {
+            self.spectrum.as_mut_slice().copy_from_slice(data);
+            // SAFETY: as in `forward_zero_padded`.
+            unsafe {
+                ffi::fftw_execute_dft_c2r(
+                    self.plans.inverse,
+                    self.spectrum.data.cast::<ffi::fftw_complex>(),
+                    self.real.data,
+                )
+            };
+            let scale = 1.0 / (self.rows as f64 * self.cols as f64);
+            let cols = self.cols;
+            let plane = self.real.as_slice();
+            for row in 0..self.rows {
+                let source = &plane[row * cols..(row + 1) * cols];
+                for (slot, &value) in out.row_mut(row).iter_mut().zip(source.iter()) {
+                    *slot = value * scale;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -772,12 +1419,33 @@ pub struct Correlation2 {
 
 impl Correlation2 {
     /// Plan a correlation between planes of `shape_a` and `shape_b` over
-    /// `window`.
+    /// `window`, on the default backend.
     pub fn new(
         shape_a: [usize; 2],
         shape_b: [usize; 2],
         window: ShiftWindow,
         padding: Padding,
+    ) -> Result<Self> {
+        Self::with_backend(
+            shape_a,
+            shape_b,
+            window,
+            padding,
+            TransformBackend::default(),
+        )
+    }
+
+    /// The same, on a named [`TransformBackend`].
+    ///
+    /// Everything except the transform itself — the padding rule, the
+    /// conjugation, the lag convention, the wrap-around report — is this type's
+    /// and is the same either way.
+    pub fn with_backend(
+        shape_a: [usize; 2],
+        shape_b: [usize; 2],
+        window: ShiftWindow,
+        padding: Padding,
+        backend: TransformBackend,
     ) -> Result<Self> {
         for axis in 0..2 {
             if shape_a[axis] == 0 || shape_b[axis] == 0 {
@@ -796,7 +1464,7 @@ impl Correlation2 {
                 )));
             }
         }
-        let transform = RealTransform2::new(padded)?;
+        let transform = RealTransform2::with_backend(padded, backend)?;
         let spectrum_a = transform.spectrum();
         let spectrum_b = transform.spectrum();
         Ok(Self {
@@ -820,6 +1488,11 @@ impl Correlation2 {
     /// The shortest padded shape that would have been free of wrap-around.
     pub fn minimal_shape(&self) -> [usize; 2] {
         self.minimal
+    }
+
+    /// Which backend the transform underneath runs on.
+    pub fn backend(&self) -> TransformBackend {
+        self.transform.backend()
     }
 
     /// Whether this plan's padding is short enough for some lag in the window to
@@ -943,6 +1616,23 @@ pub struct Landscape {
 }
 
 impl Landscape {
+    /// A landscape over `window` with nothing computed into it yet: every value
+    /// `INFINITY`, every overlap `0`.
+    ///
+    /// The buffer [`SquaredDifference::landscape_into`] fills. It is here rather
+    /// than only on the plan so that a caller can allocate one without holding a
+    /// plan, and it starts at `INFINITY`/`0` — the module's own encoding of "no
+    /// overlap, so no answer" — because a buffer that starts at zero would read
+    /// as a landscape whose every lag is a perfect match.
+    pub fn empty(window: ShiftWindow) -> Self {
+        let [rows, cols] = window.extent();
+        Self {
+            window,
+            mean_squared: Array2::from_elem((rows, cols), f64::INFINITY),
+            overlap: Array2::zeros((rows, cols)),
+        }
+    }
+
     pub fn window(&self) -> ShiftWindow {
         self.window
     }
@@ -1020,17 +1710,48 @@ pub struct SquaredDifference {
     cols_in_b: Vec<(usize, usize)>,
     overlap: Array2<u64>,
     cross: Array2<f64>,
+    /// The two energy landscapes and the two-stage scratch behind them, held by
+    /// the plan for the same reason the transform's twiddles are: they are a
+    /// function of the geometry, and the geometry does not change between calls.
+    /// `parts_a` is the larger of the two at `shape_a[0] x window cols`.
+    energy_a: Array2<f64>,
+    energy_b: Array2<f64>,
+    parts_a: Array2<f64>,
+    parts_b: Array2<f64>,
+    prefix: Vec<f64>,
 }
 
 impl SquaredDifference {
-    /// Plan a landscape between planes of `shape_a` and `shape_b` over `window`.
+    /// Plan a landscape between planes of `shape_a` and `shape_b` over `window`,
+    /// on the default backend.
     pub fn new(
         shape_a: [usize; 2],
         shape_b: [usize; 2],
         window: ShiftWindow,
         padding: Padding,
     ) -> Result<Self> {
-        let correlation = Correlation2::new(shape_a, shape_b, window, padding)?;
+        Self::with_backend(
+            shape_a,
+            shape_b,
+            window,
+            padding,
+            TransformBackend::default(),
+        )
+    }
+
+    /// The same, on a named [`TransformBackend`].
+    ///
+    /// Only the one term that goes through a transform changes: the two energy
+    /// sums and the overlap counts are rectangle arithmetic and integer
+    /// geometry, and are identical to the bit whichever backend this is.
+    pub fn with_backend(
+        shape_a: [usize; 2],
+        shape_b: [usize; 2],
+        window: ShiftWindow,
+        padding: Padding,
+        backend: TransformBackend,
+    ) -> Result<Self> {
+        let correlation = Correlation2::with_backend(shape_a, shape_b, window, padding, backend)?;
         let [rows, cols] = window.extent();
         let rows_in_a = (0..rows)
             .map(|index| overlap_in_first(shape_a[0], shape_b[0], window.shift_at([index, 0])[0]))
@@ -1062,6 +1783,11 @@ impl SquaredDifference {
             cols_in_b,
             overlap,
             cross: Array2::zeros((rows, cols)),
+            energy_a: Array2::zeros((rows, cols)),
+            energy_b: Array2::zeros((rows, cols)),
+            parts_a: Array2::zeros((shape_a[0], cols)),
+            parts_b: Array2::zeros((shape_b[0], cols)),
+            prefix: vec![0.0; shape_a[1].max(shape_b[1]) + 1],
         })
     }
 
@@ -1071,6 +1797,11 @@ impl SquaredDifference {
 
     pub fn padded_shape(&self) -> [usize; 2] {
         self.correlation.padded_shape()
+    }
+
+    /// Which backend the transform underneath runs on.
+    pub fn backend(&self) -> TransformBackend {
+        self.correlation.backend()
     }
 
     /// Whether the padding is short enough to wrap; see [`Correlation2::wraps`].
@@ -1084,8 +1815,47 @@ impl SquaredDifference {
         self.overlap.view()
     }
 
-    /// The landscape for one pair of planes.
+    /// A landscape buffer of this plan's shape, for [`Self::landscape_into`].
+    pub fn empty_landscape(&self) -> Landscape {
+        Landscape::empty(self.window())
+    }
+
+    /// The landscape for one pair of planes, allocated.
+    ///
+    /// [`Self::landscape_into`] with a fresh buffer. Convenient, and the right
+    /// call when a caller wants one landscape; a caller in a loop should hold the
+    /// buffer, for the same reason it holds the plan.
     pub fn landscape(&mut self, a: ArrayView2<f64>, b: ArrayView2<f64>) -> Result<Landscape> {
+        let mut out = self.empty_landscape();
+        self.landscape_into(a, b, &mut out)?;
+        Ok(out)
+    }
+
+    /// The landscape for one pair of planes, into a caller-owned buffer.
+    ///
+    /// Allocates nothing. `out` must be a [`Landscape::empty`] of this plan's own
+    /// [`Self::window`] — every value in it is overwritten, so its previous
+    /// contents do not matter, but its **window** does and a mismatch is an error
+    /// rather than a reshape: a landscape carries the lag convention its indices
+    /// are read against, and silently replacing it would turn a caller's stale
+    /// buffer into a wrong answer with the right shape.
+    ///
+    /// **This exists to match the rest of the module, and it is measured at
+    /// `1.003x` — which is to say at nothing.** The plan already holds the
+    /// twiddles, the spectra, the padded plane and the two-stage energy scratch,
+    /// and a per-call `Landscape` was the one buffer left over; hoisting it saves
+    /// two allocations of `window.extent()` against a transform that costs
+    /// milliseconds. `tests/fft_correlation.rs`'s `the_speed_levers_are_measured`
+    /// prints that ratio beside the ones that are real (plan reuse `1.6x`, the
+    /// padded length `5x`), and it prints it precisely so that nobody reads this
+    /// signature as a performance feature. Reach for it when a caller is holding
+    /// a landscape anyway; `landscape` is not the slow path.
+    pub fn landscape_into(
+        &mut self,
+        a: ArrayView2<f64>,
+        b: ArrayView2<f64>,
+        out: &mut Landscape,
+    ) -> Result<()> {
         if a.dim() != (self.shape_a[0], self.shape_a[1]) {
             return Err(Error::ShapeMismatch {
                 expected: self.shape_a.to_vec(),
@@ -1098,47 +1868,86 @@ impl SquaredDifference {
                 got: vec![b.dim().0, b.dim().1],
             });
         }
-        self.correlation.correlate_into(a, b, &mut self.cross)?;
-        let energy_a = rectangle_energies(a, &self.rows_in_a, &self.cols_in_a);
-        let energy_b = rectangle_energies(b, &self.rows_in_b, &self.cols_in_b);
-
+        if out.window != self.window() {
+            return Err(Error::invalid(format!(
+                "a landscape buffer over lags {:?}..={:?} cannot hold a plan over {:?}..={:?}",
+                out.window.lower(),
+                out.window.upper(),
+                self.window().lower(),
+                self.window().upper()
+            )));
+        }
         let [rows, cols] = self.window().extent();
-        let mut mean_squared = Array2::<f64>::zeros((rows, cols));
+        if out.mean_squared.dim() != (rows, cols) || out.overlap.dim() != (rows, cols) {
+            return Err(Error::ShapeMismatch {
+                expected: vec![rows, cols],
+                got: vec![out.mean_squared.dim().0, out.mean_squared.dim().1],
+            });
+        }
+
+        self.correlation.correlate_into(a, b, &mut self.cross)?;
+        rectangle_energies_into(
+            a,
+            &self.rows_in_a,
+            &self.cols_in_a,
+            &mut self.parts_a,
+            &mut self.prefix,
+            &mut self.energy_a,
+        );
+        rectangle_energies_into(
+            b,
+            &self.rows_in_b,
+            &self.cols_in_b,
+            &mut self.parts_b,
+            &mut self.prefix,
+            &mut self.energy_b,
+        );
+
         for row in 0..rows {
             for col in 0..cols {
                 let count = self.overlap[[row, col]];
-                mean_squared[[row, col]] = if count == 0 {
+                out.mean_squared[[row, col]] = if count == 0 {
+                    // Not `0 / eps`. An empty overlap has no answer, and a large
+                    // value keeps it out of an argmin where a floored division
+                    // would make it a spurious global minimum.
                     f64::INFINITY
                 } else {
-                    let total =
-                        energy_a[[row, col]] + energy_b[[row, col]] - 2.0 * self.cross[[row, col]];
+                    let total = self.energy_a[[row, col]] + self.energy_b[[row, col]]
+                        - 2.0 * self.cross[[row, col]];
                     total / count as f64
                 };
             }
         }
-        Ok(Landscape {
-            window: self.window(),
-            mean_squared,
-            overlap: self.overlap.clone(),
-        })
+        out.overlap.assign(&self.overlap);
+        Ok(())
     }
 }
 
-/// `sum` of `values[x]^2` over every rectangle `row_ranges[i] x column_ranges[j]`.
+/// `sum` of `values[x]^2` over every rectangle `row_ranges[i] x column_ranges[j]`,
+/// into buffers the caller owns.
 ///
 /// Two stages, and the split is about precision rather than only speed. Along
 /// each row a **compensated (Neumaier) prefix** holds every partial sum to a
 /// rounding of its own value however long the row is, so a rectangle's row part
 /// is a difference of two well-rounded numbers. Down the rows the parts are
 /// summed directly, which is a short accumulation over a bounded count.
-fn rectangle_energies(
+///
+/// `parts` is `values.rows() x column_ranges.len()`, `prefix` is at least
+/// `values.cols() + 1` long, and `out` is
+/// `row_ranges.len() x column_ranges.len()`. Every element of all three is
+/// written before it is read, so their previous contents do not matter. There is
+/// deliberately **no allocating wrapper**: the plan owns these three, and a
+/// convenience that allocated them per call is the thing
+/// [`SquaredDifference::landscape_into`] exists not to do.
+fn rectangle_energies_into(
     values: ArrayView2<f64>,
     row_ranges: &[(usize, usize)],
     column_ranges: &[(usize, usize)],
-) -> Array2<f64> {
-    let (value_rows, value_cols) = values.dim();
-    let mut parts = Array2::<f64>::zeros((value_rows, column_ranges.len()));
-    let mut prefix = vec![0.0f64; value_cols + 1];
+    parts: &mut Array2<f64>,
+    prefix: &mut [f64],
+    out: &mut Array2<f64>,
+) {
+    let (value_rows, _) = values.dim();
     for row in 0..value_rows {
         let source = values.row(row);
         let mut sum = 0.0f64;
@@ -1159,7 +1968,6 @@ fn rectangle_energies(
             parts[[row, index]] = prefix[high] - prefix[low];
         }
     }
-    let mut out = Array2::<f64>::zeros((row_ranges.len(), column_ranges.len()));
     for (index, &(low, high)) in row_ranges.iter().enumerate() {
         for column in 0..column_ranges.len() {
             let mut total = 0.0;
@@ -1169,7 +1977,6 @@ fn rectangle_energies(
             out[[index, column]] = total;
         }
     }
-    out
 }
 
 /// The landscape by walking every lag's overlap and summing the squared
@@ -1336,8 +2143,7 @@ mod tests {
             minimal_wrap_free_length([13, 17], [19, 23], window),
             [13 + 19 - 1, 17 + 23 - 1]
         );
-        // A narrow window asks for very much less, and this is the geometry the
-        // consumer actually has.
+        // A narrow window asks for very much less.
         let narrow = ShiftWindow::symmetric([30, 30]);
         assert_eq!(
             minimal_wrap_free_length([96, 1304], [96, 1304], narrow),
@@ -1346,6 +2152,36 @@ mod tests {
         assert_eq!(
             Padding::Smooth.resolve([96, 1304], [96, 1304], narrow),
             [128, 1350]
+        );
+    }
+
+    #[test]
+    fn the_minimal_length_depends_on_where_the_window_sits_and_not_only_on_its_width() {
+        // Both windows are 61 lags wide on the first axis and they do not ask for
+        // the same padding, because `A - lo` and `B + hi` are one-sided. The
+        // second is the geometry the module's first consumer actually has: its
+        // two cuts sit 30 apart in global coordinates, so every lag it wants is
+        // non-negative.
+        let centred = ShiftWindow::new([-30, -30], [30, 30]).unwrap();
+        let off_centre = ShiftWindow::new([0, -30], [60, 30]).unwrap();
+        assert_eq!(centred.extent()[0], off_centre.extent()[0]);
+        assert_eq!(
+            minimal_wrap_free_length([96, 1304], [96, 1304], centred)[0],
+            126
+        );
+        assert_eq!(
+            minimal_wrap_free_length([96, 1304], [96, 1304], off_centre)[0],
+            156
+        );
+        assert_eq!(
+            Padding::Smooth.resolve([96, 1304], [96, 1304], off_centre),
+            [160, 1350]
+        );
+        // And a rule that knew only the width would have to assume the worse
+        // side, so the sharp rule is what saves the centred case its 32 rows.
+        assert!(
+            minimal_wrap_free_length([96, 1304], [96, 1304], centred)[0]
+                < minimal_wrap_free_length([96, 1304], [96, 1304], off_centre)[0]
         );
     }
 
@@ -1447,7 +2283,19 @@ mod tests {
         let values = plane(13, 29, 0x0BAD_C0DE_F00D_0002);
         let rows = [(0usize, 13usize), (2, 11), (7, 8), (5, 5)];
         let columns = [(0usize, 29usize), (3, 19), (28, 29), (12, 12)];
-        let energies = rectangle_energies(values.view(), &rows, &columns);
+        // The buffers a plan would hold, filled with rubbish first: every element
+        // is written before it is read, and this is what says so.
+        let mut parts = Array2::<f64>::from_elem((13, columns.len()), f64::NAN);
+        let mut prefix = vec![f64::NAN; 30];
+        let mut energies = Array2::<f64>::from_elem((rows.len(), columns.len()), f64::NAN);
+        rectangle_energies_into(
+            values.view(),
+            &rows,
+            &columns,
+            &mut parts,
+            &mut prefix,
+            &mut energies,
+        );
         for (index, &(low, high)) in rows.iter().enumerate() {
             for (column, &(left, right)) in columns.iter().enumerate() {
                 let mut expected = 0.0;

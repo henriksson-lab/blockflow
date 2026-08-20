@@ -38,6 +38,12 @@
 // phase `p-1`, so the last level is the workflow output and levels in between
 // are intermediates. That numbering is what makes "is this write a
 // materialisation?" a comparison rather than a flag.
+//
+// A level is **allocated when something first writes to it**, not when the
+// environment is built. See [`LevelStore`] for the measurement that is for; the
+// short form is that a plan's levels are alive over *lifetimes*, and an
+// environment that allocated all of them at once cost the sum of the lifetimes
+// rather than their largest overlap.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -752,7 +758,116 @@ pub trait Environment: Sync {
 
 // ------------------------------------------------------------------ real --
 
-/// Real volumes held in memory, one per level, **each at its own element type**.
+/// One level's storage: **what it will hold, and whether it holds it yet.**
+///
+/// The declared element type and shape are known from the moment the
+/// environment is built — that is what `prepare` checks and what a read of an
+/// unwritten level is shaped by — but the buffer behind them is not allocated
+/// until the first write.
+///
+/// Why, measured
+/// -------------
+/// A level costs `volume x sizeof(dtype)` bytes for as long as it is allocated,
+/// and a plan says exactly how long that is: level `p + 1` is written by phase
+/// `p` and freed after its last reader, which is what `discard_level` already
+/// did at the far end. Allocating every level in the constructor made the *near*
+/// end wrong in the same way the far end used to be, and the two are not
+/// symmetric in cost: freeing late costs the tail of a chain, allocating early
+/// costs **all of it at once, before the first phase runs**.
+///
+/// On the 12-phase, 13-level plan this was measured against — `404 x 1304 x
+/// 3369`, 1.775 Gvoxel — the levels' largest simultaneous total is 67.8 GiB and
+/// their sum is 138.8 GiB. Constructing the environment paid the second figure,
+/// and paid it in *touched* pages rather than reservations, because an unwritten
+/// level is sentinel-filled rather than zeroed: `Voxels::unwritten` writes every
+/// element. A 1/64 scale model of that plan measured 1.96 GiB of resident set
+/// from the constructor alone, against a priced peak of 1.06 GiB — 1.85x, before
+/// a phase had run. Deferring the allocation to the first write makes the
+/// environment cost what the plan prices it at.
+///
+/// **No voxel moves.** A read of a level nobody has written yields
+/// [`Voxels::unwritten`] over the read region, which is byte-for-byte the slice
+/// it would have taken out of a fully sentinel-filled level; the first write
+/// materialises the whole level at the sentinel and then assigns into it, which
+/// is what a write into a fully sentinel-filled level always did.
+struct LevelStore {
+    /// What this level holds, whether or not it holds it yet. Kept beside the
+    /// buffer rather than read off it, because the whole point is that there
+    /// may be no buffer to read it off.
+    dtype: Dtype,
+    shape: [usize; 3],
+    /// `None` before the first write, and again after a discard.
+    data: Option<Voxels>,
+}
+
+impl LevelStore {
+    /// A level nothing has written yet.
+    ///
+    /// Fallible for one reason and it is the constructor's: `Dtype::F16` has no
+    /// buffer variant, and refusing it here — against a zero-element probe,
+    /// which allocates nothing — keeps that refusal at the moment the
+    /// environment is built rather than moving it to whichever write happened to
+    /// come first.
+    fn pending(dtype: Dtype, shape: [usize; 3]) -> Result<Self> {
+        Voxels::zeros(dtype, [0, 0, 0])?;
+        Ok(Self {
+            dtype,
+            shape,
+            data: None,
+        })
+    }
+
+    /// A level that already holds something: level 0, which is the input.
+    fn held(data: Voxels) -> Self {
+        Self {
+            dtype: data.dtype(),
+            shape: data.shape(),
+            data: Some(data),
+        }
+    }
+
+    /// Does this level hold a buffer? The measurable form of the deferral.
+    fn is_allocated(&self) -> bool {
+        self.data.is_some()
+    }
+
+    /// The whole level as it reads: the buffer, or the sentinel it would have
+    /// been filled with.
+    fn whole(&self) -> Result<Voxels> {
+        match &self.data {
+            Some(data) => Ok(data.clone()),
+            None => Voxels::unwritten(self.dtype, self.shape),
+        }
+    }
+
+    /// `region` of the level as it reads. The unwritten case allocates
+    /// `region`'s worth and not the level's, which is the point.
+    fn slice(&self, region: &Region) -> Result<Voxels> {
+        match &self.data {
+            Some(data) => data.slice_region(region),
+            None => Voxels::unwritten(self.dtype, block_shape(region)?),
+        }
+    }
+
+    /// The buffer to write into, allocated at the sentinel if this is the first
+    /// write.
+    fn buffer_mut(&mut self) -> Result<&mut Voxels> {
+        if self.data.is_none() {
+            self.data = Some(Voxels::unwritten(self.dtype, self.shape)?);
+        }
+        Ok(self.data.as_mut().expect("just allocated"))
+    }
+
+    /// Free the buffer, keeping what the level *is*. Reads are refused by the
+    /// discard flag rather than by the absence, which is the arrangement
+    /// `discard_level` already documented: the flag is what carries the meaning.
+    fn release(&mut self) {
+        self.data = None;
+    }
+}
+
+/// Real volumes held in memory, one per level, **each at its own element type**
+/// and each allocated when something first writes to it.
 ///
 /// This is the geometry oracle's environment: small volumes, real values, so
 /// identity ops must reproduce the input exactly and a window-sum op must
@@ -760,9 +875,14 @@ pub trait Environment: Sync {
 /// path — that is `region_io`'s job, and a Zarr environment would go through
 /// `ZarrRegionSink` because `zarrs` 0.23.13 loses data on concurrent partial
 /// chunk writes.
+///
+/// Being resident is not the same as being resident *all at once*: a level's
+/// lifetime runs from the phase that writes it to its last reader, and this
+/// environment now holds a level over exactly that interval. See [`LevelStore`]
+/// for the near end and [`Self::discard_level`] for the far one.
 pub struct ArrayEnvironment {
     volume: [usize; 3],
-    levels: Vec<RwLock<Voxels>>,
+    levels: Vec<RwLock<LevelStore>>,
     /// Set when a level has been discarded. Kept beside the levels rather than
     /// inferred from a placeholder's shape, because "this was freed" and "this
     /// happens to be small" are different facts and only one of them is an
@@ -808,9 +928,9 @@ impl ArrayEnvironment {
         let volume = input.shape();
         let dtype = input.dtype();
         let mut levels = Vec::with_capacity(n_phases + 1);
-        levels.push(RwLock::new(input));
+        levels.push(RwLock::new(LevelStore::held(input)));
         for _ in 0..n_phases {
-            levels.push(RwLock::new(Voxels::unwritten(dtype, volume)?));
+            levels.push(RwLock::new(LevelStore::pending(dtype, volume)?));
         }
         Ok(Self {
             discarded: (0..levels.len()).map(|_| AtomicBool::new(false)).collect(),
@@ -857,9 +977,9 @@ impl ArrayEnvironment {
             )));
         }
         let mut levels = Vec::with_capacity(decomposition.n_levels());
-        levels.push(RwLock::new(input));
+        levels.push(RwLock::new(LevelStore::held(input)));
         for (index, phase) in decomposition.phases.iter().enumerate() {
-            levels.push(RwLock::new(Voxels::unwritten(
+            levels.push(RwLock::new(LevelStore::pending(
                 decomposition.dtype_at(index + 1),
                 phase.volume(),
             )?));
@@ -890,10 +1010,45 @@ impl ArrayEnvironment {
     ///
     /// The measurable form of the whole point: a twenty-phase chain used to end
     /// with twenty-one of these and now ends with three.
+    ///
+    /// **"Still", and therefore about discarding only.** A level nothing has
+    /// written yet is counted here, because this answers "what has the run given
+    /// back" and an unwritten level was never taken. What is actually allocated
+    /// at this moment is [`Self::allocated_levels`], and the two differ during a
+    /// run for exactly the length of the chain that has not run yet.
     pub fn resident_levels(&self) -> usize {
         (0..self.levels.len())
             .filter(|&level| !self.is_discarded(level))
             .count()
+    }
+
+    /// How many levels hold a buffer **right now**.
+    ///
+    /// The near end of a level's lifetime, as [`Self::resident_levels`] is the
+    /// far end: a level is allocated by its first write and freed by its
+    /// discard, so before the run this is 1 — the input — however many phases
+    /// the plan has. That is the difference this environment used to pay in
+    /// full: see [`LevelStore`] for the 138.8 GiB against 67.8 GiB it was worth
+    /// on the plan it was measured against.
+    pub fn allocated_levels(&self) -> usize {
+        (0..self.levels.len())
+            .filter(|&level| self.level_guard(level).is_allocated())
+            .count()
+    }
+
+    /// Bytes the levels hold **right now**: what a resident environment costs at
+    /// this moment, stated the way a residency budget is.
+    ///
+    /// Only allocated levels count, because only they occupy anything. A level
+    /// the plan has not reached yet contributes nothing, which is the whole
+    /// claim and is why it is reported rather than argued.
+    pub fn allocated_level_bytes(&self) -> u64 {
+        (0..self.levels.len())
+            .filter_map(|level| {
+                let guard = self.level_guard(level);
+                guard.data.as_ref().map(|data| data.bytes())
+            })
+            .sum()
     }
 
     /// Which phase's completion freed `level`, when that was recorded.
@@ -926,31 +1081,42 @@ impl ArrayEnvironment {
         )))
     }
 
-    fn level_guard(&self, level: usize) -> std::sync::RwLockReadGuard<'_, Voxels> {
+    fn level_guard(&self, level: usize) -> std::sync::RwLockReadGuard<'_, LevelStore> {
         self.levels[level]
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The shape of one level, which is not `volume()` once a phase changes it.
+    ///
+    /// **Declared**, so it is the same answer before and after the level is
+    /// written, and after it is discarded. It used to be read off the buffer,
+    /// which meant a discarded level reported the one-voxel placeholder that
+    /// stood in for it; the flag is what says a level is gone
+    /// ([`Self::is_discarded`]), and this now says only what the level is.
     pub fn level_shape(&self, level: usize) -> [usize; 3] {
-        self.level_guard(level).shape()
+        self.level_guard(level).shape
     }
 
     /// The element type of one level, which is not the workflow's once a phase
-    /// changes it.
+    /// changes it. Declared, on [`Self::level_shape`]'s argument.
     pub fn level_dtype(&self, level: usize) -> Dtype {
-        self.level_guard(level).dtype()
+        self.level_guard(level).dtype
     }
 
     /// The last level: the workflow output.
+    ///
+    /// A workflow whose last phase never ran hands back the unwritten sentinel
+    /// over the whole level, which is what a caller reading an unwritten output
+    /// always got.
     pub fn output(&self) -> Voxels {
         self.levels
             .last()
             .expect("at least one level")
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .whole()
+            .expect("a level's element type was checked when it was declared")
     }
 
     /// One level's data, or the refusal that names why it is not there.
@@ -965,7 +1131,7 @@ impl ArrayEnvironment {
     /// it.
     pub fn try_level(&self, level: usize) -> Result<Voxels> {
         self.refuse_if_discarded(level, "level")?;
-        Ok(self.level_guard(level).clone())
+        self.level_guard(level).whole()
     }
 
     /// One level's data.
@@ -1067,7 +1233,7 @@ impl Environment for ArrayEnvironment {
     fn read(&self, level: usize, region: &Region) -> Result<BlockBuf> {
         self.refuse_if_discarded(level, "block-op read")?;
         region_within(region, &self.level_shape(level), "block-op read")?;
-        let array = self.level_guard(level).slice_region(region)?;
+        let array = self.level_guard(level).slice(region)?;
         self.counters.reads.fetch_add(1, Ordering::SeqCst);
         self.counters
             .read_voxels
@@ -1120,7 +1286,10 @@ impl Environment for ArrayEnvironment {
         let mut guard = self.levels[level]
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.assign_region(valid, &source)?;
+        // The first write to a level is what allocates it, sentinel-filled — so
+        // a partial write leaves the rest unwritten exactly as it did when every
+        // level was allocated in the constructor.
+        guard.buffer_mut()?.assign_region(valid, &source)?;
         self.counters.writes.fetch_add(1, Ordering::SeqCst);
         self.counters
             .write_voxels
@@ -1226,9 +1395,13 @@ impl Environment for ArrayEnvironment {
 
     /// Free the array and remember that it was freed.
     ///
-    /// The placeholder is one voxel rather than none: a zero-extent array is a
-    /// shape other code would have to special-case, and the flag is what carries
-    /// the meaning anyway.
+    /// There is no placeholder any more, and there does not need to be one: a
+    /// level knows its own element type and shape whether or not it holds a
+    /// buffer ([`LevelStore`]), so freeing is dropping the buffer, and the flag
+    /// carries the meaning as it always did. What that changes for a reader is
+    /// that [`Self::level_shape`] on a discarded level now reports the shape the
+    /// level *is* rather than the one-voxel stand-in — reads and writes are
+    /// still refused by name, which is the behaviour anything depends on.
     fn discard_level(&self, level: usize) -> Result<()> {
         let Some(flag) = self.discarded.get(level) else {
             return Err(Error::InvalidArgument(format!(
@@ -1239,11 +1412,10 @@ impl Environment for ArrayEnvironment {
         if flag.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let mut guard = self.levels[level]
+        self.levels[level]
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dtype = guard.dtype();
-        *guard = Voxels::zeros(dtype, [1, 1, 1])?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release();
         Ok(())
     }
 
@@ -1663,6 +1835,269 @@ mod tests {
         assert_eq!(
             wide.counters().peak_resident_bytes.load(Ordering::SeqCst),
             narrow.counters().peak_resident_bytes.load(Ordering::SeqCst) * 8
+        );
+    }
+
+    /// **The negative control for the representation.** Every element type's own
+    /// extremes, through a level and back out, compared bit for bit.
+    ///
+    /// A level that went through `f64` on its way in or out would pass every
+    /// fixture that never reaches an extreme and fail exactly here:
+    /// `u64::MAX` and `i64::MIN + 1` are not representable in an `f64` and would
+    /// come back rounded, `-0.0` would come back as `0.0` under any comparison
+    /// that used `==` on the way, and a NaN would come back a different NaN — or
+    /// as a zero, if anything on the path had used `f64::min`/`max` rather than
+    /// `total_cmp`. So the assertion is on the *bits* for the float types, which
+    /// is the only comparison that can see any of that.
+    #[test]
+    fn every_element_type_round_trips_its_extremes_through_a_level() {
+        /// One column of values in, the same column out.
+        macro_rules! round_trip {
+            ($type:ty, $values:expr, $eq:expr) => {{
+                let values: Vec<$type> = $values;
+                let extent = [values.len(), 1, 1];
+                let input =
+                    Array3::<$type>::from_shape_vec((values.len(), 1, 1), values.clone()).unwrap();
+                let env = ArrayEnvironment::new(Voxels::from(input), 1, [1, 1, 1]).unwrap();
+                let region = Region::whole(&extent);
+                let buf = env.read(0, &region).unwrap();
+                env.write(1, &Region::new(&[0, 0, 0], &extent), &region, &buf)
+                    .unwrap();
+                let out = env.output();
+                assert_eq!(out.dtype(), <$type as crate::voxels::VoxelElement>::DTYPE);
+                let got = out.view::<$type>().unwrap();
+                for (index, wanted) in values.iter().enumerate() {
+                    let held = got[[index, 0, 0]];
+                    let same: bool = $eq(held, *wanted);
+                    assert!(
+                        same,
+                        "{} lost {:?} at index {index}: got {:?}",
+                        <$type as crate::voxels::VoxelElement>::DTYPE.numpy_name(),
+                        wanted,
+                        held
+                    );
+                }
+            }};
+        }
+        round_trip!(bool, vec![true, false, true], |held, wanted| held == wanted);
+        round_trip!(u8, vec![0, 1, u8::MAX], |held, wanted| held == wanted);
+        round_trip!(u16, vec![0, 1, u16::MAX, u16::MAX - 1], |held, wanted| held
+            == wanted);
+        round_trip!(u32, vec![0, 1, u32::MAX, u32::MAX - 1], |held, wanted| held
+            == wanted);
+        // Beyond `f64`'s 53 bits of mantissa: `u64::MAX as f64 as u64` saturates
+        // and `(u64::MAX - 1) as f64 as u64` does too, so a level that had been
+        // through an `f64` could not tell these three apart.
+        round_trip!(
+            u64,
+            vec![0, 1, u64::MAX, u64::MAX - 1, (1u64 << 53) + 1],
+            |held, wanted| held == wanted
+        );
+        round_trip!(i8, vec![i8::MIN, -1, 0, i8::MAX], |held, wanted| held
+            == wanted);
+        round_trip!(i16, vec![i16::MIN, -1, 0, i16::MAX], |held, wanted| held
+            == wanted);
+        round_trip!(i32, vec![i32::MIN, -1, 0, i32::MAX], |held, wanted| held
+            == wanted);
+        round_trip!(
+            i64,
+            vec![i64::MIN, i64::MIN + 1, -1, 0, i64::MAX, i64::MAX - 1],
+            |held, wanted| held == wanted
+        );
+        // Bit equality, so `-0.0` is not `0.0` and a NaN is the NaN it was.
+        round_trip!(
+            f32,
+            vec![
+                -0.0,
+                0.0,
+                f32::NAN,
+                -f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::MIN,
+                f32::MAX,
+                f32::MIN_POSITIVE,
+                f32::EPSILON,
+            ],
+            |held: f32, wanted: f32| held.to_bits() == wanted.to_bits()
+        );
+        round_trip!(
+            f64,
+            vec![
+                -0.0,
+                0.0,
+                f64::NAN,
+                -f64::NAN,
+                f64::from_bits(0x7ff8_0000_dead_beef),
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::MIN,
+                f64::MAX,
+                f64::MIN_POSITIVE,
+                f64::EPSILON,
+            ],
+            |held: f64, wanted: f64| held.to_bits() == wanted.to_bits()
+        );
+    }
+
+    /// The control above, inverted: the comparison it uses can *see* a lost
+    /// extreme. Without this the round trip would pass just as well against a
+    /// comparison that could not fail.
+    #[test]
+    fn the_round_trip_control_would_notice_a_value_that_went_through_an_f64() {
+        // `u64::MAX` itself is not the witness: Rust's float-to-integer cast
+        // saturates, so it comes back unchanged for the wrong reason. Its
+        // neighbour is the witness, and so is the first integer above the
+        // mantissa.
+        assert_ne!(
+            u64::MAX - 1,
+            (u64::MAX - 1) as f64 as u64,
+            "`u64::MAX - 1` survives a trip through `f64`, so the control above proves nothing"
+        );
+        assert_ne!(
+            (1u64 << 53) + 1,
+            ((1u64 << 53) + 1) as f64 as u64,
+            "the first integer above `f64`'s mantissa survives a trip through it"
+        );
+        assert_ne!(
+            i64::MIN + 1,
+            (i64::MIN + 1) as f64 as i64,
+            "`i64::MIN + 1` survives a trip through `f64`"
+        );
+        assert_ne!(
+            (-0.0f64).to_bits(),
+            0.0f64.to_bits(),
+            "the float comparison cannot tell `-0.0` from `0.0`"
+        );
+        assert_ne!(
+            f64::NAN.to_bits(),
+            f64::from_bits(0x7ff8_0000_dead_beef).to_bits(),
+            "the float comparison cannot tell two NaNs apart"
+        );
+    }
+
+    /// **A level is allocated by its first write, not by the constructor.**
+    ///
+    /// The measurement in [`LevelStore`]'s header, as a fact about one
+    /// environment rather than about a run: an eight-phase plan holds one level
+    /// before anything has run, where it used to hold nine.
+    #[test]
+    fn a_level_costs_nothing_until_something_writes_to_it() {
+        let extent = [8, 8, 8];
+        let phases = 8;
+        let input = Voxels::zeros(Dtype::F64, extent).unwrap();
+        let env = ArrayEnvironment::new(input, phases, [8, 8, 8]).unwrap();
+
+        assert_eq!(env.allocated_levels(), 1, "only the input");
+        assert_eq!(
+            env.allocated_level_bytes(),
+            (8 * 8 * 8 * 8) as u64,
+            "one f64 level's worth"
+        );
+        // …and the levels are all there, at their declared shape and type.
+        assert_eq!(env.resident_levels(), phases + 1);
+        for level in 0..=phases {
+            assert_eq!(env.level_shape(level), extent);
+            assert_eq!(env.level_dtype(level), Dtype::F64);
+        }
+
+        // The liveness half: writing is what allocates, so writing everything
+        // reaches the figure the constructor used to start at.
+        let region = Region::whole(&extent);
+        let buf = env.read(0, &region).unwrap();
+        for level in 1..=phases {
+            env.write(level, &region, &region, &buf).unwrap();
+        }
+        assert_eq!(env.allocated_levels(), phases + 1);
+        assert_eq!(
+            env.allocated_level_bytes(),
+            (phases as u64 + 1) * (8 * 8 * 8 * 8)
+        );
+
+        // …and discarding gives it back, which is the far end of the same
+        // lifetime.
+        env.discard_level(1).unwrap();
+        assert_eq!(env.allocated_levels(), phases);
+        assert_eq!(env.resident_levels(), phases);
+    }
+
+    /// **Deferring the allocation moves no voxel.** A level nobody has written
+    /// reads exactly what a sentinel-filled level would have handed back — which
+    /// is what it *was*, before the allocation was deferred.
+    #[test]
+    fn an_unwritten_level_reads_as_the_sentinel_it_would_have_been_filled_with() {
+        let extent = [4, 4, 4];
+        let region = Region::new(&[1, 1, 1], &[2, 2, 2]);
+        for dtype in [
+            Dtype::Bool,
+            Dtype::U8,
+            Dtype::U16,
+            Dtype::U32,
+            Dtype::U64,
+            Dtype::I8,
+            Dtype::I16,
+            Dtype::I32,
+            Dtype::I64,
+            Dtype::F32,
+            Dtype::F64,
+        ] {
+            let env =
+                ArrayEnvironment::new(Voxels::zeros(dtype, extent).unwrap(), 1, extent).unwrap();
+            let whole = Voxels::unwritten(dtype, extent).unwrap();
+
+            let read = env.read(1, &region).unwrap();
+            let read = read.as_array().unwrap();
+            let cut = whole.slice_region(&region).unwrap();
+            assert_eq!(read.dtype(), dtype);
+            assert_eq!(read.shape(), [2, 2, 2]);
+            let held = env.try_level(1).unwrap();
+            assert_eq!(held.dtype(), dtype);
+            assert_eq!(held.shape(), extent);
+            // `NaN != NaN`, so the float types are compared through the property
+            // the sentinel is *defined* by rather than through equality — the
+            // same reason `Voxels::uniform` says a NaN-filled level is not
+            // uniform.
+            match dtype {
+                Dtype::F32 => {
+                    assert!(read.view::<f32>().unwrap().iter().all(|v| v.is_nan()));
+                    assert!(held.view::<f32>().unwrap().iter().all(|v| v.is_nan()));
+                }
+                Dtype::F64 => {
+                    assert!(read.view::<f64>().unwrap().iter().all(|v| v.is_nan()));
+                    assert!(held.view::<f64>().unwrap().iter().all(|v| v.is_nan()));
+                }
+                _ => {
+                    assert_eq!(
+                        read, &cut,
+                        "{dtype:?}: a partial read of an unwritten level"
+                    );
+                    assert_eq!(held, whole, "{dtype:?}: the whole unwritten level");
+                }
+            }
+        }
+    }
+
+    /// A partial write allocates the level and leaves the rest unwritten, which
+    /// is what a write into a fully sentinel-filled level always did. The
+    /// deferral must not turn "nobody wrote this corner" into a zero.
+    #[test]
+    fn a_partial_write_leaves_the_rest_of_a_deferred_level_unwritten() {
+        let extent = [4, 4, 4];
+        let env =
+            ArrayEnvironment::new(Voxels::filled(Dtype::U16, extent, 7.0).unwrap(), 1, extent)
+                .unwrap();
+        let corner = Region::new(&[0, 0, 0], &[2, 2, 2]);
+        let buf = env.read(0, &corner).unwrap();
+        env.write(1, &Region::new(&[0, 0, 0], &[2, 2, 2]), &corner, &buf)
+            .unwrap();
+
+        let level = env.try_level(1).unwrap();
+        let view = level.view::<u16>().unwrap();
+        assert_eq!(view[[0, 0, 0]], 7, "what was written");
+        assert_eq!(
+            view[[3, 3, 3]],
+            u16::MAX,
+            "what nobody wrote keeps the sentinel rather than becoming a zero"
         );
     }
 

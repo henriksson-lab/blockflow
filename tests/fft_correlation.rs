@@ -49,10 +49,41 @@
 // that they move by the same amount, and that the landscape's minimum is not
 // simply flat. Without it, "the two agree to 4e-16" would be equally true of two
 // implementations that both returned zero.
+//
+// Backends, and why the bar is a loop rather than a second copy of itself
+// -----------------------------------------------------------------------
+// `ops::fft` has a [`TransformBackend`], and the crate's optional `fftw` feature
+// adds a second one. **The acceptance bar does not fork.** Every parity test
+// here runs over `TransformBackend::available()` — one backend in the default
+// build, where the loop is invisible and the printed figures are unchanged to
+// the last digit, and both when the feature is on. A backend that could only
+// meet a bar written for it is not a backend, it is a second program.
+//
+// Two tests exist only when there are two backends to compare, and one exists
+// precisely because there might not be:
+//
+// | test | what it establishes |
+// |---|---|
+// | `the_feature_is_the_only_thing_that_chooses_the_backend` | runs **always**, and in the default build asserts the *absence*: one backend, and it is the portable one. The feature claim is inverted rather than dropped |
+// | `the_two_backends_agree_on_the_fixture` | the agreement *between* backends, which is a sharper question than each agreeing with the direct walk — both could pass a `1e-13` bar against the oracle and still differ by `1e-13` from each other |
+// | `the_two_backends_agree_at_the_consumers_geometry` | the same at `128 x 1350`, four orders more arithmetic for them to drift over |
+//
+// Both comparisons assert on **values**, and their liveness half is that the two
+// landscapes must differ *somewhere* in the last places: two implementations of
+// the same arithmetic that agreed to the bit would mean the test was comparing
+// one backend with itself. Comparing argmins instead would be no test at all —
+// `padding_below_the_minimum_wraps` already shows the argmin sitting still while
+// the values it is chosen from move by 12-41%.
+//
+// `plans_built_at_the_same_time_agree_with_plans_built_alone` is the other thing
+// a second backend brings: FFTW's planner is process-wide state its own
+// documentation says is not re-entrant. That test builds six plans of six shapes
+// from six threads. It is an exercise and not a proof, and `src/ops/fft.rs` says
+// so where the lock that makes it safe is written.
 
 use blockflow::ops::fft::{
     correlate_direct, minimal_wrap_free_length, squared_difference_direct, Correlation2, Landscape,
-    Padding, RealTransform2, ShiftWindow, SquaredDifference,
+    Padding, RealTransform2, ShiftWindow, SquaredDifference, TransformBackend,
 };
 use ndarray::Array2;
 
@@ -201,25 +232,34 @@ fn the_correlation_agrees_with_the_direct_walk() {
     let a = plane(SHAPE_A[0], SHAPE_A[1], 0x9E37_79B9_7F4A_7C15);
     let b = plane(SHAPE_B[0], SHAPE_B[1], 0x1234_5678_9ABC_DEF1);
     let expected = correlate_direct(a.view(), b.view(), window());
-    let mut plan = Correlation2::new(SHAPE_A, SHAPE_B, window(), Padding::Smooth).unwrap();
-    assert!(!plan.wraps());
-    let got = plan.correlate(a.view(), b.view()).unwrap();
+    // The bar is the bar for every backend this build has, and it is the same
+    // bar, on the same fixture, against the same oracle.
+    for &backend in TransformBackend::available() {
+        let mut plan =
+            Correlation2::with_backend(SHAPE_A, SHAPE_B, window(), Padding::Smooth, backend)
+                .unwrap();
+        assert_eq!(plan.backend(), backend);
+        assert!(!plan.wraps());
+        let got = plan.correlate(a.view(), b.view()).unwrap();
 
-    let mut worst = 0.0f64;
-    let mut scale = 0.0f64;
-    for (&left, &right) in got.iter().zip(expected.iter()) {
-        worst = larger(worst, (left - right).abs());
-        scale = larger(scale, right.abs());
+        let mut worst = 0.0f64;
+        let mut scale = 0.0f64;
+        for (&left, &right) in got.iter().zip(expected.iter()) {
+            worst = larger(worst, (left - right).abs());
+            scale = larger(scale, right.abs());
+        }
+        println!(
+            "correlation on {}: worst {worst:e} absolute, {:e} relative",
+            backend.name(),
+            worst / scale
+        );
+        assert!(
+            worst / scale < 1.0e-13,
+            "the {} correlation disagrees with the direct one by {:e} relative",
+            backend.name(),
+            worst / scale
+        );
     }
-    println!(
-        "correlation: worst {worst:e} absolute, {:e} relative",
-        worst / scale
-    );
-    assert!(
-        worst / scale < 1.0e-13,
-        "the transform correlation disagrees with the direct one by {:e} relative",
-        worst / scale
-    );
 }
 
 #[test]
@@ -227,56 +267,72 @@ fn the_landscape_agrees_with_the_direct_walk_and_chooses_the_same_lag() {
     let a = plane(SHAPE_A[0], SHAPE_A[1], 0x9E37_79B9_7F4A_7C15);
     let b = plane(SHAPE_B[0], SHAPE_B[1], 0x1234_5678_9ABC_DEF1);
     let expected = squared_difference_direct(a.view(), b.view(), window());
-    let mut plan = SquaredDifference::new(SHAPE_A, SHAPE_B, window(), Padding::Smooth).unwrap();
-    let got = plan.landscape(a.view(), b.view()).unwrap();
+    for &backend in TransformBackend::available() {
+        let mut plan =
+            SquaredDifference::with_backend(SHAPE_A, SHAPE_B, window(), Padding::Smooth, backend)
+                .unwrap();
+        let got = plan.landscape(a.view(), b.view()).unwrap();
 
-    // The overlap counts are integers on both sides, so *these* compare exactly.
-    assert_eq!(got.overlap(), expected.overlap());
+        // The overlap counts are integers on both sides, so *these* compare exactly.
+        assert_eq!(got.overlap(), expected.overlap());
 
-    let (absolute, relative) = agreement(&got, &expected);
-    println!("landscape: worst {absolute:e} absolute, {relative:e} relative");
-    assert!(
-        relative < 1.0e-13,
-        "the transform landscape disagrees with the direct one by {relative:e} relative"
-    );
-    // The decision the landscape exists to make is identical, which is the
-    // strongest form of agreement available when the values cannot be.
-    assert_eq!(got.argmin().unwrap().0, expected.argmin().unwrap().0);
+        let (absolute, relative) = agreement(&got, &expected);
+        println!(
+            "landscape on {}: worst {absolute:e} absolute, {relative:e} relative",
+            backend.name()
+        );
+        assert!(
+            relative < 1.0e-13,
+            "the {} landscape disagrees with the direct one by {relative:e} relative",
+            backend.name()
+        );
+        // The decision the landscape exists to make is identical, which is the
+        // strongest form of agreement available when the values cannot be.
+        assert_eq!(got.argmin().unwrap().0, expected.argmin().unwrap().0);
+    }
 }
 
 #[test]
 fn the_parity_test_is_live() {
     let a = plane(SHAPE_A[0], SHAPE_A[1], 0x9E37_79B9_7F4A_7C15);
     let b = plane(SHAPE_B[0], SHAPE_B[1], 0x1234_5678_9ABC_DEF1);
-    let mut plan = SquaredDifference::new(SHAPE_A, SHAPE_B, window(), Padding::Smooth).unwrap();
+    for &backend in TransformBackend::available() {
+        let mut plan =
+            SquaredDifference::with_backend(SHAPE_A, SHAPE_B, window(), Padding::Smooth, backend)
+                .unwrap();
 
-    let before_direct = squared_difference_direct(a.view(), b.view(), window());
-    let before_fft = plan.landscape(a.view(), b.view()).unwrap();
+        let before_direct = squared_difference_direct(a.view(), b.view(), window());
+        let before_fft = plan.landscape(a.view(), b.view()).unwrap();
 
-    // One element, in an asymmetric position, changed by a large amount.
-    let mut perturbed = a.clone();
-    perturbed[[3, 17]] += 7.5;
-    let after_direct = squared_difference_direct(perturbed.view(), b.view(), window());
-    let after_fft = plan.landscape(perturbed.view(), b.view()).unwrap();
+        // One element, in an asymmetric position, changed by a large amount.
+        let mut perturbed = a.clone();
+        perturbed[[3, 17]] += 7.5;
+        let after_direct = squared_difference_direct(perturbed.view(), b.view(), window());
+        let after_fft = plan.landscape(perturbed.view(), b.view()).unwrap();
 
-    // Both routes moved, so neither is a constant.
-    let (direct_move, _) = agreement(&before_direct, &after_direct);
-    let (fft_move, _) = agreement(&before_fft, &after_fft);
-    // The move is ten orders of magnitude above the agreement bound, so "they
-    // agree" is a statement about two things that both responded.
-    assert!(
-        direct_move > 1.0e-2,
-        "the direct route did not move: {direct_move:e}"
-    );
-    assert!(
-        fft_move > 1.0e-2,
-        "the transform route did not move: {fft_move:e}"
-    );
+        // Both routes moved, so neither is a constant.
+        let (direct_move, _) = agreement(&before_direct, &after_direct);
+        let (fft_move, _) = agreement(&before_fft, &after_fft);
+        // The move is ten orders of magnitude above the agreement bound, so "they
+        // agree" is a statement about two things that both responded.
+        assert!(
+            direct_move > 1.0e-2,
+            "the direct route did not move: {direct_move:e}"
+        );
+        assert!(
+            fft_move > 1.0e-2,
+            "the {} route did not move: {fft_move:e}",
+            backend.name()
+        );
 
-    // And they still agree afterwards, to the same bound.
-    let (_, relative) = agreement(&after_fft, &after_direct);
-    println!("after the perturbation: {relative:e} relative");
-    assert!(relative < 1.0e-13);
+        // And they still agree afterwards, to the same bound.
+        let (_, relative) = agreement(&after_fft, &after_direct);
+        println!(
+            "after the perturbation on {}: {relative:e} relative",
+            backend.name()
+        );
+        assert!(relative < 1.0e-13);
+    }
 }
 
 #[test]
@@ -322,24 +378,31 @@ fn the_landscape_agrees_at_the_consumers_geometry() {
     let a = plane(shape_a[0], shape_a[1], 0xDEAD_BEEF_CAFE_0001);
     let b = plane(shape_b[0], shape_b[1], 0x0BAD_C0DE_F00D_0002);
 
-    let mut plan = SquaredDifference::new(shape_a, shape_b, lags, Padding::Smooth).unwrap();
-    assert!(!plan.wraps());
-    let got = plan.landscape(a.view(), b.view()).unwrap();
     let expected = squared_difference_direct(a.view(), b.view(), lags);
-    assert_eq!(got.overlap(), expected.overlap());
-    let (absolute, relative) = agreement(&got, &expected);
-    println!(
-        "consumer geometry, padded to {:?}: worst {absolute:e} absolute, {relative:e} relative",
-        plan.padded_shape()
-    );
-    assert!(relative < 1.0e-12, "{relative:e}");
-    assert_eq!(got.argmin().unwrap().0, expected.argmin().unwrap().0);
+    for &backend in TransformBackend::available() {
+        let mut plan =
+            SquaredDifference::with_backend(shape_a, shape_b, lags, Padding::Smooth, backend)
+                .unwrap();
+        assert!(!plan.wraps());
+        let got = plan.landscape(a.view(), b.view()).unwrap();
+        assert_eq!(got.overlap(), expected.overlap());
+        let (absolute, relative) = agreement(&got, &expected);
+        println!(
+            "consumer geometry on {}, padded to {:?}: worst {absolute:e} absolute, \
+             {relative:e} relative",
+            backend.name(),
+            plan.padded_shape()
+        );
+        assert!(relative < 1.0e-12, "{relative:e}");
+        assert_eq!(got.argmin().unwrap().0, expected.argmin().unwrap().0);
+    }
 }
 
 #[test]
 fn the_padding_rule_produces_the_geometry_the_header_claims() {
-    // The consumer's real case: two `96 x 1304` planes and lags in `[-30, 30]`
-    // on both axes.
+    // Two `96 x 1304` planes and lags in `[-30, 30]` on both axes — the centred
+    // window the module's header works through. The **off-centre** case, which is
+    // what the first consumer actually has, is the test below this one.
     let lags = ShiftWindow::symmetric([30, 30]);
     assert_eq!(
         minimal_wrap_free_length([96, 1304], [96, 1304], lags),
@@ -351,6 +414,101 @@ fn the_padding_rule_produces_the_geometry_the_header_claims() {
     let minimal = SquaredDifference::new([96, 1304], [96, 1304], lags, Padding::Minimal).unwrap();
     assert_eq!(minimal.padded_shape(), [126, 1334]);
     assert!(!minimal.wraps());
+}
+
+#[test]
+fn an_off_centre_window_is_the_case_the_rule_exists_for_and_it_is_not_the_centred_one() {
+    // The first consumer's real geometry: its two cuts sit 30 apart in global
+    // coordinates, so every row lag it wants is non-negative and its row window
+    // is `[0, 60]` rather than `[-30, 30]`. Same width, different padding, and
+    // the difference is the whole point of the rule.
+    let off_centre = ShiftWindow::new([0, -30], [60, 30]).unwrap();
+    let centred = ShiftWindow::symmetric([30, 30]);
+    assert_eq!(off_centre.extent(), centred.extent());
+
+    assert_eq!(
+        minimal_wrap_free_length([96, 1304], [96, 1304], off_centre),
+        [156, 1334]
+    );
+    let plan = SquaredDifference::new([96, 1304], [96, 1304], off_centre, Padding::Smooth).unwrap();
+    assert_eq!(plan.padded_shape(), [160, 1350]);
+    assert!(!plan.wraps());
+
+    // And it is right as well as different: a landscape over the off-centre
+    // window still agrees with the direct walk. The planes are cut down here so
+    // the direct side stays cheap; the *window* is the consumer's.
+    let narrow = ShiftWindow::new([0, -4], [9, 5]).unwrap();
+    let shape = [24usize, 61];
+    let a = plane(shape[0], shape[1], 0x9E37_79B9_7F4A_7C15);
+    let b = plane(shape[0], shape[1], 0x1234_5678_9ABC_DEF1);
+    let mut narrow_plan = SquaredDifference::new(shape, shape, narrow, Padding::Smooth).unwrap();
+    assert!(!narrow_plan.wraps());
+    // `max(24, 24, 24 - 0, 24 + 9) = 33` on the first axis, not `24 + 24 - 1`.
+    assert_eq!(minimal_wrap_free_length(shape, shape, narrow)[0], 33);
+    let got = narrow_plan.landscape(a.view(), b.view()).unwrap();
+    let expected = squared_difference_direct(a.view(), b.view(), narrow);
+    assert_eq!(got.overlap(), expected.overlap());
+    let (_, relative) = agreement(&got, &expected);
+    println!("off-centre window: {relative:e} relative");
+    assert!(relative < 1.0e-13, "{relative:e}");
+    assert_eq!(got.argmin().unwrap().0, expected.argmin().unwrap().0);
+}
+
+// ------------------------------------------------------------- the buffers --
+
+#[test]
+fn landscape_into_gives_the_same_answer_as_the_allocating_form_and_survives_reuse() {
+    let mut plan = SquaredDifference::new(SHAPE_A, SHAPE_B, window(), Padding::Smooth).unwrap();
+    let mut buffer = plan.empty_landscape();
+    // An empty buffer is not a landscape of zeros: it reads as "no overlap
+    // anywhere", which is the only honest thing an uncomputed buffer can say.
+    assert!(buffer
+        .mean_squared()
+        .iter()
+        .all(|value| value.is_infinite()));
+    assert!(buffer.overlap().iter().all(|&count| count == 0));
+    assert_eq!(buffer.argmin(), None);
+
+    for round in 0..4u64 {
+        let a = plane(
+            SHAPE_A[0],
+            SHAPE_A[1],
+            0x9E37_79B9_7F4A_7C15 ^ (round * 0x1234_5),
+        );
+        let b = plane(
+            SHAPE_B[0],
+            SHAPE_B[1],
+            0x1234_5678_9ABC_DEF1 ^ (round * 0x9_ABCD),
+        );
+        let allocated = plan.landscape(a.view(), b.view()).unwrap();
+        plan.landscape_into(a.view(), b.view(), &mut buffer)
+            .unwrap();
+        // Bit-identical, and a reused buffer must not carry anything of the
+        // previous round — which is what makes running this in a loop the test.
+        assert_eq!(buffer, allocated, "round {round}");
+    }
+}
+
+#[test]
+fn a_landscape_buffer_of_the_wrong_window_is_refused_rather_than_reshaped() {
+    // A landscape carries the lag convention its indices are read against, so a
+    // stale buffer of the right *shape* and the wrong window would be a wrong
+    // answer that looked right. It is an error instead.
+    let mut plan = SquaredDifference::new(SHAPE_A, SHAPE_B, window(), Padding::Smooth).unwrap();
+    let a = plane(SHAPE_A[0], SHAPE_A[1], 0x9E37_79B9_7F4A_7C15);
+    let b = plane(SHAPE_B[0], SHAPE_B[1], 0x1234_5678_9ABC_DEF1);
+
+    let shifted = ShiftWindow::new([-4, -6], [7, 5]).unwrap();
+    assert_eq!(
+        shifted.extent(),
+        window().extent(),
+        "same shape, different lags"
+    );
+    let mut wrong = Landscape::empty(shifted);
+    assert!(plan.landscape_into(a.view(), b.view(), &mut wrong).is_err());
+
+    let mut right = Landscape::empty(window());
+    assert!(plan.landscape_into(a.view(), b.view(), &mut right).is_ok());
 }
 
 // -------------------------------------------------------- negative controls --
@@ -578,23 +736,78 @@ fn normalising_by_a_constant_count_moves_the_minimum() {
 fn a_cloned_plan_computes_the_same_answer_from_another_thread() {
     // The claim `ops::fft`'s header makes about parallelism across planes:
     // clone the plan, keep the twiddles, get a fresh working set.
+    //
+    // For the FFTW backend this is also the thread-safety test. A clone there
+    // shares one plan through an `Arc` and executes it from four threads at
+    // once, which is the one thing FFTW documents as re-entrant — and bit
+    // identity is what says the shared plan was not being mutated underneath.
     let a = plane(SHAPE_A[0], SHAPE_A[1], 0x9E37_79B9_7F4A_7C15);
     let b = plane(SHAPE_B[0], SHAPE_B[1], 0x1234_5678_9ABC_DEF1);
-    let plan = SquaredDifference::new(SHAPE_A, SHAPE_B, window(), Padding::Smooth).unwrap();
-    let expected = plan.clone().landscape(a.view(), b.view()).unwrap();
+    for &backend in TransformBackend::available() {
+        let plan =
+            SquaredDifference::with_backend(SHAPE_A, SHAPE_B, window(), Padding::Smooth, backend)
+                .unwrap();
+        let expected = plan.clone().landscape(a.view(), b.view()).unwrap();
 
-    let handles = (0..4)
-        .map(|_| {
-            let mut mine = plan.clone();
-            let a = a.clone();
-            let b = b.clone();
-            std::thread::spawn(move || mine.landscape(a.view(), b.view()).unwrap())
-        })
-        .collect::<Vec<_>>();
-    for handle in handles {
-        // Bit-identical: the same plan and the same data on another thread is
-        // the same arithmetic in the same order.
-        assert_eq!(handle.join().unwrap(), expected);
+        let handles = (0..4)
+            .map(|_| {
+                let mut mine = plan.clone();
+                let a = a.clone();
+                let b = b.clone();
+                std::thread::spawn(move || mine.landscape(a.view(), b.view()).unwrap())
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            // Bit-identical: the same plan and the same data on another thread is
+            // the same arithmetic in the same order.
+            assert_eq!(handle.join().unwrap(), expected, "on {}", backend.name());
+        }
+    }
+}
+
+#[test]
+fn plans_built_at_the_same_time_agree_with_plans_built_alone() {
+    // The other half of the plan question, and the half a shared-plan clone
+    // does not reach: **building** several plans at once.
+    //
+    // `rustfft`'s planner is an ordinary owned value, so this is uninteresting
+    // for the portable backend and runs anyway. FFTW's planner is process-wide
+    // state that its own documentation says is not re-entrant, so this is the
+    // shape of program that would find an unlocked one. It is an exercise
+    // rather than a proof — a race that does not happen to fire still passes —
+    // which is why the lock is argued in `src/ops/fft.rs` rather than left to
+    // this test to establish.
+    //
+    // The shapes are all different, so no two threads are asking for a plan the
+    // planner has already made.
+    let shapes: [[usize; 2]; 6] = [[13, 23], [17, 29], [11, 19], [21, 31], [15, 27], [19, 25]];
+    for &backend in TransformBackend::available() {
+        let alone = shapes
+            .iter()
+            .map(|&shape| {
+                let source = plane(shape[0], shape[1], 0x5EED_0000 ^ shape[1] as u64);
+                let mut transform = RealTransform2::with_backend(shape, backend).unwrap();
+                let mut spectrum = transform.spectrum();
+                transform.forward(source.view(), &mut spectrum).unwrap();
+                spectrum
+            })
+            .collect::<Vec<_>>();
+
+        let handles = shapes
+            .iter()
+            .map(|&shape| {
+                std::thread::spawn(move || {
+                    let source = plane(shape[0], shape[1], 0x5EED_0000 ^ shape[1] as u64);
+                    let mut transform = RealTransform2::with_backend(shape, backend).unwrap();
+                    let mut spectrum = transform.spectrum();
+                    transform.forward(source.view(), &mut spectrum).unwrap();
+                    spectrum
+                })
+            })
+            .collect::<Vec<_>>();
+        for (handle, expected) in handles.into_iter().zip(alone.iter()) {
+            assert_eq!(&handle.join().unwrap(), expected, "on {}", backend.name());
+        }
     }
 }
 
@@ -603,45 +816,244 @@ fn a_plan_reused_over_many_pairs_gives_the_same_answers_as_fresh_ones() {
     // Plan reuse is the largest single speed lever here, and a reused plan that
     // carried state between calls would be a silent wrong answer rather than a
     // slow one.
-    let mut plan = SquaredDifference::new(SHAPE_A, SHAPE_B, window(), Padding::Smooth).unwrap();
-    for round in 0..5u64 {
-        let a = plane(
-            SHAPE_A[0],
-            SHAPE_A[1],
-            0x9E37_79B9_7F4A_7C15 ^ (round * 0x1234_5),
-        );
-        let b = plane(
-            SHAPE_B[0],
-            SHAPE_B[1],
-            0x1234_5678_9ABC_DEF1 ^ (round * 0x9_ABCD),
-        );
-        let reused = plan.landscape(a.view(), b.view()).unwrap();
-        let fresh = SquaredDifference::new(SHAPE_A, SHAPE_B, window(), Padding::Smooth)
+    for &backend in TransformBackend::available() {
+        let mut plan =
+            SquaredDifference::with_backend(SHAPE_A, SHAPE_B, window(), Padding::Smooth, backend)
+                .unwrap();
+        for round in 0..5u64 {
+            let a = plane(
+                SHAPE_A[0],
+                SHAPE_A[1],
+                0x9E37_79B9_7F4A_7C15 ^ (round * 0x1234_5),
+            );
+            let b = plane(
+                SHAPE_B[0],
+                SHAPE_B[1],
+                0x1234_5678_9ABC_DEF1 ^ (round * 0x9_ABCD),
+            );
+            let reused = plan.landscape(a.view(), b.view()).unwrap();
+            let fresh = SquaredDifference::with_backend(
+                SHAPE_A,
+                SHAPE_B,
+                window(),
+                Padding::Smooth,
+                backend,
+            )
             .unwrap()
             .landscape(a.view(), b.view())
             .unwrap();
-        assert_eq!(reused, fresh, "round {round}");
+            assert_eq!(reused, fresh, "round {round} on {}", backend.name());
+        }
     }
 }
 
 #[test]
 fn a_transform_refuses_what_it_cannot_hold() {
-    assert!(RealTransform2::new([0, 4]).is_err());
-    assert!(RealTransform2::new([4, 0]).is_err());
-    let mut transform = RealTransform2::new([6, 9]).unwrap();
-    let mut spectrum = transform.spectrum();
-    assert_eq!(spectrum.dim(), (6, 5));
-    let too_big = Array2::<f64>::zeros((7, 9));
-    assert!(transform
-        .forward_zero_padded(too_big.view(), &mut spectrum)
+    // The shape checks live above the backend, so they are the same checks
+    // whichever one is underneath — which is a claim, and this is where it is
+    // tested rather than assumed.
+    for &backend in TransformBackend::available() {
+        assert!(RealTransform2::with_backend([0, 4], backend).is_err());
+        assert!(RealTransform2::with_backend([4, 0], backend).is_err());
+        let mut transform = RealTransform2::with_backend([6, 9], backend).unwrap();
+        let mut spectrum = transform.spectrum();
+        assert_eq!(spectrum.dim(), (6, 5));
+        let too_big = Array2::<f64>::zeros((7, 9));
+        assert!(transform
+            .forward_zero_padded(too_big.view(), &mut spectrum)
+            .is_err());
+        let wrong_shape = Array2::<f64>::zeros((5, 9));
+        assert!(transform
+            .forward(wrong_shape.view(), &mut spectrum)
+            .is_err());
+        // A padded length that cannot even hold the two planes is refused rather
+        // than silently truncating them.
+        assert!(Correlation2::with_backend(
+            SHAPE_A,
+            SHAPE_B,
+            window(),
+            Padding::Exact([4, 4]),
+            backend
+        )
         .is_err());
-    let wrong_shape = Array2::<f64>::zeros((5, 9));
-    assert!(transform
-        .forward(wrong_shape.view(), &mut spectrum)
-        .is_err());
-    // A padded length that cannot even hold the two planes is refused rather
-    // than silently truncating them.
-    assert!(Correlation2::new(SHAPE_A, SHAPE_B, window(), Padding::Exact([4, 4])).is_err());
+    }
+}
+
+// ------------------------------------------------------------ the backends --
+
+/// What the `fftw` feature does, asserted from both sides of it.
+///
+/// The interesting half is the one that runs by default: **with the feature off
+/// there is one backend and it is the portable one**. That is the assertion the
+/// package count and the byte-for-byte claim rest on, and it is written as an
+/// inverted form of the same test rather than left out of the default build.
+#[test]
+fn the_feature_is_the_only_thing_that_chooses_the_backend() {
+    let available = TransformBackend::available();
+    assert_eq!(available[0], TransformBackend::Portable);
+    assert!(available.contains(&TransformBackend::default()));
+    // Every plan that is not asked for a backend is on the default one, at each
+    // of the three levels that can build one.
+    assert_eq!(
+        RealTransform2::new([8, 12]).unwrap().backend(),
+        TransformBackend::default()
+    );
+    assert_eq!(
+        Correlation2::new(SHAPE_A, SHAPE_B, window(), Padding::Smooth)
+            .unwrap()
+            .backend(),
+        TransformBackend::default()
+    );
+    assert_eq!(
+        SquaredDifference::new(SHAPE_A, SHAPE_B, window(), Padding::Smooth)
+            .unwrap()
+            .backend(),
+        TransformBackend::default()
+    );
+
+    #[cfg(not(feature = "fftw"))]
+    {
+        assert_eq!(
+            available,
+            &[TransformBackend::Portable],
+            "without the `fftw` feature there is one backend and it is the pure-Rust one"
+        );
+        assert_eq!(TransformBackend::default(), TransformBackend::Portable);
+    }
+    #[cfg(feature = "fftw")]
+    {
+        assert_eq!(
+            available,
+            &[TransformBackend::Portable, TransformBackend::Fftw],
+            "with the `fftw` feature both backends are compiled, which is what lets \
+             the parity test below compare them in one process"
+        );
+        assert_eq!(
+            TransformBackend::default(),
+            TransformBackend::Fftw,
+            "the feature's whole job is to swap the default"
+        );
+    }
+}
+
+/// The feature must not change the *shape* of the API either, and the auto
+/// traits are the part of that shape nothing writes down.
+///
+/// `Send` is what `a_cloned_plan_computes_the_same_answer_from_another_thread`
+/// needs and would catch. `Sync` is the one that could have gone missing in
+/// silence: the portable plans are `Sync` because `rustfft`'s and `realfft`'s
+/// trait objects are, and an FFTW working set holding a raw pointer is `Sync`
+/// only because this test says it must be. A feature that took `Sync` off three
+/// public types would be changing the API rather than the transform behind it.
+#[test]
+fn the_plans_are_send_and_sync_whichever_backend_they_are_on() {
+    fn assert_send_and_sync<T: Send + Sync>() {}
+    assert_send_and_sync::<RealTransform2>();
+    assert_send_and_sync::<Correlation2>();
+    assert_send_and_sync::<SquaredDifference>();
+
+    // And `Sync` used rather than only asserted: two threads sharing one plan
+    // by reference, reading the geometry it computed before any data arrived.
+    for &backend in TransformBackend::available() {
+        let plan =
+            SquaredDifference::with_backend(SHAPE_A, SHAPE_B, window(), Padding::Smooth, backend)
+                .unwrap();
+        let shared = &plan;
+        std::thread::scope(|scope| {
+            let handles = (0..2)
+                .map(|_| scope.spawn(move || (shared.padded_shape(), shared.overlap().sum())))
+                .collect::<Vec<_>>();
+            for handle in handles {
+                assert_eq!(
+                    handle.join().unwrap(),
+                    (plan.padded_shape(), plan.overlap().sum())
+                );
+            }
+        });
+    }
+}
+
+/// The two backends against each other, on the fixture the bar already uses.
+///
+/// This is a different question from "each agrees with the direct walk", and a
+/// sharper one: the direct walk is compared against at `1e-13`, so two backends
+/// could each pass it and still differ from one another by `1e-13`. The number
+/// this prints is the one to quote for "the backends agree".
+///
+/// **Values, not the argmin.** The short-padding control in this file already
+/// established that an argmin can sit still while the values it is chosen from
+/// move by tens of percent, so "both backends pick the same lag" would be a test
+/// that passes for a backend that is wrong.
+#[cfg(feature = "fftw")]
+#[test]
+fn the_two_backends_agree_on_the_fixture() {
+    let a = plane(SHAPE_A[0], SHAPE_A[1], 0x9E37_79B9_7F4A_7C15);
+    let b = plane(SHAPE_B[0], SHAPE_B[1], 0x1234_5678_9ABC_DEF1);
+    let landscape = |backend| {
+        SquaredDifference::with_backend(SHAPE_A, SHAPE_B, window(), Padding::Smooth, backend)
+            .unwrap()
+            .landscape(a.view(), b.view())
+            .unwrap()
+    };
+    let portable = landscape(TransformBackend::Portable);
+    let fftw = landscape(TransformBackend::Fftw);
+
+    // Geometry is geometry: these are integers on both sides and comparing them
+    // exactly is the whole point of computing them without a transform.
+    assert_eq!(portable.overlap(), fftw.overlap());
+
+    let (absolute, relative) = agreement(&fftw, &portable);
+    println!("the two backends: worst {absolute:e} absolute, {relative:e} relative");
+    assert!(
+        relative < 1.0e-13,
+        "the two backends disagree by {relative:e} relative, which is more than \
+         either is allowed to disagree with the direct walk"
+    );
+    assert_eq!(fftw.argmin().unwrap().0, portable.argmin().unwrap().0);
+
+    // And the liveness half: a comparison of two identical things would pass the
+    // assertion above forever. These are two different implementations of the
+    // same arithmetic, so they must differ *somewhere* in the last few places —
+    // if they do not, this test is comparing one backend with itself.
+    assert!(
+        absolute > 0.0,
+        "the two backends produced a bit-identical landscape, which means the \
+         feature did not swap anything"
+    );
+}
+
+/// The same question at the geometry the consumer actually has, where the
+/// padded transform is `128 x 1350` rather than `128 x 32` and there are four
+/// orders of magnitude more arithmetic for the two to drift apart over.
+#[cfg(feature = "fftw")]
+#[test]
+fn the_two_backends_agree_at_the_consumers_geometry() {
+    let shape = [96usize, 1304];
+    let lags = ShiftWindow::new([-7, -9], [8, 6]).unwrap();
+    let a = plane(shape[0], shape[1], 0xDEAD_BEEF_CAFE_0001);
+    let b = plane(shape[0], shape[1], 0x0BAD_C0DE_F00D_0002);
+    let landscape = |backend| {
+        SquaredDifference::with_backend(shape, shape, lags, Padding::Smooth, backend)
+            .unwrap()
+            .landscape(a.view(), b.view())
+            .unwrap()
+    };
+    let portable = landscape(TransformBackend::Portable);
+    let fftw = landscape(TransformBackend::Fftw);
+
+    assert_eq!(portable.overlap(), fftw.overlap());
+    let (absolute, relative) = agreement(&fftw, &portable);
+    println!(
+        "the two backends at the consumer's geometry: worst {absolute:e} absolute, \
+         {relative:e} relative"
+    );
+    assert!(relative < 1.0e-12, "{relative:e}");
+    assert_eq!(fftw.argmin().unwrap().0, portable.argmin().unwrap().0);
+    assert!(
+        absolute > 0.0,
+        "the two backends produced a bit-identical landscape, which means the \
+         feature did not swap anything"
+    );
 }
 
 // -------------------------------------------------- the full-scale numbers --
@@ -661,30 +1073,36 @@ fn the_full_consumer_window_agrees_with_the_direct_walk() {
     let a = plane(shape[0], shape[1], 0xDEAD_BEEF_CAFE_0001);
     let b = plane(shape[0], shape[1], 0x0BAD_C0DE_F00D_0002);
 
-    let mut plan = SquaredDifference::new(shape, shape, lags, Padding::Smooth).unwrap();
-    assert_eq!(plan.padded_shape(), [128, 1350]);
-    assert!(!plan.wraps());
-
-    let started = std::time::Instant::now();
-    let got = plan.landscape(a.view(), b.view()).unwrap();
-    let fast = started.elapsed();
-
+    // The oracle is the expensive half and does not depend on the backend, so it
+    // is walked once and every backend is held against it.
     let started = std::time::Instant::now();
     let expected = squared_difference_direct(a.view(), b.view(), lags);
     let slow = started.elapsed();
 
-    assert_eq!(got.overlap(), expected.overlap());
-    let (absolute, relative) = agreement(&got, &expected);
-    println!(
-        "full window {:?} lags over {shape:?}: {absolute:e} absolute, {relative:e} relative; \
-         transform {:?}, direct {:?} ({:.0}x)",
-        lags.extent(),
-        fast,
-        slow,
-        slow.as_secs_f64() / fast.as_secs_f64()
-    );
-    assert!(relative < 1.0e-12, "{relative:e}");
-    assert_eq!(got.argmin().unwrap().0, expected.argmin().unwrap().0);
+    for &backend in TransformBackend::available() {
+        let mut plan =
+            SquaredDifference::with_backend(shape, shape, lags, Padding::Smooth, backend).unwrap();
+        assert_eq!(plan.padded_shape(), [128, 1350]);
+        assert!(!plan.wraps());
+
+        let started = std::time::Instant::now();
+        let got = plan.landscape(a.view(), b.view()).unwrap();
+        let fast = started.elapsed();
+
+        assert_eq!(got.overlap(), expected.overlap());
+        let (absolute, relative) = agreement(&got, &expected);
+        println!(
+            "full window {:?} lags over {shape:?} on {}: {absolute:e} absolute, \
+             {relative:e} relative; transform {:?}, direct {:?} ({:.0}x)",
+            lags.extent(),
+            backend.name(),
+            fast,
+            slow,
+            slow.as_secs_f64() / fast.as_secs_f64()
+        );
+        assert!(relative < 1.0e-12, "{relative:e}");
+        assert_eq!(got.argmin().unwrap().0, expected.argmin().unwrap().0);
+    }
 }
 
 /// What the levers are worth, measured rather than asserted.
@@ -729,9 +1147,29 @@ fn the_speed_levers_are_measured() {
         );
     }
 
+    // A held landscape buffer against a fresh one per call. This is the smallest
+    // lever here and it is measured rather than assumed, because "it must be
+    // faster" is how an API grows a signature that pays for nothing.
+    let mut plan = SquaredDifference::new(shape, shape, lags, Padding::Smooth).unwrap();
+    let allocating = best(&mut plan);
+    let mut buffer = plan.empty_landscape();
+    let mut into = f64::INFINITY;
+    for _ in 0..rounds {
+        let started = std::time::Instant::now();
+        plan.landscape_into(a.view(), b.view(), &mut buffer)
+            .unwrap();
+        into = smaller(into, started.elapsed().as_secs_f64());
+        std::hint::black_box(&buffer);
+    }
+    println!(
+        "landscape {:8.3} ms, landscape_into {:8.3} ms ({:.3}x)",
+        allocating * 1e3,
+        into * 1e3,
+        allocating / into
+    );
+
     // Plan reuse against re-planning per landscape, which is the mistake this
     // API's shape exists to prevent.
-    let mut plan = SquaredDifference::new(shape, shape, lags, Padding::Smooth).unwrap();
     let reused = best(&mut plan);
     let mut fresh = f64::INFINITY;
     for _ in 0..rounds {
@@ -778,6 +1216,100 @@ fn the_speed_levers_are_measured() {
             worst * 1e3,
             threads as f64 / worst,
             started.elapsed()
+        );
+    }
+}
+
+/// The backends against each other, measured rather than argued about.
+///
+/// Four numbers per backend and they are not all the same story, which is the
+/// reason this prints a table rather than a verdict:
+///
+/// * the forward transform at `128 x 1350`, the shape `Padding::Smooth` chooses
+///   for the consumer's geometry — the row FFTW was expected to win;
+/// * the forward transform at `157 x 1335`, the shape the consumer's geometry
+///   has *before* the padding rule is applied, where `157` is prime;
+/// * a whole landscape, which is two forwards, one inverse and the rectangle
+///   sums that no transform touches;
+/// * and the same landscape from eight threads over cloned plans, because a
+///   backend that cannot be shared across threads would lose the `6.4x` that is
+///   worth more than either row above.
+///
+/// Best-of on a shared machine, so read the ratios and not the milliseconds.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn the_backends_are_measured_against_each_other() {
+    let rounds = 50;
+    for shape in [[128usize, 1350usize], [157, 1335]] {
+        let source = plane(shape[0], shape[1], 0xDEAD_BEEF_CAFE_0001);
+        for &backend in TransformBackend::available() {
+            let mut transform = RealTransform2::with_backend(shape, backend).unwrap();
+            let mut spectrum = transform.spectrum();
+            let mut best = f64::INFINITY;
+            for _ in 0..rounds {
+                let started = std::time::Instant::now();
+                transform.forward(source.view(), &mut spectrum).unwrap();
+                std::hint::black_box(&spectrum);
+                best = smaller(best, started.elapsed().as_secs_f64());
+            }
+            println!(
+                "forward r2c {shape:?} on {:9}: {:8.3} ms",
+                backend.name(),
+                best * 1e3
+            );
+        }
+    }
+
+    let shape = [96usize, 1304];
+    let lags = ShiftWindow::symmetric([30, 30]);
+    let a = plane(shape[0], shape[1], 0xDEAD_BEEF_CAFE_0001);
+    let b = plane(shape[0], shape[1], 0x0BAD_C0DE_F00D_0002);
+    let rounds = 20;
+    for &backend in TransformBackend::available() {
+        let planning = std::time::Instant::now();
+        let plan =
+            SquaredDifference::with_backend(shape, shape, lags, Padding::Smooth, backend).unwrap();
+        let planning = planning.elapsed();
+        let mut mine = plan.clone();
+        let mut best = f64::INFINITY;
+        for _ in 0..rounds {
+            let started = std::time::Instant::now();
+            let landscape = mine.landscape(a.view(), b.view()).unwrap();
+            std::hint::black_box(&landscape);
+            best = smaller(best, started.elapsed().as_secs_f64());
+        }
+
+        let threads = 8usize;
+        let handles = (0..threads)
+            .map(|_| {
+                let mut mine = plan.clone();
+                let a = a.clone();
+                let b = b.clone();
+                std::thread::spawn(move || {
+                    let mut best = f64::INFINITY;
+                    for _ in 0..rounds {
+                        let started = std::time::Instant::now();
+                        let landscape = mine.landscape(a.view(), b.view()).unwrap();
+                        std::hint::black_box(&landscape);
+                        best = smaller(best, started.elapsed().as_secs_f64());
+                    }
+                    best
+                })
+            })
+            .collect::<Vec<_>>();
+        let worst = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .fold(0.0f64, larger);
+        println!(
+            "landscape {:?} on {:9}: {:8.3} ms one thread, {:8.3} landscapes/s on \
+             {threads} ({:.1}x), planned in {:?}",
+            plan.padded_shape(),
+            backend.name(),
+            best * 1e3,
+            threads as f64 / worst,
+            best * threads as f64 / worst,
+            planning
         );
     }
 }

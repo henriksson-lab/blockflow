@@ -223,7 +223,7 @@ pub use element::{
 pub use fft::{
     correlate_direct, minimal_wrap_free_length, next_smooth_length, spectrum_width,
     squared_difference_direct, Complex, Correlation2, Landscape, Padding, RealTransform2,
-    ShiftWindow, Spectrum, SquaredDifference,
+    ShiftWindow, Spectrum, SquaredDifference, TransformBackend,
 };
 pub use fill::{
     agree_on_connectivity, fill_phases, label_background_into_with, merge_faces_with, FillHolesOp,

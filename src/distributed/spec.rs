@@ -37,6 +37,7 @@
 // expected output is the input whatever the worker count.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -52,11 +53,11 @@ use crate::probes::{
 use crate::sidecar::{check_stream_name, Lifecycle};
 use crate::strategy::{Enumerating, Strategy, Workflow};
 
-use super::coordinator::DEFAULT_LEASE_MS;
 use super::handout::HandoutPolicy;
 use super::shared_volume::SharedVolumes;
 use super::wire::{
-    array, decomposition_json, flag, get, number_or, real_or, text, text_or, triple, triple_or,
+    array, decomposition_json, flag, get, millis_json, millis_or_none, number_or, real_or, text,
+    text_or, triple, triple_or,
 };
 
 /// One op, named in terms a factory resolves.
@@ -496,7 +497,25 @@ impl WorkflowSpec {
 pub struct JobSpec {
     pub id: String,
     pub workflow: WorkflowSpec,
-    pub lease_ms: u64,
+    /// How long a claim survives without a completion before the coordinator
+    /// takes the task back and gives it to somebody else — **or `None`, which
+    /// is the default and means never.**
+    ///
+    /// `None` rather than a very large number of milliseconds, and the
+    /// difference is the point. A big number is still a deadline: it can be
+    /// compared, added to, overflowed, and — worst — it can be *met*, so the
+    /// reissue path stays live and the question becomes whether the number was
+    /// chosen large enough. `None` is not a deadline at all; there is no
+    /// arithmetic to get wrong because there is no operand. A claim handed out
+    /// is a claim held until it completes.
+    ///
+    /// Set it only to opt in to reissue, which the module header explains is
+    /// no longer the default deployment's answer to a lost node. When it is
+    /// set it must exceed `(ahead + 1) x task duration`, because a worker holds
+    /// `ahead` tasks it has not started; a lease shorter than that reissues
+    /// work nobody lost. That contract being implicit and unenforceable is a
+    /// large part of why the default is `None`.
+    pub lease: Option<Duration>,
     pub policy: HandoutPolicy,
 }
 
@@ -505,7 +524,7 @@ impl JobSpec {
         Self {
             id: id.into(),
             workflow,
-            lease_ms: DEFAULT_LEASE_MS,
+            lease: None,
             policy: HandoutPolicy::default(),
         }
     }
@@ -519,7 +538,7 @@ impl JobSpec {
     pub fn to_json(&self, decomposition: &Decomposition) -> Result<Value> {
         Ok(json!({
             "id": self.id,
-            "lease_ms": self.lease_ms,
+            "lease_ms": millis_json(self.lease),
             "policy": self.policy.as_str(),
             "workflow": self.workflow.to_json(),
             "decomposition": decomposition_json(decomposition)?,
@@ -533,7 +552,14 @@ impl JobSpec {
         Ok(Self {
             id: text_or(value, "id", "job"),
             workflow: WorkflowSpec::from_json(get(value, "workflow")?)?,
-            lease_ms: number_or(value, "lease_ms", DEFAULT_LEASE_MS),
+            // Absent, `null` and a non-number all mean **no expiry**, which is
+            // also the constructor's default, so a spec that never mentions a
+            // lease and one that mentions it as `null` agree. The field's
+            // shape on the wire is unchanged — a number when there is a lease
+            // — so nothing here moves `PROTOCOL_VERSION`; what changed is what
+            // its absence means, and it now means the safe thing rather than
+            // thirty seconds nobody asked for.
+            lease: millis_or_none(value, "lease_ms"),
             policy,
         })
     }

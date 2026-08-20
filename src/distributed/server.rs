@@ -2,7 +2,7 @@
 //
 // Original work for this crate.
 //
-// The coordinator's HTTP surface: eight paths, one JSON body each.
+// The coordinator's HTTP surface: nine paths, one JSON body each.
 //
 // `tiny_http` for the same reason the progress view uses it — the executor is
 // synchronous, an async runtime would be a second concurrency model inside a
@@ -270,6 +270,40 @@ fn handle(mut request: Request, coordinator: &Coordinator) {
                 .and_then(|status| coordinator.failed(&status.job, &worker, task, &why))
                 .map(|()| json!({"ok": true}))
         }
+        // A worker is gone. The coordinator cannot see this — it has no signal
+        // for a process it did not start, and the only alternative would be to
+        // infer it from silence, which is a timeout, which is the mechanism
+        // this design removed. So the party that *did* start the worker says
+        // so: `local::run` here, a batch script or an orchestrator on a
+        // cluster. See `coordinator::Job::worker_lost`.
+        path::LOST => {
+            let worker = text_or(&body, "worker", "");
+            let why = text_or(&body, "why", "unspecified");
+            if worker.is_empty() {
+                Err(Error::invalid(
+                    "a loss names the worker that was lost; the message it produces is \
+                     no use without it"
+                        .to_string(),
+                ))
+            } else {
+                coordinator
+                    .worker_lost(job.as_deref(), &worker, &why)
+                    .map(|aborted| {
+                        json!({
+                            "aborted": true,
+                            "worker": aborted.worker,
+                            "why": aborted.why,
+                            "message": aborted.message(),
+                            "held": aborted.held.iter().map(|claim| json!({
+                                "task": claim.task,
+                                "phase": claim.phase,
+                                "index": claim.index,
+                                "held_ms": claim.held.as_millis() as u64,
+                            })).collect::<Vec<_>>(),
+                        })
+                    })
+            }
+        }
         path::STATUS => coordinator
             .status(job.as_deref())
             .map(|status| status.to_json()),
@@ -285,12 +319,13 @@ fn handle(mut request: Request, coordinator: &Coordinator) {
             .and_then(|status| coordinator.inspect(&status.job, |job| job.status().to_json())),
         _ => Err(Error::invalid(format!(
             "{route:?} is not an endpoint. This is a coordinator, not a progress view: \
-             {}, {}, {}, {}, {}, {}, {}, {}.",
+             {}, {}, {}, {}, {}, {}, {}, {}, {}.",
             path::JOIN,
             path::PULL,
             path::REPORT,
             path::COMPLETED,
             path::FAILED,
+            path::LOST,
             path::STATUS,
             path::SUBMIT,
             path::JOBS

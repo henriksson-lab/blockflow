@@ -129,6 +129,36 @@ pub fn array<'a>(object: &'a Value, name: &str) -> Result<&'a Vec<Value>> {
         .ok_or_else(|| Error::invalid(format!("{name:?} is not an array")))
 }
 
+// ------------------------------------------------------------ optional --
+// A duration that may not exist, and where **not existing is the answer** —
+// not a stand-in for a number nobody supplied.
+//
+// The one such field is the claim lease, whose default is that there is no
+// lease at all (see `coordinator`, and the module header's "nodes do not
+// die"). Encoding "no expiry" as a very large number of milliseconds would put
+// a value on the wire that arithmetic can overflow and that a reader has to
+// recognise by magnitude; `null` is the same statement with nothing to get
+// wrong. Absent reads as `None` for the same reason: a message that never
+// mentions a lease is a message asking for none, which is the default anyway,
+// so the two spellings agree rather than diverging.
+
+/// Milliseconds, or nothing. `null`, absent and a non-number all read as
+/// `None`; only an actual number is a duration.
+pub fn millis_or_none(object: &Value, name: &str) -> Option<std::time::Duration> {
+    object
+        .get(name)
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_millis)
+}
+
+/// The other half, so the two spellings cannot drift apart.
+pub fn millis_json(duration: Option<std::time::Duration>) -> Value {
+    match duration {
+        Some(duration) => json!(duration.as_millis() as u64),
+        None => Value::Null,
+    }
+}
+
 // ------------------------------------------------------------- regions --
 
 pub fn region_json(region: &Region) -> Value {

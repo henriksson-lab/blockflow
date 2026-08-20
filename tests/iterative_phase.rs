@@ -586,3 +586,114 @@ fn an_environment_that_holds_no_data_refuses_to_iterate_rather_than_guessing() {
     assert!(message.contains("holds no data"), "{message}");
     assert!(message.contains("spread"), "{message}");
 }
+
+// --------------------------------------- 9. the substage wave, at any width --
+
+/// **The blocks of one substage may run together, and it is the same answer.**
+///
+/// The independence is structural — every block of a substage reads `current`,
+/// which nothing writes until the substage ends, and writes its own core of
+/// `next`, and the cores are disjoint because they tile — so the wave is safe for
+/// the same reason the executor's ready wave is. What is *not* safe, and what
+/// this pins from the other side, is running the substages together: block `b` at
+/// substage `k + 1` reads cores its neighbours wrote at `k`, so the boundary is a
+/// real exchange point and the loop over substages stays serial.
+///
+/// A run that lost that barrier would not fail loudly. It would read a mixture of
+/// substage `k` and `k + 1` across a seam and converge to a plausible volume in a
+/// plausible number of substages, so the assertion that catches it is the whole
+/// triple: the same values, the **same substage count**, and the same amount
+/// changed in each of them.
+#[test]
+fn a_substage_wave_is_the_same_answer_at_any_width() {
+    let op = op(generous());
+    let source = input(44);
+    let (expected, expected_substages) = reference(&op, &source);
+
+    // A cut fine enough that the wave has something to schedule; one block would
+    // make every concurrency below the same run.
+    let plan = plan(&op, 6);
+    assert!(
+        plan.n_tasks() >= 8,
+        "the cut leaves {} block(s), too few for a wave",
+        plan.n_tasks()
+    );
+
+    let mut answers = Vec::new();
+    for concurrency in [1usize, 2, 4, 8] {
+        let env = ArrayEnvironment::for_decomposition(source.clone(), &plan, [8, 4, 4])
+            .expect("an environment");
+        let hints = Hints {
+            concurrency,
+            ..Hints::default()
+        };
+        let stats = execute_phases(
+            "iterate",
+            &empty_workflow(),
+            &plan,
+            &hints,
+            &env,
+            &[],
+            &[PhaseWork::Iterate(&op)],
+        )
+        .expect("a run");
+        assert_eq!(
+            values(&env.output()),
+            values(&expected),
+            "concurrency {concurrency} disagrees with the whole-volume reference"
+        );
+        assert_eq!(
+            stats.substages,
+            vec![expected_substages],
+            "concurrency {concurrency} took a different number of substages"
+        );
+        answers.push(stats.substage_changes);
+    }
+    for (concurrency, changes) in [1usize, 2, 4, 8].iter().zip(&answers) {
+        assert_eq!(
+            changes, &answers[0],
+            "concurrency {concurrency} changed a different amount per substage, which is a \
+             substage boundary that stopped being a barrier"
+        );
+    }
+}
+
+/// **What each substage changed, as a sequence rather than as a bit.**
+///
+/// The reduction the loop already takes, reported. It is worth having because
+/// the count alone cannot distinguish an iteration that is converging from one
+/// that is about to hit its limit, and the shape of the sequence can: this one
+/// decays to zero, and the zero is the last entry exactly because a phase ends on
+/// the substage that changed nothing.
+///
+/// The liveness half is the middle assertion. Without it a run that changed
+/// nothing at all — the identity, which is a well-formed iteration — would
+/// satisfy the first and the last.
+#[test]
+fn the_substage_changes_are_the_reduction_the_loop_stops_on() {
+    let op = op(generous());
+    let (_, env_substages) = reference(&op, &input(44));
+    let (stats, _) = run(&op, input(44), 12);
+
+    let changes = &stats.substage_changes[0];
+    assert_eq!(
+        changes.len(),
+        env_substages,
+        "one entry per substage: {changes:?}"
+    );
+    assert_eq!(
+        *changes.last().expect("a substage"),
+        0,
+        "a phase ends on the substage that changed nothing: {changes:?}"
+    );
+    assert!(
+        changes[..changes.len() - 1].iter().all(|count| *count > 0),
+        "every substage before the last changed something, or the loop would have stopped \
+         earlier: {changes:?}"
+    );
+    assert!(
+        changes.iter().sum::<u64>() > 0,
+        "an iteration that changed nothing anywhere is the identity, and would satisfy every \
+         other assertion here"
+    );
+}

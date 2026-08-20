@@ -520,6 +520,27 @@ pub struct Stats {
     /// it — a strategy that honoured a foreign decomposition did the same
     /// *planned* work whatever the data made it iterate.
     pub substages: Vec<usize>,
+    /// What each substage of each phase **changed**, in substage order, and an
+    /// empty list for every phase that is not an iteration.
+    ///
+    /// The same reduction [`Stats::substages`] counts, reported as a quantity
+    /// instead of only as a threshold. An iteration stops when a substage
+    /// changes nothing anywhere, so the executor already compares every block's
+    /// core against what it went in as; this is the size of that difference,
+    /// summed over the blocks, rather than the bit it is collapsed to.
+    ///
+    /// It is worth carrying because the *shape* of the sequence is the thing a
+    /// caller can act on and the count alone is not: a sequence that decays
+    /// geometrically is an iteration converging, one that plateaus is an
+    /// iteration that will hit its limit, and the two are indistinguishable from
+    /// a substage count taken after the fact. The last entry is zero exactly
+    /// when the phase ended by converging, which it always does — the runaway
+    /// limit is an error and not a return.
+    ///
+    /// Zero-length for a phase run under an environment that holds no data, on
+    /// the same argument [`crate::env::Environment::same`] returns `None` there:
+    /// a simulated run has no values to difference.
+    pub substage_changes: Vec<Vec<u64>>,
     /// Calls into the environment's loader, and what they moved. A plan
     /// predicting N reads against a run performing 3N is a planner bug the log
     /// shows and output equality never would.

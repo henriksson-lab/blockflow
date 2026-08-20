@@ -61,8 +61,19 @@ use super::placement::{self, Residency};
 use super::protocol::{Assignment, Handout, JobStatus, Joined, PROTOCOL_VERSION};
 use super::spec::JobSpec;
 
-/// How long a claim survives without a completion before it is reissued.
-pub const DEFAULT_LEASE_MS: u64 = 30_000;
+/// How long a claim survives without a completion before it is reissued, for a
+/// job that asks for a lease at all.
+///
+/// **Not a default.** [`JobSpec::lease`] is `None` unless somebody sets it, and
+/// this constant exists only so that a caller opting in has a figure to start
+/// from rather than inventing one. It has to exceed the time a worker may hold
+/// a task before starting it — a worker keeps `ahead` tasks in hand, so the
+/// real constraint is `lease > (ahead + 1) x task duration`, and a lease that
+/// violates it reissues work that nobody lost. That contract being implicit is
+/// exactly why no job has a lease unless it asks.
+///
+/// [`JobSpec::lease`]: super::spec::JobSpec::lease
+pub const SUGGESTED_LEASE_MS: u64 = 30_000;
 /// How long a per-run coordinator waits, after the last task, for the event
 /// stream to go quiet.
 ///
@@ -107,7 +118,77 @@ enum TaskState {
 struct Claim {
     worker: String,
     at: Instant,
-    lease: Duration,
+    /// The deadline this claim was handed out under, or `None` for the default
+    /// — which is that there is no deadline. Stamped from the spec at handout
+    /// rather than read from the spec at expiry, so that a claim made under one
+    /// policy is never judged by another.
+    lease: Option<Duration>,
+}
+
+/// One task a worker was holding, in the terms a person reads.
+///
+/// Exists so that a lost node can be *named* rather than counted. "Three claims
+/// outstanding" tells an operator nothing about which part of the volume has to
+/// be redone; `(task 41, phase 0, block [2, 1, 3], held 4.2 s)` tells them
+/// where the job stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldClaim {
+    pub task: usize,
+    pub phase: usize,
+    pub index: [usize; 3],
+    pub held: Duration,
+}
+
+/// Why a job stopped short of finishing.
+///
+/// A job is either running, finished, or aborted, and the third is a state and
+/// not an error return: the coordinator has to keep serving long enough to tell
+/// the surviving workers to stop and to write out its record, so "we are giving
+/// up, and here is exactly what was lost" has to be something it *holds*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Aborted {
+    /// The worker that went away.
+    pub worker: String,
+    /// How that was found out — an exit status, a launcher's message. The
+    /// coordinator does not detect this itself; see [`Job::worker_lost`].
+    pub why: String,
+    /// Exactly what that worker was holding when it went. Empty is possible and
+    /// is worth reporting as itself: a worker that died between tasks lost no
+    /// work, and the job still stops, because the decision is about the node
+    /// and not about the tasks.
+    pub held: Vec<HeldClaim>,
+}
+
+impl Aborted {
+    /// The message, in one place, so the stderr line and the report agree.
+    pub fn message(&self) -> String {
+        let held = if self.held.is_empty() {
+            "no tasks (it died between claims)".to_string()
+        } else {
+            self.held
+                .iter()
+                .map(|claim| {
+                    format!(
+                        "task {} (phase {}, block {:?}, held {:.1} s)",
+                        claim.task,
+                        claim.phase,
+                        claim.index,
+                        claim.held.as_secs_f64()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "worker {} is gone ({}). It was holding {}. This job is aborting: blockflow \
+             does not recover from the loss of a node. A lost node may have held a great \
+             deal of work in memory, and re-running only the tasks it had claimed is not \
+             the same as recovering it — so the decision is deliberately left to whatever \
+             started this job (a batch script, an orchestrator, a person) rather than \
+             guessed at here.",
+            self.worker, self.why, held
+        )
+    }
 }
 
 /// What the coordinator knows about one worker.
@@ -186,6 +267,8 @@ pub struct Job {
     /// its phase; off is here so the two can be measured against each other over
     /// the same job, which is the only way "it helps" means anything.
     scarce_placement: bool,
+    /// Set once, by [`Job::worker_lost`], and never cleared. See [`Aborted`].
+    aborted: Option<Aborted>,
 }
 
 impl Job {
@@ -225,6 +308,7 @@ impl Job {
             started: Instant::now(),
             last_event: Instant::now(),
             scarce_placement: true,
+            aborted: None,
         })
     }
 
@@ -256,6 +340,74 @@ impl Job {
 
     pub fn finished(&self) -> bool {
         self.done == self.graph.len()
+    }
+
+    /// Why this job gave up, if it did.
+    pub fn aborted(&self) -> Option<&Aborted> {
+        self.aborted.as_ref()
+    }
+
+    /// Finished or aborted — the two ways a job stops needing workers.
+    ///
+    /// Deliberately one predicate rather than two tested at every call site: a
+    /// coordinator that exits on one and hangs on the other is precisely the
+    /// silent stall this design rules out.
+    pub fn over(&self) -> bool {
+        self.finished() || self.aborted.is_some()
+    }
+
+    /// What `worker` is holding right now.
+    ///
+    /// The coordinator has always known this; it had nowhere to say it. Reads
+    /// the claim table directly rather than the cache model, because this is
+    /// about work that will not be finished and not about bytes somebody might
+    /// have.
+    pub fn claims_held_by(&self, worker: &str) -> Vec<HeldClaim> {
+        let now = Instant::now();
+        self.claims
+            .iter()
+            .filter(|(_, claim)| claim.worker == worker)
+            .map(|(&task, claim)| HeldClaim {
+                task,
+                phase: self.graph.tasks[task].phase,
+                index: self.graph.tasks[task].index,
+                held: now.duration_since(claim.at),
+            })
+            .collect()
+    }
+
+    /// A worker is gone. Stop the job and say what was lost.
+    ///
+    /// **This is the answer to a node loss, and reissue is not.** The two are
+    /// different beliefs about what a lost node costs: reissue believes the
+    /// tasks it held are the work it had, so re-running them restores the
+    /// position. That is not this deployment. A node here may hold a great deal
+    /// in memory and in its own cache, so the honest choice is between building
+    /// real recovery — a large piece of design, deliberately not attempted now
+    /// — and stopping cleanly for somebody above to decide. This is the second.
+    ///
+    /// The coordinator **does not detect this itself**, and the parameter is
+    /// the evidence rather than a guess: it has no signal for a process it did
+    /// not start, and the only thing it could use instead is silence, which is
+    /// a timeout, which is the thing this design removed. Whoever started the
+    /// worker — `local::run`, `srun`, an orchestrator — sees the exit and says
+    /// so. See the module header.
+    ///
+    /// Idempotent, and it has to be: two survivors can notice the same death,
+    /// and the first account is the one worth keeping, because by the second
+    /// the claim table has already been read.
+    pub fn worker_lost(&mut self, worker: &str, why: &str) -> Aborted {
+        if let Some(already) = &self.aborted {
+            return already.clone();
+        }
+        let aborted = Aborted {
+            worker: worker.to_string(),
+            why: why.to_string(),
+            held: self.claims_held_by(worker),
+        };
+        eprintln!("coordinator: {}", aborted.message());
+        self.aborted = Some(aborted.clone());
+        aborted
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -314,20 +466,44 @@ impl Job {
 
     /// Return every claim whose lease has expired to the pending set.
     ///
-    /// This is the whole of fault tolerance, and it is why the handout is a
-    /// pull. A worker that is preempted, reclaimed, killed or simply wedged
-    /// stops renewing, its claim expires, and the task goes to somebody else.
-    /// No failure detector, no membership protocol, no second mechanism for the
-    /// "worker is slow" case versus the "worker is gone" case — a slow worker's
-    /// task is reissued and its eventual completion is accepted or ignored,
-    /// which costs a duplicate execution and never a wrong result, because the
-    /// two executions write the same values to the same valid region.
+    /// **Off unless a job asks for it.** A claim with no lease — the default,
+    /// see [`JobSpec::lease`] and the module header — can never appear in
+    /// `expired`, so this is a scan of a table whose every entry declines, and
+    /// the reissue path below is never entered. That is deliberate rather than
+    /// vestigial: the mechanism stays compiled and tested, and a job that wants
+    /// it sets a lease.
+    ///
+    /// What it does when a job does ask: a worker that is preempted, reclaimed,
+    /// killed or simply wedged stops renewing, its claim expires, and the task
+    /// goes to somebody else. No failure detector, no membership protocol, no
+    /// second mechanism for the "worker is slow" case versus the "worker is
+    /// gone" case — a slow worker's task is reissued and its eventual
+    /// completion is accepted or ignored, which costs a duplicate execution and
+    /// never a wrong result, because the two executions write the same values
+    /// to the same valid region.
+    ///
+    /// The reason that is not the default is the reason it is worth reading
+    /// twice: **a slow worker is indistinguishable from a dead one here**, and
+    /// the coordinator issues a claim's deadline at handout while the worker
+    /// keeps `ahead` tasks in hand, so a lease shorter than `(ahead + 1) x`
+    /// task duration reissues work that nobody lost. Measured on the local
+    /// multi-node fixture with **nobody killed**, a 400 ms lease reissued 13 of
+    /// 16 tasks and recomputed 11 of 16 blocks — 69 % of a job duplicated with
+    /// no fault at all. The output stayed byte-identical, so it was waste and
+    /// not corruption, but it is waste bought with a number that has to be
+    /// guessed right.
+    ///
+    /// [`JobSpec::lease`]: super::spec::JobSpec::lease
     fn expire_claims(&mut self) {
         let now = Instant::now();
         let expired: Vec<(usize, String)> = self
             .claims
             .iter()
-            .filter(|(_, claim)| now.duration_since(claim.at) > claim.lease)
+            .filter(|(_, claim)| {
+                claim
+                    .lease
+                    .is_some_and(|lease| now.duration_since(claim.at) > lease)
+            })
             .map(|(&task, claim)| (task, claim.worker.clone()))
             .collect();
         for (task, worker) in expired {
@@ -404,7 +580,13 @@ impl Job {
     pub fn pull(&mut self, worker: &str) -> Handout {
         self.admit(worker);
         self.expire_claims();
-        if self.finished() {
+        // A survivor asking for work after the job has been abandoned is told
+        // to go home, in the same word it would hear on a clean finish. It is
+        // the same thing from the worker's side — there is no more work for it
+        // — and inventing a third answer would give every worker a new state to
+        // get wrong. The *record* keeps the difference: `aborted` is set, the
+        // report says so, and the coordinator exits non-zero.
+        if self.over() {
             return Handout::Finished;
         }
         let ready = self.ready();
@@ -473,7 +655,7 @@ impl Job {
             read: read.clone(),
             valid: entry.geometry.valid.clone(),
             attempt: self.attempts[task] + 1,
-            lease_ms: self.spec.lease_ms,
+            lease: self.spec.lease,
         };
         let placed = handout::position(&self.graph, task);
         self.attempts[task] += 1;
@@ -483,7 +665,7 @@ impl Job {
             Claim {
                 worker: worker.to_string(),
                 at: Instant::now(),
-                lease: Duration::from_millis(self.spec.lease_ms),
+                lease: self.spec.lease,
             },
         );
         // The cache model is updated **here**, from the assignment, and never
@@ -743,6 +925,19 @@ impl Coordinator {
         })
     }
 
+    /// Tell the coordinator a worker is gone. See [`Job::worker_lost`].
+    pub fn worker_lost(&self, named: Option<&str>, worker: &str, why: &str) -> Result<Aborted> {
+        let id = self.resolve(named)?;
+        self.with_job(&id, |job| Ok(job.worker_lost(worker, why)))
+    }
+
+    /// Whether any job gave up, and the first account of why.
+    pub fn aborted(&self) -> Option<Aborted> {
+        self.lock_jobs()
+            .values()
+            .find_map(|job| job.aborted().cloned())
+    }
+
     pub fn report(&self, job: &str, event: &Value) -> Result<()> {
         self.with_job(job, |job| {
             job.report(event);
@@ -786,8 +981,12 @@ impl Coordinator {
 
     /// The one place the two lifetimes differ.
     ///
-    /// Finished **and quiet**: the record has to be complete, because it is
-    /// what the run is checked from. See [`DEFAULT_LINGER_MS`].
+    /// **Over** and quiet: the record has to be complete, because it is what
+    /// the run is checked from. See [`DEFAULT_LINGER_MS`].
+    ///
+    /// Over rather than finished, so that an aborted job leaves as promptly as
+    /// a completed one. A coordinator that only exited on success would turn
+    /// every node loss into the hang the abort exists to prevent.
     pub fn should_exit(&self) -> bool {
         if !self.exit_when_done {
             return false;
@@ -796,7 +995,7 @@ impl Coordinator {
         !jobs.is_empty()
             && jobs
                 .values()
-                .all(|job| job.finished() && job.quiet_for() >= self.linger)
+                .all(|job| job.over() && job.quiet_for() >= self.linger)
     }
 
     /// The merged event stream, as an `ExecutionLog`.
@@ -861,10 +1060,53 @@ mod tests {
         assert!(matches!(job.pull("late"), Handout::Wait { .. }));
     }
 
+    /// The default, and the assertion that encodes its absence.
+    ///
+    /// A claim with no lease does not expire, however long it is held. Stated
+    /// over a *deliberately* long hold, because the failure this guards is a
+    /// default that quietly became finite again — `u64::MAX` milliseconds, a
+    /// "sensible" fallback in a `from_json`, a `unwrap_or(30_000)` — and every
+    /// one of those would pass a test that only waited a moment.
+    ///
+    /// Its liveness counterpart is the test directly below: the same claim,
+    /// under an explicit finite lease, *is* taken away. The pair is the point.
+    /// Neither half alone distinguishes "expiry is off" from "expiry is
+    /// broken".
+    #[test]
+    fn a_claim_with_no_lease_is_never_taken_away_however_long_it_is_held() {
+        let (spec, decomposition) = probe_job(6, 1, ChainSpec::identity());
+        assert_eq!(spec.lease, None, "a job has no lease unless it asks");
+        let mut job = Job::new(spec, decomposition).unwrap();
+        let Handout::Task(held) = job.pull("holder") else {
+            panic!("expected work")
+        };
+        assert_eq!(held.lease, None, "the handout advertised a deadline");
+        // Long enough that any plausible finite default has passed, and the
+        // claim is re-examined on every pull in between.
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(2));
+            let _ = job.pull("other");
+        }
+        assert!(
+            job.reissued_tasks().is_empty(),
+            "a claim was reissued by a job that has no lease: {:?}",
+            job.reissued_tasks()
+        );
+        assert_eq!(job.status().reissued, 0);
+        assert_eq!(
+            job.claims_held_by("holder")
+                .iter()
+                .map(|claim| claim.task)
+                .collect::<Vec<_>>(),
+            vec![held.task],
+            "the holder should still be holding exactly what it took"
+        );
+    }
+
     #[test]
     fn an_expired_claim_is_reissued_and_the_job_still_completes() {
         let mut spec = probe_job(6, 1, ChainSpec::identity());
-        spec.0.lease_ms = 1;
+        spec.0.lease = Some(Duration::from_millis(1));
         let mut job = Job::new(spec.0, spec.1).unwrap();
         // A worker takes one task and dies with it.
         let Handout::Task(abandoned) = job.pull("doomed") else {
@@ -890,7 +1132,7 @@ mod tests {
     #[test]
     fn a_completion_from_a_worker_that_was_thought_dead_is_accepted_and_ignored() {
         let mut spec = probe_job(4, 1, ChainSpec::identity());
-        spec.0.lease_ms = 1;
+        spec.0.lease = Some(Duration::from_millis(1));
         let mut job = Job::new(spec.0, spec.1).unwrap();
         let Handout::Task(first) = job.pull("slow") else {
             panic!("expected work")
@@ -904,6 +1146,89 @@ mod tests {
         // the same region, so there is nothing to reconcile.
         job.completed("slow", first.task).unwrap();
         assert_eq!(job.status().done, done_before);
+    }
+
+    /// A node loss stops the job, and the message says enough to act on.
+    ///
+    /// Three separate things, and each is a way this could be useless: it has
+    /// to *stop* (a job that keeps handing work to a fleet it cannot finish
+    /// with is the silent hang), it has to **name the worker**, and it has to
+    /// name **what that worker was holding** — because "one claim outstanding"
+    /// tells an operator nothing about which part of the volume has to be
+    /// redone.
+    #[test]
+    fn a_lost_worker_aborts_the_job_and_the_message_names_it_and_its_tasks() {
+        let mut job = job(6, 1);
+        let Handout::Task(taken) = job.pull("doomed") else {
+            panic!("expected work")
+        };
+        assert!(job.aborted().is_none(), "nothing has gone wrong yet");
+        let aborted = job.worker_lost("doomed", "the process exited with signal 9");
+        assert_eq!(aborted.worker, "doomed");
+        assert_eq!(
+            aborted
+                .held
+                .iter()
+                .map(|claim| claim.task)
+                .collect::<Vec<_>>(),
+            vec![taken.task],
+            "the abort did not record what the lost worker was holding"
+        );
+        let message = aborted.message();
+        for wanted in [
+            "doomed",
+            "signal 9",
+            "aborting",
+            &format!("task {}", taken.task),
+        ] {
+            assert!(
+                message.contains(wanted),
+                "the abort message does not mention {wanted:?}: {message}"
+            );
+        }
+        // It stops. A survivor asking for work is told to go home rather than
+        // being handed the five tasks that are still pending.
+        assert!(matches!(job.pull("survivor"), Handout::Finished));
+        assert!(!job.finished(), "the job did not finish; it gave up");
+        assert!(job.over(), "an abandoned job is over");
+        // And reissue is not what happened, which is the whole distinction.
+        assert!(job.reissued_tasks().is_empty());
+    }
+
+    /// Two survivors can notice the same death; the first account is kept.
+    #[test]
+    fn a_second_report_of_the_same_loss_does_not_rewrite_the_first() {
+        let mut job = job(6, 1);
+        let Handout::Task(taken) = job.pull("doomed") else {
+            panic!("expected work")
+        };
+        let first = job.worker_lost("doomed", "exited with 137");
+        // By now the claim table has been read and the survivors told to stop,
+        // so a second look would find nothing held and would report a loss
+        // that cost no work — which is the opposite of the truth.
+        let second = job.worker_lost("doomed", "noticed again, later");
+        assert_eq!(first, second);
+        assert_eq!(second.held.len(), 1);
+        assert_eq!(second.held[0].task, taken.task);
+    }
+
+    /// A coordinator that only left on success would turn every node loss into
+    /// the hang the abort exists to prevent.
+    #[test]
+    fn a_per_run_coordinator_leaves_when_a_job_is_abandoned_as_well_as_when_it_finishes() {
+        let (spec, decomposition) = probe_job(6, 1, ChainSpec::identity());
+        let coordinator = Coordinator::new(true).with_linger(Duration::from_millis(0));
+        let id = coordinator.submit(spec, decomposition).unwrap();
+        coordinator.pull(&id, "doomed").unwrap();
+        assert!(!coordinator.should_exit(), "the job has barely started");
+        coordinator
+            .worker_lost(Some(&id), "doomed", "the process exited with signal 9")
+            .unwrap();
+        assert!(
+            coordinator.should_exit(),
+            "the coordinator would have served an abandoned job forever"
+        );
+        assert_eq!(coordinator.aborted().unwrap().worker, "doomed");
     }
 
     #[test]

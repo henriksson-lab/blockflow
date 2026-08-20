@@ -15,9 +15,15 @@
 // A worker only ever does *connect, pull a task, execute, report*. It plans
 // nothing. Pull rather than static assignment because 37-41 % of blocks are
 // empty and which ones is data-dependent, so a `block % N` split hands one
-// worker a dense region and another a sparse one — and because pull gives fault
-// tolerance for free: a claim unhonoured past its lease is reissued, which
-// covers preemption and reclamation without a second mechanism.
+// worker a dense region and another a sparse one — and because pull *can* give
+// fault tolerance for free: a claim unhonoured past its lease is reissued,
+// which would cover preemption and reclamation without a second mechanism.
+//
+// That second half is **available and switched off**. A job has no lease unless
+// it sets one, so a claim is held until it completes; the `lease_ms` a handout
+// carries is `null` by default and is informational either way. See the module
+// header for the decision and its date. The first half — which blocks go where
+// — is untouched by that and is the reason the handout is a pull.
 //
 // Granularity: one block per handout
 // ----------------------------------
@@ -41,12 +47,17 @@
 // simpler to reason about, simpler to test and arrives immediately. Add a
 // window only if a measurement demands one.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use crate::error::Result;
 use crate::region::Region;
 
-use super::wire::{count, get, number, number_or, region_at, region_json, text, text_or, triple};
+use super::wire::{
+    count, get, millis_json, millis_or_none, number, number_or, region_at, region_json, text,
+    text_or, triple,
+};
 
 /// Bumped only when a message changes shape. A worker and a coordinator that
 /// disagree refuse each other at `Join` rather than at some later message whose
@@ -64,7 +75,12 @@ pub mod path {
     pub const SUBMIT: &str = "/job";
     pub const JOBS: &str = "/jobs";
     pub const LOG: &str = "/log";
-    pub const SHUTDOWN: &str = "/shutdown";
+    /// A worker is gone and the job must stop. Named `/lost` rather than
+    /// `/shutdown` because it says *why*: the coordinator does not detect a
+    /// node loss itself — it has no signal for a process it did not start —
+    /// so whoever started the worker tells it, and the message it prints has
+    /// to be able to name the worker.
+    pub const LOST: &str = "/lost";
 }
 
 /// One unit of work, as handed to a worker.
@@ -88,8 +104,17 @@ pub struct Assignment {
     /// reissued task is visible in the log rather than inferred from a
     /// duplicate.
     pub attempt: u32,
-    /// How long the coordinator will wait before assuming this worker is gone.
-    pub lease_ms: u64,
+    /// How long the coordinator will wait before taking this task back and
+    /// giving it to somebody else — or `None`, the default, meaning it never
+    /// will.
+    ///
+    /// Informational: no worker reads it, and none ever has. It is on the wire
+    /// so that a handout says, in the packet, which contract it was made under
+    /// — and `null` is a statement a reader cannot misjudge, where a very large
+    /// millisecond count would be a deadline that merely looks unreachable.
+    /// Travels as `lease_ms`: a number when there is a lease, `null` when there
+    /// is not.
+    pub lease: Option<Duration>,
 }
 
 impl Assignment {
@@ -103,7 +128,7 @@ impl Assignment {
             "read": region_json(&self.read),
             "valid": region_json(&self.valid),
             "attempt": self.attempt,
-            "lease_ms": self.lease_ms,
+            "lease_ms": millis_json(self.lease),
         })
     }
 
@@ -117,7 +142,7 @@ impl Assignment {
             read: region_at(value, "read")?,
             valid: region_at(value, "valid")?,
             attempt: number_or(value, "attempt", 1) as u32,
-            lease_ms: number_or(value, "lease_ms", 30_000),
+            lease: millis_or_none(value, "lease_ms"),
         })
     }
 }
@@ -261,7 +286,7 @@ mod tests {
             read: Region::new(&[12, 0, 0], &[24, 8, 8]),
             valid: Region::new(&[16, 0, 0], &[16, 8, 8]),
             attempt: 2,
-            lease_ms: 5_000,
+            lease: Some(Duration::from_millis(5_000)),
         }
     }
 
