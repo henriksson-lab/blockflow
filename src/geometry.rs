@@ -31,9 +31,45 @@
 // beyond the end to have read — the op saw everything that exists. Without the
 // exception every volume-edge block would report a hole and the guard would cry
 // wolf on every correct run, which is how guards get deleted.
+//
+// The same sentence is what grants it in the *source* frame, on one axis
+// -----------------------------------------------------------------------
+// A reach stated against the level below (`Frame::Source`) is otherwise denied
+// the exception, because a **cropping** phase's edge is an interior position of
+// the array it reads: a neighbour exists there, and a halo could have reached
+// it. Correct, and it is why the frame exists.
+//
+// **That reasoning does not hold for an axis the op consumes entirely.** There
+// is no beyond, and so no neighbour a halo could have reached into.
+// `AxisReach::All` is not a distance that ran off the end; it is the statement
+// that the end is where the op stops. So the exception is granted per axis, on
+// the two conditions that make it mean something: the reach on that axis is
+// `All`, and this block's read spans the whole of the axis.
+//
+// The second condition is what keeps it honest, and it pays for itself. Where
+// the axis *is* cut with a finite halo, no block spans it, every block stays
+// degenerate and the tiling check fires as before — so the declaration becomes
+// the **whole-axis mandate it always implied**: leave the axis whole, or grant a
+// whole-axis halo, and there is no third option. That is a free partial answer
+// to **G9** in `docs/ops-survey/README.md`'s register
+// (`BlockConstraint::FullExtent(axis)`), obtained without a constraint type —
+// declared by the op rather than configured by the planner, and enforced by the
+// guard that already ran.
+//
+// What this file cannot check is that the block *fetched* the axis it declared.
+// That is a fact about `BlockGeometry::source`, which is attached after this
+// runs, and `Decomposition::check` is where the claim is met. Without that half
+// the declaration would be decoration; with it, saying the truth is worth more
+// than the `Space::source_index()` escape rather than merely as much — the
+// escape records *that* a dependency exists, this records what would satisfy it.
+//
+// One thing neither half changes: `All` stated in the phase's own frame is
+// **vacuous** on a collapsed axis. `AxisReach::is_whole` requires `extent > 1`,
+// so against an axis of extent 1 the words are accepted without being a
+// statement of anything.
 
 use crate::error::{Error, Result};
-use crate::reach::Reach;
+use crate::reach::{AxisReach, Reach};
 use crate::region::Region;
 
 /// A grid of block cores over a 3-D volume.
@@ -233,14 +269,18 @@ impl BlockGeometry {
     /// inversion this module has always done, with the two sides no longer
     /// forced to be one number.
     ///
-    /// **The clamp exception is now conditional on the space.** A read clamped
-    /// at the phase's own volume edge is trustworthy when that edge is a real
-    /// edge of the array; a phase that crops or regrids has edges that are
-    /// interior positions of the level below, and a reach stated in that frame
-    /// (`Frame::Source`) is therefore not granted the exception. That is the
-    /// direction of error the crate accepts: a seam that might be real is
-    /// treated as real, so the guard fires rather than trusting a voxel whose
-    /// context was never fetched.
+    /// **The clamp exception is conditional on the space, and on one axis on
+    /// what the reach says.** A read clamped at the phase's own volume edge is
+    /// trustworthy when that edge is a real edge of the array; a phase that
+    /// crops or regrids has edges that are interior positions of the level
+    /// below, and a reach stated in that frame (`Frame::Source`) is therefore
+    /// not granted the exception. That is the direction of error the crate
+    /// accepts: a seam that might be real is treated as real, so the guard fires
+    /// rather than trusting a voxel whose context was never fetched.
+    ///
+    /// The exception to that exception is an axis the reach declares it consumes
+    /// entirely — see the module header. There is no seam to be wrong about, so
+    /// the grant is restored, per axis, for a block whose read spans the axis.
     pub fn derive_with(core: &BlockCore, volume: [usize; 3], halo: &Reach, reach: &Reach) -> Self {
         let mut read_start = [0usize; 3];
         let mut read_shape = [0usize; 3];
@@ -260,12 +300,33 @@ impl BlockGeometry {
             read_start[axis] = read_lo;
             read_shape[axis] = read_hi - read_lo;
 
-            let trust_lo = if read_lo == 0 && trust_the_edge {
+            // **A consumed axis is not a seam.** `Frame::Source` is denied
+            // the clamp exception because a cropping phase's edge is an
+            // interior position of the array it reads — a neighbour exists
+            // there and a halo could have reached it. An axis the op consumes
+            // entirely has no beyond and no such neighbour, so the grant is
+            // restored on it: the reach there is `All`, and this block's read
+            // spans the whole of the axis.
+            //
+            // Both conditions are needed. Without the second, a block that read
+            // part of a cut axis would be trusted for the part it never saw;
+            // with it, no block of a cut axis is trusted under a finite halo,
+            // every block stays degenerate, and the tiling check turns the
+            // declaration into the whole-axis mandate it always implied.
+            //
+            // `Frame::Phase` is untouched — `trust_the_edge` is already true
+            // there — so no plan that checked before this existed moves.
+            let consumed = matches!(reach.axis(axis), AxisReach::All)
+                && read_lo == 0
+                && read_hi == volume[axis];
+            let trust_axis = trust_the_edge || consumed;
+
+            let trust_lo = if read_lo == 0 && trust_axis {
                 0
             } else {
                 read_lo + reach_lo
             };
-            let trust_hi = if read_hi == volume[axis] && trust_the_edge {
+            let trust_hi = if read_hi == volume[axis] && trust_axis {
                 volume[axis]
             } else {
                 read_hi.saturating_sub(reach_hi)

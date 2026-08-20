@@ -46,7 +46,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::reach::Reach;
+use crate::reach::{AxisReach, Frame, Reach};
 use crate::region::Region;
 use crate::tiling::boxes_tile_exactly;
 
@@ -673,6 +673,18 @@ impl Decomposition {
     ///   The levels chain — level 0 is `self.volume`, level `p+1` is phase `p`'s
     ///   — so a plan whose phases do not join up is caught here rather than
     ///   becoming two decompositions with no edge between them.
+    ///
+    /// **And a whole-axis reach on the level below is checked against the
+    /// fetch.** `AxisReach::All` in `Frame::Source` says the op consumes the
+    /// whole of that axis of the array it reads. Nothing in the halo arithmetic
+    /// can confirm it — the halo is measured in this phase's own volume, and a
+    /// phase that collapses the axis has an extent of 1 there — so the only
+    /// place the claim can be met is `BlockGeometry::source`, and this is the
+    /// only place that knows what the level below is shaped like. Without it the
+    /// declaration is decoration: a projection whose fetch covers one plane of
+    /// its axis, or half of it, produces a complete, well-formed volume of
+    /// exactly the right shape and the wrong numbers, and every other guard
+    /// passes it.
     pub fn check(&self) -> Result<()> {
         if self.phases.is_empty() {
             return Err(Error::InvalidArgument(
@@ -744,6 +756,40 @@ impl Decomposition {
                     short.first()
                 ))
             })?;
+            // Last, because it is the only check about what the plan *meant*
+            // rather than about whether it is self-consistent: a whole-axis
+            // reach in the level below's frame is a claim, and the fetch is the
+            // only thing that can meet it.
+            if matches!(phase.reach.space().frame, Frame::Source) {
+                for axis in 0..3 {
+                    if !matches!(phase.reach.axis(axis), AxisReach::All) {
+                        continue;
+                    }
+                    for block in &phase.blocks {
+                        let lo = block.source.start[axis];
+                        let hi = lo + block.source.shape[axis];
+                        if lo == 0 && hi == source_volume[axis] {
+                            continue;
+                        }
+                        return Err(Error::InvalidArgument(format!(
+                            "decomposition phase {index} ({}) declares reach {} — the whole of \
+                             axis {axis} of level {index} — and block {:?} fetches {lo}..{hi} of \
+                             that axis, where the whole of it is 0..{}. A whole-axis reach in the \
+                             level below's frame is a claim about what each block reads, and only \
+                             the fetch can meet it: the halo is measured in this phase's own \
+                             volume, which is {} voxel(s) on axis {axis}, so no halo widens the \
+                             fetch. Every block has to fetch 0..{} \
+                             (`PhaseDecomposition::with_sources`).",
+                            phase.names.join(">"),
+                            phase.reach,
+                            block.index,
+                            source_volume[axis],
+                            volume[axis],
+                            source_volume[axis],
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
