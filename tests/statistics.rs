@@ -16,22 +16,40 @@
 // what it cost, plans again against the recording, runs again, and asserts that
 // the second plan's prediction is closer to what the second run actually spent.
 //
-// What is deliberately *not* asserted
-// -----------------------------------
-// **No test here asserts on wall-clock time.** Not "the run took under a
-// second", not "the calibrated plan was faster". Measurements are the subject
-// of these tests, never the assertion: everything below is a relationship
+// What is deliberately *not* asserted, and what had to be re-baselined
+// --------------------------------------------------------------------
+// **No test here asserts a duration.** Not "the run took under a second", not
+// "the calibrated plan was faster". Every assertion below is a relationship
 // between two recorded numbers — a prediction against an observation, a
-// fingerprint against a fingerprint — which is exactly as true on a loaded
-// machine as on an idle one.
+// fingerprint against a fingerprint.
 //
-// The error measure is the **ratio**, not the difference, and that is not a
-// weakening. Predicted cost spans orders of magnitude between an uncalibrated
-// model (denominated in voxelwise maps) and a calibrated one (denominated in
-// nanoseconds), and an absolute difference between two such numbers is
-// dominated by whichever is larger rather than by which is more nearly right.
-// The difference form is asserted too, since it is the literal statement of the
-// property, but the ratio is the one that means what it says.
+// **The sentence that used to follow that one was wrong, and it is the reason
+// `a_measured_coefficient_predicts_better_than_the_shipped_seed` was flaky.** It
+// claimed such a relationship is "exactly as true on a loaded machine as on an
+// idle one". It is not. A prediction fitted to one run and judged against
+// another is judged against a *second* stopwatch, and if the machine's speed
+// moves between the two the calibration is charged for a change it did not
+// cause. Sustained load is harmless — it slows both runs and the relationship
+// survives — so the failure needs load that *changes*, which is exactly what a
+// box with six other workers on it produces. Measured below.
+//
+// **The second wrong claim was about magnitudes.** It said predicted cost
+// "spans orders of magnitude" between an uncalibrated model (denominated in
+// voxelwise maps) and a calibrated one (denominated in nanoseconds). On this
+// machine it spans **2.4x**: `9.87e6` against `2.41e7` for the same plan, with
+// the observation at `2.31e7`. The shipped seed is therefore *accidentally
+// nearly right* here — one voxelwise map happens to cost about 2.3 ns of the
+// work this chain does — and that accident, not the calibration, is what sets
+// how much room the comparison has. It is why the criterion below can resolve a
+// model that is 10x wrong and cannot resolve one that is 2x too cheap: a model
+// 2x too cheap really is closer to the truth than the seed. See
+// `the_comparison_rejects_a_model_that_is_ten_times_wrong` for the measured
+// resolution in both directions.
+//
+// Both error measures are kept, because measurement showed they catch different
+// things. The **ratio** is scale-free and is the one that means what it says.
+// The **difference** is the literal statement of the property, and is the only
+// one of the two that rejects a model 2x too dear.
 
 use ndarray::Array3;
 
@@ -100,6 +118,10 @@ struct Outcome {
     observed: f64,
     stats: Stats,
     recorder: Arc<Recorder>,
+    /// Which decomposition was run. Carried because
+    /// [`paired_trial`] judges two *models* against one measurement, which is
+    /// only a fair comparison while both models plan the same thing.
+    plan: u64,
 }
 
 fn plan_and_run(model: CostModel) -> Outcome {
@@ -108,7 +130,7 @@ fn plan_and_run(model: CostModel) -> Outcome {
     let decomposition = strategy
         .decompose(&workflow, &constraints(model))
         .expect("a plan");
-    let predicted = predicted_cost(&workflow.chain, &decomposition, &model).expect("a price");
+    let predicted = predicted_cost(&workflow.chain, &decomposition, &[], &model).expect("a price");
     let env = ArrayEnvironment::for_decomposition(input(), &decomposition, [8, 8, 8])
         .expect("an environment");
     let recorder = Arc::new(Recorder::new(&workflow.chain, &decomposition));
@@ -122,72 +144,227 @@ fn plan_and_run(model: CostModel) -> Outcome {
         observed,
         stats,
         recorder,
+        plan: decomposition.fingerprint(),
     }
 }
 
 /// How wrong a prediction is, scale-free. `1.0` is exact.
 fn error(predicted: f64, observed: f64) -> f64 {
     assert!(predicted > 0.0 && observed > 0.0, "nothing was measured");
-    predicted.max(observed) / predicted.min(observed)
+    // `total_cmp` rather than `f64::max`/`f64::min`: those absorb a NaN and
+    // would hand back a ratio for a pair that has no ratio, which in an error
+    // measure reads as a very good prediction.
+    match predicted.total_cmp(&observed) {
+        std::cmp::Ordering::Less => observed / predicted,
+        _ => predicted / observed,
+    }
 }
 
 // ------------------------------------------------------------------------
 // The property the whole module exists for.
 // ------------------------------------------------------------------------
 
-/// A measured coefficient beats a stale constant.
+/// What one paired trial decided.
+struct Trial {
+    /// Whether the calibrated model beat the seed on the scale-free measure.
+    ratio_win: bool,
+    /// Whether it beat the seed on the literal difference.
+    absolute_win: bool,
+    report: String,
+}
+
+/// One fit, one held-out run, and both models judged against it.
 ///
-/// Fit on one run, evaluated against another — not against the run it was fitted
-/// to, which would be a tautology. The first run is discarded before either is
-/// measured, so that neither side is paying for cold code and first-touch page
-/// faults while the other is not: the store's premise is *repeated* runs, and
-/// comparing a cold run against a warm one would measure the warm-up rather than
-/// the calibration.
-#[test]
-fn a_measured_coefficient_predicts_better_than_the_shipped_seed() {
+/// **Why both models are judged against the *same* observation.** The property
+/// is "the measured coefficient predicts this run better than the seed did", and
+/// that is one run and two predictions, not two runs. The earlier form compared
+/// the seed against the fit run's own stopwatch and the calibration against the
+/// held-out run's, so the two errors had different denominators and a change in
+/// the machine's speed between them landed entirely on the calibration. The seed
+/// is a constant: it predicts the held-out run exactly as well as it predicted
+/// anything else, and `predicted_cost` of the same plan under the same model is
+/// the same number, so nothing is lost by asking it about the run that is
+/// actually being predicted.
+///
+/// That is sound **only while both models plan the same decomposition**, and it
+/// is asserted rather than assumed. Today no model can move it here: `constraints`
+/// builds on `Enumerating::default()`, whose `concurrency` of `1` is that type's
+/// own documented negative control — the objective collapses to the serial work
+/// total, which falls monotonically as the block grows, so every candidate list
+/// answers with its largest entry whatever the coefficients are. The assertion is
+/// there because that is a property of the fixture rather than of calibration,
+/// and a fixture that gained a pool would silently invalidate the comparison.
+///
+/// `miscalibration` is the negative control's one changed thing: `1.0` is the
+/// honest measurement, anything else is the same program with the fitted
+/// coefficients scaled off the truth by that factor. See
+/// [`the_comparison_rejects_a_model_that_is_ten_times_wrong`].
+fn paired_trial(miscalibration: f64) -> Trial {
     let seeded = CostModel::default();
 
-    // Warm-up, recorded by nobody.
-    let _ = plan_and_run(seeded);
-
-    // The seeded plan, and what it really cost.
-    let first = plan_and_run(seeded);
-
-    // The evidence, and the plan it produces.
+    // The fit. Its prediction under the seeded model is also the seed's
+    // prediction of the held-out run, because the plan is the same one.
+    let fit = plan_and_run(seeded);
     let mut store = Statistics::new();
-    store.record(&first.recorder.observations());
+    store.record(&fit.recorder.observations());
     let snapshot = store.snapshot_here();
     assert!(
         !snapshot.is_empty(),
         "one run produced no coefficients:\n{}",
         snapshot.describe()
     );
-    let calibrated = snapshot.calibrate(&seeded);
+    let mut calibrated = snapshot.calibrate(&seeded);
     assert_ne!(
         calibrated,
         seeded,
         "a snapshot with evidence left the model untouched:\n{}",
         snapshot.describe()
     );
+    if miscalibration != 1.0 {
+        calibrated.read_cost_per_voxel *= miscalibration;
+        calibrated.write_cost_per_voxel *= miscalibration;
+        calibrated.materialise_cost_per_voxel *= miscalibration;
+        calibrated.compute_scale *= miscalibration;
+    }
 
-    let second = plan_and_run(calibrated);
+    // The held-out run, under the calibrated plan.
+    let evaluated = plan_and_run(calibrated);
+    assert_eq!(
+        fit.plan, evaluated.plan,
+        "calibration moved this chain's plan, so one observation no longer \
+         judges both models; see `paired_trial`"
+    );
 
-    let before = error(first.predicted, first.observed);
-    let after = error(second.predicted, second.observed);
+    let observed = evaluated.observed;
+    let seeded_error = error(fit.predicted, observed);
+    let calibrated_error = error(evaluated.predicted, observed);
+    let seeded_gap = (fit.predicted - observed).abs();
+    let calibrated_gap = (evaluated.predicted - observed).abs();
     let report = format!(
-        "seeded:     predicted {:.3e} against observed {:.3e}, off by {before:.1}x\n\
-         calibrated: predicted {:.3e} against observed {:.3e}, off by {after:.1}x\n{}",
-        first.predicted,
-        first.observed,
-        second.predicted,
-        second.observed,
+        "observed {observed:.3e}\n\
+         seeded:     predicted {:.3e}, off by {seeded_error:.2}x, gap {seeded_gap:.3e}\n\
+         calibrated: predicted {:.3e}, off by {calibrated_error:.2}x, gap {calibrated_gap:.3e}\n\
+         miscalibration {miscalibration}\n{}",
+        fit.predicted,
+        evaluated.predicted,
         snapshot.describe()
     );
-    assert!(after < before, "calibration did not help\n{report}");
+    Trial {
+        ratio_win: calibrated_error < seeded_error,
+        absolute_win: calibrated_gap < seeded_gap,
+        report,
+    }
+}
+
+/// How many paired trials one verdict is taken over.
+///
+/// **A sign test, and the count is derived from a measured failure rate rather
+/// than picked.** One trial is a coin the machine can flip: the fit and the
+/// held-out run are about 3 ms apart, and if the box's load changes across that
+/// gap the calibration is judged against a machine that is not the one it was
+/// fitted to. Under a synthetic 30-thread load switched on and off every two
+/// seconds — the shape a box with six other workers on it actually has —
+/// **1080 paired trials** gave a per-trial failure rate of **0.09%** on the
+/// ratio measure and **2.3%** on the difference, with the worst block of nine
+/// scoring 9/9 and 7/9 respectively. Under *sustained* load of 30 the rate was
+/// **0/200 on both**: steady contention slows the fit and the held-out run alike
+/// and the relationship survives it, which is why widening a tolerance would
+/// have been the wrong repair — there is no tolerance to widen, only a
+/// coincidence in time to average out.
+///
+/// Eleven, with a bare majority required, so the verdict survives five bad
+/// coins. At the measured rates that is a failure probability under `1e-8`, and
+/// it costs about 80 ms. It is not a weakened assertion: each individual trial's
+/// criterion is still "strictly closer", and a calibration that is actually
+/// broken loses nearly every trial rather than a few — measured in
+/// [`the_comparison_rejects_a_model_that_is_ten_times_wrong`].
+const TRIALS: usize = 11;
+
+/// A measured coefficient beats a stale constant.
+///
+/// Fit on one run, judged on the next — not on the run it was fitted to, which
+/// would be a tautology. A run is discarded before any of it is measured, so
+/// that neither side is paying for cold code and first-touch page faults while
+/// the other is not: the store's premise is *repeated* runs, and comparing a
+/// cold run against a warm one would measure the warm-up rather than the
+/// calibration.
+#[test]
+fn a_measured_coefficient_predicts_better_than_the_shipped_seed() {
+    // Warm-up, recorded by nobody.
+    let _ = plan_and_run(CostModel::default());
+
+    let mut ratio_wins = 0;
+    let mut absolute_wins = 0;
+    let mut last = String::new();
+    for _ in 0..TRIALS {
+        let trial = paired_trial(1.0);
+        ratio_wins += usize::from(trial.ratio_win);
+        absolute_wins += usize::from(trial.absolute_win);
+        last = trial.report;
+    }
     assert!(
-        (second.predicted - second.observed).abs() < (first.predicted - first.observed).abs(),
-        "the calibrated prediction is not closer in absolute terms\n{report}"
+        ratio_wins * 2 > TRIALS,
+        "calibration lost the scale-free comparison in {} of {TRIALS} trials\n{last}",
+        TRIALS - ratio_wins
     );
+    assert!(
+        absolute_wins * 2 > TRIALS,
+        "calibration lost the absolute comparison in {} of {TRIALS} trials\n{last}",
+        TRIALS - absolute_wins
+    );
+}
+
+/// The liveness test beside the one above: the same program, with the fitted
+/// coefficients moved off the truth by one factor, and the verdict has to flip.
+///
+/// **Without this, the test above would pass against a calibration that had
+/// stopped working**, because the shipped seed is only 2.4x off on this machine
+/// and almost any number in the right decade beats it.
+///
+/// **The measured resolution, in both directions, over 20 blocks of nine trials
+/// each.** Wins per block, worst case:
+///
+/// ```text
+///   factor | ratio wins | absolute wins | rejected by
+///    0.1   |   0-4 / 9  |    0-4 / 9    | both
+///    0.5   |   9   / 9  |    9   / 9    | neither — and correctly so
+///    2     |   8-9 / 9  |    0-4 / 9    | the difference only
+///   10     |   0-3 / 9  |    0   / 9    | both
+/// ```
+///
+/// So the two measures are kept because they catch different things, and the
+/// factors asserted here are the ones both reject. **`0.5` is not a gap in the
+/// test.** A model half the truth genuinely *is* closer to a `2.31e7` ns
+/// observation than a seed predicting `9.87e6`, so a criterion that rejected it
+/// would be asserting something false. The resolution this criterion has is
+/// about a factor of two, which is where `CostModel` itself runs out: two
+/// identical voxelwise maps at different positions in one chain measure
+/// **1.6x** apart, and nothing denominated in voxelwise maps can claim better.
+#[test]
+fn the_comparison_rejects_a_model_that_is_ten_times_wrong() {
+    let _ = plan_and_run(CostModel::default());
+
+    for miscalibration in [10.0_f64, 0.1] {
+        let mut ratio_wins = 0;
+        let mut absolute_wins = 0;
+        let mut last = String::new();
+        for _ in 0..TRIALS {
+            let trial = paired_trial(miscalibration);
+            ratio_wins += usize::from(trial.ratio_win);
+            absolute_wins += usize::from(trial.absolute_win);
+            last = trial.report;
+        }
+        assert!(
+            ratio_wins * 2 <= TRIALS,
+            "a model {miscalibration}x off the measurement still won the \
+             scale-free comparison {ratio_wins} times in {TRIALS}\n{last}"
+        );
+        assert!(
+            absolute_wins * 2 <= TRIALS,
+            "a model {miscalibration}x off the measurement still won the \
+             absolute comparison {absolute_wins} times in {TRIALS}\n{last}"
+        );
+    }
 }
 
 // ------------------------------------------------------------------------

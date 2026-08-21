@@ -1427,6 +1427,15 @@ pub struct TabulateValuesOp {
     fixed: FixedPoint,
     stream: String,
     lifecycle: Lifecycle,
+    /// What the two operands hold, stated only when the plan cannot say.
+    ///
+    /// `None` is the honest answer for an image the run writes: its element type
+    /// is in the fold of the chain that wrote it, and a second copy here would
+    /// be a second number to disagree with the first — which is the reason
+    /// `Decomposition::declare_source_images` records the supplied ones and no
+    /// others. See [`TabulateValuesOp::holding`].
+    labels_dtype: Option<Dtype>,
+    values_dtype: Option<Dtype>,
 }
 
 impl TabulateValuesOp {
@@ -1462,7 +1471,52 @@ impl TabulateValuesOp {
             fixed,
             stream: stream.into(),
             lifecycle,
+            labels_dtype: None,
+            values_dtype: None,
         })
+    }
+
+    /// The same op, with the element types of its two operands said out loud.
+    ///
+    /// **This is what a label volume handed to the run needs, and it is the only
+    /// way to say it.** A `SourceInput` carries an optional element type, and a
+    /// **supplied** array — `ImageId::supplied(i)`, an array the caller handed in
+    /// beside image 0 — is produced by no phase, so no fold of the plan can say
+    /// what is in it and the reading op's declaration is the only statement there
+    /// is. Without one, `fragment_phase` refuses the plan by name. So before this
+    /// existed, the crate's own per-object measurement **could not be pointed at a
+    /// label volume that was not an image of its own plan**, which is the
+    /// commonest arrangement there is: a labelling produced by an earlier run, or
+    /// by an earlier `execute_phases` call over the same arrays.
+    ///
+    /// A builder rather than two more arguments on [`Self::new`], for the reason
+    /// `ops::fill::append_connected` gives about its own pair: no existing call
+    /// site has to be edited to say what it was already saying, and every one of
+    /// them reads two images the plan writes, where `None` is not a gap but the
+    /// correct answer.
+    ///
+    /// **Declaring one for an image the run writes is ignored, deliberately.**
+    /// `Decomposition::declare_source_images` and `check_source_images` both
+    /// filter to the supplied inputs before they look at the element type,
+    /// because the plan already knows and a second statement is a second thing to
+    /// drift. So this is safe to call for either operand and is only consulted
+    /// for the one that needs it.
+    pub fn holding(mut self, labels: Dtype, values: Dtype) -> Self {
+        self.labels_dtype = Some(labels);
+        self.values_dtype = Some(values);
+        self
+    }
+
+    /// What this op says its label volume holds, or `None` if it left the plan to
+    /// say.
+    pub fn labels_dtype(&self) -> Option<Dtype> {
+        self.labels_dtype
+    }
+
+    /// What this op says its value array holds, or `None` if it left the plan to
+    /// say.
+    pub fn values_dtype(&self) -> Option<Dtype> {
+        self.values_dtype
     }
 
     pub fn fixed(&self) -> FixedPoint {
@@ -1559,6 +1613,18 @@ fn holds(region: &Region, at: [usize; 3]) -> bool {
     })
 }
 
+/// A `SourceInput` with an element type attached, when there is one to attach.
+///
+/// A free function rather than a method on `SourceInput` because the crate's
+/// rule is that only a **supplied** array's reader states its width, so
+/// `holding` is deliberately not an `Option`-taking builder over there.
+fn held(input: SourceInput, dtype: Option<Dtype>) -> SourceInput {
+    match dtype {
+        Some(dtype) => input.holding(dtype),
+        None => input,
+    }
+}
+
 impl FragmentOp for TabulateValuesOp {
     fn name(&self) -> &'static str {
         self.name
@@ -1566,8 +1632,8 @@ impl FragmentOp for TabulateValuesOp {
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
         vec![
-            SourceInput::voxelwise(self.labels),
-            SourceInput::voxelwise(self.values),
+            held(SourceInput::voxelwise(self.labels), self.labels_dtype),
+            held(SourceInput::voxelwise(self.values), self.values_dtype),
         ]
     }
 

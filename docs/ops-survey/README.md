@@ -183,7 +183,7 @@ ranking no single document can see.
 | **C1** | a data-dependent reach cannot be bounded | displacement-field warping, arbitrary-plane reslicing, and with them the *apply* side of deformable registration | a **declared bound**: the caller states a maximum displacement, the op declares it as its reach and refuses at the block, by name, anything exceeding it — the shape `ops::voxelize` already takes. For a spline transform the bound is derivable from the control points, so nobody has to guess | **1** (C) | C |
 | **C2** | a `Region` cannot begin below zero | padding, growing a canvas, tile placement before the global solve — the layout is not expressible until after the solve, and the solve needs the layout | a signed origin, **or** a written-down convention that re-origining happens before planning and the crate never sees a negative coordinate. C judges the convention the cheaper answer and the one to write | **1** (C) | C |
 | **C3** | axis permutation is carried but not acted on | transpose, 90° rotation, reslicing along a non-native axis | `reach::Space` already carries `axes: [usize; 3]` and it is fingerprinted; a permuted branch needs lattice, read extent, valid region and anchor permuted *together*. `BlockGrid` and `Anchor` are the work | **1** (C) | C |
-| **G7** | no barrier phase | nothing outright — it **costs**. A fragment-and-join reduction takes N+1 passes for N blocks, because phase 1's whole-lattice fragment reach is also its halo. A reduction whose answer is one scalar reads the whole volume per block, exactly as a hole fill does | a phase declared to start when the previous one finished, stating the dependency without a halo. `fill.rs` names this as the way out and as the open architectural question. **The single largest cost lever in family B** | **1** (B) named; A's and D's global reductions pay the same toll by the same route | B |
+| **G7** | no barrier phase | nothing outright — it **costs**. A fragment-and-join reduction takes N+1 passes for N blocks, because phase 1's whole-lattice fragment reach is also its halo. A reduction whose answer is one scalar reads the whole volume per block, exactly as a hole fill does | a phase declared to start when the previous one finished, stating the dependency without a halo. `fill.rs` names this as the way out and as the open architectural question. **The single largest cost lever in family B** — and it now has a **measured price**, which it did not before. §4's globally consistent label volume was built twice, once as a phase (the merge inside the plan, so the halo is the whole volume) and once as a table applied at read time (the merge outside any plan, so there is no halo because there is no phase). Same volume, same recorded data, same downstream consumer, four lattices: the in-plan arm's reads are exactly `mask + blocks x (u32 volume) + consumer`, so its **read amplification is the block count, counted and not modelled** — 0.655, 1.440, 8.772 and **67.427 GiB** at 1, 4, 32 and 256 blocks, against a flat **0.393 GiB** for the out-of-plan merge. At 256 blocks that is **171x the pixel traffic** to produce an answer that is 148.7 KB. **And the pixels are only two thirds of it**: the same clause makes each block gather every fragment as well, so the fragment traffic goes `(1 + blocks) x` all the fragments — 0.067, 0.170, 2.241, **34.864 GiB** against a decorated 0.067, 0.068, 0.136, **0.271** — and the *total* extra at 256 blocks is **101.9 GiB against a decorated 4.2**, or **25.4x**. A barrier addresses the halo and therefore the pixels; it does not address the gather, which needs the reduction to run once rather than per block. See `docs/design/barriers.md`. The barrier's absence is not a coefficient here; it is the whole cost. Two things this pins that the row previously only asserted: the toll is **linear in the block count**, so it is worst exactly where cutting finely is most wanted; and the way out is reachable **today** by moving the reduction out of the plan and applying it at read time, at the price of the caller splitting its own pipeline into two `execute_phases` calls, because there is no barrier to express it with | **1** (B) named; A's and D's global reductions pay the same toll by the same route | B |
 | **G8** | no scalar broadcast inside an iterative phase | level sets, active contours, Chan–Vese, SLIC, Costes automatic thresholding — every scheme whose per-iteration local stencil consumes a whole-volume reduction recomputed each round | a substage able to read a value reduced over the previous substage's whole output. Same mechanism as G7 with a loop around it. **B calls it the highest-leverage item in its document** | **2** (B D) | B |
 | **G9** | ~~an op cannot require one axis be left whole~~ → **the planner cannot be told not to cut an axis** *(partially answered by §8.5; re-scoped, identifier unchanged)* | the exact Euclidean distance transform (cost, not correctness — a lattice that cuts a whole-axis-reach axis with the full halo is redundant, not wrong; and see §8.4 for what that op is and is not evidence about); any temporal alignment that must not tear a stack. **The correctness half is answered.** An op declaring `AxisReach::All` in `Frame::Source` now mandates that the axis is left whole **or** given a whole-axis halo — declared by the op, enforced by the tiling check that already existed, with no constraint type added and none needed | **Re-scoped to the planner-facing half only.** `Constraints`/`BlockConstraint` still cannot express "do not cut axis *k*", so the enumerator proposes a lattice that will be **refused** rather than avoiding it — a search that wastes candidates and a caller who sees an error instead of a plan. `BlockConstraint::FullExtent(axis)`, or an `Extent` of `Option<usize>`, is still the shape; it is now a **planning-quality** change and no longer a correctness one | **2** (B D) named, C implied by any separable sweep — unchanged, and now counting who wants the *planner-facing* half | B |
 | **G10** | ~~no K-ary reach-0 op shell~~ → **closed.** `ops::mixing` ships the shell (`TupleOp`), the kernel trait (`TupleKernel`) and the first kernel (`LinearMap`, the per-voxel matrix); `tests/tuple_map.rs` pins the map, the mixing, decomposition invariance, that every input is really read, and that side outputs are still terminal | per-voxel classification, argmax over C probability channels, linear unmixing, stain separation, crosstalk correction, colour-space conversion, and every windowed temporal filter — **all now buildable**, the extra inputs being supplied images (G5) and the extra outputs side outputs | **The clause was right about the shape, contained one error, and the error has since been fixed — all three are kept, because the middle one is the useful part.** *What this row said:* "one `BlockOp` with C−1 `source_inputs` and C′−1 `side_outputs`. No new trait and no new axis." The shape is exactly that, no axis was added, and "not a `Combine`" holds for the reason given — the trait has no side outputs. *What it did not see:* **`BlockOp::apply_side` was not handed the `SourceInputs`**, so a side output that is a function of the op's source inputs could not be computed there; `ops::mixing` shipped with a per-block map keyed by the buffer offset, filled by `apply_with` and drained by `apply_side`. *What has since landed:* the argument is threaded from the executor's call site (`strategy.rs:1032`) through `Chain::apply_side` and `Environment::apply_side`, and the per-block map is **deleted, field and all**. **So this clause is now true exactly as written.** What it bought is worth more than the tidiness: `apply_side` is a **total function of its operands** rather than of its operands plus what an earlier call left behind — the old shape was correct only while two calls stayed paired, and it held whole `f64` blocks resident that no counter knew about, in a crate whose side outputs exist *because* 95.2 MB was once counted against 158.6 MB written. The price is that the inputs are streamed twice: **1.08–1.10×** at K = K′ = 16, with the tiling's 2.5–2.8× fully retained and the flop count unchanged. Blast radius **4 overriding implementors out of ~30**, a default absorbing the rest, and nine implementors in the sibling application crate untouched; and the documented "side outputs and source leaves do not compose yet" limitation is **deleted** as a side effect. §11.3 | **2** (B D) when open; **0** now, and this time with **no residue either** — re-derived rather than carried. The residue this row briefly held costed **B** (a classifier over K channels writing C class maps) and **D** (unmixing writing C′ channels beside a residual) and blocked neither; both now pay 1.08–1.10× of streaming instead, which is a price and not a gap. A's arity-2 arithmetic combines are the adjacent, smaller case and are still unwritten | B and D independently |
@@ -232,6 +232,83 @@ the crate's most complete per-object measurement cannot be driven by the crate's
 own segmentation. `ops::label` stamps scattered points and is not this. D
 depends on the same missing op for per-object traces over a series. Nothing else
 in B unblocks as much.
+
+> **Built — and the convergence was right about what was missing and wrong about
+> its shape.** `ops::label` now carries both. The paragraph above is kept
+> **unaltered**, including the sentence that is now false — *"no op under
+> `src/ops/` produces a label volume"* — because what it got wrong is the part
+> worth having on the record, and an absence that is edited out of existence
+> when it lands takes its own history with it.
+>
+> *What the convergence said:* the missing third phase is `fill.rs:91`'s "label,
+> merge, relabel". **That phase cannot exist.**
+> `fragment::check_phase_work` refuses a pixel phase after a fragment-only one —
+> image `p+1` would go unwritten and phase `p+1` would read an image nobody
+> produced — so the three-phase shape is unplannable, and `fill.rs`'s own header
+> already said so in a paragraph the convergence did not reach. The merge folds
+> into the relabelling phase exactly as it does in `fill`, which means every
+> block re-runs the whole union-find *and*, because a whole-lattice fragment
+> reach is also the halo, every block re-reads the whole label image. That is
+> not a detail of the implementation; it is most of what the measurement below
+> is about.
+>
+> *What shipped, and it is two things rather than one, on purpose.* The merge's
+> answer is a **table** — one `u32` per `(block, local label)`, 92-149 KB against
+> a 268 MB label volume on the volume measured — and there are two things to do
+> with it. `RelabelComponentsOp` **materialises**: a `fragments -> volume` phase
+> writing a second `u32` image, the shape the framework admits.
+> `RelabelledEnvironment` **decorates**: an `Environment` that applies the table
+> to reads of the first image as they are served, correct at any read extent, so
+> a consumer's lattice need not be the labelling's. The second subsumes the
+> first — a trivial identity op over a decorated environment writes the
+> materialised volume, which is one mechanism and not two, and
+> `tests/global_labels.rs` asserts the two produce the same bytes.
+>
+> *What the convergence could not have seen, and it is the load-bearing part:* a
+> union-find root is a correct **partition** with a **decomposition-dependent
+> name**. Writing `find(node) + 1` into the volume gives a label volume whose
+> labels change when the block size changes, and every consumer that *stores* a
+> label — a table of regions, a graph whose vertices are labels, anything written
+> to disk beside another run — is then wrong in a way no per-voxel comparison
+> catches. So the numbering is a rule about the volume: components are numbered
+> in the order their lowest voxel is met in a row-major scan of the **whole
+> volume**, which is `label_members_into_with`'s own within-block rule lifted.
+> It costs one `u64` per block-local label in the fragment and `Union::fold_min`
+> to fold it, and it is what makes the blocked answer **byte-identical** to the
+> whole-volume reference rather than a relabelling of it.
+>
+> *And the consumer needed a change to be drivable at all.* `ops::tabulate` is
+> the op this row exists for, and `TabulateValuesOp` declared no element type on
+> its operands — so a **supplied** label volume, which is what a consumer of an
+> earlier run is handed, was refused by name at plan time because nothing in the
+> plan could say what it held. `TabulateValuesOp::holding` closes that. The
+> convergence said the crate's measurement could not be driven by the crate's own
+> segmentation; it turned out there were *two* reasons and only one of them was
+> the missing op.
+>
+> *Measured, on a recorded volume, and the answer has a condition.* See G7's row
+> for the numbers and `tests/label_materialisation_cost.rs` for the run. The
+> short form: **decorate**, and materialise only through the identity op over
+> the decorator — but the reason is not the one the framing suggests. Avoiding
+> the write is worth 8 bytes a voxel, about `1.05-1.45x`; everything beyond that
+> is the halo. **This is a price for G7, not a property of laziness.**
+>
+> *And the expiry condition needed correcting, which is recorded rather than
+> quietly fixed.* The first version of this note said that if G7 closes the
+> recommendation goes to about `1.2x` and becomes marginal. **That counted
+> pixels only.** There are two amplifications and they are in different
+> currencies: the relabelling phase's whole-lattice fragment reach becomes a
+> whole-volume *halo* (pixels, `blocks x` the label image) **and** a per-block
+> *gather of every fragment* (`(1 + blocks) x` all the fragments, the second
+> factor growing too because the fragments are faces and cutting finely makes
+> more face — `blocks^(4/3)` on a cubically-cut lattice, and how much depends on
+> *which axis* is cut, which `docs/design/barriers.md` §7.6 sweeps). At 256 blocks those are 67.4 GiB and 34.9 GiB against a decorated total
+> of 4.2 GiB. **A barrier removes the first and leaves the second**, so closing
+> G7 alone takes the gap from `25.4x` of total traffic to about `9.4x` — better,
+> and not marginal. Marginal needs the merge to run **once** as well, which is
+> the three-phase shape, which is blocked by the image-numbering rule and is a
+> different gap. `docs/design/barriers.md` specifies both and says which is
+> which.
 
 **2. A K-ary reach-0 op shell — G10.** *(B §10(b) and §12; D §3.6, §6, §9,
 independently.)* One shape unlocks linear unmixing, stain separation, crosstalk

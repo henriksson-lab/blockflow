@@ -42,7 +42,17 @@
 // terminal as far as images go, so the merge is folded into phase 1 and every
 // block re-runs it; and the whole-lattice fragment reach of phase 1 is also its
 // halo, which is load-bearing because the halo is the dependency edge between
-// pipelined phases. The costs are `fill`'s costs, stated there.
+// pipelined phases.
+//
+// **The costs are `fill`'s costs and they are worse than that header used to
+// say**, which is why this points at the corrected version rather than
+// summarising it. Three of them, not one: the pixel re-reads, the fragment
+// transfers, and the union-find run once per block. The third was the one nobody
+// had priced — small at every lattice per invocation, and there is one per block
+// — and at a fine cut it is the largest of the three. This op pays all three,
+// like `fill` and unlike `ops::detect`, which escapes the pixels.
+// `docs/design/barriers.md` specifies the way out and measures what each part of
+// it would recover.
 //
 // The two adjacencies, which are one relation and must stay one
 // --------------------------------------------------------------

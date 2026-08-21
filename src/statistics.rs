@@ -1048,10 +1048,15 @@ impl Snapshot {
         if families.len() < 2 {
             return None;
         }
-        let values: Vec<f64> = families.values().map(|c| c.nanos_per_unit).collect();
-        let low = values.iter().copied().fold(f64::INFINITY, f64::min);
-        let high = values.iter().copied().fold(0.0_f64, f64::max);
-        (low > 0.0).then_some(high / low)
+        // `total_cmp` rather than `f64::min`/`f64::max`, which absorb a NaN
+        // silently and would report a spread over a coefficient that is not a
+        // number. A NaN here would be a bug upstream; the point is that it
+        // surfaces as one rather than as a plausible ratio.
+        let mut values: Vec<f64> = families.values().map(|c| c.nanos_per_unit).collect();
+        values.sort_by(f64::total_cmp);
+        let low = values[0];
+        let high = values[values.len() - 1];
+        (low > 0.0 && high.is_finite()).then_some(high / low)
     }
 
     /// `model`, with every coefficient this snapshot has evidence for replaced

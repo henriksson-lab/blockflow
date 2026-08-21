@@ -6,7 +6,8 @@ same run spreads over many machines.
 *Split out of `README.md`. Companion files:
 [`dimensions-and-modules.md`](dimensions-and-modules.md),
 [`writing-an-op.md`](writing-an-op.md),
-[`images-and-phases.md`](images-and-phases.md).*
+[`images-and-phases.md`](images-and-phases.md),
+[`barriers.md`](barriers.md).*
 
 > **Where this came from, and how far to trust it.** These sections were split
 > out of the crate's `README.md`, where they sat below a line reading

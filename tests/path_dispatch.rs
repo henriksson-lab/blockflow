@@ -320,7 +320,7 @@ fn the_priming_term_reaches_the_plans_predicted_cost() -> Result<()> {
         };
         let workflow = Workflow::new(fast(), VOLUME, Dtype::U16);
         let plan = Enumerating::default().decompose(&workflow, &constraints)?;
-        predicted_cost(&workflow.chain, &plan, &CostModel::default())
+        predicted_cost(&workflow.chain, &plan, &[], &CostModel::default())
     };
     let per_voxel = |edge: usize| -> Result<f64> {
         Ok(cost(edge)? / (VOLUME.iter().product::<usize>() as f64))

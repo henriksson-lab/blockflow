@@ -685,7 +685,12 @@ struct StoredArray {
     /// life of the environment.
     id: u64,
     dtype: Dtype,
+    /// **The image's** shape, which is the array's only when the image is the
+    /// whole array. See [`Window`].
     shape: Vec<usize>,
+    /// Where the image starts inside the array. `[0, 0, 0]` for every array
+    /// this environment creates, because it creates them at the image's shape.
+    offset: [usize; 3],
     chunk: Vec<usize>,
     /// What this array's chunks are encoded with. Kept so that
     /// [`ZarrEnvironment::compression_at`] can answer without re-reading the
@@ -728,12 +733,93 @@ impl StoredArray {
             id,
             dtype,
             shape: shape.to_vec(),
+            offset: [0, 0, 0],
             chunk: chunk.iter().map(|&value| value.max(1)).collect(),
             compression,
         })
     }
 
+    /// Bind to an array that already exists, rather than creating one.
+    ///
+    /// Everything the environment needs — shape, element type, chunking, codec
+    /// — is read off the array's own metadata, because the array is the
+    /// authority on all four and a caller restating them is a caller who can be
+    /// wrong.
+    fn open(
+        store: &Arc<Store>,
+        path: &str,
+        id: u64,
+        window: Option<Window>,
+    ) -> Result<Self> {
+        let array = ZarrArray::open(store.clone(), path).map_err(Error::backend)?;
+        let array_shape: Vec<usize> = array.shape().iter().map(|&value| value as usize).collect();
+        if array_shape.len() != 3 {
+            return Err(Error::InvalidArgument(format!(
+                "attached array {path} has rank {}, and an image is rank 3. An array with extra                  axes — an OME-Zarr `[t, c, z, y, x]`, say — is not refused because rank 3 is a                  limitation; it is refused because which of its axes are the image's, and where                  the others are held, is a question only the caller can answer and this                  constructor has nowhere to hear it.",
+                array_shape.len()
+            )));
+        }
+
+        let dtype = dtype_from_zarr(array.data_type(), path)?;
+        let chunk: Vec<usize> = array
+            .chunk_shape(&[0, 0, 0])
+            .map_err(Error::backend)?
+            .iter()
+            .map(|value| value.get() as usize)
+            .collect();
+        let compression = compression_of(&array, path)?;
+
+        let (offset, shape) = match window {
+            None => ([0, 0, 0], array_shape.clone()),
+            Some(window) => {
+                for axis in 0..3 {
+                    let end = window.start[axis] + window.shape[axis];
+                    if window.shape[axis] == 0 || end > array_shape[axis] {
+                        return Err(Error::InvalidArgument(format!(
+                            "window {:?}..{:?} does not fit inside {path}, which is {array_shape:?}",
+                            window.start,
+                            [
+                                window.start[0] + window.shape[0],
+                                window.start[1] + window.shape[1],
+                                window.start[2] + window.shape[2],
+                            ],
+                        )));
+                    }
+                }
+                (window.start, window.shape.to_vec())
+            }
+        };
+
+        Ok(Self {
+            array,
+            id,
+            dtype,
+            shape,
+            offset,
+            chunk,
+            compression,
+        })
+    }
+
+    /// `region`, stated in the image's coordinates, in the array's.
+    ///
+    /// The identity for every array this environment created. For an attached
+    /// one it is where the window puts it — and it is derived in **one** place
+    /// so that the read, the write and the lock stripes cannot disagree about
+    /// which chunks a block touches.
+    fn stored_region(&self, region: &Region) -> Region {
+        if self.offset == [0, 0, 0] {
+            return region.clone();
+        }
+        let mut moved = region.clone();
+        for (axis, start) in moved.start.iter_mut().enumerate() {
+            *start += self.offset.get(axis).copied().unwrap_or(0);
+        }
+        moved
+    }
+
     fn subset(&self, region: &Region) -> Result<ArraySubset> {
+        let region = self.stored_region(region);
         ArraySubset::new_with_start_shape(
             region.start.iter().map(|&value| value as u64).collect(),
             region.shape.iter().map(|&value| value as u64).collect(),
@@ -788,7 +874,8 @@ impl StoredArray {
         locks: Option<&ChunkLocks>,
     ) -> Result<bool> {
         let subset = self.subset(region)?;
-        let guards = locks.map(|locks| locks.hold(self.id, region, &self.chunk));
+        let stored = self.stored_region(region);
+        let guards = locks.map(|locks| locks.hold(self.id, &stored, &self.chunk));
         let serialised = guards.as_ref().is_some_and(|held| !held.is_empty());
         let outcome = self
             .array
@@ -796,6 +883,152 @@ impl StoredArray {
             .map_err(Error::backend);
         drop(guards);
         outcome.map(|()| serialised)
+    }
+}
+
+/// The Zarr data type, as this crate's element type.
+///
+/// The inverse of [`zarr_data_type`], and stated as a separate function rather
+/// than derived from it because the interesting half is the failure: an array
+/// whose element type this crate has no buffer for is refused **by name**, at
+/// the moment it is attached, rather than at the first read of the first block.
+fn dtype_from_zarr(data_type: &DataType, path: &str) -> Result<Dtype> {
+    for candidate in [
+        Dtype::Bool,
+        Dtype::U8,
+        Dtype::U16,
+        Dtype::U32,
+        Dtype::U64,
+        Dtype::I8,
+        Dtype::I16,
+        Dtype::I32,
+        Dtype::I64,
+        Dtype::F32,
+        Dtype::F64,
+    ] {
+        if zarr_data_type(candidate)? == *data_type {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::InvalidArgument(format!(
+        "attached array {path} holds {:?}, which is not an element type a block can hold. \
+         `float16` is the expected case and is refused for the reason `zarr_data_type` gives.",
+        data_type
+    )))
+}
+
+/// What an existing array is compressed with, in this environment's terms.
+///
+/// The refusal is the point. This crate builds `zarrs` with
+/// `default-features = false` and exactly `filesystem` and `gzip`, so an array
+/// compressed with anything else is not merely undescribable here — **it cannot
+/// be decoded**, and the first symptom would otherwise be a decode error on
+/// some block, half way through a run, naming a codec rather than a file. Said
+/// here, it is one message at attach time naming the array and what to write
+/// instead.
+fn compression_of(array: &Stored, path: &str) -> Result<Compression> {
+    // Read off the metadata document rather than the built codec chain: the
+    // chain's contents are private, the document is `serde` and `serde_json` is
+    // already here, and the document is what a person looking at the file sees.
+    let metadata = serde_json::to_value(array.metadata())
+        .map_err(|error| Error::backend(format!("{path}: {error}")))?;
+    let codecs = metadata
+        .get("codecs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!("attached array {path} declares no codec chain"))
+        })?;
+
+    let mut found = Compression::None;
+    for codec in codecs {
+        let name = codec.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
+        match name {
+            // The array-to-bytes codec every array here uses, and the identity
+            // as far as compression goes.
+            "bytes" => {}
+            "gzip" => {
+                let level = codec
+                    .get("configuration")
+                    .and_then(|configuration| configuration.get("level"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1) as u32;
+                found = Compression::Gzip(level);
+            }
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "attached array {path} uses the `{other}` codec, which this crate cannot \
+                     decode: `zarrs` is built here with `default-features = false` and only \
+                     `filesystem` and `gzip`, for the reasons `Cargo.toml` gives — so `blosc`, \
+                     `zstd`, `sharding_indexed` and `transpose` are all absent. Write the array \
+                     with `gzip`, or with no compressor at all."
+                )))
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The sub-box of a stored array that one image is.
+///
+/// Three quite different needs turn out to be this one thing, which is why it
+/// is a window and not three features:
+///
+/// * **one channel of a multi-channel array.** An OME-Zarr level is `[c, y, x]`;
+///   the image is one `c`, so the window is `start = [c, 0, 0]`,
+///   `shape = [1, height, width]`;
+/// * **a region of a large image**, to iterate on a piece of it without
+///   converting or copying a smaller one;
+/// * **a pyramid level**, which is just attaching to a different array.
+///
+/// A window costs nothing at read time — it is an addition on the region's
+/// start — and it costs at *chunk* time, which is the part worth knowing: a
+/// window whose start is not a whole number of chunks makes every read a
+/// partial-chunk decode. `ZarrEnvironment::unaligned_reads` counts them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    /// Lower corner of the image inside the array.
+    pub start: [usize; 3],
+    /// The image's extent.
+    pub shape: [usize; 3],
+}
+
+/// One image of a run, bound to an array that already exists on a disk.
+///
+/// `dir` is the array's own directory — the thing holding its `zarr.json` —
+/// rather than a path inside a shared root, because the arrays a run is handed
+/// need not live together and generally do not: an OME-Zarr's level 0 and level
+/// 1, or four channels of one acquisition, or an input and a mask written by a
+/// different tool on a different day.
+#[derive(Clone, Debug)]
+pub struct AttachedImage {
+    dir: PathBuf,
+    window: Option<Window>,
+}
+
+impl AttachedImage {
+    /// The whole of the array in `dir`.
+    pub fn at(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into(), window: None }
+    }
+
+    /// A sub-box of it. See [`Window`].
+    pub fn window(mut self, start: [usize; 3], shape: [usize; 3]) -> Self {
+        self.window = Some(Window { start, shape });
+        self
+    }
+
+    /// One index of axis 0 — the channel, for an OME-Zarr `[c, y, x]` level —
+    /// and the whole of the other two.
+    ///
+    /// `shape` is the array's `[y, x]` extent, which the caller has because it
+    /// is the image they mean to process.
+    pub fn plane(self, index: usize, shape: [usize; 2]) -> Self {
+        self.window([index, 0, 0], [1, shape[0], shape[1]])
+    }
+
+    fn open(&self, id: u64) -> Result<StoredArray> {
+        let store = Arc::new(FilesystemStore::new(&self.dir).map_err(Error::backend)?);
+        StoredArray::open(&store, "/", id, self.window)
     }
 }
 
@@ -928,6 +1161,96 @@ impl ZarrEnvironment {
             discarded: RwLock::new(BTreeSet::new()),
             compression,
             locks,
+            serialised_writes: AtomicU64::new(0),
+            unaligned_reads: AtomicU64::new(0),
+            counters: EnvCounters::default(),
+            sidecars,
+        })
+    }
+
+    /// **Bind to arrays that already exist**, instead of writing one in.
+    ///
+    /// Every other constructor here takes `input: &Voxels` — the whole of image
+    /// 0, in memory. For a crate whose subject is out-of-core execution that is
+    /// a gap with a sharp edge: the one case it cannot start from is data that
+    /// is already too large to hold, which is the case it exists for. A slide at
+    /// `66048 x 157440 x 4` is 41 GB before anything is computed.
+    ///
+    /// `images[0]` is image 0 and `images[1..]` are the supplied inputs, in
+    /// order, exactly as [`Self::create_with_inputs`] arranges them — including
+    /// the rule that a supplied input is read at the reading block's own fetch
+    /// region and so must be in image 0's coordinate space, which is checked
+    /// here.
+    ///
+    /// `work` is where everything the *run* creates goes: the intermediate
+    /// images `prepare` makes, the side outputs, the sidecars. It is separate
+    /// from the attached arrays' own directories, and deliberately: writing
+    /// `level1` into somebody's OME-Zarr would leave an array beside its
+    /// pyramid that no `multiscales` mentions.
+    ///
+    /// Nothing about a run changes: an attached image is read, charged and
+    /// priced exactly as a created one is, and `tests/zarr_env.rs` asserts that
+    /// a chain over an array written by `create` and re-opened by `attach`
+    /// produces what the same chain produces without the round trip.
+    pub fn attach(work: impl Into<PathBuf>, images: &[AttachedImage]) -> Result<Self> {
+        Self::attach_with_compression(work, images, CompressionPolicy::derived())
+    }
+
+    /// [`Self::attach`], with the codec policy for the images the *run*
+    /// creates. The attached arrays keep whatever they were written with, which
+    /// is read off them and reported by [`Self::compression_at`].
+    pub fn attach_with_compression(
+        work: impl Into<PathBuf>,
+        images: &[AttachedImage],
+        compression: CompressionPolicy,
+    ) -> Result<Self> {
+        let Some((first, rest)) = images.split_first() else {
+            return Err(Error::InvalidArgument(
+                "attach: no images. A run reads image 0, so there is at least one.".to_string(),
+            ));
+        };
+
+        let work = work.into();
+        std::fs::create_dir_all(&work).map_err(Error::backend)?;
+        let store = Arc::new(FilesystemStore::new(&work).map_err(Error::backend)?);
+
+        let image0 = first.open(0)?;
+        let volume: [usize; 3] = [image0.shape[0], image0.shape[1], image0.shape[2]];
+        let input_chunk: [usize; 3] = [image0.chunk[0], image0.chunk[1], image0.chunk[2]];
+
+        let mut supplied = Vec::with_capacity(rest.len());
+        for (which, image) in rest.iter().enumerate() {
+            // Ids are the array's identity for the lock stripes. Attached
+            // arrays are never written, but two of them may be windows on one
+            // file, and an id that collided would serialise writes to unrelated
+            // intermediates.
+            let array = image.open(u64::MAX - which as u64)?;
+            if array.shape != image0.shape {
+                return Err(Error::InvalidArgument(format!(
+                    "attach: {} is {:?} and image 0 is {:?}. A supplied input is read at the \
+                     reading block's own fetch region, so it is in image 0's coordinate space and \
+                     no other — window it to that extent if the array is larger.",
+                    describe_image(ImageId::supplied(which).index()),
+                    array.shape,
+                    image0.shape
+                )));
+            }
+            supplied.push(Arc::new(array));
+        }
+
+        let sidecars = Sidecars::new(FileSidecars::at(work.join("sidecars"))?);
+        Ok(Self {
+            root: work,
+            store,
+            volume,
+            input_chunk,
+            output_chunk: None,
+            images: RwLock::new(vec![Arc::new(image0)]),
+            supplied: RwLock::new(supplied),
+            side: RwLock::new(BTreeMap::new()),
+            discarded: RwLock::new(BTreeSet::new()),
+            compression,
+            locks: ChunkLocks::new(),
             serialised_writes: AtomicU64::new(0),
             unaligned_reads: AtomicU64::new(0),
             counters: EnvCounters::default(),
@@ -1558,7 +1881,11 @@ impl Environment for ZarrEnvironment {
     fn read(&self, image: usize, region: &Region) -> Result<BlockBuf> {
         let array = self.image_array(image)?;
         region_within(region, &array.shape, "block-op read")?;
-        if !self.aligned(region, &array.chunk) {
+        // Alignment is a fact about where the read lands on the *array's* chunk
+        // grid, so it is asked of the stored region. A window whose start is not
+        // a whole number of chunks makes every read partial, which is a real
+        // cost and one `unaligned_reads` should report rather than hide.
+        if !self.aligned(&array.stored_region(region), &array.chunk) {
             self.unaligned_reads.fetch_add(1, Ordering::SeqCst);
         }
         let block = by_dtype!(array.dtype, |Element| array.read_as::<Element>(region))?;
@@ -1575,7 +1902,10 @@ impl Environment for ZarrEnvironment {
         // they never touch.
         self.counters
             .chunks_read
-            .fetch_add(chunks_touched(region, &array.chunk), Ordering::SeqCst);
+            .fetch_add(
+                chunks_touched(&array.stored_region(region), &array.chunk),
+                Ordering::SeqCst,
+            );
         self.counters.add_resident(block.bytes());
         Ok(BlockBuf::Array(block))
     }

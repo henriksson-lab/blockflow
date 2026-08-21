@@ -770,6 +770,111 @@ impl Decomposition {
             .collect()
     }
 
+    /// The whole-array bytes this plan's images occupy at the worst moment of a
+    /// run, from the plan alone.
+    ///
+    /// # What the number is
+    ///
+    /// Exactly one thing: **the images this plan names, sized by the volumes and
+    /// element widths it declares, summed over the phase boundary at which most
+    /// of them are simultaneously alive.** An image is alive from the phase that
+    /// writes it until its last reader finishes; a
+    /// [`Visibility::Published`] image — image 0, the
+    /// output, a supplied input — is never discarded, because
+    /// `ArrayEnvironment` does not discard them. Every input is an integer the
+    /// plan states, so two runs of the same plan give the same answer and two
+    /// plans differ here only where they really do name different arrays.
+    ///
+    /// It is the figure that decides whether a stage is worth *attempting* at a
+    /// given size, and it is the right thing to compare two plans on when the
+    /// question is about arrays the plan names.
+    ///
+    /// # What the number is not, measured rather than hedged
+    ///
+    /// **It is not a bound on a run's resident bytes, in either direction**, and
+    /// the two ways it misses were measured rather than reasoned about — on the
+    /// same plan at two block sizes, against a counting allocator:
+    ///
+    /// * **at one block the run saved more than this figure predicted, by 25%.**
+    ///   A `Chain::Parallel` allocates a buffer per branch at the block's read
+    ///   extent, and narrowing a reach shrinks every one of them. No
+    ///   `Decomposition` can see those buffers: they are not images, they have no
+    ///   entry here, and nothing in this walk moves when they do.
+    /// * **at `32^3` the run saved half what this figure predicted.**
+    ///   `ImageStore::pending` allocates an image lazily at first write and frees
+    ///   an internal one after its last reader, so a five-image plan never holds
+    ///   five and the peak this walk computes is a moment the run does not have.
+    ///
+    /// So a caller comparing two plans gets a figure that is **directionally
+    /// right and quantitatively not** — the plan that names fewer and smaller
+    /// arrays does hold less, and by how much is a question only a run answers.
+    /// A caller sizing a machine wants a measured `VmHWM`, and
+    /// `crate::budget::MemoryBudget` for what a run is *permitted* to hold.
+    ///
+    /// # Why `work`
+    ///
+    /// Phase `p` writes image `p + 1` — **unless it does not**. A fragment phase
+    /// that writes no pixels writes no image, and a plan whose last phase is one
+    /// has an image slot nothing ever fills. Whether a phase writes is the op's
+    /// answer and not the plan's ([`crate::fragment::PhaseWork::writes_an_image`]),
+    /// which is the same reason [`predicted_cost`] takes this argument, and it is
+    /// enforced the same way: `&[]` is fine for an all-pixel plan and a slotless
+    /// phase with no entry is **refused** rather than assumed to write.
+    ///
+    /// The read side needs no argument, because the plan already records it:
+    /// [`PhaseDecomposition::reads_input_image`] is what `fragment_phase` put
+    /// there and what [`Self::exact_read_voxels`] already counts with.
+    ///
+    /// # Why this does not call `images_dead_after`
+    ///
+    /// Because [`Self::readers_of_image`] counts phase `p` as a reader of image
+    /// `p` unconditionally, and a fragment phase that reads no pixels is not one.
+    /// Correcting that there would change which images the **executor frees**,
+    /// which is a residency behaviour change wanting its own measurement; the
+    /// walk here is a statement about a plan and can be exact today. An image
+    /// nothing reads dies as soon as it is written, which is the same rule —
+    /// *after its last reader* — at zero readers.
+    pub fn peak_image_bytes(&self, work: &[crate::fragment::PhaseWork<'_>]) -> Result<u64> {
+        let bytes_of = |image: usize| -> u64 {
+            let volume = self.volume_at(image);
+            volume.iter().product::<usize>() as u64 * self.dtype_at(image).size_of() as u64
+        };
+        // Every image the run holds: the ones the plan fills in, and the
+        // supplied inputs, which `n_images` deliberately excludes because every
+        // other caller of it counts what the plan *writes*. A supplied array is
+        // as resident as image 0 and is `Published` for the same reason.
+        let mut live: Vec<(usize, u64)> = vec![(0, bytes_of(0))];
+        for image in self.supplied_input_images() {
+            live.push((image, bytes_of(image)));
+        }
+        let mut peak: u64 = live.iter().map(|&(_, bytes)| bytes).sum();
+        for (index, phase) in self.phases.iter().enumerate() {
+            let writes = phase_traffic(index, phase, work.get(index))?.writes_an_image;
+            let written = index + 1;
+            if writes && written < self.n_images() {
+                live.push((written, bytes_of(written)));
+            }
+            let now: u64 = live.iter().map(|&(_, bytes)| bytes).sum();
+            if now > peak {
+                peak = now;
+            }
+            // Freed after this phase: an internal image whose last reader was
+            // this phase, and an internal image nothing reads at all — the same
+            // rule at zero readers. `readers_of_image` is asked about the plan's
+            // own images only; a supplied input has no producer to die after.
+            live.retain(|&(image, _)| {
+                if self.image_visibility(image) != Visibility::Internal {
+                    return true;
+                }
+                match self.readers_of_image(image).last() {
+                    Some(&last) => last > index,
+                    None => false,
+                }
+            });
+        }
+        Ok(peak)
+    }
+
     /// A stable identifier, for the manifest.
     ///
     /// Deterministic across runs and processes: it hashes only integers and
@@ -1169,6 +1274,50 @@ pub struct Constraints {
     pub model: CostModel,
     /// Block edges the planner may choose between, per phase. Small by design —
     /// the search is `partitions x candidates^phases`, so this must stay short.
+    ///
+    /// # Why this is a list of scalars and not of `[usize; 3]`
+    ///
+    /// Because it was measured, and a per-axis candidate list does not earn its
+    /// mechanism. The question was raised by strongly anisotropic volumes —
+    /// `404 x 1304 x 3369` — on the reasoning that a scalar ladder searches a
+    /// diagonal of the space. Two findings, both from sweeping the model over
+    /// families of candidates at a fixed byte budget:
+    ///
+    /// * **A scalar edge does not produce a cubic block.** [`BlockGrid::along`]
+    ///   clamps each axis at the volume and [`cuttable_axes`] drops an axis a cut
+    ///   would not narrow, so edge 512 on that volume gives `[404, 512, 512]` and
+    ///   the `[2]` default gives a z-slab. The diagonal is projected onto the
+    ///   volume's own box before it is priced, and the reachable shapes are
+    ///   already anisotropic.
+    /// * **Where a general per-axis family does win, a finer scalar ladder wins
+    ///   by more, and costs nothing but entries here.** Adding a rung at `3/4` of
+    ///   each power of two — 24, 48, 96, 192, 384 — takes the working-set step
+    ///   between neighbours from 8x to about 2.4x. Swept over two volumes, three
+    ///   reaches, three worker counts and five budgets: the finer ladder beat the
+    ///   coarse one by up to **2.7x** (a tight budget where the coarse ladder
+    ///   drops from a 32-cube to a 16-cube and lands far under the budget, while
+    ///   a 24-cube uses it), against at most **1.4x** for full per-axis freedom
+    ///   over the same coarse rungs. The general family won a minority of cells
+    ///   and never by as much.
+    ///
+    /// So the gap is real and it is **granularity, not anisotropy** — and it is
+    /// reachable today. The same result holds on an isotropic `1024^3`, which is
+    /// what says it is not about the volume's aspect ratio.
+    ///
+    /// # What this does not price, and what that is worth
+    ///
+    /// **Fragment traffic, which can prefer the opposite lattice.** In-plan
+    /// fragment traffic is `(1 + blocks) x F(blocks)` with `F` the total face
+    /// area, and `F = sum over axes of (cuts on that axis) x (area of the face
+    /// perpendicular to it)`. On a volume whose axis-0 face is 66x its axis-2
+    /// face, `F` is very nearly a function of axis-0 cuts alone. Measured on the
+    /// volume above: **52.4 GiB at 482 slab blocks against 136.8 GiB at 512 cube
+    /// blocks** — near-identical block counts, 2.6x apart in traffic. Nothing in
+    /// [`price_phase`] grows with the block *count* per block, so a planner
+    /// choosing on pixel cost alone will pick the expensive lattice, and the
+    /// direction is knowable in closed form from the volume's aspect ratio before
+    /// any sweep is run. That is the case for extending this list; the case for
+    /// making its entries per-axis is the one the measurement above declines.
     pub block_candidates: Vec<usize>,
     /// Which axes may be cut. `[2]` is the z-only default that every recorded
     /// parity figure was measured under.
@@ -1398,6 +1547,52 @@ pub fn cuttable_axes(
         .collect()
 }
 
+/// What a block of one phase actually moves, as opposed to how it is blocked.
+///
+/// **The three facts [`price_phase`] cannot get from a grid and a halo.** A grid
+/// says how the volume is cut and a halo says how far past a core a block
+/// fetches; neither says *how many arrays* are fetched over that extent, nor
+/// whether anything is written back. Before this existed the price assumed one
+/// read and one write for every phase, and a `fragments -> fragments` phase —
+/// which reads no pixel and writes no image — was charged a full traversal of
+/// the volume plus a full write of it, per phase, for traffic that
+/// [`Decomposition::exact_read_voxels`] correctly reports as **zero**.
+///
+/// That is the same defect class the halo charge was: the size of the phantom is
+/// `mean_core * redundancy * n_blocks`, which varies with the candidate, so it
+/// is not a constant a model could absorb and it moves the ranking. See
+/// `tests/phase_pricing.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseTraffic {
+    /// How many stored images a block reads over its read extent.
+    ///
+    /// The same count [`Decomposition::exact_read_voxels`] uses — the phase's own
+    /// input image if it reads one, plus each entry of
+    /// [`PhaseDecomposition::source_images`] — so the price and the exact figure
+    /// are counting the same fetches. It is **not** clamped to one: a phase with
+    /// a [`Chain::Source`] arm really does traverse two arrays, and charging it
+    /// once was an under-charge in the direction the model is not allowed to be
+    /// wrong in.
+    pub images_read: usize,
+    /// Whether the phase writes the image after it.
+    ///
+    /// [`crate::fragment::PhaseWork::writes_an_image`] is the answer, and it is
+    /// the op's rather than the plan's: a fragment phase writes an image only if
+    /// its op says it does, and the plan records no such field.
+    pub writes_an_image: bool,
+}
+
+impl PhaseTraffic {
+    /// One image in, one image out — every pixel phase with no second array,
+    /// which is what the price assumed before the distinction existed.
+    pub fn one_in_one_out() -> Self {
+        PhaseTraffic {
+            images_read: 1,
+            writes_an_image: true,
+        }
+    }
+}
+
 /// The infinite-grid per-block cost of one phase.
 ///
 /// `total = n_blocks x per_block_cost(B, partition)`, with no boundary term.
@@ -1405,6 +1600,67 @@ pub fn cuttable_axes(
 /// clamped, so an edge block reads less and costs less than an interior one.
 /// Assuming every block is interior therefore overestimates, which can only
 /// make the planner cautious — the same direction of error as a generous halo.
+/// # The rule this type has now been wrong under twice
+///
+/// **A term that is wrong by an amount which varies with the candidate is not a
+/// conservative approximation. It is a bias.**
+///
+/// Every figure here is stated on the infinite grid, and the file is full of
+/// deliberate over-charges justified by "the error is in the safe direction".
+/// That justification is only available to an error whose *size* is a property
+/// of the work. An error whose size is a property of the **candidate being
+/// priced** does not make the planner cautious — it reorders the candidates, and
+/// it reorders them for a reason that has nothing to do with what any plan would
+/// do. Two instances have been found in this one expression, and they were found
+/// separately because nothing named the pattern:
+///
+/// * the **core** was charged at `BlockGrid::core_voxels`, the widest block, so
+///   each candidate paid for its own grid's padding: `1.253 / 1.588 / 1.404 /
+///   1.151` at edges `512 / 256 / 128 / 64` over the pipeline tile, a 38%
+///   penalty on 256 against 64 unconnected to the work. Now
+///   [`BlockGrid::mean_core_voxels`], which is exact and has no constant to tune.
+/// * the **read** was charged at the phase's `reach` rather than its `halo`, so
+///   a granted halo the ops did not ask for was counted zero times per block
+///   however many blocks there were: `0.0% / -15.8% / -45.2% / -70.4%` at edges
+///   `64 / 32 / 16 / 8`. Now the halo. See [`price_phase`].
+///
+/// A third of the same shape was found beside them and is fixed here too: a
+/// phase's *traffic* was assumed to be one image in and one image out, so a
+/// `fragments -> fragments` phase was charged a phantom traversal whose size is
+/// `mean_core x redundancy x n_blocks`. See [`PhaseTraffic`].
+///
+/// A fourth was found in the same window, and it is the subtlest: an iterative
+/// phase runs `S` substages of read-and-compute but writes its image **once**, so
+/// pricing it at `S == 1` over-weights the write by a residual that varies with
+/// the block edge. See [`phase_compute_per_voxel`]. A fifth, in
+/// [`crate::strategy::phase_makespan`]'s pool, was found by holding
+/// `is_materialised` fixed on the argument that the write enters the channel
+/// bound as `mean_core x n = volume` identically at every candidate — true of the
+/// channel, false of the pool, where it enters as `mean_core x ceil(n / workers)`
+/// and a one-block candidate carries the whole write while a forty-block one
+/// carries a fortieth.
+///
+/// # The test to apply
+///
+/// Not "is this an over-estimate" but **"is the size of the over-estimate the
+/// same question for every candidate"**. Where it is not, the term has to be made
+/// exact, or kept out of the number the search ranks on — which is what
+/// [`Self::working_set_bytes_per_block`] does in the other direction: it is
+/// allowed to over-state, because it feeds a budget and never a comparison.
+///
+/// **The sharper form, which catches the ones that do not look like costs:** a
+/// reassurance about a *per-item* cost must name the item count, and the defect
+/// is when that count is the thing the caller is free to increase. Every one of
+/// the five above reads as a bounded per-block statement and is unbounded in the
+/// block count, the array count, the substage count or the worker count.
+///
+/// And the corollary, because all five looked constant right up until somebody
+/// swept them: **"constant across candidates" is a claim to be tested
+/// adversarially, not asserted from the algebra.** Two of the five were argued
+/// correctly from the algebra of one term while a second term, in the same
+/// expression, did the opposite.
+///
+/// [`BlockGrid::mean_core_voxels`]: crate::geometry::BlockGrid::mean_core_voxels
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PhaseCost {
     /// Read amplification on the infinite grid, charged per axis.
@@ -1486,6 +1742,45 @@ pub struct PhaseCost {
 /// charged exactly 3. The barrier remains the more expensive of the two at the
 /// same grid, which is what the distinction costs out to once neither is cut.
 ///
+/// **What is charged is the phase's `halo`, not its `reach`, and the two are
+/// only usually the same number.** A phase fetches `core (+) halo` — that is
+/// what [`PhaseDecomposition::derive`] hands `BlockGeometry::derive_with` and
+/// what [`Decomposition::exact_read_voxels`] adds up — while the *reach* is the
+/// narrower thing the halo is required to cover. They part exactly where a halo
+/// is granted wider than the ops asked for: a `BlockConstraint` whose mandated
+/// extent forces a per-block window ([`BlockConstraint::lattice`]), and a
+/// fragment phase whose halo is raised by a fragment input's reach in blocks or
+/// by a second array's ([`crate::fragment::fragment_phase`]).
+///
+/// **And the charge is exact.** Measured on a `64^3` volume cut on all three
+/// axes, reach `1`, as the granted halo widens — predicted whole-phase read
+/// against `exact_read_voxels`, which is the geometry the run will really fetch.
+/// Each cell is *what this function charges* / *what charging the reach instead
+/// would charge*, the second kept as the negative control:
+///
+/// | halo | edge 64 | edge 32 | edge 16 | edge 8 |
+/// |---|---|---|---|---|
+/// | 1 (= reach) | 0.0% / +0.0% | 0.0% / +0.0% | 0.0% / +0.0% | 0.0% / +0.0% |
+/// | 2 | 0.0% / +0.0% | 0.0% / **-8.6%** | 0.0% / **-21.9%** | 0.0% / **-39.1%** |
+/// | 4 | 0.0% / +0.0% | 0.0% / **-23.0%** | 0.0% / **-49.7%** | 0.0% / **-72.5%** |
+/// | 8 | 0.0% / +0.0% | 0.0% / **-43.8%** | 0.0% / **-75.6%** | 0.0% / **-91.3%** |
+///
+/// The reach charge fails the test the core charge was fixed under, in the same
+/// words: **the size of the error is a property of the candidate.** It is zero at
+/// one block and grows without bound as the edge falls, because the ungranted
+/// part of the halo is counted zero times per block however many blocks there
+/// are — so a price built on it prefers the smallest grid on offer for a reason
+/// that has nothing to do with the work.
+///
+/// The halo column is zero rather than merely small because the charge is
+/// [`BlockGrid::mean_read_voxels`] — the exact clamped mean, not the
+/// infinite-grid one. That was a second fix of the same shape and its history is
+/// on [`PhaseCost`]. `tests/phase_pricing.rs` holds both columns and asserts the
+/// first as an **equality**, which is what leaves no width for a
+/// candidate-dependent error to hide in.
+///
+/// [`BlockGrid::mean_read_voxels`]: crate::geometry::BlockGrid::mean_read_voxels
+///
 /// The charge is deliberately kept out of the residency figure. `read_voxels`
 /// feeds the *choice*, where over-charging is the design's declared safe
 /// direction; `working_set_bytes_per_block` feeds the *budget*, where
@@ -1499,13 +1794,14 @@ pub struct PhaseCost {
 #[allow(clippy::too_many_arguments)]
 pub fn price_phase(
     grid: &BlockGrid,
-    reach: &Reach,
+    halo: &Reach,
     compute_per_voxel: f64,
     distinct_orders: usize,
     is_materialised: bool,
     bytes_per_voxel: f64,
     model: &CostModel,
     materialise_cost_per_voxel: f64,
+    traffic: PhaseTraffic,
 ) -> PhaseCost {
     // The **average** core, not the widest. Every block is still charged the
     // widest block's *halo* below, which is the declared over-charge; the core
@@ -1516,34 +1812,80 @@ pub fn price_phase(
     let core_voxels = grid.mean_core_voxels();
     let block = grid.block();
     let volume = grid.volume();
-    let reach = reach.in_voxels(block);
-    let mut redundancy = 1.0_f64;
+    let halo = halo.in_voxels(block);
+    let mut read_per_block = 1.0_f64;
     let mut resident_voxels = 1.0_f64;
     for axis in 0..3 {
         // The widest block's halo, because the model is stated on the infinite
-        // grid: a per-block reach is charged at its worst block, the same
+        // grid: a per-block halo is charged at its worst block, the same
         // direction of error a generous halo has. That over-charge is kept —
         // unlike the core's, it is bounded and barely moves with the edge. On
         // the tile of `BlockGrid::mean_core_voxels`'s table it over-states the
         // grid's true read amplification by 7.4% / 3.5% / 1.3% / 2.2% at the
         // four edges, against the core's 1.253 / 1.588 / 1.404 / 1.151.
-        let (lo, hi) = reach.axis(axis).bound(volume[axis]);
+        let (lo, hi) = halo.axis(axis).bound(volume[axis]);
         let grown = block[axis] as f64 + lo as f64 + hi as f64;
-        let charged = grid.split_axes().contains(&axis)
-            || reach.is_whole_axis(axis, volume[axis])
-            || (grid.n_blocks() == 1 && halo_spans_axis(&reach, axis, volume[axis]));
-        if charged {
-            redundancy *= grown / block[axis] as f64;
-        }
-        resident_voxels *= grown.min(volume[axis] as f64);
+        // The two axes that are charged on the **infinite grid** on purpose. Not
+        // a boundary approximation — a statement that the infinite-grid model
+        // has broken and the clamp *is* the whole behaviour, so pricing the
+        // clamped truth would say the phase is free to fuse across when it
+        // cannot be blocked at all. Everything else takes the exact clamped
+        // mean, which is what the two paragraphs below used to be arguing about.
+        let on_the_infinite_grid = halo.is_whole_axis(axis, volume[axis])
+            || (grid.n_blocks() == 1 && halo_spans_axis(&halo, axis, volume[axis]));
+        read_per_block *= if on_the_infinite_grid {
+            grown
+        } else {
+            grid.mean_read_extent(axis, lo, hi)
+        };
+        // `total_cmp`, not `f64::min`: the crate does not select between two
+        // `f64`s through a partial order, here or anywhere.
+        let extent = volume[axis] as f64;
+        resident_voxels *= if grown.total_cmp(&extent).is_gt() {
+            extent
+        } else {
+            grown
+        };
     }
-    let read_voxels = core_voxels * redundancy;
+    // One traversal of the read extent per stored image the phase reads. Zero
+    // for a phase that reads none — the `fragments -> fragments` case — and the
+    // zero is the point: see `PhaseTraffic::images_read`.
+    // Reported rather than computed: the ratio the model used to build the read
+    // from, kept because callers and tests read it as "how many times over does
+    // this grid traverse the volume".
+    let redundancy = read_per_block / core_voxels;
+    let read_voxels = read_per_block * traffic.images_read as f64;
+    // **The voxels the op computes over, which is one traversal and not one per
+    // array.** A phase that gathers four operands still evaluates its kernel
+    // once per output voxel; charging the compute at `read_voxels` charged it
+    // four times, and — the part that made it a defect rather than a scale
+    // factor — the multiplier is the *group's* array count, so fusing multiplied
+    // the whole chain's compute by the number of `Chain::Source` arms anywhere
+    // in it while cutting spread them. That is a pressure to cut that grows with
+    // the arms and exists nowhere in any run.
+    //
+    // It reached a consumer of this crate's planner before it reached a test
+    // here: a partition suite over a real chain cut a **single-block, zero-halo**
+    // plan into three phases, where there is by construction nothing for a cut
+    // to spread. The control that should have caught it lives here now —
+    // `tests/phase_pricing.rs`'s
+    // `nothing_makes_the_search_cut_a_single_block_plan_with_no_halo`.
+    //
+    // Zero when the phase reads no array at all: a `fragments -> fragments` op
+    // traverses no voxels, so there are none to compute over.
+    let compute_voxels = if traffic.images_read == 0 {
+        0.0
+    } else {
+        read_per_block
+    };
     let conflict = if distinct_orders > 1 {
         model.order_conflict_penalty * core_voxels * (distinct_orders - 1) as f64
     } else {
         0.0
     };
-    let write = if is_materialised {
+    let write = if !traffic.writes_an_image {
+        0.0
+    } else if is_materialised {
         materialise_cost_per_voxel
     } else {
         model.write_cost_per_voxel
@@ -1552,10 +1894,18 @@ pub fn price_phase(
         redundancy,
         read_voxels_per_block: read_voxels,
         compute_per_voxel,
-        // input buffer plus output buffer, both over the clamped read extent
+        // Input buffer plus output buffer, both over the clamped read extent —
+        // and deliberately **not** scaled by `traffic`. This figure feeds the
+        // byte budget, where over-charging invents infeasibility but is at least
+        // a statement about one grid, while under-charging admits a plan that
+        // will not run. A phase reading nothing is charged as if it read one
+        // image, which is the safe direction; a phase reading three is charged
+        // as if it read one, which is not, and is a known gap recorded here
+        // rather than half-fixed: correcting it changes which plans are
+        // *affordable*, and that is a budget review with its own measurements.
         working_set_bytes_per_block: resident_voxels * bytes_per_voxel * 2.0,
-        cost_per_block: read_voxels
-            * (model.read_cost_per_voxel + model.compute_scale * compute_per_voxel)
+        cost_per_block: read_voxels * model.read_cost_per_voxel
+            + compute_voxels * model.compute_scale * compute_per_voxel
             + core_voxels * write
             + conflict,
     }
@@ -1580,9 +1930,24 @@ pub fn price_phase(
 /// binding half, and a second derivation that disagreed with it would be a
 /// second planner. The chain is still needed, for what each slot declared it
 /// would cost — that is the one thing a plan records only as a name.
+///
+/// **`work` is required for the same reason the chain is.** A fragment or
+/// iterative phase owns no chain slot, so the fold over `phase.slots` visits
+/// nothing and every such phase priced at exactly **zero compute** — while
+/// `IterativeOp::cost_per_voxel` sat there unread and the phase most likely to
+/// be one is a thinning, whose whole cost is compute. The same arrangement
+/// [`check_dtypes`] and [`check_output_shapes`] already have: the plan records
+/// names, the ops are the only things that know, and a caller holding both is
+/// the only place the question can be asked.
+///
+/// A caller whose plan is all pixels may pass `&[]`. That is not a silent
+/// default — [`phase_traffic`] **refuses** a phase that owns no slot and has no
+/// `work` entry, by name, because such a phase is precisely the one whose price
+/// would otherwise be a fabricated zero.
 pub fn predicted_cost(
     chain: &Chain,
     decomposition: &Decomposition,
+    work: &[crate::fragment::PhaseWork<'_>],
     model: &CostModel,
 ) -> Result<f64> {
     let slots = chain.slots();
@@ -1599,19 +1964,23 @@ pub fn predicted_cost(
         let (_, _, _, orders) = summarise_slots(&slots, &phase.slots, volume)?;
         // At the grid the plan actually holds, which is the same figure the
         // search priced this candidate with. See `compute_per_voxel`.
-        let compute = compute_per_voxel(&slots, &phase.slots, phase.grid.block());
+        let compute = phase_compute_per_voxel(&slots, phase, work.get(index))?;
+        let traffic = phase_traffic(index, phase, work.get(index))?;
         // The last phase writes the workflow's output; every other writes an
         // intermediate. Exactly the test the enumeration makes.
         let is_materialised = index + 1 < decomposition.phases.len();
         let cost = price_phase(
             &phase.grid,
-            &phase.reach,
+            // The halo, because that is the extent a block fetches; see
+            // `price_phase`, which carries the measurement.
+            &phase.halo,
             compute,
             orders.len(),
             is_materialised,
             decomposition.dtype_at(index).size_of() as f64,
             model,
             model.materialise_cost_per_voxel,
+            traffic,
         );
         total += cost.cost_per_block * phase.grid.n_blocks() as f64;
     }
@@ -1628,6 +1997,118 @@ pub fn predicted_cost(
 /// re-asks it per candidate rather than pricing every grid with the figure from
 /// no grid. For every op that takes the default this is the same number by the
 /// same route, so no plan built before it existed moves.
+/// How many stored arrays a block of a run of pixel slots traverses.
+///
+/// One for the phase's own input image, plus one for each distinct image a
+/// [`Chain::Source`] leaf in the run reads. It is the search's counterpart of the
+/// count [`Decomposition::exact_read_voxels`] takes off a finished plan, and it
+/// exists because the search prices *before* `declare_source_images` has run —
+/// so the plan cannot be asked and the chain is the only thing that knows.
+///
+/// Charging one where a phase traverses two was an under-charge, which is the
+/// direction this model is not permitted to be wrong in, and it is exactly the
+/// saving a source arm is supposed to *not* have: `Chain::Source` is cheaper than
+/// materialising the second array because it adds nothing to the halo, not
+/// because its traversal is free.
+pub fn images_read_by(slots: &[&Chain], group: &[usize], volume: [usize; 3]) -> Result<usize> {
+    let mut images: Vec<usize> = Vec::new();
+    for &slot in group {
+        for input in slots[slot].source_inputs(volume)? {
+            let index = input.image.index();
+            if !images.contains(&index) {
+                images.push(index);
+            }
+        }
+    }
+    Ok(1 + images.len())
+}
+
+/// What one phase costs per voxel, whatever kind of work it runs.
+///
+/// **The fold over `phase.slots` is only an answer for a pixel phase.** A
+/// fragment or iterative phase owns no slot, so that fold returns `0.0` — and it
+/// returns it for a phase that has forgotten its `work` entry as readily as for
+/// one that genuinely computes nothing. Those two are not the same statement, so
+/// they do not get the same answer here: the second is an error naming the phase.
+///
+/// The iterative case is **one substage's** cost, which is what
+/// [`crate::iterate::IterativeOp::cost_per_voxel`] documents itself as and is the
+/// only figure available — the substage count is a fixed point over data, so no
+/// plan holds it.
+///
+/// **What that costs was got wrong here once and is worth stating carefully.**
+/// This doc claimed the missing count could not move the block edge, because a
+/// common factor across the candidates cannot move an argmin. The claim was
+/// measured and is false, twice over:
+///
+/// * the count is not a common factor of the whole price. A substage reads and
+///   computes; the image is written **once**, after the loop. So `S` substages
+///   are `S x (read + compute) + write`, and pricing at `S == 1` over-weights the
+///   write against the rest by a residual that varies with the block edge.
+/// * even at a fixed count, scaling the compute moves the edge above one worker.
+///   [`crate::strategy::phase_makespan`] is a roofline and compute is in its pool
+///   but not in its channel bound, so raising it walks the phase across the knee.
+///   Flat at `workers == 1`, where the objective collapses to serial work and the
+///   largest candidate always wins; moves at every worker count above it.
+///   `tests/phase_pricing.rs` sweeps both.
+///
+/// The first of those is a correction this function cannot make, because the
+/// count is not in the plan. See the note on [`PhaseCost`]: what is wanted is a
+/// statement of **which terms of a phase repeat and which happen once**, which is
+/// a fact about `strategy::run_iterative_phase` rather than about any builder.
+pub(crate) fn phase_compute_per_voxel(
+    slots: &[&Chain],
+    phase: &PhaseDecomposition,
+    work: Option<&crate::fragment::PhaseWork<'_>>,
+) -> Result<f64> {
+    match work {
+        Some(crate::fragment::PhaseWork::Fragments(op)) => Ok(op.cost_per_voxel()),
+        Some(crate::fragment::PhaseWork::Iterate(op)) => Ok(op.cost_per_voxel()),
+        Some(crate::fragment::PhaseWork::Pixels) | None => {
+            if phase.slots.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {:?} owns no chain slot and `work` does not say what it runs, so its                      compute would be priced at zero — which is a number nobody stated. A                      fragment or iterative phase must appear in `work`; see                      `fragment::PhaseWork`.",
+                    phase.names
+                )));
+            }
+            Ok(compute_per_voxel(slots, &phase.slots, phase.grid.block()))
+        }
+    }
+}
+
+/// How many arrays a block of `phase` reads and whether it writes one.
+///
+/// Both are facts the price needs and the grid cannot supply; see
+/// [`PhaseTraffic`]. The read count comes from the plan — it is the same count
+/// [`Decomposition::exact_read_voxels`] adds up — and the write comes from the
+/// op, because a fragment phase writes an image only if its op says so.
+///
+/// **A slotless phase with no `work` entry is refused**, on the argument
+/// [`phase_compute_per_voxel`] makes: `reads_input_image` defaults true and
+/// `writes_an_image` would default true, so such a phase would be priced for a
+/// read and a write it may do neither of, silently.
+pub(crate) fn phase_traffic(
+    index: usize,
+    phase: &PhaseDecomposition,
+    work: Option<&crate::fragment::PhaseWork<'_>>,
+) -> Result<PhaseTraffic> {
+    let writes_an_image = match work {
+        Some(entry) => entry.writes_an_image(),
+        None => {
+            if phase.slots.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index} owns no chain slot and `work` does not say what it runs, so                      the plan cannot say whether it reads or writes an image at all. A fragment                      or iterative phase must appear in `work`; see `fragment::PhaseWork`."
+                )));
+            }
+            true
+        }
+    };
+    Ok(PhaseTraffic {
+        images_read: usize::from(phase.reads_input_image) + phase.source_images.len(),
+        writes_an_image,
+    })
+}
+
 pub fn compute_per_voxel(slots: &[&Chain], group: &[usize], block: [usize; 3]) -> f64 {
     group
         .iter()
@@ -2789,6 +3270,7 @@ mod tests {
                 8.0,
                 &model,
                 1.0,
+                PhaseTraffic::one_in_one_out(),
             )
             .cost_per_block
         };
@@ -2873,7 +3355,17 @@ mod tests {
         let grid = BlockGrid::whole(volume).unwrap();
         assert!(grid.split_axes().is_empty());
         let model = CostModel::default();
-        let cost = price_phase(&grid, &volume.into(), 1.0, 1, false, 8.0, &model, 1.0);
+        let cost = price_phase(
+            &grid,
+            &volume.into(),
+            1.0,
+            1,
+            false,
+            8.0,
+            &model,
+            1.0,
+            PhaseTraffic::one_in_one_out(),
+        );
         assert!(
             cost.redundancy > 1.0,
             "a phase whose every voxel depends on the whole volume priced at \
@@ -2883,7 +3375,17 @@ mod tests {
 
         // and a bounded reach on an axis the block spans is still free, because
         // there the clamp is exact: the read cannot leave the volume
-        let bounded = price_phase(&grid, &[4, 0, 0].into(), 1.0, 1, false, 8.0, &model, 1.0);
+        let bounded = price_phase(
+            &grid,
+            &[4, 0, 0].into(),
+            1.0,
+            1,
+            false,
+            8.0,
+            &model,
+            1.0,
+            PhaseTraffic::one_in_one_out(),
+        );
         assert_eq!(bounded.redundancy, 1.0);
     }
 
@@ -2908,7 +3410,18 @@ mod tests {
         assert!(halo_spans_axis(&nearly, 0, volume[0]), "lo + hi >= extent");
 
         let single = BlockGrid::whole(volume).unwrap();
-        let charged = price_phase(&single, &nearly, 1.0, 1, false, 8.0, &model, 1.0).redundancy;
+        let charged = price_phase(
+            &single,
+            &nearly,
+            1.0,
+            1,
+            false,
+            8.0,
+            &model,
+            1.0,
+            PhaseTraffic::one_in_one_out(),
+        )
+        .redundancy;
         assert!(charged > 1.0, "priced at the clamp discount: {charged}");
         // strictly under a barrier's charge at the same grid: `lo + hi` is under
         // `2 * extent` for a bounded reach and exactly `2 * extent` for `All`
@@ -2921,6 +3434,7 @@ mod tests {
             8.0,
             &model,
             1.0,
+            PhaseTraffic::one_in_one_out(),
         )
         .redundancy;
         assert_eq!(barrier, 3.0);
@@ -2932,8 +3446,36 @@ mod tests {
         let cut = BlockGrid::along(volume, &[0], 128).unwrap();
         let spanning: Reach = [24, 24, 24].into();
         assert!(halo_spans_axis(&spanning, 1, volume[1]));
-        let cost = price_phase(&cut, &spanning, 1.0, 1, false, 8.0, &model, 1.0).redundancy;
-        assert_eq!(cost, (128.0 + 48.0) / 128.0, "axis 0 only, and no other");
+        let cost = price_phase(
+            &cut,
+            &spanning,
+            1.0,
+            1,
+            false,
+            8.0,
+            &model,
+            1.0,
+            PhaseTraffic::one_in_one_out(),
+        )
+        .redundancy;
+        // **Re-measured when the read charge stopped being an infinite-grid
+        // one.** This used to be `(128 + 48) / 128 = 1.375`, every block paying
+        // a full halo on both sides. Axis 0 has eight blocks of 128 over 1024
+        // and a halo of 24 a side: six interior blocks read `24 + 128 + 24`, and
+        // the two on the boundary read `128 + 24`, because there is nothing
+        // outside the volume to read. The mean is `1360 / 8 = 170`.
+        //
+        // The number is derived here rather than pasted, so that a change to the
+        // grid or the halo moves both sides together and this stays a statement
+        // about *which axes are charged* — which is what it is for, and which is
+        // unchanged: axes 1 and 2 are spanned by the block, so they contribute
+        // exactly 1 and the whole ratio is axis 0's.
+        let interior = 24.0 + 128.0 + 24.0;
+        let boundary = 128.0 + 24.0;
+        let mean_read = (6.0 * interior + 2.0 * boundary) / 8.0;
+        assert_eq!(mean_read, 170.0);
+        assert_eq!(cost, mean_read / 128.0, "axis 0 only, and no other");
+        assert_eq!(cost, 1.328125);
     }
 
     /// The two-sided form of the barrier predicate, and exact like it.
@@ -2977,6 +3519,7 @@ mod tests {
             8.0,
             &model,
             1.0,
+            PhaseTraffic::one_in_one_out(),
         );
         let whole_volume_bytes = (volume.iter().product::<usize>() * 8 * 2) as f64;
         assert!(

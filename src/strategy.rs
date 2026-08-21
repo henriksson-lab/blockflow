@@ -1862,6 +1862,14 @@ pub fn planned_block(
     constraints: &Constraints,
 ) -> Result<[usize; 3]> {
     let reach = chain.reach_spec(volume)?;
+    // The whole chain as one phase, which is what this function is asked about;
+    // its slots are `0..n` and every source leaf in it is one this run reads.
+    let slots = chain.slots();
+    let group: Vec<usize> = (0..slots.len()).collect();
+    let traffic = super::decomposition::PhaseTraffic {
+        images_read: super::decomposition::images_read_by(&slots, &group, volume)?,
+        writes_an_image: true,
+    };
     let mut candidates = constraints.block_candidates.clone();
     candidates.sort_unstable_by(|a, b| b.cmp(a));
     for edge in candidates {
@@ -1881,6 +1889,7 @@ pub fn planned_block(
             dtype.size_of() as f64,
             &constraints.model,
             constraints.model.materialise_cost_per_voxel,
+            traffic,
         );
         let fits = constraints.budget_bytes.is_none_or(|budget| {
             cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
@@ -2330,6 +2339,37 @@ pub enum PartitionSearch {
     /// that breaks it needs a search that never assumed it. It is also the
     /// oracle the DP is tested against.
     Exhaustive,
+    /// **No partition at all: every slot in one phase, and only the block edge
+    /// is chosen.**
+    ///
+    /// Not an optimisation of the two above — it answers a different question,
+    /// and the difference is who decides the fusion. A caller that has already
+    /// decided its chain is one phase, for a reason the cost model cannot see,
+    /// does not want a search that may cut it. The case this was built for is a
+    /// consumer's thinning stage: it fuses `n` passes into one round because the
+    /// phase it really runs is an [`crate::iterate::IterativeOp`] with **one**
+    /// substage, and the chain it hands a planner is a stand-in with `n` slots.
+    /// Asking the DP about that stand-in gets a correct answer to a question the
+    /// stage cannot act on — measured there, it returns one phase at one pass
+    /// per round, two at two and four at four, buying a materialisation per pass
+    /// that an iterative op has no way to perform.
+    ///
+    /// So the group is given and the sweep over [`Constraints::block_candidates`]
+    /// is the whole of the search. That sweep is not re-implemented: it is the
+    /// same [`PhasePricer`], the same [`price_phase`], the same
+    /// [`phase_makespan`] and the same tie-break — *lower makespan, then the
+    /// larger edge* — which is the point, because a caller that hand-rolls it
+    /// prices a grid the search would never offer the moment either drifts.
+    ///
+    /// **A barrier is refused rather than fused over.** A full-reach op must be
+    /// alone in its phase ([`crate::decomposition::is_planning_barrier`]), and a
+    /// caller asking for one group across one is asking for a plan that is not
+    /// legal rather than one that is merely expensive. The two searches drop
+    /// such a partition and carry on; this one has nothing to carry on to, so it
+    /// says so by name.
+    ///
+    /// [`Constraints::block_candidates`]: crate::decomposition::Constraints::block_candidates
+    SingleGroup,
 }
 
 /// The longest chain the `O(n^2)` DP will plan.
@@ -2480,9 +2520,16 @@ enum GroupPrice {
 /// The units are the model's: voxelwise maps under
 /// [`CostModel::default`](crate::decomposition::CostModel::default),
 /// nanoseconds under one calibrated from a [`crate::statistics::Snapshot`].
+///
+/// `work` is what [`crate::decomposition::predicted_cost`] takes it for, word
+/// for word: a fragment or iterative phase owns no chain slot, and without it
+/// such a phase prices at zero compute and at a read and a write it may not
+/// perform. `&[]` is allowed for a plan that is all pixels and is **refused**
+/// for one that is not.
 pub fn predicted_makespan(
     chain: &Chain,
     decomposition: &Decomposition,
+    work: &[crate::fragment::PhaseWork<'_>],
     model: &super::decomposition::CostModel,
     workers: usize,
 ) -> Result<f64> {
@@ -2499,19 +2546,30 @@ pub fn predicted_makespan(
         let volume = decomposition.volume_at(index);
         let (_, _, _, orders) =
             super::decomposition::summarise_slots(&slots, &phase.slots, volume)?;
-        let compute = compute_per_voxel(&slots, &phase.slots, phase.grid.block());
+        let compute =
+            super::decomposition::phase_compute_per_voxel(&slots, phase, work.get(index))?;
+        let traffic = super::decomposition::phase_traffic(index, phase, work.get(index))?;
         let is_materialised = index + 1 < decomposition.phases.len();
         let cost = price_phase(
             &phase.grid,
-            &phase.reach,
+            // The halo, not the reach: the two differ exactly where a granted
+            // halo is wider than the ops asked for, and there the reach
+            // under-charges by a factor that grows as the block shrinks. See
+            // `price_phase`.
+            &phase.halo,
             compute,
             orders.len(),
             is_materialised,
             decomposition.dtype_at(index).size_of() as f64,
             model,
             model.materialise_cost_per_voxel,
+            traffic,
         );
-        let write = if is_materialised {
+        // Zero for a phase that writes no image, so that the channel bound below
+        // counts the same bytes `price_phase` charged for. See `PhaseTraffic`.
+        let write = if !traffic.writes_an_image {
+            0.0
+        } else if is_materialised {
             model.materialise_cost_per_voxel
         } else {
             model.write_cost_per_voxel
@@ -2655,7 +2713,13 @@ pub fn phase_makespan(
     // maxed against would not be one.
     let channel = cost.read_voxels_per_block * n * model.read_cost_per_voxel
         + grid.mean_core_voxels() * n * write_cost_per_voxel;
-    pool.max(channel)
+    // `total_cmp`, not `f64::max`: the crate's arithmetic never selects between
+    // two `f64`s through a partial order.
+    if pool.total_cmp(&channel).is_lt() {
+        channel
+    } else {
+        pool
+    }
 }
 
 /// What one contiguous run's sweep over the candidate edges came to.
@@ -2731,16 +2795,34 @@ impl PhasePricer<'_> {
         // the fold, because an op may declare a term whose denominator is a
         // block extent — see `decomposition::compute_per_voxel`. For every op
         // that does not, this is the same number by the same route.
-        let price = |grid: &BlockGrid| {
+        // Priced at the halo the grid would be *granted*, which is the reach
+        // everywhere except under a mandate — see `price_phase` for why the
+        // difference is not a rounding one.
+        // One traversal per array the run reads: its own input image plus every
+        // distinct image a `Chain::Source` leaf in it names. See
+        // `images_read_by`.
+        let images_read =
+            match super::decomposition::images_read_by(self.slots, &group, self.volume) {
+                Ok(count) => count,
+                Err(err) => return (GroupPrice::Refused(Some(err.to_string())), tally),
+            };
+        let traffic = super::decomposition::PhaseTraffic {
+            images_read,
+            // A run of chain slots is a pixel phase, and a pixel phase writes
+            // the image after it.
+            writes_an_image: true,
+        };
+        let price = |grid: &BlockGrid, halo: &Reach| {
             price_phase(
                 grid,
-                &reach,
+                halo,
                 compute_per_voxel(self.slots, &group, grid.block()),
                 fold.orders.len(),
                 is_materialised,
                 self.bytes,
                 &self.constraints.model,
                 self.constraints.model.materialise_cost_per_voxel,
+                traffic,
             )
         };
         let affordable = |cost: &super::decomposition::PhaseCost| {
@@ -2764,7 +2846,7 @@ impl PhasePricer<'_> {
             // not fit — but there is nothing to choose between.
             match constraint.lattice(self.volume, &reach) {
                 Ok(Some((grid, window))) => {
-                    let cost = price(&grid);
+                    let cost = price(&grid, &window);
                     tally.offered += 1;
                     if affordable(&cost) {
                         tally.priced += 1;
@@ -2806,7 +2888,7 @@ impl PhasePricer<'_> {
                         continue;
                     }
                 };
-                let cost = price(&grid);
+                let cost = price(&grid, &reach);
                 if !affordable(&cost) {
                     tally.over_budget += 1;
                     continue;
@@ -2981,6 +3063,39 @@ impl PriceTableRefusalView<'_> {
 /// there, and the enumeration would then break the tie on the phase count. No
 /// generated chain has produced it; it is stated because it is the only known
 /// gap.
+/// The whole chain as one phase, if that is a legal plan at all.
+///
+/// Two failures, distinguished because a caller can act on one and not the
+/// other:
+///
+/// * **A barrier inside the group** is refused here with `Err`, naming the cut,
+///   because no block candidate could ever fix it. The other two searches drop
+///   the partition and keep going; this one has no other partition, and
+///   answering "nothing fits the budget" would send the caller to widen a budget
+///   that was never the problem.
+/// * **No candidate fits** is `Ok(None)`, the same shape the other two return,
+///   and the caller's message says a budget.
+fn search_single_group(
+    table: &PriceTable,
+    forced_cuts: u32,
+) -> Result<Option<Vec<(usize, usize)>>> {
+    if forced_cuts != 0 {
+        let first = forced_cuts.trailing_zeros() as usize;
+        return Err(Error::InvalidArgument(format!(
+            "enumerating: `PartitionSearch::SingleGroup` was asked for one phase over all \
+             {} slots, and a full-reach op forces a cut between slots {first} and {}. A \
+             planning barrier must be alone in its phase, so no block candidate makes this \
+             one group legal — see `decomposition::is_planning_barrier`.",
+            table.n,
+            first + 1
+        )));
+    }
+    Ok(match table.get(0, table.n) {
+        Some(GroupPrice::Priced(_)) => Some(vec![(0, table.n)]),
+        _ => None,
+    })
+}
+
 fn search_dp(table: &PriceTable) -> Option<Vec<(usize, usize)>> {
     let n = table.n;
     // (cost, phases, cut mask, the cut this state came from)
@@ -3124,11 +3239,17 @@ impl Enumerating {
             ));
         }
         let limit = match self.search {
+            // No cut mask and no table of runs: one group is priced once, so
+            // the `u32` mask that bounds the other two does not apply.
+            PartitionSearch::SingleGroup => usize::MAX,
             PartitionSearch::Dp => MAX_SLOTS,
             PartitionSearch::Exhaustive => MAX_EXHAUSTIVE_SLOTS,
         };
         if slots.len() > limit {
             return Err(Error::InvalidArgument(match self.search {
+                PartitionSearch::SingleGroup => {
+                    unreachable!("SingleGroup has no slot limit, so this branch is unreachable")
+                }
                 PartitionSearch::Dp => format!(
                     "enumerating: {} slots exceeds the {MAX_SLOTS} the O(n^2) DP admits. The \
                      search is not what bounds it — the cut mask a plan is chosen by is a \
@@ -3168,6 +3289,7 @@ impl Enumerating {
         let mut constraint_note: Option<String> = None;
         let mut budget_failures = 0usize;
         let spans = match self.search {
+            PartitionSearch::SingleGroup => search_single_group(&table, forced_cuts)?,
             PartitionSearch::Dp => search_dp(&table),
             PartitionSearch::Exhaustive => search_exhaustive(
                 &table,
@@ -3185,6 +3307,14 @@ impl Enumerating {
                 ),
             };
             Error::InvalidArgument(match self.search {
+                PartitionSearch::SingleGroup => format!(
+                    "enumerating: the one phase of all {} slots fits none of the block candidates                      {:?} within the {:?} byte budget at concurrency {}. `SingleGroup` has no                      other partition to fall back to — that is what asking for it means — so                      add a smaller candidate, raise the budget, or use `PartitionSearch::Dp` and                      let the search cut.{}",
+                    slots.len(),
+                    constraints.block_candidates,
+                    constraints.budget_bytes,
+                    constraints.expected_concurrency,
+                    reason(&constraint_note),
+                ),
                 PartitionSearch::Exhaustive => format!(
                     "enumerating: none of the {} partitions fits the {:?} byte budget at \
                      concurrency {} with block candidates {:?}. Reduce the concurrency, add a \
@@ -3387,6 +3517,11 @@ fn phase_for_group(
     let (reach, _compute, names, orders) =
         super::decomposition::summarise_slots(slots, group, volume)?;
     let mandated = constraint_for(slots, group, volume)?;
+    // The same count `PhasePricer::price` takes; see `images_read_by`.
+    let traffic = super::decomposition::PhaseTraffic {
+        images_read: super::decomposition::images_read_by(slots, group, volume)?,
+        writes_an_image: true,
+    };
     let mut grid = None;
     let mut halo = reach.clone();
     if let Some(constraint) = &mandated {
@@ -3404,13 +3539,15 @@ fn phase_for_group(
         halo = window;
         let cost = price_phase(
             &candidate,
-            &reach,
+            // The granted window, not the reach; see `price_phase`.
+            &halo,
             compute_per_voxel(slots, group, candidate.block()),
             orders.len(),
             is_materialised,
             bytes,
             &constraints.model,
             constraints.model.materialise_cost_per_voxel,
+            traffic,
         );
         let fits = constraints.budget_bytes.is_none_or(|budget| {
             cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
@@ -3439,6 +3576,7 @@ fn phase_for_group(
                 bytes,
                 &constraints.model,
                 constraints.model.materialise_cost_per_voxel,
+                traffic,
             );
             let fits = constraints.budget_bytes.is_none_or(|budget| {
                 cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
@@ -3631,7 +3769,14 @@ impl Materialising {
     /// the objective the search is minimising.
     pub fn incumbent_cost(&self, workflow: &Workflow, constraints: &Constraints) -> Result<f64> {
         let decomposition = self.decompose(workflow, constraints)?;
-        super::decomposition::predicted_cost(&workflow.chain, &decomposition, &constraints.model)
+        // `&[]`: this strategy partitions a `Chain` and every phase it produces
+        // owns slots of it, so there is no slotless phase for `work` to describe.
+        super::decomposition::predicted_cost(
+            &workflow.chain,
+            &decomposition,
+            &[],
+            &constraints.model,
+        )
     }
 }
 
@@ -3710,7 +3855,7 @@ mod tests {
 #[cfg(test)]
 mod block_floor_tests {
     use super::*;
-    use crate::decomposition::{cuttable_axes, splittable_axes, CostModel};
+    use crate::decomposition::{cuttable_axes, splittable_axes, CostModel, PhaseTraffic};
     use crate::env::ArrayEnvironment;
     use crate::probes::WindowSumOp;
     use crate::reach::Reach;
@@ -3876,8 +4021,18 @@ mod block_floor_tests {
             )
             .unwrap();
             let price = |grid: &BlockGrid| {
-                price_phase(grid, &reach, 1.0, 1, false, 8.0, &CostModel::default(), 1.0)
-                    .working_set_bytes_per_block
+                price_phase(
+                    grid,
+                    &reach,
+                    1.0,
+                    1,
+                    false,
+                    8.0,
+                    &CostModel::default(),
+                    1.0,
+                    PhaseTraffic::one_in_one_out(),
+                )
+                .working_set_bytes_per_block
             };
             assert!(
                 price(&after) <= price(&before),
@@ -4085,6 +4240,7 @@ mod block_floor_tests {
             8.0,
             &CostModel::default(),
             1.0,
+            PhaseTraffic::one_in_one_out(),
         )
         .redundancy;
         assert!(

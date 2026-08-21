@@ -611,6 +611,32 @@ impl Union {
         }
         roots
     }
+
+    /// Reduce one `u64` per node onto the root of its component by `min`, and
+    /// return the per-root answer. A node's own value is included, so a
+    /// singleton component folds to itself.
+    ///
+    /// **The same argument [`Self::fold_or`] rests on, and it is the whole
+    /// reason this is a fold rather than a running minimum kept as the unions
+    /// happen.** `min` is associative, commutative and idempotent, so the
+    /// per-root answer is a function of the *set* of nodes in a component and
+    /// not of the order they were joined in — which is what makes a quantity
+    /// derived from it the same under every decomposition.
+    ///
+    /// A root that is not the least node of its component still gets the least
+    /// *value*: the fold visits every node and asks `find` where it lives, so
+    /// nothing depends on which member the union-by-size left holding the
+    /// component.
+    pub fn fold_min(&mut self, values: &[u64]) -> Vec<u64> {
+        let mut roots = vec![u64::MAX; values.len()];
+        for (node, &value) in values.iter().enumerate() {
+            let root = self.find(node);
+            if value < roots[root] {
+                roots[root] = value;
+            }
+        }
+        roots
+    }
 }
 
 /// A flat numbering of every `(block, label)` in a lattice.
@@ -710,15 +736,31 @@ impl LabelIndex {
         sets: &mut Union,
         per_root: &[bool],
     ) -> BTreeMap<[usize; 3], Vec<bool>> {
+        self.per_block_of(sets, per_root)
+    }
+
+    /// [`Self::per_block`] for a per-component answer of any `Copy` type.
+    ///
+    /// The `bool` form above is this at `T = bool` and did not move; the reason
+    /// for the generalisation is that a per-component **label** is a `u32` and
+    /// the walk that reads it back out is the same walk, character for
+    /// character. Two copies of it would be two chances for the flat numbering
+    /// and the inverse of the flat numbering to disagree, and the flat numbering
+    /// is the one thing every op built on this module shares.
+    pub fn per_block_of<T: Copy>(
+        &self,
+        sets: &mut Union,
+        per_root: &[T],
+    ) -> BTreeMap<[usize; 3], Vec<T>> {
         let mut out = BTreeMap::new();
         for &block in &self.order {
             let (base, labels) = self.span[&block];
-            let mut flags = Vec::with_capacity(labels);
+            let mut values = Vec::with_capacity(labels);
             for label in 0..labels {
                 let root = sets.find(base + label);
-                flags.push(per_root[root]);
+                values.push(per_root[root]);
             }
-            out.insert(block, flags);
+            out.insert(block, values);
         }
         out
     }
@@ -930,6 +972,67 @@ pub fn core_within_read(at: &BlockView<'_>) -> Result<([usize; 3], [usize; 3])> 
 mod tests {
     use super::*;
     use ndarray::Array3;
+
+    /// **`fold_min` is order-independent, and that is the whole of why it is a
+    /// fold.** The same component built by two different sequences of unions
+    /// must reduce to the same least value — because the value a component is
+    /// *named* by downstream is derived from it, and a name that depended on the
+    /// union order would be a name that depended on the block iteration order.
+    #[test]
+    fn fold_min_reduces_to_the_least_value_whatever_order_the_unions_arrived_in() {
+        let values = [70u64, 30, 50, 90];
+        let mut forwards = Union::new(4);
+        forwards.union(0, 1);
+        forwards.union(1, 2);
+        let mut backwards = Union::new(4);
+        backwards.union(2, 1);
+        backwards.union(1, 0);
+
+        let a = forwards.fold_min(&values);
+        let b = backwards.fold_min(&values);
+        for node in 0..4 {
+            assert_eq!(
+                a[forwards.find(node)],
+                b[backwards.find(node)],
+                "node {node} disagreed between two union orders"
+            );
+        }
+        assert_eq!(
+            a[forwards.find(0)],
+            30,
+            "the least reaches the whole component"
+        );
+        assert_eq!(
+            a[forwards.find(3)],
+            90,
+            "and no further: a singleton is itself"
+        );
+    }
+
+    /// The generic `per_block_of` and the `bool` `per_block` are one walk. If
+    /// they ever stop agreeing, the flat numbering has two inverses.
+    #[test]
+    fn per_block_and_per_block_of_are_the_same_walk() {
+        let mut reports: BTreeMap<[usize; 3], u32> = BTreeMap::new();
+        reports.insert([0, 0, 0], 2);
+        reports.insert([0, 0, 1], 3);
+        let index = LabelIndex::build(&reports, [1, 1, 2], |&count| count).expect("an index");
+        let mut sets = Union::new(index.total());
+        sets.union(index.node([0, 0, 0], 1), index.node([0, 0, 1], 2));
+
+        let flags: Vec<bool> = (0..index.total()).map(|node| node % 2 == 0).collect();
+        let by_root = sets.fold_or(&flags);
+        let bools = index.per_block(&mut sets, &by_root);
+        let generic = index.per_block_of(&mut sets, &by_root);
+        assert_eq!(bools, generic);
+
+        // and the generic form carries a `u32`, which is what the label volume
+        // wants and what the `bool` form cannot say
+        let named: Vec<u32> = (0..index.total()).map(|node| node as u32 + 100).collect();
+        let labels = index.per_block_of(&mut sets, &named);
+        assert_eq!(labels[&[0, 0, 0]].len(), 2);
+        assert_eq!(labels[&[0, 0, 1]].len(), 3);
+    }
 
     #[test]
     fn a_union_is_by_size_and_folds_without_regard_to_order() {

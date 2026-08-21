@@ -215,8 +215,77 @@ impl BlockGrid {
     ///
     /// Nothing here is tuned: the mean is a fact about the grid and there is no
     /// constant to pick.
+    ///
+    /// **This is one instance of a pattern, not a one-off.** The same failure —
+    /// a term wrong by an amount that varies with the candidate, which is a bias
+    /// and not a conservative approximation — was found a second time in the
+    /// same expression, in the read charge. The rule and both measurements are
+    /// stated once on [`PhaseCost`](crate::decomposition::PhaseCost).
     pub fn mean_core_voxels(&self) -> f64 {
         self.volume.iter().map(|&edge| edge as f64).product::<f64>() / self.n_blocks() as f64
+    }
+
+    /// The mean over this grid's blocks of the voxels one block **reads** at
+    /// `halo`, exactly, with the volume boundary clamped.
+    ///
+    /// The counterpart of [`Self::mean_core_voxels`] for the read extent, and it
+    /// exists for the same reason and was arrived at by the same route. The core
+    /// was charged at the widest block until that was measured to be a bias; the
+    /// read was charged on the **infinite grid** — every block assumed interior,
+    /// so every block paying a full halo on both sides — and that is the same
+    /// mistake with a different justification attached to it.
+    ///
+    /// **Why the infinite-grid charge was defensible and then was not.** On its
+    /// own it over-states by the boundary fraction, 1.3% to 9.4% over the grids
+    /// measured in `tests/phase_pricing.rs`, always in the direction the cost
+    /// model is declared safe in. What removed the defence is that the
+    /// over-statement is a function of the candidate — a wider halo has a larger
+    /// boundary fraction, and a phase reading three arrays pays the fraction
+    /// three times — so once a phase's traffic entered the price the model began
+    /// ranking partitions on the size of its own error. A sibling crate's
+    /// partition suite caught it: at a 32-cube block the search preferred a
+    /// four-phase plan over a three-phase one that reads 3.2% **fewer** voxels
+    /// and writes one intermediate fewer, which is worse by both of the
+    /// quantities the model is made of. See
+    /// [`PhaseCost`](crate::decomposition::PhaseCost) for the rule.
+    ///
+    /// **This is exact, and that is checkable rather than claimed.** Blocks are
+    /// a Cartesian product of per-axis positions and a read extent is a product
+    /// of per-axis lengths, so the mean of the product is the product of the
+    /// means — no independence assumption, just the factorisation. Multiplied by
+    /// [`Self::n_blocks`] it therefore equals
+    /// `Decomposition::exact_read_voxels` for one image, to the voxel, and
+    /// `tests/phase_pricing.rs` asserts that equality rather than a band around
+    /// it.
+    ///
+    /// Nothing here is tuned. There was a constant to pick while the charge was
+    /// approximate; there is none now.
+    pub fn mean_read_voxels(&self, halo: &Reach) -> f64 {
+        (0..3)
+            .map(|axis| {
+                let (lo, hi) = halo.axis(axis).bound(self.volume[axis]);
+                self.mean_read_extent(axis, lo, hi)
+            })
+            .product()
+    }
+
+    /// The mean read length along one axis, clamped at both ends of the volume.
+    ///
+    /// Split out because [`crate::decomposition::price_phase`] charges some axes
+    /// on the infinite grid deliberately — a full-reach axis, and a single-block
+    /// phase whose halo spans the axis — and needs the two charges side by side
+    /// to do it.
+    pub fn mean_read_extent(&self, axis: usize, lo: usize, hi: usize) -> f64 {
+        let volume = self.volume[axis];
+        let block = self.block[axis];
+        let blocks = self.blocks_per_axis()[axis];
+        let mut total = 0usize;
+        for index in 0..blocks {
+            let core_lo = index * block;
+            let core_hi = ((index + 1) * block).min(volume);
+            total += (core_hi + hi).min(volume) - core_lo.saturating_sub(lo);
+        }
+        total as f64 / blocks as f64
     }
 
     /// Every core, in natural (axis 0 slowest) order.

@@ -203,7 +203,7 @@ pub use decomposition::{
     check_block_constraints, check_chunk_exclusive_writes, check_output_shapes,
     check_source_images, constraint_for, cuttable_axes, halo_spans_axis, is_planning_barrier,
     predicted_cost, reaches_whole_axis, splittable_axes, Constraints, CostModel, Decomposition,
-    PhaseDecomposition,
+    PhaseDecomposition, PhaseTraffic,
 };
 pub use distributed::{
     Assignment, ChunkGrid, Coordinator, Handout, HandoutPolicy, JobSpec, JobStatus, ModelledCache,
@@ -273,4 +273,4 @@ pub use table::{
 pub use tiling::boxes_tile_exactly;
 pub use voxels::{SideBuf, VoxelElement, Voxels};
 #[cfg(feature = "zarr")]
-pub use zarr_env::{chunk_for_block, zarr_data_type, ZarrEnvironment};
+pub use zarr_env::{chunk_for_block, zarr_data_type, AttachedImage, Window, ZarrEnvironment};

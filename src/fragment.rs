@@ -615,8 +615,80 @@ pub trait FragmentOp: Send + Sync {
     /// `decomposition.rs` compares a number against itself and cannot fire. An
     /// op whose answer depends on every block returns `volume_len`, and see the
     /// module header for exactly what the geometry then does.
+    ///
+    /// # The default is `0`, and that contradicts the rule the sibling trait states
+    ///
+    /// [`BlockOp::reach`] is the same quantity under the same contract and it has
+    /// **no default**, for a reason written out beside it: *it is the one place a
+    /// silent zero would produce a complete, well-formed, wrong volume.* Every
+    /// word of that applies here. An op that reads a neighbourhood and forgets to
+    /// say so gets valid regions wider than its answers support, the seam voxels
+    /// are wrong, and nothing anywhere reports it.
+    ///
+    /// **The guard is not the protection, and cannot be made into one.** The
+    /// check in [`Decomposition::check`] fires when the granted halo is narrower
+    /// than the declared reach. [`fragment_phase`] builds the halo *from* the
+    /// reach and only ever widens it, so for a plan this crate builds the guard
+    /// is structurally unable to fire — it exists for a plan that arrives from
+    /// elsewhere or off a wire, which is real but is a different failure. A reach
+    /// under-declared at zero satisfies every halo there is. `tests/fragment_ops.rs`
+    /// keeps the guard honest for the case it *can* see, a full reach against a
+    /// short halo; no test can be written for this one, because there is nothing
+    /// to observe.
+    ///
+    /// # Audited before it was left alone
+    ///
+    /// Across this crate, its test suite and its caller, a minority of the
+    /// implementors override this method and the rest take the default. Every one
+    /// of the defaulting ones is **correct** at zero, and correct for a reason
+    /// that is structural rather than lucky: a fragment op resolves what crosses
+    /// a block boundary through the fragment stream, whose reach is declared
+    /// separately and in blocks on [`FragmentInput`], not through a pixel halo.
+    /// The pixel-reading ones — a plateau labeller, a regional-maxima mask, a
+    /// connected-component labeller, a hole filler — all read their own block's
+    /// pixels and reach across seams through a stream.
+    ///
+    /// So the default is not producing a wrong answer anywhere today. What it is
+    /// producing is *silence*, in the one place this crate has decided silence is
+    /// not allowed, and the fix is the one `BlockOp` already took: remove the
+    /// default. That is a change to every implementor, several of which are
+    /// outside this file, so it is stated here as the argument rather than made
+    /// here as an edit.
+    ///
+    /// [`BlockOp::reach`]: crate::op::BlockOp::reach
+    /// [`Decomposition::check`]: crate::decomposition::Decomposition::check
     fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
         0
+    }
+
+    /// Relative compute cost per voxel of the block this op is handed.
+    ///
+    /// The same quantity and the same units as [`BlockOp::cost_per_voxel`] and
+    /// [`IterativeOp::cost_per_voxel`], and the default is theirs: `1.0`, a
+    /// placeholder that says "an ordinary voxelwise pass" rather than a measured
+    /// figure.
+    ///
+    /// **Unlike [`Self::reach`], this default cannot be silently wrong for the
+    /// op that most often takes it.** The pricing path multiplies it by the
+    /// voxels the phase actually reads, and a phase whose op declares
+    /// [`Self::reads_pixels`] `== false` and no
+    /// [`source_inputs`](Self::source_inputs) reads none — so every
+    /// `fragments -> fragments` op is charged zero compute whatever it answers
+    /// here, and the default is a statement only for the ops that do touch
+    /// pixels. That is the difference between a defaulted number and a defaulted
+    /// *dependency*: this one is bounded by something the plan already knows,
+    /// and a reach is not bounded by anything.
+    ///
+    /// It is per **voxel read**, not per fragment. An op whose real cost is per
+    /// fragment — a merge over a stream — has no per-voxel figure to give, which
+    /// is the same case as reading no pixels and is charged the same nothing.
+    /// Pricing a fragment stream by its own cardinality would need the plan to
+    /// know how many fragments a block emits, which is data.
+    ///
+    /// [`BlockOp::cost_per_voxel`]: crate::op::BlockOp::cost_per_voxel
+    /// [`IterativeOp::cost_per_voxel`]: crate::iterate::IterativeOp::cost_per_voxel
+    fn cost_per_voxel(&self) -> f64 {
+        1.0
     }
 
     /// Does this op read its block's pixels?

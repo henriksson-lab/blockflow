@@ -1,0 +1,994 @@
+// SPDX-License-Identifier: MIT
+//
+// **What one block of a phase actually holds, against what the byte budget
+// charges for it.**
+//
+// `PhaseCost::working_set_bytes_per_block` is `resident_voxels x bytes_per_voxel
+// x 2.0` — "input buffer plus output buffer" — and `strategy` admits the largest
+// candidate block for which `working_set_bytes_per_block x expected_concurrency
+// <= budget_bytes`. The figure is deliberately allowed to over-state, on the
+// stated grounds that it feeds a budget and never a ranking, and over-charging
+// only invents infeasibility.
+//
+// That argument is sound for the direction it was written about and it does not
+// cover the other one. `price_phase` records the gap in its own words: "a phase
+// reading three is charged as if it read one, which is not [the safe direction],
+// and is a known gap recorded here rather than half-fixed". This file is the
+// measurement that gap was waiting on.
+//
+// Why an allocator and not an argument
+// ------------------------------------
+// The buffers a block holds are not all the phase's to declare. The executor
+// allocates the input block and the output block; `Chain::Sequence` clones its
+// input and allocates an intermediate; `Chain::Parallel` allocates **one buffer
+// per branch, all alive at once**, plus a fold intermediate; a `Chain::Source`
+// arm is handed a buffer the executor fetched. Only the first two are in the
+// `x 2.0`. So the question "how far out is it" cannot be answered from the plan
+// — every term that is missing is missing *because* no `Decomposition` can see
+// it — and the honest instrument is to count the allocator.
+//
+// The measurement is one `apply` of one block, because that is the quantity the
+// budget is denominated in. It is not the whole-run peak: `tests/
+// mask_carrier_residency.rs` measures that, and the two differ for reasons —
+// lazy image allocation, images freed after their last reader — that have
+// nothing to do with this question.
+//
+// **The control is the one-in-one-out row.** If the harness could not reproduce
+// `x 2.0` for the shape the formula was written for, it would be measuring
+// itself rather than the gap.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+use ndarray::Array3;
+
+use blockflow::assemble::ImageId;
+use blockflow::budget::{
+    admission_bytes, FrameworkFigure, UNOBSERVED_OP_MARGIN, UNOBSERVED_SHAPE_MARGIN,
+};
+use blockflow::decomposition::{price_phase, CostModel, PhaseTraffic};
+use blockflow::geometry::BlockGrid;
+use blockflow::op::{Anchor, BlockResidency, Chain, SourceInputs};
+use blockflow::ops::{
+    ElementShape, Logic, LogicCombine, Morphology, MorphologyOp, RankFilterOp, StructuringElement,
+    VoxelwiseMapOp,
+};
+use blockflow::reach::Reach;
+use blockflow::voxels::Voxels;
+use blockflow::Dtype;
+
+// ------------------------------------------------------- the measurement --
+
+// **Per thread, not per process, and that took two failures to learn.**
+//
+// These were process-wide atomics. A control row that reproduces the formula's
+// own shape caught it twice: first when a second test in this binary was
+// measured into the first, and again — after every test was serialised behind a
+// mutex — when the suite still went red at about one run in three. The gate was
+// not the fix because the contaminating allocations are not the tests': `libtest`
+// runs a binary's tests on threads it owns and allocates on them for its own
+// bookkeeping, whatever the tests do.
+//
+// A thread-local counter is immune to all of it. Every buffer this file measures
+// is allocated by `Chain::apply_placed` on the calling thread, so the figures do
+// not move; what moves is that nothing else can land in them.
+//
+// **What that costs, stated because it is a real limit.** An op that allocates
+// on a worker thread — a rayon-parallel kernel, say — is invisible here, so the
+// op-internal figures below are a *lower* bound on op-internal residency. That
+// is the conservative direction for this file's argument, which is that such
+// residency exists and is unpriced: under-counting it can only weaken the case
+// being made, never manufacture it.
+thread_local! {
+    static LIVE: Cell<usize> = const { Cell::new(0) };
+    static PEAK: Cell<usize> = const { Cell::new(0) };
+}
+
+struct Counting;
+
+fn took(bytes: usize) {
+    // `try_with`, because a thread tearing down its locals may still free — and
+    // an allocator that panicked there would take the process with it.
+    let _ = LIVE.try_with(|live| {
+        let now = live.get().saturating_add(bytes);
+        live.set(now);
+        let _ = PEAK.try_with(|peak| {
+            if now > peak.get() {
+                peak.set(now);
+            }
+        });
+    });
+}
+
+fn gave(bytes: usize) {
+    let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(bytes)));
+}
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = System.alloc(layout);
+        if !ptr.is_null() {
+            took(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = System.alloc_zeroed(layout);
+        if !ptr.is_null() {
+            took(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        gave(layout.size());
+        System.dealloc(ptr, layout);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new = System.realloc(ptr, layout, new_size);
+        if !new.is_null() {
+            if new_size >= layout.size() {
+                took(new_size - layout.size());
+            } else {
+                gave(layout.size() - new_size);
+            }
+        }
+        new
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// The bytes `body` added at its worst moment, over what this thread already
+/// held.
+fn peak_of<R>(body: impl FnOnce() -> R) -> (R, usize) {
+    let base = LIVE.with(|live| live.get());
+    PEAK.with(|peak| peak.set(base));
+    let result = body();
+    let peak = PEAK.with(|peak| peak.get());
+    (result, peak.saturating_sub(base))
+}
+
+// ------------------------------------------------------------ the shapes --
+
+const BLOCK: [usize; 3] = [64, 64, 64];
+const VOLUME: [usize; 3] = [128, 64, 64];
+
+/// One `f64` block buffer, which is the unit every figure below is quoted in.
+fn buffer_bytes() -> usize {
+    BLOCK.iter().product::<usize>() * 8
+}
+
+fn block() -> Voxels {
+    Array3::<f64>::zeros((BLOCK[0], BLOCK[1], BLOCK[2])).into()
+}
+
+fn map(name: &'static str) -> Chain {
+    Chain::op(VoxelwiseMapOp::new(name, |value: f64| value * 2.0 + 1.0))
+}
+
+/// What the budget charges for one block of a phase reading `images_read`
+/// images, at zero reach so that the resident extent is exactly the block and
+/// the arithmetic is transparent: `block_voxels x 8 x 2`.
+fn charged(images_read: usize) -> f64 {
+    let grid = BlockGrid::along(VOLUME, &[0], BLOCK[0]).expect("a lattice");
+    price_phase(
+        &grid,
+        &Reach::symmetric([0, 0, 0]),
+        1.0,
+        1,
+        false,
+        8.0,
+        &CostModel::default(),
+        1.0,
+        PhaseTraffic {
+            images_read,
+            writes_an_image: true,
+        },
+    )
+    .working_set_bytes_per_block
+}
+
+/// One block through `chain`, with `sources` stored arrays supplied beside it —
+/// **all of it inside the measured region**, because every one of those buffers
+/// is resident while the block is in flight and the budget is a statement about
+/// exactly that moment. The executor allocates the input, the output and each
+/// fetched source; the chain allocates the rest.
+fn measure(chain: &Chain, sources: &[ImageId]) -> (usize, BlockResidency, usize) {
+    // **The harness's own two allocations, computed rather than measured.**
+    // `held` and `entries` are built inside the measured region — they must be,
+    // because the buffers they hold are part of the figure — and their spines
+    // are not block buffers and are not in `BlockResidency`. Both are built by
+    // `collect` from an exact-size iterator, so each is one allocation of
+    // exactly `len x size_of::<T>()` and there is nothing to measure: at zero
+    // sources a `Vec` of capacity zero does not allocate at all.
+    //
+    // This is here so the comparison below can be an equality. A test that
+    // allowed a window because its author could not account for the difference
+    // is a test that will absorb a real regression later.
+    let spines = if sources.is_empty() {
+        0
+    } else {
+        sources.len() * std::mem::size_of::<Voxels>()
+            + sources.len() * std::mem::size_of::<(ImageId, &Voxels)>()
+    };
+    let (observed, peak) = peak_of(|| {
+        let input = block();
+        let held: Vec<Voxels> = sources.iter().map(|_| block()).collect();
+        let entries: Vec<(ImageId, &Voxels)> = sources
+            .iter()
+            .copied()
+            .zip(held.iter())
+            .map(|(image, buffer)| (image, buffer))
+            .collect();
+        let mut out = Voxels::zeros(Dtype::F64, BLOCK).expect("an output block");
+        // The observing form, so the allocator's figure and the walk's own come
+        // from **one** execution rather than two — nothing between them can
+        // differ, not even a run.
+        chain
+            .apply_observing(
+                &input,
+                SourceInputs::new(&entries),
+                &mut out,
+                &Anchor::whole(BLOCK),
+            )
+            .expect("one block through the chain")
+    });
+    (peak, observed, spines)
+}
+
+fn fan_in(computed: usize, sources: &[ImageId]) -> Chain {
+    let mut branches: Vec<Chain> = (0..computed).map(|_| map("arm")).collect();
+    for &image in sources {
+        branches.push(Chain::source(image, Dtype::F64));
+    }
+    Chain::parallel(branches, Box::new(LogicCombine::new("or", Logic::Or))).expect("a fan-in")
+}
+
+/// **The budget under-charges every phase that reads more than one image, and by
+/// how much is not a constant.**
+///
+/// Each row is one `apply` of one `64^3` block, measured through the allocator,
+/// against `working_set_bytes_per_block` for the same block and the same
+/// `images_read`. The unit is one `f64` block buffer — 2 MiB — because that is
+/// what the formula's `x 2.0` counts and it makes the ratio readable.
+#[test]
+fn what_a_block_holds_against_what_the_budget_charges_for_it() {
+    let unit = buffer_bytes() as f64;
+    let one = ImageId::from(7usize);
+    let two = ImageId::from(8usize);
+
+    let cases: Vec<(&str, Chain, Vec<ImageId>, usize)> = vec![
+        ("one in, one out", map("only"), vec![], 1),
+        (
+            "sequence of four maps",
+            Chain::sequence(vec![map("a"), map("b"), map("c"), map("d")]),
+            vec![],
+            1,
+        ),
+        ("fan-in, 2 computed arms", fan_in(2, &[]), vec![], 1),
+        ("fan-in, 3 computed arms", fan_in(3, &[]), vec![], 1),
+        ("fan-in, 1 arm + 1 source", fan_in(1, &[one]), vec![one], 2),
+        (
+            "fan-in, 1 arm + 2 sources",
+            fan_in(1, &[one, two]),
+            vec![one, two],
+            3,
+        ),
+    ];
+
+    eprintln!(
+        "\none {BLOCK:?} f64 block = {:.2} MiB\n{:<26} {:>9} {:>9} {:>8}",
+        unit / (1024.0 * 1024.0),
+        "phase shape",
+        "held",
+        "charged",
+        "ratio"
+    );
+    let mut rows = Vec::new();
+    for (name, chain, sources, images_read) in &cases {
+        let held = measure(chain, sources).0 as f64;
+        let charge = charged(*images_read);
+        eprintln!(
+            "{name:<26} {:>7.2}x {:>7.2}x {:>7.2}x",
+            held / unit,
+            charge / unit,
+            held / charge
+        );
+        rows.push((*name, held, charge));
+    }
+
+    // **The control.** The shape the formula was written for reproduces it: one
+    // in, one out is two buffers and is charged two. Without this row the rest
+    // of the table would be a measurement of the harness.
+    let (_, held, charge) = rows[0];
+    assert_eq!(
+        held as u64, charge as u64,
+        "the one-in-one-out row must reproduce the formula it is the formula for, exactly: two \
+         block buffers, charged as two. Not a tolerance — this row is what says the rest of the \
+         table is the gap and not the harness, and a window here would let the harness drift \
+         into the number it is supposed to be validating."
+    );
+
+    // Every other shape holds more than it is charged for, and the excess is not
+    // a constant — which is the property that matters. A fixed factor could be
+    // absorbed into the budget; a factor that varies with the phase's shape
+    // cannot, because the planner compares candidates across shapes.
+    let mut ratios = Vec::new();
+    for (name, held, charge) in &rows[1..] {
+        assert!(
+            held > charge,
+            "{name} was expected to hold more than it is charged: {held} against {charge}"
+        );
+        ratios.push(held / charge);
+    }
+    let widest = ratios.iter().copied().fold(f64::NEG_INFINITY, |a, b| {
+        if a.total_cmp(&b).is_gt() {
+            a
+        } else {
+            b
+        }
+    });
+    let narrowest =
+        ratios.iter().copied().fold(
+            f64::INFINITY,
+            |a, b| if a.total_cmp(&b).is_lt() { a } else { b },
+        );
+    assert!(
+        widest - narrowest > 0.5,
+        "the under-charge is nearly constant across shapes ({narrowest:.2}x to {widest:.2}x), \
+         which would make it absorbable into the budget and this whole review unnecessary"
+    );
+}
+
+/// **Even a corrected count would not be an upper bound, and this is why.**
+///
+/// Everything the table above measures is allocated by `Chain::apply_placed` —
+/// this crate's own code, whose allocation pattern is a function of the chain's
+/// shape and therefore exactly knowable without measuring anything. That is what
+/// makes a corrected figure possible at all.
+///
+/// What is *not* knowable is what an op allocates inside `BlockOp::apply`.
+/// Nothing declares it, the trait has no method for it, and the two ops below
+/// are ordinary library ops rather than contrived ones. So a residency figure
+/// built from the chain's structure is a statement about the **framework's**
+/// buffers and not about the block, and calling it a bound would be a false
+/// bound — the one thing this review is not allowed to produce.
+///
+/// The row that matters is the comparison with `one in, one out` in the table
+/// above: the same chain shape, the same block, the same two framework buffers,
+/// and a different answer, entirely because of what the op does inside.
+#[test]
+fn an_ops_own_working_buffers_are_not_visible_to_any_declaration() {
+    let unit = buffer_bytes() as f64;
+    let element = StructuringElement::from_radius(ElementShape::Box, [2, 2, 2]);
+
+    let plain_bytes = measure(&map("map"), &[]).0;
+    let plain = plain_bytes as f64 / unit;
+    let rank = measure(
+        &Chain::op(RankFilterOp::median("median", element.clone())),
+        &[],
+    )
+    .0 as f64
+        / unit;
+    let morph = measure(
+        &Chain::op(MorphologyOp::new("open", Morphology::Open, element)),
+        &[],
+    )
+    .0 as f64
+        / unit;
+
+    eprintln!(
+        "\nsame chain shape, two framework buffers, different residency\n  \
+         {:<22} {plain:.2}x\n  {:<22} {rank:.2}x\n  {:<22} {morph:.2}x",
+        "voxelwise map", "rank filter", "morphological open"
+    );
+
+    // The framework's own count is 2 for all three — one input, one output, no
+    // sequence, no fan-in, no source. If residency were a function of the chain
+    // alone these would agree. Exactly two, not about two: see the control in
+    // `what_a_block_holds_against_what_the_budget_charges_for_it`.
+    assert_eq!(
+        plain_bytes,
+        2 * buffer_bytes(),
+        "the voxelwise map should hold exactly the two framework buffers"
+    );
+    assert!(
+        rank > plain + 0.05 || morph > plain + 0.05,
+        "neither library op allocated anything of its own ({rank}x, {morph}x against {plain}x), \
+         so this file cannot claim that op-internal residency is unpriced — re-measure with an \
+         op that does before relying on the claim"
+    );
+}
+
+/// **What a corrected figure would cost in affordable plans, and when the
+/// under-charge actually bites.**
+///
+/// The admission rule is `strategy`'s own: the largest candidate edge for which
+/// `working_set_bytes_per_block x expected_concurrency <= budget_bytes`. The
+/// factors are measured above — `1.00` is what the formula charges today,
+/// `2.00` a sequence or a two-arm fan-in, `3.56` the widest framework shape
+/// here, `4.00` a one-in-one-out phase whose op is a rank filter.
+///
+/// **The affordability cost is bounded at one step of the ladder, and that is
+/// arithmetic rather than luck**: the candidates go up by a factor of two in
+/// edge, which is eight in volume, and every measured factor is under eight. The
+/// sweep asserts it at every budget rather than arguing it once.
+///
+/// What it said, at 40 workers on a ladder of powers of two:
+///
+/// ```text
+///  budget | admitted edge: map  2.00x  3.56x  4.00x | over-hold: 1.00x 2.00x 3.56x 4.00x
+///   1 GiB |                 64     64     64     64 |            0.16x 0.31x 0.56x 0.62x
+///   2 GiB |                128     64     64     64 |            0.62x 1.25x 2.23x 2.50x
+///   4 GiB |                128    128     64     64 |            0.31x 0.62x 1.11x 1.25x
+///   8 GiB |                128    128    128    128 |            0.16x 0.31x 0.56x 0.62x
+///  16 GiB |                256    128    128    128 |            0.62x 1.25x 2.23x 2.50x
+///  32 GiB |                256    256    128    128 |            0.31x 0.62x 1.11x 1.25x
+///  64 GiB |                256    256    256    256 |            0.16x 0.31x 0.56x 0.62x
+/// 128 GiB |                512    256    256    256 |            0.62x 1.25x 2.23x 2.50x
+/// ```
+///
+/// **The correction costs one ladder step at five of the eight budgets and
+/// nothing at the other three**, and never two. What it buys is the row beside
+/// it: at the budgets where it costs something, an uncorrected `4.00x` phase
+/// holds **2.50x** the budget it was certified against.
+///
+/// **The over-hold is not bounded, and it is worst exactly where it matters.**
+/// A coarse ladder usually leaves headroom — at 8 GiB the planner picks edge 128
+/// and uses a sixth of its budget, so even a `4.00x` phase still fits, and the
+/// under-charge costs nothing. The rows where `over-hold` exceeds `1.00x` are
+/// the ones where the chosen candidate sits near the budget, which is the
+/// situation a memory-constrained run is in by definition. That is the failure
+/// this gap produces: not a plan that is slightly too big, but one the planner
+/// certified and the machine cannot hold.
+#[test]
+fn what_a_corrected_figure_would_cost_in_affordable_plans() {
+    const CANDIDATES: [usize; 6] = [512, 256, 128, 64, 32, 16];
+    const PLANE: [usize; 3] = [1024, 1024, 1024];
+    const CONCURRENCY: u64 = 40;
+    const FACTORS: [(&str, f64); 4] = [
+        ("map", 1.00),
+        ("seq / 2-arm", 2.00),
+        ("1 arm + 2 src", 3.56),
+        ("rank filter", 4.00),
+    ];
+
+    // `working_set_bytes_per_block x concurrency` for one candidate, from the
+    // real pricing function at zero reach.
+    let demand = |edge: usize| -> Option<f64> {
+        let grid = BlockGrid::along(PLANE, &[0, 1, 2], edge).ok()?;
+        let cost = price_phase(
+            &grid,
+            &Reach::symmetric([0, 0, 0]),
+            1.0,
+            1,
+            false,
+            8.0,
+            &CostModel::default(),
+            1.0,
+            PhaseTraffic::one_in_one_out(),
+        );
+        Some(cost.working_set_bytes_per_block * CONCURRENCY as f64)
+    };
+    let admitted = |factor: f64, budget: u64| -> usize {
+        CANDIDATES
+            .iter()
+            .copied()
+            .find(|&edge| demand(edge).is_some_and(|need| need * factor <= budget as f64))
+            .unwrap_or(*CANDIDATES.last().expect("a ladder"))
+    };
+
+    let gib = |n: u64| n * 1024 * 1024 * 1024;
+    eprintln!(
+        "\nconcurrency {CONCURRENCY}, candidates {CANDIDATES:?}, zero reach, 8 B/voxel\n\
+         {:>7} | {:>26} | {:>26}",
+        "budget", "admitted edge, by factor", "over-hold at today's edge"
+    );
+    eprintln!(
+        "{:>7} | {:>6}{:>6}{:>7}{:>7} | {:>6}{:>6}{:>7}{:>7}",
+        "",
+        FACTORS[0].0,
+        FACTORS[1].0,
+        FACTORS[2].0,
+        FACTORS[3].0,
+        "1.00x",
+        "2.00x",
+        "3.56x",
+        "4.00x"
+    );
+
+    let mut biting = 0usize;
+    for power in 0..8u32 {
+        let budget = gib(1u64 << power);
+        let today = admitted(1.0, budget);
+        let today_need = demand(today).expect("a priced candidate");
+        let edges: Vec<usize> = FACTORS
+            .iter()
+            .map(|(_, factor)| admitted(*factor, budget))
+            .collect();
+        let holds: Vec<f64> = FACTORS
+            .iter()
+            .map(|(_, factor)| today_need * factor / budget as f64)
+            .collect();
+        biting += holds.iter().filter(|held| **held > 1.0).count();
+        eprintln!(
+            "{:>5} GiB | {:>6}{:>6}{:>7}{:>7} | {:>5.2}x{:>5.2}x{:>6.2}x{:>6.2}x",
+            1u64 << power,
+            edges[0],
+            edges[1],
+            edges[2],
+            edges[3],
+            holds[0],
+            holds[1],
+            holds[2],
+            holds[3]
+        );
+
+        // **The affordability cost is at most one step**, at every budget. A
+        // ladder step is 8x in volume and every measured factor is under 8.
+        let today_index = CANDIDATES
+            .iter()
+            .position(|&e| e == today)
+            .expect("on the ladder");
+        for ((name, factor), edge) in FACTORS.iter().zip(edges.iter()) {
+            let index = CANDIDATES
+                .iter()
+                .position(|e| e == edge)
+                .expect("on the ladder");
+            assert!(
+                index <= today_index + 1,
+                "at {} GiB, {name} ({factor}x) fell {} ladder steps; a factor under 8 cannot \
+                 cost more than one on a ladder of powers of two",
+                1u64 << power,
+                index - today_index
+            );
+        }
+    }
+
+    // The control on the whole table: if no row ever over-held, the gap would be
+    // real but unreachable, and this review would be recommending a change with
+    // no failure behind it.
+    assert!(
+        biting > 0,
+        "no budget in the sweep put a phase over its budget, so the table shows a gap that \
+         cannot be reached and the recommendation would have nothing behind it"
+    );
+    eprintln!(
+        "\n{biting} of {} rows over-hold their budget",
+        8 * FACTORS.len()
+    );
+}
+
+/// **The walk's own figure, against the allocator, from one execution.**
+///
+/// `Chain::apply_observing` returns the high-water mark of the buffers the walk
+/// allocated, plus the input, the output and the distinct source buffers. This
+/// is that number checked against what the process actually took — measured
+/// around the *same* call, so nothing between the two can differ.
+///
+/// **Where the two agree, the observation is exact.** Where they do not, the
+/// residual is a `Combine`'s own scratch: `LogicCombine` folds three or more
+/// branches through an intermediate it allocates inside `Combine::apply`, which
+/// no walk over the chain can see. That residual is asserted to be exactly one
+/// `Bool` block, because a residual nobody has accounted for is the thing this
+/// whole review exists to stop happening.
+#[test]
+fn the_walks_own_figure_matches_the_allocator_except_for_what_it_says_it_omits() {
+    let unit = buffer_bytes() as f64;
+    let one = ImageId::from(7usize);
+    let two = ImageId::from(8usize);
+    // **The two things the walk cannot see, named and computed.** Both are
+    // allocated inside a callee — the same rule that puts an op's scratch out of
+    // scope — so the walk is right not to count them, and this test is what says
+    // how much they are rather than leaving a window for them to hide in.
+    //
+    // `fold`: one `Bool` block, the intermediate `LogicCombine` allocates once
+    // it has three or more branches to fold, inside `Combine::apply`.
+    let fold = BLOCK.iter().product::<usize>();
+    // `region`: `Chain::Source` finishes with `Voxels::assign`, which builds a
+    // `Region::whole` — two three-element `Vec<usize>`. Only one is ever live,
+    // because each `assign` frees its own before the next arm runs.
+    let region = 2 * 3 * std::mem::size_of::<usize>();
+    // **And where a chain has both, the peak takes the larger and not the sum.**
+    // They are transient, in different callees, at different moments: every
+    // `assign` has finished by the time the combine allocates. Summing them
+    // would over-account by exactly one of them — which is what the equality
+    // below said, the first time this was written as `fold + region`.
+    let both = std::cmp::max(fold, region);
+
+    let cases: Vec<(&str, Chain, Vec<ImageId>, usize)> = vec![
+        ("one in, one out", map("only"), vec![], 0),
+        (
+            "sequence of four maps",
+            Chain::sequence(vec![map("a"), map("b"), map("c"), map("d")]),
+            vec![],
+            0,
+        ),
+        ("fan-in, 2 computed arms", fan_in(2, &[]), vec![], 0),
+        ("fan-in, 3 computed arms", fan_in(3, &[]), vec![], fold),
+        (
+            "fan-in, 1 arm + 1 source",
+            fan_in(1, &[one]),
+            vec![one],
+            region,
+        ),
+        (
+            "fan-in, 1 arm + 2 sources",
+            fan_in(1, &[one, two]),
+            vec![one, two],
+            both,
+        ),
+    ];
+
+    eprintln!(
+        "\n{:<26} {:>9} {:>9} {:>8} {:>7} {:>9}",
+        "phase shape", "allocator", "observed", "callee", "spines", "residual"
+    );
+    for (name, chain, sources, expected_scratch) in &cases {
+        let (allocator, observed, spines) = measure(chain, sources);
+        let accounted = observed.peak_bytes() as usize + spines + expected_scratch;
+        eprintln!(
+            "{name:<26} {:>7.2}x {:>7.2}x {:>8} {:>7} {:>9}",
+            allocator as f64 / unit,
+            observed.peak_bytes() as f64 / unit,
+            expected_scratch,
+            spines,
+            allocator as i64 - accounted as i64
+        );
+
+        // **Every byte accounted for, as an equality.** The walk's figure, plus
+        // the harness's two `Vec` spines, plus the combine's own scratch where
+        // it has any, is the number the allocator saw — exactly. A residual of
+        // any size is either a node that started allocating something the tally
+        // does not count, or a combine that changed what it holds, and both are
+        // cases where a window would have swallowed the news.
+        assert_eq!(
+            allocator,
+            accounted,
+            "{name}: {allocator} bytes taken against {accounted} accounted for — \
+             {} unexplained. Nothing here is allowed to be unexplained: see this file's \
+             header for why the counter is per thread and what that rules out.",
+            allocator as i64 - accounted as i64
+        );
+
+        // The observation carries its scope, and refuses outside it.
+        assert!(observed.describes(chain));
+        assert_eq!(observed.shape_id(), chain.shape_id());
+        assert_eq!(observed.block(), BLOCK);
+        assert_eq!(observed.bytes_at(chain, BLOCK), Some(observed.peak_bytes()));
+        assert_eq!(
+            observed.bytes_at(chain, [32, 32, 32]),
+            None,
+            "{name}: a figure taken at one block must not answer for another"
+        );
+        assert_eq!(
+            observed.bytes_at(&map("something else"), BLOCK),
+            None,
+            "{name}: a figure taken on one chain must not answer for another"
+        );
+        // The estimate does scale along the block axis, and says so in its name.
+        let eighth = observed
+            .estimate_at(chain, [32, 32, 32])
+            .expect("same chain");
+        assert_eq!(eighth, observed.peak_bytes() / 8);
+        assert_eq!(
+            observed.estimate_at(&map("something else"), BLOCK),
+            None,
+            "{name}: not even the estimate crosses the workload axis"
+        );
+    }
+}
+
+/// The scope key distinguishes the things the measurements say it must.
+///
+/// Every pair below measured differently in the tables above, so a key that
+/// collapsed any of them would let one chain's residency be quoted for another —
+/// which is the failure mode a sibling measurement hit when a store keyed by
+/// machine was asked about a different workload.
+#[test]
+fn the_scope_key_separates_every_shape_that_measured_differently() {
+    let one = ImageId::from(7usize);
+    let two = ImageId::from(8usize);
+    let keys = [
+        map("only").shape_key(),
+        Chain::sequence(vec![map("a"), map("b")]).shape_key(),
+        Chain::sequence(vec![map("a"), map("b"), map("c"), map("d")]).shape_key(),
+        fan_in(2, &[]).shape_key(),
+        fan_in(3, &[]).shape_key(),
+        fan_in(1, &[one]).shape_key(),
+        fan_in(1, &[one, two]).shape_key(),
+        Chain::op(RankFilterOp::median(
+            "median",
+            StructuringElement::from_radius(ElementShape::Box, [2, 2, 2]),
+        ))
+        .shape_key(),
+    ];
+    for (i, left) in keys.iter().enumerate() {
+        for right in keys.iter().skip(i + 1) {
+            assert_ne!(left, right, "two shapes share one key");
+        }
+    }
+
+    // **The op's name is in the key, and that is the load-bearing part**: the
+    // two chains below are structurally identical and measured `2.00x` against
+    // `4.00x`. A key over structure alone would quote one for the other.
+    let element = StructuringElement::from_radius(ElementShape::Box, [2, 2, 2]);
+    assert_ne!(
+        Chain::op(RankFilterOp::median("median", element.clone())).shape_key(),
+        Chain::op(MorphologyOp::new("open", Morphology::Open, element)).shape_key()
+    );
+    // and the same chain built twice is the same key, or nothing could ever match
+    assert_eq!(fan_in(2, &[]).shape_key(), fan_in(2, &[]).shape_key());
+}
+
+// ------------------------------------------- the cold-start charge, priced --
+
+/// A structuring element big enough that the ops built on it allocate.
+fn element() -> StructuringElement {
+    StructuringElement::from_radius(ElementShape::Box, [2, 2, 2])
+}
+
+/// A fan-in whose arms are given rather than assumed to be cheap maps.
+fn fan_in_of(arms: Vec<Chain>, sources: &[ImageId]) -> Chain {
+    let mut branches = arms;
+    for &image in sources {
+        branches.push(Chain::source(image, Dtype::F64));
+    }
+    Chain::parallel(branches, Box::new(LogicCombine::new("or", Logic::Or))).expect("a fan-in")
+}
+
+/// **The margin is derived from the measurements, not chosen.**
+///
+/// `UNOBSERVED_SHAPE_MARGIN` is asserted to be the **smallest whole number that
+/// covers every shape measured here** — not merely "large enough", because a
+/// margin quietly larger than its evidence is a number nobody can defend, and
+/// not an exact fit either, because a fit to three decimal places is a number
+/// that fails the next time anything is measured.
+///
+/// **The shapes include combinations**, which is the correction this test forced.
+/// The tables above measure framework cost and op cost on *separate* chains —
+/// `3.56x` for a fan-in of cheap maps with two source arms, `2.00x` for a rank
+/// filter in a one-in-one-out chain — and a margin justified by the larger of
+/// those two would not cover a chain that has both at once. So the worst case is
+/// measured rather than argued from the parts.
+#[test]
+fn the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured() {
+    let unit = buffer_bytes();
+    let one = ImageId::from(7usize);
+    let two = ImageId::from(8usize);
+    let heavy = || Chain::op(RankFilterOp::median("median", element()));
+    let assumed = 2.0 * unit as f64;
+
+    let shapes: Vec<(&str, Chain, Vec<ImageId>)> = vec![
+        ("one in, one out", map("only"), vec![]),
+        (
+            "sequence of four maps",
+            Chain::sequence(vec![map("a"), map("b"), map("c"), map("d")]),
+            vec![],
+        ),
+        ("fan-in, 2 computed arms", fan_in(2, &[]), vec![]),
+        ("fan-in, 3 computed arms", fan_in(3, &[]), vec![]),
+        ("fan-in, 1 arm + 1 source", fan_in(1, &[one]), vec![one]),
+        (
+            "fan-in, 1 arm + 2 sources",
+            fan_in(1, &[one, two]),
+            vec![one, two],
+        ),
+        ("rank filter alone", heavy(), vec![]),
+        (
+            "morphological open alone",
+            Chain::op(MorphologyOp::new("open", Morphology::Open, element())),
+            vec![],
+        ),
+        // The combinations. A chain is not obliged to be either expensive in its
+        // framework buffers or expensive in its op, and a margin defended by the
+        // worse of two separate measurements would not cover one that is both.
+        (
+            "fan-in, rank arm + 2 sources",
+            fan_in_of(vec![heavy()], &[one, two]),
+            vec![one, two],
+        ),
+        (
+            "sequence of four rank filters",
+            Chain::sequence(vec![heavy(), heavy(), heavy(), heavy()]),
+            vec![],
+        ),
+    ];
+
+    eprintln!("\n{:<32} {:>9} {:>10}", "shape", "held", "of assumed");
+    let mut widest: f64 = 0.0;
+    let mut worst = "";
+    for (name, chain, sources) in &shapes {
+        let held = measure(chain, sources).0 as f64;
+        let ratio = held / assumed;
+        eprintln!("{name:<32} {:>7.2}x {:>9.4}x", held / unit as f64, ratio);
+        if ratio.total_cmp(&widest).is_gt() {
+            widest = ratio;
+            worst = name;
+        }
+    }
+    eprintln!("widest: {worst} at {widest:.2}x of the assumed charge");
+
+    // **The smallest tenth that covers it**, which is what the constant is.
+    //
+    // Not the smallest whole number, which is what this test asked for first and
+    // was wrong to: a rank filter measures `2.0002x` its framework buffers, and
+    // rounding that up to `3` would be fifty per cent of headroom bought with
+    // two ten-thousandths of evidence — the exact thing the second assertion
+    // below forbids. A tenth is fine enough that the rounding is not an argument
+    // and coarse enough that a constant does not move on noise.
+    let smallest_covering = (widest * 10.0).ceil() / 10.0;
+    assert_eq!(
+        UNOBSERVED_SHAPE_MARGIN, smallest_covering,
+        "the widest shape measured holds {widest:.4}x the assumed charge ({worst}), so the \
+         smallest tenth that covers it is {smallest_covering}. The constant is \
+         {UNOBSERVED_SHAPE_MARGIN}: either a measurement moved or the constant was chosen \
+         rather than derived."
+    );
+    assert!(
+        UNOBSERVED_SHAPE_MARGIN - 0.1 < widest,
+        "the margin is more than a tenth above what any measurement asks for, which is headroom \
+         nobody can point at evidence for"
+    );
+
+    // and it does cover, in bytes, which is the statement that actually matters
+    let charged = admission_bytes(FrameworkFigure::Assumed(assumed));
+    assert!(charged as f64 >= widest * assumed);
+}
+
+/// The same rule for the op margin, on the figure that remains once the
+/// framework's half is exact.
+///
+/// With the framework known, what is left is what an op allocates inside
+/// `BlockOp::apply`. Measured against the two framework buffers a
+/// one-in-one-out chain holds, so that the ratio is the op's own contribution
+/// and not the chain's.
+#[test]
+fn the_op_margin_is_the_smallest_tenth_that_covers_the_ops_measured() {
+    let unit = buffer_bytes();
+    let framework = 2.0 * unit as f64;
+    let ops: Vec<(&str, Chain)> = vec![
+        ("voxelwise map", map("map")),
+        (
+            "morphological open",
+            Chain::op(MorphologyOp::new("open", Morphology::Open, element())),
+        ),
+        (
+            "rank filter",
+            Chain::op(RankFilterOp::median("median", element())),
+        ),
+    ];
+    let mut widest: f64 = 0.0;
+    let mut worst = "";
+    eprintln!("\n{:<24} {:>10}", "op, one in one out", "of framework");
+    for (name, chain) in &ops {
+        let ratio = measure(chain, &[]).0 as f64 / framework;
+        eprintln!("{name:<24} {ratio:>9.4}x");
+        if ratio.total_cmp(&widest).is_gt() {
+            widest = ratio;
+            worst = name;
+        }
+    }
+    assert_eq!(
+        UNOBSERVED_OP_MARGIN,
+        (widest * 10.0).ceil() / 10.0,
+        "the widest op measured holds {widest:.4}x its chain's framework buffers ({worst})"
+    );
+    assert!(UNOBSERVED_OP_MARGIN - 0.1 < widest);
+
+    // The exact branch is the cheaper of the two on one phase, which is the
+    // whole reason to prefer a known framework figure to an assumed one.
+    assert!(
+        admission_bytes(FrameworkFigure::Exact(2 * unit as u64))
+            < admission_bytes(FrameworkFigure::Assumed(framework))
+    );
+}
+
+/// **Neither margin can cost more than one step of the candidate ladder, at any
+/// budget.**
+///
+/// This is what makes the policy affordable, and it is arithmetic rather than
+/// luck: a ladder of powers of two steps by **eight** in volume, and every
+/// margin here is under eight — `UNOBSERVED_SHAPE_MARGIN` on its own, and the
+/// widest measured framework figure times `UNOBSERVED_OP_MARGIN` for the exact
+/// branch. The sweep asserts it at every budget rather than trusting the
+/// arithmetic once.
+#[test]
+fn a_margin_never_costs_more_than_one_ladder_step() {
+    const CANDIDATES: [usize; 6] = [512, 256, 128, 64, 32, 16];
+    const PLANE: [usize; 3] = [1024, 1024, 1024];
+    const CONCURRENCY: u64 = 40;
+
+    let assumed_for = |edge: usize| -> Option<f64> {
+        let grid = BlockGrid::along(PLANE, &[0, 1, 2], edge).ok()?;
+        Some(
+            price_phase(
+                &grid,
+                &Reach::symmetric([0, 0, 0]),
+                1.0,
+                1,
+                false,
+                8.0,
+                &CostModel::default(),
+                1.0,
+                PhaseTraffic::one_in_one_out(),
+            )
+            .working_set_bytes_per_block,
+        )
+    };
+    let charges: [(&str, Box<dyn Fn(f64) -> u64>); 3] = [
+        ("today", Box::new(|ws: f64| ws.round() as u64)),
+        (
+            "assumed x margin",
+            Box::new(|ws: f64| admission_bytes(FrameworkFigure::Assumed(ws))),
+        ),
+        (
+            "exact(3.56x) x margin",
+            Box::new(|ws: f64| admission_bytes(FrameworkFigure::Exact((ws * 3.56).round() as u64))),
+        ),
+    ];
+
+    eprintln!(
+        "\n{:>7} | {:>7} {:>18} {:>22}",
+        "budget", "today", "assumed x margin", "exact(3.56x) x margin"
+    );
+    let mut cold_start_steps = 0usize;
+    for power in 0..9u32 {
+        let budget = (1u64 << power) * 1024 * 1024 * 1024;
+        let admitted: Vec<usize> = charges
+            .iter()
+            .map(|(_, charge)| {
+                CANDIDATES
+                    .iter()
+                    .copied()
+                    .find(|&edge| {
+                        assumed_for(edge).is_some_and(|ws| charge(ws) * CONCURRENCY <= budget)
+                    })
+                    .unwrap_or(*CANDIDATES.last().expect("a ladder"))
+            })
+            .collect();
+        eprintln!(
+            "{:>5} GiB | {:>7} {:>18} {:>22}",
+            1u64 << power,
+            admitted[0],
+            admitted[1],
+            admitted[2]
+        );
+
+        let today = CANDIDATES
+            .iter()
+            .position(|e| *e == admitted[0])
+            .expect("on the ladder");
+        for (index, (name, _)) in charges.iter().enumerate().skip(1) {
+            let step = CANDIDATES
+                .iter()
+                .position(|e| *e == admitted[index])
+                .expect("on the ladder");
+            assert!(
+                step <= today + 1,
+                "at {} GiB, {name} fell {} ladder steps. A ladder step is 8x in volume and every \
+                 margin here is under 8, so more than one step means a margin grew past the \
+                 arithmetic this claim rests on.",
+                1u64 << power,
+                step - today
+            );
+            if index == 1 && step > today {
+                cold_start_steps += 1;
+            }
+        }
+    }
+
+    // **What the cold-start charge costs, counted rather than described.**
+    // `budget.rs` quotes this figure where it argues the policy, and a figure
+    // quoted in prose beside a test that does not check it is a figure that
+    // rots.
+    assert_eq!(
+        cold_start_steps, 6,
+        "the cold-start charge costs a ladder step at {cold_start_steps} of 9 budgets; \
+         `UNOBSERVED_SHAPE_MARGIN`'s documentation says six"
+    );
+}

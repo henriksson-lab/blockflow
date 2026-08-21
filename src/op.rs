@@ -1114,6 +1114,27 @@ impl<'a> SourceInputs<'a> {
         Self { entries }
     }
 
+    /// The bytes of the **distinct** buffers supplied here.
+    ///
+    /// Distinct because two source leaves may name one image and the executor
+    /// fetched it once; counting it twice would over-state a figure whose whole
+    /// value is that it is what the machine actually holds. Part of
+    /// [`BlockResidency`], which is where the number is used.
+    /// Quadratic in the number of entries and deliberately **allocation-free**:
+    /// a `Vec` of seen images here would be allocated inside
+    /// [`Chain::apply_observing`], while the block's buffers are live, so the
+    /// observation would perturb what it observes. A phase reads a handful of
+    /// images, and `n^2` over a handful is not a cost.
+    pub fn resident_bytes(&self) -> u64 {
+        let mut bytes = 0;
+        for (index, (image, buffer)) in self.entries.iter().enumerate() {
+            if !self.entries[..index].iter().any(|(seen, _)| seen == image) {
+                bytes += buffer.bytes();
+            }
+        }
+        bytes
+    }
+
     /// The buffer for `image`, or an error naming what was supplied.
     ///
     /// An error rather than an `Option` because there is no sensible thing to
@@ -1140,6 +1161,190 @@ impl<'a> SourceInputs<'a> {
                         .join(", ")
                 ))
             })
+    }
+}
+
+// ---------------------------------------------- what a block actually held --
+
+/// A running count of the block buffers one [`Chain::apply_tallied`] walk holds.
+///
+/// `live` is what is held now, `peak` the worst moment. Two integer adds per
+/// buffer, which is why it is unconditional — see [`Chain::apply_tallied`].
+#[derive(Debug, Default, Clone, Copy)]
+struct Tally {
+    live: u64,
+    peak: u64,
+}
+
+impl Tally {
+    fn take(&mut self, bytes: u64) {
+        self.live = self.live.saturating_add(bytes);
+        if self.live > self.peak {
+            self.peak = self.live;
+        }
+    }
+
+    fn give(&mut self, bytes: u64) {
+        self.live = self.live.saturating_sub(bytes);
+    }
+}
+
+/// **What one block held, observed — not forecast, and not a bound.**
+///
+/// `PhaseCost::working_set_bytes_per_block` is `resident_voxels x
+/// bytes_per_voxel x 2.0`: one input buffer and one output buffer. That is the
+/// whole of what a `Decomposition` can see, and `tests/working_set_residency.rs`
+/// measures what a block really holds through a global allocator, in units of
+/// one block buffer:
+///
+/// ```text
+/// one in, one out                2.00x        fan-in, 3 computed arms    5.13x
+/// sequence of four maps          4.00x        fan-in, 1 arm + 1 source   5.00x
+/// fan-in, 2 computed arms        4.00x        fan-in, 1 arm + 2 sources  7.13x
+/// ```
+///
+/// The excess is buffers [`Chain::apply_placed`] allocates — a `Sequence` clones
+/// its input and holds an intermediate, a `Parallel` holds one buffer per branch
+/// **at once**, a `Chain::Source` arm is handed a fetched buffer besides. This
+/// type is that walk reporting its own high-water mark.
+///
+/// Why observed and not derived
+/// ----------------------------
+/// The alternative was a function that walks a `Chain` and predicts what
+/// `apply_placed` will allocate. It was rejected: an allocation pattern that
+/// lives in one function should be reported by that function, because a second
+/// function describing it is a second source of truth and the two drift the
+/// first time a node learns to allocate something new — silently, since nothing
+/// would compare them. Here a buffer that is not tallied is a buffer that was
+/// not allocated.
+///
+/// **What it counts is exact.** `tests/working_set_residency.rs` compares this
+/// figure against the allocator over the same execution and accounts for every
+/// byte as an equality, not a window — the block buffers, and the two small
+/// bookkeeping vectors a `Sequence` and a `Parallel` allocate beside them, which
+/// are counted because a tally with a rounding error in it is where a real
+/// regression hides.
+///
+/// **It is still not a ceiling, and [`crate::budget`] must keep saying so.**
+/// What is outside it is what is allocated inside a *callee*, by the rule that
+/// this walk can only count what this walk allocates:
+///
+/// * whatever an op allocates inside [`BlockOp::apply`]. Measured on the *same*
+///   chain shape and the same block, two framework buffers in every case: a
+///   voxelwise map holds `2.00x`, a `5^3` morphological open `2.38x`, a `5^3`
+///   rank filter `4.00x`;
+/// * whatever a [`Combine`] allocates inside its own `apply` — `LogicCombine`'s
+///   fold intermediate, one `Bool` block, once it has three branches to fold;
+/// * the `Region` [`Voxels::assign`] builds, which is how a [`Chain::Source`]
+///   arm finishes: two three-element `Vec<usize>`, 48 bytes.
+///
+/// **Those are transient, and a peak takes the largest rather than their sum.**
+/// Every `assign` has finished before a combine allocates, so a chain with both
+/// is short by the larger of the two and not by both. The test asserts that
+/// exactly; writing it as a sum was wrong by precisely one of them, and the
+/// equality is what said so.
+///
+/// So this narrows the gap and does not close it. A figure claiming to close it
+/// would be worse than the one it replaced, because the one it replaced is at
+/// least known to be wrong.
+///
+/// Why this does not go into [`crate::statistics`]
+/// ----------------------------------------------
+/// That module has the machinery — a recorder, per-run observations, a bounded
+/// history keyed by machine — and it is the right home for a **rate**. Every
+/// term there is nanoseconds per unit, runs are combined by averaging, and old
+/// evidence is diluted by new. All three are wrong here:
+///
+/// * a high-water mark is a **maximum**, and two runs at `2x` and `4x` do not
+///   make one at `3x`;
+/// * dilution lowers a ceiling, which is the one direction a residency figure
+///   must not drift on its own;
+/// * the failure directions differ. A cost coefficient that is wrong makes the
+///   planner choose a slower plan — a sibling measurement puts that at `1.06x`.
+///   A residency figure that is wrong *low* makes the run unrunnable. That is
+///   the asymmetry [`crate::budget`]'s header already draws between compute,
+///   which may wait, and admission, which may not.
+///
+/// So the observation is **returned to its caller** rather than folded into a
+/// store here. A caller that wants to persist it may; this type does not create
+/// a second averaging store with the wrong combination rule in it.
+///
+/// What it carries, and what it refuses
+/// ------------------------------------
+/// A residency observed on one chain does not describe another: the table above
+/// spans `2.00x` to `3.56x` across chain shapes, and the op figures span
+/// `2.00x` to `4.00x` *within* one shape. So an observation carries the chain it
+/// was taken on — [`Chain::shape_id`], which includes every op's name — and
+/// [`Self::bytes_at`] answers only for that chain at that block.
+/// [`Self::estimate_at`] will scale along the block axis and is named for what
+/// it is; neither will answer for a different chain at all. That is the hazard a
+/// sibling measurement found the expensive way — a store recorded on the wrong
+/// workload, undetectable because the key partitioned by machine while the
+/// mismatch was on a workload axis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockResidency {
+    peak_bytes: u64,
+    chain_bytes: u64,
+    block: [usize; 3],
+    shape: u64,
+}
+
+impl BlockResidency {
+    /// Every byte the observation covers: the input buffer, the output buffer,
+    /// each distinct buffer the executor supplied for a source leaf, and the
+    /// high-water mark of what the walk itself allocated.
+    pub fn peak_bytes(&self) -> u64 {
+        self.peak_bytes
+    }
+
+    /// Of [`Self::peak_bytes`], the part the walk allocated — zero for a chain
+    /// of one op, which is the shape the `x 2.0` was written for.
+    pub fn chain_bytes(&self) -> u64 {
+        self.chain_bytes
+    }
+
+    /// The block extent it was observed at.
+    pub fn block(&self) -> [usize; 3] {
+        self.block
+    }
+
+    /// The structural identity of the chain it was observed on. Compare with
+    /// [`Chain::shape_id`]; read with [`Chain::shape_key`], which the caller can
+    /// ask of the chain it already holds.
+    pub fn shape_id(&self) -> u64 {
+        self.shape
+    }
+
+    /// Is this an observation of `chain`?
+    pub fn describes(&self, chain: &Chain) -> bool {
+        self.shape == chain.shape_id()
+    }
+
+    /// The observed figure, for the chain and the block it was taken on.
+    ///
+    /// `None` for any other chain **or** any other block. Refusing rather than
+    /// extrapolating is the point; see the type's last section.
+    pub fn bytes_at(&self, chain: &Chain, block: [usize; 3]) -> Option<u64> {
+        (self.describes(chain) && self.block == block).then_some(self.peak_bytes)
+    }
+
+    /// The observed figure scaled to another block, **as an estimate**.
+    ///
+    /// Still `None` for a different chain — the workload axis is not one this
+    /// extrapolates along at all. Along the block axis it does, and the name is
+    /// the warning: every buffer counted here is block-shaped, so the scaling is
+    /// exact for a chain whose nodes keep their extent and an estimate for one
+    /// that resizes or clamps at a volume boundary.
+    pub fn estimate_at(&self, chain: &Chain, block: [usize; 3]) -> Option<u64> {
+        if !self.describes(chain) {
+            return None;
+        }
+        let observed: usize = self.block.iter().product();
+        if observed == 0 {
+            return None;
+        }
+        let wanted: usize = block.iter().product();
+        Some((self.peak_bytes as f64 * wanted as f64 / observed as f64).round() as u64)
     }
 }
 
@@ -1943,6 +2148,168 @@ impl Chain {
         out: &mut Voxels,
         at: &Placement,
     ) -> Result<()> {
+        self.apply_tallied(input, sources, out, at, &mut Tally::default())
+    }
+
+    /// [`Self::apply_with`], reporting **what the block actually held**.
+    ///
+    /// The same walk, the same buffers, the same answer in `out` — the only
+    /// difference is that the tally the walk keeps anyway is handed back instead
+    /// of dropped. See [`BlockResidency`] for what the figure covers, what it
+    /// deliberately does not, and why it is not a bound.
+    ///
+    /// The block is `input`'s extent, and the observation is keyed to it: a
+    /// figure taken at one block answers for that block, and
+    /// [`BlockResidency::estimate_at`] is the named way to ask about another.
+    ///
+    /// **This allocates nothing of its own**, which is a correctness property
+    /// and not a nicety: an observation that allocated while the block's buffers
+    /// were live would be perturbing the thing it observes, by an amount that
+    /// varies with the chain. Both parts that could have — the scope key and the
+    /// distinct-source sum — are written to avoid it, and each says so where it
+    /// is defined. It was a measured 8 bytes before they were.
+    pub fn apply_observing(
+        &self,
+        input: &Voxels,
+        sources: SourceInputs<'_>,
+        out: &mut Voxels,
+        at: &Anchor,
+    ) -> Result<BlockResidency> {
+        let mut tally = Tally::default();
+        self.apply_tallied(
+            input,
+            sources,
+            out,
+            &Placement::same(at.clone()),
+            &mut tally,
+        )?;
+        Ok(BlockResidency {
+            peak_bytes: input.bytes() + out.bytes() + sources.resident_bytes() + tally.peak,
+            chain_bytes: tally.peak,
+            block: input.shape(),
+            shape: self.shape_id(),
+        })
+    }
+
+    /// The structural identity of this chain, readable: every node and every op
+    /// name, in order.
+    ///
+    /// **The scope a [`BlockResidency`] carries**, in the form meant for people.
+    /// Two chains with the same key allocate the same buffers, because the key
+    /// holds exactly what the walk branches on; two with different keys may not,
+    /// and the measured spread is wide enough that guessing is not an option —
+    /// see [`BlockResidency`]'s last section. This form allocates, so it is what
+    /// an error message uses and not what a comparison uses; the comparison is
+    /// [`Self::shape_id`], and both are written by one walk so they cannot
+    /// disagree about what a chain is.
+    pub fn shape_key(&self) -> String {
+        let mut key = String::new();
+        self.write_shape(&mut key);
+        key
+    }
+
+    /// The same identity, as 64 bits and **without allocating**.
+    ///
+    /// This is what [`BlockResidency`] stores, and the reason is a measurement
+    /// that caught itself: building the readable key inside
+    /// [`Self::apply_observing`] allocated a `String` while the block's buffers
+    /// were live, so the observation perturbed the thing it was observing — by 8
+    /// bytes for a one-op chain, and by an amount that depends on the chain's
+    /// name lengths and on where in the walk the peak fell. A measurement whose
+    /// own cost varies with what it measures is not one to correct for; it is
+    /// one to remove.
+    ///
+    /// **Sixty-four bits, and what that is and is not good for.** A collision
+    /// would let one chain's residency be quoted for another. It is worth the
+    /// trade here and would not be for a parity claim: residency is already
+    /// documented as an estimate known to run low — the systematic error is
+    /// around a factor of two — so a `1 in 2^64` chance of a wrong estimate is
+    /// many orders below the error already declared. A caller who wants an exact
+    /// comparison has [`Self::shape_key`] and the chain in hand.
+    pub fn shape_id(&self) -> u64 {
+        use std::hash::Hasher;
+        struct Feed<'a>(&'a mut std::collections::hash_map::DefaultHasher);
+        impl std::fmt::Write for Feed<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.0.write(text.as_bytes());
+                Ok(())
+            }
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.write_shape(&mut Feed(&mut hasher));
+        hasher.finish()
+    }
+
+    /// The one walk both forms are written by. Allocates nothing itself; whether
+    /// anything is allocated is the sink's business.
+    fn write_shape(&self, into: &mut dyn std::fmt::Write) {
+        match self {
+            Chain::Op(op) => {
+                let _ = write!(into, "op({})", op.name());
+            }
+            Chain::Source { image, dtype } => {
+                let _ = write!(into, "src({}:{})", image.index(), dtype.numpy_name());
+            }
+            Chain::Sequence(children) => {
+                let _ = into.write_str("seq[");
+                for (position, child) in children.iter().enumerate() {
+                    if position > 0 {
+                        let _ = into.write_char(',');
+                    }
+                    child.write_shape(into);
+                }
+                let _ = into.write_char(']');
+            }
+            Chain::Alternative { branches, taken } => {
+                let _ = write!(into, "alt{taken}[");
+                for (position, branch) in branches.iter().enumerate() {
+                    if position > 0 {
+                        let _ = into.write_char(',');
+                    }
+                    branch.write_shape(into);
+                }
+                let _ = into.write_char(']');
+            }
+            Chain::Parallel { branches, combine } => {
+                let _ = write!(into, "par({})[", combine.name());
+                for (position, branch) in branches.iter().enumerate() {
+                    if position > 0 {
+                        let _ = into.write_char(',');
+                    }
+                    branch.write_shape(into);
+                }
+                let _ = into.write_char(']');
+            }
+        }
+    }
+
+    /// [`Self::apply_placed`], keeping a running count of the buffers **this
+    /// walk** allocates.
+    ///
+    /// There is one walk and not two, which is the whole point. A separate
+    /// function predicting what this one allocates would be a second source of
+    /// truth about an allocation pattern that lives here, and the two would
+    /// drift the first time a node learned to allocate something new — silently,
+    /// because nothing would compare them. Counting inside the walk cannot
+    /// drift: a buffer that is not tallied is a buffer that was not allocated.
+    ///
+    /// The tally is unconditional. It is two integer adds per block buffer,
+    /// next to zeroing a block buffer, so there is no fast path to keep separate
+    /// and no configuration under which the observed path and the real path are
+    /// different code.
+    ///
+    /// **On an error the tally is abandoned rather than unwound.** An early
+    /// `?` leaves `live` above zero, which would matter if the value survived —
+    /// it does not: [`Self::apply_observing`] returns the error and drops the
+    /// tally with it.
+    fn apply_tallied(
+        &self,
+        input: &Voxels,
+        sources: SourceInputs<'_>,
+        out: &mut Voxels,
+        at: &Placement,
+        tally: &mut Tally,
+    ) -> Result<()> {
         let wanted_shape = self.placed_output_shape(input.shape(), at)?;
         let wanted_dtype = self.produces(input.dtype())?;
         if out.shape() != wanted_shape {
@@ -1987,7 +2354,7 @@ impl Chain {
                 out.assign(stored)
             }
             Chain::Alternative { branches, taken } => {
-                branches[*taken].apply_placed(input, sources, out, at)
+                branches[*taken].apply_tallied(input, sources, out, at, tally)
             }
             // Every branch, over the **same** buffer at the **same** anchor,
             // then the combine over all of their results. The shared input is
@@ -2002,13 +2369,27 @@ impl Chain {
             // never reach the environment, because an image is a phase's output
             // and this whole node is one slot of one phase.
             Chain::Parallel { branches, combine } => {
-                let mut results = Vec::with_capacity(branches.len());
+                let mut results: Vec<Voxels> = Vec::with_capacity(branches.len());
+                // Every branch's result is held until the combine has read them
+                // all, so they are taken and not released one at a time. This is
+                // the term the byte budget's `x 2.0` is most wrong about.
+                //
+                // The vector's own spine is counted with them. It is three
+                // orders smaller than what it holds and it is still a real
+                // allocation this walk makes; a tally that skipped it would be a
+                // tally with a rounding error in it, and a rounding error is
+                // where a real regression hides.
+                let mut held = (results.capacity() * std::mem::size_of::<Voxels>()) as u64;
+                tally.take(held);
                 for branch in branches {
                     let mut result = Voxels::zeros(
                         branch.produces(input.dtype())?,
                         branch.placed_output_shape(input.shape(), at)?,
                     )?;
-                    branch.apply_placed(input, sources, &mut result, at)?;
+                    let bytes = result.bytes();
+                    tally.take(bytes);
+                    held += bytes;
+                    branch.apply_tallied(input, sources, &mut result, at, tally)?;
                     results.push(result);
                 }
                 // The combine writes this node's output, so it is anchored where
@@ -2016,27 +2397,55 @@ impl Chain {
                 // anchors are the same value — a `Parallel` reads and writes one
                 // grid — so this is a statement of which one is meant rather than
                 // a change of behaviour.
-                combine.apply(&results, out, &at.output)
+                // The combine's own scratch — `LogicCombine`'s fold
+                // intermediate, say — is **not** counted, for the same reason an
+                // op's is not: it is allocated inside `Combine::apply` and
+                // nothing here can see it. See `BlockResidency`, which says so
+                // where a reader will meet the number.
+                let done = combine.apply(&results, out, &at.output);
+                tally.give(held);
+                done
             }
             Chain::Sequence(children) => match children.len() {
                 0 => out.assign(input),
-                1 => children[0].apply_placed(input, sources, out, at),
+                1 => children[0].apply_tallied(input, sources, out, at, tally),
                 n => {
                     let parts: Vec<&Chain> = children.iter().collect();
                     let places = place_parts(&parts, at, input.shape());
+                    // The two bookkeeping vectors, for the `Parallel` arm's
+                    // reason: small, real, and counted.
+                    let book = (std::mem::size_of_val(&parts[..])
+                        + std::mem::size_of_val(&places[..])) as u64;
+                    tally.take(book);
+                    // The clone is a buffer too, and an easy one to forget: a
+                    // sequence of `n` children holds its input twice over before
+                    // it has computed anything.
                     let mut current = input.clone();
+                    let mut held = current.bytes();
+                    tally.take(held);
                     for (position, child) in children.iter().enumerate() {
                         let place = &places[position];
                         if position + 1 == n {
-                            return child.apply_placed(&current, sources, out, place);
+                            let done = child.apply_tallied(&current, sources, out, place, tally);
+                            tally.give(held);
+                            tally.give(book);
+                            return done;
                         }
                         let mut next = Voxels::zeros(
                             child.produces(current.dtype())?,
                             child.placed_output_shape(current.shape(), place)?,
                         )?;
-                        child.apply_placed(&current, sources, &mut next, place)?;
+                        let next_bytes = next.bytes();
+                        tally.take(next_bytes);
+                        child.apply_tallied(&current, sources, &mut next, place, tally)?;
+                        // `current` is dropped by the assignment below, so its
+                        // bytes come back at exactly the moment they really do.
+                        tally.give(held);
                         current = next;
+                        held = next_bytes;
                     }
+                    tally.give(held);
+                    tally.give(book);
                     Ok(())
                 }
             },

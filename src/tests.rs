@@ -219,6 +219,7 @@ fn the_planner_segments_at_a_full_reach_op_rather_than_fusing_across_it() {
             8.0,
             &model,
             1.0,
+            crate::decomposition::PhaseTraffic::one_in_one_out(),
         )
         .cost_per_block
     };
@@ -352,6 +353,7 @@ fn a_large_but_bounded_reach_is_not_a_barrier_and_still_fuses() {
             8.0,
             &CostModel::default(),
             1.0,
+            crate::decomposition::PhaseTraffic::one_in_one_out(),
         )
         .redundancy
     };

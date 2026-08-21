@@ -334,7 +334,7 @@ fn the_incumbent_bounds_the_search_from_above() {
     let searched = Enumerating::default()
         .decompose(&workflow, &plain)
         .expect("a plan");
-    let best = predicted_cost(&workflow.chain, &searched, &plain.model).expect("a price");
+    let best = predicted_cost(&workflow.chain, &searched, &[], &plain.model).expect("a price");
 
     assert!(
         best <= incumbent,
@@ -357,7 +357,7 @@ fn the_incumbent_is_the_price_of_the_plan_it_hands_out() {
     let plain = constraints(vec![4, 8]);
     let strategy = Materialising::default();
     let plan = strategy.decompose(&workflow, &plain).expect("a plan");
-    let by_hand = predicted_cost(&workflow.chain, &plan, &plain.model).expect("a price");
+    let by_hand = predicted_cost(&workflow.chain, &plan, &[], &plain.model).expect("a price");
     let quoted = strategy.incumbent_cost(&workflow, &plain).expect("a price");
     assert_eq!(by_hand, quoted);
 }
@@ -615,6 +615,11 @@ const REPETITIONS: usize = 5;
 ///   family per unit of declared cost, and even taking every unstable row at its
 ///   *worst* repetition the spread stays above 2.8x. The direction is not in
 ///   doubt: rank filtering is charged far too little relative to smoothing.
+///   *Re-measured 2026-08-21 at a load average of 28 with 158 GB free, five
+///   repetitions: **4.78x**.* The spread itself moves with contention — it is a
+///   ratio between two families whose sensitivity to a busy box differs — so
+///   take the number as "between 4 and 7 and never near 1", which is the only
+///   part of it any decision here rests on.
 /// * **`SmoothOp` is over-priced, and by how much cannot be pinned here.**
 ///   `SMOOTH_COST_PER_TAP` values 21 taps at 28.77 map-units. Measured against
 ///   `offset` as the map unit it is worth about 17.6, and against `scale` about
@@ -673,13 +678,12 @@ fn measured_against_declared() {
     }
     let voxels = &runs[0].voxels;
 
-    let best = |index: usize| -> f64 {
-        runs.iter()
-            .map(|run| run.nanos[index])
-            .fold(f64::INFINITY, f64::min)
-    };
-    let worst =
-        |index: usize| -> f64 { runs.iter().map(|run| run.nanos[index]).fold(0.0, f64::max) };
+    // `least`/`greatest` rather than `f64::min`/`f64::max`, which absorb a NaN
+    // and would report a plausible best-of over a row that never produced a
+    // number. A NaN in a duration is a broken measurement, and this table exists
+    // to be believed.
+    let best = |index: usize| -> f64 { least(runs.iter().map(|run| run.nanos[index])) };
+    let worst = |index: usize| -> f64 { greatest(runs.iter().map(|run| run.nanos[index])) };
 
     let total_units: f64 = declared
         .iter()
@@ -736,10 +740,7 @@ fn measured_against_declared() {
             .filter_map(|run| run.terms.get(&term))
             .map(|(units, nanos)| nanos / units)
             .collect();
-        match (
-            rates.iter().copied().fold(f64::INFINITY, f64::min),
-            rates.len(),
-        ) {
+        match (least(rates.iter().copied()), rates.len()) {
             (_, 0) => println!(
                 "{:<26} {:>14} {:>14} {:>10.2}",
                 term.key(),
@@ -753,7 +754,7 @@ fn measured_against_declared() {
                 runs[0].terms[&term].0,
                 low,
                 quoted,
-                rates.iter().copied().fold(0.0, f64::max) / low,
+                greatest(rates.iter().copied()) / low,
             ),
         }
     }
@@ -761,8 +762,8 @@ fn measured_against_declared() {
     let accounted: Vec<f64> = runs.iter().map(Attribution::accounted).collect();
     println!(
         "\naccounted fraction: {:.4} to {:.4} over {REPETITIONS} repetitions",
-        accounted.iter().copied().fold(f64::INFINITY, f64::min),
-        accounted.iter().copied().fold(0.0, f64::max),
+        least(accounted.iter().copied()),
+        greatest(accounted.iter().copied()),
     );
     println!(
         "  best-of op time {:.0} ns against a wall clock of {:.0} ns",
@@ -823,4 +824,33 @@ fn the_store_sees_what_the_log_sees() {
         "observed {:.0} ns over the event stream",
         observed_nanos(&stats.log)
     );
+}
+
+/// The smallest of a sequence, by `total_cmp`, and `INFINITY` when it is empty.
+///
+/// `f64::min` would have been shorter and is banned here for the reason it is
+/// banned everywhere in this crate: it *absorbs* a NaN rather than propagating
+/// it, so a broken row disappears into a plausible answer instead of showing up
+/// as one.
+fn least(values: impl Iterator<Item = f64>) -> f64 {
+    values.fold(f64::INFINITY, |low, value| {
+        if value.total_cmp(&low) == std::cmp::Ordering::Less {
+            value
+        } else {
+            low
+        }
+    })
+}
+
+/// The largest of a sequence, by `total_cmp`, and `0.0` when it is empty — which
+/// is the identity these callers had before and the one that keeps an empty
+/// spread at zero rather than at negative infinity.
+fn greatest(values: impl Iterator<Item = f64>) -> f64 {
+    values.fold(0.0_f64, |high, value| {
+        if value.total_cmp(&high) == std::cmp::Ordering::Greater {
+            value
+        } else {
+            high
+        }
+    })
 }

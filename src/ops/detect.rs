@@ -297,11 +297,48 @@
 // ---------------
 // `ops::fill`'s costs, minus the pixels. Phase 0 is halo-free and embarrassingly
 // parallel. Phase 1 declares a whole-lattice fragment reach, so on `N` blocks it
-// moves `N` fragments to each of `N` blocks and runs the same union-find `N`
-// times; what it does *not* do is read an image, because it does not need one, so
-// the read amplification `fill`'s header measures is not paid here at all. The
-// fragment is six planes of labels plus eight words per label, against a block of
-// pixels — the same shape, for the same reason.
+// moves every block's fragment to each of `N` blocks and runs the same union-find
+// once per block; what it does *not* do is read an image, because it does not
+// need one — `reads_pixels` is `false`, so the executor performs no pixel IO for
+// the phase at all and the read amplification `fill`'s header measures is not
+// paid here.
+//
+// **That escape is smaller than this paragraph used to imply, and the correction
+// matters more here than in `fill`.** What it says is true: the pixel half is not
+// paid. What it left the reader with is that this op therefore gets the cheap
+// version of the shape — and it does not. Of the three costs `fill`'s header now
+// separates, this op escapes **one** and pays the other two in full:
+//
+// | | `ops::fill` | here |
+// |---|---|---|
+// | pixel re-reads, `N x` the label image | paid | **not paid** |
+// | fragment transfers, `(1 + N) x` the whole fragment set | paid | paid |
+// | the union-find, once per block | paid | paid |
+//
+// And the third of those is the one that was measured last and turned out
+// largest. `fill`'s header has the figures and the sweep; the short form is that
+// one merge is small at every lattice, there is one per block, and at a fine cut
+// their sum exceeds the whole rest of the pipeline. This op runs the *larger*
+// merge of the two — face labels plus a count and three position sums per label,
+// folded over every component — so nothing here is cheaper than what was measured
+// there.
+//
+// The old closing sentence said the fragment is six planes of labels plus eight
+// words per label, "against a block of pixels — the same shape, for the same
+// reason". That comparison is per block and it is the same false reassurance:
+// against a *block* of pixels a fragment is small, and the phase moves the whole
+// fragment set once per block rather than one fragment once. Past a fine enough
+// cut the fragment set exceeds the whole volume, measured, and this op has no
+// pixels to be small beside anyway.
+//
+// `docs/design/barriers.md` specifies the way out and prices it, and the way it
+// lands here is the opposite of what "minus the pixels" suggests. That note
+// separates two changes: a **barrier**, which relieves the halo, and a barrier
+// that additionally lets the phase run its **reduction once**. A barrier alone
+// recovers the pixel re-reads — so it recovers **nothing at all for this op**,
+// which does not pay them. Everything this op pays is in the second change.
+// Being the cheapest of the three ops today makes it the one with the least to
+// gain from half the fix and the most to gain, proportionally, from all of it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -27,12 +27,11 @@
 // That node now exists, and the sentence above was taken literally
 // ---------------------------------------------------------------
 // [`Chain::Parallel`] holds a `Box<dyn Combine>`; [`LogicCombine`] is the
-// implementation of it that this module owes. It calls exactly the two kernels
-// [`CombineOp`] calls — `logic_into` for two `bool` buffers, `combine_into`
-// through this module's mask convention for `f64` — and the **arrangement** is
-// what changed: the second operand is a sibling branch's result, produced by
-// the same block from the same input, instead of a whole-volume array held by
-// the op and sliced at the anchor.
+// implementation of it that this module owes. It calls this module's own
+// kernels and nothing else — [`mask_logic_into`], of which `logic_into` is the
+// all-`bool` case — and the **arrangement** is what changed: the second operand
+// is a sibling branch's result, produced by the same block from the same input,
+// instead of a whole-volume array held by the op and sliced at the anchor.
 //
 // `CombineOp` stays. It is not a worse `LogicCombine`; it is a different shape
 // — one arm computed, one arm supplied from outside the chain — and it is the
@@ -59,6 +58,30 @@
 // example somebody writing their *own* fusion op copies. Everything such an op
 // needs is public: the kernels in this module and its siblings are generic free
 // functions over `ArrayView3`, callable from inside a user's own loop.
+//
+// A mask is one bit, and two things carry it
+// -------------------------------------------
+// The other half of this module is not the arithmetic, it is the **width**. A
+// mask has always had two carriers here — `bool`, and `f64` under [`is_set`] /
+// [`from_set`] — and for a long time a chain could only *arrive* at the narrow
+// one by computing the answer in the wide one first, because [`VoxelwiseMapOp`]
+// holds an `f64 -> f64` map by construction and [`NarrowOp::to_mask`] can only
+// narrow a buffer that has already been allocated and filled.
+//
+// [`MaskFn`] and [`VoxelwiseMaskOp`] are [`MapFn`] and [`VoxelwiseMapOp`] with
+// the codomain changed, and they exist because the intermediate buffer is the
+// cost rather than the second pass: `Chain::apply_placed` allocates one buffer
+// per fan-in branch at the branch's own declared width, so a verdict computed as
+// `1.0` and `0.0` costs its eight bytes a voxel whatever is done to it
+// afterwards.
+//
+// [`LogicCombine`] then joins branches in **either** carrier, with the carrier
+// of its answer stated by the caller where the branches disagree — its own
+// header is the argument for why that is stated rather than inferred — and
+// [`CarryOp`] is what a branch carrying a sink forward uses, because [`Identity`]
+// is a `MapFn` and therefore `f64`-only. Those three together are what makes a
+// mask sink narrowable **one phase at a time**, without every arm feeding it
+// having to change width in the same commit.
 //
 // **A user-injected fusion cannot be discovered by the planner**, and that is a
 // limitation rather than an oversight. The planner would have to *name* the
@@ -153,13 +176,17 @@ impl Logic {
 }
 
 /// Combine two `bool` volumes with a connective.
+///
+/// [`mask_logic_into`] with every carrier `bool`, and written in terms of it so
+/// that the `bool` case and the mixed one cannot be two different foldings of
+/// the same connective.
 pub fn logic_into(
     left: ArrayView3<'_, bool>,
     right: ArrayView3<'_, bool>,
     out: ArrayViewMut3<'_, bool>,
     logic: Logic,
 ) -> Result<()> {
-    combine_into(left, right, out, |&left, &right| logic.apply(left, right))
+    mask_logic_into(left, right, out, logic)
 }
 
 /// The complement. The unary member of the set above, and a voxelwise map.
@@ -186,6 +213,68 @@ pub fn from_set(value: bool) -> f64 {
     } else {
         0.0
     }
+}
+
+/// An element type this module will **carry a mask in**, and the conversion
+/// each one uses.
+///
+/// There are two, and they are two *carriers of one bit* rather than two kinds
+/// of value: `bool` carries it as itself, and `f64` carries it under the
+/// convention immediately above — [`is_set`] to read, [`from_set`] to write.
+/// The trait exists so that the conversion is named once per carrier here and
+/// is not re-chosen at each op that has to move a mask between the two; an op
+/// that picked its own predicate is exactly how two ops in one chain come to
+/// disagree about what a mask is, which is what [`is_set`]'s own header warns
+/// about.
+///
+/// **Nothing else is a carrier.** `u8` would be an obvious third and is
+/// deliberately absent: `is_set` is stated over `f64` and there is no reading of
+/// an integer mask this crate has had to make, so adding one would be inventing
+/// a convention rather than reaching for one.
+pub trait MaskElement: VoxelElement {
+    /// Is this voxel set?
+    fn set(self) -> bool;
+    /// The voxel a set or clear bit is written as.
+    fn of(set: bool) -> Self;
+}
+
+impl MaskElement for bool {
+    fn set(self) -> bool {
+        self
+    }
+
+    fn of(set: bool) -> Self {
+        set
+    }
+}
+
+impl MaskElement for f64 {
+    fn set(self) -> bool {
+        is_set(self)
+    }
+
+    fn of(set: bool) -> Self {
+        from_set(set)
+    }
+}
+
+/// Combine two mask volumes with a connective, **in any pair of carriers**,
+/// writing the answer in a third.
+///
+/// The generalisation of [`logic_into`], which is this with all three carriers
+/// `bool` and is written in terms of it. Nothing about a connective depends on
+/// which carrier its operands arrived in — `And` over two bits is `And` over two
+/// bits — so the three parameters are independent, and each is resolved at
+/// compile time into one conversion rather than a per-voxel branch.
+pub fn mask_logic_into<L: MaskElement, R: MaskElement, O: MaskElement>(
+    left: ArrayView3<'_, L>,
+    right: ArrayView3<'_, R>,
+    out: ArrayViewMut3<'_, O>,
+    logic: Logic,
+) -> Result<()> {
+    combine_into(left, right, out, |&left, &right| {
+        O::of(logic.apply(L::set(left), R::set(right)))
+    })
 }
 
 // --------------------------------------------------------- the map plug-in --
@@ -330,6 +419,170 @@ pub enum ThresholdTest {
     AtOrAbove,
 }
 
+// -------------------------------------------------------- the mask plug-in --
+
+/// A pure, position-independent `f64 -> bool` predicate, as a **type** rather
+/// than a boxed closure.
+///
+/// [`MapFn`]'s sibling, and the whole of the difference is the codomain: a map
+/// answers with a number, a predicate answers with a bit. That is why both
+/// exist rather than one. A `MapFn` writing `1.0` and `0.0` spends eight bytes a
+/// voxel carrying one bit — [`VoxelwiseMapOp`] passes its input width through,
+/// so an `f64 -> f64` map in an `f64` buffer is the only shape it has — and no
+/// `f64 -> f64` signature can say "the answer is a bit" however it is written.
+/// [`VoxelwiseMaskOp`] is the shell that spends one byte instead, and this is
+/// what it holds.
+///
+/// Everything else is [`MapFn`]'s arrangement for [`MapFn`]'s reasons. Purity is
+/// a precondition of implementing this and not something checked, and it is what
+/// licenses [`constant_holds`](Self::constant_holds); [`holds`](Self::holds) is
+/// the one method with no default; `Self` is concrete at every call site, so the
+/// predicate inlines and the loop vectorises; and a third party writes
+/// `impl MaskFn for MyTest` outside this crate and gets a fully monomorphised
+/// op, with no variant added here.
+pub trait MaskFn: Send + Sync + 'static {
+    /// The predicate, on one value.
+    fn holds(&self, value: f64) -> bool;
+
+    /// The predicate, over a run of contiguous voxels.
+    ///
+    /// **The default is genuinely free**, for [`MapFn::map_slice`]'s reason, and
+    /// is overridden only where the type knows something the general case cannot
+    /// — [`ThresholdMask`] hoists its comparison out of the loop.
+    ///
+    /// `src` and `dst` are the same length; [`VoxelwiseMaskOp::apply`] checks the
+    /// two buffers agree before it gets here. The default zips, which would
+    /// silently stop at the shorter of the two, so the check is the caller's job
+    /// rather than this method's.
+    fn holds_slice(&self, src: &[f64], dst: &mut [bool]) {
+        for (slot, &value) in dst.iter_mut().zip(src.iter()) {
+            *slot = self.holds(value);
+        }
+    }
+
+    /// What this predicate gives for a block that is entirely `value`, if that
+    /// is known. `None` means "not known", which disables the short circuit.
+    ///
+    /// The default is the predicate applied to the constant — exactly right for
+    /// a pure predicate, which is this trait's precondition.
+    fn constant_holds(&self, value: f64) -> Option<bool> {
+        Some(self.holds(value))
+    }
+
+    /// What one voxel of this predicate costs, in the unit
+    /// [`COST_MEASUREMENT`](super::COST_MEASUREMENT) defines. The default is
+    /// [`MASK_COST`] — measured, and **below** [`MAP_COST`], because the
+    /// comparison is the same instruction and the store is an eighth of the
+    /// bytes.
+    fn cost(&self) -> f64 {
+        MASK_COST
+    }
+}
+
+/// Any pure `f64 -> bool` closure is a [`MaskFn`].
+///
+/// [`MapFn`]'s escape hatch, for [`MapFn`]'s reason and at the same price. `F`
+/// is a type parameter here too, so a closure is monomorphised into the loop and
+/// there is no indirect call on this path either; what a closure gives up is
+/// only what a closure cannot *say* — `constant_holds` falls back to calling it
+/// and `cost` falls back to the flat [`MASK_COST`]. A predicate that wants either
+/// derived becomes a named type.
+impl<F> MaskFn for F
+where
+    F: Fn(f64) -> bool + Send + Sync + 'static,
+{
+    fn holds(&self, value: f64) -> bool {
+        self(value)
+    }
+}
+
+/// [`Threshold`]'s comparison, without its two values: `value > level`, or
+/// `value >= level`, and nothing else.
+///
+/// **The predicate, written in exactly one place.** Before this existed the
+/// comparison appeared twice inside [`Threshold`] — once branchlessly in `map`
+/// and once hoisted in `map_slice` — and a threshold that also produced `bool`
+/// would have made it four. Two spellings of one boundary is how `>` and `>=`
+/// come to disagree about the voxels sitting exactly *on* the level, which are
+/// the only voxels a threshold is ever asked a hard question about, and this
+/// crate's own header for [`ThresholdTest`] records that the difference "lands
+/// exactly where data piles up". [`Self::holds_with`] is therefore the only
+/// function here that names either operator, and every other threshold path in
+/// this module calls it.
+///
+/// [`Threshold`] holds one of these and asks it the question; so does
+/// [`VoxelwiseMaskOp::threshold`]. That is what makes "the same threshold as a
+/// `bool` image and as a `1.0`/`0.0` image" a property of one comparison rather
+/// than an agreement between two that has to be maintained.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThresholdMask {
+    pub level: f64,
+    pub test: ThresholdTest,
+}
+
+impl ThresholdMask {
+    /// `value > level`.
+    pub fn above(level: f64) -> Self {
+        Self {
+            level,
+            test: ThresholdTest::Above,
+        }
+    }
+
+    /// `value >= level`.
+    pub fn at_or_above(level: f64) -> Self {
+        Self {
+            level,
+            test: ThresholdTest::AtOrAbove,
+        }
+    }
+
+    /// The comparison, with the test as a **compile-time** argument.
+    ///
+    /// The one place `>` and `>=` are written for a threshold. Monomorphised on
+    /// the constant, so each instantiation is a single comparison with nothing
+    /// left to branch on, and the two ways a caller wants it — the branch
+    /// hoisted once outside a loop, or both arms computed and combined
+    /// branchlessly — are both built out of this and neither restates it.
+    ///
+    /// A `NaN` compares false both ways, so it never holds.
+    #[inline(always)]
+    fn holds_with<const AT_OR_ABOVE: bool>(&self, value: f64) -> bool {
+        if AT_OR_ABOVE {
+            value >= self.level
+        } else {
+            value > self.level
+        }
+    }
+}
+
+impl MaskFn for ThresholdMask {
+    /// Branchless, and measured to be worth it: see [`Threshold::map`], whose
+    /// measurement this is and which now reaches the comparison through here.
+    fn holds(&self, value: f64) -> bool {
+        let at_or_above = matches!(self.test, ThresholdTest::AtOrAbove);
+        self.holds_with::<false>(value) | (at_or_above & self.holds_with::<true>(value))
+    }
+
+    /// The test is chosen **once**, outside the loop, for the reason
+    /// [`Threshold::map_slice`] gives: the choice is a field, and a per-voxel
+    /// load and branch on it is what the optimiser is not obliged to hoist.
+    fn holds_slice(&self, src: &[f64], dst: &mut [bool]) {
+        match self.test {
+            ThresholdTest::Above => {
+                for (slot, &value) in dst.iter_mut().zip(src.iter()) {
+                    *slot = self.holds_with::<false>(value);
+                }
+            }
+            ThresholdTest::AtOrAbove => {
+                for (slot, &value) in dst.iter_mut().zip(src.iter()) {
+                    *slot = self.holds_with::<true>(value);
+                }
+            }
+        }
+    }
+}
+
 /// Compare against a fixed level: `above` where the test holds, `below` where it
 /// does not.
 ///
@@ -371,6 +624,35 @@ impl Threshold {
             below,
         }
     }
+
+    /// The same comparison, with the two values dropped.
+    ///
+    /// **The link between this op's answer and a `bool` image's.** A caller with
+    /// a `Threshold` builds the `Bool`-producing form of the *same* threshold by
+    /// handing this to [`VoxelwiseMaskOp::from_mask`], and does not restate a
+    /// level or a test; a caller going the other way uses [`Self::from_mask`].
+    /// Both directions are `Copy` field moves, so there is nothing between the
+    /// two ops for a boundary to drift across.
+    pub fn mask(&self) -> ThresholdMask {
+        ThresholdMask {
+            level: self.level,
+            test: self.test,
+        }
+    }
+
+    /// The `1.0` / `0.0` form of a comparison, or any other pair of values.
+    ///
+    /// The inverse of [`Self::mask`]. `Threshold::from_mask(mask, 1.0, 0.0)` is
+    /// what the `f64` carrier of `mask` is, under this module's
+    /// [`from_set`] convention.
+    pub fn from_mask(mask: ThresholdMask, above: f64, below: f64) -> Self {
+        Self {
+            level: mask.level,
+            test: mask.test,
+            above,
+            below,
+        }
+    }
 }
 
 impl MapFn for Threshold {
@@ -391,12 +673,16 @@ impl MapFn for Threshold {
     /// three field loads a closure bakes in as immediates, which is the price of
     /// the parameters being data.
     ///
+    /// **The expression itself is now [`ThresholdMask::holds`]**, which is the
+    /// same three operations reached through the type that owns the comparison —
+    /// `mask()` is a `Copy` of two fields and inlines away. The measurement
+    /// above is the measurement of this line; what moved is where the `>` and
+    /// the `>=` are written, and there is now one place rather than two.
+    ///
     /// `NaN` compares false both ways and lands on `below`, which is what the
     /// `match` form did too.
     fn map(&self, value: f64) -> f64 {
-        let at_or_above = matches!(self.test, ThresholdTest::AtOrAbove);
-        let set = (value > self.level) | (at_or_above & (value >= self.level));
-        if set {
+        if self.mask().holds(value) {
             self.above
         } else {
             self.below
@@ -411,16 +697,24 @@ impl MapFn for Threshold {
     /// takes when it is the whole map, and it is why `map` above only has to be
     /// good enough for the composed case.
     fn map_slice(&self, src: &[f64], dst: &mut [f64]) {
-        let (level, above, below) = (self.level, self.above, self.below);
+        let (mask, above, below) = (self.mask(), self.above, self.below);
         match self.test {
             ThresholdTest::Above => {
                 for (slot, &value) in dst.iter_mut().zip(src.iter()) {
-                    *slot = if value > level { above } else { below };
+                    *slot = if mask.holds_with::<false>(value) {
+                        above
+                    } else {
+                        below
+                    };
                 }
             }
             ThresholdTest::AtOrAbove => {
                 for (slot, &value) in dst.iter_mut().zip(src.iter()) {
-                    *slot = if value >= level { above } else { below };
+                    *slot = if mask.holds_with::<true>(value) {
+                        above
+                    } else {
+                        below
+                    };
                 }
             }
         }
@@ -634,6 +928,215 @@ impl<M: MapFn> BlockOp for VoxelwiseMapOp<M> {
     }
 }
 
+/// `out = mask(in)`, voxelwise, into a **`Bool`** buffer.
+///
+/// [`VoxelwiseMapOp`]'s sibling and the whole of the difference is the width of
+/// what it writes: one byte a voxel rather than eight, because the answer is one
+/// bit and the buffer says so.
+///
+/// Why this is an op and not a composition that already existed
+/// ------------------------------------------------------------
+/// `VoxelwiseMapOp::threshold` followed by [`NarrowOp::to_mask`] computes the
+/// same voxels, and it is what a chain had to write before this. It is two ops,
+/// and the cost is not the second pass: it is the buffer **between** them, which
+/// is the `f64` image the narrowing exists to avoid and which a fan-in allocates
+/// per branch (`Chain::apply_placed`'s `Parallel` arm allocates one buffer per
+/// branch at the branch's own declared width). A threshold whose branch result
+/// is `f64` therefore costs the eight bytes a voxel whatever is done to it
+/// afterwards, and inserting the narrowing after it does not take them back.
+///
+/// So this is not a convenience over the pair. It is the only arrangement in
+/// which the comparison's answer is never materialised eight bytes wide.
+///
+/// `f64` in, and only `f64`
+/// ------------------------
+/// [`NarrowOp`]'s rule, for [`NarrowOp`]'s reason: [`WidenOp`] is the way in, and
+/// a predicate stated over `f64` applied to a narrower type would be this op
+/// choosing a conversion on the caller's behalf. A caller thresholding a `u16`
+/// image writes `WidenOp` and then this — or, where the comparison is against
+/// the source's own units and the widening would be an image rather than a block
+/// buffer, writes its own `BlockOp`, which is what [`MaskFn`] being a trait
+/// rather than a closed enum is for.
+pub struct VoxelwiseMaskOp<M: MaskFn> {
+    name: &'static str,
+    mask: M,
+    cost: f64,
+}
+
+impl<M: MaskFn> VoxelwiseMaskOp<M> {
+    /// From any [`MaskFn`] — a named one from this module, or a caller's own.
+    ///
+    /// The cost is taken from the predicate at construction rather than read on
+    /// every call, for [`VoxelwiseMapOp::from_map`]'s reason.
+    pub fn from_mask(name: &'static str, mask: M) -> Self {
+        let cost = mask.cost();
+        Self { name, mask, cost }
+    }
+
+    /// The predicate this op holds, for a caller that built it generically.
+    pub fn mask(&self) -> &M {
+        &self.mask
+    }
+
+    /// Override the derived cost, for a predicate that cannot price itself.
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+/// The closure constructor, kept separate from [`VoxelwiseMaskOp::from_mask`]
+/// for [`VoxelwiseMapOp::new`]'s reason: a generic `M: MaskFn` gives rustc
+/// nothing to infer a closure's parameter type from.
+impl<F> VoxelwiseMaskOp<F>
+where
+    F: Fn(f64) -> bool + Send + Sync + 'static,
+{
+    /// `mask` must be pure: same argument, same answer, wherever it is called.
+    pub fn new(name: &'static str, mask: F) -> Self {
+        Self::from_mask(name, mask)
+    }
+}
+
+impl VoxelwiseMaskOp<ThresholdMask> {
+    /// `true` where `value > level`.
+    ///
+    /// The same comparison [`VoxelwiseMapOp::threshold`] makes, through the same
+    /// [`ThresholdMask::holds_with`], in a `Bool` buffer instead of a `1.0` /
+    /// `0.0` one.
+    pub fn threshold(name: &'static str, level: f64) -> Self {
+        Self::from_mask(name, ThresholdMask::above(level))
+    }
+
+    /// The same, with the non-strict test: `true` where `value >= level`.
+    pub fn at_or_above(name: &'static str, level: f64) -> Self {
+        Self::from_mask(name, ThresholdMask::at_or_above(level))
+    }
+}
+
+impl<M: MaskFn> BlockOp for VoxelwiseMaskOp<M> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Zero, on every axis and at every volume size. A voxelwise predicate reads
+    /// the voxel it writes and nothing else.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    /// `f64` only. See the type's documentation.
+    fn accepts(&self, dtype: Dtype) -> bool {
+        dtype == Dtype::F64
+    }
+
+    /// `Bool`, whatever it read — which is the whole point of the op, and is the
+    /// declaration the image is allocated from.
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::Bool
+    }
+
+    /// Two paths and one shape check, exactly as [`VoxelwiseMapOp::apply`] has:
+    /// the contiguous one is what [`MaskFn::holds_slice`] exists for, and the
+    /// `map_into` fallback is there because an `ArrayView` need not be in
+    /// standard layout. The failure label is `map_into` in both, so a shape
+    /// mismatch reads the same here as it does for a map.
+    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        let input = input.view::<f64>()?;
+        let mut out = out.view_mut::<bool>()?;
+        shapes_agree(input.shape(), out.shape(), "map_into")?;
+        if input.is_standard_layout() && out.is_standard_layout() {
+            let src = input.as_slice().expect("standard layout is contiguous");
+            let dst = out.as_slice_mut().expect("standard layout is contiguous");
+            self.mask.holds_slice(src, dst);
+            return Ok(());
+        }
+        map_into(input, out, |&value| self.mask.holds(value))
+    }
+
+    /// Whatever the predicate says, in the short circuit's own currency.
+    ///
+    /// The answer is an `f64` because that is what `constant_maps_to` is stated
+    /// in whatever the buffer holds, and [`from_set`] is exactly
+    /// `VoxelElement::into_f64` for `bool` — one convention, and the same one
+    /// [`NarrowOp::constant_maps_to`] uses for its `Bool` target.
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        self.mask.constant_holds(value).map(from_set)
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+}
+
+/// The block, unchanged, **at whatever width it arrived in**.
+///
+/// **Not `VoxelwiseMapOp::identity`**, and the difference is the only reason
+/// this exists. [`Identity`] is a [`MapFn`], which is `f64 -> f64` by
+/// construction, so the op that holds it accepts `f64` and nothing else. That is
+/// right for a map and wrong for a *carry*: the case this serves is a fan-in
+/// branch whose job is to hand the phase's own input to the combine — the sink
+/// of a chain of `OR`s, most of all — and such a branch has no arithmetic to be
+/// `f64` about. Before this, a chain whose sink was `Bool` could not carry it
+/// forward on a branch at all, and had to reach the image by name through a
+/// [`Chain::Source`](crate::op::Chain::Source) instead, which is a read where a
+/// copy would do.
+///
+/// **The copy is a copy, and is not elidable from inside an op**, which is
+/// exactly what [`Identity`]'s own header says about the `f64` case:
+/// [`BlockOp::apply`] is handed an input buffer and a separate output buffer,
+/// and there is no way through this signature to say "the output *is* the
+/// input". [`Voxels::assign`] is the widest copy available for the width in
+/// hand, and it refuses a width mismatch rather than converting — which is the
+/// behaviour that makes a mis-declared chain fail rather than silently cast.
+pub struct CarryOp {
+    name: &'static str,
+}
+
+impl CarryOp {
+    pub fn new(name: &'static str) -> Self {
+        Self { name }
+    }
+}
+
+impl BlockOp for CarryOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Nothing: it writes the voxel it read.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    /// Every width a buffer holds. There is nothing for a copy to be unable to
+    /// do, and refusing a type here would be refusing to hand something back
+    /// that was handed in.
+    fn accepts(&self, _dtype: Dtype) -> bool {
+        true
+    }
+
+    /// What it read. The default, stated because this op's whole content is that
+    /// the width is passed through rather than chosen.
+    fn produces(&self, input: Dtype) -> Dtype {
+        input
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        out.assign(input)
+    }
+
+    /// A constant carries to itself, in every width.
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        Some(value)
+    }
+
+    /// A copy, which is what [`IDENTITY_COST`] was measured on.
+    fn cost_per_voxel(&self) -> f64 {
+        IDENTITY_COST
+    }
+}
+
 /// `out = logic(in, operand)`, voxelwise, against a second whole-volume operand.
 ///
 /// The operand is in **volume** coordinates and is sliced at the anchor, so this
@@ -660,6 +1163,13 @@ impl<M: MapFn> BlockOp for VoxelwiseMapOp<M> {
 /// it is honestly good at — a small operand a caller already holds, combined
 /// against a chain that has no plan around it yet — and it is not a worse
 /// `LogicCombine`; it is a different arrangement of the same kernels.
+///
+/// **The block and the operand need not be carried in the same thing**, and the
+/// op does **not** take a stated output. [`Self::accepts`] is where both halves
+/// are argued; the short form is that the connective reads two bits however they
+/// arrive, and that `produces` here is the identity on one input rather than a
+/// choice among *n* branches, so there is no question for a `producing` to
+/// answer.
 pub struct CombineOp {
     name: &'static str,
     logic: Logic,
@@ -696,14 +1206,39 @@ impl BlockOp for CombineOp {
         0
     }
 
-    /// The element type of the operand it was built with, and nothing else.
+    /// Either mask carrier, and **not** required to be the operand's.
     ///
-    /// A two-input op has two element types to agree about, and the second one
-    /// is fixed when the op is constructed. So this is not a policy — it is what
-    /// the operand *is*, and a block of any other type has nothing to be
-    /// combined with.
+    /// This used to read `dtype == self.operand.dtype()`, and the sentence
+    /// justifying it — "a block of any other type has nothing to be combined
+    /// with" — is the thing [`MaskElement`] falsifies. A `bool` block has a
+    /// great deal to be combined with in an `f64` mask: the connective is a
+    /// function of two *bits*, this crate fixes the conversion between the two
+    /// carriers in one place, and the answer is not in doubt. The rule was an
+    /// artefact of [`Self::apply`] reading one tag and using it for all three
+    /// buffers, which is exactly the artefact [`LogicCombine::accepts`] had.
+    ///
+    /// **What is still checked is that both are carriers at all.** The equality
+    /// used to get that for free; without it the operand needs saying, because
+    /// `accepts` is the only place a plan can learn anything about an array the
+    /// op holds and the plan has never seen. An operand of some third type makes
+    /// this op unusable at *every* input, and it says so when the plan is made
+    /// rather than when a block reaches it.
+    ///
+    /// **This op does not gain `LogicCombine::producing`, and the reason is the
+    /// same reason read from the other side.** That combine needed the carrier
+    /// of its answer stated because it has *n* branches and no canonical one, so
+    /// taking the output from a branch would have made an image's width a
+    /// consequence of an arm's. This one has exactly one input, and
+    /// `BlockOp::produces` hands it straight back — the identity, not an
+    /// inference, and a function of something the plan already holds. A stated
+    /// output here would be a parameter with no question behind it, which is the
+    /// mistake [`NarrowOp`]'s header declines for a unified cast. Relaxing the
+    /// input rule moves this op *towards* `Chain::produces`'s invariant rather
+    /// than away from it: the width of what it writes now depends on the plan's
+    /// own stream and no longer on an array nothing in the plan can see.
     fn accepts(&self, dtype: Dtype) -> bool {
-        dtype == self.operand.dtype() && matches!(dtype, Dtype::Bool | Dtype::F64)
+        matches!(dtype, Dtype::Bool | Dtype::F64)
+            && matches!(self.operand.dtype(), Dtype::Bool | Dtype::F64)
     }
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
@@ -725,27 +1260,39 @@ impl BlockOp for CombineOp {
         }
         let window = crate::region::Region::new(&at.offset, &shape);
         let logic = self.logic;
-        match input.dtype() {
-            // Two `bool` buffers into the `bool` connective: the diamond's sink
-            // with no conversion on either arm.
-            Dtype::Bool => {
-                let operand = self.operand.slice_region(&window)?;
-                logic_into(
-                    input.view::<bool>()?,
-                    operand.view::<bool>()?,
-                    out.view_mut::<bool>()?,
-                    logic,
-                )
-            }
-            _ => {
-                let operand = self.operand.slice_region(&window)?;
-                combine_into(
-                    input.view::<f64>()?,
-                    operand.view::<f64>()?,
-                    out.view_mut::<f64>()?,
-                    |&left, &right| from_set(logic.apply(is_set(left), is_set(right))),
-                )
-            }
+        let operand = self.operand.slice_region(&window)?;
+        // **Two carriers to resolve and not three**, which is this op's whole
+        // difference from [`LogicCombine::pair`] written as code: `produces` is
+        // the default, so the output carries what the input carried and there is
+        // no third thing to choose. Each arm is one monomorphisation of
+        // [`mask_logic_into`]; the two that were reachable before are the two on
+        // the diagonal, and they are the same kernel over the same conversions
+        // they were reaching through `logic_into` and `combine_into`.
+        match (input.dtype(), operand.dtype()) {
+            (Dtype::Bool, Dtype::Bool) => mask_logic_into(
+                input.view::<bool>()?,
+                operand.view::<bool>()?,
+                out.view_mut::<bool>()?,
+                logic,
+            ),
+            (Dtype::Bool, _) => mask_logic_into(
+                input.view::<bool>()?,
+                operand.view::<f64>()?,
+                out.view_mut::<bool>()?,
+                logic,
+            ),
+            (_, Dtype::Bool) => mask_logic_into(
+                input.view::<f64>()?,
+                operand.view::<bool>()?,
+                out.view_mut::<f64>()?,
+                logic,
+            ),
+            _ => mask_logic_into(
+                input.view::<f64>()?,
+                operand.view::<f64>()?,
+                out.view_mut::<f64>()?,
+                logic,
+            ),
         }
     }
 
@@ -781,14 +1328,39 @@ impl BlockOp for CombineOp {
 /// list of one, and `cost_per_voxel` is told `n` so a three-arm join is charged
 /// for the two pairs it actually does.
 ///
-/// **The element types must agree across branches**, which is a statement about
-/// *this* combine and not about fan-in. A connective is a function of two
-/// values of the same kind; a combine joining an image with a mask is a
-/// different combine, and `Chain::produces` deliberately leaves that decision
-/// here rather than imposing agreement on every fan-in there could be.
+/// **The branches carry masks, and they need not carry them in the same
+/// thing.** This combine never reads a number: both of its paths have always
+/// gone through [`is_set`] and written through [`from_set`], and its answer is
+/// one bit per voxel in every case. `Bool` and `F64` are therefore two
+/// *carriers* of one bit — [`MaskElement`] is where that is said — and the rule
+/// this used to enforce, that every branch agree, was not a statement about the
+/// connective at all. It was an artefact of [`Self::pair`] reading one branch's
+/// tag and using it for all three buffers. A connective over a `bool` branch and
+/// an `f64` branch is perfectly well defined, and refusing it cost the case this
+/// relaxation exists for: a mask sink narrowed to `Bool` beside arms whose own
+/// arithmetic is `f64` and whose verdicts are therefore `f64`.
+///
+/// **What is not relaxed is the output.** An image is allocated at one width and
+/// a decomposition is binding — `Chain::produces`'s own words — so inferring the
+/// carrier of the answer from the branches ("`Bool` if any branch is `Bool`",
+/// or the converse) would make an image's width a consequence of a branch's,
+/// and flipping one arm would silently re-width an image other phases read. So:
+///
+/// * branches that **agree** produce that carrier, which is exactly the rule
+///   this had before and means every plan already written still means what it
+///   meant;
+/// * branches that **differ** are joined only when the caller has said what to
+///   write, with [`Self::producing`]. Without it they are refused when the plan
+///   is made, which is where they were refused before.
+///
+/// [`Self::producing`] also applies where the branches agree — an `OR` of two
+/// `f64` masks writing a `Bool` image is how a chain's sink is narrowed at the
+/// first join and stays narrow, without any arm having to change width in step
+/// with it.
 pub struct LogicCombine {
     name: &'static str,
     logic: Logic,
+    output: Option<Dtype>,
     cost: f64,
 }
 
@@ -797,8 +1369,34 @@ impl LogicCombine {
         Self {
             name,
             logic,
+            output: None,
             cost: COMBINE_COST,
         }
+    }
+
+    /// State the carrier of the answer, rather than taking it from the branches.
+    ///
+    /// The type's header is the argument for why this is stated and not
+    /// inferred. Only the two mask carriers are accepted, because those are the
+    /// two [`MaskElement`] names and a third would be a convention this crate
+    /// has not stated.
+    pub fn producing(mut self, output: Dtype) -> Result<Self> {
+        if !matches!(output, Dtype::Bool | Dtype::F64) {
+            return Err(Error::InvalidArgument(format!(
+                "{}: a connective answers with one bit, and the two carriers this crate states a \
+                 convention for are bool and float64. {} is neither.",
+                self.name,
+                output.numpy_name()
+            )));
+        }
+        self.output = Some(output);
+        Ok(self)
+    }
+
+    /// The carrier this was told to write, or `None` for "whatever the branches
+    /// agreed on".
+    pub fn output(&self) -> Option<Dtype> {
+        self.output
     }
 
     pub fn with_cost(mut self, cost: f64) -> Self {
@@ -807,20 +1405,37 @@ impl LogicCombine {
     }
 
     /// One pair, through this module's kernels and nothing else.
+    ///
+    /// The three carriers are resolved here, once per pair rather than once per
+    /// voxel: each arm names a monomorphisation of [`mask_logic_into`], so the
+    /// loop that runs has one conversion compiled into it and no tag left to
+    /// look at. A tag that is neither carrier reaches `view` and is named there,
+    /// which is the same failure it has always been — [`Self::accepts`] refuses
+    /// it when the plan is made.
     fn pair(&self, left: &Voxels, right: &Voxels, out: &mut Voxels) -> Result<()> {
-        match left.dtype() {
-            Dtype::Bool => logic_into(
-                left.view::<bool>()?,
-                right.view::<bool>()?,
-                out.view_mut::<bool>()?,
-                self.logic,
-            ),
-            _ => combine_into(
-                left.view::<f64>()?,
-                right.view::<f64>()?,
-                out.view_mut::<f64>()?,
-                |&left, &right| from_set(self.logic.apply(is_set(left), is_set(right))),
-            ),
+        macro_rules! into_out {
+            ($left:ty, $right:ty) => {
+                match out.dtype() {
+                    Dtype::Bool => mask_logic_into(
+                        left.view::<$left>()?,
+                        right.view::<$right>()?,
+                        out.view_mut::<bool>()?,
+                        self.logic,
+                    ),
+                    _ => mask_logic_into(
+                        left.view::<$left>()?,
+                        right.view::<$right>()?,
+                        out.view_mut::<f64>()?,
+                        self.logic,
+                    ),
+                }
+            };
+        }
+        match (left.dtype(), right.dtype()) {
+            (Dtype::Bool, Dtype::Bool) => into_out!(bool, bool),
+            (Dtype::Bool, _) => into_out!(bool, f64),
+            (_, Dtype::Bool) => into_out!(f64, bool),
+            _ => into_out!(f64, f64),
         }
     }
 }
@@ -839,14 +1454,29 @@ impl Combine for LogicCombine {
         0
     }
 
+    /// At least two branches, every one of them a mask carrier, and — unless
+    /// the caller has stated the output with [`Self::producing`] — all of them
+    /// the same carrier.
+    ///
+    /// The last clause is the one that used to be unconditional. See the type's
+    /// header for why it is conditional rather than gone: a fan-in whose
+    /// branches disagree has a well-defined answer but no obvious width to write
+    /// it in, and this crate does not let an image's width be an inference.
     fn accepts(&self, inputs: &[Dtype]) -> bool {
         inputs.len() >= 2
-            && matches!(inputs[0], Dtype::Bool | Dtype::F64)
-            && inputs.iter().all(|&dtype| dtype == inputs[0])
+            && inputs
+                .iter()
+                .all(|dtype| matches!(dtype, Dtype::Bool | Dtype::F64))
+            && (self.output.is_some() || inputs.iter().all(|&dtype| dtype == inputs[0]))
     }
 
+    /// What it was told to write, or what the branches agreed on.
+    ///
+    /// Only ever called for a list [`Self::accepts`] passed, so the second case
+    /// is only reached where the branches do agree and `inputs[0]` is every
+    /// branch's answer rather than the first one's.
     fn produces(&self, inputs: &[Dtype]) -> Dtype {
-        inputs[0]
+        self.output.unwrap_or(inputs[0])
     }
 
     /// Every branch must have produced the same extent, and the two that did
@@ -890,7 +1520,14 @@ impl Combine for LogicCombine {
             if last {
                 self.pair(folded.as_ref().unwrap_or(&inputs[0]), &inputs[index], out)?;
             } else {
-                let mut next = Voxels::zeros(inputs[0].dtype(), inputs[0].shape())?;
+                // **The intermediate is a `Bool`**, whatever the branches and
+                // the output are: what a partial fold holds is a bit, and this
+                // is the one buffer in the node whose width nothing outside the
+                // node can observe. Under the mask convention it carries the
+                // same information an `f64` one did — `from_set` writes what
+                // `is_set` reads — at an eighth of the bytes, at the block sizes
+                // where a fan-in's own buffers are what a run is holding.
+                let mut next = Voxels::zeros(Dtype::Bool, inputs[0].shape())?;
                 self.pair(
                     folded.as_ref().unwrap_or(&inputs[0]),
                     &inputs[index],
@@ -1450,6 +2087,21 @@ pub const MAP_COST: f64 = 1.0;
 /// not the 4%, is what this number is for.
 pub const IDENTITY_COST: f64 = 0.95;
 
+/// What a [`MaskFn`] costs: the same comparison as a map, an **eighth of the
+/// stores**.
+///
+/// Measured, in [`COST_MEASUREMENT`]'s own run: `0.44` ns/voxel against the
+/// threshold's `0.69` for the identical comparison, which is `0.64`. The
+/// arithmetic is the same instruction either way, so the whole of the difference
+/// is the write — which is the same thing [`IDENTITY_COST`] says from the other
+/// end, that a voxelwise op is bound by memory and not by what it computes.
+///
+/// It is the default for every [`MaskFn`] and not only for [`ThresholdMask`],
+/// which is the same asymmetry [`MAP_COST`] already has: a predicate with real
+/// arithmetic in it overrides [`MaskFn::cost`], and one that has not been asked
+/// says what the *shape* costs.
+pub const MASK_COST: f64 = 0.65;
+
 /// Measured; see `super::COST_MEASUREMENT`.
 pub(super) const COMBINE_COST: f64 = 0.49;
 
@@ -1503,6 +2155,43 @@ pub(super) const COMBINE_COST: f64 = 0.49;
 /// numbers the constants in four other modules were read off. `super`'s header
 /// already records three ops that measure themselves in their own file for
 /// reasons of their own; this is a fourth, for that one.
+///
+/// **Two rows arrived later**, with the narrow carrier, and are kept apart from
+/// the table above rather than folded into it: they were taken on the same
+/// machine but at a **load average of 27**, and a figure taken there does not
+/// belong beside one taken on a quiet one. Each row below is the best of 40
+/// within a run *and* the best across six runs, because at that load a single
+/// run reads 15 to 50% high and the minimum is the only estimator that is not
+/// mostly a measurement of the other jobs:
+///
+/// ```text
+/// case                                     ns/voxel   relative     stored
+/// threshold                                    0.69       1.00       1.00
+/// threshold, into bool                         0.44       0.64       0.65
+/// identity                                     0.68       0.99       0.95
+/// carry                                        0.60       0.87       0.95
+/// four thresholds composed                     3.29       4.77       4.00
+/// four closures composed                       0.61       0.88       4.00
+/// threshold, as a closure                      0.60       0.87       1.00
+/// ```
+///
+/// The five rows the two runs share are within noise of each other, which is
+/// what makes the run comparable at all, and the two new ones say:
+///
+/// * **[`MASK_COST`], measured.** The same comparison into a `bool` buffer is
+///   `0.64` of the same comparison into an `f64` one. The arithmetic is one
+///   instruction either way, so the whole difference is the store — which is the
+///   third bullet above, read from the other end.
+/// * **[`CarryOp`] is [`Identity`] without the `f64` restriction**, and prices
+///   as one.
+///
+/// Neither row is evidence that the refactor they arrived with was free. That is
+/// `tests/mask_carrier.rs`'s
+/// `routing_the_comparison_through_one_function_costs_nothing`, which times four
+/// composed [`Threshold`]s — now reaching their comparison through
+/// `ThresholdMask::holds_with` — against the same expression written inline,
+/// **alternating, in one process**: `3.66` against `3.68` ns/voxel, `1.00x`. A
+/// ratio taken that way survives a load the absolute figures do not.
 pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
     use std::time::Instant;
 
@@ -1531,10 +2220,20 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
             "threshold".to_string(),
             Box::new(VoxelwiseMapOp::threshold("map", 500.0, 1.0, 0.0)),
         ),
+        // The same comparison as the row above, into a `Bool` buffer instead of
+        // an `f64` one. The pair is the whole of what the narrow carrier costs:
+        // one comparison either way, an eighth of the stores.
+        (
+            "threshold, into bool".to_string(),
+            Box::new(VoxelwiseMaskOp::threshold("mask", 500.0)),
+        ),
         (
             "identity".to_string(),
             Box::new(VoxelwiseMapOp::identity("identity")),
         ),
+        // A copy at the width it was handed, which is what a fan-in's
+        // sink-carrying branch does once per block.
+        ("carry".to_string(), Box::new(CarryOp::new("carry"))),
         (
             "four thresholds composed".to_string(),
             Box::new(VoxelwiseMapOp::from_map("composed", composed)),
@@ -1588,7 +2287,12 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
             let started = Instant::now();
             op.apply(&input, &mut out, &anchor).unwrap();
             let elapsed = started.elapsed().as_secs_f64() * 1e9;
-            std::hint::black_box(out.view::<f64>().unwrap().iter().take(1).sum::<f64>());
+            // One voxel, in whatever the op wrote — `Bool` now that a row
+            // produces one — so that the optimiser cannot drop the call.
+            std::hint::black_box(match out.dtype() {
+                Dtype::Bool => from_set(out.view::<bool>().unwrap()[[0, 0, 0]]),
+                _ => out.view::<f64>().unwrap()[[0, 0, 0]],
+            });
             best = best.min(elapsed / voxels);
         }
         rows.push((name, best, op.cost_per_voxel()));
@@ -1709,13 +2413,29 @@ mod tests {
 
     /// The same connective over two `bool` operands, at an eighth of the bytes
     /// and with no mask conversion on either arm.
+    ///
+    /// **The second assertion used to be `!op.accepts(Dtype::F64)`**, and it is
+    /// inverted here rather than deleted, because the thing it recorded the
+    /// absence of has landed: a `bool` operand and an `f64` block are two
+    /// carriers of one bit and the connective over them is not in doubt. See
+    /// [`CombineOp::accepts`] for why the equality it enforced was an artefact,
+    /// and `the_held_operand_need_not_be_carried_the_way_the_block_is` in
+    /// `tests/mask_carrier.rs` for the evidence that the crossed pairs answer
+    /// what the diagonal ones do.
     #[test]
     fn the_combine_op_takes_two_bool_operands_directly() {
         let volume = [4usize, 2, 2];
         let operand = Array3::from_shape_fn((4, 2, 2), |(i, _, _)| i >= 2);
         let op = CombineOp::new("and", Logic::And, Arc::new(operand.into()));
         assert!(op.accepts(Dtype::Bool));
-        assert!(!op.accepts(Dtype::F64));
+        assert!(op.accepts(Dtype::F64), "a bool operand joins an f64 block");
+        // and the operand still has to be a carrier at all, at every input
+        let wrong = CombineOp::new(
+            "and",
+            Logic::And,
+            Arc::new(Voxels::zeros(Dtype::U16, [4, 2, 2]).unwrap()),
+        );
+        assert!(!wrong.accepts(Dtype::Bool) && !wrong.accepts(Dtype::F64));
 
         let input: Voxels = Array3::from_elem((2, 2, 2), true).into();
         let mut high = Voxels::zeros(Dtype::Bool, [2, 2, 2]).unwrap();
@@ -2267,6 +2987,13 @@ impl BlockOp for WidenOp {
 /// `bool` was therefore unreachable from inside a plan, whatever the plan
 /// computed, and so was every image of an integer type.
 ///
+/// **For a comparison specifically there is now a one-pass form**, and it is the
+/// one to reach for: [`VoxelwiseMaskOp`] holds a `f64 -> bool` predicate and
+/// writes `Bool` directly, so the eight-byte buffer this narrows is never
+/// allocated at all. This op keeps the cases that one cannot serve — every
+/// numeric target, and narrowing an `f64` image somebody else computed — which
+/// is most of what it is for.
+///
 /// Two ops rather than one parameterised on a target type, and the asymmetry is
 /// real
 /// ------------------------------------------------------------------------
@@ -2341,6 +3068,13 @@ impl NarrowOp {
     /// that answer in a `bool` one, at an eighth of the bytes, and it is exact
     /// because the two conventions are the same convention — [`from_set`] writes
     /// what [`is_set`] reads.
+    ///
+    /// **Where the comparison is the chain's own**, prefer
+    /// [`VoxelwiseMaskOp`]: it makes the same comparison and writes the same
+    /// `bool`, without the `f64` buffer in between. This constructor is for the
+    /// case where the `f64` mask already exists — a phase somebody else wrote,
+    /// or an op whose output is a mask in this module's convention — and the
+    /// only question left is what to store it in.
     pub fn to_mask(name: &'static str) -> Self {
         Self {
             name,

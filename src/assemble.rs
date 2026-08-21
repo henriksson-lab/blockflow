@@ -105,16 +105,17 @@
 // disagree, which was the failure this is here to remove.
 
 use crate::decomposition::{
-    check_block_constraints, check_dtypes, check_source_images, Constraints, Decomposition,
-    PhaseDecomposition,
+    check_block_constraints, check_dtypes, check_source_images, cuttable_axes, phase_traffic,
+    price_phase, Constraints, Decomposition, PhaseCost, PhaseDecomposition,
 };
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::fragment::{check_phase_work, fragment_phase, FragmentOp, PhaseWork};
 use crate::geometry::BlockGrid;
-use crate::iterate::{iterative_phase, IterativeOp};
+use crate::iterate::{iterative_phase, substage_reach, IterativeOp};
 use crate::op::Chain;
-use crate::strategy::{Strategy, Workflow};
+use crate::reach::Reach;
+use crate::strategy::{phase_makespan, CandidateTally, Strategy, Workflow};
 
 /// An image of the plan: image 0 is the input, image `p + 1` is what phase `p`
 /// wrote, and an address at or above [`ImageId::SUPPLIED_BASE`] is one of the
@@ -273,6 +274,175 @@ impl Phase {
                 self.index + 1
             ))
         })
+    }
+}
+
+/// How many substages an iterative phase is expected to run, where anybody knows.
+///
+/// **Not [`crate::iterate::SubstageLimit`]**, and the distinction is the one that
+/// type exists to make: the limit is a runaway guard, deliberately generous, and
+/// pricing against it would price the backstop rather than the work. This is a
+/// *count*, and the only honest source for one is a run that already happened —
+/// `Stats::substages` reports it per phase, which is why this can be asked for
+/// without inventing a number.
+///
+/// # Why it is asked for at all
+///
+/// `IterativeOp::cost_per_voxel` is per substage and the planner prices one, on
+/// the argument that the count is a positive constant common to every candidate
+/// and so cannot move an argmin. **The first half of that is measured and true;
+/// the second half is false.** The count really is independent of the lattice —
+/// `tests/iterative_block_choice.rs` runs the executor over nineteen grids
+/// including one block per voxel, where every propagation step crosses a seam,
+/// and the count never moves — but it multiplies only *part* of the price. A
+/// phase runs `S` substages of read-and-compute and writes its image **once**,
+/// so the true cost is `S * (read + compute) + write`, and ranking on `S == 1`
+/// weighs the write `S` times too heavily. The error is
+/// `(S - 1) * (read + compute)`, which is a function of the block edge through
+/// the read amplification — the same family of mistake as the two before it.
+///
+/// Swept, the chosen edge departs from the one-substage choice at counts as
+/// ordinary as `2` and `4` rather than only at extreme ones, in a small minority
+/// of configurations, and never below three workers. The regret — the price of
+/// the one-substage choice under the objective the phase really has — reaches
+/// `1.125x` over the sweep `tests/iterative_block_choice.rs` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Substages {
+    /// Nobody has run it. One substage is priced, which is what the planner has
+    /// always done and is byte-identical to it.
+    Unknown,
+    /// A count from a previous run's `Stats::substages` for this phase.
+    Measured(usize),
+}
+
+impl Substages {
+    /// The multiplier the repeated half of the price is charged at.
+    ///
+    /// Fallible on zero for [`crate::iterate::SubstageLimit::of`]'s reason: a
+    /// phase that ran no substages wrote nothing, so a zero here is a
+    /// transcription error rather than a measurement, and silently treating it
+    /// as one would price the phase at its write alone.
+    fn factor(self, op: &str) -> Result<f64> {
+        match self {
+            Substages::Unknown => Ok(1.0),
+            Substages::Measured(0) => Err(Error::InvalidArgument(format!(
+                "iterative op {op:?} was priced against a measured substage count of zero. An \
+                 iteration that ran no substages wrote no image, so zero is a mis-transcribed \
+                 measurement rather than one; `Substages::Unknown` is how a caller says it does \
+                 not have the number."
+            ))),
+            Substages::Measured(count) => Ok(count as f64),
+        }
+    }
+}
+
+/// What becomes of the image a phase writes, which is what its write is charged
+/// at.
+///
+/// **A caller's statement, not an inference**, and the reason is measured
+/// rather than argued: see [`PlanBuilder::iterate_priced`], which found the
+/// choice of block edge sensitive to it. `predicted_makespan` reads the same
+/// fact off a finished plan as `index + 1 < n_phases`; a builder pricing a
+/// phase it is in the middle of appending has no finished plan to read it off,
+/// and the two weights are equal under
+/// [`CostModel::default`](crate::decomposition::CostModel::default), so an
+/// assumption here would have been invisible in every default-model test and
+/// wrong for exactly the caller who calibrated a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Materialisation {
+    /// Another phase will read it: charged `materialise_cost_per_voxel`.
+    ///
+    /// The case to reach for when in doubt. The default model's note gives the
+    /// reason — it "assumes poor compression, which biases towards fusing — the
+    /// cheaper mistake" — and a phase appended mid-plan is more often followed
+    /// than not.
+    Intermediate,
+    /// It is the plan's output: charged `write_cost_per_voxel`.
+    Output,
+}
+
+/// Whether one candidate's working set fits the budget, at the concurrency the
+/// caller expects to run at.
+///
+/// Lifted out of the sweep rather than inlined because it is the partition
+/// search's own rule, word for word (`PhasePricer::affordable`), and a second
+/// copy that drifted would let this builder accept a lattice the search would
+/// have refused. `working_set_bytes_per_block` is computed from the *clamped*
+/// read extent for exactly this reason: a budget checked against an
+/// over-charged read invents infeasibility.
+fn affordable(cost: &PhaseCost, constraints: &Constraints) -> bool {
+    constraints.budget_bytes.is_none_or(|budget| {
+        cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
+            <= budget as f64
+    })
+}
+
+/// The phase one [`PlanBuilder::iterate_priced`] call made, the lattice it was
+/// priced onto, and what the sweep looked at on the way.
+///
+/// **The tally is not decoration.** A sweep that silently dropped every
+/// candidate but one reads exactly like a sweep that considered them all and
+/// preferred that one, and the difference decides whether a caller should widen
+/// its budget or its candidate list. It is the same [`CandidateTally`] the
+/// partition search folds into its own account, so the two read the same way.
+#[derive(Debug, Clone)]
+pub struct PricedPhase {
+    phase: Phase,
+    grid: BlockGrid,
+    makespan: f64,
+    ranked: f64,
+    tally: CandidateTally,
+}
+
+impl PricedPhase {
+    /// The phase, for addressing what it wrote.
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// The image the phase wrote.
+    pub fn image(&self) -> ImageId {
+        self.phase
+            .writes()
+            .expect("an iterative phase writes an image")
+    }
+
+    /// The lattice the sweep settled on.
+    ///
+    /// Offered rather than applied, on [`Partition::grid`]'s argument: whether
+    /// the phases appended *next* should sit on it is a second planning
+    /// decision and belongs to whoever is making it. A caller who wants it says
+    /// [`PlanBuilder::regrid`] with this.
+    pub fn grid(&self) -> &BlockGrid {
+        &self.grid
+    }
+
+    /// What the winning candidate was predicted to take, **for one substage**.
+    ///
+    /// One substage because that is what can be priced without data; see
+    /// [`PlanBuilder::iterate_priced`] for why the ranking is nevertheless the
+    /// whole phase's. In the model's units — a bare number under
+    /// [`crate::decomposition::CostModel::default`], nanoseconds under one
+    /// calibrated from a [`crate::statistics::Snapshot`].
+    pub fn makespan(&self) -> f64 {
+        self.makespan
+    }
+
+    /// What the sweep actually minimised.
+    ///
+    /// Equal to [`Self::makespan`] under [`Substages::Unknown`], and `S` times
+    /// the repeated half of it plus one write under a measured count. It is
+    /// reported rather than kept private because a caller comparing two
+    /// candidate plans has to know which of the two numbers it is comparing —
+    /// and because a ranking done on a quantity nobody can read back is the
+    /// thing [`crate::strategy::predicted_makespan`] exists to prevent.
+    pub fn ranked_makespan(&self) -> f64 {
+        self.ranked
+    }
+
+    /// What the sweep was offered and what it dropped.
+    pub fn tally(&self) -> CandidateTally {
+        self.tally
     }
 }
 
@@ -604,17 +774,350 @@ impl PlanBuilder {
         Ok(Partition { phases, grid })
     }
 
-    /// Append an `Iterate` phase.
+    /// Append an `Iterate` phase **on the lattice the builder is holding**.
     ///
     /// The reach is one substage's, which is `iterative_phase`'s whole point and
     /// is left to it. The op is taken by value because a `PhaseWork` borrows it
     /// and something has to own it until the run is over.
+    ///
+    /// The grid is the previous phase's, unpriced, and that is a statement and
+    /// not an oversight — the same statement [`Self::new`] makes about the
+    /// caller's opening lattice. What was an oversight was that it was the
+    /// *only* thing on offer: a caller who wanted the edge chosen rather than
+    /// inherited had nothing to call. [`Self::iterate_priced`] is that, and the
+    /// two stand in the same relation as [`Self::pixels`] and
+    /// [`Self::partition`] — "I want exactly this phase" against "choose for
+    /// me", both kept because they are different statements.
     pub fn iterate(&mut self, op: impl IterativeOp + 'static) -> Result<Phase> {
         let phase = iterative_phase(&op, self.grid.clone())?;
         // An iteration feeds its own output back in, so it hands the element
         // type on unchanged; `check_dtypes` asserts the op accepts what it is
         // handed rather than assuming it.
         Ok(self.push(phase, Work::Iterate(Box::new(op)), true))
+    }
+
+    /// Append an `Iterate` phase **on the cheapest lattice `constraints` offers**.
+    ///
+    /// The counterpart of [`Self::iterate`], and the reason it exists is that
+    /// `iterate` inherits `self.grid()` with no pricing at all. Every other
+    /// phase kind in this builder either has its edge chosen by a search
+    /// ([`Self::partition`]) or has it stated by a caller who is choosing
+    /// ([`Self::pixels`]); an iterative phase had neither, and inheriting the
+    /// grid of the phase before it is not a choice, it is the absence of one.
+    ///
+    /// # What the sweep is
+    ///
+    /// Each edge in `constraints.block_candidates` is turned into a grid by the
+    /// same two steps the partition search uses — [`cuttable_axes`] takes the
+    /// reach-derived floor off the axes, [`BlockGrid::along`] builds the
+    /// lattice — the phase is derived on it, priced by [`price_phase`], dropped
+    /// if the working set exceeds `budget_bytes`, and scored by
+    /// [`phase_makespan`]. The winner is the lowest makespan, ties broken
+    /// towards the larger edge, which is `PhasePricer`'s rule and is here so a
+    /// caller reading two plans side by side is not comparing two tie-breaks.
+    ///
+    /// **The number this reports is the number the finished plan reports.** It
+    /// is built from the same calls in the same order as
+    /// [`crate::strategy::predicted_makespan`]'s per-phase term, so a caller can
+    /// price the whole plan afterwards and find this phase's contribution
+    /// unchanged. `tests/iterative_block_choice.rs` asserts that equality rather
+    /// than trusting it — a sweep minimising a quantity the plan does not report
+    /// would be choosing on a number nobody can check — and asserts it for both
+    /// values of `materialisation`, which is the argument that makes it true.
+    ///
+    /// # What moves the answer, measured rather than assumed
+    ///
+    /// The objective is a roofline, `max(pool, channel)` — see
+    /// [`phase_makespan`] — and **which side binds is the whole of it.** Every
+    /// statement below is about that.
+    ///
+    /// * **`workers` decides whether there is a choice at all.** At
+    ///   `workers == 1` the pool term is the channel term plus the compute and
+    ///   the conflict, so the pool always binds, the objective is the phase's
+    ///   serial work, and that is monotone in the edge: the sweep answers "the
+    ///   largest candidate that fits" for every op, every reach and every
+    ///   compute figure. That is not a defect — it is
+    ///   [`crate::strategy::Enumerating`]'s own account of what `concurrency ==
+    ///   1` means — but a caller who leaves `workers` at one has bought a sweep
+    ///   that cannot move and would do as well with [`Self::iterate`] and the
+    ///   coarsest grid.
+    /// * **The declared compute moves the argmin, and moves it a long way.**
+    ///   This corrects a claim carried in from the pricing work: that scaling
+    ///   `IterativeOp::cost_per_voxel` leaves the choice fixed because compute
+    ///   is charged over the same extent as the read. That holds only where the
+    ///   pool binds *for every candidate*, which is `workers == 1`. Above it,
+    ///   compute appears in the pool and not in the channel, so raising it
+    ///   walks the phase from bandwidth-bound to compute-bound and the argmin
+    ///   walks with it — over `1e-3 .. 1e3` on this file's probe, from the
+    ///   coarsest candidate to the finest. Measured at every `workers > 1`
+    ///   swept and at no `workers == 1`.
+    /// * **The halo**, through the read amplification `(edge + lo + hi) / edge`,
+    ///   which is the term that grows without bound as the edge falls and is
+    ///   the whole reason a fine grid is ever refused. It moves the *price* at
+    ///   every candidate; whether it moves the *argmin* depends on which side
+    ///   binds, which is why it is not on its own a lever a caller can reason
+    ///   about.
+    ///
+    /// `workers` is an argument because the builder has no other source for it:
+    /// it is [`crate::strategy::Enumerating::concurrency`], which reaches the
+    /// executor through [`crate::strategy::Strategy::hints`] and is not
+    /// recoverable from a `Constraints`.
+    ///
+    /// # Why `materialisation` is asked for rather than assumed
+    ///
+    /// A phase's write is charged at `write_cost_per_voxel` if it is the plan's
+    /// output and at `materialise_cost_per_voxel` if another phase will read it,
+    /// and `predicted_makespan` decides that by position — `index + 1 <
+    /// n_phases`. A builder cannot: when this is called the phase *is* the last
+    /// one, and whether it stays last is a fact about calls the caller has not
+    /// made yet.
+    ///
+    /// Assuming it was the first version of this method, on the argument that
+    /// the two weights enter the pool as `core * write * ceil(n / workers)` and
+    /// the channel as `mean_core * n * write`, the second of which is the volume
+    /// exactly at every candidate — so the write would shift every candidate by
+    /// the same amount and could not move a ranking. **The argument is wrong and
+    /// the sweep says so.** It is right in the channel bound and false in the
+    /// pool bound, where `ceil(n / workers) / n` is a function of the block
+    /// count: while `n < workers` it is `1 / n`, so a one-block candidate carries
+    /// the whole write and a forty-block one carries a fortieth of it. Swept over
+    /// `1e-6 .. 1e6` against reach, compute, split axes and `workers`, the chosen
+    /// edge moves in about a quarter of the configurations — at **every**
+    /// `workers > 1` tried and at **no** `workers == 1`, which is the same
+    /// dividing line every other lever in this method falls on.
+    /// `tests/iterative_block_choice.rs` holds the sweep.
+    ///
+    /// This was the third time this file had priced something with an error term
+    /// that was itself a function of the candidate — `price_phase`'s core charge
+    /// and its reach charge were the first two — so the rule is worth writing
+    /// down: an approximation is admissible in a *price* only when it is
+    /// constant across the things being ranked, and that is a measurement and
+    /// never an argument. `substages` below is the fourth, found by applying it.
+    ///
+    /// # Why `substages` is asked for rather than left out
+    ///
+    /// The first version of this method excluded the substage count on a
+    /// two-part argument: `IterativeOp::cost_per_voxel` is per substage, and the
+    /// count is a positive constant common to every candidate, so it cannot move
+    /// an argmin.
+    ///
+    /// **The first part survives a hard sweep and the second does not.** The
+    /// count really is a property of the data and the op and not of the lattice:
+    /// the executor was run over nineteen grids — including one block per voxel,
+    /// where every step of the propagation crosses a seam, and ragged grids that
+    /// divide no axis evenly — across five substage reaches and two data shapes,
+    /// one of them a one-voxel-wide serpentine that forces a long geodesic
+    /// through the volume, and the count is the whole-volume count every time.
+    /// That is the halo doing its job: it is one substage's reach wide and holds
+    /// the neighbours' cores from the previous substage, so information crosses
+    /// a seam at exactly the rate it crosses the inside of a block.
+    ///
+    /// But a constant multiplier is only neutral if it multiplies the *whole*
+    /// price, and this one does not. A phase runs `S` substages of read and
+    /// compute and writes its image **once**, at the fixed point — the substages
+    /// ping-pong two private buffers and touch no image — so the true shape is
+    /// `S * (read + compute) + write`, and ranking at `S == 1` weighs the write
+    /// `S` times too heavily relative to the rest. The residual is
+    /// `(S - 1) * (read + compute)`, a function of the block edge through the
+    /// read amplification. Swept, the choice departs from the one-substage
+    /// choice at counts as ordinary as `2` and `4` — not only at extreme ones —
+    /// in a small minority of configurations, never below three workers, and the
+    /// one-substage choice costs up to `1.125x` the chosen one under the
+    /// objective the phase really has.
+    ///
+    /// A uniform multiplier on the *whole* price really would be neutral, and
+    /// `tests/iterative_block_choice.rs` asserts that too — beside the
+    /// repeated-half version that is not — because a correction that scaled
+    /// everything by the count would look like a correction and do nothing.
+    ///
+    /// So the count is asked for where a caller has it, and
+    /// [`Substages::Unknown`] is byte-identical to not asking. It is a
+    /// *measurement*, from `Stats::substages` of a previous run, and explicitly
+    /// not `IterativeOp::limit()`, which is a runaway guard and would price the
+    /// backstop.
+    ///
+    /// **The ranking and the reported price are then two different numbers**,
+    /// deliberately: [`PricedPhase::makespan`] stays the one-substage figure the
+    /// finished plan reports, because `predicted_makespan` prices one substage
+    /// and nothing downstream of the phase knows the count, and
+    /// [`PricedPhase::ranked_makespan`] is what the sweep minimised. Under
+    /// `Substages::Unknown` they are the same number.
+    ///
+    /// The *shape* of that correction — which terms of a phase repeat and which
+    /// happen once — is a fact about `strategy::run_iterative_phase` rather than
+    /// about this builder, and would be better stated beside `price_phase` where
+    /// `predicted_makespan` could use it too. It is here because this is the
+    /// only door an iterative phase's block edge can come through: a phase with
+    /// no chain slot is not a member of the partition search.
+    pub fn iterate_priced(
+        &mut self,
+        op: impl IterativeOp + 'static,
+        constraints: &Constraints,
+        workers: usize,
+        materialisation: Materialisation,
+        substages: Substages,
+    ) -> Result<PricedPhase> {
+        if constraints.block_candidates.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "iterate_priced: iterative op {:?} was asked to be priced against an empty \
+                 `block_candidates`, so there is nothing to choose between. A caller who wants \
+                 the lattice this builder is already holding says `iterate` and says it out loud.",
+                op.name()
+            )));
+        }
+        let volume = self.grid.volume();
+        let reach: Reach = substage_reach(&op).into();
+        let bytes = self.reads.size_of() as f64;
+        // The phase's own index, which is where it will land: `push` appends.
+        let index = self.phases.len();
+        // The caller's, because the builder cannot know it and the sweep is not
+        // indifferent to it. See the doc above for the measurement that settles
+        // which of those two facts is the binding one.
+        let is_materialised = matches!(materialisation, Materialisation::Intermediate);
+        // The repeated half of the price, charged as many times as the phase
+        // will repeat it. The write is charged once whatever this is: an
+        // iterative phase writes its image at the fixed point and never at a
+        // substage — `run_iterative_phase` ping-pongs two private buffers and
+        // writes the image once at the end — so the write is not part of what
+        // repeats. See `Substages` for the measurement that made this worth
+        // having.
+        let repeats = substages.factor(op.name())?;
+        let ranking_model = Constraints {
+            model: crate::decomposition::CostModel {
+                read_cost_per_voxel: constraints.model.read_cost_per_voxel * repeats,
+                ..constraints.model
+            },
+            ..constraints.clone()
+        };
+        let ranking_model = &ranking_model.model;
+
+        let mut tally = CandidateTally::default();
+        let mut chosen: Option<(f64, usize, PhaseDecomposition)> = None;
+        for &edge in &constraints.block_candidates {
+            tally.offered += 1;
+            // Per candidate, not hoisted: an axis is cut only where the cut
+            // narrows what a block reads, and that depends on the edge.
+            let axes = cuttable_axes(&constraints.split_axes, &reach, volume, edge);
+            let Ok(grid) = BlockGrid::along(volume, &axes, edge) else {
+                tally.no_grid += 1;
+                continue;
+            };
+            // Derived rather than assembled by hand, so that the thing priced is
+            // the thing appended. `iterative_phase` also runs `check_iterative`,
+            // which is why an op that could never be a phase is refused here at
+            // the first candidate rather than after a sweep.
+            let phase = iterative_phase(&op, grid)?;
+            let work = PhaseWork::Iterate(&op);
+            let traffic = phase_traffic(index, &phase, Some(&work))?;
+            let cost = price_phase(
+                &phase.grid,
+                // The halo, not the reach. They are equal for an iterative
+                // phase — `iterative_phase` sets both to one substage's — but
+                // the argument that picks between them is `price_phase`'s and
+                // is not this file's to re-decide.
+                &phase.halo,
+                op.cost_per_voxel() * repeats,
+                // A slotless phase has no `preferred_iteration` to conflict
+                // with, and this is the number `predicted_makespan` passes for
+                // it. Anything else here and the sweep would minimise a
+                // quantity the finished plan does not report.
+                0,
+                is_materialised,
+                bytes,
+                ranking_model,
+                ranking_model.materialise_cost_per_voxel,
+                traffic,
+            );
+            if !affordable(&cost, constraints) {
+                tally.over_budget += 1;
+                continue;
+            }
+            tally.priced += 1;
+            // The per-voxel write charge, derived from `traffic` rather than
+            // from `materialisation` alone, which is `predicted_makespan`'s own
+            // line: the channel bound has to count the bytes `price_phase`
+            // charged for, and a phase that writes no image was charged for
+            // none. An iterative phase always writes one — so this is a branch
+            // that never takes its first arm today — and it is written this way
+            // so that it goes on agreeing with the plan's own price if that
+            // ever stops being true.
+            let write_cost = if !traffic.writes_an_image {
+                0.0
+            } else if is_materialised {
+                constraints.model.materialise_cost_per_voxel
+            } else {
+                constraints.model.write_cost_per_voxel
+            };
+            let makespan = phase_makespan(&cost, &phase.grid, workers, ranking_model, write_cost);
+            let better = match &chosen {
+                None => true,
+                Some((best, best_edge, _)) => {
+                    (makespan, std::cmp::Reverse(edge)) < (*best, std::cmp::Reverse(*best_edge))
+                }
+            };
+            if better {
+                chosen = Some((makespan, edge, phase));
+            }
+        }
+
+        let Some((ranked, _, phase)) = chosen else {
+            return Err(Error::InvalidArgument(format!(
+                "iterate_priced: iterative op {:?} over volume {volume:?} has no affordable \
+                 lattice. Of the {} candidate edge(s) {:?}, {} produced no grid at all once the \
+                 reach-derived floor had taken the axes off {:?}, and {} exceeded the byte \
+                 budget {:?} at a concurrency of {}. A wider budget, a coarser candidate or a \
+                 narrower substage reach than {reach} is what changes that.",
+                op.name(),
+                tally.offered,
+                constraints.block_candidates,
+                tally.no_grid,
+                constraints.split_axes,
+                tally.over_budget,
+                constraints.budget_bytes,
+                constraints.expected_concurrency.max(1),
+            )));
+        };
+        // The winner, re-priced at **one** substage under the caller's own model,
+        // because that is the number the finished plan reports:
+        // `predicted_makespan` prices one substage and cannot do otherwise —
+        // nothing downstream of the phase knows the count. So the sweep ranks on
+        // the phase's real shape and reports the plan's own figure, and the two
+        // are separate fields rather than one number that is neither.
+        let traffic = phase_traffic(index, &phase, Some(&PhaseWork::Iterate(&op)))?;
+        let plan_cost = price_phase(
+            &phase.grid,
+            &phase.halo,
+            op.cost_per_voxel(),
+            0,
+            is_materialised,
+            bytes,
+            &constraints.model,
+            constraints.model.materialise_cost_per_voxel,
+            traffic,
+        );
+        let plan_write = if !traffic.writes_an_image {
+            0.0
+        } else if is_materialised {
+            constraints.model.materialise_cost_per_voxel
+        } else {
+            constraints.model.write_cost_per_voxel
+        };
+        let makespan = phase_makespan(
+            &plan_cost,
+            &phase.grid,
+            workers,
+            &constraints.model,
+            plan_write,
+        );
+        let grid = phase.grid.clone();
+        let phase = self.push(phase, Work::Iterate(Box::new(op)), true);
+        Ok(PricedPhase {
+            phase,
+            grid,
+            makespan,
+            ranked,
+            tally,
+        })
     }
 
     /// Append a `Fragments` phase.
@@ -673,6 +1176,27 @@ impl PlanBuilder {
     /// here does not make the executor's copies redundant — a plan may arrive
     /// from any strategy or off a wire — it means a plan written by hand fails
     /// at the line that wrote it.
+    ///
+    /// # What it costs, and why that is worth a paragraph here
+    ///
+    /// This is on a partition search's inner loop: a search prices a candidate
+    /// grid by building the plan it implies and closing it, so `finish` runs
+    /// once per candidate and the fine candidates are the ones with the most
+    /// blocks. It is therefore the one method in this file whose complexity is
+    /// a feature rather than an implementation detail.
+    ///
+    /// It is **linear in the block count**, and every term is: the chain is
+    /// assembled once, `declare_source_images` walks each phase's slots once,
+    /// and of the five checks only `Decomposition::check` looks at blocks at
+    /// all, once each. That was not always true — `check` asks
+    /// [`crate::tiling::boxes_tile_exactly`] whether a phase's blocks cover
+    /// their volume once each, and that predicate used to compare every pair of
+    /// blocks, which made closing a plan quadratic and made it the *whole* cost
+    /// of pricing a candidate: `445 ms` at `8192` blocks against `11 ms` to
+    /// build the phases themselves, and half a minute at the block counts a
+    /// fine grid asks for. `tiling`'s header has the algorithm that replaced it
+    /// and the before/after; `tests/tiling_scaling.rs` pins the scaling with a
+    /// step counter rather than a stopwatch.
     pub fn finish(self) -> Result<Assembly> {
         if self.phases.is_empty() {
             return Err(Error::InvalidArgument(

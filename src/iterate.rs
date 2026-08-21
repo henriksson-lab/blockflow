@@ -290,9 +290,31 @@ pub trait IterativeOp: Send + Sync {
     /// the default of 1.0 is a placeholder, as it is on `BlockOp`.
     ///
     /// A phase whose substage count is unknown cannot be priced as a whole. The
-    /// planner prices one substage and records that the phase is unbounded; since
-    /// nothing can fuse across it — self-contained, external reach one substage's
-    /// worth — that changes the predicted duration and not the plan's shape.
+    /// planner prices **one** substage — and the second half of what this doc
+    /// used to say, *that this changes the predicted duration and not the plan's
+    /// shape*, is measured false. It changes the shape too, through the block
+    /// edge.
+    ///
+    /// A constant multiplier is neutral only if it multiplies the **whole**
+    /// price, and `S` substages do not. A substage reads and computes; the image
+    /// is written **once**, at the fixed point, because the substages ping-pong
+    /// two private buffers and `strategy::run_iterative_phase` writes only after
+    /// the loop. The true shape is `S x (read + compute) + write`, so ranking at
+    /// `S == 1` weighs the write `S` times too heavily against the rest, and the
+    /// residual `(S - 1) x (read + compute)` is a function of the block edge
+    /// through the read amplification. Measured: the choice departs from the
+    /// one-substage choice at counts as ordinary as two and four, never below
+    /// three workers, and the one-substage choice costs up to **1.125x** the
+    /// right one.
+    ///
+    /// What *is* true, and now has evidence rather than an argument: **the
+    /// substage count does not vary with the block edge.** Swept over thirteen
+    /// lattices including `[1, 1, 1]` — where every step of the propagation is a
+    /// halo exchange — four reaches and two data shapes including a serpentine
+    /// forcing a long geodesic, the count is the whole-volume count every time.
+    /// The halo is one substage's reach wide and holds the neighbours' cores from
+    /// the previous substage, so a seam is crossed at exactly the rate the inside
+    /// of a block is, which is what this module's header claims.
     fn cost_per_voxel(&self) -> f64 {
         1.0
     }

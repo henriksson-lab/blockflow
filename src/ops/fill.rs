@@ -93,10 +93,10 @@
 // `check_phase_work` refuses it in as many words, because image `p+1` would go
 // unwritten and phase `p+1` would read an image nobody produced. The merge is
 // therefore folded into phase 1, which reads the fragments *and* the labels and
-// writes the answer. The cost of the fold is that every block re-runs the same
-// global union-find; the union-find is over face labels rather than voxels, so
-// it is small next to the pixels, but it is `N` times redundant and it is not
-// nothing. See "What this costs" below.
+// writes the answer. The cost of the fold is that **every block re-runs the same
+// global union-find**, and what that costs is "What this costs" below — where it
+// is now measured, because this sentence used to reason about it and reasoned
+// wrong. `docs/design/barriers.md` is the specification for the way out.
 //
 // **A fragment op could not change the element type of the image it writes.**
 // Phase 0 reads a `bool` mask and writes `u32` labels, and `check_dtypes` folds
@@ -111,11 +111,65 @@
 // What this costs, stated rather than discovered
 // ------------------------------------------------
 // Phase 1 declares a whole-lattice fragment reach, so on a lattice of `N` blocks
-// it transfers `N` fragments to each of `N` blocks: the transfer is quadratic in
-// the block count, and each fragment is the block's six face planes. For a
-// 256-cube block that is about 1.5 MB of faces, so a 1000-block lattice moves
-// on the order of a terabyte of face planes to do a merge whose answer is a few
-// thousand booleans.
+// it transfers every block's fragment to each of `N` blocks, and each fragment is
+// the block's six face planes. **Hold the block edge fixed and grow the volume**
+// and that is quadratic in the block count, because each block contributes a
+// fixed amount of face: a lattice of a thousand 256-cube blocks moves on the
+// order of a terabyte of face planes to do a merge whose answer is one boolean
+// per label.
+//
+// **Hold the volume fixed and cut it more finely and it is not quadratic**, and
+// the difference is worth stating because the two regimes look like a
+// contradiction and are not. The traffic is `(1 + N) x F`, where `F` is what all
+// the fragments weigh together — the **total face area of the cut** — and `F` is
+// constant per block only in the first regime. In the second it obeys
+//
+// > `F = sum over axes of (cuts on that axis) x (area of the face perpendicular
+// > to it)`
+//
+// so it grows with the cut, but sub-linearly in `N`, and *which axis is cut*
+// matters more than how many blocks result: `F` is dominated by the largest
+// face, which is the one perpendicular to the volume's **shortest** axis. Cutting
+// that axis is doubly expensive, because it raises both factors of `(1 + N) x F`.
+// Swept in `tests/label_materialisation_cost.rs`, which found a cubic cut
+// carrying three times the fragments of a slab cut *at the same block count* on
+// an anisotropic volume — and the prediction that motivated the sweep was the
+// other way round.
+//
+// **Three sentences of this header were a false reassurance, and the shape of the
+// mistake is worth more than the correction.** They said the union-find is over
+// face labels rather than voxels, so it is small next to the pixels, and that the
+// fragment is six planes against a whole block of pixels. Every clause is true
+// **per invocation** — which is exactly why it read as safe — and the paragraph
+// never multiplied by the number of invocations, of which there is one per block.
+// Measured in `tests/label_materialisation_cost.rs`, on a recorded `bool` volume
+// of `[16, 1304, 3369]`, timing the merge alone — `ops::label`'s, which is this
+// program with a different per-label fact, so the shape is this one's and the
+// constants are not claimed for `fill` exactly. **The CPU half:**
+//
+// | lattice | every block's merge, together, serial |
+// |---|---|
+// | `[1, 1, 1]` | 0.10 s |
+// | `[1, 2, 2]` | 0.14 s |
+// | `[2, 4, 4]` | 2.47 s |
+// | `[4, 8, 8]` | **33.67 s** |
+//
+// One invocation stays between about three hundredths and a seventh of a second
+// across that whole sweep — it really is small, at every lattice, which is
+// exactly why the sentence read as safe — and there is one per block. The same
+// pipeline with the merge hoisted out of the per-block loop runs end to end in
+// under four seconds. So at a fine cut the **redundant merge alone is the largest
+// single cost of the op**, in a currency no byte counter shows, and it grows
+// faster than the block count, because there are `N` invocations and each decodes
+// a fragment set that is itself growing.
+//
+// **The byte half fails too**, past the cut where the total face area exceeds the
+// volume, and that point is reachable: measured on the same volume, the fragment
+// set against the label image is 12.8% at one block, 25.5% at `[2, 2, 2]`, 51.0%
+// at `[4, 4, 4]` and **101.9%** at `[8, 8, 8]` — where one transmission of the
+// fragments costs more than one transmission of the whole label image, before any
+// per-block multiplier. "The fragments are small beside the pixels" is a
+// statement about coarse lattices and nobody had swept it.
 //
 // **And that reach is also a halo, which costs pixels as well as fragments.**
 // `fragment_phase` sets `halo = max(reach, fragment reach * block edge)`, so
@@ -134,8 +188,12 @@
 // pipelined plan: `N` blocks each reading the whole label image. The acceptance
 // suite measures it rather than describing it. The way out is a **barrier**
 // rather than a halo — a phase that is declared to start only when the previous
-// one has finished needs no halo to express the same dependency — and that is
-// where the segmentation work in the design record leads.
+// one has finished needs no halo to express the same dependency — and
+// `docs/design/barriers.md` is now the specification for it, with all three
+// costs above measured against the alternatives. The short form: a barrier
+// removes the pixel amplification and leaves the other two, and a barrier that
+// also lets the phase run its reduction **once** removes all three, taking the
+// whole pipeline to within a few per cent of not decomposing the merge at all.
 //
 // The alternative is the classic one — propagate labels to immediate neighbours
 // only, `fragments -> fragments` at block reach 1, and iterate until nothing

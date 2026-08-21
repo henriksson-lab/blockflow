@@ -279,9 +279,12 @@ pub use ridge::{
     Response, RidgeFilterOp, RidgeResponse, ScaleSpace,
 };
 pub use rows::{
-    collect_rows, filter_blob, filter_into, gather_blob, gather_into, gathered_schema, merge_rows,
-    scale_blob, scale_into, scaled_at, scaled_bound, scaled_index, value_at, walk_rows, ColumnTest,
-    FilterRowsOp, GatherRowsOp, Limit, RowFilter, RowStreams, RowValues, ScaleRowsOp,
+    append_group_phases, collect_groups, collect_rows, decode_groups, encode_groups, filter_blob,
+    filter_into, gather_blob, gather_into, gathered_schema, group_values, merge_rows, scale_blob,
+    scale_into, scaled_at, scaled_bound, scaled_index, value_at, walk_rows, Aggregate, ColumnFold,
+    ColumnTest, FilterRowsOp, GatherRowsOp, GroupFold, GroupRowsOp, GroupValues, Grouping, Limit,
+    MergeGroupsOp, Reduction, RowFilter, RowStreams, RowValues, ScaleRowsOp, GROUP_ROWS,
+    MAX_PACKED_COORDINATE,
 };
 pub use skeleton::{thin, thinning_pass, thinning_reach, ThinningOp};
 pub use sliding::{
@@ -296,9 +299,10 @@ pub use tabulate::{
 };
 pub use voxelize::{decode_points, encode_points, Point, VoxelizeOp};
 pub use voxelwise::{
-    combine_into, from_set, is_set, logic_into, map_into, not_into, CombineOp, Compose, Identity,
-    Logic, LogicCombine, MapFn, NarrowOp, Not, Threshold, ThresholdTest, VoxelwiseMapOp, WidenOp,
-    IDENTITY_COST, MAP_COST,
+    combine_into, from_set, is_set, logic_into, map_into, mask_logic_into, not_into, CarryOp,
+    CombineOp, Compose, Identity, Logic, LogicCombine, MapFn, MaskElement, MaskFn, NarrowOp, Not,
+    Threshold, ThresholdMask, ThresholdTest, VoxelwiseMapOp, VoxelwiseMaskOp, WidenOp,
+    IDENTITY_COST, MAP_COST, MASK_COST,
 };
 pub use walk::{
     walk_blob, walk_from, walk_into, walk_schema, walked_distance, OffsetSequence, OffsetWalkOp,

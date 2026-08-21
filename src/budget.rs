@@ -35,6 +35,69 @@
 // bytes-per-voxel estimate fed to it. That estimate is measured, not guessed
 // (`progress.json` records `bytes_per_voxel` per stage), but it is an estimate,
 // and the accounting says so rather than pretending to observe the allocator.
+//
+// What the planner asks this budget for is smaller than what a block holds
+// --------------------------------------------------------------------------
+// The figure `strategy` checks against a budget is
+// `PhaseCost::working_set_bytes_per_block`, which is `resident_voxels x
+// bytes_per_voxel x 2.0` — one input buffer and one output buffer. That is the
+// whole of what it counts, and `tests/working_set_residency.rs` counts what one
+// block of a phase actually holds, through a global allocator, in units of one
+// `f64` block buffer:
+//
+// ```text
+// one in, one out                2.00x   (the shape the formula is for)
+// sequence of four maps          4.00x
+// fan-in, 2 computed arms        4.00x
+// fan-in, 3 computed arms        5.13x
+// fan-in, 1 arm + 1 source       5.00x
+// fan-in, 1 arm + 2 sources      7.13x
+// ```
+//
+// The excess is `Chain::apply_placed`'s own allocations — a `Sequence` clones
+// its input and holds an intermediate, a `Parallel` holds **one buffer per
+// branch at once** plus a fold intermediate, and a `Chain::Source` arm is handed
+// a fetched buffer besides. None of it is in the `x 2.0`.
+//
+// **So a lease granted against that figure is not a bound on what the block
+// holds, and this module must not be read as if it were.** Two consequences,
+// both stated here because this is where the promise is made:
+//
+// * the shortfall is **shape-dependent**, `2.00x` to `3.56x` across ordinary
+//   chains, so it is not a constant a caller can pre-multiply away and have the
+//   planner still rank candidates on comparable numbers;
+// * even a figure corrected for every buffer above would still not be a bound,
+//   because an op may allocate whatever it likes inside `BlockOp::apply` and
+//   nothing declares it. Measured on the *same* chain shape and the same block —
+//   two framework buffers in every case — a voxelwise map holds `2.00x`, a
+//   `5^3` morphological open `2.38x`, and a `5^3` rank filter `4.00x`.
+//
+// The honest position is therefore that this is an **estimate that is known to
+// run low**, not a ceiling; a caller sizing a machine should read
+// `tests/working_set_residency.rs` for the factor its own chain shape earns.
+// Making the framework's half exact is a change to `price_phase` and to what the
+// planner is handed, and it moves which plans are affordable — that is a budget
+// review, and the numbers it needs are in the same file.
+//
+// **The framework's half is now observable.** `Chain::apply_observing` runs a
+// block and hands back `BlockResidency`, the high-water mark of the buffers the
+// walk itself allocated plus the input, the output and the distinct source
+// buffers. It is measured rather than forecast — the same walk that allocates
+// keeps the tally, so a buffer that is not counted is a buffer that was not
+// allocated — and `tests/working_set_residency.rs` checks it against the
+// allocator over the same execution, accounting for every byte as an equality
+// rather than a window.
+//
+// **It does not make a lease a promise, and nothing here should be read as if
+// it had.** Two things stay outside any such figure: what an op allocates inside
+// `BlockOp::apply` — `2.00x`, `2.38x` and `4.00x` for a map, a `5^3` open and a
+// `5^3` rank filter on the *same* chain shape and block — and what a `Combine`
+// allocates inside its own. A residency observation is also scoped to the chain
+// it was taken on and refuses to answer for another, which is why it cannot
+// simply be substituted for the `x 2.0` at plan time without the planner
+// deciding what to do when it has no observation. That decision belongs with
+// the budget review; the sentence that must survive it is the one above — an
+// estimate known to run low, not a ceiling.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -439,6 +502,181 @@ pub fn auto_budget_bytes() -> Option<u64> {
     let total = meminfo_field(&meminfo, "MemTotal:")?;
     let available = meminfo_field(&meminfo, "MemAvailable:").unwrap_or(total);
     Some((total / 2).min(available / 4 * 3).max(MIN_BUDGET_BYTES))
+}
+
+// ------------------------------------------------ what admission charges --
+
+/// The margin over an **assumed** framework figure, on a first run.
+///
+/// `PhaseCost::working_set_bytes_per_block` is `resident_voxels x
+/// bytes_per_voxel x 2.0` — one input buffer and one output buffer — and
+/// `tests/working_set_residency.rs` measures what a block really holds. **As
+/// multiples of that assumed charge**, which is the unit this constant is in:
+///
+/// ```text
+/// one in, one out                 1.00x     rank filter alone           2.00x
+/// sequence of four maps           2.00x     morphological open alone    1.19x
+/// fan-in, 2 computed arms         2.00x     fan-in, rank arm + 2 src    3.56x
+/// fan-in, 3 computed arms         2.56x     sequence of four ranks      3.00x
+/// fan-in, 1 arm + 1 source        2.50x
+/// fan-in, 1 arm + 2 sources     3.5626x  <- widest
+/// ```
+///
+/// `3.6` is the **smallest tenth that covers every shape measured**, which is
+/// what `tests/working_set_residency.rs`'s
+/// `the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured`
+/// asserts, in both directions — a margin above its evidence is headroom nobody
+/// can point at, and one below it is the failure it exists to prevent.
+///
+/// **A tenth and not a whole number**, which this constant was first written as
+/// and had to be corrected. Rounding up to whole numbers reads well until a
+/// measurement lands just over one: [`UNOBSERVED_OP_MARGIN`]'s widest op is
+/// `2.0002x`, and `3` would have been fifty per cent of headroom bought with two
+/// ten-thousandths of evidence. A tenth is fine enough that the rounding is not
+/// an argument and coarse enough that a constant does not move on noise.
+///
+/// **The last two rows are combinations, and they are why the margin is derived
+/// from a measurement rather than from the parts.** A chain may be expensive in
+/// its framework buffers *and* in its op, and a margin justified by the worse of
+/// two separate measurements need not cover one that is both. In the event
+/// neither combination is the worst: putting a rank filter on the widest fan-in
+/// left it at `3.56x`, because an op's scratch is transient and that chain's
+/// peak falls at the combine instead. That is a fact about these chains and not
+/// a rule — which is exactly why the combinations are measured rather than
+/// reasoned about.
+///
+/// It is a **margin fitted to those measurements, not a bound**. An op that
+/// allocates more, at a moment when the rest of the chain is also at its
+/// widest, would exceed it, and nothing declares that none does — see
+/// [`crate::op::BlockResidency`].
+pub const UNOBSERVED_SHAPE_MARGIN: f64 = 3.6;
+
+/// The margin over an **exact** framework figure.
+///
+/// Once the framework's half is exact — an observation, or the shape-derived
+/// figure that would replace it at plan time — the only thing left unpriced is
+/// what an op allocates inside `BlockOp::apply`. Measured on one chain shape and
+/// one block, against the two framework buffers that shape holds: a voxelwise
+/// map `1.0000x`, a `5^3` morphological open `1.1875x`, a `5^3` rank filter
+/// `2.0002x`. `2.1` is the smallest tenth that covers them, by the same rule and
+/// asserted the same way.
+///
+/// **The `2.0002` is the reason the rule is a tenth**, not a decoration on it: a
+/// rank filter holds two block buffers of its own *and a little more*, so a rule
+/// that rounded to whole numbers would have charged `3` for it. See
+/// [`UNOBSERVED_SHAPE_MARGIN`].
+///
+/// Fitted to three ops, and a margin for the same reason as above.
+pub const UNOBSERVED_OP_MARGIN: f64 = 2.1;
+
+/// The best figure available for the framework's half of one block's residency.
+///
+/// The variants are ordered by how much is known, and the policy in
+/// [`admission_bytes`] is a function of which one a caller can supply.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FrameworkFigure {
+    /// `PhaseCost::working_set_bytes_per_block`, which assumes one image in and
+    /// one out. Wrong by `1.00x` to `3.56x` depending on the phase's shape, and
+    /// the only figure a plan can produce today.
+    Assumed(f64),
+    /// The framework's half, exact: a [`crate::op::BlockResidency`] observed for
+    /// this chain at this block, or the shape-derived figure that would stand in
+    /// for one before a first run.
+    ///
+    /// **Exact about the framework and silent about the op**, which is why it
+    /// still takes a margin.
+    Exact(u64),
+}
+
+/// **What admission charges for one block, and the policy behind it.**
+///
+/// The question this settles is narrow: on a first run, with nothing observed,
+/// what does the budget charge? Three answers were available and each fails
+/// differently.
+///
+/// The decision
+/// ------------
+/// **Charge a stated margin over the best framework figure there is.** With
+/// nothing but the plan, that is [`UNOBSERVED_SHAPE_MARGIN`] over the assumed
+/// figure; with the framework's half exact, it is the smaller
+/// [`UNOBSERVED_OP_MARGIN`], because the exactness has already absorbed the part
+/// the larger margin was covering. Both are measured, both are fitted, and
+/// neither is a ceiling.
+///
+/// **Why a flat factor is legitimate here and would not be for the cost.**
+/// `PhaseCost`'s own header sets the test for anything added to it: "is the size
+/// of the over-estimate the same question for every candidate", and an error
+/// that varies with the candidate "does not make the planner cautious — it
+/// reorders the candidates". That rule governs the number the search *ranks* on.
+/// This is not that number. The same header says so: `working_set_bytes_per_block`
+/// "is allowed to over-state, because it feeds a budget and never a comparison".
+/// A budget figure that is uniformly high refuses some plans and mis-ranks none,
+/// which is exactly the trade this margin makes.
+///
+/// **What it costs when wrong, in each direction.** The asymmetry is the whole
+/// argument:
+///
+/// * **too low** — the run holds more than the budget promised. Measured today,
+///   with no margin at all: up to `2.50x` over budget, on 13 of the 32 rows of
+///   `tests/working_set_residency.rs`'s sweep, and worst exactly where the
+///   planner has just fitted a large candidate, which is the situation a
+///   memory-constrained run is in by definition. That is a killed run;
+/// * **too high** — the planner takes a block one step smaller down the
+///   candidate ladder. It costs read amplification and more tasks. It cannot
+///   make a run unrunnable and it cannot move a voxel. Counted over a sweep of
+///   nine budgets: the cold-start charge costs one step at **six** of them and
+///   nothing at the other three, and never two — see
+///   `a_margin_never_costs_more_than_one_ladder_step`, which asserts both.
+///
+/// **And the ceiling on that cost is arithmetic rather than luck.** A ladder of
+/// powers of two steps by eight in volume, and every margin here is under eight
+/// — `3.6` on its own, and `3.5626 x 2.1 = 7.48` for the worst measured shape
+/// under the exact figure. So **neither branch can cost more than one ladder
+/// step, at any budget**, which `a_margin_never_costs_more_than_one_ladder_step`
+/// asserts across a sweep rather than arguing here.
+///
+/// That headroom is thin, and deliberately so: it is what says the two margins
+/// cannot both be raised much further without the affordability argument
+/// changing shape. A future measurement that needs a wider margin needs this
+/// paragraph rewritten, not quietly exceeded.
+///
+/// The two that were not chosen
+/// ----------------------------
+/// * **Charge the framework figure with no margin.** It is exact for what it
+///   covers and silent about the op, so it would still under-charge a rank
+///   filter by `2.00x` — the same failure in the same direction, merely smaller.
+///   Being exact about one half is not a reason to price the other half at zero.
+/// * **Refuse to admit fine cuts until something is observed.** This one is
+///   backwards, and worth writing down so it is not re-proposed: admission takes
+///   the *largest* block that fits, and residency grows with block size, so the
+///   conservative move is a **smaller** block — which is precisely what a larger
+///   charge already produces. A separate refusal would be a second control for
+///   the same effect, and it would buy nothing the margin does not while costing
+///   read amplification on every phase rather than on the ones near their
+///   budget.
+///
+/// What must not be read into this
+/// -------------------------------
+/// **A lease is still an estimate known to run low, not a ceiling.** The margin
+/// makes it run low less often; it does not make it a promise, and an observed
+/// figure does not either — [`crate::op::BlockResidency`] measures the
+/// framework's half exactly and is silent about the op's, which is why the
+/// exact branch still takes a margin. Nothing here should be quoted as a bound
+/// on what a block holds. The module header above is the statement of record.
+pub fn admission_bytes(figure: FrameworkFigure) -> u64 {
+    let (bytes, margin) = match figure {
+        FrameworkFigure::Assumed(bytes) => (bytes.max(0.0), UNOBSERVED_SHAPE_MARGIN),
+        FrameworkFigure::Exact(bytes) => (bytes as f64, UNOBSERVED_OP_MARGIN),
+    };
+    let charged = bytes * margin;
+    // A budget is compared against this, so a figure that is not a number would
+    // admit everything. Saturating at `u64::MAX` refuses everything instead,
+    // which is the safe direction for a quantity whose whole job is to say no.
+    if charged.is_finite() {
+        charged.round() as u64
+    } else {
+        u64::MAX
+    }
 }
 
 fn meminfo_field(meminfo: &str, field: &str) -> Option<u64> {

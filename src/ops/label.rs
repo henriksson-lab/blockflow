@@ -158,17 +158,27 @@
 // no arity, and the collision rule does not count. So a surprising count changes
 // which voxels are marked and nothing else, which is what it should change.
 
-use ndarray::{Array3, ArrayViewMut3, Axis, Slice};
+use ndarray::{Array3, ArrayView3, ArrayViewMut3, Axis, Slice};
 
+use std::collections::BTreeMap;
+
+use crate::decomposition::Decomposition;
 use crate::dtype::Dtype;
+use crate::env::{BlockBuf, Environment};
 use crate::error::{Error, Result};
 use crate::fragment::{BlockOutput, BlockView, FragmentInput, FragmentOp};
 use crate::geometry::BlockGrid;
+use crate::op::{Chain, Placement};
 use crate::points::{decode_points, Point};
 use crate::region::Region;
-use crate::sidecar::check_stream_name;
+use crate::sidecar::{check_stream_name, Lifecycle};
 use crate::voxels::Voxels;
 
+use super::components::{
+    bytes_to_words, core_within_read, empty_planes, expect_end, label_members_into_with, planes_of,
+    push_planes, read_header, take_planes, walk_seams_with, words_to_bytes, Connectivity,
+    FacePlanes, LabelIndex, Union, UNLABELLED,
+};
 use super::element::{StepOrigin, StructuringElement};
 use super::voxelize::block_reach;
 
@@ -683,6 +693,1090 @@ fn store(labels: &Array3<u64>, at: [usize; 3], into: &mut Voxels) -> Result<()> 
         }
     }
     Ok(())
+}
+
+// ============================================================================
+// A mask in, a **globally consistent** label volume out
+// ============================================================================
+//
+// Everything above this line is the op that stamps labels a caller already has.
+// Below it is the op that *derives* them: connected-component labelling over a
+// mask, decomposed, with one numbering that is a function of the volume and not
+// of where the volume was cut.
+//
+// Why this is here and not in `ops::fill`
+// ----------------------------------------
+// `ops::fill` and `ops::regional` already do nine tenths of it. Both label each
+// block locally, write the labels as a `u32` image, and close them across the
+// seams with the union-find in `ops::components`. Neither hands the closed
+// labelling back: `fill` collapses it to a mask of holes, `regional` to a mask
+// of maxima, and `detect` to a handful of points. The ops-survey index records
+// the consequence — *"no op under `src/ops/` produces a label volume, while
+// `ops::tabulate`'s header opens 'One row per region of a **label volume**', so
+// the crate's most complete per-object measurement cannot be driven by the
+// crate's own segmentation."* This module's subject is exactly "a label volume",
+// which is why the op lands beside [`LabelPointsOp`] rather than beside the two
+// ops whose machinery it borrows.
+//
+// The numbering, and why it is not the union-find's
+// --------------------------------------------------
+// A union-find hands back a **root node**, and a root node is
+// `(block, local label)` flattened — which is to say it is a function of the
+// decomposition, twice over: which block, and which label within it. Writing
+// `find(node) + 1` into the volume produces a correct *partition* whose *labels*
+// change when the block size changes. That is not a globally consistent label
+// volume; it is a globally consistent equivalence relation with a
+// decomposition-dependent name for each class, and every consumer that stores a
+// label — a table of regions, a graph whose vertices are labels, anything
+// written to disk and read back beside another run — is then wrong in a way no
+// per-voxel comparison catches.
+//
+// So the numbering is stated as a rule about the **volume**:
+//
+// > components are numbered from 1, in the order their lowest voxel is met in a
+// > row-major scan of the whole volume.
+//
+// That is `label_members_into_with`'s own rule — the one it applies inside a
+// block — lifted to the volume, and it is why the blocked answer here is
+// **byte-identical** to the whole-volume reference rather than merely a
+// relabelling of it. It costs one extra `u64` per block-local label in the
+// fragment: the least row-major index, in volume coordinates, of any voxel
+// carrying that label. `min` over that is associative, commutative and
+// idempotent, so folding it onto a component's root is order-independent for
+// exactly [`Union::fold_or`]'s reason, and [`Union::fold_min`] is that fold.
+//
+// Sorting the roots by their component's least voxel then gives a dense
+// numbering, and the sort has no ties to break: two distinct components cannot
+// share a least voxel, because a voxel belongs to one component.
+//
+// Two ways to spend the map, and this module ships both
+// ------------------------------------------------------
+// The merge's whole answer is a **table** — one `u32` per `(block, local
+// label)`. Its size is the number of block-local labels, which is the component
+// count plus whatever the cut splits, so it grows with the **lattice** and not
+// with the voxel count: it is the one quantity here that does not scale with the
+// volume. That is the premise the second design below rests on, so it is
+// asserted as a ratio at every grid rather than described —
+// `the_reconciliation_table_is_far_smaller_than_the_volume_it_reconciles` — and
+// [`GlobalLabels::table_bytes`] is measured rather than derived, because the
+// per-block overhead stops being negligible at a fine cut.
+//
+// What to *do* with that table is a design question with two answers, and they
+// differ in more than taste:
+//
+// | | what it is | what a consumer sees |
+// |---|---|---|
+// | **materialise** | [`RelabelComponentsOp`], a `fragments -> volume` phase that rewrites the local labels into global ones and writes a second `u32` image | an ordinary image |
+// | **decorate** | [`RelabelledEnvironment`], which applies the table to a read of the local-label image as the read is served | an ordinary image |
+//
+// The second subsumes the first: an identity op over a decorated environment
+// writes the materialised volume, so there is one mechanism and a trivial
+// materialiser rather than two mechanisms. What it costs is stated with the
+// type, and it is not lines of code — see [`RelabelledEnvironment`].
+//
+// **The materialising phase cannot be three phases**, and that is a framework
+// fact rather than a choice made here. The natural shape is label, merge,
+// relabel; `fragment::check_phase_work` refuses a pixel phase after a
+// fragment-only one, because the image that phase would read went unwritten. So
+// the merge folds into the relabelling phase, exactly as it does in
+// `ops::fill`, and every block re-runs the whole union-find — and, because a
+// whole-lattice fragment reach is also the halo, every block of that phase also
+// **reads the entire label image**. `ops::fill`'s header states that cost; this
+// op pays the same one, on an image four times as wide as a mask.
+//
+// The decorator does not pay it, and the reason is worth naming rather than
+// counting: the merge happens *outside* any phase, so nothing forces it to be a
+// halo. That is G7's barrier, obtained by not being in the plan.
+//
+// **What that costs the caller, and it is an invariant no type enforces.** The
+// merge must run between two `execute_phases` calls, because phases pipeline: a
+// consumer block may begin before every producer block has written its fragment,
+// so a table built lazily on first read would be built from an incomplete
+// fragment set and the run would fail — or not — depending on the schedule. The
+// cheap arm is therefore correct by the caller's discipline. `docs/design/
+// barriers.md` specifies what the framework would need in order to state it
+// instead, prices what not stating it costs, and says what a barrier would and
+// would not fix.
+//
+// What each design costs in invariants
+// -------------------------------------
+// The second axis, and the one that is not a number. Neither list is about how
+// much code there is; both are about what a *future* op on this machinery has to
+// keep true, and what happens when it does not.
+//
+// **Both designs share three**, and they come from the merge rather than from
+// either design:
+//
+// 1. the flood's connectivity and the seam walk's are one equivalence relation
+//    split in half, so a plan whose halves disagree answers differently
+//    depending on where the volume was cut. Checked at plan time by
+//    [`component_label_phases`], and *not* checkable for a caller driving the
+//    kernels by hand;
+// 2. every per-label fact the merge folds must be associative, commutative and
+//    idempotent, or two blocks fold it to two different answers. `fold_or` and
+//    [`Union::fold_min`] are; a running mean would not be, and nothing in the
+//    types says so;
+// 3. the local-label image is **decomposition-dependent** and must never be
+//    published, compared between runs or read by anything but the merge's own
+//    consumer.
+//
+// **Materialising adds two, both of them shaped like a wrong answer rather than
+// an error:**
+//
+// 4. the relabelling phase's read extent is the **whole volume**, so its `apply`
+//    must write only its own core. Reading block 3's label 2 as this block's
+//    label 2 produces a complete, well-formed, wrong volume;
+//    `components::core_within_read` exists because this is the third op on the
+//    shape and it is the third op that had to remember;
+// 5. it holds a **second** whole-volume image of the label width, alive with the
+//    first, per concurrent block — which is a constraint on everything else the
+//    plan wants alive at that phase, and it is not local to this op.
+//
+// **Decorating adds three, and the first is the expensive one to keep true:**
+//
+// 6. an `Environment` decorator's forwarding is total or it is wrong. Thirty-odd
+//    methods, most of them defaulted; a method left unforwarded silently reverts
+//    an inner environment's override to the trait default, and a method *added*
+//    to `Environment` later must be added here too. Nothing checks that;
+// 7. the table is a function of the labelling lattice, and the decorator applies
+//    it by coordinate. A table from another cut of the same volume is a
+//    well-formed wrong answer — `tests/global_labels.rs` asserts that it is
+//    wrong rather than pretending it is caught;
+// 8. the remap is paid **per reader**, so the cost of a decorated image is a
+//    property of the plan around it rather than of the image. That is not a
+//    hazard, it is the term the recommendation turns on, and
+//    `tests/label_materialisation_cost.rs` measures both sides of it.
+//
+// Five against six is not the comparison; **4 and 7 are the same kind of thing**
+// — an addressing scheme applied under the wrong numbering — and 6 is the one
+// with no analogue on the other side.
+
+/// What one block tells the component merge about itself.
+///
+/// The six face planes, plus one `u64` per local label. Deliberately not the
+/// block's label volume: what the merge needs is which labels meet across a
+/// seam, and only the faces can say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentFaces {
+    /// How many components this block found on its own.
+    pub labels: u32,
+    /// Per label, the least row-major index **in volume coordinates** of a voxel
+    /// carrying it. This is what makes the global numbering a function of the
+    /// volume; see the section header.
+    pub first: Vec<u64>,
+    /// The six faces, ordered `axis * 2 + side` with side 0 low and 1 high.
+    pub faces: FacePlanes,
+}
+
+impl ComponentFaces {
+    /// Read a block's faces off its label volume, given the per-label first
+    /// voxels [`first_voxels`] computed.
+    pub fn of(labels: ArrayView3<'_, u32>, count: u32, first: Vec<u64>) -> Result<Self> {
+        if first.len() != count as usize {
+            return Err(Error::InvalidArgument(format!(
+                "{count} labels but {} first-voxel entries",
+                first.len()
+            )));
+        }
+        Ok(Self {
+            labels: count,
+            first,
+            faces: planes_of(labels),
+        })
+    }
+
+    /// The empty report: a block with nothing to say, which is what an
+    /// accounting run produces and is a different fact from no fragment at all.
+    pub fn empty() -> Self {
+        Self {
+            labels: 0,
+            first: Vec::new(),
+            faces: empty_planes(),
+        }
+    }
+
+    /// A self-describing byte form: little-endian `u32` throughout, with a magic
+    /// and a version in front, and each `u64` as low word then high word. See
+    /// `components::read_header` for why the magic is not decoration.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut words: Vec<u32> = vec![COMPONENT_MAGIC, COMPONENT_VERSION, self.labels];
+        for &first in &self.first {
+            words.push(first as u32);
+            words.push((first >> 32) as u32);
+        }
+        push_planes(&self.faces, &mut words);
+        words_to_bytes(&words)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        const NOUN: &str = "a component-faces fragment";
+        let words = bytes_to_words(bytes, NOUN)?;
+        let labels = read_header(&words, COMPONENT_MAGIC, COMPONENT_VERSION, NOUN)?;
+        let mut at = 3usize;
+        let end = at + 2 * labels as usize;
+        if words.len() < end {
+            return Err(Error::InvalidArgument(format!(
+                "{NOUN} ends inside its first-voxel table"
+            )));
+        }
+        let first = words[at..end]
+            .chunks_exact(2)
+            .map(|pair| pair[0] as u64 | ((pair[1] as u64) << 32))
+            .collect();
+        at = end;
+        let faces = take_planes(&words, &mut at, NOUN)?;
+        expect_end(&words, at, NOUN)?;
+        Ok(Self {
+            labels,
+            first,
+            faces,
+        })
+    }
+}
+
+/// `"CMPN"` little-endian.
+const COMPONENT_MAGIC: u32 = 0x4e50_4d43;
+const COMPONENT_VERSION: u32 = 1;
+
+/// Per local label, the least row-major index in **volume** coordinates of a
+/// voxel carrying it.
+///
+/// `offset` is where the block's labels sit in the volume and `volume` is the
+/// whole extent, so the index computed is the one a whole-volume scan would
+/// have reached that voxel at. Unlabelled voxels take no part.
+///
+/// The `min` is written out rather than relying on the scan order agreeing with
+/// the volume's. It does agree — row-major over a box is the volume's row-major
+/// restricted to that box, both being lexicographic on the coordinate triple —
+/// but the fold below is a `min` and this being one too means the two cannot
+/// come apart if the traversal here is ever reordered.
+pub fn first_voxels(
+    labels: ArrayView3<'_, u32>,
+    count: u32,
+    offset: [usize; 3],
+    volume: [usize; 3],
+) -> Vec<u64> {
+    let mut first = vec![u64::MAX; count as usize];
+    let shape = [labels.shape()[0], labels.shape()[1], labels.shape()[2]];
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let label = labels[[i, j, k]];
+                if label == UNLABELLED {
+                    continue;
+                }
+                let at = ((offset[0] + i) as u64 * volume[1] as u64 + (offset[1] + j) as u64)
+                    * volume[2] as u64
+                    + (offset[2] + k) as u64;
+                let slot = &mut first[label as usize - 1];
+                if at < *slot {
+                    *slot = at;
+                }
+            }
+        }
+    }
+    first
+}
+
+// ------------------------------------------------------------ the merge --
+
+/// The whole answer of the merge: what every block-local label is called in the
+/// volume.
+///
+/// One `u32` per `(block, local label)`, and nothing else. That is what makes
+/// the second design below possible at all — the reconciliation between a
+/// decomposed labelling and a global one is a **table**, not a volume, and it is
+/// smaller than the volume by the ratio of voxels to components.
+pub struct GlobalLabels {
+    /// Per block, per local label minus one, the global label.
+    per_block: BTreeMap<[usize; 3], Vec<u32>>,
+    components: u32,
+    /// The labelling lattice: how the volume was cut when the local labels were
+    /// written. A voxel's block is `coordinate / block`, so this is what turns a
+    /// read region back into the numbering it was written under.
+    block: [usize; 3],
+    lattice: [usize; 3],
+    volume: [usize; 3],
+}
+
+impl GlobalLabels {
+    /// Close every block's local labels into components and number the
+    /// components by where their lowest voxel sits in the volume.
+    ///
+    /// `connectivity` **must** be the one the labelling ran under, for
+    /// `ops::components`' reason: the flood inside a block and the walk across a
+    /// seam generate one equivalence relation between them.
+    pub fn merge(
+        reports: &BTreeMap<[usize; 3], ComponentFaces>,
+        grid: &BlockGrid,
+        connectivity: Connectivity,
+    ) -> Result<Self> {
+        let counts = grid.blocks_per_axis();
+        let index = LabelIndex::build(reports, counts, |report| report.labels)?;
+        let firsts = index.gather(reports, |report| &report.first[..], u64::MAX);
+        let mut sets = Union::new(index.total());
+        walk_seams_with(
+            reports,
+            counts,
+            &index,
+            connectivity,
+            |report| &report.faces,
+            |a, b| sets.union(a, b),
+        )?;
+
+        // Every component's least voxel, then the components in the order a
+        // whole-volume scan would have met them. `sort_unstable` is enough
+        // because the keys are distinct: two components cannot share a voxel.
+        let least = sets.fold_min(&firsts);
+        let mut roots: Vec<(u64, usize)> = (0..index.total())
+            .filter(|&node| sets.find(node) == node)
+            .map(|node| (least[node], node))
+            .collect();
+        roots.sort_unstable();
+        // Ascending, so a component with no voxel of its own — `u64::MAX` from
+        // `gather`'s `missing` — sorts to the **end** and is checked there.
+        if let Some(&(first, node)) = roots.last() {
+            if first == u64::MAX {
+                return Err(Error::InvalidArgument(format!(
+                    "component {node} has no voxel of its own, so the fragments carry more \
+                     labels than the label volume does. The two are written by one call and a \
+                     mismatch means they came from different runs."
+                )));
+            }
+        }
+        if roots.len() > u32::MAX as usize {
+            return Err(Error::InvalidArgument(format!(
+                "{} components, which is more than a `u32` label volume holds. The local \
+                 labels this closes are themselves `u32` per block, so this is reachable only \
+                 on a lattice with more blocks than a single block has labels.",
+                roots.len()
+            )));
+        }
+        let mut named = vec![0u32; index.total()];
+        for (rank, &(_, root)) in roots.iter().enumerate() {
+            named[root] = rank as u32 + 1;
+        }
+
+        Ok(Self {
+            per_block: index.per_block_of(&mut sets, &named),
+            components: roots.len() as u32,
+            block: grid.block(),
+            lattice: counts,
+            volume: grid.volume(),
+        })
+    }
+
+    /// How many components the volume has.
+    pub fn components(&self) -> u32 {
+        self.components
+    }
+
+    /// The lattice the local labels were written on.
+    pub fn lattice(&self) -> [usize; 3] {
+        self.lattice
+    }
+
+    /// The block edge the local labels were written on.
+    pub fn block(&self) -> [usize; 3] {
+        self.block
+    }
+
+    /// The bytes this table occupies, which is the figure the two designs are
+    /// compared on and the one a decorated read has to hold resident.
+    ///
+    /// The payload only — the `u32` per `(block, label)` — plus the `BTreeMap`'s
+    /// own key and `Vec` header per block, which at a fine lattice is not
+    /// negligible and is the reason it is counted rather than derived from the
+    /// component count.
+    pub fn table_bytes(&self) -> usize {
+        let entries: usize = self.per_block.values().map(|labels| labels.len()).sum();
+        entries * std::mem::size_of::<u32>()
+            + self.per_block.len()
+                * (std::mem::size_of::<[usize; 3]>() + std::mem::size_of::<Vec<u32>>())
+    }
+
+    /// What block `block`'s local labels are called in the volume, indexed
+    /// `[local - 1]`.
+    pub fn labels_of(&self, block: [usize; 3]) -> Result<&[u32]> {
+        self.per_block
+            .get(&block)
+            .map(|labels| &labels[..])
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "the merge produced no answer for block {block:?} of a {:?} lattice. The \
+                     table is built from the same fragments the labels were written with, so a \
+                     missing block means the two came from different runs.",
+                    self.lattice
+                ))
+            })
+    }
+
+    /// Rewrite a block's local labels into global ones.
+    pub fn remap_block(
+        &self,
+        block: [usize; 3],
+        labels: ArrayView3<'_, u32>,
+        mut out: ArrayViewMut3<'_, u32>,
+    ) -> Result<()> {
+        super::shapes_agree(labels.shape(), out.shape(), "GlobalLabels::remap_block")?;
+        let table = self.labels_of(block)?;
+        for (slot, &label) in out.iter_mut().zip(labels.iter()) {
+            *slot = self.lookup(table, label, block)?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite a **read region** of the label volume in place.
+    ///
+    /// This is the decorator's kernel and it is where the design earns or loses:
+    /// the region is whatever a consumer asked for and need not be one block, so
+    /// every voxel is looked up under *its own* block's numbering. A halo, a
+    /// differently cut consumer lattice and a whole-volume read are all the same
+    /// case.
+    ///
+    /// One table lookup per `(row, block)` rather than per voxel: within a row
+    /// the block index changes only at a lattice plane, so the run between two
+    /// planes shares one slice.
+    pub fn remap_region(&self, region: &Region, mut labels: ArrayViewMut3<'_, u32>) -> Result<()> {
+        let shape = [labels.shape()[0], labels.shape()[1], labels.shape()[2]];
+        for axis in 0..3 {
+            let end = region.start[axis] + region.shape[axis];
+            if region.shape[axis] != shape[axis] || end > self.volume[axis] {
+                return Err(Error::InvalidArgument(format!(
+                    "a read of {:?}+{:?} arrived as a {shape:?} buffer over a {:?} volume. A \
+                     decorated read is rewritten by position, so the region and the buffer it \
+                     holds have to be the same box.",
+                    region.start, region.shape, self.volume
+                )));
+            }
+        }
+        for i in 0..shape[0] {
+            let bi = (region.start[0] + i) / self.block[0];
+            for j in 0..shape[1] {
+                let bj = (region.start[1] + j) / self.block[1];
+                let mut k = 0usize;
+                while k < shape[2] {
+                    let global = region.start[2] + k;
+                    let bk = global / self.block[2];
+                    let stop = (((bk + 1) * self.block[2]) - region.start[2]).min(shape[2]);
+                    let block = [bi, bj, bk];
+                    let table = self.labels_of(block)?;
+                    for slot in k..stop {
+                        let label = labels[[i, j, slot]];
+                        if label != UNLABELLED {
+                            labels[[i, j, slot]] = self.lookup(table, label, block)?;
+                        }
+                    }
+                    k = stop;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup(&self, table: &[u32], label: u32, block: [usize; 3]) -> Result<u32> {
+        if label == UNLABELLED {
+            return Ok(UNLABELLED);
+        }
+        table.get(label as usize - 1).copied().ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "block {block:?} carries label {label} and the merge gave it {} labels. The \
+                 table and the label volume are written by one call, so a gap means the two \
+                 came from different runs.",
+                table.len()
+            ))
+        })
+    }
+}
+
+// ------------------------------------------------------------- the phases --
+
+/// Phase 0: label each block's components and say what crosses its faces.
+///
+/// **Reach zero.** A block-local labelling reads nothing outside its own core;
+/// everything that would need a neighbour is in the fragment instead.
+///
+/// It writes the `u32` local labels as an image, and that image is
+/// **decomposition-dependent on purpose** — the same voxel is label 4 under one
+/// cut and label 11 under another. `ops::fill`'s header makes the argument and
+/// it holds unchanged here: the local labels are an addressing scheme, and the
+/// only things that read them are the merge's table and the rewrite that
+/// consumes it, both of which are built from the same fragments.
+pub struct LabelComponentsOp {
+    name: &'static str,
+    stream: String,
+    lifecycle: Lifecycle,
+    connectivity: Connectivity,
+}
+
+impl LabelComponentsOp {
+    pub fn new(name: &'static str, stream: impl Into<String>, lifecycle: Lifecycle) -> Self {
+        Self {
+            name,
+            stream: stream.into(),
+            lifecycle,
+            connectivity: Connectivity::Faces,
+        }
+    }
+
+    /// The same op, flooding under a stated [`Connectivity`].
+    pub fn connecting(mut self, connectivity: Connectivity) -> Self {
+        self.connectivity = connectivity;
+        self
+    }
+
+    pub fn connectivity(&self) -> Connectivity {
+        self.connectivity
+    }
+
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+}
+
+impl FragmentOp for LabelComponentsOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reads_pixels(&self) -> bool {
+        true
+    }
+
+    fn writes_pixels(&self) -> bool {
+        true
+    }
+
+    /// Labels, whatever the mask arrived as. The same statement
+    /// `ops::fill::LabelBackgroundOp` makes and for the same reason: a label is
+    /// an integer and the width is this op's to name.
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::U32
+    }
+
+    fn outputs(&self) -> Vec<crate::fragment::FragmentOutput> {
+        vec![crate::fragment::FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            crate::fragment::Coverage::EveryBlock,
+        )]
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let mut buffer = at.output_buffer(0.0)?;
+        let BlockBuf::Array(pixels) = at.pixels()? else {
+            // An accounting run has no data. "Present and empty" is a different
+            // fact from "absent", which is what `Coverage::EveryBlock` checks.
+            return Ok(BlockOutput::fragment(
+                self.stream.clone(),
+                ComponentFaces::empty().encode(),
+            )
+            .with_pixels(buffer));
+        };
+        let mask = super::fill::as_mask(pixels)?;
+        let shape = [mask.shape()[0], mask.shape()[1], mask.shape()[2]];
+        let BlockBuf::Array(out) = &mut buffer else {
+            unreachable!("the environment gave data for the input and none for the output");
+        };
+        let mut view = out.view_mut::<u32>()?;
+        let count =
+            label_members_into_with(shape, self.connectivity, |at| mask[at], view.view_mut())?;
+        let first = first_voxels(view.view(), count, at.at.offset, at.at.volume);
+        let faces = ComponentFaces::of(view.view(), count, first)?;
+        Ok(BlockOutput::fragment(self.stream.clone(), faces.encode()).with_pixels(buffer))
+    }
+}
+
+/// Phase 1: close the components and write the **global** label volume.
+///
+/// This is the *materialising* half of the pair, in the shape the framework
+/// admits. Declares a whole-lattice fragment reach, which is what makes it a
+/// planning barrier — and which is also its halo, so every block of this phase
+/// reads the whole `u32` local-label image. `ops::fill` pays exactly this and
+/// its header is where the coupling is argued; the difference here is only that
+/// the image being re-read per block is four bytes a voxel rather than one.
+///
+/// The merge is re-run per block for the same reason: the three-phase shape —
+/// label, merge, relabel — is refused by `fragment::check_phase_work`, because
+/// the fragment-only middle phase would leave its image unwritten.
+pub struct RelabelComponentsOp {
+    name: &'static str,
+    stream: String,
+    faces_phase: usize,
+    lattice: [usize; 3],
+    connectivity: Connectivity,
+}
+
+impl RelabelComponentsOp {
+    /// `faces_phase` is the phase whose blocks wrote the faces — part of the
+    /// address rather than a default, for `FragmentInput`'s reason.
+    pub fn new(
+        name: &'static str,
+        stream: impl Into<String>,
+        faces_phase: usize,
+        grid: &BlockGrid,
+    ) -> Self {
+        Self {
+            name,
+            stream: stream.into(),
+            faces_phase,
+            lattice: grid.blocks_per_axis(),
+            connectivity: Connectivity::Faces,
+        }
+    }
+
+    /// The same op, addressed by a [`crate::assemble::Phase`] handle.
+    pub fn reading(
+        name: &'static str,
+        stream: impl Into<String>,
+        faces: crate::assemble::Phase,
+        grid: &BlockGrid,
+    ) -> Self {
+        Self::new(name, stream, faces.index(), grid)
+    }
+
+    /// The same op, closing the components under a stated [`Connectivity`]. It
+    /// must be the labelling's; [`component_label_phases`] checks the pair.
+    pub fn connecting(mut self, connectivity: Connectivity) -> Self {
+        self.connectivity = connectivity;
+        self
+    }
+
+    pub fn connectivity(&self) -> Connectivity {
+        self.connectivity
+    }
+
+    pub fn lattice(&self) -> [usize; 3] {
+        self.lattice
+    }
+}
+
+impl FragmentOp for RelabelComponentsOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reads_pixels(&self) -> bool {
+        true
+    }
+
+    fn writes_pixels(&self) -> bool {
+        true
+    }
+
+    /// A label volume in, a label volume out — the same width, and this is the
+    /// one op in the pair for which "unchanged" is the honest answer.
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::U32
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![FragmentInput::own(self.stream.clone(), self.faces_phase).with_reach(self.lattice)]
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let mut buffer = at.output_buffer(0.0)?;
+        let BlockBuf::Array(pixels) = at.pixels()? else {
+            return Ok(BlockOutput::nothing().with_pixels(buffer));
+        };
+        let labels = pixels.view::<u32>()?;
+
+        let mut reports = BTreeMap::new();
+        for (key, bytes) in at.fragments(&self.stream) {
+            reports.insert(key.block, ComponentFaces::decode(bytes)?);
+        }
+        let global = GlobalLabels::merge(&reports, at.grid, self.connectivity)?;
+
+        // **Only the core.** The whole-lattice fragment reach is also the halo,
+        // so the buffer holds every block's labels under every block's own
+        // numbering; `components::core_within_read` states the argument.
+        let (offset, extent) = core_within_read(at)?;
+        let window = ndarray::s![
+            offset[0]..offset[0] + extent[0],
+            offset[1]..offset[1] + extent[1],
+            offset[2]..offset[2] + extent[2],
+        ];
+        let BlockBuf::Array(out) = &mut buffer else {
+            unreachable!("the environment gave data for the input and none for the output");
+        };
+        let mut view = out.view_mut::<u32>()?;
+        global.remap_block(at.index, labels.slice(window), view.slice_mut(window))?;
+        Ok(BlockOutput::nothing().with_pixels(buffer))
+    }
+}
+
+/// The two phases, on one lattice: a mask on image 0, local labels on image 1,
+/// the global label volume on image 2.
+///
+/// **The two connectivities are checked here**, which is the only place both ops
+/// are in one hand. See `ops::fill::agree_on_connectivity`.
+pub fn component_label_phases(
+    grid: BlockGrid,
+    mask_dtype: Dtype,
+    label: &LabelComponentsOp,
+    relabel: &RelabelComponentsOp,
+) -> Result<Decomposition> {
+    super::fill::agree_on_connectivity(label.connectivity(), relabel.connectivity())?;
+    let volume = grid.volume();
+    let mut labelling = crate::fragment::fragment_phase(label, grid.clone())?;
+    labelling.dtype = Some(label.produces(mask_dtype));
+    let mut relabelling = crate::fragment::fragment_phase(relabel, grid)?;
+    relabelling.dtype = Some(relabel.produces(Dtype::U32));
+    let plan = Decomposition {
+        volume,
+        dtype: mask_dtype,
+        phases: vec![labelling, relabelling],
+        chain_reach: [0, 0, 0],
+    };
+    plan.check()?;
+    Ok(plan)
+}
+
+/// One phase: label each block and stop. What the **decorated** design plans,
+/// and the whole of what it plans.
+///
+/// The merge that closes the labels is not a phase here — it is
+/// [`GlobalLabels::merge`], run once over the fragments this phase left behind.
+/// That is the difference the measurement is about: a merge that is not a phase
+/// is not a halo either, so nothing re-reads the label image and nothing re-runs
+/// the union-find per block.
+pub fn component_labelling_phase(
+    grid: BlockGrid,
+    mask_dtype: Dtype,
+    label: &LabelComponentsOp,
+) -> Result<Decomposition> {
+    let volume = grid.volume();
+    let mut labelling = crate::fragment::fragment_phase(label, grid)?;
+    labelling.dtype = Some(label.produces(mask_dtype));
+    let plan = Decomposition {
+        volume,
+        dtype: mask_dtype,
+        phases: vec![labelling],
+        chain_reach: [0, 0, 0],
+    };
+    plan.check()?;
+    Ok(plan)
+}
+
+/// Gather every block's component fragment out of a finished run's sidecars.
+///
+/// The counterpart of the executor's own gather, for the case where the merge is
+/// **not** a phase. `Coverage::EveryBlock` is checked by the executor at the end
+/// of the phase, so a stream that gets here has one fragment per block; a
+/// missing one is still refused rather than assumed empty, because
+/// `LabelIndex::build` cannot tell the two apart and would be wrong either way.
+pub fn gather_component_faces(
+    env: &dyn Environment,
+    stream: &str,
+    phase: usize,
+    grid: &BlockGrid,
+) -> Result<BTreeMap<[usize; 3], ComponentFaces>> {
+    let counts = grid.blocks_per_axis();
+    let mut reports = BTreeMap::new();
+    for i in 0..counts[0] {
+        for j in 0..counts[1] {
+            for k in 0..counts[2] {
+                let block = [i, j, k];
+                let bytes = env.read_sidecar(stream, phase, block)?.ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "block {block:?} wrote no {stream:?} fragment in phase {phase}. The \
+                         stream is declared every-block, so a missing one is a block that did \
+                         not run rather than a block with nothing to say."
+                    ))
+                })?;
+                reports.insert(block, ComponentFaces::decode(&bytes)?);
+            }
+        }
+    }
+    Ok(reports)
+}
+
+// ---------------------------------------------------------- the decorator --
+
+/// An [`Environment`] that applies a [`GlobalLabels`] table to reads of one
+/// image, so that a consumer of the **local** label volume sees the **global**
+/// one without a global label volume existing anywhere.
+///
+/// What this is, mechanically
+/// --------------------------
+/// Every read the executor performs goes through `Environment::read(image,
+/// region)`. This forwards all of them and rewrites the buffer for one of them.
+/// The region is whatever the consumer asked for — a core, a core with a halo, a
+/// whole volume — and [`GlobalLabels::remap_region`] handles all of those by
+/// looking each voxel up under the block it was *written* by, which is a
+/// function of its coordinate and the labelling lattice. So the consumer's
+/// lattice need not be the labelling's, and nothing about the consumer changes.
+///
+/// **A trivial materialiser over this is the other design.** A one-op identity
+/// plan reading the decorated image writes the global label volume as an
+/// ordinary image. That is the whole of why this is offered as the decorator and
+/// not as a pair of unrelated features: there is one mechanism, and
+/// materialisation is a use of it.
+///
+/// What it costs, and it is not lines
+/// -----------------------------------
+/// Three things, and every one of them is an invariant some future op has to
+/// respect rather than a quantity that can be measured once:
+///
+/// 1. **The forwarding is total or it is wrong.** `Environment` has thirty-odd
+///    methods and most of them are defaulted. A decorator that forwards only the
+///    required ones silently reverts every overridden default to the trait's —
+///    an inner environment that overrode `slice` to avoid a copy, or
+///    `read_sidecar` to go to a network store, would be bypassed and the run
+///    would still produce a well-formed answer. So every method is forwarded
+///    here, including the ones whose defaults are currently what the inner
+///    environment uses, and a method added to `Environment` later is a method
+///    that must be added here too. Nothing checks that.
+/// 2. **The table has to be right about the lattice.** The remap reads a voxel's
+///    block off its coordinate, so a table built on a different lattice from the
+///    one the labels were written on produces a complete, well-formed, wrong
+///    volume. [`GlobalLabels`] carries the lattice it was built on and
+///    [`GlobalLabels::remap_region`] refuses a region outside the volume, but it
+///    cannot check that the image it is being applied to is the image the labels
+///    were written into — the `image` number is the caller's statement.
+/// 3. **It is a read-time cost, so it is paid per reader.** Two consumers of the
+///    same label volume remap it twice; a materialised volume is remapped once.
+///    That is the axis the measurement is about, and it is the one the
+///    complexity argument cannot settle.
+///
+/// What it does **not** cost is the one thing the "avoid a write" framing
+/// suggests: see the acceptance suite for what the write is actually worth
+/// against what the phase that would have written it costs.
+pub struct RelabelledEnvironment<'e> {
+    inner: &'e dyn Environment,
+    image: usize,
+    table: std::sync::Arc<GlobalLabels>,
+    /// Reads intercepted and rewritten, so a run can assert the decoration
+    /// happened rather than assume it. A decoration that silently matched no
+    /// read would leave local labels in place and answer plausibly.
+    remapped: std::sync::atomic::AtomicU64,
+}
+
+impl<'e> RelabelledEnvironment<'e> {
+    /// Decorate reads of `image` with `table`.
+    pub fn new(
+        inner: &'e dyn Environment,
+        image: impl Into<crate::assemble::ImageId>,
+        table: std::sync::Arc<GlobalLabels>,
+    ) -> Self {
+        Self {
+            inner,
+            image: image.into().index(),
+            table,
+            remapped: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The table this applies.
+    pub fn table(&self) -> &GlobalLabels {
+        &self.table
+    }
+
+    /// How many reads have been intercepted and rewritten.
+    pub fn remapped_reads(&self) -> u64 {
+        self.remapped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Environment for RelabelledEnvironment<'_> {
+    fn volume(&self) -> [usize; 3] {
+        self.inner.volume()
+    }
+
+    fn prepare(&self, decomposition: &Decomposition) -> Result<()> {
+        self.inner.prepare(decomposition)
+    }
+
+    /// The one method that is not a forward.
+    ///
+    /// The rewrite is in place on the buffer the inner environment just
+    /// produced, so nothing is allocated here and the bytes the counters
+    /// recorded are the bytes that moved. An `Accounted` buffer — a costing run
+    /// — carries no data and is passed through: there is nothing to rewrite and
+    /// the cost of the read is unchanged by whether it is decorated.
+    fn read(&self, image: usize, region: &Region) -> Result<BlockBuf> {
+        let mut buf = self.inner.read(image, region)?;
+        if image != self.image {
+            return Ok(buf);
+        }
+        if let BlockBuf::Array(voxels) = &mut buf {
+            if voxels.dtype() != Dtype::U32 {
+                return Err(Error::InvalidArgument(format!(
+                    "image {image} is decorated with a global label table and holds {:?}. The \
+                     table is a map from the `u32` labels `ops::label`'s labelling phase writes, \
+                     so a different width is a different image.",
+                    voxels.dtype()
+                )));
+            }
+            self.table.remap_region(region, voxels.view_mut::<u32>()?)?;
+            self.remapped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(buf)
+    }
+
+    fn apply(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Placement,
+    ) -> Result<BlockBuf> {
+        self.inner.apply(slot, input, sources, at)
+    }
+
+    fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
+        self.inner.write(image, within, valid, buf)
+    }
+
+    fn declare_side_output(&self, output: &crate::op::Output) -> Result<()> {
+        self.inner.declare_side_output(output)
+    }
+
+    fn apply_side(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        primary: &BlockBuf,
+        block: &crate::op::SideBlock<'_>,
+    ) -> Result<Vec<crate::voxels::SideBuf>> {
+        self.inner.apply_side(slot, input, sources, primary, block)
+    }
+
+    fn write_side(
+        &self,
+        output: &crate::op::Output,
+        phase: usize,
+        region: &Region,
+        buf: &crate::voxels::SideBuf,
+    ) -> Result<()> {
+        self.inner.write_side(output, phase, region, buf)
+    }
+
+    fn put_side(
+        &self,
+        output: &crate::op::Output,
+        phase: usize,
+        region: &Region,
+        buf: &crate::voxels::SideBuf,
+    ) -> Result<()> {
+        self.inner.put_side(output, phase, region, buf)
+    }
+
+    fn side_constant(&self, region: &Region) -> crate::voxels::SideBuf {
+        self.inner.side_constant(region)
+    }
+
+    fn release_side(&self, buf: &crate::voxels::SideBuf) {
+        self.inner.release_side(buf)
+    }
+
+    fn uniform(&self, buf: &BlockBuf) -> Option<f64> {
+        self.inner.uniform(buf)
+    }
+
+    fn constant(&self, dtype: Dtype, region: &Region, value: f64) -> Result<BlockBuf> {
+        self.inner.constant(dtype, region, value)
+    }
+
+    fn release(&self, buf: &BlockBuf) {
+        self.inner.release(buf)
+    }
+
+    fn slice(&self, buf: &BlockBuf, holds: &Region, region: &Region) -> Result<BlockBuf> {
+        self.inner.slice(buf, holds, region)
+    }
+
+    fn place(
+        &self,
+        target: &mut BlockBuf,
+        holds: &Region,
+        region: &Region,
+        source: &BlockBuf,
+    ) -> Result<()> {
+        self.inner.place(target, holds, region, source)
+    }
+
+    fn same(&self, left: &BlockBuf, right: &BlockBuf) -> Option<bool> {
+        self.inner.same(left, right)
+    }
+
+    fn apply_substage(
+        &self,
+        op: &dyn crate::iterate::IterativeOp,
+        index: usize,
+        operands: &[BlockBuf],
+        at: &crate::op::Anchor,
+    ) -> Result<BlockBuf> {
+        self.inner.apply_substage(op, index, operands, at)
+    }
+
+    fn finish(&self, image: usize) -> Result<()> {
+        self.inner.finish(image)
+    }
+
+    fn discard_image(&self, image: usize) -> Result<()> {
+        self.inner.discard_image(image)
+    }
+
+    fn discard_image_after(&self, image: usize, phase: usize) -> Result<()> {
+        self.inner.discard_image_after(image, phase)
+    }
+
+    fn counters(&self) -> &crate::env::EnvCounters {
+        self.inner.counters()
+    }
+
+    fn chunk_shape(&self) -> [usize; 3] {
+        self.inner.chunk_shape()
+    }
+
+    fn sidecars(&self) -> Option<&crate::sidecar::Sidecars> {
+        self.inner.sidecars()
+    }
+
+    fn require_sidecars(&self) -> Result<&crate::sidecar::Sidecars> {
+        self.inner.require_sidecars()
+    }
+
+    fn declare_sidecar(&self, stream: &str, lifecycle: Lifecycle) -> Result<()> {
+        self.inner.declare_sidecar(stream, lifecycle)
+    }
+
+    fn write_sidecar(
+        &self,
+        stream: &str,
+        phase: usize,
+        block: [usize; 3],
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.inner.write_sidecar(stream, phase, block, bytes)
+    }
+
+    fn read_sidecar(
+        &self,
+        stream: &str,
+        phase: usize,
+        block: [usize; 3],
+    ) -> Result<Option<Vec<u8>>> {
+        self.inner.read_sidecar(stream, phase, block)
+    }
+
+    fn sidecar_keys(&self, stream: &str) -> Result<Vec<crate::sidecar::FragmentKey>> {
+        self.inner.sidecar_keys(stream)
+    }
+
+    fn sidecar_fragments(
+        &self,
+        stream: &str,
+    ) -> Result<Vec<(crate::sidecar::FragmentKey, Vec<u8>)>> {
+        self.inner.sidecar_fragments(stream)
+    }
+
+    fn discard_sidecars(&self) -> Result<crate::sidecar::Discarded> {
+        self.inner.discard_sidecars()
+    }
 }
 
 #[cfg(test)]

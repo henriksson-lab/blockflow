@@ -364,8 +364,13 @@ fn sweep(
                     // same, which is to say only where the enumeration's own
                     // choice was made by rounding rather than by its tie-break.
                     let cost = |plan: &Decomposition| {
-                        predicted_cost(&case(seed, min_slots, span, arithmetic).chain, plan, &model)
-                            .expect("a plan the search returned prices")
+                        predicted_cost(
+                            &case(seed, min_slots, span, arithmetic).chain,
+                            plan,
+                            &[],
+                            &model,
+                        )
+                        .expect("a plan the search returned prices")
                     };
                     let (mine, theirs) = (cost(&dp), cost(&exhaustive));
                     assert!(

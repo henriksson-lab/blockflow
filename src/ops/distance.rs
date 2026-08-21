@@ -179,7 +179,7 @@
 use ndarray::{Array3, ArrayView3, Axis as NdAxis};
 
 use crate::assemble::{Assembly, Phase, PlanBuilder};
-use crate::decomposition::{price_phase, CostModel};
+use crate::decomposition::{price_phase, CostModel, PhaseTraffic};
 use crate::error::{Error, Result};
 use crate::geometry::BlockGrid;
 use crate::op::{Anchor, BlockOp, Chain};
@@ -788,13 +788,25 @@ pub fn working_set_bytes(
         .map(|phase| {
             price_phase(
                 &phase.grid,
-                &phase.reach,
+                // The **halo**, because that is the extent a block fetches and
+                // therefore the extent it holds; the reach is the narrower thing
+                // the halo is required to cover. Measured across this stage's
+                // plans at three volumes and three block edges, every phase has
+                // `reach == halo` and the substitution moves no figure in the
+                // table above — so this is the contract being stated correctly
+                // rather than a re-baselining, and a future `plan` that grants a
+                // wider halo will now be charged for it instead of silently not.
+                &phase.halo,
                 0.0,
                 1,
                 true,
                 8.0,
                 &CostModel::default(),
                 1.0,
+                // `working_set_bytes_per_block` is deliberately independent of
+                // the traffic figure — see `PhaseTraffic` — so this argument
+                // does not reach the number read below.
+                PhaseTraffic::one_in_one_out(),
             )
             .working_set_bytes_per_block
         })

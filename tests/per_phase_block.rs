@@ -294,8 +294,8 @@ fn a_search_that_cannot_see_task_count_takes_one_block_everywhere() {
     assert_eq!(total(&informed), 32768);
     let model = constraints().model;
     let (workflow, _, _) = plan(8);
-    let control_time = predicted_makespan(&workflow.chain, &control, &model, 8).unwrap();
-    let informed_time = predicted_makespan(&workflow.chain, &informed, &model, 8).unwrap();
+    let control_time = predicted_makespan(&workflow.chain, &control, &[], &model, 8).unwrap();
+    let informed_time = predicted_makespan(&workflow.chain, &informed, &[], &model, 8).unwrap();
     assert_eq!(control_time / informed_time, 2.6);
 }
 
@@ -328,13 +328,13 @@ fn the_local_phase_is_six_times_faster_for_no_extra_reading() {
         "the cut moved no bytes, which is the point"
     );
     assert_eq!(
-        predicted_cost(&workflow.chain, &informed, &constraints.model).unwrap(),
-        predicted_cost(&workflow.chain, &uncut, &constraints.model).unwrap(),
+        predicted_cost(&workflow.chain, &informed, &[], &constraints.model).unwrap(),
+        predicted_cost(&workflow.chain, &uncut, &[], &constraints.model).unwrap(),
         "and it changed no work, which is why the old objective was blind to it"
     );
 
-    let cut = predicted_makespan(&workflow.chain, &informed, &constraints.model, 8).unwrap();
-    let whole = predicted_makespan(&workflow.chain, &uncut, &constraints.model, 8).unwrap();
+    let cut = predicted_makespan(&workflow.chain, &informed, &[], &constraints.model, 8).unwrap();
+    let whole = predicted_makespan(&workflow.chain, &uncut, &[], &constraints.model, 8).unwrap();
     assert_eq!(whole, 245760.0);
     assert_eq!(cut, 81920.0);
     // The plan-level figure is diluted by the join phase, which is one block
@@ -347,7 +347,7 @@ fn the_local_phase_is_six_times_faster_for_no_extra_reading() {
     // saves a materialisation and pays for it in wall clock.
     let (_, control, _) = plan(1);
     let control_makespan =
-        predicted_makespan(&workflow.chain, &control, &constraints.model, 8).unwrap();
+        predicted_makespan(&workflow.chain, &control, &[], &constraints.model, 8).unwrap();
     assert_eq!(control_makespan, 212992.0);
     assert_eq!(control_makespan / cut, 2.6);
 }
@@ -512,14 +512,14 @@ fn the_plan_is_the_minimum_of_the_objective_it_claims() {
     for workers in [1usize, 2, 4, 8, 16, 40] {
         let (workflow, chosen, _) = plan(workers);
         let best =
-            predicted_makespan(&workflow.chain, &chosen, &constraints.model, workers).unwrap();
+            predicted_makespan(&workflow.chain, &chosen, &[], &constraints.model, workers).unwrap();
         for index in 0..chosen.n_phases() {
             for &edge in &CANDIDATES {
                 let Some(variant) = with_edge(&chosen, index, edge) else {
                     continue;
                 };
                 let cost =
-                    predicted_makespan(&workflow.chain, &variant, &constraints.model, workers)
+                    predicted_makespan(&workflow.chain, &variant, &[], &constraints.model, workers)
                         .unwrap();
                 assert!(
                     cost >= best,

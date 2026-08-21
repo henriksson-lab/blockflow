@@ -657,15 +657,29 @@ fn assemble<T>(shape: &[usize], order: Order, values: Vec<T>, what: &str) -> Res
     })
 }
 
-/// Decode `count` elements out of a reader through a fixed buffer.
-fn decode<T: NpyElement>(
+/// Decode `count` elements out of a reader through a fixed buffer, converting
+/// each one as it is read.
+///
+/// The conversion happens **inside** the loop, which is the whole point of the
+/// parameter: the alternative is to decode the file's own type into a full-size
+/// `Vec` and map that, which holds the source array and the destination array at
+/// once. On a `uint16` volume of 1.775e9 elements read as `f64` the difference
+/// is 3.55 GB against nothing, on top of the 14.2 GB the caller asked for. That
+/// is not a matter of speed: a consumer whose test *measures* peak residency has
+/// the measurement corrupted by a reader that inflates it.
+///
+/// `Src` is what the file holds, so `Src::DTYPE` is what the header must say;
+/// `Dst` is what the caller wants and is never checked against the header,
+/// because the caller supplied the function that produces it.
+fn decode_mapped<Src: NpyElement, Dst>(
     reader: &mut impl Read,
     count: usize,
     endian: Endian,
     what: &str,
-) -> Result<Vec<T>> {
-    let width = T::DTYPE.size_of();
-    let mut values: Vec<T> = Vec::with_capacity(count);
+    map: &mut impl FnMut(Src) -> Dst,
+) -> Result<Vec<Dst>> {
+    let width = Src::DTYPE.size_of();
+    let mut values: Vec<Dst> = Vec::with_capacity(count);
     let per_pass = (BUFFER / width).max(1);
     let mut raw = vec![0u8; per_pass * width];
     let mut done = 0;
@@ -676,16 +690,26 @@ fn decode<T: NpyElement>(
             reader,
             slice,
             what,
-            &format!("{count} elements of {}", T::DTYPE.numpy_name()),
+            &format!("{count} elements of {}", Src::DTYPE.numpy_name()),
         )?;
         values.extend(
             slice
                 .chunks_exact(width)
-                .map(|chunk| T::read_element(chunk, endian)),
+                .map(|chunk| map(Src::read_element(chunk, endian))),
         );
         done += this_pass;
     }
     Ok(values)
+}
+
+/// Decode `count` elements as themselves.
+fn decode<T: NpyElement>(
+    reader: &mut impl Read,
+    count: usize,
+    endian: Endian,
+    what: &str,
+) -> Result<Vec<T>> {
+    decode_mapped(reader, count, endian, what, &mut |value| value)
 }
 
 /// Read a whole array off a reader, holding one copy of it and nothing more.
@@ -738,6 +762,80 @@ pub fn read_array_file<T: NpyElement>(path: &Path, policy: OrderPolicy) -> Resul
     let file = File::open(path).map_err(Error::backend)?;
     let mut reader = std::io::BufReader::with_capacity(BUFFER, file);
     read_array_from::<T>(&mut reader, &what, policy)
+}
+
+/// Read a whole array off a reader, converting every element as it is decoded.
+///
+/// For the caller who wants a file's elements in a *wider* type than the file
+/// holds and cannot afford both at once. `read_array_from::<u16>` followed by
+/// `mapv(f64::from)` is the same answer and holds the `uint16` array and the
+/// `f64` array simultaneously; this holds only the `f64` array and the fixed
+/// 64 KiB buffer, whatever the file's size.
+///
+/// The element type is still checked against the header — `Src` must be what
+/// the file says it holds. This is a widening for the caller's convenience, not
+/// a licence to read one type as another; that refusal is the module's whole
+/// subject and it is not weakened here.
+pub fn read_array_mapped_from<Src: NpyElement, Dst>(
+    reader: &mut impl Read,
+    what: &str,
+    policy: OrderPolicy,
+    mut map: impl FnMut(Src) -> Dst,
+) -> Result<ArrayD<Dst>> {
+    let header = Header::read_from(reader, what)?;
+    policy.check(header.order, what)?;
+    header.check_element::<Src>(what)?;
+    let values = decode_mapped::<Src, Dst>(reader, header.elements(), header.endian, what, &mut map)?;
+    assemble(&header.shape, header.order, values, what)
+}
+
+/// The same, out of bytes that are exactly one file.
+pub fn read_array_mapped<Src: NpyElement, Dst>(
+    bytes: &[u8],
+    what: &str,
+    policy: OrderPolicy,
+    map: impl FnMut(Src) -> Dst,
+) -> Result<ArrayD<Dst>> {
+    let header = Header::parse(bytes, what)?;
+    let wanted = header.file_bytes(what)?;
+    if bytes.len() != wanted {
+        return Err(Error::invalid(format!(
+            "{what}: the header declares shape {:?} of {}, which is {wanted} bytes with its \
+             header, and there are {}.",
+            header.shape,
+            header.dtype.numpy_name(),
+            bytes.len()
+        )));
+    }
+    let mut cursor = bytes;
+    read_array_mapped_from::<Src, Dst>(&mut cursor, what, policy, map)
+}
+
+/// The same, from a path.
+pub fn read_array_mapped_file<Src: NpyElement, Dst>(
+    path: &Path,
+    policy: OrderPolicy,
+    map: impl FnMut(Src) -> Dst,
+) -> Result<ArrayD<Dst>> {
+    let what = path.display().to_string();
+    let file = File::open(path).map_err(Error::backend)?;
+    let mut reader = std::io::BufReader::with_capacity(BUFFER, file);
+    read_array_mapped_from::<Src, Dst>(&mut reader, &what, policy, map)
+}
+
+/// [`read_array_mapped_file`] for the conversion that needs no function: the one
+/// Rust already calls lossless.
+///
+/// `Dst: From<Src>` is the whole of the safety argument. `u16 -> f64`, `i32 ->
+/// i64` and `bool -> u8` are all `From` and all exact; `i64 -> f64` and `u32 ->
+/// u16` are not `From`, so they cannot be spelled here and a caller who wants
+/// one has to write the `mapv` and own the loss. Nothing has to be documented as
+/// lossy because nothing lossy compiles.
+pub fn read_array_file_as<Src: NpyElement, Dst: From<Src>>(
+    path: &Path,
+    policy: OrderPolicy,
+) -> Result<ArrayD<Dst>> {
+    read_array_mapped_file::<Src, Dst>(path, policy, Dst::from)
 }
 
 /// A file's header without its data.
@@ -895,6 +993,479 @@ where
     Ok(T::wrap(array))
 }
 
+// --------------------------------------------------- an array of any dtype --
+
+/// An array of any rank, holding whichever element type the file named.
+///
+/// The counterpart of [`Voxels`] for the shapes a [`Voxels`] is not: a table, a
+/// column, a scalar. [`read_voxels`] already erases the element type, but it
+/// checks rank 3, and that check is right — a `(378, 3)` table read as a volume
+/// is a real mistake and not a pedantic one. The consequence was that a caller
+/// reading a *table* whose dtype it does not know in advance had no erasing
+/// reader at all, and had to write `match header.dtype { … }` with one arm per
+/// type it might meet.
+///
+/// That was measured rather than supposed. A consumer of this crate migrating
+/// twenty-three private `.npy` readers onto this module had to add that ladder
+/// to fifteen files, nine arms in two of them — which traded one duplication for
+/// a smaller one of the same kind. This type is what those ladders collapse to.
+///
+/// **There is no `F16` variant**, for the reason [`descr_of`] gives: Rust has no
+/// native 16-bit float, so `Dtype::F16` is a byte-width tag for storage and not
+/// an element type. A `float16` file is refused by name at the read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Elements {
+    Bool(ArrayD<bool>),
+    U8(ArrayD<u8>),
+    U16(ArrayD<u16>),
+    U32(ArrayD<u32>),
+    U64(ArrayD<u64>),
+    I8(ArrayD<i8>),
+    I16(ArrayD<i16>),
+    I32(ArrayD<i32>),
+    I64(ArrayD<i64>),
+    F32(ArrayD<f32>),
+    F64(ArrayD<f64>),
+}
+
+/// The one `float16` refusal, written once so the two erasing readers cannot
+/// drift apart in what they say about it.
+fn refuse_float16(what: &str) -> Error {
+    Error::invalid(format!(
+        "{what}: the file holds `float16`, and there is no variant for it here — Rust has no \
+         native 16-bit float, so `Dtype::F16` is a byte-width tag for storage rather than an \
+         element type. Reading it would mean widening, and a reader that widened would hand back \
+         numbers no file contains."
+    ))
+}
+
+/// Every [`Elements`] variant, by the tag a header carries.
+macro_rules! elements_by_dtype {
+    ($dtype:expr, $what:expr, |$element:ident| $body:expr) => {
+        match $dtype {
+            Dtype::Bool => {
+                type $element = bool;
+                $body
+            }
+            Dtype::U8 => {
+                type $element = u8;
+                $body
+            }
+            Dtype::U16 => {
+                type $element = u16;
+                $body
+            }
+            Dtype::U32 => {
+                type $element = u32;
+                $body
+            }
+            Dtype::U64 => {
+                type $element = u64;
+                $body
+            }
+            Dtype::I8 => {
+                type $element = i8;
+                $body
+            }
+            Dtype::I16 => {
+                type $element = i16;
+                $body
+            }
+            Dtype::I32 => {
+                type $element = i32;
+                $body
+            }
+            Dtype::I64 => {
+                type $element = i64;
+                $body
+            }
+            Dtype::F32 => {
+                type $element = f32;
+                $body
+            }
+            Dtype::F64 => {
+                type $element = f64;
+                $body
+            }
+            Dtype::F16 => return Err(refuse_float16($what)),
+        }
+    };
+}
+
+/// Do the same thing to whichever array is held.
+macro_rules! over_elements {
+    ($elements:expr, |$array:ident| $body:expr) => {
+        match $elements {
+            Elements::Bool($array) => $body,
+            Elements::U8($array) => $body,
+            Elements::U16($array) => $body,
+            Elements::U32($array) => $body,
+            Elements::U64($array) => $body,
+            Elements::I8($array) => $body,
+            Elements::I16($array) => $body,
+            Elements::I32($array) => $body,
+            Elements::I64($array) => $body,
+            Elements::F32($array) => $body,
+            Elements::F64($array) => $body,
+        }
+    };
+}
+
+/// How an element type gets into and out of the [`Elements`] enum.
+///
+/// Separate from [`NpyElement`], which says only how an element crosses the file
+/// boundary, and modelled on [`crate::voxels::VoxelElement`], which is the same
+/// three methods over [`Voxels`]. Written as a trait rather than as a downcast
+/// so that getting the array back out is a pattern match the compiler checks.
+pub trait ElementsVariant: NpyElement {
+    /// This array as the variant its type names.
+    fn erase(array: ArrayD<Self>) -> Elements;
+
+    /// A borrow of the held array, if the variant is this one.
+    fn peek(elements: &Elements) -> Option<&ArrayD<Self>>;
+
+    /// The held array, if the variant is this one; otherwise the `Elements`
+    /// back, unmoved, so a refusal can still name what it holds.
+    fn take(elements: Elements) -> std::result::Result<ArrayD<Self>, Elements>;
+}
+
+macro_rules! elements_variant {
+    ($type:ty, $variant:ident) => {
+        impl ElementsVariant for $type {
+            fn erase(array: ArrayD<Self>) -> Elements {
+                Elements::$variant(array)
+            }
+
+            fn peek(elements: &Elements) -> Option<&ArrayD<Self>> {
+                match elements {
+                    Elements::$variant(array) => Some(array),
+                    _ => None,
+                }
+            }
+
+            fn take(elements: Elements) -> std::result::Result<ArrayD<Self>, Elements> {
+                match elements {
+                    Elements::$variant(array) => Ok(array),
+                    other => Err(other),
+                }
+            }
+        }
+    };
+}
+
+elements_variant!(bool, Bool);
+elements_variant!(u8, U8);
+elements_variant!(u16, U16);
+elements_variant!(u32, U32);
+elements_variant!(u64, U64);
+elements_variant!(i8, I8);
+elements_variant!(i16, I16);
+elements_variant!(i32, I32);
+elements_variant!(i64, I64);
+elements_variant!(f32, F32);
+elements_variant!(f64, F64);
+
+impl Elements {
+    /// The tag this holds.
+    pub fn dtype(&self) -> Dtype {
+        match self {
+            Elements::Bool(_) => Dtype::Bool,
+            Elements::U8(_) => Dtype::U8,
+            Elements::U16(_) => Dtype::U16,
+            Elements::U32(_) => Dtype::U32,
+            Elements::U64(_) => Dtype::U64,
+            Elements::I8(_) => Dtype::I8,
+            Elements::I16(_) => Dtype::I16,
+            Elements::I32(_) => Dtype::I32,
+            Elements::I64(_) => Dtype::I64,
+            Elements::F32(_) => Dtype::F32,
+            Elements::F64(_) => Dtype::F64,
+        }
+    }
+
+    /// The logical shape. May be empty — a zero-rank array is one element — and
+    /// may contain a zero.
+    pub fn shape(&self) -> &[usize] {
+        over_elements!(self, |array| array.shape())
+    }
+
+    /// How many axes it has.
+    pub fn ndim(&self) -> usize {
+        self.shape().len()
+    }
+
+    /// How many elements it holds. A zero-rank array holds one.
+    pub fn len(&self) -> usize {
+        over_elements!(self, |array| array.len())
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// A borrow of the array, if it is of the type asked for, and a refusal
+    /// naming both types if it is not.
+    ///
+    /// The element type is never converted here, for the reason
+    /// [`Header`]'s element check gives: a reader that widened or narrowed
+    /// silently would turn a wrong `descr` into plausible numbers. The two
+    /// conversions wanted often enough to be worth naming are
+    /// [`Elements::widened`] and [`Elements::widened_i64`], and each says in its
+    /// own signature what it costs.
+    pub fn get<T: ElementsVariant>(&self, what: &str) -> Result<&ArrayD<T>> {
+        T::peek(self).ok_or_else(|| self.wrong_type::<T>(what))
+    }
+
+    /// The same, taking ownership.
+    pub fn into_array<T: ElementsVariant>(self, what: &str) -> Result<ArrayD<T>> {
+        T::take(self).map_err(|held| held.wrong_type::<T>(what))
+    }
+
+    fn wrong_type<T: ElementsVariant>(&self, what: &str) -> Error {
+        Error::invalid(format!(
+            "{what}: the file holds {} and it is being taken as {}. An element type is not \
+             converted here — `Elements::widened` and `Elements::widened_i64` are the two \
+             conversions that are, and each names what it costs.",
+            self.dtype().numpy_name(),
+            T::DTYPE.numpy_name()
+        ))
+    }
+
+    /// Every element as an `f64`.
+    ///
+    /// **Lossy above 2^53, and that is why it is not the only widening on
+    /// offer.** An `int64` or `uint64` identifier past that has no exact `f64`,
+    /// and the nearest one is a different identifier which compares equal to its
+    /// neighbours. A caller widening *identifiers* wants
+    /// [`Elements::widened_i64`], which refuses rather than rounds; a caller
+    /// widening *measurements* into a kernel that accumulates in `f64` wants
+    /// this. Which of the two a file holds is the caller's knowledge and cannot
+    /// be guessed here, so both exist and neither is the default.
+    ///
+    /// It allocates eight bytes an element, which is the cost [`Voxels`] exists
+    /// to avoid paying by default; the same caution applies.
+    pub fn widened(&self) -> ArrayD<f64> {
+        match self {
+            Elements::Bool(array) => array.mapv(f64::from),
+            Elements::U8(array) => array.mapv(f64::from),
+            Elements::U16(array) => array.mapv(f64::from),
+            Elements::U32(array) => array.mapv(f64::from),
+            Elements::U64(array) => array.mapv(|value| value as f64),
+            Elements::I8(array) => array.mapv(f64::from),
+            Elements::I16(array) => array.mapv(f64::from),
+            Elements::I32(array) => array.mapv(f64::from),
+            Elements::I64(array) => array.mapv(|value| value as f64),
+            Elements::F32(array) => array.mapv(f64::from),
+            Elements::F64(array) => array.clone(),
+        }
+    }
+
+    /// Every element as an `i64`, **exactly**, or a refusal naming why not.
+    ///
+    /// The widening a caller reading identifiers wants: labels, vertex indices,
+    /// edge endpoints. Every integer type held here is an `i64` except `uint64`
+    /// above `i64::MAX`, and that one is refused with the offending value in the
+    /// message rather than wrapped — a wrapped identifier is a negative number
+    /// no file contains and is indistinguishable downstream from a real one,
+    /// which is the whole reason this returns a `Result` where
+    /// [`Elements::widened`] does not.
+    ///
+    /// **The float types are refused by name rather than truncated**, and this
+    /// is not fastidiousness. A reader that reached a `float64` array through an
+    /// integer path has been found in the wild: it took the sign of the type
+    /// from whether the `descr` contained an `i`, so `<f8` went down the
+    /// unsigned branch and every IEEE-754 bit pattern came back as an integer.
+    /// It passed its test because both sides of the comparison got the same
+    /// reinterpretation, and it would have panicked on the first negative value
+    /// it ever met. A caller that means to truncate has `mapv` and can say so.
+    pub fn widened_i64(&self, what: &str) -> Result<ArrayD<i64>> {
+        let refuse_float = |name: &str| {
+            Error::invalid(format!(
+                "{what}: the file holds {name} and this is the exact integer widening, which has \
+                 no answer for a fraction, a `NaN` or an infinity. Which way to round is the \
+                 caller's decision and not one to guess here. Read it as itself and say what you \
+                 mean with `mapv`, or take `Elements::widened` if `f64` was what you wanted."
+            ))
+        };
+        Ok(match self {
+            Elements::Bool(array) => array.mapv(i64::from),
+            Elements::U8(array) => array.mapv(i64::from),
+            Elements::U16(array) => array.mapv(i64::from),
+            Elements::U32(array) => array.mapv(i64::from),
+            Elements::I8(array) => array.mapv(i64::from),
+            Elements::I16(array) => array.mapv(i64::from),
+            Elements::I32(array) => array.mapv(i64::from),
+            Elements::I64(array) => array.clone(),
+            Elements::U64(array) => {
+                let mut out: Vec<i64> = Vec::with_capacity(array.len());
+                for value in array.iter() {
+                    out.push(i64::try_from(*value).map_err(|_| {
+                        Error::invalid(format!(
+                            "{what}: the file holds uint64 and one element is {value}, which is \
+                             past `i64::MAX` and has no `i64`. Wrapping it would turn a large \
+                             identifier into a negative one that no file contains, so it is \
+                             refused instead. Read it as `u64` if the range is real."
+                        ))
+                    })?);
+                }
+                assemble(array.shape(), Order::C, out, what)?
+            }
+            Elements::F32(_) => return Err(refuse_float("float32")),
+            Elements::F64(_) => return Err(refuse_float("float64")),
+        })
+    }
+
+    /// This as a [`Voxels`], or a refusal if it is not rank 3.
+    ///
+    /// [`read_voxels`]'s rank check, in the one direction that still needs it: a
+    /// caller that read a file without knowing its rank and then wants a volume
+    /// asks here and gets the same sentence the volume reader would have given.
+    pub fn into_voxels(self, what: &str) -> Result<Voxels> {
+        if self.ndim() != 3 {
+            return Err(Error::invalid(format!(
+                "{what}: the array is {}-dimensional with shape {:?}, and a `Voxels` is rank 3.",
+                self.ndim(),
+                self.shape()
+            )));
+        }
+        let rank_three = |error: ndarray::ShapeError| {
+            Error::invalid(format!("{what}: a rank-3 array was not rank 3 ({error})."))
+        };
+        Ok(match self {
+            Elements::Bool(array) => Voxels::Bool(array.into_dimensionality().map_err(rank_three)?),
+            Elements::U8(array) => Voxels::U8(array.into_dimensionality().map_err(rank_three)?),
+            Elements::U16(array) => Voxels::U16(array.into_dimensionality().map_err(rank_three)?),
+            Elements::U32(array) => Voxels::U32(array.into_dimensionality().map_err(rank_three)?),
+            Elements::U64(array) => Voxels::U64(array.into_dimensionality().map_err(rank_three)?),
+            Elements::I8(array) => Voxels::I8(array.into_dimensionality().map_err(rank_three)?),
+            Elements::I16(array) => Voxels::I16(array.into_dimensionality().map_err(rank_three)?),
+            Elements::I32(array) => Voxels::I32(array.into_dimensionality().map_err(rank_three)?),
+            Elements::I64(array) => Voxels::I64(array.into_dimensionality().map_err(rank_three)?),
+            Elements::F32(array) => Voxels::F32(array.into_dimensionality().map_err(rank_three)?),
+            Elements::F64(array) => Voxels::F64(array.into_dimensionality().map_err(rank_three)?),
+        })
+    }
+}
+
+impl From<Voxels> for Elements {
+    /// A volume is an array. Free: `into_dyn` changes the dimension type and
+    /// not the buffer.
+    fn from(voxels: Voxels) -> Self {
+        match voxels {
+            Voxels::Bool(array) => Elements::Bool(array.into_dyn()),
+            Voxels::U8(array) => Elements::U8(array.into_dyn()),
+            Voxels::U16(array) => Elements::U16(array.into_dyn()),
+            Voxels::U32(array) => Elements::U32(array.into_dyn()),
+            Voxels::U64(array) => Elements::U64(array.into_dyn()),
+            Voxels::I8(array) => Elements::I8(array.into_dyn()),
+            Voxels::I16(array) => Elements::I16(array.into_dyn()),
+            Voxels::I32(array) => Elements::I32(array.into_dyn()),
+            Voxels::I64(array) => Elements::I64(array.into_dyn()),
+            Voxels::F32(array) => Elements::F32(array.into_dyn()),
+            Voxels::F64(array) => Elements::F64(array.into_dyn()),
+        }
+    }
+}
+
+/// Read a file of any rank as an [`Elements`], with the element type the file
+/// names.
+///
+/// The rank-free counterpart of [`read_voxels_from`]. `policy` is still the
+/// caller's: a table indexed logically wants [`OrderPolicy::Either`], and a
+/// buffer handed to something that assumes a layout wants [`OrderPolicy::Only`].
+pub fn read_elements_from(
+    reader: &mut impl Read,
+    what: &str,
+    policy: OrderPolicy,
+) -> Result<Elements> {
+    let header = Header::read_from(reader, what)?;
+    policy.check(header.order, what)?;
+    let count = header.elements();
+    let endian = header.endian;
+    let shape = header.shape.clone();
+    let order = header.order;
+    elements_by_dtype!(header.dtype, what, |Element| {
+        let values = decode::<Element>(reader, count, endian, what)?;
+        Ok(<Element as ElementsVariant>::erase(assemble(
+            &shape, order, values, what,
+        )?))
+    })
+}
+
+/// The same, out of bytes that are exactly one file.
+///
+/// Refuses trailing bytes as well as missing ones, for the reason
+/// [`read_array`] gives: a shape that parses to fewer elements than the file
+/// holds is the same mistake as one that parses to more, and it is the direction
+/// that otherwise succeeds.
+pub fn read_elements(bytes: &[u8], what: &str, policy: OrderPolicy) -> Result<Elements> {
+    let header = Header::parse(bytes, what)?;
+    policy.check(header.order, what)?;
+    // Before the length check, so that a `float16` file says `float16` rather
+    // than arithmetic about its size.
+    if header.dtype == Dtype::F16 {
+        return Err(refuse_float16(what));
+    }
+    let wanted = header.file_bytes(what)?;
+    if bytes.len() != wanted {
+        return Err(Error::invalid(format!(
+            "{what}: the header declares shape {:?} of {}, which is {wanted} bytes with its \
+             header, and there are {}.",
+            header.shape,
+            header.dtype.numpy_name(),
+            bytes.len()
+        )));
+    }
+    let mut cursor = &bytes[header.data_offset..];
+    let count = header.elements();
+    let endian = header.endian;
+    let shape = header.shape.clone();
+    let order = header.order;
+    elements_by_dtype!(header.dtype, what, |Element| {
+        let values = decode::<Element>(&mut cursor, count, endian, what)?;
+        Ok(<Element as ElementsVariant>::erase(assemble(
+            &shape, order, values, what,
+        )?))
+    })
+}
+
+/// The same, from a path. The path names itself in every refusal.
+pub fn read_elements_file(path: &Path, policy: OrderPolicy) -> Result<Elements> {
+    let what = path.display().to_string();
+    let file = File::open(path).map_err(Error::backend)?;
+    let mut reader = std::io::BufReader::with_capacity(BUFFER, file);
+    read_elements_from(&mut reader, &what, policy)
+}
+
+/// Write an [`Elements`] as a `.npy`, streamed.
+pub fn write_elements_to(
+    elements: &Elements,
+    order: Order,
+    what: &str,
+    out: &mut impl Write,
+) -> Result<()> {
+    over_elements!(elements, |array| write_array_to(array, order, what, out))
+}
+
+/// The same, into memory.
+pub fn write_elements(elements: &Elements, order: Order, what: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(128 + elements.len() * elements.dtype().size_of());
+    write_elements_to(elements, order, what, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// The same, to a path.
+pub fn write_elements_file(path: &Path, elements: &Elements, order: Order) -> Result<()> {
+    let what = path.display().to_string();
+    let file = File::create(path).map_err(Error::backend)?;
+    let mut out = BufWriter::with_capacity(BUFFER, file);
+    write_elements_to(elements, order, &what, &mut out)?;
+    out.flush().map_err(Error::backend)?;
+    Ok(())
+}
+
+
 // ----------------------------------------------------------------- writing --
 
 /// Encode an array's elements in `order` through a fixed buffer.
@@ -1019,6 +1590,46 @@ pub fn write_voxels_file(path: &Path, voxels: &Voxels, order: Order) -> Result<(
 /// flat contiguous buffer, so a rectangular box is `region.voxels() /
 /// run_length` runs and one seek each. `visit` is handed an offset **in
 /// elements** and a run **in elements**.
+///
+/// Adjacent runs are not merged, and that is a measured decision
+/// ---------------------------------------------------------------
+/// Two runs can be physically adjacent: it happens exactly when the box is full
+/// along every axis faster than the slowest one it is partial in — the ordinary
+/// whole-width slab. The question is whether merging them into one large read is
+/// worth the state it would take, and the answer was measured on a
+/// `404 x 1304 x 3369` `uint16` file rather than argued.
+///
+/// | box | runs now | runs merged |
+/// |---|---|---|
+/// | C order, slab `[0:66, all, all]` | 86064 of 6738 B | **1** of 290 MB |
+/// | C order, block `[0:66, 0:128, 0:128]` | 8448 of 256 B | 8448 — no change |
+/// | Fortran order, face `[0:66, all, all]` | 4393176 of 132 B | 4393176 — **no change** |
+///
+/// The last row is the one worth stating, because it is the case that prompted
+/// the question. A face taken along the *fastest* axis is 66 of every 404
+/// consecutive elements, so consecutive runs are 404 apart and can never touch;
+/// merging is a no-op on the shape it was proposed for.
+///
+/// And on the one shape where it does apply, it is not reliably a win. The same
+/// 290 MB, read as the 86064 reads this does and as the single read merging
+/// would give:
+///
+/// | | 86064 reads | one read |
+/// |---|---|---|
+/// | page cache warm | 0.242 s | 0.345 s |
+/// | page cache cold | 1.056 s | 0.779 s |
+///
+/// So it is 1.36x cold, 0.70x warm, and 1.00x on the shape that asked for it —
+/// a direction that depends on the page cache, which this cannot know. Against
+/// that, merging means carrying a pending run across iterations, and
+/// [`NpySink::write_region`] walks these same runs in lockstep with an element
+/// iterator, so a merge would have to be correct on both sides or the two would
+/// disagree silently about how many elements a run consumes. Not worth it here.
+///
+/// The measurement is of a local file. A backend where a syscall costs
+/// milliseconds rather than microseconds — a network or user-space filesystem —
+/// would move the warm column and is the condition under which this is worth
+/// re-opening.
 fn for_each_run(
     order: Order,
     whole: &[usize],
@@ -1612,6 +2223,233 @@ mod tests {
         );
     }
 
+
+    /// An array of any rank comes back as itself, and comes back out again.
+    #[test]
+    fn an_elements_holds_what_the_file_named_at_any_rank() {
+        let table = Array2::from_shape_fn((5, 3), |(row, column)| (row * 3 + column) as i16);
+        let bytes = write_array(&table, Order::C, "<memory>").unwrap();
+        let elements = read_elements(&bytes, "<memory>", OrderPolicy::Either).unwrap();
+        assert_eq!(elements.dtype(), Dtype::I16);
+        assert_eq!(elements.shape(), &[5, 3]);
+        assert_eq!(elements.ndim(), 2);
+        assert_eq!(elements.len(), 15);
+        assert!(!elements.is_empty());
+        assert_eq!(elements.get::<i16>("<memory>").unwrap(), &table.into_dyn());
+
+        // Rank 1 and rank 0, which are the shapes `Voxels` cannot hold at all.
+        for shape in [vec![7usize], vec![]] {
+            let array = ArrayD::<f64>::from_elem(IxDyn(&shape), 1.5);
+            let bytes = write_array(&array, Order::C, "<memory>").unwrap();
+            let back = read_elements(&bytes, "<memory>", OrderPolicy::Either).unwrap();
+            assert_eq!(back.shape(), &shape[..]);
+            assert_eq!(back.into_array::<f64>("<memory>").unwrap(), array);
+        }
+
+        // And a zero in the shape is an array with no elements, not an absence.
+        let empty = ArrayD::<u32>::zeros(IxDyn(&[2, 0, 4]));
+        let bytes = write_array(&empty, Order::C, "<memory>").unwrap();
+        let back = read_elements(&bytes, "<memory>", OrderPolicy::Either).unwrap();
+        assert!(back.is_empty());
+        assert_eq!(back.shape(), &[2, 0, 4]);
+    }
+
+    /// Every element type round trips through [`Elements`] as itself.
+    #[test]
+    fn every_element_type_survives_an_elements_round_trip() {
+        macro_rules! check {
+            ($type:ty, $dtype:expr, $value:expr) => {{
+                let array = ArrayD::<$type>::from_elem(IxDyn(&[2, 3]), $value);
+                let bytes = write_array(&array, Order::C, "<memory>").unwrap();
+                let held = read_elements(&bytes, "<memory>", OrderPolicy::Either).unwrap();
+                assert_eq!(held.dtype(), $dtype);
+                assert_eq!(held.get::<$type>("<memory>").unwrap(), &array);
+                // And back out as bytes, identically.
+                assert_eq!(write_elements(&held, Order::C, "<memory>").unwrap(), bytes);
+            }};
+        }
+        check!(bool, Dtype::Bool, true);
+        check!(u8, Dtype::U8, 200u8);
+        check!(u16, Dtype::U16, 60000u16);
+        check!(u32, Dtype::U32, 4_000_000_000u32);
+        check!(u64, Dtype::U64, u64::MAX);
+        check!(i8, Dtype::I8, -100i8);
+        check!(i16, Dtype::I16, -30000i16);
+        check!(i32, Dtype::I32, i32::MIN);
+        check!(i64, Dtype::I64, i64::MIN);
+        check!(f32, Dtype::F32, -0.5f32);
+        check!(f64, Dtype::F64, f64::MIN_POSITIVE);
+    }
+
+    /// Asking an `Elements` for the wrong type is refused, naming both.
+    ///
+    /// The negative control for [`Elements::get`]: an erasing reader whose
+    /// accessor converted silently would be the widening this module refuses,
+    /// reintroduced one level up.
+    #[test]
+    fn taking_an_elements_as_the_wrong_type_is_refused_by_name() {
+        let bytes = write_array(&Array1::<i64>::zeros(4), Order::C, "<memory>").unwrap();
+        let held = read_elements(&bytes, "column.npy", OrderPolicy::Either).unwrap();
+        let text = held.get::<f64>("column.npy").unwrap_err().to_string();
+        assert!(text.contains("column.npy"), "{text}");
+        assert!(text.contains("int64") && text.contains("float64"), "{text}");
+        // The owning form refuses the same way rather than panicking.
+        let text = held.into_array::<u8>("column.npy").unwrap_err().to_string();
+        assert!(text.contains("int64") && text.contains("uint8"), "{text}");
+    }
+
+    /// `Elements` reads a Fortran file as a Fortran array, and refuses one under
+    /// `Only(C)` — the same two answers the typed reader gives.
+    #[test]
+    fn an_elements_takes_the_order_policy_the_caller_gives_it() {
+        let rows = Array2::from_shape_fn((5, 3), |(row, column)| (row * 3 + column) as f64);
+        let bytes = write_array(&rows, Order::Fortran, "<memory>").unwrap();
+
+        let held = read_elements(&bytes, "<memory>", OrderPolicy::Either).unwrap();
+        let back = held.get::<f64>("<memory>").unwrap();
+        for row in 0..5 {
+            for column in 0..3 {
+                assert_eq!(back[[row, column]], rows[[row, column]], "{row},{column}");
+            }
+        }
+
+        let text = read_elements(&bytes, "t.npy", OrderPolicy::Only(Order::C))
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("Fortran order") && text.contains("C order"), "{text}");
+    }
+
+    /// The exact integer widening is exact, and refuses everything it cannot do
+    /// exactly.
+    #[test]
+    fn the_exact_integer_widening_refuses_rather_than_rounds() {
+        // Exact past 2^53, where `widened`'s `f64` is not.
+        let past = 9_007_199_254_740_993i64; // 2^53 + 1
+        let held = Elements::I64(ArrayD::from_elem(IxDyn(&[1]), past));
+        assert_eq!(held.widened_i64("<memory>").unwrap()[[0]], past);
+        assert_ne!(held.widened()[[0]] as i64, past, "the f64 path does lose it");
+
+        // Every integer type, and `bool` as zero and one.
+        assert_eq!(
+            Elements::Bool(ArrayD::from_shape_vec(IxDyn(&[2]), vec![false, true]).unwrap())
+                .widened_i64("<memory>")
+                .unwrap()
+                .into_raw_vec_and_offset()
+                .0,
+            vec![0i64, 1]
+        );
+        for (held, expected) in [
+            (Elements::U8(ArrayD::from_elem(IxDyn(&[1]), u8::MAX)), 255i64),
+            (Elements::U32(ArrayD::from_elem(IxDyn(&[1]), u32::MAX)), 4_294_967_295),
+            (Elements::I8(ArrayD::from_elem(IxDyn(&[1]), i8::MIN)), -128),
+            (Elements::I32(ArrayD::from_elem(IxDyn(&[1]), i32::MIN)), -2_147_483_648),
+            (Elements::U64(ArrayD::from_elem(IxDyn(&[1]), i64::MAX as u64)), i64::MAX),
+        ] {
+            assert_eq!(held.widened_i64("<memory>").unwrap()[[0]], expected);
+        }
+
+        // `uint64` past `i64::MAX` is refused with the value in the message,
+        // rather than wrapped to a negative identifier no file contains.
+        let big = Elements::U64(ArrayD::from_elem(IxDyn(&[1]), u64::MAX));
+        let text = big.widened_i64("labels.npy").unwrap_err().to_string();
+        assert!(text.contains("labels.npy"), "{text}");
+        assert!(text.contains("18446744073709551615"), "{text}");
+        assert!(text.contains("i64::MAX"), "{text}");
+
+        // The float types are refused by name, both of them.
+        for (held, name) in [
+            (Elements::F64(ArrayD::from_elem(IxDyn(&[1]), 1.0f64)), "float64"),
+            (Elements::F32(ArrayD::from_elem(IxDyn(&[1]), 1.0f32)), "float32"),
+        ] {
+            let text = held.widened_i64("x.npy").unwrap_err().to_string();
+            assert!(text.contains(name), "{text}");
+            assert!(text.contains("mapv"), "{text}");
+        }
+    }
+
+    /// An `Elements` becomes a `Voxels` at rank 3 and says so at any other.
+    #[test]
+    fn only_a_rank_three_elements_becomes_a_volume() {
+        let volume = ArrayD::<u16>::from_elem(IxDyn(&[2, 3, 4]), 7);
+        let held = Elements::U16(volume.clone());
+        assert_eq!(
+            held.into_voxels("<memory>").unwrap(),
+            Voxels::U16(volume.into_dimensionality::<Ix3>().unwrap())
+        );
+
+        let table = Elements::U16(ArrayD::zeros(IxDyn(&[5, 3])));
+        let text = table.into_voxels("t.npy").unwrap_err().to_string();
+        assert!(text.contains("2-dimensional") && text.contains("rank 3"), "{text}");
+
+        // And the other direction is free and exact.
+        let voxels: Voxels = Array3::<i32>::from_elem((2, 2, 2), -3).into();
+        assert_eq!(
+            Elements::from(voxels.clone()).into_voxels("<memory>").unwrap(),
+            voxels
+        );
+    }
+
+    /// `float16` has no variant, and the erasing reader says so before it says
+    /// anything about size.
+    #[test]
+    fn an_elements_refuses_float16_by_name() {
+        let mut header = Header::render(Dtype::U16, &[2], Order::C, "<memory>").unwrap();
+        let text = String::from_utf8_lossy(&header[10..74]).to_string();
+        let swapped = text.replace("'descr': '<u2'", "'descr': '<f2'");
+        header.splice(10..74, swapped.bytes());
+        header.extend_from_slice(&[0, 0, 0, 0]);
+        let text = read_elements(&header, "half.npy", OrderPolicy::Either)
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("half.npy"), "{text}");
+        assert!(text.contains("float16") && text.contains("no variant"), "{text}");
+    }
+
+    /// The mapping reader converts inside the decode and still checks the file's
+    /// own type.
+    #[test]
+    fn a_mapped_read_widens_without_holding_the_narrow_array() {
+        let source = Array2::from_shape_fn((4, 5), |(row, column)| (row * 5 + column) as u16);
+        let bytes = write_array(&source, Order::C, "<memory>").unwrap();
+
+        let wide: ArrayD<f64> =
+            read_array_mapped::<u16, f64>(&bytes, "<memory>", OrderPolicy::Either, f64::from)
+                .unwrap();
+        assert_eq!(wide.shape(), &[4, 5]);
+        for row in 0..4 {
+            for column in 0..5 {
+                assert_eq!(wide[[row, column]], f64::from(source[[row, column]]));
+            }
+        }
+
+        // An arbitrary map, not only a widening: this is the `int64 -> u32`
+        // narrowing a caller has to spell out because it is not `From`.
+        let counted: ArrayD<u32> =
+            read_array_mapped::<u16, u32>(&bytes, "<memory>", OrderPolicy::Either, |value| {
+                u32::from(value) * 2
+            })
+            .unwrap();
+        assert_eq!(counted[[0, 3]], 6);
+
+        // **The negative control.** `Src` is still checked against the header,
+        // so a mapped read cannot be used to read one type as another — which
+        // would be the silent widening this module exists to refuse, wearing a
+        // closure.
+        let text = read_array_mapped::<i16, f64>(&bytes, "t.npy", OrderPolicy::Either, f64::from)
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("uint16") && text.contains("int16"), "{text}");
+
+        // And the order policy still applies.
+        let fortran = write_array(&source, Order::Fortran, "<memory>").unwrap();
+        assert!(read_array_mapped::<u16, f64>(
+            &fortran,
+            "t.npy",
+            OrderPolicy::Only(Order::C),
+            f64::from
+        )
+        .is_err());
+    }
     /// The runs of a region are the file's own contiguous stretches, in the
     /// order the region's memory layout wants them.
     #[test]

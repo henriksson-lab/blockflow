@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use blockflow::decomposition::{
-    price_phase, Constraints, CostModel, Decomposition, PhaseDecomposition,
+    price_phase, Constraints, CostModel, Decomposition, PhaseDecomposition, PhaseTraffic,
 };
 use blockflow::dtype::Dtype;
 use blockflow::env::{AccountingEnvironment, ArrayEnvironment, Environment};
@@ -442,7 +442,17 @@ fn the_cost_model_prices_a_full_reach_phase_towards_one_block() {
     let mut costs = Vec::new();
     for edge in [8usize, 16, 32] {
         let lattice = BlockGrid::along(VOLUME, &[0], edge).expect("a lattice");
-        let cost = price_phase(&lattice, &VOLUME.into(), 1.0, 1, false, 8.0, &model, 1.0);
+        let cost = price_phase(
+            &lattice,
+            &VOLUME.into(),
+            1.0,
+            1,
+            false,
+            8.0,
+            &model,
+            1.0,
+            PhaseTraffic::one_in_one_out(),
+        );
         costs.push((
             edge,
             lattice.n_blocks(),
