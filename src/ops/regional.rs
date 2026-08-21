@@ -27,7 +27,7 @@
 //
 // | phase | shape | what it does |
 // |---|---|---|
-// | 0 | `volume -> fragments`, and writes pixels | label the block's plateaus locally; write the labels as a `u32` level; emit the block's six face planes, one value per label and one flag per label |
+// | 0 | `volume -> fragments`, and writes pixels | label the block's plateaus locally; write the labels as a `u32` image; emit the block's six face planes, one value per label and one flag per label |
 // | 1 | `fragments -> volume` | read every block's faces, close the local labels into global components, OR the flag over each component, and rewrite this block's labels into the mask |
 //
 // The per-label fact is "**does any voxel adjacent to this component have a
@@ -39,7 +39,7 @@
 //
 // Read `ops::fill`'s header for the two walls this shape ran into. Both apply
 // here unchanged and neither had to be re-solved: a fragment-only phase is
-// terminal as far as levels go, so the merge is folded into phase 1 and every
+// terminal as far as images go, so the merge is folded into phase 1 and every
 // block re-runs it; and the whole-lattice fragment reach of phase 1 is also its
 // halo, which is load-bearing because the halo is the dependency edge between
 // pipelined phases. The costs are `fill`'s costs, stated there.
@@ -207,7 +207,7 @@ fn unordered<T: PartialOrd>(value: &T) -> bool {
 /// Deterministic, and deterministic in a way that matters: plateaus are numbered
 /// in the order their lowest voxel is met in row-major order, so the same block
 /// always produces the same labels. Two runs of the same decomposition are then
-/// byte-identical in the intermediate level as well as in the output, which is
+/// byte-identical in the intermediate image as well as in the output, which is
 /// what makes the intermediate worth looking at when something is wrong.
 ///
 /// Iterative rather than recursive. A plateau can span the whole block — a
@@ -690,7 +690,7 @@ impl FragmentOp for LabelPlateauxOp {
 
     /// **`u32` labels, whatever width the volume arrived in.** A component index
     /// is not a sample, and saying so here is what lets the plan allocate the
-    /// label level at the width it is actually written at rather than at the
+    /// label image at the width it is actually written at rather than at the
     /// input's.
     fn produces(&self, _input: Dtype) -> Dtype {
         Dtype::U32
@@ -766,11 +766,11 @@ impl RegionalMaximaOp {
     /// s" is not a well-formed request.
     ///
     /// `mask` is the element type the answer is written in. Stated rather than
-    /// inherited: this op reads a `u32` label level and hands back a mask, so
+    /// inherited: this op reads a `u32` label image and hands back a mask, so
     /// "unchanged" is exactly the wrong default and there is no width it could
     /// infer. `Dtype::Bool` is the natural one — the output is a mask and
     /// nothing else — and a wider type is offered only so that a mask can be
-    /// carried down a chain whose level is already `f64`.
+    /// carried down a chain whose image is already `f64`.
     pub fn new(
         name: &'static str,
         stream: impl Into<String>,
@@ -921,7 +921,7 @@ impl FragmentOp for RegionalMaximaOp {
 /// one has to be that and what it costs — the halo is the dependency edge
 /// between pipelined phases, not merely a fetch extent.
 ///
-/// `input_dtype` is the element type of the level the volume arrives in, and is
+/// `input_dtype` is the element type of the image the volume arrives in, and is
 /// checked here rather than at the first block: a plan that cannot run is worth
 /// refusing before anything is scheduled.
 pub fn regional_phases(
@@ -954,7 +954,7 @@ pub fn regional_phases(
 /// [`regional_phases`] builds a whole `Decomposition` and is therefore unusable
 /// the moment these two phases are part of something larger: its body has to be
 /// re-derived by hand, including the `labelling.dtype` line, whose omission is
-/// refused by a message about a level's width rather than about the missing
+/// refused by a message about an image's width rather than about the missing
 /// line. This is that body, against a builder instead of a fresh plan — and the
 /// element types are not restated here at all, because [`PlanBuilder::fragments`]
 /// asks the ops.
@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     /// Labels are numbered in the order their lowest voxel is met, which is what
-    /// makes the intermediate level reproducible between runs of one
+    /// makes the intermediate image reproducible between runs of one
     /// decomposition.
     #[test]
     fn labels_are_numbered_in_scan_order_and_are_reproducible() {

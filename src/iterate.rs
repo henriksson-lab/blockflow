@@ -2,7 +2,7 @@
 //
 // Original work for this crate.
 //
-// `docs/design/BLOCK_OPS.md` §"Levels have a lifetime, and iteration has
+// `docs/design/BLOCK_OPS.md` §"Images have a lifetime, and iteration has
 // substages". **One phase that internally runs an unknown number of substages,
 // with more than one operand available at every substage.**
 //
@@ -22,7 +22,7 @@
 // tidiness:
 //
 // **The phase's external reach is the per-substage reach, whatever the substage
-// count turns out to be.** Substage 0 reads the phase's input level over
+// count turns out to be.** Substage 0 reads the phase's input image over
 // core ⊕ r and writes its core of a private buffer; substage `k` reads the
 // private buffer substage `k-1` wrote, over core ⊕ r, and its neighbours *wrote*
 // their cores of it. The depth is paid in private round trips, not in halo,
@@ -44,7 +44,7 @@
 // Where the loop stops
 // --------------------
 // **At convergence, not at a stated count.** The count appears in no reach, no
-// level allocation and no phase structure, so there is nothing in the binding
+// image allocation and no phase structure, so there is nothing in the binding
 // half of a plan for it to be: the same plan is shipped to a worker before any
 // data is seen and compared against alternatives exactly as before, and
 // determinism is untouched — same plan, same data, same substage count, same
@@ -85,14 +85,14 @@ use crate::voxels::Voxels;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
     /// The running estimate: substage `k` is handed what substage `k-1` wrote,
-    /// and substage 0 is handed the phase's input level.
+    /// and substage 0 is handed the phase's input image.
     ///
     /// Exactly one operand must be this, because it is what the iteration
     /// iterates and it is what the two private buffers ping-pong between. An op
     /// declaring none would compute the same answer forever; an op declaring two
     /// would need two ping-pongs, which is a different shape and is not this one.
     Running,
-    /// The phase's input level, re-read at **every** substage.
+    /// The phase's input image, re-read at **every** substage.
     ///
     /// The motivating case is a step of the form `g <- min(dilate(g), f)`, where
     /// `f` is fixed for the whole iteration and read pointwise. Supplying it only
@@ -101,16 +101,16 @@ pub enum Operand {
     /// `tests/iterative_phase.rs` carries a test that fails if it is.
     ///
     /// Today every `Fixed` operand is a view of the same array, because a phase
-    /// has one input level. When levels become a DAG this variant is where the
-    /// level number goes, and nothing else about the interface moves.
+    /// has one input image. When images become a DAG this variant is where the
+    /// image number goes, and nothing else about the interface moves.
     ///
-    /// **A second level is now expressible, and this variant has not moved to
+    /// **A second image is now expressible, and this variant has not moved to
     /// it.** [`Chain::Source`](crate::op::Chain::Source) is a leaf that reads a
-    /// stored level at the block's read extent, and a phase records which levels
-    /// it reads in `PhaseDecomposition::source_levels`. That is the general
+    /// stored image at the block's read extent, and a phase records which images
+    /// it reads in `PhaseDecomposition::source_images`. That is the general
     /// form of what this variant does narrowly — but an iterative phase owns no
     /// chain slot, so it has no leaf to carry the number and would need the
-    /// level on `SubstageOperand` instead. Adding it is a change to this enum
+    /// image on `SubstageOperand` instead. Adding it is a change to this enum
     /// and to `run_iterative_phase`'s operand gathering, and nothing else; it is
     /// left undone rather than guessed at, because no op has asked for it yet
     /// and an untested variant of a two-array iteration is exactly the kind of
@@ -220,7 +220,7 @@ impl<'a> Substage<'a> {
     /// Which substage this is, counting from zero.
     ///
     /// Most ops ignore it. One that initialises its running estimate from the
-    /// input level — which is what substage 0's `Running` operand *is* — reads it.
+    /// input image — which is what substage 0's `Running` operand *is* — reads it.
     pub fn index(&self) -> usize {
         self.index
     }

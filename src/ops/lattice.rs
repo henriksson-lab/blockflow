@@ -50,7 +50,7 @@
 //   tile what it writes and every chunk of that output must fall inside exactly
 //   one of them. Cutting the *input* grid and deriving output counts would put
 //   block boundaries wherever the arithmetic landed; cutting the output grid
-//   cannot. What varies instead is how much of the other level each block
+//   cannot. What varies instead is how much of the other image each block
 //   reads, and that is stated per block in `BlockGeometry::source`.
 //
 // The reach both ops declare is therefore `Reach::none()` in
@@ -128,7 +128,7 @@ use crate::voxels::Voxels;
 
 /// The reach both ops in this module declare, in the space that says what it
 /// means: nothing this phase's halo can supply, because the dependency is in
-/// the other level's own lattice and is satisfied by the fetch region.
+/// the other image's own lattice and is satisfied by the fetch region.
 fn lattice_reach() -> Reach {
     Reach::none().in_space(Space::source_index())
 }
@@ -232,13 +232,13 @@ impl LatticeStatisticOp {
     /// [`LatticeInterpolateOp`] blends between, so narrowing them moves every
     /// fine voxel in the gaps and not only the ones sitting on a sample.
     ///
-    /// **The level's declared type does not change**, and that is deliberate. A
-    /// [`Narrowing`] is a narrowing of the *value*; the coarse level stays
-    /// `f64`, holds the same numbers a level of the narrower type would, and
+    /// **The image's declared type does not change**, and that is deliberate. A
+    /// [`Narrowing`] is a narrowing of the *value*; the coarse image stays
+    /// `f64`, holds the same numbers an image of the narrower type would, and
     /// costs bytes rather than precision. Declaring a narrower output type
     /// instead would make the storage decide the arithmetic, and the two are not
     /// the same question — a caller may well want a narrowed value written into
-    /// a wide level, which is exactly what the pair of ops this reproduces does.
+    /// a wide image, which is exactly what the pair of ops this reproduces does.
     ///
     /// A builder rather than an argument to [`Self::new`], for
     /// [`LatticeInterpolateOp::with_alignment`]'s reason: no narrowing is what
@@ -418,7 +418,7 @@ impl BlockOp for LatticeStatisticOp {
     ///
     /// The phase's own grid is the **lattice**, and a sample's dependency on the
     /// fine voxels of its window is not a distance in lattice steps at all: it
-    /// is a region of another level, and it is stated per block in
+    /// is a region of another image, and it is stated per block in
     /// `BlockGeometry::source`. `Units::SourceIndex` is what carries that
     /// without inventing a conversion, and it is checked rather than trusted —
     /// a phase declaring it with no per-block fetch regions is refused.
@@ -475,7 +475,7 @@ impl BlockOp for LatticeStatisticOp {
         let out = out.view_mut::<f64>()?;
         if self.lattice.volume() != at.volume {
             return Err(Error::InvalidArgument(format!(
-                "op {:?}: the lattice is over {:?} and the anchor says the level being read is \
+                "op {:?}: the lattice is over {:?} and the anchor says the image being read is \
                  {:?}. This op is bound to one volume — see its own docs for why — so a plan over \
                  a different one is a plan for a different op.",
                 self.name,
@@ -658,7 +658,7 @@ pub fn statistic_block_edge(op: &LatticeStatisticOp, axis: usize, wanted: usize)
 }
 
 /// The phase a lattice statistic needs: the grid over the **lattice**, and each
-/// block's fetch region in the fine level below.
+/// block's fetch region in the fine image below.
 ///
 /// Shipped with the op rather than written at the call site, for
 /// `resample_phase`'s reason: the fetch mapping is the op's own geometry, and a
@@ -772,7 +772,7 @@ pub use super::local::Alignment;
 
 /// Interpolate a lattice-shaped volume back to full resolution.
 ///
-/// The other half of the split: it reads the coarse level
+/// The other half of the split: it reads the coarse image
 /// [`LatticeStatisticOp`] writes and produces the fine volume the lattice was
 /// laid over. **Its halo is one coarse voxel per side**, which is `gap` times
 /// cheaper on every axis than the fused form's, and it is declared here rather
@@ -1000,7 +1000,7 @@ impl BlockOp for LatticeInterpolateOp {
 
     /// A source-index nothing, for [`LatticeStatisticOp::reach_spec`]'s reason
     /// and with the direction reversed: the dependency is on the *coarse*
-    /// level's own lattice, and a step of it is not a distance in this phase's
+    /// image's own lattice, and a step of it is not a distance in this phase's
     /// fine voxels that any grid could supply.
     fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
         lattice_reach()
@@ -1109,7 +1109,7 @@ impl BlockOp for LatticeInterpolateOp {
         }
         if at.input.volume != self.lattice.lattice_volume() {
             return Err(Error::InvalidArgument(format!(
-                "op {:?}: this lattice holds {:?} sample(s) and the placement says the level being \
+                "op {:?}: this lattice holds {:?} sample(s) and the placement says the image being \
                  read is {:?}",
                 self.name,
                 self.lattice.lattice_volume(),
@@ -1163,7 +1163,7 @@ impl BlockOp for LatticeInterpolateOp {
         let mut out = out.view_mut::<f64>()?;
         if self.lattice.lattice_volume() != at.volume {
             return Err(Error::InvalidArgument(format!(
-                "op {:?}: this lattice holds {:?} sample(s) and the anchor says the level being \
+                "op {:?}: this lattice holds {:?} sample(s) and the anchor says the image being \
                  read is {:?}",
                 self.name,
                 self.lattice.lattice_volume(),
@@ -1323,7 +1323,7 @@ pub fn interpolate_block_edge(
 }
 
 /// The phase a lattice interpolation needs: the grid over the **fine** volume,
-/// and each block's fetch region in the coarse level below.
+/// and each block's fetch region in the coarse image below.
 ///
 /// `grid` is over the fine volume and **any block edge is allowed**. That is the
 /// whole visible effect of migration step 4 here: this used to refuse anything
@@ -1353,7 +1353,7 @@ pub fn lattice_interpolate_phase(
     }
     // The halo is nothing in the phase's own space, as it is for the statistic
     // half: every fine voxel is written by exactly one block, and what a block
-    // needs beyond its own core is in the *coarse* level and is stated as a
+    // needs beyond its own core is in the *coarse* image and is stated as a
     // fetch region rather than as a distance.
     let phase = PhaseDecomposition::derive(slots, names, lattice_reach(), Reach::none(), grid);
     let sources = phase

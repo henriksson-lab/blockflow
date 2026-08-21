@@ -49,13 +49,14 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
+use crate::assemble::ImageId;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::region::Region;
 use crate::tiling::boxes_tile_exactly;
 
 use super::decomposition::{
-    check_block_constraints, check_dtypes, check_output_shapes, check_source_levels,
+    check_block_constraints, check_dtypes, check_output_shapes, check_source_images,
     compute_per_voxel, constraint_for, cuttable_axes, groups_for, is_planning_barrier, price_phase,
     region_to_ranges, Constraints, Decomposition, PhaseDecomposition, Visibility,
 };
@@ -114,7 +115,7 @@ impl Workflow {
     /// the executor is the one that goes stale. Folding it off the chain means
     /// an op cannot be added to execution and forgotten in the accounting.
     ///
-    /// The primary's shape is **level 0's**, which is the output's too unless a
+    /// The primary's shape is **image 0's**, which is the output's too unless a
     /// phase changes it; `Decomposition::output_volume` is the authority there,
     /// and it is the plan the executor allocates from rather than this.
     pub fn outputs(&self) -> Vec<Output> {
@@ -149,22 +150,22 @@ pub struct Hints {
     /// Reserved for `MULTISLAB_IO.md` §4's hint-driven prefetcher. Recorded so
     /// a strategy can express it before there is a prefetcher to consume it.
     pub prefetch_depth: usize,
-    /// Internal levels to keep rather than free when their reader finishes.
+    /// Internal images to keep rather than free when their reader finishes.
     ///
     /// **Advisory, and it belongs here rather than in the plan for one reason:
     /// keeping an intermediate cannot change a voxel.** It changes what is on
     /// disk when the run ends, which is a debugging decision, so it sits with
     /// every other value a strategy may get wrong at no cost to the answer.
     ///
-    /// Empty means "free every internal level as soon as its reader is done",
+    /// Empty means "free every internal image as soon as its reader is done",
     /// which is the behaviour worth having by default: an `N`-phase chain then
-    /// holds three levels at once instead of `N + 1`. Naming a level here is how
+    /// holds three images at once instead of `N + 1`. Naming an image here is how
     /// a caller says "I want to look at that one" — the same choice the sidecar
     /// store spells `Lifecycle::Persistent`.
     ///
-    /// Naming level 0 or the output level is harmless and does nothing; neither
+    /// Naming image 0 or the output image is harmless and does nothing; neither
     /// is ever freed.
-    pub keep_levels: BTreeSet<usize>,
+    pub keep_images: BTreeSet<ImageId>,
 }
 
 impl Default for Hints {
@@ -174,7 +175,7 @@ impl Default for Hints {
             priority: SchedulePriority::PhaseMajor,
             concurrency: 1,
             prefetch_depth: 0,
-            keep_levels: BTreeSet::new(),
+            keep_images: BTreeSet::new(),
         }
     }
 }
@@ -309,7 +310,7 @@ pub fn execute_phases(
             slots.len()
         )));
     }
-    // Level 0 only. What the *later* levels are shaped like is the phases' own
+    // Image 0 only. What the *later* images are shaped like is the phases' own
     // business now, and an environment that cannot host a phase which changes
     // shape says so from `prepare` — where it knows what it allocated — rather
     // than here, where the old whole-plan equality made every such plan
@@ -327,7 +328,7 @@ pub fn execute_phases(
     // plan and the implementations; see `check_block_constraints`.
     check_block_constraints(&workflow.chain, decomposition)?;
     // The same arrangement for the element type: declared by the op, folded by
-    // the chain, and re-checked here because a plan whose levels are the wrong
+    // the chain, and re-checked here because a plan whose images are the wrong
     // width would otherwise be discovered one block at a time.
     check_dtypes(&workflow.chain, decomposition, work)?;
     // And the same arrangement for the extent. It is not the per-block
@@ -336,12 +337,12 @@ pub fn execute_phases(
     // scale with the plan's answer withheld, which is the one form of it no op
     // can answer from the plan. See `check_output_shapes`.
     check_output_shapes(&workflow.chain, decomposition, work)?;
-    // And the same arrangement for the levels a phase reads besides its own
+    // And the same arrangement for the images a phase reads besides its own
     // input. **Before `prepare` and before the graph**: a forward reference is
     // a plan that is not a plan, and it is refused by name here rather than
-    // becoming a missing dependency edge or a block asking for a level nothing
+    // becoming a missing dependency edge or a block asking for an image nothing
     // has written.
-    check_source_levels(&workflow.chain, decomposition)?;
+    check_source_images(&workflow.chain, decomposition)?;
     env.prepare(decomposition)?;
     // Once, before any task, and by the executor rather than by each op: a
     // stream must exist before a block writes to it, and a declaration inside
@@ -541,38 +542,38 @@ pub fn execute_phases(
             }
             phase_remaining[phase] -= 1;
             if phase_remaining[phase] == 0 {
-                // Every level whose **last** reader is this phase is now dead.
+                // Every image whose **last** reader is this phase is now dead.
                 //
-                // This used to be the single level `phase` reads, on the
-                // argument that exactly one phase reads a level. A source leaf
-                // makes that a special case: a level read by a later phase has a
+                // This used to be the single image `phase` reads, on the
+                // argument that exactly one phase reads an image. A source leaf
+                // makes that a special case: an image read by a later phase has a
                 // second reader, and freeing it here would free something still
-                // wanted. `levels_dead_after` is the general statement — a level
+                // wanted. `images_dead_after` is the general statement — an image
                 // dies after its last reader — and it answers `[phase]` for
                 // every plan with no source leaf, so this is the same behaviour
                 // stated in a way that stays true when there are two.
                 //
                 // The saving is the whole point of `Visibility`: without this an
-                // `N`-phase chain holds `N + 1` full levels for the length of
+                // `N`-phase chain holds `N + 1` full images for the length of
                 // the run, and only ever two of them are live.
-                for level in decomposition.levels_dead_after(phase) {
-                    if decomposition.level_visibility(level) == Visibility::Internal
-                        && !hints.keep_levels.contains(&level)
+                for image in decomposition.images_dead_after(phase) {
+                    if decomposition.image_visibility(image) == Visibility::Internal
+                        && !hints.keep_images.contains(&ImageId::from(image))
                     {
-                        // The phase goes with the level, so that a reader who
-                        // wanted it back is told which `keep_levels` entry they
+                        // The phase goes with the image, so that a reader who
+                        // wanted it back is told which `keep_images` entry they
                         // needed rather than only that it is gone.
-                        env.discard_level_after(level, phase)?;
+                        env.discard_image_after(image, phase)?;
                     }
                 }
-                if work[phase].writes_a_level() {
-                    // A phase that wrote no level has nothing to flush and
+                if work[phase].writes_an_image() {
+                    // A phase that wrote no image has nothing to flush and
                     // nothing to materialise, and saying otherwise would put a
                     // byte count on the stream for bytes never written.
                     env.finish(phase + 1)?;
                     events.emit(Event::Materialised {
                         phase,
-                        level: phase + 1,
+                        image: phase + 1,
                         bytes: phase_bytes[phase],
                         intermediate: phase + 1 < n_phases,
                     });
@@ -604,7 +605,7 @@ pub fn execute_phases(
     // The guard again, on what was *actually* written rather than on what the
     // decomposition promised. A decomposition that tiles and an executor that
     // wrote something else would otherwise agree. Against **each phase's own**
-    // volume, which is the level it wrote.
+    // volume, which is the image it wrote.
     for (phase, boxes) in written.iter().enumerate() {
         boxes_tile_exactly(boxes, &decomposition.phases[phase].volume()).map_err(|err| {
             Error::InvalidArgument(format!(
@@ -845,8 +846,8 @@ fn run_task(
     }
     let phase = &decomposition.phases[task.phase];
     // Two regions, in two coordinate spaces, and which is which is the whole
-    // content of the change that introduced `source`: `fetch` is asked of level
-    // `task.phase` and is in that level's space; `read` is this phase's own read
+    // content of the change that introduced `source`: `fetch` is asked of image
+    // `task.phase` and is in that image's space; `read` is this phase's own read
     // extent, is what `valid` was derived from, and is the space the output goes
     // back in. They are the same region for every phase whose output grid is its
     // input grid.
@@ -865,13 +866,13 @@ fn run_task(
     // reduces to the old comparison, unchanged.
     // Where this block sits in **every** space the phase touches, which is two
     // regions the executor has had all along and passed one of: `fetch` is in
-    // the level that was read, `read` is in the level being written. They are
+    // the image that was read, `read` is in the image being written. They are
     // the same region in the same volume for every phase whose output grid is
     // its input grid, which is why one anchor sufficed until a lattice phase
     // needed both. See `op::Placement`.
     //
     // The buffer holds `fetch`, so that is where the ops read from, and the
-    // volume is the one `fetch` is a region of — the level that was read. An op
+    // volume is the one `fetch` is a region of — the image that was read. An op
     // is handed the *volume* it belongs to, not the block, which is what keeps a
     // globally-anchored sample grid from moving with the block.
     //
@@ -929,7 +930,7 @@ fn run_task(
     let read_chunks = chunks_touched(fetch, &env.chunk_shape());
     events.emit(Event::RegionRead {
         source: format!("level {}", task.phase),
-        level: task.phase,
+        image: task.phase,
         index: Some(task.index),
         region: fetch.clone(),
         voxels: fetch.voxels(),
@@ -974,10 +975,10 @@ fn run_task(
 
     let mut side_written: Vec<(String, Region)> = Vec::new();
     if !short_circuited {
-        // The levels this phase's source leaves read, at **the same region**:
+        // The images this phase's source leaves read, at **the same region**:
         // a source leaf has reach 0, so what it reads is what the block already
-        // fetches, and `check_source_levels` is what makes those the same
-        // integers by requiring the two levels to be on one lattice.
+        // fetches, and `check_source_images` is what makes those the same
+        // integers by requiring the two images to be on one lattice.
         //
         // Read here rather than beside the input read for one reason: a block
         // that short circuits has not looked at its input, and reading a second
@@ -985,26 +986,26 @@ fn run_task(
         // phase with a source leaf never short circuits — `Chain::Source`
         // declines `constant_maps_to` — so this is a property of the code
         // rather than of the plan, and worth keeping true by construction.)
-        let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_levels.len());
-        for &level in &phase.source_levels {
+        let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_images.len());
+        for &image in &phase.source_images {
             let started = Instant::now();
-            let stored = env.read(level, fetch)?;
+            let stored = env.read(image, fetch)?;
             let read_ns = started.elapsed().as_nanos() as u64;
             // Priced exactly like the input read, through the same event, so a
             // run that reads two arrays per block reports two arrays' worth of
             // bytes. A second arm that cost nothing in the counters would make
             // every measurement of this feature a measurement of the wrong plan.
             events.emit(Event::RegionRead {
-                source: format!("level {level}"),
-                level,
+                source: format!("level {image}"),
+                image,
                 index: Some(task.index),
                 region: fetch.clone(),
                 voxels: fetch.voxels(),
-                bytes: fetch.voxels() as u64 * decomposition.dtype_at(level).size_of() as u64,
+                bytes: fetch.voxels() as u64 * decomposition.dtype_at(image).size_of() as u64,
                 chunks: chunks_touched(fetch, &env.chunk_shape()),
                 duration_ns: read_ns,
             });
-            sources.push((level, stored));
+            sources.push((image, stored));
         }
         for (&slot, place) in phase.slots.iter().zip(&places) {
             let started = Instant::now();
@@ -1029,7 +1030,7 @@ fn run_task(
                     within: &within,
                     regions: &regions,
                 };
-                let produced = env.apply_side(slots[slot], &buf, &next, &block)?;
+                let produced = env.apply_side(slots[slot], &buf, &sources, &next, &block)?;
                 for ((output, region), extra) in declared.iter().zip(&regions).zip(produced.iter())
                 {
                     env.write_side(output, task.phase, region, extra)?;
@@ -1056,7 +1057,7 @@ fn run_task(
             });
         }
         // After the last slot, not after the first: a phase may fuse several
-        // slots and any of them may hold a source leaf naming the same level.
+        // slots and any of them may hold a source leaf naming the same image.
         for (_, stored) in &sources {
             env.release(stored);
         }
@@ -1070,7 +1071,7 @@ fn run_task(
     env.release(&buf);
     events.emit(Event::RegionWritten {
         sink: format!("level {}", task.phase + 1),
-        level: task.phase + 1,
+        image: task.phase + 1,
         index: Some(task.index),
         region: valid.clone(),
         voxels: valid.voxels(),
@@ -1150,7 +1151,7 @@ fn run_fragment_task(
     n_phases: usize,
 ) -> Result<TaskOutcome> {
     let phase = &decomposition.phases[task.phase];
-    // As in `run_task`: `fetch` is in the read level's space, `read` in this
+    // As in `run_task`: `fetch` is in the read image's space, `read` in this
     // phase's own.
     let fetch = &task.geometry.source;
     let read = &task.geometry.read;
@@ -1164,7 +1165,7 @@ fn run_fragment_task(
         let read_chunks = chunks_touched(fetch, &env.chunk_shape());
         events.emit(Event::RegionRead {
             source: format!("level {}", task.phase),
-            level: task.phase,
+            image: task.phase,
             index: Some(task.index),
             region: fetch.clone(),
             voxels: fetch.voxels(),
@@ -1184,36 +1185,36 @@ fn run_fragment_task(
         None
     };
 
-    // The levels this op declared besides the one it is handed, at the block's
+    // The images this op declared besides the one it is handed, at the block's
     // **own fetch region** — the same arrangement `run_task` has for a chain's
     // source leaves, through the same event, so a fragment phase that reads two
     // arrays reports two arrays' worth of bytes. A second arm that cost nothing
     // in the counters would make every measurement of this feature a measurement
     // of the wrong plan.
     //
-    // Read whether or not the op reads its own level: `reads_pixels` is about
-    // level `p` and `source_inputs` is about every other level, so an op that
+    // Read whether or not the op reads its own image: `reads_pixels` is about
+    // image `p` and `source_inputs` is about every other image, so an op that
     // consults a stored array without wanting its own input pays for one array
     // rather than two.
-    let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_levels.len());
-    for &level in &phase.source_levels {
+    let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_images.len());
+    for &image in &phase.source_images {
         let started = Instant::now();
-        let stored = env.read(level, fetch)?;
+        let stored = env.read(image, fetch)?;
         let read_ns = started.elapsed().as_nanos() as u64;
         events.emit(Event::RegionRead {
-            source: format!("level {level}"),
-            level,
+            source: format!("level {image}"),
+            image,
             index: Some(task.index),
             region: fetch.clone(),
             voxels: fetch.voxels(),
-            bytes: fetch.voxels() as u64 * decomposition.dtype_at(level).size_of() as u64,
+            bytes: fetch.voxels() as u64 * decomposition.dtype_at(image).size_of() as u64,
             chunks: chunks_touched(fetch, &env.chunk_shape()),
             duration_ns: read_ns,
         });
-        sources.push((level, stored));
+        sources.push((image, stored));
     }
     let borrowed: Vec<(usize, &BlockBuf)> =
-        sources.iter().map(|(level, buf)| (*level, buf)).collect();
+        sources.iter().map(|(image, buf)| (*image, buf)).collect();
 
     let counts = phase.grid.blocks_per_axis();
     let mut wanted = BTreeMap::new();
@@ -1375,7 +1376,7 @@ fn run_fragment_task(
     if op.writes_pixels() {
         let Some(buf) = &produced.pixels else {
             return Err(Error::InvalidArgument(format!(
-                "fragment op {:?} declares `writes_pixels` and returned no buffer, so level \
+                "fragment op {:?} declares `writes_pixels` and returned no buffer, so image \
                  {} would have a hole where this block's core is. Use \
                  `BlockView::output_buffer`, which works under a simulated environment too.",
                 op.name(),
@@ -1390,7 +1391,7 @@ fn run_fragment_task(
         env.release(buf);
         events.emit(Event::RegionWritten {
             sink: format!("level {}", task.phase + 1),
-            level: task.phase + 1,
+            image: task.phase + 1,
             index: Some(task.index),
             region: valid.clone(),
             voxels: valid.voxels(),
@@ -1430,7 +1431,7 @@ fn run_fragment_task(
 ///
 /// Returns the substage count and one outcome per block, in the phase's block
 /// order, so the caller's bookkeeping — the tiling guard, the byte counts, the
-/// level lifetime, the dependents — is the same code that runs for every other
+/// image lifetime, the dependents — is the same code that runs for every other
 /// kind of phase.
 ///
 /// **The trivial form, on purpose.** Every block runs every substage, and the
@@ -1493,7 +1494,7 @@ fn run_iterative_phase(
     // and a forty-substage phase costs exactly what a two-substage one costs. They
     // are allocated through the environment so that residency is booked the way it
     // books it, and owned here rather than by the environment because nothing
-    // outside this phase can see them: the plan allocates no level for them and
+    // outside this phase can see them: the plan allocates no image for them and
     // `Visibility` has nothing to say about them.
     //
     // The fill value is never read. Every block writes its core at substage 0 and
@@ -1540,20 +1541,20 @@ fn run_iterative_phase(
                     // an extent rather than each getting its own.
                     let mut buffers = Vec::with_capacity(operands.len());
                     for operand in &operands {
-                        // The running operand comes off the level only at substage 0;
+                        // The running operand comes off the image only at substage 0;
                         // after that it is what the previous substage wrote, and it is
                         // the neighbours' *cores* of that which make the reach stay at
-                        // one substage's worth. A fixed operand comes off the level
+                        // one substage's worth. A fixed operand comes off the image
                         // every time, which is the whole point of declaring it.
-                        let from_level = operand.operand == Operand::Fixed || ran == 0;
-                        if from_level {
+                        let from_image = operand.operand == Operand::Fixed || ran == 0;
+                        if from_image {
                             let started = Instant::now();
                             let buf = env.read(phase_index, fetch)?;
                             let read_ns = started.elapsed().as_nanos() as u64;
                             let chunks = chunks_touched(fetch, &env.chunk_shape());
                             events.emit(Event::RegionRead {
                                 source: format!("level {phase_index}"),
-                                level: phase_index,
+                                image: phase_index,
                                 index: Some(task.index),
                                 region: fetch.clone(),
                                 voxels: fetch.voxels(),
@@ -1570,7 +1571,7 @@ fn run_iterative_phase(
                             });
                             buffers.push(buf);
                         } else {
-                            // A private buffer is not a level: no `RegionRead`, because
+                            // A private buffer is not an image: no `RegionRead`, because
                             // nothing was fetched from storage. The residency is still
                             // booked, because the block is still resident.
                             buffers.push(env.slice(&current, &whole, fetch)?);
@@ -1639,7 +1640,7 @@ fn run_iterative_phase(
         }
 
         // The fixed point, written out block by block. This is the only write the
-        // phase makes to a level, which is what makes the substage count invisible
+        // phase makes to an image, which is what makes the substage count invisible
         // to everything downstream.
         let mut outcomes = Vec::with_capacity(tasks.len());
         let write_bytes_per_voxel = decomposition.dtype_at(phase_index + 1).size_of() as u64;
@@ -1653,7 +1654,7 @@ fn run_iterative_phase(
             env.release(&piece);
             events.emit(Event::RegionWritten {
                 sink: format!("level {}", phase_index + 1),
-                level: phase_index + 1,
+                image: phase_index + 1,
                 index: Some(task.index),
                 region: valid.clone(),
                 voxels: valid.voxels(),
@@ -1916,7 +1917,7 @@ pub fn planned_block(
 ///   a plan for every branch. That is not a coincidence, it is what `taken`
 ///   being an index into equally-planned branches means.
 /// * *It cannot change an answer.* Branches of an `Alternative` are candidates
-///   for one level: [`Chain::produces`] already refuses branches that write
+///   for one image: [`Chain::produces`] already refuses branches that write
 ///   different element types, and [`Chain::placed_output_shape`] already refuses
 ///   branches that write different extents. That the values agree is the chain
 ///   author's claim, exactly as it was before anything chose between them — what
@@ -2036,7 +2037,7 @@ impl Strategy for Trivial {
             chain_reach,
         };
         decomposition.declare_dtypes(&workflow.chain)?;
-        decomposition.declare_source_levels(&workflow.chain)?;
+        decomposition.declare_source_images(&workflow.chain)?;
         decomposition.check()?;
         // The oracle has exactly one plan to offer, so it consults the ops'
         // constraint by *checking* rather than by choosing: an op that mandates
@@ -2053,7 +2054,7 @@ impl Strategy for Trivial {
             priority: SchedulePriority::PhaseMajor,
             concurrency: 1,
             prefetch_depth: 0,
-            keep_levels: BTreeSet::new(),
+            keep_images: BTreeSet::new(),
         }
     }
 }
@@ -2063,11 +2064,99 @@ impl Strategy for Trivial {
 /// selectable — see [`PartitionSearch`].
 ///
 /// Per-phase block sizes are separable given the partition — the total is
-/// `sum over phases of n_blocks_p x cost_per_block_p` and the budget binds each
-/// phase independently — so choosing them is an inner loop over candidates
-/// rather than a `candidates^phases` product.
+/// `sum over phases of makespan_p` and the budget binds each phase
+/// independently — so choosing them is an inner loop over candidates rather
+/// than a `candidates^phases` product.
+///
+/// # The objective is a makespan, and that is what makes the block choice real
+///
+/// The per-phase block edge has always been an inner loop here. What it lacked
+/// was a reason to answer differently in different phases. The old objective was
+/// the phase's **serial work**, `cost_per_block x n_blocks`, and that is
+/// `volume x redundancy x per-voxel` — `n_blocks` cancels, `redundancy >= 1`
+/// falls monotonically as the block grows, and so the sweep answered *"the
+/// largest candidate"* in every phase of every chain. The freedom was on paper.
+///
+/// It has to be more than read volume, because a smaller block trades two things
+/// against each other and read volume is only one of them:
+///
+/// * it **raises** the read, by `prod((B + lo + hi) / B)` per cut axis — that is
+///   the term the old objective had, and the term that makes a fragment-and-join
+///   op want one block;
+/// * it **creates** the concurrency, because the unit of parallelism is the
+///   block. At one block a phase has one task, and a pool of 40 workers runs it
+///   on one thread with 39 parked. A local op — reach zero, redundancy `1.0` at
+///   every grid — pays *nothing* for the cut and is the whole width of the pool
+///   faster for it. Read volume alone cannot see that: it is the same number at
+///   every edge, and the tie-break then takes the largest.
+///
+/// So the objective is the phase's predicted **wall clock**, and it is
+/// [`phase_makespan`] — the larger of the two lower bounds a phase has:
+///
+/// ```text
+/// makespan(phase) = max( cost_per_block x ceil(n / workers) ,  read x read_cost + core x write )
+///                        \------------ the pool -----------/    \--------- the channel -------/
+/// ```
+///
+/// summed over phases, which are sequential because a phase boundary is a
+/// materialisation.
+///
+/// The **pool** bound's `ceil` is not a fudge: the blocks of one phase depend
+/// only on the phase before, so they are independent and identically priced, and
+/// `ceil(n / P)` is the exact makespan of `n` identical independent tasks on `P`
+/// processors. It is honest about the quantisation too — 41 blocks on 40 workers
+/// costs two rounds, and a search told so will not propose it.
+///
+/// The **channel** bound is there because the pool bound divides *everything* by
+/// the pool, reads included, and workers do not multiply bandwidth. Without it
+/// the search buys parallelism with read amplification — see [`phase_makespan`],
+/// which records what that cost when it was measured. It is what makes the
+/// search take the cut where it is free and refuse it where it is paid for in
+/// traffic.
+///
+/// `workers` is [`Enumerating::concurrency`], the same number
+/// [`Strategy::hints`] hands the executor. Nothing new is configured, and no
+/// coefficient is invented: both bounds are built from
+/// [`CostModel`](crate::decomposition::CostModel) as it already is.
+///
+/// **At `concurrency == 1` this is the old objective exactly** — `ceil(n / 1)`
+/// is `n`, the pool bound is then the channel bound plus the compute and the
+/// conflict so the `max` returns it, the expression is the one that was there,
+/// and the `f64` is bit-identical. That is deliberate twice over: no plan built
+/// before this moves, and the old objective stays reachable as the **negative
+/// control**, a search that cannot see task count, takes one block everywhere,
+/// and looks optimal on read volume while running on one thread.
+///
+/// # What it does not price
+///
+/// **Residency**, in two halves that go opposite ways and are worth separating.
+///
+/// * *The block half can only improve.* `budget_bytes` binds
+///   `working_set_bytes_per_block x expected_concurrency` per phase and that
+///   test is unchanged; a phase this objective moves to a *smaller* block has a
+///   strictly smaller working set, and one it leaves alone has the same.
+///   `tests/per_phase_block.rs` asserts the priced peak does not rise.
+/// * *The partition half can rise.* More phases means more intermediate images
+///   alive, and buying a cut in order to give one half its own grid is exactly
+///   what this objective does. The cut is priced — it has to pay its own
+///   `materialise_cost_per_voxel` — but it is priced in **time**, and a whole
+///   intermediate image is a lot of bytes to buy with seconds. A caller whose
+///   ceiling is bytes says so with `budget_bytes`, or leaves `concurrency` at
+///   one. This is the one direction in which raising `concurrency` is not free,
+///   and it is stated here rather than discovered at tile scale.
+///
+/// **Anything that would break the DP.** Both bounds read this phase's own grid,
+/// this phase's own price and the pool width, so the objective is additive over
+/// phases and local to one group — see [`PartitionSearch`], whose list of what
+/// would break additivity this does not join.
 #[derive(Debug, Clone)]
 pub struct Enumerating {
+    /// Blocks the run will hold in flight — handed to the executor by
+    /// [`Strategy::hints`], and the `workers` of the makespan objective above.
+    ///
+    /// `1` is the negative control and the default: it makes the objective the
+    /// serial work total, which is monotone in the block edge, so every phase
+    /// takes the largest candidate that fits.
     pub concurrency: usize,
     pub priority: SchedulePriority,
     /// Which search over contiguous partitions picks the cuts. Both give the
@@ -2104,9 +2193,13 @@ impl Default for Enumerating {
 /// with `price(j..i)` a function of that group's slots and nothing else. It
 /// holds here, and each clause of it is checkable:
 ///
-/// * [`price_phase`] is charged per phase and the totals are summed — the same
-///   arithmetic [`crate::decomposition::predicted_cost`] re-does over a
-///   finished plan, one phase at a time;
+/// * [`price_phase`] is charged per phase and the phase makespans are summed —
+///   the same arithmetic [`predicted_makespan`] re-does over a finished plan,
+///   one phase at a time. [`phase_makespan`] turns a per-block cost into a
+///   phase time out of that phase's own grid, that phase's own read, and the
+///   pool width, so it is as local to one group as the price it multiplies. At
+///   `concurrency == 1` it reduces to `cost_per_block x n_blocks` and this is
+///   [`crate::decomposition::predicted_cost`] exactly;
 /// * [`crate::decomposition::summarise_slots`] and [`constraint_for`] fold over
 ///   the group alone, so the reach, the traversal preferences and the mandate
 ///   are the group's own;
@@ -2195,6 +2288,11 @@ impl Default for Enumerating {
 ///   bears no relation to the old one and the price may go either way.
 /// * **[`compute_per_voxel`] at a changed block**, for an op whose cost has a
 ///   block extent in its denominator.
+/// * **[`rounds`] crossing a step**, once the objective is a makespan: a
+///   widening that costs a phase one more round is a jump the fixed-grid
+///   argument does not cover either. Same shape as the three above — widening
+///   changed what was chosen — and it is one more reason the prune stays
+///   unwritten.
 ///
 /// And two conditions the argument quietly assumes: every model coefficient and
 /// every `cost_per_voxel` is non-negative (a negative one breaks both halves at
@@ -2207,8 +2305,12 @@ impl Default for Enumerating {
 /// absorbs), so redundancy only grows; `distinct_orders` only grows;
 /// infeasibility is absorbing in this direction, because the working set only
 /// grows and a mandate or space conflict cannot be undone by adding a member.
-/// A budget that forces a *smaller* edge raises the total too, since the read is
-/// `volume x prod((B + lo + hi) / B)` and that falls with `B`. And the concern
+/// A budget that forces a *smaller* edge raises the *work* total too, since the
+/// read is `volume x prod((B + lo + hi) / B)` and that falls with `B` — though
+/// under the makespan objective a smaller edge may still be cheaper, because it
+/// buys rounds; that is a statement about which grid is chosen and not about the
+/// monotonicity of the price at a fixed grid, which is what this paragraph is
+/// establishing. And the concern
 /// that a wider group swallows a phase boundary and its write does **not**
 /// apply: `is_materialised` is `i < n`, so for a fixed `i` it is the same for
 /// every `j`, and the saved boundary is priced in `best[j]`, outside this term.
@@ -2362,27 +2464,254 @@ enum GroupPrice {
     Refused(Option<String>),
 }
 
+/// What a plan predicts it will take on `workers`, under `model`.
+///
+/// [`crate::decomposition::predicted_cost`] is the same walk over the same
+/// phases with the same [`price_phase`] arguments; the one difference is the
+/// factor a phase's per-block cost is multiplied by — `n_blocks` there, and
+/// [`rounds`] here. So `predicted_cost` is this at `workers == 1`, bit for bit,
+/// and the relation is the whole of the change [`Enumerating`] documents.
+///
+/// It exists for the reason `predicted_cost` gives for itself: the search now
+/// minimises a quantity, and a quantity nobody can read back off the plan is a
+/// claim nobody can check. `tests/per_phase_block.rs` checks it — that the plan
+/// the search returns is the plan that minimises this over the reachable ones.
+///
+/// The units are the model's: voxelwise maps under
+/// [`CostModel::default`](crate::decomposition::CostModel::default),
+/// nanoseconds under one calibrated from a [`crate::statistics::Snapshot`].
+pub fn predicted_makespan(
+    chain: &Chain,
+    decomposition: &Decomposition,
+    model: &super::decomposition::CostModel,
+    workers: usize,
+) -> Result<f64> {
+    let slots = chain.slots();
+    let mut total = 0.0_f64;
+    for (index, phase) in decomposition.phases.iter().enumerate() {
+        if phase.slots.iter().any(|&slot| slot >= slots.len()) {
+            return Err(Error::InvalidArgument(format!(
+                "predicted_makespan: phase {index} names slot {:?}, and the chain has {}",
+                phase.slots.iter().max(),
+                slots.len()
+            )));
+        }
+        let volume = decomposition.volume_at(index);
+        let (_, _, _, orders) =
+            super::decomposition::summarise_slots(&slots, &phase.slots, volume)?;
+        let compute = compute_per_voxel(&slots, &phase.slots, phase.grid.block());
+        let is_materialised = index + 1 < decomposition.phases.len();
+        let cost = price_phase(
+            &phase.grid,
+            &phase.reach,
+            compute,
+            orders.len(),
+            is_materialised,
+            decomposition.dtype_at(index).size_of() as f64,
+            model,
+            model.materialise_cost_per_voxel,
+        );
+        let write = if is_materialised {
+            model.materialise_cost_per_voxel
+        } else {
+            model.write_cost_per_voxel
+        };
+        total += phase_makespan(&cost, &phase.grid, workers, model, write);
+    }
+    Ok(total)
+}
+
+/// What the partition search looked at, and what it threw away.
+///
+/// **A search that caps itself silently reads as a search that considered
+/// everything.** Every number here is a count of something the search declined
+/// to carry forward, and [`Enumerating::decompose_accounted`] is how a caller
+/// reads them back off the plan it was given.
+///
+/// The space, stated so the counts have a denominator. For `n` slots the search
+/// is over contiguous partitions **and** a block edge per phase. Those two are
+/// separable — see [`Enumerating`] — so it is not `partitions x candidates^n`:
+/// it is `n(n+1)/2` contiguous runs, each sweeping `block_candidates` once, and
+/// then a search over partitions that only ever *looks up* a priced run.
+///
+/// What is pruned, in the order it happens:
+///
+/// * **barrier cuts** — `runs_forbidden_by_barrier` runs are never priced,
+///   because a full-reach slot must be alone in its phase (`barrier_cuts`).
+/// * **the reach-derived floor** — an axis a cut would not narrow is dropped
+///   from the candidate's grid before it is priced ([`cuttable_axes`]). This is
+///   not counted as a drop because the candidate survives; only its axes change.
+/// * **candidates with no grid** — `candidates.no_grid`, an edge at which
+///   [`BlockGrid::along`] produces nothing once the floor has taken its axes.
+/// * **candidates over budget** — `candidates.over_budget`.
+/// * **runs that cannot be a phase at all** — `runs_refused`: a mandate
+///   conflict, two coordinate spaces, or no affordable candidate.
+///
+/// And one hard cap, which is the one worth shouting about: `slots` above
+/// [`MAX_SLOTS`] is **refused**, not truncated. There is no silent cap in here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchAccount {
+    pub slots: usize,
+    /// The `workers` the makespan objective was taken against. `1` is the
+    /// negative control — see [`Enumerating::concurrency`].
+    pub workers: usize,
+    /// `block_candidates.len()`, the width of the per-run inner sweep. A run
+    /// with a mandated extent offers one grid instead; see
+    /// [`CandidateTally::offered`].
+    pub candidates_offered_per_run: usize,
+    /// Contiguous runs priced, out of the `n(n+1)/2` that exist.
+    pub runs_priced: usize,
+    /// Of those, how many could not be a phase at all — a mandate conflict, two
+    /// coordinate spaces, or no affordable candidate.
+    pub runs_refused: usize,
+    /// Runs never priced because a barrier cut forbids them.
+    pub runs_forbidden_by_barrier: usize,
+    /// The candidate sweep, summed over every run priced.
+    pub candidates: CandidateTally,
+    /// The chosen plan, phase by phase.
+    ///
+    /// This is the result the whole change exists for. Two entries with
+    /// different blocks is a per-phase decision the caller can point at.
+    pub chosen: Vec<ChosenPhase>,
+}
+
+/// One phase of the plan the search returned, as the search sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChosenPhase {
+    /// The slot range this phase covers, `start..end`.
+    pub slots: (usize, usize),
+    pub block: [usize; 3],
+    pub n_blocks: usize,
+    /// `ceil(n_blocks / workers)` — see [`rounds`]. Equal to `n_blocks` under
+    /// the negative control, which is what makes that control what it is.
+    pub rounds: usize,
+}
+
+/// How many rounds of `workers` it takes to run `n_blocks` independent blocks.
+///
+/// **This is the term that makes the per-phase block choice a choice.** Blocks
+/// inside a phase depend only on the phase before it — a boundary is a
+/// materialisation — so the blocks of one phase are mutually independent and a
+/// pool of `workers` runs them in `ceil(n / workers)` rounds. For identical
+/// tasks that is not an approximation of the makespan, it *is* the makespan of
+/// list scheduling, and the tasks are identical because [`price_phase`] charges
+/// every block at the widest one.
+///
+/// At `workers == 1` it is `n_blocks`, so `cost_per_block * rounds` is the
+/// literal expression the search used before this existed and every plan built
+/// under it is bit-identical. See [`Enumerating::concurrency`].
+pub fn rounds(n_blocks: usize, workers: usize) -> usize {
+    n_blocks.div_ceil(workers.max(1))
+}
+
+/// What one phase is predicted to take on `workers`: a **roofline**, the larger
+/// of the two lower bounds a phase has.
+///
+/// ```text
+/// makespan = max( cost_per_block x ceil(n / workers) ,  read x n x read_cost + core x n x write )
+///                 \------------- the pool ---------/    \------------ the channel ----------/
+/// ```
+///
+/// # Why the second term has to be there
+///
+/// The first term alone says a phase can be made arbitrarily fast by cutting it
+/// into more blocks, because it divides *everything* — the reads included — by
+/// the pool. That is false and this crate has already paid for it once: a
+/// 716-offset element on a `24 x 20` volume, cut into 336 blocks, ran past
+/// fifteen minutes where one block read the volume once, and
+/// [`cuttable_axes`] exists because of it. Blocks share a channel; workers do
+/// not multiply bandwidth. Measured on this file's own probe before the term
+/// existed, a phase whose reach denied every useful cut was handed 32 blocks at
+/// **16x the read volume** for a predicted 2.5x — the same trade, re-derived.
+///
+/// So the phase cannot finish before its bytes have moved. That is a bound that
+/// does not divide by anything, and the two together are what makes the search
+/// buy parallelism where it is free (a local op reads the same total at every
+/// grid) and refuse it where it is paid for in traffic (a wide reach reads
+/// `(B + lo + hi) / B` times the volume, which is the whole term). Neither is a
+/// tunable: both are built from coefficients
+/// [`CostModel`](crate::decomposition::CostModel) already carries.
+///
+/// # It changes nothing at `workers == 1`
+///
+/// `cost_per_block` is `read x (read_cost + compute) + core x write + conflict`
+/// and every one of those is non-negative — the assumption [`PartitionSearch`]
+/// already states it searches under. So at `rounds == n` the first term is the
+/// second plus the compute and the conflict, the `max` returns the first, and
+/// the `f64` is the one the old objective produced. Bit for bit.
+pub fn phase_makespan(
+    cost: &super::decomposition::PhaseCost,
+    grid: &BlockGrid,
+    workers: usize,
+    model: &super::decomposition::CostModel,
+    write_cost_per_voxel: f64,
+) -> f64 {
+    let n = grid.n_blocks() as f64;
+    let pool = cost.cost_per_block * rounds(grid.n_blocks(), workers) as f64;
+    let channel = cost.read_voxels_per_block * n * model.read_cost_per_voxel
+        + grid.core_voxels() * n * write_cost_per_voxel;
+    pool.max(channel)
+}
+
+/// What one contiguous run's sweep over the candidate edges came to.
+///
+/// Kept because a search that silently drops candidates reads as a search that
+/// considered everything. Folded into [`SearchAccount`] as the search prices.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CandidateTally {
+    /// Candidate grids this run had to choose between. That is
+    /// `block_candidates.len()` for an ordinary run and **one** for a run whose
+    /// ops mandate a block extent — a mandate replaces the candidate list rather
+    /// than filtering it, so there is nothing to choose between and nothing
+    /// dropped.
+    pub offered: usize,
+    /// Dropped because [`BlockGrid::along`] produces no grid at that edge —
+    /// after [`cuttable_axes`] has taken the reach-derived floor off the axes.
+    pub no_grid: usize,
+    /// Dropped because the working set times the concurrency exceeds the budget.
+    pub over_budget: usize,
+    /// Priced and compared. `offered - no_grid - over_budget`.
+    pub priced: usize,
+}
+
 /// Everything needed to price one contiguous run of slots.
 struct PhasePricer<'a> {
     slots: &'a [&'a Chain],
     volume: [usize; 3],
     bytes: f64,
     constraints: &'a Constraints,
+    /// Blocks the run will hold in flight, from [`Enumerating::concurrency`] —
+    /// the same number [`Strategy::hints`] hands the executor. See [`rounds`].
+    workers: usize,
 }
 
 impl PhasePricer<'_> {
+    /// The per-voxel write charge [`price_phase`] applies, re-derived so
+    /// [`phase_makespan`] can put the same number on the channel bound.
+    fn write_cost(&self, is_materialised: bool) -> f64 {
+        if is_materialised {
+            self.constraints.model.materialise_cost_per_voxel
+        } else {
+            self.constraints.model.write_cost_per_voxel
+        }
+    }
+
     /// Price the run `fold` covers, choosing its block edge.
     ///
     /// `is_materialised` is the whole of this function's dependence on the rest
     /// of the partition, and it is `fold.end < slots.len()` — see
     /// [`PartitionSearch`] on why that is what makes the DP legitimate.
-    fn price(&self, fold: &GroupFold, is_materialised: bool) -> GroupPrice {
+    ///
+    /// **The figure returned is a makespan, not a work total**, and the two
+    /// differ by exactly [`rounds`]. See [`Enumerating`] for the argument.
+    fn price(&self, fold: &GroupFold, is_materialised: bool) -> (GroupPrice, CandidateTally) {
+        let mut tally = CandidateTally::default();
         // Reaches in two coordinate spaces cannot be folded without a grid, so a
         // run containing both is infeasible *as a run* — the same shape of
         // answer a block-shape conflict gives, and it drops the partition rather
         // than the plan.
         if let Some(refusal) = &fold.refusal {
-            return GroupPrice::Refused(Some(refusal.clone()));
+            return (GroupPrice::Refused(Some(refusal.clone())), tally);
         }
         let group: Vec<usize> = (fold.start..fold.end).collect();
         let reach = fold.reach.clone().unwrap_or_default();
@@ -2391,7 +2720,7 @@ impl PhasePricer<'_> {
         // drops the partition and the search goes on.
         let mandated = match constraint_for(self.slots, &group, self.volume) {
             Ok(found) => found,
-            Err(err) => return GroupPrice::Refused(Some(err.to_string())),
+            Err(err) => return (GroupPrice::Refused(Some(err.to_string())), tally),
         };
         // The compute figure is re-asked per candidate rather than taken from
         // the fold, because an op may declare a term whose denominator is a
@@ -2431,9 +2760,20 @@ impl PhasePricer<'_> {
             match constraint.lattice(self.volume, &reach) {
                 Ok(Some((grid, window))) => {
                     let cost = price(&grid);
+                    tally.offered += 1;
                     if affordable(&cost) {
+                        tally.priced += 1;
                         halo = window;
-                        chosen = Some((cost.cost_per_block * grid.n_blocks() as f64, 0, grid));
+                        let makespan = phase_makespan(
+                            &cost,
+                            &grid,
+                            self.workers,
+                            &self.constraints.model,
+                            self.write_cost(is_materialised),
+                        );
+                        chosen = Some((makespan, 0, grid));
+                    } else {
+                        tally.over_budget += 1;
                     }
                 }
                 Ok(None) => {
@@ -2449,19 +2789,38 @@ impl PhasePricer<'_> {
             }
         } else {
             for &edge in &self.constraints.block_candidates {
+                tally.offered += 1;
                 // The reach-derived floor, per candidate: an axis is cut only
                 // where the cut narrows what a block reads, which depends on the
                 // edge and so cannot be hoisted out of this loop.
                 let axes = cuttable_axes(&self.constraints.split_axes, &reach, self.volume, edge);
                 let grid = match BlockGrid::along(self.volume, &axes, edge) {
                     Ok(grid) => grid,
-                    Err(_) => continue,
+                    Err(_) => {
+                        tally.no_grid += 1;
+                        continue;
+                    }
                 };
                 let cost = price(&grid);
                 if !affordable(&cost) {
+                    tally.over_budget += 1;
                     continue;
                 }
-                let phase_total = cost.cost_per_block * grid.n_blocks() as f64;
+                tally.priced += 1;
+                // **The objective.** Not `cost_per_block * n_blocks`, which is
+                // the phase's serial *work* and falls monotonically as the block
+                // grows — under it this loop always answers "the largest
+                // candidate" and the per-phase freedom is freedom on paper. This
+                // is the phase's predicted *wall clock*: the same per-block cost
+                // over `ceil(n_blocks / workers)` rounds. At `workers == 1` the
+                // two are the same expression and the same bits.
+                let phase_total = phase_makespan(
+                    &cost,
+                    &grid,
+                    self.workers,
+                    &self.constraints.model,
+                    self.write_cost(is_materialised),
+                );
                 // deterministic: lower cost, then the larger block edge
                 let better = match &chosen {
                     None => true,
@@ -2476,7 +2835,7 @@ impl PhasePricer<'_> {
             }
         }
         let Some((total, _, grid)) = chosen else {
-            return GroupPrice::Refused(note);
+            return (GroupPrice::Refused(note), tally);
         };
         let priced = PricedGroup {
             total,
@@ -2492,10 +2851,10 @@ impl PhasePricer<'_> {
             let phase = priced.clone().into_phase(fold.start, fold.end);
             let label = format!("phase {}..{}", fold.start, fold.end);
             if let Err(err) = constraint.check(&phase.blocks, &label) {
-                return GroupPrice::Refused(Some(err.to_string()));
+                return (GroupPrice::Refused(Some(err.to_string())), tally);
             }
         }
-        GroupPrice::Priced(priced)
+        (GroupPrice::Priced(priced), tally)
     }
 }
 
@@ -2514,12 +2873,20 @@ struct PriceTable {
     /// longer run from the same start spans it too.
     runs: Vec<Vec<GroupPrice>>,
     n: usize,
+    /// What the sweep over runs and candidates cost, and what it threw away.
+    account: SearchAccount,
 }
 
 impl PriceTable {
     fn build(pricer: &PhasePricer, forced_cuts: u32) -> Self {
         let n = pricer.slots.len();
         let mut runs = Vec::with_capacity(n);
+        let mut account = SearchAccount {
+            slots: n,
+            workers: pricer.workers.max(1),
+            candidates_offered_per_run: pricer.constraints.block_candidates.len(),
+            ..SearchAccount::default()
+        };
         for start in 0..n {
             let mut row = Vec::new();
             let mut fold = GroupFold::new(start);
@@ -2529,14 +2896,26 @@ impl PriceTable {
                 // there ends the row: neither this run nor any longer one from
                 // this start is a legal phase.
                 if end >= start + 2 && forced_cuts & (1u32 << (end - 2)) != 0 {
+                    account.runs_forbidden_by_barrier += n + 1 - end;
                     break;
                 }
                 fold.extend(pricer.slots, pricer.volume);
-                row.push(pricer.price(&fold, end < n));
+                let (price, tally) = pricer.price(&fold, end < n);
+                account.candidates.offered += tally.offered;
+                account.candidates.no_grid += tally.no_grid;
+                account.candidates.over_budget += tally.over_budget;
+                account.candidates.priced += tally.priced;
+                row.push(price);
             }
             runs.push(row);
         }
-        Self { runs, n }
+        let (refused, priced, _) = {
+            let table = PriceTableRefusalView(&runs);
+            table.refusals()
+        };
+        account.runs_priced = priced;
+        account.runs_refused = refused;
+        Self { runs, n, account }
     }
 
     /// The price of `start..end`, or `None` where a forced cut forbids the run.
@@ -2548,10 +2927,20 @@ impl PriceTable {
     /// first reason that was not the budget — in `(start, end)` order, which is
     /// the DP's own.
     fn refusals(&self) -> (usize, usize, Option<String>) {
+        PriceTableRefusalView(&self.runs).refusals()
+    }
+}
+
+/// [`PriceTable::refusals`] over the rows alone, so `build` can tally them
+/// before the table it is building exists.
+struct PriceTableRefusalView<'a>(&'a [Vec<GroupPrice>]);
+
+impl PriceTableRefusalView<'_> {
+    fn refusals(&self) -> (usize, usize, Option<String>) {
         let mut refused = 0;
         let mut priced = 0;
         let mut note = None;
-        for row in &self.runs {
+        for row in self.0 {
             for entry in row {
                 priced += 1;
                 if let GroupPrice::Refused(reason) = entry {
@@ -2694,6 +3083,35 @@ impl Strategy for Enumerating {
     }
 
     fn decompose(&self, workflow: &Workflow, constraints: &Constraints) -> Result<Decomposition> {
+        self.decompose_accounted(workflow, constraints)
+            .map(|(decomposition, _)| decomposition)
+    }
+
+    fn hints(&self, workflow: &Workflow, decomposition: &Decomposition) -> Hints {
+        Hints {
+            visit_order: consensus_order(workflow, decomposition),
+            priority: self.priority,
+            concurrency: self.concurrency,
+            prefetch_depth: 1,
+            // Nothing kept: a strategy advising on speed has no reason to want
+            // an intermediate afterwards. A caller who does overrides it.
+            keep_images: BTreeSet::new(),
+        }
+    }
+}
+
+impl Enumerating {
+    /// [`Strategy::decompose`], with the [`SearchAccount`] it built the plan by.
+    ///
+    /// `decompose` is this and a `.0`. It exists separately because the trait
+    /// returns a `Decomposition` and the counts are not part of the plan — they
+    /// are a fact about the *search*, and a caller who wants to know what was
+    /// dropped should not have to re-run it to find out.
+    pub fn decompose_accounted(
+        &self,
+        workflow: &Workflow,
+        constraints: &Constraints,
+    ) -> Result<(Decomposition, SearchAccount)> {
         let slots = workflow.chain.slots();
         if slots.is_empty() {
             return Err(Error::InvalidArgument(
@@ -2735,6 +3153,7 @@ impl Strategy for Enumerating {
             volume,
             bytes: workflow.dtype.size_of() as f64,
             constraints,
+            workers: self.concurrency.max(1),
         };
         let table = PriceTable::build(&pricer, forced_cuts);
 
@@ -2796,6 +3215,22 @@ impl Strategy for Enumerating {
             })
             .collect();
 
+        let mut account = table.account.clone();
+        account.chosen = phases
+            .iter()
+            .map(|phase| {
+                let n = phase.grid.n_blocks();
+                let start = phase.slots.first().copied().unwrap_or(0);
+                let end = phase.slots.last().map_or(0, |last| last + 1);
+                ChosenPhase {
+                    slots: (start, end),
+                    block: phase.grid.block(),
+                    n_blocks: n,
+                    rounds: rounds(n, account.workers),
+                }
+            })
+            .collect();
+
         let mut decomposition = Decomposition {
             volume,
             dtype: workflow.dtype,
@@ -2803,21 +3238,9 @@ impl Strategy for Enumerating {
             chain_reach: workflow.chain.reach3(&volume),
         };
         decomposition.declare_dtypes(&workflow.chain)?;
-        decomposition.declare_source_levels(&workflow.chain)?;
+        decomposition.declare_source_images(&workflow.chain)?;
         decomposition.check()?;
-        Ok(decomposition)
-    }
-
-    fn hints(&self, workflow: &Workflow, decomposition: &Decomposition) -> Hints {
-        Hints {
-            visit_order: consensus_order(workflow, decomposition),
-            priority: self.priority,
-            concurrency: self.concurrency,
-            prefetch_depth: 1,
-            // Nothing kept: a strategy advising on speed has no reason to want
-            // an intermediate afterwards. A caller who does overrides it.
-            keep_levels: BTreeSet::new(),
-        }
+        Ok((decomposition, account))
     }
 }
 
@@ -2915,7 +3338,7 @@ impl Strategy for Greedy {
             chain_reach: workflow.chain.reach3(&volume),
         };
         decomposition.declare_dtypes(&workflow.chain)?;
-        decomposition.declare_source_levels(&workflow.chain)?;
+        decomposition.declare_source_images(&workflow.chain)?;
         decomposition.check()?;
         Ok(decomposition)
     }
@@ -2926,7 +3349,7 @@ impl Strategy for Greedy {
             priority: SchedulePriority::BlockMajor,
             concurrency: self.concurrency,
             prefetch_depth: 2,
-            keep_levels: BTreeSet::new(),
+            keep_images: BTreeSet::new(),
         }
     }
 }
@@ -3078,7 +3501,7 @@ fn phase_for_group(
 /// asserts that it is not merely an accident of the group-building loop.
 ///
 /// **What it is not.** It is not a strategy to run production work with — it
-/// writes every intermediate to a level and reads it back — and it does not
+/// writes every intermediate to an image and reads it back — and it does not
 /// claim to be cheap. It claims to be *legible*.
 #[derive(Debug, Clone)]
 pub struct Materialising {
@@ -3158,7 +3581,7 @@ impl Strategy for Materialising {
             chain_reach: workflow.chain.reach3(&volume),
         };
         decomposition.declare_dtypes(&workflow.chain)?;
-        decomposition.declare_source_levels(&workflow.chain)?;
+        decomposition.declare_source_images(&workflow.chain)?;
         decomposition.check()?;
         Ok(decomposition)
     }
@@ -3169,7 +3592,7 @@ impl Strategy for Materialising {
             priority: self.priority,
             concurrency: self.concurrency,
             prefetch_depth: 1,
-            keep_levels: BTreeSet::new(),
+            keep_images: BTreeSet::new(),
         }
     }
 }
@@ -3192,6 +3615,15 @@ impl Materialising {
     /// the workflow and the constraints, neither of which this value holds, and a
     /// planner that memoised against the wrong one would be a planner whose
     /// answer depended on its history.
+    ///
+    /// **It is a work total, and [`Enumerating`] now minimises a makespan.** The
+    /// two agree at `concurrency == 1` and part above it, in the direction that
+    /// makes this an over-estimate: a makespan is never more than the work it is
+    /// scheduled from. So it remains a valid *upper* bound for a pruned search
+    /// over either objective — but a loose one at a wide pool, and anybody
+    /// wiring branch-and-bound at `concurrency > 1` wants this strategy's plan
+    /// through [`predicted_makespan`] instead, which is the same plan priced on
+    /// the objective the search is minimising.
     pub fn incumbent_cost(&self, workflow: &Workflow, constraints: &Constraints) -> Result<f64> {
         let decomposition = self.decompose(workflow, constraints)?;
         super::decomposition::predicted_cost(&workflow.chain, &decomposition, &constraints.model)
@@ -3390,7 +3822,7 @@ mod block_floor_tests {
         let run = |plan: &Decomposition| -> Voxels {
             let env = ArrayEnvironment::for_decomposition(input.clone(), plan, [4, 4, 4]).unwrap();
             execute("floor", &workflow, plan, &Hints::default(), &env).unwrap();
-            env.level(plan.n_phases())
+            env.image(plan.n_phases())
         };
 
         let oracle = run(&Trivial
@@ -3520,7 +3952,7 @@ mod block_floor_tests {
         let run = |plan: &Decomposition| -> Voxels {
             let env = ArrayEnvironment::for_decomposition(input.clone(), plan, [4, 4, 4]).unwrap();
             execute("floor", &workflow, plan, &Hints::default(), &env).unwrap();
-            env.level(plan.n_phases())
+            env.image(plan.n_phases())
         };
         let oracle = run(&Trivial
             .decompose(&workflow, &Constraints::default())

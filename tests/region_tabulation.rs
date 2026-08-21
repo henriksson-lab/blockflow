@@ -157,7 +157,7 @@ fn labels(volume: [usize; 3], of: fn([usize; 3]) -> u64) -> Voxels {
 }
 
 /// Writes the value array from the **global** coordinate, so that a block's
-/// output is a function of where it is and not of how big it is. Level 1 has to
+/// output is a function of where it is and not of how big it is. Image 1 has to
 /// be produced by a phase — an `ArrayEnvironment` holds one input array — and
 /// this is the smallest honest producer of a second one.
 struct CoordinateValuesOp {
@@ -190,7 +190,7 @@ fn values_workflow(volume: [usize; 3], of: fn([usize; 3]) -> f64) -> Workflow {
     Workflow::new(Chain::op(CoordinateValuesOp { of }), volume, Dtype::F64)
 }
 
-/// One pixel phase over `block`, which writes the value array into level 1. The
+/// One pixel phase over `block`, which writes the value array into image 1. The
 /// two fragment phases are appended after it.
 fn values_phase(volume: [usize; 3], block: [usize; 3]) -> Decomposition {
     Decomposition {
@@ -208,7 +208,7 @@ fn values_phase(volume: [usize; 3], block: [usize; 3]) -> Decomposition {
 }
 
 /// The three-phase plan: the value array, the per-block partials read out of
-/// **level 0 and level 1**, and the merge.
+/// **image 0 and image 1**, and the merge.
 fn tabulation_plan(
     volume: [usize; 3],
     block: [usize; 3],
@@ -218,7 +218,7 @@ fn tabulation_plan(
     let lattice = base.phases[0].grid.blocks_per_axis();
     let tabulate =
         TabulateValuesOp::new("tabulate", 0, 1, point, "partials", Lifecycle::DeleteOnExit)
-            .expect("two different levels");
+            .expect("two different images");
     let merge = MergeTabulationOp::new(
         "merge",
         "partials",
@@ -803,7 +803,7 @@ fn region_sizes_equal_the_scene_object_voxel_counts() {
     let lattice = base.phases[0].grid.blocks_per_axis();
     let tabulate =
         TabulateValuesOp::new("tabulate", 0, 1, point, "partials", Lifecycle::DeleteOnExit)
-            .expect("two levels");
+            .expect("two images");
     let merge = MergeTabulationOp::new(
         "merge",
         "partials",
@@ -1015,18 +1015,18 @@ fn every_region_is_written_by_exactly_one_block() {
     }
 }
 
-/// The second array is read, and charged for, as a read of the level it names.
+/// The second array is read, and charged for, as a read of the image it names.
 /// A second array that cost nothing in the counters would make every measurement
 /// of this op a measurement of a different plan.
 #[test]
-fn both_arrays_are_read_and_counted_as_reads_of_their_own_levels() {
+fn both_arrays_are_read_and_counted_as_reads_of_their_own_images() {
     let block = [3usize, 4, 4];
     let (plan, _, _, _) = tabulation_plan(VOLUME, block, fixed());
-    // Level 0 and level 1 are both the tabulating phase's operands; nothing else
-    // reads level 1, and the merge reads no pixels at all.
-    assert_eq!(plan.phases[1].source_levels, vec![0, 1]);
-    assert_eq!(plan.phases[0].source_levels, Vec::<usize>::new());
-    assert_eq!(plan.phases[2].source_levels, Vec::<usize>::new());
+    // Image 0 and image 1 are both the tabulating phase's operands; nothing else
+    // reads image 1, and the merge reads no pixels at all.
+    assert_eq!(plan.phases[1].source_images, vec![0, 1]);
+    assert_eq!(plan.phases[0].source_images, Vec::<usize>::new());
+    assert_eq!(plan.phases[2].source_images, Vec::<usize>::new());
     // The tabulating phase's operands are voxelwise, so it is granted no halo:
     // every voxel is read by the one block whose core holds it.
     assert_eq!(plan.phases[1].halo, [0, 0, 0]);
@@ -1035,23 +1035,23 @@ fn both_arrays_are_read_and_counted_as_reads_of_their_own_levels() {
     // partial a dependency of every block's merge.
     assert_eq!(plan.phases[2].halo, VOLUME);
 
-    // And the counters agree with the plan. Level 0 is read once per block by
+    // And the counters agree with the plan. Image 0 is read once per block by
     // the pixel phase and once per block as the tabulating phase's first
-    // operand; level 1 once per block as its second. Nothing reads level 2 —
+    // operand; image 1 once per block as its second. Nothing reads image 2 —
     // the tabulating phase declares `reads_pixels() == false` and the merge is
     // fragments to fragments.
     let run = run_at(VOLUME, block, fixed());
     let blocks = VOLUME[0] / block[0];
     assert_eq!(run.partials.len(), blocks, "every block wrote a partial");
-    let mut per_level: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut per_image: BTreeMap<usize, usize> = BTreeMap::new();
     for event in run.log.events() {
-        if let Event::RegionRead { level, .. } = event {
-            *per_level.entry(level).or_default() += 1;
+        if let Event::RegionRead { image, .. } = event {
+            *per_image.entry(image).or_default() += 1;
         }
     }
-    assert_eq!(per_level.get(&0).copied().unwrap_or(0), 2 * blocks);
-    assert_eq!(per_level.get(&1).copied().unwrap_or(0), blocks);
-    assert_eq!(per_level.get(&2).copied().unwrap_or(0), 0);
+    assert_eq!(per_image.get(&0).copied().unwrap_or(0), 2 * blocks);
+    assert_eq!(per_image.get(&1).copied().unwrap_or(0), blocks);
+    assert_eq!(per_image.get(&2).copied().unwrap_or(0), 0);
 }
 
 /// A tabulation at one scale cannot be read as one at another. The scale is in
@@ -1082,7 +1082,7 @@ fn two_fixed_point_scales_are_two_schemas_and_do_not_mix() {
 fn a_block_can_be_tallied_without_a_run() {
     let point = fixed();
     let op = TabulateValuesOp::new("tabulate", 0, 1, point, "partials", Lifecycle::DeleteOnExit)
-        .expect("two levels");
+        .expect("two images");
     let read = Region::new(&[2, 0, 0], &[2, 4, 4]);
     let mut label_block = Array3::<f64>::zeros((2, 4, 4));
     let mut value_block = Array3::<f64>::zeros((2, 4, 4));
@@ -1881,7 +1881,7 @@ fn the_ops_are_shareable_across_workers() {
     let point = fixed();
     let tabulate: Arc<dyn FragmentOp> = Arc::new(
         TabulateValuesOp::new("tabulate", 0, 1, point, "partials", Lifecycle::DeleteOnExit)
-            .expect("two levels"),
+            .expect("two images"),
     );
     let merge: Arc<dyn FragmentOp> = Arc::new(MergeTabulationOp::new(
         "merge",

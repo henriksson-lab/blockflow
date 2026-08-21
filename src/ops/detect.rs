@@ -26,15 +26,15 @@
 // | 1 | `fragments -> fragments` | read every block's faces, close the local labels into global components with a union-find, add the counts and the sums over each component, and emit the points for the components **this** block owns |
 //
 // It differs from the two ops before it in one structural way, and the way is
-// worth naming: **neither phase writes a level.** `fill` and `regional` both end
+// worth naming: **neither phase writes an image.** `fill` and `regional` both end
 // by rewriting a label volume into a mask, so phase 0 has to write the labels
 // down for phase 1 to read back. Here the answer is not a volume at all — it is
 // a handful of points — and everything phase 1 needs is already in the fragment.
-// The labels are a within-block temporary, so nothing allocates a `u32` level the
+// The labels are a within-block temporary, so nothing allocates a `u32` image the
 // size of the volume to hold a numbering nobody reads. That makes this the first
 // op in `ops/` of `fragment.rs`'s second shape, `fragments -> fragments`, and
 // the guard on it is the output stream's `Coverage::EveryBlock`: a phase that
-// writes no level is not constrained by the tiling check at all, so the coverage
+// writes no image is not constrained by the tiling check at all, so the coverage
 // declaration is the only thing that can fail, and it is declared.
 //
 // The accumulators, which are why this is tractable at all
@@ -174,7 +174,7 @@
 //   one and a rule about which side of a seam owns the face — that is a design,
 //   not a field, and it is not this op's;
 // * **anything needing a second input array** — an intensity total, a weighted
-//   centroid, a background-corrected maximum. A `FragmentOp` reads one level and
+//   centroid, a background-corrected maximum. A `FragmentOp` reads one image and
 //   this op reads the mask. See "The weighted centroid, which is not here"
 //   below, which is where that hook goes.
 //
@@ -195,7 +195,7 @@
 // Which block owns a point, and why exactly one does
 // --------------------------------------------------
 // Phase 1 runs the same merge in every block — it has to, because a fragment
-// phase cannot hand its answer to a later phase without going through a level —
+// phase cannot hand its answer to a later phase without going through an image —
 // so every block computes every component's centroid. What stops the same point
 // being written N times is the ownership rule:
 //
@@ -223,14 +223,14 @@
 // and the one is the one that always mattered:
 //
 // * it needs a **second input array** beside the mask. **That capability is
-//   built.** A [`FragmentOp`] declares the other levels it reads with
+//   built.** A [`FragmentOp`] declares the other images it reads with
 //   [`FragmentOp::source_inputs`], is handed them through
 //   [`FragmentOp::apply_with`], and states what its fold does across a seam with
-//   [`SeamFold`]; the phase records the levels, so the executor fetches them, the
+//   [`SeamFold`]; the phase records the images, so the executor fetches them, the
 //   DAG orders them and `exact_read_voxels` counts them. `ops::tabulate` uses all
 //   three to reduce a second array over the regions of a label volume. Nothing is
 //   waiting on a mechanism any more;
-// * the tempting shortcut — take the weight from the mask level itself, since a
+// * the tempting shortcut — take the weight from the mask image itself, since a
 //   mask may arrive as any width and `is_set` only asks whether a voxel is
 //   non-zero — would give up the exactness above. The weights would be arbitrary
 //   reals, `f64` addition does not associate, and the seam merge would stop being
@@ -298,7 +298,7 @@
 // `ops::fill`'s costs, minus the pixels. Phase 0 is halo-free and embarrassingly
 // parallel. Phase 1 declares a whole-lattice fragment reach, so on `N` blocks it
 // moves `N` fragments to each of `N` blocks and runs the same union-find `N`
-// times; what it does *not* do is read a level, because it does not need one, so
+// times; what it does *not* do is read an image, because it does not need one, so
 // the read amplification `fill`'s header measures is not paid here at all. The
 // fragment is six planes of labels plus eight words per label, against a block of
 // pixels — the same shape, for the same reason.
@@ -732,7 +732,7 @@ pub const MAX: [&str; 3] = ["max_0", "max_1", "max_2"];
 ///
 /// **What is deliberately absent** is anything needing a second input array — an
 /// intensity, a weighted centroid, a background-corrected total. A `FragmentOp`
-/// reads one level and this op reads the mask; the module header says what that
+/// reads one image and this op reads the mask; the module header says what that
 /// would take and why it is not a hook.
 pub fn measurement_schema() -> Schema {
     let mut columns = vec![Column::u64(COUNT)];
@@ -1125,7 +1125,7 @@ pub fn merge_moments_with(
 /// point of the split — the expensive, per-voxel half is fully parallel and
 /// halo-free, and only the cheap, global half is a reduction.
 ///
-/// **Writes no level.** The labels are consumed inside this call — the face
+/// **Writes no image.** The labels are consumed inside this call — the face
 /// planes and the accumulators are everything phase 1 reads — so there is
 /// nothing to hand on, and the module header says what that saves.
 pub struct LabelRegionsOp {
@@ -1378,7 +1378,7 @@ impl FragmentOp for RegionPointsOp {
             self.points_stream.clone(),
             self.lifecycle,
             // Every block, always — and here it is the only guard there is, since
-            // this phase writes no level for the tiling check to bite on. A block
+            // this phase writes no image for the tiling check to bite on. A block
             // that owns no component writes a zero-length blob, which is present
             // and therefore checkable.
             Coverage::EveryBlock,
@@ -1425,7 +1425,7 @@ impl FragmentOp for RegionPointsOp {
 /// merely a fetch extent — and here it is *only* that, because this phase reads
 /// no pixels at all.
 ///
-/// Neither phase declares a `dtype`: neither writes a level, so there is no level
+/// Neither phase declares a `dtype`: neither writes an image, so there is no image
 /// whose width could be wrong, and `check_dtypes` skips both for that reason.
 pub fn detect_phases(
     grid: BlockGrid,

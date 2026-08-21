@@ -21,9 +21,9 @@
 // The rows arrive as a fragment from an earlier phase and the array is a
 // **second** array, declared with [`FragmentOp::source_inputs`] and handed over
 // by `apply_with`. That is the arrangement `ops::rows` describes for a gather
-// and for the same reason: a fragment phase `p` reads level `p`, the phase
+// and for the same reason: a fragment phase `p` reads image `p`, the phase
 // before a row op is the row *producer*, and a producer writes fragments and no
-// level — so there is no arrangement of phases in which this op reads its rows
+// image — so there is no arrangement of phases in which this op reads its rows
 // from an earlier phase and reaches the array through `reads_pixels`. The
 // operand declaration is the one that fits, and it is the one that costs one
 // array rather than two.
@@ -647,8 +647,8 @@ pub fn walk_blob(
 
 /// **Rows in, the same rows with a measured distance out.**
 ///
-/// Reads no pixels of its own level, reads one stored level as an operand,
-/// writes no level, and has reach zero: the answer for a row is written for the
+/// Reads no pixels of its own image, reads one stored image as an operand,
+/// writes no image, and has reach zero: the answer for a row is written for the
 /// row's own coordinate, whatever window the operand was read over. The operand
 /// reach is the sequence's stated maximum and is derived from it.
 ///
@@ -657,7 +657,7 @@ pub fn walk_blob(
 pub struct OffsetWalkOp {
     name: &'static str,
     rows: RowStreams,
-    level: usize,
+    image: usize,
     column: String,
     sequence: OffsetSequence,
     stop: Limit,
@@ -665,8 +665,8 @@ pub struct OffsetWalkOp {
 }
 
 impl OffsetWalkOp {
-    /// `level` is the stored array walked, in the numbering
-    /// `PhaseDecomposition::source_levels` uses. `not_found` is what a row whose
+    /// `image` is the stored array walked, in the numbering
+    /// `PhaseDecomposition::source_images` uses. `not_found` is what a row whose
     /// walk reached the stated maximum is given.
     ///
     /// **`not_found` is a parameter, it must be finite, and it may not be a
@@ -681,12 +681,13 @@ impl OffsetWalkOp {
     pub fn new(
         name: &'static str,
         rows: RowStreams,
-        level: usize,
+        image: impl Into<crate::assemble::ImageId>,
         column: impl Into<String>,
         sequence: OffsetSequence,
         stop: Limit,
         not_found: f64,
     ) -> Result<Self> {
+        let image = image.into().index();
         let column = column.into();
         walk_schema(&rows.schema, &column)?;
         if !not_found.is_finite() {
@@ -709,7 +710,7 @@ impl OffsetWalkOp {
         Ok(Self {
             name,
             rows,
-            level,
+            image,
             column,
             sequence,
             stop,
@@ -760,7 +761,7 @@ impl FragmentOp for OffsetWalkOp {
         vec![FragmentOutput::new(
             self.rows.output.clone(),
             self.rows.lifecycle,
-            // Every block, always. This phase writes no level, so the tiling
+            // Every block, always. This phase writes no image, so the tiling
             // check has nothing to bite on and this declaration is the only
             // guard there is.
             Coverage::EveryBlock,
@@ -768,7 +769,7 @@ impl FragmentOp for OffsetWalkOp {
     }
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
-        vec![SourceInput::new(self.level, self.sequence.reach())]
+        vec![SourceInput::new(self.image, self.sequence.reach())]
     }
 
     fn seam_fold(&self) -> Option<SeamFold> {
@@ -790,7 +791,7 @@ impl FragmentOp for OffsetWalkOp {
     fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
         let schema = self.schema()?;
         let blob = at.own(&self.rows.input).unwrap_or(&[]);
-        let BlockBuf::Array(pixels) = sources.get(self.level)? else {
+        let BlockBuf::Array(pixels) = sources.get(self.image)? else {
             // An accounting run holds no data. It still writes a fragment,
             // because what such a run measures is the IO and a phase that
             // silently produced nothing would be a measurement of a different

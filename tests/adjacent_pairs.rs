@@ -174,7 +174,7 @@ fn shape_of(mask: &Array3<bool>) -> [usize; 3] {
 }
 
 /// Run the one phase and hand back the environment, which is where the answer
-/// is: this op writes no level, so there is nothing to read out of the level
+/// is: this op writes no image, so there is nothing to read out of the image
 /// stack and everything to read out of the store.
 fn run_with(
     mask: &Array3<bool>,

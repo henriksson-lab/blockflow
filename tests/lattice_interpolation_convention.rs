@@ -502,8 +502,8 @@ fn the_pinned_convention_is_decomposition_invariant() {
 ///
 /// The statistic half is untouched by the convention — it writes samples and
 /// interpolates nothing — so what this adds over the test above is that the
-/// coarse level is *materialised* between the two, and the interpolation reads a
-/// level whose shape is neither the volume's nor its own output's while still
+/// coarse image is *materialised* between the two, and the interpolation reads a
+/// image whose shape is neither the volume's nor its own output's while still
 /// mapping global fine coordinates.
 #[test]
 fn the_composition_is_decomposition_invariant_in_both_grids() {
@@ -664,7 +664,7 @@ fn the_convention_changes_no_declared_volume_or_reach() {
         assert_eq!(pinned.reach_spec(VOLUME), positions.reach_spec(VOLUME));
         assert_eq!(pinned.reach_spec(VOLUME).space(), Space::source_index());
         assert_eq!(pinned.cost_per_voxel(), positions.cost_per_voxel());
-        // A uniform coarse level is still exactly uniform after the blend, under
+        // A uniform coarse image is still exactly uniform after the blend, under
         // either convention: every tap is `a + t * (b - a)` with `a == b`.
         assert_eq!(pinned.constant_maps_to(3.5), Some(3.5));
     }
@@ -858,7 +858,7 @@ fn the_fused_default_is_the_convention_it_already_had() {
 /// The fused op and the pair of split ops share nothing but `Alignment::bracket`
 /// — the fused form holds a `Sampling` and materialises its lattice per call
 /// from the anchor, the split pair binds a `SampleLattice` into each op and
-/// passes a coarse level between two phases — and they are asserted equal on the
+/// passes a coarse image between two phases — and they are asserted equal on the
 /// bits under both conventions, at four spacings none of which divides any axis
 /// of `VOLUME`.
 ///
@@ -1007,7 +1007,7 @@ fn the_fused_op_is_decomposition_invariant_when_the_ends_are_pinned() {
     }
 }
 
-/// The threshold carries the convention too, and carries it into the level it
+/// The threshold carries the convention too, and carries it into the image it
 /// compares against rather than into the comparison.
 ///
 /// Checked against the fused statistic's own output put through the same affine
@@ -1070,7 +1070,7 @@ fn the_threshold_carries_the_convention_as_well() {
 ///
 /// The split interpolation declares `Reach::none()` in the source-index space
 /// and states its dependency per block as a fetch region, so its reach cannot
-/// change. The fused op has no second level to fetch from: its dependency is on
+/// change. The fused op has no second image to fetch from: its dependency is on
 /// fine voxels of its own input and is stated as a halo. Pinning the ends maps a
 /// voxel near an end past the lattice's unsampled margin, so it reads a sample
 /// that sits further away than any voxel reaches under the other convention —

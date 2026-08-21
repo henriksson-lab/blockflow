@@ -24,8 +24,8 @@
 //    pool — which is the configuration the partial-chunk race lives in.
 // 3. **Decomposition invariance survives storage.** The property the framework
 //    rests on does not become weaker for having been written to a disk.
-// 4. **Chunk-exclusive writing is a mandate.** Every chunk of a level is
-//    written by exactly one task. A level nobody outside the run reads derives
+// 4. **Chunk-exclusive writing is a mandate.** Every chunk of an image is
+//    written by exactly one task. An image nobody outside the run reads derives
 //    its chunking from the block grid that writes it, so the invariant is free;
 //    a plan whose blocks straddle a chunk grid a caller *dictated* is refused,
 //    naming the chunk. Alignment on the **read** side stays a performance fact
@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ndarray::Array3;
 
+use blockflow::assemble::ImageId;
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::{ArrayEnvironment, Environment};
 use blockflow::geometry::BlockGrid;
@@ -176,7 +177,7 @@ fn through_storage(
     )
 }
 
-/// The same run, with the codec of every level said explicitly, and the wall
+/// The same run, with the codec of every image said explicitly, and the wall
 /// clock it took.
 ///
 /// The elapsed time covers `prepare` and the execution and nothing else — not
@@ -223,7 +224,7 @@ fn through_storage_with(
 
 /// Equality that says where it failed, and treats two NaNs as equal.
 ///
-/// `Voxels` is `PartialEq`, but a level's unwritten sentinel is `f64::NAN` and
+/// `Voxels` is `PartialEq`, but an image's unwritten sentinel is `f64::NAN` and
 /// `NaN != NaN` — so a bare `assert_eq!` would report a difference between two
 /// runs that had agreed perfectly about which voxels nobody wrote. Comparing
 /// them as equal is the honest thing: "unwritten here and unwritten there" is
@@ -365,9 +366,9 @@ fn every_op_through_storage_is_byte_identical_to_the_same_op_in_memory() {
 /// gives one answer.
 ///
 /// Four policies rather than two, because "compressed" is not one thing: the
-/// derived default leaves a `float64` level raw, so a run that only compared
-/// `derived` against `None` would never have compressed the levels these chains
-/// mostly produce. The `uniform` arms compress every level whatever it holds,
+/// derived default leaves a `float64` image raw, so a run that only compared
+/// `derived` against `None` would never have compressed the images these chains
+/// mostly produce. The `uniform` arms compress every image whatever it holds,
 /// which is what actually exercises the codec on `float64`.
 #[test]
 fn compression_is_invisible_to_the_answer_for_every_op_family() {
@@ -388,7 +389,7 @@ fn compression_is_invisible_to_the_answer_for_every_op_family() {
             let scratch = Scratch::new("compressed-identity");
             // An input chunk shape that divides neither the volume nor the block
             // grid, so reads decompress chunks they keep a corner of, and the
-            // written level's own chunks overhang the volume's far edge — which
+            // written image's own chunks overhang the volume's far edge — which
             // makes those writes decompress-patch-recompress, the path a codec
             // is most likely to get wrong.
             let (storage, env) = through_storage_with(
@@ -451,7 +452,7 @@ fn a_compressed_store_and_a_raw_one_differ_on_disk_and_agree_in_the_answer() {
     assert_eq!(gzip_env.compression_at(1).unwrap(), Compression::Gzip(1));
     assert!(
         gzip_env.stored_bytes(1).unwrap() * 4 < raw_env.stored_bytes(1).unwrap(),
-        "the bool level stored {} bytes compressed against {} raw",
+        "the bool image stored {} bytes compressed against {} raw",
         gzip_env.stored_bytes(1).unwrap(),
         raw_env.stored_bytes(1).unwrap()
     );
@@ -464,18 +465,18 @@ fn a_compressed_store_and_a_raw_one_differ_on_disk_and_agree_in_the_answer() {
     );
 }
 
-/// **The measurement.** Stored bytes and elapsed time, per level, under six
-/// policies, over a `synthetic::Scene` volume with a `bool` level in it — and a
-/// second, shorter table for a `uint16` level, which no chain here produces.
+/// **The measurement.** Stored bytes and elapsed time, per image, under six
+/// policies, over a `synthetic::Scene` volume with a `bool` image in it — and a
+/// second, shorter table for a `uint16` image, which no chain here produces.
 ///
 /// This is the evidence for `Compression::for_dtype`, and it is a test rather
 /// than a note in a document so that it is re-run rather than remembered. It
 /// prints the table — `cargo test --features zarr --release compression_pays --
 /// --nocapture` — and asserts only the two directions the defaults depend on:
 ///
-/// * the `bool` level compresses **a great deal**, so the default for `bool`
+/// * the `bool` image compresses **a great deal**, so the default for `bool`
 ///   must be to compress it;
-/// * the `float64` level compresses **hardly at all**, so the default for the
+/// * the `float64` image compresses **hardly at all**, so the default for the
 ///   floats must be to leave them alone rather than pay deflate to discover
 ///   that.
 ///
@@ -509,8 +510,8 @@ fn compression_pays_for_bool_and_not_for_float() {
     }
     let source: Voxels = array.into();
 
-    // One phase, so two levels: level 0 is the `float64` scene as written, and
-    // level 1 is the `bool` mask derived from it. Both are levels this framework
+    // One phase, so two images: image 0 is the `float64` scene as written, and
+    // image 1 is the `bool` mask derived from it. Both are images this framework
     // really produces, and they are the two ends of the compressibility range.
     //
     // The threshold in front of the `non zero` is load-bearing for the
@@ -550,8 +551,8 @@ fn compression_pays_for_bool_and_not_for_float() {
 
     let memory = through_memory(&workflow, &decomposition, &source, &Hints::default());
 
-    // The last three are the question the *per level* design exists to ask: if
-    // the `bool` level is where the ratio is, is it worth turning that one level
+    // The last three are the question the *per image* design exists to ask: if
+    // the `bool` image is where the ratio is, is it worth turning that one image
     // up while leaving the `float64` one alone? The table answers it.
     let policies = [
         (
@@ -569,11 +570,11 @@ fn compression_pays_for_bool_and_not_for_float() {
         ("derived (the default)", CompressionPolicy::derived()),
         (
             "derived, bool at gzip6",
-            CompressionPolicy::derived().with_level(1, Compression::Gzip(6)),
+            CompressionPolicy::derived().with_image(1, Compression::Gzip(6)),
         ),
         (
             "derived, bool at gzip9",
-            CompressionPolicy::derived().with_level(1, Compression::Gzip(9)),
+            CompressionPolicy::derived().with_image(1, Compression::Gzip(9)),
         ),
     ];
     let mut measured = Vec::new();
@@ -601,7 +602,7 @@ fn compression_pays_for_bool_and_not_for_float() {
 
     eprintln!(
         "\ncompression over a {BIG:?} synthetic::Scene, chunk {CHUNK:?}, \
-         {} build\n  level 0 = float64 intensities ({} B raw), level 1 = bool mask ({} B raw)",
+         {} build\n  image 0 = float64 intensities ({} B raw), image 1 = bool mask ({} B raw)",
         if cfg!(debug_assertions) {
             "debug"
         } else {
@@ -612,15 +613,15 @@ fn compression_pays_for_bool_and_not_for_float() {
     );
     eprintln!(
         "{:<24} {:>12} {:>8} {:>12} {:>8} {:>10} {:>12}",
-        "policy", "level0 B", "ratio", "level1 B", "ratio", "run", "break-even"
+        "policy", "image0 B", "ratio", "image1 B", "ratio", "run", "break-even"
     );
     let (_, raw0, raw1, raw_time) = measured[0];
-    for &(what, level0, level1, elapsed) in &measured {
+    for &(what, image0, image1, elapsed) in &measured {
         // The number that decides the trade, and the reason this prints a
         // throughput rather than a ratio: compression pays exactly when the
         // bytes it saved would have taken longer to move than the CPU it spent
         // saving them. Below this store speed, compress; above it, do not.
-        let saved = (raw0 + raw1).saturating_sub(level0 + level1) as f64;
+        let saved = (raw0 + raw1).saturating_sub(image0 + image1) as f64;
         let extra = elapsed.saturating_sub(raw_time).as_secs_f64();
         let break_even = if extra > 0.0 {
             format!("{:.1} MB/s", saved / extra / 1e6)
@@ -628,19 +629,19 @@ fn compression_pays_for_bool_and_not_for_float() {
             "-".to_string()
         };
         eprintln!(
-            "{what:<24} {level0:>12} {:>7.2}x {level1:>12} {:>7.2}x {:>9.0?} {break_even:>12}",
-            raw0 as f64 / level0 as f64,
-            raw1 as f64 / level1 as f64,
+            "{what:<24} {image0:>12} {:>7.2}x {image1:>12} {:>7.2}x {:>9.0?} {break_even:>12}",
+            raw0 as f64 / image0 as f64,
+            raw1 as f64 / image1 as f64,
             elapsed
         );
     }
     eprintln!();
 
-    // ---- and the same question for an integer level, which needs no chain --
+    // ---- and the same question for an integer image, which needs no chain --
     //
     // The `uint16` case is the third row of `Compression::for_dtype`'s table and
     // it is not reachable from the chain above, so it is measured directly: a
-    // twelve-bit quantisation of the same scene, written as level 0 and never
+    // twelve-bit quantisation of the same scene, written as image 0 and never
     // read. That is exactly the shape of a raw acquisition, which is the input
     // this framework is usually handed.
     let quantised = Voxels::from(
@@ -649,7 +650,7 @@ fn compression_pays_for_bool_and_not_for_float() {
             .unwrap()
             .mapv(|value| (value.clamp(0.0, 1.0) * 4095.0) as u16),
     );
-    eprintln!("a uint16 quantisation of the same scene, written as level 0:");
+    eprintln!("a uint16 quantisation of the same scene, written as image 0:");
     let mut integer = Vec::new();
     for compression in [
         Compression::None,
@@ -667,7 +668,7 @@ fn compression_pays_for_bool_and_not_for_float() {
         )
         .unwrap();
         let elapsed = started.elapsed();
-        assert_eq!(env.level(0).unwrap(), quantised, "{}", compression.name());
+        assert_eq!(env.image(0).unwrap(), quantised, "{}", compression.name());
         integer.push((compression, env.stored_bytes(0).unwrap(), elapsed));
     }
     let (_, raw16, _) = integer[0];
@@ -682,26 +683,26 @@ fn compression_pays_for_bool_and_not_for_float() {
     eprintln!();
     assert!(
         integer[1].1 < raw16,
-        "the uint16 level did not compress at all ({} B against {raw16} B); the integer default \
+        "the uint16 image did not compress at all ({} B against {raw16} B); the integer default \
          assumes it does",
         integer[1].1
     );
 
     let gzip1 = measured[1];
-    // The `bool` level: this is the case the defaults are built around.
+    // The `bool` image: this is the case the defaults are built around.
     assert!(
         gzip1.2 * 5 < raw1,
-        "the bool level compressed only {:.2}x ({} B against {} B); the default for bool is \
+        "the bool image compressed only {:.2}x ({} B against {} B); the default for bool is \
          premised on it compressing a great deal, and if it no longer does the default should \
          change rather than this threshold",
         raw1 as f64 / gzip1.2 as f64,
         gzip1.2,
         raw1
     );
-    // The `float64` level: this is the case the defaults *decline*.
+    // The `float64` image: this is the case the defaults *decline*.
     assert!(
         gzip1.1 * 4 > raw0 * 3,
-        "the float64 level compressed {:.2}x ({} B against {} B), which is more than the \
+        "the float64 image compressed {:.2}x ({} B against {} B), which is more than the \
          `Compression::for_dtype` default assumes. If float data on this framework really does \
          compress, the default to leave it raw is wrong and should be revisited on this number \
          rather than defended by loosening this assertion.",
@@ -711,15 +712,15 @@ fn compression_pays_for_bool_and_not_for_float() {
     );
 }
 
-/// A plan whose levels want different answers gets them, and the override is
+/// A plan whose images want different answers gets them, and the override is
 /// heard over the derivation.
 ///
-/// This is what "per level, not per run" buys, made mechanical: the `float64`
-/// level is compressed because the caller asked, and the `bool` level is left
+/// This is what "per image, not per run" buys, made mechanical: the `float64`
+/// image is compressed because the caller asked, and the `bool` image is left
 /// raw because the caller asked — both against what the derivation would have
 /// done, so a policy that was quietly ignored would fail here.
 #[test]
-fn a_per_level_override_reaches_the_arrays_it_names() {
+fn a_per_image_override_reaches_the_arrays_it_names() {
     let input = intensities();
     let source: Voxels = input.into();
     let chain = Chain::sequence(vec![
@@ -751,16 +752,16 @@ fn a_per_level_override_reaches_the_arrays_it_names() {
     decomposition.declare_dtypes(&workflow.chain).unwrap();
     assert_eq!(decomposition.dtype_at(2), Dtype::Bool);
 
-    // Both levels against the grain of the derivation.
+    // Both images against the grain of the derivation.
     let policy = CompressionPolicy::derived()
-        .with_level(0, Compression::Gzip(6))
-        .with_level(2, Compression::None);
-    // Every level pinned: this test inspects the *intermediates*, which are
+        .with_image(0, Compression::Gzip(6))
+        .with_image(2, Compression::None);
+    // Every image pinned: this test inspects the *intermediates*, which are
     // otherwise erased the moment the phase that reads them finishes. That is
-    // what `keep_levels` is for, and saying so here is cheaper than a test that
-    // silently stopped checking level 1.
+    // what `keep_images` is for, and saying so here is cheaper than a test that
+    // silently stopped checking image 1.
     let keep_all = Hints {
-        keep_levels: (0..decomposition.n_levels()).collect(),
+        keep_images: (0..decomposition.n_images()).map(ImageId::from).collect(),
         ..Hints::default()
     };
     let memory = through_memory(&workflow, &decomposition, &source, &keep_all);
@@ -774,24 +775,24 @@ fn a_per_level_override_reaches_the_arrays_it_names() {
         &keep_all,
         policy,
     );
-    assert_same(&memory, &storage, "a mixed per-level policy");
+    assert_same(&memory, &storage, "a mixed per-image policy");
 
     assert_eq!(env.compression_at(0).unwrap(), Compression::Gzip(6));
-    // Level 1 was not named, so it kept the derivation for its own type.
-    assert_eq!(env.level_dtype(1).unwrap(), Dtype::F64);
+    // Image 1 was not named, so it kept the derivation for its own type.
+    assert_eq!(env.image_dtype(1).unwrap(), Dtype::F64);
     assert_eq!(env.compression_at(1).unwrap(), Compression::None);
-    assert_eq!(env.level_dtype(2).unwrap(), Dtype::Bool);
+    assert_eq!(env.image_dtype(2).unwrap(), Dtype::Bool);
     assert_eq!(env.compression_at(2).unwrap(), Compression::None);
-    // And the level that was told to compress really did.
+    // And the image that was told to compress really did.
     assert!(
         env.stored_bytes(2).unwrap() > 0,
-        "the bool level was written and stored nothing"
+        "the bool image was written and stored nothing"
     );
 }
 
 /// Compression does not change what the alignment counters mean.
 ///
-/// Two runs with every level compressed: a plan aligned on both sides is zero on
+/// Two runs with every image compressed: a plan aligned on both sides is zero on
 /// both counters, and a plan whose blocks straddle the **input**'s chunk grid is
 /// not. That matters because compression is precisely what makes an unaligned
 /// read expensive — a decompress of a whole chunk to keep a face of it — so the
@@ -850,7 +851,7 @@ fn the_alignment_counters_still_mean_what_they_meant_under_compression() {
 /// threads writing valid regions that tile the volume but not the chunk grid —
 /// and it deliberately chose a coprime block edge and chunk shape so that every
 /// chunk was shared. Under the chunk-exclusive invariant that arrangement is no
-/// longer expressible for a level: the written level takes its chunking from the
+/// longer expressible for an image: the written image takes its chunking from the
 /// block grid, so no two tasks can meet in a chunk however many threads run.
 ///
 /// So what this measures now is the *other* half — that concurrency does not
@@ -890,12 +891,12 @@ fn concurrent_execution_through_storage_is_still_byte_identical() {
         );
         assert_same(&serial, &storage, &format!("at concurrency {concurrency}"));
         // And the plan really is chunk-exclusive, rather than merely lucky: the
-        // levels these blocks wrote are chunked from the blocks themselves.
-        for level in 1..decomposition.n_levels() {
+        // images these blocks wrote are chunked from the blocks themselves.
+        for image in 1..decomposition.n_images() {
             assert_eq!(
-                env.chunk_at(level).unwrap(),
-                chunk_for_block(decomposition.phases[level - 1].grid.block(), Dtype::F64),
-                "level {level} at concurrency {concurrency}"
+                env.chunk_at(image).unwrap(),
+                chunk_for_block(decomposition.phases[image - 1].grid.block(), Dtype::F64),
+                "image {image} at concurrency {concurrency}"
             );
         }
     }
@@ -960,7 +961,7 @@ fn decomposition_invariance_survives_storage() {
 /// What the old test checked independently is checked here still, in the last
 /// arm: the answer does not depend on the block grid. Six-voxel blocks remain
 /// perfectly legal — they are only illegal against a chunk grid somebody else
-/// fixed, and with nothing dictated the level derives its chunking from them.
+/// fixed, and with nothing dictated the image derives its chunking from them.
 #[test]
 fn a_block_grid_that_straddles_a_dictated_chunk_grid_is_refused_and_names_the_chunk() {
     let input = intensities();
@@ -1044,9 +1045,9 @@ fn a_block_grid_that_straddles_a_dictated_chunk_grid_is_refused_and_names_the_ch
     assert_eq!(
         derived_env.chunk_at(1).unwrap(),
         [6, 6, 6],
-        "the level a phase writes takes its chunking from that phase's blocks"
+        "the image a phase writes takes its chunking from that phase's blocks"
     );
-    // Level 0 keeps the layout it arrived with, and reads of it straddle — which
+    // Image 0 keeps the layout it arrived with, and reads of it straddle — which
     // is legal, is what a halo does, and is still counted.
     assert_eq!(derived_env.chunk_at(0).unwrap(), [4, 4, 4]);
     assert_same(&aligned, &derived, "four-voxel blocks against six-voxel");
@@ -1056,7 +1057,7 @@ fn a_block_grid_that_straddles_a_dictated_chunk_grid_is_refused_and_names_the_ch
 /// the counter was only ever a hint at.
 ///
 /// Under the invariant no two tasks share a chunk, so the read-modify-write path
-/// is unreachable for a level write — with one exception that is worth stating
+/// is unreachable for an image write — with one exception that is worth stating
 /// rather than hiding: `zarrs` compares a subset against the **unclipped** chunk
 /// extent, so a chunk that overhangs the volume's far edge takes the slow path
 /// even though it holds no voxel anybody else can write. The block edges here
@@ -1093,18 +1094,18 @@ fn a_conforming_plan_serialises_no_write_and_over_reads_no_chunk() {
     }
 }
 
-// ------------------------------------------------ levels are per-phase --
+// ------------------------------------------------ images are per-phase --
 
-/// A phase that changes the element type gets a level of that type on disk, and
+/// A phase that changes the element type gets an image of that type on disk, and
 /// the run still agrees with the one in memory.
 ///
-/// This is what `prepare` is for: level `p+1` is created at phase `p`'s
+/// This is what `prepare` is for: image `p+1` is created at phase `p`'s
 /// `volume_at` and `dtype_at`, not at the workflow's. A storage environment that
-/// created every level at the input's type would write a `float64` array where
+/// created every image at the input's type would write a `float64` array where
 /// the plan says `bool` — an eight-fold overcount that every reader downstream
 /// would be right to believe.
 #[test]
-fn a_phase_that_changes_element_type_gets_a_level_of_that_type_on_disk() {
+fn a_phase_that_changes_element_type_gets_an_image_of_that_type_on_disk() {
     let input = intensities();
     let source: Voxels = input.into();
     let chain = Chain::sequence(vec![
@@ -1139,10 +1140,10 @@ fn a_phase_that_changes_element_type_gets_a_level_of_that_type_on_disk() {
     assert_eq!(decomposition.dtype_at(1), Dtype::F64);
     assert_eq!(decomposition.dtype_at(2), Dtype::Bool);
 
-    // Pinned for the same reason as the per-level policy test: what is being
+    // Pinned for the same reason as the per-image policy test: what is being
     // checked here is the width of an intermediate on disk.
     let keep_all = Hints {
-        keep_levels: (0..decomposition.n_levels()).collect(),
+        keep_images: (0..decomposition.n_images()).map(ImageId::from).collect(),
         ..Hints::default()
     };
     let memory = through_memory(&workflow, &decomposition, &source, &keep_all);
@@ -1155,14 +1156,14 @@ fn a_phase_that_changes_element_type_gets_a_level_of_that_type_on_disk() {
         [8, 8, 8],
         &keep_all,
     );
-    assert_eq!(env.level_dtype(0).unwrap(), Dtype::F64);
-    assert_eq!(env.level_dtype(1).unwrap(), Dtype::F64);
-    assert_eq!(env.level_dtype(2).unwrap(), Dtype::Bool);
+    assert_eq!(env.image_dtype(0).unwrap(), Dtype::F64);
+    assert_eq!(env.image_dtype(1).unwrap(), Dtype::F64);
+    assert_eq!(env.image_dtype(2).unwrap(), Dtype::Bool);
     assert_same(&memory, &storage, "a phase that changes element type");
 
-    // The `bool` level really is one byte a voxel on disk, which is the whole
-    // reason the element type became a level's own business.
-    assert_eq!(env.level(2).unwrap().dtype(), Dtype::Bool);
+    // The `bool` image really is one byte a voxel on disk, which is the whole
+    // reason the element type became an image's own business.
+    assert_eq!(env.image(2).unwrap().dtype(), Dtype::Bool);
 }
 
 // --------------------------------------------------------- side outputs --
@@ -1253,9 +1254,9 @@ fn a_run_through_storage_agrees_with_the_whole_volume_kernels() {
     assert_same(&reference, &storage, "whole-volume kernels against storage");
 }
 
-/// A read outside the level is refused rather than clamped, and says which axis.
+/// A read outside the image is refused rather than clamped, and says which axis.
 #[test]
-fn a_region_outside_a_level_is_refused_by_name() {
+fn a_region_outside_an_image_is_refused_by_name() {
     let scratch = Scratch::new("bounds");
     let source = Voxels::zeros(Dtype::U8, [4, 4, 4]).unwrap();
     let env = ZarrEnvironment::create(scratch.path(), &source, [2, 2, 2]).unwrap();
@@ -1302,9 +1303,9 @@ fn two_disagreeing_side_output_declarations_are_refused() {
     assert!(err.contains("table"), "got: {err}");
 }
 
-/// An environment given a plan it cannot host says so, naming the level.
+/// An environment given a plan it cannot host says so, naming the image.
 #[test]
-fn a_plan_that_disagrees_with_level_zero_is_refused_by_prepare() {
+fn a_plan_that_disagrees_with_image_zero_is_refused_by_prepare() {
     let scratch = Scratch::new("prepare");
     let source = Voxels::zeros(Dtype::F64, [4, 4, 4]).unwrap();
     let env = ZarrEnvironment::create(scratch.path(), &source, [2, 2, 2]).unwrap();
@@ -1349,20 +1350,20 @@ fn a_side_output_written_before_it_was_declared_is_refused() {
     assert!(err.contains("declared"), "got: {err}");
 }
 
-// ------------------------------------------------------- level lifetime --
+// ------------------------------------------------------- image lifetime --
 
-/// An intermediate level is **erased from the store** once the phase that reads
+/// An intermediate image is **erased from the store** once the phase that reads
 /// it has finished, and the answer is unchanged.
 ///
-/// This is where the level-lifetime work is measured in the units that matter.
+/// This is where the image-lifetime work is measured in the units that matter.
 /// In memory it is an allocation; here it is a directory of chunks on a disk
 /// that, at the scale this crate exists for, has no room for `N` copies of it.
 ///
 /// Three things asserted, and the third is what makes the first two safe:
 /// the directory is gone, the output is byte-identical to a run that kept
-/// everything, and reading the freed level fails with a message about the plan.
+/// everything, and reading the freed image fails with a message about the plan.
 #[test]
-fn an_intermediate_level_is_erased_from_the_store_and_the_answer_is_unchanged() {
+fn an_intermediate_image_is_erased_from_the_store_and_the_answer_is_unchanged() {
     let input = intensities();
     let source: Voxels = input.clone().into();
     let chain = Chain::sequence(vec![
@@ -1375,7 +1376,7 @@ fn an_intermediate_level_is_erased_from_the_store_and_the_answer_is_unchanged() 
         Chain::op(VoxelwiseMapOp::threshold("threshold", 0.4, 1.0, 0.0)),
     ]);
     let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
-    // one phase per slot, so every stage really materialises a level
+    // one phase per slot, so every stage really materialises an image
     let slots = workflow.chain.slots();
     let grid = BlockGrid::along(VOLUME, &[0], 16).unwrap();
     let plan = Decomposition {
@@ -1395,9 +1396,9 @@ fn an_intermediate_level_is_erased_from_the_store_and_the_answer_is_unchanged() 
         chain_reach: workflow.chain.reach3(&VOLUME),
     };
 
-    let kept_root = Scratch::new("level-lifetime-kept");
+    let kept_root = Scratch::new("image-lifetime-kept");
     let keep_all = Hints {
-        keep_levels: (0..plan.n_levels()).collect(),
+        keep_images: (0..plan.n_images()).map(ImageId::from).collect(),
         ..Hints::default()
     };
     let (kept, kept_env) = through_storage(
@@ -1409,7 +1410,7 @@ fn an_intermediate_level_is_erased_from_the_store_and_the_answer_is_unchanged() 
         &keep_all,
     );
 
-    let freed_root = Scratch::new("level-lifetime-freed");
+    let freed_root = Scratch::new("image-lifetime-freed");
     let (freed, freed_env) = through_storage(
         freed_root.path(),
         &workflow,
@@ -1426,33 +1427,33 @@ fn an_intermediate_level_is_erased_from_the_store_and_the_answer_is_unchanged() 
     );
 
     // the directories: present in the run that kept them, gone in the other
-    for level in 1..plan.n_levels() - 1 {
+    for image in 1..plan.n_images() - 1 {
         assert!(
-            kept_root.path().join(format!("level{level}")).exists(),
-            "level {level} should still be on disk when it was pinned"
+            kept_root.path().join(format!("level{image}")).exists(),
+            "image {image} should still be on disk when it was pinned"
         );
         assert!(
-            !freed_root.path().join(format!("level{level}")).exists(),
-            "level {level} should have been erased"
+            !freed_root.path().join(format!("level{image}")).exists(),
+            "image {image} should have been erased"
         );
-        assert!(freed_env.is_discarded(level));
-        assert!(!kept_env.is_discarded(level));
+        assert!(freed_env.is_discarded(image));
+        assert!(!kept_env.is_discarded(image));
     }
 
-    // level 0 is somebody else's array and the output is what the run is for
+    // image 0 is somebody else's array and the output is what the run is for
     assert!(freed_root.path().join("level0").exists());
     assert!(freed_root
         .path()
-        .join(format!("level{}", plan.n_levels() - 1))
+        .join(format!("level{}", plan.n_images() - 1))
         .exists());
     assert!(!freed_env.is_discarded(0));
-    assert!(!freed_env.is_discarded(plan.n_levels() - 1));
+    assert!(!freed_env.is_discarded(plan.n_images() - 1));
 
-    // and the freed level is loud rather than empty
+    // and the freed image is loud rather than empty
     let message = freed_env
         .read(1, &blockflow::region::Region::new(&[0, 0, 0], &[4, 4, 4]))
         .unwrap_err()
         .to_string();
     assert!(message.contains("discarded"), "{message}");
-    assert!(message.contains("keep_levels"), "{message}");
+    assert!(message.contains("keep_images"), "{message}");
 }

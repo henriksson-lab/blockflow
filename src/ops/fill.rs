@@ -21,7 +21,7 @@
 //
 // | phase | shape | what it does |
 // |---|---|---|
-// | 0 | `volume -> fragments`, and writes pixels | label each block's background locally; write the labels as a level; emit the block's six faces and which of its labels touch the volume's outside |
+// | 0 | `volume -> fragments`, and writes pixels | label each block's background locally; write the labels as an image; emit the block's six faces and which of its labels touch the volume's outside |
 // | 1 | `fragments -> volume` | read every block's faces, close the labels into global components, and rewrite this block's labels into the filled mask |
 //
 // Phase 0 is embarrassingly parallel with **reach zero** — a block-local
@@ -29,12 +29,12 @@
 // paid for exactly once, in phase 1, and what crosses between them is six
 // planes of labels per block rather than any volume of pixels.
 //
-// The intermediate level is decomposition-dependent, and the output is not
+// The intermediate image is decomposition-dependent, and the output is not
 // -----------------------------------------------------------------------------
 // Worth stating plainly because it looks at first like the defect this crate
 // exists to prevent. Block-local labels *are* a function of the block: the same
 // background voxel gets label 4 under one decomposition and label 11 under
-// another, and the level phase 0 writes therefore differs between two runs that
+// another, and the image phase 0 writes therefore differs between two runs that
 // must agree. That is fine, and it is fine for a reason rather than by luck: the
 // labels are an addressing scheme, phase 1 consumes them only through the
 // `(block, label) -> outside?` map it builds from the same fragments, and
@@ -87,18 +87,18 @@
 //
 // Two walls this op ran into, and what was done about each
 // --------------------------------------------------------
-// **A fragment-only phase is terminal as far as levels go.** The natural
+// **A fragment-only phase is terminal as far as images go.** The natural
 // three-phase shape — label, merge, relabel — puts a `fragments -> fragments`
 // merge between two pixel phases, and that cannot be planned: `fragment.rs`'s
-// `check_phase_work` refuses it in as many words, because level `p+1` would go
-// unwritten and phase `p+1` would read a level nobody produced. The merge is
+// `check_phase_work` refuses it in as many words, because image `p+1` would go
+// unwritten and phase `p+1` would read an image nobody produced. The merge is
 // therefore folded into phase 1, which reads the fragments *and* the labels and
 // writes the answer. The cost of the fold is that every block re-runs the same
 // global union-find; the union-find is over face labels rather than voxels, so
 // it is small next to the pixels, but it is `N` times redundant and it is not
 // nothing. See "What this costs" below.
 //
-// **A fragment op could not change the element type of the level it writes.**
+// **A fragment op could not change the element type of the image it writes.**
 // Phase 0 reads a `bool` mask and writes `u32` labels, and `check_dtypes` folds
 // a plan's element types over the *chain* — which a fragment phase owns no slot
 // of. So the fold saw nothing, compared `bool` against the `u32` the plan
@@ -120,7 +120,7 @@
 // **And that reach is also a halo, which costs pixels as well as fragments.**
 // `fragment_phase` sets `halo = max(reach, fragment reach * block edge)`, so
 // phase 1's halo is the whole volume, so phase 1's *read extent* is the whole
-// volume, so every block of it reads the entire label level. That looked at
+// volume, so every block of it reads the entire label image. That looked at
 // first like a convenience constructor conflating two quantities — the executor
 // gathers fragments from `neighbourhood(index, input.reach, counts)` and never
 // consults the halo — and building the phases by hand with a zero halo was the
@@ -131,7 +131,7 @@
 // had written yet. The coupling is load-bearing and the two costs are one cost.
 //
 // So the read amplification is real and is the price of a global reduction in a
-// pipelined plan: `N` blocks each reading the whole label level. The acceptance
+// pipelined plan: `N` blocks each reading the whole label image. The acceptance
 // suite measures it rather than describing it. The way out is a **barrier**
 // rather than a halo — a phase that is declared to start only when the previous
 // one has finished needs no halo to express the same dependency — and that is
@@ -481,7 +481,7 @@ impl FragmentOp for LabelBackgroundOp {
 
     /// **`u32` labels, whatever width the mask arrived in.** A mask may be one
     /// bit or eight bytes; a component index is neither, and saying so here is
-    /// what lets the plan allocate the label level at the width it is actually
+    /// what lets the plan allocate the label image at the width it is actually
     /// written at rather than at the mask's.
     fn produces(&self, _input: Dtype) -> Dtype {
         Dtype::U32
@@ -595,7 +595,7 @@ impl FillHolesOp {
     /// written by two phases holds two generations and "the fragments of stream
     /// s" is not a well-formed request.
     /// `filled` is the element type the answer is written in. Stated rather
-    /// than inherited: this op reads a `u32` label level and hands back a mask,
+    /// than inherited: this op reads a `u32` label image and hands back a mask,
     /// so "unchanged" is exactly the wrong default and there is no width it
     /// could infer.
     pub fn new(
@@ -747,7 +747,7 @@ impl FragmentOp for FillHolesOp {
 /// to be that and what it costs — the halo is the dependency edge between
 /// pipelined phases, not merely a fetch extent.
 ///
-/// `mask_dtype` is the element type of the level the mask arrives in; the width
+/// `mask_dtype` is the element type of the image the mask arrives in; the width
 /// of the answer comes from `fill`, which is where a caller states it.
 ///
 /// **The two connectivities are checked here**, which is the only place both ops
@@ -983,7 +983,7 @@ mod tests {
     }
 
     /// Labels are numbered in the order their lowest voxel is met, which is what
-    /// makes the intermediate level reproducible between runs of one
+    /// makes the intermediate image reproducible between runs of one
     /// decomposition.
     #[test]
     fn labels_are_numbered_in_scan_order_and_are_reproducible() {

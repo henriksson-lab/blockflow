@@ -850,7 +850,7 @@ fn resolve_offset(
 /// traversal is only defined over one, and a [`HistogramQuery`], because the
 /// traversal is the part that is shared and the question is the part that is not.
 ///
-/// Optionally masked, in which case the population is read from a stored level
+/// Optionally masked, in which case the population is read from a stored image
 /// over the same window, exactly as `MaskedRankFilterOp` reads it. One op rather
 /// than two, because the mask is one more reason an offset does not join the
 /// window and not a second traversal.
@@ -905,8 +905,8 @@ impl SlidingHistogramOp {
         Self::new(name, element, domain, Box::new(query))
     }
 
-    /// Read the window's population from `mask`, which must be a `Bool` level.
-    pub fn masked_by(mut self, mask: impl Into<crate::assemble::Level>) -> Self {
+    /// Read the window's population from `mask`, which must be a `Bool` image.
+    pub fn masked_by(mut self, mask: impl Into<crate::assemble::ImageId>) -> Self {
         self.mask = Some(mask.into().index());
         self.cost *= MASK_COST_FACTOR;
         self
@@ -1008,9 +1008,9 @@ impl BlockOp for SlidingHistogramOp {
     }
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        if let Some(level) = self.mask {
+        if let Some(image) = self.mask {
             return Err(Error::InvalidArgument(format!(
-                "{}: the population comes from level {level}, so this op has no answer from its \
+                "{}: the population comes from image {image}, so this op has no answer from its \
                  input alone. It is applied through `apply_with`.",
                 self.name
             )));
@@ -1025,13 +1025,13 @@ impl BlockOp for SlidingHistogramOp {
         out: &mut Voxels,
         at: &Anchor,
     ) -> Result<()> {
-        let Some(level) = self.mask else {
+        let Some(image) = self.mask else {
             return self.apply(input, out, at);
         };
-        let mask = sources.get(level)?;
+        let mask = sources.get(image)?;
         if mask.dtype() != Dtype::Bool {
             return Err(Error::InvalidArgument(format!(
-                "{}: the population is read from level {level}, which holds {}. A population is a \
+                "{}: the population is read from image {image}, which holds {}. A population is a \
                  yes-or-no per voxel and is stored as one.",
                 self.name,
                 mask.dtype().numpy_name()

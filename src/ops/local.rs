@@ -366,10 +366,10 @@ impl SampleLattice {
     // (`check_chunk_exclusive_writes`). Cutting the fine grid and deriving
     // lattice counts would put block boundaries wherever the arithmetic landed
     // and cut chunks; cutting this grid cannot. What varies instead is how much
-    // of the fine level each block reads, and that is stated per block in
+    // of the fine image each block reads, and that is stated per block in
     // `BlockGeometry::source`, which exists for exactly this.
 
-    /// The shape of the coarse level this lattice defines: one voxel per sample.
+    /// The shape of the coarse image this lattice defines: one voxel per sample.
     pub fn lattice_volume(&self) -> [usize; 3] {
         [self.count(0), self.count(1), self.count(2)]
     }
@@ -565,10 +565,10 @@ impl SampleLattice {
 /// difference is worth stating because it is easy to carry the wrong half of it
 /// across:
 ///
-/// * the **split** interpolation reads a second level and states its dependency
+/// * the **split** interpolation reads a second image and states its dependency
 ///   per block as a fetch region, in the lattice's own indices. Its declared
 ///   reach is `Reach::none()` under either convention and stays there.
-/// * the **fused** statistic has no second level. Its dependency is on fine
+/// * the **fused** statistic has no second image. Its dependency is on fine
 ///   voxels of its own input and is stated as a halo, so the convention moves
 ///   the reach — [`Self::PinnedEnds`] maps a voxel near an end past the
 ///   lattice's unsampled margin and reads a sample further away than any voxel
@@ -870,7 +870,7 @@ impl Rounding {
 /// that takes it there.
 ///
 /// The value comes back as an `f64` — this is a narrowing of the *value*, not
-/// of the buffer it is stored in. Nothing about a level's declared type changes:
+/// of the buffer it is stored in. Nothing about an image's declared type changes:
 /// a narrowed value held in an `f64` buffer is the same number it would be in a
 /// buffer of `element`, and holding it in the wider one costs bytes and no
 /// precision.
@@ -915,7 +915,7 @@ impl Narrowing {
             Dtype::Bool => Err(Error::InvalidArgument(
                 "a narrowing to a two-valued type has no rounding rule to apply: every finite \
                  value lands on one of two, which is a comparison rather than a narrowing. \
-                 `threshold_against_into` is where a comparison against a level lives."
+                 `threshold_against_into` is where a comparison against an image lives."
                     .to_string(),
             )),
             Dtype::F16 => Err(Error::InvalidArgument(
@@ -2568,7 +2568,7 @@ impl LocalStatistic {
 /// Write the local statistic itself.
 ///
 /// Optionally masked, in which case each window's population is read from a
-/// stored level over the same window the input is read over — exactly as
+/// stored image over the same window the input is read over — exactly as
 /// `MaskedRankFilterOp` reads it, and one op rather than two for the reason
 /// `SlidingHistogramOp` gives: a mask is one more reason an offset does not join
 /// the window, not a second traversal.
@@ -2597,11 +2597,11 @@ impl LocalStatisticOp {
         }
     }
 
-    /// Read each window's population from `mask`, which must be a `Bool` level.
+    /// Read each window's population from `mask`, which must be a `Bool` image.
     ///
     /// A builder rather than an argument to [`Self::new`], so the choice is
     /// additive: a caller who never had it keeps its call and its answer.
-    pub fn masked_by(mut self, mask: impl Into<crate::assemble::Level>) -> Self {
+    pub fn masked_by(mut self, mask: impl Into<crate::assemble::ImageId>) -> Self {
         self.mask = Some(mask.into().index());
         self.cost *= super::rank::MASK_COST_FACTOR;
         self
@@ -2651,8 +2651,8 @@ impl LocalStatisticOp {
         self
     }
 
-    /// The level this op reads its population from, where it reads one.
-    pub fn mask_level(&self) -> Option<usize> {
+    /// The image this op reads its population from, where it reads one.
+    pub fn mask_image(&self) -> Option<usize> {
         self.mask
     }
 
@@ -2705,9 +2705,9 @@ impl BlockOp for LocalStatisticOp {
     /// shell work, so this shell declares what it can actually bridge instead of
     /// promising a conversion it would have to invent.
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
-        if let Some(level) = self.mask {
+        if let Some(image) = self.mask {
             return Err(Error::InvalidArgument(format!(
-                "{}: the population comes from level {level}, so this op has no answer from its \
+                "{}: the population comes from image {image}, so this op has no answer from its \
                  input alone. It is applied through `apply_with`.",
                 self.name
             )));
@@ -2724,7 +2724,7 @@ impl BlockOp for LocalStatisticOp {
     /// lattice distance plus the element, which is this op's own
     /// [`Self::reach_spec`] and equal to it by construction rather than by
     /// arrangement. That equality is what keeps this op inside what a plan can
-    /// fetch; see `check_source_levels`, which refuses an operand wanting more
+    /// fetch; see `check_source_images`, which refuses an operand wanting more
     /// than its phase.
     fn source_inputs(&self, volume: [usize; 3]) -> Vec<SourceInput> {
         match self.mask {
@@ -2740,10 +2740,10 @@ impl BlockOp for LocalStatisticOp {
         out: &mut Voxels,
         at: &Anchor,
     ) -> Result<()> {
-        let Some(level) = self.mask else {
+        let Some(image) = self.mask else {
             return self.apply(input, out, at);
         };
-        let mask = population_level(self.name, level, sources)?;
+        let mask = population_image(self.name, image, sources)?;
         self.statistic.evaluate_masked_into(
             input.view::<f64>()?,
             mask,
@@ -2774,21 +2774,21 @@ impl BlockOp for LocalStatisticOp {
     }
 }
 
-/// The `Bool` level an op reads a population from, or the refusal that names
+/// The `Bool` image an op reads a population from, or the refusal that names
 /// what it holds instead.
 ///
 /// One function rather than one per shell: the check, the message and the view
 /// are the same three lines, and two copies of them would be two places for the
 /// dtype rule to drift.
-fn population_level<'a>(
+fn population_image<'a>(
     name: &str,
-    level: usize,
+    image: usize,
     sources: SourceInputs<'a>,
 ) -> Result<ArrayView3<'a, bool>> {
-    let mask = sources.get(level)?;
+    let mask = sources.get(image)?;
     if mask.dtype() != Dtype::Bool {
         return Err(Error::InvalidArgument(format!(
-            "{name}: the population is read from level {level}, which holds {}. A population is a \
+            "{name}: the population is read from image {image}, which holds {}. A population is a \
              yes-or-no per voxel and is stored as one; a wider type would leave 'which non-zero \
              values count' to be decided somewhere this op cannot see.",
             mask.dtype().numpy_name()
@@ -2833,9 +2833,9 @@ impl AdaptiveThresholdOp {
     }
 
     /// Read the *statistic's* population from `mask`, which must be a `Bool`
-    /// level. The comparison itself is still made at every voxel: a mask decides
+    /// image. The comparison itself is still made at every voxel: a mask decides
     /// what the level is computed from, not which voxels get an answer.
-    pub fn masked_by(mut self, mask: impl Into<crate::assemble::Level>) -> Self {
+    pub fn masked_by(mut self, mask: impl Into<crate::assemble::ImageId>) -> Self {
         self.mask = Some(mask.into().index());
         self.cost *= super::rank::MASK_COST_FACTOR;
         self
@@ -2871,8 +2871,8 @@ impl AdaptiveThresholdOp {
         self
     }
 
-    /// The level this op reads its population from, where it reads one.
-    pub fn mask_level(&self) -> Option<usize> {
+    /// The image this op reads its population from, where it reads one.
+    pub fn mask_image(&self) -> Option<usize> {
         self.mask
     }
 
@@ -2959,9 +2959,9 @@ impl BlockOp for AdaptiveThresholdOp {
     /// input would have to be widened to be compared against it, which is a
     /// conversion this shell would be choosing rather than adapting.
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
-        if let Some(level) = self.mask {
+        if let Some(image) = self.mask {
             return Err(Error::InvalidArgument(format!(
-                "{}: the population comes from level {level}, so this op has no answer from its \
+                "{}: the population comes from image {image}, so this op has no answer from its \
                  input alone. It is applied through `apply_with`.",
                 self.name
             )));
@@ -2986,10 +2986,10 @@ impl BlockOp for AdaptiveThresholdOp {
         out: &mut Voxels,
         at: &Anchor,
     ) -> Result<()> {
-        let Some(level) = self.mask else {
+        let Some(image) = self.mask else {
             return self.apply(input, out, at);
         };
-        let mask = population_level(self.name, level, sources)?;
+        let mask = population_image(self.name, image, sources)?;
         self.compare(input, Some(mask), out, at)
     }
 

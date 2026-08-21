@@ -3,7 +3,7 @@
 // Original work for this crate. Written against the `zarrs` API; nothing here is
 // derived from any other consumer of it.
 //
-// A **storage** environment: levels are Zarr v3 arrays on a filesystem store.
+// A **storage** environment: images are Zarr v3 arrays on a filesystem store.
 //
 // Why this exists
 // ---------------
@@ -12,7 +12,7 @@
 // costs only) and the multi-node `SharedVolumes`. Every correctness claim the
 // crate makes was therefore made about arrays that had already been allocated in
 // full — which is exactly the case out-of-core execution exists to avoid. Until
-// something here could read a level off a disk and write the next one back,
+// something here could read an image off a disk and write the next one back,
 // "out-of-core block processing" was a description of the scheduling, not of the
 // data.
 //
@@ -22,16 +22,16 @@
 // produces through `ArrayEnvironment`. `tests/zarr_env.rs` asserts exactly that
 // over `synthetic::Scene` data, at several block sizes.
 //
-// Levels are arrays
+// Images are arrays
 // -----------------
-// Level `l` is the array at `root/level<l>`. Level 0 is the workflow input and
+// Image `l` is the array at `root/level<l>`. Image 0 is the workflow input and
 // is created by [`ZarrEnvironment::create`]; [`Environment::prepare`] creates
-// levels 1..=n from the plan, each at **its own** `volume_at` and `dtype_at`,
+// images 1..=n from the plan, each at **its own** `volume_at` and `dtype_at`,
 // because a phase owns its volume and its element type and an environment that
-// allocated one shape for every level could not host a plan that changes either.
+// allocated one shape for every image could not host a plan that changes either.
 //
 // The fill value is `Voxels::unwritten`'s sentinel — NaN for the floats, the
-// maximum for the integers — so that a level read back before it was written is
+// maximum for the integers — so that an image read back before it was written is
 // loud in storage for the same reason it is loud in memory. Zarr gives this for
 // free: a chunk nobody wrote is not a file, and reads back as the fill value.
 //
@@ -83,17 +83,17 @@
 //
 // Chunk-exclusive writing, and why it is a mandate now
 // ----------------------------------------------------
-// **Every chunk of a level is written by exactly one task.** That is a
+// **Every chunk of an image is written by exactly one task.** That is a
 // system-wide invariant, not an optimisation, and
 // [`check_chunk_exclusive_writes`] refuses a plan that breaks it —
 // [`Environment::prepare`] is where it runs, because that is the first place
 // that holds both the plan and the chunk shapes.
 //
-// It is nearly free, because for a level nobody outside the run reads, *the
+// It is nearly free, because for an image nobody outside the run reads, *the
 // chunk shape is ours to choose*: derive it from the writing phase's block grid
 // ([`chunk_for_block`]) and the invariant holds by construction. The dependency
 // only runs the other way — block grid quantised to the chunk grid — where a
-// caller dictates a layout for downstream consumers, which is the output level
+// caller dictates a layout for downstream consumers, which is the output image
 // and nothing else ([`ZarrEnvironment::with_output_chunk`]).
 //
 // What that leaves the locks doing. Two things, and neither is the hazard the
@@ -103,8 +103,8 @@
 //   own; nothing in the plan tiles it, several phases may contribute to one, and
 //   `side_chunk` picks its chunking from its extent. No invariant covers those
 //   writes, so they are the case the guard now exists for.
-// * **anything outside `prepare`.** Level 0 is written by `create` before a plan
-//   exists, and a caller may write a level directly. The guard is a property of
+// * **anything outside `prepare`.** Image 0 is written by `create` before a plan
+//   exists, and a caller may write an image directly. The guard is a property of
 //   the store's write path rather than a consequence of the planner, which is
 //   what keeps it true for callers the planner never saw.
 //
@@ -119,20 +119,20 @@
 //
 // **What the guard does not cover**, stated rather than implied: a read
 // concurrent with a write of the same array. Reads take no locks. The contract
-// this environment is written to is the executor's — a level is written by one
+// this environment is written to is the executor's — an image is written by one
 // phase, sealed by `finish`, and read by the next — and `RegionSink` already
 // documents writes as disjoint. A caller who reads an array while another thread
 // is writing it is outside that contract and this guard does not rescue them.
 //
-// Compression, and why it is per level
+// Compression, and why it is per image
 // ------------------------------------
-// [`Compression`] says how a level's chunks are encoded; [`CompressionPolicy`]
-// says which level gets which. Per level rather than per environment, because
-// the levels of one plan are not one kind of data: a `bool` mask and the
+// [`Compression`] says how an image's chunks are encoded; [`CompressionPolicy`]
+// says which image gets which. Per image rather than per environment, because
+// the images of one plan are not one kind of data: a `bool` mask and the
 // `float64` it was thresholded out of sit in the same run and want opposite
 // answers, and a single switch would have to be wrong for one of them.
 //
-// The default is **derived, not configured**. Levels already carry their own
+// The default is **derived, not configured**. Images already carry their own
 // element type — `Decomposition::dtype_at` — and the element type is the single
 // best predictor of whether deflate will pay, so [`Compression::for_dtype`]
 // reads the plan rather than asking the caller. What that derivation is, and the
@@ -181,6 +181,7 @@ use zarrs::array::{
 use zarrs::filesystem::FilesystemStore;
 use zarrs::storage::{StorePrefix, WritableStorageTraits};
 
+use crate::assemble::{describe_image, is_supplied_image, ImageId};
 use crate::decomposition::{check_chunk_exclusive_writes, Decomposition, Visibility};
 use crate::dtype::Dtype;
 use crate::env::{block_shape, BlockBuf, EnvCounters, Environment};
@@ -194,7 +195,7 @@ use crate::voxels::{SideBuf, VoxelElement, Voxels};
 /// The store this environment is written against.
 type Store = FilesystemStore;
 
-/// One Zarr array: a level, or one of the arrays an op writes beside its result.
+/// One Zarr array: an image, or one of the arrays an op writes beside its result.
 type Stored = ZarrArray<Store>;
 
 // ------------------------------------------------------------- data types --
@@ -312,9 +313,9 @@ impl Compression {
     /// **The evidence.** `compression_pays_for_bool_and_not_for_float` in
     /// `tests/zarr_env.rs` runs a chain over a 64³ `synthetic::Scene` through
     /// this environment under six policies and prints stored bytes and elapsed
-    /// time per level. A release build, one run, chunk 32³:
+    /// time per image. A release build, one run, chunk 32³:
     ///
-    /// | policy | level 0 (`float64`) | level 1 (`bool`) | run | break-even |
+    /// | policy | image 0 (`float64`) | image 1 (`bool`) | run | break-even |
     /// |---|---|---|---|---|
     /// | no compression | 2 097 152 B | 262 144 B | 7 ms | — |
     /// | `gzip1` everywhere | 1 978 908 B (1.06x) | 22 845 B (11.5x) | 42 ms | 10.4 MB/s |
@@ -362,7 +363,7 @@ impl Compression {
     ///
     /// One free win that is *not* compression and should not be credited to it:
     /// a chunk every element of which equals the fill value is not written at
-    /// all. On a `bool` level whose fill value is `true`, an entirely-`true`
+    /// all. On a `bool` image whose fill value is `true`, an entirely-`true`
     /// region costs nothing whatever the codec. The test above thresholds before
     /// masking precisely so that this does not flatter the numbers above.
     ///
@@ -422,24 +423,24 @@ impl Compression {
     }
 }
 
-/// Which [`Compression`] each level gets.
+/// Which [`Compression`] each image gets.
 ///
 /// Three ways to say it, in the order they should be reached for:
 ///
-/// * [`CompressionPolicy::derived`] — the default. Every level gets
+/// * [`CompressionPolicy::derived`] — the default. Every image gets
 ///   [`Compression::for_dtype`] of **its own** element type, which the plan
 ///   already knows. Nothing to configure and nothing to keep in step with the
 ///   plan when the plan changes.
 /// * [`CompressionPolicy::uniform`] — one answer for the whole run. For a
 ///   caller who is measuring, or who knows something about their data that the
 ///   element type does not say.
-/// * [`CompressionPolicy::with_level`] — an override for one level, on top of
-///   either of the above. This is the knob the per-level design exists for: the
-///   level a plan reads once and deletes can be left raw while the mask beside
-///   it is compressed, without the caller having to restate the other levels.
+/// * [`CompressionPolicy::with_image`] — an override for one image, on top of
+///   either of the above. This is the knob the per-image design exists for: the
+///   image a plan reads once and deletes can be left raw while the mask beside
+///   it is compressed, without the caller having to restate the other images.
 ///
-/// Levels are numbered as they are everywhere else here: level 0 is the input,
-/// level `p+1` is what phase `p` wrote. An override naming a level the plan does
+/// Images are numbered as they are everywhere else here: image 0 is the input,
+/// image `p+1` is what phase `p` wrote. An override naming an image the plan does
 /// not have is not an error — it simply never applies, because a policy is
 /// written before the plan is known and refusing it would make the two orders of
 /// construction disagree.
@@ -447,34 +448,34 @@ impl Compression {
 pub struct CompressionPolicy {
     /// `None` means "derive from the element type", which is the default.
     everywhere: Option<Compression>,
-    at_level: BTreeMap<usize, Compression>,
+    at_image: BTreeMap<usize, Compression>,
 }
 
 impl CompressionPolicy {
-    /// Every level gets [`Compression::for_dtype`] of its own element type.
+    /// Every image gets [`Compression::for_dtype`] of its own element type.
     pub fn derived() -> Self {
         Self::default()
     }
 
-    /// Every level gets the same thing, whatever it holds.
+    /// Every image gets the same thing, whatever it holds.
     pub fn uniform(compression: Compression) -> Self {
         Self {
             everywhere: Some(compression),
-            at_level: BTreeMap::new(),
+            at_image: BTreeMap::new(),
         }
     }
 
-    /// One level, said explicitly, overriding whatever this policy would
+    /// One image, said explicitly, overriding whatever this policy would
     /// otherwise have chosen for it.
     #[must_use]
-    pub fn with_level(mut self, level: usize, compression: Compression) -> Self {
-        self.at_level.insert(level, compression);
+    pub fn with_image(mut self, image: usize, compression: Compression) -> Self {
+        self.at_image.insert(image, compression);
         self
     }
 
-    /// What level `level`, holding `dtype`, is stored as.
-    pub fn at(&self, level: usize, dtype: Dtype) -> Compression {
-        match self.at_level.get(&level) {
+    /// What image `image`, holding `dtype`, is stored as.
+    pub fn at(&self, image: usize, dtype: Dtype) -> Compression {
+        match self.at_image.get(&image) {
             Some(&explicit) => explicit,
             None => self
                 .everywhere
@@ -484,10 +485,10 @@ impl CompressionPolicy {
 
     /// What a side output holding `dtype` is stored as.
     ///
-    /// A side output is not a level and has no level number, so a per-level
+    /// A side output is not an image and has no image number, so a per-image
     /// override cannot name one — but a `uniform` policy is a statement about
     /// the run and does apply. Otherwise it is derived from the declared element
-    /// type, exactly as a level is.
+    /// type, exactly as an image is.
     pub fn for_side(&self, dtype: Dtype) -> Compression {
         self.everywhere
             .unwrap_or_else(|| Compression::for_dtype(dtype))
@@ -800,7 +801,7 @@ impl StoredArray {
 
 // ---------------------------------------------------------- the environment --
 
-/// Levels as Zarr v3 arrays under one root.
+/// Images as Zarr v3 arrays under one root.
 ///
 /// The storage counterpart of `ArrayEnvironment`, and held to the same standard:
 /// `tests/zarr_env.rs` runs the same chains over the same data through both and
@@ -809,27 +810,35 @@ pub struct ZarrEnvironment {
     root: PathBuf,
     store: Arc<Store>,
     volume: [usize; 3],
-    /// **Level 0's chunking, and nothing else's.**
+    /// **Image 0's chunking, and nothing else's.**
     ///
-    /// Level 0 is the workflow input: somebody else's array, arriving with the
+    /// Image 0 is the workflow input: somebody else's array, arriving with the
     /// layout it already has, read by this run and written by nobody. It is the
-    /// one level the chunk-exclusive invariant says nothing about, which is why
-    /// a caller states it and every other level derives one.
+    /// one image the chunk-exclusive invariant says nothing about, which is why
+    /// a caller states it and every other image derives one.
     input_chunk: [usize; 3],
-    /// A layout dictated for the **output** level, when a caller has downstream
+    /// A layout dictated for the **output** image, when a caller has downstream
     /// consumers to satisfy.
     ///
-    /// `None` — the default — means the output level is chunked like every other
-    /// level a phase writes: derived from the block grid that writes it. Saying
+    /// `None` — the default — means the output image is chunked like every other
+    /// image a phase writes: derived from the block grid that writes it. Saying
     /// otherwise is a real constraint and is treated as one: the block grid then
     /// has to be a whole multiple of it, and a plan where it is not is refused by
     /// `prepare` rather than quietly given straddling writes.
     output_chunk: Option<[usize; 3]>,
-    /// Level `l` at index `l`. Level 0 exists from construction; `prepare` adds
+    /// Image `l` at index `l`. Image 0 exists from construction; `prepare` adds
     /// the rest, because only the plan knows their shapes and element types.
-    levels: RwLock<Vec<Arc<StoredArray>>>,
-    /// Levels erased from the store by `discard_level`. Held separately from
-    /// `levels` because the fact worth recording is "this was freed", and an
+    images: RwLock<Vec<Arc<StoredArray>>>,
+    /// The arrays the run was handed besides its input, in the order they were
+    /// handed over: `supplied[i]` is `ImageId::supplied(i)`.
+    ///
+    /// Beside `images` rather than appended to it because the two are addressed
+    /// in disjoint ranges and `images` is indexed by the image number. Written
+    /// once, by the constructor, and never again: no phase writes a supplied
+    /// input and nothing frees one.
+    supplied: RwLock<Vec<Arc<StoredArray>>>,
+    /// Images erased from the store by `discard_image`. Held separately from
+    /// `images` because the fact worth recording is "this was freed", and an
     /// absent handle would be indistinguishable from one `prepare` never made.
     discarded: RwLock<BTreeSet<usize>>,
     /// The arrays ops write beside their primary result, by declared name.
@@ -837,8 +846,8 @@ pub struct ZarrEnvironment {
     /// A `BTreeMap` rather than a `HashMap` so that iteration is declaration
     /// order, matching `ArrayEnvironment`.
     side: RwLock<BTreeMap<String, Arc<StoredArray>>>,
-    /// Which level is stored with which codec. Consulted by `prepare`, which is
-    /// where every level but level 0 is created.
+    /// Which image is stored with which codec. Consulted by `prepare`, which is
+    /// where every image but image 0 is created.
     compression: CompressionPolicy,
     locks: ChunkLocks,
     /// Writes that had to read-modify-write at least one chunk, and reads that
@@ -847,36 +856,36 @@ pub struct ZarrEnvironment {
     serialised_writes: AtomicU64,
     unaligned_reads: AtomicU64,
     counters: EnvCounters,
-    /// On disk, to match the levels. An environment whose volumes are shared
+    /// On disk, to match the images. An environment whose volumes are shared
     /// between processes must not offer fragments that are not.
     sidecars: Sidecars,
 }
 
 impl ZarrEnvironment {
-    /// Create the store at `root` and write `input` as level 0.
+    /// Create the store at `root` and write `input` as image 0.
     ///
-    /// `root` is created if it does not exist. The remaining levels are not
+    /// `root` is created if it does not exist. The remaining images are not
     /// created here — [`Environment::prepare`] does that, from the plan, because
     /// a phase owns its volume, its element type **and its chunking** and this
     /// constructor knows none of the three.
     ///
-    /// `chunk` is level 0's, and level 0's only. It used to be every level's,
+    /// `chunk` is image 0's, and image 0's only. It used to be every image's,
     /// which made the storage's grid an input to every write the plan made; see
     /// [`chunk_for_block`] for what replaced it and [`Self::with_output_chunk`]
     /// for the one case where a caller still dictates one.
     ///
-    /// Compression is [`CompressionPolicy::derived`]: every level is stored as
+    /// Compression is [`CompressionPolicy::derived`]: every image is stored as
     /// [`Compression::for_dtype`] of its own element type. See
     /// [`Self::create_with_compression`] to say otherwise.
     pub fn create(root: impl Into<PathBuf>, input: &Voxels, chunk: [usize; 3]) -> Result<Self> {
         Self::create_with_compression(root, input, chunk, CompressionPolicy::derived())
     }
 
-    /// [`Self::create`], with the codec of every level said explicitly.
+    /// [`Self::create`], with the codec of every image said explicitly.
     ///
     /// The policy is kept for the life of the environment, because
-    /// [`Environment::prepare`] creates levels 1..=n later and has to ask it the
-    /// same question this constructor asks it about level 0.
+    /// [`Environment::prepare`] creates images 1..=n later and has to ask it the
+    /// same question this constructor asks it about image 0.
     pub fn create_with_compression(
         root: impl Into<PathBuf>,
         input: &Voxels,
@@ -887,9 +896,9 @@ impl ZarrEnvironment {
         std::fs::create_dir_all(&root).map_err(Error::backend)?;
         let store = Arc::new(FilesystemStore::new(&root).map_err(Error::backend)?);
         let volume = input.shape();
-        let level0 = StoredArray::create(
+        let image0 = StoredArray::create(
             &store,
-            &level_path(0),
+            &image_path(0),
             0,
             input.dtype(),
             &volume,
@@ -904,7 +913,7 @@ impl ZarrEnvironment {
             // `Voxels` this crate builds is — costs nothing here.
             let standard = view.as_standard_layout();
             let data = standard.as_slice().expect("standard layout is contiguous");
-            level0.write_as::<Element>(&whole, data, Some(&locks))?;
+            image0.write_as::<Element>(&whole, data, Some(&locks))?;
         });
         let sidecars = Sidecars::new(FileSidecars::at(root.join("sidecars"))?);
         Ok(Self {
@@ -913,7 +922,8 @@ impl ZarrEnvironment {
             volume,
             input_chunk: chunk,
             output_chunk: None,
-            levels: RwLock::new(vec![Arc::new(level0)]),
+            images: RwLock::new(vec![Arc::new(image0)]),
+            supplied: RwLock::new(Vec::new()),
             side: RwLock::new(BTreeMap::new()),
             discarded: RwLock::new(BTreeSet::new()),
             compression,
@@ -925,12 +935,73 @@ impl ZarrEnvironment {
         })
     }
 
+    /// [`Self::create`], **and the arrays the run is handed besides its input**.
+    ///
+    /// `supplied[i]` becomes [`ImageId::supplied(i)`] and is written to
+    /// `root/input{i}` with the same chunking and codec image 0 gets. It is a
+    /// image like any other — read through `Environment::read` at the reading
+    /// block's own fetch region, charged the same bytes, named by a
+    /// `Chain::Source` leaf or a `BlockOp::source_input` — with the one
+    /// difference that no phase writes it and nothing can rebuild it, so a write
+    /// to it and a discard of it are both refused by name.
+    ///
+    /// Their shapes are checked against image 0's here rather than at
+    /// `prepare`, because a reach-0 operand is read at the reading block's fetch
+    /// region and this constructor already holds both arrays. Their element
+    /// types are their own, and `prepare` checks each against what the plan's
+    /// readers declared — which is the first moment a plan exists to be checked
+    /// against.
+    ///
+    /// [`ImageId::supplied(i)`]: crate::assemble::ImageId::supplied
+    pub fn create_with_inputs(
+        root: impl Into<PathBuf>,
+        input: &Voxels,
+        supplied: &[&Voxels],
+        chunk: [usize; 3],
+    ) -> Result<Self> {
+        let env = Self::create(root, input, chunk)?;
+        let volume = input.shape();
+        let mut held = Vec::with_capacity(supplied.len());
+        for (which, array) in supplied.iter().enumerate() {
+            if array.shape() != volume {
+                return Err(Error::InvalidArgument(format!(
+                    "zarr environment: {} is {:?} and its input is {volume:?}. A supplied input \
+                     is read at the reading block's own fetch region, so it is in image 0's \
+                     coordinate space and no other.",
+                    describe_image(ImageId::supplied(which).index()),
+                    array.shape()
+                )));
+            }
+            let stored = StoredArray::create(
+                &env.store,
+                &input_path(which),
+                0,
+                array.dtype(),
+                &volume,
+                &chunk,
+                env.compression.at(0, array.dtype()),
+            )?;
+            let whole = Region::whole(&volume);
+            by_dtype!(array.dtype(), |Element| {
+                let view = array.view::<Element>()?;
+                let standard = view.as_standard_layout();
+                let data = standard.as_slice().expect("standard layout is contiguous");
+                stored.write_as::<Element>(&whole, data, Some(&env.locks))?;
+            });
+            held.push(Arc::new(stored));
+        }
+        *env.supplied
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = held;
+        Ok(env)
+    }
+
     /// Where the arrays live.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Dictate the **output** level's chunking, for a consumer outside the run.
+    /// Dictate the **output** image's chunking, for a consumer outside the run.
     ///
     /// This is the one place a chunk grid is allowed to constrain a block grid
     /// rather than the other way round, and it is stated as a builder call so
@@ -939,7 +1010,7 @@ impl ZarrEnvironment {
     /// every axis, and [`Environment::prepare`] refuses the plan if they are
     /// not, naming the chunk and the two blocks that would share it.
     ///
-    /// There is deliberately no equivalent for an internal level. Nobody outside
+    /// There is deliberately no equivalent for an internal image. Nobody outside
     /// the run reads one, so a layout for it could only be a preference, and a
     /// preference that can make a plan illegal is worse than no knob.
     #[must_use]
@@ -948,36 +1019,36 @@ impl ZarrEnvironment {
         self
     }
 
-    /// The chunk shape this environment will give each level of `decomposition`,
-    /// indexed by level.
+    /// The chunk shape this environment will give each image of `decomposition`,
+    /// indexed by image.
     ///
     /// Public so that a caller can check a plan **before** running it: pair it
     /// with [`check_chunk_exclusive_writes`] and the refusal `prepare` would
     /// have raised is available while there is still time to choose another
     /// block grid.
     pub fn chunk_plan(&self, decomposition: &Decomposition) -> Vec<[usize; 3]> {
-        let mut chunks = Vec::with_capacity(decomposition.n_levels());
+        let mut chunks = Vec::with_capacity(decomposition.n_images());
         chunks.push(self.input_chunk);
-        for level in 1..decomposition.n_levels() {
-            let phase = &decomposition.phases[level - 1];
-            let derived = chunk_for_block(phase.grid.block(), decomposition.dtype_at(level));
-            chunks.push(match decomposition.level_visibility(level) {
+        for image in 1..decomposition.n_images() {
+            let phase = &decomposition.phases[image - 1];
+            let derived = chunk_for_block(phase.grid.block(), decomposition.dtype_at(image));
+            chunks.push(match decomposition.image_visibility(image) {
                 // Nobody outside the run reads it, so its layout is ours and the
                 // invariant is free.
                 Visibility::Internal => derived,
                 // The output. Dictated only if a caller said so; otherwise it is
-                // derived like any other level a phase writes.
+                // derived like any other image a phase writes.
                 Visibility::Published => self.output_chunk.unwrap_or(derived),
             });
         }
         chunks
     }
 
-    /// What one level's chunks are actually shaped, read off the array rather
+    /// What one image's chunks are actually shaped, read off the array rather
     /// than recomputed — so it answers what was built, not what would be built
     /// now. The same argument as [`Self::compression_at`].
-    pub fn chunk_at(&self, level: usize) -> Result<[usize; 3]> {
-        let array = self.level_array(level)?;
+    pub fn chunk_at(&self, image: usize) -> Result<[usize; 3]> {
+        let array = self.image_array(image)?;
         block_shape(&Region::whole(&array.chunk))
     }
 
@@ -985,7 +1056,7 @@ impl ZarrEnvironment {
     ///
     /// Zero says every write covered its chunks from edge to edge and took the
     /// lock-free path. Since the chunk-exclusive invariant makes a *shared*
-    /// chunk impossible for a level, what is left for this to count is the
+    /// chunk impossible for an image, what is left for this to count is the
     /// chunk that **overhangs the volume's far edge** — `zarrs` compares against
     /// the unclipped chunk extent, so a volume the chunk shape does not divide
     /// pays a decode and re-encode on its last chunk per axis. That is a cost
@@ -1005,66 +1076,81 @@ impl ZarrEnvironment {
         self.unaligned_reads.load(Ordering::SeqCst)
     }
 
-    fn levels_guard(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<StoredArray>>> {
-        self.levels
+    fn images_guard(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<StoredArray>>> {
+        self.images
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// One level, or an error saying how many there are.
+    /// One image, or an error saying how many there are.
     ///
     /// The guard is taken **once**. Reading an `RwLock` twice in one expression
     /// — which is what an `ok_or_else` closure that reaches for the length
     /// again would do — is a recursive read, and `std` is explicit that a
     /// recursive read may deadlock against a waiting writer.
-    /// Whether `level` has been erased from the store.
-    pub fn is_discarded(&self, level: usize) -> bool {
+    /// Whether `image` has been erased from the store.
+    pub fn is_discarded(&self, image: usize) -> bool {
         self.discarded
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&level)
+            .contains(&image)
     }
 
-    fn level_array(&self, level: usize) -> Result<Arc<StoredArray>> {
-        if self.is_discarded(level) {
+    fn image_array(&self, image: usize) -> Result<Arc<StoredArray>> {
+        if let Some(which) = ImageId::from(image).supplied_index() {
+            let supplied = self
+                .supplied
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            return match supplied.get(which) {
+                Some(array) => Ok(array.clone()),
+                None => Err(Error::InvalidArgument(format!(
+                    "this environment was handed {} array(s) besides its input and {} was asked \
+                     for; `ZarrEnvironment::create_with_inputs` is what seeds them",
+                    supplied.len(),
+                    describe_image(image)
+                ))),
+            };
+        }
+        if self.is_discarded(image) {
             return Err(Error::InvalidArgument(format!(
-                "level {level} was discarded — the phase that reads it finished, so the plan \
+                "image {image} was discarded — the phase that reads it finished, so the plan \
                  says nothing wants it again, and its arrays are gone from the store. Pin it \
-                 with `Hints::keep_levels` if something does."
+                 with `Hints::keep_images` if something does."
             )));
         }
-        let levels = self.levels_guard();
-        match levels.get(level) {
+        let images = self.images_guard();
+        match images.get(image) {
             Some(array) => Ok(array.clone()),
             None => Err(Error::InvalidArgument(format!(
-                "this environment holds {} level(s) and level {level} was asked for; \
-                 `Environment::prepare` creates the levels a plan writes, and is called once \
+                "this environment holds {} image(s) and image {image} was asked for; \
+                 `Environment::prepare` creates the images a plan writes, and is called once \
                  before any task",
-                levels.len()
+                images.len()
             ))),
         }
     }
 
-    /// The shape of one level, which is not `volume()` once a phase changes it.
-    pub fn level_shape(&self, level: usize) -> Result<[usize; 3]> {
-        let array = self.level_array(level)?;
+    /// The shape of one image, which is not `volume()` once a phase changes it.
+    pub fn image_shape(&self, image: usize) -> Result<[usize; 3]> {
+        let array = self.image_array(image)?;
         block_shape(&Region::whole(&array.shape))
     }
 
-    /// The element type of one level.
-    pub fn level_dtype(&self, level: usize) -> Result<Dtype> {
-        Ok(self.level_array(level)?.dtype)
+    /// The element type of one image.
+    pub fn image_dtype(&self, image: usize) -> Result<Dtype> {
+        Ok(self.image_array(image)?.dtype)
     }
 
-    /// What one level's chunks are actually stored as.
+    /// What one image's chunks are actually stored as.
     ///
     /// Read off the array rather than recomputed from the policy, so it answers
     /// what was built and not what would be built now.
-    pub fn compression_at(&self, level: usize) -> Result<Compression> {
-        Ok(self.level_array(level)?.compression)
+    pub fn compression_at(&self, image: usize) -> Result<Compression> {
+        Ok(self.image_array(image)?.compression)
     }
 
-    /// How many bytes one level occupies on the disk.
+    /// How many bytes one image occupies on the disk.
     ///
     /// **The measurement compression exists to move**, and an accessor rather
     /// than a number in a document because it is the only honest way to compare
@@ -1077,10 +1163,10 @@ impl ZarrEnvironment {
     /// not what was declared. That is the same convention `EnvCounters`'
     /// `write_bytes` uses for the *uncompressed* side, which makes the pair of
     /// them a ratio without any further bookkeeping.
-    pub fn stored_bytes(&self, level: usize) -> Result<u64> {
-        // Named to check the level exists, so a typo is an error and not a zero.
-        let _ = self.level_array(level)?;
-        Ok(directory_bytes(&self.root.join(format!("level{level}"))))
+    pub fn stored_bytes(&self, image: usize) -> Result<u64> {
+        // Named to check the image exists, so a typo is an error and not a zero.
+        let _ = self.image_array(image)?;
+        Ok(directory_bytes(&self.root.join(format!("level{image}"))))
     }
 
     /// How many bytes one side output occupies on the disk, or `None` if nothing
@@ -1094,20 +1180,20 @@ impl ZarrEnvironment {
         known.then(|| directory_bytes(&self.root.join("side").join(name)))
     }
 
-    /// One whole level, read back.
+    /// One whole image, read back.
     ///
     /// For inspection and for the byte-identity comparison; it deliberately does
     /// **not** touch the counters, which are the run's, not the assertion's.
-    pub fn level(&self, level: usize) -> Result<Voxels> {
-        let array = self.level_array(level)?;
+    pub fn image(&self, image: usize) -> Result<Voxels> {
+        let array = self.image_array(image)?;
         let whole = Region::whole(&array.shape);
         by_dtype!(array.dtype, |Element| array.read_as::<Element>(&whole))
     }
 
-    /// The last level: the workflow output.
+    /// The last image: the workflow output.
     pub fn output(&self) -> Result<Voxels> {
-        let last = self.levels_guard().len().saturating_sub(1);
-        self.level(last)
+        let last = self.images_guard().len().saturating_sub(1);
+        self.image(last)
     }
 
     /// One side output, by declared name, or `None` if nothing declared it.
@@ -1160,7 +1246,7 @@ impl ZarrEnvironment {
     /// whether the caller's **dictated** output layout is what made the plan
     /// illegal, and therefore which of the two grids they can move.
     ///
-    /// Established by asking the guard again with that one level derived instead
+    /// Established by asking the guard again with that one image derived instead
     /// of dictated, rather than by reading the message it already produced. A
     /// refusal that says "drop this and the plan is legal" should have checked
     /// that it is, or it is advice that may be false — and the plan is refused
@@ -1174,7 +1260,7 @@ impl ZarrEnvironment {
         let Some(dictated) = self.output_chunk else {
             return err;
         };
-        let output = decomposition.n_levels() - 1;
+        let output = decomposition.n_images() - 1;
         if output == 0 {
             return err;
         }
@@ -1184,13 +1270,13 @@ impl ZarrEnvironment {
             decomposition.dtype_at(output),
         );
         if check_chunk_exclusive_writes(decomposition, &derived).is_err() {
-            // Something other than the dictate is wrong — an internal level
+            // Something other than the dictate is wrong — an internal image
             // whose valid regions are not its phase's cores. Blaming the caller
             // for that would send them to fix the one thing that is fine.
             return err;
         }
         Error::InvalidArgument(format!(
-            "{err} This plan is legal with the output level chunked {:?}, derived from the blocks \
+            "{err} This plan is legal with the output image chunked {:?}, derived from the blocks \
              that write it; it is illegal only because {dictated:?} was dictated for it \
              (`with_output_chunk`). So it is the **block grid** that has to give here — and if that \
              phase's block extent is itself mandated by one of its ops (`BlockConstraint::Extent`, \
@@ -1227,8 +1313,18 @@ fn directory_bytes(at: &Path) -> u64 {
 ///
 /// A leading `/` because a Zarr node path is absolute within its store, and the
 /// store's own root is the directory.
-fn level_path(level: usize) -> String {
-    format!("/level{level}")
+fn image_path(image: usize) -> String {
+    format!("/level{image}")
+}
+
+/// `root/input<i>`: where the `i`th array handed to the run is stored.
+///
+/// A separate prefix from `level<n>` and not a continuation of it, because the
+/// two are numbered independently — a supplied input's index does not move when
+/// a phase is added — and because `discard_image` erases a `level<n>/` prefix
+/// and must never be able to name one of these.
+fn input_path(which: usize) -> String {
+    format!("/input{which}")
 }
 
 /// `root/side/<name>`. The name is the op's declaration and is used verbatim, so
@@ -1257,7 +1353,7 @@ const MAX_CHUNK_BYTES: u128 = 4 << 20;
 /// preference, and the divisor lattice does not always contain a member of it.
 const MIN_CHUNK_BYTES: u128 = 256 << 10;
 
-/// **The chunk shape for a level, derived from the block grid that writes it.**
+/// **The chunk shape for an image, derived from the block grid that writes it.**
 ///
 /// The rule, and why it is this one:
 ///
@@ -1320,7 +1416,7 @@ pub fn chunk_for_block(block: [usize; 3], dtype: Dtype) -> [usize; 3] {
 /// divisor to move to.
 ///
 /// Trial division: the numbers here are block extents, so the loop runs a few
-/// dozen times at most and is paid once per level per run.
+/// dozen times at most and is paid once per image per run.
 fn largest_proper_divisor(n: usize) -> usize {
     if n <= 1 {
         return n;
@@ -1339,7 +1435,7 @@ fn largest_proper_divisor(n: usize) -> usize {
 /// A chunk shape for an array of arbitrary rank.
 ///
 /// A side output's rank and extent are its own — one row per object, one score
-/// per class per position — so the level chunk shape does not apply and there is
+/// per class per position — so the image chunk shape does not apply and there is
 /// nothing to inherit. 256 per axis is a chunk of a few megabytes at eight bytes
 /// an element, which is the size the rest of this crate is tuned around, capped
 /// at the extent so a small array is one chunk.
@@ -1352,8 +1448,8 @@ impl Environment for ZarrEnvironment {
         self.volume
     }
 
-    /// Create levels 1..=n at the plan's per-phase volume, element type **and
-    /// chunking**, and check that level 0 is what the plan says it read.
+    /// Create images 1..=n at the plan's per-phase volume, element type **and
+    /// chunking**, and check that image 0 is what the plan says it read.
     ///
     /// Idempotent in the only sense that matters: called twice with the same
     /// plan it rebuilds the same arrays over the same metadata. It is called
@@ -1361,61 +1457,106 @@ impl Environment for ZarrEnvironment {
     ///
     /// **This is where the chunk-exclusive invariant is enforced**, and it is
     /// here for the reason `check_dtypes` runs in the executor rather than in
-    /// `Decomposition::check`: the plan does not know how a level is chunked and
+    /// `Decomposition::check`: the plan does not know how an image is chunked and
     /// this is the first place that holds both halves. A caller who wants the
     /// answer earlier has [`Self::chunk_plan`] and
     /// [`check_chunk_exclusive_writes`].
     fn prepare(&self, decomposition: &Decomposition) -> Result<()> {
-        let held = self.level_shape(0)?;
+        let held = self.image_shape(0)?;
         let wanted = decomposition.volume_at(0);
         if held != wanted {
             return Err(Error::InvalidArgument(format!(
-                "zarr environment holds level 0 as {held:?} and the decomposition reads it as \
+                "zarr environment holds image 0 as {held:?} and the decomposition reads it as \
                  {wanted:?}"
             )));
         }
-        let held = self.level_dtype(0)?;
+        let held = self.image_dtype(0)?;
         let wanted = decomposition.dtype_at(0);
         if held != wanted {
             return Err(Error::InvalidArgument(format!(
-                "zarr environment holds level 0 as {} and the decomposition reads it as {}",
+                "zarr environment holds image 0 as {} and the decomposition reads it as {}",
                 held.numpy_name(),
                 wanted.numpy_name()
             )));
         }
+        let wanted = decomposition.supplied_input_images();
+        let held = self
+            .supplied
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if held.len() != wanted.len() {
+            return Err(Error::InvalidArgument(format!(
+                "zarr environment holds {} supplied input(s) and the decomposition reads {}. \
+                 `ZarrEnvironment::create_with_inputs` is what seeds them.",
+                held.len(),
+                wanted.len()
+            )));
+        }
+        for (which, array) in held.iter().enumerate() {
+            let image = ImageId::supplied(which).index();
+            if !wanted.contains(&image) {
+                return Err(Error::InvalidArgument(format!(
+                    "zarr environment holds {} and the decomposition does not read it. Supplied \
+                     inputs are addressed from zero in the order they are handed over, so a gap \
+                     in the list moves every array after it.",
+                    describe_image(image)
+                )));
+            }
+            let shape = block_shape(&Region::whole(&array.shape))?;
+            if shape != decomposition.volume_at(image) {
+                return Err(Error::InvalidArgument(format!(
+                    "zarr environment holds {} as {shape:?} and the decomposition reads it as \
+                     {:?}",
+                    describe_image(image),
+                    decomposition.volume_at(image)
+                )));
+            }
+            if array.dtype != decomposition.dtype_at(image) {
+                return Err(Error::InvalidArgument(format!(
+                    "zarr environment holds {} as {} and the plan's readers declare {}. Nothing \
+                     folds an element type for an array no phase wrote, so the declaration is \
+                     the only statement there is and it has to be the array's own.",
+                    describe_image(image),
+                    array.dtype.numpy_name(),
+                    decomposition.dtype_at(image).numpy_name()
+                )));
+            }
+        }
+        drop(held);
+
         let chunks = self.chunk_plan(decomposition);
         if let Err(err) = check_chunk_exclusive_writes(decomposition, &chunks) {
             return Err(self.blame_the_dictated_layout(err, decomposition, &chunks));
         }
 
-        let mut levels = Vec::with_capacity(decomposition.n_levels());
-        levels.push(self.level_array(0)?);
-        for level in 1..decomposition.n_levels() {
-            // The plan's own element type for this level, asked twice: once for
+        let mut images = Vec::with_capacity(decomposition.n_images());
+        images.push(self.image_array(0)?);
+        for image in 1..decomposition.n_images() {
+            // The plan's own element type for this image, asked twice: once for
             // what to store and once for how. Deriving the codec here rather
-            // than at construction is the whole reason the policy is per level
-            // — level 0 is the only one whose type this environment knew before
+            // than at construction is the whole reason the policy is per image
+            // — image 0 is the only one whose type this environment knew before
             // it saw a plan.
-            let dtype = decomposition.dtype_at(level);
-            levels.push(Arc::new(StoredArray::create(
+            let dtype = decomposition.dtype_at(image);
+            images.push(Arc::new(StoredArray::create(
                 &self.store,
-                &level_path(level),
-                level as u64,
+                &image_path(image),
+                image as u64,
                 dtype,
-                &decomposition.volume_at(level),
-                &chunks[level],
-                self.compression.at(level, dtype),
+                &decomposition.volume_at(image),
+                &chunks[image],
+                self.compression.at(image, dtype),
             )?));
         }
         *self
-            .levels
+            .images
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = levels;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = images;
         Ok(())
     }
 
-    fn read(&self, level: usize, region: &Region) -> Result<BlockBuf> {
-        let array = self.level_array(level)?;
+    fn read(&self, image: usize, region: &Region) -> Result<BlockBuf> {
+        let array = self.image_array(image)?;
         region_within(region, &array.shape, "block-op read")?;
         if !self.aligned(region, &array.chunk) {
             self.unaligned_reads.fetch_add(1, Ordering::SeqCst);
@@ -1428,9 +1569,9 @@ impl Environment for ZarrEnvironment {
         self.counters
             .read_bytes
             .fetch_add(block.bytes(), Ordering::SeqCst);
-        // The level's own chunk shape, not the environment's: since a level
+        // The image's own chunk shape, not the environment's: since an image
         // derives its chunking from the phase that writes it, charging every
-        // read against level 0's grid would price most of them against a grid
+        // read against image 0's grid would price most of them against a grid
         // they never touch.
         self.counters
             .chunks_read
@@ -1465,16 +1606,23 @@ impl Environment for ZarrEnvironment {
         Ok(BlockBuf::Array(out))
     }
 
-    fn write(&self, level: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
+    fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
+        if is_supplied_image(image) {
+            return Err(Error::InvalidArgument(format!(
+                "block-op write: {} was handed to the run. An input is not the run's to \
+                 overwrite, and a plan that wrote one would change what a re-run reads.",
+                describe_image(image)
+            )));
+        }
         let block = buf.as_array()?;
-        let array = self.level_array(level)?;
+        let array = self.image_array(image)?;
         region_within(valid, &array.shape, "block-op write")?;
         if valid.voxels() == 0 {
             return Ok(());
         }
         if block.dtype() != array.dtype {
             return Err(Error::InvalidArgument(format!(
-                "level write: this block holds {} and level {level} holds {}",
+                "image write: this block holds {} and image {image} holds {}",
                 block.dtype().numpy_name(),
                 array.dtype.numpy_name()
             )));
@@ -1532,7 +1680,7 @@ impl Environment for ZarrEnvironment {
             }
             return Ok(());
         }
-        // Ids above the level range, so a side array and a level can never
+        // Ids above the image range, so a side array and an image can never
         // collide on the lock stripes for the wrong reason.
         let id = 1u64 << 32 | outer.len() as u64;
         let array = StoredArray::create(
@@ -1624,43 +1772,53 @@ impl Environment for ZarrEnvironment {
         self.counters.drop_resident(buf.bytes());
     }
 
-    /// Everything written to `level` is durable.
+    /// Everything written to `image` is durable.
     ///
     /// A `FilesystemStore` write is a completed `write` to a file by the time
     /// `store_array_subset` returns, so there is nothing here to flush. It is
     /// still an override point rather than an omission: a store with a write-back
     /// cache would need one, and a caller must be able to write the barrier
     /// without knowing which store it has.
-    /// Erase the level's arrays from the store.
+    /// Erase the image's arrays from the store.
     ///
     /// **This is where the saving is measured in disk rather than in memory.**
     /// An `N`-phase chain over a real volume writes `N` full copies of it; only
     /// two are ever live, and until now every one of them survived to the end of
     /// the run.
     ///
-    /// The prefix is erased rather than the chunks enumerated: a level is a Zarr
+    /// The prefix is erased rather than the chunks enumerated: an image is a Zarr
     /// group of its own (`/levelN`), so its metadata document goes with its
     /// chunks and what is left behind is nothing rather than an array with no
     /// data — which a reader would otherwise find and read as fill values.
-    fn discard_level(&self, level: usize) -> Result<()> {
+    fn discard_image(&self, image: usize) -> Result<()> {
+        // An intermediate may be dropped and rebuilt by re-running the phase
+        // that wrote it; an input cannot be rebuilt at any price, because no
+        // phase produces it. See `decomposition::ImageKind`.
+        if is_supplied_image(image) {
+            return Err(Error::InvalidArgument(format!(
+                "cannot discard {}: it was handed to the run and no phase writes it, so nothing \
+                 could rebuild it. Only an image the run produces may be freed.",
+                describe_image(image)
+            )));
+        }
         let mut discarded = self
             .discarded
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !discarded.insert(level) {
+        if !discarded.insert(image) {
             return Ok(());
         }
         drop(discarded);
-        let prefix = StorePrefix::new(format!("level{level}/")).map_err(Error::backend)?;
+        let prefix = StorePrefix::new(format!("level{image}/")).map_err(Error::backend)?;
         self.store.erase_prefix(&prefix).map_err(Error::backend)?;
-        // The handle in `levels` stays where it is. Removing it would shift
-        // every index above it, and `level_array` consults `discarded` first
-        // anyway — so a read of a freed level fails with a message about the
+        // The handle in `images` stays where it is. Removing it would shift
+        // every index above it, and `image_array` consults `discarded` first
+        // anyway — so a read of a freed image fails with a message about the
         // plan rather than with whatever the store says about a missing key.
         Ok(())
     }
 
-    fn finish(&self, _level: usize) -> Result<()> {
+    fn finish(&self, _image: usize) -> Result<()> {
         Ok(())
     }
 
@@ -1668,13 +1826,13 @@ impl Environment for ZarrEnvironment {
         &self.counters
     }
 
-    /// Level 0's chunk shape.
+    /// Image 0's chunk shape.
     ///
-    /// The trait has room for one triple and levels no longer share one, so this
-    /// answers for the level every plan reads and no plan writes. It feeds the
+    /// The trait has room for one triple and images no longer share one, so this
+    /// answers for the image every plan reads and no plan writes. It feeds the
     /// per-task `chunks` figure in the observability record, which is an
     /// estimate of IO granularity rather than an input to anything;
-    /// [`Self::chunk_at`] is the exact answer, per level.
+    /// [`Self::chunk_at`] is the exact answer, per image.
     fn chunk_shape(&self) -> [usize; 3] {
         self.input_chunk
     }
@@ -1790,39 +1948,39 @@ mod tests {
 
     /// The three ways to say it, and which one wins where.
     #[test]
-    fn a_per_level_override_beats_a_uniform_policy_which_beats_the_derivation() {
+    fn a_per_image_override_beats_a_uniform_policy_which_beats_the_derivation() {
         let derived = CompressionPolicy::derived();
         assert_eq!(derived.at(0, Dtype::F64), Compression::None);
         assert_eq!(derived.at(1, Dtype::Bool), Compression::Gzip(1));
 
-        // A `uniform` policy speaks for every level, including the ones the
+        // A `uniform` policy speaks for every image, including the ones the
         // derivation would have left alone.
         let everywhere = CompressionPolicy::uniform(Compression::Gzip(6));
         assert_eq!(everywhere.at(0, Dtype::F64), Compression::Gzip(6));
         assert_eq!(everywhere.at(7, Dtype::Bool), Compression::Gzip(6));
 
-        // And a level named explicitly wins over either.
+        // And an image named explicitly wins over either.
         let mixed = CompressionPolicy::derived()
-            .with_level(0, Compression::Gzip(9))
-            .with_level(2, Compression::None);
+            .with_image(0, Compression::Gzip(9))
+            .with_image(2, Compression::None);
         assert_eq!(mixed.at(0, Dtype::F64), Compression::Gzip(9));
         assert_eq!(mixed.at(1, Dtype::Bool), Compression::Gzip(1));
         assert_eq!(mixed.at(2, Dtype::Bool), Compression::None);
-        // A level the plan does not have is not an error; it simply never fires.
+        // An image the plan does not have is not an error; it simply never fires.
         assert_eq!(
             CompressionPolicy::derived()
-                .with_level(99, Compression::Gzip(9))
+                .with_image(99, Compression::Gzip(9))
                 .at(3, Dtype::F32),
             Compression::None
         );
 
-        // Side outputs have no level number, so an override cannot name one, but
+        // Side outputs have no image number, so an override cannot name one, but
         // a statement about the whole run does apply to them.
         assert_eq!(mixed.for_side(Dtype::F64), Compression::None);
         assert_eq!(everywhere.for_side(Dtype::F64), Compression::Gzip(6));
     }
 
-    /// A level out of `zarrs`'s range is clamped rather than refused, and the
+    /// An image out of `zarrs`'s range is clamped rather than refused, and the
     /// array is still built.
     ///
     /// Clamped and not refused because the number is a dial, not an identity: a
@@ -1843,7 +2001,7 @@ mod tests {
             CompressionPolicy::uniform(Compression::Gzip(12)),
         )
         .unwrap();
-        assert_eq!(env.level(0).unwrap(), input);
+        assert_eq!(env.image(0).unwrap(), input);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1902,7 +2060,7 @@ mod tests {
             .unwrap();
             sizes.push(env.stored_bytes(0).unwrap());
             counted.push(env.counters().byte_snapshot());
-            assert_eq!(env.level(0).unwrap(), input, "{}", compression.name());
+            assert_eq!(env.image(0).unwrap(), input, "{}", compression.name());
             let _ = std::fs::remove_dir_all(&root);
         }
         assert_eq!(sizes[0], 16 * 16 * 16, "raw uint8 is one byte a voxel");
@@ -1954,7 +2112,7 @@ mod tests {
                     assert_eq!(env.compression_at(0).unwrap(), compression);
 
                     // The whole volume, which is chunk-aligned by construction.
-                    let whole = env.level(0).unwrap();
+                    let whole = env.image(0).unwrap();
                     assert_eq!(whole, input, "{dtype:?} at chunk {chunk:?}");
 
                     // A read that lands on the grid where the grid divides it, and a
@@ -2000,7 +2158,7 @@ mod tests {
         .unwrap();
         assert!(env.serialised_writes() > 0, "this write straddles chunks");
 
-        let got = env.level(0).unwrap();
+        let got = env.image(0).unwrap();
         let got = got.view::<u16>().unwrap();
         let want = input.view::<u16>().unwrap();
         for i in 0..8 {
@@ -2018,14 +2176,14 @@ mod tests {
     /// An unwritten voxel reads back as the sentinel a `Voxels` would hold, not
     /// as a convincing zero.
     #[test]
-    fn an_unwritten_level_reads_back_as_the_unwritten_sentinel() {
+    fn an_unwritten_image_reads_back_as_the_unwritten_sentinel() {
         let root = scratch("unwritten");
         let input = Voxels::zeros(Dtype::F64, [4, 4, 4]).unwrap();
         let env = ZarrEnvironment::create(&root, &input, [2, 2, 2]).unwrap();
-        // A level the plan creates and nothing writes.
+        // An image the plan creates and nothing writes.
         let array = StoredArray::create(
             &env.store,
-            &level_path(9),
+            &image_path(9),
             9,
             Dtype::F64,
             &[4, 4, 4],
@@ -2132,11 +2290,11 @@ mod tests {
         assert_eq!(chunk_for_block([7, 7, 7], Dtype::F64), [7, 7, 7]);
     }
 
-    /// A level's chunking follows the phase that writes it; level 0 keeps
+    /// An image's chunking follows the phase that writes it; image 0 keeps
     /// whatever the caller's array already had; and a dictated output layout is
     /// heard only for the output.
     #[test]
-    fn the_chunk_plan_derives_every_level_a_phase_writes() {
+    fn the_chunk_plan_derives_every_image_a_phase_writes() {
         use crate::decomposition::PhaseDecomposition;
         use crate::geometry::BlockGrid;
 
@@ -2165,13 +2323,13 @@ mod tests {
         assert_eq!(
             env.chunk_plan(&plan),
             vec![[5, 5, 5], [8, 8, 8], [4, 4, 4]],
-            "level 0 keeps the caller's layout; each other level takes its phase's block"
+            "image 0 keeps the caller's layout; each other image takes its phase's block"
         );
         let dictated = env.with_output_chunk([2, 2, 2]);
         assert_eq!(
             dictated.chunk_plan(&plan),
             vec![[5, 5, 5], [8, 8, 8], [2, 2, 2]],
-            "a dictated layout speaks for the output level and for nothing else"
+            "a dictated layout speaks for the output image and for nothing else"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2286,7 +2444,7 @@ mod tests {
     ///
     /// **Run on both a raw and a compressed array**, and the compressed arm is
     /// not a formality: it is the configuration this environment now writes by
-    /// default for an integer level, so a guard that had only ever been measured
+    /// default for an integer image, so a guard that had only ever been measured
     /// on raw arrays would be a guard measured somewhere nobody runs.
     #[test]
     fn concurrent_partial_chunk_writes_lose_data_without_the_guard_and_not_with_it() {
@@ -2372,10 +2530,10 @@ mod tests {
             .unwrap();
 
         let storage = ZarrEnvironment::create(&root, &input, [4, 4, 4]).unwrap();
-        // One phase, so one level beside the input, at the same shape and type.
+        // One phase, so one image beside the input, at the same shape and type.
         let extra = StoredArray::create(
             &storage.store,
-            &level_path(1),
+            &image_path(1),
             1,
             Dtype::U16,
             &[8, 8, 8],
@@ -2383,7 +2541,7 @@ mod tests {
             Compression::for_dtype(Dtype::U16),
         )
         .unwrap();
-        storage.levels.write().unwrap().push(Arc::new(extra));
+        storage.images.write().unwrap().push(Arc::new(extra));
         let buf = storage.read(0, &region).unwrap();
         storage
             .write(1, &Region::whole(&[4, 4, 4]), &region, &buf)
@@ -2397,10 +2555,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A level allocated at one type and written at another is refused, rather
+    /// An image allocated at one type and written at another is refused, rather
     /// than silently converted — the same guard `ArrayEnvironment` carries.
     #[test]
-    fn writing_a_level_in_the_wrong_element_type_is_refused_by_name() {
+    fn writing_an_image_in_the_wrong_element_type_is_refused_by_name() {
         let root = scratch("wrong-type");
         let input = Voxels::zeros(Dtype::F64, [2, 2, 2]).unwrap();
         let env = ZarrEnvironment::create(&root, &input, [2, 2, 2]).unwrap();

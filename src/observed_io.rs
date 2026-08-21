@@ -88,7 +88,7 @@ pub struct ObservedSource<T, S: RegionSource<T>> {
     /// Resolved once: `describe()` may format, and formatting per read would be
     /// an allocation on the IO path for a string that never changes.
     name: String,
-    level: usize,
+    image: usize,
     chunk: Option<Vec<usize>>,
     marker: std::marker::PhantomData<fn() -> T>,
 }
@@ -100,15 +100,15 @@ impl<T, S: RegionSource<T>> ObservedSource<T, S> {
             inner,
             dispatch: IoDispatch::new(listeners),
             name,
-            level: 0,
+            image: 0,
             chunk: None,
             marker: std::marker::PhantomData,
         }
     }
 
-    /// Which storage level this source is, for a multi-phase run. Default 0.
-    pub fn at_level(mut self, level: usize) -> Self {
-        self.level = level;
+    /// Which storage image this source is, for a multi-phase run. Default 0.
+    pub fn at_image(mut self, image: usize) -> Self {
+        self.image = image;
         self
     }
 
@@ -157,7 +157,7 @@ impl<T: Send + Sync, S: RegionSource<T>> RegionSource<T> for ObservedSource<T, S
         let voxels = region.voxels();
         self.dispatch.emit(Event::RegionRead {
             source: self.name.clone(),
-            level: self.level,
+            image: self.image,
             index: None,
             region: region.clone(),
             voxels,
@@ -179,7 +179,7 @@ pub struct ObservedSink<T, S: RegionSink<T>> {
     inner: S,
     dispatch: IoDispatch,
     name: String,
-    level: usize,
+    image: usize,
     phase: usize,
     intermediate: bool,
     chunk: Option<Vec<usize>>,
@@ -194,7 +194,7 @@ impl<T, S: RegionSink<T>> ObservedSink<T, S> {
             inner,
             dispatch: IoDispatch::new(listeners),
             name,
-            level: 0,
+            image: 0,
             phase: 0,
             intermediate: false,
             chunk: None,
@@ -208,7 +208,7 @@ impl<T, S: RegionSink<T>> ObservedSink<T, S> {
     /// event's fields.
     pub fn at_phase(mut self, phase: usize, intermediate: bool) -> Self {
         self.phase = phase;
-        self.level = phase + 1;
+        self.image = phase + 1;
         self.intermediate = intermediate;
         self
     }
@@ -238,7 +238,7 @@ impl<T: Send + Sync, S: RegionSink<T>> RegionSink<T> for ObservedSink<T, S> {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.dispatch.emit(Event::RegionWritten {
             sink: self.name.clone(),
-            level: self.level,
+            image: self.image,
             index: None,
             region: region.clone(),
             voxels,
@@ -253,7 +253,7 @@ impl<T: Send + Sync, S: RegionSink<T>> RegionSink<T> for ObservedSink<T, S> {
         self.inner.finish()?;
         self.dispatch.emit(Event::Materialised {
             phase: self.phase,
-            level: self.level,
+            image: self.image,
             bytes: self.bytes.load(Ordering::Relaxed),
             intermediate: self.intermediate,
         });
@@ -338,11 +338,11 @@ mod tests {
         match &events[2] {
             Event::Materialised {
                 phase,
-                level,
+                image,
                 bytes,
                 intermediate,
             } => {
-                assert_eq!((*phase, *level, *intermediate), (1, 2, true));
+                assert_eq!((*phase, *image, *intermediate), (1, 2, true));
                 assert_eq!(*bytes, 8 * 8 * 8 * 8, "both writes, in bytes");
             }
             other => panic!("{other:?}"),

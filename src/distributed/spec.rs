@@ -138,7 +138,7 @@ impl OpSpec {
 /// with no data and no cluster.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StoreSpec {
-    /// One file per level on a filesystem every worker can see. This is the
+    /// One file per image on a filesystem every worker can see. This is the
     /// stand-in for the shared storage the design assumes; a deployment
     /// supplies its own environment through its own factory.
     Files { dir: PathBuf },
@@ -272,7 +272,7 @@ pub fn read_task_fragment(bytes: &[u8]) -> Result<([usize; 3], usize)> {
 ///
 /// Fragment phases are appended **after** the chain's phases, which is where
 /// `fragment::check_phase_work` requires them: a phase that writes only
-/// fragments produces no level for a later pixel phase to read.
+/// fragments produces no image for a later pixel phase to read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FragmentPhaseSpec {
     /// Which fragment probe. `"summary"`, `"fold"` or `"reduce"`.
@@ -425,7 +425,7 @@ pub struct WorkflowSpec {
     pub ops: Vec<OpSpec>,
     pub store: StoreSpec,
     /// Per-block output that is not a pixel region. `None` — the usual case —
-    /// means the job produces nothing but levels.
+    /// means the job produces nothing but images.
     pub sidecar: Option<SidecarSpec>,
     /// Fragment phases appended after the chain's. Empty — the usual case —
     /// means every phase is `region -> region`.

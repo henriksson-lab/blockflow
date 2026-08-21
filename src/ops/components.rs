@@ -16,7 +16,7 @@
 //
 // | phase | shape | what it does |
 // |---|---|---|
-// | 0 | `volume -> fragments`, and writes pixels | label the block's components locally at reach 0, write the labels as a `u32` level, emit the block's six face planes plus one fact per label |
+// | 0 | `volume -> fragments`, and writes pixels | label the block's components locally at reach 0, write the labels as a `u32` image, emit the block's six face planes plus one fact per label |
 // | 1 | `fragments -> volume` | read every block's faces, close the local labels into global components with a union-find, fold the per-label fact over each component, and rewrite this block's labels into the answer |
 //
 // What is genuinely common is everything except the two things the ops differ
@@ -128,7 +128,7 @@ use crate::fragment::BlockView;
 
 /// The label reserved for "this voxel belongs to no component".
 ///
-/// Zero rather than a sentinel at the top of the range, so that a level
+/// Zero rather than a sentinel at the top of the range, so that an image
 /// allocated as zeros starts out entirely unlabelled and a lookup table is
 /// indexed by `label - 1` with no offset arithmetic anywhere else.
 ///

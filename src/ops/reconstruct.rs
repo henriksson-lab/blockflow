@@ -49,7 +49,7 @@
 // algorithm needs, and demanding `Ord` would exclude the floating-point volumes
 // this is mostly used on. The loop belongs to the framework: `IterativeOp`
 // declares the operands, the executor runs substages until a global convergence
-// check says stop, and the substage count appears in no reach, no level and no
+// check says stop, and the substage count appears in no reach, no image and no
 // plan.
 //
 // [`reconstruct_to_fixed_point`] is the same kernel in a plain loop over a whole
@@ -80,12 +80,12 @@
 // every later substage takes the `Running` estimate and the `Fixed` mask.
 //
 // **This works only because a reconstruction's seed and its mask are the same
-// array.** A phase has one input level, so every `Fixed` operand is a view of
+// array.** A phase has one input image, so every `Fixed` operand is a view of
 // the array substage 0 seeds from; `crate::iterate::Operand::Fixed` is where a
-// level id will go when levels are a DAG, and until they are, *reconstruct A
+// image id will go when images are a DAG, and until they are, *reconstruct A
 // under a mask B computed elsewhere* cannot be a phase. It is not lost — it is
 // [`reconstruct_to_fixed_point`], for a caller holding the whole volume — and
-// when the level DAG exists the op for it is a shell over this same kernel and
+// when the image DAG exists the op for it is a shell over this same kernel and
 // not a second implementation. That is what the split is for.
 //
 // The reach, and what it is not multiplied by
@@ -116,7 +116,7 @@
 // **One obligation the shape puts on substage 0, discharged here and worth
 // knowing about.** The executor asks after every substage whether what was
 // written differs from what was read, and what substage 0 read is the input
-// level — so an op whose seed *equals* its input is declared converged before a
+// image — so an op whose seed *equals* its input is declared converged before a
 // single step runs. For this op that is exactly right: `h = 0` gives the seed
 // `f`, and `min(dilate(f), f)` is `f`, so the seed is already the fixed point and
 // `HMAX_0` costs one pass rather than two. It is right by argument rather than by
@@ -449,7 +449,7 @@ pub fn reconstruct_step_into_at<T: Copy + PartialOrd>(
 /// * it is the oracle a block-decomposed run is checked against, which is the bar
 ///   every op in this crate meets;
 /// * it is the only way to reconstruct from an **externally supplied** seed
-///   today. A phase has one input level, so an op cannot be handed two arrays;
+///   today. A phase has one input image, so an op cannot be handed two arrays;
 ///   see the module header.
 ///
 /// `limit` bounds the steps this loop takes, on
@@ -528,7 +528,7 @@ pub fn reconstruct_to_fixed_point<T: Copy + PartialOrd>(
 /// **Substage 0 both seeds and answers the convergence question**, which is the
 /// one place this has to model the executor rather than the mathematics: the
 /// executor compares what a substage wrote against what it read, and what
-/// substage 0 read is the input level. So a seed equal to the input — which is
+/// substage 0 read is the input image. So a seed equal to the input — which is
 /// what `h = 0` gives — converges in one substage without a step ever running,
 /// and `HMAX_0` costs one pass rather than two. Modelled by the comparison below
 /// rather than by a test on `h`, because it is the array the executor compares
@@ -772,7 +772,7 @@ impl IterativeOp for HExtremaOp {
         if at.index() == 0 {
             // **The seed is derived from the mask operand**, not from the running
             // one, and the two are the same array — that identity is what makes
-            // this op expressible with one input level at all, and reading the
+            // this op expressible with one input image at all, and reading the
             // mask here says so in the code rather than only in the header.
             let mut target = out.view_mut::<f64>()?;
             shapes_agree(mask.shape(), target.shape(), "h-extrema seed")?;

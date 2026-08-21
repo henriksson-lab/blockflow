@@ -279,7 +279,7 @@ fn the_resolved_chain_runs_and_gives_the_whole_volume_answer() -> Result<()> {
     );
     let env = ArrayEnvironment::for_decomposition(input.clone().into(), &plan, [8, 8, 8])?;
     execute("dispatch", &workflow, &plan, &Hints::default(), &env)?;
-    assert_eq!(env.level(plan.n_phases()), want, "the fast path, blocked");
+    assert_eq!(env.image(plan.n_phases()), want, "the fast path, blocked");
 
     // The oracle: the general path, one block, no seams.
     let general = Workflow::new(
@@ -290,7 +290,7 @@ fn the_resolved_chain_runs_and_gives_the_whole_volume_answer() -> Result<()> {
     let oracle = Trivial.decompose(&general, &Constraints::default())?;
     let env = ArrayEnvironment::for_decomposition(input.into(), &oracle, [8, 8, 8])?;
     execute("oracle", &general, &oracle, &Hints::default(), &env)?;
-    assert_eq!(env.level(oracle.n_phases()), want, "the oracle");
+    assert_eq!(env.image(oracle.n_phases()), want, "the oracle");
     Ok(())
 }
 

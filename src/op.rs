@@ -24,6 +24,7 @@
 
 use ndarray::ArrayD;
 
+use crate::assemble::ImageId;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::geometry::BlockGeometry;
@@ -92,7 +93,7 @@ impl Anchor {
 /// One array a workflow writes.
 ///
 /// **Why an op declares more than one.** A `Workflow` names a single output of a
-/// single element type, and the executor writes one buffer to one level. An
+/// single element type, and the executor writes one buffer to one image. An
 /// operation that produces several results — a labelling plus the scores it was
 /// thresholded from, a segmentation plus its boundaries — then has nowhere to
 /// put the rest, so they are written on the side by whatever is holding the
@@ -349,14 +350,14 @@ pub struct Placement {
     /// Equal to `input` for every phase whose output grid is its input grid,
     /// which is why nothing needed it until a lattice phase did.
     pub output: Anchor,
-    /// Per source level, where that buffer sits in its own level.
+    /// Per source image, where that buffer sits in its own image.
     pub sources: Vec<(usize, Anchor)>,
     /// The extent of the block written, when the plan states one.
     writes: Option<[usize; 3]>,
 }
 
 impl Placement {
-    /// The same region in both spaces and no source levels: the placement of
+    /// The same region in both spaces and no source images: the placement of
     /// every phase whose output grid is its input grid.
     pub fn same(at: Anchor) -> Self {
         Self {
@@ -395,11 +396,11 @@ impl Placement {
         self.writes
     }
 
-    /// Where the buffer for `level` sits in its own level.
-    pub fn source(&self, level: usize) -> Option<&Anchor> {
+    /// Where the buffer for `image` sits in its own image.
+    pub fn source(&self, image: usize) -> Option<&Anchor> {
         self.sources
             .iter()
-            .find(|(named, _)| *named == level)
+            .find(|(named, _)| *named == image)
             .map(|(_, at)| at)
     }
 }
@@ -507,8 +508,8 @@ impl Geometry {
     }
 }
 
-/// A stored level an op reads *besides* the input it is handed, and how far
-/// beyond the voxel it writes it reads that level.
+/// A stored image an op reads *besides* the input it is handed, and how far
+/// beyond the voxel it writes it reads that image.
 ///
 /// **The reach is per input, and that is the whole point of the type.** Before
 /// it, the only way a second array reached a chain was `Chain::Source`, whose
@@ -528,10 +529,23 @@ impl Geometry {
 /// [`FragmentInput::reach`]: crate::fragment::FragmentInput::reach
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceInput {
-    /// The level read, in the same numbering `Chain::Source` and
-    /// `PhaseDecomposition::source_levels` use.
-    pub level: usize,
-    /// What this op reads of *that level*, beyond the voxel it writes.
+    /// The image read, in the same numbering `Chain::Source` and
+    /// `PhaseDecomposition::source_images` use.
+    pub image: ImageId,
+    /// What that image holds, when the reader is the only thing that can say.
+    ///
+    /// `None` — the default, and every op that shipped before supplied inputs
+    /// existed — means *ask the plan*: for an image the run writes, the element
+    /// type is the fold of the chain up to it and
+    /// [`Decomposition::dtype_at`](crate::decomposition::Decomposition::dtype_at)
+    /// is the answer. A **supplied** input has no fold, because no phase
+    /// produces it, so the readers are the only declaration there is; an op
+    /// naming one without saying what it holds is refused by name at plan time.
+    ///
+    /// `Chain::Source` has carried this since before the field existed and sets
+    /// it here; the field is what lets a `BlockOp` say the same thing.
+    pub dtype: Option<Dtype>,
+    /// What this op reads of *that image*, beyond the voxel it writes.
     ///
     /// A [`Reach`] rather than a symmetric integer because the case that needs
     /// the feature needs the asymmetry: an element with an even extent is
@@ -541,17 +555,30 @@ pub struct SourceInput {
 }
 
 impl SourceInput {
-    /// `level`, read at exactly the extent written — the `Chain::Source`
+    /// `image`, read at exactly the extent written — the `Chain::Source`
     /// contract, stated as a declaration instead of assumed.
-    pub fn voxelwise(level: usize) -> Self {
+    pub fn voxelwise(image: impl Into<ImageId>) -> Self {
         Self {
-            level,
+            image: image.into(),
+            dtype: None,
             reach: Reach::none(),
         }
     }
 
-    pub fn new(level: usize, reach: Reach) -> Self {
-        Self { level, reach }
+    pub fn new(image: impl Into<ImageId>, reach: Reach) -> Self {
+        Self {
+            image: image.into(),
+            dtype: None,
+            reach,
+        }
+    }
+
+    /// Say what the image holds. Required for a supplied input and harmless
+    /// anywhere else, where it is checked against the plan's own fold.
+    #[must_use]
+    pub fn holding(mut self, dtype: Dtype) -> Self {
+        self.dtype = Some(dtype);
+        self
     }
 }
 
@@ -629,7 +656,7 @@ pub trait BlockOp: Send + Sync {
         Geometry::stencil(input_volume, self.reach_spec(input_volume))
     }
 
-    /// Stored levels this op reads besides `input`, each with its own reach.
+    /// Stored images this op reads besides `input`, each with its own reach.
     ///
     /// Empty by default, which is every op this crate shipped before the method
     /// existed and is the honest answer for all of them: an op that says nothing
@@ -643,11 +670,11 @@ pub trait BlockOp: Send + Sync {
         Vec::new()
     }
 
-    /// [`Self::apply`], with the stored levels [`Self::source_inputs`] declared.
+    /// [`Self::apply`], with the stored images [`Self::source_inputs`] declared.
     ///
     /// Each buffer holds that input's **own** region: the block's core grown by
     /// that input's reach, which is *not* in general the extent of `input`.
-    /// Reading a level at a different extent from the one being processed is the
+    /// Reading an image at a different extent from the one being processed is the
     /// point of the pair of methods.
     ///
     /// **The default refuses rather than falling through.** It hands off to
@@ -668,14 +695,14 @@ pub trait BlockOp: Send + Sync {
         let declared = self.source_inputs(at.volume);
         if !declared.is_empty() {
             return Err(Error::InvalidArgument(format!(
-                "op {:?} declares {} source input(s) (level(s) {}) and does not override \
+                "op {:?} declares {} source input(s) (image(s) {}) and does not override \
                  `apply_with`, so the operands it asked the plan to fetch would be dropped on \
                  the floor and the block would be computed from its input alone.",
                 self.name(),
                 declared.len(),
                 declared
                     .iter()
-                    .map(|input| input.level.to_string())
+                    .map(|input| input.image.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
@@ -791,7 +818,7 @@ pub trait BlockOp: Send + Sync {
     /// default hands the type on unchanged, which is right for every op whose
     /// output is the same kind of thing as its input; a thresholding op that
     /// narrows to `bool`, or a statistic that widens to `f64`, says so here and
-    /// the level it writes is allocated at that width.
+    /// the image it writes is allocated at that width.
     fn produces(&self, input: Dtype) -> Dtype {
         input
     }
@@ -910,18 +937,31 @@ pub trait BlockOp: Send + Sync {
 
     /// This block's slice of each side output, in declaration order.
     ///
-    /// Called once per block, with the buffer the op was given **and the primary
-    /// result it produced**, so an op deriving a side output from its own answer
-    /// does not recompute it and one that does not can ignore `primary`.
+    /// Called once per block with **the operands [`Self::apply_with`] was called
+    /// with** — the buffer the op was given and the [`SourceInputs`] the phase
+    /// read beside it — and **the primary result it produced**, so an op
+    /// deriving a side output from its own answer does not recompute it and one
+    /// that does not can ignore `primary`.
+    ///
+    /// `sources` is here because a side output is not always a function of the
+    /// op's own input. An op reading `K` arrays writes arrays that are functions
+    /// of *every* one of them, and one handed a single buffer could not compute
+    /// them at all: it would have to be told them by the call that could, which
+    /// is a channel between two calls rather than a contract, and it goes wrong
+    /// silently the moment the two stop being called in the order it assumed.
+    /// The list is the same one, at the same block and keyed by image, so an op
+    /// that reads nothing beside its own input ignores it exactly as it ignores
+    /// `primary`.
     ///
     /// Each array must have the shape of the corresponding [`SideBlock::regions`]
     /// entry; the environment checks that rather than trusting it.
     /// The arrays are `ArrayD<f64>` and stay so: a side output's **rank** is its
-    /// own — see [`Output`] — and pinning it to 3 the way a level now is would
+    /// own — see [`Output`] — and pinning it to 3 the way an image now is would
     /// delete the case the type exists for.
     fn apply_side(
         &self,
         _input: &Voxels,
+        _sources: SourceInputs<'_>,
         _primary: &Voxels,
         _block: &SideBlock<'_>,
     ) -> Result<Vec<ArrayD<f64>>> {
@@ -933,7 +973,7 @@ pub trait BlockOp: Send + Sync {
     /// What this op requires of the blocks it is handed. `None` — the default —
     /// means "any".
     ///
-    /// `volume` is the extent of the **level the phase reads**, because that is
+    /// `volume` is the extent of the **image the phase reads**, because that is
     /// the space a block's `source` region is in and `source` is what the op is
     /// handed. For every phase whose output grid is its input grid the two are
     /// the same; where they differ, a lattice laid over an array is a lattice
@@ -1044,12 +1084,12 @@ pub trait Combine: Send + Sync {
     }
 }
 
-/// The stored levels a chain's [`Chain::Source`] leaves are handed, keyed by
-/// level.
+/// The stored images a chain's [`Chain::Source`] leaves are handed, keyed by
+/// image.
 ///
-/// **One entry per level, not one per leaf.** Two leaves naming the same level
+/// **One entry per image, not one per leaf.** Two leaves naming the same image
 /// read the same voxels of the same array at the same extent, so giving them
-/// one buffer is not a cache — it is the statement that a level is one thing.
+/// one buffer is not a cache — it is the statement that an image is one thing.
 /// It also removes the only ordering question a positional list would have had:
 /// a `Chain::Alternative` whose live branch skips a leaf would consume a
 /// different number of entries than the tree contains, and every fold in this
@@ -1060,7 +1100,7 @@ pub trait Combine: Send + Sync {
 /// was handed. The executor reads it; nothing here fetches.
 #[derive(Clone, Copy)]
 pub struct SourceInputs<'a> {
-    entries: &'a [(usize, &'a Voxels)],
+    entries: &'a [(ImageId, &'a Voxels)],
 }
 
 impl<'a> SourceInputs<'a> {
@@ -1070,30 +1110,32 @@ impl<'a> SourceInputs<'a> {
         Self { entries: &[] }
     }
 
-    pub fn new(entries: &'a [(usize, &'a Voxels)]) -> Self {
+    pub fn new(entries: &'a [(ImageId, &'a Voxels)]) -> Self {
         Self { entries }
     }
 
-    /// The buffer for `level`, or an error naming what was supplied.
+    /// The buffer for `image`, or an error naming what was supplied.
     ///
     /// An error rather than an `Option` because there is no sensible thing to
     /// do without it: a missing operand is a block that would combine against
     /// nothing, which is the class of quiet wrong answer this crate is arranged
     /// against.
-    pub fn get(&self, level: usize) -> Result<&'a Voxels> {
+    pub fn get(&self, image: impl Into<ImageId>) -> Result<&'a Voxels> {
+        let image = image.into();
         self.entries
             .iter()
-            .find(|(named, _)| *named == level)
+            .find(|(named, _)| *named == image)
             .map(|(_, buf)| *buf)
             .ok_or_else(|| {
                 Error::InvalidArgument(format!(
-                    "a source leaf reads level {level} and the executor supplied [{}]. The \
-                     levels a phase reads besides its own input are recorded in the plan \
-                     (`PhaseDecomposition::source_levels`) and read there; a leaf naming one \
+                    "a source leaf reads image {} and the executor supplied [{}]. The \
+                     images a phase reads besides its own input are recorded in the plan \
+                     (`PhaseDecomposition::source_images`) and read there; a leaf naming one \
                      the plan does not list has nothing to be handed.",
+                    image.index(),
                     self.entries
                         .iter()
-                        .map(|(named, _)| named.to_string())
+                        .map(|(named, _)| named.index().to_string())
                         .collect::<Vec<_>>()
                         .join(", ")
                 ))
@@ -1153,13 +1195,13 @@ pub enum Chain {
         combine: Box<dyn Combine>,
     },
     Op(Box<dyn BlockOp>),
-    /// A leaf that **reads** a stored level instead of computing one.
+    /// A leaf that **reads** a stored image instead of computing one.
     ///
     /// Every other node in this tree is a function of the buffer handed to it.
-    /// This one ignores that buffer and answers with a level of the run, read
+    /// This one ignores that buffer and answers with an image of the run, read
     /// at the block's own read extent. It is what makes a two-array operation
     /// expressible without holding the second array whole:
-    /// `Chain::parallel([computed, Chain::source(level, dtype)], combine)` is a
+    /// `Chain::parallel([computed, Chain::source(image, dtype)], combine)` is a
     /// diamond whose second arm is an array on disk, and every fold below folds
     /// it exactly as it folds a computed arm.
     ///
@@ -1169,7 +1211,7 @@ pub enum Chain {
     /// and `tests/fan_in.rs` already proves that machinery. A second input on
     /// `PhaseDecomposition` would have needed a parallel set of folds — reach,
     /// element type, shape, cost — for the same shape of question. So the edge
-    /// the design record asks for (`docs/design/BLOCK_OPS.md`, *"Levels are a
+    /// the design record asks for (`docs/design/BLOCK_OPS.md`, *"Images are a
     /// DAG"*) is added where the DAG already existed.
     ///
     /// **Reach 0, and that is exact rather than conservative.** It reads the
@@ -1180,23 +1222,23 @@ pub enum Chain {
     ///
     /// **The element type is declared and then checked.** `produces` has only
     /// an input element type to work from and a source leaf's answer does not
-    /// depend on it, so the leaf carries the answer. What the level actually
+    /// depend on it, so the leaf carries the answer. What the image actually
     /// holds is known to the plan, not to the chain, so
-    /// [`check_source_levels`](crate::decomposition::check_source_levels)
+    /// [`check_source_images`](crate::decomposition::check_source_images)
     /// compares the two — the same arrangement as every other quantity this
     /// crate states twice.
     ///
-    /// **`level` is a level of the plan, so a chain carrying one constrains the
-    /// plans it is valid for.** That is not a leak: which level is read is
-    /// parity-visible, it is recorded in `PhaseDecomposition::source_levels`,
-    /// and a partition that renumbers the level out from under a leaf is
+    /// **`image` is an image of the plan, so a chain carrying one constrains the
+    /// plans it is valid for.** That is not a leak: which image is read is
+    /// parity-visible, it is recorded in `PhaseDecomposition::source_images`,
+    /// and a partition that renumbers the image out from under a leaf is
     /// refused by name at plan time rather than discovered at the first block.
     Source {
-        /// The level read. Must be at or below the level its phase reads, so
+        /// The image read. Must be at or below the image its phase reads, so
         /// that the phase that wrote it has run; a forward reference is refused
-        /// by `check_source_levels`.
-        level: usize,
-        /// The element type that level holds.
+        /// by `check_source_images`.
+        image: ImageId,
+        /// The element type that image holds.
         dtype: Dtype,
     },
 }
@@ -1227,40 +1269,40 @@ impl Chain {
         ))
     }
 
-    /// A leaf that reads level `level`, which holds `dtype`.
+    /// A leaf that reads image `image`, which holds `dtype`.
     ///
-    /// **`level` is a [`Level`](crate::assemble::Level) and not a phase index**,
+    /// **`image` is an [`ImageId`](crate::assemble::ImageId) and not a phase index**,
     /// and the two are different types for the reason that motivated the
-    /// distinction: phase `p` writes level `p + 1`, so the two numbers are
-    /// adjacent, both in range, and swapping them reads a real level that is the
-    /// wrong one. `usize` converts into a `Level`, so every caller that already
+    /// distinction: phase `p` writes image `p + 1`, so the two numbers are
+    /// adjacent, both in range, and swapping them reads a real image that is the
+    /// wrong one. `usize` converts into an `ImageId`, so every caller that already
     /// writes a literal is unchanged; what the type buys is that a caller
     /// holding a [`Phase`](crate::assemble::Phase) handle cannot pass it here.
     ///
-    /// Infallible here on purpose: whether the level exists, whether it is a
+    /// Infallible here on purpose: whether the image exists, whether it is a
     /// forward reference and whether it really holds `dtype` are all questions
     /// about a *plan*, and this constructor has none. They are answered by
-    /// [`check_source_levels`](crate::decomposition::check_source_levels), in
+    /// [`check_source_images`](crate::decomposition::check_source_images), in
     /// one place, at plan time.
-    pub fn source(level: impl Into<crate::assemble::Level>, dtype: Dtype) -> Chain {
+    pub fn source(image: impl Into<ImageId>, dtype: Dtype) -> Chain {
         Chain::Source {
-            level: level.into().index(),
+            image: image.into(),
             dtype,
         }
     }
 
-    /// Every level named by a source leaf anywhere in the subtree, ascending
+    /// Every image named by a source leaf anywhere in the subtree, ascending
     /// and without repeats.
     ///
     /// **Every branch of an `Alternative` counts, not just `taken`.** This is
     /// the `reach` reading rather than the `side_outputs` reading, and for
-    /// `reach`'s reason: the level has to be *there* whichever branch is live,
+    /// `reach`'s reason: the image has to be *there* whichever branch is live,
     /// so it must be kept alive and read for all of them. Over-declaring costs
     /// a read; under-declaring is a branch with no operand.
-    /// Every level this subtree reads besides its input, with the **widest**
+    /// Every image this subtree reads besides its input, with the **widest**
     /// reach any reader of it declared.
     ///
-    /// One entry per level, matching [`SourceInputs`]: two readers of one level
+    /// One entry per image, matching [`SourceInputs`]: two readers of one image
     /// are handed one buffer, so the buffer has to satisfy the hungrier of them.
     /// Folding by max is the same rule `reach` folds an `Alternative` by, and it
     /// is safe in the same direction — over-declaring costs voxels, and
@@ -1268,24 +1310,44 @@ impl Chain {
     pub fn source_inputs(&self, volume: [usize; 3]) -> Result<Vec<SourceInput>> {
         let mut seen: Vec<SourceInput> = Vec::new();
         self.collect_source_inputs(volume, &mut seen)?;
-        seen.sort_by_key(|input| input.level);
+        seen.sort_by_key(|input| input.image);
         Ok(seen)
     }
 
-    /// The levels of [`Self::source_inputs`], ascending and without repeats.
-    pub fn source_levels(&self, volume: [usize; 3]) -> Result<Vec<usize>> {
+    /// The images of [`Self::source_inputs`], ascending and without repeats.
+    pub fn source_images(&self, volume: [usize; 3]) -> Result<Vec<usize>> {
         Ok(self
             .source_inputs(volume)?
             .into_iter()
-            .map(|input| input.level)
+            .map(|input| input.image.index())
             .collect())
     }
 
     fn collect_source_inputs(&self, volume: [usize; 3], seen: &mut Vec<SourceInput>) -> Result<()> {
         let mut note = |declared: SourceInput| -> Result<()> {
-            match seen.iter_mut().find(|held| held.level == declared.level) {
+            match seen.iter_mut().find(|held| held.image == declared.image) {
                 Some(held) => {
                     held.reach = held.reach.max(&declared.reach)?;
+                    // Two readers of one image are handed one buffer, so they
+                    // cannot disagree about what is in it. The reach folds by
+                    // max — over-declaring costs voxels — but an element type
+                    // has no safe direction to over-declare in, so a
+                    // disagreement is refused rather than resolved.
+                    match (held.dtype, declared.dtype) {
+                        (Some(held_dtype), Some(want)) if held_dtype != want => {
+                            return Err(Error::InvalidArgument(format!(
+                                "two readers of {} declare it holds {} and {}. One buffer is \
+                                 fetched per image per block and handed to both, so the two \
+                                 declarations describe the same bytes and only one of them can \
+                                 be right.",
+                                crate::assemble::describe_image(declared.image.index()),
+                                held_dtype.numpy_name(),
+                                want.numpy_name()
+                            )));
+                        }
+                        (None, Some(want)) => held.dtype = Some(want),
+                        _ => {}
+                    }
                 }
                 None => seen.push(declared),
             }
@@ -1295,7 +1357,7 @@ impl Chain {
             // A source *leaf* is the reach-zero case stated as a declaration:
             // it produces the extent it was handed, so what it needs is what
             // the block already fetches.
-            Chain::Source { level, .. } => note(SourceInput::voxelwise(*level)),
+            Chain::Source { image, dtype } => note(SourceInput::voxelwise(*image).holding(*dtype)),
             Chain::Op(op) => {
                 for declared in op.source_inputs(volume) {
                     note(declared)?;
@@ -1365,7 +1427,9 @@ impl Chain {
     pub fn display_name(&self) -> String {
         match self {
             Chain::Op(op) => op.name().to_string(),
-            Chain::Source { level, .. } => format!("source(level {level})"),
+            Chain::Source { image, .. } => {
+                format!("source({})", crate::assemble::describe_image(image.index()))
+            }
             Chain::Parallel { branches, combine } => format!(
                 "par({})>{}",
                 branches
@@ -1503,7 +1567,7 @@ impl Chain {
     ///
     /// A [`InputMap::Stencil`] is one directly. A [`InputMap::Table`] is not a
     /// reach at all and must not be flattened into one: its dependency is stated
-    /// per block, in the level below's coordinates, and there is no factor a
+    /// per block, in the image below's coordinates, and there is no factor a
     /// `BlockGrid` could supply that would turn it into a distance in this
     /// phase's voxels. So it answers **nothing, in
     /// [`Space::source_index`]** — which is not a silent zero but a marked one:
@@ -1541,7 +1605,7 @@ impl Chain {
     /// stencil whose reach is in a space that converts to voxels. An
     /// [`InputMap::Affine`] does not keep its grid (its offsets scale), and a
     /// stencil stated in [`crate::reach::Space::source_index`] does not either —
-    /// that space exists to say the dependency is in another level's lattice,
+    /// that space exists to say the dependency is in another image's lattice,
     /// which is exactly the case where an offset does not carry across.
     fn keeps_grid(&self, volume: [usize; 3]) -> bool {
         match self {
@@ -1595,15 +1659,15 @@ impl Chain {
     /// which is the same walk `apply` takes. Exclusive branches must **agree** —
     /// and that is the one place this departs from `reach`, deliberately. A
     /// reach may be over-declared because a wider halo is merely wasteful; an
-    /// element type cannot, because the level is allocated at one width and the
+    /// element type cannot, because the image is allocated at one width and the
     /// plan is binding. Two branches that write different types are a phase
     /// whose output type depends on which arm ran, so they are refused here
     /// rather than producing a plan that is right for one of them.
     ///
     /// **Concurrent branches are required to agree with the *combine*, not with
     /// each other** — the same rule stated from the other side. An
-    /// `Alternative`'s branches are candidates for one level, so they must
-    /// match each other. A `Parallel`'s branch results never become a level:
+    /// `Alternative`'s branches are candidates for one image, so they must
+    /// match each other. A `Parallel`'s branch results never become an image:
     /// they are transient buffers, allocated and consumed inside one slot, and
     /// only the combine's answer is written. Requiring them to match each other
     /// would forbid the case the node exists for — an image branch and a mask
@@ -1628,9 +1692,9 @@ impl Chain {
             // **Accepts anything and answers what it holds.** A source leaf is
             // not a function of the buffer it was handed — it ignores it — so
             // refusing an element type here would be refusing something it
-            // never looks at. The declaration is checked against the level it
-            // names by `check_source_levels`, which is the only place that
-            // knows what the level holds.
+            // never looks at. The declaration is checked against the image it
+            // names by `check_source_images`, which is the only place that
+            // knows what the image holds.
             Chain::Source { dtype, .. } => Ok(*dtype),
             Chain::Sequence(children) => {
                 let mut current = input;
@@ -1648,7 +1712,7 @@ impl Chain {
                         Some(existing) if existing == produced => {}
                         Some(existing) => {
                             return Err(Error::InvalidArgument(format!(
-                                "{:?} writes {} on one branch and {} on another. A level is \
+                                "{:?} writes {} on one branch and {} on another. An image is \
                                  allocated at one width and a decomposition is binding, so an \
                                  element type that depends on which branch is live is not a plan.",
                                 self.display_name(),
@@ -1694,7 +1758,7 @@ impl Chain {
     /// The shape the subtree produces from `input`, folded the same way.
     ///
     /// Exclusive branches must agree, on the same argument as [`Self::produces`]:
-    /// the level's extent is in the plan and the plan does not know which branch
+    /// the image's extent is in the plan and the plan does not know which branch
     /// runs.
     ///
     /// Concurrent branches are **not** required to agree here; the combine is
@@ -1729,7 +1793,7 @@ impl Chain {
                         Some(existing) => {
                             return Err(Error::InvalidArgument(format!(
                                 "{:?} produces {existing:?} on one branch and {produced:?} on \
-                                 another from an input of {input:?}. The level's extent is in the \
+                                 another from an input of {input:?}. The image's extent is in the \
                                  plan, and the plan does not know which branch is live.",
                                 self.display_name()
                             )))
@@ -1783,7 +1847,7 @@ impl Chain {
                         Some(existing) => {
                             return Err(Error::InvalidArgument(format!(
                                 "{:?} produces {existing:?} on one branch and {produced:?} on \
-                                 another from an input of {input:?}. The level's extent is in the \
+                                 another from an input of {input:?}. The image's extent is in the \
                                  plan, and the plan does not know which branch is live.",
                                 self.display_name()
                             )))
@@ -1839,7 +1903,7 @@ impl Chain {
     /// element type. It is checked rather than assumed because this is the seam
     /// where a wrong declaration would otherwise become a wrong volume.
     ///
-    /// A subtree containing a [`Chain::Source`] fails here, naming the level:
+    /// A subtree containing a [`Chain::Source`] fails here, naming the image:
     /// this entry point has no stored operands to hand it, and producing a
     /// buffer without one would be the quiet wrong answer rather than the loud
     /// one. Use [`Self::apply_with`].
@@ -1847,7 +1911,7 @@ impl Chain {
         self.apply_with(input, SourceInputs::none(), out, at)
     }
 
-    /// [`Self::apply`], with the stored levels this subtree's source leaves
+    /// [`Self::apply`], with the stored images this subtree's source leaves
     /// read.
     ///
     /// `sources` is threaded down unchanged, exactly as `at` is and for the
@@ -1899,15 +1963,15 @@ impl Chain {
         match self {
             Chain::Op(op) => op.apply_placed(input, sources, out, at),
             // The one node that answers from something other than `input`. The
-            // buffer holds the block's read extent of the level, so this is a
+            // buffer holds the block's read extent of the image, so this is a
             // copy and not a slice: the executor already asked for exactly the
             // extent, at reach 0, and anything else would mean the plan and the
             // read disagreed.
-            Chain::Source { level, dtype } => {
-                let stored = sources.get(*level)?;
+            Chain::Source { image, dtype } => {
+                let stored = sources.get(*image)?;
                 if stored.dtype() != *dtype {
                     return Err(Error::InvalidArgument(format!(
-                        "a source leaf declares level {level} holds {} and the buffer read from \
+                        "a source leaf declares image {image} holds {} and the buffer read from \
                          it holds {}. The declaration is what every fold of this chain was built \
                          from, so the two have to be one fact.",
                         dtype.numpy_name(),
@@ -1934,8 +1998,8 @@ impl Chain {
             // The results live here, in this frame, for the length of this
             // call: `branches.len()` buffers of the branch's own declared shape
             // and element type, allocated exactly the way `Sequence` allocates
-            // its intermediates a few lines below. They never reach a level and
-            // never reach the environment, because a level is a phase's output
+            // its intermediates a few lines below. They never reach an image and
+            // never reach the environment, because an image is a phase's output
             // and this whole node is one slot of one phase.
             Chain::Parallel { branches, combine } => {
                 let mut results = Vec::with_capacity(branches.len());
@@ -2018,8 +2082,8 @@ impl Chain {
     pub fn side_region(&self, which: usize, valid: &Region, volume: [usize; 3]) -> Result<Region> {
         match self {
             Chain::Op(op) => op.side_region(which, valid, volume),
-            Chain::Source { level, .. } => Err(Error::InvalidArgument(format!(
-                "side output {which} of a leaf reading level {level}, which declares none"
+            Chain::Source { image, .. } => Err(Error::InvalidArgument(format!(
+                "side output {which} of a leaf reading image {image}, which declares none"
             ))),
             Chain::Alternative { branches, taken } => {
                 branches[*taken].side_region(which, valid, volume)
@@ -2055,27 +2119,24 @@ impl Chain {
     /// a caller applying a whole chain by hand, which is the whole-volume
     /// reference case and is meant to be simple rather than fast.
     ///
-    /// **Side outputs and source leaves do not compose yet, and the failure is
-    /// loud.** Re-deriving an intermediate calls [`Self::apply`] rather than
-    /// [`Self::apply_with`], so a subtree that both declares a side output and
-    /// contains a [`Chain::Source`] fails naming the level. The combination the
-    /// executor actually meets is safe: a `Parallel` skips every branch that
-    /// declares no side output, so a source arm beside a side-output arm is
-    /// never re-derived. Threading the stored operands through here as well
-    /// would widen [`crate::env::Environment::apply_side`] for a case nothing
-    /// exercises, and a widening nothing tests is worse than a refusal that
-    /// says what is missing.
+    /// **Side outputs and source leaves compose.** `sources` is the list
+    /// [`Self::apply_with`] is handed, threaded down unchanged and addressed by
+    /// image rather than by position, so re-deriving an intermediate goes
+    /// through [`Self::apply_with`] and a subtree that both declares a side
+    /// output and contains a [`Chain::Source`] is handed the buffer the executor
+    /// read instead of failing naming the image.
     pub fn apply_side(
         &self,
         input: &Voxels,
+        sources: SourceInputs<'_>,
         primary: &Voxels,
         block: &SideBlock<'_>,
     ) -> Result<Vec<ArrayD<f64>>> {
         match self {
-            Chain::Op(op) => op.apply_side(input, primary, block),
+            Chain::Op(op) => op.apply_side(input, sources, primary, block),
             Chain::Source { .. } => Ok(Vec::new()),
             Chain::Alternative { branches, taken } => {
-                branches[*taken].apply_side(input, primary, block)
+                branches[*taken].apply_side(input, sources, primary, block)
             }
             // Every branch's side outputs, in branch order, matching what
             // `side_outputs` declared.
@@ -2097,10 +2158,11 @@ impl Chain {
                         branch.produces(input.dtype())?,
                         branch.output_shape(input.shape())?,
                     )?;
-                    branch.apply(input, &mut result, block.at)?;
+                    branch.apply_with(input, sources, &mut result, block.at)?;
                     let regions = &block.regions[produced.len()..produced.len() + taken];
                     produced.extend(branch.apply_side(
                         input,
+                        sources,
                         &result,
                         &SideBlock { regions, ..*block },
                     )?);
@@ -2118,13 +2180,14 @@ impl Chain {
                             child.produces(current.dtype())?,
                             child.output_shape(current.shape())?,
                         )?;
-                        child.apply(&current, &mut next, block.at)?;
+                        child.apply_with(&current, sources, &mut next, block.at)?;
                         next
                     };
                     let taken = child.side_outputs(block.at.volume).len();
                     let regions = &block.regions[produced.len()..produced.len() + taken];
                     produced.extend(child.apply_side(
                         &current,
+                        sources,
                         &result,
                         &SideBlock { regions, ..*block },
                     )?);
@@ -2220,7 +2283,7 @@ impl Chain {
         match self {
             Chain::Op(op) => op.cost_per_voxel(),
             // Zero *compute*. What a source arm costs is a read, and a read is
-            // priced where every other read is — by voxels fetched from a level,
+            // priced where every other read is — by voxels fetched from an image,
             // through `Environment::read` and `Decomposition::exact_read_voxels`
             // — not by a compute figure that would then be counted twice.
             Chain::Source { .. } => 0.0,
@@ -2357,9 +2420,9 @@ impl Chain {
     /// the decomposition-dependent behaviour this framework exists to prevent.
     ///
     /// A `Parallel` is one indivisible slot too, and for a blunter reason: a
-    /// phase reads **one** level and writes **one** level
+    /// phase reads **one** image and writes **one** image
     /// (`Decomposition::dtype_at`, `Environment::read`), so a cut placed after
-    /// the branches and before the combine would need a level per branch and a
+    /// the branches and before the combine would need an image per branch and a
     /// phase with several inputs, neither of which a `Decomposition` can state.
     /// `docs/design/BLOCK_OPS.md` names cutting inside the diamond as what
     /// fan-in would eventually *let* the planner do; this change makes the

@@ -94,14 +94,14 @@ impl ChunkGrid {
         self.counts.iter().map(|&count| count as u64).product()
     }
 
-    /// Every chunk a read of `region` at `level` touches.
+    /// Every chunk a read of `region` at `image` touches.
     ///
-    /// `level` is in the key because a run holds several arrays at once — the
-    /// input and one intermediate per phase boundary — and chunk 7 of level 0
-    /// is not chunk 7 of level 1. A model keyed on the chunk alone would
+    /// `image` is in the key because a run holds several arrays at once — the
+    /// input and one intermediate per phase boundary — and chunk 7 of image 0
+    /// is not chunk 7 of image 1. A model keyed on the chunk alone would
     /// believe a phase-1 task's chunks were already resident because a phase-0
     /// task had read the same *coordinates* from a different array.
-    pub fn keys(&self, level: usize, region: &Region) -> Vec<u64> {
+    pub fn keys(&self, image: usize, region: &Region) -> Vec<u64> {
         let mut out = Vec::new();
         if region.voxels() == 0 {
             return out;
@@ -118,7 +118,7 @@ impl ChunkGrid {
             for j in lo[1]..=hi[1] {
                 for k in lo[2]..=hi[2] {
                     let flat = ((i * self.counts[1]) + j) * self.counts[2] + k;
-                    out.push(key(level, flat as u64));
+                    out.push(key(image, flat as u64));
                 }
             }
         }
@@ -126,12 +126,12 @@ impl ChunkGrid {
     }
 }
 
-/// `(level, chunk)` in one integer, so the model is a set of `u64`.
+/// `(image, chunk)` in one integer, so the model is a set of `u64`.
 ///
-/// Forty bits of chunk index is a trillion chunks; a level count that overflows
+/// Forty bits of chunk index is a trillion chunks; an image count that overflows
 /// twenty-four bits would be a decomposition with sixteen million phases.
-fn key(level: usize, chunk: u64) -> u64 {
-    ((level as u64) << 40) | (chunk & 0xff_ffff_ffff)
+fn key(image: usize, chunk: u64) -> u64 {
+    ((image as u64) << 40) | (chunk & 0xff_ffff_ffff)
 }
 
 /// What the coordinator believes one worker's cache holds.
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn a_level_is_part_of_the_identity() {
+    fn an_image_is_part_of_the_identity() {
         let grid = grid();
         let region = Region::new(&[0, 0, 0], &[16, 16, 16]);
         assert_ne!(grid.keys(0, &region), grid.keys(1, &region));

@@ -26,7 +26,7 @@
 // The problem this removes
 // ------------------------
 // Every other node this crate materialises has a partitioning that is a
-// *function of its domain*: a level is voxels partitioned by chunk, a fragment
+// *function of its domain*: an image is voxels partitioned by chunk, a fragment
 // stream is blocks partitioned by block. A point set is the odd one out — its
 // domain is position, and its partitioning is **whichever block happened to emit
 // it**. That is not a property of the data; it is a property of the run that

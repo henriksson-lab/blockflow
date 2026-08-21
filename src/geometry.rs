@@ -34,7 +34,7 @@
 //
 // The same sentence is what grants it in the *source* frame, on one axis
 // -----------------------------------------------------------------------
-// A reach stated against the level below (`Frame::Source`) is otherwise denied
+// A reach stated against the image below (`Frame::Source`) is otherwise denied
 // the exception, because a **cropping** phase's edge is an interior position of
 // the array it reads: a neighbour exists there, and a halo could have reached
 // it. Correct, and it is why the frame exists.
@@ -211,7 +211,7 @@ pub struct BlockCore {
 /// `core`, `read` and `valid` are all in **this phase's own** coordinate space —
 /// the space its `BlockGrid` is cut from, which is also the space its output
 /// lands in. `source` is the odd one out: it is the region actually fetched from
-/// the level below, in **that** level's space, and it is equal to `read`
+/// the image below, in **that** image's space, and it is equal to `read`
 /// wherever the two spaces are the same, which is every phase this crate shipped
 /// before it existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +220,7 @@ pub struct BlockGeometry {
     pub flat: usize,
     pub core: Region,
     pub read: Region,
-    /// What the task fetches from the level below, in the level below's
+    /// What the task fetches from the image below, in the image below's
     /// coordinate space. Defaults to `read`.
     ///
     /// **Why this is here rather than in an `Environment`.** A cross-grid read
@@ -230,7 +230,7 @@ pub struct BlockGeometry {
     /// case predicted `121 x payload` and moved four times the spatial volume,
     /// with no term anywhere for the difference. Stated here it is in the
     /// binding half: `Decomposition::exact_read_voxels` counts it,
-    /// `Decomposition::check` refuses one that leaves the level it reads,
+    /// `Decomposition::check` refuses one that leaves the image it reads,
     /// `TaskGraph` builds dependencies from it, and the fingerprint records it.
     pub source: Region,
     /// `core ∩ trustworthy`. **Smaller than `core` iff the halo was short**,
@@ -272,7 +272,7 @@ impl BlockGeometry {
     /// **The clamp exception is conditional on the space, and on one axis on
     /// what the reach says.** A read clamped at the phase's own volume edge is
     /// trustworthy when that edge is a real edge of the array; a phase that
-    /// crops or regrids has edges that are interior positions of the level
+    /// crops or regrids has edges that are interior positions of the image
     /// below, and a reach stated in that frame (`Frame::Source`) is therefore
     /// not granted the exception. That is the direction of error the crate
     /// accepts: a seam that might be real is treated as real, so the guard fires
@@ -363,7 +363,7 @@ impl BlockGeometry {
         }
     }
 
-    /// Read this block from `source` of the level below instead of from `read`.
+    /// Read this block from `source` of the image below instead of from `read`.
     ///
     /// The halo arithmetic above is untouched: `read` stays the extent this
     /// phase's own reach and halo produced, `valid` stays derived from it, and

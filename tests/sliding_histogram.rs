@@ -590,7 +590,7 @@ fn decomposed_rank() -> Rank {
     Rank::ceiling_percentile(0.25).unwrap()
 }
 
-/// `image > CUT`, into a `Bool` level — the mask producer. Kept here rather than
+/// `image > CUT`, into a `Bool` image — the mask producer. Kept here rather than
 /// taken from `src/ops` because what is under test is the consumer.
 struct Binarize;
 
@@ -663,7 +663,7 @@ fn plan(chain: &Chain, grid: &BlockGrid) -> Decomposition {
         chain_reach: [1, 1, 1],
     };
     plan.declare_dtypes(chain).unwrap();
-    plan.declare_source_levels(chain).unwrap();
+    plan.declare_source_images(chain).unwrap();
     plan
 }
 
@@ -767,7 +767,7 @@ fn the_op_declares_its_population_at_the_elements_reach() {
     .masked_by(MASK);
     let declared = op.source_inputs(VOLUME);
     assert_eq!(declared.len(), 1);
-    assert_eq!(declared[0].level, MASK);
+    assert_eq!(declared[0].image.index(), MASK);
     assert_eq!(op.reach(0, 100), 1);
     assert_eq!(op.reach(1, 100), 1);
     assert_eq!(op.reach(2, 100), 1);

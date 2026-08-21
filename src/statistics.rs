@@ -201,13 +201,13 @@ pub const RETAINED_RUNS: usize = 8;
 /// nanoseconds per one unit of the named thing.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Term {
-    /// Nanoseconds per voxel fetched from a level, over every level a block
+    /// Nanoseconds per voxel fetched from an image, over every image a block
     /// reads. Feeds `CostModel::read_cost_per_voxel`.
     Read,
     /// Nanoseconds per voxel written to the **workflow output**. Feeds
     /// `CostModel::write_cost_per_voxel`.
     Write,
-    /// Nanoseconds per voxel written to an **intermediate** level. Feeds
+    /// Nanoseconds per voxel written to an **intermediate** image. Feeds
     /// `CostModel::materialise_cost_per_voxel`, which is a separate weight for
     /// exactly this reason: an intermediate compresses differently from an
     /// output, so one number over-values fusing late stages.
@@ -223,7 +223,7 @@ pub enum Term {
     /// gap — see `Snapshot::families`.
     ComputeOf(String),
     /// Nanoseconds per **byte** read. Diagnostic, for the same reason:
-    /// `CostModel` prices reads per voxel, and a run whose levels have
+    /// `CostModel` prices reads per voxel, and a run whose images have
     /// different element types has no single bytes-per-voxel.
     ReadBytes,
     /// Nanoseconds per byte written, over both destinations. Diagnostic.
@@ -452,9 +452,9 @@ pub struct Recorder {
     /// Voxels and nanoseconds per slot. One pair of atomics per slot, allocated
     /// before the run, so an `OpApplied` costs two `fetch_add`s and an index.
     per_slot: Vec<(AtomicU64, AtomicU64)>,
-    /// The level the workflow output lands in. A write below it is a
+    /// The image the workflow output lands in. A write below it is a
     /// materialisation; a write to it is the output.
-    output_level: usize,
+    output_image: usize,
     read: Traffic,
     written: Traffic,
     materialised: Traffic,
@@ -504,7 +504,7 @@ impl Recorder {
             machine: MachineKey::detect(),
             slots,
             per_slot,
-            output_level: decomposition.n_phases(),
+            output_image: decomposition.n_phases(),
             read: Traffic::default(),
             written: Traffic::default(),
             materialised: Traffic::default(),
@@ -587,19 +587,19 @@ impl EventListener for Recorder {
                 ..
             } => self.read.add(*voxels as u64, *bytes, *duration_ns),
             Event::RegionWritten {
-                level,
+                image,
                 voxels,
                 bytes,
                 duration_ns,
                 ..
             } => {
                 // Which side of the phase boundary this write is on, decided
-                // from the level rather than from a neighbouring event: the
+                // from the image rather than from a neighbouring event: the
                 // `BlockWritten` that says `materialised` is emitted from the
                 // same thread immediately after, but listeners see concurrent
                 // blocks interleaved, so pairing on adjacency would be wrong
                 // under any concurrency at all.
-                let traffic = if *level < self.output_level {
+                let traffic = if *image < self.output_image {
                     &self.materialised
                 } else {
                     &self.written

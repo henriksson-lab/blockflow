@@ -48,7 +48,7 @@
 // of those are answers: the first is a fact about which writers happened to have
 // finished, which is the decomposition showing through in the worst possible
 // place, and the second is indistinguishable from a region that is genuinely
-// empty. This crate fills an unwritten level with NaN rather than zeros for the
+// empty. This crate fills an unwritten image with NaN rather than zeros for the
 // same reason — an absence must not be able to pass for a value.
 //
 // Making the states a *type* rather than a convention is what turns "every
@@ -306,14 +306,14 @@
 //   actually write" would stop being answerable from the table. Widening a
 //   schema is a new table.
 // * **No join.** Two tables cannot be joined here, and a table cannot be joined
-//   to a level. A join on the position triple is the operation that would let a
+//   to an image. A join on the position triple is the operation that would let a
 //   caller assemble a row out of several producers, and it needs a decision this
 //   module has no basis for — what to do when one side has a row the other does
 //   not — which is a question about the pipeline rather than about the store.
 //   The row is the unit precisely so that a producer that knows the answer emits
 //   it whole.
 // * **It is not yet a node the planner knows about.** `docs/design/BLOCK_OPS.md`
-//   §"Levels are a DAG" lists a point set as a node with a domain, a partitioning
+//   §"Images are a DAG" lists a point set as a node with a domain, a partitioning
 //   and a unit; this is that node generalised, and like `PointStore` it is
 //   filled by a caller after a run rather than materialised by the executor.
 //   Making it a node means a lifetime, a cost model row and a place in the

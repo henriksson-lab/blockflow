@@ -135,7 +135,7 @@ fn render_with_log(
     let (plan, voxelize) = plan_for(volume, block, element);
     let source = PointSourceOp::new(points.to_vec());
     let env = ArrayEnvironment::new(
-        Voxels::zeros(Dtype::F64, volume).expect("a level"),
+        Voxels::zeros(Dtype::F64, volume).expect("an image"),
         plan.n_phases(),
         [4, 4, 4],
     )
@@ -166,7 +166,7 @@ fn render_with_log(
     let output = env.output();
     let rendered = output
         .view::<f64>()
-        .expect("an f64 level")
+        .expect("an f64 image")
         .iter()
         .copied()
         .collect();
@@ -525,7 +525,7 @@ fn under_declaring_the_block_reach_is_wrong_and_no_framework_guard_sees_it() {
     check_phase_work(&plan, &work).expect("the fragment reach still agrees with the halo");
 
     let env = ArrayEnvironment::new(
-        Voxels::zeros(Dtype::F64, volume).expect("a level"),
+        Voxels::zeros(Dtype::F64, volume).expect("an image"),
         plan.n_phases(),
         [4, 4, 4],
     )
@@ -543,7 +543,7 @@ fn under_declaring_the_block_reach_is_wrong_and_no_framework_guard_sees_it() {
     let output = env.output();
     let rendered: Vec<f64> = output
         .view::<f64>()
-        .expect("an f64 level")
+        .expect("an f64 image")
         .iter()
         .copied()
         .collect();
@@ -620,7 +620,7 @@ fn a_block_with_no_points_still_writes_a_fragment() {
     let (plan, voxelize) = plan_for(volume, block, &single_voxel());
     let source = PointSourceOp::new(points.clone());
     let env = ArrayEnvironment::new(
-        Voxels::zeros(Dtype::F64, volume).expect("a level"),
+        Voxels::zeros(Dtype::F64, volume).expect("an image"),
         plan.n_phases(),
         [4, 4, 4],
     )

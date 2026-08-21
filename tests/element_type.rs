@@ -2,13 +2,13 @@
 //
 // Original work for this crate.
 //
-// The element type is a tag and a level is rank 3. This file is the acceptance
+// The element type is a tag and an image is rank 3. This file is the acceptance
 // suite for what that bought and for what it had to be refused to buy it.
 //
 // Five things, and each catches something the others cannot
 // ---------------------------------------------------------
 // 1. **The tax, measured.** The same chain over the same extent, once with the
-//    level held as `f64` and once as `bool`, with the byte figure taken from the
+//    image held as `f64` and once as `bool`, with the byte figure taken from the
 //    environment's own counter. Not an argument about widths — the run's own
 //    number, and the answer must be exactly 8x.
 // 2. **The narrow run is still the right run.** A `bool` workload agrees with
@@ -18,7 +18,7 @@
 // 3. **An op refuses a type at plan time.** `decompose` fails, naming the op and
 //    the type, before any block exists. A refusal that arrives when a block
 //    reaches the op is the failure this replaces.
-// 4. **A phase may change the element type**, and the level is allocated at what
+// 4. **A phase may change the element type**, and the image is allocated at what
 //    it writes rather than at what the workflow declared.
 // 5. **A phase may change the shape**, which is the wall `apply` declaring its
 //    output shape closed — and the guard that used to refuse every such plan is
@@ -87,7 +87,7 @@ fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decompositio
 /// widths.
 ///
 /// Both runs are the *same chain over the same extent with the same
-/// decomposition*; the only difference is what the level holds. Before the
+/// decomposition*; the only difference is what the image holds. Before the
 /// element type became a tag the `bool` column was not expressible at all — a
 /// `BlockBuf` was an `ArrayD<f64>` — so the `f64` figure is what this workload
 /// cost and the `bool` figure is what it costs now.
@@ -246,15 +246,15 @@ fn an_op_that_cannot_take_the_element_type_is_refused_when_the_plan_is_made() {
 /// a `Decomposition` records op *names*, so nothing but the executor holds both
 /// the plan and the implementations.
 #[test]
-fn a_plan_whose_level_is_the_wrong_width_is_refused_by_the_executor() {
+fn a_plan_whose_image_is_the_wrong_width_is_refused_by_the_executor() {
     let workflow = Workflow::new(
         Chain::op(NonZeroOp::new("set", [0, 0, 0])),
         VOLUME,
         Dtype::F64,
     );
     let mut hand_built = plan(&workflow, 8, &[0]);
-    // Undo what `declare_dtypes` recorded: a plan that says its level is `f64`
-    // while its op writes `bool` is precisely the plan whose level is the wrong
+    // Undo what `declare_dtypes` recorded: a plan that says its image is `f64`
+    // while its op writes `bool` is precisely the plan whose image is the wrong
     // width, and it is the one a wire or an older planner could hand over.
     hand_built.phases[0].dtype = None;
     hand_built.check().unwrap();
@@ -265,17 +265,17 @@ fn a_plan_whose_level_is_the_wrong_width_is_refused_by_the_executor() {
         .unwrap_err()
         .to_string();
     assert!(
-        message.contains("its ops write bool") && message.contains("allocates level 1 as float64"),
+        message.contains("its ops write bool") && message.contains("allocates image 1 as float64"),
         "{message}"
     );
 }
 
 // ------------------------------------------- 4. a phase changes the type --
 
-/// A workflow that reads `f64` and writes `bool`: the plan says so, the level is
+/// A workflow that reads `f64` and writes `bool`: the plan says so, the image is
 /// allocated one byte wide, and the answer is the predicate.
 #[test]
-fn a_phase_may_narrow_the_element_type_and_the_level_follows_the_plan() {
+fn a_phase_may_narrow_the_element_type_and_the_image_follows_the_plan() {
     let workflow = Workflow::new(
         Chain::op(NonZeroOp::new("set", [0, 0, 0])),
         VOLUME,
@@ -301,20 +301,20 @@ fn a_phase_may_narrow_the_element_type_and_the_level_follows_the_plan() {
     )
     .unwrap();
 
-    assert_eq!(env.level_dtype(1), Dtype::Bool);
+    assert_eq!(env.image_dtype(1), Dtype::Bool);
     let out = env.output();
     assert_eq!(out.bytes(), VOLUME.iter().product::<usize>() as u64);
     let out = out.view::<bool>().unwrap().to_owned();
     assert_eq!(out, input.mapv(|value| value != 0.0));
 
-    // `ArrayEnvironment::new` gives every level the input's type, which cannot
+    // `ArrayEnvironment::new` gives every image the input's type, which cannot
     // host this plan — and says so rather than converting at the write.
     let flat = ArrayEnvironment::new(input.into(), 1, [4, 4, 4]).unwrap();
     let message = execute("flat", &workflow, &decomposition, &Hints::default(), &flat)
         .unwrap_err()
         .to_string();
     assert!(
-        message.contains("holds level 1 as float64") && message.contains("as bool"),
+        message.contains("holds image 1 as float64") && message.contains("as bool"),
         "{message}"
     );
 }
@@ -324,7 +324,7 @@ fn a_phase_may_narrow_the_element_type_and_the_level_follows_the_plan() {
 /// The output volume of a decimating phase, in the decomposition.
 ///
 /// `read` is the phase's own (output) extent; `source` is the extent in the
-/// level below that the op must be handed to produce it. Stating the second is
+/// image below that the op must be handed to produce it. Stating the second is
 /// what change 2 added; declaring that the op turns one into the other is what
 /// change 5 added, and the two together are what make this plan runnable.
 fn decimating_plan(workflow: &Workflow, factor: usize, block: usize) -> Decomposition {
@@ -350,14 +350,14 @@ fn decimating_plan(workflow: &Workflow, factor: usize, block: usize) -> Decompos
     }
 }
 
-/// A level that is **half the size of the one below it**, checked and run.
+/// An image that is **half the size of the one below it**, checked and run.
 ///
 /// This is the wall `strategy.rs` used to refuse outright: `apply` wrote an
 /// output the shape of its input, so a cross-grid fetch could translate but
 /// never resize, and the refusal named what was missing. What was missing was an
 /// op saying what shape it produces.
 #[test]
-fn a_phase_may_resize_the_level_when_its_op_declares_the_shape() {
+fn a_phase_may_resize_the_image_when_its_op_declares_the_shape() {
     for factor in [2usize, 3] {
         let workflow = Workflow::new(
             Chain::op(DecimateOp::new("decimate", factor)),
@@ -421,7 +421,7 @@ fn a_phase_whose_op_does_not_resize_is_refused_and_names_both_extents() {
         Dtype::F64,
     );
     let decomposition = decimating_plan(&workflow, 2, 4);
-    // The plan itself is fine: every fetch lies inside the level it reads, which
+    // The plan itself is fine: every fetch lies inside the image it reads, which
     // is all a plan can say. What it cannot say is what the op will do with it.
     decomposition.check().unwrap();
 

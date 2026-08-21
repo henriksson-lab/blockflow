@@ -6,7 +6,7 @@
 // **A table of rows in, a table of rows out.** The three operations here are
 // the ones that transform a `crate::table::Table` rather than a volume:
 //
-// | op | what one row becomes | reads a level | its `FragmentOp` shell |
+// | op | what one row becomes | reads an image | its `FragmentOp` shell |
 // |---|---|---|---|
 // | scale | the same row at a scaled coordinate | no | [`ScaleRowsOp`] |
 // | gather | the same row with one more column, read at the row's own coordinate | **yes — a declared second array** | [`GatherRowsOp`] |
@@ -108,9 +108,9 @@
 // expectations against a written-out table of both rules rather than against a
 // recomputation.
 //
-// How the gather gets its level, and why not through `reads_pixels`
+// How the gather gets its image, and why not through `reads_pixels`
 // ------------------------------------------------------------------
-// A gather reads a **level** at a scattered coordinate, which is a shape no
+// A gather reads an **image** at a scattered coordinate, which is a shape no
 // other op in this file has. The shell to reach for looks like the one
 // `ops::fill`'s second phase uses: `reads_pixels() == true` alongside a
 // `FragmentInput::own` at reach `[0, 0, 0]`, so the executor reads this block's
@@ -119,30 +119,30 @@
 // plan**, for a reason about the *phase index* rather than about gathering, and
 // both halves of it were measured against the executor rather than argued:
 //
-// * **a fragment phase `p` reads level `p`.** So a gather at phase `p` needs
-//   phase `p - 1` to have written a level, and the phase before a row op is the
-//   row *producer*, which writes fragments and no level. The executor says so:
-//   *"phase 1 reads level 1, which phase 0 did not write: it runs a fragment op
+// * **a fragment phase `p` reads image `p`.** So a gather at phase `p` needs
+//   phase `p - 1` to have written an image, and the phase before a row op is the
+//   row *producer*, which writes fragments and no image. The executor says so:
+//   *"phase 1 reads image 1, which phase 0 did not write: it runs a fragment op
 //   that declares `writes_pixels() == false`"*;
 // * **a fragment input must come from a strictly earlier phase.** So the gather
-//   cannot be phase 0 — where it would read level 0, the array the run was
+//   cannot be phase 0 — where it would read image 0, the array the run was
 //   handed — because its rows would have to come from phase 0 too. Splitting it
 //   into a second `execute_phases` over the same store does not help; the phase
 //   index is a plan-local number and the check fires again: *"reads stream
 //   \"rows.set\" from phase 0, which is this phase or a later one"*.
 //
 // **Both refusals still stand, and [`GatherRowsOp`] does not go round either.**
-// What resolves it is that the level a gather wants was never level `p`: it is a
+// What resolves it is that the image a gather wants was never image `p`: it is a
 // *second* array, and [`FragmentOp::source_inputs`] is the declaration for one.
-// So the shell declares `reads_pixels() == false` — it never touches the level
+// So the shell declares `reads_pixels() == false` — it never touches the image
 // its phase was handed, and `fragment.rs` is explicit that the two declarations
-// are independent, so it *"pays for one array rather than two"* — names the level
+// are independent, so it *"pays for one array rather than two"* — names the image
 // it samples with [`SourceInput::voxelwise`], and is applied through
 // `apply_with`, whose default refuses rather than dropping the operand.
 //
-// The level it names may be any level at or below the phase's own, level 0
+// The image it names may be any image at or below the phase's own, image 0
 // included, and it is fetched over the block's own fetch region and recorded on
-// the phase, so the DAG depends on its producer, the level lifetimes keep it
+// the phase, so the DAG depends on its producer, the image lifetimes keep it
 // alive and the read counters see it. **Rows from one array and values from a
 // second** — the case the consumers have, and the one folding the gather into
 // the row producer cannot serve — is therefore the ordinary arrangement rather
@@ -168,7 +168,7 @@
 //
 // **Reach 0 is honest only because of a precondition, and the precondition is
 // checked rather than assumed.** A block is handed the rows of *its own*
-// fragment, and it reads *its own* block of the level; those two agree only while
+// fragment, and it reads *its own* block of the image; those two agree only while
 // every row in a block's fragment lies inside that block's core. That holds for
 // the rows `ops::coordinates` and `ops::detect` write, and it stops holding the
 // moment a [`ScaleRowsOp`] runs: after a scale, block `B`'s fragment holds rows
@@ -204,7 +204,7 @@
 //   that gathers from a volume other than its table's own resolves it before the
 //   rows reach here.
 //
-// A gathered value is a **finite `f64`**, and a level whose element type cannot
+// A gathered value is a **finite `f64`**, and an image whose element type cannot
 // be carried in one exactly — `u64` and `i64`, whose ranges exceed `f64`'s exact
 // integers — is refused rather than rounded. Everything narrower converts with
 // no loss. That keeps the schema a function of the column name alone, which is
@@ -516,7 +516,7 @@ pub fn gathered_schema(input: &Schema, column: &str) -> Result<Schema> {
 /// table as a nearby number that is indistinguishable from a measurement. Every
 /// narrower type converts exactly.
 ///
-/// A non-finite value is refused naming the coordinate. An unwritten level in
+/// A non-finite value is refused naming the coordinate. An unwritten image in
 /// this crate is filled with NaN precisely so that an absence cannot pass for a
 /// value, and gathering one is that absence reaching a consumer.
 pub fn value_at(pixels: &Voxels, at: [usize; 3]) -> Result<f64> {
@@ -548,17 +548,17 @@ pub fn value_at(pixels: &Voxels, at: [usize; 3]) -> Result<f64> {
         Voxels::F64(array) => array[index],
         Voxels::U64(_) | Voxels::I64(_) => {
             return Err(Error::invalid(format!(
-                "a gather was asked to read a {} level into an f64 column. That type holds \
+                "a gather was asked to read a {} image into an f64 column. That type holds \
                  integers beyond the ones an f64 represents exactly, so a large value would \
                  arrive as a nearby number nothing downstream could tell from a measurement. \
-                 Narrow the level, or carry the value some other way.",
+                 Narrow the image, or carry the value some other way.",
                 pixels.dtype().numpy_name()
             )))
         }
     };
     if !value.is_finite() {
         return Err(Error::invalid(format!(
-            "the level holds {value} at {at:?}, which is not finite. An unwritten level in this \
+            "the image holds {value} at {at:?}, which is not finite. An unwritten image in this \
              crate is NaN so that an absence cannot pass for a value, and gathering one is that \
              absence reaching a consumer; it is refused here rather than carried."
         )));
@@ -566,7 +566,7 @@ pub fn value_at(pixels: &Voxels, at: [usize; 3]) -> Result<f64> {
     Ok(value)
 }
 
-/// Every row of `table`, with the level's value at its own coordinate appended.
+/// Every row of `table`, with the image's value at its own coordinate appended.
 ///
 /// `within` is the region the rows are **required** to lie in and `origin` is
 /// where `pixels[0, 0, 0]` sits in the volume. A row outside `within` is refused
@@ -593,7 +593,7 @@ pub fn gather_into(
                 return Err(Error::invalid(format!(
                     "a gather was handed a row at {at:?} and a region starting {:?} of shape \
                      {:?}, which does not hold it: it is outside on axis {axis}. A gather reads \
-                     the level its own block holds, so a row somewhere else would be given a \
+                     the image its own block holds, so a row somewhere else would be given a \
                      real value read at the wrong place. The usual cause is a scale between the \
                      rows and this phase, which moves rows out of the block that carries them; \
                      merge and re-scatter over the new volume rather than widening a reach, \
@@ -932,7 +932,7 @@ impl RowStreams {
         vec![FragmentOutput::new(
             self.output.clone(),
             self.lifecycle,
-            // Every block, always. These phases write no level, so the tiling
+            // Every block, always. These phases write no image, so the tiling
             // check has nothing to bite on and this declaration is the only
             // guard there is; a range whose every row was filtered out writes a
             // header and no rows, which is present and therefore checkable.
@@ -954,7 +954,7 @@ impl RowStreams {
 
 /// **Rows in, the same rows at scaled coordinates out.**
 ///
-/// Reads no pixels, writes no level, reach 0. The rows it emits are in the
+/// Reads no pixels, writes no image, reach 0. The rows it emits are in the
 /// **scaled** volume, which is not the volume this phase is anchored in — see
 /// [`scaled_bound`], and see the module header for why a gather must not follow
 /// this in the same lattice.
@@ -1018,21 +1018,21 @@ impl FragmentOp for ScaleRowsOp {
 }
 
 /// **Rows in, the same rows with one more column out** — the value a stored
-/// level holds at each row's own coordinate.
+/// image holds at each row's own coordinate.
 ///
-/// Reads no pixels, writes no level, reach 0. `reads_pixels` is about the level
-/// the phase is *handed* and a gather never wants that one; the level it samples
+/// Reads no pixels, writes no image, reach 0. `reads_pixels` is about the image
+/// the phase is *handed* and a gather never wants that one; the image it samples
 /// is declared as a [`SourceInput`], fetched at the block's own fetch region and
 /// recorded on the phase, so this op pays for one array rather than two and the
 /// plan says which. See the module header for why that declaration is what makes
 /// the shell possible at all, and for the [`SeamFold::PerBlock`] claim.
 ///
-/// The level may be any at or below the phase's own — level 0 included — so
+/// The image may be any at or below the phase's own — image 0 included — so
 /// *rows from one array, values from a second* is the ordinary arrangement.
 pub struct GatherRowsOp {
     name: &'static str,
     rows: RowStreams,
-    level: usize,
+    image: usize,
     column: String,
     /// The input's schema plus the gathered column.
     ///
@@ -1051,23 +1051,24 @@ impl GatherRowsOp {
     pub fn new(
         name: &'static str,
         rows: RowStreams,
-        level: usize,
+        image: impl Into<crate::assemble::ImageId>,
         column: impl Into<String>,
     ) -> Result<Self> {
+        let image = image.into().index();
         let column = column.into();
         let schema = gathered_schema(&rows.schema, &column)?;
         Ok(Self {
             name,
             rows,
-            level,
+            image,
             column,
             schema,
         })
     }
 
-    /// The level this op samples.
-    pub fn level(&self) -> usize {
-        self.level
+    /// The image this op samples.
+    pub fn image(&self) -> usize {
+        self.image
     }
 
     /// The column it appends.
@@ -1080,7 +1081,7 @@ impl GatherRowsOp {
         &self.schema
     }
 
-    /// One block's rows, gathered against the block of `level` covering `read`,
+    /// One block's rows, gathered against the block of `image` covering `read`,
     /// with the rows required to lie in `core`.
     ///
     /// A free function in all but name, and separated from the [`FragmentOp`]
@@ -1092,11 +1093,11 @@ impl GatherRowsOp {
         &self,
         volume: [usize; 3],
         blob: &[u8],
-        level: &BlockBuf,
+        image: &BlockBuf,
         read: &Region,
         core: &Region,
     ) -> Result<Vec<u8>> {
-        let BlockBuf::Array(pixels) = level else {
+        let BlockBuf::Array(pixels) = image else {
             // A simulated run holds no array, so there is no value to read.
             // The rows are **not** emitted with an invented one: a gathered
             // column is a measurement, and a fabricated measurement is the
@@ -1108,10 +1109,10 @@ impl GatherRowsOp {
         let shape = [read.shape[0], read.shape[1], read.shape[2]];
         if pixels.shape() != shape {
             return Err(Error::invalid(format!(
-                "a gather was handed level {} as {:?} for a block read extent of {shape:?}. A \
-                 source level is fetched at the block's own fetch region, so a disagreement here \
+                "a gather was handed image {} as {:?} for a block read extent of {shape:?}. A \
+                 source image is fetched at the block's own fetch region, so a disagreement here \
                  is the plan handing over two geometries rather than a row in the wrong place.",
-                self.level,
+                self.image,
                 pixels.shape()
             )));
         }
@@ -1140,12 +1141,12 @@ impl FragmentOp for GatherRowsOp {
         self.rows.outputs()
     }
 
-    /// The level sampled, at exactly the extent the block owns. A gather reads
+    /// The image sampled, at exactly the extent the block owns. A gather reads
     /// one voxel per row and every row is inside this block's core, so there is
     /// nothing outside the block's own fetch to read; a reach here would widen
     /// the phase halo and buy nothing.
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
-        vec![SourceInput::voxelwise(self.level)]
+        vec![SourceInput::voxelwise(self.image)]
     }
 
     /// See the module header: a row is read by one block and its value comes
@@ -1158,7 +1159,7 @@ impl FragmentOp for GatherRowsOp {
 
     fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
         Err(Error::invalid(
-            "a gather reads a level at each row's coordinate and cannot be computed from the \
+            "a gather reads an image at each row's coordinate and cannot be computed from the \
              rows alone. It is applied through `apply_with`.",
         ))
     }
@@ -1169,7 +1170,7 @@ impl FragmentOp for GatherRowsOp {
             self.gather_block(
                 at.volume(),
                 self.rows.own(at),
-                sources.get(self.level)?,
+                sources.get(self.image)?,
                 at.read,
                 at.core,
             )?,
@@ -1179,7 +1180,7 @@ impl FragmentOp for GatherRowsOp {
 
 /// **Rows in, the rows that satisfy the predicate out.**
 ///
-/// Reads no pixels, writes no level, reach 0. Coordinates and columns travel
+/// Reads no pixels, writes no image, reach 0. Coordinates and columns travel
 /// untouched, so the output is a subsequence of the input — and the surviving
 /// rows are renumbered, because a row's only name is its position. The module
 /// header says what follows from that.
@@ -1594,22 +1595,22 @@ mod tests {
         ))
     }
 
-    /// The gathered column is the level's value at the row's own coordinate, and
+    /// The gathered column is the image's value at the row's own coordinate, and
     /// the schema is the input's plus one.
     #[test]
-    fn a_gather_reads_the_level_at_the_rows_coordinate() {
+    fn a_gather_reads_the_image_at_the_rows_coordinate() {
         let rows = vec![row([1, 2, 3], 0, 0.0), row([7, 0, 0], 1, 0.0)];
         let out = gather_blob(
             VOLUME,
             &schema(),
             &blob(&rows),
-            "level",
+            "image",
             &Region::whole(&VOLUME),
             &ramp(),
             [0, 0, 0],
         )
         .expect("the rows are inside");
-        let gathered = gathered_schema(&schema(), "level").expect("a fresh name");
+        let gathered = gathered_schema(&schema(), "image").expect("a fresh name");
         assert_eq!(gathered.len(), 3);
         let merged = merged(VOLUME, gathered, &[out]);
         assert_eq!(
@@ -1645,13 +1646,13 @@ mod tests {
                 VOLUME,
                 &schema(),
                 &ours,
-                "level",
+                "image",
                 region,
                 &pixels,
                 [0, 0, 0],
             )
             .expect("its own row is inside its own region");
-            let gathered = gathered_schema(&schema(), "level").expect("a fresh name");
+            let gathered = gathered_schema(&schema(), "image").expect("a fresh name");
             assert_eq!(merged(VOLUME, gathered, &[out]).len(), 1);
 
             // And the other side's row is refused rather than answered, which is
@@ -1662,7 +1663,7 @@ mod tests {
                 VOLUME,
                 &schema(),
                 &not_ours,
-                "level",
+                "image",
                 region,
                 &pixels,
                 [0, 0, 0]
@@ -1681,7 +1682,7 @@ mod tests {
             VOLUME,
             &schema(),
             &blob(&rows),
-            "level",
+            "image",
             &core,
             &ramp(),
             [0, 0, 0],
@@ -1703,10 +1704,10 @@ mod tests {
         assert!(table.write([0, 0, 0], &outside).is_err());
     }
 
-    /// Two levels an `f64` column cannot carry exactly are refused rather than
+    /// Two images an `f64` column cannot carry exactly are refused rather than
     /// rounded; every narrower one converts with no loss.
     #[test]
-    fn a_level_too_wide_for_an_f64_column_is_refused() {
+    fn an_image_too_wide_for_an_f64_column_is_refused() {
         let one = [1usize, 1, 1];
         assert!(value_at(&Voxels::U64(Array3::zeros((2, 2, 2))), one).is_err());
         assert!(value_at(&Voxels::I64(Array3::zeros((2, 2, 2))), one).is_err());
@@ -1720,7 +1721,7 @@ mod tests {
         );
     }
 
-    /// An unwritten level is NaN so that an absence cannot pass for a value;
+    /// An unwritten image is NaN so that an absence cannot pass for a value;
     /// gathering one is refused where the coordinate can still be named.
     #[test]
     fn gathering_a_non_finite_value_is_refused() {
@@ -1732,7 +1733,7 @@ mod tests {
     #[test]
     fn a_gather_onto_an_existing_column_is_refused() {
         assert!(gathered_schema(&schema(), "score").is_err());
-        assert!(gathered_schema(&schema(), "level").is_ok());
+        assert!(gathered_schema(&schema(), "image").is_ok());
     }
 
     // ------------------------------------------------- the op shells ------
@@ -1758,7 +1759,7 @@ mod tests {
                 .expect("one test"),
         )
         .expect("the column exists");
-        let gather = GatherRowsOp::new("gather", rows(), 0, "level").expect("a fresh name");
+        let gather = GatherRowsOp::new("gather", rows(), 0, "image").expect("a fresh name");
         let ops: [&dyn FragmentOp; 3] = [&scale, &filter, &gather];
         for op in ops {
             for axis in 0..3 {
@@ -1766,9 +1767,9 @@ mod tests {
             }
             assert_eq!(op.inputs()[0].reach, [0, 0, 0], "{}", op.name());
             assert!(!op.writes_pixels(), "{}", op.name());
-            // **None of the three reads the level its phase is handed**, the
+            // **None of the three reads the image its phase is handed**, the
             // gather included: the array a gather samples is a *second* one, and
-            // it says so with `source_inputs` rather than by taking level `p`.
+            // it says so with `source_inputs` rather than by taking image `p`.
             // See the module header — that is the whole reason the shell can be
             // written, and it costs one array rather than two.
             assert!(!op.reads_pixels(), "{}", op.name());
@@ -1778,7 +1779,7 @@ mod tests {
         assert_eq!(
             gather.source_inputs(VOLUME),
             vec![SourceInput::voxelwise(0)],
-            "the gather names its level, at exactly the extent the block owns"
+            "the gather names its image, at exactly the extent the block owns"
         );
     }
 
@@ -1793,7 +1794,7 @@ mod tests {
     fn a_gather_claims_per_block_and_reaches_one_fragment() {
         let rows =
             RowStreams::new("in", 0, "out", Lifecycle::DeleteOnExit, schema()).expect("two names");
-        let gather = GatherRowsOp::new("gather", rows, 0, "level").expect("a fresh name");
+        let gather = GatherRowsOp::new("gather", rows, 0, "image").expect("a fresh name");
         assert_eq!(gather.seam_fold(), Some(SeamFold::PerBlock));
         assert_eq!(gather.inputs().len(), 1);
         assert_eq!(gather.inputs()[0].reach, [0, 0, 0]);
@@ -1801,9 +1802,9 @@ mod tests {
         // The output schema is known before any block runs, which is what a
         // consumer planning against this phase needs.
         assert_eq!(gather.schema().len(), schema().len() + 1);
-        assert_eq!(gather.schema().index_of("level"), Some(2));
-        assert_eq!(gather.level(), 0);
-        assert_eq!(gather.column(), "level");
+        assert_eq!(gather.schema().index_of("image"), Some(2));
+        assert_eq!(gather.image(), 0);
+        assert_eq!(gather.column(), "image");
     }
 
     #[test]
@@ -1812,7 +1813,7 @@ mod tests {
             RowStreams::new("in", 0, "out", Lifecycle::DeleteOnExit, schema()).expect("two names")
         };
         assert!(GatherRowsOp::new("gather", rows(), 0, "score").is_err());
-        assert!(GatherRowsOp::new("gather", rows(), 0, "level").is_ok());
+        assert!(GatherRowsOp::new("gather", rows(), 0, "image").is_ok());
     }
 
     /// The shell's own arithmetic — the offset between a block's buffer and the
@@ -1833,7 +1834,7 @@ mod tests {
             "gather",
             RowStreams::new("in", 0, "out", Lifecycle::DeleteOnExit, schema()).expect("two names"),
             0,
-            "level",
+            "image",
         )
         .expect("a fresh name");
 
@@ -1881,7 +1882,7 @@ mod tests {
             "gather",
             RowStreams::new("in", 0, "out", Lifecycle::DeleteOnExit, schema()).expect("two names"),
             0,
-            "level",
+            "image",
         )
         .expect("a fresh name");
         let error = gather
@@ -1908,7 +1909,7 @@ mod tests {
             "gather",
             RowStreams::new("in", 0, "out", Lifecycle::DeleteOnExit, schema()).expect("two names"),
             0,
-            "level",
+            "image",
         )
         .expect("a fresh name");
         let out = gather

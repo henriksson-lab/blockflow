@@ -162,7 +162,7 @@ fn constraints(candidates: Vec<usize>) -> Constraints {
     }
 }
 
-/// Plan with `strategy`, run it, and hand back the output level.
+/// Plan with `strategy`, run it, and hand back the output image.
 fn run(
     strategy: &dyn Strategy,
     chain: Chain,
@@ -176,7 +176,7 @@ fn run(
     strategy
         .run(&workflow, &decomposition, &env)
         .expect("a run");
-    env.level(decomposition.n_phases())
+    env.image(decomposition.n_phases())
 }
 
 // ==================================================== 1. the baseline is right ==
@@ -198,7 +198,7 @@ fn the_answer_does_not_change() {
 /// And on the chain the planners disagree most about: the oracle fuses all four
 /// slots into one unblocked pass, materialising cuts three times *and* blocks
 /// each piece, and the barrier sits between them. Every intermediate is written
-/// to a level and read back, which is three round trips the oracle never makes.
+/// to an image and read back, which is three round trips the oracle never makes.
 #[test]
 fn the_answer_does_not_change_across_a_barrier() {
     let plain = constraints(vec![4, 8]);
@@ -552,7 +552,7 @@ fn a_barrier_is_timed_separately_too() {
 ///
 /// The number is also what makes the `spread` column possible, and that column
 /// turned out to matter more than any single figure: the first repetition pays
-/// first-touch page faults on every level the environment allocated, and on the
+/// first-touch page faults on every image the environment allocated, and on the
 /// cheap voxelwise slots that is worth more than a factor of two. A one-shot
 /// table reports it as the op's cost.
 const REPETITIONS: usize = 5;

@@ -76,19 +76,20 @@
 //   nothing reads a side output back inside the chain; that is why they are
 //   declared separately rather than returned from `apply`. The Hessian is the
 //   opposite — the primary result is computed *from* it. And `apply_side` is
-//   handed the input and the primary and nothing else, so declaring the Hessian
-//   would not hand the executor a field that already exists, it would make the
-//   op compute it a second time.
+//   handed the operands — the input, the images the phase read beside it, and
+//   the primary — and never an intermediate, so declaring the Hessian would not
+//   hand the executor a field that already exists, it would make the op compute
+//   it a second time.
 // * **The arithmetic.** With `S` scales the declaration is `10 * S` arrays the
-//   size of the level. At three scales that is thirty times the primary's bytes,
+//   size of the image. At three scales that is thirty times the primary's bytes,
 //   written, for fields that are a pure function of the input and the
 //   parameters. `docs/design/BLOCK_OPS.md`'s reason for the machinery was an
 //   accounting *shortfall*; declaring these would close no shortfall, because
 //   nothing writes them today.
 // * **They are not a different shape or rank.** The `Output`/`SideBlock`
 //   machinery earns its keep where the second array is a different kind of thing
-//   — one row per object, one score per class. Six arrays of the level's own
-//   shape are a level's worth of data each and are better recomputed than
+//   — one row per object, one score per class. Six arrays of the image's own
+//   shape are an image's worth of data each and are better recomputed than
 //   stored.
 //
 // What *is* offered as a side output, and what it costs
@@ -99,10 +100,12 @@
 // know how wide the structure at a voxel is, not only that there is one.
 //
 // It is opt-in because of a real cost, stated rather than hidden: `apply_side`
-// receives the input and the primary, and the argmax is carried by neither, so a
-// block that declares the scale map runs the whole multi-scale pass **twice**.
-// There is no channel from `apply` to `apply_side` that would let the two share
-// it. A caller who does not want the map pays nothing.
+// receives the operands and not the intermediates, and the argmax is one of the
+// intermediates, so a block that declares the scale map runs the whole
+// multi-scale pass **twice**. The source inputs `apply_side` is now handed do
+// not change that and could not: they are *stored images*, and the winning scale
+// at a voxel is not stored anywhere — it is made and discarded inside `apply`.
+// A caller who does not want the map pays nothing.
 //
 // Costs
 // -----
@@ -121,7 +124,7 @@ use ndarray::{Array3, ArrayD, ArrayView3, ArrayViewMut3, Axis, Slice};
 
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::op::{Anchor, BlockOp, Output, SideBlock};
+use crate::op::{Anchor, BlockOp, Output, SideBlock, SourceInputs};
 use crate::voxels::Voxels;
 
 use super::shapes_agree;
@@ -1416,11 +1419,13 @@ impl RidgeFilterOp {
     /// scale whose response won at each voxel.
     ///
     /// **This doubles the op's compute for a block**, and the reason is
-    /// structural rather than an oversight: `apply_side` is handed the input and
-    /// the primary result, and the argmax is carried by neither, so the
-    /// multi-scale pass runs again to recover it. There is no channel from
-    /// `apply` to `apply_side` to carry it across. That is why the map is opt-in
-    /// — a caller who does not ask pays nothing at all.
+    /// structural rather than an oversight: `apply_side` is handed the operands
+    /// — the input, the images read beside it and the primary result — and the
+    /// argmax is carried by none of them, so the multi-scale pass runs again to
+    /// recover it. Being handed the source inputs does not help and cannot: they
+    /// are stored images, and the winning scale is made and discarded inside
+    /// `apply` rather than read from anywhere. That is why the map is opt-in — a
+    /// caller who does not ask pays nothing at all.
     pub fn with_scale_map(mut self, suffix: &'static str) -> Self {
         self.scale_map = Some(suffix);
         self
@@ -1555,7 +1560,7 @@ impl BlockOp for RidgeFilterOp {
             None => Vec::new(),
             // `U32` rather than `F64`: the values are scale indices, which are
             // small non-negative integers exactly representable in either, and
-            // a level's worth of `f64` for a number below the scale count is
+            // an image's worth of `f64` for a number below the scale count is
             // eight times the bytes for nothing. A side output carrying its own
             // dtype is what makes that a declaration rather than a cast.
             Some(suffix) => vec![Output::new(
@@ -1569,6 +1574,7 @@ impl BlockOp for RidgeFilterOp {
     fn apply_side(
         &self,
         input: &Voxels,
+        _sources: SourceInputs<'_>,
         _primary: &Voxels,
         block: &SideBlock<'_>,
     ) -> Result<Vec<ArrayD<f64>>> {

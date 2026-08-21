@@ -70,7 +70,7 @@
 // name says nothing about rounding.
 //
 // The cost of that honesty is real and is stated here rather than discovered:
-// smoothing a `u16` level writes a level four times its size. A caller who wants
+// smoothing a `u16` image writes an image four times its size. A caller who wants
 // the narrow type back says so with a [`VoxelwiseMapOp`](super::voxelwise) —
 // which is one op, is visible in the chain, and puts the rounding rule where a
 // reader can see which one was chosen.

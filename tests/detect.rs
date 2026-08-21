@@ -188,7 +188,7 @@ fn plan_emitting(
 }
 
 /// Run the two phases and hand back the environment, which is where the answer
-/// is: this op writes no level at all, so there is nothing to read out of
+/// is: this op writes no image at all, so there is nothing to read out of
 /// `env.output()` and everything to read out of the store.
 fn run(mask: &Array3<bool>, block: [usize; 3]) -> (ArrayEnvironment, Decomposition) {
     run_emitting(mask, block, Emission::Point)
@@ -630,7 +630,7 @@ fn the_points_a_run_writes_go_into_a_store_and_come_back_by_region() {
 /// What this op costs in *pixels*, measured rather than described, and it is the
 /// number that distinguishes it from the two ops it shares its program with.
 ///
-/// `fill` and `regional` both end by rewriting a label level, so their phase 1
+/// `fill` and `regional` both end by rewriting a label image, so their phase 1
 /// reads the whole volume once per block — a read amplification equal to the
 /// block count. This op's phase 1 reads no pixels at all, because everything it
 /// needs is in the fragments, so the whole run reads each voxel exactly once.
@@ -663,7 +663,7 @@ fn the_labelling_is_halo_free_and_the_merge_reads_no_pixels_at_all() {
     );
     assert_eq!(
         write_voxels, 0,
-        "neither phase writes a level, so nothing may be written"
+        "neither phase writes an image, so nothing may be written"
     );
     assert!(reads > 0 && writes == 0);
 }

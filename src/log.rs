@@ -69,14 +69,14 @@ pub enum Event {
         phase: usize,
         index: [usize; 3],
     },
-    /// The IO layer moved bytes *in*. `level` is the storage level read from:
-    /// level 0 is the workflow input, level `p` is the intermediate phase `p-1`
+    /// The IO layer moved bytes *in*. `image` is the storage image read from:
+    /// image 0 is the workflow input, image `p` is the intermediate phase `p-1`
     /// wrote. Emitted once per `Environment::read`.
     RegionRead {
         /// Human-readable name of what was read — `"level 0"` from the
         /// executor, `RegionSource::describe()` from an observed source.
         source: String,
-        level: usize,
+        image: usize,
         /// The block this read served, when the reader knows. A bare
         /// `RegionSource` does not, and says so rather than inventing one.
         index: Option<[usize; 3]>,
@@ -89,7 +89,7 @@ pub enum Event {
     /// The IO layer moved bytes *out*, once per `Environment::write`.
     RegionWritten {
         sink: String,
-        level: usize,
+        image: usize,
         index: Option<[usize; 3]>,
         region: Region,
         voxels: usize,
@@ -97,12 +97,12 @@ pub enum Event {
         chunks: u64,
         duration_ns: u64,
     },
-    /// A phase's output is complete and durable at `level`. `bytes` is what
+    /// A phase's output is complete and durable at `image`. `bytes` is what
     /// that phase wrote in total. This is the materialisation the fuse-vs-spill
     /// decision is about, priced.
     Materialised {
         phase: usize,
-        level: usize,
+        image: usize,
         bytes: u64,
         /// `false` for the last phase, whose destination is the workflow
         /// output rather than an intermediate.
@@ -192,7 +192,7 @@ pub enum Event {
     ///
     /// Its own event rather than a `RegionWritten` with a different sink,
     /// because a side output is addressed by name in a space of its own rank —
-    /// there is no level for it and its region is not a region of one. The
+    /// there is no image for it and its region is not a region of one. The
     /// bytes are stated, since that is the figure a run was silently short of.
     SideOutputWritten {
         output: String,
@@ -514,7 +514,7 @@ pub struct Stats {
     ///
     /// **The one figure of a run that is a function of the data**, and therefore
     /// the one that is reported rather than planned: an iterative phase runs to
-    /// convergence, so its count appears in no reach, no level allocation and no
+    /// convergence, so its count appears in no reach, no image allocation and no
     /// phase structure. Two runs of one plan over two datasets may differ here
     /// and agree everywhere else, which is why `same_work_as` does not compare
     /// it — a strategy that honoured a foreign decomposition did the same
@@ -552,7 +552,7 @@ pub struct Stats {
     /// The arrays the ops wrote beside their primary results, and what they
     /// came to. Beside `writes`/`write_voxels` rather than folded into them: a
     /// side output has its own element type and its own rank, so its elements
-    /// are not the level's voxels. `side_bytes_written` is the commensurable
+    /// are not the image's voxels. `side_bytes_written` is the commensurable
     /// figure, and it is the one a run used to be short of — 95.2 MB counted
     /// against 158.6 MB written.
     pub side_writes: u64,

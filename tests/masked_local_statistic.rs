@@ -6,7 +6,7 @@
 // and on a coarse lattice.
 //
 // The dense selection has had a population for a while: `MaskedRankFilterOp`
-// reads a second level over the same window it reads its input over, and
+// reads a second image over the same window it reads its input over, and
 // `SlidingHistogramOp` does the same thing through a different traversal. The
 // statistic evaluated on a lattice had no population concept at all, so a window
 // could not drop a voxel — which is the one thing standing between this crate
@@ -39,7 +39,7 @@
 //    arms actually run.
 // 7. **The declaration is checked**: the population is declared at the
 //    *statistic's* reach — the lattice distance plus the element, not the
-//    element alone — a level that does not hold `Bool` is refused by name, and
+//    element alone — an image that does not hold `Bool` is refused by name, and
 //    the op refuses to run without its operand at all.
 // 8. **The constant algebra is honest**, which matters more here than usual: a
 //    short circuit has not read the mask, so a declaration that depends on it
@@ -528,7 +528,7 @@ fn an_excluded_centre_and_an_empty_window_are_asked_separately() {
 
 // --------------------- 6. decomposition invariance on a lattice --
 
-/// `image > 8`, into a `Bool` level. The population producer, kept here rather
+/// `image > 8`, into a `Bool` image. The population producer, kept here rather
 /// than taken from `src/ops` because what is under test is the *consumer*.
 struct Binarize;
 
@@ -605,7 +605,7 @@ fn plan(chain: &Chain, grid: &BlockGrid) -> Decomposition {
         chain_reach: reach,
     };
     plan.declare_dtypes(chain).unwrap();
-    plan.declare_source_levels(chain).unwrap();
+    plan.declare_source_images(chain).unwrap();
     plan
 }
 
@@ -733,7 +733,7 @@ fn the_masked_threshold_is_decomposition_invariant_too() {
 
     let source: Voxels = image.clone().into();
     let mut whole = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
-    let entries = [(MASK, &Voxels::from(mask.clone()))];
+    let entries = [(MASK.into(), &Voxels::from(mask.clone()))];
     slots[2]
         .apply_with(
             &source,
@@ -778,7 +778,7 @@ fn the_masked_threshold_is_decomposition_invariant_too() {
             chain_reach: reach,
         };
         decomposition.declare_dtypes(&chain).unwrap();
-        decomposition.declare_source_levels(&chain).unwrap();
+        decomposition.declare_source_images(&chain).unwrap();
         let workflow = Workflow::new(
             Chain::sequence(vec![
                 Chain::op(Binarize),
@@ -820,13 +820,13 @@ fn the_masked_threshold_is_decomposition_invariant_too() {
 /// **Not the element's reach**, which is what the dense filter declares. The
 /// window sits around a lattice point, so the population is needed a lattice
 /// distance further out — and it has to equal the op's own reach exactly, or
-/// `check_source_levels` refuses the plan.
+/// `check_source_images` refuses the plan.
 #[test]
 fn the_population_is_declared_at_the_statistics_reach_and_not_the_elements() {
     let op = masked_lattice_op(Population::new());
     let declared = op.source_inputs(VOLUME);
     assert_eq!(declared.len(), 1);
-    assert_eq!(declared[0].level, MASK);
+    assert_eq!(declared[0].image.index(), MASK);
     assert_eq!(
         declared[0].reach,
         op.statistic().reach_spec(VOLUME),
@@ -852,16 +852,16 @@ fn the_population_is_declared_at_the_statistics_reach_and_not_the_elements() {
 fn an_unmasked_statistic_declares_no_operand() {
     let op = LocalStatisticOp::new("plain", sampled_statistic(element()));
     assert!(op.source_inputs(VOLUME).is_empty());
-    assert_eq!(op.mask_level(), None);
+    assert_eq!(op.mask_image(), None);
 }
 
 #[test]
-fn a_population_level_that_is_not_bool_is_refused_by_name() {
+fn a_population_image_that_is_not_bool_is_refused_by_name() {
     let op = masked_lattice_op(Population::new());
     let input: Voxels = image().into();
     let wrong: Voxels = image().into();
     let mut out = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
-    let entries = [(MASK, &wrong)];
+    let entries = [(MASK.into(), &wrong)];
     let failed = op
         .apply_with(
             &input,
@@ -873,7 +873,7 @@ fn a_population_level_that_is_not_bool_is_refused_by_name() {
     let message = failed.to_string();
     assert!(
         message.contains("float64") && message.contains(&MASK.to_string()),
-        "the refusal must name the level and what it holds: {message}"
+        "the refusal must name the image and what it holds: {message}"
     );
 }
 

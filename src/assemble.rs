@@ -4,13 +4,13 @@
 //
 // **Assembly, not planning.** Every number a `Decomposition` holds is
 // parity-visible: change a slot range, a halo, a per-phase element type or which
-// level an arm reads and the output changes. So a builder that *decided* any of
+// image an arm reads and the output changes. So a builder that *decided* any of
 // them would be a planner wearing a convenience's name, and the two must not be
 // the same object — `strategy::Strategy::decompose` is where a plan is chosen.
 // What this module removes is the **bookkeeping** between a caller who already
 // knows what the phases are and a `Decomposition` that records them, and nothing
 // else. Everything it produces goes through `Decomposition::check`,
-// `check_dtypes`, `check_source_levels`, `check_block_constraints` and
+// `check_dtypes`, `check_source_images`, `check_block_constraints` and
 // `check_phase_work` unchanged, and `PlanBuilder::finish` runs all five so that
 // a plan that would be refused at execution is refused where it was written.
 //
@@ -20,7 +20,7 @@
 // and its author kept a list of what that cost. Six of the eight entries were
 // one thing each: **the slot cursor, the names, the per-phase reach, the
 // fragment phase's element type, the `PhaseWork` list, and remembering to call
-// `declare_source_levels`.** Those six are this builder's whole remit. The list
+// `declare_source_images`.** Those six are this builder's whole remit. The list
 // is worth reading as a design constraint rather than as history, because each
 // entry is a place where writing the *wrong* number compiles, runs, and produces
 // a different answer with no error at all:
@@ -30,17 +30,17 @@
 // | a phase index passed to an op's constructor | a literal that is off by one reads a *different generation* of a stream — a wrong answer, not an error | [`Phase`], which can only come from the builder that made the phase |
 // | slot ranges and names, as two parallel lists with three cursors | a slice off by one names the wrong op in every log and event | derived here from the chain fragment itself |
 // | a phase's reach, taken from a fragment before it was moved into the sequence | had to be taken *early*, which is the easiest ordering in the file to get wrong | taken here, in the one place that holds the fragment |
-// | `phase.dtype = Some(Dtype::U32)` after `fragment_phase` | forgetting it is refused, but by a message about a level's width | asked of the op, which is the only thing that knows |
+// | `phase.dtype = Some(Dtype::U32)` after `fragment_phase` | forgetting it is refused, but by a message about an image's width | asked of the op, which is the only thing that knows |
 // | a second list of `PhaseWork`, tied to the phase list by a `debug_assert_eq!` on its length | a length check catches the count, never the order | **not a second list**: the builder records the kind *with* the phase |
-// | `declare_source_levels`, called by hand at the end | forgetting it does not fail `check()`; it fails as a level freed before its second reader | part of [`PlanBuilder::finish`] |
+// | `declare_source_images`, called by hand at the end | forgetting it does not fail `check()`; it fails as an image freed before its second reader | part of [`PlanBuilder::finish`] |
 //
 // What is a type here rather than a check, and why that is the point
 // ------------------------------------------------------------------
-// [`Phase`] and [`Level`] are both a `usize` and they are deliberately not
-// interchangeable. A phase index and a level number are different quantities
-// that are numerically close — phase `p` writes level `p + 1` — so the mistake
+// [`Phase`] and [`ImageId`] are both a `usize` and they are deliberately not
+// interchangeable. A phase index and an image number are different quantities
+// that are numerically close — phase `p` writes image `p + 1` — so the mistake
 // worth making impossible is not "a number out of range" but "the *other*
-// number, which is also in range". `Chain::source` takes a [`Level`] and an op
+// number, which is also in range". `Chain::source` takes an [`ImageId`] and an op
 // that reads another phase's stream takes a [`Phase`], so passing one where the
 // other belongs is a compile error rather than a plan that runs and answers
 // differently.
@@ -56,7 +56,7 @@
 // a caller who knows the phases must be able to say so. That left the partition
 // planner with no way in: `strategy::Strategy::decompose` takes a `Workflow` —
 // one chain, one input, one output, a linear pipeline — and a stage that needs
-// several levels has none of that to offer, so it grouped its own phases by
+// several images has none of that to offer, so it grouped its own phases by
 // hand and the planner never got a vote. Every performance figure this crate
 // has for such a stage is therefore measured on a partition nobody chose.
 //
@@ -73,13 +73,13 @@
 // What it does deliberately do
 // ----------------------------
 // * **Synthesise the `Workflow` per call**, over the sub-chain, the current
-//   level's volume and the element type the next phase reads. `decompose` reads
-//   exactly those three fields, so a chain in the middle of a level DAG can be
+//   image's volume and the element type the next phase reads. `decompose` reads
+//   exactly those three fields, so a chain in the middle of an image DAG can be
 //   priced without the planner learning about the DAG.
 // * **Renumber the slots.** The planner numbers a chain from zero; a plan under
 //   assembly is at whatever the cursor says.
 // * **Leave the source leaves alone.** [`crate::op::Chain::Source`] names an
-//   absolute level of the whole plan, and cutting a chain into phases never
+//   absolute image of the whole plan, and cutting a chain into phases never
 //   changes one — see [`PlanBuilder::partition`] for the argument.
 //
 // What it deliberately does not absorb
@@ -105,7 +105,7 @@
 // disagree, which was the failure this is here to remove.
 
 use crate::decomposition::{
-    check_block_constraints, check_dtypes, check_source_levels, Constraints, Decomposition,
+    check_block_constraints, check_dtypes, check_source_images, Constraints, Decomposition,
     PhaseDecomposition,
 };
 use crate::dtype::Dtype;
@@ -116,42 +116,117 @@ use crate::iterate::{iterative_phase, IterativeOp};
 use crate::op::Chain;
 use crate::strategy::{Strategy, Workflow};
 
-/// A level of the plan: level 0 is the input, level `p + 1` is what phase `p`
-/// wrote.
+/// An image of the plan: image 0 is the input, image `p + 1` is what phase `p`
+/// wrote, and an address at or above [`ImageId::SUPPLIED_BASE`] is one of the
+/// arrays the caller handed the run.
 ///
 /// A newtype over the index and not an alias, because the whole reason it exists
 /// is to be a *different type* from [`Phase`]. `From<usize>` is implemented so
 /// that every caller who already writes a literal keeps working; what it buys is
-/// that a caller holding a phase handle cannot pass it where a level belongs.
+/// that a caller holding a phase handle cannot pass it where an image belongs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Level(usize);
+pub struct ImageId(usize);
 
-impl Level {
-    /// The level number, for the places that index by it.
+impl ImageId {
+    /// The first address in the **supplied-input** range.
+    ///
+    /// An image below this is written by the run: image 0 by whoever seeded it,
+    /// image `p + 1` by phase `p`. An image at or above it is an array the caller
+    /// handed the run, which no phase produces and nothing can recompute.
+    ///
+    /// **Why a disjoint high range rather than `0..k` at the bottom.** A caller
+    /// has to know a supplied input's address *before* it builds the ops that
+    /// read it — `Chain::source` takes the number, and a `BlockOp` that reads a
+    /// second array stores the number inside itself — and a plan does not know
+    /// how many phases it has until it is finished, because
+    /// [`PlanBuilder::partition`] lets a strategy choose. Numbering the inputs
+    /// `0..k` and the phase outputs `k + p` would fix that, at the price of
+    /// renumbering **every phase-written image** the moment a second input is
+    /// added: an op holding `Chain::source(3)` because it meant "phase 2's
+    /// output" would silently mean something else. This range renumbers nothing,
+    /// and it is stable under a partition that adds phases.
+    ///
+    /// It is the high bit of a `usize`, so the test is one instruction and no
+    /// plan can reach it by counting phases.
+    pub const SUPPLIED_BASE: usize = usize::MAX / 2 + 1;
+
+    /// The address of the `which`th array handed to the run, counted from zero.
+    ///
+    /// Available before a single phase has been appended, which is the whole
+    /// point: the ops that read it are built first.
+    pub fn supplied(which: usize) -> Self {
+        assert!(
+            which < Self::SUPPLIED_BASE,
+            "supplied input {which} is outside the address range"
+        );
+        ImageId(Self::SUPPLIED_BASE + which)
+    }
+
+    /// The image number, for the places that index by it.
     pub fn index(self) -> usize {
         self.0
     }
-}
 
-impl From<usize> for Level {
-    fn from(level: usize) -> Self {
-        Level(level)
+    /// Whether this address names an array handed to the run.
+    pub fn is_supplied(self) -> bool {
+        is_supplied_image(self.0)
+    }
+
+    /// Which supplied array this is, or `None` for an image the run writes.
+    pub fn supplied_index(self) -> Option<usize> {
+        self.is_supplied().then(|| self.0 - Self::SUPPLIED_BASE)
     }
 }
 
-impl From<Level> for usize {
-    fn from(level: Level) -> Self {
-        level.0
+/// Whether `image` addresses an array handed to the run rather than one it
+/// writes.
+///
+/// A free function as well as an [`ImageId`] method because the *recorded* half
+/// of the plan still carries a bare `usize` — `PhaseDecomposition::source_images`
+/// and `supplied_dtypes` are serialised to the distributed wire and hashed into
+/// `Decomposition::fingerprint`, so their element type is part of a format — and
+/// the question has to be askable there without a round trip through the
+/// newtype. The *declared* half (`Chain::Source`, `SourceInput::image`) is an
+/// [`ImageId`] and asks it as [`ImageId::is_supplied`].
+pub fn is_supplied_image(image: usize) -> bool {
+    image >= ImageId::SUPPLIED_BASE
+}
+
+/// How to name `image` in a message: an index for an image the run writes, and
+/// "supplied input `i`" for one it was handed.
+///
+/// Without this every diagnostic about a supplied input prints a
+/// nineteen-digit number, which is an address nobody typed and nobody can read
+/// back.
+pub fn describe_image(image: usize) -> String {
+    match is_supplied_image(image) {
+        true => format!("supplied input {}", image - ImageId::SUPPLIED_BASE),
+        false => format!("image {image}"),
     }
 }
 
-impl std::fmt::Display for Level {
+impl From<usize> for ImageId {
+    fn from(image: usize) -> Self {
+        ImageId(image)
+    }
+}
+
+impl From<ImageId> for usize {
+    fn from(image: ImageId) -> Self {
+        image.0
+    }
+}
+
+impl std::fmt::Display for ImageId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        match self.supplied_index() {
+            Some(which) => write!(f, "supplied input {which}"),
+            None => write!(f, "{}", self.0),
+        }
     }
 }
 
-/// A phase of the plan under assembly: where it landed, and the level it writes.
+/// A phase of the plan under assembly: where it landed, and the image it writes.
 ///
 /// **The handle is the whole of item one.** An op that reads another phase's
 /// fragment stream needs that phase's index, and the index is only known once
@@ -168,9 +243,9 @@ impl std::fmt::Display for Level {
 pub struct Phase {
     index: usize,
     /// `None` for a phase that writes fragments and no pixels — which is
-    /// terminal as far as levels go, and is a fact about the op rather than
+    /// terminal as far as images go, and is a fact about the op rather than
     /// about the builder.
-    writes: Option<Level>,
+    writes: Option<ImageId>,
 }
 
 impl Phase {
@@ -179,20 +254,20 @@ impl Phase {
         self.index
     }
 
-    /// The level this phase writes, if it writes one.
-    pub fn writes(self) -> Option<Level> {
+    /// The image this phase writes, if it writes one.
+    pub fn writes(self) -> Option<ImageId> {
         self.writes
     }
 
-    /// The level this phase writes, or the refusal that names why there is none.
+    /// The image this phase writes, or the refusal that names why there is none.
     ///
     /// The fallible form exists because whether a fragment phase writes pixels
     /// is the op's answer, not something a signature can promise. For a pixel or
     /// an iterative phase it cannot fail, and the `?` costs nothing.
-    pub fn level(self) -> Result<Level> {
+    pub fn image(self) -> Result<ImageId> {
         self.writes.ok_or_else(|| {
             Error::InvalidArgument(format!(
-                "phase {} writes fragments and no pixels, so there is no level {} for anything \
+                "phase {} writes fragments and no pixels, so there is no image {} for anything \
                  to read. A phase that hands pixels on says so with `FragmentOp::writes_pixels`.",
                 self.index,
                 self.index + 1
@@ -204,8 +279,8 @@ impl Phase {
 /// The phases one [`PlanBuilder::partition`] call made, in plan order.
 ///
 /// **A run of phases is not a phase, and the difference is worth a type.** A
-/// caller carries on building from the *last* level a call produced, so that is
-/// what [`Self::level`] and [`Self::last`] answer; but "how many did the planner
+/// caller carries on building from the *last* image a call produced, so that is
+/// what [`Self::image`] and [`Self::last`] answer; but "how many did the planner
 /// make" is the question the whole entry exists to be able to ask — a bridge
 /// that silently always made one would pass every other test — so the count is
 /// here rather than left to be inferred by subtracting two `n_phases()` readings
@@ -228,16 +303,16 @@ impl Partition {
             .expect("a partition holds at least one phase")
     }
 
-    /// The level the last phase wrote.
+    /// The image the last phase wrote.
     ///
-    /// Infallible where [`Phase::level`] is not, and for a reason rather than
+    /// Infallible where [`Phase::image`] is not, and for a reason rather than
     /// for convenience: every phase a partition holds is a `Pixels` phase over a
-    /// run of chain slots, and such a phase always writes the level below it
+    /// run of chain slots, and such a phase always writes the image below it
     /// plus one. There is no fragment op here to answer otherwise.
-    pub fn level(&self) -> Level {
+    pub fn image(&self) -> ImageId {
         self.last()
             .writes()
-            .expect("a pixel phase writes the level above it")
+            .expect("a pixel phase writes the image above it")
     }
 
     /// How many phases the planner made of the chain.
@@ -305,14 +380,14 @@ pub struct PlanBuilder {
     /// Responsibilities two to four, per phase, and five beside them.
     phases: Vec<PhaseDecomposition>,
     work: Vec<Work>,
-    /// The element type of the level the *next* phase will read. Folded here for
+    /// The element type of the image the *next* phase will read. Folded here for
     /// the same reason `Decomposition::declare_dtypes` folds it: a fragment
     /// phase owns no slot, so nothing downstream can recover what it was handed.
     reads: Dtype,
 }
 
 impl PlanBuilder {
-    /// A plan over `volume`, whose level 0 holds `dtype`, cut on `grid`.
+    /// A plan over `volume`, whose image 0 holds `dtype`, cut on `grid`.
     ///
     /// The grid is the caller's because choosing one is planning: it trades
     /// halo against task count against residency, and this builder has no cost
@@ -377,7 +452,7 @@ impl PlanBuilder {
         let slots = chain.slots();
         if slots.is_empty() {
             return Err(Error::InvalidArgument(
-                "a pixel phase with no chain slots would read a level and write it back \
+                "a pixel phase with no chain slots would read an image and write it back \
                  unchanged, at the price of a full materialisation. If that copy is wanted, \
                  say so with an identity op; if it is not, the phase is not a phase."
                     .to_string(),
@@ -421,12 +496,12 @@ impl PlanBuilder {
     /// statements and a builder that could only make one of them would be
     /// deciding on the caller's behalf either way.
     ///
-    /// # How a `Workflow`-shaped planner is reached from a level DAG
+    /// # How a `Workflow`-shaped planner is reached from an image DAG
     ///
     /// `Strategy::decompose` takes a [`Workflow`], which is one chain over one
     /// volume in one element type. It reads exactly those three fields, so the
     /// workflow is **synthesised here, per call**, from the chain, from
-    /// `self.grid().volume()` — the space the level this chain reads lives in,
+    /// `self.grid().volume()` — the space the image this chain reads lives in,
     /// which is not `Decomposition::volume` once a phase has changed shape — and
     /// from [`Self::reads`]. The `input` and `output` names it carries are the
     /// defaults and mean nothing mid-plan; nothing in a partition search looks at
@@ -439,23 +514,23 @@ impl PlanBuilder {
     /// output, so the final cut is very slightly under-charged. Both weights
     /// default to `1.0`, where the distinction disappears.
     ///
-    /// # What happens to the level a source leaf names
+    /// # What happens to the image a source leaf names
     ///
     /// Nothing, and that is the property to check rather than to assume.
-    /// [`Chain::source`] names a level of the *whole plan*; the planner never
-    /// sees a level number, only slots, so it cannot rewrite one. What cutting
+    /// [`Chain::source`] names an image of the *whole plan*; the planner never
+    /// sees an image number, only slots, so it cannot rewrite one. What cutting
     /// changes is which phase a leaf ends up in: with one phase every slot sits
-    /// at phase `p` and reads level `p`, and with `k` phases a slot may sit as
+    /// at phase `p` and reads image `p`, and with `k` phases a slot may sit as
     /// late as `p + k - 1`. The rule
-    /// [`crate::decomposition::check_source_levels`] enforces is that a leaf's
-    /// level is at most its phase's own — so a leaf that was legal fused is
+    /// [`crate::decomposition::check_source_images`] enforces is that a leaf's
+    /// image is at most its phase's own — so a leaf that was legal fused is
     /// legal cut, because cutting only ever moves it later. The reverse is what
     /// would be unsound, and the reverse is not a thing this can do.
     ///
     /// The one direction in which a cut can genuinely refuse is an op declaring
-    /// a *reach* over the level it sources: the granted halo is the phase's, and
+    /// a *reach* over the image it sources: the granted halo is the phase's, and
     /// a phase holding fewer slots may grant less than the fused one did. That
-    /// is refused by name at [`Self::finish`], with the level and both reaches
+    /// is refused by name at [`Self::finish`], with the image and both reaches
     /// in the message, rather than run.
     ///
     /// # Where the numbers come from
@@ -476,7 +551,7 @@ impl PlanBuilder {
         if slots.is_empty() {
             return Err(Error::InvalidArgument(
                 "a planned run of pixel phases with no chain slots: there is nothing to \
-                 partition. A phase that reads a level and writes it back unchanged is an \
+                 partition. A phase that reads an image and writes it back unchanged is an \
                  identity op, said out loud."
                     .to_string(),
             ));
@@ -515,7 +590,7 @@ impl PlanBuilder {
             // zero; the plan under assembly is at the cursor. Everything else it
             // recorded — the reach, the halo, the grid, the element type it
             // declares — is a fact about the run of slots and travels unchanged,
-            // and `source_levels` is absolute already and is re-derived over the
+            // and `source_images` is absolute already and is re-derived over the
             // whole chain by `finish` in any case.
             for slot in &mut phase.slots {
                 *slot += base;
@@ -547,9 +622,9 @@ impl PlanBuilder {
     /// **Responsibility four is here**, and it is the one the hand-built plan's
     /// author called the biggest: a fragment phase owns no chain slot, so
     /// `check_dtypes` has nothing to fold and asks the op instead — and the plan
-    /// has to have allocated the level at the width the op says it writes.
+    /// has to have allocated the image at the width the op says it writes.
     /// Stating that by hand is a line that is easy to omit and whose omission is
-    /// refused by a message about a level's width rather than about the missing
+    /// refused by a message about an image's width rather than about the missing
     /// line. Here it is asked of the op, which is the only thing that knows.
     pub fn fragments(&mut self, op: impl FragmentOp + 'static) -> Result<Phase> {
         self.fragments_boxed(Box::new(op))
@@ -574,22 +649,22 @@ impl PlanBuilder {
 
     /// The one place a phase and its kind are appended, so that there is no
     /// order for them to disagree about.
-    fn push(&mut self, phase: PhaseDecomposition, work: Work, writes_a_level: bool) -> Phase {
+    fn push(&mut self, phase: PhaseDecomposition, work: Work, writes_an_image: bool) -> Phase {
         let index = self.phases.len();
         self.phases.push(phase);
         self.work.push(work);
         Phase {
             index,
-            writes: writes_a_level.then(|| Level(index + 1)),
+            writes: writes_an_image.then(|| ImageId(index + 1)),
         }
     }
 
     /// Close the plan: assemble the chain, derive what a chain can derive, and
     /// run every guard the executor would.
     ///
-    /// **Responsibility six is `declare_source_levels`**, and it is here rather
+    /// **Responsibility six is `declare_source_images`**, and it is here rather
     /// than offered as a step because forgetting it is not refused by
-    /// `Decomposition::check` — it surfaces later as a level freed before its
+    /// `Decomposition::check` — it surfaces later as an image freed before its
     /// second reader, or as an executor refusing a dependency it was never told
     /// about. A construction step that can be forgotten and whose omission is
     /// diagnosed somewhere else is not a step, it is a trap.
@@ -613,7 +688,7 @@ impl PlanBuilder {
             phases: self.phases,
             chain_reach,
         };
-        decomposition.declare_source_levels(&workflow.chain)?;
+        decomposition.declare_source_images(&workflow.chain)?;
 
         let assembly = Assembly {
             workflow,
@@ -631,7 +706,7 @@ impl PlanBuilder {
             check_phase_work(&assembly.decomposition, &work)?;
             check_block_constraints(&assembly.workflow.chain, &assembly.decomposition)?;
             check_dtypes(&assembly.workflow.chain, &assembly.decomposition, &work)?;
-            check_source_levels(&assembly.workflow.chain, &assembly.decomposition)?;
+            check_source_images(&assembly.workflow.chain, &assembly.decomposition)?;
         }
         Ok(assembly)
     }
@@ -717,22 +792,22 @@ mod tests {
             ],
             chain_reach: chain.reach3(&volume),
         };
-        hand.declare_source_levels(&chain).expect("source levels");
+        hand.declare_source_images(&chain).expect("source images");
 
         assert_eq!(built.decomposition, hand);
         assert_eq!(built.decomposition.fingerprint(), hand.fingerprint());
     }
 
-    /// A phase handle knows which level its phase wrote, and the two numbers are
+    /// A phase handle knows which image its phase wrote, and the two numbers are
     /// different types so that they cannot be swapped.
     #[test]
-    fn a_phase_handle_carries_the_level_it_wrote() {
+    fn a_phase_handle_carries_the_image_it_wrote() {
         let mut plan = PlanBuilder::new([16, 8, 8], Dtype::F64, grid());
         let first = plan
             .pixels(Chain::op(IdentityOp::new("first", [1, 0, 0])))
             .expect("a pixel phase");
         assert_eq!(first.index(), 0);
-        assert_eq!(first.level().expect("a level"), Level::from(1));
+        assert_eq!(first.image().expect("an image"), ImageId::from(1));
     }
 
     #[test]
@@ -765,9 +840,9 @@ mod tests {
 /// * **the planner must actually be consulted.** A bridge that quietly always
 ///   made one phase would pass every other test here, so one chain is asserted
 ///   to come back cut and one to come back whole;
-/// * **a source leaf must still name the level it meant.** This is the failure
-///   that is silent: a leaf reads a level *by index*, and an entry that renumbers
-///   levels under one would read real voxels from the wrong array;
+/// * **a source leaf must still name the image it meant.** This is the failure
+///   that is silent: a leaf reads an image *by index*, and an entry that renumbers
+///   images under one would read real voxels from the wrong array;
 /// * **and the cut has to be worth making**, on the shape the gap was found on:
 ///   a large-reach op with reach-0 work either side of it, which is what fusing
 ///   makes expensive and what nobody was pricing.
@@ -806,13 +881,13 @@ mod planned_phases {
 
     /// The chain the gap was found on, at a size a test can run.
     ///
-    /// A large-reach op between two reach-0 fan-ins, each of which reads a level
+    /// A large-reach op between two reach-0 fan-ins, each of which reads an image
     /// back through a source leaf. Both halves matter: the reach-0 work is what
     /// pays the blur's halo when it is fused with it, and the source leaves are
-    /// what make that expensive twice over — a level a phase sources is fetched
-    /// at the block's own read extent, so a fused phase reads *three* levels at
+    /// what make that expensive twice over — an image a phase sources is fetched
+    /// at the block's own read extent, so a fused phase reads *three* images at
     /// the blur's halo where a cut one reads one.
-    fn arm(values: Level, sink: Level, sigma: f64) -> Chain {
+    fn arm(values: ImageId, sink: ImageId, sigma: f64) -> Chain {
         Chain::sequence(vec![
             Chain::parallel(
                 vec![
@@ -864,19 +939,19 @@ mod planned_phases {
 
     /// The two phases the arm reads back through its source leaves. Both plans
     /// below start with these, so everything the comparison sees is the arm's.
-    fn preamble(plan: &mut PlanBuilder) -> (Level, Level) {
+    fn preamble(plan: &mut PlanBuilder) -> (ImageId, ImageId) {
         let values = plan
             .pixels(Chain::op(VoxelwiseMapOp::new("values", |value| {
                 value + 1.0
             })))
             .expect("a pixel phase")
-            .level()
-            .expect("a level");
+            .image()
+            .expect("an image");
         let sink = plan
             .pixels(Chain::op(VoxelwiseMapOp::new("sink", |value| value * 0.25)))
             .expect("a pixel phase")
-            .level()
-            .expect("a level");
+            .image()
+            .expect("an image");
         (values, sink)
     }
 
@@ -937,7 +1012,7 @@ mod planned_phases {
             .into()
     }
 
-    /// Run a plan and hand back the level it wrote last.
+    /// Run a plan and hand back the image it wrote last.
     fn run(assembly: &Assembly) -> Voxels {
         let env = ArrayEnvironment::for_decomposition(
             input(assembly.decomposition.volume),
@@ -955,7 +1030,7 @@ mod planned_phases {
             &assembly.work(),
         )
         .expect("a run");
-        env.level(assembly.decomposition.n_phases())
+        env.image(assembly.decomposition.n_phases())
     }
 
     /// Voxels read over the arm's phases only — the two leading phases are the
@@ -1023,7 +1098,7 @@ mod planned_phases {
 
         // The same partition the planner returns when it is asked directly, so
         // that what arrived in the plan is its answer and not a rounding of it.
-        let workflow = Workflow::new(arm(Level(1), Level(2), SIGMA), VOLUME, Dtype::F64);
+        let workflow = Workflow::new(arm(ImageId(1), ImageId(2), SIGMA), VOLUME, Dtype::F64);
         let direct = Enumerating::default()
             .decompose(&workflow, &constraints)
             .expect("a plan");
@@ -1050,47 +1125,47 @@ mod planned_phases {
             .partition(voxelwise_chain(), &Enumerating::default(), &constraints)
             .expect("a planned run of phases");
         assert_eq!(made.n_phases(), 1);
-        assert_eq!(made.level(), Level(1));
+        assert_eq!(made.image(), ImageId(1));
         let assembly = plan.finish().expect("a plan");
         assert_eq!(assembly.decomposition.n_phases(), 1);
         assert_eq!(assembly.decomposition.phases[0].slots, vec![0, 1, 2]);
     }
 
-    // ------------------------------------- three: the source leaf's level --
+    // ------------------------------------- three: the source leaf's image --
 
-    /// **The silent failure, checked.** A source leaf names a level of the whole
-    /// plan; cutting the chain around it must not move the level it means.
+    /// **The silent failure, checked.** A source leaf names an image of the whole
+    /// plan; cutting the chain around it must not move the image it means.
     ///
     /// Cutting can only ever move a slot *later*, and the rule is that a leaf's
-    /// level is at most its phase's own — so the direction cutting moves in is
+    /// image is at most its phase's own — so the direction cutting moves in is
     /// the safe one. This asserts the outcome rather than the argument: the
-    /// levels recorded against the phases are the levels the chain named, in
+    /// images recorded against the phases are the images the chain named, in
     /// both plans, whatever the partition did.
     #[test]
-    fn cutting_a_chain_does_not_renumber_the_levels_its_source_leaves_name() {
+    fn cutting_a_chain_does_not_renumber_the_images_its_source_leaves_name() {
         let constraints = small_constraints();
         let fused = fused(VOLUME, SIGMA, &constraints);
         let (planned, phases) = planned(VOLUME, SIGMA, &constraints);
         assert!(phases > 1);
 
-        // Fused: one phase, both leaves, both levels.
-        assert_eq!(fused.decomposition.phases[2].source_levels, vec![1, 2]);
-        // Cut: the same two levels, now in the phases the slots landed in, and
-        // every one of them at or below its own phase's input level.
+        // Fused: one phase, both leaves, both images.
+        assert_eq!(fused.decomposition.phases[2].source_images, vec![1, 2]);
+        // Cut: the same two images, now in the phases the slots landed in, and
+        // every one of them at or below its own phase's input image.
         let named: Vec<usize> = planned.decomposition.phases[2..]
             .iter()
-            .flat_map(|phase| phase.source_levels.iter().copied())
+            .flat_map(|phase| phase.source_images.iter().copied())
             .collect();
         assert_eq!(named, vec![1, 2]);
         for (index, phase) in planned.decomposition.phases.iter().enumerate() {
-            for &level in &phase.source_levels {
+            for &image in &phase.source_images {
                 assert!(
-                    level <= index,
-                    "phase {index} sources level {level}, which it runs before"
+                    image <= index,
+                    "phase {index} sources image {image}, which it runs before"
                 );
             }
         }
-        // `finish` ran `check_source_levels` over both, which is the guard this
+        // `finish` ran `check_source_images` over both, which is the guard this
         // is the readable form of.
     }
 

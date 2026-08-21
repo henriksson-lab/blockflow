@@ -233,13 +233,13 @@ pub fn decomposition_json(decomposition: &Decomposition) -> Result<Value> {
             if let Some(dtype) = phase.dtype {
                 entry["dtype"] = json!(dtype.numpy_name());
             }
-            // Likewise for the levels a phase reads besides its own input: a
+            // Likewise for the images a phase reads besides its own input: a
             // generator like the rest — the far end re-derives the geometry, and
-            // *which levels* is a fact only the plan carries — and absent for
-            // every plan that reads one level, which is the document this was
+            // *which images* is a fact only the plan carries — and absent for
+            // every plan that reads one image, which is the document this was
             // before source leaves existed.
-            if !phase.source_levels.is_empty() {
-                entry["source_levels"] = json!(phase.source_levels);
+            if !phase.source_images.is_empty() {
+                entry["source_levels"] = json!(phase.source_images);
             }
             entry
         })
@@ -262,7 +262,7 @@ pub fn decomposition_from_json(value: &Value) -> Result<Decomposition> {
     let mut phases = Vec::new();
     for phase in array(value, "phases")? {
         let block = triple(phase, "block")?;
-        // Absent means "the same as the level below", which is what a phase
+        // Absent means "the same as the image below", which is what a phase
         // that does not change shape or element type says by saying nothing.
         let phase_volume = match phase.get("volume") {
             Some(_) => triple(phase, "volume")?,
@@ -285,7 +285,7 @@ pub fn decomposition_from_json(value: &Value) -> Result<Decomposition> {
             })?);
         }
         if phase.get("source_levels").is_some() {
-            rebuilt = rebuilt.with_source_levels(counts(phase, "source_levels")?);
+            rebuilt = rebuilt.with_source_images(counts(phase, "source_levels")?);
         }
         phases.push(rebuilt);
     }
@@ -352,11 +352,11 @@ mod tests {
         assert!(error.to_string().contains("different builds"), "{error}");
     }
 
-    /// The levels a phase reads besides its own input are part of the plan, so
-    /// they cross the wire — and a plan that reads one level says nothing, so
+    /// The images a phase reads besides its own input are part of the plan, so
+    /// they cross the wire — and a plan that reads one image says nothing, so
     /// the document is the one it was before source leaves existed.
     #[test]
-    fn the_levels_a_phase_also_reads_survive_the_wire_and_are_absent_without_them() {
+    fn the_images_a_phase_also_reads_survive_the_wire_and_are_absent_without_them() {
         let plain = a_decomposition();
         assert!(decomposition_json(&plain).unwrap()["phases"][0]
             .get("source_levels")
@@ -364,14 +364,14 @@ mod tests {
 
         let mut original = plain.clone();
         let last = original.phases.len() - 1;
-        original.phases[last] = original.phases[last].clone().with_source_levels([0]);
+        original.phases[last] = original.phases[last].clone().with_source_images([0]);
         let document = decomposition_json(&original).unwrap();
         assert_eq!(document["phases"][last]["source_levels"], json!([0]));
 
         let rebuilt = decomposition_from_json(&document).unwrap();
         assert_eq!(rebuilt, original);
         assert_eq!(rebuilt.fingerprint(), original.fingerprint());
-        // and it really is a different plan from the one that reads one level
+        // and it really is a different plan from the one that reads one image
         assert_ne!(original.fingerprint(), plain.fingerprint());
     }
 

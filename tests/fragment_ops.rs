@@ -187,7 +187,7 @@ fn a_volume_to_fragments_phase_leaves_one_fragment_per_block_and_they_reduce_to_
     assert_eq!(stored_blocks(&env, "fragments", 1), lattice_blocks());
 
     // Accounting sees the fragment traffic, and the pixel counters are the
-    // pixel phase's alone: two levels of 512 voxels read and written.
+    // pixel phase's alone: two images of 512 voxels read and written.
     let (writes, reads, bytes_written, bytes_read) = env.counters().sidecar_snapshot();
     assert_eq!(writes, BLOCKS as u64);
     assert_eq!(reads, 0, "nothing read a fragment in this run");
@@ -582,7 +582,7 @@ fn a_stream_that_declares_every_block_and_leaves_a_hole_fails_the_run() {
 
 /// A stream that is honestly sparse is allowed, and then only containment is
 /// checked — but the phase must still have something checkable about it, so a
-/// sparse-only phase that writes no level is refused before it runs.
+/// sparse-only phase that writes no image is refused before it runs.
 #[test]
 fn a_phase_with_nothing_checkable_about_it_is_refused_rather_than_run() {
     struct SparseOnly;

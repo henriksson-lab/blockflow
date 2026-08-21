@@ -210,11 +210,11 @@ fn one_pixel_phase(block: [usize; 3]) -> Decomposition {
     }
 }
 
-/// The three phases: a pixel phase to have a level, the row producer, and the
-/// walk. The walk reads the rows from phase 1 and the **array from level 0**,
+/// The three phases: a pixel phase to have an image, the row producer, and the
+/// walk. The walk reads the rows from phase 1 and the **array from image 0**,
 /// which is the arrangement that makes a row op able to read a volume at all —
-/// a fragment phase `p` reads level `p`, and the phase before a row op writes no
-/// level.
+/// a fragment phase `p` reads image `p`, and the phase before a row op writes no
+/// image.
 fn run(block: [usize; 3], out_of_band: Option<OffsetSequence>) -> Result<Vec<RowValues>> {
     let points = PointsOp {
         stream: "rows.points".to_string(),
@@ -502,7 +502,7 @@ fn the_operand_reach_is_the_stated_maximum() {
         [0, 0, 0],
         "a widened operand window is not a widened trust region"
     );
-    assert_eq!(plan.phases[2].source_levels, vec![0]);
+    assert_eq!(plan.phases[2].source_images, vec![0]);
     plan.check().expect("the valid regions still tile");
 }
 

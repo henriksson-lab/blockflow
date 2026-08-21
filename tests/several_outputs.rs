@@ -8,7 +8,7 @@
 // -----------------------------------
 // An operation that produces more than one result had nowhere to put the extra
 // ones. A `Workflow` names a single output of a single element type and the
-// executor writes one buffer to one level, so the rest were written on the side
+// executor writes one buffer to one image, so the rest were written on the side
 // by whatever happened to be holding the storage, and nothing in the framework
 // knew they existed. Measured on the patch-lattice harness: the run wrote
 // **158.6 MB** and the framework counted **95.2 MB**, short by a factor of
@@ -43,7 +43,7 @@ use ndarray::{Array3, ArrayD, IxDyn};
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::{AccountingEnvironment, ArrayEnvironment};
 use blockflow::geometry::BlockGrid;
-use blockflow::op::{Anchor, BlockOp, Chain, Output, SideBlock};
+use blockflow::op::{Anchor, BlockOp, Chain, Output, SideBlock, SourceInputs};
 use blockflow::region::Region;
 use blockflow::strategy::{execute, execute_observed, Hints, Workflow};
 use blockflow::voxels::Voxels;
@@ -191,6 +191,7 @@ fn reference(chain: &Chain, input: &Voxels) -> Vec<ArrayD<f64>> {
     chain
         .apply_side(
             input,
+            SourceInputs::none(),
             &primary,
             &SideBlock {
                 at: &at,
@@ -308,6 +309,7 @@ impl BlockOp for MisplacingOp {
     fn apply_side(
         &self,
         _input: &Voxels,
+        _sources: SourceInputs<'_>,
         _primary: &Voxels,
         block: &SideBlock<'_>,
     ) -> blockflow::Result<Vec<ArrayD<f64>>> {
@@ -427,12 +429,12 @@ fn short_circuits(workflow: &Workflow, input: &Voxels) -> usize {
 /// translate but not resize", and this is the half of it that these outputs
 /// close: an array a third the size of the volume, and one of rank 4, both
 /// written per block, both in the plan's accounting and both under the coverage
-/// guard. What is still not resizable is the **level** — `BlockOp::apply` writes
-/// an output the shape of its input, so the buffer that goes back to level `p+1`
-/// is the shape of the one that came off level `p`, and that is what the
+/// guard. What is still not resizable is the **image** — `BlockOp::apply` writes
+/// an output the shape of its input, so the buffer that goes back to image `p+1`
+/// is the shape of the one that came off image `p`, and that is what the
 /// executor still refuses by name.
 #[test]
-fn a_side_output_may_be_a_different_size_and_a_different_rank_from_the_level() {
+fn a_side_output_may_be_a_different_size_and_a_different_rank_from_the_image() {
     let input = ramp();
     let chain = side_chain();
     let produced = reference(&chain, &input);
@@ -443,7 +445,7 @@ fn a_side_output_may_be_a_different_size_and_a_different_rank_from_the_level() {
         "a third of the elements"
     );
 
-    // and the level itself still may not resize, said plainly
+    // and the image itself still may not resize, said plainly
     let workflow = Workflow::new(side_chain(), VOLUME, Dtype::F64);
     let grid = BlockGrid::along(VOLUME, &[0], 4).unwrap();
     let mut decomposition = one_phase(&workflow, VOLUME, grid, [0, 0, 0], [0, 0, 0]);

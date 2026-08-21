@@ -16,7 +16,7 @@
 // and no chunk of that output may be cut by a region boundary, so cutting the
 // fine grid and deriving lattice counts would put boundaries wherever the
 // arithmetic landed. Cutting the lattice cannot. What varies instead is how much
-// of the fine level each block reads, which is stated per block.
+// of the fine image each block reads, which is stated per block.
 //
 // This file pins the geometry that makes that work, before any op uses it:
 //

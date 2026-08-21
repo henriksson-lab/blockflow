@@ -59,9 +59,9 @@ use blockflow::strategy::{execute, Enumerating, Hints, Strategy, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
 
-/// Level 1 in the chains below: the seeds.
+/// Image 1 in the chains below: the seeds.
 const SEEDS: usize = 1;
-/// Level 2: the floodable region.
+/// Image 2: the floodable region.
 const MASK: usize = 2;
 
 // ------------------------------------------------------------- fixtures --
@@ -487,9 +487,9 @@ fn the_op_declares_the_whole_volume_and_the_planner_reads_it() {
     // every voxel of all three or it is a different flood.
     let declared = op.source_inputs(volume);
     assert_eq!(declared.len(), 2);
-    assert_eq!(declared[0].level, SEEDS);
+    assert_eq!(declared[0].image.index(), SEEDS);
     assert_eq!(declared[0].reach, Reach::all());
-    assert_eq!(declared[1].level, MASK);
+    assert_eq!(declared[1].image.index(), MASK);
     assert_eq!(declared[1].reach, Reach::all());
 }
 
@@ -1005,17 +1005,17 @@ fn the_op_refuses_to_run_without_its_seeds() {
     let message = failed.to_string();
     assert!(
         message.contains("apply_with") && message.contains(&SEEDS.to_string()),
-        "the refusal must name the level and the method: {message}"
+        "the refusal must name the image and the method: {message}"
     );
 }
 
 #[test]
-fn a_seed_level_that_is_not_u32_is_refused_by_name() {
+fn a_seed_image_that_is_not_u32_is_refused_by_name() {
     let op = SeededWatershedOp::new("watershed", SEEDS, Separation::Line);
     let input: Voxels = Array3::<f64>::zeros((4, 4, 4)).into();
     let wrong: Voxels = Array3::<f64>::zeros((4, 4, 4)).into();
     let mut out = Voxels::zeros(Dtype::U32, [4, 4, 4]).unwrap();
-    let entries = [(SEEDS, &wrong)];
+    let entries = [(SEEDS.into(), &wrong)];
     let failed = op
         .apply_with(
             &input,
@@ -1032,13 +1032,13 @@ fn a_seed_level_that_is_not_u32_is_refused_by_name() {
 }
 
 #[test]
-fn a_mask_level_that_is_not_bool_is_refused_by_name() {
+fn a_mask_image_that_is_not_bool_is_refused_by_name() {
     let op = SeededWatershedOp::new("watershed", SEEDS, Separation::Line).within(MASK);
     let input: Voxels = Array3::<f64>::zeros((4, 4, 4)).into();
     let seeds: Voxels = Array3::<u32>::zeros((4, 4, 4)).into();
     let wrong: Voxels = Array3::<f64>::zeros((4, 4, 4)).into();
     let mut out = Voxels::zeros(Dtype::U32, [4, 4, 4]).unwrap();
-    let entries = [(SEEDS, &seeds), (MASK, &wrong)];
+    let entries = [(SEEDS.into(), &seeds), (MASK.into(), &wrong)];
     let failed = op
         .apply_with(
             &input,
@@ -1204,7 +1204,7 @@ impl BlockOp for Negate {
     }
 }
 
-/// Level 0 is the image, 1 the seeds, 2 the mask, 3 the negated cost, 4 the
+/// Image 0 is the image, 1 the seeds, 2 the mask, 3 the negated cost, 4 the
 /// labels.
 fn chain() -> Chain {
     Chain::sequence(vec![
@@ -1282,7 +1282,7 @@ fn plan_with(prefix: &BlockGrid) -> (Chain, Decomposition) {
         chain_reach: [VOLUME[0], VOLUME[1], VOLUME[2]],
     };
     plan.declare_dtypes(&chain).unwrap();
-    plan.declare_source_levels(&chain).unwrap();
+    plan.declare_source_images(&chain).unwrap();
     (chain, plan)
 }
 

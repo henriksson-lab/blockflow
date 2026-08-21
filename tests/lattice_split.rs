@@ -271,7 +271,7 @@ fn the_interpolation_is_the_lattices_own_brackets() {
 ///
 /// This is the claim the split has to earn. `LocalStatisticOp` evaluates the
 /// statistic at every lattice point and interpolates back in one pass; the two
-/// ops here do the same two things through two levels. If they were merely
+/// ops here do the same two things through two images. If they were merely
 /// *similar* the difference would show up as a handful of voxels near the
 /// unsampled margins, which is where the two would most easily disagree about a
 /// convention.
@@ -311,8 +311,8 @@ fn the_two_phases_reproduce_the_fused_op_exactly() {
 /// The same, with the **coarse** phase blocked, through the executor.
 ///
 /// The two-phase plan is the shape a caller actually writes, and it exercises
-/// what one phase alone cannot: the coarse level is *materialised* between the
-/// two, so the interpolation reads a level whose shape is neither the volume's
+/// what one phase alone cannot: the coarse image is *materialised* between the
+/// two, so the interpolation reads an image whose shape is neither the volume's
 /// nor its own output's. The fine phase is one block, which is all it can be —
 /// see `a_multi_block_interpolation_is_refused_and_says_what_is_missing`.
 #[test]
@@ -428,7 +428,7 @@ fn a_multi_block_interpolation_is_the_whole_volume_answer() {
 ///
 /// The point the previous test cannot make on its own. Each half is now
 /// decomposition-invariant separately; what a caller writes is the pair, through
-/// two levels, with the coarse level materialised between them — and the claim
+/// two images, with the coarse image materialised between them — and the claim
 /// worth having is that *no* choice of the two block sizes changes a bit.
 #[test]
 fn the_two_phase_split_is_decomposition_invariant_in_both_grids() {
@@ -608,9 +608,9 @@ fn the_split_fetches_strictly_less_than_the_fused_form() {
         &split_plan,
     );
 
-    // The split reads the fine level once with an element-sized fetch and the
-    // coarse level once; the fused form reads the fine level with a fetch that
-    // also carries the spacing. The second read is of a level `4*4*2` times
+    // The split reads the fine image once with an element-sized fetch and the
+    // coarse image once; the fused form reads the fine image with a fetch that
+    // also carries the spacing. The second read is of an image `4*4*2` times
     // smaller, so it does not undo the saving.
     assert!(
         split_counters < fused_counters,
@@ -734,9 +734,9 @@ impl blockflow::op::BlockOp for CoordinateOp {
 ///
 /// The fold this test exists for. A phase's slots are a run of chains, each
 /// handed what the one before produced, and every one of them used to be given
-/// the same `Anchor` — the phase's fetch, in the level that was read. That is
+/// the same `Anchor` — the phase's fetch, in the image that was read. That is
 /// right exactly as long as no slot changes the grid. Here the first slot does:
-/// it reads the coarse level and writes the fine one, so the slot after it is
+/// it reads the coarse image and writes the fine one, so the slot after it is
 /// anchored in a space the phase's fetch does not describe. `CoordinateOp` reads
 /// both halves of that anchor, so a slot given the coarse one fails on the
 /// volume and a slot given the coarse *offset* would differ on every voxel.

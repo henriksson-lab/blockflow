@@ -497,7 +497,7 @@ fn plan(chain: &Chain, grid: &BlockGrid) -> Decomposition {
         chain_reach: reach,
     };
     plan.declare_dtypes(chain).unwrap();
-    plan.declare_source_levels(chain).unwrap();
+    plan.declare_source_images(chain).unwrap();
     plan
 }
 
@@ -664,7 +664,7 @@ fn the_split_pair_narrowed_is_the_fused_op_narrowed() {
         let coarse = run(Chain::op(coarse_op()), &input, &coarse_plan);
 
         // The narrowed grid is the hand-written reference for it, truncated
-        // sample by sample — so the split's coarse level is pinned by the
+        // sample by sample — so the split's coarse image is pinned by the
         // definition and not only by the fused op's agreement with it.
         let expected = {
             let mut grid = reference_statistic(&fine, op.element(), op.lattice());

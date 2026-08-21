@@ -167,7 +167,7 @@ fn go() -> Result<()> {
         spec.workflow.chunk,
         decomposition.n_phases(),
     )?;
-    store.write_level(0, &ramp(spec.workflow.shape))?;
+    store.write_image(0, &ramp(spec.workflow.shape))?;
     drop(store);
 
     let mut options = LocalOptions::new(dir.clone(), workers)?;

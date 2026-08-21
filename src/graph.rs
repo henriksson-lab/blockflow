@@ -52,32 +52,32 @@ pub struct Task {
     pub geometry: BlockGeometry,
     /// Task ids in the previous phase whose valid output this task reads.
     pub deps: Vec<usize>,
-    /// The same thing for every level this task reads through a source leaf:
-    /// one entry per level in `PhaseDecomposition::source_levels`.
+    /// The same thing for every image this task reads through a source leaf:
+    /// one entry per image in `PhaseDecomposition::source_images`.
     ///
     /// **Kept apart from `deps` rather than merged into it**, because the two
-    /// are checked against different regions of different levels.
+    /// are checked against different regions of different images.
     /// `dependencies_cover_reads` asks whether the union of a set of valid
     /// regions covers what is fetched, and that question is only well posed one
-    /// level at a time — merged, two producers of two levels would each cover
+    /// image at a time — merged, two producers of two images would each cover
     /// the fetch and the sum would be twice what was asked for.
     ///
-    /// **Explicit rather than inferred from the phase order.** A source level is
+    /// **Explicit rather than inferred from the phase order.** A source image is
     /// written by a phase that has already run, so one can argue that the
-    /// transitive dependency is there anyway — but only while every level
+    /// transitive dependency is there anyway — but only while every image
     /// between the two is on the same lattice, and a phase that resamples
     /// breaks that argument without breaking any test. The edge that matters is
     /// cheap to state, so it is stated.
     pub source_deps: Vec<SourceDep>,
 }
 
-/// One level a task reads through a source leaf, and the tasks that wrote the
+/// One image a task reads through a source leaf, and the tasks that wrote the
 /// part of it the task reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceDep {
-    pub level: usize,
-    /// Task ids in phase `level - 1`. Empty for level 0, which no phase writes
-    /// — the same fact that makes level 0 the original source node.
+    pub image: usize,
+    /// Task ids in phase `image - 1`. Empty for image 0, which no phase writes
+    /// — the same fact that makes image 0 the original source node.
     pub deps: Vec<usize>,
 }
 
@@ -132,34 +132,41 @@ impl TaskGraph {
                         &geometry.source,
                     ),
                 };
-                // Every level this phase reads besides the one it is handed.
+                // Every image this phase reads besides the one it is handed.
                 // Read at the *same* region — a source leaf has reach 0 — which
-                // is exactly why `check_source_levels` requires the two levels
+                // is exactly why `check_source_images` requires the two images
                 // to be on one lattice: without that, `geometry.source` would be
                 // the wrong integers here.
                 let source_deps = decomposition.phases[phase_index]
-                    .source_levels
+                    .source_images
                     .iter()
-                    .map(|&level| SourceDep {
-                        level,
-                        deps: match level {
-                            // Level 0 is written by no phase. It is the original
-                            // source node, and the reason "a level with no
+                    .map(|&image| SourceDep {
+                        image,
+                        deps: match image {
+                            // Image 0 is written by no phase. It is the original
+                            // source node, and the reason "an image with no
                             // producing phase" is a case of a rule rather than a
                             // special case.
                             0 => Vec::new(),
+                            // A supplied input is the same case, arrived at from
+                            // the other end: it was handed to the run, so it is
+                            // ready before the first task and depends on
+                            // nothing. Written out rather than left to fall
+                            // through the `get` below — which would answer
+                            // `None` for it, correctly and by accident.
+                            _ if crate::assemble::is_supplied_image(image) => Vec::new(),
                             // `get`, not an index: a forward reference has no
-                            // entry here yet, and it is `check_source_levels`
+                            // entry here yet, and it is `check_source_images`
                             // that must report it — by name, with the two phase
                             // numbers — rather than this line panicking on a
                             // plan somebody handed us.
-                            _ => match phase_ranges.get(level - 1) {
+                            _ => match phase_ranges.get(image - 1) {
                                 None => Vec::new(),
                                 Some(&(from, end)) => producers_of(
                                     &tasks,
                                     from,
                                     end,
-                                    &decomposition.phases[level - 1].grid,
+                                    &decomposition.phases[image - 1].grid,
                                     &geometry.source,
                                 ),
                             },
@@ -210,7 +217,7 @@ impl TaskGraph {
                 out[dep].push(task.id);
             }
             // One entry per occurrence, deliberately: a task that is both a
-            // producer of the previous level and a producer of a level read by
+            // producer of the previous image and a producer of an image read by
             // a source leaf appears twice here and is counted twice by
             // `Task::n_dependencies`, so the indegree still reaches zero
             // exactly once.
@@ -236,14 +243,19 @@ impl TaskGraph {
     /// is the check that says the two halves of such a plan are one plan.
     pub fn dependencies_cover_reads(&self, decomposition: &Decomposition) -> Result<(), String> {
         for task in &self.tasks {
-            // Every level a source leaf reads, on the same argument and against
+            // Every image a source leaf reads, on the same argument and against
             // the same region: a source leaf has reach 0, so what it reads is
-            // what the task fetches. Level 0 is skipped because no phase writes
+            // what the task fetches. Image 0 is skipped because no phase writes
             // it — it is there before the run, which is the whole reason a
-            // level with no producer is a case of the rule rather than an
+            // image with no producer is a case of the rule rather than an
             // exception to it.
             for source in &task.source_deps {
-                if source.level == 0 {
+                // ... and a supplied input for the same reason arrived at from
+                // the other end: it was handed to the run, so no phase produces
+                // it and there is nothing whose valid regions could cover the
+                // fetch. That it is *there* at all is the environment's check,
+                // and its extent is `check_source_images`'.
+                if source.image == 0 || crate::assemble::is_supplied_image(source.image) {
                     continue;
                 }
                 let covered: usize = source
@@ -256,14 +268,14 @@ impl TaskGraph {
                 let wanted = task.geometry.source.voxels();
                 if covered != wanted {
                     return Err(format!(
-                        "task (phase {}, block {:?}) reads {wanted} voxels of level {} through a \
+                        "task (phase {}, block {:?}) reads {wanted} voxels of image {} through a \
                          source leaf, and the {} task(s) of phase {} it depends on produce \
                          {covered} of them",
                         task.phase,
                         task.index,
-                        source.level,
+                        source.image,
                         source.deps.len(),
-                        source.level - 1,
+                        source.image - 1,
                     ));
                 }
             }
@@ -317,7 +329,7 @@ impl TaskGraph {
 /// edge, which is 45 M comparisons at 6700 blocks and would have made the DAG
 /// cost more to build than the work it schedules.
 ///
-/// Shared by the two kinds of edge — the phase before, and a level a source leaf
+/// Shared by the two kinds of edge — the phase before, and an image a source leaf
 /// reads — because they are the same question asked of a different phase, and a
 /// second copy of this arithmetic is a second place for the clamping to be
 /// wrong.
@@ -444,13 +456,13 @@ mod tests {
         assert_eq!(graph.len(), 3072);
     }
 
-    /// A level read by a source leaf is an edge in the graph, to the phase that
+    /// An image read by a source leaf is an edge in the graph, to the phase that
     /// wrote it — not an assumption that the phase order made it available.
     #[test]
-    fn a_source_level_is_an_edge_to_the_phase_that_wrote_it() {
+    fn a_source_image_is_an_edge_to_the_phase_that_wrote_it() {
         let mut plan = two_phase([4, 0, 0], [4, 0, 0]);
-        // Phase 1 reads level 1 as its input and level 0 as a second arm.
-        plan.phases[1] = plan.phases[1].clone().with_source_levels([0]);
+        // Phase 1 reads image 1 as its input and image 0 as a second arm.
+        plan.phases[1] = plan.phases[1].clone().with_source_images([0]);
         let graph = TaskGraph::build(&plan);
         for task in graph.tasks_in_phase(0) {
             assert!(task.source_deps.is_empty());
@@ -458,13 +470,13 @@ mod tests {
         }
         for task in graph.tasks_in_phase(1) {
             assert_eq!(task.source_deps.len(), 1);
-            // Level 0 is written by nobody, so it waits on nothing extra.
-            assert_eq!(task.source_deps[0].level, 0);
+            // Image 0 is written by nobody, so it waits on nothing extra.
+            assert_eq!(task.source_deps[0].image, 0);
             assert!(task.source_deps[0].deps.is_empty());
             assert_eq!(task.n_dependencies(), task.deps.len());
         }
 
-        // A three-phase plan whose last phase reads level 1: now there is a
+        // A three-phase plan whose last phase reads image 1: now there is a
         // producing phase, and the edge points at the tasks that covered the
         // fetch.
         let mut plan = two_phase([4, 0, 0], [4, 0, 0]);
@@ -477,13 +489,13 @@ mod tests {
                 [0, 0, 0],
                 grid,
             )
-            .with_source_levels([1]),
+            .with_source_images([1]),
         );
         let graph = TaskGraph::build(&plan);
         for task in graph.tasks_in_phase(2) {
             let source = &task.source_deps[0];
-            assert_eq!(source.level, 1);
-            // Phase 0 wrote level 1, and a zero-reach block reads its own core.
+            assert_eq!(source.image, 1);
+            // Phase 0 wrote image 1, and a zero-reach block reads its own core.
             assert_eq!(source.deps.len(), 1);
             assert_eq!(graph.tasks[source.deps[0]].phase, 0);
             assert_eq!(graph.tasks[source.deps[0]].block, task.block);

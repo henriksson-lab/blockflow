@@ -321,7 +321,7 @@ fn a_diamond_is_decomposition_invariant_in_memory() {
 ///
 /// A fan-in exercises it in a way a linear chain does not: the branch results
 /// never touch the environment, so what reaches storage is the combine's answer
-/// and only that. If the branch buffers were ever routed through a level — the
+/// and only that. If the branch buffers were ever routed through an image — the
 /// arrangement this node deliberately avoids — this is where the extra
 /// materialisation would appear.
 #[cfg(feature = "zarr")]

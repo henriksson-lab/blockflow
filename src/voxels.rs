@@ -20,7 +20,7 @@
 //   read" — and `Output` carries a dtype per side array. The motivating chain
 //   reads `u16`, computes in `f64` and writes `bool`. `Chain<T>` cannot express
 //   that at all; a tag can, because the dtype is a *value* that flows down the
-//   levels the same way a volume does.
+//   images the same way a volume does.
 // * **Monomorphisation.** The executor, the planner, the cost model and the
 //   cache are byte-oriented on purpose (see `dtype.rs`, which says so). A
 //   generic parameter would infect all four to buy nothing: none of them reads
@@ -33,7 +33,7 @@
 //
 // Why rank 3 rather than `ArrayD`
 // -------------------------------
-// A *level* is a volume. `BlockGeometry`, `Anchor`, `BlockGrid` and `Region`'s
+// A *image* is a volume. `BlockGeometry`, `Anchor`, `BlockGrid` and `Region`'s
 // use in the executor are all rank 3 already, and `ops::view3` existed purely to
 // convert a dynamic rank back to the static one at every call. Two dimensions
 // are the degenerate case of three, not a separate case, so the dynamic rank
@@ -195,12 +195,12 @@ impl Voxels {
 
     /// A block filled with the value an **unwritten** voxel holds.
     ///
-    /// `f64::NAN` for the float types, on the argument the levels have always
+    /// `f64::NAN` for the float types, on the argument the images have always
     /// been NaN-filled with: a voxel nobody wrote must be loud rather than a
     /// convincing zero. **The integer and `bool` types have no such value**, and
     /// pretending otherwise would be worse than admitting it: the maximum is
     /// merely implausible, and for `bool` there is no implausible value at all.
-    /// So a coverage hole in a `bool` level is caught by
+    /// So a coverage hole in a `bool` image is caught by
     /// [`crate::tiling::boxes_tile_exactly`] and by the write accounting, and not
     /// by looking at the data. That is a real loss and it is recorded here rather
     /// than papered over.
@@ -240,9 +240,9 @@ impl Voxels {
     /// Is every element the same value? `None` means "no", or "empty".
     ///
     /// Reported as an `f64` because the short circuit it licenses is stated in
-    /// `f64` — see [`crate::op::BlockOp::constant_maps_to`]. A NaN-filled level
+    /// `f64` — see [`crate::op::BlockOp::constant_maps_to`]. A NaN-filled image
     /// is *not* uniform under this, which is the existing behaviour and the right
-    /// one: `NaN != NaN`, so an unwritten level never short-circuits.
+    /// one: `NaN != NaN`, so an unwritten image never short-circuits.
     pub fn uniform(&self) -> Option<f64> {
         over_voxels!(self, |array| {
             let first = *array.iter().next()?;
@@ -468,7 +468,7 @@ impl From<Array3<bool>> for Voxels {
 
 /// A side output's buffer, or a stand-in for one.
 ///
-/// **Dynamic rank, and that is the point.** A level is a volume; the array an op
+/// **Dynamic rank, and that is the point.** An image is a volume; the array an op
 /// writes beside it often is not — one row per object, one score per class per
 /// position — and [`crate::op::Output::shape`] is a `Vec<usize>` for exactly that
 /// reason. So this is the one buffer in the crate that keeps `ArrayD`, and it

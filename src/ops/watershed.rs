@@ -77,8 +77,8 @@
 // | array | width |
 // |---|---|
 // | cost (the input) | 8 B (`f64`) |
-// | seeds (a source level) | 4 B (`u32`) |
-// | mask (a source level) | 1 B (`bool`) |
+// | seeds (a source image) | 4 B (`u32`) |
+// | mask (a source image) | 1 B (`bool`) |
 // | labels (the output) | 4 B (`u32`) |
 // | the kernel's own copy of the mask | 1 B (`bool`) |
 // | | **18 B/voxel** |
@@ -88,7 +88,7 @@
 // slice and the label slice go in as they are, and the seeds are written into
 // the output that is about to be flooded in place. The mask is the one array
 // that has to be duplicated, because carving a separating line means clearing
-// voxels in it and the level it came from has other readers. A naive shell that
+// voxels in it and the image it came from has other readers. A naive shell that
 // materialised each of the four would cost 30 B/voxel, which on a 1024^3 volume
 // is 13 GiB of pure copy.
 //
@@ -233,7 +233,7 @@ fn flood(
 
     // The mask is the one array that must be owned: the kernel clears voxels in
     // it to carve the separating line, and it is handed in as a shared view of a
-    // stored level that other readers must still find intact.
+    // stored image that other readers must still find intact.
     let mut flags: Vec<bool> = match mask.as_ref() {
         Some(mask) => mask.iter().copied().collect(),
         None => vec![true; image.len()],
@@ -270,7 +270,7 @@ pub fn seeded_watershed(
 // ---------------------------------------------------------------- the op --
 
 /// [`seeded_watershed_into`] as a phase: a cost volume in, one label per voxel
-/// out, seeds and mask read from stored levels.
+/// out, seeds and mask read from stored images.
 ///
 /// **This op is a planning barrier** and says so through [`Reach::all`]. See the
 /// module documentation for the argument and for what it costs.
@@ -283,10 +283,10 @@ pub struct SeededWatershedOp {
 }
 
 impl SeededWatershedOp {
-    /// `seeds` is the level holding the labels to flood from.
+    /// `seeds` is the image holding the labels to flood from.
     pub fn new(
         name: &'static str,
-        seeds: impl Into<crate::assemble::Level>,
+        seeds: impl Into<crate::assemble::ImageId>,
         separation: Separation,
     ) -> Self {
         Self {
@@ -303,16 +303,16 @@ impl SeededWatershedOp {
 
     /// Flood only within `mask`. Without one the whole block is floodable, and
     /// every voxel of it takes a label.
-    pub fn within(mut self, mask: impl Into<crate::assemble::Level>) -> Self {
+    pub fn within(mut self, mask: impl Into<crate::assemble::ImageId>) -> Self {
         self.mask = Some(mask.into().into());
         self
     }
 
-    pub fn seed_level(&self) -> usize {
+    pub fn seed_image(&self) -> usize {
         self.seeds
     }
 
-    pub fn mask_level(&self) -> Option<usize> {
+    pub fn mask_image(&self) -> Option<usize> {
         self.mask
     }
 
@@ -372,7 +372,7 @@ impl BlockOp for SeededWatershedOp {
     /// answer, it has an empty one. See [`BlockOp::apply_with`].
     fn apply(&self, _input: &Voxels, _out: &mut Voxels, _at: &Anchor) -> Result<()> {
         Err(Error::InvalidArgument(format!(
-            "{}: the seeds come from level {}, so this op has no answer from its input alone — \
+            "{}: the seeds come from image {}, so this op has no answer from its input alone — \
              it would flood nothing and write an empty volume. It is applied through \
              `apply_with`.",
             self.name, self.seeds
@@ -389,7 +389,7 @@ impl BlockOp for SeededWatershedOp {
         let seeds = sources.get(self.seeds)?;
         if seeds.dtype() != Dtype::U32 {
             return Err(Error::InvalidArgument(format!(
-                "{}: the seeds are read from level {}, which holds {}. A seed is a label and is \
+                "{}: the seeds are read from image {}, which holds {}. A seed is a label and is \
                  stored as one; a float would leave 'which values are the same seed' to be \
                  decided somewhere this op cannot see.",
                 self.name,
@@ -400,14 +400,14 @@ impl BlockOp for SeededWatershedOp {
         let seeds = seeds.view::<u32>()?;
 
         let mask = match self.mask {
-            Some(level) => {
-                let mask = sources.get(level)?;
+            Some(image) => {
+                let mask = sources.get(image)?;
                 if mask.dtype() != Dtype::Bool {
                     return Err(Error::InvalidArgument(format!(
-                        "{}: the floodable region is read from level {}, which holds {}. It is a \
+                        "{}: the floodable region is read from image {}, which holds {}. It is a \
                          yes-or-no per voxel and is stored as one.",
                         self.name,
-                        level,
+                        image,
                         mask.dtype().numpy_name()
                     )));
                 }

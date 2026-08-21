@@ -4,7 +4,7 @@
 // not adapted from any implementation of it.
 //
 // Resizing a volume by an arbitrary factor per axis: the first op here whose
-// **output level is a different shape from the input level**, which is the
+// **output image is a different shape from the input image**, which is the
 // capability `docs/design/BLOCK_OPS.md` §"Step 3" opened and left unused.
 //
 // What is resampled, and by what map
@@ -148,7 +148,7 @@
 // ----------------------------------------
 // A resampling phase's blocks live in **two coordinate spaces**: its grid is cut
 // over the *output* volume, and what it fetches is a region of the *input*
-// level. `BlockGeometry::source` is where that fetch is stated and
+// image. `BlockGeometry::source` is where that fetch is stated and
 // [`resample_phase`] is what states it — the mapping is this op's own geometry,
 // so shipping the plan-builder beside the op is what keeps the two from
 // drifting.
@@ -539,7 +539,7 @@ impl Resample {
     /// The shape of the whole output volume.
     ///
     /// Fails where an axis would be emptied — an extent of 5 shrunk by a factor
-    /// of 8 is zero output voxels, and a level of zero extent is not a level.
+    /// of 8 is zero output voxels, and an image of zero extent is not an image.
     /// That is a fact about the request, so it is refused by name rather than
     /// rounded up to one.
     /// A stated extent is bound to one input volume, and asking it about another
@@ -617,13 +617,13 @@ impl Resample {
     /// at this phase's own volume edge may be trusted. Here it may, and for the
     /// reason the exception exists — the output volume's edge *is* the image of
     /// the input volume's edge, the fetch for the last block runs to the end of
-    /// the level below ([`Resample::source_region`]), and the samples an edge
+    /// the image below ([`Resample::source_region`]), and the samples an edge
     /// output voxel wants beyond it do not exist for the whole-volume reference
     /// either. The claim is checked rather than asserted: the acceptance suite
     /// compares every voxel, edges included, against that reference.
     /// **Under a stated extent this is `Units::SourceIndex` instead**, which is
     /// `lattice.rs`'s statement and is made for its reason: the dependency is a
-    /// region of the level below, named per block, and there is no factor
+    /// region of the image below, named per block, and there is no factor
     /// converting it into a voxel of this phase — `Space::converts_to_voxels` is
     /// `false` for exactly that, so a plan cannot mistake the zero for a distance
     /// it may grow a halo by.
@@ -682,7 +682,7 @@ impl Resample {
     ///
     /// **Nothing under a stated extent**, and for the same reason `lattice.rs`
     /// grants nothing: every output voxel is written by exactly one block, and
-    /// what a block needs beyond its own core is in the level below and is stated
+    /// what a block needs beyond its own core is in the image below and is stated
     /// as a fetch region rather than as a distance in this phase's voxels. There
     /// is no lattice to snap to and no reach to cover.
     pub fn halo(&self, grid: &BlockGrid) -> Reach {
@@ -753,7 +753,7 @@ impl Resample {
         )
     }
 
-    /// The region of the level below that a block reading `read` must fetch.
+    /// The region of the image below that a block reading `read` must fetch.
     ///
     /// The image of `read` under the factor, with one exception at the top of
     /// each axis: a read extent that ends at the output volume's edge fetches to
@@ -836,7 +836,7 @@ impl Resample {
             if source_high > input_volume[axis] || source_low > source_high {
                 return Err(Error::InvalidArgument(format!(
                     "resampling: a block reading {low}..{high} on axis {axis} would fetch \
-                     {source_low}..{source_high} of a level of {}",
+                     {source_low}..{source_high} of an image of {}",
                     input_volume[axis]
                 )));
             }
@@ -1002,7 +1002,7 @@ fn axis_taps(placement: &Placement, ratio: Ratio, interpolation: Interpolation) 
 /// makes it the resampling for **label data** — an integer volume of object ids,
 /// a `bool` mask — where a blend would invent a value that names nothing.
 ///
-/// `at` says where `input` sits in the level being read, and it is not
+/// `at` says where `input` sits in the image being read, and it is not
 /// decoration: the sample lattice is anchored to the whole volume, so a block
 /// computes the same output voxels from the same source voxels the whole volume
 /// would. There is no way to ask for a lattice laid out relative to the buffer,
@@ -1022,7 +1022,7 @@ pub fn resample_nearest_into<T: Copy>(
 }
 
 /// [`resample_nearest_into`] with **both** positions stated: where the buffer
-/// sits in the level below, and which output voxel the block's first output is.
+/// sits in the image below, and which output voxel the block's first output is.
 ///
 /// The pair is what an [`Anchor`] cannot carry and what a stated output extent
 /// needs — see [`Resample::to_extent`]. Nothing else differs: the same taps, the
@@ -1449,7 +1449,7 @@ impl BlockOp for ResampleOp {
         if at.input.volume != stated_input {
             return Err(Error::InvalidArgument(format!(
                 "op {:?}: this resampling states {stated_output:?} from an input volume of \
-                 {stated_input:?}, and the placement says the level being read is {:?}",
+                 {stated_input:?}, and the placement says the image being read is {:?}",
                 self.name, at.input.volume
             )));
         }
@@ -2175,7 +2175,7 @@ mod tests {
     ///
     /// [`Resample::reach_spec`] states `Frame::Phase`, and the design records
     /// that as the dangerous choice for a phase that reads across grids — a
-    /// cropping phase's edges are interior positions of the level below, so a
+    /// cropping phase's edges are interior positions of the image below, so a
     /// read clamped there is not an edge and trusting it is a false premise.
     /// Here it is not false, because this phase's output volume edge *is* the
     /// image of the input volume's edge and the last block's fetch runs to it.

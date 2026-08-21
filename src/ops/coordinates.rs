@@ -121,7 +121,7 @@
 // A block with no set voxel in it writes a header and no rows, and the output
 // stream declares [`Coverage::EveryBlock`] so that it does. Present-and-empty
 // is a different fact from absent, and it is the one the coverage guard can
-// check — this phase writes no pixel level, so the tiling check has nothing to
+// check — this phase writes no pixel image, so the tiling check has nothing to
 // bite on and the coverage declaration is the only guard there is.
 //
 // Such a block contributes nothing to the list **and shifts nobody's index**,
@@ -428,7 +428,7 @@ pub fn block_base_indices(
 
 /// **A mask in, one row per set voxel out**, at reach 0.
 ///
-/// Reads its block's pixels, writes one fragment and no level. Every coordinate
+/// Reads its block's pixels, writes one fragment and no image. Every coordinate
 /// it writes is a **volume** coordinate and lies in this block's core, so the
 /// blobs of a run partition the answer; the order they are put back into is
 /// [`merge_coordinates`]', and is a function of the coordinates rather than of
@@ -481,7 +481,7 @@ impl FragmentOp for SetVoxelsOp {
             self.stream.clone(),
             self.lifecycle,
             // Every block, always — and here it is the only guard there is,
-            // since this phase writes no level for the tiling check to bite on.
+            // since this phase writes no image for the tiling check to bite on.
             // A block that found no set voxel writes a header and no rows, which
             // is present and therefore checkable.
             Coverage::EveryBlock,
@@ -528,7 +528,7 @@ impl FragmentOp for SetVoxelsOp {
 ///
 /// The op declares no reach and no fragment input, so `fragment_phase` derives
 /// no halo and every block's valid region is its core. The phase declares no
-/// element type because it writes no level, and `check_dtypes` skips it for that
+/// element type because it writes no image, and `check_dtypes` skips it for that
 /// reason.
 pub fn set_voxels_phase(
     grid: BlockGrid,

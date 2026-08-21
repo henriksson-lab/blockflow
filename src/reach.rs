@@ -56,7 +56,7 @@ pub enum Units {
     /// reach in index units to find a task's neighbours. The conversion is done
     /// in [`Reach::in_voxels`], at the one place a grid is known.
     Blocks,
-    /// Steps of the **level below's own lattice**, which this phase's geometry
+    /// Steps of the **image below's own lattice**, which this phase's geometry
     /// cannot convert into its own voxels.
     ///
     /// The case that costs the most and the one the coordinate space exists for:
@@ -86,14 +86,14 @@ pub enum Units {
 /// defect: `BlockGeometry::derive` treats a read clamped at the phase's own
 /// volume edge as trustworthy — correct at a real edge of the array, because
 /// there is nothing beyond the end to have read, and **wrong for a phase whose
-/// edges are not edges of the level below**.
+/// edges are not edges of the image below**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Frame {
     /// The phase's own volume: what its cores are cut from and what its valid
     /// regions must tile.
     #[default]
     Phase,
-    /// The level below — the space `BlockGeometry::source` is stated in.
+    /// The image below — the space `BlockGeometry::source` is stated in.
     ///
     /// A reach in this frame is **not granted the clamp exception** at the
     /// phase's own boundaries, because a cropping or regridding phase's boundary
@@ -137,7 +137,7 @@ impl Space {
         Self::default()
     }
 
-    /// Voxels of the level below: the same distance, measured against an array
+    /// Voxels of the image below: the same distance, measured against an array
     /// whose edges this phase's edges are not.
     pub fn source_voxels() -> Self {
         Self {
@@ -146,7 +146,7 @@ impl Space {
         }
     }
 
-    /// Steps of the level below's own lattice — see [`Units::SourceIndex`].
+    /// Steps of the image below's own lattice — see [`Units::SourceIndex`].
     pub fn source_index() -> Self {
         Self {
             frame: Frame::Source,
@@ -707,7 +707,7 @@ impl Reach {
                 Units::Voxels => self.axes[stated].clone(),
                 Units::Blocks => self.axes[stated].scaled(block[canonical].max(1)),
                 // Nothing. Not zero-because-we-do-not-know: a dependency in the
-                // level below's own lattice is satisfied by the fetch region,
+                // image below's own lattice is satisfied by the fetch region,
                 // not by this phase's halo, and inventing a voxel distance for
                 // it is the one thing that would be wrong rather than absent.
                 Units::SourceIndex => AxisReach::none(),

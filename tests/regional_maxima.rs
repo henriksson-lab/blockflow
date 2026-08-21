@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 
 use ndarray::Array3;
 
+use blockflow::assemble::ImageId;
 use blockflow::decomposition::Decomposition;
 use blockflow::dtype::Dtype;
 use blockflow::env::{ArrayEnvironment, Environment};
@@ -144,11 +145,11 @@ fn run(values: &Array3<f64>, block: [usize; 3]) -> Array3<bool> {
     run_keeping(values, block, &[]).0
 }
 
-/// The same, pinning some internal levels so a test can look at them.
+/// The same, pinning some internal images so a test can look at them.
 ///
-/// Without this the label level is freed the moment the phase that reads it
+/// Without this the label image is freed the moment the phase that reads it
 /// finishes — which is the point of `Visibility::Internal`, and which makes
-/// `keep_levels` the way a *debugging* test says it wants the intermediate.
+/// `keep_images` the way a *debugging* test says it wants the intermediate.
 fn run_keeping(
     values: &Array3<f64>,
     block: [usize; 3],
@@ -160,7 +161,7 @@ fn run_keeping(
     let env = ArrayEnvironment::for_decomposition(input, &plan, [4, 4, 4]).expect("environment");
     let workflow = Workflow::new(Chain::sequence(Vec::new()), volume, Dtype::F64);
     let hints = Hints {
-        keep_levels: keep.iter().copied().collect(),
+        keep_images: keep.iter().copied().map(ImageId::from).collect(),
         ..Hints::default()
     };
     execute_phases(
@@ -461,13 +462,13 @@ fn a_nan_on_a_seam_joins_nothing_and_disqualifies_nothing() {
 /// Phase 0 is halo-free: a block-local labelling reads exactly its own core.
 /// Phase 1 is not, and cannot be — its whole-lattice fragment reach is also the
 /// dependency edge that makes it wait for phase 0's blocks, so its halo covers
-/// the volume and every block of it reads the entire label level.
+/// the volume and every block of it reads the entire label image.
 ///
 /// The number is asserted because it is the argument for a barrier. If a future
 /// change lets a phase state "after all of phase 0" without a halo, this test
 /// fails and the reason it fails is the improvement.
 #[test]
-fn the_labelling_is_halo_free_and_the_merge_reads_the_whole_level() {
+fn the_labelling_is_halo_free_and_the_merge_reads_the_whole_image() {
     let (plan, _, _) = plan_for(VOLUME, CUT);
     let volume_voxels = VOLUME[0] * VOLUME[1] * VOLUME[2];
 
@@ -486,7 +487,7 @@ fn the_labelling_is_halo_free_and_the_merge_reads_the_whole_level() {
         assert_eq!(
             block.read.voxels(),
             volume_voxels,
-            "the merge reads the whole level, which is what its halo says"
+            "the merge reads the whole image, which is what its halo says"
         );
         assert_eq!(block.valid.ranges(), block.core.ranges());
         read += block.read.voxels();
@@ -550,7 +551,7 @@ fn the_merge_reads_every_block_and_the_fragments_carry_the_plateau_values() {
     }
 }
 
-/// The label level is decomposition-*dependent* while the output is not. Stated
+/// The label image is decomposition-*dependent* while the output is not. Stated
 /// in `ops/fill.rs` for the op this one is modelled on, and asserted here too,
 /// because it looks like the defect the crate exists to prevent and a reader
 /// deserves the evidence that it is not.
@@ -561,8 +562,8 @@ fn the_intermediate_labels_differ_between_decompositions_and_the_output_does_not
     let (fine_out, fine_env, _) = run_keeping(&values, CUT, &[1]);
     assert_eq!(coarse_out, fine_out);
 
-    let coarse_labels = coarse_env.level(1).view::<u32>().unwrap().to_owned();
-    let fine_labels = fine_env.level(1).view::<u32>().unwrap().to_owned();
+    let coarse_labels = coarse_env.image(1).view::<u32>().unwrap().to_owned();
+    let fine_labels = fine_env.image(1).view::<u32>().unwrap().to_owned();
     assert_ne!(
         coarse_labels, fine_labels,
         "if the two label volumes agree, this test is asserting nothing"
@@ -571,7 +572,7 @@ fn the_intermediate_labels_differ_between_decompositions_and_the_output_does_not
     let (_, again, _) = run_keeping(&values, CUT, &[1]);
     assert_eq!(
         fine_labels,
-        again.level(1).view::<u32>().unwrap().to_owned()
+        again.image(1).view::<u32>().unwrap().to_owned()
     );
 }
 

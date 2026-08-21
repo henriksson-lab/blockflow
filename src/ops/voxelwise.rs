@@ -277,7 +277,7 @@ where
 ///
 /// Call sites all over this workspace ask for `|value| value`, and at least one
 /// of them cannot simply be deleted: a downstream pipeline uses an identity
-/// phase to hold a level index still when an optional stage is switched off, so
+/// phase to hold an image index still when an optional stage is switched off, so
 /// that the plan's wiring does not change with a parameter. The identity
 /// therefore has to exist, and has to be as cheap as the shape allows.
 ///
@@ -288,7 +288,7 @@ where
 /// [`BlockOp::apply`] is handed an input buffer and a separate output buffer the
 /// executor has already allocated, and there is no way through this signature to
 /// say "the output *is* the input". Removing the copy altogether is a planner
-/// decision — drop the phase, or alias its level to its input — and neither is
+/// decision — drop the phase, or alias its image to its input — and neither is
 /// expressible from inside an op. What is expressible is that the copy is a
 /// copy, and that is what this does.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -645,18 +645,18 @@ impl<M: MapFn> BlockOp for VoxelwiseMapOp<M> {
 /// to `at.volume` on every block — so this op costs one full copy of the second
 /// array, resident for the length of the run, at the sizes an out-of-core
 /// framework exists for. The out-of-core form is
-/// [`Chain::Source`](crate::op::Chain::Source): a leaf that reads a stored level
+/// [`Chain::Source`](crate::op::Chain::Source): a leaf that reads a stored image
 /// at the block's own read extent, so that
 ///
 /// ```text
 /// Chain::parallel(
-///     vec![computed_arm, Chain::source(level, dtype)],
+///     vec![computed_arm, Chain::source(image, dtype)],
 ///     Box::new(LogicCombine::new("and", Logic::And)),
 /// )
 /// ```
 ///
 /// is the same answer with the second operand read a block at a time. Prefer it
-/// wherever the second array is a level of the run. This one stays for the case
+/// wherever the second array is an image of the run. This one stays for the case
 /// it is honestly good at — a small operand a caller already holds, combined
 /// against a chain that has no plan around it yet — and it is not a worse
 /// `LogicCombine`; it is a different arrangement of the same kernels.
@@ -1520,7 +1520,7 @@ mod tests {
         out
     }
 
-    /// The gap, closed: a comparison computed in `f64` reaching a `bool` level.
+    /// The gap, closed: a comparison computed in `f64` reaching a `bool` image.
     ///
     /// The fixture is a ramp with `-0.0` and two denormals in it, because the
     /// mask convention is "non-zero", and `-0.0 != 0.0` is **false** while
@@ -1528,7 +1528,7 @@ mod tests {
     /// `!= 0.0 && is_normal()` would differ from this one on exactly those
     /// voxels.
     #[test]
-    fn a_threshold_can_now_write_a_bool_level() {
+    fn a_threshold_can_now_write_a_bool_image() {
         let input: Voxels = ramp((7, 5, 3)).into();
         let threshold = VoxelwiseMapOp::threshold("t", 0.0, 1.0, 0.0);
         let compared = one(&threshold, &input);
@@ -1544,7 +1544,7 @@ mod tests {
         for (value, &set) in source.iter().zip(mask_view.iter()) {
             assert_eq!(set, *value > 0.0, "at {value}");
         }
-        // and the whole point of the narrower level, in bytes
+        // and the whole point of the narrower image, in bytes
         assert_eq!(compared.bytes(), mask.bytes() * 8);
     }
 
@@ -1579,7 +1579,7 @@ mod tests {
     }
 
     /// The numeric targets use [`Narrowing`], which is this crate's one
-    /// narrowing rule — so the value a level receives is the value the same
+    /// narrowing rule — so the value an image receives is the value the same
     /// narrowing would have produced inside a statistic, and there is no second
     /// rounding rule to keep in step.
     #[test]
@@ -1700,7 +1700,7 @@ mod tests {
 
 /// Widen any element type to `f64`, value for value.
 ///
-/// **The op that was missing between a level and a kernel stated in `f64`.**
+/// **The op that was missing between an image and a kernel stated in `f64`.**
 /// `Voxels::widened` has always existed; nothing exposed it as a step of a
 /// chain, so a phase writing `u16` — a median run at the reference's own width,
 /// say — could not be read by an op whose kernel is `f64`, and the chain simply
@@ -1774,9 +1774,9 @@ impl BlockOp for WidenOp {
 /// **The op that was missing in the other direction from [`WidenOp`].**
 /// `VoxelwiseMapOp` passes its input width straight through — it is an
 /// `f64 -> f64` map in an `f64` buffer — so a chain could compute
-/// `value > level` and had nowhere narrower to put the answer. A level of
+/// `value > level` and had nowhere narrower to put the answer. An image of
 /// `bool` was therefore unreachable from inside a plan, whatever the plan
-/// computed, and so was every level of an integer type.
+/// computed, and so was every image of an integer type.
 ///
 /// Two ops rather than one parameterised on a target type, and the asymmetry is
 /// real
@@ -1798,7 +1798,7 @@ impl BlockOp for WidenOp {
 /// Both are rules this crate already states somewhere else, and this op
 /// **reaches for them rather than restating them**, which is what keeps the
 /// answer the same whether a value is narrowed on the way through a statistic or
-/// on the way into a level:
+/// on the way into an image:
 ///
 /// * to any type with numbers in it, [`Narrowing`] — the rounding rule is a
 ///   parameter, out of range saturates, and `NaN` goes to zero, because that is
@@ -1819,7 +1819,7 @@ impl BlockOp for WidenOp {
 /// `f64` in, and only `f64`
 /// ------------------------
 /// The input side is not parameterised, because [`WidenOp`] is the way in and
-/// there is no reason for a second one. A chain narrowing a `u16` level to a
+/// there is no reason for a second one. A chain narrowing a `u16` image to a
 /// `bool` one writes `WidenOp` then this, which is two passes over a block and
 /// **one** conversion rule to reason about rather than the hundred-odd pairs a
 /// type-to-type cast would have to define.
@@ -1844,7 +1844,7 @@ impl NarrowOp {
         }
     }
 
-    /// Write a `bool` level, under this module's mask convention: **non-zero is
+    /// Write a `bool` image, under this module's mask convention: **non-zero is
     /// true**.
     ///
     /// This is the constructor gap 2 exists for. `VoxelwiseMapOp::threshold`
@@ -1950,7 +1950,7 @@ impl BlockOp for NarrowOp {
     /// and neither reads anything else.
     ///
     /// The answer is an `f64` whatever the target is, which is what the short
-    /// circuit's currency is: a `bool` level's constant is `1.0` or `0.0`, which
+    /// circuit's currency is: a `bool` image's constant is `1.0` or `0.0`, which
     /// is `VoxelElement::into_f64` for `bool` and [`from_set`] here — one
     /// convention, stated in both places and the same in both.
     fn constant_maps_to(&self, value: f64) -> Option<f64> {

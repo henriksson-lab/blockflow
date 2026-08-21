@@ -39,7 +39,7 @@ use crate::error::{Error, Result};
 use crate::region::Region;
 use crate::voxels::Voxels;
 
-use super::op::{Anchor, BlockConstraint, BlockOp, Output, SideBlock};
+use super::op::{Anchor, BlockConstraint, BlockOp, Output, SideBlock, SourceInputs};
 
 /// The design's `NoopOp`: an arbitrary declared reach, cost and traversal
 /// preference over an operation that computes the identity.
@@ -571,7 +571,7 @@ impl crate::fragment::FragmentOp for NeighbourFoldOp {
 /// put every fragment in memory once per block.
 ///
 /// It writes the summed voxel count into every voxel of its block, so the output
-/// level is a constant volume whose value is knowable without a reference
+/// image is a constant volume whose value is knowable without a reference
 /// implementation.
 pub struct FragmentReduceOp {
     name: &'static str,
@@ -678,7 +678,7 @@ pub fn region_of(at: [usize; 3], edge: usize, volume: [usize; 3]) -> u64 {
 ///
 /// **The op the second-array support exists for**, in its smallest honest form.
 /// It declares [`crate::fragment::FragmentOp::source_inputs`] and reads its
-/// quantity out of *that* level, not out of the level the phase is handed —
+/// quantity out of *that* image, not out of the image the phase is handed —
 /// `reads_pixels()` is `false`, so a run of it moves exactly one array's worth
 /// of voxels and the counters say which array.
 ///
@@ -693,7 +693,7 @@ pub fn region_of(at: [usize; 3], edge: usize, volume: [usize; 3]) -> u64 {
 /// however wide a halo the plan granted.
 pub struct RegionSumOp {
     name: &'static str,
-    level: usize,
+    image: usize,
     edge: usize,
     stream: String,
     lifecycle: crate::sidecar::Lifecycle,
@@ -702,14 +702,14 @@ pub struct RegionSumOp {
 impl RegionSumOp {
     pub fn new(
         name: &'static str,
-        level: usize,
+        image: usize,
         edge: usize,
         stream: impl Into<String>,
         lifecycle: crate::sidecar::Lifecycle,
     ) -> Self {
         Self {
             name,
-            level,
+            image,
             edge,
             stream: stream.into(),
             lifecycle,
@@ -738,7 +738,7 @@ impl crate::fragment::FragmentOp for RegionSumOp {
     }
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<crate::op::SourceInput> {
-        vec![crate::op::SourceInput::voxelwise(self.level)]
+        vec![crate::op::SourceInput::voxelwise(self.image)]
     }
 
     fn seam_fold(&self) -> Option<crate::fragment::SeamFold> {
@@ -771,7 +771,7 @@ impl crate::fragment::FragmentOp for RegionSumOp {
         let volume = at.volume();
         let offset = at.at.offset;
         let mut totals: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
-        match sources.get(self.level)? {
+        match sources.get(self.image)? {
             crate::env::BlockBuf::Array(array) => {
                 let values = array.widened();
                 for (index, value) in values.indexed_iter() {
@@ -1143,11 +1143,12 @@ impl BlockOp for SideOutputOp {
     fn apply_side(
         &self,
         _input: &Voxels,
+        _sources: SourceInputs<'_>,
         primary: &Voxels,
         block: &SideBlock<'_>,
     ) -> Result<Vec<ArrayD<f64>>> {
         // A side output here is a mean, so the shell widens rather than asking
-        // the level to be `f64`. See `Voxels::widened` for why that is a
+        // the image to be `f64`. See `Voxels::widened` for why that is a
         // deliberate copy and not the default.
         let primary = primary.widened();
         // The trustworthy sub-box of the buffer. A side output is written once
@@ -1322,7 +1323,7 @@ impl BlockOp for SpreadLatticeOp {
 /// input is non-zero.
 ///
 /// The probe for `produces`. Everything else in this module hands its input type
-/// on unchanged, so nothing else exercises a level allocated at a width its
+/// on unchanged, so nothing else exercises an image allocated at a width its
 /// input was not — which is the case the element type became a tag for. The
 /// predicate is the crate's one mask convention (`ops::voxelwise::is_set`), so a
 /// `bool` result read back through `VoxelElement::into_f64` is the same mask.
@@ -1350,7 +1351,7 @@ impl BlockOp for NonZeroOp {
         dtype != Dtype::F16
     }
 
-    /// `bool`, whatever it read. The declaration the level is allocated from.
+    /// `bool`, whatever it read. The declaration the image is allocated from.
     fn produces(&self, _input: Dtype) -> Dtype {
         Dtype::Bool
     }
@@ -1377,7 +1378,7 @@ impl BlockOp for NonZeroOp {
 /// its output shape, `Environment::apply` allocated the output as the input's
 /// own extent and `run_task` refused outright any plan whose fetch extent was
 /// not its write extent — so a phase could translate its read but never resize
-/// it, and a level that changes size was unrunnable however the plan was built.
+/// it, and an image that changes size was unrunnable however the plan was built.
 /// Decimation is the smallest operation that has the property, and the *value*
 /// is a value that was read, so a decimated volume can be checked against its
 /// source with no reference implementation.
@@ -1523,7 +1524,7 @@ impl crate::iterate::IterativeOp for CappedSpreadOp {
         for i in 0..shape[0] {
             for j in 0..shape[1] {
                 for k in 0..shape[2] {
-                    // Substage 0 seeds the running estimate from the level it was
+                    // Substage 0 seeds the running estimate from the image it was
                     // handed. That is what "the running operand of substage 0 is
                     // the phase's input" is *for*: an iteration whose starting
                     // estimate is a function of its input needs no second entry

@@ -487,7 +487,7 @@ where
     let spread = parameters.spread();
     // The estimate, initialised to the observation. The observation itself is
     // *not* widened into a second array: it is read through the view one voxel
-    // at a time where the ratio is formed, which is a level's worth of `f64`
+    // at a time where the ratio is formed, which is an image's worth of `f64`
     // this op does not allocate.
     let mut estimate = observed.map(|value| (*value).into());
     let mut blurred = Array3::<f64>::zeros(dim);

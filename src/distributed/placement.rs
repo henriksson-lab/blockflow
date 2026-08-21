@@ -110,8 +110,8 @@ use super::cache_model::{ChunkGrid, ModelledCache};
 /// What one worker is modelled as holding, for the purpose of placing a scarce
 /// task.
 ///
-/// Two tiers, because a barrier reads a level that was only ever **written**.
-/// Phase `p` reads level `p` and writes level `p + 1`, so the level a barrier at
+/// Two tiers, because a barrier reads an image that was only ever **written**.
+/// Phase `p` reads image `p` and writes image `p + 1`, so the image a barrier at
 /// phase `p` reads is the one phase `p - 1` produced and nobody read. A model
 /// fed only by reads therefore scores every worker identically for a barrier and
 /// has nothing to say at exactly the moment it matters most; `produced` is what
@@ -292,7 +292,7 @@ mod tests {
     }
 
     /// Note that a worker was assigned block `index` of phase 0, which is what
-    /// the coordinator does on handout: it reads level 0 and writes level 1.
+    /// the coordinator does on handout: it reads image 0 and writes image 1.
     fn ran_first_phase(resident: &mut ModelledCache, produced: &mut ModelledCache, index: usize) {
         let chunks = ChunkGrid::new([64, 8, 8], [8, 8, 8]);
         let block = Region::new(&[index * 8, 0, 0], &[8, 8, 8]);

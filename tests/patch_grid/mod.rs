@@ -42,7 +42,7 @@
 // ----------------------------------------
 // [`RegridEnvironment`] wraps `AccountingEnvironment`, so the real executor runs
 // the real scheduler over a real task graph, and no pixel exists. What the
-// wrapper adds is the coordinate mapping the framework cannot express: a level-0
+// wrapper adds is the coordinate mapping the framework cannot express: an image-0
 // read arrives in the coordinates of the array being *written* and is served
 // from an array in a different space, and the wrapper prices the fetch that
 // implies.
@@ -331,7 +331,7 @@ impl BlockOp for CountedOp {
 
 // ------------------------------------------------------- the environment --
 
-/// Which array a level-0 read is really served from.
+/// Which array an image-0 read is really served from.
 ///
 /// The executor asks for a region in the coordinates of the array it is
 /// *writing*. When the input lives in another grid, something has to map. The
@@ -349,7 +349,7 @@ pub enum Inbound {
 /// One output beyond the workflow's own region output.
 ///
 /// `Workflow` names a single output of a single dtype, and `Environment::write`
-/// writes one buffer to one level, so an operation with several outputs of
+/// writes one buffer to one image, so an operation with several outputs of
 /// differing dtype and rank has to declare them somewhere the framework cannot
 /// see. Here, that is this list — and the tests measure how far the framework's
 /// own byte accounting is out as a result.
@@ -371,7 +371,7 @@ pub struct RegridEnvironment {
     /// Bytes per block of per-block, non-pixel output. Zero disables it.
     sidecar_bytes: usize,
     sidecar_stream: &'static str,
-    final_level: usize,
+    final_image: usize,
     /// The grid whose block indices the sidecar and the touch log are keyed by.
     write_grid: BlockGrid,
     foreign_reads: AtomicU64,
@@ -392,7 +392,7 @@ impl RegridEnvironment {
             extras: Vec::new(),
             sidecar_bytes: 0,
             sidecar_stream: "block_summary",
-            final_level: 1,
+            final_image: 1,
             write_grid,
             foreign_reads: AtomicU64::new(0),
             foreign_union_elements: AtomicU64::new(0),
@@ -421,8 +421,8 @@ impl RegridEnvironment {
         Ok(self)
     }
 
-    pub fn with_final_level(mut self, level: usize) -> Self {
-        self.final_level = level;
+    pub fn with_final_image(mut self, image: usize) -> Self {
+        self.final_image = image;
         self
     }
 
@@ -512,8 +512,8 @@ impl Environment for RegridEnvironment {
         self.inner.prepare(decomposition)
     }
 
-    fn read(&self, level: usize, region: &Region) -> Result<BlockBuf> {
-        if level == 0 {
+    fn read(&self, image: usize, region: &Region) -> Result<BlockBuf> {
+        if image == 0 {
             if let Some((union, gathered)) = self.foreign_extent(region) {
                 self.foreign_reads.fetch_add(1, Ordering::SeqCst);
                 self.foreign_union_elements
@@ -522,7 +522,7 @@ impl Environment for RegridEnvironment {
                     .fetch_add(gathered, Ordering::SeqCst);
             }
         }
-        self.inner.read(level, region)
+        self.inner.read(image, region)
     }
 
     fn apply(
@@ -535,8 +535,8 @@ impl Environment for RegridEnvironment {
         self.inner.apply(slot, input, sources, at)
     }
 
-    fn write(&self, level: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
-        self.inner.write(level, within, valid, buf)?;
+    fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
+        self.inner.write(image, within, valid, buf)?;
         if valid.voxels() == 0 {
             return Ok(());
         }
@@ -545,7 +545,7 @@ impl Environment for RegridEnvironment {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(index);
-        if level == self.final_level {
+        if image == self.final_image {
             for extra in &self.extras {
                 let elements = valid.voxels() as f64 * extra.elements_per_valid_voxel;
                 self.extra_output_bytes.fetch_add(
@@ -559,7 +559,7 @@ impl Environment for RegridEnvironment {
                 // is written from the only place that has both a block and a
                 // store, which is the environment's own `write`.
                 let payload = vec![0u8; self.sidecar_bytes];
-                self.write_sidecar(self.sidecar_stream, level - 1, index, &payload)?;
+                self.write_sidecar(self.sidecar_stream, image - 1, index, &payload)?;
             }
         }
         Ok(())
@@ -577,8 +577,8 @@ impl Environment for RegridEnvironment {
         self.inner.release(buf)
     }
 
-    fn finish(&self, level: usize) -> Result<()> {
-        self.inner.finish(level)
+    fn finish(&self, image: usize) -> Result<()> {
+        self.inner.finish(image)
     }
 
     fn counters(&self) -> &EnvCounters {

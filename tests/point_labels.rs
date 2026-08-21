@@ -149,7 +149,7 @@ fn run(
 ) -> Result<Vec<u32>> {
     let (plan, label) = plan_for(volume, block, element);
     let env = ArrayEnvironment::new(
-        Voxels::zeros(Dtype::U32, volume).expect("a level"),
+        Voxels::zeros(Dtype::U32, volume).expect("an image"),
         plan.n_phases(),
         [4, 4, 4],
     )
@@ -174,7 +174,7 @@ fn run(
     Ok(env
         .output()
         .view::<u32>()
-        .expect("a u32 level")
+        .expect("a u32 image")
         .iter()
         .copied()
         .collect())
@@ -397,10 +397,10 @@ fn a_point_outside_the_volume_is_refused_rather_than_dropped() {
     assert!(error.contains("outside that block's core"), "{error}");
 }
 
-/// A label the level cannot hold is refused rather than saturated onto another
+/// A label the image cannot hold is refused rather than saturated onto another
 /// label — under every cut, and with the ceiling named.
 #[test]
-fn a_label_past_the_end_of_the_level_is_refused() {
+fn a_label_past_the_end_of_the_image_is_refused() {
     let element = single_voxel();
     let points = vec![Point::weighted([2, 2, 2], 5_000_000_000.0)];
     for block in CUTS {

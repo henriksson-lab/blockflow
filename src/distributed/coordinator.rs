@@ -218,7 +218,7 @@ struct WorkerModel {
     /// it, are untouched; only `placement` reads it.
     ///
     /// It exists because without it the barrier case is unanswerable. Phase `p`
-    /// reads level `p` and writes level `p + 1`, so the level a barrier at phase
+    /// reads image `p` and writes image `p + 1`, so the image a barrier at phase
     /// `p` reads is one that only ever got written — every worker misses all of
     /// it under a read-only model, no worker is better than any other, and the
     /// placement rule correctly declines to have an opinion. Being wrong about
@@ -671,9 +671,9 @@ impl Job {
         // The cache model is updated **here**, from the assignment, and never
         // from anything a worker says. See `cache_model`.
         let keys = self.chunks.keys(phase, &read);
-        // What this task will write, on the same terms. Phase `p` writes level
+        // What this task will write, on the same terms. Phase `p` writes image
         // `p + 1`, over the block's *valid* region — the part it owns, which is
-        // what tiles the level exactly. Recorded at assignment rather than at
+        // what tiles the image exactly. Recorded at assignment rather than at
         // completion for the same reason the read is: the coordinator is
         // modelling what it caused, and a task that never finishes leaves the
         // model claiming residency the node does not have, which costs a
@@ -1375,7 +1375,7 @@ mod tests {
         ready[0]
     }
 
-    /// The rule, at the coordinator: the worker that produced most of the level
+    /// The rule, at the coordinator: the worker that produced most of the image
     /// gets the barrier, whoever asks first.
     #[test]
     fn a_barrier_is_withheld_from_a_worker_a_better_placed_peer_could_take() {

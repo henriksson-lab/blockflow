@@ -253,7 +253,7 @@ fn plan_with(
 }
 
 /// The truthful declaration: whole-axis reach on the collapsed axis, in the
-/// frame the numbers are actually measured against — the level below.
+/// frame the numbers are actually measured against — the image below.
 fn truthful_reach() -> Reach {
     Reach::per_axis([AxisReach::All, AxisReach::none(), AxisReach::none()])
         .in_space(Space::source_voxels())
@@ -500,7 +500,7 @@ fn a_projection_that_reads_only_its_own_extent_is_refused_by_name() {
     assert!(plan.phases[0].blocks_missing_valid_core().is_empty());
 
     let err = plan.check().unwrap_err().to_string();
-    assert!(err.contains("the whole of axis 0 of level 0"), "{err}");
+    assert!(err.contains("the whole of axis 0 of image 0"), "{err}");
     assert!(err.contains("fetches 0..1 of that axis"), "{err}");
     assert!(err.contains("the whole of it is 0..11"), "{err}");
     assert!(err.contains("PhaseDecomposition::with_sources"), "{err}");
@@ -519,7 +519,7 @@ fn a_projection_that_reads_only_its_own_extent_is_refused_by_name() {
 fn a_fetch_covering_half_the_collapsed_axis_is_refused_by_name() {
     let plan = plan_with(truthful_reach(), COLLAPSED, Some(half_axis_fetch));
     let err = plan.check().unwrap_err().to_string();
-    assert!(err.contains("the whole of axis 0 of level 0"), "{err}");
+    assert!(err.contains("the whole of axis 0 of image 0"), "{err}");
     assert!(err.contains("fetches 0..5 of that axis"), "{err}");
     assert!(err.contains("the whole of it is 0..11"), "{err}");
 

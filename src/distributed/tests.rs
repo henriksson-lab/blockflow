@@ -108,7 +108,7 @@ fn there_is_no_way_for_a_worker_to_report_its_cache() {
 /// What N workers cost each other, over one decomposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Locality {
-    /// Distinct `(level, chunk)` the whole job touches. What one node with an
+    /// Distinct `(image, chunk)` the whole job touches. What one node with an
     /// unbounded cache would fetch.
     distinct: usize,
     /// Summed over workers, the distinct chunks each one touches. What N nodes
@@ -316,7 +316,7 @@ fn the_handout_policy_changes_who_does_what_and_never_what_is_done() {
 /// decision the phase has, and it is worth the whole phase's read cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BarrierPlacement {
-    /// Distinct chunks the barrier task reads. The whole of its level.
+    /// Distinct chunks the barrier task reads. The whole of its image.
     read_chunks: usize,
     /// Per worker, how many of those it had **not** had through its hands when
     /// the barrier became ready — what the phase would have cost had it landed
@@ -542,7 +542,7 @@ fn the_barrier_saving_holds_across_cluster_sizes() {
 /// selection buys nothing.
 ///
 /// Every worker ran the same number of blocks of the previous phase, so every
-/// worker holds the same share of the level the barrier reads, no worker is
+/// worker holds the same share of the image the barrier reads, no worker is
 /// strictly better than any other, and the rule declines to have an opinion —
 /// which is the same fallback a cold start takes. The saving is real only where
 /// the shares are unequal, and it is worth having only because they usually are.

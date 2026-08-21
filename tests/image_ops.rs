@@ -855,7 +855,7 @@ fn a_diamond_combines_two_arms_and_stays_decomposition_invariant() {
 // --------------------------------------------------- global anchoring --
 
 /// The defect class this batch's last two ops are exposed to, asserted at the
-/// level a user would notice it.
+/// image a user would notice it.
 ///
 /// An unanchored sample lattice gives the same voxel a different value depending
 /// on which block it landed in — **throughout** the block, not at its seams — so

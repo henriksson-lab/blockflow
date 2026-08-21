@@ -151,7 +151,7 @@ learn what a block is.
 | `net` | One bind policy, shared by both servers, and how a coordinator decides what address to publish. |
 | `distributed` | A coordinator, workers that pull, four rendezvous backends, and a local multi-node mode that runs all of it as separate processes. |
 | `gui` | *(feature `gui`)* An HTTP server over the progress listener, and the browser view it feeds. |
-| `zarr_env` | *(feature `zarr`)* Levels as Zarr v3 arrays on a filesystem store — the `Environment` that actually moves bytes. Compression is per level and derived from the level's own element type. |
+| `zarr_env` | *(feature `zarr`)* Images as Zarr v3 arrays on a filesystem store — the `Environment` that actually moves bytes. Compression is per image and derived from the image's own element type. |
 
 ## Branching: three shapes, and why `max` is not enough
 
@@ -196,8 +196,8 @@ variant carries no "which branch" to consult.
 Two things a `Parallel` deliberately does not do:
 
 * **It does not become several phases.** It is one indivisible slot. A phase
-  reads one level and writes one level, so a cut between the branches and the
-  combine would need a level per branch and a phase with several inputs, neither
+  reads one image and writes one image, so a cut between the branches and the
+  combine would need an image per branch and a phase with several inputs, neither
   of which a `Decomposition` can state. Branch results are transient buffers
   inside one task — allocated where a `Sequence`'s intermediates are — so they
   add no task, no DAG edge and no materialisation.
@@ -212,18 +212,18 @@ acceptable to the combine, which is checked when the plan is made.
 
 ### Two arrays: a branch that reads instead of computing
 
-A phase reads the level it is handed. An operation needing a *second* array —
+A phase reads the image it is handed. An operation needing a *second* array —
 measuring one array against another, masking, seeding a reconstruction from
 somewhere other than its own mask — used to get it by holding it whole
 (`CombineOp`), which is one full copy of the array resident for the length of
 the run.
 
-`Chain::Source` is a leaf that reads a stored level instead of computing one,
+`Chain::Source` is a leaf that reads a stored image instead of computing one,
 so the second arm of a fan-in can be an array in storage:
 
 ```rust
 Chain::parallel(
-    vec![computed_arm, Chain::source(level, Dtype::F64)],
+    vec![computed_arm, Chain::source(image, Dtype::F64)],
     Box::new(LogicCombine::new("xor", Logic::Xor)),
 )?
 ```
@@ -234,24 +234,24 @@ none of them is assumed:
 
 * **reach 0**, exactly. It reads the block's own read extent and nothing
   around it, so it never widens the halo of the arm beside it.
-* **the level is in the plan.** Which level an arm reads changes voxels, so it
-  is recorded in `PhaseDecomposition::source_levels`, fingerprinted, and sent
-  over the wire. `check_source_levels` compares it against the chain and
-  refuses, *by name and when the plan is made*, a level that does not exist, a
+* **the image is in the plan.** Which image an arm reads changes voxels, so it
+  is recorded in `PhaseDecomposition::source_images`, fingerprinted, and sent
+  over the wire. `check_source_images` compares it against the chain and
+  refuses, *by name and when the plan is made*, an image that does not exist, a
   forward reference to one a later phase writes, one on a different lattice,
   and one whose element type is not what the leaf declared.
-* **a level dies after its last reader.** A level with a second reader is not
-  freed when the first one finishes. `Decomposition::readers_of_level` is the
+* **an image dies after its last reader.** An image with a second reader is not
+  freed when the first one finishes. `Decomposition::readers_of_image` is the
   refcount; with no source leaf it answers one phase and the old rule falls out
   of the new one unchanged.
 
-Level 0 is the case of this that always existed: a level with no producing
+Image 0 is the case of this that always existed: an image with no producing
 phase. `Chain::source(0, dtype)` says so explicitly — and it is the one form
-that is valid under *every* partition, because level 0 is below every phase
+that is valid under *every* partition, because image 0 is below every phase
 whatever the planner does with the chain. A leaf naming an intermediate names a
-level number, so it constrains where the phase boundaries may fall; the shipped
+image number, so it constrains where the phase boundaries may fall; the shipped
 planners do not yet place a boundary to satisfy one, they are refused by
-`check_source_levels` if they do not.
+`check_source_images` if they do not.
 
 ## Reach: what an op reads, and in what units
 
@@ -274,9 +274,9 @@ measurable:
 
 `Space` is the one that caused most of the loss: the same dependency is `2` in a
 lattice's index space and `255` in voxels. It carries a **frame** (this phase's
-volume, or the level below's — which decides whether a read clamped at the
+volume, or the image below's — which decides whether a read clamped at the
 phase's own edge may be trusted), a **unit** (voxels, whole blocks of this
-phase's lattice, or steps of the level below's lattice) and an **axis order**.
+phase's lattice, or steps of the image below's lattice) and an **axis order**.
 Conversion happens in `PhaseDecomposition::derive`, the first place a grid
 exists; before that a reach stays symbolic, because the planner is comparing
 candidate grids and a reach that changed with the grid could not be compared
@@ -298,8 +298,8 @@ is the plan it always was — fingerprint included.
 Until `zarr_env` existed, every claim this crate made was a claim about arrays
 already in memory: `ArrayEnvironment` holds whole volumes, `AccountingEnvironment`
 holds nothing and prices what it would have held. That is a real gap in a crate
-whose subject is out-of-core execution, and `ZarrEnvironment` closes it. Level
-`l` is the array at `root/level<l>`; `prepare` creates levels 1..n at each
+whose subject is out-of-core execution, and `ZarrEnvironment` closes it. Image
+`l` is the array at `root/level<l>`; `prepare` creates images 1..n at each
 phase's own volume and element type; all eleven element types a `Voxels` can hold
 map to a Zarr v3 data type, and `float16` is **refused by name** rather than
 widened, because this crate has no buffer that can hold one.
@@ -327,36 +327,36 @@ caller who can align their blocks to the chunk grid can see that it worked. The
 answer is the same either way, which is this crate's founding principle applied
 to the write side: *a mistake about chunks costs performance, never correctness.*
 
-### Compression, chosen per level and derived from the element type
+### Compression, chosen per image and derived from the element type
 
 An out-of-core framework writes and re-reads its intermediates constantly, and
-one of them is a `bool` mask that should cost almost nothing to keep. So a level
-carries a codec, and — because the levels of one plan are not one kind of data —
-**it is chosen per level, not per run**:
+one of them is a `bool` mask that should cost almost nothing to keep. So an image
+carries a codec, and — because the images of one plan are not one kind of data —
+**it is chosen per image, not per run**:
 
 ```rust
-// The default. Every level gets `Compression::for_dtype` of its own type.
+// The default. Every image gets `Compression::for_dtype` of its own type.
 let env = ZarrEnvironment::create(root, &input, [64, 64, 64])?;
 
-// Or say it. `uniform` speaks for the run; `with_level` overrides one level.
+// Or say it. `uniform` speaks for the run; `with_image` overrides one image.
 let policy = CompressionPolicy::derived()
-    .with_level(2, Compression::Gzip(6));      // the mask, harder
+    .with_image(2, Compression::Gzip(6));      // the mask, harder
 let env = ZarrEnvironment::create_with_compression(root, &input, chunk, policy)?;
 
 env.compression_at(2)?;      // what was built, read off the array
 env.stored_bytes(2)?;        // and what it cost on the disk
 ```
 
-The default is *derived* rather than configured: levels already carry their own
+The default is *derived* rather than configured: images already carry their own
 element type (`Decomposition::dtype_at`), and the element type is the best single
 predictor of whether deflate will pay. **`bool` and the integers compress at
 level 1; `float32` and `float64` are left raw.**
 
 The evidence is a test, not a claim — `compression_pays_for_bool_and_not_for_float`
 prints this table on every run. A 64³ `synthetic::Scene`, chunk 32³, release
-build, level 0 `float64` and level 1 a `bool` mask:
+build, image 0 `float64` and image 1 a `bool` mask:
 
-| policy | level 0 (`float64`) | level 1 (`bool`) | run | break-even |
+| policy | image 0 (`float64`) | image 1 (`bool`) | run | break-even |
 |---|---|---|---|---|
 | no compression | 2 097 152 B | 262 144 B | 7 ms | — |
 | `gzip1` everywhere | 1 978 908 B (1.06x) | 22 845 B (11.5x) | 42 ms | 10.4 MB/s |
@@ -367,10 +367,10 @@ build, level 0 `float64` and level 1 a `bool` mask:
 
 **break-even** is bytes saved over CPU seconds spent saving them: the store speed
 below which compressing is faster end to end. It is the number the defaults are
-picked on. Compressing the `float64` level — the step from the derived row to
+picked on. Compressing the `float64` image — the step from the derived row to
 `gzip1` everywhere — costs 31 ms to save 118 kB, a break-even of **3.8 MB/s**,
 slower than any store this will meet, so the floats are left alone. Compressing
-the `bool` level costs 4 ms to save 239 kB — **73.7 MB/s**, which most network and
+the `bool` image costs 4 ms to save 239 kB — **73.7 MB/s**, which most network and
 shared storage is slower than. Turning `bool` up to level 6 doubles the ratio
 again, but the *incremental* trade is 12 kB for 14 ms — 0.9 MB/s, worse than the
 `float64` case just refused, which is why the default is level 1 and the higher
@@ -471,7 +471,7 @@ Three things worth knowing:
 * **The tiling guard cannot see fragments, so there is a second guard.** A
   fragment phase's valid regions are its cores whatever it wrote, so the exact-
   tiling check passes vacuously. `Coverage::EveryBlock` makes the executor check
-  the *store* after the phase; a phase that writes no level and declares no
+  the *store* after the phase; a phase that writes no image and declares no
   every-block stream is refused, because nothing about it would be checkable.
 
 A stream is declared `DeleteOnExit` or `Persistent` and `Lifecycle` has no

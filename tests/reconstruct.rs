@@ -657,11 +657,11 @@ fn the_limit_fires_by_name_on_a_path_longer_than_the_geometry_predicts() {
     assert!(message.contains("deliberately not written"), "{message}");
 
     // A partially flooded volume is plausible, well-formed and wrong, so none of
-    // it reaches the output: the level is still the unwritten sentinel.
+    // it reaches the output: the image is still the unwritten sentinel.
     let out = env.output().view::<f64>().expect("f64").to_owned();
     assert!(
         out.iter().all(|value| value.is_nan()),
-        "a truncated answer reached the output level"
+        "a truncated answer reached the output image"
     );
 
     // And raising the limit is the fix the message names. The corridor then floods
@@ -781,7 +781,7 @@ fn the_infinities_behave_as_the_order_says_and_need_no_special_case() {
 // ------------------------------------------------------- 7. composition --
 
 /// A three-phase plan: the h-maxima transform, then the two phases the regional
-/// maxima are found with. One run, one environment, three levels.
+/// maxima are found with. One run, one environment, three images.
 fn extended_maxima_plan(
     h: f64,
     block: [usize; 3],

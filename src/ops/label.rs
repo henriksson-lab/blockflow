@@ -18,9 +18,9 @@
 // a flood that grows regions out of marked voxels reads zero as "nothing here"
 // and every distinct positive integer as a distinct starting region. So:
 //
-// * the output is an **integer** level. `Dtype::Bool` and the float types are
+// * the output is an **integer** image. `Dtype::Bool` and the float types are
 //   refused by name — see [`label_ceiling`] — because a two-valued type cannot
-//   hold a label at all (`ops::voxelize` into a `bool` level is the op that
+//   hold a label at all (`ops::voxelize` into a `bool` image is the op that
 //   answers "did any point's kernel cover this voxel") and a float one invites
 //   labels to be compared with `==` on values that arrived through a rounding;
 // * a label of **zero is refused**, for `VoxelizeOp::new`'s reason about an
@@ -107,7 +107,7 @@
 //
 // Coverage, and the halo
 // ----------------------
-// No output stream is declared: this phase's output is a pixel level, exactly as
+// No output stream is declared: this phase's output is a pixel image, exactly as
 // in `ops::voxelize`. Only the **valid** region of a block is filled; the halo
 // margin around it is left at zero, because a voxel out there may have a
 // contributor beyond the gathered neighbourhood and an unmarked voxel is a
@@ -182,22 +182,22 @@ use super::voxelize::block_reach;
 /// letting two objects merge in the last bit of a float.
 pub const MAX_EXACT_LABEL: u64 = 1 << 53;
 
-/// The largest label a level of `dtype` can hold, or `None` for a type that
+/// The largest label an image of `dtype` can hold, or `None` for a type that
 /// cannot hold labels at all.
 ///
 /// **Integer types only, and the two refusals each have a reason.** `Dtype::Bool`
 /// holds one bit, which is enough to say "marked" and not enough to say *which*
-/// mark — the op that writes that volume is `ops::voxelize` into a `bool` level,
+/// mark — the op that writes that volume is `ops::voxelize` into a `bool` image,
 /// which answers exactly "did any point's kernel cover this voxel". The float
 /// types are refused because a label is compared for equality by every consumer
 /// of a label volume, and equality on a value that has passed through a rounding
 /// is the kind of comparison that works until it does not; a caller who really
-/// wants labels in an `f64` buffer writes this to an integer level and puts
+/// wants labels in an `f64` buffer writes this to an integer image and puts
 /// `ops::voxelwise::WidenOp` after it, where the widening is exact and is
 /// something they asked for.
 ///
 /// The ceiling is the smaller of the type's own maximum and [`MAX_EXACT_LABEL`],
-/// so a `u64` level does not admit labels the `f64` weight could not have
+/// so a `u64` image does not admit labels the `f64` weight could not have
 /// carried.
 pub fn label_ceiling(dtype: Dtype) -> Option<u64> {
     let own = match dtype {
@@ -271,7 +271,7 @@ pub fn label_of(point: &Point) -> Result<u64> {
 /// allocates no buffer refuses exactly what a run which allocates one refuses:
 /// the point lies in the core of the block whose fragment carries it, and its
 /// weight is a label this destination can hold. `ceiling` comes from
-/// [`label_ceiling`] applied to the level's element type.
+/// [`label_ceiling`] applied to the image's element type.
 ///
 /// The result is in the order the fragments were handed over, which is
 /// deliberately *not* stated as part of the answer — see the module header on
@@ -553,7 +553,7 @@ impl FragmentOp for LabelPointsOp {
     }
 
     /// No pixel IO on the way in: the input is the fragment stream, and a phase
-    /// running this op reads not one voxel of the level below it.
+    /// running this op reads not one voxel of the image below it.
     fn reads_pixels(&self) -> bool {
         false
     }
@@ -584,8 +584,8 @@ impl FragmentOp for LabelPointsOp {
         let ceiling = label_ceiling(dtype).ok_or_else(|| {
             Error::invalid(format!(
                 "label op {:?} writes labels — zero is unmarked and every other value names a \
-                 point — and a level of {} holds no such value. Write an integer level; a \
-                 two-valued level is `ops::voxelize` into a bool level, and a float one is this \
+                 point — and an image of {} holds no such value. Write an integer image; a \
+                 two-valued image is `ops::voxelize` into a bool image, and a float one is this \
                  op followed by `ops::voxelwise::WidenOp`.",
                 self.name,
                 dtype.numpy_name()
@@ -633,7 +633,7 @@ impl FragmentOp for LabelPointsOp {
     }
 }
 
-/// Write a `u64` label buffer into `at` of a buffer of the level's own type.
+/// Write a `u64` label buffer into `at` of a buffer of the image's own type.
 ///
 /// No rounding and no saturation, unlike `ops::voxelize::store`: every label has
 /// already been checked against [`label_ceiling`] for this element type, so the
@@ -677,7 +677,7 @@ fn store(labels: &Array3<u64>, at: [usize; 3], into: &mut Voxels) -> Result<()> 
         // before reaching here, so this arm is unreachable through the op.
         other => {
             return Err(Error::invalid(format!(
-                "label: a level of {} holds no labels",
+                "label: an image of {} holds no labels",
                 other.numpy_name()
             )))
         }
@@ -1053,7 +1053,7 @@ mod tests {
         assert_eq!(label_ceiling(Dtype::U16), Some(65_535));
         assert_eq!(label_ceiling(Dtype::U32), Some(u32::MAX as u64));
         assert_eq!(label_ceiling(Dtype::I32), Some(i32::MAX as u64));
-        // a `u64` level does not admit labels the `f64` weight could not carry
+        // a `u64` image does not admit labels the `f64` weight could not carry
         assert_eq!(label_ceiling(Dtype::U64), Some(MAX_EXACT_LABEL));
         assert_eq!(label_ceiling(Dtype::I64), Some(MAX_EXACT_LABEL));
         for refused in [Dtype::Bool, Dtype::F16, Dtype::F32, Dtype::F64] {

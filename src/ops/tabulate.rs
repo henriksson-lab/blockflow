@@ -275,7 +275,7 @@
 // The shape, and why it is two phases
 // -----------------------------------
 // [`TabulateValuesOp`] is `(volume, volume) -> fragments`: it reads **both**
-// arrays as declared source levels and emits one partial per block, over that
+// arrays as declared source images and emits one partial per block, over that
 // block's core only, so every voxel is counted exactly once whatever halo the
 // plan granted. It declares `SeamFold::PerBlock`, which is true of it: a partial
 // is a function of its own block.
@@ -288,7 +288,7 @@
 // it is reused rather than restated: the centroid is a function of the merged
 // region, the cores tile the volume, so exactly one block owns each row.
 //
-// Neither phase reads the level it is handed. `reads_pixels()` is `false` on
+// Neither phase reads the image it is handed. `reads_pixels()` is `false` on
 // both, so a run of this pair moves exactly two arrays and the read counters name
 // which two.
 //
@@ -987,8 +987,8 @@ pub fn decode_partial(bytes: &[u8]) -> Result<Vec<Tally>> {
 
 /// `(label volume, value array) -> fragments`. One partial per block.
 ///
-/// Reads **both** arrays as declared source levels and declares
-/// `reads_pixels() == false`, so the level the phase is handed is not read at
+/// Reads **both** arrays as declared source images and declares
+/// `reads_pixels() == false`, so the image the phase is handed is not read at
 /// all: a run of this phase moves exactly two arrays and the read counters name
 /// which two. Which array is which is the caller's statement rather than a
 /// position in a chain, because the two are not interchangeable and a plan that
@@ -1013,25 +1013,27 @@ pub struct TabulateValuesOp {
 }
 
 impl TabulateValuesOp {
-    /// The two levels, which must be different ones.
+    /// The two images, which must be different ones.
     ///
     /// Reducing an array over its own regions is refused rather than computed:
     /// the answer is `label * count` and the caller meant something else. It is
-    /// also unplannable — `fragment_phase` records one source level per
+    /// also unplannable — `fragment_phase` records one source image per
     /// declaration and `check_phase_work` compares that record against the
     /// deduplicated list — so the refusal here is the readable version of an
     /// error that would otherwise arrive from the plan checker.
     pub fn new(
         name: &'static str,
-        labels: usize,
-        values: usize,
+        labels: impl Into<crate::assemble::ImageId>,
+        values: impl Into<crate::assemble::ImageId>,
         fixed: FixedPoint,
         stream: impl Into<String>,
         lifecycle: Lifecycle,
     ) -> Result<Self> {
+        let labels = labels.into().index();
+        let values = values.into().index();
         if labels == values {
             return Err(Error::invalid(format!(
-                "tabulate: the label volume and the value array are both level {labels}. \
+                "tabulate: the label volume and the value array are both image {labels}. \
                  Reducing an array over the regions of itself gives `label * count` and nothing \
                  else; the second array is the point of this op."
             )));
@@ -1126,7 +1128,7 @@ fn label_at(raw: f64, at: [usize; 3]) -> Result<u64> {
         return Err(Error::invalid(format!(
             "tabulate: the label volume holds {raw} at {at:?}, which is not a label. A label is \
              a whole number from 0 to {MAX_EXACT_LABEL}; 0 means no region and there is no \
-             negative half. A fractional or non-finite entry is a level that was written by \
+             negative half. A fractional or non-finite entry is an image that was written by \
              something other than a labelling, and rounding it would invent a region."
         )));
     }
@@ -1390,7 +1392,7 @@ fn absorb(totals: &mut BTreeMap<u64, Tally>, bytes: &[u8]) -> Result<()> {
 /// the dependency edge that makes every block's partial available to every other
 /// one.
 ///
-/// Neither phase declares an element type — neither writes a level — so
+/// Neither phase declares an element type — neither writes an image — so
 /// `check_dtypes` skips both.
 ///
 /// Returns the plan and the phase index the **rows** are keyed under, which is
@@ -1423,9 +1425,9 @@ pub fn append_tabulate_phases(
 
 /// A plan that is these two phases and nothing else, over `volume`.
 ///
-/// For a caller whose label volume and value array are already levels: level 0
-/// is whichever of them the environment was built from, and the levels the ops
-/// name have to exist. `dtype` is level 0's.
+/// For a caller whose label volume and value array are already images: image 0
+/// is whichever of them the environment was built from, and the images the ops
+/// name have to exist. `dtype` is image 0's.
 pub fn tabulate_phases(
     grid: BlockGrid,
     dtype: Dtype,
@@ -1640,7 +1642,7 @@ mod tests {
 
     fn tabulator(fixed: FixedPoint) -> TabulateValuesOp {
         TabulateValuesOp::new("tabulate", 0, 1, fixed, "partials", Lifecycle::DeleteOnExit)
-            .expect("two different levels")
+            .expect("two different images")
     }
 
     // ------------------------------------------------------ the fixed point --
@@ -2062,9 +2064,9 @@ mod tests {
             Lifecycle::DeleteOnExit,
         )
         .err()
-        .expect("one level cannot be both operands")
+        .expect("one image cannot be both operands")
         .to_string();
-        assert!(failed.contains("level 2"), "{failed}");
+        assert!(failed.contains("image 2"), "{failed}");
     }
 
     // ------------------------------------------------------------ the schema --

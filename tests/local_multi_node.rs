@@ -112,9 +112,9 @@ fn prepare(dir: &Path, phases: usize, lease: Option<Duration>) -> (JobSpec, Deco
         spec.workflow.chunk,
         decomposition.n_phases(),
     )
-    .expect("level files");
+    .expect("image files");
     store
-        .write_level(0, &ramp(spec.workflow.shape))
+        .write_image(0, &ramp(spec.workflow.shape))
         .expect("an input");
     (spec, decomposition)
 }
@@ -126,7 +126,7 @@ fn options(dir: &Path, workers: usize) -> LocalOptions {
     options
 }
 
-/// The final level's bytes, exactly as they are on disk.
+/// The final image's bytes, exactly as they are on disk.
 fn output_bytes(dir: &Path, spec: &JobSpec, decomposition: &Decomposition) -> Vec<u8> {
     let store = SharedVolumes::open(
         &dir.join("volumes"),
@@ -136,8 +136,8 @@ fn output_bytes(dir: &Path, spec: &JobSpec, decomposition: &Decomposition) -> Ve
     )
     .expect("the volumes");
     store
-        .level_bytes(decomposition.n_phases())
-        .expect("the output level")
+        .image_bytes(decomposition.n_phases())
+        .expect("the output image")
 }
 
 /// A **single-node** run: one process, the crate's own scheduler, the same
@@ -155,9 +155,9 @@ fn single_node(dir: &Path, spec: &JobSpec, decomposition: &Decomposition) -> Vec
         spec.workflow.chunk,
         decomposition.n_phases(),
     )
-    .expect("level files");
+    .expect("image files");
     store
-        .write_level(0, &ramp(spec.workflow.shape))
+        .write_image(0, &ramp(spec.workflow.shape))
         .expect("an input");
     let chain = ProbeWorkflows.chain(&spec.workflow).expect("a chain");
     let workflow = Workflow::new(chain, spec.workflow.shape, spec.workflow.dtype);
@@ -170,8 +170,8 @@ fn single_node(dir: &Path, spec: &JobSpec, decomposition: &Decomposition) -> Vec
     )
     .expect("a single-node run");
     store
-        .level_bytes(decomposition.n_phases())
-        .expect("the output level")
+        .image_bytes(decomposition.n_phases())
+        .expect("the output image")
 }
 
 /// The merged event stream, decoded back into an `ExecutionLog`.
@@ -266,7 +266,7 @@ fn n_workers_produce_byte_identical_output_to_a_single_node_run() {
 }
 
 /// The same, across a **barrier** — a full-reach op, which resolves to a single
-/// block, so one worker reads the whole of a level every other worker helped
+/// block, so one worker reads the whole of an image every other worker helped
 /// write.
 ///
 /// This is the phase locality-aware placement exists for, and it is the phase in
@@ -334,9 +334,9 @@ fn a_barrier_phase_lands_on_one_worker_and_the_output_is_still_byte_identical() 
             spec.workflow.chunk,
             decomposition.n_phases(),
         )
-        .expect("level files");
+        .expect("image files");
         store
-            .write_level(0, &ramp(spec.workflow.shape))
+            .write_image(0, &ramp(spec.workflow.shape))
             .expect("an input");
         drop(store);
 
@@ -797,9 +797,9 @@ fn how_deep_the_work_list_should_be() {
                 spec.workflow.chunk,
                 decomposition.n_phases(),
             )
-            .expect("level files");
+            .expect("image files");
             store
-                .write_level(0, &ramp(spec.workflow.shape))
+                .write_image(0, &ramp(spec.workflow.shape))
                 .expect("an input");
             let mut options = options(&dir, WORKERS);
             options.ahead = ahead;
@@ -1277,9 +1277,9 @@ fn fragment_job(dir: &Path, reach: [usize; 3]) -> (JobSpec, Decomposition) {
         spec.workflow.chunk,
         decomposition.n_phases(),
     )
-    .expect("level files");
+    .expect("image files");
     store
-        .write_level(0, &ramp(spec.workflow.shape))
+        .write_image(0, &ramp(spec.workflow.shape))
         .expect("an input");
     (spec, decomposition)
 }

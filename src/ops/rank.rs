@@ -629,13 +629,13 @@ impl BlockOp for RankFilterOp {
     }
 }
 
-/// [`RankFilterOp`], with a stored level deciding which voxels count.
+/// [`RankFilterOp`], with a stored image deciding which voxels count.
 ///
 /// **The case it exists for** is a percentile taken over a window with
 /// background voxels removed from the population, so that the statistic
 /// describes the structure present rather than the proportion of the window it
 /// occupies. It is a `BlockOp` like any other; what is new is that it reads a
-/// *second* level over the same window it reads its input over, which is what
+/// *second* image over the same window it reads its input over, which is what
 /// [`BlockOp::source_inputs`] exists to declare.
 ///
 /// **Why a stored mask rather than a predicate baked into the kernel.** Both
@@ -656,14 +656,14 @@ pub struct MaskedRankFilterOp {
 }
 
 impl MaskedRankFilterOp {
-    /// `mask` is the level holding the population, which must be a `Bool`
-    /// level — checked when the plan is made, by the same `check_dtypes` fold
-    /// that checks every other level.
+    /// `mask` is the image holding the population, which must be a `Bool`
+    /// image — checked when the plan is made, by the same `check_dtypes` fold
+    /// that checks every other image.
     pub fn new(
         name: &'static str,
         element: StructuringElement,
         rank: Rank,
-        mask: impl Into<crate::assemble::Level>,
+        mask: impl Into<crate::assemble::ImageId>,
     ) -> Self {
         let cost = cost_for(&element) * MASK_COST_FACTOR;
         Self {
@@ -682,7 +682,7 @@ impl MaskedRankFilterOp {
     /// A builder rather than an argument to [`Self::new`], so that the choice is
     /// additive: a caller who never had it keeps its call and its answer.
     ///
-    /// The value is stated in `f64` and converted to the level's element type by
+    /// The value is stated in `f64` and converted to the image's element type by
     /// the saturating `VoxelElement::from_f64`, which is how every other
     /// constant in this module crosses that boundary.
     pub fn with_excluded_centre(mut self, centre: ExcludedCentre<f64>) -> Self {
@@ -705,7 +705,7 @@ impl MaskedRankFilterOp {
         name: &'static str,
         element: StructuringElement,
         fraction: f64,
-        mask: impl Into<crate::assemble::Level>,
+        mask: impl Into<crate::assemble::ImageId>,
     ) -> Result<Self> {
         let rank = Rank::ceiling_percentile(fraction)?;
         Ok(Self::new(name, element, rank, mask))
@@ -715,8 +715,8 @@ impl MaskedRankFilterOp {
         &self.element
     }
 
-    /// The level this op reads its population from.
-    pub fn mask_level(&self) -> usize {
+    /// The image this op reads its population from.
+    pub fn mask_image(&self) -> usize {
         self.mask
     }
 
@@ -744,7 +744,7 @@ impl BlockOp for MaskedRankFilterOp {
     /// Equal to this op's own reach by construction rather than by arrangement:
     /// the population is consulted at the element's offsets, so it is the
     /// element that states both. That equality is also what keeps this op
-    /// inside what a plan can currently fetch — see `check_source_levels`.
+    /// inside what a plan can currently fetch — see `check_source_images`.
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<crate::op::SourceInput> {
         vec![crate::op::SourceInput::new(
             self.mask,
@@ -760,7 +760,7 @@ impl BlockOp for MaskedRankFilterOp {
     /// a second array cannot be computed from one. See [`BlockOp::apply_with`].
     fn apply(&self, _input: &Voxels, _out: &mut Voxels, _at: &Anchor) -> Result<()> {
         Err(Error::InvalidArgument(format!(
-            "{}: the population comes from level {}, so this op has no answer from its input \
+            "{}: the population comes from image {}, so this op has no answer from its input \
              alone. It is applied through `apply_with`.",
             self.name, self.mask
         )))
@@ -777,7 +777,7 @@ impl BlockOp for MaskedRankFilterOp {
         let mask = sources.get(self.mask)?;
         if mask.dtype() != Dtype::Bool {
             return Err(Error::InvalidArgument(format!(
-                "{}: the population is read from level {}, which holds {}. A population is a \
+                "{}: the population is read from image {}, which holds {}. A population is a \
                  yes-or-no per voxel and is stored as one; a wider type would leave 'which \
                  non-zero values count' to be decided somewhere this op cannot see.",
                 self.name,
@@ -887,7 +887,7 @@ impl BlockOp for MaskedRankFilterOp {
     /// them, and where it is empty the centre is written. On a constant block
     /// both are the constant, so this holds bit for bit without the short
     /// circuit needing to know the mask — which matters, because the mask is a
-    /// level the short circuit has not read.
+    /// image the short circuit has not read.
     ///
     /// A [`ExcludedCentre::Fill`] breaks exactly that. The output of a constant
     /// block is then the constant where the mask keeps the centre and the fill

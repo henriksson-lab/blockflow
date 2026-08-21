@@ -6,7 +6,7 @@
 // fingerprint, which is the number a parity figure is attached to.
 //
 // That is the only bar worth setting. A `Decomposition` is the binding half of a
-// plan: change a slot range, a halo, a per-phase element type or which level an
+// plan: change a slot range, a halo, a per-phase element type or which image an
 // arm reads and the output changes. A builder that produced a *different* plan
 // that happened to run would be a second planner, and this crate would then have
 // two of them disagreeing silently. So the tests below build the same plan twice
@@ -18,7 +18,7 @@
 // The two shapes are the two the hand-assembly hurt on:
 //
 // * **the mixed-kind chain**: `Pixels`, `Pixels`, `Iterate`, `Fragments`,
-//   `Fragments`, `Pixels` reading a level back through a source leaf,
+//   `Fragments`, `Pixels` reading an image back through a source leaf,
 //   `Fragments`, `Fragments`. Eight phases, three kinds, two fragment streams,
 //   one source leaf, and two phases that change the element type without owning
 //   a chain slot. Every one of the six responsibilities appears in it.
@@ -26,7 +26,7 @@
 //   `ops::fill::fill_phases` builds as a whole plan and therefore cannot
 //   contribute to a larger one.
 //
-// Beside them: that the plans *run* to the same answer, that a level freed
+// Beside them: that the plans *run* to the same answer, that an image freed
 // after its last reader says so by name, and that naming the wrong phase in a
 // fragment address is refused with both phases in the message.
 
@@ -34,7 +34,7 @@ use std::collections::BTreeSet;
 
 use ndarray::Array3;
 
-use blockflow::assemble::PlanBuilder;
+use blockflow::assemble::{ImageId, PlanBuilder};
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::dtype::Dtype;
 use blockflow::env::{ArrayEnvironment, Environment};
@@ -60,10 +60,10 @@ const PLATEAUX: &str = "test.plateaux";
 const MOMENTS: &str = "test.moments";
 const POINTS: &str = "test.points";
 
-/// The level the second phase writes and the sixth reads back. A constant in the
+/// The image the second phase writes and the sixth reads back. A constant in the
 /// hand-built half because that is what it had to be: `Chain::source` took a
-/// number, so "the level phase 1 wrote" was a statement made in two places.
-const SECOND_LEVEL: usize = 2;
+/// number, so "the image phase 1 wrote" was a statement made in two places.
+const SECOND_IMAGE: usize = 2;
 
 fn grid() -> BlockGrid {
     BlockGrid::new(VOLUME, BLOCK).expect("a lattice")
@@ -95,14 +95,14 @@ fn second_fragment() -> Chain {
     Chain::op(VoxelwiseMapOp::new("identity", |value| value))
 }
 
-/// A fan-in of the mask against the level the second phase wrote, which is the
+/// A fan-in of the mask against the image the second phase wrote, which is the
 /// slot that makes a source leaf part of the plan.
-fn gate_fragment(level: impl Into<blockflow::assemble::Level>) -> Chain {
+fn gate_fragment(image: impl Into<blockflow::assemble::ImageId>) -> Chain {
     Chain::parallel(
         vec![
             Chain::op(VoxelwiseMapOp::new("mask", |value| value)),
             Chain::sequence(vec![
-                Chain::source(level, Dtype::F64),
+                Chain::source(image, Dtype::F64),
                 Chain::op(VoxelwiseMapOp::new("above", |value| {
                     if value >= 0.5 {
                         1.0
@@ -123,7 +123,7 @@ fn gate_fragment(level: impl Into<blockflow::assemble::Level>) -> Chain {
 /// builder existed.
 ///
 /// Kept verbatim rather than tidied: the cursors, the three name slices, the
-/// `dtype` lines and the trailing `declare_source_levels` are what the builder
+/// `dtype` lines and the trailing `declare_source_images` are what the builder
 /// is measured against, and a tidier version of this would be measuring
 /// something else.
 struct HandBuilt {
@@ -142,7 +142,7 @@ impl HandBuilt {
 
         let first = first_fragment();
         let second = second_fragment();
-        let gate = gate_fragment(SECOND_LEVEL);
+        let gate = gate_fragment(SECOND_IMAGE);
         let (n_first, first_reach) = (first.slots().len(), first.reach3(&VOLUME));
         let (n_second, second_reach) = (second.slots().len(), second.reach3(&VOLUME));
         let (n_gate, gate_reach) = (gate.slots().len(), gate.reach3(&VOLUME));
@@ -218,8 +218,8 @@ impl HandBuilt {
             chain_reach,
         };
         decomposition
-            .declare_source_levels(&workflow.chain)
-            .expect("source levels");
+            .declare_source_images(&workflow.chain)
+            .expect("source images");
         decomposition.check().expect("a plan");
 
         Self {
@@ -256,7 +256,7 @@ fn assembled() -> blockflow::assemble::Assembly {
         .expect("an iterative phase");
     blockflow::ops::regional::append_to(&mut plan, PLATEAUX, Lifecycle::DeleteOnExit, Dtype::F64)
         .expect("the two maxima phases");
-    plan.pixels(gate_fragment(second.level().expect("a level")))
+    plan.pixels(gate_fragment(second.image().expect("an image")))
         .expect("a pixel phase");
     blockflow::ops::detect::append_to(
         &mut plan,
@@ -435,7 +435,7 @@ fn the_assembled_appended_global_op_is_the_hand_built_one() {
         ],
         chain_reach: chain.reach3(&VOLUME),
     };
-    hand.declare_source_levels(&chain).expect("source levels");
+    hand.declare_source_images(&chain).expect("source images");
     hand.check().expect("a plan");
 
     let mut plan = PlanBuilder::new(VOLUME, Dtype::F64, grid);
@@ -457,12 +457,12 @@ fn the_assembled_appended_global_op_is_the_hand_built_one() {
 
 // ------------------------------------------------ the two new refusals --
 
-/// A level freed after its last reader must name **itself, the phase that freed
+/// An image freed after its last reader must name **itself, the phase that freed
 /// it, and the way to keep it**. Before this it handed back a `1 x 1 x 1`
 /// placeholder, which failed somewhere else as a shape mismatch against the
 /// volume — an error naming a symptom and no part of the cause.
 #[test]
-fn reading_a_freed_level_names_the_level_the_phase_and_the_hint() {
+fn reading_a_freed_image_names_the_image_the_phase_and_the_hint() {
     let built = assembled();
     let input = input_volume();
     let env =
@@ -478,14 +478,14 @@ fn reading_a_freed_level_names_the_level_the_phase_and_the_hint() {
     )
     .expect("a run");
 
-    // Level 1 is written by phase 0 and read by phase 1, so phase 1's
+    // Image 1 is written by phase 0 and read by phase 1, so phase 1's
     // completion is what frees it.
     assert!(env.is_discarded(1));
     assert_eq!(env.freed_after(1), Some(1));
-    let message = env.try_level(1).expect_err("a freed level").to_string();
-    assert!(message.contains("level 1"), "{message}");
+    let message = env.try_image(1).expect_err("a freed image").to_string();
+    assert!(message.contains("image 1"), "{message}");
     assert!(message.contains("after phase 1"), "{message}");
-    assert!(message.contains("keep_levels"), "{message}");
+    assert!(message.contains("keep_images"), "{message}");
 
     // And the hint is the answer: pin it and the same read succeeds.
     let env = ArrayEnvironment::for_decomposition(input_volume(), &built.decomposition, [4, 4, 4])
@@ -495,7 +495,7 @@ fn reading_a_freed_level_names_the_level_the_phase_and_the_hint() {
         &built.workflow,
         &built.decomposition,
         &Hints {
-            keep_levels: BTreeSet::from([1usize]),
+            keep_images: BTreeSet::from([ImageId::from(1)]),
             ..Hints::default()
         },
         &env,
@@ -504,7 +504,7 @@ fn reading_a_freed_level_names_the_level_the_phase_and_the_hint() {
     )
     .expect("a run");
     assert!(!env.is_discarded(1));
-    assert_eq!(env.try_level(1).expect("a level").shape(), VOLUME);
+    assert_eq!(env.try_image(1).expect("an image").shape(), VOLUME);
 }
 
 /// A fragment op reads a stream **from a phase**, and naming the wrong one reads

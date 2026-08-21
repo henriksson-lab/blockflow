@@ -6,7 +6,7 @@
 //
 // Why this exists
 // ---------------
-// The executor can write exactly one kind of thing: a valid region of a level.
+// The executor can write exactly one kind of thing: a valid region of an image.
 // That covers every op whose output is an image, and it covers nothing else —
 // yet several real steps produce, per block, a **fragment** that a later global
 // step merges: incident lists, connected-component boundaries, per-block
@@ -50,7 +50,7 @@
 // value is that its nodes are independent. So the caller runs the block phase,
 // reads the fragments back, and merges them itself. Multi-node needs nothing
 // extra for that: the fragments are on shared storage, so whichever process
-// merges simply reads them, exactly as a worker reads an intermediate level
+// merges simply reads them, exactly as a worker reads an intermediate image
 // another worker wrote.
 //
 // Lifecycle is declared, never defaulted

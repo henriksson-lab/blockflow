@@ -364,7 +364,7 @@ fn a_one_sided_reach_cuts_the_over_fetch_and_the_index_space_removes_the_rest() 
 
     // ---- the index space, as a per-block fetch region, off the plan ----
     //
-    // Level 0 is the patch array; the phase is over the spatial one; each block
+    // Image 0 is the patch array; the phase is over the spatial one; each block
     // fetches exactly the patch slots covering its core, and the dependency is
     // declared in that array's frame rather than restated in voxels of this one.
     // The permutation is real: the phase's axes are `(z, y, x)` and the patch
@@ -426,7 +426,7 @@ fn a_one_sided_reach_cuts_the_over_fetch_and_the_index_space_removes_the_rest() 
 /// it.
 ///
 /// What does not: the extra **arrays**. A `Workflow` names one output of one
-/// dtype and `Environment::write` writes one buffer to one level, so the other
+/// dtype and `Environment::write` writes one buffer to one image, so the other
 /// two outputs are written by the environment on the side. The framework's own
 /// byte figure is then wrong by the ratio this test pins.
 #[test]
@@ -506,7 +506,7 @@ fn several_outputs_of_differing_dtype_and_rank_leave_the_frameworks_accounting_s
 /// them. A phase owns its volume now, and what took the refusal's place is a
 /// check with something to say rather than a shape assertion:
 ///
-/// * a phase reading level `p` must fetch from **inside** level `p`, and a plan
+/// * a phase reading image `p` must fetch from **inside** image `p`, and a plan
 ///   that changes shape without saying how is caught by exactly that — the
 ///   second phase's blocks are cut from the spatial array and default to reading
 ///   their own extent, which is not a region of the patch array;
@@ -550,7 +550,7 @@ fn a_phase_boundary_may_change_the_shape_when_it_says_where_it_reads() {
     };
     let error = unmapped.check().unwrap_err().to_string();
     assert!(
-        error.contains("reads from level 1") && error.contains("region axis"),
+        error.contains("reads from image 1") && error.contains("region axis"),
         "{error}"
     );
 

@@ -3,7 +3,7 @@
 // Original work for this crate.
 //
 // The acceptance suite for `ops::rows`: a table of rows in, a table of rows out
-// — scaled, gathered against a level, or filtered — over a sweep of lattices.
+// — scaled, gathered against an image, or filtered — over a sweep of lattices.
 //
 // **Nothing here is compared as a set.** Every comparison is `assert_eq!` on a
 // whole `Vec`, in order. A table's rows are addressed by position, so a permuted
@@ -17,7 +17,7 @@
 // | op | the claim | the fixture that can see it fail |
 // |---|---|---|
 // | scale | ties round to **even** | coordinates at `1`, `3`, `5` halved: exact `.5` at both parities of the floor |
-// | gather | the value is the level's at the row's own voxel, and the row is in the block that reads it | a level whose every voxel differs, so a read from the wrong block is a wrong number rather than a plausible one |
+// | gather | the value is the image's at the row's own voxel, and the row is in the block that reads it | an image whose every voxel differs, so a read from the wrong block is a wrong number rather than a plausible one |
 // | filter | the survivors keep their order, and are renumbered | a predicate rejecting at both ends of the list |
 //
 // And one thing all three are on trial for together: **the same list out
@@ -27,10 +27,10 @@
 // ---------------------------------------------------------------
 // `ops::rows` ships a `FragmentOp` for each of the three. The gather was for a
 // while the one that could not have a shell: while a `FragmentOp` read only the
-// level its phase was handed, no arrangement of phases gave a gather both its
+// image its phase was handed, no arrangement of phases gave a gather both its
 // rows and the array it must sample, and this file pinned that finding as a test
 // written to stop passing. `FragmentOp::source_inputs` is what resolved it — the
-// array a gather samples was never the level its phase is handed, it is a
+// array a gather samples was never the image its phase is handed, it is a
 // *second* one — and the test that pinned the two refusals has been deleted,
 // which is exactly what it was written to make happen. Neither refusal was
 // weakened; see `ops::rows`' header.
@@ -38,10 +38,10 @@
 // So the gather is driven **twice**, and the two are compared:
 //
 // * **by hand**, block by block — each block's own rows and each block's own
-//   slice of the level, straight through `gather_blob`. This is the path the
+//   slice of the image, straight through `gather_blob`. This is the path the
 //   suite trusted before the shell existed, and it uses no executor at all;
 // * **through a plan**, as a `GatherRowsOp` phase, with the executor fetching
-//   the declared level, gathering the fragments and writing the answer.
+//   the declared image, gathering the fragments and writing the answer.
 //
 // Asserting that the two agree, list for list, is what says the shell is plumbing
 // over the kernel rather than a second implementation of it: the hand-driven path
@@ -82,17 +82,17 @@ const GATHERED: &str = "rows.gathered";
 const MARKED: &str = "rows.marked";
 const VALUE: &str = "value";
 const MARK: &str = "mark";
-const LEVEL: &str = "level";
+const IMAGE: &str = "image";
 
 // -------------------------------------------------------------- the scene --
 
-/// The level: **every voxel a different number**, and zero where no row is
+/// The image: **every voxel a different number**, and zero where no row is
 /// wanted.
 ///
 /// `1 + 64 i + 8 j + k` is injective over this volume and is never zero, so a
 /// value read back **names the voxel it came from** — which is what makes a
 /// block mix-up visible in the answer rather than only in a count. Against a
-/// constant level, a gather that read the right voxel of the wrong block would
+/// constant image, a gather that read the right voxel of the wrong block would
 /// return the right number and this suite would pass.
 ///
 /// The non-zero voxels are arranged to be awkward across a seam:
@@ -106,7 +106,7 @@ const LEVEL: &str = "level";
 ///    special;
 /// 4. `[3, 6, 6]` and `[4, 6, 6]`, either side of the seam at 4 on the slowest
 ///    axis: the block-boundary case, as a fixture.
-fn level() -> Array3<u16> {
+fn image() -> Array3<u16> {
     let mut array = Array3::<u16>::zeros((VOLUME[0], VOLUME[1], VOLUME[2]));
     let mut set = |at: [usize; 3]| {
         array[at] = (1 + 64 * at[0] + 8 * at[1] + at[2]) as u16;
@@ -133,15 +133,15 @@ fn level() -> Array3<u16> {
 /// Every non-zero voxel and its value, in the canonical order — the definition
 /// the runs are measured against.
 fn seeded() -> Vec<RowValues> {
-    let level = level();
+    let image = image();
     let mut rows = Vec::new();
     for i in 0..VOLUME[0] {
         for j in 0..VOLUME[1] {
             for k in 0..VOLUME[2] {
-                if level[[i, j, k]] != 0 {
+                if image[[i, j, k]] != 0 {
                     rows.push(RowValues::new(
                         [i, j, k],
-                        vec![Value::F64(level[[i, j, k]] as f64)],
+                        vec![Value::F64(image[[i, j, k]] as f64)],
                     ));
                 }
             }
@@ -182,7 +182,7 @@ const CUTS: [[usize; 3]; 7] = [
 /// it.
 ///
 /// It is also the honest statement of what a row op can and cannot be spared:
-/// this producer reads the level it emits values from, so where the value wanted
+/// this producer reads the image it emits values from, so where the value wanted
 /// *is* the array the rows came from, no gather is needed at all. The case the
 /// consumers have is the other one — rows from one array, values from a second —
 /// and that is what needs the shell that does not exist yet.
@@ -250,7 +250,7 @@ fn streams(input: &str, phase: usize, output: &str, schema: Schema) -> RowStream
 
 /// The predicate, and what makes it discriminating.
 ///
-/// `[200, 500)` over a level running 1..=512 rejects rows at **both** ends — the
+/// `[200, 500)` over an image running 1..=512 rejects rows at **both** ends — the
 /// low corner at 1 and the far corner at 512 — and in the middle. A predicate
 /// that kept everything would test no predicate at all, which
 /// `the_predicate_rejects_at_both_ends` asserts rather than assumes.
@@ -273,11 +273,11 @@ fn kept_by_predicate(rows: &[RowValues]) -> Vec<RowValues> {
         .collect()
 }
 
-/// Run a plan of fragment phases over the level and hand back the environment,
-/// which is where the answer is: no phase here writes a level.
+/// Run a plan of fragment phases over the image and hand back the environment,
+/// which is where the answer is: no phase here writes an image.
 fn run(block: [usize; 3], ops: &[&dyn FragmentOp]) -> Result<(ArrayEnvironment, Decomposition)> {
     let plan = fragment_only(VOLUME, block, Dtype::U16, ops)?;
-    let input: Voxels = level().into();
+    let input: Voxels = image().into();
     let env = ArrayEnvironment::for_decomposition(input, &plan, CHUNK)?;
     let workflow = Workflow::new(Chain::sequence(Vec::new()), VOLUME, Dtype::U16);
     let work: Vec<PhaseWork<'_>> = ops.iter().map(|op| PhaseWork::Fragments(*op)).collect();
@@ -295,12 +295,12 @@ fn run(block: [usize; 3], ops: &[&dyn FragmentOp]) -> Result<(ArrayEnvironment, 
 
 // ------------------------------------------------------ the fixture's teeth --
 
-/// The level is the one described: injective where it is set, and holding the
+/// The image is the one described: injective where it is set, and holding the
 /// rows the other tests name.
 #[test]
-fn the_level_names_every_voxel_it_holds() {
-    let level = level();
-    let mut seen: Vec<u16> = level.iter().copied().filter(|value| *value != 0).collect();
+fn the_image_names_every_voxel_it_holds() {
+    let image = image();
+    let mut seen: Vec<u16> = image.iter().copied().filter(|value| *value != 0).collect();
     let rows = seen.len();
     seen.sort_unstable();
     seen.dedup();
@@ -308,11 +308,11 @@ fn the_level_names_every_voxel_it_holds() {
     assert_eq!(rows, seeded().len());
 
     for at in [[3usize, 6, 6], [4, 6, 6], [0, 0, 0], [7, 7, 7]] {
-        assert_ne!(level[at], 0, "{at:?} should be a row");
+        assert_ne!(image[at], 0, "{at:?} should be a row");
     }
     // The two either side of the seam at 4 differ by a whole block of the ramp,
     // so reading one for the other is not a near miss.
-    assert_ne!(level[[3, 6, 6]], level[[4, 6, 6]]);
+    assert_ne!(image[[3, 6, 6]], image[[4, 6, 6]]);
 }
 
 /// The predicate rejects at both ends and keeps a middle, so the filter tests
@@ -329,13 +329,13 @@ fn the_predicate_rejects_at_both_ends() {
         kept.len() < all.len(),
         "a predicate that keeps everything tests no predicate"
     );
-    let level = level();
+    let image = image();
     assert!(
-        (level[[0, 0, 0]] as f64) < 200.0,
+        (image[[0, 0, 0]] as f64) < 200.0,
         "the low corner is rejected"
     );
     assert!(
-        (level[[7, 7, 7]] as f64) >= 500.0,
+        (image[[7, 7, 7]] as f64) >= 500.0,
         "the far corner is rejected"
     );
 }
@@ -427,7 +427,7 @@ fn filtering_keeps_a_subsequence_and_renumbers_it() {
 /// is exactly the rows sitting on the limit.
 #[test]
 fn a_strict_bound_and_a_closed_one_differ_on_a_row_at_the_limit() {
-    let limit = level()[[3, 6, 6]] as f64;
+    let limit = image()[[3, 6, 6]] as f64;
     let count = |bound: Limit| {
         let filter = FilterRowsOp::new(
             "filter",
@@ -457,7 +457,7 @@ fn a_strict_bound_and_a_closed_one_differ_on_a_row_at_the_limit() {
 
 /// **The rounding rule, through the executor.**
 ///
-/// The level holds rows at 1, 3 and 5 on every axis; halved those are `0.5`,
+/// The image holds rows at 1, 3 and 5 on every axis; halved those are `0.5`,
 /// `1.5` and `2.5` — exact ties at **both** parities of the floor. Ties-to-even
 /// sends them to 0, 2 and 2; `f64::round` would send them to 1, 2 and 3.
 ///
@@ -535,18 +535,18 @@ fn the_scale_rounds_ties_to_even_through_a_run() {
 // ------------------------------------------------------------ the gather --
 
 /// One block's gather, exactly as the shell will do it: this block's rows, this
-/// block's slice of the level, and this block's core as the region the rows must
+/// block's slice of the image, and this block's core as the region the rows must
 /// lie in.
 fn gather_one_block(
     env: &ArrayEnvironment,
-    level: &Array3<u16>,
+    image: &Array3<u16>,
     core: &Region,
     index: [usize; 3],
 ) -> Result<Vec<u8>> {
     let rows = env
         .read_sidecar(SEEDED, 0, index)?
         .unwrap_or_else(|| panic!("block {index:?} wrote no blob"));
-    let slice: Array3<u16> = level
+    let slice: Array3<u16> = image
         .slice(s![
             core.start[0]..core.start[0] + core.shape[0],
             core.start[1]..core.start[1] + core.shape[1],
@@ -557,7 +557,7 @@ fn gather_one_block(
         VOLUME,
         &SeedRowsOp::schema(),
         &rows,
-        LEVEL,
+        IMAGE,
         core,
         &Voxels::U16(slice),
         [core.start[0], core.start[1], core.start[2]],
@@ -569,20 +569,20 @@ fn gather_one_block(
 fn gathered(block: [usize; 3]) -> Vec<RowValues> {
     let (env, _) = run(block, &[&SeedRowsOp]).expect("a run");
     let grid = BlockGrid::new(VOLUME, block).expect("a grid");
-    let level = level();
+    let image = image();
     let blobs: Vec<([usize; 3], Vec<u8>)> = grid
         .cores()
         .into_iter()
         .map(|core| {
             (
                 core.index,
-                gather_one_block(&env, &level, &core.core, core.index).expect("its own rows"),
+                gather_one_block(&env, &image, &core.core, core.index).expect("its own rows"),
             )
         })
         .collect();
     merge_rows(
         VOLUME,
-        gathered_schema(&SeedRowsOp::schema(), LEVEL).expect("a fresh name"),
+        gathered_schema(&SeedRowsOp::schema(), IMAGE).expect("a fresh name"),
         blobs
             .iter()
             .map(|(index, bytes)| (*index, bytes.as_slice())),
@@ -591,13 +591,13 @@ fn gathered(block: [usize; 3]) -> Vec<RowValues> {
 }
 
 /// The gather **as a phase**: rows off `input`, written by `phase`, and the
-/// level it samples named as a second array — level 0, the array the run was
+/// image it samples named as a second array — image 0, the array the run was
 /// handed.
 ///
-/// It declares `reads_pixels() == false`, so the phase it runs as reads no level
+/// It declares `reads_pixels() == false`, so the phase it runs as reads no image
 /// of its own; the one array it pays for is the one it names here.
 fn gather_op(input: &str, phase: usize, schema: Schema) -> GatherRowsOp {
-    GatherRowsOp::new("gather", streams(input, phase, GATHERED, schema), 0, LEVEL)
+    GatherRowsOp::new("gather", streams(input, phase, GATHERED, schema), 0, IMAGE)
         .expect("a fresh column name")
 }
 
@@ -608,14 +608,14 @@ fn gathered_by_plan(block: [usize; 3]) -> Vec<RowValues> {
     collect_rows(&env, GATHERED, 1, VOLUME, gather.schema().clone()).expect("the merge")
 }
 
-/// The answer the definition gives: every seeded row, with the level's own value
+/// The answer the definition gives: every seeded row, with the image's own value
 /// at its own voxel appended.
 fn gathered_definition() -> Vec<RowValues> {
-    let level = level();
+    let image = image();
     seeded()
         .into_iter()
         .map(|row| {
-            let value = Value::F64(level[row.at] as f64);
+            let value = Value::F64(image[row.at] as f64);
             let mut values = row.values;
             values.push(value);
             RowValues::new(row.at, values)
@@ -634,7 +634,7 @@ fn holds(region: &Region, at: [usize; 3]) -> bool {
 /// **The acceptance property for the gather**: the same ordered list out of
 /// every cut, out of *both* paths, and it is the list the definition gives.
 ///
-/// The injective level is what gives this teeth — a value read from the wrong
+/// The injective image is what gives this teeth — a value read from the wrong
 /// block is a different number, not a plausible one. Comparing the two paths
 /// against each other says the shell is plumbing over the kernel; comparing both
 /// against the definition stops that being two wrongs agreeing.
@@ -672,11 +672,11 @@ fn every_cut_gathers_one_list() {
 #[test]
 fn a_row_on_a_block_seam_is_read_once_by_the_block_that_holds_it() {
     let rows = gathered_by_plan([4, 8, 8]);
-    let level = level();
+    let image = image();
     for at in [[3usize, 6, 6], [4, 6, 6]] {
         let found: Vec<&RowValues> = rows.iter().filter(|row| row.at == at).collect();
         assert_eq!(found.len(), 1, "{at:?} appeared {} times", found.len());
-        assert_eq!(found[0].values[1], Value::F64(level[at] as f64));
+        assert_eq!(found[0].values[1], Value::F64(image[at] as f64));
     }
 }
 
@@ -703,9 +703,9 @@ fn every_blocks_gathered_fragment_is_a_function_of_its_own_core() {
 
     let block = [4, 4, 4];
     let (env, plan) = run(block, &[&SeedRowsOp, &gather]).expect("a run");
-    // The level is fetched at the block's own extent and nothing wider, which is
+    // The image is fetched at the block's own extent and nothing wider, which is
     // what makes "its own core" the whole story rather than most of it.
-    assert_eq!(plan.phases[1].source_levels, vec![0]);
+    assert_eq!(plan.phases[1].source_images, vec![0]);
     assert_eq!(plan.phases[1].halo, [0, 0, 0]);
 
     let whole = gathered_definition();
@@ -753,12 +753,12 @@ fn a_gather_handed_another_blocks_rows_refuses_them() {
     let (env, _) = run([4, 8, 8], &[&SeedRowsOp]).expect("a run");
     let grid = BlockGrid::new(VOLUME, [4, 8, 8]).expect("a grid");
     let cores = grid.cores();
-    let level = level();
+    let image = image();
 
     // Its own rows are fine.
-    assert!(gather_one_block(&env, &level, &cores[0].core, cores[0].index).is_ok());
+    assert!(gather_one_block(&env, &image, &cores[0].core, cores[0].index).is_ok());
     // The next block's rows, against this block's core, are not.
-    let err = gather_one_block(&env, &level, &cores[0].core, cores[1].index)
+    let err = gather_one_block(&env, &image, &cores[0].core, cores[1].index)
         .expect_err("those rows are outside this core");
     let text = format!("{err}");
     assert!(
@@ -773,7 +773,7 @@ fn a_gather_handed_another_blocks_rows_refuses_them() {
 /// nothing except "a row is here".
 ///
 /// The uninformative payload is the point. In the plan below these rows come out
-/// of a *different* level from the one the gather samples, and the mark carries
+/// of a *different* image from the one the gather samples, and the mark carries
 /// no trace of which voxel it came from — so the only voxel identity in the
 /// answer is the gathered column, and it can only have come from the second
 /// array. With a producer that already carried the value, a gather that returned
@@ -833,9 +833,9 @@ impl FragmentOp for MarkRowsOp {
     }
 }
 
-/// Three phases: a pixel phase turning the injective level into a **bool** level
+/// Three phases: a pixel phase turning the injective image into a **bool** image
 /// 1 that says only *where* the rows are, a producer reading that, and the
-/// gather reading **level 0** — an array no phase between it and the rows
+/// gather reading **image 0** — an array no phase between it and the rows
 /// touched.
 fn two_array_plan(block: [usize; 3]) -> (Decomposition, GatherRowsOp) {
     let base = Decomposition {
@@ -848,9 +848,9 @@ fn two_array_plan(block: [usize; 3]) -> (Decomposition, GatherRowsOp) {
             [0, 0, 0],
             BlockGrid::new(VOLUME, block).expect("a lattice"),
         )
-        // The phase changes the element type — a level of marks is `bool` — and
-        // a plan that did not say so would allocate level 1 at the width of the
-        // level below it.
+        // The phase changes the element type — an image of marks is `bool` — and
+        // a plan that did not say so would allocate image 1 at the width of the
+        // image below it.
         .with_dtype(Dtype::Bool)],
         chain_reach: [0, 0, 0],
     };
@@ -864,18 +864,18 @@ fn two_array_plan(block: [usize; 3]) -> (Decomposition, GatherRowsOp) {
 /// values from a second, and the second is named rather than inherited.
 ///
 /// This is what folding the gather into the row producer cannot do, and it is
-/// the arrangement `source_inputs` buys: the producer reads level 1 and knows
-/// nothing about level 0, and the gather reads level 0 and never touches the
-/// level its own phase was handed.
+/// the arrangement `source_inputs` buys: the producer reads image 1 and knows
+/// nothing about image 0, and the gather reads image 0 and never touches the
+/// image its own phase was handed.
 #[test]
 fn a_gather_reads_a_second_array_the_rows_did_not_come_from() {
-    let level = level();
+    let image = image();
     let want: Vec<RowValues> = seeded()
         .into_iter()
         .map(|row| {
             RowValues::new(
                 row.at,
-                vec![Value::F64(1.0), Value::F64(level[row.at] as f64)],
+                vec![Value::F64(1.0), Value::F64(image[row.at] as f64)],
             )
         })
         .collect();
@@ -884,13 +884,13 @@ fn a_gather_reads_a_second_array_the_rows_did_not_come_from() {
     for block in [[8usize, 8, 8], [4, 4, 4], [3, 3, 3]] {
         let (plan, gather) = two_array_plan(block);
         // The plan records the second array, which is what makes the executor
-        // fetch it, the DAG depend on its producer and the level survive to be
-        // read. A gather whose level went unrecorded would read whatever
+        // fetch it, the DAG depend on its producer and the image survive to be
+        // read. A gather whose image went unrecorded would read whatever
         // `prepare` left behind.
-        assert_eq!(plan.phases[2].source_levels, vec![0]);
-        assert_eq!(plan.phases[1].source_levels, Vec::<usize>::new());
+        assert_eq!(plan.phases[2].source_images, vec![0]);
+        assert_eq!(plan.phases[1].source_images, Vec::<usize>::new());
 
-        let env = ArrayEnvironment::for_decomposition(level.clone().into(), &plan, CHUNK)
+        let env = ArrayEnvironment::for_decomposition(image.clone().into(), &plan, CHUNK)
             .expect("an environment");
         let workflow = Workflow::new(
             Chain::op(NonZeroOp::new("marks", [0, 0, 0])),
@@ -956,27 +956,27 @@ fn a_scale_before_a_gather_is_refused_by_the_row_it_moved() {
     );
 }
 
-/// A gather naming a level **nothing wrote** is refused before any block runs.
+/// A gather naming an image **nothing wrote** is refused before any block runs.
 ///
-/// Level 1 of a fragment-only plan is allocated and never written, and an
-/// unwritten level in this crate is `NaN` precisely so that an absence cannot
+/// Image 1 of a fragment-only plan is allocated and never written, and an
+/// unwritten image in this crate is `NaN` precisely so that an absence cannot
 /// pass for a value. The framework does not let it get as far as the `NaN`: a
-/// second array has to be a level some phase produced.
+/// second array has to be an image some phase produced.
 #[test]
-fn a_gather_naming_a_level_nothing_wrote_is_refused_before_it_runs() {
+fn a_gather_naming_an_image_nothing_wrote_is_refused_before_it_runs() {
     let gather = GatherRowsOp::new(
         "gather",
         streams(SEEDED, 0, GATHERED, SeedRowsOp::schema()),
         1,
-        LEVEL,
+        IMAGE,
     )
     .expect("a fresh column name");
     let Err(error) = run([4, 4, 4], &[&SeedRowsOp, &gather]) else {
-        panic!("a level nobody wrote is not a second array, it is whatever `prepare` allocated")
+        panic!("an image nobody wrote is not a second array, it is whatever `prepare` allocated")
     };
     let text = format!("{error}");
     assert!(
-        text.contains("level 1") && text.contains("did not write"),
-        "expected the refusal of a level no phase produced: {text}"
+        text.contains("image 1") && text.contains("did not write"),
+        "expected the refusal of an image no phase produced: {text}"
     );
 }

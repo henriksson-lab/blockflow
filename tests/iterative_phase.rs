@@ -2,7 +2,7 @@
 //
 // Original work for this crate.
 //
-// `docs/design/BLOCK_OPS.md` §"Levels have a lifetime, and iteration has
+// `docs/design/BLOCK_OPS.md` §"Images have a lifetime, and iteration has
 // substages", the executable half. One phase, an unknown number of substages,
 // two operands at every one of them.
 //
@@ -20,7 +20,7 @@
 //    one-substage run, where `Chain::sequence` of forty-six one-substage ops would
 //    have reach forty-six and `ops/deconvolve.rs`'s in-op loop has `2rn`.
 // 2. **Live storage is two buffers, whatever the count.** Measured the way
-//    `tests/level_lifetime.rs` measures level residency — from the environment's
+//    `tests/image_lifetime.rs` measures image residency — from the environment's
 //    own counter, not argued.
 // 3. **Decomposition invariance**, against a whole-volume reference that runs the
 //    same kernel in a loop. The bar every op in this crate meets.
@@ -259,7 +259,7 @@ fn the_external_reach_does_not_grow_with_the_substage_count() {
 /// Two private buffers, whatever `N` is.
 ///
 /// Measured from the environment's own residency counter, the way
-/// `tests/level_lifetime.rs` counts resident levels: a run that iterated
+/// `tests/image_lifetime.rs` counts resident images: a run that iterated
 /// forty-six times must peak at exactly what a run that iterated three times
 /// peaked at, because the buffer written at substage `k` is the one holding
 /// substage `k-2`.
@@ -287,9 +287,9 @@ fn live_storage_is_constant_in_the_substage_count() {
     );
     assert!(deep.peak_resident_bytes > 2 * volume_bytes);
 
-    // The levels themselves are unaffected: input and output, as always.
-    assert_eq!(brief_env.resident_levels(), 2);
-    assert_eq!(deep_env.resident_levels(), 2);
+    // The images themselves are unaffected: input and output, as always.
+    assert_eq!(brief_env.resident_images(), 2);
+    assert_eq!(deep_env.resident_images(), 2);
 }
 
 // ----------------------------------------------------- 3. invariance --
@@ -407,11 +407,11 @@ fn the_limit_fires_by_name_and_returns_no_partial_result() {
     assert!(message.contains("deliberately not written"), "{message}");
 
     // A partially converged volume is plausible, well-formed and wrong, so none
-    // of it is there: the output level is still the unwritten sentinel.
+    // of it is there: the output image is still the unwritten sentinel.
     let out = values(&env.output());
     assert!(
         out.iter().all(|value| value.is_nan()),
-        "a truncated answer reached the output level"
+        "a truncated answer reached the output image"
     );
 }
 
@@ -455,7 +455,7 @@ fn the_halo_guard_fires_for_an_iterative_phase_with_a_short_halo() {
 // ------------------------------------------------- the surrounding plan --
 
 /// An iterative phase in the middle of a chain: the tasks before it feed it, the
-/// tasks after it read what it wrote, and the level it read is freed when it is
+/// tasks after it read what it wrote, and the image it read is freed when it is
 /// done with it.
 #[test]
 fn an_iterative_phase_sits_between_ordinary_phases() {
@@ -514,11 +514,11 @@ fn an_iterative_phase_sits_between_ordinary_phases() {
     // One entry per phase, and only the iteration has a count.
     assert_eq!(stats.substages, vec![0, expected_substages, 0]);
     assert_eq!(stats.tasks, 3 * grid_blocks());
-    // The level the iteration read is internal and is freed the moment the
+    // The image the iteration read is internal and is freed the moment the
     // iteration finishes, exactly as any other phase's input is.
     assert!(env.is_discarded(1));
     assert!(env.is_discarded(2));
-    assert_eq!(env.resident_levels(), 2);
+    assert_eq!(env.resident_images(), 2);
 }
 
 fn grid_blocks() -> usize {
@@ -530,7 +530,7 @@ fn grid_blocks() -> usize {
 // -------------------------------------------------------------- guards --
 
 /// An iterative phase owns no slot of the chain, and a plan that gives it one is
-/// refused before a block runs rather than producing a level nobody wrote.
+/// refused before a block runs rather than producing an image nobody wrote.
 #[test]
 fn an_iterative_phase_that_is_given_a_chain_slot_is_refused() {
     let op = op(generous());

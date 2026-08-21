@@ -2,10 +2,10 @@
 //
 // Original work for this crate.
 //
-// The acceptance suite for a phase that **changes the shape of the level it
+// The acceptance suite for a phase that **changes the shape of the image it
 // writes**. Everything else in this crate's test tree resamples nothing, so
 // every property here is being asserted for the first time on a plan whose two
-// levels are different sizes.
+// images are different sizes.
 //
 // Eight things, and each catches something the others cannot
 // ----------------------------------------------------------
@@ -26,8 +26,8 @@
 //    the tight dependency rather than argued: 1.00x for every downsampling and
 //    every integer growth, 1.52x to 2.01x for a rational growth at a small block
 //    edge.
-// 6. **Through `ZarrEnvironment`**: a resize changes the level's shape, and
-//    `prepare` creates levels from `volume_at`/`dtype_at`, so this is the first
+// 6. **Through `ZarrEnvironment`**: a resize changes the image's shape, and
+//    `prepare` creates images from `volume_at`/`dtype_at`, so this is the first
 //    workload that exercises that path with two different shapes.
 // 7. **Label data survives** a nearest resampling through the executor, which is
 //    the case a general library is asked for and the one linear cannot serve.
@@ -180,7 +180,7 @@ fn every_decomposition_reproduces_the_whole_volume_answer() {
                     assert_eq!(
                         decomposition.output_volume(),
                         want.shape(),
-                        "the plan's level is not the shape the op produces"
+                        "the plan's image is not the shape the op produces"
                     );
                     assert_eq!(decomposition.uniform_volume(), None);
                     let got = run(&resample, &input, &decomposition);
@@ -225,8 +225,8 @@ fn a_factor_that_does_not_divide_the_volume_drops_a_named_tail() {
 ///
 /// That last clause is the reason this is here rather than left to the kernel
 /// test of `constant_maps_to`: the executor allocates the replacement buffer
-/// from the read extent and the level's own element type, and no other workload
-/// in this tree has ever asked it to do that for a level of a different shape.
+/// from the read extent and the image's own element type, and no other workload
+/// in this tree has ever asked it to do that for an image of a different shape.
 #[test]
 fn a_uniform_volume_short_circuits_a_resizing_phase_at_the_output_shape() {
     for interpolation in [Interpolation::Nearest, Interpolation::Linear] {
@@ -246,7 +246,7 @@ fn a_uniform_volume_short_circuits_a_resizing_phase_at_the_output_shape() {
 ///
 /// This is the arrangement a caller actually wants — decimate, then do the
 /// expensive thing on less data — and it is the one that exercises the seam:
-/// level 1 is a different shape from level 0, phase 1's blocks read level 1
+/// image 1 is a different shape from image 0, phase 1's blocks read image 1
 /// through their own halo, and `TaskGraph` has to join the two across the
 /// change of extent. `dependencies_cover_reads` is asked directly, because a
 /// missing edge there is a race rather than a wrong number and would not show
@@ -323,7 +323,7 @@ fn a_resampling_phase_chains_into_a_filter_on_the_smaller_volume() {
 
 /// Upsample then downsample by the same integer factor with nearest is the
 /// identity — and it is the identity **through the executor**, at a block edge
-/// that divides neither level.
+/// that divides neither image.
 ///
 /// Why it holds: growing by `n` writes each source voxel into `n` consecutive
 /// output voxels, and shrinking by `n` takes the one at `n*o + (n-1)/2`, which
@@ -627,10 +627,10 @@ fn the_halo_must_be_per_block_and_per_side_and_the_alignment_is_priced() {
 
 /// The same run through Zarr arrays on a disk, against the in-memory answer.
 ///
-/// A resize changes the level's shape, and `ZarrEnvironment::prepare` creates
-/// levels from `volume_at`/`dtype_at` — so this is the first workload where
-/// those two calls return different answers per level, and the first that
-/// exercises writing a level that is not the shape of the one below it.
+/// A resize changes the image's shape, and `ZarrEnvironment::prepare` creates
+/// images from `volume_at`/`dtype_at` — so this is the first workload where
+/// those two calls return different answers per image, and the first that
+/// exercises writing an image that is not the shape of the one below it.
 #[cfg(feature = "zarr")]
 #[test]
 fn a_resizing_phase_runs_through_zarr_and_agrees_with_memory() {

@@ -24,7 +24,7 @@
 // 5. **Decomposition invariance**: the same volume from every block size,
 //    against the whole-volume reference. The acceptance bar for the whole crate,
 //    and a second input read over a window is the obvious way to break it.
-// 6. **The declaration is checked**: a mask level that does not hold `Bool` is
+// 6. **The declaration is checked**: a mask image that does not hold `Bool` is
 //    refused by name, and the op refuses to run without its operand at all.
 // 7. **The policy at an excluded centre**, which is a parameter rather than a
 //    rule: filter there anyway, or write a stated value. Asserted with masks
@@ -109,7 +109,7 @@ fn reference() -> Array3<f64> {
 
 // ------------------------------------------------------------- the op --
 
-/// `image > CUT`, into a `Bool` level. The mask producer, kept here rather than
+/// `image > CUT`, into a `Bool` image. The mask producer, kept here rather than
 /// taken from `src/ops` because what is under test is the *consumer*.
 struct Binarize;
 
@@ -289,7 +289,7 @@ fn plan(chain: &Chain, grid: &BlockGrid) -> Decomposition {
         chain_reach: [1, 1, 1],
     };
     plan.declare_dtypes(chain).unwrap();
-    plan.declare_source_levels(chain).unwrap();
+    plan.declare_source_images(chain).unwrap();
     plan
 }
 
@@ -326,12 +326,12 @@ fn every_decomposition_gives_the_whole_volume_answer() {
 // --------------------------------------------- 6. the declaration holds --
 
 #[test]
-fn a_mask_level_that_is_not_bool_is_refused_by_name() {
+fn a_mask_image_that_is_not_bool_is_refused_by_name() {
     let op = MaskedRankFilterOp::new("masked", element(), rank(), MASK);
     let input: Voxels = image().into();
     let wrong: Voxels = image().into();
     let mut out = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
-    let entries = [(MASK, &wrong)];
+    let entries = [(MASK.into(), &wrong)];
     let failed = op
         .apply_with(
             &input,
@@ -343,7 +343,7 @@ fn a_mask_level_that_is_not_bool_is_refused_by_name() {
     let message = failed.to_string();
     assert!(
         message.contains("float64") && message.contains(&MASK.to_string()),
-        "the refusal must name the level and what it holds: {message}"
+        "the refusal must name the image and what it holds: {message}"
     );
 }
 
@@ -366,7 +366,7 @@ fn the_op_declares_the_mask_at_the_elements_reach() {
     let op = MaskedRankFilterOp::new("masked", element(), rank(), MASK);
     let declared = op.source_inputs(VOLUME);
     assert_eq!(declared.len(), 1);
-    assert_eq!(declared[0].level, MASK);
+    assert_eq!(declared[0].image.index(), MASK);
     assert_eq!(
         declared[0].reach,
         element().reach_spec(),
@@ -622,7 +622,7 @@ fn a_fill_that_is_not_the_constant_withdraws_the_short_circuit() {
         filling.constant_maps_to(3.5),
         None,
         "a block of 3.5 comes out part 3.5 and part 0.0, and which is which is a \
-         fact about a level the short circuit never read"
+         fact about an image the short circuit never read"
     );
     assert_eq!(
         filling.constant_maps_to(0.0),

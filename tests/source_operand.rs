@@ -4,23 +4,23 @@
 //
 // **A second array that reaches into a window, not just into a voxel.**
 //
-// `Chain::Source` already lets a chain read a stored level, and `tests/
+// `Chain::Source` already lets a chain read a stored image, and `tests/
 // source_leaf.rs` proves that arm correct. But a source leaf has reach **zero**
 // by construction — it produces the extent it was handed — so the only thing
 // downstream can do with it is combine voxelwise. An op with a window over its
 // *operand* had nowhere to say so.
 //
-// `BlockOp::source_inputs` is that statement: per operand, a level and a
+// `BlockOp::source_inputs` is that statement: per operand, an image and a
 // `Reach`. `BlockOp::apply_with` is where the operand reaches the kernel. This
 // file asserts, in dependency order:
 //
 // 1. **An operand read through a window is decomposition-invariant** — every
 //    block size gives the whole-volume answer, byte for byte.
-// 2. **It is the level that was named**, not the phase's own input wearing its
+// 2. **It is the image that was named**, not the phase's own input wearing its
 //    number. The kernel below is built so the two differ everywhere.
 // 3. **An op that declares an operand and forgets to consume it is refused**,
 //    loudly, rather than computing a complete and well-formed wrong volume.
-// 4. **Two readers of one level fold to the wider reach**, because they are
+// 4. **Two readers of one image fold to the wider reach**, because they are
 //    handed one buffer.
 // 5. **An operand reaching past the phase's halo is refused by name**, which is
 //    the equal-reach limit stated where a caller meets it.
@@ -31,7 +31,7 @@
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{check_source_levels, Decomposition, PhaseDecomposition};
+use blockflow::decomposition::{check_source_images, Decomposition, PhaseDecomposition};
 use blockflow::env::ArrayEnvironment;
 use blockflow::error::Result;
 use blockflow::geometry::BlockGrid;
@@ -44,7 +44,7 @@ use blockflow::Dtype;
 
 const VOLUME: [usize; 3] = [16, 12, 10];
 /// Written by phase 0, read by phase 1 as its input **and** by phase 2 as a
-/// windowed operand. An intermediate, deliberately: level 0 is never freed, so
+/// windowed operand. An intermediate, deliberately: image 0 is never freed, so
 /// it would not exercise the lifetime the operand keeps alive.
 const STORED: usize = 1;
 const RADIUS: usize = 1;
@@ -61,13 +61,13 @@ const RADIUS: usize = 1;
 /// And the two terms occupy different decimal places, so a failure says which
 /// half was wrong instead of only that something was.
 struct WindowedOperand {
-    level: usize,
+    image: usize,
     radius: usize,
 }
 
 impl WindowedOperand {
-    fn new(level: usize, radius: usize) -> Self {
-        Self { level, radius }
+    fn new(image: usize, radius: usize) -> Self {
+        Self { image, radius }
     }
 }
 
@@ -92,7 +92,7 @@ impl BlockOp for WindowedOperand {
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
         vec![SourceInput::new(
-            self.level,
+            self.image,
             Reach::symmetric([self.radius; 3]),
         )]
     }
@@ -104,7 +104,7 @@ impl BlockOp for WindowedOperand {
         out: &mut Voxels,
         _at: &Anchor,
     ) -> Result<()> {
-        let operand = sources.get(self.level)?;
+        let operand = sources.get(self.image)?;
         let input = input.view::<f64>()?;
         let operand = operand.view::<f64>()?;
         let mut out = out.view_mut::<f64>()?;
@@ -141,7 +141,7 @@ impl BlockOp for WindowedOperand {
 /// The same declaration with **no kernel**: it asks the plan for an operand and
 /// never overrides `apply_with`. The shape of bug claim 3 is about.
 struct ForgetfulOperand {
-    level: usize,
+    image: usize,
 }
 
 impl BlockOp for ForgetfulOperand {
@@ -158,7 +158,7 @@ impl BlockOp for ForgetfulOperand {
     }
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
-        vec![SourceInput::voxelwise(self.level)]
+        vec![SourceInput::voxelwise(self.image)]
     }
 }
 
@@ -184,12 +184,12 @@ fn erode() -> Chain {
     Chain::op(MorphologyOp::new("erode", Morphology::Erode, element()))
 }
 
-/// Phase 0 dilates into level 1, phase 1 erodes into level 2, phase 2 reads
-/// level 2 as its input and level 1 as its operand.
+/// Phase 0 dilates into image 1, phase 1 erodes into image 2, phase 2 reads
+/// image 2 as its input and image 1 as its operand.
 ///
-/// **Level 1 and level 2 differ everywhere the input has a boundary**, which is
+/// **Image 1 and image 2 differ everywhere the input has a boundary**, which is
 /// what makes claim 2 checkable: an implementation handing the op its own input
-/// in place of the named level produces a different array, not the same one.
+/// in place of the named image produces a different array, not the same one.
 fn chain() -> Chain {
     Chain::sequence(vec![
         dilate(),
@@ -232,7 +232,7 @@ fn one_phase_per_slot(chain: &Chain, grid: &BlockGrid) -> Decomposition {
         chain_reach: [2, 2, 2],
     };
     plan.declare_dtypes(chain).unwrap();
-    plan.declare_source_levels(chain).unwrap();
+    plan.declare_source_images(chain).unwrap();
     plan
 }
 
@@ -279,23 +279,23 @@ fn the_operand_term_is_not_constant() {
     assert!(high > 0.0, "no operand voxel was ever counted");
 }
 
-// ------------------------------------------------- 2. the level it names --
+// ------------------------------------------------- 2. the image it names --
 
 /// Reading the operand is not the same as reading the phase's own input.
 ///
-/// The op is handed level 2 and names level 1. If the executor supplied the
+/// The op is handed image 2 and names image 1. If the executor supplied the
 /// input in the operand's place, the answer would be the array this test
 /// computes — so asserting they *differ* is what pins the routing.
 #[test]
-fn the_operand_is_the_level_named_and_not_the_phases_own_input() {
+fn the_operand_is_the_image_named_and_not_the_phases_own_input() {
     let real = run(&BlockGrid::new(VOLUME, VOLUME).unwrap());
 
-    let level_two = whole(&Chain::sequence(vec![dilate(), erode()]));
+    let image_two = whole(&Chain::sequence(vec![dilate(), erode()]));
     let mut wrong = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
     let op = WindowedOperand::new(STORED, RADIUS);
-    let entries = [(STORED, &level_two)];
+    let entries = [(STORED.into(), &image_two)];
     op.apply_with(
-        &level_two,
+        &image_two,
         SourceInputs::new(&entries),
         &mut wrong,
         &Anchor::whole(VOLUME),
@@ -305,7 +305,7 @@ fn the_operand_is_the_level_named_and_not_the_phases_own_input() {
     assert_ne!(
         real,
         wrong.view::<f64>().unwrap().to_owned(),
-        "level 1 and level 2 produced the same answer, so this test proves nothing"
+        "image 1 and image 2 produced the same answer, so this test proves nothing"
     );
 }
 
@@ -313,11 +313,11 @@ fn the_operand_is_the_level_named_and_not_the_phases_own_input() {
 
 #[test]
 fn an_op_that_declares_an_operand_and_never_consumes_it_is_refused() {
-    let op = ForgetfulOperand { level: STORED };
+    let op = ForgetfulOperand { image: STORED };
     let input: Voxels = input().into();
     let mut out = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
     let stored = input.clone();
-    let entries = [(STORED, &stored)];
+    let entries = [(STORED.into(), &stored)];
     let failed = op
         .apply_with(
             &input,
@@ -333,23 +333,23 @@ fn an_op_that_declares_an_operand_and_never_consumes_it_is_refused() {
     );
     assert!(
         message.contains(&STORED.to_string()),
-        "and the level it asked for: {message}"
+        "and the image it asked for: {message}"
     );
 }
 
 // ------------------------------------------- 4. two readers, one buffer --
 
-/// One level, two readers, different reaches: the fold keeps the wider, because
-/// the executor supplies **one** buffer per level and it has to satisfy both.
+/// One image, two readers, different reaches: the fold keeps the wider, because
+/// the executor supplies **one** buffer per image and it has to satisfy both.
 #[test]
-fn two_readers_of_one_level_fold_to_the_wider_reach() {
+fn two_readers_of_one_image_fold_to_the_wider_reach() {
     let chain = Chain::sequence(vec![
         Chain::op(WindowedOperand::new(STORED, 1)),
         Chain::op(WindowedOperand::new(STORED, 3)),
     ]);
     let inputs = chain.source_inputs(VOLUME).unwrap();
-    assert_eq!(inputs.len(), 1, "one entry per level, not per reader");
-    assert_eq!(inputs[0].level, STORED);
+    assert_eq!(inputs.len(), 1, "one entry per image, not per reader");
+    assert_eq!(inputs[0].image.index(), STORED);
     assert_eq!(inputs[0].reach.as_symmetric(), Some([3, 3, 3]));
 }
 
@@ -386,16 +386,16 @@ fn an_operand_reaching_past_the_phase_halo_is_refused_by_name() {
         chain_reach: [3, 3, 3],
     };
     plan.declare_dtypes(&chain).unwrap();
-    plan.declare_source_levels(&chain).unwrap();
+    plan.declare_source_images(&chain).unwrap();
 
-    let failed = check_source_levels(&chain, &plan).unwrap_err();
+    let failed = check_source_images(&chain, &plan).unwrap_err();
     let message = failed.to_string();
     assert!(
         message.contains("per-input halo"),
         "the refusal must name what would lift the limit: {message}"
     );
     assert!(
-        message.contains(&format!("level {STORED}")),
+        message.contains(&format!("image {STORED}")),
         "and which operand: {message}"
     );
 }
@@ -429,8 +429,8 @@ fn an_operand_within_the_halo_is_accepted() {
         chain_reach: [3, 3, 3],
     };
     plan.declare_dtypes(&chain).unwrap();
-    plan.declare_source_levels(&chain).unwrap();
-    check_source_levels(&chain, &plan).expect("an operand inside the halo is fetchable");
+    plan.declare_source_images(&chain).unwrap();
+    check_source_images(&chain, &plan).expect("an operand inside the halo is fetchable");
 }
 
 // -------------------------------------------- 6. the leaf is unchanged --
@@ -443,7 +443,7 @@ fn a_source_leaf_is_the_reach_zero_case() {
     let leaf = Chain::source(STORED, Dtype::F64);
     let inputs = leaf.source_inputs(VOLUME).unwrap();
     assert_eq!(inputs.len(), 1);
-    assert_eq!(inputs[0].level, STORED);
+    assert_eq!(inputs[0].image.index(), STORED);
     assert!(inputs[0].reach.is_none(), "a source leaf reaches nothing");
 }
 

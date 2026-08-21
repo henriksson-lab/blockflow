@@ -101,7 +101,7 @@
 // `+` is not associative, so the order the contributions are summed in is
 // observable in the result. It is fixed here rather than left to the gather:
 //
-// * every contribution is accumulated in **`f64`**, whatever the level's element
+// * every contribution is accumulated in **`f64`**, whatever the image's element
 //   type. An `f32` accumulator would put the disagreement at around `1e-7` of
 //   the total, which is small enough to look like noise and large enough to make
 //   two decompositions of the same data differ;
@@ -175,7 +175,7 @@
 // Coverage
 // --------
 // This op declares **no output stream**. `Coverage` is a decision about a
-// *fragment* output, and this phase's output is a pixel level: the tiling guard
+// *fragment* output, and this phase's output is a pixel image: the tiling guard
 // over its valid regions is a real guard here, not the vacuous one
 // `fragment.rs` warns about, because the valid regions are what the pixels are
 // written from. Inventing a stream to have something to declare would add a
@@ -554,7 +554,7 @@ impl FragmentOp for VoxelizeOp {
     }
 
     /// No pixel IO on the way in: the input is the fragment stream, and a phase
-    /// running this op reads not one voxel of the level below it.
+    /// running this op reads not one voxel of the image below it.
     fn reads_pixels(&self) -> bool {
         false
     }
@@ -620,13 +620,13 @@ impl FragmentOp for VoxelizeOp {
     }
 }
 
-/// Write an `f64` accumulator into `at` of a buffer of the level's own type.
+/// Write an `f64` accumulator into `at` of a buffer of the image's own type.
 ///
 /// Rounded to nearest for the integer types, for `resample.rs`'s reason:
 /// truncating biases every deposit down by up to a whole unit, and a count that
 /// is systematically low is the kind of wrongness nobody notices. `bool` is not
 /// rounded — it takes `VoxelElement::from_f64`'s stated convention, non-zero is
-/// true, so a `bool` level answers "did any point's kernel cover this voxel".
+/// true, so a `bool` image answers "did any point's kernel cover this voxel".
 fn store(accumulated: &Array3<f64>, at: [usize; 3], into: &mut Voxels) -> Result<()> {
     let shape = [
         accumulated.shape()[0],
@@ -668,7 +668,7 @@ fn store(accumulated: &Array3<f64>, at: [usize; 3], into: &mut Voxels) -> Result
         Dtype::F64 => arm!(f64, false),
         Dtype::F16 => {
             return Err(Error::invalid(
-                "voxelize: no buffer holds half-precision; a level of it could not have been \
+                "voxelize: no buffer holds half-precision; an image of it could not have been \
                  allocated in the first place",
             ))
         }

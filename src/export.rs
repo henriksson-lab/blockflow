@@ -98,7 +98,7 @@
 // | `sidecar_discarded` | `stream`, `fragments`, `bytes` — a whole stream removed |
 // | `side_output_written` | `output`, `phase`, `index`, `start`, `shape`, `bytes` — a block's slice of an array the op writes beside its primary result. `start`/`shape` are in **that output's own** space and may be of a different rank from the volume's, so they must not be read as voxel coordinates of it |
 //
-// `level` is a storage level: 0 is the workflow input, level `p` is the
+// `level` is a storage image: 0 is the workflow input, image `p` is the
 // intermediate that phase `p-1` wrote. `index` is `null` when the emitter is a
 // bare `RegionSource`/`RegionSink`, which has no notion of blocks.
 //
@@ -205,7 +205,7 @@ pub fn event_json(event: &Event) -> Value {
         }
         Event::RegionRead {
             source,
-            level,
+            image,
             index,
             region,
             voxels,
@@ -215,7 +215,7 @@ pub fn event_json(event: &Event) -> Value {
         } => {
             map.insert("type".to_string(), json!("region_read"));
             map.insert("source".to_string(), json!(source));
-            map.insert("level".to_string(), json!(level));
+            map.insert("level".to_string(), json!(image));
             map.insert("index".to_string(), json!(index));
             region_fields(&mut map, region);
             map.insert("voxels".to_string(), json!(voxels));
@@ -225,7 +225,7 @@ pub fn event_json(event: &Event) -> Value {
         }
         Event::RegionWritten {
             sink,
-            level,
+            image,
             index,
             region,
             voxels,
@@ -235,7 +235,7 @@ pub fn event_json(event: &Event) -> Value {
         } => {
             map.insert("type".to_string(), json!("region_written"));
             map.insert("sink".to_string(), json!(sink));
-            map.insert("level".to_string(), json!(level));
+            map.insert("level".to_string(), json!(image));
             map.insert("index".to_string(), json!(index));
             region_fields(&mut map, region);
             map.insert("voxels".to_string(), json!(voxels));
@@ -245,13 +245,13 @@ pub fn event_json(event: &Event) -> Value {
         }
         Event::Materialised {
             phase,
-            level,
+            image,
             bytes,
             intermediate,
         } => {
             map.insert("type".to_string(), json!("materialised"));
             map.insert("phase".to_string(), json!(phase));
-            map.insert("level".to_string(), json!(level));
+            map.insert("level".to_string(), json!(image));
             map.insert("bytes".to_string(), json!(bytes));
             map.insert("intermediate".to_string(), json!(intermediate));
         }
@@ -662,7 +662,7 @@ pub fn event_from_json(object: &Value, at: usize) -> Result<Option<Event>> {
         },
         "region_read" => Event::RegionRead {
             source: string_at(object, "source", at)?,
-            level: usize_at(object, "level", at)?,
+            image: usize_at(object, "level", at)?,
             index: optional_index(object, at)?,
             region: region_at(object, at)?,
             voxels: usize_at(object, "voxels", at)?,
@@ -672,7 +672,7 @@ pub fn event_from_json(object: &Value, at: usize) -> Result<Option<Event>> {
         },
         "region_written" => Event::RegionWritten {
             sink: string_at(object, "sink", at)?,
-            level: usize_at(object, "level", at)?,
+            image: usize_at(object, "level", at)?,
             index: optional_index(object, at)?,
             region: region_at(object, at)?,
             voxels: usize_at(object, "voxels", at)?,
@@ -682,7 +682,7 @@ pub fn event_from_json(object: &Value, at: usize) -> Result<Option<Event>> {
         },
         "materialised" => Event::Materialised {
             phase: usize_at(object, "phase", at)?,
-            level: usize_at(object, "level", at)?,
+            image: usize_at(object, "level", at)?,
             bytes: u64_at(object, "bytes", at)?,
             intermediate: bool_at(object, "intermediate", at)?,
         },
@@ -962,7 +962,7 @@ mod tests {
             log.on_event(&Event::TaskAdmitted { phase: 0, index });
             log.on_event(&Event::RegionRead {
                 source: "level 0".to_string(),
-                level: 0,
+                image: 0,
                 index: Some(index),
                 region: read.clone(),
                 voxels: read.voxels(),
@@ -996,7 +996,7 @@ mod tests {
         }
         log.on_event(&Event::Materialised {
             phase: 0,
-            level: 1,
+            image: 1,
             bytes: 1024,
             intermediate: false,
         });
@@ -1050,7 +1050,7 @@ mod tests {
             },
             Event::RegionRead {
                 source: "s".to_string(),
-                level: 0,
+                image: 0,
                 index: None,
                 region: region.clone(),
                 voxels: 8,
@@ -1060,7 +1060,7 @@ mod tests {
             },
             Event::RegionWritten {
                 sink: "s".to_string(),
-                level: 1,
+                image: 1,
                 index: None,
                 region: region.clone(),
                 voxels: 8,
@@ -1070,7 +1070,7 @@ mod tests {
             },
             Event::Materialised {
                 phase: 0,
-                level: 1,
+                image: 1,
                 bytes: 64,
                 intermediate: true,
             },

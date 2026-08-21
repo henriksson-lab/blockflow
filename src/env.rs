@@ -32,16 +32,27 @@
 // against a generic parameter. Both variants of `BlockBuf` know their dtype,
 // because the simulated one has to price bytes and a byte is a width.
 //
-// Levels
+// Images
 // ------
-// Level 0 is the workflow input. Level `p` (1..=n_phases) is the output of
-// phase `p-1`, so the last level is the workflow output and levels in between
+// Image 0 is the workflow input. Image `p` (1..=n_phases) is the output of
+// phase `p-1`, so the last image is the workflow output and images in between
 // are intermediates. That numbering is what makes "is this write a
 // materialisation?" a comparison rather than a flag.
 //
-// A level is **allocated when something first writes to it**, not when the
-// environment is built. See [`LevelStore`] for the measurement that is for; the
-// short form is that a plan's levels are alive over *lifetimes*, and an
+// A run may also be handed **more arrays than one**, and those are images too:
+// read through the same `read`, priced by the same counters, named by the same
+// `source_images`. They are addressed in a disjoint high range —
+// `assemble::ImageId::supplied(i)` — so that adding one renumbers nothing, and
+// because a caller has to know the address before it builds the ops that read
+// it, which is before the plan knows how many phases it has. See
+// `ArrayEnvironment::with_inputs`. The one behavioural difference is that they
+// are never written and never freed: no phase produces one, so nothing could
+// rebuild it, which is the distinction `decomposition::ImageKind` records and
+// `Visibility` cannot.
+//
+// An image is **allocated when something first writes to it**, not when the
+// environment is built. See [`ImageStore`] for the measurement that is for; the
+// short form is that a plan's images are alive over *lifetimes*, and an
 // environment that allocated all of them at once cost the sum of the lifetimes
 // rather than their largest overlap.
 
@@ -57,20 +68,24 @@ use crate::region::Region;
 use crate::sidecar::{Discarded, FragmentKey, Lifecycle, Sidecars};
 use crate::voxels::{SideBuf, Voxels};
 
+use crate::assemble::{describe_image, is_supplied_image, ImageId};
+
 use super::decomposition::Decomposition;
 use super::geometry::{chunks_touched, region_within};
 use super::op::{Anchor, Chain, Output, Placement, SideBlock, SourceInputs};
 
-/// Unwrap the executor's `(level, buffer)` list into the `(level, &Voxels)` form
+/// Unwrap the executor's `(image, buffer)` list into the `(image, &Voxels)` form
 /// [`SourceInputs`] holds.
 ///
 /// A free function rather than a method on `SourceInputs` because the borrow has
 /// to outlive the call: the `Vec` it returns owns the references, and the caller
 /// keeps it alive for as long as it holds the `SourceInputs`.
-pub(crate) fn as_source_arrays(sources: &[(usize, BlockBuf)]) -> Result<Vec<(usize, &Voxels)>> {
+pub(crate) fn as_source_arrays(
+    sources: &[(usize, BlockBuf)],
+) -> Result<Vec<(crate::assemble::ImageId, &Voxels)>> {
     sources
         .iter()
-        .map(|(level, buf)| Ok((*level, buf.as_array()?)))
+        .map(|(image, buf)| Ok(((*image).into(), buf.as_array()?)))
         .collect()
 }
 
@@ -149,10 +164,10 @@ pub struct EnvCounters {
     pub writes: AtomicU64,
     pub read_voxels: AtomicU64,
     pub write_voxels: AtomicU64,
-    /// Bytes of level data moved, **decoded**.
+    /// Bytes of image data moved, **decoded**.
     ///
     /// Beside the voxel counts rather than derived from them, because a run
-    /// whose levels have different element types has no single bytes-per-voxel
+    /// whose images have different element types has no single bytes-per-voxel
     /// and a caller multiplying by one would get a number that means nothing.
     /// This is the figure the element type change is measured in: the same
     /// chain over the same volume moves an eighth of these bytes as `bool` as it
@@ -175,7 +190,7 @@ pub struct EnvCounters {
     /// Traffic to the arrays an op writes **beside** its primary result. Counted
     /// separately from `writes`/`write_voxels` for the same reason sidecars are:
     /// a side output has its own element type and its own rank, so its voxels
-    /// are not commensurable with the level's and adding them would produce one
+    /// are not commensurable with the image's and adding them would produce one
     /// number that means nothing. `side_bytes_written` is the commensurable one,
     /// and it is the figure that was missing — the framework counted 95.2 MB of
     /// a run that wrote 158.6.
@@ -214,7 +229,7 @@ impl EnvCounters {
         )
     }
 
-    /// `(bytes read, bytes written)` for level data, decoded.
+    /// `(bytes read, bytes written)` for image data, decoded.
     ///
     /// Its own accessor rather than two more slots in `snapshot`, whose tuple
     /// several callers destructure positionally.
@@ -261,7 +276,7 @@ pub trait Environment: Sync {
     /// before any task runs.
     fn prepare(&self, decomposition: &Decomposition) -> Result<()>;
 
-    fn read(&self, level: usize, region: &Region) -> Result<BlockBuf>;
+    fn read(&self, image: usize, region: &Region) -> Result<BlockBuf>;
 
     /// Apply one slot of the chain over the whole buffer.
     ///
@@ -274,9 +289,9 @@ pub trait Environment: Sync {
     /// [`Anchor`]. It is threaded rather than recomputed so the two cannot
     /// disagree.
     ///
-    /// `sources` is the same arrangement for the levels the slot's
-    /// [`Chain::Source`] leaves read: one `(level, buffer)` per level in
-    /// `PhaseDecomposition::source_levels`, each holding **the same extent as
+    /// `sources` is the same arrangement for the images the slot's
+    /// [`Chain::Source`] leaves read: one `(image, buffer)` per image in
+    /// `PhaseDecomposition::source_images`, each holding **the same extent as
     /// `input`**, read by the executor through [`Self::read`] so that its bytes
     /// are counted exactly where every other read's are. Empty for every slot
     /// with no source leaf, which is every slot this crate shipped before they
@@ -296,11 +311,11 @@ pub trait Environment: Sync {
     ) -> Result<BlockBuf>;
 
     /// Write the sub-box `within` of `buf` to absolute position `valid`.
-    fn write(&self, level: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()>;
+    fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()>;
 
     // -------------------------------------------------- side outputs --
     //
-    // A level is one array of one element type, which is the shape of every
+    // An image is one array of one element type, which is the shape of every
     // op whose result is a volume. An op that produces several results has to
     // put the rest somewhere, and where it used to put them was outside the
     // framework — a custom environment writing on the side, with no term
@@ -310,8 +325,8 @@ pub trait Environment: Sync {
     // These are beside `write` rather than a wider `write`, on the same
     // argument the sidecar block below is made with: a side output has its own
     // element type, its own rank and its own coordinate space, so it is
-    // addressed by name and by a region of its own rather than by a level and
-    // a region of the level's.
+    // addressed by name and by a region of its own rather than by an image and
+    // a region of the image's.
     //
     // `write_side` is the executor's entry point and is **not** an override
     // point: it counts, then stores. An environment supplies storage by
@@ -341,10 +356,18 @@ pub trait Environment: Sync {
     /// `block.regions` is one per declared output, from
     /// [`crate::op::BlockOp::side_region`]; the buffers come back in the same
     /// order and with those shapes, checked here.
+    ///
+    /// `sources` is the list [`Self::apply`] was handed for this block, in the
+    /// same form and for the same reason: a side output may be a function of
+    /// every array the phase read and not only of the one the op was applied to.
+    /// It is unwrapped **after** the simulated arm returns, because an accounted
+    /// block holds no array and asking one for a buffer before the arithmetic is
+    /// known to be happening would turn a counting run into a refusal.
     fn apply_side(
         &self,
         slot: &Chain,
         input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
         primary: &BlockBuf,
         block: &SideBlock<'_>,
     ) -> Result<Vec<SideBuf>> {
@@ -358,7 +381,8 @@ pub trait Environment: Sync {
         let (BlockBuf::Array(input), BlockBuf::Array(result)) = (input, primary) else {
             return Ok(buffers);
         };
-        let produced = slot.apply_side(input, result, block)?;
+        let stored = as_source_arrays(sources)?;
+        let produced = slot.apply_side(input, SourceInputs::new(&stored), result, block)?;
         if produced.len() != regions.len() {
             return Err(Error::InvalidArgument(format!(
                 "op {:?} declares {} side output(s) and produced {}. The declaration is what \
@@ -425,7 +449,7 @@ pub trait Environment: Sync {
     ///
     /// The override point an environment that holds no data uses to allocate
     /// nothing. Separate from [`Self::constant`] because a side output has its
-    /// own rank and its own coordinate space, and a level buffer has neither —
+    /// own rank and its own coordinate space, and an image buffer has neither —
     /// merging them would put a `Vec<usize>` shape back into the type the rank
     /// was just pinned out of.
     fn side_constant(&self, region: &Region) -> SideBuf {
@@ -448,7 +472,7 @@ pub trait Environment: Sync {
     ///
     /// `dtype` is an argument rather than an implicit for the same reason
     /// `reach` takes `volume_len`: the caller is the only thing that knows which
-    /// level this block is destined for, and a buffer allocated at the wrong
+    /// image this block is destined for, and a buffer allocated at the wrong
     /// width is a buffer the write refuses.
     fn constant(&self, dtype: Dtype, region: &Region, value: f64) -> Result<BlockBuf>;
 
@@ -457,11 +481,11 @@ pub trait Environment: Sync {
 
     // ------------------------------------------------ buffer arithmetic --
     //
-    // Three operations on buffers the *executor* holds, rather than on levels.
+    // Three operations on buffers the *executor* holds, rather than on images.
     // They exist for the iterative phase (`crate::iterate`), whose two private
     // ping-pong buffers are whole-volume blocks the executor allocates through
-    // `constant` and owns for the length of the phase — never levels, because
-    // nothing outside the phase can see them and the plan allocates no level for
+    // `constant` and owns for the length of the phase — never images, because
+    // nothing outside the phase can see them and the plan allocates no image for
     // them.
     //
     // They are on this trait, and not free functions over `BlockBuf`, for the
@@ -601,42 +625,42 @@ pub trait Environment: Sync {
         Ok(BlockBuf::Array(out))
     }
 
-    /// Stage barrier: everything written to `level` is durable.
-    fn finish(&self, level: usize) -> Result<()>;
+    /// Stage barrier: everything written to `image` is durable.
+    fn finish(&self, image: usize) -> Result<()>;
 
-    /// This level is dead: nothing will read it again, so free it.
+    /// This image is dead: nothing will read it again, so free it.
     ///
     /// **The default is to keep it**, which is what every environment did before
     /// this existed. Freeing is an optimisation and forgetting to free costs
     /// space; freeing something still wanted costs an answer, so the safe
     /// default is the one that does nothing.
     ///
-    /// Called by the executor when the phase that reads `level` has finished
-    /// every one of its tasks, and only for a level the plan calls
+    /// Called by the executor when the phase that reads `image` has finished
+    /// every one of its tasks, and only for an image the plan calls
     /// [`Visibility::Internal`](crate::decomposition::Visibility::Internal) and
-    /// the caller has not pinned. A level is read by exactly one phase, so that
+    /// the caller has not pinned. An image is read by exactly one phase, so that
     /// moment is unambiguous.
     ///
-    /// Reading a discarded level afterwards must **fail**, not return zeros. A
-    /// freed level that reads as data is the same class of defect as an
-    /// unwritten level that reads as zeros, and this crate fills those with NaN
+    /// Reading a discarded image afterwards must **fail**, not return zeros. A
+    /// freed image that reads as data is the same class of defect as an
+    /// unwritten image that reads as zeros, and this crate fills those with NaN
     /// for the same reason.
-    fn discard_level(&self, _level: usize) -> Result<()> {
+    fn discard_image(&self, _image: usize) -> Result<()> {
         Ok(())
     }
 
     /// The same, and **which phase's completion freed it**.
     ///
     /// A separate method with a default that forwards, rather than a sixth
-    /// argument to `discard_level`, so that every environment written before it
+    /// argument to `discard_image`, so that every environment written before it
     /// existed keeps compiling and keeps behaving identically. What it buys is
-    /// the diagnostic: "level 4 was discarded" is a fact a reader can do nothing
-    /// with, and "level 4 was freed after phase 3, which the plan says is its
-    /// last reader" tells them which `Hints::keep_levels` entry they wanted. An
+    /// the diagnostic: "image 4 was discarded" is a fact a reader can do nothing
+    /// with, and "image 4 was freed after phase 3, which the plan says is its
+    /// last reader" tells them which `Hints::keep_images` entry they wanted. An
     /// environment that does not record the phase loses only the second half of
     /// that sentence.
-    fn discard_level_after(&self, level: usize, _phase: usize) -> Result<()> {
-        self.discard_level(level)
+    fn discard_image_after(&self, image: usize, _phase: usize) -> Result<()> {
+        self.discard_image(image)
     }
 
     fn counters(&self) -> &EnvCounters;
@@ -758,40 +782,40 @@ pub trait Environment: Sync {
 
 // ------------------------------------------------------------------ real --
 
-/// One level's storage: **what it will hold, and whether it holds it yet.**
+/// One image's storage: **what it will hold, and whether it holds it yet.**
 ///
 /// The declared element type and shape are known from the moment the
 /// environment is built — that is what `prepare` checks and what a read of an
-/// unwritten level is shaped by — but the buffer behind them is not allocated
+/// unwritten image is shaped by — but the buffer behind them is not allocated
 /// until the first write.
 ///
 /// Why, measured
 /// -------------
-/// A level costs `volume x sizeof(dtype)` bytes for as long as it is allocated,
-/// and a plan says exactly how long that is: level `p + 1` is written by phase
-/// `p` and freed after its last reader, which is what `discard_level` already
-/// did at the far end. Allocating every level in the constructor made the *near*
+/// An image costs `volume x sizeof(dtype)` bytes for as long as it is allocated,
+/// and a plan says exactly how long that is: image `p + 1` is written by phase
+/// `p` and freed after its last reader, which is what `discard_image` already
+/// did at the far end. Allocating every image in the constructor made the *near*
 /// end wrong in the same way the far end used to be, and the two are not
 /// symmetric in cost: freeing late costs the tail of a chain, allocating early
 /// costs **all of it at once, before the first phase runs**.
 ///
-/// On the 12-phase, 13-level plan this was measured against — `404 x 1304 x
-/// 3369`, 1.775 Gvoxel — the levels' largest simultaneous total is 67.8 GiB and
+/// On the 12-phase, 13-image plan this was measured against — `404 x 1304 x
+/// 3369`, 1.775 Gvoxel — the images' largest simultaneous total is 67.8 GiB and
 /// their sum is 138.8 GiB. Constructing the environment paid the second figure,
 /// and paid it in *touched* pages rather than reservations, because an unwritten
-/// level is sentinel-filled rather than zeroed: `Voxels::unwritten` writes every
+/// image is sentinel-filled rather than zeroed: `Voxels::unwritten` writes every
 /// element. A 1/64 scale model of that plan measured 1.96 GiB of resident set
 /// from the constructor alone, against a priced peak of 1.06 GiB — 1.85x, before
 /// a phase had run. Deferring the allocation to the first write makes the
 /// environment cost what the plan prices it at.
 ///
-/// **No voxel moves.** A read of a level nobody has written yields
+/// **No voxel moves.** A read of an image nobody has written yields
 /// [`Voxels::unwritten`] over the read region, which is byte-for-byte the slice
-/// it would have taken out of a fully sentinel-filled level; the first write
-/// materialises the whole level at the sentinel and then assigns into it, which
-/// is what a write into a fully sentinel-filled level always did.
-struct LevelStore {
-    /// What this level holds, whether or not it holds it yet. Kept beside the
+/// it would have taken out of a fully sentinel-filled image; the first write
+/// materialises the whole image at the sentinel and then assigns into it, which
+/// is what a write into a fully sentinel-filled image always did.
+struct ImageStore {
+    /// What this image holds, whether or not it holds it yet. Kept beside the
     /// buffer rather than read off it, because the whole point is that there
     /// may be no buffer to read it off.
     dtype: Dtype,
@@ -800,8 +824,8 @@ struct LevelStore {
     data: Option<Voxels>,
 }
 
-impl LevelStore {
-    /// A level nothing has written yet.
+impl ImageStore {
+    /// An image nothing has written yet.
     ///
     /// Fallible for one reason and it is the constructor's: `Dtype::F16` has no
     /// buffer variant, and refusing it here — against a zero-element probe,
@@ -817,7 +841,7 @@ impl LevelStore {
         })
     }
 
-    /// A level that already holds something: level 0, which is the input.
+    /// An image that already holds something: image 0, which is the input.
     fn held(data: Voxels) -> Self {
         Self {
             dtype: data.dtype(),
@@ -826,12 +850,12 @@ impl LevelStore {
         }
     }
 
-    /// Does this level hold a buffer? The measurable form of the deferral.
+    /// Does this image hold a buffer? The measurable form of the deferral.
     fn is_allocated(&self) -> bool {
         self.data.is_some()
     }
 
-    /// The whole level as it reads: the buffer, or the sentinel it would have
+    /// The whole image as it reads: the buffer, or the sentinel it would have
     /// been filled with.
     fn whole(&self) -> Result<Voxels> {
         match &self.data {
@@ -840,8 +864,8 @@ impl LevelStore {
         }
     }
 
-    /// `region` of the level as it reads. The unwritten case allocates
-    /// `region`'s worth and not the level's, which is the point.
+    /// `region` of the image as it reads. The unwritten case allocates
+    /// `region`'s worth and not the image's, which is the point.
     fn slice(&self, region: &Region) -> Result<Voxels> {
         match &self.data {
             Some(data) => data.slice_region(region),
@@ -858,15 +882,15 @@ impl LevelStore {
         Ok(self.data.as_mut().expect("just allocated"))
     }
 
-    /// Free the buffer, keeping what the level *is*. Reads are refused by the
+    /// Free the buffer, keeping what the image *is*. Reads are refused by the
     /// discard flag rather than by the absence, which is the arrangement
-    /// `discard_level` already documented: the flag is what carries the meaning.
+    /// `discard_image` already documented: the flag is what carries the meaning.
     fn release(&mut self) {
         self.data = None;
     }
 }
 
-/// Real volumes held in memory, one per level, **each at its own element type**
+/// Real volumes held in memory, one per image, **each at its own element type**
 /// and each allocated when something first writes to it.
 ///
 /// This is the geometry oracle's environment: small volumes, real values, so
@@ -876,20 +900,36 @@ impl LevelStore {
 /// `ZarrRegionSink` because `zarrs` 0.23.13 loses data on concurrent partial
 /// chunk writes.
 ///
-/// Being resident is not the same as being resident *all at once*: a level's
+/// Being resident is not the same as being resident *all at once*: an image's
 /// lifetime runs from the phase that writes it to its last reader, and this
-/// environment now holds a level over exactly that interval. See [`LevelStore`]
-/// for the near end and [`Self::discard_level`] for the far one.
+/// environment now holds an image over exactly that interval. See [`ImageStore`]
+/// for the near end and [`Self::discard_image`] for the far one.
 pub struct ArrayEnvironment {
     volume: [usize; 3],
-    levels: Vec<RwLock<LevelStore>>,
-    /// Set when a level has been discarded. Kept beside the levels rather than
+    /// Every array, addressed by slot: `0..n_written` are the images the plan
+    /// writes and the rest are the arrays the caller handed the run, in the
+    /// order they were handed over.
+    ///
+    /// One vector rather than two because a supplied input is an image in every
+    /// way that this environment cares about — it is read through `read`, it is
+    /// priced by the same counters, it holds a shape and an element type — and
+    /// the only thing that is different about it is its **address**, which
+    /// [`Self::slot`] translates in one place. Two vectors would put the
+    /// translation in every method instead.
+    images: Vec<RwLock<ImageStore>>,
+    /// How many of `images` the plan writes: image 0 plus one per phase.
+    ///
+    /// The boundary between the two address ranges, and what `output()` counts
+    /// back from — it used to be `images.last()`, which stopped being the output
+    /// the moment something was appended after it.
+    n_written: usize,
+    /// Set when an image has been discarded. Kept beside the images rather than
     /// inferred from a placeholder's shape, because "this was freed" and "this
     /// happens to be small" are different facts and only one of them is an
     /// error to read.
     discarded: Vec<AtomicBool>,
-    /// The phase after whose completion each level was freed, or `usize::MAX`
-    /// for a level nobody has freed or one freed through `discard_level`, which
+    /// The phase after whose completion each image was freed, or `usize::MAX`
+    /// for an image nobody has freed or one freed through `discard_image`, which
     /// does not say.
     ///
     /// Beside `discarded` rather than folded into it because they answer
@@ -900,17 +940,17 @@ pub struct ArrayEnvironment {
     /// The arrays ops write beside their primary result, by declared name.
     ///
     /// Allocated on declaration rather than on first write, and NaN-filled on
-    /// the same argument the levels are: a voxel nobody wrote must be loud. The
+    /// the same argument the images are: a voxel nobody wrote must be loud. The
     /// map is behind one lock because declaration is once-per-run and writes go
     /// through the inner lock; a `BTreeMap` rather than a `HashMap` so that
     /// iteration order is the declaration order a diagnostic reports in.
     ///
     /// Still `ArrayD<f64>`: a side output's **rank** is its own, which is the
-    /// whole reason it is not a level, and its dtype is carried by the `Output`
+    /// whole reason it is not an image, and its dtype is carried by the `Output`
     /// that declared it and charged by `write_side`.
     side: RwLock<BTreeMap<String, RwLock<ArrayD<f64>>>>,
     counters: EnvCounters,
-    /// In-memory, to match the levels: an environment whose volumes are not
+    /// In-memory, to match the images: an environment whose volumes are not
     /// shared cannot offer shared fragments either, and pretending otherwise
     /// would make a single-node test pass for a reason a distributed run does
     /// not have.
@@ -918,27 +958,28 @@ pub struct ArrayEnvironment {
 }
 
 impl ArrayEnvironment {
-    /// `n_phases` levels are written; level 0 holds `input`.
+    /// `n_phases` images are written; image 0 holds `input`.
     ///
-    /// Every level gets `input`'s element type, which is right for the plans
+    /// Every image gets `input`'s element type, which is right for the plans
     /// that keep one and is all this constructor can know. A plan whose phases
     /// change type — or shape — needs [`Self::for_decomposition`], which reads
     /// both off the plan.
     pub fn new(input: Voxels, n_phases: usize, chunk: [usize; 3]) -> Result<Self> {
         let volume = input.shape();
         let dtype = input.dtype();
-        let mut levels = Vec::with_capacity(n_phases + 1);
-        levels.push(RwLock::new(LevelStore::held(input)));
+        let mut images = Vec::with_capacity(n_phases + 1);
+        images.push(RwLock::new(ImageStore::held(input)));
         for _ in 0..n_phases {
-            levels.push(RwLock::new(LevelStore::pending(dtype, volume)?));
+            images.push(RwLock::new(ImageStore::pending(dtype, volume)?));
         }
         Ok(Self {
-            discarded: (0..levels.len()).map(|_| AtomicBool::new(false)).collect(),
-            freed_after: (0..levels.len())
+            discarded: (0..images.len()).map(|_| AtomicBool::new(false)).collect(),
+            freed_after: (0..images.len())
                 .map(|_| AtomicUsize::new(usize::MAX))
                 .collect(),
             volume,
-            levels,
+            n_written: images.len(),
+            images,
             chunk,
             side: RwLock::new(BTreeMap::new()),
             counters: EnvCounters::default(),
@@ -946,13 +987,13 @@ impl ArrayEnvironment {
         })
     }
 
-    /// Levels shaped **and typed** by the plan: level `p+1` gets phase `p`'s
+    /// Images shaped **and typed** by the plan: image `p+1` gets phase `p`'s
     /// volume and phase `p`'s element type.
     ///
-    /// [`Self::new`] gives every level the input's shape and type, which is
+    /// [`Self::new`] gives every image the input's shape and type, which is
     /// right for every plan that keeps one, and is the only thing that could be
     /// done while a plan *had* one of each. A phase that changes either needs
-    /// its output level allocated at what it writes, and the decomposition is
+    /// its output image allocated at what it writes, and the decomposition is
     /// what says which — so both are read from the decomposition rather than
     /// passed alongside it, where they could disagree.
     pub fn for_decomposition(
@@ -963,34 +1004,35 @@ impl ArrayEnvironment {
         let volume = input.shape();
         if volume != decomposition.volume {
             return Err(Error::InvalidArgument(format!(
-                "array environment: the input is {volume:?} and the decomposition reads level \
+                "array environment: the input is {volume:?} and the decomposition reads image \
                  0 as {:?}",
                 decomposition.volume
             )));
         }
         if input.dtype() != decomposition.dtype {
             return Err(Error::InvalidArgument(format!(
-                "array environment: the input holds {} and the decomposition reads level 0 as \
+                "array environment: the input holds {} and the decomposition reads image 0 as \
                  {}",
                 input.dtype().numpy_name(),
                 decomposition.dtype.numpy_name()
             )));
         }
-        let mut levels = Vec::with_capacity(decomposition.n_levels());
-        levels.push(RwLock::new(LevelStore::held(input)));
+        let mut images = Vec::with_capacity(decomposition.n_images());
+        images.push(RwLock::new(ImageStore::held(input)));
         for (index, phase) in decomposition.phases.iter().enumerate() {
-            levels.push(RwLock::new(LevelStore::pending(
+            images.push(RwLock::new(ImageStore::pending(
                 decomposition.dtype_at(index + 1),
                 phase.volume(),
             )?));
         }
         Ok(Self {
-            discarded: (0..levels.len()).map(|_| AtomicBool::new(false)).collect(),
-            freed_after: (0..levels.len())
+            discarded: (0..images.len()).map(|_| AtomicBool::new(false)).collect(),
+            freed_after: (0..images.len())
                 .map(|_| AtomicUsize::new(usize::MAX))
                 .collect(),
             volume,
-            levels,
+            n_written: images.len(),
+            images,
             chunk,
             side: RwLock::new(BTreeMap::new()),
             counters: EnvCounters::default(),
@@ -998,77 +1040,170 @@ impl ArrayEnvironment {
         })
     }
 
-    /// Whether `level` has been freed.
-    pub fn is_discarded(&self, level: usize) -> bool {
+    /// The plan's images, **and the arrays the run was handed besides its
+    /// input**.
+    ///
+    /// `input` is image 0 and is what the first phase reads. `supplied` is
+    /// everything else the run was given: `supplied[i]` is
+    /// [`ImageId::supplied(i)`], and it is an image like any other — read through
+    /// the same `Environment::read` at the reading block's own fetch region,
+    /// charged the same bytes, named by a `Chain::Source` leaf or a
+    /// `BlockOp::source_input` — with one difference, which is the whole
+    /// distinction the [`ImageKind`] split records: **no phase writes it and
+    /// nothing can rebuild it**, so it is never freed and a write to it is
+    /// refused by name.
+    ///
+    /// Every one of them must be in image 0's shape, because a source leaf has
+    /// reach 0 and is handed the reading block's fetch region: across shapes the
+    /// same integers would name different voxels. Their element types are their
+    /// own, and each is checked against what the plan's readers declared.
+    ///
+    /// [`ImageId::supplied(i)`]: crate::assemble::ImageId::supplied
+    /// [`ImageKind`]: crate::decomposition::ImageKind
+    pub fn with_inputs(
+        input: Voxels,
+        supplied: Vec<Voxels>,
+        decomposition: &Decomposition,
+        chunk: [usize; 3],
+    ) -> Result<Self> {
+        let mut env = Self::for_decomposition(input, decomposition, chunk)?;
+        let wanted = decomposition.supplied_input_images();
+        if supplied.len() != wanted.len() {
+            return Err(Error::InvalidArgument(format!(
+                "array environment was handed {} array(s) besides its input and the plan reads                  {}: {}. An array nothing reads is not an image of this plan, and an image nothing                  supplied has nothing to be fetched from.",
+                supplied.len(),
+                wanted.len(),
+                wanted
+                    .iter()
+                    .map(|&image| describe_image(image))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        for (which, array) in supplied.into_iter().enumerate() {
+            let image = ImageId::supplied(which).index();
+            if !wanted.contains(&image) {
+                return Err(Error::InvalidArgument(format!(
+                    "array environment was handed {} and the plan does not read it; it reads {}.                      Supplied inputs are addressed from zero in the order they are handed over,                      so a gap in the list moves every array after it.",
+                    describe_image(image),
+                    wanted
+                        .iter()
+                        .map(|&image| describe_image(image))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            let held = array.shape();
+            let volume = decomposition.volume_at(image);
+            if held != volume {
+                return Err(Error::InvalidArgument(format!(
+                    "array environment: {} is {held:?} and the plan reads it as {volume:?}. A                      supplied input is read at the reading block's own fetch region, so it is in                      image 0's coordinate space and no other.",
+                    describe_image(image)
+                )));
+            }
+            let held = array.dtype();
+            let wants = decomposition.dtype_at(image);
+            if held != wants {
+                return Err(Error::InvalidArgument(format!(
+                    "array environment: {} holds {} and the plan's readers declare {}. Nothing                      folds an element type for an array no phase wrote, so the declaration is                      the only statement there is and it has to be the array's own.",
+                    describe_image(image),
+                    held.numpy_name(),
+                    wants.numpy_name()
+                )));
+            }
+            env.images.push(RwLock::new(ImageStore::held(array)));
+            env.discarded.push(AtomicBool::new(false));
+            env.freed_after.push(AtomicUsize::new(usize::MAX));
+        }
+        Ok(env)
+    }
+
+    /// Where `image` sits in `self.images`.
+    ///
+    /// The one place the two address ranges meet. An image the plan writes is at
+    /// its own number; a supplied input is at `n_written` plus its index, which
+    /// is the order it was handed over in.
+    fn slot(&self, image: usize) -> usize {
+        match ImageId::from(image).supplied_index() {
+            Some(which) => self.n_written + which,
+            None => image,
+        }
+    }
+
+    /// Whether `image` has been freed.
+    pub fn is_discarded(&self, image: usize) -> bool {
         self.discarded
-            .get(level)
+            .get(self.slot(image))
             .map(|flag| flag.load(Ordering::SeqCst))
             .unwrap_or(false)
     }
 
-    /// How many levels still hold their data.
+    /// How many images still hold their data.
     ///
     /// The measurable form of the whole point: a twenty-phase chain used to end
     /// with twenty-one of these and now ends with three.
     ///
-    /// **"Still", and therefore about discarding only.** A level nothing has
+    /// **"Still", and therefore about discarding only.** An image nothing has
     /// written yet is counted here, because this answers "what has the run given
-    /// back" and an unwritten level was never taken. What is actually allocated
-    /// at this moment is [`Self::allocated_levels`], and the two differ during a
+    /// back" and an unwritten image was never taken. What is actually allocated
+    /// at this moment is [`Self::allocated_images`], and the two differ during a
     /// run for exactly the length of the chain that has not run yet.
-    pub fn resident_levels(&self) -> usize {
-        (0..self.levels.len())
-            .filter(|&level| !self.is_discarded(level))
+    pub fn resident_images(&self) -> usize {
+        (0..self.images.len())
+            .filter(|&image| !self.is_discarded(image))
             .count()
     }
 
-    /// How many levels hold a buffer **right now**.
+    /// How many images hold a buffer **right now**.
     ///
-    /// The near end of a level's lifetime, as [`Self::resident_levels`] is the
-    /// far end: a level is allocated by its first write and freed by its
+    /// The near end of an image's lifetime, as [`Self::resident_images`] is the
+    /// far end: an image is allocated by its first write and freed by its
     /// discard, so before the run this is 1 — the input — however many phases
     /// the plan has. That is the difference this environment used to pay in
-    /// full: see [`LevelStore`] for the 138.8 GiB against 67.8 GiB it was worth
+    /// full: see [`ImageStore`] for the 138.8 GiB against 67.8 GiB it was worth
     /// on the plan it was measured against.
-    pub fn allocated_levels(&self) -> usize {
-        (0..self.levels.len())
-            .filter(|&level| self.level_guard(level).is_allocated())
+    pub fn allocated_images(&self) -> usize {
+        (0..self.images.len())
+            .filter(|&image| self.image_guard(image).is_allocated())
             .count()
     }
 
-    /// Bytes the levels hold **right now**: what a resident environment costs at
+    /// Bytes the images hold **right now**: what a resident environment costs at
     /// this moment, stated the way a residency budget is.
     ///
-    /// Only allocated levels count, because only they occupy anything. A level
+    /// Only allocated images count, because only they occupy anything. An image
     /// the plan has not reached yet contributes nothing, which is the whole
     /// claim and is why it is reported rather than argued.
-    pub fn allocated_level_bytes(&self) -> u64 {
-        (0..self.levels.len())
-            .filter_map(|level| {
-                let guard = self.level_guard(level);
+    pub fn allocated_image_bytes(&self) -> u64 {
+        (0..self.images.len())
+            .filter_map(|image| {
+                let guard = self.image_guard(image);
                 guard.data.as_ref().map(|data| data.bytes())
             })
             .sum()
     }
 
-    /// Which phase's completion freed `level`, when that was recorded.
+    /// Which phase's completion freed `image`, when that was recorded.
     ///
-    /// `None` for a live level and for one freed through `discard_level`, which
+    /// `None` for a live image and for one freed through `discard_image`, which
     /// carries no phase; the two are distinguished by [`Self::is_discarded`].
-    pub fn freed_after(&self, level: usize) -> Option<usize> {
-        let phase = self.freed_after.get(level)?.load(Ordering::SeqCst);
+    pub fn freed_after(&self, image: usize) -> Option<usize> {
+        let phase = self
+            .freed_after
+            .get(self.slot(image))?
+            .load(Ordering::SeqCst);
         (phase != usize::MAX).then_some(phase)
     }
 
-    fn refuse_if_discarded(&self, level: usize, what: &str) -> Result<()> {
-        if !self.is_discarded(level) {
+    fn refuse_if_discarded(&self, image: usize, what: &str) -> Result<()> {
+        if !self.is_discarded(image) {
             return Ok(());
         }
         // The phase is named where it is known, because it is the whole of what
-        // a reader needs: `keep_levels` takes a level number, and the question
+        // a reader needs: `keep_images` takes an image number, and the question
         // that gets somebody there is "who freed it and why did the plan think
         // it could". Without it the message says only that something happened.
-        let freed = match self.freed_after(level) {
+        let freed = match self.freed_after(image) {
             Some(phase) => format!(
                 "was discarded after phase {phase}, whose completion the plan says is the last \
                  read of it"
@@ -1076,75 +1211,74 @@ impl ArrayEnvironment {
             None => "was discarded".to_string(),
         };
         Err(Error::InvalidArgument(format!(
-            "{what}: level {level} {freed}, so the plan says nothing wants it again. Pin it \
-             with `Hints::keep_levels` if something does."
+            "{what}: {} {freed}, so the plan says nothing wants it again. Pin it with \
+             `Hints::keep_images` if something does.",
+            describe_image(image)
         )))
     }
 
-    fn level_guard(&self, level: usize) -> std::sync::RwLockReadGuard<'_, LevelStore> {
-        self.levels[level]
+    fn image_guard(&self, image: usize) -> std::sync::RwLockReadGuard<'_, ImageStore> {
+        self.images[self.slot(image)]
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The shape of one level, which is not `volume()` once a phase changes it.
+    /// The shape of one image, which is not `volume()` once a phase changes it.
     ///
-    /// **Declared**, so it is the same answer before and after the level is
+    /// **Declared**, so it is the same answer before and after the image is
     /// written, and after it is discarded. It used to be read off the buffer,
-    /// which meant a discarded level reported the one-voxel placeholder that
-    /// stood in for it; the flag is what says a level is gone
-    /// ([`Self::is_discarded`]), and this now says only what the level is.
-    pub fn level_shape(&self, level: usize) -> [usize; 3] {
-        self.level_guard(level).shape
+    /// which meant a discarded image reported the one-voxel placeholder that
+    /// stood in for it; the flag is what says an image is gone
+    /// ([`Self::is_discarded`]), and this now says only what the image is.
+    pub fn image_shape(&self, image: usize) -> [usize; 3] {
+        self.image_guard(image).shape
     }
 
-    /// The element type of one level, which is not the workflow's once a phase
-    /// changes it. Declared, on [`Self::level_shape`]'s argument.
-    pub fn level_dtype(&self, level: usize) -> Dtype {
-        self.level_guard(level).dtype
+    /// The element type of one image, which is not the workflow's once a phase
+    /// changes it. Declared, on [`Self::image_shape`]'s argument.
+    pub fn image_dtype(&self, image: usize) -> Dtype {
+        self.image_guard(image).dtype
     }
 
-    /// The last level: the workflow output.
+    /// The last image: the workflow output.
     ///
     /// A workflow whose last phase never ran hands back the unwritten sentinel
-    /// over the whole level, which is what a caller reading an unwritten output
+    /// over the whole image, which is what a caller reading an unwritten output
     /// always got.
     pub fn output(&self) -> Voxels {
-        self.levels
-            .last()
-            .expect("at least one level")
+        self.images[self.n_written - 1]
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .whole()
-            .expect("a level's element type was checked when it was declared")
+            .expect("an image's element type was checked when it was declared")
     }
 
-    /// One level's data, or the refusal that names why it is not there.
+    /// One image's data, or the refusal that names why it is not there.
     ///
-    /// **The checked form, and the one to use.** A discarded level holds a
-    /// one-voxel placeholder — see [`Self::discard_level`] — so reading one
-    /// through [`Self::level`] used to hand back a `1 x 1 x 1` array that then
+    /// **The checked form, and the one to use.** A discarded image holds a
+    /// one-voxel placeholder — see [`Self::discard_image`] — so reading one
+    /// through [`Self::image`] used to hand back a `1 x 1 x 1` array that then
     /// failed, somewhere else, as a shape mismatch against the volume. That is
-    /// the same class of defect as a freed level reading as zeros: the error
-    /// names a symptom, and the fact worth reporting — this level was freed, by
-    /// this phase, and `Hints::keep_levels` is how to keep it — is nowhere in
+    /// the same class of defect as a freed image reading as zeros: the error
+    /// names a symptom, and the fact worth reporting — this image was freed, by
+    /// this phase, and `Hints::keep_images` is how to keep it — is nowhere in
     /// it.
-    pub fn try_level(&self, level: usize) -> Result<Voxels> {
-        self.refuse_if_discarded(level, "level")?;
-        self.level_guard(level).whole()
+    pub fn try_image(&self, image: usize) -> Result<Voxels> {
+        self.refuse_if_discarded(image, "image")?;
+        self.image_guard(image).whole()
     }
 
-    /// One level's data.
+    /// One image's data.
     ///
-    /// **Panics on a discarded level**, with [`Self::try_level`]'s message. The
+    /// **Panics on a discarded image**, with [`Self::try_image`]'s message. The
     /// signature cannot become a `Result` without changing every caller of it,
     /// and handing back the placeholder is the one behaviour that is definitely
     /// wrong — so the accessor keeps its shape and states its precondition the
-    /// way an index does. A caller who does not know whether a level survived
-    /// the run is asking a question, and [`Self::try_level`] is the form that
+    /// way an index does. A caller who does not know whether an image survived
+    /// the run is asking a question, and [`Self::try_image`] is the form that
     /// answers it.
-    pub fn level(&self, level: usize) -> Voxels {
-        self.try_level(level)
+    pub fn image(&self, image: usize) -> Voxels {
+        self.try_image(image)
             .unwrap_or_else(|refusal| panic!("{refusal}"))
     }
 
@@ -1181,36 +1315,47 @@ impl Environment for ArrayEnvironment {
     }
 
     fn prepare(&self, decomposition: &Decomposition) -> Result<()> {
-        if decomposition.n_phases() + 1 != self.levels.len() {
+        if decomposition.n_phases() + 1 != self.n_written {
             return Err(Error::InvalidArgument(format!(
                 "array environment built for {} phases, decomposition has {}",
-                self.levels.len() - 1,
+                self.n_written - 1,
                 decomposition.n_phases()
             )));
         }
-        // Per level, because a phase owns its volume and its element type. This
+        let supplied = decomposition.supplied_input_images();
+        if supplied.len() != self.images.len() - self.n_written {
+            return Err(Error::InvalidArgument(format!(
+                "array environment holds {} supplied input(s) and the decomposition reads {}. \
+                 `ArrayEnvironment::with_inputs` is what seeds them.",
+                self.images.len() - self.n_written,
+                supplied.len()
+            )));
+        }
+        // Per image, because a phase owns its volume and its element type. This
         // is the check that used to be `Decomposition::check` refusing the plan
-        // outright: an environment which allocated one shape for every level
+        // outright: an environment which allocated one shape for every image
         // cannot host a phase that changes shape, and that is a fact about the
         // environment, not about the plan. `for_decomposition` builds one that
         // can.
-        for level in 0..self.levels.len() {
-            let held = self.level_shape(level);
-            let wanted = decomposition.volume_at(level);
+        for image in (0..self.n_written).chain(supplied.iter().copied()) {
+            let held = self.image_shape(image);
+            let wanted = decomposition.volume_at(image);
             if held != wanted {
                 return Err(Error::InvalidArgument(format!(
-                    "array environment holds level {level} as {held:?} and the decomposition \
-                     writes it as {wanted:?}. `ArrayEnvironment::for_decomposition` allocates \
-                     each level at the shape its phase gives it."
+                    "array environment holds {} as {held:?} and the decomposition writes it \
+                     as {wanted:?}. `ArrayEnvironment::for_decomposition` allocates each image \
+                     at the shape its phase gives it.",
+                    describe_image(image)
                 )));
             }
-            let held = self.level_dtype(level);
-            let wanted = decomposition.dtype_at(level);
+            let held = self.image_dtype(image);
+            let wanted = decomposition.dtype_at(image);
             if held != wanted {
                 return Err(Error::InvalidArgument(format!(
-                    "array environment holds level {level} as {} and the decomposition writes \
-                     it as {}. `ArrayEnvironment::for_decomposition` allocates each level at \
-                     the element type its phase gives it.",
+                    "array environment holds {} as {} and the decomposition writes it as {}. \
+                     `ArrayEnvironment::for_decomposition` allocates each image at the element \
+                     type its phase gives it.",
+                    describe_image(image),
                     held.numpy_name(),
                     wanted.numpy_name()
                 )));
@@ -1222,7 +1367,7 @@ impl Environment for ArrayEnvironment {
         // tasks read-modify-write one chunk, and a cache that cannot give a
         // shared chunk a lifetime — and this environment has neither. Its
         // `chunk` is an accounting fiction, used by `chunks_touched` to price IO
-        // that is not happening; a level here is one `Array3` and a write is a
+        // that is not happening; an image here is one `Array3` and a write is a
         // slice assignment into disjoint indices, which no chunk grid mediates.
         // Enforcing it would refuse plans that are perfectly well defined in
         // memory, for a hazard that is not present, and would make the in-memory
@@ -1230,10 +1375,19 @@ impl Environment for ArrayEnvironment {
         Ok(())
     }
 
-    fn read(&self, level: usize, region: &Region) -> Result<BlockBuf> {
-        self.refuse_if_discarded(level, "block-op read")?;
-        region_within(region, &self.level_shape(level), "block-op read")?;
-        let array = self.level_guard(level).slice(region)?;
+    fn read(&self, image: usize, region: &Region) -> Result<BlockBuf> {
+        if self.slot(image) >= self.images.len() {
+            return Err(Error::InvalidArgument(format!(
+                "block-op read: this environment does not hold {}. It holds {} image(s) the plan \
+                 writes and {} supplied input(s).",
+                describe_image(image),
+                self.n_written,
+                self.images.len() - self.n_written
+            )));
+        }
+        self.refuse_if_discarded(image, "block-op read")?;
+        region_within(region, &self.image_shape(image), "block-op read")?;
+        let array = self.image_guard(image).slice(region)?;
         self.counters.reads.fetch_add(1, Ordering::SeqCst);
         self.counters
             .read_voxels
@@ -1275,20 +1429,27 @@ impl Environment for ArrayEnvironment {
         Ok(BlockBuf::Array(out))
     }
 
-    fn write(&self, level: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
-        self.refuse_if_discarded(level, "block-op write")?;
+    fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
+        if is_supplied_image(image) {
+            return Err(Error::InvalidArgument(format!(
+                "block-op write: {} was handed to the run. An input is not the run's to \
+                 overwrite, and a plan that wrote one would change what a re-run reads.",
+                describe_image(image)
+            )));
+        }
+        self.refuse_if_discarded(image, "block-op write")?;
         let array = buf.as_array()?;
-        region_within(valid, &self.level_shape(level), "block-op write")?;
+        region_within(valid, &self.image_shape(image), "block-op write")?;
         if valid.voxels() == 0 {
             return Ok(());
         }
         let source = array.slice_region(within)?;
-        let mut guard = self.levels[level]
+        let mut guard = self.images[self.slot(image)]
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // The first write to a level is what allocates it, sentinel-filled — so
+        // The first write to an image is what allocates it, sentinel-filled — so
         // a partial write leaves the rest unwritten exactly as it did when every
-        // level was allocated in the constructor.
+        // image was allocated in the constructor.
         guard.buffer_mut()?.assign_region(valid, &source)?;
         self.counters.writes.fetch_add(1, Ordering::SeqCst);
         self.counters
@@ -1389,30 +1550,42 @@ impl Environment for ArrayEnvironment {
         self.counters.drop_resident(buf.bytes());
     }
 
-    fn finish(&self, _level: usize) -> Result<()> {
+    fn finish(&self, _image: usize) -> Result<()> {
         Ok(())
     }
 
     /// Free the array and remember that it was freed.
     ///
     /// There is no placeholder any more, and there does not need to be one: a
-    /// level knows its own element type and shape whether or not it holds a
-    /// buffer ([`LevelStore`]), so freeing is dropping the buffer, and the flag
+    /// image knows its own element type and shape whether or not it holds a
+    /// buffer ([`ImageStore`]), so freeing is dropping the buffer, and the flag
     /// carries the meaning as it always did. What that changes for a reader is
-    /// that [`Self::level_shape`] on a discarded level now reports the shape the
-    /// level *is* rather than the one-voxel stand-in — reads and writes are
+    /// that [`Self::image_shape`] on a discarded image now reports the shape the
+    /// image *is* rather than the one-voxel stand-in — reads and writes are
     /// still refused by name, which is the behaviour anything depends on.
-    fn discard_level(&self, level: usize) -> Result<()> {
-        let Some(flag) = self.discarded.get(level) else {
+    fn discard_image(&self, image: usize) -> Result<()> {
+        // **The one thing the three-kind split is for.** An intermediate may be
+        // dropped and rebuilt by re-running the phase that wrote it; an input
+        // cannot be rebuilt at any price, because no phase produces it. Freeing
+        // one would be an image that is gone and unrecoverable, so it is refused
+        // here rather than left to `image_visibility` to avoid asking for.
+        if is_supplied_image(image) {
             return Err(Error::InvalidArgument(format!(
-                "cannot discard level {level}; this environment holds {}",
-                self.levels.len()
+                "cannot discard {}: it was handed to the run and no phase writes it, so nothing \
+                 could rebuild it. Only an image the run produces may be freed.",
+                describe_image(image)
+            )));
+        }
+        let Some(flag) = self.discarded.get(self.slot(image)) else {
+            return Err(Error::InvalidArgument(format!(
+                "cannot discard image {image}; this environment holds {}",
+                self.n_written
             )));
         };
         if flag.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        self.levels[level]
+        self.images[self.slot(image)]
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .release();
@@ -1420,17 +1593,17 @@ impl Environment for ArrayEnvironment {
     }
 
     /// The same, recording the phase so that a later reader can be told who
-    /// took the level away rather than only that somebody did.
+    /// took the image away rather than only that somebody did.
     ///
-    /// Recorded **before** the discard, so that a level which is observably
+    /// Recorded **before** the discard, so that an image which is observably
     /// discarded is never observably discarded-by-nobody: the flag is what a
     /// concurrent reader tests, and the phase must already be there when it
     /// flips.
-    fn discard_level_after(&self, level: usize, phase: usize) -> Result<()> {
-        if let Some(slot) = self.freed_after.get(level) {
+    fn discard_image_after(&self, image: usize, phase: usize) -> Result<()> {
+        if let Some(slot) = self.freed_after.get(self.slot(image)) {
             slot.store(phase, Ordering::SeqCst);
         }
-        self.discard_level(level)
+        self.discard_image(image)
     }
 
     fn counters(&self) -> &EnvCounters {
@@ -1481,11 +1654,11 @@ pub(crate) fn relative(region: &Region, holds: &Region, what: &str) -> Result<Re
     Ok(Region::new(&start, &region.shape))
 }
 
-/// A level region's extent as the rank-3 array it is, or an error saying so.
+/// An image region's extent as the rank-3 array it is, or an error saying so.
 pub(crate) fn block_shape(region: &Region) -> Result<[usize; 3]> {
     if region.shape.len() != 3 {
         return Err(Error::InvalidArgument(format!(
-            "a level's blocks are 3-D, got a region of rank {}",
+            "an image's blocks are 3-D, got a region of rank {}",
             region.shape.len()
         )));
     }
@@ -1583,17 +1756,17 @@ impl Environment for AccountingEnvironment {
     }
 
     fn prepare(&self, decomposition: &Decomposition) -> Result<()> {
-        // One volume, for every level: this environment counts regions against a
-        // single extent and has no per-level shape to check a read against. A
+        // One volume, for every image: this environment counts regions against a
+        // single extent and has no per-image shape to check a read against. A
         // plan whose phases change shape is refused *here*, by the environment
         // that cannot host it, rather than by the plan's own guard.
         let uniform = decomposition.uniform_volume().ok_or_else(|| {
             Error::InvalidArgument(format!(
                 "accounting environment has one volume {:?}, and this decomposition changes \
-                 shape between levels: {:?}",
+                 shape between images: {:?}",
                 self.volume,
-                (0..decomposition.n_levels())
-                    .map(|level| decomposition.volume_at(level))
+                (0..decomposition.n_images())
+                    .map(|image| decomposition.volume_at(image))
                     .collect::<Vec<_>>()
             ))
         })?;
@@ -1606,7 +1779,7 @@ impl Environment for AccountingEnvironment {
         Ok(())
     }
 
-    fn read(&self, _level: usize, region: &Region) -> Result<BlockBuf> {
+    fn read(&self, _image: usize, region: &Region) -> Result<BlockBuf> {
         region_within(region, &self.volume, "simulated read")?;
         self.counters.reads.fetch_add(1, Ordering::SeqCst);
         self.counters
@@ -1678,7 +1851,7 @@ impl Environment for AccountingEnvironment {
         })
     }
 
-    fn write(&self, _level: usize, _within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
+    fn write(&self, _image: usize, _within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
         self.counters.writes.fetch_add(1, Ordering::SeqCst);
         self.counters
             .write_voxels
@@ -1724,7 +1897,7 @@ impl Environment for AccountingEnvironment {
             .drop_resident(buf.voxels() as u64 * self.bytes_per_voxel);
     }
 
-    fn finish(&self, _level: usize) -> Result<()> {
+    fn finish(&self, _image: usize) -> Result<()> {
         Ok(())
     }
 
@@ -1813,7 +1986,7 @@ mod tests {
     /// environment's own counter rather than argued: the identical chain over
     /// the identical extent moves an eighth of the bytes.
     #[test]
-    fn a_narrow_level_reads_an_eighth_of_the_bytes_a_wide_one_does() {
+    fn a_narrow_image_reads_an_eighth_of_the_bytes_a_wide_one_does() {
         let extent = [16, 16, 16];
         let region = Region::whole(&extent);
 
@@ -1839,9 +2012,9 @@ mod tests {
     }
 
     /// **The negative control for the representation.** Every element type's own
-    /// extremes, through a level and back out, compared bit for bit.
+    /// extremes, through an image and back out, compared bit for bit.
     ///
-    /// A level that went through `f64` on its way in or out would pass every
+    /// An image that went through `f64` on its way in or out would pass every
     /// fixture that never reaches an extreme and fail exactly here:
     /// `u64::MAX` and `i64::MIN + 1` are not representable in an `f64` and would
     /// come back rounded, `-0.0` would come back as `0.0` under any comparison
@@ -1850,7 +2023,7 @@ mod tests {
     /// `total_cmp`. So the assertion is on the *bits* for the float types, which
     /// is the only comparison that can see any of that.
     #[test]
-    fn every_element_type_round_trips_its_extremes_through_a_level() {
+    fn every_element_type_round_trips_its_extremes_through_an_image() {
         /// One column of values in, the same column out.
         macro_rules! round_trip {
             ($type:ty, $values:expr, $eq:expr) => {{
@@ -1886,7 +2059,7 @@ mod tests {
         round_trip!(u32, vec![0, 1, u32::MAX, u32::MAX - 1], |held, wanted| held
             == wanted);
         // Beyond `f64`'s 53 bits of mantissa: `u64::MAX as f64 as u64` saturates
-        // and `(u64::MAX - 1) as f64 as u64` does too, so a level that had been
+        // and `(u64::MAX - 1) as f64 as u64` does too, so an image that had been
         // through an `f64` could not tell these three apart.
         round_trip!(
             u64,
@@ -1976,56 +2149,56 @@ mod tests {
         );
     }
 
-    /// **A level is allocated by its first write, not by the constructor.**
+    /// **An image is allocated by its first write, not by the constructor.**
     ///
-    /// The measurement in [`LevelStore`]'s header, as a fact about one
-    /// environment rather than about a run: an eight-phase plan holds one level
+    /// The measurement in [`ImageStore`]'s header, as a fact about one
+    /// environment rather than about a run: an eight-phase plan holds one image
     /// before anything has run, where it used to hold nine.
     #[test]
-    fn a_level_costs_nothing_until_something_writes_to_it() {
+    fn an_image_costs_nothing_until_something_writes_to_it() {
         let extent = [8, 8, 8];
         let phases = 8;
         let input = Voxels::zeros(Dtype::F64, extent).unwrap();
         let env = ArrayEnvironment::new(input, phases, [8, 8, 8]).unwrap();
 
-        assert_eq!(env.allocated_levels(), 1, "only the input");
+        assert_eq!(env.allocated_images(), 1, "only the input");
         assert_eq!(
-            env.allocated_level_bytes(),
+            env.allocated_image_bytes(),
             (8 * 8 * 8 * 8) as u64,
-            "one f64 level's worth"
+            "one f64 image's worth"
         );
-        // …and the levels are all there, at their declared shape and type.
-        assert_eq!(env.resident_levels(), phases + 1);
-        for level in 0..=phases {
-            assert_eq!(env.level_shape(level), extent);
-            assert_eq!(env.level_dtype(level), Dtype::F64);
+        // …and the images are all there, at their declared shape and type.
+        assert_eq!(env.resident_images(), phases + 1);
+        for image in 0..=phases {
+            assert_eq!(env.image_shape(image), extent);
+            assert_eq!(env.image_dtype(image), Dtype::F64);
         }
 
         // The liveness half: writing is what allocates, so writing everything
         // reaches the figure the constructor used to start at.
         let region = Region::whole(&extent);
         let buf = env.read(0, &region).unwrap();
-        for level in 1..=phases {
-            env.write(level, &region, &region, &buf).unwrap();
+        for image in 1..=phases {
+            env.write(image, &region, &region, &buf).unwrap();
         }
-        assert_eq!(env.allocated_levels(), phases + 1);
+        assert_eq!(env.allocated_images(), phases + 1);
         assert_eq!(
-            env.allocated_level_bytes(),
+            env.allocated_image_bytes(),
             (phases as u64 + 1) * (8 * 8 * 8 * 8)
         );
 
         // …and discarding gives it back, which is the far end of the same
         // lifetime.
-        env.discard_level(1).unwrap();
-        assert_eq!(env.allocated_levels(), phases);
-        assert_eq!(env.resident_levels(), phases);
+        env.discard_image(1).unwrap();
+        assert_eq!(env.allocated_images(), phases);
+        assert_eq!(env.resident_images(), phases);
     }
 
-    /// **Deferring the allocation moves no voxel.** A level nobody has written
-    /// reads exactly what a sentinel-filled level would have handed back — which
+    /// **Deferring the allocation moves no voxel.** An image nobody has written
+    /// reads exactly what a sentinel-filled image would have handed back — which
     /// is what it *was*, before the allocation was deferred.
     #[test]
-    fn an_unwritten_level_reads_as_the_sentinel_it_would_have_been_filled_with() {
+    fn an_unwritten_image_reads_as_the_sentinel_it_would_have_been_filled_with() {
         let extent = [4, 4, 4];
         let region = Region::new(&[1, 1, 1], &[2, 2, 2]);
         for dtype in [
@@ -2050,12 +2223,12 @@ mod tests {
             let cut = whole.slice_region(&region).unwrap();
             assert_eq!(read.dtype(), dtype);
             assert_eq!(read.shape(), [2, 2, 2]);
-            let held = env.try_level(1).unwrap();
+            let held = env.try_image(1).unwrap();
             assert_eq!(held.dtype(), dtype);
             assert_eq!(held.shape(), extent);
             // `NaN != NaN`, so the float types are compared through the property
             // the sentinel is *defined* by rather than through equality — the
-            // same reason `Voxels::uniform` says a NaN-filled level is not
+            // same reason `Voxels::uniform` says a NaN-filled image is not
             // uniform.
             match dtype {
                 Dtype::F32 => {
@@ -2069,19 +2242,19 @@ mod tests {
                 _ => {
                     assert_eq!(
                         read, &cut,
-                        "{dtype:?}: a partial read of an unwritten level"
+                        "{dtype:?}: a partial read of an unwritten image"
                     );
-                    assert_eq!(held, whole, "{dtype:?}: the whole unwritten level");
+                    assert_eq!(held, whole, "{dtype:?}: the whole unwritten image");
                 }
             }
         }
     }
 
-    /// A partial write allocates the level and leaves the rest unwritten, which
-    /// is what a write into a fully sentinel-filled level always did. The
+    /// A partial write allocates the image and leaves the rest unwritten, which
+    /// is what a write into a fully sentinel-filled image always did. The
     /// deferral must not turn "nobody wrote this corner" into a zero.
     #[test]
-    fn a_partial_write_leaves_the_rest_of_a_deferred_level_unwritten() {
+    fn a_partial_write_leaves_the_rest_of_a_deferred_image_unwritten() {
         let extent = [4, 4, 4];
         let env =
             ArrayEnvironment::new(Voxels::filled(Dtype::U16, extent, 7.0).unwrap(), 1, extent)
@@ -2091,8 +2264,8 @@ mod tests {
         env.write(1, &Region::new(&[0, 0, 0], &[2, 2, 2]), &corner, &buf)
             .unwrap();
 
-        let level = env.try_level(1).unwrap();
-        let view = level.view::<u16>().unwrap();
+        let image = env.try_image(1).unwrap();
+        let view = image.view::<u16>().unwrap();
         assert_eq!(view[[0, 0, 0]], 7, "what was written");
         assert_eq!(
             view[[3, 3, 3]],
@@ -2101,11 +2274,11 @@ mod tests {
         );
     }
 
-    /// A level allocated at one type and written at another is refused, rather
-    /// than silently converted. This is the guard `prepare` gained when a level
+    /// An image allocated at one type and written at another is refused, rather
+    /// than silently converted. This is the guard `prepare` gained when an image
     /// stopped being `f64` by definition.
     #[test]
-    fn writing_a_level_in_the_wrong_element_type_is_refused_by_name() {
+    fn writing_an_image_in_the_wrong_element_type_is_refused_by_name() {
         let env = ArrayEnvironment::new(Array3::from_elem((2, 2, 2), 0.0f64).into(), 1, [2, 2, 2])
             .unwrap();
         let region = Region::whole(&[2, 2, 2]);

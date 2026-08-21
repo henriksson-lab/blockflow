@@ -72,7 +72,7 @@
 // ------------------------------------------------
 // `Decomposition::check` and the executor's post-run check assert that a
 // phase's *valid regions* tile the volume. For a phase whose output is
-// fragments that assertion is about a level nobody wrote: `valid == core` by
+// fragments that assertion is about an image nobody wrote: `valid == core` by
 // construction, cores tile by construction, and the check passes without
 // constraining the fragments at all. A guard that cannot fail is worse than no
 // guard, because it is trusted.
@@ -80,7 +80,7 @@
 // So a fragment stream declares its [`Coverage`], with no default, and
 // [`check_fragment_coverage`] runs after the phase's last task — against the
 // *store*, so that what is checked is what landed. A phase that writes no pixel
-// level and declares no every-block stream is refused at plan time, because
+// image and declares no every-block stream is refused at plan time, because
 // nothing about it would be checkable at all.
 //
 // What is still the caller's
@@ -95,7 +95,7 @@
 // -------------------------------------------------
 // A `volume -> fragments` op summarising one array against *another* — per
 // region of a label array, a quantity read out of an intensity array — had no
-// way to say so: a fragment op read the one level it was handed. `BlockOp`
+// way to say so: a fragment op read the one image it was handed. `BlockOp`
 // already had the shape for it ([`BlockOp::source_inputs`] plus
 // [`BlockOp::apply_with`]), so this file takes that shape rather than inventing
 // a second one, down to the defaulted `apply_with` **erroring** when an operand
@@ -108,10 +108,10 @@
 // kind of thing at the same block extent. A `fragments -> fragments` merge has
 // no pixel array at either end — that is what `reads_pixels() == false` buys —
 // so it has nothing to combine an operand against. It is not *forbidden* one,
-// because the two declarations are independent (`reads_pixels` is about level
-// `p`, `source_inputs` is about every other level, and each is read and counted
+// because the two declarations are independent (`reads_pixels` is about image
+// `p`, `source_inputs` is about every other image, and each is read and counted
 // on its own), and a merge that genuinely wants to look at a stored array can
-// say so without also paying for a level it does not want. What it may not do
+// say so without also paying for an image it does not want. What it may not do
 // is take one silently.
 //
 // The seam, which is the part that is not plumbing
@@ -136,6 +136,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::assemble::{describe_image, is_supplied_image};
 use crate::decomposition::{Decomposition, PhaseDecomposition};
 use crate::dtype::Dtype;
 use crate::env::{BlockBuf, Environment};
@@ -194,8 +195,8 @@ impl FragmentInput {
 /// **This is the fragment side of the tiling guard, and it exists because
 /// without it there is none.** `Decomposition::check` and the executor's
 /// post-run check both assert that the phase's *valid regions* tile the volume.
-/// For a phase that writes a pixel level that is a statement about the output.
-/// For a phase whose output is fragments it is a statement about a level nobody
+/// For a phase that writes a pixel image that is a statement about the output.
+/// For a phase whose output is fragments it is a statement about an image nobody
 /// wrote: `valid == core` by construction, cores tile by construction, and the
 /// check passes while asserting nothing at all about the fragments — which are
 /// the actual output. A guard that cannot fail is worse than no guard, because
@@ -319,10 +320,10 @@ pub struct BlockView<'a> {
     pub valid: &'a Region,
     /// Where `read` sits in the volume, for an op anchored to the global grid.
     pub at: Anchor,
-    /// The element type of the level this phase **writes**, which is what
+    /// The element type of the image this phase **writes**, which is what
     /// [`Self::output_buffer`] allocates at. Carried rather than assumed: a
     /// buffer of the wrong width is a buffer the write refuses, and the executor
-    /// is the only thing that knows which level this block is destined for.
+    /// is the only thing that knows which image this block is destined for.
     pub dtype: Dtype,
     env: &'a dyn Environment,
     pixels: Option<&'a BlockBuf>,
@@ -400,7 +401,7 @@ impl<'a> BlockView<'a> {
     /// serve both. A `writes_pixels` op that built an array directly would be
     /// unsimulatable.
     ///
-    /// The element type is the one the level this phase writes holds; see
+    /// The element type is the one the image this phase writes holds; see
     /// [`Self::dtype`].
     pub fn output_buffer(&self, value: f64) -> Result<BlockBuf> {
         self.env.constant(self.dtype, self.read, value)
@@ -472,10 +473,10 @@ impl<'a> BlockView<'a> {
     }
 }
 
-/// The stored levels a fragment op declared, keyed by level.
+/// The stored images a fragment op declared, keyed by image.
 ///
 /// The fragment side of [`SourceInputs`](crate::op::SourceInputs), with the same
-/// contract: one entry per level rather than one per declaration, each holding
+/// contract: one entry per image rather than one per declaration, each holding
 /// **the extent the block was read at**, and [`Self::get`] erroring rather than
 /// returning an `Option` — a missing operand is a block that would compute
 /// against nothing, which is the class of quiet wrong answer this crate is
@@ -487,7 +488,7 @@ impl<'a> BlockView<'a> {
 /// not be simulated would be a phase the planner cannot price. Nothing else
 /// about it differs, and nothing about it is a second *mechanism* — the
 /// declaration is `BlockOp`'s [`SourceInput`], the plan record is the same
-/// `PhaseDecomposition::source_levels`, and the executor reads it through the
+/// `PhaseDecomposition::source_images`, and the executor reads it through the
 /// same `Environment::read`.
 #[derive(Clone, Copy)]
 pub struct SourceBlocks<'a> {
@@ -504,22 +505,22 @@ impl<'a> SourceBlocks<'a> {
         Self { entries }
     }
 
-    /// The levels supplied, in the order the executor read them.
-    pub fn levels(&self) -> Vec<usize> {
-        self.entries.iter().map(|(level, _)| *level).collect()
+    /// The images supplied, in the order the executor read them.
+    pub fn images(&self) -> Vec<usize> {
+        self.entries.iter().map(|(image, _)| *image).collect()
     }
 
-    /// The block of `level`, or an error naming what was supplied.
-    pub fn get(&self, level: usize) -> Result<&'a BlockBuf> {
+    /// The block of `image`, or an error naming what was supplied.
+    pub fn get(&self, image: usize) -> Result<&'a BlockBuf> {
         self.entries
             .iter()
-            .find(|(named, _)| *named == level)
+            .find(|(named, _)| *named == image)
             .map(|(_, buf)| *buf)
             .ok_or_else(|| {
                 Error::InvalidArgument(format!(
-                    "a fragment op reads level {level} and the executor supplied [{}]. The \
-                     levels a phase reads besides its own input are recorded in the plan \
-                     (`PhaseDecomposition::source_levels`) and read there; an op naming one \
+                    "a fragment op reads image {image} and the executor supplied [{}]. The \
+                     images a phase reads besides its own input are recorded in the plan \
+                     (`PhaseDecomposition::source_images`) and read there; an op naming one \
                      the plan does not list has nothing to be handed.",
                     self.entries
                         .iter()
@@ -630,9 +631,9 @@ pub trait FragmentOp: Send + Sync {
 
     /// Does this op write a pixel region?
     ///
-    /// `true` makes the phase produce a level like any other, so an ordinary
+    /// `true` makes the phase produce an image like any other, so an ordinary
     /// pixel phase may follow it. `false` means the phase writes fragments and
-    /// nothing else, and is therefore terminal as far as levels are concerned.
+    /// nothing else, and is therefore terminal as far as images are concerned.
     fn writes_pixels(&self) -> bool {
         false
     }
@@ -641,7 +642,7 @@ pub trait FragmentOp: Send + Sync {
     ///
     /// The counterpart of [`BlockOp::produces`](crate::op::BlockOp::produces),
     /// and it exists for the same reason: `check_dtypes` folds a plan's element
-    /// types from level 0 and refuses a level allocated at a width its producer
+    /// types from image 0 and refuses an image allocated at a width its producer
     /// does not write. That fold runs over the *chain*, and a fragment phase owns
     /// no slot of the chain — so before this method existed there was nothing to
     /// fold and a fragment op that changed the width was refused with a message
@@ -651,8 +652,8 @@ pub trait FragmentOp: Send + Sync {
     /// fragment op this crate shipped before the method existed and is the safe
     /// default in the same way `BlockOp`'s is: an op that says nothing keeps
     /// exactly the contract it already had. Only consulted when
-    /// [`Self::writes_pixels`] is true; a phase that writes no level has no
-    /// level whose width could be wrong.
+    /// [`Self::writes_pixels`] is true; a phase that writes no image has no
+    /// image whose width could be wrong.
     fn produces(&self, input: Dtype) -> Dtype {
         input
     }
@@ -680,17 +681,17 @@ pub trait FragmentOp: Send + Sync {
         true
     }
 
-    /// Stored levels this op reads **besides** the level it is handed, each with
+    /// Stored images this op reads **besides** the image it is handed, each with
     /// its own reach.
     ///
     /// The same declaration [`BlockOp::source_inputs`] makes, in the same units,
-    /// recorded in the same `PhaseDecomposition::source_levels` and read by the
+    /// recorded in the same `PhaseDecomposition::source_images` and read by the
     /// executor through the same `Environment::read`. Empty by default, which is
     /// every fragment op this crate shipped before the method existed and is the
     /// honest answer for all of them.
     ///
-    /// **Independent of [`Self::reads_pixels`].** That method is about level
-    /// `p`, the one the phase is handed; this is about every other level. An op
+    /// **Independent of [`Self::reads_pixels`].** That method is about image
+    /// `p`, the one the phase is handed; this is about every other image. An op
     /// may read a second array without reading its own input — a merge that
     /// consults a stored array says so here and still declares
     /// `reads_pixels() == false`, and pays for one array rather than two.
@@ -719,9 +720,9 @@ pub trait FragmentOp: Send + Sync {
     /// writes nothing, which is exactly what an absent key means to a reader.
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput>;
 
-    /// [`Self::apply`], with the stored levels [`Self::source_inputs`] declared.
+    /// [`Self::apply`], with the stored images [`Self::source_inputs`] declared.
     ///
-    /// Each buffer holds that level over the **block's own fetch region** — the
+    /// Each buffer holds that image over the **block's own fetch region** — the
     /// same extent [`BlockView::pixels`] would be, and the same extent
     /// `Chain::Source` leaves are handed — because that is what the plan
     /// records and the executor reads.
@@ -743,7 +744,7 @@ pub trait FragmentOp: Send + Sync {
         let declared = self.source_inputs(at.volume());
         if !declared.is_empty() {
             return Err(Error::InvalidArgument(format!(
-                "fragment op {:?} declares {} source input(s) (level(s) {}) and does not \
+                "fragment op {:?} declares {} source input(s) (image(s) {}) and does not \
                  override `apply_with`, so the operands it asked the plan to fetch would be \
                  dropped on the floor and the block would be summarised from one array while \
                  claiming to summarise two.",
@@ -751,7 +752,7 @@ pub trait FragmentOp: Send + Sync {
                 declared.len(),
                 declared
                     .iter()
-                    .map(|input| input.level.to_string())
+                    .map(|input| input.image.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
@@ -777,9 +778,9 @@ pub enum PhaseWork<'a> {
     /// An iteration run to a fixed point inside this one phase. The phase must
     /// own no chain slots.
     ///
-    /// `region -> region` like `Pixels`, and it reads and writes a level the same
+    /// `region -> region` like `Pixels`, and it reads and writes an image the same
     /// way; what differs is that a block of it is visited an unknown number of
-    /// times before the level is written, and that every visit is handed more
+    /// times before the image is written, and that every visit is handed more
     /// than one operand. See `crate::iterate` for why that cannot be a
     /// `Chain::sequence`.
     Iterate(&'a dyn crate::iterate::IterativeOp),
@@ -794,16 +795,16 @@ impl PhaseWork<'_> {
         matches!(self, PhaseWork::Iterate(_))
     }
 
-    /// Whether this phase produces the level after it.
-    pub fn writes_a_level(&self) -> bool {
+    /// Whether this phase produces the image after it.
+    pub fn writes_an_image(&self) -> bool {
         match self {
             PhaseWork::Pixels | PhaseWork::Iterate(_) => true,
             PhaseWork::Fragments(op) => op.writes_pixels(),
         }
     }
 
-    /// Whether this phase reads the level before it.
-    pub fn reads_a_level(&self) -> bool {
+    /// Whether this phase reads the image before it.
+    pub fn reads_an_image(&self) -> bool {
         match self {
             PhaseWork::Pixels | PhaseWork::Iterate(_) => true,
             PhaseWork::Fragments(op) => op.reads_pixels(),
@@ -879,14 +880,14 @@ pub fn neighbourhood_size(index: [usize; 3], reach: [usize; 3], counts: [usize; 
 /// statement about trust and says it in [`FragmentOp::reach`]; nothing here can
 /// say it on its behalf.
 ///
-/// The levels the source inputs name are recorded on the phase, which is what
-/// makes the executor fetch them, the DAG depend on their producers, the level
+/// The images the source inputs name are recorded on the phase, which is what
+/// makes the executor fetch them, the DAG depend on their producers, the image
 /// lifetimes keep them alive, `exact_read_voxels` count them and the fingerprint
 /// hash them. A fragment phase built any other way would read a second array off
 /// the books.
 ///
 /// The op's [`FragmentOp::reads_pixels`] is recorded too, for the other half of
-/// the same books: an op that declines its own level is not charged for it by
+/// the same books: an op that declines its own image is not charged for it by
 /// `Decomposition::exact_read_voxels`, because `strategy::run_fragment_task`
 /// does not fetch it. A phase reading a second array and not its own then
 /// predicts one array's worth rather than two, which is what the run performs.
@@ -920,19 +921,36 @@ pub fn fragment_phase(op: &dyn FragmentOp, grid: BlockGrid) -> Result<PhaseDecom
     for output in op.outputs() {
         check_stream_name(&output.stream)?;
     }
-    let mut levels = Vec::new();
+    let mut images = Vec::new();
+    let mut supplied = Vec::new();
     for input in op.source_inputs(volume) {
         let wanted = input.reach.in_voxels(edge);
         for (axis, value) in halo.iter_mut().enumerate() {
             let (lo, hi) = wanted.axis(axis).bound(volume[axis]);
             *value = (*value).max(lo).max(hi);
         }
-        levels.push(input.level);
+        // A supplied input is produced by no phase, so there is no fold that
+        // could say what is in it and the op's own declaration is the only
+        // statement there is. Recorded here for the same reason
+        // `Decomposition::declare_source_images` records the chain half's: this
+        // is the only thing holding the op.
+        if input.image.is_supplied() {
+            let dtype = input.dtype.ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "fragment op {:?} reads {}, and nothing says what it holds. An image the run                      writes has its element type in the fold of the chain that wrote it; a                      supplied input is produced by no phase, so the reader is the only                      statement there is — declare it with `SourceInput::holding`.",
+                    op.name(),
+                    describe_image(input.image.index())
+                ))
+            })?;
+            supplied.push((input.image.index(), dtype));
+        }
+        images.push(input.image.index());
     }
     Ok(
         PhaseDecomposition::derive(Vec::new(), Vec::new(), reach, halo, grid)
-            .with_source_levels(levels)
-            .reading_input_level(op.reads_pixels()),
+            .with_source_images(images)
+            .with_supplied_dtypes(supplied)
+            .reading_input_image(op.reads_pixels()),
     )
 }
 
@@ -1018,9 +1036,9 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
             work.len()
         )));
     }
-    // Level 0 is the workflow input and always exists; level p+1 exists iff
+    // Image 0 is the workflow input and always exists; image p+1 exists iff
     // phase p wrote it. A phase that reads no pixels needs neither.
-    let mut level_written: Vec<Option<usize>> = vec![None; work.len() + 1];
+    let mut image_written: Vec<Option<usize>> = vec![None; work.len() + 1];
     // Streams holding values that came out of a **second array**, addressed the
     // way a `FragmentInput` addresses them: `(stream, the phase that wrote it)`.
     //
@@ -1034,17 +1052,17 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
     let mut carries_operand: BTreeSet<(String, usize)> = BTreeSet::new();
     for (index, entry) in work.iter().enumerate() {
         let phase = &plan.phases[index];
-        if entry.reads_a_level() && index > 0 && level_written[index].is_none() {
+        if entry.reads_an_image() && index > 0 && image_written[index].is_none() {
             return Err(Error::InvalidArgument(format!(
-                "phase {index} reads level {index}, which phase {} did not write: it runs a \
+                "phase {index} reads image {index}, which phase {} did not write: it runs a \
                  fragment op that declares `writes_pixels() == false`. A phase that writes \
-                 only fragments is terminal as far as levels go; an op that hands pixels on \
+                 only fragments is terminal as far as images go; an op that hands pixels on \
                  says `writes_pixels`.",
                 index - 1
             )));
         }
-        if entry.writes_a_level() {
-            level_written[index + 1] = Some(index);
+        if entry.writes_an_image() {
+            image_written[index + 1] = Some(index);
         }
         if let PhaseWork::Iterate(op) = entry {
             // Re-run when the plan is *used*, not only when it is built, on
@@ -1061,14 +1079,14 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                 )));
             }
             // The private ping-pong buffers are the phase's own volume, and the
-            // running operand of substage 0 is the level below read through the
+            // running operand of substage 0 is the image below read through the
             // same block geometry. A phase that resized or re-gridded between the
             // two would be handing substage 1 an operand of a different shape
             // than substage 0 produced, so the iteration would not close.
             let below = plan.volume_at(index);
             if phase.volume() != below || phase.reads_across_grids() {
                 return Err(Error::InvalidArgument(format!(
-                    "phase {index} runs iterative op {:?} and reads a {below:?} level to write a \
+                    "phase {index} runs iterative op {:?} and reads a {below:?} image to write a \
                      {:?} one. An iteration feeds its own output back in, so its substages must \
                      agree on one extent and one lattice; a phase that changes either is a \
                      transformation and belongs before or after the iteration, not inside it.",
@@ -1077,23 +1095,23 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                 )));
             }
         }
-        // **The half of `check_source_levels` a chain cannot make.** That guard
+        // **The half of `check_source_images` a chain cannot make.** That guard
         // folds the *slots* of a phase, so it can only speak for a phase that
         // owns some, and it skips the ones that do not. The two kinds that own
         // none are the two here: a `Pixels` phase with an empty slot list reads
         // nothing besides its input, and an iterative phase's second operand is
-        // `Operand::Fixed`, which is its own input level and not a second one.
-        // Either recording a source level is a plan that would fetch an array
+        // `Operand::Fixed`, which is its own input image and not a second one.
+        // Either recording a source image is a plan that would fetch an array
         // nothing consumes, and be priced for it.
-        if phase.slots.is_empty() && !entry.is_fragments() && !phase.source_levels.is_empty() {
+        if phase.slots.is_empty() && !entry.is_fragments() && !phase.source_images.is_empty() {
             return Err(Error::InvalidArgument(format!(
                 "decomposition phase {index} ({}) owns no chain slot and records that it also \
-                 reads level(s) {:?}. Only a fragment op can read a second level without a \
+                 reads image(s) {:?}. Only a fragment op can read a second image without a \
                  chain slot to say so, and this phase runs {}. The recorded list is what the \
                  executor fetches and what the fingerprint hashes, so an entry nothing reads \
                  is a plan priced for an array no block consumes.",
                 phase.names.join(">"),
-                phase.source_levels,
+                phase.source_images,
                 entry.describe()
             )));
         }
@@ -1115,7 +1133,7 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                 op.name()
             )));
         }
-        // The gap this closes: a phase that writes no pixel level is not
+        // The gap this closes: a phase that writes no pixel image is not
         // constrained by the tiling check at all — its valid regions equal its
         // cores by construction, so the check passes whatever the fragments do.
         // If nothing about such a phase is checkable, say so at plan time
@@ -1127,7 +1145,7 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                 .any(|output| output.coverage == Coverage::EveryBlock)
         {
             return Err(Error::InvalidArgument(format!(
-                "phase {index}: fragment op {:?} writes no pixel level and declares no \
+                "phase {index}: fragment op {:?} writes no pixel image and declares no \
                  every-block stream, so nothing about its output can be checked. The \
                  tiling guard passes for such a phase whatever it wrote — its valid \
                  regions are its cores by construction — so a run of it would be entirely \
@@ -1141,7 +1159,7 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
 
         // ------------------------------------------------ the second array --
         //
-        // Everything `check_source_levels` asserts about a chain's source
+        // Everything `check_source_images` asserts about a chain's source
         // leaves, asserted here about a fragment op's, because this is the only
         // place holding both the plan and the op. The list is deliberately the
         // same list, in the same order, so that the two guards cannot drift into
@@ -1152,8 +1170,8 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
             && (phase.volume() != read_volume || phase.reads_across_grids())
         {
             return Err(Error::InvalidArgument(format!(
-                "phase {index}: fragment op {:?} reads a second level and the phase reads a \
-                 {read_volume:?} level to work in {:?}. A source level is fetched at the \
+                "phase {index}: fragment op {:?} reads a second image and the phase reads a \
+                 {read_volume:?} image to work in {:?}. A source image is fetched at the \
                  block's own fetch region, so an op that reads one must be on one lattice in \
                  one coordinate space; across grids the same integers name different voxels, \
                  and the op is asked for its declaration in a volume that is not the one it \
@@ -1166,7 +1184,7 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
             let granted = phase.halo.in_voxels(edge);
             for input in &declared_sources {
                 // **The equal-reach limit binds here too, and is not loosened.**
-                // The executor reads a source level at the block's own fetch
+                // The executor reads a source image at the block's own fetch
                 // region, so an operand wanting more than the phase fetches
                 // would be handed a buffer narrower than its kernel walks. What
                 // differs from the chain case is only who widens the halo:
@@ -1179,76 +1197,94 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                     let (have_lo, have_hi) = granted.axis(axis).bound(read_volume[axis]);
                     if want_lo > have_lo || want_hi > have_hi {
                         return Err(Error::InvalidArgument(format!(
-                            "phase {index}: fragment op {:?} reads level {} with a reach of \
+                            "phase {index}: fragment op {:?} reads image {} with a reach of \
                              {want_lo}+{want_hi} on axis {axis}, and the phase is granted a \
-                             halo of {have_lo}+{have_hi} there. A source level is read at the \
+                             halo of {have_lo}+{have_hi} there. A source image is read at the \
                              block's own fetch region, so an operand reaching further than the \
                              phase does would be handed a buffer its kernel walks past the end \
                              of. Build the phase with `fragment_phase`, which folds this reach \
                              into the halo.",
                             op.name(),
-                            input.level
+                            input.image
                         )));
                     }
                 }
             }
-            let mut named: Vec<usize> = declared_sources.iter().map(|input| input.level).collect();
+            let mut named: Vec<usize> = declared_sources
+                .iter()
+                .map(|input| input.image.index())
+                .collect();
             named.sort_unstable();
             named.dedup();
-            if named != phase.source_levels {
+            if named != phase.source_images {
                 return Err(Error::InvalidArgument(format!(
-                    "phase {index}: fragment op {:?} reads level(s) {named:?} besides its own, \
+                    "phase {index}: fragment op {:?} reads image(s) {named:?} besides its own, \
                      and the decomposition records {:?}. The recorded list is what the executor \
                      fetches, what the DAG takes its edges from and what the fingerprint \
-                     hashes, so a plan whose record disagrees with its op would price one level \
+                     hashes, so a plan whose record disagrees with its op would price one image \
                      and read another.",
                     op.name(),
-                    phase.source_levels
+                    phase.source_images
                 )));
             }
-            for &level in &named {
-                if level >= plan.n_levels() {
+            for &image in &named {
+                if is_supplied_image(image) {
+                    // Handed to the run: no producing phase, so neither the
+                    // bound, nor the forward reference, nor "which phase wrote
+                    // it" is a question that can be asked of it. What is left is
+                    // the extent, which is the same question for every image.
+                    let stored = plan.volume_at(image);
+                    if stored != read_volume {
+                        return Err(Error::InvalidArgument(format!(
+                            "phase {index}: fragment op {:?} reads {}, which is {stored:?},                              beside image {index}, which is {read_volume:?}. A supplied input is                              read at the block's own fetch region, so it has to be in the same                              coordinate space as the image the phase reads, and that space is                              image 0's.",
+                            op.name(),
+                            describe_image(image)
+                        )));
+                    }
+                    continue;
+                }
+                if image >= plan.n_images() {
                     return Err(Error::InvalidArgument(format!(
-                        "phase {index}: fragment op {:?} reads level {level}, and this plan has \
-                         {} level(s), numbered 0 to {}.",
+                        "phase {index}: fragment op {:?} reads image {image}, and this plan has \
+                         {} image(s), numbered 0 to {}.",
                         op.name(),
-                        plan.n_levels(),
-                        plan.n_levels() - 1
+                        plan.n_images(),
+                        plan.n_images() - 1
                     )));
                 }
-                if level > index {
+                if image > index {
                     return Err(Error::InvalidArgument(format!(
-                        "phase {index}: fragment op {:?} reads level {level}, but level {level} \
+                        "phase {index}: fragment op {:?} reads image {image}, but image {image} \
                          is written by phase {}, which runs after it. Phases run in order, so a \
-                         second level may only be one at or below the level this phase is \
-                         handed — level {index} here.",
+                         second image may only be one at or below the image this phase is \
+                         handed — image {index} here.",
                         op.name(),
-                        level - 1
+                        image - 1
                     )));
                 }
                 // **The check the chain half has no way to need.** Every phase
-                // of a pixel plan writes the level above it, so a level at or
+                // of a pixel plan writes the image above it, so an image at or
                 // below the current one exists by construction. A fragment phase
                 // writes one only if it says `writes_pixels`, so a plan can
-                // name a level that no phase ever wrote — an array with no
+                // name an image that no phase ever wrote — an array with no
                 // producer, which the executor would read as whatever `prepare`
                 // left behind.
-                if level > 0 && level_written[level].is_none() {
+                if image > 0 && image_written[image].is_none() {
                     return Err(Error::InvalidArgument(format!(
-                        "phase {index}: fragment op {:?} reads level {level}, which phase {} \
+                        "phase {index}: fragment op {:?} reads image {image}, which phase {} \
                          did not write: it runs a fragment op that declares `writes_pixels() \
-                         == false`. A level nothing wrote is not a second array, it is whatever \
+                         == false`. An image nothing wrote is not a second array, it is whatever \
                          `prepare` allocated.",
                         op.name(),
-                        level - 1
+                        image - 1
                     )));
                 }
-                let stored = plan.volume_at(level);
+                let stored = plan.volume_at(image);
                 if stored != read_volume {
                     return Err(Error::InvalidArgument(format!(
-                        "phase {index}: fragment op {:?} reads level {level}, which is \
-                         {stored:?}, beside level {index}, which is {read_volume:?}. A source \
-                         level is read at the block's own fetch region, so the two levels have \
+                        "phase {index}: fragment op {:?} reads image {image}, which is \
+                         {stored:?}, beside image {index}, which is {read_volume:?}. A source \
+                         image is read at the block's own fetch region, so the two images have \
                          to be in one coordinate space; across grids the same integers would \
                          name different voxels.",
                         op.name()
@@ -1373,10 +1409,10 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                             .collect::<Vec<_>>()
                     ),
                     Some(PhaseWork::Pixels) => {
-                        "runs chain slots, which write a level and no stream".to_string()
+                        "runs chain slots, which write an image and no stream".to_string()
                     }
                     Some(PhaseWork::Iterate(producer)) => format!(
-                        "runs iterative op {:?}, which writes a level and no stream",
+                        "runs iterative op {:?}, which writes an image and no stream",
                         producer.name()
                     ),
                     None => "is not in the work list at all".to_string(),
@@ -1796,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn a_phase_may_not_follow_one_that_wrote_no_level() {
+    fn a_phase_may_not_follow_one_that_wrote_no_image() {
         let plan = fragment_only([32, 4, 4], [8, 4, 4], Dtype::F64, &[&Nothing, &Nothing]).unwrap();
         let error = check_phase_work(&plan, &[PhaseWork::Fragments(&Nothing), PhaseWork::Pixels])
             .unwrap_err()

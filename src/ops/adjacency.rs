@@ -532,7 +532,7 @@ fn ordered_pairs(table: &mut Table, volume: [usize; 3]) -> Result<Vec<Pair>> {
 /// **A mask in, one row per adjacent pair of set voxels out**, at reach 1.
 ///
 /// Reads its block's pixels with a one-voxel halo, writes one fragment and no
-/// level, and depends on no other block. Every row it writes has its lower
+/// image, and depends on no other block. Every row it writes has its lower
 /// endpoint in this block's core, so the blobs of a run partition the answer;
 /// the order they are put back into is [`merge_pairs`]', and is a function of
 /// the rows rather than of this op.
@@ -609,7 +609,7 @@ impl FragmentOp for AdjacentPairsOp {
         vec![FragmentOutput::new(
             self.stream.clone(),
             self.lifecycle,
-            // Every block, always. This phase writes no level, so the tiling
+            // Every block, always. This phase writes no image, so the tiling
             // check has nothing to bite on and the coverage declaration is the
             // only guard there is — and a block that owns no pair is the common
             // case on a sparse mask rather than an oddity.
@@ -644,7 +644,7 @@ impl FragmentOp for AdjacentPairsOp {
 /// The op declares a reach of one and no fragment input, so `fragment_phase`
 /// derives a halo of one and every block's valid region is its core — the read
 /// extent is the core grown by one and shrunk by one again. The phase declares
-/// no element type because it writes no level.
+/// no element type because it writes no image.
 pub fn adjacent_pairs_phase(
     grid: BlockGrid,
     mask_dtype: Dtype,
@@ -718,7 +718,7 @@ mod tests {
     }
 
     /// And they are the same set `components` calls the forward directions of a
-    /// lattice — the same "each pair once, from the lower one" rule, one level
+    /// lattice — the same "each pair once, from the lower one" rule, one image
     /// up. A cross-check between two tables that must agree and are written
     /// apart.
     #[test]

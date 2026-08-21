@@ -6,7 +6,7 @@
 //
 // What this is for
 // ----------------
-// `FragmentOp` read the one level its phase was handed. The shape that did not
+// `FragmentOp` read the one image its phase was handed. The shape that did not
 // fit was the useful one: summarise a *label* array against an *intensity*
 // array, per region, where the regions are not the blocks and a region may be
 // cut in half by a block seam. `BlockOp` already had the mechanism —
@@ -77,7 +77,7 @@ fn identity_workflow(volume: [usize; 3]) -> Workflow {
     )
 }
 
-/// One pixel phase over `block`, as the level the fragment phases are appended
+/// One pixel phase over `block`, as the image the fragment phases are appended
 /// after. Built by hand so the block count is stated rather than chosen.
 fn one_pixel_phase(volume: [usize; 3], block: [usize; 3]) -> Decomposition {
     Decomposition {
@@ -121,7 +121,7 @@ fn reference_totals(volume: [usize; 3]) -> BTreeMap<u64, (u64, u64)> {
 /// The fingerprints are pinned, and they are the values the crate produced
 /// **before** `source_inputs` existed on `FragmentOp`.
 ///
-/// `Decomposition::fingerprint` hashes `source_levels` only when the list is
+/// `Decomposition::fingerprint` hashes `source_images` only when the list is
 /// non-empty, so a plan whose ops declare no second array hashes exactly as it
 /// did — but that is an argument, and the argument is worth a number. These two
 /// were read off the pre-change library.
@@ -154,7 +154,7 @@ fn a_fragment_plan_that_reads_no_second_array_is_the_plan_it_always_was() {
     // why they did not move: an op that says nothing records nothing.
     for phase in &plan.phases {
         assert!(
-            phase.source_levels.is_empty(),
+            phase.source_images.is_empty(),
             "a phase whose op declares no second array recorded one"
         );
     }
@@ -163,10 +163,10 @@ fn a_fragment_plan_that_reads_no_second_array_is_the_plan_it_always_was() {
 // ------------------------------ 2. decomposition invariance, over a seam --
 
 /// The three-phase plan the invariance test runs: identity pixels, then per-
-/// region partials read out of **level 0**, then the merge.
+/// region partials read out of **image 0**, then the merge.
 ///
 /// The partial phase declares `reads_pixels() == false`, so the array it reads
-/// is genuinely a second one — it never touches the level it was handed.
+/// is genuinely a second one — it never touches the image it was handed.
 fn region_sum_plan(block: [usize; 3]) -> (Decomposition, RegionSumOp, RegionMergeOp) {
     let base = one_pixel_phase(VOLUME, block);
     let lattice = base.phases[0].grid.blocks_per_axis();
@@ -280,37 +280,37 @@ fn a_per_region_sum_over_a_second_array_is_byte_identical_across_block_sizes() {
 }
 
 #[test]
-fn the_second_array_is_read_and_counted_as_a_read_of_that_level() {
-    // Phase 0 reads level 0 once per block, phase 1 reads level 0 once per
-    // block *as its operand*, and nothing reads level 1 at all — phase 1
+fn the_second_array_is_read_and_counted_as_a_read_of_that_image() {
+    // Phase 0 reads image 0 once per block, phase 1 reads image 0 once per
+    // block *as its operand*, and nothing reads image 1 at all — phase 1
     // declares `reads_pixels() == false` and phase 2 is fragments to fragments.
     // A second array that cost nothing in the counters would make every
     // measurement of this feature a measurement of the wrong plan.
     let block = [3, 4, 4];
     let (_, _, log) = run_at(block);
-    let mut per_level: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut per_image: BTreeMap<usize, usize> = BTreeMap::new();
     for event in log.events() {
-        if let Event::RegionRead { level, .. } = event {
-            *per_level.entry(level).or_default() += 1;
+        if let Event::RegionRead { image, .. } = event {
+            *per_image.entry(image).or_default() += 1;
         }
     }
     let blocks = VOLUME[0] / block[0];
     assert_eq!(
-        per_level.get(&0).copied().unwrap_or(0),
+        per_image.get(&0).copied().unwrap_or(0),
         2 * blocks,
-        "level 0 is read once per block by the pixel phase and once per block as the operand"
+        "image 0 is read once per block by the pixel phase and once per block as the operand"
     );
     assert_eq!(
-        per_level.get(&1).copied().unwrap_or(0),
+        per_image.get(&1).copied().unwrap_or(0),
         0,
-        "nothing reads the level the fragment phase was handed"
+        "nothing reads the image the fragment phase was handed"
     );
 
-    // The plan says so too, which is what makes the level survive to be read.
+    // The plan says so too, which is what makes the image survive to be read.
     let (plan, _, _) = region_sum_plan(block);
-    assert_eq!(plan.phases[1].source_levels, vec![0]);
-    assert_eq!(plan.phases[0].source_levels, Vec::<usize>::new());
-    assert_eq!(plan.phases[2].source_levels, Vec::<usize>::new());
+    assert_eq!(plan.phases[1].source_images, vec![0]);
+    assert_eq!(plan.phases[0].source_images, Vec::<usize>::new());
+    assert_eq!(plan.phases[2].source_images, Vec::<usize>::new());
 }
 
 // -------------------------- 3. the silent operand is not expressible --
@@ -364,7 +364,7 @@ fn an_op_that_declares_a_second_array_and_takes_the_default_is_refused_by_name()
     .to_string();
     assert!(failed.contains("forgetful"), "{failed}");
     assert!(failed.contains("apply_with"), "{failed}");
-    assert!(failed.contains("level(s) 0"), "{failed}");
+    assert!(failed.contains("image(s) 0"), "{failed}");
 }
 
 // -------------------------------- 4. the order-dependence hazard --
@@ -643,7 +643,7 @@ fn an_operand_reaching_past_the_phase_halo_is_refused_rather_than_planned() {
         [0, 0, 0],
         short.phases[1].grid.clone(),
     )
-    .with_source_levels([0]);
+    .with_source_images([0]);
     let env = ArrayEnvironment::new(ramp(VOLUME), short.n_phases(), [4, 4, 4]).expect("an env");
     let failed = execute_phases(
         "windowed",
@@ -658,5 +658,5 @@ fn an_operand_reaching_past_the_phase_halo_is_refused_rather_than_planned() {
     .to_string();
     assert!(failed.contains("windowed-operand"), "{failed}");
     assert!(failed.contains("halo"), "{failed}");
-    assert!(failed.contains("level 0"), "{failed}");
+    assert!(failed.contains("image 0"), "{failed}");
 }

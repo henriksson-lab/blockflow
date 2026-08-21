@@ -50,14 +50,14 @@ fn ramp(shape: [usize; 3]) -> Array3<f64> {
     array
 }
 
-/// The last level as `f64`, which is what every test in this file works in.
+/// The last image as `f64`, which is what every test in this file works in.
 ///
-/// A level's element type is a tag now, so a test that wants `f64` says so
+/// An image's element type is a tag now, so a test that wants `f64` says so
 /// once here rather than at every assertion.
 fn output(env: &ArrayEnvironment) -> Array3<f64> {
     env.output()
         .view::<f64>()
-        .expect("these tests run f64 levels")
+        .expect("these tests run f64 images")
         .to_owned()
 }
 
@@ -677,7 +677,7 @@ fn an_affine_chain_lands_at_the_right_offsets_under_every_schedule() {
 // ------------------------------------------- a phase that changes shape --
 
 /// A two-phase plan whose second phase is cut from a **smaller** volume and
-/// reads a window of the level below.
+/// reads a window of the image below.
 ///
 /// This is the plan that could not exist: `Decomposition::check` refused any
 /// phase whose grid was over a different volume, so `input grid != output grid`
@@ -691,7 +691,7 @@ fn an_affine_chain_lands_at_the_right_offsets_under_every_schedule() {
 ///   so; the test provokes it.
 /// * `BlockGeometry::derive` treats a read clamped at the phase's own volume
 ///   edge as trustworthy, which is exactly right when that edge is a real edge
-///   of the array — and a cropping phase's edges are *not* edges of the level
+///   of the array — and a cropping phase's edges are *not* edges of the image
 ///   below. So the reach is zero here. A non-zero reach across a crop seam needs
 ///   the reach to be stated in the source space, which is the pending reach
 ///   work; nothing in this change makes it wrong, and nothing in it makes it
@@ -785,7 +785,7 @@ fn a_phase_may_read_one_volume_and_write_another_across_several_decompositions()
     }
 }
 
-/// The environment that holds one shape per level refuses the plan it cannot
+/// The environment that holds one shape per image refuses the plan it cannot
 /// hold, and the one built from the plan holds it.
 #[test]
 fn an_environment_says_whether_it_can_host_a_plan_that_changes_shape() {
@@ -795,11 +795,11 @@ fn an_environment_says_whether_it_can_host_a_plan_that_changes_shape() {
 
     let flat = ArrayEnvironment::new(input.clone().into(), plan.n_phases(), [2, 2, 2]).unwrap();
     let error = flat.prepare(&plan).unwrap_err().to_string();
-    assert!(error.contains("holds level 2"), "{error}");
+    assert!(error.contains("holds image 2"), "{error}");
 
     let counting = AccountingEnvironment::new(shape, [2, 2, 2], 8);
     let error = counting.prepare(&plan).unwrap_err().to_string();
-    assert!(error.contains("changes shape between levels"), "{error}");
+    assert!(error.contains("changes shape between images"), "{error}");
 
     ArrayEnvironment::for_decomposition(input.into(), &plan, [2, 2, 2])
         .unwrap()

@@ -101,7 +101,7 @@ fn exe(name: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct LocalOptions {
     pub workers: usize,
-    /// Scratch: the job spec, the rendezvous, the level files and the reports.
+    /// Scratch: the job spec, the rendezvous, the image files and the reports.
     pub dir: PathBuf,
     pub binaries: Binaries,
     /// Make worker `index` stop after `tasks` tasks, to demonstrate a death.

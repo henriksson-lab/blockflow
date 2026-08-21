@@ -57,7 +57,7 @@
 // | `points` | The four-column case of `table`: a position and one weight. Keeps the point's type and its headerless encoding; the store is `table`'s. |
 // | `geometry` | The inversion: read extent, trustworthy extent, `valid = core ∩ trustworthy`. |
 // | `decomposition` | The **binding** plan — parity-visible, deterministic, data-blind, hashable — plus the cost model used to choose it. |
-// | `assemble` | Writing one down: a slot cursor, the names, the per-phase reach, the element type a fragment phase writes, what each phase runs, and the source levels. Assembly only — it decides nothing the plan records, and hands back handles so a phase is never addressed by a literal. |
+// | `assemble` | Writing one down: a slot cursor, the names, the per-phase reach, the element type a fragment phase writes, what each phase runs, and the source images. Assembly only — it decides nothing the plan records, and hands back handles so a phase is never addressed by a literal. |
 // | `graph` | `(block, phase)` tasks with explicit dependencies. Thousands of nodes, never per-voxel. |
 // | `voxels` | What a block *is*: rank 3, element type as a run-time tag. Plus the dynamic-rank buffer a side output goes to, which is a different question. |
 // | `env` | The injected environment: real arrays, or a loader that only accumulates cost. |
@@ -87,7 +87,7 @@
 pub mod agreement;
 pub mod animate;
 /// Assembling a plan: the slot cursor, the names, the per-phase reach, the
-/// element type a fragment phase writes, what each phase runs, and the levels a
+/// element type a fragment phase writes, what each phase runs, and the images a
 /// phase reads besides its own input. **Assembly, not planning** — it decides
 /// nothing a `Decomposition` records, and everything it produces goes through
 /// the same five guards the executor runs.
@@ -170,7 +170,7 @@ pub mod tiling;
 /// dynamic-rank buffer a side output goes to, which is a different question and
 /// says so.
 pub mod voxels;
-/// Levels as Zarr v3 arrays on a filesystem store: the `Environment` that moves
+/// Images as Zarr v3 arrays on a filesystem store: the `Environment` that moves
 /// bytes. Behind the `zarr` feature; with it off this crate is unchanged and
 /// pulls no extra dependency.
 #[cfg(feature = "zarr")]
@@ -185,7 +185,7 @@ mod tests;
 
 pub use agreement::{compare_labels, Agreement, Matched, Merged, Split};
 pub use animate::{render, RenderRequest, View};
-pub use assemble::{Assembly, Level, Phase, PlanBuilder};
+pub use assemble::{Assembly, ImageId, Phase, PlanBuilder};
 pub use budget::{Class, Lease, MemoryBudget};
 pub use cache::{
     ArrayId, ArrayPolicy, CacheElement, CacheStats, CachingSource, ChunkCache, ChunkFetcher,
@@ -193,7 +193,7 @@ pub use cache::{
 };
 pub use decomposition::{
     check_block_constraints, check_chunk_exclusive_writes, check_output_shapes,
-    check_source_levels, constraint_for, cuttable_axes, halo_spans_axis, is_planning_barrier,
+    check_source_images, constraint_for, cuttable_axes, halo_spans_axis, is_planning_barrier,
     predicted_cost, reaches_whole_axis, splittable_axes, Constraints, CostModel, Decomposition,
     PhaseDecomposition,
 };

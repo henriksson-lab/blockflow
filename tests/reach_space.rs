@@ -338,7 +338,7 @@ fn all_is_a_barrier_without_anybody_measuring_it() {
 ///
 /// `derive` trusts a read clamped at the phase's own volume edge, because at a
 /// real array boundary the operation saw everything that exists. A cropping
-/// phase's boundary is an interior position of the level below, so the same
+/// phase's boundary is an interior position of the image below, so the same
 /// clamp trusts a voxel whose context was never fetched. Declared in the source
 /// frame, that trust is withdrawn and the guard reports the hole.
 #[test]
@@ -358,7 +358,7 @@ fn a_phase_whose_edges_are_not_the_arrays_edges_is_not_granted_the_clamp() {
     assert_eq!(trusted.valid.start, vec![0, 0, 0]);
     assert!(trusted.valid_covers_core());
 
-    // Stated against the level below, it is not: the first two planes had
+    // Stated against the image below, it is not: the first two planes had
     // context that was never fetched, and they are excluded.
     let untrusted = BlockGeometry::derive_with(&core, [32, 4, 4], &halo, &below);
     assert_eq!(untrusted.valid.start, vec![2, 0, 0]);
@@ -394,7 +394,7 @@ fn a_reach_in_blocks_is_converted_by_the_grid_it_is_cut_on() {
     }
 }
 
-/// A dependency in the level below's own lattice is carried, and a phase that
+/// A dependency in the image below's own lattice is carried, and a phase that
 /// declares one without saying where its blocks read is refused.
 ///
 /// This is the form that cannot be converted: there is no factor turning a step
@@ -403,7 +403,7 @@ fn a_reach_in_blocks_is_converted_by_the_grid_it_is_cut_on() {
 /// combination that would be a lie, which is declaring the dependency and then
 /// fetching one's own read extent.
 #[test]
-fn a_dependency_in_the_level_belows_lattice_needs_a_fetch_region_to_meet_it() {
+fn a_dependency_in_the_image_belows_lattice_needs_a_fetch_region_to_meet_it() {
     let workflow = workflow(0);
     let stated = Reach::from([2, 0, 0]).in_space(Space::source_index());
     assert!(!stated.space().converts_to_voxels());
@@ -412,7 +412,7 @@ fn a_dependency_in_the_level_belows_lattice_needs_a_fetch_region_to_meet_it() {
     let refused = plan(&workflow, 8, &[0], stated.clone());
     let message = refused.check().unwrap_err().to_string();
     assert!(
-        message.contains("steps of the level below's own lattice")
+        message.contains("steps of the image below's own lattice")
             && message.contains("where each block reads"),
         "{message}"
     );
@@ -427,8 +427,8 @@ fn a_dependency_in_the_level_belows_lattice_needs_a_fetch_region_to_meet_it() {
     // extent", so the refusal stands; the mapping has to be a real one.
     assert!(carried.check().is_err());
 
-    // A real mapping: every block reads the same window of the level below,
-    // which is nothing like its own read extent and is inside the level.
+    // A real mapping: every block reads the same window of the image below,
+    // which is nothing like its own read extent and is inside the image.
     let mut mapped = refused.clone();
     mapped.phases[0] = mapped.phases[0].clone().with_sources(|block| {
         let mut start = block.read.start.clone();

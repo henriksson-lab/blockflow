@@ -772,7 +772,7 @@ impl IterativeOp for ConfigurationFixedPointOp {
     /// One operand and one voxel of it.
     ///
     /// There is no `Fixed` operand: a pass consults the table and the running
-    /// estimate and nothing else, so declaring the input level as a second
+    /// estimate and nothing else, so declaring the input image as a second
     /// operand would fetch a halo per substage that no voxel reads.
     fn operands(&self) -> Vec<SubstageOperand> {
         vec![SubstageOperand::running([1, 1, 1])]

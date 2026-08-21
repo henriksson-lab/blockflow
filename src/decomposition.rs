@@ -21,11 +21,11 @@
 // decomposition that peeked at content would seam differently on two datasets
 // and no parity figure would transfer between them.
 //
-// Levels, and why a volume is per phase
+// Images, and why a volume is per phase
 // -------------------------------------
-// Level 0 is the input; level `p+1` is what phase `p` wrote. Each phase owns
+// Image 0 is the input; image `p+1` is what phase `p` wrote. Each phase owns
 // the volume its lattice is cut from — `PhaseDecomposition::volume` — and reads
-// the level below, whose shape is `Decomposition::volume_at(p)`. The two are
+// the image below, whose shape is `Decomposition::volume_at(p)`. The two are
 // equal for every phase whose output grid is its input grid, which is most of
 // them, and the plan is byte-identical there. Where they differ the plan *says
 // so*, which is the whole point: a phase that changes shape used to be refused
@@ -44,6 +44,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use crate::assemble::{describe_image, is_supplied_image};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::reach::{AxisReach, Frame, Reach};
@@ -95,35 +96,56 @@ pub struct PhaseDecomposition {
     /// the field existed, and is why `derive` still takes five arguments — the
     /// alternative was a default element type, and a default is exactly the kind
     /// of plausible wrong answer a binding plan must not contain. Resolve it
-    /// with [`Decomposition::dtype_at`], which folds the chain from level 0.
+    /// with [`Decomposition::dtype_at`], which folds the chain from image 0.
     pub dtype: Option<Dtype>,
-    /// Levels this phase reads **besides** the one it is handed, ascending and
+    /// Images this phase reads **besides** the one it is handed, ascending and
     /// without repeats: one per [`Chain::Source`] leaf in its slots.
     ///
     /// **Two different things in this file are called a source, and this is the
-    /// one that is a level.** `BlockGeometry::source` is a *region* — where in
-    /// the level below a block fetches from — and every phase has one per
-    /// block. This is a list of *levels*, and it is empty for every phase that
+    /// one that is an image.** `BlockGeometry::source` is a *region* — where in
+    /// the image below a block fetches from — and every phase has one per
+    /// block. This is a list of *images*, and it is empty for every phase that
     /// does not read a second array. They meet in exactly one place: a source
-    /// level is read at each block's `source` region, because a source leaf has
+    /// image is read at each block's `source` region, because a source leaf has
     /// reach 0 and therefore reads what the phase already fetches.
     ///
-    /// **In the binding half of the plan, unlike `Visibility`.** Which level an
+    /// **In the binding half of the plan, unlike `Visibility`.** Which image an
     /// arm reads changes voxels, so it is recorded, fingerprinted and shipped —
     /// the "explicit edges in the binding plan" of `docs/design/BLOCK_OPS.md`
-    /// §"Levels are a DAG", in the one shape this crate needs them.
+    /// §"Images are a DAG", in the one shape this crate needs them.
     ///
-    /// Derived from the chain by [`Decomposition::declare_source_levels`] and
-    /// verified against it by [`check_source_levels`], the same split
+    /// Derived from the chain by [`Decomposition::declare_source_images`] and
+    /// verified against it by [`check_source_images`], the same split
     /// `declare_dtypes` and `check_dtypes` have.
-    pub source_levels: Vec<usize>,
-    /// Whether this phase reads the level it is handed — level `p`, the one
+    pub source_images: Vec<usize>,
+    /// What each **supplied** image in `source_images` holds, ascending by
+    /// image and without repeats.
+    ///
+    /// Empty for every phase that reads only images the run writes, which is
+    /// every phase this crate shipped before a run could be handed a second
+    /// array.
+    ///
+    /// **Why it is recorded here and not derived.** The element type of an image
+    /// the run writes is the fold of the chain up to it, and
+    /// [`Decomposition::dtype_at`] computes it — there is nothing to store. A
+    /// supplied input is produced by no phase, so there is no fold and no
+    /// arithmetic that could answer; the only statement of what is in it is the
+    /// one its readers make (`Chain::Source`'s `dtype`, `SourceInput::dtype`).
+    /// So it is recorded beside the images it belongs to, derived from the chain
+    /// by [`Decomposition::declare_source_images`] and verified against it by
+    /// [`check_source_images`] — exactly the split `declare_dtypes` and
+    /// `check_dtypes` have, and the same one `source_images` itself has.
+    ///
+    /// Two phases reading one supplied input must agree, and
+    /// [`check_source_images`] says so by name if they do not.
+    pub supplied_dtypes: Vec<(usize, Dtype)>,
+    /// Whether this phase reads the image it is handed — image `p`, the one
     /// below it — at all.
     ///
     /// `true` for every phase that owns a slot, because a chain reads its input
     /// by construction, and `true` is therefore the derived default. It is
     /// `false` only for a fragment phase whose op declares
-    /// `FragmentOp::reads_pixels() == false`: such a phase is handed a level and
+    /// `FragmentOp::reads_pixels() == false`: such a phase is handed an image and
     /// never touches it, and `fragment::fragment_phase` is what records that
     /// here.
     ///
@@ -139,7 +161,7 @@ pub struct PhaseDecomposition {
     /// because what it describes is a property of the op and the op is not in
     /// the plan. A plan that arrives with it wrong is a plan whose read figure
     /// is wrong, which is exactly the fault it is here to make visible.
-    pub reads_input_level: bool,
+    pub reads_input_image: bool,
     /// Cores, read extents and valid regions, derived and recorded.
     pub blocks: Vec<BlockGeometry>,
 }
@@ -182,21 +204,22 @@ impl PhaseDecomposition {
             halo,
             grid,
             dtype: None,
-            source_levels: Vec::new(),
-            reads_input_level: true,
+            source_images: Vec::new(),
+            supplied_dtypes: Vec::new(),
+            reads_input_image: true,
             blocks,
         }
     }
 
     /// The coordinate space **this phase** works in: what its cores are cut
-    /// from, what its valid regions must tile, and the shape of the level it
+    /// from, what its valid regions must tile, and the shape of the image it
     /// writes.
     ///
     /// It is derived from the grid rather than stored beside it, because two
     /// copies of one number are two numbers that can disagree, and a plan that
     /// disagrees with itself is worse than a plan that cannot express something.
     ///
-    /// What it is *not* is the shape of what the phase reads. That is the level
+    /// What it is *not* is the shape of what the phase reads. That is the image
     /// below — `Decomposition::volume_at(phase)` — and the two differ exactly
     /// when the phase changes the array's shape.
     pub fn volume(&self) -> [usize; 3] {
@@ -209,29 +232,41 @@ impl PhaseDecomposition {
         self
     }
 
-    /// Say this phase also reads these levels, through source leaves.
+    /// Say this phase also reads these images, through source leaves.
     ///
     /// Normalised on the way in — ascending, no repeats — because the list is
-    /// fingerprinted and two plans that read the same levels must hash the same
+    /// fingerprinted and two plans that read the same images must hash the same
     /// whatever order the chain was walked in.
-    pub fn with_source_levels(mut self, levels: impl IntoIterator<Item = usize>) -> Self {
-        let mut levels: Vec<usize> = levels.into_iter().collect();
-        levels.sort_unstable();
-        levels.dedup();
-        self.source_levels = levels;
+    pub fn with_source_images(mut self, images: impl IntoIterator<Item = usize>) -> Self {
+        let mut images: Vec<usize> = images.into_iter().collect();
+        images.sort_unstable();
+        images.dedup();
+        self.source_images = images;
         self
     }
 
-    /// Say whether this phase reads the level it is handed.
+    /// Say what the supplied inputs this phase reads hold.
+    ///
+    /// Normalised on the way in — ascending, no repeats — for the reason
+    /// [`Self::with_source_images`] is: the list is fingerprinted.
+    pub fn with_supplied_dtypes(mut self, held: impl IntoIterator<Item = (usize, Dtype)>) -> Self {
+        let mut held: Vec<(usize, Dtype)> = held.into_iter().collect();
+        held.sort_by_key(|(image, _)| *image);
+        held.dedup();
+        self.supplied_dtypes = held;
+        self
+    }
+
+    /// Say whether this phase reads the image it is handed.
     ///
     /// Only a fragment phase ever passes `false`; see
-    /// [`PhaseDecomposition::reads_input_level`].
-    pub fn reading_input_level(mut self, reads: bool) -> Self {
-        self.reads_input_level = reads;
+    /// [`PhaseDecomposition::reads_input_image`].
+    pub fn reading_input_image(mut self, reads: bool) -> Self {
+        self.reads_input_image = reads;
         self
     }
 
-    /// Give every block a fetch region in the level below's coordinate space.
+    /// Give every block a fetch region in the image below's coordinate space.
     ///
     /// `map` is handed each block's geometry — index, core, read extent and all
     /// — and returns the region to fetch for it. It must be a function of the
@@ -241,7 +276,7 @@ impl PhaseDecomposition {
     /// The mapping is applied once, here, and what is recorded is its result, so
     /// the plan carries the regions rather than a closure nobody can hash. What
     /// checks them is [`Decomposition::check`], which is the only place that
-    /// knows what volume the level below has.
+    /// knows what volume the image below has.
     pub fn with_sources(mut self, map: impl Fn(&BlockGeometry) -> Region) -> Self {
         self.blocks = self
             .blocks
@@ -272,15 +307,74 @@ impl PhaseDecomposition {
     }
 }
 
-/// Whether a level survives the run.
+/// What an image **is**: given to the run, made on the way through, or the
+/// answer.
+///
+/// The distinction [`Visibility`] cannot make, and the one a scheduler needs.
+/// `Published` covers both ends of the run on the single shared ground that
+/// somebody outside reads them, which gets image 0's *behaviour* right — never
+/// freed — for a reason that is not the real one. The real one is the middle
+/// column below.
+///
+/// | | produced by a phase? | recomputable by this run? | must exist when the run ends? |
+/// |---|---|---|---|
+/// | [`Input`](ImageKind::Input) | no — handed to the run | **never, at any price** | n/a: it existed before the run and is not the run's to free |
+/// | [`Intermediate`](ImageKind::Intermediate) | yes | yes | no |
+/// | [`Output`](ImageKind::Output) | yes | yes | **yes** |
+///
+/// An intermediate may be dropped and rebuilt — the memory-for-recomputation
+/// trade. An input may not be, because there is no phase that produces it. The
+/// two look identical through `Visibility`, and any policy that trades residency
+/// for recomputation has to be able to tell them apart.
+///
+/// "Recomputable" and "must be there at the end" are separate columns on
+/// purpose: an output is exactly as recomputable as an intermediate, and what
+/// makes it an output is a **materialisation obligation** rather than a property
+/// of the computation. Welding the two makes "I may drop this and rebuild it,
+/// but I must rebuild it before I finish" unsayable, and that is a real state.
+///
+/// `docs/design/images-and-phases.md` specifies a rename in which this enum
+/// replaces [`Visibility`] outright. The spelling half of that is done — this is
+/// `ImageKind` and not `LevelKind` — and the removal is **not**, deliberately:
+/// `Visibility` answers the narrower question every one of its callers actually
+/// asks — *may this be freed* — and folding it away would make each of them
+/// restate `Input | Output` for itself. The two are kept because they are two
+/// questions, and this one is derived from that one so they cannot disagree.
+///
+/// **The argument deliberately does not turn on a count.** Two attempts to
+/// state one disagreed — nine, then eight-and-none-in-the-consumer — and both
+/// were wrong: `image_visibility` is read at seven sites here and **four in the
+/// consumer**, and one of the eight matches a counter found was this file's own
+/// definition. A number in a doc comment is a fact about the day it was written;
+/// what carries the decision is that the two enums answer different questions,
+/// which is true at any count above zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageKind {
+    /// Handed to the run. No phase writes it and nothing can rebuild it.
+    Input,
+    /// Written by one phase, read by its readers, then dead.
+    Intermediate,
+    /// Written by a phase, and somebody outside the run reads it.
+    Output,
+}
+
+/// Whether an image survives the run.
+///
+/// Derived from [`ImageKind`], which is the finer question: see that type for
+/// what this one cannot say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Visibility {
-    /// Level 0 and the workflow output. Somebody outside the run reads these,
+    /// An input and the workflow output. Somebody outside the run reads these,
     /// so they exist when it ends.
     Published,
-    /// Written by one phase, read by exactly one phase, then dead.
+    /// Written by one phase, read by its readers, then dead.
     ///
-    /// The reason this is worth naming: today every level of an `N`-phase plan
+    /// *Its readers*, plural, and not "read by exactly one phase": a source leaf
+    /// is a second reader, so the general statement is the one
+    /// [`Decomposition::readers_of_image`] makes — an image dies after its
+    /// **last** reader.
+    ///
+    /// The reason this is worth naming: today every image of an `N`-phase plan
     /// is allocated at full volume for the whole run, so a twenty-stage chain
     /// holds twenty-one copies of the data at once. Only ever two of them are
     /// live. Saying which are which is what lets the environment free the rest.
@@ -290,16 +384,16 @@ pub enum Visibility {
 /// The binding plan: what must be reproduced exactly for output to match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decomposition {
-    /// The shape of **level 0** — the input the first phase reads.
+    /// The shape of **image 0** — the input the first phase reads.
     ///
     /// Not "the volume of the plan": every phase owns its own volume
-    /// ([`PhaseDecomposition::volume`]), and level `p+1` is phase `p`'s. Level 0
-    /// is the one level that is no phase's output, so it is the one that has to
+    /// ([`PhaseDecomposition::volume`]), and image `p+1` is phase `p`'s. Image 0
+    /// is the one image that is no phase's output, so it is the one that has to
     /// be stated here. [`Decomposition::volume_at`] is the accessor that reads
     /// either kind, and [`Decomposition::uniform_volume`] is the derived
     /// "everything agrees" answer the single-volume callers want.
     pub volume: [usize; 3],
-    /// The element type of **level 0**, on the same argument. A phase that
+    /// The element type of **image 0**, on the same argument. A phase that
     /// changes it says so in its own `dtype`; [`Decomposition::dtype_at`] folds
     /// the chain.
     pub dtype: Dtype,
@@ -336,54 +430,111 @@ impl Decomposition {
         self.phases.iter().map(|phase| phase.blocks.len()).sum()
     }
 
-    /// The number of levels: level 0 plus one per phase.
-    pub fn n_levels(&self) -> usize {
+    /// The number of images **the run writes into**: image 0 plus one per phase.
+    ///
+    /// **This is not the number of arrays a run touches**, and stopped being it
+    /// when a run could be handed more than one. Supplied inputs are images —
+    /// they are read through the same `source_images`, fetched through the same
+    /// `Environment::read`, priced by the same byte accounting — but they are
+    /// addressed in a disjoint high range ([`ImageId::SUPPLIED_BASE`]) and are not
+    /// counted here, because every caller of this counts *what the plan fills
+    /// in*: a chunk list, an image table, a bound on an image a phase may name.
+    /// [`Self::n_supplied_inputs`] is the other half, and the two are added by
+    /// nobody, deliberately.
+    ///
+    /// [`ImageId::SUPPLIED_BASE`]: crate::assemble::ImageId::SUPPLIED_BASE
+    pub fn n_images(&self) -> usize {
         self.phases.len() + 1
     }
 
-    /// The shape of level `level`: level 0 is the input, level `p+1` is what
-    /// phase `p` wrote.
+    /// Every supplied input any phase reads, ascending and without repeats.
+    ///
+    /// Derived from `source_images` and not recorded: an array nothing reads is
+    /// not an image of this plan, whatever the caller handed the environment.
+    pub fn supplied_input_images(&self) -> Vec<usize> {
+        let mut images: Vec<usize> = self
+            .phases
+            .iter()
+            .flat_map(|phase| phase.source_images.iter().copied())
+            .filter(|&image| is_supplied_image(image))
+            .collect();
+        images.sort_unstable();
+        images.dedup();
+        images
+    }
+
+    /// How many arrays this plan expects to be handed.
+    pub fn n_supplied_inputs(&self) -> usize {
+        self.supplied_input_images().len()
+    }
+
+    /// The shape of image `image`: image 0 is the input, image `p+1` is what
+    /// phase `p` wrote, and a supplied input is in image 0's space.
     ///
     /// This is the accessor a caller that used to read `decomposition.volume`
-    /// and meant "the space this phase reads" wants. It panics on a level that
+    /// and meant "the space this phase reads" wants. It panics on an image that
     /// does not exist, like an index, because every caller of it holds a phase
     /// number it got from the plan.
-    pub fn volume_at(&self, level: usize) -> [usize; 3] {
-        match level {
+    pub fn volume_at(&self, image: usize) -> [usize; 3] {
+        match image {
             0 => self.volume,
-            _ => self.phases[level - 1].volume(),
+            // A supplied input is read at the reading block's own fetch region
+            // — a source leaf has reach 0 — so it has to be in the coordinate
+            // space that fetch is stated in, and that is image 0's. Stated as a
+            // rule rather than recorded per input, and it is not an assumption:
+            // `check_source_images` compares this against the volume of every
+            // phase that reads it and refuses the pair by name, so a plan that
+            // reshapes and then reads a supplied input is caught at plan time.
+            _ if is_supplied_image(image) => self.volume,
+            _ => self.phases[image - 1].volume(),
         }
     }
 
-    /// The element type of level `level`, folded from level 0: a phase that
+    /// The element type of image `image`, folded from image 0: a phase that
     /// declares no `dtype` hands on the one it read.
-    pub fn dtype_at(&self, level: usize) -> Dtype {
+    pub fn dtype_at(&self, image: usize) -> Dtype {
+        if is_supplied_image(image) {
+            // No phase writes it, so there is no chain to fold: the readers'
+            // declaration is the only statement there is, and
+            // `declare_source_images` recorded it. Falling back to image 0's
+            // type for an unread supplied image is the honest answer to a
+            // question about an array this plan does not read — and
+            // `check_source_images` is what makes sure an image a phase *does*
+            // read was recorded.
+            return self
+                .phases
+                .iter()
+                .flat_map(|phase| phase.supplied_dtypes.iter())
+                .find(|(named, _)| *named == image)
+                .map(|(_, dtype)| *dtype)
+                .unwrap_or(self.dtype);
+        }
         let mut dtype = self.dtype;
-        for phase in self.phases.iter().take(level) {
+        for phase in self.phases.iter().take(image) {
             dtype = phase.dtype.unwrap_or(dtype);
         }
         dtype
     }
 
-    /// Every phase that reads `level`, ascending: the phase it is the input of,
-    /// plus every later phase naming it in `source_levels`.
+    /// Every phase that reads `image`, ascending: the phase it is the input of,
+    /// plus every later phase naming it in `source_images`.
     ///
     /// **The refcount.** Before source leaves existed this was always a single
-    /// phase — level `p` is phase `p`'s input and nobody else's — and the whole
+    /// phase — image `p` is phase `p`'s input and nobody else's — and the whole
     /// lifetime rule was written to that special case. A source leaf is a
     /// second reader, so the general statement is the one the design record
-    /// asks for: *a level dies after its last reader*. With no source leaf
-    /// anywhere this returns `vec![level]` for every level a phase reads, and
-    /// [`Self::levels_dead_after`] reduces to exactly what it replaced.
+    /// asks for: *an image dies after its last reader*. With no source leaf
+    /// anywhere this returns `vec![image]` for every image a phase reads, and
+    /// [`Self::images_dead_after`] reduces to exactly what it replaced.
     ///
-    /// The last level has no reader at all, which is why it is `Published`.
-    pub fn readers_of_level(&self, level: usize) -> Vec<usize> {
+    /// The last image has no reader at all, which is why it is `Published`.
+    pub fn readers_of_image(&self, image: usize) -> Vec<usize> {
         let mut readers = Vec::new();
-        if level < self.n_phases() {
-            readers.push(level);
+        if image < self.n_phases() {
+            readers.push(image);
         }
         for (phase, decomposition) in self.phases.iter().enumerate() {
-            if phase != level && decomposition.source_levels.contains(&level) {
+            if phase != image && decomposition.source_images.contains(&image) {
                 readers.push(phase);
             }
         }
@@ -391,35 +542,35 @@ impl Decomposition {
         readers
     }
 
-    /// The levels whose **last** reader is `phase`: what dies when this phase
+    /// The images whose **last** reader is `phase`: what dies when this phase
     /// finishes every one of its tasks.
     ///
     /// This is the quantity the executor wants, and stating it this way is what
     /// keeps the executor from having to know whether the rule is "one reader"
     /// or "several". A plan with no source leaf answers `[phase]`, which is the
-    /// level the phase read — the old rule, unchanged, as an instance of the
+    /// image the phase read — the old rule, unchanged, as an instance of the
     /// new one.
     ///
-    /// Whether a level may be freed at all is still [`Self::level_visibility`]'s
+    /// Whether an image may be freed at all is still [`Self::image_visibility`]'s
     /// question, and pinning is still the caller's; neither is folded in here,
     /// because this is a fact about the plan and those two are policy.
-    pub fn levels_dead_after(&self, phase: usize) -> Vec<usize> {
-        (0..self.n_levels())
-            .filter(|&level| self.readers_of_level(level).last() == Some(&phase))
+    pub fn images_dead_after(&self, phase: usize) -> Vec<usize> {
+        (0..self.n_images())
+            .filter(|&image| self.readers_of_image(image).last() == Some(&phase))
             .collect()
     }
 
-    /// Whether a level survives the run, or exists only to get from one phase
+    /// Whether an image survives the run, or exists only to get from one phase
     /// to the next.
     ///
-    /// **Derived, not recorded.** Level 0 is the input and the last level is the
+    /// **Derived, not recorded.** Image 0 is the input and the last image is the
     /// output; everything between them is written by one phase, read by at least
     /// one phase, and then dead. Nothing in the plan needs to say so, and a
     /// field that could disagree with the arithmetic would be a field that
     /// eventually does.
     ///
-    /// *Which* phase is the last reader is [`Self::levels_dead_after`]'s
-    /// question and has moved; whether the level is somebody else's to keep has
+    /// *Which* phase is the last reader is [`Self::images_dead_after`]'s
+    /// question and has moved; whether the image is somebody else's to keep has
     /// not, because a source leaf is inside the run and cannot make an
     /// intermediate outlive it.
     ///
@@ -428,11 +579,31 @@ impl Decomposition {
     /// keeping one is a decision about debuggability rather than about the
     /// answer — it belongs in `Hints`, next to every other advisory value, and
     /// the fingerprint is unchanged by it.
-    pub fn level_visibility(&self, level: usize) -> Visibility {
-        if level == 0 || level + 1 >= self.n_levels() {
-            Visibility::Published
+    pub fn image_visibility(&self, image: usize) -> Visibility {
+        match self.image_kind(image) {
+            ImageKind::Input | ImageKind::Output => Visibility::Published,
+            ImageKind::Intermediate => Visibility::Internal,
+        }
+    }
+
+    /// What `image` **is**: handed to the run, made on the way through, or the
+    /// answer.
+    ///
+    /// **Derived, on the same argument [`Self::image_visibility`] is derived**,
+    /// and now with something to say that the arithmetic it replaced could not:
+    /// image 0 and every supplied input are `Input` because no phase writes
+    /// them, the last image a phase writes is `Output`, and everything between
+    /// is `Intermediate`. The old rule collapsed the first and the last into one
+    /// answer and had no way to distinguish "must not be freed because nothing
+    /// could rebuild it" from "must not be freed because somebody is waiting for
+    /// it".
+    pub fn image_kind(&self, image: usize) -> ImageKind {
+        if image == 0 || is_supplied_image(image) {
+            ImageKind::Input
+        } else if image + 1 >= self.n_images() {
+            ImageKind::Output
         } else {
-            Visibility::Internal
+            ImageKind::Intermediate
         }
     }
 
@@ -441,7 +612,7 @@ impl Decomposition {
         self.volume_at(self.n_phases())
     }
 
-    /// The one volume every level is in, when they are all the same.
+    /// The one volume every image is in, when they are all the same.
     ///
     /// **The derived form of what used to be a field.** `None` says the plan
     /// changes shape somewhere, which is precisely the question a caller that
@@ -456,7 +627,7 @@ impl Decomposition {
             .then_some(self.volume)
     }
 
-    /// The one element type every level is in, when they are all the same.
+    /// The one element type every image is in, when they are all the same.
     pub fn uniform_dtype(&self) -> Option<Dtype> {
         self.phases
             .iter()
@@ -467,7 +638,7 @@ impl Decomposition {
     /// Record the element type each phase writes, from the ops that write it.
     ///
     /// Consulted by a strategy at the end of `decompose`, so that a shipped
-    /// planner produces a plan whose levels are the width its chain needs rather
+    /// planner produces a plan whose images are the width its chain needs rather
     /// than one `check_dtypes` will refuse. Separate from `check_dtypes` because
     /// the two answer different questions — this one *derives*, that one
     /// *verifies* a plan that may have come from anywhere.
@@ -492,18 +663,18 @@ impl Decomposition {
         Ok(())
     }
 
-    /// Record which levels each phase reads besides its own input, from the
+    /// Record which images each phase reads besides its own input, from the
     /// source leaves in its slots.
     ///
     /// The counterpart of [`Self::declare_dtypes`], and separate from
-    /// [`check_source_levels`] for the same reason: this one *derives* from a
+    /// [`check_source_images`] for the same reason: this one *derives* from a
     /// chain the caller is holding, that one *verifies* a plan that may have
     /// arrived from anywhere.
     ///
     /// A phase with no source leaf is left declaring nothing, which is what
     /// keeps a plan that does not use the feature fingerprinting exactly as it
     /// did before the feature existed.
-    pub fn declare_source_levels(&mut self, chain: &Chain) -> Result<()> {
+    pub fn declare_source_images(&mut self, chain: &Chain) -> Result<()> {
         let slots = chain.slots();
         // Volumes first, because a source input's reach is stated over the
         // phase's own anchoring volume and `self.phases` is about to be borrowed
@@ -515,23 +686,39 @@ impl Decomposition {
             // **A phase that owns no slot is left alone rather than emptied.**
             // This derives from the chain, and a phase with no slot of the chain
             // has nothing in the chain that could say what it reads — a fragment
-            // phase's second level is declared by its op and recorded by
+            // phase's second image is declared by its op and recorded by
             // `fragment::fragment_phase`, which is the only thing holding the
             // op. Overwriting it here would silently drop it, and the run would
             // then fetch nothing while the op asked for something.
             if phase.slots.is_empty() {
                 continue;
             }
-            let mut levels = Vec::new();
+            let mut declared: Vec<crate::op::SourceInput> = Vec::new();
             for &slot in &phase.slots {
                 let Some(node) = slots.get(slot) else {
                     continue;
                 };
-                levels.extend(node.source_levels(volumes[index])?);
+                for input in node.source_inputs(volumes[index])? {
+                    if !declared.iter().any(|held| held.image == input.image) {
+                        declared.push(input);
+                    }
+                }
             }
-            levels.sort_unstable();
-            levels.dedup();
-            phase.source_levels = levels;
+            let mut images: Vec<usize> = declared.iter().map(|input| input.image.index()).collect();
+            images.sort_unstable();
+            images.dedup();
+            // Only the supplied ones. An image the run writes has its element
+            // type in the fold and recording a second copy of it would be a
+            // second number to disagree with the first.
+            let mut held: Vec<(usize, Dtype)> = declared
+                .iter()
+                .filter(|input| input.image.is_supplied())
+                .filter_map(|input| input.dtype.map(|dtype| (input.image.index(), dtype)))
+                .collect();
+            held.sort_by_key(|(image, _)| *image);
+            held.dedup();
+            phase.source_images = images;
+            phase.supplied_dtypes = held;
         }
         Ok(())
     }
@@ -548,25 +735,25 @@ impl Decomposition {
     /// whole reason `source` is in the plan is that this figure was silently
     /// wrong by 4x when the mapping lived in an environment instead.
     ///
-    /// **Once per level read, and a phase with source leaves reads more than
+    /// **Once per image read, and a phase with source leaves reads more than
     /// one.** Each one is fetched at the same region as the input — reach 0 —
-    /// so the multiplier is the number of levels the phase actually reads. A
+    /// so the multiplier is the number of images the phase actually reads. A
     /// figure that counted only the input would be under by that factor for
     /// precisely the plans this number is most worth checking, and it is
     /// compared against a run's counter to the voxel.
     ///
-    /// **The input level is one of them only when the phase reads it.** A
+    /// **The input image is one of them only when the phase reads it.** A
     /// fragment phase whose op declares `reads_pixels() == false` is handed
-    /// level `p` and never fetches it — `strategy::run_fragment_task` skips the
-    /// read outright — so the multiplier is `source_levels.len()` and not one
-    /// more. This used to be `1 + source_levels.len()` unconditionally, which
+    /// image `p` and never fetches it — `strategy::run_fragment_task` skips the
+    /// read outright — so the multiplier is `source_images.len()` and not one
+    /// more. This used to be `1 + source_images.len()` unconditionally, which
     /// charged such a phase for a fetch that does not happen. It was invisible
-    /// while the only non-reading fragment phases had no source levels either
+    /// while the only non-reading fragment phases had no source images either
     /// and thus no `Environment::read` to be compared against; it stopped being
     /// invisible when phases appeared that read a second array and not their
-    /// own, and it was over by one whole halo-inflated level each.
+    /// own, and it was over by one whole halo-inflated image each.
     ///
-    /// A phase that reads neither its input nor any source level scores zero,
+    /// A phase that reads neither its input nor any source image scores zero,
     /// and that is the right answer rather than a degenerate one:
     /// `fragments -> fragments` merges move no voxels at all, only sidecar
     /// bytes, and this function has never counted those — its own header calls
@@ -576,9 +763,9 @@ impl Decomposition {
         self.phases
             .iter()
             .map(|phase| {
-                let per_level: usize = phase.blocks.iter().map(|block| block.source.voxels()).sum();
-                let levels = usize::from(phase.reads_input_level) + phase.source_levels.len();
-                per_level * levels
+                let per_image: usize = phase.blocks.iter().map(|block| block.source.voxels()).sum();
+                let images = usize::from(phase.reads_input_image) + phase.source_images.len();
+                per_image * images
             })
             .collect()
     }
@@ -617,21 +804,27 @@ impl Decomposition {
                 dtype.numpy_name().hash(&mut hasher);
             }
             // Hashed only where it is used, on exactly `dtype`'s argument: a
-            // phase that reads no second level contributes nothing, so every
+            // phase that reads no second image contributes nothing, so every
             // plan built before source leaves existed fingerprints as it did.
-            // Which level an arm reads changes voxels, so a plan that uses one
+            // Which image an arm reads changes voxels, so a plan that uses one
             // must not collide with a plan that reads another.
-            if !phase.source_levels.is_empty() {
-                phase.source_levels.hash(&mut hasher);
+            if !phase.supplied_dtypes.is_empty() {
+                for (image, dtype) in &phase.supplied_dtypes {
+                    image.hash(&mut hasher);
+                    dtype.numpy_name().hash(&mut hasher);
+                }
             }
-            // `reads_input_level` is deliberately **not** hashed. Every other
-            // field here can change a voxel: which levels an arm reads, what
+            if !phase.source_images.is_empty() {
+                phase.source_images.hash(&mut hasher);
+            }
+            // `reads_input_image` is deliberately **not** hashed. Every other
+            // field here can change a voxel: which images an arm reads, what
             // type a phase writes, where a block fetches from. That one cannot
-            // — it says a phase does not touch a level it was never going to
+            // — it says a phase does not touch an image it was never going to
             // use, so the same plan with it right and with it wrong produces
             // identical output and differs only in a *predicted* read count.
             // Hashing it would renumber the plans of every fragment op that
-            // declines its own level, breaking the frozen fingerprints those
+            // declines its own image, breaking the frozen fingerprints those
             // ops are pinned by, in exchange for discriminating between two
             // plans that cannot disagree about a voxel.
             for block in &phase.blocks {
@@ -652,7 +845,7 @@ impl Decomposition {
     }
 
     /// The guard. Every phase's valid regions must tile **its own** volume
-    /// exactly, and every block must fetch from inside the level it reads.
+    /// exactly, and every block must fetch from inside the image it reads.
     ///
     /// A short halo makes a phase's valid regions shrink below their cores, the
     /// tiling develops a hole, and this fires. There is no separate
@@ -668,19 +861,19 @@ impl Decomposition {
     /// * the tiling runs against the phase's own volume, so it is a real check
     ///   for every phase rather than a check of one phase and a shape assertion
     ///   for the rest;
-    /// * a block's `source` must lie inside the level it reads, which is the
+    /// * a block's `source` must lie inside the image it reads, which is the
     ///   part that used to be true by construction and now has to be verified.
-    ///   The levels chain — level 0 is `self.volume`, level `p+1` is phase `p`'s
+    ///   The images chain — image 0 is `self.volume`, image `p+1` is phase `p`'s
     ///   — so a plan whose phases do not join up is caught here rather than
     ///   becoming two decompositions with no edge between them.
     ///
-    /// **And a whole-axis reach on the level below is checked against the
+    /// **And a whole-axis reach on the image below is checked against the
     /// fetch.** `AxisReach::All` in `Frame::Source` says the op consumes the
     /// whole of that axis of the array it reads. Nothing in the halo arithmetic
     /// can confirm it — the halo is measured in this phase's own volume, and a
     /// phase that collapses the axis has an extent of 1 there — so the only
     /// place the claim can be met is `BlockGeometry::source`, and this is the
-    /// only place that knows what the level below is shaped like. Without it the
+    /// only place that knows what the image below is shaped like. Without it the
     /// declaration is decoration: a projection whose fetch covers one plane of
     /// its axis, or half of it, produces a complete, well-formed volume of
     /// exactly the right shape and the wrong numbers, and every other guard
@@ -705,7 +898,7 @@ impl Decomposition {
             phase
                 .halo
                 .check_lattice(blocks, &format!("decomposition phase {index} halo"))?;
-            // A reach in the level below's own lattice is satisfied by the fetch
+            // A reach in the image below's own lattice is satisfied by the fetch
             // region and by nothing else — there is no factor turning a step of
             // that lattice into a voxel of this one, so it contributes nothing to
             // the halo. A phase that declares one and then fetches its own read
@@ -713,7 +906,7 @@ impl Decomposition {
             // exactly the shape of the zero somebody writes to get past a guard.
             if !phase.reach.space().converts_to_voxels() && !phase.reads_across_grids() {
                 return Err(Error::InvalidArgument(format!(
-                    "decomposition phase {index} ({}) states its reach as {} — steps of the level \
+                    "decomposition phase {index} ({}) states its reach as {} — steps of the image \
                      below's own lattice — and every block fetches its own read extent. A \
                      dependency in that space is met by where a block reads, not by how wide its \
                      halo is, so the plan has to say where each block reads \
@@ -732,7 +925,7 @@ impl Decomposition {
                     &block.source,
                     &source_volume,
                     &format!(
-                        "decomposition phase {index} block {:?}: the region it reads from level \
+                        "decomposition phase {index} block {:?}: the region it reads from image \
                          {index}",
                         block.index
                     ),
@@ -758,7 +951,7 @@ impl Decomposition {
             })?;
             // Last, because it is the only check about what the plan *meant*
             // rather than about whether it is self-consistent: a whole-axis
-            // reach in the level below's frame is a claim, and the fetch is the
+            // reach in the image below's frame is a claim, and the fetch is the
             // only thing that can meet it.
             if matches!(phase.reach.space().frame, Frame::Source) {
                 for axis in 0..3 {
@@ -773,9 +966,9 @@ impl Decomposition {
                         }
                         return Err(Error::InvalidArgument(format!(
                             "decomposition phase {index} ({}) declares reach {} — the whole of \
-                             axis {axis} of level {index} — and block {:?} fetches {lo}..{hi} of \
+                             axis {axis} of image {index} — and block {:?} fetches {lo}..{hi} of \
                              that axis, where the whole of it is 0..{}. A whole-axis reach in the \
-                             level below's frame is a claim about what each block reads, and only \
+                             image below's frame is a claim about what each block reads, and only \
                              the fetch can meet it: the halo is measured in this phase's own \
                              volume, which is {} voxel(s) on axis {axis}, so no halo widens the \
                              fetch. Every block has to fetch 0..{} \
@@ -821,8 +1014,9 @@ impl Decomposition {
                     phase.grid.clone(),
                 );
                 rebuilt.dtype = phase.dtype;
-                rebuilt.source_levels = phase.source_levels.clone();
-                rebuilt.reads_input_level = phase.reads_input_level;
+                rebuilt.source_images = phase.source_images.clone();
+                rebuilt.supplied_dtypes = phase.supplied_dtypes.clone();
+                rebuilt.reads_input_image = phase.reads_input_image;
                 if phase.reads_across_grids() {
                     for (block, original) in rebuilt.blocks.iter_mut().zip(&phase.blocks) {
                         block.source = original.source.clone();
@@ -1492,9 +1686,9 @@ pub fn check_block_constraints(chain: &Chain, decomposition: &Decomposition) -> 
             // executor's own slot-order check. Nothing to say here.
             continue;
         }
-        // The **level the phase reads**, not the phase's own volume. A mandate
+        // The **image the phase reads**, not the phase's own volume. A mandate
         // is about the region an op is handed, and that region — `source` — is
-        // in the level below's coordinate space. The two are the same for every
+        // in the image below's coordinate space. The two are the same for every
         // phase whose output grid is its input grid, which is most of them, and
         // where they differ this is the one that means anything: a lattice laid
         // over an array is a lattice over *that* array's extent.
@@ -1510,7 +1704,7 @@ pub fn check_block_constraints(chain: &Chain, decomposition: &Decomposition) -> 
     Ok(())
 }
 
-/// Every source leaf in `chain` names a level its phase can actually read, and
+/// Every source leaf in `chain` names an image its phase can actually read, and
 /// the plan records which ones.
 ///
 /// **The guard that cannot live in [`Decomposition::check`]**, on exactly
@@ -1519,33 +1713,39 @@ pub fn check_block_constraints(chain: &Chain, decomposition: &Decomposition) -> 
 /// the first place holding both halves, and it runs this before the first
 /// block — a forward reference is a fact about the plan, and a plan that is not
 /// a plan should be refused as one rather than survive until some block asks
-/// for a level nothing has written.
+/// for an image nothing has written.
 ///
 /// Four things are checked, and each of them is a way for a well-formed,
 /// complete, wrong volume to come out otherwise:
 ///
-/// * **the level exists.** An index past the end is not a reference to
+/// * **the image exists.** An index past the end is not a reference to
 ///   anything.
-/// * **it is not a forward reference.** Phases run `0..n`, so level `s` is
+/// * **it is not a forward reference.** Phases run `0..n`, so image `s` is
 ///   written by phase `s - 1` and is only there for a phase that runs after it:
-///   `s <= p` for phase `p`, which reads level `p`. Refused *by name*, saying
-///   which phase writes the level and which reads it. (`s == p` is the phase's
+///   `s <= p` for phase `p`, which reads image `p`. Refused *by name*, saying
+///   which phase writes the image and which reads it. (`s == p` is the phase's
 ///   own input read a second time — degenerate, harmless, and not worth a
-///   special case that would then have to be right.)
+///   special case that would then have to be right.) A **supplied** input is
+///   written by no phase and existed before the first one ran, so this question
+///   does not arise for it: every phase may read it, and that is the whole of
+///   what makes it an input rather than an early image.
+/// * **a supplied input says what it holds.** There is no fold to ask, so a
+///   reader that names one without declaring its element type is refused, and
+///   two readers that declare different ones are refused by name.
 /// * **it is on the same lattice.** A source leaf has reach 0 and reads the
-///   block's own fetch region, so the level it reads has to be in the same
-///   coordinate space as the level the phase reads. A different volume would
+///   block's own fetch region, so the image it reads has to be in the same
+///   coordinate space as the image the phase reads. A different volume would
 ///   make the same integers mean different voxels, which is the failure this
 ///   crate exists to prevent rather than one to price.
-/// * **the declared element type is the level's.** The leaf carries a `Dtype`
+/// * **the declared element type is the image's.** The leaf carries a `Dtype`
 ///   because `Chain::produces` has nothing else to answer with, and every fold
 ///   of the chain was built from that answer; here it meets the plan, which is
-///   the only thing that knows what the level holds.
+///   the only thing that knows what the image holds.
 ///
-/// Finally the recorded `source_levels` must be exactly what the slots name —
-/// a plan whose record disagrees with its chain would read one level and price
+/// Finally the recorded `source_images` must be exactly what the slots name —
+/// a plan whose record disagrees with its chain would read one image and price
 /// another, and the whole reason the field exists is that it is parity-visible.
-pub fn check_source_levels(chain: &Chain, decomposition: &Decomposition) -> Result<()> {
+pub fn check_source_images(chain: &Chain, decomposition: &Decomposition) -> Result<()> {
     let slots = chain.slots();
     for (phase_index, phase) in decomposition.phases.iter().enumerate() {
         if phase.slots.iter().any(|&slot| slot >= slots.len()) {
@@ -1555,10 +1755,10 @@ pub fn check_source_levels(chain: &Chain, decomposition: &Decomposition) -> Resu
         }
         // **A phase with no slot is not this guard's to speak for.** It folds
         // the chain, and a phase owning no part of the chain has nothing here
-        // that could name a level: a fragment op declares its second level on
+        // that could name an image: a fragment op declares its second image on
         // itself, and only the `(plan, work)` pair holds the op. That half is
         // `fragment::check_phase_work`, which makes every assertion below and
-        // two more the chain has no way to need. Asserting `source_levels` is
+        // two more the chain has no way to need. Asserting `source_images` is
         // empty here would refuse exactly the plans that guard exists to check.
         if phase.slots.is_empty() {
             continue;
@@ -1567,16 +1767,16 @@ pub fn check_source_levels(chain: &Chain, decomposition: &Decomposition) -> Resu
         let mut declared: Vec<crate::op::SourceInput> = Vec::new();
         for &slot in &phase.slots {
             for input in slots[slot].source_inputs(volume)? {
-                match declared.iter_mut().find(|held| held.level == input.level) {
+                match declared.iter_mut().find(|held| held.image == input.image) {
                     Some(held) => held.reach = held.reach.max(&input.reach)?,
                     None => declared.push(input),
                 }
             }
         }
-        declared.sort_by_key(|input| input.level);
+        declared.sort_by_key(|input| input.image);
 
         // **The equal-reach limit, stated where it is checkable.** The executor
-        // reads a source level at the block's own fetch region, so an operand
+        // reads a source image at the block's own fetch region, so an operand
         // wanting *more* than the phase already fetches would be handed a buffer
         // narrower than its kernel walks. Per-input halos are what would lift
         // this, and nothing shipped needs them yet — the masked-window case that
@@ -1592,60 +1792,131 @@ pub fn check_source_levels(chain: &Chain, decomposition: &Decomposition) -> Resu
                 let (have_lo, have_hi) = granted.axis(axis).bound(volume[axis]);
                 if want_lo > have_lo || want_hi > have_hi {
                     return Err(Error::InvalidArgument(format!(
-                        "decomposition phase {phase_index} ({}) reads level {} with a reach of \
+                        "decomposition phase {phase_index} ({}) reads image {} with a reach of \
                          {want_lo}+{want_hi} on axis {axis}, and the phase is granted a halo of \
-                         {have_lo}+{have_hi} there. A source level is read at the block's own \
+                         {have_lo}+{have_hi} there. A source image is read at the block's own \
                          fetch region, so an operand reaching further than the phase does would \
                          be handed a buffer its kernel walks past the end of. Widening only this \
                          input needs a per-input halo, which this plan cannot express.",
                         phase.names.join(">"),
-                        input.level
+                        input.image
                     )));
                 }
             }
         }
 
-        let mut named: Vec<usize> = declared.iter().map(|input| input.level).collect();
+        // A supplied input has no producing phase, so nothing in the plan can
+        // be folded to say what is in it: the readers are the declaration. One
+        // that says nothing would leave `dtype_at` guessing, and every fold the
+        // chain makes is built on that answer.
+        for input in &declared {
+            if input.image.is_supplied() && input.dtype.is_none() {
+                return Err(Error::InvalidArgument(format!(
+                    "decomposition phase {phase_index} ({}) reads {}, and nothing says what it \
+                     holds. An image the run writes has its element type in the fold of the chain \
+                     that wrote it; a supplied input is produced by no phase, so the reader is \
+                     the only statement there is — declare it with `SourceInput::holding`, or \
+                     read the array through a `Chain::Source` leaf, which carries it.",
+                    phase.names.join(">"),
+                    describe_image(input.image.index())
+                )));
+            }
+        }
+        let mut held: Vec<(usize, Dtype)> = declared
+            .iter()
+            .filter(|input| input.image.is_supplied())
+            .filter_map(|input| input.dtype.map(|dtype| (input.image.index(), dtype)))
+            .collect();
+        held.sort_by_key(|(image, _)| *image);
+        held.dedup();
+        if held != phase.supplied_dtypes {
+            return Err(Error::InvalidArgument(format!(
+                "decomposition phase {phase_index} ({}) records that its supplied inputs hold \
+                 {:?}, and its slots declare {:?}. The recorded list is what `dtype_at` answers \
+                 with and what the fingerprint hashes, so a plan whose record disagrees with its \
+                 chain would allocate one width and read another.",
+                phase.names.join(">"),
+                phase.supplied_dtypes,
+                held
+            )));
+        }
+        for (image, dtype) in &phase.supplied_dtypes {
+            let plan = decomposition.dtype_at(*image);
+            if plan != *dtype {
+                return Err(Error::InvalidArgument(format!(
+                    "decomposition phase {phase_index} ({}) reads {} as {}, and another phase of \
+                     the same plan reads it as {}. One array is handed to the run and every \
+                     phase that names it is handed the same bytes, so the two cannot both be \
+                     right.",
+                    phase.names.join(">"),
+                    describe_image(*image),
+                    dtype.numpy_name(),
+                    plan.numpy_name()
+                )));
+            }
+        }
+
+        let mut named: Vec<usize> = declared.iter().map(|input| input.image.index()).collect();
         named.sort_unstable();
         named.dedup();
-        if named != phase.source_levels {
+        if named != phase.source_images {
             return Err(Error::InvalidArgument(format!(
-                "decomposition phase {phase_index} ({}) records that it also reads level(s) \
+                "decomposition phase {phase_index} ({}) records that it also reads image(s) \
                  {:?}, and its slots name {:?}. The recorded list is what the executor reads and \
                  what the fingerprint hashes, so a plan whose record disagrees with its chain \
-                 would price one level and read another.",
+                 would price one image and read another.",
                 phase.names.join(">"),
-                phase.source_levels,
+                phase.source_images,
                 named
             )));
         }
-        for &level in &named {
-            if level >= decomposition.n_levels() {
+        for &image in &named {
+            if is_supplied_image(image) {
+                // No producing phase, so neither the bound nor the forward
+                // reference is a question that can be asked of it. What is left
+                // is the lattice, which is checked below for every image alike.
+                let read = decomposition.volume_at(phase_index);
+                let stored = decomposition.volume_at(image);
+                if stored != read {
+                    return Err(Error::InvalidArgument(format!(
+                        "decomposition phase {phase_index} ({}) reads {}, which is {stored:?}, \
+                         beside image {phase_index}, which is {read:?}. A supplied input is read \
+                         at the block's own fetch region — a source leaf has reach 0 — so it has \
+                         to be in the same coordinate space as the image the phase reads, and \
+                         that space is image 0's. A phase downstream of one that changes shape \
+                         cannot read a supplied array directly.",
+                        phase.names.join(">"),
+                        describe_image(image)
+                    )));
+                }
+                continue;
+            }
+            if image >= decomposition.n_images() {
                 return Err(Error::InvalidArgument(format!(
-                    "decomposition phase {phase_index} ({}) reads level {level} through a source \
-                     leaf, and this plan has {} level(s), numbered 0 to {}.",
+                    "decomposition phase {phase_index} ({}) reads image {image} through a source \
+                     leaf, and this plan has {} image(s), numbered 0 to {}.",
                     phase.names.join(">"),
-                    decomposition.n_levels(),
-                    decomposition.n_levels() - 1
+                    decomposition.n_images(),
+                    decomposition.n_images() - 1
                 )));
             }
-            if level > phase_index {
+            if image > phase_index {
                 return Err(Error::InvalidArgument(format!(
-                    "decomposition phase {phase_index} ({}) reads level {level} through a source \
-                     leaf, but level {level} is written by phase {}, which runs after it. Phases \
-                     run in order, so a source leaf may only name a level at or below the one its \
-                     phase is handed — level {phase_index} here.",
+                    "decomposition phase {phase_index} ({}) reads image {image} through a source \
+                     leaf, but image {image} is written by phase {}, which runs after it. Phases \
+                     run in order, so a source leaf may only name an image at or below the one its \
+                     phase is handed — image {phase_index} here.",
                     phase.names.join(">"),
-                    level - 1
+                    image - 1
                 )));
             }
             let read = decomposition.volume_at(phase_index);
-            let stored = decomposition.volume_at(level);
+            let stored = decomposition.volume_at(image);
             if stored != read {
                 return Err(Error::InvalidArgument(format!(
-                    "decomposition phase {phase_index} ({}) reads level {level}, which is \
-                     {stored:?}, beside level {phase_index}, which is {read:?}. A source leaf has \
-                     reach 0 and is read at the block's own fetch region, so the two levels have \
+                    "decomposition phase {phase_index} ({}) reads image {image}, which is \
+                     {stored:?}, beside image {phase_index}, which is {read:?}. A source leaf has \
+                     reach 0 and is read at the block's own fetch region, so the two images have \
                      to be in one coordinate space; across grids the same integers would name \
                      different voxels.",
                     phase.names.join(">")
@@ -1659,7 +1930,7 @@ pub fn check_source_levels(chain: &Chain, decomposition: &Decomposition) -> Resu
     Ok(())
 }
 
-/// Walk one slot's source leaves and compare each declaration against the level.
+/// Walk one slot's source leaves and compare each declaration against the image.
 fn check_declared_source_dtypes(
     node: &Chain,
     phase_index: usize,
@@ -1668,14 +1939,15 @@ fn check_declared_source_dtypes(
 ) -> Result<()> {
     match node {
         Chain::Op(_) => Ok(()),
-        Chain::Source { level, dtype } => {
-            let held = decomposition.dtype_at(*level);
+        Chain::Source { image, dtype } => {
+            let image = image.index();
+            let held = decomposition.dtype_at(image);
             if held != *dtype {
                 return Err(Error::InvalidArgument(format!(
-                    "decomposition phase {phase_index} ({}) has a source leaf declaring level \
-                     {level} holds {}, and the plan folds that level to {}. Every fold of the \
+                    "decomposition phase {phase_index} ({}) has a source leaf declaring image \
+                     {image} holds {}, and the plan folds that image to {}. Every fold of the \
                      chain — what the combine accepts, what the phase writes — was built from \
-                     the declaration, so it has to be the level's own element type.",
+                     the declaration, so it has to be the image's own element type.",
                     phase.names.join(">"),
                     dtype.numpy_name(),
                     held.numpy_name()
@@ -1708,8 +1980,8 @@ fn check_declared_source_dtypes(
 /// * an op handed an element type it does not [`accept`](crate::op::BlockOp::accepts)
 ///   — the message names the op and the type, because that is a chain that
 ///   cannot run at all rather than a plan that is merely wrong;
-/// * a phase whose level is allocated at one type while its ops write another —
-///   the message names the level, because that *is* the plan being wrong.
+/// * a phase whose image is allocated at one type while its ops write another —
+///   the message names the image, because that *is* the plan being wrong.
 pub fn check_dtypes(
     chain: &Chain,
     decomposition: &Decomposition,
@@ -1720,12 +1992,12 @@ pub fn check_dtypes(
     for (index, phase) in decomposition.phases.iter().enumerate() {
         // A fragment phase owns no slot, so the fold above has nothing to fold
         // and the op is the only thing that knows what it writes. Before this
-        // arm existed, a `volume -> fragments` op that widened its level — a
+        // arm existed, a `volume -> fragments` op that widened its image — a
         // labelling writing `u32` over a `bool` mask — was refused by a message
         // about ops the phase does not have.
         if let Some(crate::fragment::PhaseWork::Fragments(op)) = work.get(index) {
             if !op.writes_pixels() {
-                // Terminal as far as levels go; there is no level to be wrong.
+                // Terminal as far as images go; there is no image to be wrong.
                 continue;
             }
             let produced = op.produces(current);
@@ -1733,7 +2005,7 @@ pub fn check_dtypes(
             if declared != produced {
                 return Err(Error::InvalidArgument(format!(
                     "phase {index} runs fragment op {:?}, which reads {} and writes {}, but \
-                     the plan allocates level {} as {}. A phase that changes the element type \
+                     the plan allocates image {} as {}. A phase that changes the element type \
                      says so in its own `dtype`.",
                     op.name(),
                     current.numpy_name(),
@@ -1773,9 +2045,9 @@ pub fn check_dtypes(
         let declared = decomposition.dtype_at(index + 1);
         if declared != current {
             return Err(Error::InvalidArgument(format!(
-                "phase {index} ({}) reads {} and its ops write {}, but the plan allocates level \
+                "phase {index} ({}) reads {} and its ops write {}, but the plan allocates image \
                  {} as {}. A phase that changes the element type says so in its own `dtype`; a \
-                 plan that does not is a plan whose level is the wrong width.",
+                 plan that does not is a plan whose image is the wrong width.",
                 phase.names.join(">"),
                 decomposition.dtype_at(index).numpy_name(),
                 current.numpy_name(),
@@ -1923,15 +2195,15 @@ fn block_extent(region: &Region) -> [usize; 3] {
     [region.shape[0], region.shape[1], region.shape[2]]
 }
 
-/// **Every chunk of a level is written by exactly one task.**
+/// **Every chunk of an image is written by exactly one task.**
 ///
 /// The fifth guard that cannot live in [`Decomposition::check`], for the same
 /// reason [`check_block_constraints`] and [`check_dtypes`] cannot: a plan says
-/// nothing about how a level is chunked, so the plan alone cannot answer this.
+/// nothing about how an image is chunked, so the plan alone cannot answer this.
 /// The chunk shapes come from whatever holds the storage, and the first place
 /// that holds both halves is the environment's `prepare`.
 ///
-/// Precisely: for phase `p`, which writes level `p+1`, every chunk of level
+/// Precisely: for phase `p`, which writes image `p+1`, every chunk of image
 /// `p+1` must lie inside exactly one of phase `p`'s **valid regions**. The valid
 /// regions already tile the phase's volume exactly — that is what
 /// [`Decomposition::check`] asserts — so "exactly one" reduces to "no chunk is
@@ -1949,9 +2221,9 @@ fn block_extent(region: &Region) -> [usize; 3] {
 ///   "partly valid" that no cache tier wants to carry.
 ///
 /// **It constrains writes, not reads.** Reads may straddle chunks freely — that
-/// is what a halo is — so `chunks[0]` is never looked at: level 0 is nobody's
+/// is what a halo is — so `chunks[0]` is never looked at: image 0 is nobody's
 /// output. It is still taken, so that the argument is "the chunk shape of every
-/// level" and a caller does not have to remember an off-by-one.
+/// image" and a caller does not have to remember an off-by-one.
 ///
 /// A chunk overhanging the volume's far edge is not a violation. It holds no
 /// voxel outside the array, so the one valid region that meets it owns every
@@ -1960,23 +2232,23 @@ pub fn check_chunk_exclusive_writes(
     decomposition: &Decomposition,
     chunks: &[[usize; 3]],
 ) -> Result<()> {
-    if chunks.len() != decomposition.n_levels() {
+    if chunks.len() != decomposition.n_images() {
         return Err(Error::InvalidArgument(format!(
-            "chunk-exclusive check: this plan has {} level(s) and {} chunk shape(s) were given. \
-             The argument is one shape per level, level 0 included, so that the index is the \
-             level number.",
-            decomposition.n_levels(),
+            "chunk-exclusive check: this plan has {} image(s) and {} chunk shape(s) were given. \
+             The argument is one shape per image, image 0 included, so that the index is the \
+             image number.",
+            decomposition.n_images(),
             chunks.len()
         )));
     }
     for (index, phase) in decomposition.phases.iter().enumerate() {
-        let level = index + 1;
-        let chunk = chunks[level];
+        let image = index + 1;
+        let chunk = chunks[image];
         let volume = phase.volume();
         for axis in 0..3 {
             if chunk[axis] == 0 {
                 return Err(Error::InvalidArgument(format!(
-                    "chunk-exclusive check: level {level} is chunked {chunk:?}, and a chunk of \
+                    "chunk-exclusive check: image {image} is chunked {chunk:?}, and a chunk of \
                      zero extent on axis {axis} tiles nothing"
                 )));
             }
@@ -2007,7 +2279,7 @@ pub fn check_chunk_exclusive_writes(
                 chunk_index[axis] = cut / chunk[axis];
                 return Err(shared_chunk_error(
                     index,
-                    level,
+                    image,
                     phase,
                     &chunk_index,
                     &chunk,
@@ -2028,7 +2300,7 @@ pub fn check_chunk_exclusive_writes(
 /// whether the block grid or the chunk grid is the thing to move.
 fn shared_chunk_error(
     index: usize,
-    level: usize,
+    image: usize,
     phase: &PhaseDecomposition,
     chunk_index: &[usize; 3],
     chunk: &[usize; 3],
@@ -2060,12 +2332,12 @@ fn shared_chunk_error(
         })
         .collect();
     Error::InvalidArgument(format!(
-        "decomposition phase {index} ({}) writes level {level}, which is chunked {chunk:?}: chunk \
+        "decomposition phase {index} ({}) writes image {image}, which is chunked {chunk:?}: chunk \
          {chunk_index:?} spans {lo:?}..{hi:?} and {} of this phase's valid regions land in it — \
-         {}. Every chunk of a level must be written by exactly one task: two writers of one chunk \
+         {}. Every chunk of an image must be written by exactly one task: two writers of one chunk \
          lose each other's bytes in any store whose partial write is a read-modify-write, and a \
          chunk with no single owner has no lifetime a cache can hold it by. Either the block grid \
-         must be a whole multiple of the chunk shape, or — for a level whose layout nobody outside \
+         must be a whole multiple of the chunk shape, or — for an image whose layout nobody outside \
          the run has asked for — the chunk shape should be derived from the block grid, which \
          satisfies this at no cost.",
         phase.names.join(">"),
@@ -2286,8 +2558,8 @@ mod tests {
         }
     }
 
-    /// Level 0 is `[16, 4, 4]`, the phase writes `[8, 4, 4]`, and each block
-    /// fetches twice its read extent from the level below.
+    /// Image 0 is `[16, 4, 4]`, the phase writes `[8, 4, 4]`, and each block
+    /// fetches twice its read extent from the image below.
     fn decimating_plan() -> Decomposition {
         let grid = BlockGrid::new([8, 4, 4], [4, 4, 4]).unwrap();
         let phase = PhaseDecomposition::derive(
@@ -2419,20 +2691,20 @@ mod tests {
         }
     }
 
-    /// One shape per level, level 0 included, so that the index is the level
+    /// One shape per image, image 0 included, so that the index is the image
     /// number — and a caller who gets that wrong is told rather than checked
     /// against the wrong grid.
     #[test]
-    fn the_chunk_check_wants_one_shape_per_level() {
+    fn the_chunk_check_wants_one_shape_per_image() {
         let plan = decomposition([4, 0, 0], [4, 0, 0]);
         let err = check_chunk_exclusive_writes(&plan, &[[8, 8, 8]])
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("2 level(s)") && err.contains("1 chunk shape"),
+            err.contains("2 image(s)") && err.contains("1 chunk shape"),
             "got: {err}"
         );
-        // Level 0 is read-only, so whatever it is chunked as says nothing.
+        // Image 0 is read-only, so whatever it is chunked as says nothing.
         check_chunk_exclusive_writes(&plan, &[[7, 3, 5], [8, 8, 8]]).unwrap();
     }
 
@@ -2682,8 +2954,8 @@ mod tests {
     /// Two phases over two volumes, joined by a fetch region.
     ///
     /// The plan a single `volume` field made inexpressible: phase 0 writes a
-    /// `[16, 4, 4]` level, phase 1 is cut from `[8, 4, 4]` and reads the top half
-    /// of the level below.
+    /// `[16, 4, 4]` image, phase 1 is cut from `[8, 4, 4]` and reads the top half
+    /// of the image below.
     fn two_volumes(halo: [usize; 3], reach: [usize; 3]) -> Decomposition {
         let first = PhaseDecomposition::derive(
             vec![0],
@@ -2726,16 +2998,16 @@ mod tests {
         assert_eq!(plan.exact_read_voxels(), vec![16 * 4 * 4, 8 * 4 * 4]);
     }
 
-    /// The read figure counts levels the phase reads, and no others.
+    /// The read figure counts images the phase reads, and no others.
     ///
     /// Four cases, and the third is the one this test was written for: a phase
-    /// that reads a second array and *not* the level it was handed — a fragment
+    /// that reads a second array and *not* the image it was handed — a fragment
     /// op declaring `reads_pixels() == false` alongside `source_inputs` — used
     /// to be charged for two arrays and reads one. The over-count was a whole
-    /// halo-inflated level, on exactly the plans the figure is checked against a
+    /// halo-inflated image, on exactly the plans the figure is checked against a
     /// run for.
     #[test]
-    fn a_phase_is_charged_for_the_levels_it_reads_and_not_for_the_one_it_declines() {
+    fn a_phase_is_charged_for_the_images_it_reads_and_not_for_the_one_it_declines() {
         let base = PhaseDecomposition::derive(
             vec![0],
             vec!["only".to_string()],
@@ -2751,20 +3023,20 @@ mod tests {
             chain_reach: [0, 0, 0],
         };
 
-        // its own level, which is every chain phase
-        assert!(base.reads_input_level);
+        // its own image, which is every chain phase
+        assert!(base.reads_input_image);
         assert_eq!(plan(base.clone()).exact_read_voxels(), vec![voxels]);
-        // its own level and one more
-        let with_source = base.clone().with_source_levels([0]);
+        // its own image and one more
+        let with_source = base.clone().with_source_images([0]);
         assert_eq!(
             plan(with_source.clone()).exact_read_voxels(),
             vec![2 * voxels]
         );
-        // one other level and not its own
-        let source_only = with_source.reading_input_level(false);
+        // one other image and not its own
+        let source_only = with_source.reading_input_image(false);
         assert_eq!(plan(source_only).exact_read_voxels(), vec![voxels]);
         // and neither: a fragments-to-fragments phase moves no voxels at all
-        let neither = base.reading_input_level(false);
+        let neither = base.reading_input_image(false);
         assert_eq!(plan(neither).exact_read_voxels(), vec![0]);
     }
 
@@ -2788,7 +3060,7 @@ mod tests {
     /// phase that changes shape and does *not* say where it reads is fetching
     /// coordinates of one array out of another.
     #[test]
-    fn a_fetch_outside_the_level_it_reads_is_refused() {
+    fn a_fetch_outside_the_image_it_reads_is_refused() {
         let mut plan = two_volumes([0, 0, 0], [0, 0, 0]);
         // strip the mapping: the blocks fall back to their own read extents,
         // which are regions of [8, 4, 4] and not of the [16, 4, 4] below
@@ -2797,7 +3069,7 @@ mod tests {
         });
         let message = plan.check().unwrap_err().to_string();
         assert!(
-            message.contains("reads from level 1") && message.contains("region axis 0"),
+            message.contains("reads from image 1") && message.contains("region axis 0"),
             "{message}"
         );
     }
@@ -2832,10 +3104,10 @@ mod tests {
         assert!(!same.reads_across_grids());
     }
 
-    /// The element type is folded from level 0, so a phase that says nothing
+    /// The element type is folded from image 0, so a phase that says nothing
     /// hands on what it read.
     #[test]
-    fn the_element_type_is_per_level_and_folded_from_the_input() {
+    fn the_element_type_is_per_image_and_folded_from_the_input() {
         let mut plan = two_volumes([0, 0, 0], [0, 0, 0]);
         assert_eq!(plan.dtype_at(0), Dtype::F64);
         assert_eq!(plan.dtype_at(2), Dtype::F64);
@@ -2843,7 +3115,7 @@ mod tests {
         plan.phases[0] = plan.phases[0].clone().with_dtype(Dtype::U8);
         assert_eq!(plan.dtype_at(0), Dtype::F64);
         assert_eq!(plan.dtype_at(1), Dtype::U8);
-        // phase 1 declares nothing, so level 2 is what level 1 was
+        // phase 1 declares nothing, so image 2 is what image 1 was
         assert_eq!(plan.dtype_at(2), Dtype::U8);
         assert_eq!(plan.uniform_dtype(), None);
     }

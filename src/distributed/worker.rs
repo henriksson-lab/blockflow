@@ -298,7 +298,7 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
                 environment.finish(task.phase + 1)?;
                 // The task's non-pixel output, keyed by the block it came from.
                 //
-                // Written before the completion for the same reason the level
+                // Written before the completion for the same reason the image
                 // is flushed before it, but note the barrier is *weaker* here
                 // and legitimately so: no task ever reads a peer's fragment.
                 // Fragments are consumed by a global merge after the job, so

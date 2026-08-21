@@ -184,23 +184,23 @@ pub fn project(seq: u64, event: &Event) -> Option<TimelineEvent> {
             ..base("task_admitted")
         },
         Event::RegionRead {
-            level,
+            image,
             index,
             duration_ns,
             ..
         } => TimelineEvent {
-            phase: Some(*level),
+            phase: Some(*image),
             index: *index,
             duration_ns: Some(*duration_ns),
             ..base("region_read")
         },
         Event::RegionWritten {
-            level,
+            image,
             index,
             duration_ns,
             ..
         } => TimelineEvent {
-            phase: Some(*level),
+            phase: Some(*image),
             index: *index,
             duration_ns: Some(*duration_ns),
             ..base("region_written")

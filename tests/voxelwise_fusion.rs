@@ -7,7 +7,7 @@
 // `ops::voxelwise::Compose` lets a caller replace two chain slots with one, so
 // that a block is read once, mapped twice in registers, and written once —
 // rather than read, mapped, written, read, mapped, written, with a whole
-// intermediate level in between. The saving is real and the planner can see it
+// intermediate image in between. The saving is real and the planner can see it
 // in `cost_per_voxel`. What makes the saving *legitimate* is that the two
 // arrangements produce the same numbers, and that is what this file asserts.
 //
@@ -160,11 +160,11 @@ fn a_fused_map_equals_the_two_phases_it_replaces_under_every_decomposition() {
 }
 
 /// The fused chain is **one** slot where the split chain is two, which is the
-/// whole point: one phase, one level, one pass. Asserted rather than assumed,
+/// whole point: one phase, one image, one pass. Asserted rather than assumed,
 /// because if the plan gave them the same shape the test above would be
 /// comparing two identical arrangements.
 #[test]
-fn fusing_removes_a_slot_and_the_level_that_goes_with_it() {
+fn fusing_removes_a_slot_and_the_image_that_goes_with_it() {
     assert_eq!(split().slots().len(), 2);
     assert_eq!(fused().slots().len(), 1);
 
@@ -218,7 +218,7 @@ fn every_way_of_splitting_one_map_gives_the_same_volume() {
 
 // ------------------------------------------------------------- widening --
 //
-// `WidenOp` is the step that was missing between a level held at the width its
+// `WidenOp` is the step that was missing between an image held at the width its
 // producer wrote and a kernel stated in `f64`. Without it a chain whose median
 // runs at `u16` — the reference's own width — cannot be followed by any local
 // statistic, and the plan simply refuses to assemble.
@@ -277,10 +277,10 @@ fn widening_preserves_every_value() {
     assert!(source.iter().any(|&value| value > 255));
 }
 
-/// A chain that could not previously be assembled: a `u16` level read by an op
+/// A chain that could not previously be assembled: a `u16` image read by an op
 /// whose kernel is `f64`.
 #[test]
-fn widening_lets_a_narrow_level_feed_an_f64_kernel() {
+fn widening_lets_a_narrow_image_feed_an_f64_kernel() {
     use blockflow::op::Chain;
     use blockflow::ops::{ElementShape, Rank, RankFilterOp, StructuringElement, WidenOp};
 

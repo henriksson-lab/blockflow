@@ -9,12 +9,12 @@
 // The distribution design rests on one property: **a task never needs a peer's
 // in-memory output.** A task depends on the previous phase's tasks covering its
 // read extent, and satisfies that by *reading storage*. Every existing
-// environment in this crate is in-process — `ArrayEnvironment` holds the levels
+// environment in this crate is in-process — `ArrayEnvironment` holds the images
 // in its own memory, `AccountingEnvironment` holds nothing — so neither can
 // stand in for that shared storage across a process boundary, and a distributed
 // run could not be exercised for real without one.
 //
-// So this is the smallest thing that is genuinely shared: one file per level,
+// So this is the smallest thing that is genuinely shared: one file per image,
 // positional reads and writes, no locking. It is not a storage layer and does
 // not want to become one — a deployment supplies its own environment through
 // its own `WorkflowFactory`, and would use a chunked, compressed store.
@@ -37,7 +37,7 @@
 // --------------------------------------
 // A phase-`p+1` task reads what phase-`p` tasks wrote, possibly on another node.
 // The barrier that makes that safe is **not** a global one: a worker flushes its
-// level before it reports the task complete, and the coordinator does not release
+// image before it reports the task complete, and the coordinator does not release
 // a dependent task until every dependency has been reported. Durability is
 // therefore a precondition of a completion message rather than a synchronisation
 // point, and no worker ever waits for another.
@@ -45,15 +45,15 @@
 // On `f64`
 // --------
 // This file stores `f64`, and now says so rather than inheriting it. A block's
-// element type is a tag (`voxels::Voxels`) and a level may be any of them, but
+// element type is a tag (`voxels::Voxels`) and an image may be any of them, but
 // the on-disk layout here is a flat array of eight-byte little-endian words —
 // the file name says `.f64` and the offset arithmetic multiplies by `BYTES`. So
-// a plan whose levels are not `f64` is **refused by `prepare`**, by name, rather
+// a plan whose images are not `f64` is **refused by `prepare`**, by name, rather
 // than silently converted at the seam: a conversion would make the headline
 // claim ("N workers produce byte-identical output to a single-node run") a
 // statement about a different array than the one the plan describes.
 //
-// Widening it is a storage change — one file per level at that level's width,
+// Widening it is a storage change — one file per image at that image's width,
 // and the sentinel question `Voxels::unwritten` documents — not a buffer change.
 // **Nothing in the distribution protocol is affected either way**: a message
 // carries block indices, phases and regions, and never an element.
@@ -121,14 +121,14 @@ fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<()> 
     Ok(())
 }
 
-/// One file per storage level, in a directory every worker can see.
+/// One file per storage image, in a directory every worker can see.
 pub struct SharedVolumes {
     dir: PathBuf,
     volume: [usize; 3],
     chunk: [usize; 3],
-    levels: Vec<File>,
+    images: Vec<File>,
     counters: EnvCounters,
-    /// Fragments beside the levels, in the same shared directory and for the
+    /// Fragments beside the images, in the same shared directory and for the
     /// same reason: a task's non-pixel output has to be readable by whichever
     /// process merges, and shared storage is the only thing every process here
     /// has in common. It is what lets a per-block fragment stop being an
@@ -137,21 +137,21 @@ pub struct SharedVolumes {
 }
 
 impl SharedVolumes {
-    /// Where level `level` lives. Named rather than numbered opaquely so a
+    /// Where image `image` lives. Named rather than numbered opaquely so a
     /// directory left behind by a run can be read by anything.
-    pub fn level_path(dir: &Path, level: usize) -> PathBuf {
-        dir.join(format!("level-{level}.f64"))
+    pub fn image_path(dir: &Path, image: usize) -> PathBuf {
+        dir.join(format!("level-{image}.f64"))
     }
 
     /// Where the sidecar fragments live. Under the job's own directory, so a
-    /// worker that can see the levels can see the fragments by construction.
+    /// worker that can see the images can see the fragments by construction.
     pub fn sidecar_root(dir: &Path) -> PathBuf {
         dir.join("sidecars")
     }
 
-    /// Create the level files, sized and initialised.
+    /// Create the image files, sized and initialised.
     ///
-    /// Level 0 is the workflow input and is left at zero; levels above it are
+    /// Image 0 is the workflow input and is left at zero; images above it are
     /// filled with the sentinel so a voxel nobody writes is detectable.
     pub fn create(
         dir: &Path,
@@ -162,8 +162,8 @@ impl SharedVolumes {
         std::fs::create_dir_all(dir)
             .map_err(|err| Error::backend(format!("creating {}: {err}", dir.display())))?;
         let voxels: usize = volume.iter().product();
-        for level in 0..=n_phases {
-            let path = Self::level_path(dir, level);
+        for image in 0..=n_phases {
+            let path = Self::image_path(dir, image);
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -171,7 +171,7 @@ impl SharedVolumes {
                 .truncate(true)
                 .open(&path)
                 .map_err(|err| Error::backend(format!("creating {}: {err}", path.display())))?;
-            let fill = if level == 0 { 0.0 } else { UNWRITTEN };
+            let fill = if image == 0 { 0.0 } else { UNWRITTEN };
             // Written in slabs rather than one enormous buffer, so the memory
             // cost of creating a volume does not scale with the volume.
             let slab = 1usize << 16;
@@ -190,17 +190,17 @@ impl SharedVolumes {
         Self::open(dir, volume, chunk, n_phases)
     }
 
-    /// Open level files that already exist. What every worker does.
+    /// Open image files that already exist. What every worker does.
     pub fn open(
         dir: &Path,
         volume: [usize; 3],
         chunk: [usize; 3],
         n_phases: usize,
     ) -> Result<Self> {
-        let mut levels = Vec::with_capacity(n_phases + 1);
-        for level in 0..=n_phases {
-            let path = Self::level_path(dir, level);
-            levels.push(
+        let mut images = Vec::with_capacity(n_phases + 1);
+        for image in 0..=n_phases {
+            let path = Self::image_path(dir, image);
+            images.push(
                 OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -218,7 +218,7 @@ impl SharedVolumes {
             dir: dir.to_path_buf(),
             volume,
             chunk,
-            levels,
+            images,
             counters: EnvCounters::default(),
             sidecars: Sidecars::new(FileSidecars::at(Self::sidecar_root(dir))?),
         })
@@ -233,43 +233,43 @@ impl SharedVolumes {
             * BYTES as u64
     }
 
-    fn level(&self, level: usize) -> Result<&File> {
-        self.levels.get(level).ok_or_else(|| {
+    fn image(&self, image: usize) -> Result<&File> {
+        self.images.get(image).ok_or_else(|| {
             Error::invalid(format!(
-                "level {level} does not exist; this store has {}",
-                self.levels.len()
+                "image {image} does not exist; this store has {}",
+                self.images.len()
             ))
         })
     }
 
-    /// The whole of one level, for setting an input up or checking an output.
-    pub fn read_level(&self, level: usize) -> Result<Array3<f64>> {
+    /// The whole of one image, for setting an input up or checking an output.
+    pub fn read_image(&self, image: usize) -> Result<Array3<f64>> {
         let region = Region::whole(&self.volume);
-        match self.read(level, &region)? {
+        match self.read(image, &region)? {
             BlockBuf::Array(array) => Ok(array.view::<f64>()?.to_owned()),
             BlockBuf::Accounted { .. } => unreachable!("this environment holds arrays"),
         }
     }
 
-    /// Replace the whole of one level.
-    pub fn write_level(&self, level: usize, values: &Array3<f64>) -> Result<()> {
+    /// Replace the whole of one image.
+    pub fn write_image(&self, image: usize, values: &Array3<f64>) -> Result<()> {
         let region = Region::whole(&self.volume);
         self.write(
-            level,
+            image,
             &region,
             &region,
             &BlockBuf::Array(values.clone().into()),
         )
     }
 
-    /// One level's bytes, exactly as they are on disk.
+    /// One image's bytes, exactly as they are on disk.
     ///
     /// The comparison the headline verification makes: "N workers produce
     /// byte-identical output to a single-node run" is a statement about bytes,
     /// and comparing decoded arrays would quietly treat two different bit
     /// patterns for the same value — or two sentinels — as equal.
-    pub fn level_bytes(&self, level: usize) -> Result<Vec<u8>> {
-        let path = Self::level_path(&self.dir, level);
+    pub fn image_bytes(&self, image: usize) -> Result<Vec<u8>> {
+        let path = Self::image_path(&self.dir, image);
         std::fs::read(&path)
             .map_err(|err| Error::backend(format!("reading {}: {err}", path.display())))
     }
@@ -281,16 +281,16 @@ impl Environment for SharedVolumes {
     }
 
     fn prepare(&self, decomposition: &Decomposition) -> Result<()> {
-        // Every level is a file of one shape, so this environment can host only
+        // Every image is a file of one shape, so this environment can host only
         // a plan that keeps one. Refused here rather than in the plan's guard:
         // see `AccountingEnvironment::prepare`.
         let uniform = decomposition.uniform_volume().ok_or_else(|| {
             Error::invalid(format!(
-                "shared volumes hold one shape {:?} per level, and this decomposition changes \
-                 shape between levels: {:?}",
+                "shared volumes hold one shape {:?} per image, and this decomposition changes \
+                 shape between images: {:?}",
                 self.volume,
-                (0..decomposition.n_levels())
-                    .map(|level| decomposition.volume_at(level))
+                (0..decomposition.n_images())
+                    .map(|image| decomposition.volume_at(image))
                     .collect::<Vec<_>>()
             ))
         })?;
@@ -300,22 +300,22 @@ impl Environment for SharedVolumes {
                 self.volume, decomposition.volume
             )));
         }
-        if decomposition.n_phases() + 1 != self.levels.len() {
+        if decomposition.n_phases() + 1 != self.images.len() {
             return Err(Error::invalid(format!(
                 "shared volumes were opened for {} phases, the decomposition has {}",
-                self.levels.len() - 1,
+                self.images.len() - 1,
                 decomposition.n_phases()
             )));
         }
-        // The on-disk layout is eight-byte words, so a level of any other width
-        // has no place to go. Refused here, naming the level, rather than
+        // The on-disk layout is eight-byte words, so an image of any other width
+        // has no place to go. Refused here, naming the image, rather than
         // converted at the write — see this file's header.
-        for level in 0..=decomposition.n_phases() {
-            let dtype = decomposition.dtype_at(level);
+        for image in 0..=decomposition.n_phases() {
+            let dtype = decomposition.dtype_at(image);
             if dtype != Dtype::F64 {
                 return Err(Error::invalid(format!(
-                    "shared volumes store level {level} as eight-byte words and this \
-                     decomposition writes it as {}. Storing a narrower level is a change to \
+                    "shared volumes store image {image} as eight-byte words and this \
+                     decomposition writes it as {}. Storing a narrower image is a change to \
                      the file layout, not to the buffer.",
                     dtype.numpy_name()
                 )));
@@ -324,9 +324,9 @@ impl Environment for SharedVolumes {
         Ok(())
     }
 
-    fn read(&self, level: usize, region: &Region) -> Result<BlockBuf> {
+    fn read(&self, image: usize, region: &Region) -> Result<BlockBuf> {
         region.check_within(&self.volume, "shared-volume read")?;
-        let file = self.level(level)?;
+        let file = self.image(image)?;
         let shape = [region.shape[0], region.shape[1], region.shape[2]];
         let mut values = vec![0.0f64; shape.iter().product()];
         let run = shape[2];
@@ -338,7 +338,7 @@ impl Environment for SharedVolumes {
                     let offset =
                         self.offset([region.start[0] + i, region.start[1] + j, region.start[2]]);
                     read_exact_at(file, &mut raw, offset).map_err(|err| {
-                        Error::backend(format!("reading level {level} at {offset}: {err}"))
+                        Error::backend(format!("reading image {image} at {offset}: {err}"))
                     })?;
                     for (slot, chunk) in raw.chunks_exact(BYTES).enumerate() {
                         values[at + slot] =
@@ -385,13 +385,13 @@ impl Environment for SharedVolumes {
         Ok(BlockBuf::Array(out))
     }
 
-    fn write(&self, level: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
+    fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
         let array = buf.as_array()?.view::<f64>()?;
         valid.check_within(&self.volume, "shared-volume write")?;
         if valid.voxels() == 0 {
             return Ok(());
         }
-        let file = self.level(level)?;
+        let file = self.image(image)?;
         let run = valid.shape[2];
         let mut raw = vec![0u8; run * BYTES];
         for i in 0..valid.shape[0] {
@@ -406,7 +406,7 @@ impl Environment for SharedVolumes {
                 }
                 let offset = self.offset([valid.start[0] + i, valid.start[1] + j, valid.start[2]]);
                 write_all_at(file, &raw, offset).map_err(|err| {
-                    Error::backend(format!("writing level {level} at {offset}: {err}"))
+                    Error::backend(format!("writing image {image} at {offset}: {err}"))
                 })?;
             }
         }
@@ -437,15 +437,15 @@ impl Environment for SharedVolumes {
 
     fn release(&self, _buf: &BlockBuf) {}
 
-    /// Everything written to `level` by *this* worker is durable.
+    /// Everything written to `image` by *this* worker is durable.
     ///
     /// Called before a task's completion is reported, which is what makes a
     /// dependent task safe to hand to anybody. Not a barrier: it waits for this
     /// process's own writes and for nothing else.
-    fn finish(&self, level: usize) -> Result<()> {
-        if let Ok(file) = self.level(level) {
+    fn finish(&self, image: usize) -> Result<()> {
+        if let Ok(file) = self.image(image) {
             file.sync_data()
-                .map_err(|err| Error::backend(format!("flushing level {level}: {err}")))?;
+                .map_err(|err| Error::backend(format!("flushing image {image}: {err}")))?;
         }
         Ok(())
     }
@@ -489,15 +489,15 @@ mod tests {
         for (flat, value) in input.iter_mut().enumerate() {
             *value = flat as f64;
         }
-        store.write_level(0, &input).unwrap();
-        assert_eq!(store.read_level(0).unwrap(), input);
+        store.write_image(0, &input).unwrap();
+        assert_eq!(store.read_image(0).unwrap(), input);
 
         let region = Region::new(&[1, 1, 1], &[2, 2, 2]);
         let buf = store.read(0, &region).unwrap();
         store
             .write(1, &Region::new(&[0, 0, 0], &[2, 2, 2]), &region, &buf)
             .unwrap();
-        let out = store.read_level(1).unwrap();
+        let out = store.read_image(1).unwrap();
         assert_eq!(out[[1, 1, 1]], input[[1, 1, 1]]);
         assert_eq!(out[[2, 2, 2]], input[[2, 2, 2]]);
         assert!(out[[0, 0, 0]].is_nan(), "an unwritten voxel must stay loud");
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn two_handles_on_one_directory_see_each_others_writes() {
         // The whole reason this environment exists: another process reading a
-        // level a different process wrote, with no message between them.
+        // image a different process wrote, with no message between them.
         let dir = scratch("two-handles");
         let volume = [8, 2, 2];
         let writer = SharedVolumes::create(&dir, volume, [4, 2, 2], 1).unwrap();
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn disjoint_writers_do_not_need_a_lock() {
         // The tiling property in action: several threads writing different
-        // valid regions of one level, with no coordination, and every byte
+        // valid regions of one image, with no coordination, and every byte
         // landing where it should.
         let dir = scratch("disjoint");
         let volume = [16, 2, 2];
@@ -548,7 +548,7 @@ mod tests {
                 });
             }
         });
-        let out = store.read_level(1).unwrap();
+        let out = store.read_image(1).unwrap();
         for block in 0..4usize {
             assert_eq!(out[[block * 4, 0, 0]], block as f64);
             assert_eq!(out[[block * 4 + 3, 1, 1]], block as f64);

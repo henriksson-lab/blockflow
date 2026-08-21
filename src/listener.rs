@@ -632,7 +632,7 @@ pub fn dispatch_overhead_report(events: usize) -> String {
             Event::TaskAdmitted { phase: 0, index },
             Event::RegionRead {
                 source: "level 0".to_string(),
-                level: 0,
+                image: 0,
                 index: Some(index),
                 region: region.clone(),
                 voxels: 262_144,
@@ -660,7 +660,7 @@ pub fn dispatch_overhead_report(events: usize) -> String {
         }
         out.push(Event::RegionWritten {
             sink: "level 1".to_string(),
-            level: 1,
+            image: 1,
             index: Some(index),
             region: region.clone(),
             voxels: 262_144,
