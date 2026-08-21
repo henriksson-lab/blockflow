@@ -77,10 +77,11 @@ use blockflow::geometry::BlockGrid;
 use blockflow::log::{Event, ExecutionLog};
 use blockflow::op::{Anchor, BlockOp, Chain};
 use blockflow::ops::tabulate::{
-    append_tabulate_phases, collect_tabulation, decode_partial, region_values, tabulation_schema,
-    FixedPoint, MergeTabulationOp, RegionValues, TabulateValuesOp, Tally, DEFAULT_FRACTION_BITS,
-    MAX as MAX_COLUMN, MAX_FRACTION_BITS, MIN as MIN_COLUMN, MOMENT as MOMENT_COLUMN,
-    SUM as SUM_COLUMN,
+    append_tabulate_phases, collect_shapes, collect_tabulation, decode_partial, region_shape,
+    region_values, signed_column, tabulation_schema, FixedPoint, MergeTabulationOp, PrincipalAxes,
+    RegionShape, RegionValues, TabulateValuesOp, Tally, CENTRAL as CENTRAL_COLUMN,
+    DEFAULT_FRACTION_BITS, MAX as MAX_COLUMN, MAX_FRACTION_BITS, MIN as MIN_COLUMN,
+    MOMENT as MOMENT_COLUMN, PAIRS, SUM as SUM_COLUMN,
 };
 use blockflow::region::Region;
 use blockflow::sidecar::Lifecycle;
@@ -240,6 +241,10 @@ fn tabulation_plan(
 struct Run {
     words: Vec<u64>,
     rows: Vec<RegionValues>,
+    /// The **shape** half of the same rows, decoded by `region_shape`. A second
+    /// reading of one row rather than a wider first one; see the op's header on
+    /// why the label volume's measurement and the value array's are two.
+    shapes: Vec<RegionShape>,
     partials: BTreeMap<[usize; 3], Vec<u8>>,
     row_blobs: BTreeMap<[usize; 3], Vec<u8>>,
     lattice_blocks: usize,
@@ -307,9 +312,11 @@ fn try_run(
     table.seal().expect("a sealed table");
     let mut words = Vec::new();
     let mut rows = Vec::new();
+    let mut shapes = Vec::new();
     for row in table.scan(&Region::whole(&volume)).expect("a scan") {
         words.extend_from_slice(row.words());
         rows.push(region_values(&row, point).expect("a decoded row"));
+        shapes.push(region_shape(&row).expect("a decoded shape"));
     }
 
     // And the caller-facing path answers the same thing, so that a consumer
@@ -318,10 +325,17 @@ fn try_run(
     let collected =
         collect_tabulation(&env, "rows", rows_phase, volume, point).expect("the collected rows");
     assert_eq!(collected, rows, "the two read paths disagree");
+    let collected_shapes =
+        collect_shapes(&env, "rows", rows_phase, volume, point).expect("the collected shapes");
+    assert_eq!(
+        collected_shapes, shapes,
+        "the two shape read paths disagree"
+    );
 
     Ok(Run {
         words,
         rows,
+        shapes,
         partials,
         row_blobs,
         lattice_blocks: plan.phases[rows_phase].grid.cores().len(),
@@ -475,6 +489,31 @@ fn a_per_region_reduction_is_byte_identical_across_block_sizes() {
                     .map(|centre| centre.map(f64::to_bits)),
                 "block {block:?}: label {}",
                 row.label
+            );
+        }
+
+        // And the shape half of the same rows, against the same oracle. The
+        // whole `RegionShape` at once, on `Eq` over integers — the six second
+        // moments, the coordinate sums, the count and the position are all
+        // exact, so there is no comparison here that has to choose a tolerance.
+        assert_eq!(run.shapes.len(), expected.len(), "block {block:?}");
+        for shape in &run.shapes {
+            let tally = expected
+                .get(&shape.label)
+                .unwrap_or_else(|| panic!("block {block:?} invented label {}", shape.label));
+            assert_eq!(
+                Some(*shape),
+                tally.shape().expect("the oracle's shape"),
+                "block {block:?}: label {}",
+                shape.label
+            );
+            // the raw form the columns are *not* stored in comes back out of
+            // them exactly, which is what says nothing was given up by centring
+            assert_eq!(
+                shape.second_moments_about_origin(),
+                tally.second,
+                "block {block:?}: label {} does not recover its moments about the volume origin",
+                shape.label
             );
         }
 
@@ -1896,4 +1935,799 @@ fn the_ops_are_shareable_across_workers() {
     assert_eq!(merge.seam_fold(), Some(SeamFold::Unordered));
     assert!(!merge.gathers(), "the whole-lattice merge streams");
     assert!(!tabulate.reads_pixels() && !merge.reads_pixels());
+}
+
+// ------------------------------------------------ 7. the second moments, --
+// ------------------------- which are the shape and are about its own centre --
+
+/// **The shape fixture**, and every region in it is there to fail a different
+/// implementation.
+///
+/// The hazard a second-moment test has to beat is that most objects cannot tell
+/// a working implementation from several broken ones. A ball has no orientation
+/// to get wrong. An **axis-aligned** object has three zero off-diagonals, so it
+/// cannot distinguish a moment matrix whose off-diagonal components were
+/// permuted, transposed, or dropped — every one of those is the same matrix when
+/// the off-diagonals are zero. So the fixture is built the other way:
+///
+/// * `1` is a **one-voxel-wide line along `(1, 1, 0)`**, the whole depth of the
+///   volume. Its off-diagonal `central_01` equals its diagonals and its other
+///   two off-diagonals are exactly zero, so permuting the three moves the
+///   answer — which is asserted, not assumed;
+/// * `2` is a **slab three voxels thick about the same diagonal and five wide on
+///   axis 2**, so all three of its variances are distinct and *none* of its
+///   principal axes is an axis of the lattice. It is the region that pins the
+///   whole decomposition rather than one direction of it;
+/// * `3` is a **five-voxel cube**. Odd-sided on purpose: its centroid is a voxel,
+///   so it is exactly isotropic and the degenerate answer is exact rather than
+///   nearly so. It has no orientation and must say so;
+/// * `4` is a **line along axis 0 alone** — the object that *cannot* discriminate
+///   — and it is here so that the fixture's discrimination can be asserted as a
+///   difference against it rather than claimed;
+/// * `5` is a **flat five-by-five plate**, the other degeneracy: two equal
+///   variances at the *top* rather than at the bottom, so its minor axis is
+///   determined and its major pair is not.
+///
+/// Every one of them spans enough of axis 0 or axis 1 that **every cut below
+/// puts every region across a seam**, which the test asserts before it asserts
+/// anything else.
+const SHAPE_VOLUME: [usize; 3] = [12, 12, 12];
+
+/// The block sizes the shape fixture is cut by. The first is the whole volume,
+/// which is the reference; the rest are chosen so that no region survives whole
+/// in any of them — see the assertion in
+/// [`the_second_moments_are_byte_identical_across_block_sizes`].
+const SHAPE_BLOCKS: [[usize; 3]; 5] = [[12, 12, 12], [6, 6, 6], [5, 5, 5], [4, 12, 3], [7, 3, 12]];
+
+fn shape_labels(at: [usize; 3]) -> u64 {
+    let [z, y, x] = at;
+    if x == 11 && z == y {
+        return 1;
+    }
+    if (6..11).contains(&x) && z.abs_diff(y) <= 1 {
+        return 2;
+    }
+    if x < 5 && (4..9).contains(&z) && y < 5 {
+        return 3;
+    }
+    if x == 5 && y == 11 {
+        return 4;
+    }
+    if x == 5 && (2..7).contains(&z) && (6..11).contains(&y) {
+        return 5;
+    }
+    0
+}
+
+/// A finite, signed, axis-asymmetric value array. The shape does not read it —
+/// that is the claim [`the_shape_is_a_reading_of_the_label_volume_alone`] makes
+/// — so what it holds matters only in that it must not be constant, or "the
+/// shape ignores the values" would be indistinguishable from "the values are all
+/// the same".
+fn shape_value_at(at: [usize; 3]) -> f64 {
+    at[0] as f64 * 0.5 - at[1] as f64 * 0.25 + at[2] as f64 - 3.0
+}
+
+/// Every voxel non-finite. See [`the_shape_is_a_reading_of_the_label_volume_alone`].
+fn nothing_finite_at(_at: [usize; 3]) -> f64 {
+    f64::NAN
+}
+
+fn shape_for(shapes: &[RegionShape], label: u64) -> RegionShape {
+    *shapes
+        .iter()
+        .find(|shape| shape.label == label)
+        .unwrap_or_else(|| panic!("no shape row for label {label}"))
+}
+
+/// The angle between two unit directions, taken as **lines**: the sign of an
+/// eigenvector is a convention, so two directions that differ by a sign are the
+/// same axis and this reports zero for them.
+fn angle_between(one: [f64; 3], other: [f64; 3]) -> f64 {
+    let dot = one[0] * other[0] + one[1] * other[1] + one[2] * other[2];
+    let clamped = if dot.abs().total_cmp(&1.0).is_ge() {
+        1.0
+    } else {
+        dot.abs()
+    };
+    clamped.acos()
+}
+
+/// **The acceptance criterion for the six new columns.** Byte-identical across
+/// five block sizes against a whole-volume reference, on a fixture where every
+/// region straddles every cut.
+#[test]
+fn the_second_moments_are_byte_identical_across_block_sizes() {
+    let point = fixed();
+    let mut answers: Vec<(String, Vec<u64>)> = Vec::new();
+    let oracle = reference_with(SHAPE_VOLUME, point, shape_labels, shape_value_at);
+    assert_eq!(oracle.len(), 5, "the fixture is five regions");
+
+    for block in SHAPE_BLOCKS {
+        let run = try_run(SHAPE_VOLUME, block, point, shape_labels, shape_value_at).expect("a run");
+
+        // Which labels were cut, and the assertion that makes the byte-identity
+        // below mean something: five runs that merged nothing would agree
+        // perfectly and prove nothing.
+        let mut contributors: BTreeMap<u64, BTreeSet<[usize; 3]>> = BTreeMap::new();
+        for (index, bytes) in &run.partials {
+            for tally in decode_partial(bytes).expect("a partial") {
+                contributors.entry(tally.label).or_default().insert(*index);
+            }
+        }
+        if block == SHAPE_BLOCKS[0] {
+            assert!(
+                contributors.values().all(|who| who.len() == 1),
+                "the one-block lattice cannot straddle anything"
+            );
+        } else {
+            for label in oracle.keys() {
+                assert!(
+                    contributors[label].len() > 1,
+                    "block {block:?} kept label {label} inside one block, so its second moments \
+                     never met the merge"
+                );
+            }
+        }
+
+        assert_eq!(run.shapes.len(), oracle.len(), "block {block:?}");
+        for shape in &run.shapes {
+            let tally = &oracle[&shape.label];
+            assert_eq!(
+                Some(*shape),
+                tally.shape().expect("the oracle's shape"),
+                "block {block:?}: label {}",
+                shape.label
+            );
+            // and the derived geometry, on the bits, because a decomposition
+            // that moved with the cut would be a decomposition of a matrix that
+            // moved with the cut
+            let axes = shape.principal_axes().expect("a non-empty region");
+            let expected = tally
+                .shape()
+                .expect("the oracle's shape")
+                .expect("a non-empty region")
+                .principal_axes()
+                .expect("a non-empty region");
+            assert_eq!(
+                axes.variance.map(f64::to_bits),
+                expected.variance.map(f64::to_bits),
+                "block {block:?}: label {}",
+                shape.label
+            );
+            assert_eq!(
+                axes.axis
+                    .map(|found| found.map(|direction| direction.map(f64::to_bits))),
+                expected
+                    .axis
+                    .map(|found| found.map(|direction| direction.map(f64::to_bits))),
+                "block {block:?}: label {}",
+                shape.label
+            );
+        }
+        answers.push((format!("{block:?}"), run.words));
+    }
+
+    let (first_name, first) = &answers[0];
+    for (name, words) in &answers[1..] {
+        assert_eq!(
+            words, first,
+            "the second moments differ between block {first_name} and block {name}; a region's \
+             shape must not be a function of the plan"
+        );
+    }
+}
+
+/// **The liveness partner.** A cube has no orientation to get wrong and an
+/// axis-aligned rod cannot distinguish a moment matrix whose off-diagonals were
+/// permuted; this asserts that the off-axis regions *can*, which is what makes
+/// the invariance test above a test.
+#[test]
+fn an_off_axis_region_reports_the_direction_it_is_elongated_along() {
+    let point = fixed();
+    let run = try_run(SHAPE_VOLUME, [5, 5, 5], point, shape_labels, shape_value_at).expect("a run");
+
+    let diagonal = 1.0 / 2.0f64.sqrt();
+
+    // Label 1 — the one-voxel line along (1, 1, 0), hand-computable end to end.
+    let line = shape_for(&run.shapes, 1);
+    assert_eq!(line.count, 12);
+    assert_eq!(line.at, [6, 6, 11]);
+    // sum (z - 6)^2 for z in 0..12 is 146, and z == y throughout, so the (0,1)
+    // component equals it and the three touching axis 2 are exactly zero.
+    assert_eq!(line.central, [146, 146, 0, 146, 0, 0]);
+    let axes = line.principal_axes().expect("a region with voxels");
+    let orientation = line.orientation().expect("an elongated region");
+    assert!(
+        // `1e-6` and not `1e-9`: two unit vectors that differ in their last
+        // bit have a dot product `1 - 1e-16` and an angle of `1.4e-8`, because
+        // `acos` near one has a square root in it. The assertion is about the
+        // direction, not about the last bit of a cosine.
+        angle_between(orientation, [diagonal, diagonal, 0.0]) < 1e-6,
+        "the line along (1,1,0) reported {orientation:?}"
+    );
+    // Its other two variances are *exactly* zero — it is one voxel wide — and
+    // the closed-form solve reports them as about `1e-7`, which is
+    // [`AXIS_SEPARATION`]'s whole subject made visible: near a repeated root the
+    // trigonometric form resolves the pair only to `sqrt` of the machine
+    // epsilon. Relative to the major variance that is `6e-9`, an order below the
+    // threshold, so the pair is correctly called degenerate.
+    let noise = 1e-6 * axes.variance[0];
+    assert!(axes.variance[1].abs() < noise, "{:?}", axes.variance);
+    assert!(axes.variance[2].abs() < noise, "{:?}", axes.variance);
+    assert!(
+        axes.variance[1].abs() > 0.0,
+        "the solve returned an exact zero, so this assertion is no longer about the solver's \
+         resolution and the reasoning behind `AXIS_SEPARATION` has lost its evidence"
+    );
+    assert_eq!(axes.axis[1], None);
+    assert_eq!(axes.axis[2], None);
+    assert!(line.eccentricity().expect("a region with extent") > 1.0 - 1e-6);
+
+    // **The discrimination.** Permute the three off-diagonal components — the
+    // mistake an axis-aligned fixture cannot see — and the orientation moves.
+    let permuted = RegionShape {
+        central: [
+            line.central[0],
+            line.central[2],
+            line.central[1],
+            line.central[3],
+            line.central[4],
+            line.central[5],
+        ],
+        ..line
+    };
+    let moved = permuted
+        .orientation()
+        .expect("still elongated, just differently");
+    assert!(
+        angle_between(orientation, moved) > 0.5,
+        "permuting the off-diagonal components moved the orientation by only {} radians, so this \
+         fixture does not discriminate one",
+        angle_between(orientation, moved)
+    );
+
+    // **And the same permutation on the axis-aligned rod does nothing at all**,
+    // which is the assertion that says why the fixture had to be built off-axis.
+    // An absence, inverted rather than left out.
+    let rod = shape_for(&run.shapes, 4);
+    assert_eq!(rod.central, [146, 0, 0, 0, 0, 0]);
+    let rod_permuted = RegionShape {
+        central: [
+            rod.central[0],
+            rod.central[2],
+            rod.central[1],
+            rod.central[3],
+            rod.central[4],
+            rod.central[5],
+        ],
+        ..rod
+    };
+    assert_eq!(
+        rod.orientation().map(|axis| axis.map(f64::to_bits)),
+        rod_permuted
+            .orientation()
+            .map(|axis| axis.map(f64::to_bits)),
+        "the axis-aligned rod distinguished a permuted moment matrix, which it cannot do — its \
+         off-diagonals are all zero"
+    );
+    assert!(angle_between(rod.orientation().expect("elongated"), [1.0, 0.0, 0.0]) < 1e-6);
+
+    // Label 2 — the thick diagonal slab, whose three variances are distinct and
+    // none of whose axes is an axis of the lattice. This is the region that pins
+    // the whole decomposition rather than one direction of it.
+    let slab = shape_for(&run.shapes, 2);
+    let slab_axes = slab.principal_axes().expect("a region with voxels");
+    assert!(
+        slab_axes.variance[0] > slab_axes.variance[1]
+            && slab_axes.variance[1] > slab_axes.variance[2],
+        "the slab's variances are {:?} and were meant to be three distinct numbers",
+        slab_axes.variance
+    );
+    let expected = [
+        [diagonal, diagonal, 0.0],
+        [0.0, 0.0, 1.0],
+        [diagonal, -diagonal, 0.0],
+    ];
+    for (index, want) in expected.into_iter().enumerate() {
+        let found = slab_axes.axis[index].expect("three separated eigenvalues, three directions");
+        assert!(
+            angle_between(found, want) < 1e-6,
+            "the slab's axis {index} is {found:?} and was meant to be {want:?}"
+        );
+    }
+    // orthonormal, which a cross-product recipe can lose if it takes the wrong
+    // pair of rows
+    for one in 0..3 {
+        let a = slab_axes.axis[one].expect("determined");
+        assert!((a[0] * a[0] + a[1] * a[1] + a[2] * a[2] - 1.0).abs() < 1e-12);
+        for other in (one + 1)..3 {
+            let b = slab_axes.axis[other].expect("determined");
+            assert!((a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).abs() < 1e-12);
+        }
+    }
+    // the equivalent-ellipsoid lengths, which is what `regionprops` calls
+    // `axis_major_length` and `axis_minor_length`
+    assert!(slab_axes.length[0] > slab_axes.length[2]);
+    for (length, variance) in slab_axes.length.into_iter().zip(slab_axes.variance) {
+        assert!((length - 2.0 * (5.0 * variance).sqrt()).abs() < 1e-12);
+    }
+    let eccentricity = slab.eccentricity().expect("a region with extent");
+    assert!(
+        (eccentricity
+            - (1.0
+                - slab_axes.length[2] * slab_axes.length[2]
+                    / (slab_axes.length[0] * slab_axes.length[0])))
+            .sqrt()
+            .abs()
+            < 1.0,
+        "eccentricity {eccentricity} is not the ratio of the axis lengths"
+    );
+    assert!(eccentricity > 0.9 && eccentricity < 1.0);
+}
+
+/// **A region with no orientation says so.** A `None`, never a `NaN` and never
+/// an arbitrary pick — and the eigen*values* are reported in every case, because
+/// those are always determined.
+#[test]
+fn a_region_with_no_orientation_reports_none_rather_than_a_number() {
+    let point = fixed();
+    let run = try_run(SHAPE_VOLUME, [6, 6, 6], point, shape_labels, shape_value_at).expect("a run");
+
+    // The cube: three equal variances, three `None`s. Odd-sided, so its centroid
+    // is exactly a voxel and its covariance is exactly `diag(2, 2, 2)` — the
+    // variance of five consecutive integers is `(25 - 1) / 12`.
+    let cube = shape_for(&run.shapes, 3);
+    assert_eq!(cube.count, 125);
+    let covariance = cube.covariance().expect("a region with voxels");
+    for one in 0..3 {
+        for other in 0..3 {
+            let want = if one == other { 2.0 } else { 0.0 };
+            assert!(
+                (covariance[one][other] - want).abs() < 1e-12,
+                "the cube's covariance is {covariance:?}"
+            );
+        }
+    }
+    let axes = cube.principal_axes().expect("a region with voxels");
+    assert_eq!(
+        axes.axis,
+        [None, None, None],
+        "a cube has no principal axis"
+    );
+    assert_eq!(cube.orientation(), None);
+    for variance in axes.variance {
+        assert!((variance - 2.0).abs() < 1e-12);
+        assert!(variance.is_finite(), "a `NaN` where a `None` was promised");
+    }
+    for length in axes.length {
+        assert!(length.is_finite());
+    }
+    // a ball is not eccentric, and that is a number rather than an absence:
+    // the *values* are determined even where the directions are not
+    assert_eq!(cube.eccentricity(), Some(0.0));
+
+    // The plate: two equal variances at the **top**, so the minor axis is
+    // determined and the major pair is not. The other degeneracy, and it is not
+    // the same one — an implementation that only ever looked at the largest gap
+    // would answer this one wrongly.
+    let plate = shape_for(&run.shapes, 5);
+    assert_eq!(plate.count, 25);
+    let flat = plate.principal_axes().expect("a region with voxels");
+    assert_eq!(flat.axis[0], None, "an oblate region has no major axis");
+    assert_eq!(flat.axis[1], None);
+    let minor = flat.axis[2].expect("the odd one out is determined");
+    assert!(angle_between(minor, [0.0, 0.0, 1.0]) < 1e-6, "{minor:?}");
+    assert!((flat.variance[0] - 2.0).abs() < 1e-12);
+    assert!((flat.variance[1] - 2.0).abs() < 1e-12);
+    assert_eq!(flat.variance[2], 0.0);
+    assert_eq!(plate.orientation(), None);
+
+    // and the prolate case for completeness: a determined major axis and an
+    // undetermined minor pair — see
+    // `an_off_axis_region_reports_the_direction_it_is_elongated_along`, which is
+    // where the direction itself is checked.
+    let line = shape_for(&run.shapes, 1);
+    let prolate = line.principal_axes().expect("a region with voxels");
+    assert!(prolate.axis[0].is_some());
+    assert_eq!(prolate.axis[1], None);
+    assert_eq!(prolate.axis[2], None);
+}
+
+/// **The shape is a reading of the label volume and of nothing else**, so it is
+/// taken over *every* voxel of a region — including the voxels whose value was
+/// not finite, which `sum`, `min`, `max` and the first moments must exclude.
+///
+/// The same fixture with every value a `NaN`. A region with no finite value at
+/// all has no sum, no extremes and no weighted centre, and still has a shape,
+/// bit for bit the one it had when the values were ordinary numbers. This is the
+/// half of the weighted-versus-unweighted argument that is a property rather
+/// than a preference.
+#[test]
+fn the_shape_is_a_reading_of_the_label_volume_alone() {
+    let point = fixed();
+    let ordinary =
+        try_run(SHAPE_VOLUME, [5, 5, 5], point, shape_labels, shape_value_at).expect("a run");
+    let broken = try_run(
+        SHAPE_VOLUME,
+        [5, 5, 5],
+        point,
+        shape_labels,
+        nothing_finite_at,
+    )
+    .expect("a run over an array of `NaN`s");
+
+    assert_eq!(ordinary.shapes, broken.shapes);
+    for row in &broken.rows {
+        assert!(
+            row.all_nonfinite(),
+            "label {} kept a finite value, so this run does not exercise the claim",
+            row.label
+        );
+        assert_eq!(row.weighted_centroid, None);
+        assert_eq!(row.sum_fixed, 0);
+    }
+    // and the two runs really did report different *values*, or the comparison
+    // above would be of two identical runs
+    assert_ne!(
+        ordinary.rows.iter().map(|row| row.sum_fixed).sum::<i64>(),
+        0
+    );
+}
+
+// ------------------------------ 8. the fold, and the two directions it has --
+
+/// The corner of an imaginary volume the fold fixture's partials come from:
+/// `2^26`, where one voxel's `z^2` is `2^52`.
+///
+/// **Why the number is this large, which is the finding this fixture carries.**
+/// The second moment is a sum of *non-negative integers*, each at most `L^2`. An
+/// `f64` fold of such a sum is exact until it passes `2^53`, and there is no
+/// cancellation available to bring it there early, so a fixture on which an
+/// `f64` fold of a second moment differs from an integer one needs
+/// `sum x^2 >= 2^53`. That is a whole-volume region about **2 000 voxels on a
+/// side** — eight thousand million voxels, sixty-four gigabytes of `f64` before
+/// the second array — and the cheapest arrangement of it is not much better:
+/// `sum z^2` over `T` voxels reaching a coordinate `L` is at most `T * L`, so
+/// `T >= 2^26.5`, or about a hundred million voxels. **No fixture that fits in
+/// memory can separate the two fold directions on this column through a run.**
+///
+/// So the separation is done where the seam actually is: on the partials, at
+/// [`MergeTabulationOp::fold`], which is the same function the merge phase calls
+/// and the same [`Tally::merge`] underneath it. The partials are real —
+/// [`TabulateValuesOp::tally_block`] takes them from real blocks placed at a real
+/// global offset, which is what the fetch region is for — and the comparison is
+/// on [`Tally::row_words`], which is byte for byte what the executor's reversal
+/// check compares. What is not exercised here is the executor's plumbing, and
+/// that is exercised on every other run in this file.
+///
+/// The production case is not hypothetical: above about two thousand voxels on a
+/// side an `f64` fold of this column *would* drift, and out-of-core volumes are
+/// what this crate is for.
+const WIDE_CORNER: usize = 1 << 26;
+
+/// One partial, taken from a real block of two voxels at `start`, carrying label
+/// `1` where `carried` says so.
+fn planted_partial(op: &TabulateValuesOp, start: [usize; 3], carried: [bool; 2]) -> Vec<u8> {
+    let mut label_block = Array3::<f64>::zeros((1, 2, 1));
+    let value_block = Array3::<f64>::zeros((1, 2, 1));
+    for (index, held) in carried.into_iter().enumerate() {
+        label_block[[0, index, 0]] = if held { 1.0 } else { 0.0 };
+    }
+    let read = Region::new(&start, &[1, 2, 1]);
+    let tallies = op
+        .tally_block(
+            &blockflow::env::BlockBuf::Array(label_block.into()),
+            &blockflow::env::BlockBuf::Array(value_block.into()),
+            &read,
+            &read,
+        )
+        .expect("a tally");
+    blockflow::ops::tabulate::encode_partial(&tallies)
+}
+
+/// The three partials the two fixtures below share: `sum z^2` of `1`, `9` and
+/// `2^53`, from blocks at `z = 1`, `z = 3` and `z = 2^26`.
+///
+/// `1` and `9` rather than `1` and `1` because only one voxel has `z^2 == 1`;
+/// the pair has to add to an even multiple of `2^53`'s two-unit spacing while
+/// each is below half of it, and `10` is the smallest such sum two distinct
+/// squares reach.
+fn wide_partials(op: &TabulateValuesOp) -> Vec<Vec<u8>> {
+    vec![
+        planted_partial(op, [1, 0, 0], [true, false]),
+        planted_partial(op, [3, 0, 0], [true, false]),
+        planted_partial(op, [WIDE_CORNER, 0, 0], [true, true]),
+    ]
+}
+
+/// **The fold gives the same answer in both directions where an `f64` fold does
+/// not**, on the column whose `f64` hazard no runnable fixture can reach. See
+/// [`WIDE_CORNER`].
+#[test]
+fn the_second_moment_folds_to_one_answer_where_an_f64_fold_gives_two() {
+    let point = FixedPoint::bits(0).expect("zero fraction bits");
+    let op = TabulateValuesOp::new("tabulate", 0, 1, point, "partials", Lifecycle::DeleteOnExit)
+        .expect("two images");
+    let partials = wide_partials(&op);
+
+    // First: the fixture separates. An `f64` fold of these three terms gives one
+    // answer forwards and another backwards, and only one of them is right.
+    let terms: Vec<f64> = partials
+        .iter()
+        .map(|bytes| decode_partial(bytes).expect("a partial")[0].second[0] as f64)
+        .collect();
+    let forwards = terms.iter().fold(0.0f64, |total, term| total + term);
+    let backwards = terms.iter().rev().fold(0.0f64, |total, term| total + term);
+    let exact = (1i128 << 53) + 10;
+    assert_ne!(
+        forwards.to_bits(),
+        backwards.to_bits(),
+        "an `f64` fold of {terms:?} did not depend on the order, so this fixture has nothing to \
+         catch"
+    );
+    assert_eq!(forwards, exact as f64, "forwards happens to be right");
+    assert_eq!(
+        backwards,
+        (exact - 2) as f64,
+        "backwards loses two, which is the whole point of the fixture"
+    );
+
+    // Second: the integer fold does not, and gets it right from either end.
+    let merge = MergeTabulationOp::new(
+        "merge",
+        "partials",
+        1,
+        [3, 1, 1],
+        point,
+        "rows",
+        Lifecycle::Persistent,
+    );
+    let one_way = merge
+        .fold(partials.iter().map(|bytes| bytes.as_slice()))
+        .expect("a fold");
+    let other_way = merge
+        .fold(partials.iter().rev().map(|bytes| bytes.as_slice()))
+        .expect("a fold");
+    assert_eq!(one_way, other_way, "the integer fold moved with the order");
+    assert_eq!(one_way.len(), 1);
+    assert_eq!(one_way[0].count, 4);
+    assert_eq!(one_way[0].second[0], exact);
+
+    // And on the **bytes**, which is what `SeamFold::Unordered` is checked on:
+    // the executor applies each block a second time with its neighbourhood
+    // reversed and requires the same output blob.
+    assert_eq!(
+        one_way[0].row_words(point).expect("a row"),
+        other_way[0].row_words(point).expect("a row"),
+        "the two fold directions wrote different bytes"
+    );
+
+    // The row itself: the centring happens once, at the end, and turns a moment
+    // of `2^53` about the volume origin into one of `4.50e15` about the
+    // region's own centre — which is `sum (z - c)^2` for the four voxels this
+    // region has, and is a number a caller can check by hand.
+    let shape = one_way[0]
+        .shape()
+        .expect("a shape")
+        .expect("a region with voxels");
+    assert_eq!(shape.count, 4);
+    assert_eq!(shape.at[0], (1 << 25) + 1);
+    assert_eq!(shape.central[0], 4_503_599_358_935_046);
+    assert_eq!(
+        shape.second_moments_about_origin()[0],
+        exact,
+        "the raw form does not come back out of the centred one"
+    );
+}
+
+/// **The negative control the survey's row is about**: the same region measured
+/// about the *volume* origin rather than about its own.
+///
+/// Two regions, and the two halves of "either overflow by name or move the
+/// answer" are one each.
+#[test]
+fn moments_about_the_volume_origin_overflow_by_name_where_the_regions_own_do_not() {
+    let point = FixedPoint::bits(0).expect("zero fraction bits");
+    let op = TabulateValuesOp::new("tabulate", 0, 1, point, "partials", Lifecycle::DeleteOnExit)
+        .expect("two images");
+    // Four voxels: two at `z = 2^31` and two four voxels further on. A region
+    // sixteen thousandths of the way across an axis a `usize` can address, and
+    // five voxels wide.
+    let edge = 1usize << 31;
+    let partials = vec![
+        planted_partial(&op, [edge, 0, 0], [true, true]),
+        planted_partial(&op, [edge + 4, 0, 0], [true, true]),
+    ];
+    let merge = MergeTabulationOp::new(
+        "merge",
+        "partials",
+        1,
+        [2, 1, 1],
+        point,
+        "rows",
+        Lifecycle::Persistent,
+    );
+    let folded = merge
+        .fold(partials.iter().map(|bytes| bytes.as_slice()))
+        .expect("a fold");
+    let shape = folded[0]
+        .shape()
+        .expect("the region's own origin holds it")
+        .expect("a region with voxels");
+
+    // **Every count is reproduced**: the two framings differ in where they are
+    // measured from and in nothing else.
+    assert_eq!(shape.count, 4);
+    assert_eq!(shape.position, [4 * edge as u64 + 8, 2, 0]);
+    // Axis 1 rounds to 1: the four voxels sit two at `y = 0` and two at `y = 1`,
+    // so the exact mean is a half and the row's position rounds it half up.
+    assert_eq!(shape.at, [edge + 2, 1, 0]);
+
+    // About the region's own centre the answer is `16` and fits in a column with
+    // sixty-two bits to spare.
+    assert_eq!(shape.central[0], 16);
+
+    // About the volume origin it is `1.8e19`, which is above what a signed
+    // 64-bit column holds — and the refusal says so by name rather than
+    // wrapping to a plausible number.
+    let raw = shape.second_moments_about_origin()[0];
+    assert!(
+        raw >= (1i128 << 63),
+        "the raw moment is {raw} and was meant to be past 2^63"
+    );
+    let failed = signed_column(raw)
+        .expect_err("2^63 does not fit a signed 64-bit column")
+        .to_string();
+    assert!(failed.contains("above"), "{failed}");
+    assert!(failed.contains("signed 64-bit"), "{failed}");
+    assert!(failed.contains(&raw.to_string()), "{failed}");
+    // and the centred one at the same place does not refuse, which is what says
+    // the refusal is about the origin and not about the region
+    assert!(signed_column(shape.central[0] as i128).is_ok());
+}
+
+/// The other half of the same control: a region whose moments about the volume
+/// origin **fit**, and where measuring from there **moves the answer** instead of
+/// refusing.
+///
+/// This is the failure mode that matters more, because it is silent.
+#[test]
+fn moments_about_the_volume_origin_move_the_orientation() {
+    let point = fixed();
+    let run = try_run(SHAPE_VOLUME, [5, 5, 5], point, shape_labels, shape_value_at).expect("a run");
+    let line = shape_for(&run.shapes, 1);
+
+    let raw = line.second_moments_about_origin();
+    // It fits — a twelve-voxel region in a twelve-voxel volume is nowhere near
+    // the range — so nothing refuses and nothing warns.
+    let mut about_origin = line;
+    for (slot, value) in about_origin.central.iter_mut().zip(raw) {
+        *slot = i64::try_from(value).expect("a small volume's raw moments fit");
+    }
+    // and the counts are the same in both framings
+    assert_eq!(about_origin.count, line.count);
+    assert_eq!(about_origin.position, line.position);
+
+    let honest = line.orientation().expect("an elongated region");
+    // `PrincipalAxes::of` on the raw matrix directly, so that the row's own
+    // half-voxel correction cannot be mistaken for the effect being measured.
+    let voxels = line.count as f64;
+    let mut matrix = [[0.0f64; 3]; 3];
+    for (value, pair) in raw.into_iter().zip(PAIRS) {
+        let entry = value as f64 / voxels;
+        matrix[pair[0]][pair[1]] = entry;
+        matrix[pair[1]][pair[0]] = entry;
+    }
+    let misplaced = PrincipalAxes::of(matrix).axis[0].expect("still has a largest eigenvalue");
+
+    let moved = angle_between(honest, misplaced);
+    assert!(
+        moved > 0.5,
+        "measuring from the volume origin moved the orientation by only {moved} radians. The \
+         region is a line along (1,1,0) at x = 11, so about the origin its largest eigenvector \
+         leans into axis 2 and the answer is the direction of the region rather than the \
+         direction the region points"
+    );
+    // and specifically: about the origin the reported axis picks up axis 2,
+    // which the region has no extent on at all
+    assert!(
+        misplaced[2].abs() > 0.5,
+        "the misplaced axis is {misplaced:?} and was meant to lean into the axis the region does \
+         not extend along"
+    );
+    assert!(honest[2].abs() < 1e-9);
+}
+
+/// **The second moments carry no scale, so they do not narrow the one the sum
+/// runs at.** The scale sweep is the same sweep it was.
+///
+/// This is the claim the design turns on, run rather than argued: the first
+/// moment is still the column that binds first on the *scale* axis, and the six
+/// new columns are the same integers at every scale the run admits. A weighted
+/// second moment would have moved this count — its bound is the sum's divided by
+/// the product of *two* coordinates — and it is the reason there is not one.
+#[test]
+fn the_second_moments_do_not_move_the_scale_the_sum_runs_at() {
+    let mut accepted = 0usize;
+    let mut refused = 0usize;
+    let mut first: Option<[i64; 6]> = None;
+    for bits in 0..=MAX_FRACTION_BITS {
+        let point = FixedPoint::bits(bits).expect("in range");
+        let run = match try_run(
+            AWKWARD_VOLUME,
+            [1, 1, 1],
+            point,
+            two_region_labels,
+            awkward_value_at,
+        ) {
+            Ok(run) => run,
+            Err(_) => {
+                refused += 1;
+                continue;
+            }
+        };
+        accepted += 1;
+        let central = shape_for(&run.shapes, 1).central;
+        match first {
+            None => first = Some(central),
+            Some(seen) => assert_eq!(
+                central, seen,
+                "the second moments moved with the fixed-point scale at {bits} fraction bits, \
+                 which they cannot do — there is no scale in them"
+            ),
+        }
+    }
+    // The same 50 and 13 the selection sweep counts. The six columns landed and
+    // the edge did not move, which is the whole of what "they carry no scale"
+    // buys a caller.
+    assert_eq!(
+        (accepted, refused),
+        (50, 13),
+        "the admissible scale range moved when the second moments landed"
+    );
+    // and the refusal at the edge is still the first moment's, naming its axis
+    let by_moment = try_run(
+        AWKWARD_VOLUME,
+        [1, 1, 1],
+        FixedPoint::bits(50).expect("50 bits"),
+        two_region_labels,
+        awkward_value_at,
+    )
+    .expect_err("the first moment does not fit at 50 fraction bits")
+    .to_string();
+    assert!(by_moment.contains("first moment on axis 0"), "{by_moment}");
+    assert!(by_moment.contains("binds first"), "{by_moment}");
+    assert!(
+        !by_moment.contains("second moment"),
+        "the second moment refused where the first one binds: {by_moment}"
+    );
+}
+
+/// The six columns are named without a scale at every scale, which is what
+/// [`region_shape`] reading them by index rests on.
+#[test]
+fn the_second_moment_columns_carry_no_accumulator_in_their_names() {
+    for bits in [0u32, 8, DEFAULT_FRACTION_BITS, MAX_FRACTION_BITS] {
+        let point = FixedPoint::bits(bits).expect("in range");
+        let schema = tabulation_schema(point);
+        for (index, name) in CENTRAL_COLUMN.into_iter().enumerate() {
+            assert_eq!(
+                schema.index_of(name),
+                Some(12 + index),
+                "at {bits} fraction bits the second moments are not where `region_shape` reads \
+                 them"
+            );
+        }
+        let scaled = schema
+            .columns()
+            .iter()
+            .filter(|column| column.name().starts_with("central_"))
+            .any(|column| column.name().contains("_q"));
+        assert!(
+            !scaled,
+            "a second moment carries an accumulator's scale at {bits} fraction bits, which would \
+             make it a quantised coordinate"
+        );
+    }
 }

@@ -38,6 +38,17 @@
 // the cost here would be one convention baked into an op that has no reason to
 // hold one; the mask is the caller's for the same reason, and is one threshold.
 //
+// **`super::distance` is where that distance now comes from**, and this line no
+// longer names an operation the caller has to supply from outside the crate.
+// `distance::distance_transform` is the resident form and `distance::plan` the
+// blocked one; the negation is the same one `voxelwise` map as above, because a
+// distance-transform watershed seeds at the field's *maxima* and this op floods
+// from the lowest cost. `distance::squared_distance_transform` is the cheaper
+// input where only the ordering matters, which is every case where the basins
+// are wanted and the distances are not: the square root is monotone, so it
+// changes no comparison between two distinct values, and the squared field is
+// the one whose values are exact integers rather than a libm's last bit.
+//
 // **A barrier, and why that is the honest declaration**
 // ----------------------------------------------------
 // This op declares [`Reach::all`], which makes it a planning barrier: it gets a

@@ -36,6 +36,19 @@ wrongly.
 note's; the dangling citations are recorded here as a known state, not repaired,
 and nothing below cites that file as though it were readable.
 
+> *Later, by another worker.* The `README.md` split that produced
+> [`writing-an-op.md`](writing-an-op.md) checked whether the material it was
+> moving was what those 45 citations want. **It is not.** The moved sections
+> succeed `BLOCK_OPS.md` on the diamond — what it recorded as "`Chain` has no
+> fan-in" now ships as `Chain::Parallel` — and reproduce exactly one of its
+> section titles, *"A full-reach op is a planning barrier"*. The planning,
+> costing and execution sections the other citations quote (§"The planning
+> problem is NP-hard", §"Emit a dependency graph, do not inline the loops",
+> §"Workflow -> Planner -> Executor", §"Simulating strategies", §"Estimating
+> from noisy samples", §"Images are a DAG", §"Block size may differ per phase",
+> §"Step 1/2/3") are in no file in this directory. The gap stands; it has now
+> been looked at rather than only recorded.
+
 ---
 
 ## The decision

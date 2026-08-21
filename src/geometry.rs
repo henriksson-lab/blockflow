@@ -165,8 +165,58 @@ impl BlockGrid {
 
     /// Voxels in an interior block's core — the unit the infinite-grid cost
     /// model is stated in.
+    ///
+    /// This is the **widest** block, and a grid whose edge does not divide its
+    /// volume has none of that size at its boundary. Use it where over-stating
+    /// is the safe direction — a residency budget, a buffer size. For anything
+    /// that *compares two grids*, use [`BlockGrid::mean_core_voxels`] and read
+    /// its note on why.
     pub fn core_voxels(&self) -> f64 {
         self.block.iter().map(|&edge| edge as f64).product()
+    }
+
+    /// Voxels in the **average** block's core: the volume, over the blocks that
+    /// cover it.
+    ///
+    /// Exact, not an estimate. [`BlockGrid::cores`] clips every core to the
+    /// volume and the cores tile it without overlap, so the cores sum to the
+    /// volume and this is that sum divided by [`BlockGrid::n_blocks`]. It
+    /// equals [`BlockGrid::core_voxels`] exactly when the block divides the
+    /// volume on every split axis, and is smaller otherwise.
+    ///
+    /// # Why a price that compares grids must use this one
+    ///
+    /// Charging every block at the widest is a deliberate over-charge, and as a
+    /// statement about *one* grid it is harmless — it is the same direction of
+    /// error a generous halo has. What makes it harmful is that the planner
+    /// uses the price to **choose between** grids, and the size of the
+    /// over-charge is a property of the candidate rather than of the machine:
+    /// it is the grid's padding, `n_blocks * core_voxels / volume`, and that
+    /// ratio moves with the edge because the boundary remainder does.
+    ///
+    /// Measured on the pipeline's `404 x 1304 x 3369` tile, over the four edges
+    /// `skeletonize`'s ladder offers there:
+    ///
+    /// ```text
+    /// edge | blocks | n x core_voxels / volume
+    ///  512 |     21 | 1.253
+    ///  256 |    168 | 1.588
+    ///  128 |   1188 | 1.404
+    ///   64 |   7791 | 1.151
+    /// ```
+    ///
+    /// A price built on the widest block therefore charges the 256 grid **38%
+    /// more per voxel of real work than the 64 grid**, for no reason connected
+    /// to the work. That is an order of magnitude larger than the margins the
+    /// search decides on — it inverted 256 against 128, which the model
+    /// preferred by 4.1% and which measures 38% slower — and it is not a
+    /// coefficient anybody can measure away, because it is not a cost. It is
+    /// the model quoting a different unit for each candidate.
+    ///
+    /// Nothing here is tuned: the mean is a fact about the grid and there is no
+    /// constant to pick.
+    pub fn mean_core_voxels(&self) -> f64 {
+        self.volume.iter().map(|&edge| edge as f64).product::<f64>() / self.n_blocks() as f64
     }
 
     /// Every core, in natural (axis 0 slowest) order.

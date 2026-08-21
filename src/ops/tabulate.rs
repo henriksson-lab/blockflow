@@ -24,6 +24,7 @@
 // | `max` | the largest finite value, **as it was read** | `max` |
 // | `sum_0..2` | per-axis sum of the voxels' coordinates | `+` |
 // | `moment_0..2_q{n}` | fixed-point sum of value times coordinate | `+` |
+// | `central_00..22` | second moment about its own centre | `+`, then centred |
 //
 // and positioned at the region's rounded centroid, which is what `sum_0..2` and
 // `count` say exactly and the position says to a voxel. Every combine in that
@@ -61,6 +62,180 @@
 // position — see [`MergeTabulationOp`] — and a weighted centroid over signed
 // values need not be inside the region, inside its bounding box, or inside the
 // volume at all. A position that could leave the lattice is not a position.
+//
+// The second moments, which are the region's shape and are about its own centre
+// ----------------------------------------------------------------------------
+// `central_00..central_22` are the six independent components of
+// `sum_i (x_i - c)(x_i - c)^T` — the region's central second-moment (scatter)
+// matrix, in the axis-pair order [`PAIRS`] gives. They are what
+// `orientation`, the principal axes, the axis lengths and `eccentricity` are
+// eigen-decompositions of, and they are the last per-region quantity the columns
+// beside them do not determine: `count` and `sum_0..2` fix a region's centre and
+// say nothing whatever about its shape, and two regions with identical counts
+// and identical coordinate totals can be a ball and a diagonal rod.
+//
+// **They are unweighted, and that is a decision rather than an oversight.**
+// `measure.regionprops` reports both an unweighted moment family and a weighted
+// one, but every field this column set exists to unlock — `orientation`,
+// `axis_major_length`, `axis_minor_length`, `eccentricity`,
+// `inertia_tensor_eigvals` — is defined on the **unweighted** one; the weighted
+// family stops at the moments themselves and `centroid_weighted`, which this op
+// already has. Three further things settled it, and the third is the one that
+// binds:
+//
+// * **They are a property of the label volume alone.** No value is read into
+//   them, so they are taken over *every* voxel of the region — including the
+//   voxels whose value was not finite, which `sum`, `min`, `max` and the first
+//   moments must exclude. A region every one of whose values is a `NaN` still
+//   has a shape, and reports it. A weighted second moment would inherit the
+//   non-finite caveat and would be absent exactly where a shape is most wanted.
+// * **They carry no fixed-point scale at all**, because there is nothing in them
+//   to quantise: a coordinate is already an integer. So the six columns are
+//   exact integers, like `sum_0..2`, and — this is the load-bearing part — they
+//   **cannot narrow anybody's `n`**. A weighted second moment would be
+//   `sum(q(v) * x_a * x_b)`, whose bound is the sum's own divided by the product
+//   of *two* coordinates rather than one: `|sum(v * x_a * x_b)| < 2^(63-n) /
+//   ((extent[a]-1) * (extent[b]-1))`. At the default twenty bits over a volume a
+//   thousand voxels on a side, that leaves `8.8e6` for the region's *total
+//   value* rather than the `8.8e12` the sum gets — so a million voxels of
+//   magnitude ten out near the far corner are already refused, and they are an
+//   ordinary region. Worse, every caller who *derives* a scale from a bound
+//   rather than picking one gives up a further `log2(max extent)` bits whether
+//   or not it ever reads the column. A consumer deriving a scale for a
+//   32 x 32 x 24 volume by the recipe below goes from **32 fraction bits to 27**
+//   — five bits of resolution spent on six columns it does not read. Six
+//   columns that nothing named derives anything from, costing every caller five
+//   bits of resolution, is the trade `docs/ops-survey` judged "not worth it
+//   before a consumer asked", and no consumer has asked for the weighted one.
+// * A caller who does want them is not silently short-changed: this header says
+//   what they would cost, and the answer is a scale decision rather than a
+//   missing mechanism.
+//
+// **The origin is the region's own rounded centroid — the row's own position —
+// and not the volume's.** That is the whole of what makes the range liveable,
+// and it is the survey's prescription with one substitution. The survey named
+// the object's bounding-box minimum, on the ground that it is already a column
+// of `ops::detect`, a function of the region alone, and therefore a
+// decomposition-invariant origin. `tabulate` has no bounding box; it has the
+// rounded centroid, which has all three properties — it is already the row's
+// position, it is a function of the merged region alone, and it is an integer,
+// so the re-centred moment is an integer too — and is strictly the better
+// choice, because `sum (x - c)^2` is *minimised* at the centre. Nothing is lost
+// by centring: the moments about the volume origin are
+//
+//     S_ab = M_ab + c_a * P_b + c_b * P_a - N * c_a * c_b
+//
+// from `central`, `sum_0..2`, `count` and the row's position, exactly, in
+// integers — [`RegionShape::second_moments_about_origin`] is that line — so the
+// centred form is the one that is kept for exactly the reason the survey gives
+// for keeping the derivable ones out.
+//
+// **A block cannot know the centre, so the fold is about the volume origin and
+// the re-centring happens once, at the end.** [`Tally::second`] accumulates
+// `sum (x_a * x_b)` about the volume origin in `i128` — associative, commutative
+// and exact, so `SeamFold::Unordered` holds for it on the integers' own terms —
+// and [`Tally::central`] subtracts the centre off at the moment the answer
+// becomes a row, on numbers that are already decomposition-invariant. That is
+// the survey's second option ("a block can accumulate about the volume origin in
+// `i128` and the merge can re-centre once, at the end") and it is the one that
+// needs no second pass.
+//
+// The range, worked out rather than discovered
+// --------------------------------------------
+// `M_aa = sum (x_a - c_a)^2` is a sum of squares and is non-negative;
+// `|M_ab| <= sqrt(M_aa * M_bb)` by Cauchy-Schwarz, so the diagonal bounds the
+// whole matrix. With `l_a` the region's own extent on axis `a` and `N` its voxel
+// count, Popoviciu's bound on a variance gives
+//
+//     M_aa <= N * ((l_a - 1)^2 + 1) / 4,   so   |M_ab| ~< N * l_a * l_b / 4.
+//
+// The column is a signed 64-bit word in offset binary, so the limit is
+// `+/- 2^63`. For the worst region there is — one filling the whole volume, `N =
+// L^3` and `l = L` — that is `L^5 / 4 < 2^63`, or **`L` of exactly 8 192 voxels
+// on a side**, since `8192^5` is `2^65` and `2^65 / 4` is `2^63` — the bound
+// lands on a power of two, which is a coincidence of the constants and a
+// convenient one to quote.
+//
+// About the *volume* origin the same column would hold `sum x_a x_b <= N *
+// (L-1)^2 ~ L^5`, which is `L` of about 6 200 signed — and, since the question
+// is usually asked of `u64`, about **7 100 unsigned by that crude bound** or
+// **8 900 on the exact `L^5 / 3`**. Those two numbers are the ones
+// worth carrying, because the survey's register quotes `L ~ 1800` for this row
+// and `1800^5` is `2^54`, not `2^64`: the figure is right for an accumulator
+// whose exact integers stop at `2^53` — an `f64` — and is about four times too
+// small for the `u64` the row names. The survey's own next clause, "a tenth of
+// the volume the other ten survive", is consistent with 7 100 against 65 536 and
+// not with 1800.
+//
+// **In the worst case the centring buys only `4^(1/5)`; in every realistic case
+// it buys `4 (L / l)^2`.** A region of `N` voxels whose own extent is `l`,
+// sitting anywhere in a volume of side `L`, has a moment about the volume origin
+// of order `N * L^2` and a moment about its own centre of order `N * l^2 / 4`.
+// For a twenty-voxel object in a volume 65 536 on a side that ratio is `4.3e7`.
+// The worst case is the one that binds the *guarantee*; the ratio is the one that
+// says why the column is usable at all.
+//
+// **Which column binds first, on each of the two axes the range has.** On the
+// *scale* axis — the one `FixedPoint` moves along — nothing has changed: the
+// first moment `moment_a_q{n}` is still the column that binds first, at the
+// sum's bound divided by the largest coordinate on its axis, and the second
+// moments have no scale to be narrowed by. On the *geometric* axis, the one that
+// is a fact about the volume rather than about `n`, **the second moment is now
+// the column that binds first**: it fails at a region of 8 192 voxels on a
+// side where the coordinate sums beside it survive to 65 536 and the count
+// survives past any array. Both refusals name themselves — the first moment
+// names its axis, the second moment names its axis pair — so a caller is never
+// sent to the wrong number.
+//
+// What is a column and what a caller derives
+// ------------------------------------------
+// The six integers are columns because nothing beside them determines them.
+// Everything downstream of them is a closed-form function of those six, `count`
+// and the coordinate sums, so none of it is a column: the covariance
+// ([`RegionShape::covariance`]), the inertia tensor `tr(C) I - C`
+// ([`RegionShape::inertia_tensor`]), the eigenvalues, the principal directions,
+// the equivalent-ellipsoid axis lengths ([`RegionShape::principal_axes`]),
+// `orientation` ([`RegionShape::orientation`]) and `eccentricity`
+// ([`RegionShape::eccentricity`]). That is the same rule the weighted centroid
+// was added under, read the other way round: it is a column's *quotient* and not
+// a column, and these are a column's *eigen-decomposition* and not columns.
+//
+// **The decode is [`region_shape`] and not a wider [`region_values`]**, and the
+// split is semantic before it is anything else. `RegionValues` is one region's
+// *values* — every field of it is a reading of the value array, over the finite
+// voxels, at a scale. The shape is a reading of the *label volume*, over every
+// voxel, at no scale. They come off the same row and they are two measurements;
+// a caller wanting both takes both, and a caller wanting neither pays for
+// neither.
+//
+// Degeneracy, which is the part that has no numerical answer
+// ----------------------------------------------------------
+// The eigenvalues of a symmetric 3x3 are continuous in its entries and are
+// always determined; the eigen*vectors* are not. A ball has no orientation, and
+// a region with two equal eigenvalues has no principal axis in the plane they
+// span — any pair of orthogonal directions in it is as good as any other. So
+// [`PrincipalAxes`] reports `variance` and `length` always, and reports each
+// `axis` as an `Option`, `None` exactly where that eigenvalue is not separated
+// from its neighbour by more than [`AXIS_SEPARATION`] times the largest
+// eigenvalue. **A `None`, never a `NaN` and never an arbitrary pick** — the same
+// vocabulary [`Tally::weighted_centroid`] uses for a quotient that does not
+// exist, and for the same reason: the quantity is absent, not zero, and
+// `Table::write` refuses a non-finite `F64` anyway.
+//
+// It is a statement about *determinacy*, not about beauty. A cube of voxels has
+// an exactly isotropic scatter matrix and gets three `None`s. A digitised ball
+// does not: its lattice gives it a real, if tiny, preferred direction, and the
+// op reports the direction its arithmetic actually determined rather than
+// deciding on the caller's behalf that the object was meant to be round. The
+// separation is where the reported direction stops being a function of the
+// region and starts being a function of the last bits of a division.
+//
+// A direction is a **line and not a ray**, so its sign is a convention rather
+// than a measurement, and the convention is stated and total: the component of
+// largest magnitude is made positive, ties broken by the earliest axis. Two runs
+// of the same region give the same bits; the three axes are orthonormal but are
+// not promised to be right-handed, because forcing handedness would break the
+// per-axis convention.
 //
 // Why it is not `ops::detect`
 // ---------------------------
@@ -298,7 +473,8 @@
 // whole-lattice fragment reach, so on `N` blocks it moves `N` partials to each of
 // `N` blocks and runs the same fold `N` times — the price of ending a run in a
 // fragment phase, the same one `ops::fill` and `ops::detect` pay. A partial is
-// sixteen words per label *present in that block*, not per label in the volume.
+// twenty-eight words per label *present in that block*, not per label in the
+// volume.
 //
 // `SeamFold::Unordered` adds one more application of the merge per block, and —
 // because the merge streams rather than gathers — one more pass of fragment
@@ -503,16 +679,43 @@ pub const MAX: &str = "max";
 /// [`SUM`]'s reason: a moment is an accumulation and an accumulation has a scale.
 pub const MOMENT: [&str; 3] = ["moment_0", "moment_1", "moment_2"];
 
-/// Payload columns a tabulated row has.
-pub const COLUMNS: usize = 12;
+/// The axis pair each of the six second-moment components is taken over, and
+/// the order every array of six in this module is in: `(0,0)`, `(0,1)`,
+/// `(0,2)`, `(1,1)`, `(1,2)`, `(2,2)`.
+///
+/// Six rather than nine because the matrix is symmetric — `sum (x_a - c_a)(x_b -
+/// c_b)` does not care which way round the two factors are written — so the
+/// upper triangle is the whole of it. Carrying nine would be carrying three
+/// columns whose only content is that they equal three others.
+pub const PAIRS: [[usize; 2]; 6] = [[0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [2, 2]];
 
-/// Words a tabulated row occupies: the three positions and the nine columns.
+/// Names of the six second-moment columns, in [`PAIRS`] order: `central_00`,
+/// `central_01`, `central_02`, `central_11`, `central_12`, `central_22`.
+///
+/// **Whole names rather than stems, and that is the point of them.** `sum` and
+/// `moment_0..2` carry [`FixedPoint::suffix`] because they are accumulations of
+/// a *value* and an accumulation of a value needs a scale. A second moment
+/// accumulates coordinates, which are already integers, so there is no scale in
+/// it to name — exactly [`MIN`]'s argument, arrived at from the other end.
+pub const CENTRAL: [&str; 6] = [
+    "central_00",
+    "central_01",
+    "central_02",
+    "central_11",
+    "central_12",
+    "central_22",
+];
+
+/// Payload columns a tabulated row has.
+pub const COLUMNS: usize = 18;
+
+/// Words a tabulated row occupies: the three positions and the payload columns.
 pub const ROW_WORDS: usize = POSITION_WORDS + COLUMNS;
 
 /// The schema this op writes, at `fixed`.
 ///
-/// **Ten `U64` columns and two `F64` ones, and the split is the whole of what
-/// this op decided.** The entry condition `ops::detect::measurement_schema`
+/// **Sixteen `U64` columns and two `F64` ones, and the split is the whole of
+/// what this op decided.** The entry condition `ops::detect::measurement_schema`
 /// states — that a column here is a merged accumulator, and an `F64` column
 /// merged across a seam is not the same number as the whole fold — is an
 /// argument about an *accumulation*, and it is right about every accumulation
@@ -537,7 +740,8 @@ pub const ROW_WORDS: usize = POSITION_WORDS + COLUMNS;
 /// **The moments are appended rather than placed beside the sum**, so that every
 /// column that existed before this one keeps the index it had. A consumer reading
 /// by index is reading the same column, and a consumer reading by name was never
-/// affected either way.
+/// affected either way. The six [`CENTRAL`] columns are appended on the same
+/// terms and for the same reason, behind the three first moments.
 pub fn tabulation_schema(fixed: FixedPoint) -> Schema {
     let suffix = fixed.suffix();
     let columns = vec![
@@ -553,11 +757,17 @@ pub fn tabulation_schema(fixed: FixedPoint) -> Schema {
         Column::u64(format!("{}{suffix}", MOMENT[0])),
         Column::u64(format!("{}{suffix}", MOMENT[1])),
         Column::u64(format!("{}{suffix}", MOMENT[2])),
+        Column::u64(CENTRAL[0]),
+        Column::u64(CENTRAL[1]),
+        Column::u64(CENTRAL[2]),
+        Column::u64(CENTRAL[3]),
+        Column::u64(CENTRAL[4]),
+        Column::u64(CENTRAL[5]),
     ];
-    // Twelve distinct, non-empty names, so this cannot fail; expressed as a
+    // Eighteen distinct, non-empty names, so this cannot fail; expressed as a
     // `Result` internally and unwrapped here rather than making every caller
     // handle an impossibility.
-    Schema::new(columns).expect("the tabulation schema names twelve distinct columns")
+    Schema::new(columns).expect("the tabulation schema names eighteen distinct columns")
 }
 
 // ------------------------------------------------------------------ tally --
@@ -601,6 +811,23 @@ pub struct Tally {
     /// whose denominator is [`Self::sum`]: a numerator taken over one voxel set
     /// and a denominator over another would not be a centroid of either.
     pub moment: [i128; 3],
+    /// The **raw second moments about the volume origin**, `sum (x[a] * x[b])`
+    /// per axis pair in [`PAIRS`] order.
+    ///
+    /// This is the fold's form and not the row's. A block cannot know where the
+    /// region's centre is — the region reaches blocks this one will never see —
+    /// so the accumulation is about the one origin every block already agrees
+    /// on, and the centring happens once, in [`Self::central`], at the moment
+    /// the answer becomes a row. `i128` for the same reason [`Self::sum`] is:
+    /// the fold has no range limit of its own, and the one stated limit belongs
+    /// at the boundary where the answer becomes a column.
+    ///
+    /// **Over every voxel of the label, not only the finite-valued ones.** No
+    /// value is read into it: a coordinate is a coordinate whatever the value
+    /// array held there. So this belongs with [`Self::count`] and
+    /// [`Self::position`] rather than with [`Self::sum`], and a region whose
+    /// every value was a `NaN` still has a shape.
+    pub second: [i128; 6],
 }
 
 /// A selection's bits, which is what two tallies are compared on.
@@ -620,6 +847,7 @@ impl PartialEq for Tally {
             && self.sum == other.sum
             && self.position == other.position
             && self.moment == other.moment
+            && self.second == other.second
             && selection_bits(self.min) == selection_bits(other.min)
             && selection_bits(self.max) == selection_bits(other.max)
     }
@@ -669,6 +897,7 @@ impl Tally {
             max: None,
             position: [0; 3],
             moment: [0; 3],
+            second: [0; 6],
         }
     }
 
@@ -695,6 +924,19 @@ impl Tally {
             *sum = sum
                 .checked_add(at[axis] as u64)
                 .ok_or_else(|| overflowed("a coordinate sum"))?;
+        }
+        // The raw second moments, about the volume origin. Before the quantise
+        // and outside its `match` on purpose: no value is read into them, so
+        // they are taken over every voxel exactly as `count` and `position`
+        // are, and a voxel holding a `NaN` still has a position and therefore
+        // still has a shape. See [`Self::second`].
+        for (slot, pair) in self.second.iter_mut().zip(PAIRS) {
+            let term = (at[pair[0]] as i128)
+                .checked_mul(at[pair[1]] as i128)
+                .ok_or_else(|| overflowed("a second moment"))?;
+            *slot = slot
+                .checked_add(term)
+                .ok_or_else(|| overflowed("a second moment"))?;
         }
         match fixed.quantise(value)? {
             None => {
@@ -773,6 +1015,11 @@ impl Tally {
                 .checked_add(other.moment[axis])
                 .ok_or_else(|| overflowed("a fixed-point first moment"))?;
         }
+        for (mine, theirs) in self.second.iter_mut().zip(other.second) {
+            *mine = mine
+                .checked_add(theirs)
+                .ok_or_else(|| overflowed("a second moment"))?;
+        }
         Ok(())
     }
 
@@ -828,7 +1075,96 @@ impl Tally {
         Some(at)
     }
 
-    /// The row's fifteen words: the position, then the payload in schema order.
+    /// The six second moments **about the region's own rounded centroid**, which
+    /// is what the columns hold and what every derived shape quantity is a
+    /// function of. `None` for a tally with no voxels, which has no centre to be
+    /// about.
+    ///
+    /// `M_ab = S_ab - c_a * P_b - c_b * P_a + N * c_a * c_b`, with `S` the raw
+    /// moments about the volume origin ([`Self::second`]), `P` the coordinate
+    /// sums, `N` the count and `c` the rounded centroid. Every term is an
+    /// integer and every one of the four is a function of the region's voxel set
+    /// alone, so the answer is too — which is why the centring can wait until
+    /// the end instead of needing a second pass to agree on an origin.
+    ///
+    /// **The centre is [`Self::centroid`], the rounded one, and not the exact
+    /// mean.** The exact mean would make `M` a rational rather than an integer
+    /// and would put a division on the path; the rounded centroid is within half
+    /// a voxel of it, is already the row's position, and keeps the whole thing
+    /// in the integers.
+    ///
+    /// The half-voxel is not swept under anything. It costs `N * (m_a - c_a)(m_b
+    /// - c_b)` on each component — at most `N / 4`, which is 17% of a
+    /// four-voxel-wide region's own moment and would be a visible false
+    /// anisotropy on a cube — and it is **removed exactly** where the moment
+    /// becomes a measurement: `RegionShape::covariance` subtracts it, from
+    /// `position` and `count`, both of which are columns. So the integer stored
+    /// is about the rounded centre, the covariance read off it is about the
+    /// exact mean, and the two differ by a quantity the row determines.
+    ///
+    /// Checked throughout, on this module's rule that a wrapped total is a
+    /// plausible number and therefore the expensive kind of wrong.
+    pub fn central(&self) -> Result<Option<[i128; 6]>> {
+        let Some(at) = self.centroid() else {
+            return Ok(None);
+        };
+        let count = self.count as i128;
+        let mut central = [0i128; 6];
+        for (index, (slot, pair)) in central.iter_mut().zip(PAIRS).enumerate() {
+            let (a, b) = (pair[0], pair[1]);
+            let (centre_a, centre_b) = (at[a] as i128, at[b] as i128);
+            let fail = || overflowed("a central second moment");
+            let cross = centre_a
+                .checked_mul(self.position[b] as i128)
+                .ok_or_else(fail)?
+                .checked_add(
+                    centre_b
+                        .checked_mul(self.position[a] as i128)
+                        .ok_or_else(fail)?,
+                )
+                .ok_or_else(fail)?;
+            let squared = count
+                .checked_mul(centre_a)
+                .ok_or_else(fail)?
+                .checked_mul(centre_b)
+                .ok_or_else(fail)?;
+            *slot = self.second[index]
+                .checked_sub(cross)
+                .ok_or_else(fail)?
+                .checked_add(squared)
+                .ok_or_else(fail)?;
+        }
+        Ok(Some(central))
+    }
+
+    /// This tally's shape, in the same form [`region_shape`] decodes off a row —
+    /// so that "the table says what the fold said" is a comparison of one type
+    /// against itself rather than of two spellings of the same arithmetic.
+    ///
+    /// `None` for a tally with no voxels. Refuses, naming the axis pair, when a
+    /// central moment does not fit the signed 64-bit word a column is.
+    pub fn shape(&self) -> Result<Option<RegionShape>> {
+        let Some(at) = self.centroid() else {
+            return Ok(None);
+        };
+        let Some(central) = self.central()? else {
+            return Ok(None);
+        };
+        let mut narrowed = [0i64; 6];
+        for (slot, (value, pair)) in narrowed.iter_mut().zip(central.into_iter().zip(PAIRS)) {
+            *slot = from_signed_column(central_column(value, pair)?);
+        }
+        Ok(Some(RegionShape {
+            label: self.label,
+            at,
+            count: self.count,
+            position: self.position,
+            central: narrowed,
+        }))
+    }
+
+    /// The row's twenty-one words: the position, then the payload in schema
+    /// order.
     ///
     /// The words rather than a struct, because **this array is the canonical
     /// sort key** — `crate::table` orders rows by their own words, so sorting
@@ -842,6 +1178,9 @@ impl Tally {
     /// reported by the count that already reports it.
     pub fn row_words(&self, fixed: FixedPoint) -> Result<Option<[u64; ROW_WORDS]>> {
         let Some(at) = self.centroid() else {
+            return Ok(None);
+        };
+        let Some(central) = self.central()? else {
             return Ok(None);
         };
         let mut words = [0u64; ROW_WORDS];
@@ -869,8 +1208,65 @@ impl Tally {
                     ))
                 })?;
         }
+        // The second moments narrow here and nowhere earlier, exactly as the sum
+        // and the first moments do — and here the narrowing is also the
+        // *centring*, because the fold's form is about the volume origin and the
+        // column's is about the region's own centre. The refusal names the axis
+        // pair; see [`central_column`].
+        for (index, (value, pair)) in central.into_iter().zip(PAIRS).enumerate() {
+            words[POSITION_WORDS + 12 + index] = central_column(value, pair)?;
+        }
         Ok(Some(words))
     }
+}
+
+/// A second moment narrowed to its column, refusing by name.
+///
+/// Separate from [`FixedPoint::to_column`] because there is no fixed point in
+/// it: the message a caller needs here is about the *geometry* — the region's
+/// voxel count and its own extent — and not about fraction bits, and a refusal
+/// that offered "use fewer fraction bits" would be sending them to a knob that
+/// cannot move this column at all.
+fn central_column(value: i128, pair: [usize; 2]) -> Result<u64> {
+    signed_column(value).map_err(|failed| {
+        Error::invalid(format!(
+            "{failed} This is the second moment on axes ({}, {}) — `sum((x - c)(x - c))` about \
+             the region's own rounded centroid — whose magnitude is bounded by the region's \
+             voxel count times a quarter of the product of its own bounding-box extents. It is \
+             the column that binds first on the geometric axis: a region filling a volume 8 192 \
+             voxels on a side reaches this limit exactly, where the coordinate sums beside it \
+             survive to 65 536 and the count survives past any array. The fixed point cannot \
+             move it — a coordinate is an integer and carries no scale — so the thing to change \
+             is the extent measured or the region measured, not `n`.",
+            pair[0], pair[1]
+        ))
+    })
+}
+
+/// An exact integer narrowed to a signed 64-bit column in **offset binary**,
+/// `value + 2^63`.
+///
+/// [`FixedPoint::to_column`]'s arithmetic without its scale, and offset binary
+/// for [`FixedPoint::to_column`]'s reason: `crate::table` compares a `U64`
+/// column's bits as they stand, and under two's complement every negative
+/// second moment would sort above every positive one.
+pub fn signed_column(value: i128) -> Result<u64> {
+    let low = -(1i128 << 63);
+    let high = 1i128 << 63;
+    if value < low || value >= high {
+        return Err(Error::invalid(format!(
+            "tabulate: an exact integer total of {value} is {} the range of a signed 64-bit \
+             column, which is +/- {high}. The fold itself is exact — it is `i128` — so this is \
+             the answer being too large to report rather than too large to compute.",
+            if value < low { "below" } else { "above" }
+        )));
+    }
+    Ok((value + high) as u64)
+}
+
+/// The other half of [`signed_column`].
+pub fn from_signed_column(word: u64) -> i64 {
+    (word as i128 - (1i128 << 63)) as i64
 }
 
 fn overflowed(what: &str) -> Error {
@@ -885,7 +1281,8 @@ fn overflowed(what: &str) -> Error {
 
 /// Words one label occupies in a **partial**: the label, the two counts, the
 /// `i128` sum as a word pair, the two selections as one word each, the three
-/// coordinate sums, and the three `i128` first moments as a word pair each.
+/// coordinate sums, the three `i128` first moments as a word pair each, and the
+/// six `i128` raw second moments as a word pair each.
 ///
 /// The sum and the moments are wider here than in a row on purpose. A partial is
 /// folded, not read, so it carries the accumulator's own type — `i128`, which has
@@ -897,8 +1294,17 @@ fn overflowed(what: &str) -> Error {
 /// only ever compared.
 ///
 /// The moments are appended rather than placed beside the sum, so the entry's
-/// leading words are the ones they always were.
-const PARTIAL_WORDS: usize = 16;
+/// leading words are the ones they always were, and the second moments are
+/// appended behind them on the same terms.
+///
+/// **The second moments travel in the fold's form — about the volume origin —
+/// and not the column's.** A partial cannot be centred: the block that wrote it
+/// does not know where the region's centre is, and will not until every other
+/// block's partial has been folded in. Centring at the end is what makes the
+/// merge a plain `+`; centring per partial would make it a formula that has to
+/// undo one origin before applying another, which is the same arithmetic done
+/// `N` times and rounded `N` times more.
+const PARTIAL_WORDS: usize = 28;
 
 fn put_i128(words: &mut Vec<u64>, value: i128) {
     let bits = value as u128;
@@ -948,6 +1354,9 @@ pub fn encode_partial(tallies: &BTreeMap<u64, Tally>) -> Vec<u8> {
         for axis in 0..3 {
             put_i128(&mut words, tally.moment[axis]);
         }
+        for component in tally.second {
+            put_i128(&mut words, component);
+        }
     }
     pack_u64(&words)
 }
@@ -977,6 +1386,14 @@ pub fn decode_partial(bytes: &[u8]) -> Result<Vec<Tally>> {
                 get_i128(entry[10], entry[11]),
                 get_i128(entry[12], entry[13]),
                 get_i128(entry[14], entry[15]),
+            ],
+            second: [
+                get_i128(entry[16], entry[17]),
+                get_i128(entry[18], entry[19]),
+                get_i128(entry[20], entry[21]),
+                get_i128(entry[22], entry[23]),
+                get_i128(entry[24], entry[25]),
+                get_i128(entry[26], entry[27]),
             ],
         });
     }
@@ -1564,6 +1981,481 @@ pub fn region_values(row: &Row<'_>, fixed: FixedPoint) -> Result<RegionValues> {
     })
 }
 
+// ------------------------------------------------------------- the shape --
+
+/// Relative eigenvalue separation below which a principal direction is treated
+/// as **not determined by the region**.
+///
+/// An eigenvector of a symmetric matrix is stable to a perturbation `E` only to
+/// about `|E| / gap`, where `gap` is the distance from its eigenvalue to the
+/// nearest other one, so below some gap the reported direction stops being a
+/// function of the region. **Where that line sits is set by the solver, and it
+/// is `sqrt` of the machine epsilon rather than the machine epsilon**, which is
+/// the one thing about the closed form worth knowing:
+/// [`symmetric_eigenvalues`] reads the roots off `acos(r)/3`, and near a
+/// repeated pair `r` is within an epsilon of `+/-1`, where `acos` has infinite
+/// derivative. An error of `1e-16` in `r` becomes one of `sqrt(2e-16)/3 ~ 5e-9`
+/// in the angle and of about `1e-8` *relative* in the two roots that are trying
+/// to coincide. So a matrix whose pair is exactly repeated comes back with a gap
+/// of order `1e-8`, and a threshold below that would call an exactly isotropic
+/// region anisotropic — which is what a first attempt at `1e-9` did, on a cube.
+///
+/// `1e-6` is two orders above that floor and is where the reported direction is
+/// still worth reporting: at the threshold the Davis-Kahan bound puts it within
+/// a few times `1e-2` radians, and the error falls off as the gap opens, so a
+/// region with any real anisotropy is answered properly. Below it the answer is
+/// `None`, which is a statement about determinacy and not about beauty: see the
+/// module header on why a digitised ball is not the same case as a cube.
+pub const AXIS_SEPARATION: f64 = 1e-6;
+
+/// `value` if it is above `floor`, else `floor`, under [`f64::total_cmp`].
+///
+/// `total_cmp` rather than [`f64::max`] for this module's standing reason — the
+/// two differ on operands that compare equal without being the same bits, and
+/// on a `NaN`, and this op does not have an order dependence anywhere.
+fn at_least(value: f64, floor: f64) -> f64 {
+    if value.total_cmp(&floor).is_gt() {
+        value
+    } else {
+        floor
+    }
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn norm_squared(a: [f64; 3]) -> f64 {
+    a[0] * a[0] + a[1] * a[1] + a[2] * a[2]
+}
+
+/// The eigenvalues of a symmetric 3x3, **descending**, in closed form.
+///
+/// The characteristic cubic of a symmetric matrix has three real roots, so it is
+/// solved by the trigonometric method rather than by Cardano's radicals: shift
+/// by the mean eigenvalue `q = tr(A)/3`, scale by `p` so that the shifted matrix
+/// has a fixed second invariant, and read the three roots off `acos` of half its
+/// determinant, a third of the angle apart. No iteration, no convergence test,
+/// no tolerance — which is why it is here rather than a Jacobi sweep: the
+/// answer has to be a *function* of the six integers, the same bits every time,
+/// or the invariance claim the rest of this module makes would stop at the
+/// column and not reach the measurement.
+///
+/// The exactly-diagonal case is taken first and separately, because there `off`
+/// is zero and the scaling has nothing to divide by. It is not a rare case here:
+/// an axis-aligned region has exactly zero off-diagonal moments, and it is also
+/// the case in which the answer comes back *exact* rather than to the
+/// `sqrt`-of-epsilon [`AXIS_SEPARATION`] describes.
+fn symmetric_eigenvalues(a: [[f64; 3]; 3]) -> [f64; 3] {
+    let off = a[0][1] * a[0][1] + a[0][2] * a[0][2] + a[1][2] * a[1][2];
+    if off == 0.0 {
+        let mut diagonal = [a[0][0], a[1][1], a[2][2]];
+        diagonal.sort_by(|one, other| other.total_cmp(one));
+        return diagonal;
+    }
+    let q = (a[0][0] + a[1][1] + a[2][2]) / 3.0;
+    let spread = (a[0][0] - q) * (a[0][0] - q)
+        + (a[1][1] - q) * (a[1][1] - q)
+        + (a[2][2] - q) * (a[2][2] - q)
+        + 2.0 * off;
+    // `off > 0` gives `spread >= 2 * off > 0`, so this is a real positive number
+    // and the divisions below have something to divide by.
+    let p = (spread / 6.0).sqrt();
+    let b = [
+        [(a[0][0] - q) / p, a[0][1] / p, a[0][2] / p],
+        [a[1][0] / p, (a[1][1] - q) / p, a[1][2] / p],
+        [a[2][0] / p, a[2][1] / p, (a[2][2] - q) / p],
+    ];
+    let determinant = b[0][0] * (b[1][1] * b[2][2] - b[1][2] * b[2][1])
+        - b[0][1] * (b[1][0] * b[2][2] - b[1][2] * b[2][0])
+        + b[0][2] * (b[1][0] * b[2][1] - b[1][1] * b[2][0]);
+    let half = determinant / 2.0;
+    // Exactly `+/-1` is the repeated-root case and rounding can put `half` a few
+    // ulps outside `[-1, 1]`, where `acos` is a `NaN`. Clamped rather than
+    // trusted, under `total_cmp`.
+    let angle = if half.total_cmp(&-1.0).is_le() {
+        std::f64::consts::PI / 3.0
+    } else if half.total_cmp(&1.0).is_ge() {
+        0.0
+    } else {
+        half.acos() / 3.0
+    };
+    let largest = q + 2.0 * p * angle.cos();
+    let smallest = q + 2.0 * p * (angle + 2.0 * std::f64::consts::PI / 3.0).cos();
+    // The trace is exact and cheap, and taking the middle root from it rather
+    // than from a third cosine keeps the three summing to it.
+    [largest, 3.0 * q - largest - smallest, smallest]
+}
+
+/// A unit vector spanning the null space of `A - lambda I`, or `None` when there
+/// is not one — which for a simple eigenvalue there always is.
+///
+/// `A - lambda I` is rank two at a simple eigenvalue, so any two of its rows are
+/// independent and their cross product spans the null space. All three pairs are
+/// tried and the largest cross product is taken: which pair is degenerate
+/// depends on the matrix, and picking one in advance is picking the one that
+/// sometimes returns zero.
+fn null_direction(a: [[f64; 3]; 3], lambda: f64) -> Option<[f64; 3]> {
+    let rows = [
+        [a[0][0] - lambda, a[0][1], a[0][2]],
+        [a[1][0], a[1][1] - lambda, a[1][2]],
+        [a[2][0], a[2][1], a[2][2] - lambda],
+    ];
+    let mut best = [0.0f64; 3];
+    let mut best_norm = 0.0f64;
+    for (one, other) in [(0usize, 1usize), (0, 2), (1, 2)] {
+        let candidate = cross(rows[one], rows[other]);
+        let norm = norm_squared(candidate);
+        if norm.total_cmp(&best_norm).is_gt() {
+            best_norm = norm;
+            best = candidate;
+        }
+    }
+    if best_norm.total_cmp(&0.0).is_le() || !best_norm.is_finite() {
+        return None;
+    }
+    let length = best_norm.sqrt();
+    Some([best[0] / length, best[1] / length, best[2] / length])
+}
+
+/// The sign convention, stated and total: the component of largest magnitude is
+/// made positive, ties broken by the earliest axis.
+///
+/// An eigenvector is a **line**, so its sign is a convention and not a
+/// measurement; what matters is that the convention is a function of the vector
+/// alone, so that the same region gives the same bits however it was cut. See
+/// the module header.
+fn oriented(mut direction: [f64; 3]) -> [f64; 3] {
+    let mut pick = 0usize;
+    for axis in 1..3 {
+        if direction[axis]
+            .abs()
+            .total_cmp(&direction[pick].abs())
+            .is_gt()
+        {
+            pick = axis;
+        }
+    }
+    if direction[pick].total_cmp(&0.0).is_lt() {
+        for component in direction.iter_mut() {
+            *component = -*component;
+        }
+    }
+    direction
+}
+
+/// The **principal axes** of a region: what its second moments say about its
+/// shape, once.
+///
+/// Not a column and deliberately not one — every field here is a closed-form
+/// function of the six [`CENTRAL`] columns and `count`, so storing it would be
+/// storing a reading of columns that are already there. See the module header on
+/// what is a column and what a caller derives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrincipalAxes {
+    /// The variance along each principal axis, **largest first**: the
+    /// eigenvalues of the covariance `M / count`.
+    ///
+    /// Always determined, even where the directions are not — the eigenvalues of
+    /// a symmetric matrix are continuous in its entries and a repeated pair is
+    /// still a pair of numbers. That is why this is a `[f64; 3]` and
+    /// [`Self::axis`] is not.
+    pub variance: [f64; 3],
+    /// The **full** axis lengths of the uniform solid ellipsoid with these
+    /// second moments, largest first: `2 * sqrt(5 * variance)`.
+    ///
+    /// The factor is the density's, not a choice: a uniform solid ellipsoid of
+    /// semi-axis `a` has variance `a^2 / 5` along it, so `2a = 2 sqrt(5 v)`.
+    /// This is `regionprops`' `axis_major_length` and `axis_minor_length`, whose
+    /// two-dimensional factor is `4 sqrt(v)` for the same reason with a
+    /// two-dimensional density.
+    pub length: [f64; 3],
+    /// The unit direction of each principal axis, in the same order — or `None`
+    /// where that eigenvalue is not separated from its neighbour's by more than
+    /// [`AXIS_SEPARATION`], and the direction is therefore not determined by the
+    /// region.
+    ///
+    /// A ball gets three `None`s, a prolate region gets its major axis and two
+    /// `None`s, an oblate one gets its minor axis and two `None`s. **Never a
+    /// `NaN` and never an arbitrary pick.**
+    pub axis: [Option<[f64; 3]>; 3],
+}
+
+impl PrincipalAxes {
+    /// The decomposition of a covariance — [`RegionShape::covariance`] is where
+    /// one comes from.
+    ///
+    /// A matrix rather than the six columns and a count, because the columns are
+    /// about the *rounded* centre and a decomposition of them is a
+    /// decomposition of the wrong matrix by up to `N/4` a component. The
+    /// correction belongs where the count and the coordinate sums are, which is
+    /// the row; this takes the answer.
+    pub fn of(matrix: [[f64; 3]; 3]) -> Self {
+        let variance = symmetric_eigenvalues(matrix);
+
+        // The separation rule, once, from the largest eigenvalue. A covariance
+        // is positive semi-definite so that is `variance[0]`; `abs` on both ends
+        // anyway, because a matrix that arrived here some other way should not
+        // silently get a negative tolerance.
+        let scale = at_least(variance[0].abs(), variance[2].abs());
+        let tolerance = AXIS_SEPARATION * scale;
+        let high = variance[0] - variance[1];
+        let low = variance[1] - variance[2];
+        let separated = [
+            high.total_cmp(&tolerance).is_gt(),
+            high.total_cmp(&tolerance).is_gt() && low.total_cmp(&tolerance).is_gt(),
+            low.total_cmp(&tolerance).is_gt(),
+        ];
+
+        let mut axis: [Option<[f64; 3]>; 3] = [None, None, None];
+        if separated[0] {
+            axis[0] = null_direction(matrix, variance[0]);
+        }
+        if separated[2] {
+            axis[2] = null_direction(matrix, variance[2]);
+        }
+        if separated[1] {
+            // The middle direction from the other two rather than from its own
+            // null space: it is the one whose gaps are smallest on both sides,
+            // so it is the least accurate to solve for directly, and a cross
+            // product of two directions that are already orthogonal is exactly
+            // the third.
+            axis[1] = match (axis[0], axis[2]) {
+                (Some(major), Some(minor)) => {
+                    let middle = cross(minor, major);
+                    let norm = norm_squared(middle);
+                    if norm.total_cmp(&0.0).is_gt() {
+                        let length = norm.sqrt();
+                        Some([middle[0] / length, middle[1] / length, middle[2] / length])
+                    } else {
+                        null_direction(matrix, variance[1])
+                    }
+                }
+                _ => null_direction(matrix, variance[1]),
+            };
+        }
+        for direction in axis.iter_mut() {
+            if let Some(found) = direction {
+                *found = oriented(*found);
+            }
+        }
+
+        let mut length = [0.0f64; 3];
+        for (slot, value) in length.iter_mut().zip(variance) {
+            // A variance is a mean of squares and cannot be negative; the
+            // analytic solve can still hand back a few ulps below zero for one
+            // that is exactly zero, and `sqrt` of that is a `NaN` this op will
+            // not report.
+            *slot = 2.0 * (5.0 * at_least(value, 0.0)).sqrt();
+        }
+        Self {
+            variance,
+            length,
+            axis,
+        }
+    }
+
+    /// `sqrt(1 - (minor / major)^2)`, or `None` for a region with no extent at
+    /// all — where the ratio is `0/0`.
+    ///
+    /// This is `regionprops`' definition read in three dimensions: there it is
+    /// `sqrt(1 - l_minor / l_major)` on the two inertia eigenvalues of a planar
+    /// region, which is the same expression on the two axis lengths. **Note what
+    /// that means for a region one voxel thick**: its smallest variance is
+    /// exactly zero, so this is exactly `1`, however round it is in its own
+    /// plane. That is the correct eccentricity of a flat body in three
+    /// dimensions and it is not the number a two-dimensional caller wants; the
+    /// in-plane one is `sqrt(1 - (length[1] / length[0])^2)`, from the same
+    /// struct, and is left to the caller for the module header's reason.
+    pub fn eccentricity(&self) -> Option<f64> {
+        if self.length[0].total_cmp(&0.0).is_le() {
+            return None;
+        }
+        let ratio = self.length[2] / self.length[0];
+        Some(at_least(1.0 - ratio * ratio, 0.0).sqrt())
+    }
+}
+
+/// One region's **shape**, decoded from the same row [`region_values`] reads its
+/// values from.
+///
+/// A second reading rather than more fields on [`RegionValues`], and the split is
+/// semantic before it is anything else: `RegionValues` is a region's *values* —
+/// every field of it is a reading of the value array, over the finite voxels, at
+/// a fixed-point scale — and this is a reading of the *label volume*, over every
+/// voxel, at no scale. They come off one row and they are two measurements. A
+/// caller wanting both takes both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionShape {
+    pub label: u64,
+    /// The rounded centroid, which is where the row sits **and** the origin the
+    /// second moments are about. The two being the same number is not a
+    /// coincidence: see the module header.
+    pub at: [usize; 3],
+    pub count: u64,
+    /// Per-axis sum of the voxels' coordinates, as the exact integer the column
+    /// holds — the form the invariance claim is about, offered beside
+    /// [`RegionValues::centroid`]'s quotient rather than behind it, and the
+    /// thing [`Self::second_moments_about_origin`] needs to be exact.
+    pub position: [u64; 3],
+    /// The six independent components of `sum (x - c)(x - c)^T` about the
+    /// region's own rounded centroid `c`, in [`PAIRS`] order.
+    ///
+    /// **Exact integers.** There is no scale in them and no rounding on the path
+    /// to them: the fold is `i128` about the volume origin, the centring is
+    /// integer arithmetic, and the column is the answer rather than a
+    /// quantisation of it.
+    pub central: [i64; 6],
+}
+
+impl RegionShape {
+    /// The exact centre, which [`Self::at`] rounds.
+    pub fn centroid(&self) -> Option<[f64; 3]> {
+        if self.count == 0 {
+            return None;
+        }
+        let voxels = self.count as f64;
+        Some([
+            self.position[0] as f64 / voxels,
+            self.position[1] as f64 / voxels,
+            self.position[2] as f64 / voxels,
+        ])
+    }
+
+    /// The **raw second moments about the volume origin**, `sum (x_a * x_b)`,
+    /// recovered exactly from this row.
+    ///
+    /// Here because it is the demonstration that nothing was given up by storing
+    /// the centred form: `S_ab = M_ab + c_a P_b + c_b P_a - N c_a c_b`, integers
+    /// throughout. It is not a column for exactly that reason — the module
+    /// header's rule is that what a caller can derive should not be stored, and
+    /// this is the derivable one of the two forms as well as the one whose range
+    /// binds `L^5` about the volume rather than about the region.
+    pub fn second_moments_about_origin(&self) -> [i128; 6] {
+        let count = self.count as i128;
+        let mut raw = [0i128; 6];
+        for (index, (slot, pair)) in raw.iter_mut().zip(PAIRS).enumerate() {
+            let (a, b) = (pair[0], pair[1]);
+            let (centre_a, centre_b) = (self.at[a] as i128, self.at[b] as i128);
+            *slot = self.central[index] as i128
+                + centre_a * self.position[b] as i128
+                + centre_b * self.position[a] as i128
+                - count * centre_a * centre_b;
+        }
+        raw
+    }
+
+    /// The **covariance** of the region's voxel coordinates, about their exact
+    /// mean, as a full symmetric 3x3. `None` for a region with no voxels.
+    ///
+    /// This is `regionprops`' `moments_central` divided by `m00`, and the "about
+    /// their exact mean" is the whole of the work this method does. The column
+    /// is about the *rounded* centroid, because that is the integer origin that
+    /// keeps the moment an integer; the exact mean is `position / count` and the
+    /// two differ by up to half a voxel, so
+    ///
+    /// ```text
+    /// sum (x_a - m_a)(x_b - m_b) = M_ab - N (m_a - c_a)(m_b - c_b)
+    /// ```
+    ///
+    /// and the correction is subtracted here, from two columns that are already
+    /// in the row. It is not a rounding-order nicety: for a cube four voxels on
+    /// a side it is `N/4` against a moment of `96`, which without it reports a
+    /// cube as elongated along `(1,1,1)` — a false orientation on the one object
+    /// that has none. `m_a - c_a` is `(P_a - N c_a) / N` with an exactly
+    /// integer numerator no larger than `N/2`, so the correction is at most a
+    /// quarter and is computed at full precision beside a term that dominates
+    /// it.
+    pub fn covariance(&self) -> Option<[[f64; 3]; 3]> {
+        if self.count == 0 {
+            return None;
+        }
+        let voxels = self.count as f64;
+        let mut offset = [0.0f64; 3];
+        for (axis, slot) in offset.iter_mut().enumerate() {
+            let exact = self.position[axis] as i128 - self.count as i128 * self.at[axis] as i128;
+            *slot = exact as f64 / voxels;
+        }
+        let mut matrix = [[0.0f64; 3]; 3];
+        for (value, pair) in self.central.into_iter().zip(PAIRS) {
+            let entry = value as f64 / voxels - offset[pair[0]] * offset[pair[1]];
+            matrix[pair[0]][pair[1]] = entry;
+            matrix[pair[1]][pair[0]] = entry;
+        }
+        Some(matrix)
+    }
+
+    /// The **inertia tensor** of the region taken as a uniform body:
+    /// `trace(C) * I - C`, with `C` the covariance.
+    ///
+    /// `regionprops`' `inertia_tensor`, whose eigenvalues are
+    /// `inertia_tensor_eigvals`. Offered beside [`Self::covariance`] because the
+    /// two carry the same information and the field a caller is comparing
+    /// against decides which one it wants; the principal *directions* are the
+    /// same for both, and the eigenvalues are related by `I_i = trace(C) - v_i`,
+    /// which reverses their order.
+    pub fn inertia_tensor(&self) -> Option<[[f64; 3]; 3]> {
+        let covariance = self.covariance()?;
+        let trace = covariance[0][0] + covariance[1][1] + covariance[2][2];
+        let mut inertia = [[0.0f64; 3]; 3];
+        for row in 0..3 {
+            for column in 0..3 {
+                inertia[row][column] = if row == column {
+                    trace - covariance[row][column]
+                } else {
+                    -covariance[row][column]
+                };
+            }
+        }
+        Some(inertia)
+    }
+
+    /// The principal axes, largest variance first. See [`PrincipalAxes`].
+    pub fn principal_axes(&self) -> Option<PrincipalAxes> {
+        Some(PrincipalAxes::of(self.covariance()?))
+    }
+
+    /// The region's **orientation**: the unit direction of its major principal
+    /// axis, or `None` when it has none to report.
+    ///
+    /// `None` is the ball, the cube and every region whose two largest
+    /// variances coincide — see [`PrincipalAxes::axis`]. A direction rather than
+    /// an angle because in three dimensions there is no single angle to give:
+    /// `regionprops`' scalar `orientation` is a planar measurement, and its
+    /// three-dimensional equivalent is this vector.
+    pub fn orientation(&self) -> Option<[f64; 3]> {
+        self.principal_axes()?.axis[0]
+    }
+
+    /// The region's **eccentricity**. See [`PrincipalAxes::eccentricity`].
+    pub fn eccentricity(&self) -> Option<f64> {
+        self.principal_axes()?.eccentricity()
+    }
+}
+
+/// Decode the shape half of one row of [`tabulation_schema`].
+pub fn region_shape(row: &Row<'_>) -> Result<RegionShape> {
+    let mut position = [0u64; 3];
+    for (axis, sum) in position.iter_mut().enumerate() {
+        *sum = row.u64(6 + axis)?;
+    }
+    let mut central = [0i64; 6];
+    for (index, slot) in central.iter_mut().enumerate() {
+        *slot = from_signed_column(row.u64(12 + index)?);
+    }
+    Ok(RegionShape {
+        label: row.u64(0)?,
+        at: row.at(),
+        count: row.u64(1)?,
+        position,
+        central,
+    })
+}
+
 /// Every block's row blob, in the canonical order, as one list.
 ///
 /// **This is where the order is restored, and it is restored from the rows
@@ -1609,6 +2501,35 @@ pub fn collect_tabulation(
         table.write(key.block, bytes)
     })?;
     ordered_rows(&mut table, volume, fixed)
+}
+
+/// [`collect_tabulation`]'s shape twin: the same rows, read by [`region_shape`].
+///
+/// A second call rather than a wider first one, on the split the module header
+/// states — one row, two measurements — and it is one more pass over a table of
+/// rows rather than one more pass over the volume, so a caller who wants both
+/// pays for a second read of the *fragments* and nothing else. The two are the
+/// same rows in the same canonical order, so they zip.
+pub fn collect_shapes(
+    env: &dyn crate::env::Environment,
+    stream: &str,
+    phase: usize,
+    volume: [usize; 3],
+    fixed: FixedPoint,
+) -> Result<Vec<RegionShape>> {
+    let mut table = Table::new(volume, tabulation_schema(fixed))?;
+    crate::fragment::fold_fragments(env, stream, &mut |key, bytes| {
+        if key.phase != phase {
+            return Ok(());
+        }
+        table.write(key.block, bytes)
+    })?;
+    table.seal()?;
+    let mut found = Vec::with_capacity(table.len());
+    for row in table.scan(&Region::whole(&volume))? {
+        found.push(region_shape(&row)?);
+    }
+    Ok(found)
 }
 
 fn ordered_rows(
@@ -1707,6 +2628,254 @@ mod tests {
         // and the limit itself is where it says it is
         assert!(fixed.quantise(fixed.limit() - 1.0).is_ok());
         assert!(fixed.quantise(fixed.limit() * 2.0).is_err());
+    }
+
+    // ------------------------------------------------- the decomposition --
+
+    /// `Q diag(v) Q^T` for an orthonormal `Q` given by its columns.
+    fn rebuild(axes: [[f64; 3]; 3], variance: [f64; 3]) -> [[f64; 3]; 3] {
+        let mut matrix = [[0.0f64; 3]; 3];
+        for (direction, value) in axes.into_iter().zip(variance) {
+            for row in 0..3 {
+                for column in 0..3 {
+                    matrix[row][column] += value * direction[row] * direction[column];
+                }
+            }
+        }
+        matrix
+    }
+
+    fn angle(one: [f64; 3], other: [f64; 3]) -> f64 {
+        let dot = one[0] * other[0] + one[1] * other[1] + one[2] * other[2];
+        if dot.abs().total_cmp(&1.0).is_ge() {
+            0.0
+        } else {
+            dot.abs().acos()
+        }
+    }
+
+    /// A frame that is not the lattice's: no column of it is an axis, and no
+    /// off-diagonal of a matrix built from it is zero. An axis-aligned frame
+    /// would let a decomposition that read the wrong component pass.
+    fn skew_frame() -> [[f64; 3]; 3] {
+        let major = [2.0f64, 1.0, 1.0];
+        let scale = (major[0] * major[0] + major[1] * major[1] + major[2] * major[2]).sqrt();
+        let major = [major[0] / scale, major[1] / scale, major[2] / scale];
+        let raw = [0.0f64, 1.0, -1.0];
+        let dot = raw[0] * major[0] + raw[1] * major[1] + raw[2] * major[2];
+        let middle = [
+            raw[0] - dot * major[0],
+            raw[1] - dot * major[1],
+            raw[2] - dot * major[2],
+        ];
+        let scale = norm_squared(middle).sqrt();
+        let middle = [middle[0] / scale, middle[1] / scale, middle[2] / scale];
+        let minor = cross(major, middle);
+        [major, middle, minor]
+    }
+
+    /// The decomposition returns the frame it was built from, on a frame that is
+    /// not the lattice's.
+    #[test]
+    fn the_closed_form_returns_the_axes_the_matrix_was_built_from() {
+        let frame = skew_frame();
+        let variance = [9.0f64, 4.0, 1.0];
+        let axes = PrincipalAxes::of(rebuild(frame, variance));
+        for (found, want) in axes.variance.into_iter().zip(variance) {
+            assert!((found - want).abs() < 1e-12, "{:?}", axes.variance);
+        }
+        for (index, want) in frame.into_iter().enumerate() {
+            let found = axes.axis[index].expect("three separated eigenvalues");
+            assert!(angle(found, want) < 1e-7, "axis {index} is {found:?}");
+        }
+        // and the lengths are the equivalent ellipsoid's
+        for (length, value) in axes.length.into_iter().zip(variance) {
+            assert!((length - 2.0 * (5.0 * value).sqrt()).abs() < 1e-12);
+        }
+        // the sign convention is a function of the vector alone, so a second
+        // call gives the same bits
+        let again = PrincipalAxes::of(rebuild(frame, variance));
+        assert_eq!(
+            axes.axis
+                .map(|found| found.map(|way| way.map(f64::to_bits))),
+            again
+                .axis
+                .map(|found| found.map(|way| way.map(f64::to_bits)))
+        );
+    }
+
+    /// **The liveness partner for [`AXIS_SEPARATION`]**: a gap a hundred times
+    /// the threshold is still answered, and answered correctly, so the threshold
+    /// is not swallowing real anisotropy.
+    ///
+    /// Without this, `AXIS_SEPARATION` could be raised until nothing ever had an
+    /// orientation and every degeneracy test above would still pass.
+    #[test]
+    fn a_separation_above_the_threshold_is_still_answered() {
+        let frame = skew_frame();
+        let gap = 100.0 * AXIS_SEPARATION;
+        let variance = [1.0 + gap, 1.0, 1.0 - gap];
+        let axes = PrincipalAxes::of(rebuild(frame, variance));
+        for index in 0..3 {
+            let found = axes.axis[index]
+                .unwrap_or_else(|| panic!("axis {index} was called degenerate at a gap of {gap}"));
+            assert!(
+                angle(found, frame[index]) < 1e-2,
+                "axis {index} is {found:?} against {:?}",
+                frame[index]
+            );
+        }
+        // and just below the threshold it is `None` rather than a worse answer
+        let gap = AXIS_SEPARATION / 100.0;
+        let narrow = PrincipalAxes::of(rebuild(frame, [1.0 + gap, 1.0, 1.0 - gap]));
+        assert_eq!(narrow.axis, [None, None, None]);
+        // the *values* are still reported, which is the split the type makes
+        for value in narrow.variance {
+            assert!((value - 1.0).abs() < 1e-3);
+        }
+    }
+
+    /// The three degeneracies, each with the axes it does and does not
+    /// determine. Directly on the matrix, so that "a cube has no orientation" is
+    /// a statement about the decomposition rather than about one fixture.
+    #[test]
+    fn a_repeated_eigenvalue_has_no_axis_and_the_others_still_do() {
+        let frame = skew_frame();
+        // isotropic: nothing is determined
+        let ball = PrincipalAxes::of(rebuild(frame, [3.0, 3.0, 3.0]));
+        assert_eq!(ball.axis, [None, None, None]);
+        // `1.5e-8` rather than exactly zero, and that number is
+        // `sqrt(f64::EPSILON)` — [`AXIS_SEPARATION`]'s subject again. An
+        // *exactly diagonal* isotropic matrix takes the other branch of
+        // [`symmetric_eigenvalues`] and does come back exactly zero; this one is
+        // built from a skew frame, so it is the analytic path.
+        let eccentricity = ball.eccentricity().expect("a ball has extent");
+        assert!(eccentricity < 1e-6, "{eccentricity}");
+        for value in ball.variance {
+            assert!((value - 3.0).abs() < 1e-12);
+            assert!(value.is_finite());
+        }
+        // prolate: the major axis is determined and the minor pair is not
+        let prolate = PrincipalAxes::of(rebuild(frame, [9.0, 1.0, 1.0]));
+        assert!(angle(prolate.axis[0].expect("a major axis"), frame[0]) < 1e-6);
+        assert_eq!(prolate.axis[1], None);
+        assert_eq!(prolate.axis[2], None);
+        // oblate: the minor axis is determined and the major pair is not
+        let oblate = PrincipalAxes::of(rebuild(frame, [9.0, 9.0, 1.0]));
+        assert_eq!(oblate.axis[0], None);
+        assert_eq!(oblate.axis[1], None);
+        assert!(angle(oblate.axis[2].expect("a minor axis"), frame[2]) < 1e-6);
+        // and nothing anywhere is a `NaN`
+        for axes in [ball, prolate, oblate] {
+            for value in axes.variance.into_iter().chain(axes.length) {
+                assert!(value.is_finite());
+            }
+        }
+    }
+
+    /// A zero matrix — a single-voxel region — has no axis and no eccentricity,
+    /// and says so rather than dividing by zero.
+    #[test]
+    fn a_region_with_no_extent_reports_no_axis_and_no_eccentricity() {
+        let axes = PrincipalAxes::of([[0.0; 3]; 3]);
+        assert_eq!(axes.variance, [0.0, 0.0, 0.0]);
+        assert_eq!(axes.length, [0.0, 0.0, 0.0]);
+        assert_eq!(axes.axis, [None, None, None]);
+        assert_eq!(axes.eccentricity(), None);
+
+        let mut tally = Tally::new(7);
+        tally
+            .add([4, 5, 6], 1.0, FixedPoint::default())
+            .expect("one voxel");
+        let shape = tally
+            .shape()
+            .expect("a shape")
+            .expect("a region with one voxel");
+        assert_eq!(shape.central, [0; 6]);
+        assert_eq!(shape.at, [4, 5, 6]);
+        assert_eq!(shape.orientation(), None);
+        assert_eq!(shape.eccentricity(), None);
+    }
+
+    /// The centring is exactly invertible, which is what says the column keeps
+    /// everything the fold had.
+    #[test]
+    fn the_centred_moments_recover_the_raw_ones_exactly() {
+        let fixed = FixedPoint::default();
+        let mut tally = Tally::new(3);
+        for at in [[2usize, 9, 4], [3, 9, 5], [7, 1, 4], [8, 0, 9], [8, 1, 9]] {
+            tally.add(at, 1.5, fixed).expect("in range");
+        }
+        let shape = tally
+            .shape()
+            .expect("a shape")
+            .expect("a region with voxels");
+        assert_eq!(shape.second_moments_about_origin(), tally.second);
+        // and the raw moments really are what they say they are
+        let mut raw = [0i128; 6];
+        for at in [[2usize, 9, 4], [3, 9, 5], [7, 1, 4], [8, 0, 9], [8, 1, 9]] {
+            for (slot, pair) in raw.iter_mut().zip(PAIRS) {
+                *slot += (at[pair[0]] * at[pair[1]]) as i128;
+            }
+        }
+        assert_eq!(raw, tally.second);
+        // the centred form is smaller on every component, which is the whole
+        // reason the column holds it
+        for (centred, origin) in shape.central.into_iter().zip(raw) {
+            assert!(
+                (centred as i128).abs() <= origin.abs(),
+                "{centred} is not nearer zero than {origin}"
+            );
+        }
+    }
+
+    /// The covariance is about the **exact** mean, not the rounded one, and the
+    /// half-voxel is really there to be removed.
+    #[test]
+    fn the_covariance_corrects_the_half_voxel_the_rounded_centre_costs() {
+        let fixed = FixedPoint::default();
+        let mut tally = Tally::new(1);
+        // a four-voxel-wide cube, whose exact centre is a half and whose rounded
+        // centre is therefore half a voxel away on every axis
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    tally.add([z, y, x], 1.0, fixed).expect("in range");
+                }
+            }
+        }
+        let shape = tally.shape().expect("a shape").expect("a region");
+        assert_eq!(shape.at, [2, 2, 2]);
+        // about the rounded centre the off-diagonals are `N/4` rather than zero,
+        // which without the correction reports a cube as elongated along (1,1,1)
+        assert_eq!(shape.central, [96, 16, 16, 96, 16, 96]);
+        let covariance = shape.covariance().expect("a region with voxels");
+        for one in 0..3 {
+            for other in 0..3 {
+                let want = if one == other { 1.25 } else { 0.0 };
+                assert!(
+                    (covariance[one][other] - want).abs() < 1e-12,
+                    "{covariance:?}"
+                );
+            }
+        }
+        // and the cube therefore has no orientation, which is the assertion the
+        // correction exists for
+        assert_eq!(shape.orientation(), None);
+        assert_eq!(
+            shape.principal_axes().expect("a region").axis,
+            [None, None, None]
+        );
+        // the inertia tensor is the covariance read the other way
+        // The inertia tensor is `trace(C) I - C`, so an isotropic covariance of
+        // `1.25` gives `3 * 1.25 - 1.25` on each diagonal and nothing off it.
+        let inertia = shape.inertia_tensor().expect("a region with voxels");
+        for one in 0..3 {
+            for other in 0..3 {
+                let want = if one == other { 2.5 } else { 0.0 };
+                assert!((inertia[one][other] - want).abs() < 1e-12, "{inertia:?}");
+            }
+        }
     }
 
     // ------------------------------------------------------------ the tally --
@@ -1950,6 +3119,51 @@ mod tests {
         assert_eq!(back[1].min, None);
         assert_eq!(back[1].max, None);
         assert!(decode_partial(&bytes[..bytes.len() - 8]).is_err());
+        // the second moments are in the entry and are not zero, so the equality
+        // above is a statement about the wire format carrying them
+        assert_ne!(one.second, [0; 6]);
+        assert_eq!(back[0].second, one.second);
+        assert_eq!(back[1].second, [0; 6]);
+    }
+
+    /// **The stated range bound, run rather than believed**, and the refusal
+    /// that names it.
+    #[test]
+    fn the_second_moments_range_is_where_the_header_says_it_is() {
+        // `L^5 / 4 < 2^63` lands on a power of two at `L = 8192`, which is what
+        // the header quotes and the reason it quotes an exact number.
+        assert_eq!(8192u128.pow(5), 1u128 << 65);
+        assert_eq!(8192u128.pow(5) / 4, 1u128 << 63);
+
+        // the column takes everything inside `+/- 2^63` and refuses the ends
+        assert!(signed_column((1i128 << 63) - 1).is_ok());
+        assert!(signed_column(-(1i128 << 63)).is_ok());
+        assert!(signed_column(1i128 << 63).is_err());
+        assert!(signed_column(-(1i128 << 63) - 1).is_err());
+
+        // offset binary, so a `U64` column's bits order as its signed values do
+        let words: Vec<u64> = [-9i128, -1, 0, 1, 9]
+            .into_iter()
+            .map(|value| signed_column(value).expect("in range"))
+            .collect();
+        let mut sorted = words.clone();
+        sorted.sort_unstable();
+        assert_eq!(words, sorted);
+        for (word, value) in words.iter().zip([-9i64, -1, 0, 1, 9]) {
+            assert_eq!(from_signed_column(*word), value);
+        }
+
+        // and the refusal a row raises names the axis pair and does **not**
+        // offer the fixed point, which cannot move this column at all
+        let failed = central_column(1i128 << 63, [1, 2])
+            .expect_err("2^63 is past the column")
+            .to_string();
+        assert!(failed.contains("axes (1, 2)"), "{failed}");
+        assert!(
+            failed.contains("binds first on the geometric axis"),
+            "{failed}"
+        );
+        assert!(!failed.contains("fraction bit"), "{failed}");
     }
 
     // -------------------------------------------------------- the tabulation --
@@ -2072,7 +3286,7 @@ mod tests {
     // ------------------------------------------------------------ the schema --
 
     #[test]
-    fn the_schema_is_twelve_columns_and_the_accumulated_values_carry_the_scale() {
+    fn the_schema_is_eighteen_columns_and_the_accumulated_values_carry_the_scale() {
         let schema = tabulation_schema(FixedPoint::default());
         assert_eq!(schema.len(), COLUMNS);
         assert_eq!(schema.width(), ROW_WORDS);
@@ -2089,6 +3303,16 @@ mod tests {
             ("moment_0_q20", ColumnType::U64),
             ("moment_1_q20", ColumnType::U64),
             ("moment_2_q20", ColumnType::U64),
+            // The six second moments, appended behind the first ones, and
+            // **without a scale in their names** — there is none in them, for
+            // `min`'s reason arrived at from the other end: a coordinate is
+            // already an integer.
+            ("central_00", ColumnType::U64),
+            ("central_01", ColumnType::U64),
+            ("central_02", ColumnType::U64),
+            ("central_11", ColumnType::U64),
+            ("central_12", ColumnType::U64),
+            ("central_22", ColumnType::U64),
         ];
         for (index, column) in schema.columns().iter().enumerate() {
             assert_eq!(column.name(), expected[index].0);
@@ -2118,6 +3342,18 @@ mod tests {
         }
         for (axis, name) in POSITION_SUM.into_iter().enumerate() {
             assert_eq!(schema.index_of(name), Some(6 + axis));
+        }
+        for (axis, name) in MOMENT.into_iter().enumerate() {
+            assert_eq!(schema.index_of(&format!("{name}_q20")), Some(9 + axis));
+        }
+        for (index, name) in CENTRAL.into_iter().enumerate() {
+            assert_eq!(schema.index_of(name), Some(12 + index));
+            // and the second moments carry no suffix at any scale, which is the
+            // property `region_shape` reads them by index on
+            assert_eq!(
+                tabulation_schema(FixedPoint::bits(8).unwrap()).index_of(name),
+                Some(12 + index)
+            );
         }
 
         // a different scale is a different schema, which is what stops two

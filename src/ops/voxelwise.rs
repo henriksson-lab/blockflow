@@ -924,6 +924,495 @@ impl Combine for LogicCombine {
     }
 }
 
+// -------------------------------------------------------- the arithmetic --
+
+/// The element types an arithmetic combine is **closed** over: the two floats.
+///
+/// A trait rather than a `match` on [`Dtype`] because the four operations are
+/// one expression each and the shell should not hold four copies of them, and
+/// because the bound is the honest statement of what the arithmetic needs — a
+/// type with the four operations and a total order over it. The integers are
+/// deliberately not here; [`Arithmetic::admits`] says why in the place a caller
+/// meets the refusal.
+///
+/// **The two selections are on this trait rather than beside it** so that
+/// `f64`'s answer and `f32`'s come from one line of code. They are *not*
+/// `f64::min` and `f64::max`: those are IEEE 754-2019's minimum-number
+/// operation, which returns the other operand when one is a `NaN` and whose
+/// documented behaviour for `min(-0.0, +0.0)` is that it **may return either**.
+/// A combine folded over its branches in one order and a reference computed in
+/// another would then be free to disagree in the sign of a zero, which is a bit
+/// — and this crate's acceptance bar is bytes. [`f64::total_cmp`] is a total
+/// order over every bit pattern, the zeros and the `NaN`s included, so a
+/// selection through it is associative and commutative and gives the same value
+/// whatever order the fold takes.
+pub trait Arithmetical: Copy {
+    fn add(self, other: Self) -> Self;
+    fn subtract(self, other: Self) -> Self;
+    fn multiply(self, other: Self) -> Self;
+    fn divide(self, other: Self) -> Self;
+    /// The lower of the two under the **total** order. See the trait's header.
+    fn lower(self, other: Self) -> Self;
+    /// The upper of the two under the **total** order.
+    fn upper(self, other: Self) -> Self;
+}
+
+macro_rules! arithmetical {
+    ($type:ty) => {
+        impl Arithmetical for $type {
+            fn add(self, other: Self) -> Self {
+                self + other
+            }
+            fn subtract(self, other: Self) -> Self {
+                self - other
+            }
+            fn multiply(self, other: Self) -> Self {
+                self * other
+            }
+            fn divide(self, other: Self) -> Self {
+                self / other
+            }
+            fn lower(self, other: Self) -> Self {
+                if self.total_cmp(&other).is_le() {
+                    self
+                } else {
+                    other
+                }
+            }
+            fn upper(self, other: Self) -> Self {
+                if self.total_cmp(&other).is_ge() {
+                    self
+                } else {
+                    other
+                }
+            }
+        }
+    };
+}
+
+arithmetical!(f64);
+arithmetical!(f32);
+
+/// The binary arithmetic over two co-located voxels, and the two selections
+/// between them.
+///
+/// **One enum and one shell rather than six ops, on [`Logic`]'s precedent** —
+/// and the argument is worth making because the two are not shaped identically.
+/// `Logic`'s three connectives share an arity rule, an element-type rule and a
+/// fold; these six share the *shape* (reach 0, two co-located operands, one
+/// result of the operands' own type) and differ in exactly two stated ways,
+/// each of which is one method here rather than a separate type: which element
+/// types they admit ([`Self::admits`]) and whether more than two branches has an
+/// unambiguous reading ([`Self::folds_over_many`]). Six types would repeat the
+/// `Combine` implementation six times to vary two predicates, and a caller
+/// choosing between `Add` and `Multiply` would be choosing between two `use`
+/// lines rather than between two values of a parameter — which is the thing this
+/// crate says a caller should be able to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Arithmetic {
+    Add,
+    Subtract,
+    Multiply,
+    /// **Division is IEEE-754 division and nothing is guarded.** See
+    /// [`Self::admits`] for why that is a complete statement rather than an
+    /// omission: this combine admits only the floats, where `x / 0.0` is
+    /// `±inf` with the sign of `x` times the sign of the zero and `0.0 / 0.0`
+    /// is a `NaN`. Both are values, both propagate, and neither is a trap or a
+    /// panic. A caller who wants a guarded quotient wants a *parameter* — the
+    /// floor `ops::normalise::Removal::Divide` carries — and that is a
+    /// different operation with a different declaration, not a default this one
+    /// could pick.
+    Divide,
+    /// The lower of the two, under the **total** order of the element type.
+    ///
+    /// A selection rather than arithmetic: the value written is a value that was
+    /// read. That is what [`Self::admits`] rests on and it is `ops::rank`'s
+    /// argument for the same conclusion.
+    Minimum,
+    /// The upper of the two, under the **total** order of the element type.
+    Maximum,
+}
+
+impl Arithmetic {
+    /// The operation over two floats.
+    pub fn apply<T: Arithmetical>(self, left: T, right: T) -> T {
+        match self {
+            Arithmetic::Add => left.add(right),
+            Arithmetic::Subtract => left.subtract(right),
+            Arithmetic::Multiply => left.multiply(right),
+            Arithmetic::Divide => left.divide(right),
+            Arithmetic::Minimum => left.lower(right),
+            Arithmetic::Maximum => left.upper(right),
+        }
+    }
+
+    /// The two **selections** over a type that has a total order of its own,
+    /// and `None` for the four that are arithmetic.
+    ///
+    /// Separate from [`Self::apply`] because the bound is different and smaller:
+    /// a selection needs an order and nothing else, which every integer and
+    /// `bool` has, and which is exactly the set [`Self::admits`] opens to them.
+    pub fn select<T: Ord>(self, left: T, right: T) -> Option<T> {
+        match self {
+            Arithmetic::Minimum => Some(left.min(right)),
+            Arithmetic::Maximum => Some(left.max(right)),
+            _ => None,
+        }
+    }
+
+    /// Which element types this operation is stated over — **and it is not one
+    /// answer for all six**, which is the whole of the element-type design.
+    ///
+    /// * [`Self::Minimum`] and [`Self::Maximum`] admit **every element type a
+    ///   buffer holds** bar `f16`, which no buffer holds. They select a value
+    ///   that was read: nothing is summed, nothing is rounded, nothing can
+    ///   leave the type's range, and the answer is exact in every format. That
+    ///   is `ops::rank`'s argument for accepting every ordered type and it
+    ///   holds here for the same reason. `bool` is in the set and means what it
+    ///   reads as — a minimum is `AND` and a maximum is `OR` — which agrees
+    ///   with [`LogicCombine`] rather than competing with it.
+    /// * [`Self::Add`], [`Self::Subtract`], [`Self::Multiply`] and
+    ///   [`Self::Divide`] admit **`f64` and `f32` only**. The integers are
+    ///   refused rather than wrapped, saturated or promoted, and the refusal is
+    ///   the point: a `u16` sum leaves `u16` at 65 536 and Rust's answer for
+    ///   what happens then is *a property of the build profile* — a panic in
+    ///   debug, a wrap in release. A combine whose answer depends on how the
+    ///   consumer was compiled is not a combine this crate can offer.
+    ///   Saturation and wrapping are both defensible and they are **different
+    ///   operations**; picking one here would be picking it for every caller.
+    ///   The route in is the one `VoxelwiseMapOp` already documents:
+    ///   [`WidenOp`] to `f64`, the arithmetic, then [`NarrowOp`] with a stated
+    ///   [`Narrowing`] — which carries the saturating clamp, the rounding rule
+    ///   and the `NaN` rule as *parameters*, in the one place this crate has
+    ///   already decided they belong.
+    ///
+    /// Division has no separate rule to state once the set is this one: see
+    /// [`Self::Divide`].
+    pub fn admits(self, dtype: Dtype) -> bool {
+        match self {
+            Arithmetic::Minimum | Arithmetic::Maximum => dtype != Dtype::F16,
+            _ => matches!(dtype, Dtype::F64 | Dtype::F32),
+        }
+    }
+
+    /// Whether folding over **more than two** branches has one reading.
+    ///
+    /// `true` for the four that are commutative and associative *as operations*
+    /// — a sum, a product, a minimum and a maximum over a list mean one thing —
+    /// and `false` for subtraction and division, where `a - b - c` is a
+    /// convention about parentheses rather than a meaning. That is
+    /// `ops::background::DifferenceCombine`'s argument, kept rather than
+    /// restated, and it is why [`ArithmeticCombine::accepts`] asks for exactly
+    /// two branches for those two and at least two for the others.
+    ///
+    /// **This is not a claim that the floating-point fold is associative.** It
+    /// is not: `(a + b) + c` and `a + (b + c)` differ in the last bit. What
+    /// makes that harmless here is that the fold order is **fixed** — left, in
+    /// branch order, which is the order `Chain::Parallel` supplies the results
+    /// in and is a property of the plan rather than of the decomposition — so
+    /// every block and every whole-volume reference sum the same values in the
+    /// same order and agree bit for bit. The two selections are genuinely
+    /// associative, under the total order, and would agree in any order.
+    pub fn folds_over_many(self) -> bool {
+        !matches!(self, Arithmetic::Subtract | Arithmetic::Divide)
+    }
+
+    /// The name this operation carries into a refusal.
+    pub fn label(self) -> &'static str {
+        match self {
+            Arithmetic::Add => "add",
+            Arithmetic::Subtract => "subtract",
+            Arithmetic::Multiply => "multiply",
+            Arithmetic::Divide => "divide",
+            Arithmetic::Minimum => "minimum",
+            Arithmetic::Maximum => "maximum",
+        }
+    }
+}
+
+/// `out = op(left, right)`, voxelwise, over two floating-point volumes.
+///
+/// Generic over [`Arithmetical`], which is the whole of what the operation
+/// requires: one voxel is read from each operand and one is written, with no
+/// order, no accumulator and no conversion.
+pub fn arithmetic_into<T: Arithmetical>(
+    left: ArrayView3<'_, T>,
+    right: ArrayView3<'_, T>,
+    out: ArrayViewMut3<'_, T>,
+    op: Arithmetic,
+) -> Result<()> {
+    combine_into(left, right, out, |&left, &right| op.apply(left, right))
+}
+
+/// `out = op(left, right)` where `op` is a **selection** and the element type
+/// has an order of its own.
+///
+/// Refuses the four arithmetic operations by name rather than silently doing
+/// something: an integer sum is what [`Arithmetic::admits`] declines and this is
+/// the kernel that would have had to invent a rule for it.
+pub fn selection_into<T: Ord + Copy>(
+    left: ArrayView3<'_, T>,
+    right: ArrayView3<'_, T>,
+    out: ArrayViewMut3<'_, T>,
+    op: Arithmetic,
+) -> Result<()> {
+    if !matches!(op, Arithmetic::Minimum | Arithmetic::Maximum) {
+        return Err(Error::InvalidArgument(format!(
+            "selection_into: `{}` is arithmetic rather than a selection, and this kernel is \
+             stated over an ordered element type that need not be closed under it",
+            op.label()
+        )));
+    }
+    combine_into(left, right, out, |&left, &right| {
+        op.select(left, right).expect("a selection, checked above")
+    })
+}
+
+/// The sink of a diamond, doing arithmetic: join branch results with one of
+/// [`Arithmetic`]'s six.
+///
+/// The same arrangement [`LogicCombine`] has — every branch produced a buffer
+/// from the same input at the same anchor, and they arrive as a slice in branch
+/// order — so nothing is held, nothing is sliced and the anchor is not consulted
+/// at all. What is new is the arithmetic, and with it three statements a
+/// Boolean combine never had to make: which element types
+/// ([`Arithmetic::admits`]), what division by zero does
+/// ([`Arithmetic::Divide`]), and which order a selection breaks a tie in
+/// ([`Arithmetical`]).
+///
+/// **The second operand may be an array the run did not compute.** A branch of
+/// a `Chain::parallel` may be a `Chain::source` leaf, and a source leaf may name
+/// a **supplied** image — `ImageId::supplied(i)`, handed to the run by
+/// `ArrayEnvironment::with_inputs` — read at the block's own fetch region. So
+/// this one combine covers both halves of the two-volume arithmetic: between two
+/// branches of one plan, and against an array the caller brought. The residue is
+/// G2's and is refused elsewhere by name — a supplied array is in image 0's
+/// coordinate space, so one at a different extent or a different binning is
+/// refused at plan time rather than mis-fetched.
+///
+/// **The arity rule is per-operation**, which is the one place this differs in
+/// shape from `LogicCombine`: see [`Arithmetic::folds_over_many`].
+pub struct ArithmeticCombine {
+    name: &'static str,
+    op: Arithmetic,
+    cost: f64,
+}
+
+impl ArithmeticCombine {
+    pub fn new(name: &'static str, op: Arithmetic) -> Self {
+        Self {
+            name,
+            op,
+            cost: COMBINE_COST,
+        }
+    }
+
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+
+    /// Which operation this joins with.
+    pub fn operation(&self) -> Arithmetic {
+        self.op
+    }
+
+    /// One pair, through this module's kernels and nothing else.
+    fn pair(&self, left: &Voxels, right: &Voxels, out: &mut Voxels) -> Result<()> {
+        macro_rules! selected {
+            ($type:ty) => {
+                selection_into(
+                    left.view::<$type>()?,
+                    right.view::<$type>()?,
+                    out.view_mut::<$type>()?,
+                    self.op,
+                )
+            };
+        }
+        match left.dtype() {
+            Dtype::F64 => arithmetic_into(
+                left.view::<f64>()?,
+                right.view::<f64>()?,
+                out.view_mut::<f64>()?,
+                self.op,
+            ),
+            Dtype::F32 => arithmetic_into(
+                left.view::<f32>()?,
+                right.view::<f32>()?,
+                out.view_mut::<f32>()?,
+                self.op,
+            ),
+            Dtype::Bool => selected!(bool),
+            Dtype::U8 => selected!(u8),
+            Dtype::U16 => selected!(u16),
+            Dtype::U32 => selected!(u32),
+            Dtype::U64 => selected!(u64),
+            Dtype::I8 => selected!(i8),
+            Dtype::I16 => selected!(i16),
+            Dtype::I32 => selected!(i32),
+            Dtype::I64 => selected!(i64),
+            other => Err(Error::InvalidArgument(format!(
+                "{}: `{}` is not stated over {}. `accepts` refuses it before a run starts.",
+                self.name,
+                self.op.label(),
+                other.numpy_name()
+            ))),
+        }
+    }
+}
+
+impl Combine for ArithmeticCombine {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Zero, on every axis and at every volume size — this reads the voxel it
+    /// writes, in each of its operands, and nothing else. Stated explicitly
+    /// because [`Combine::reach`] has no default.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    /// The arity rule is the operation's and the element-type rule is the
+    /// operation's; this method is the two of them and the agreement across
+    /// branches.
+    fn accepts(&self, inputs: &[Dtype]) -> bool {
+        let arity = if self.op.folds_over_many() {
+            inputs.len() >= 2
+        } else {
+            inputs.len() == 2
+        };
+        arity && self.op.admits(inputs[0]) && inputs.iter().all(|&dtype| dtype == inputs[0])
+    }
+
+    fn produces(&self, inputs: &[Dtype]) -> Dtype {
+        inputs[0]
+    }
+
+    /// Every branch must have produced the same extent, and the two that did not
+    /// are named.
+    ///
+    /// **This is the refusal that matters for two whole volumes.** Two images
+    /// that are not the same size have no correspondence between their voxels,
+    /// so there is no pairing to be voxelwise about; the alternative to refusing
+    /// is to pick one extent and combine the wrong pairs, which is the class of
+    /// well-formed wrong volume this crate is arranged against. Two images on
+    /// *different lattices* — the same field at two binnings — are the same
+    /// failure one step earlier, and are G2's rather than this method's: a
+    /// supplied array is required to be in image 0's coordinate space and
+    /// `check_source_images` refuses one that is not, by name, at plan time.
+    fn output_shape(&self, inputs: &[[usize; 3]]) -> Result<[usize; 3]> {
+        if !self.op.folds_over_many() && inputs.len() != 2 {
+            return Err(Error::InvalidArgument(format!(
+                "{}: `{}` has a left operand and a right operand and was handed {} branch \
+                 results. It is not associative, so there is no fold over a longer list that is \
+                 not a convention about parentheses.",
+                self.name,
+                self.op.label(),
+                inputs.len()
+            )));
+        }
+        let first = *inputs.first().ok_or_else(|| {
+            Error::InvalidArgument(format!("{}: no branch results to join", self.name))
+        })?;
+        for (branch, shape) in inputs.iter().enumerate() {
+            if shape != &first {
+                return Err(Error::InvalidArgument(format!(
+                    "{}: branch 0 produced {first:?} and branch {branch} produced {shape:?}. A \
+                     voxelwise join pairs co-located voxels, and buffers of different extents \
+                     have no such pairing.",
+                    self.name
+                )));
+            }
+        }
+        Ok(first)
+    }
+
+    fn apply(&self, inputs: &[Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        if inputs.len() < 2 || (!self.op.folds_over_many() && inputs.len() != 2) {
+            return Err(Error::InvalidArgument(format!(
+                "{}: `{}` joins {} results and was handed {}",
+                self.name,
+                self.op.label(),
+                if self.op.folds_over_many() {
+                    "at least two"
+                } else {
+                    "exactly two"
+                },
+                inputs.len()
+            )));
+        }
+        // Fold left, writing the **last** pair straight into `out` so the
+        // two-branch case — which is the diamond — allocates nothing at all.
+        // Left, and in branch order: see `Arithmetic::folds_over_many` for why
+        // the order is part of the answer rather than an implementation detail.
+        let mut folded: Option<Voxels> = None;
+        for index in 1..inputs.len() {
+            let last = index + 1 == inputs.len();
+            if last {
+                self.pair(folded.as_ref().unwrap_or(&inputs[0]), &inputs[index], out)?;
+            } else {
+                let mut next = Voxels::zeros(inputs[0].dtype(), inputs[0].shape())?;
+                self.pair(
+                    folded.as_ref().unwrap_or(&inputs[0]),
+                    &inputs[index],
+                    &mut next,
+                )?;
+                folded = Some(next);
+            }
+        }
+        Ok(())
+    }
+
+    /// The fold, **only where it is the same value in every element type this
+    /// combine admits**.
+    ///
+    /// A declaration here licenses the executor to fill a whole block without
+    /// running the op, so it has to be what the op would have written, bit for
+    /// bit. Two things stand between the arithmetic and that, and both are
+    /// checked rather than argued:
+    ///
+    /// * **the block may be `f32`.** The executor narrows one `f64` declaration
+    ///   to fill whatever the block holds, and narrowing an `f64` sum is not the
+    ///   `f32` sum — a double rounding is not a rounding. So the fold is done
+    ///   twice, once in each width, and declared only where narrowing the first
+    ///   gives the bits of the second. `ops::background::DifferenceCombine`
+    ///   avoids this by declaring only `+0.0`; this is the same objection
+    ///   answered by measurement instead of by exclusion, which is what lets a
+    ///   sum of constants fold at all.
+    /// * **a `NaN` is not equal to itself**, and neither is an infinity useful
+    ///   to declare, so a non-finite fold declares nothing. That covers division
+    ///   by zero exactly: `1.0 / 0.0` is a value the op will happily write and
+    ///   is not a value a short circuit may promise.
+    ///
+    /// The **selections** go through the same two gates rather than round them,
+    /// even though a selected value is exact in its own format by construction:
+    /// an integer block's constant arrives here as an `f64` and the gate is
+    /// cheap, and one rule that is checked beats two rules that are argued.
+    fn constant_maps_to(&self, values: &[f64]) -> Option<f64> {
+        if values.len() < 2 || (!self.op.folds_over_many() && values.len() != 2) {
+            return None;
+        }
+        let mut wide = values[0];
+        let mut narrow = values[0] as f32;
+        for &value in &values[1..] {
+            wide = self.op.apply(wide, value);
+            narrow = self.op.apply(narrow, value as f32);
+        }
+        if !wide.is_finite() {
+            return None;
+        }
+        ((wide as f32).to_bits() == narrow.to_bits()).then_some(wide)
+    }
+
+    /// `branches - 1` pairs' worth of work, which is what folding a binary
+    /// operation over a list costs. [`LogicCombine::cost_per_voxel`]'s rule,
+    /// said in the same form so a reader comparing them sees one rule.
+    fn cost_per_voxel(&self, branches: usize) -> f64 {
+        self.cost * branches.saturating_sub(1) as f64
+    }
+}
+
 /// The unit of the whole cost model: one voxelwise map's worth of work per
 /// voxel.
 ///
@@ -1959,5 +2448,316 @@ impl BlockOp for NarrowOp {
 
     fn cost_per_voxel(&self) -> f64 {
         MAP_COST
+    }
+}
+
+/// The arithmetic and selection sinks, tested where they live. The composed
+/// filters, the decomposition invariance and the negative controls are in
+/// `tests/image_arithmetic_and_convolution.rs`; this module is the algebra and
+/// the refusals.
+#[cfg(test)]
+mod arithmetic_tests {
+    use super::*;
+    use ndarray::Array3;
+
+    const OPS: [Arithmetic; 6] = [
+        Arithmetic::Add,
+        Arithmetic::Subtract,
+        Arithmetic::Multiply,
+        Arithmetic::Divide,
+        Arithmetic::Minimum,
+        Arithmetic::Maximum,
+    ];
+
+    fn joined(op: Arithmetic, left: Voxels, right: Voxels) -> Voxels {
+        let combine = ArithmeticCombine::new("arithmetic", op);
+        let mut out = Voxels::zeros(left.dtype(), left.shape()).unwrap();
+        combine
+            .apply(&[left, right], &mut out, &Anchor::whole([1, 1, 1]))
+            .unwrap();
+        out
+    }
+
+    /// **The convention this crate holds absolutely.** `f64::min(-0.0, 0.0)` is
+    /// permitted by IEEE to return either operand, so a fold that used it could
+    /// give a different *bit* depending on which order a decomposition happened
+    /// to visit its branches in. `total_cmp` orders `-0.0` strictly below `+0.0`
+    /// and orders the `NaN`s too, so a selection over it is one value whatever
+    /// the order.
+    #[test]
+    fn the_selections_are_the_total_order_and_not_the_ieee_minimum() {
+        assert_eq!(
+            Arithmetic::Minimum.apply(-0.0f64, 0.0).to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(
+            Arithmetic::Minimum.apply(0.0f64, -0.0).to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(
+            Arithmetic::Maximum.apply(-0.0f64, 0.0).to_bits(),
+            (0.0f64).to_bits()
+        );
+        assert_eq!(
+            Arithmetic::Maximum.apply(0.0f64, -0.0).to_bits(),
+            (0.0f64).to_bits()
+        );
+        // …and the same in both argument orders, which is the property a fold
+        // needs and the one `f64::min` does not give.
+        for &(a, b) in &[
+            (-0.0f64, 0.0f64),
+            (1.0, -1.0),
+            (f64::NAN, 1.0),
+            (1.0, f64::NAN),
+        ] {
+            assert_eq!(
+                Arithmetic::Minimum.apply(a, b).to_bits(),
+                Arithmetic::Minimum.apply(b, a).to_bits(),
+                "minimum of {a} and {b}"
+            );
+            assert_eq!(
+                Arithmetic::Maximum.apply(a, b).to_bits(),
+                Arithmetic::Maximum.apply(b, a).to_bits(),
+                "maximum of {a} and {b}"
+            );
+        }
+        // A `NaN` sorts outside every number under the total order rather than
+        // being swallowed the way `f64::min` swallows it.
+        assert!(Arithmetic::Maximum.apply(f64::NAN, f64::INFINITY).is_nan());
+        assert_eq!(
+            Arithmetic::Minimum.apply(f64::NAN, f64::INFINITY),
+            f64::INFINITY
+        );
+        // …and `f64::min` really does disagree, so the line above is a choice
+        // and not a restatement of the built-in.
+        assert!(f64::min(f64::NAN, f64::INFINITY) == f64::INFINITY);
+        assert!(f64::max(f64::NAN, f64::INFINITY) == f64::INFINITY);
+    }
+
+    /// The element-type decision, in one table.
+    #[test]
+    fn the_selections_admit_every_ordered_type_and_the_arithmetic_admits_the_floats() {
+        let every = [
+            Dtype::Bool,
+            Dtype::U8,
+            Dtype::U16,
+            Dtype::U32,
+            Dtype::U64,
+            Dtype::I8,
+            Dtype::I16,
+            Dtype::I32,
+            Dtype::I64,
+            Dtype::F32,
+            Dtype::F64,
+        ];
+        for dtype in every {
+            assert!(Arithmetic::Minimum.admits(dtype), "{dtype:?}");
+            assert!(Arithmetic::Maximum.admits(dtype), "{dtype:?}");
+        }
+        for op in OPS {
+            assert!(!op.admits(Dtype::F16), "no buffer holds half-precision");
+            assert!(op.admits(Dtype::F64));
+            assert!(op.admits(Dtype::F32));
+        }
+        for op in [
+            Arithmetic::Add,
+            Arithmetic::Subtract,
+            Arithmetic::Multiply,
+            Arithmetic::Divide,
+        ] {
+            for dtype in [Dtype::Bool, Dtype::U8, Dtype::U16, Dtype::U64, Dtype::I32] {
+                assert!(!op.admits(dtype), "{op:?} over {dtype:?}");
+            }
+        }
+        // and `accepts` really carries it
+        let add = ArithmeticCombine::new("add", Arithmetic::Add);
+        assert!(add.accepts(&[Dtype::F64, Dtype::F64]));
+        assert!(!add.accepts(&[Dtype::U16, Dtype::U16]));
+        assert!(
+            !add.accepts(&[Dtype::F64, Dtype::F32]),
+            "the branches must agree"
+        );
+        let lower = ArithmeticCombine::new("minimum", Arithmetic::Minimum);
+        assert!(lower.accepts(&[Dtype::U16, Dtype::U16]));
+        assert!(lower.accepts(&[Dtype::Bool, Dtype::Bool, Dtype::Bool]));
+    }
+
+    /// A minimum over `bool` is `AND` and a maximum is `OR`, which is what makes
+    /// admitting `bool` to the selections a statement that agrees with
+    /// [`LogicCombine`] rather than a second answer to the same question.
+    #[test]
+    fn the_selections_over_bool_are_the_two_connectives() {
+        let left: Voxels = Array3::from_shape_vec((2, 1, 2), vec![true, true, false, false])
+            .unwrap()
+            .into();
+        let right: Voxels = Array3::from_shape_vec((2, 1, 2), vec![true, false, true, false])
+            .unwrap()
+            .into();
+        let lower = joined(Arithmetic::Minimum, left.clone(), right.clone());
+        let upper = joined(Arithmetic::Maximum, left, right);
+        assert_eq!(
+            lower
+                .view::<bool>()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![true, false, false, false]
+        );
+        assert_eq!(
+            upper
+                .view::<bool>()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![true, true, true, false]
+        );
+    }
+
+    /// Subtraction and division have a left operand and a right one; a fold over
+    /// three is a convention about parentheses and is refused rather than
+    /// invented.
+    #[test]
+    fn the_two_that_do_not_fold_refuse_a_third_branch_by_name() {
+        for op in [Arithmetic::Subtract, Arithmetic::Divide] {
+            let combine = ArithmeticCombine::new("op", op);
+            assert!(!combine.accepts(&[Dtype::F64; 3]), "{op:?}");
+            assert!(combine.accepts(&[Dtype::F64; 2]), "{op:?}");
+            let refusal = combine
+                .output_shape(&[[2, 2, 2], [2, 2, 2], [2, 2, 2]])
+                .expect_err("a refusal");
+            let message = refusal.to_string();
+            assert!(message.contains(op.label()), "{message}");
+            assert!(message.contains("parentheses"), "{message}");
+        }
+        for op in [
+            Arithmetic::Add,
+            Arithmetic::Multiply,
+            Arithmetic::Minimum,
+            Arithmetic::Maximum,
+        ] {
+            let combine = ArithmeticCombine::new("op", op);
+            assert!(combine.accepts(&[Dtype::F64; 3]), "{op:?}");
+            combine
+                .output_shape(&[[2, 2, 2], [2, 2, 2], [2, 2, 2]])
+                .expect("a fold");
+        }
+    }
+
+    /// Buffers of different extents have no pairing, and the refusal names both.
+    #[test]
+    fn branches_of_different_extents_are_refused_by_name() {
+        let combine = ArithmeticCombine::new("add", Arithmetic::Add);
+        let refusal = combine
+            .output_shape(&[[4, 4, 4], [4, 4, 3]])
+            .expect_err("a refusal");
+        let message = refusal.to_string();
+        assert!(message.contains("[4, 4, 4]"), "{message}");
+        assert!(message.contains("[4, 4, 3]"), "{message}");
+        assert!(message.contains("co-located"), "{message}");
+    }
+
+    /// **Division by zero is IEEE-754 and is written down as such.** It is a
+    /// value the op happily produces; what it is not is a value a short circuit
+    /// may promise, because a `NaN` is not equal to itself and an infinity is
+    /// not a number a narrowing can be checked through.
+    #[test]
+    fn division_by_zero_is_ieee_and_is_never_declared() {
+        let numerators: Voxels = Array3::from_shape_vec((2, 1, 2), vec![1.0f64, -1.0, 0.0, 3.0])
+            .unwrap()
+            .into();
+        let zeros: Voxels = Array3::from_shape_vec((2, 1, 2), vec![0.0f64, 0.0, 0.0, -0.0])
+            .unwrap()
+            .into();
+        let quotient = joined(Arithmetic::Divide, numerators, zeros);
+        let view = quotient.view::<f64>().unwrap();
+        let got: Vec<f64> = view.iter().copied().collect();
+        assert_eq!(got[0], f64::INFINITY);
+        assert_eq!(got[1], f64::NEG_INFINITY);
+        assert!(got[2].is_nan(), "0/0 is a NaN");
+        assert_eq!(got[3], f64::NEG_INFINITY, "3 / -0.0");
+
+        let combine = ArithmeticCombine::new("divide", Arithmetic::Divide);
+        assert_eq!(combine.constant_maps_to(&[1.0, 0.0]), None);
+        assert_eq!(combine.constant_maps_to(&[0.0, 0.0]), None);
+        // …and a finite quotient is declared, so the line above is about the
+        // zero and not about division.
+        assert_eq!(combine.constant_maps_to(&[3.0, 2.0]), Some(1.5));
+    }
+
+    /// The declaration is checked against what the op writes, in **both** widths
+    /// and bit for bit, because the executor narrows one `f64` declaration to
+    /// fill whichever the block holds.
+    #[test]
+    fn every_declared_constant_is_what_the_op_would_have_written() {
+        let values = [0.0f64, 1.0, -1.0, 0.5, 3.0, 2.0, 0.1, 1e30, -7.25, 1e-40];
+        let mut declared = 0usize;
+        for op in OPS {
+            let combine = ArithmeticCombine::new("op", op);
+            for &left in &values {
+                for &right in &values {
+                    let Some(promise) = combine.constant_maps_to(&[left, right]) else {
+                        continue;
+                    };
+                    declared += 1;
+                    let wide = joined(
+                        op,
+                        Array3::from_elem((1, 1, 1), left).into(),
+                        Array3::from_elem((1, 1, 1), right).into(),
+                    );
+                    assert_eq!(
+                        wide.view::<f64>().unwrap()[[0, 0, 0]].to_bits(),
+                        promise.to_bits(),
+                        "{op:?} f64 {left} {right}"
+                    );
+                    if op.admits(Dtype::F32) {
+                        let narrow = joined(
+                            op,
+                            Array3::from_elem((1, 1, 1), left as f32).into(),
+                            Array3::from_elem((1, 1, 1), right as f32).into(),
+                        );
+                        assert_eq!(
+                            narrow.view::<f32>().unwrap()[[0, 0, 0]].to_bits(),
+                            (promise as f32).to_bits(),
+                            "{op:?} f32 {left} {right}"
+                        );
+                    }
+                }
+            }
+        }
+        // The liveness partner: a rule that declared nothing would pass the loop
+        // above without executing its body once.
+        assert!(declared > 100, "only {declared} declarations were made");
+    }
+
+    /// The kernel that refuses to invent an integer sum, said where a caller who
+    /// bypassed `accepts` would meet it.
+    #[test]
+    fn the_selection_kernel_refuses_the_arithmetic_by_name() {
+        let left = Array3::from_elem((1, 1, 1), 3u16);
+        let right = Array3::from_elem((1, 1, 1), 4u16);
+        let mut out = Array3::from_elem((1, 1, 1), 0u16);
+        let refusal = selection_into(left.view(), right.view(), out.view_mut(), Arithmetic::Add)
+            .expect_err("a refusal");
+        let message = refusal.to_string();
+        assert!(message.contains("`add` is arithmetic"), "{message}");
+        selection_into(
+            left.view(),
+            right.view(),
+            out.view_mut(),
+            Arithmetic::Maximum,
+        )
+        .expect("a selection");
+        assert_eq!(out[[0, 0, 0]], 4);
+    }
+
+    /// `cost_per_voxel` is `n - 1` pairs, which is [`LogicCombine`]'s rule.
+    #[test]
+    fn a_fold_over_n_branches_is_charged_for_n_minus_one_pairs() {
+        let combine = ArithmeticCombine::new("add", Arithmetic::Add);
+        assert_eq!(combine.cost_per_voxel(2), COMBINE_COST);
+        assert_eq!(combine.cost_per_voxel(4), COMBINE_COST * 3.0);
+        assert_eq!(combine.cost_per_voxel(1), 0.0);
     }
 }

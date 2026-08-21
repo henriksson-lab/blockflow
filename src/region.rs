@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: MIT
 //
 // Original work. Extracted from `clearmap_rs::parallel_processing::region_io`,
-// which retains the backend implementations (Zarr, npy) that depend on that
-// crate's IO layer. What moved here is exactly the part with no backend in it:
-// the box, the two traits, and the in-memory implementations that make
-// byte-identity between a streamed and an unstreamed run testable.
+// which retains the backend implementations that depend on that crate's IO
+// layer. What moved here is exactly the part with no backend in it: the box,
+// the two traits, and the in-memory implementations that make byte-identity
+// between a streamed and an unstreamed run testable.
+//
+// The npy backend was one of the ones that stayed, and that was a mistake — the
+// format is not this application's, and leaving it behind cost twenty private
+// re-implementations of it in the crates that consume this one. It is `npy` in
+// this crate now, implementing the two traits below over a file rather than
+// over an array; see that module's header for the count and for what it does
+// about memory order. The Zarr backend's position is unchanged.
 //
 // The split is the point of the crate boundary. A `RegionSource` is what the
 // executor, the cache and the prefetcher are written against; where the bytes

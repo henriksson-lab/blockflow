@@ -726,20 +726,30 @@ impl StructuringElement {
     ///   and the two readings cannot come apart. Each op's module header carries
     ///   the argument in full.
     ///
-    /// `ops::sliding` **refuses** a `ClippedStart` element by name: a carried
-    /// histogram is a decomposition of *one* window into leavers and joiners, and
-    /// a window that re-phases has no such decomposition — consecutive centres
-    /// read different residue classes, so the traversal degenerates into the
-    /// dense gather it exists to avoid.
+    /// **Two ops refuse a `ClippedStart` element by name instead**, and their
+    /// reasons are different, which is the part worth reading:
+    ///
+    /// * `ops::sliding` — a carried histogram is a decomposition of *one* window
+    ///   into leavers and joiners, and a window that re-phases has no such
+    ///   decomposition: consecutive centres read different residue classes, so
+    ///   the traversal degenerates into the dense gather it exists to avoid.
+    /// * `ops::convolve` — a rank filter's per-offset fact is **membership**,
+    ///   which a re-phased set answers for itself. A convolution's is **a number
+    ///   the caller supplied for that member**, and a re-phased set contains
+    ///   offsets the weight list has no entry for. Inventing a weight, dropping
+    ///   the tap and renormalising are each silently a *different filter*, so
+    ///   `Kernel::new` refuses at construction and names `StepOrigin::Anchor` as
+    ///   the fix. Every kernel it can then hold reads one offset set everywhere,
+    ///   which is why its gather may read [`Self::offsets`] directly.
     ///
     /// So the list is complete: every op that places an element either asks this
-    /// method or refuses the element that needs it. `ops::sliding` is the one
-    /// left reading [`Self::offsets`] for its members, and it may, because the
-    /// refusal above means the only elements it ever sees are the ones for which
+    /// method or refuses the element that needs it. Those two are the ones left
+    /// reading [`Self::offsets`] for their members, and they may, because the
+    /// refusals above mean the only elements they ever see are the ones for which
     /// `offsets` *is* the whole truth. That is measured rather than asserted, in
     /// `tests/clipped_start_through_the_gathering_ops.rs`, which takes a
-    /// re-phasing element through every op above and states the refusal beside
-    /// them.
+    /// re-phasing element through every op above and states `ops::sliding`'s
+    /// refusal beside them; `ops::convolve`'s is pinned in that op's own tests.
     pub fn offsets_at<'a>(
         &'a self,
         anchor: [isize; 3],

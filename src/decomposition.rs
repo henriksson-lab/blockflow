@@ -1097,6 +1097,35 @@ pub(crate) fn region_to_ranges(region: &Region) -> Vec<(usize, usize)> {
 /// not fuse across is settled structurally, by `is_planning_barrier`, and needs
 /// no price at all.
 ///
+/// **There is deliberately no per-block overhead price either, and that one is
+/// measured rather than argued.** Every weight here is per voxel, so a grid of
+/// many small blocks is charged nothing for being many. That looks like the
+/// obvious gap whenever the search prefers a finer grid than the machine does,
+/// and on the one case where it has been checked it is not the gap. Measured
+/// through [`crate::strategy::execute`] over a `256^3` volume with a zero-reach
+/// op — so that redundancy is 1 at every edge and the only thing that moves is
+/// the block count — the slope between adjacent grids is:
+///
+/// ```text
+/// 256^3 f64, zero-reach map, best of 9, us of wall clock per extra block
+/// edge   blocks   1 worker   40 workers
+///  128        8          -            -
+///   64       64          -       +336.9      (the pool filling up, not overhead)
+///   32      512      -33.1         +3.3
+///   16     4096      +57.8        +48.3
+///    8    32768     +347.7       +291.0      (4 kB blocks; the scheduler, not a grid)
+/// ```
+///
+/// **Zero within noise at any block a planner would choose**, and tens of
+/// microseconds even at 32 kB blocks. The case that motivated looking — the
+/// thinning over a `404 x 1304 x 3369` tile, where the model preferred a 128
+/// grid that measured 1.38x slower than a 256 one — needed about **14.5 ms per
+/// block** to flip, which is three orders of magnitude away. The defect was in
+/// [`BlockGrid::mean_core_voxels`]'s territory instead, and a per-block constant
+/// large enough to have papered over it would have been fitted to that one
+/// table rather than measured. If a future case really does want this term,
+/// measure it the same way first.
+///
 /// None of this can produce a wrong voxel. The partition decides where
 /// intermediates land, not what is computed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1478,16 +1507,26 @@ pub fn price_phase(
     model: &CostModel,
     materialise_cost_per_voxel: f64,
 ) -> PhaseCost {
-    let core_voxels = grid.core_voxels();
+    // The **average** core, not the widest. Every block is still charged the
+    // widest block's *halo* below, which is the declared over-charge; the core
+    // it is charged against is the grid's own, because the padding a widest-core
+    // price adds is a property of the candidate rather than of the work and it
+    // is what inverted this model's ranking. See `BlockGrid::mean_core_voxels`,
+    // which carries the measurement.
+    let core_voxels = grid.mean_core_voxels();
     let block = grid.block();
     let volume = grid.volume();
     let reach = reach.in_voxels(block);
     let mut redundancy = 1.0_f64;
     let mut resident_voxels = 1.0_f64;
     for axis in 0..3 {
-        // The widest block, because the price is per block and the model is
-        // stated on the infinite grid: a per-block reach is charged at its worst
-        // block, the same direction of error a generous halo has.
+        // The widest block's halo, because the model is stated on the infinite
+        // grid: a per-block reach is charged at its worst block, the same
+        // direction of error a generous halo has. That over-charge is kept —
+        // unlike the core's, it is bounded and barely moves with the edge. On
+        // the tile of `BlockGrid::mean_core_voxels`'s table it over-states the
+        // grid's true read amplification by 7.4% / 3.5% / 1.3% / 2.2% at the
+        // four edges, against the core's 1.253 / 1.588 / 1.404 / 1.151.
         let (lo, hi) = reach.axis(axis).bound(volume[axis]);
         let grown = block[axis] as f64 + lo as f64 + hi as f64;
         let charged = grid.split_axes().contains(&axis)

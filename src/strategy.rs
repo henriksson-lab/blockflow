@@ -2648,8 +2648,13 @@ pub fn phase_makespan(
 ) -> f64 {
     let n = grid.n_blocks() as f64;
     let pool = cost.cost_per_block * rounds(grid.n_blocks(), workers) as f64;
+    // `mean_core_voxels`, so that `core * n` is the volume the phase writes
+    // rather than the volume plus the grid's padding. `price_phase` charges the
+    // same core, and the channel bound is meant to be the same bytes counted a
+    // second way — a bound stated in a different unit from the term it is
+    // maxed against would not be one.
     let channel = cost.read_voxels_per_block * n * model.read_cost_per_voxel
-        + grid.core_voxels() * n * write_cost_per_voxel;
+        + grid.mean_core_voxels() * n * write_cost_per_voxel;
     pool.max(channel)
 }
 

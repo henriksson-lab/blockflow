@@ -28,7 +28,7 @@
 // | outward dependency, before | now |
 // |---|---|
 // | `clearmap_rs::{ClearMapError, Result}` | `error::Error` — three variants, because the framework only ever raised two of ClearMap's thirty, plus one for foreign backends. `clearmap-rs` converts both ways at the boundary. |
-// | `parallel_processing::region_io` | `region` — the box, the two traits and the in-memory implementations moved; the Zarr and npy backends stayed, and now implement this crate's traits. |
+// | `parallel_processing::region_io` | `region` — the box, the two traits and the in-memory implementations moved; the Zarr backend stayed and implements this crate's traits. The npy backend stayed too, and that decision was later reversed and counted: twenty private re-implementations of one array format. It is `npy` now. |
 // | `io::source::DataType` | `dtype::Dtype` — a byte-width tag, which is all the cost model and the cache ever wanted from it. |
 // | `block_processing::valid_boxes_tile_volume` | `tiling::boxes_tile_exactly` — **reimplemented, not moved**: the original lives in a GPL-translated file. See `tiling`'s header; `clearmap-rs` carries a test that the two agree. |
 //
@@ -64,6 +64,7 @@
 // | `strategy` | One `Strategy` trait with `decompose` (binding) and `run` (dynamic), and the single executor every strategy shares. |
 // | `log` | The `Event` stream — scheduling, op, IO and cache layers — and the log the acceptance criterion is asserted from. |
 // | `listener` | `EventListener`, the dispatch set, and two listeners: the order log and a live per-block progress view. |
+// | `npy` | The `.npy` file format: header, element type, memory order, and both traits over it. Both orders read, neither transposed. |
 // | `observed_io` | `RegionSource`/`RegionSink` decorators, so IO outside the executor emits through the same trait. |
 // | `export` | The order log as JSON, with the cross-language schema documented in its header. |
 // | `animate` | The seam to the bundled renderer, which turns an exported log into a movie. Opt-in; the crate does not depend on it. |
@@ -127,6 +128,13 @@ pub mod iterate;
 pub mod listener;
 pub mod log;
 pub mod net;
+/// The `.npy` array file format: a header, an element type, a memory order and
+/// a flat contiguous buffer. Whole arrays of any rank, `Voxels` for the rank-3
+/// case, and `RegionSource`/`RegionSink` implementations that read and write a
+/// box without holding the volume. **Both memory orders are handled and neither
+/// is transposed**; a caller that can take only one says so and gets a refusal
+/// naming the order it found.
+pub mod npy;
 pub mod observed_io;
 pub mod op;
 /// Image-processing operations: voxelwise combination, rank filtering,
@@ -221,6 +229,12 @@ pub use iterate::{
 };
 pub use listener::{BlockProgress, EventListener, LatestOpPerChunk, OrderLog, ProgressKind};
 pub use log::{Event, ExecutionLog, Stats};
+pub use npy::{
+    descr_of, read_array, read_array_file, read_array_from, read_header_file, read_voxels,
+    read_voxels_file, read_voxels_from, write_array, write_array_file, write_array_to,
+    write_voxels, write_voxels_file, write_voxels_to, Endian, Header, NpyElement, NpySink,
+    NpySource, Order, OrderPolicy,
+};
 pub use observed_io::{ObservedSink, ObservedSource};
 pub use op::{
     Anchor, BlockConstraint, BlockOp, Chain, Combine, Geometry, InputMap, Output, Placement,

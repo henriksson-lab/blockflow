@@ -34,8 +34,18 @@
 // | `ops::label`'s stamp | honours, at the point's position in the volume | at the end of this file, and its own tests |
 // | `ops::voxelize`'s deposit | honours, at the point's position in the volume | at the end of this file, and its own tests |
 // | `ops::sliding` | **refuses**, by name | its own tests |
+// | `ops::convolve` | **refuses**, by name, for a *different* reason | its own tests |
 //
-// The refusal is the interesting one and it is not a shortfall. A histogram
+// **The two refusals are the interesting rows, and they refuse for different
+// reasons.** `ops::convolve`'s is not this one: a rank filter's or a histogram's
+// per-offset fact is *membership*, which a re-phased set answers for itself; a
+// convolution's is *a number the caller supplied for that member*, and a
+// re-phased set contains offsets the weight list has no entry for. Inventing a
+// weight, dropping the tap and renormalising are each silently a different
+// filter, so `Kernel::new` refuses at construction. This file does not exercise
+// it — the element never reaches a kernel — and that op's own tests pin it.
+//
+// The sliding refusal is not a shortfall either. A histogram
 // carried along a scan line is a decomposition of **one** window into what a
 // step of one retires and admits; a window that re-phases has no such
 // decomposition, because consecutive centres read different residue classes.

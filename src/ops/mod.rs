@@ -309,6 +309,36 @@ pub use watershed::{
     WATERSHED_LINE_COST,
 };
 
+// Appended rather than filed alphabetically, because this list is shared and an
+// append is the edit that does not move anybody else's lines.
+/// **The exact Euclidean distance transform**, as three separable whole-axis
+/// sweeps and a pointwise finish. `ops::watershed`'s "a caller who wants a
+/// distance-transform watershed passes the distance" is what this supplies.
+pub mod distance;
+pub use distance::{
+    append_to as append_distance, brute_force_distance, chamfer_distance,
+    cost_report as distance_cost_report, distance_transform, plan as distance_plan,
+    seed as seed_distance_field, squared_distance_transform, sweep_axis as sweep_distance_axis,
+    sweep_grid as distance_sweep_grid, working_set_bytes as distance_working_set_bytes,
+    DistanceFinishOp, DistanceParams, DistanceSweepOp, Unbounded, DISTANCE_FINISH_COST,
+    DISTANCE_SEED_SWEEP_COST, DISTANCE_SWEEP_COST,
+};
+
+// Appended, for the reason the block above it is: this list is shared today and
+// an append is the edit that moves nobody else's lines.
+/// **Convolution with a caller-supplied kernel**, in a caller-supplied sense
+/// (correlation or convolution, named rather than assumed) and a caller-supplied
+/// boundary convention. `ops::smooth` is the Gaussian; this is the general one.
+pub mod convolve;
+pub use convolve::{
+    convolve_into, cost_report as convolve_cost_report, ConvolveOp, Kernel, Sense,
+    CONVOLVE_COST_PER_TAP,
+};
+/// The arithmetic and selection sinks of a diamond, beside `voxelwise`'s
+/// Boolean ones: add, subtract, multiply, divide, per-voxel minimum and maximum
+/// between two images.
+pub use voxelwise::{arithmetic_into, selection_into, Arithmetic, ArithmeticCombine, Arithmetical};
+
 /// How the costs in this module were obtained, and what they are relative to.
 ///
 /// `BlockOp::cost_per_voxel` says it must be measured rather than guessed, and
@@ -369,3 +399,14 @@ pub(crate) fn shapes_agree(input: &[usize], out: &[usize], what: &str) -> Result
     }
     Ok(())
 }
+
+// The **second-moment half of `ops::tabulate`**, appended as its own `pub use`
+// rather than folded into the `tabulate` list above: three workers are landing
+// ops in this file today, and a line nobody else has to touch is a line nobody
+// else can conflict with. `RegionShape`/`region_shape` are the shape reading of
+// a tabulated row — the label volume's own measurement, over every voxel and at
+// no scale — and `PrincipalAxes` is what its six `CENTRAL` columns decompose to.
+pub use tabulate::{
+    collect_shapes, from_signed_column, region_shape, signed_column, PrincipalAxes, RegionShape,
+    AXIS_SEPARATION, CENTRAL, PAIRS,
+};
