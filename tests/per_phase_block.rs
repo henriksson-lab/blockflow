@@ -114,6 +114,7 @@ fn constraints() -> Constraints {
         block_candidates: CANDIDATES.to_vec(),
         // One axis, so a block edge is a block count and nothing else.
         split_axes: vec![0],
+        ..Default::default()
     }
 }
 

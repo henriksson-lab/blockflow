@@ -35,24 +35,23 @@
 // the corresponding cut of a whole generation — which is what makes it valid
 // data for a decomposition test rather than merely convenient.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use ndarray::Array3;
 
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::ArrayEnvironment;
 use blockflow::geometry::BlockGrid;
-use blockflow::op::{Anchor, BlockOp, Chain};
+use blockflow::op::{Anchor, Chain};
 use blockflow::ops::{
     AdaptiveThresholdOp, ElementShape, LocalStatistic, Logic, LogicCombine, Morphology,
     MorphologyOp, RankFilterOp, Statistic, StructuringElement, VoxelwiseMapOp,
 };
-use blockflow::probes::SideOutputOp;
+use blockflow::probes::{CountingIdentityOp, SideOutputOp};
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
-use blockflow::{Dtype, Result};
+use blockflow::Dtype;
 
 const VOLUME: [usize; 3] = [32, 24, 20];
 
@@ -82,55 +81,10 @@ fn box_element(radius: [usize; 3]) -> StructuringElement {
     StructuringElement::from_radius(ElementShape::Box, radius)
 }
 
-/// An identity that counts how many times it was applied.
-///
-/// The whole content of the bug this file is about is *which subtrees run*, and
-/// a value test can only see a branch that both ran and changed something. This
-/// sees the run itself. It is an identity so that inserting one at the head of
-/// an arm changes nothing about the answer — the counter is the only
-/// observation it makes.
-struct CountingOp {
-    name: &'static str,
-    calls: Arc<AtomicUsize>,
-}
-
-impl CountingOp {
-    fn new(name: &'static str) -> (Self, Arc<AtomicUsize>) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        (
-            Self {
-                name,
-                calls: Arc::clone(&calls),
-            },
-            calls,
-        )
-    }
-}
-
-impl BlockOp for CountingOp {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    /// Zero, so that inserting one does not change any plan's halo.
-    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
-        0
-    }
-
-    fn accepts(&self, _dtype: Dtype) -> bool {
-        true
-    }
-
-    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        out.assign(input)
-    }
-}
-
 // --------------------------------------------------------------- the arms --
 
 /// Arm A: a global threshold. Reach 0, so its answer is exact everywhere.
-fn arm_a(counter: Option<CountingOp>) -> Chain {
+fn arm_a(counter: Option<CountingIdentityOp>) -> Chain {
     let threshold = Chain::op(VoxelwiseMapOp::threshold("threshold", 0.30, 1.0, 0.0));
     match counter {
         None => threshold,
@@ -140,7 +94,7 @@ fn arm_a(counter: Option<CountingOp>) -> Chain {
 
 /// Arm B: a locally-anchored threshold, then an opening. Reach is **not** zero,
 /// so the fan-in's halo comes from this arm and a short one is visible.
-fn arm_b(counter: Option<CountingOp>) -> Chain {
+fn arm_b(counter: Option<CountingIdentityOp>) -> Chain {
     let inner = Chain::sequence(vec![
         Chain::op(AdaptiveThresholdOp::new(
             "adaptive",
@@ -166,7 +120,7 @@ fn stem() -> Chain {
 }
 
 /// The chain this whole file is about: `median > (A & B) > or`.
-fn diamond(count_a: Option<CountingOp>, count_b: Option<CountingOp>) -> Chain {
+fn diamond(count_a: Option<CountingIdentityOp>, count_b: Option<CountingIdentityOp>) -> Chain {
     Chain::sequence(vec![
         stem(),
         Chain::parallel(
@@ -272,8 +226,8 @@ fn both_arms_of_a_diamond_run_once_per_block_and_both_reach_the_sink() {
     assert_ne!(reference(&the_bug(1), &input), both);
 
     // (1) both arms ran, once per block, through the executor.
-    let (count_a, calls_a) = CountingOp::new("count_a");
-    let (count_b, calls_b) = CountingOp::new("count_b");
+    let (count_a, calls_a) = CountingIdentityOp::new("count_a");
+    let (count_b, calls_b) = CountingIdentityOp::new("count_b");
     let workflow = workflow(diamond(Some(count_a), Some(count_b)));
     let decomposition = plan(&workflow, 8, &[0, 1, 2]);
     let blocks = decomposition.n_tasks();

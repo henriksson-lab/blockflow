@@ -642,8 +642,12 @@ fn the_merged_event_stream_satisfies_the_single_node_acceptance_criterion() {
     }
     // Feed the coordinator the stream the way a worker would, one event at a
     // time, and assert from what the coordinator ended up holding.
-    for event in outbox.events() {
-        job.report(&crate::export::event_json(&event));
+    for (at, event) in outbox.events().iter().enumerate() {
+        job.report(
+            "one",
+            Some(at as u64 + 1),
+            &crate::export::event_json(event),
+        );
     }
     assert_eq!(job.unknown_events(), 0);
     job.check_coverage()

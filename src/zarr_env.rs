@@ -187,7 +187,7 @@ use crate::dtype::Dtype;
 use crate::env::{block_shape, BlockBuf, EnvCounters, Environment};
 use crate::error::{Error, Result};
 use crate::geometry::{chunks_touched, region_within};
-use crate::op::{Chain, Output, Placement, SourceInputs};
+use crate::op::{Chain, Output, Placement};
 use crate::region::Region;
 use crate::sidecar::{FileSidecars, Sidecars};
 use crate::voxels::{SideBuf, VoxelElement, Voxels};
@@ -745,12 +745,7 @@ impl StoredArray {
     /// — is read off the array's own metadata, because the array is the
     /// authority on all four and a caller restating them is a caller who can be
     /// wrong.
-    fn open(
-        store: &Arc<Store>,
-        path: &str,
-        id: u64,
-        window: Option<Window>,
-    ) -> Result<Self> {
+    fn open(store: &Arc<Store>, path: &str, id: u64, window: Option<Window>) -> Result<Self> {
         let array = ZarrArray::open(store.clone(), path).map_err(Error::backend)?;
         let array_shape: Vec<usize> = array.shape().iter().map(|&value| value as usize).collect();
         if array_shape.len() != 3 {
@@ -941,7 +936,10 @@ fn compression_of(array: &Stored, path: &str) -> Result<Compression> {
 
     let mut found = Compression::None;
     for codec in codecs {
-        let name = codec.get("name").and_then(serde_json::Value::as_str).unwrap_or("");
+        let name = codec
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         match name {
             // The array-to-bytes codec every array here uses, and the identity
             // as far as compression goes.
@@ -1008,7 +1006,10 @@ pub struct AttachedImage {
 impl AttachedImage {
     /// The whole of the array in `dir`.
     pub fn at(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), window: None }
+        Self {
+            dir: dir.into(),
+            window: None,
+        }
     }
 
     /// A sub-box of it. See [`Window`].
@@ -1900,12 +1901,10 @@ impl Environment for ZarrEnvironment {
         // derives its chunking from the phase that writes it, charging every
         // read against image 0's grid would price most of them against a grid
         // they never touch.
-        self.counters
-            .chunks_read
-            .fetch_add(
-                chunks_touched(&array.stored_region(region), &array.chunk),
-                Ordering::SeqCst,
-            );
+        self.counters.chunks_read.fetch_add(
+            chunks_touched(&array.stored_region(region), &array.chunk),
+            Ordering::SeqCst,
+        );
         self.counters.add_resident(block.bytes());
         Ok(BlockBuf::Array(block))
     }
@@ -1913,6 +1912,7 @@ impl Environment for ZarrEnvironment {
     /// Identical to `ArrayEnvironment::apply`, and identical on purpose: where
     /// the bytes live has nothing to do with what an op computes, and the moment
     /// this diverges the byte-identity claim stops being about storage.
+    /// Both entry points, one body: see `crate::env::apply_chain_to_block`.
     fn apply(
         &self,
         slot: &Chain,
@@ -1920,20 +1920,22 @@ impl Environment for ZarrEnvironment {
         sources: &[(usize, BlockBuf)],
         at: &Placement,
     ) -> Result<BlockBuf> {
-        let array = input.as_array()?;
-        let stored = crate::env::as_source_arrays(sources)?;
-        let mut out = Voxels::zeros(
-            slot.produces(array.dtype())?,
-            slot.placed_output_shape(array.shape(), at)?,
-        )?;
-        slot.apply_placed(array, SourceInputs::new(&stored), &mut out, at)?;
-        self.counters.ops_applied.fetch_add(1, Ordering::SeqCst);
-        self.counters.estimated_work.fetch_add(
-            (array.len() as f64 * slot.cost_per_voxel()) as u64,
-            Ordering::SeqCst,
-        );
+        self.apply_sliced(slot, input, sources, at, 1)
+            .map(|(out, _)| out)
+    }
+
+    fn apply_sliced(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Placement,
+        slabs: usize,
+    ) -> Result<(BlockBuf, usize)> {
+        let (out, ran) =
+            crate::env::apply_chain_to_block(&self.counters, slot, input, sources, at, slabs)?;
         self.counters.add_resident(out.bytes());
-        Ok(BlockBuf::Array(out))
+        Ok((BlockBuf::Array(out), ran))
     }
 
     fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {

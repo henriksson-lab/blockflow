@@ -20,9 +20,12 @@
 //    over worker counts. The headline, and the one that would catch a wrong
 //    seam, a missing flush or a mis-stitched block.
 // 2. **Every block executed exactly once**, asserted by the crate's *existing*
-//    `check_coverage_and_order` over the merged event stream — no
-//    distribution-specific analysis, because a merged stream is an
-//    `ExecutionLog` like any other.
+//    coverage criteria over the merged event stream — no distribution-specific
+//    analysis, because a merged stream is an `ExecutionLog` like any other.
+//    Which criterion depends on the merge and not on the work: a one-worker
+//    stream is a single FIFO and gets `check_coverage_and_order`, a
+//    many-worker stream arrives interleaved and gets
+//    `check_coverage_unordered`. Both are asserted, over the same job.
 // 3. **A worker dies and the job stops, naming what was lost.** The default:
 //    node loss is not recovered from, and what to do about it is decided above
 //    this crate. What must not happen is a silent hang.
@@ -31,7 +34,29 @@
 //    header for the decision of 2026-08-17 — and this test is what keeps it
 //    compiled, exercised and honest.
 // 5. **The work list stays at least one task ahead**, so a worker never blocks
-//    except on its own pull. No single-node test would catch this regressing.
+//    except on its own pull. No single-node test would catch this regressing,
+//    and it is asserted from both ends — `starved` at the worker, `withheld` at
+//    the coordinator — because neither end can see the whole question.
+//
+// A note on what a green run in this file does and does not say
+// -------------------------------------------------------------
+// Every test here starts real processes, and a process is a thing that can fail
+// to be given anything to do. Three of the claims above have a **premise** as
+// well as an assertion — several processes wrote these fragments; a worker died
+// while the job was running — and a premise that quietly fails leaves a test
+// that passes while measuring nothing, or fails while measuring nothing, which
+// is worse because it reads as the design breaking. Every such premise here is
+// asserted before the claim it supports and says so in its own words when it
+// does not hold.
+//
+// **Holding the work back until the whole cohort has joined was tried, and it
+// is worse.** A coordinator that refuses every handout until N workers have
+// asked does make the premises hold — and it turns one slow worker into a slow
+// job, which on a loaded machine is the common case rather than the rare one:
+// measured over forty runs, thirty-nine took longer than ten seconds against
+// none without it, and the failures went up rather than down. Pull-based
+// handout tolerates a straggler by construction and a cohort gate gives that
+// up. So the premises are checked, not enforced.
 //
 // A note on 3 and 4 together, because the pair is the load-bearing part. Each
 // is the other's counterexample: 4 alone cannot tell "expiry is off" from
@@ -67,6 +92,55 @@ use serde_json::Value;
 
 const BLOCKS: usize = 16;
 
+/// The block count the two **death** tests decompose over, and the reason it is
+/// not `BLOCKS`.
+///
+/// A death test's premise is that a worker died *while the job was running*, and
+/// that premise used to be a race. The runner killed a worker once the
+/// coordinator reported two tasks done, which it learned by polling — over the
+/// same HTTP server three workers were posting an event stream to. A sixteen
+/// block probe job is milliseconds of arithmetic behind a few hundred
+/// milliseconds of process startup, so under load the runner walked from "two
+/// done" straight past "all sixteen done" between two samples, killed a worker
+/// that had already gone home, and both death tests read that as the design
+/// failing. Neither a flake nor a defect in the design: the fixture could not
+/// keep its own premise, and raising the block count alone did not fix it — the
+/// extra work is extra traffic on the server being polled, which is the thing
+/// that was slow.
+///
+/// So the death is now the **worker's own**, counted on its side where nothing
+/// is sampled: `LocalOptions::abort_worker_after`. The block count is still
+/// raised, for the one thing it does buy — the survivors have a job left to
+/// finish, so "the job completed after a death" and "the lease reissued a
+/// claim" are statements about a run rather than about its last instant. And
+/// the premise is *asserted* either way: both tests check `run.died` before they
+/// check anything else, because a worker that never got a task cannot die
+/// holding one.
+const DEATH_BLOCKS: usize = 128;
+
+/// The block count for the tests whose premise is that **several worker
+/// processes did the work**, and the same argument as [`DEATH_BLOCKS`] in a
+/// different place.
+///
+/// Neither the coordinator nor the handout promises a spread — the founding
+/// property of this layer is that any assignment of blocks to workers produces
+/// the same output — so a test that needs one has to make it rather than hope
+/// for it. Measured over forty runs at load 50, at the sixteen-block size this
+/// used to run, the handout spreads a three-worker fragment job perfectly well:
+/// `[12, 12, 8]`, `[9, 13, 10]`, `[11, 13, 8]`. What it cannot do is give work
+/// to a worker that has not arrived, and sixteen blocks here is forty-eight
+/// tasks of arithmetic behind a few hundred milliseconds of process startup —
+/// so under load one worker occasionally finished the lot before its peers had
+/// joined, and the run came out `[32, 0, 0]`.
+///
+/// **That is the fixture's fault and not the handout's**, which is why the
+/// answer is a job long enough that a late joiner still has something to do
+/// rather than a change to how work is placed. The premise stays asserted in
+/// both tests — a run where only one process produced fragments demonstrates
+/// nothing about several and says so — because sizing makes it likely and only
+/// the assertion makes it checked.
+const SPREAD_BLOCKS: usize = 64;
+
 fn binaries() -> Binaries {
     Binaries {
         coordinator: PathBuf::from(env!("CARGO_BIN_EXE_blockflow-coordinator")),
@@ -95,9 +169,19 @@ fn ramp(shape: [usize; 3]) -> Array3<f64> {
 
 /// Build the job, lay down its input, and return everything needed to run it.
 fn prepare(dir: &Path, phases: usize, lease: Option<Duration>) -> (JobSpec, Decomposition) {
+    prepare_over(dir, BLOCKS, phases, lease)
+}
+
+/// [`prepare`] over a stated block count.
+fn prepare_over(
+    dir: &Path,
+    blocks: usize,
+    phases: usize,
+    lease: Option<Duration>,
+) -> (JobSpec, Decomposition) {
     let volumes = dir.join("volumes");
     let (mut spec, decomposition) = probe_job_over(
-        BLOCKS,
+        blocks,
         phases,
         ChainSpec::identity(),
         StoreSpec::Files {
@@ -419,11 +503,21 @@ fn several_workers_agree_with_one_node_across_a_phase_boundary() {
         reference,
         "four workers across a phase boundary disagree with one node"
     );
+    // A phase boundary is where a worker legitimately runs out: its list empties
+    // while the coordinator has nothing ready for it yet. Printed rather than
+    // asserted — `the_work_list_stays_at_least_one_task_ahead` is where the
+    // criterion lives and a second copy of it here would add failure surface
+    // and no coverage. What this line is for is the *other* number: this is the
+    // one job in the file where `told_to_wait` is expected to move, and a
+    // counter nobody ever sees move is a counter nobody can trust.
     println!(
-        "{} phases, {} tasks, 4 workers: byte-identical in {:?}",
+        "{} phases, {} tasks, 4 workers: byte-identical in {:?}; {} starved, {} told to \
+         wait across the boundary",
         decomposition.n_phases(),
         run.status.tasks,
-        run.elapsed
+        run.elapsed,
+        run.starved(),
+        run.told_to_wait()
     );
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&reference_dir).ok();
@@ -431,8 +525,45 @@ fn several_workers_agree_with_one_node_across_a_phase_boundary() {
 
 // ---------------------------------------------------- 2. exactly-once --
 
+/// **Order is asked of the stream that has one, coverage of the stream that does
+/// not.** Both are asserted here, over the same job, because the difference
+/// between them is a property of the *merge* and not of the work.
+///
+/// A worker posts its events from its own reporter thread as they happen and the
+/// coordinator appends them in **arrival** order. With one worker that is a
+/// single FIFO — the executor pushes in the order it ran, the reporter drains it
+/// in order, so arrival order *is* the order the work ran in and the full
+/// criterion applies. With four, two workers running two phases of one block can
+/// land their `OpApplied` events in either order however strictly the work was
+/// ordered, so sequence-equality is a question the merged stream cannot answer:
+/// asserted anyway it was wrong about one run in forty here, naming a block
+/// whose two phases arrived the other way round. See
+/// `ExecutionLog::check_coverage_unordered` for what recovering the order across
+/// workers would actually need — a causal key, not a tighter assertion.
+///
+/// The one-worker leg is what keeps the strict criterion exercised over a merged
+/// stream rather than only over in-process ones, so a `check_coverage_and_order`
+/// that stopped checking order would still be caught here.
 #[test]
 fn every_block_was_executed_exactly_once_across_the_merged_event_stream() {
+    // One worker: arrival order is the order the work ran in, so the full
+    // criterion — every block, every op, **in the chain's order**, once each.
+    let single_dir = scratch("coverage-one");
+    let (single_spec, single_decomposition) = prepare(&single_dir, 2, None);
+    let single = local::run(
+        &options(&single_dir, 1),
+        &single_spec,
+        &single_decomposition,
+    )
+    .expect("a one-worker run");
+    merged_log(&single)
+        .check_coverage_and_order(
+            &expected_ops(&single_decomposition),
+            single_decomposition.phases[0].blocks.len(),
+        )
+        .expect("one worker's merged stream is one FIFO, so order is askable of it");
+    std::fs::remove_dir_all(&single_dir).ok();
+
     let dir = scratch("coverage");
     let (spec, decomposition) = prepare(&dir, 2, None);
     let run = local::run(&options(&dir, 4), &spec, &decomposition).expect("a four-worker run");
@@ -450,13 +581,14 @@ fn every_block_was_executed_exactly_once_across_the_merged_event_stream() {
         "the coordinator could not decode some of what its workers sent"
     );
 
-    // And again here, from the exported stream, with the crate's own check.
+    // And again here, from the exported stream, with the crate's own check —
+    // the *unordered* one, for the reason in this test's header.
     let log = merged_log(&run);
-    log.check_coverage_and_order(
+    log.check_coverage_unordered(
         &expected_ops(&decomposition),
         decomposition.phases[0].blocks.len(),
     )
-    .expect("every block affected by every op, in the right order, once each");
+    .expect("every block affected by every op, once each");
     assert!(
         log.duplicate_applications().is_empty(),
         "with nobody dying, no block should have run twice: {:?}",
@@ -464,7 +596,8 @@ fn every_block_was_executed_exactly_once_across_the_merged_event_stream() {
     );
     assert_eq!(run.status.reissued, 0, "nothing should have been reissued");
     println!(
-        "{} tasks over {} workers: {} events merged, coverage and order hold",
+        "{} tasks over {} workers: {} events merged, coverage holds; and over one worker, \
+         coverage and order both",
         run.status.tasks, run.status.workers, run.status.events
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -490,21 +623,39 @@ fn every_block_was_executed_exactly_once_across_the_merged_event_stream() {
 /// Timed, because "eventually" is not the claim: the run has to end in the
 /// seconds after the kill, not at the harness timeout, and a hang that is
 /// merely slow would otherwise pass.
+///
+/// **Over [`DEATH_BLOCKS`], with the death timed by the dying worker.** See that
+/// constant for why the runner is no longer the one holding the knife, and for
+/// what a run that contains no death is worth.
 #[test]
 fn a_worker_that_is_killed_mid_run_aborts_the_job_by_default_and_names_what_was_lost() {
     let dir = scratch("loss");
-    let (spec, decomposition) = prepare(&dir, 1, None);
+    let (spec, decomposition) = prepare_over(&dir, DEATH_BLOCKS, 1, None);
     assert_eq!(spec.lease, None, "a job has no lease unless it asks");
     let mut options = options(&dir, 3);
     options.timeout = Duration::from_secs(60);
-    options.kill_at_progress = vec![(0, 2)];
+    options.abort_worker_after = vec![(0, 2)];
     let started = std::time::Instant::now();
     let outcome = local::run(&options, &spec, &decomposition);
     let took = started.elapsed();
 
-    let error = outcome.err().unwrap_or_else(|| {
-        panic!("a worker was killed and the run reported success; node loss is not recovered from")
-    });
+    let error = match outcome {
+        Err(error) => error,
+        Ok(run) => match run.died.first() {
+            None => panic!(
+                "the run reported success and no worker was seen to die. worker-0 was told \
+                 to abort after two tasks; if it never got two, this run does not exercise \
+                 node loss at all. Tasks per worker: {:?}, ready after (ms) {:?}",
+                run.tasks_per_worker(),
+                run.ready_ms_per_worker()
+            ),
+            Some(died) => panic!(
+                "worker-{} died ({}) and the run reported success; node loss is not \
+                 recovered from",
+                died.index, died.status
+            ),
+        },
+    };
     let message = error.to_string();
     assert!(
         message.contains("worker-0"),
@@ -526,7 +677,7 @@ fn a_worker_that_is_killed_mid_run_aborts_the_job_by_default_and_names_what_was_
          rather than an abort",
         options.timeout
     );
-    println!("a worker was killed two tasks in and the job aborted after {took:?}: {message}");
+    println!("a worker died two tasks in and the job aborted after {took:?}: {message}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -539,6 +690,16 @@ fn a_worker_that_is_killed_mid_run_aborts_the_job_by_default_and_names_what_was_
 /// moment of. The process is taken wherever it is: possibly inside a task, with
 /// a block part-written and nothing reported, and certainly holding the tasks
 /// its work list was keeping ahead.
+///
+/// **What the lease is for, restated because a failure here reads as the lease's
+/// fault and never once was.** It is not a failure detector: node loss is
+/// detected by whoever started the process and answered by aborting, which is
+/// the test above. The lease is a *policy* a job opts into — "my tasks are cheap
+/// enough to re-run, carry on without that node" — and this is the one place in
+/// the suite that asks for it, which is what keeps the reissue path compiled and
+/// exercised. Every failure of this test measured on this tree was the fixture
+/// failing to produce a death, never the lease failing to expire; the assertion
+/// below now says which of the two it is.
 ///
 /// **Opt-in, and the explicit lease below is the documentation.** A job has no
 /// lease by default, and the default answer to the death above is to abort. A
@@ -556,7 +717,7 @@ fn a_worker_that_is_killed_mid_run_aborts_the_job_by_default_and_names_what_was_
 fn a_worker_that_is_killed_mid_run_has_its_tasks_reissued_and_the_output_is_still_right() {
     let reference_dir = scratch("death-reference");
     let (spec, decomposition) = probe_job_over(
-        BLOCKS,
+        DEATH_BLOCKS,
         1,
         ChainSpec::identity(),
         StoreSpec::Files {
@@ -572,19 +733,41 @@ fn a_worker_that_is_killed_mid_run_has_its_tasks_reissued_and_the_output_is_stil
     // place in the suite that asks for the other thing. 400 ms so the test does
     // not sit out a long one; see the header for what that costs when nobody
     // has died.
-    let (spec, decomposition) = prepare(&dir, 1, Some(Duration::from_millis(400)));
+    let (spec, decomposition) =
+        prepare_over(&dir, DEATH_BLOCKS, 1, Some(Duration::from_millis(400)));
     let mut options = options(&dir, 3);
-    options.kill_at_progress = vec![(0, 2)];
+    options.abort_worker_after = vec![(0, 2)];
     let run = local::run(&options, &spec, &decomposition).expect("the survivors finish the job");
 
+    // The premise first: a job that finished with everybody alive has nothing
+    // to reissue, and "no death" is indistinguishable from "the lease did not
+    // fire" if it is not checked. It is exactly what this pair looked like when
+    // the death was a sampled kill that could arrive after the last task —
+    // see DEATH_BLOCKS.
+    let died = run.died.first().unwrap_or_else(|| {
+        panic!(
+            "no worker was seen to die, so there was nothing for the lease to reissue. \
+             Tasks per worker: {:?}, ready after (ms) {:?}",
+            run.tasks_per_worker(),
+            run.ready_ms_per_worker()
+        )
+    });
+    assert!(
+        !died.cleanly,
+        "worker-{} left with {}, which is a worker going home rather than a node being \
+         lost",
+        died.index, died.status
+    );
     assert_eq!(
         run.status.done, run.status.tasks,
         "the job did not finish after a worker died"
     );
     assert!(
         run.status.reissued >= 1,
-        "a worker vanished holding work and nothing was reissued; either the lease never \
-         expired or the claim was never made"
+        "worker-{} vanished ({}) holding work and nothing was reissued; either the lease \
+         never expired or the claim was never made",
+        died.index,
+        died.status
     );
     assert_eq!(
         output_bytes(&dir, &spec, &decomposition),
@@ -638,9 +821,12 @@ fn a_worker_that_is_killed_mid_run_has_its_tasks_reissued_and_the_output_is_stil
     }
     let blocks: BTreeSet<[usize; 3]> = duplicated.iter().map(|&(index, _, _)| index).collect();
     println!(
-        "a worker was killed two tasks in: {} claim(s) reissued {:?}, {} block(s) computed \
-         twice {:?}, every one of them a task the coordinator had reissued, output \
-         byte-identical to a clean single-node run",
+        "worker-{} died ({}) two tasks in, of {} tasks: {} claim(s) reissued {:?}, {} \
+         block(s) computed twice {:?}, every one of them a task the coordinator had \
+         reissued, output byte-identical to a clean single-node run",
+        died.index,
+        died.status,
+        run.status.tasks,
         run.status.reissued,
         reissued,
         blocks.len(),
@@ -657,9 +843,32 @@ fn a_worker_that_is_killed_mid_run_has_its_tasks_reissued_and_the_output_is_stil
 /// The regression this guards is specific and silent: a handout that only
 /// answers when a worker is idle leaves the list empty at exactly the moment
 /// prefetch needed to start, so **prefetch stops working multi-node while every
-/// single-node test keeps passing**. `starved` counts a wait that happened
-/// while the coordinator was known to have work, and it is the number that must
-/// be zero.
+/// single-node test keeps passing**.
+///
+/// # Two numbers, because one worker cannot see the whole question
+///
+/// `starved` is the worker's half: its list ran empty and the wait ended with a
+/// task the coordinator had been holding all along. `withheld` is the
+/// coordinator's half: a pull it answered "wait" while its ready set was not
+/// empty. Both must be zero, and neither implies the other — a handout that
+/// refuses an idle worker raises the second whatever the worker's timing does,
+/// and a `ready()` that quietly stopped offering claimed-elsewhere work would
+/// raise the first while the second stayed at zero.
+///
+/// The coordinator's half is the one that cannot be raced, which is why it is
+/// here: `withheld` is read off the coordinator's own state at the moment it
+/// refuses, so the regression is caught whether or not the refused worker
+/// happened to run dry. `src/distributed/coordinator.rs` has the two unit tests
+/// that make it move and hold it at zero over the same fixture, so a zero here
+/// is a measurement rather than a number that cannot change.
+///
+/// **What is not asserted, and why.** This used to demand at most one wait per
+/// worker. That is a claim about latency and not about the handout: the last
+/// task of a phase legitimately leaves the next asker with nothing, and how
+/// often that lands mid-job is a property of how fast the machine happened to
+/// be. What is asserted instead is that every wait past each worker's first was
+/// one the coordinator had *explained* — the accounting below — which is the
+/// part that stops being true when prefetch breaks.
 #[test]
 fn the_work_list_stays_at_least_one_task_ahead_of_what_is_being_computed() {
     let dir = scratch("pipeline");
@@ -673,17 +882,27 @@ fn the_work_list_stays_at_least_one_task_ahead_of_what_is_being_computed() {
         "a worker's list ran empty while the coordinator had work: {:?}",
         run.workers
     );
-    // Every task after each worker's first should have started with the next
-    // one already in hand.
+    assert_eq!(
+        run.withheld(),
+        0,
+        "the coordinator answered a pull with 'wait' while its ready set was not empty. \
+         No phase of this job is scarce, so nothing here may be held for a better-placed \
+         peer: {:?}",
+        run.workers
+    );
     let waited: u64 = run
         .workers
         .iter()
         .filter_map(|report| report.get("started_after_waiting").and_then(Value::as_u64))
         .sum();
+    // Every wait past each worker's first is classified, one way or the other.
+    // A gap here would mean a wait nobody accounted for.
     assert!(
-        waited <= workers as u64,
-        "{waited} tasks started only after waiting, with {workers} workers; at most one \
-         each — the first — is expected on a single-phase job"
+        run.starved() + run.told_to_wait() + workers >= waited as usize,
+        "{waited} waits over {workers} workers, of which {} were starves and {} were \
+         refusals: some wait was never classified",
+        run.starved(),
+        run.told_to_wait()
     );
     assert!(
         run.started_ready() + waited as usize >= run.status.tasks,
@@ -691,10 +910,15 @@ fn the_work_list_stays_at_least_one_task_ahead_of_what_is_being_computed() {
     );
     println!(
         "{workers} workers, {} tasks: {} started with work in hand, {waited} after waiting, \
-         {} starved",
+         {} starved, {} told to wait, {} withheld; slowest first handout {} ms against a \
+         coordinator serving its slowest pull in {} us",
         run.status.tasks,
         run.started_ready(),
-        run.starved()
+        run.starved(),
+        run.told_to_wait(),
+        run.withheld(),
+        run.worst_handout_wait().1,
+        run.slowest_served_pull_us()
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -918,7 +1142,15 @@ fn events_are_sent_as_they_happen_without_holding_the_work_up() {
         run.status.events,
         run.status.tasks
     );
-    assert_eq!(run.starved(), 0);
+    assert_eq!(
+        run.starved(),
+        0,
+        "a worker's list ran empty while the coordinator had work; {} of its waits were \
+         answered 'nothing now'. Observation must not be able to slow the work down, and \
+         this is the number that would say it had.",
+        run.told_to_wait()
+    );
+    assert_eq!(run.withheld(), 0);
     let sent: u64 = run
         .workers
         .iter()
@@ -987,7 +1219,13 @@ fn a_persistent_coordinator_accepts_a_job_over_http_and_outlives_it() {
     options.name = Some("in-process".to_string());
     let report = worker::run(options, &ProbeWorkflows).expect("a worker finishes the job");
     assert_eq!(report.tasks, decomposition.n_tasks());
-    assert_eq!(report.starved, 0);
+    assert_eq!(
+        report.starved, 0,
+        "one worker, one phase, every task ready from the start: the only way this list \
+         runs empty is the worker outrunning its own puller. {} of its waits were answered \
+         'nothing now'",
+        report.told_to_wait
+    );
 
     // The job is finished; the coordinator is not.
     assert!(coordinator.all_finished());
@@ -1098,7 +1336,7 @@ fn fragments_written_by_several_worker_processes_are_readable_by_one_merging_rea
     const PHASES: usize = 2;
     for workers in [1usize, 3, 5] {
         let dir = scratch(&format!("sidecar-workers-{workers}"));
-        let (mut spec, decomposition) = prepare(&dir, PHASES, None);
+        let (mut spec, decomposition) = prepare_over(&dir, SPREAD_BLOCKS, PHASES, None);
         spec.workflow.sidecar = Some(SidecarSpec::new("fragments", Lifecycle::DeleteOnExit));
         let run = local::run(&options(&dir, workers), &spec, &decomposition)
             .unwrap_or_else(|error| panic!("{workers} workers: {error}"));
@@ -1115,8 +1353,11 @@ fn fragments_written_by_several_worker_processes_are_readable_by_one_merging_rea
         if workers > 1 {
             assert!(
                 per_worker.iter().filter(|count| **count > 0).count() > 1,
-                "{workers} workers but only one produced fragments ({per_worker:?}); this run \
-                 proves nothing about several processes"
+                "{workers} workers but only one produced fragments ({per_worker:?}), tasks \
+                 per worker {:?}, ready after (ms) {:?}; this run proves nothing about \
+                 several processes",
+                run.tasks_per_worker(),
+                run.ready_ms_per_worker()
             );
         }
 
@@ -1245,10 +1486,10 @@ fn a_persistent_sidecar_stream_survives_the_discard_that_removes_a_delete_on_exi
 
 /// The chain's phases, plus a `volume -> fragments` phase and a
 /// `fragments -> fragments` phase that reaches one block either way.
-fn fragment_job(dir: &Path, reach: [usize; 3]) -> (JobSpec, Decomposition) {
+fn fragment_job(dir: &Path, blocks: usize, reach: [usize; 3]) -> (JobSpec, Decomposition) {
     let volumes = dir.join("volumes");
     let (mut spec, pixels_only) = probe_job_over(
-        BLOCKS,
+        blocks,
         1,
         ChainSpec::identity(),
         StoreSpec::Files {
@@ -1289,7 +1530,7 @@ fn a_fragment_written_by_one_worker_is_read_by_another_when_the_reach_demands_it
     const REACH: [usize; 3] = [1, 0, 0];
     for workers in [1usize, 3, 5] {
         let dir = scratch(&format!("fragment-ops-{workers}"));
-        let (spec, decomposition) = fragment_job(&dir, REACH);
+        let (spec, decomposition) = fragment_job(&dir, SPREAD_BLOCKS, REACH);
         let phases = decomposition.n_phases();
         let summary_phase = phases - 2;
         let fold_phase = phases - 1;
@@ -1403,8 +1644,12 @@ fn a_fragment_written_by_one_worker_is_read_by_another_when_the_reach_demands_it
                 crossings > 0,
                 "{workers} workers: no block folded fragments from more than one process, so \
                  this run does not demonstrate cross-node fragment visibility. Fragments per \
-                 worker: {:?}",
-                run.fragments_per_worker()
+                 worker: {:?}, tasks per worker: {:?}, ready after (ms) {:?} — a worker \
+                 ready in single-figure milliseconds that ran nothing was not late, it was \
+                 not served",
+                run.fragments_per_worker(),
+                run.tasks_per_worker(),
+                run.ready_ms_per_worker()
             );
         }
         println!(
@@ -1424,7 +1669,7 @@ fn a_fragment_written_by_one_worker_is_read_by_another_when_the_reach_demands_it
 #[test]
 fn a_zero_reach_fragment_phase_reads_no_neighbour_across_nodes_either() {
     let dir = scratch("fragment-ops-zero-reach");
-    let (spec, decomposition) = fragment_job(&dir, [0, 0, 0]);
+    let (spec, decomposition) = fragment_job(&dir, BLOCKS, [0, 0, 0]);
     let fold_phase = decomposition.n_phases() - 1;
     let run = local::run(&options(&dir, 4), &spec, &decomposition).expect("a run");
     assert_eq!(run.status.done, run.status.tasks);

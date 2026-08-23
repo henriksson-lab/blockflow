@@ -95,6 +95,11 @@
 // | 256 | materialise | 23.50 | 67.427 | 0.524 | 34.864 | 3.250 | 5.227 | — |
 // | 256 | decorate | **2.30** | **0.393** | **0.262** | **0.271** | 3.250 | 3.194 | 148.7 |
 //
+// **The `materialise` rows above are a record of `ops::label` before it declared
+// a barrier**, and the arm now measures the migrated op; see the four-arm table
+// below for the re-run and for what each of its rows became. They are kept
+// rather than overwritten because they are what the change is measured against.
+//
 // Every byte column above is **deterministic** — two runs at load 32 and load 40
 // produced them to the digit — and the wall clock is not. The fragment columns
 // are split into the merge's own traffic and the consumer's, because only the
@@ -129,8 +134,11 @@
 // **Four arms, not two, since `barriers.md` asked what the ceiling is.** The two
 // middle ones are what the framework would produce with G7 closed — a barrier
 // alone, and a barrier with the reduction hoisted out of the per-block loop —
-// obtained today by moving the same work out of the plan. Total bytes moved,
-// pixels and fragments together, at `D = 16`:
+// obtained here by moving the same work out of the plan. They were simulations
+// when this was written and they still are; what changed is that the framework
+// now has the real thing and the **first** arm is it. Total bytes moved, pixels
+// and fragments together, at `D = 16`, **as recorded before `ops::label` was
+// migrated**:
 //
 // | blocks | in-plan | barrier | barrier + hoisted | merge outside the plan |
 // |---|---|---|---|---|
@@ -141,6 +149,45 @@
 // | | 25.4x | 9.41x | **1.13x** | 1.00 |
 //
 // All four agree on 23 627 components and 23 627 rows at every lattice.
+//
+// **The `in-plan` column above is superseded, and it is superseded by
+// `ops::label` having been migrated rather than by a better measurement.**
+// The arm is `component_label_phases` — the shipped ops — so what it measures is
+// whatever those ops declare. When the table above was recorded they declared a
+// whole-lattice fragment reach and nothing else; they now declare
+// `barrier() == true` and a hoisted `reduce`, which is `barriers.md` §8.9's
+// "the measurement that would close §6.1 and §6.2 properly". Re-run on the same
+// recording, same `D = 16`, same lattices, load 42-54:
+//
+// | blocks | in-plan, **as shipped now** | barrier | barrier + hoisted | merge outside the plan |
+// |---|---|---|---|---|
+// | 1 | 1.26 | 1.26 | 1.26 | 0.74 |
+// | 4 | 1.33 | 1.40 | 1.30 | 0.77 |
+// | 32 | 1.74 | 3.78 | 1.67 | 1.15 |
+// | 256 | **4.84** | **39.29** | **4.70** | **4.18** |
+// | | **1.16x** | 9.41x | 1.13x | 1.00 |
+//
+// Every other column reproduced to the digit — 39.29, 4.70, 4.18, 23 627
+// components at every lattice — which is what makes the one column that moved
+// attributable. **106.07 GiB became 4.84**, a factor of **21.9**, and the
+// remaining `1.16x` over the fully out-of-plan arm is the extra read and write of
+// the label volume that materialising *is*, plus one item below.
+//
+// **Why 1.16x and not the projected 1.13x, and it is not noise.** The shipped op
+// declares `SeamFold::Unordered`, so `strategy::reduce_phase` runs the reduction
+// a second time over the reversed lattice and requires the same bytes — the
+// decomposition-invariance check `barriers.md` §8.5 added. `PhaseView` reads its
+// fragments out of the store, so that second pass re-reads the whole fragment
+// set: the merge's fragment traffic is `0.407` here against the hoisted arm's
+// `0.271`, and the difference is exactly `F = 0.136 GiB`. §8.5 prices the check
+// at "one extra reduction", which is right about the fold and silent about the
+// re-read. It is 0.14 GiB against the 34.5 removed.
+//
+// **The merge CPU, re-timed on this machine**: 0.08 s at 1 block, 0.12 at 4,
+// 3.00 at 32, **48.86 at 256** — the same shape as the 0.10 / 0.14 / 2.47 /
+// 33.67 recorded, larger throughout because the load was 42-54 rather than
+// 20-45. The shipped arm's *entire run* at 256 blocks is 4.45 s, against the
+// barrier-alone arm's 53.47 s.
 //
 // **And the largest cost of the per-block reduction is not traffic at all.**
 // Timed directly, re-deriving the merge once per block takes **0.10 s at 1

@@ -241,6 +241,19 @@ pub fn decomposition_json(decomposition: &Decomposition) -> Result<Value> {
             if !phase.source_images.is_empty() {
                 entry["source_levels"] = json!(phase.source_images);
             }
+            // **Not a generator: a barrier cannot be re-derived at all.** The
+            // far end rebuilds the geometry by running the same derivation over
+            // the same numbers, and every other field here is an input to that.
+            // This one is not derived from anything — it comes from the op's
+            // `FragmentOp::barrier`, and the far end does not hold the ops when
+            // it builds the plan. Dropped, it would produce a plan that runs,
+            // answers from however complete a fragment set the schedule left,
+            // and disagrees with the sender's fingerprint. Written only when it
+            // is set, so a plan with no barrier is the document it was before
+            // barriers existed.
+            if phase.barrier {
+                entry["barrier"] = json!(true);
+            }
             entry
         })
         .collect();
@@ -286,6 +299,11 @@ pub fn decomposition_from_json(value: &Value) -> Result<Decomposition> {
         }
         if phase.get("source_levels").is_some() {
             rebuilt = rebuilt.with_source_images(counts(phase, "source_levels")?);
+        }
+        if let Some(value) = phase.get("barrier") {
+            rebuilt = rebuilt.with_barrier(value.as_bool().ok_or_else(|| {
+                Error::invalid(format!("phase barrier is {value}, which is not a boolean"))
+            })?);
         }
         phases.push(rebuilt);
     }

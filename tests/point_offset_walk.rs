@@ -40,19 +40,17 @@
 // stopped a particular walk in a tie group. That claim cannot be made and no
 // fixture in this file makes it.
 
-use std::sync::Arc;
-
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::dtype::Dtype;
 use blockflow::env::ArrayEnvironment;
 use blockflow::error::Result;
 use blockflow::fragment::{
-    append_fragment_phase, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput, PhaseWork,
+    append_fragment_phase, BlockOutput, BlockView, FragmentOp, FragmentOutput, PhaseWork,
 };
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::ops::coordinates::coordinate_schema;
-use blockflow::ops::rows::{collect_rows, Limit, RowStreams, RowValues};
+use blockflow::ops::rows::{collect_rows, Limit, RowSourceOp, RowStreams, RowValues};
 use blockflow::ops::walk::{walk_from, OffsetSequence, OffsetWalkOp};
 use blockflow::probes::IdentityOp;
 use blockflow::sidecar::Lifecycle;
@@ -147,42 +145,31 @@ fn sequence() -> OffsetSequence {
 
 // -------------------------------------------------------- the row producer --
 
-/// Writes the rows of `POINTS` that lie in this block's core, and nothing else.
+/// The row source: the rows of `POINTS` that lie in this block's core, and
+/// nothing else.
 ///
-/// Reads no pixels and no fragments: it exists so that the walk has a row source
-/// whose contents are a constant of the test rather than a function of the
-/// array, which is what lets `EXPECTED` be written out. Every block writes a
-/// fragment, empty or not, so the coverage guard has something to check.
-struct PointsOp {
-    stream: String,
-}
-
-impl FragmentOp for PointsOp {
-    fn name(&self) -> &'static str {
-        "points"
-    }
-
-    fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            self.stream.clone(),
-            Lifecycle::DeleteOnExit,
-            Coverage::EveryBlock,
-        )]
-    }
-
-    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
-        let mut rows = blockflow::table::RowBuilder::new(Arc::new(coordinate_schema()));
-        for point in POINTS {
-            let mine = (0..3).all(|axis| {
-                point[axis] >= at.core.start[axis]
-                    && point[axis] < at.core.start[axis] + at.core.shape[axis]
-            });
-            if mine {
-                rows.push(point, &[])?;
-            }
-        }
-        Ok(BlockOutput::fragment(self.stream.clone(), rows.encode()))
-    }
+/// It exists so that the walk has a row source whose contents are a constant of
+/// the test rather than a function of the array, which is what lets `EXPECTED`
+/// be written out. Every block writes a fragment, empty or not, so the coverage
+/// guard has something to check.
+///
+/// **This file wrote it by hand until `ops::rows::RowSourceOp` landed** — see
+/// `docs/ops-survey/README.md`, G17 — and the keying is the same answer by a
+/// different route: the copy tested core containment directly, the library op
+/// keys by `ops::detect::owner_of`, and for a coordinate inside the volume
+/// those agree by construction, because `owner_of` names the block whose core
+/// holds it. Every point in `POINTS` is inside `VOLUME`.
+fn points_source(stream: &str) -> RowSourceOp {
+    RowSourceOp::new(
+        "points",
+        stream,
+        Lifecycle::DeleteOnExit,
+        coordinate_schema(),
+        POINTS
+            .iter()
+            .map(|at| RowValues::new(*at, Vec::new()))
+            .collect(),
+    )
 }
 
 // -------------------------------------------------------------- the runner --
@@ -216,9 +203,7 @@ fn one_pixel_phase(block: [usize; 3]) -> Decomposition {
 /// a fragment phase `p` reads image `p`, and the phase before a row op writes no
 /// image.
 fn run(block: [usize; 3], out_of_band: Option<OffsetSequence>) -> Result<Vec<RowValues>> {
-    let points = PointsOp {
-        stream: "rows.points".to_string(),
-    };
+    let points = points_source("rows.points");
     let streams = RowStreams::new(
         "rows.points",
         1,
@@ -472,9 +457,7 @@ fn reversing_the_ties_is_a_permutation_of_the_levels_and_nothing_else() {
 /// operand was read over.
 #[test]
 fn the_operand_reach_is_the_stated_maximum() {
-    let points = PointsOp {
-        stream: "rows.points".to_string(),
-    };
+    let points = points_source("rows.points");
     let streams = RowStreams::new(
         "rows.points",
         1,
@@ -555,6 +538,15 @@ impl FragmentOp for UnderdeclaredWalkOp {
         "underdeclared-walk"
     }
 
+    /// Delegated, and it is **not** the thing this op understates. The real op
+    /// answers zero here; what is understated is the *operand* reach in
+    /// [`Self::source_inputs`]. Keeping the two apart is the whole point of the
+    /// fixture: a phase reach and an operand window are separate declarations
+    /// that the planner folds into one halo, and only one of them is wrong.
+    fn reach(&self, axis: usize, volume_len: usize) -> usize {
+        self.0.reach(axis, volume_len)
+    }
+
     fn inputs(&self) -> Vec<blockflow::fragment::FragmentInput> {
         self.0.inputs()
     }
@@ -586,9 +578,7 @@ impl FragmentOp for UnderdeclaredWalkOp {
 
 #[test]
 fn a_short_operand_reach_is_refused_by_the_run_rather_than_answered() {
-    let points = PointsOp {
-        stream: "rows.points".to_string(),
-    };
+    let points = points_source("rows.points");
     let streams = RowStreams::new(
         "rows.points",
         1,

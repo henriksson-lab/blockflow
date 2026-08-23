@@ -554,6 +554,14 @@ impl FragmentOp for DriftingMergeOp {
         "drifting-merge"
     }
 
+    /// Nothing crosses as pixels, because none are read. The partials this folds
+    /// arrive on `partials` over the whole-lattice fragment reach in
+    /// [`Self::inputs`]. What this control varies is [`Self::seam_fold`] and
+    /// nothing else, which is what makes it a control.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn inputs(&self) -> Vec<FragmentInput> {
         vec![FragmentInput::own("partials", 1).with_reach(self.lattice)]
     }

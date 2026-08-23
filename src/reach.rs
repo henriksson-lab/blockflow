@@ -236,6 +236,43 @@ pub enum AxisReach {
     /// `Decomposition` is parity-visible and must be reproducible from what it
     /// records.
     PerBlock(Vec<(usize, usize)>),
+    /// A bound that **shrinks when the lattice's block edge is a whole number of
+    /// `stride`**, stated as the two answers rather than as one plus a rule.
+    ///
+    /// The one variant whose value is a function of the grid rather than of the
+    /// axis. It exists because an op can need a *divisibility* of the block edge
+    /// — not an axis left whole, which is [`Self::All`], and not a per-block
+    /// table, which needs the lattice to write down.
+    ///
+    /// **Both answers are carried, and that is what makes it fold.** A single
+    /// `(lo, hi)` plus "`stride - 1` when unaligned" cannot survive addition:
+    /// two ops of stride 32 fused reach `31 + 31` past their kernels when the
+    /// edge is odd, which no `stride - 1` can express, and a fold that tried
+    /// would **under-halo by 31**. With both states present the sum is
+    /// componentwise on each and is exact.
+    ///
+    /// **The first payer is `ops::convolve::TransformConvolveOp`.** Its tile grid
+    /// is anchored to the volume, so a block whose core starts mid-tile must
+    /// reach back to that tile's start; a block edge that is a multiple of the
+    /// tile makes every core start tile-aligned, because `BlockGrid::cores`
+    /// builds `start = index * block`, and then the true halo is exactly the
+    /// kernel's.
+    ///
+    /// **Everything that does not know the grid answers `unaligned`**, which is
+    /// the only safe direction: [`Self::bound`], [`Self::at`] and
+    /// [`Self::widest`] all do. [`Reach::in_voxels`] and
+    /// [`crate::decomposition::cuttable_axes`] are handed the lattice and are the
+    /// two places the discount is taken.
+    ///
+    /// Build one with [`Self::aligned`], which is the only way to get the
+    /// invariant right: `unaligned` is never narrower than `aligned`.
+    Aligned {
+        stride: usize,
+        /// `(lo, hi)` on a lattice whose block edge `stride` divides.
+        aligned: (usize, usize),
+        /// `(lo, hi)` on one it does not. Never narrower than `aligned`.
+        unaligned: (usize, usize),
+    },
     /// Everything on this axis, whatever its extent.
     ///
     /// Distinct from `Bounded { lo: n, hi: n }` with `n >= extent` even though
@@ -278,6 +315,9 @@ impl AxisReach {
                 .copied()
                 .or_else(|| table.last().copied())
                 .unwrap_or((0, 0)),
+            // No grid here, so the worst alignment: see the variant's own
+            // documentation for why this direction and not the other.
+            Self::Aligned { .. } => self.worst_case(),
             Self::All => (extent, extent),
         }
     }
@@ -289,8 +329,129 @@ impl AxisReach {
             Self::PerBlock(table) => table
                 .iter()
                 .fold((0, 0), |(lo, hi), &(l, h)| (lo.max(l), hi.max(h))),
+            Self::Aligned { .. } => self.worst_case(),
             Self::All => (extent, extent),
         }
+    }
+
+    /// A reach of `(lo, hi)` on any lattice whose block edge `stride` divides,
+    /// and `stride - 1` wider on each side on one it does not.
+    ///
+    /// The only constructor for [`Self::Aligned`], because the invariant that
+    /// `unaligned` is never narrower than `aligned` is the whole safety of the
+    /// variant and a struct literal could get it backwards. A `stride` of 0 or 1
+    /// divides nothing or everything and collapses to a plain [`Self::Bounded`],
+    /// which is what it means.
+    pub fn aligned(stride: usize, lo: usize, hi: usize) -> Self {
+        let slack = stride.saturating_sub(1);
+        Self::Aligned {
+            stride,
+            aligned: (lo, hi),
+            unaligned: (slack + lo, slack + hi),
+        }
+        .normalised()
+    }
+
+    /// The unaligned `(lo, hi)` of an [`Self::Aligned`], `(0, 0)` for anything
+    /// else. What every question asked without a lattice gets.
+    fn worst_case(&self) -> (usize, usize) {
+        match self {
+            Self::Aligned { unaligned, .. } => *unaligned,
+            _ => (0, 0),
+        }
+    }
+
+    /// An [`Self::Aligned`] whose two answers agree is a [`Self::Bounded`], and
+    /// saying so keeps a plan's recorded reach the simplest form of itself.
+    fn normalised(self) -> Self {
+        match self {
+            Self::Aligned {
+                aligned, unaligned, ..
+            } if aligned == unaligned => Self::Bounded {
+                lo: aligned.0,
+                hi: aligned.1,
+            },
+            other => other,
+        }
+    }
+
+    /// This reach against a lattice whose block edge on this axis is `edge`.
+    ///
+    /// The identity for every variant but [`Self::Aligned`], which is the point:
+    /// the others say the same thing whatever the lattice, and this one does
+    /// not. `edge = 0` resolves to the unaligned answer rather than dividing by
+    /// it.
+    pub fn resolved(&self, edge: usize) -> Self {
+        match self {
+            Self::Aligned {
+                stride,
+                aligned,
+                unaligned,
+            } => {
+                let (lo, hi) = if *stride > 0 && edge > 0 && edge % stride == 0 {
+                    *aligned
+                } else {
+                    *unaligned
+                };
+                Self::Bounded { lo, hi }
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// The unaligned answer as a plain [`Self::Bounded`]: what this reach means
+    /// to anything that cannot see a lattice, and what a fold falls back to when
+    /// two strides have no usable common multiple.
+    fn flattened(&self) -> Self {
+        match self {
+            Self::Aligned { .. } => {
+                let (lo, hi) = self.worst_case();
+                Self::Bounded { lo, hi }
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// The two answers this reach gives, for a fold to combine componentwise.
+    /// A reach with no stride gives the same answer on both lattices, which is
+    /// exactly why folding one in is exact.
+    fn both(&self) -> Option<((usize, usize), (usize, usize), usize)> {
+        match self {
+            Self::Aligned {
+                stride,
+                aligned,
+                unaligned,
+            } => Some((*aligned, *unaligned, *stride)),
+            Self::Bounded { lo, hi } => Some(((*lo, *hi), (*lo, *hi), 1)),
+            _ => None,
+        }
+    }
+
+    /// Fold two reaches that both answer per lattice, combining each answer with
+    /// `join` and the strides with their least common multiple.
+    ///
+    /// `None` when either side is a table or `All`, or when the common multiple
+    /// overflows — in each case the caller falls back to the unaligned answers,
+    /// which is what this variant meant before it could fold and is never wrong,
+    /// only dearer.
+    fn fold_aligned(&self, other: &Self, join: impl Fn(usize, usize) -> usize) -> Option<Self> {
+        let (left_aligned, left_unaligned, left_stride) = self.both()?;
+        let (right_aligned, right_unaligned, right_stride) = other.both()?;
+        let stride = least_common_multiple(left_stride, right_stride)?;
+        Some(
+            Self::Aligned {
+                stride,
+                aligned: (
+                    join(left_aligned.0, right_aligned.0),
+                    join(left_aligned.1, right_aligned.1),
+                ),
+                unaligned: (
+                    join(left_unaligned.0, right_unaligned.0),
+                    join(left_unaligned.1, right_unaligned.1),
+                ),
+            }
+            .normalised(),
+        )
     }
 
     /// The symmetric per-axis integer this used to be: the widest side.
@@ -309,6 +470,10 @@ impl AxisReach {
         match self {
             Self::Bounded { lo, hi } => (*lo).min(*hi),
             Self::PerBlock(table) => table.iter().map(|&(lo, hi)| lo.min(hi)).min().unwrap_or(0),
+            // What is granted *everywhere* is the aligned amount, not the
+            // unaligned one: this is the direction the doc above calls the one
+            // `widest` is not, and understating here is the safe error.
+            Self::Aligned { aligned, .. } => aligned.0.min(aligned.1),
             Self::All => extent,
         }
     }
@@ -329,6 +494,21 @@ impl AxisReach {
 
     /// Applied one after the other, reaches add.
     pub fn add(&self, other: &Self) -> Self {
+        // **An `Aligned` survives a fold, and it has to.** Fusing a transform
+        // convolution with a voxelwise map that reaches nothing used to flatten
+        // it, which lost the whole discount to the most ordinary fusion there
+        // is: measured on `96^3`, **27 blocks alone against one when fused**.
+        // Adding zero must be the identity, and the fold below makes it so —
+        // exactly for `add`, because both answers combine componentwise.
+        if matches!(self, Self::Aligned { .. }) || matches!(other, Self::Aligned { .. }) {
+            return match self.fold_aligned(other, |a, b| a + b) {
+                Some(folded) => folded,
+                // A table, an `All`, or a common multiple that overflows: fall
+                // back to the unaligned answers, which is what this variant
+                // meant before it could fold. Never wrong, only dearer.
+                None => self.flattened().add(&other.flattened()),
+            };
+        }
         match (self, other) {
             (Self::All, _) | (_, Self::All) => Self::All,
             (Self::Bounded { lo: a, hi: b }, Self::Bounded { lo: c, hi: d }) => Self::Bounded {
@@ -341,6 +521,18 @@ impl AxisReach {
 
     /// Alternatives and concurrent branches take the wider of the two, per side.
     pub fn max(&self, other: &Self) -> Self {
+        // Folded like [`Self::add`], and **exact where it matters and generous
+        // where it cannot be**: on an edge the common multiple divides, both
+        // branches take their aligned answer and the maximum of the two is the
+        // truth. On an edge only one stride divides, this reports the maximum of
+        // the two *unaligned* answers, which is at least the truth — the safe
+        // direction, and the one a halo may err in.
+        if matches!(self, Self::Aligned { .. }) || matches!(other, Self::Aligned { .. }) {
+            return match self.fold_aligned(other, |a, b| a.max(b)) {
+                Some(folded) => folded,
+                None => self.flattened().max(&other.flattened()),
+            };
+        }
         match (self, other) {
             (Self::All, _) | (_, Self::All) => Self::All,
             (Self::Bounded { lo: a, hi: b }, Self::Bounded { lo: c, hi: d }) => Self::Bounded {
@@ -367,6 +559,11 @@ impl AxisReach {
                     .map(|&(lo, hi)| (lo * edge, hi * edge))
                     .collect(),
             ),
+            // A reach counted in **blocks** and a stride counted in **voxels**
+            // are not the same quantity, and multiplying one by the other would
+            // invent a number. The unaligned answer, scaled, is the honest one
+            // and no op states both today.
+            Self::Aligned { .. } => self.flattened().scaled(edge),
         }
     }
 
@@ -379,6 +576,15 @@ impl AxisReach {
             Self::Bounded { lo, hi } if lo == hi => json!(lo),
             Self::Bounded { lo, hi } => json!({ "lo": lo, "hi": hi }),
             Self::All => json!("all"),
+            Self::Aligned {
+                stride,
+                aligned,
+                unaligned,
+            } => json!({
+                "stride": stride,
+                "aligned": [aligned.0, aligned.1],
+                "unaligned": [unaligned.0, unaligned.1],
+            }),
             Self::PerBlock(table) => json!({
                 "per_block": table.iter().map(|&(lo, hi)| json!([lo, hi])).collect::<Vec<_>>(),
             }),
@@ -418,11 +624,68 @@ impl AxisReach {
             }
             return Ok(Self::PerBlock(pairs));
         }
+        // **Before the fall-through below, and that ordering is the whole
+        // hazard.** The last arm accepts any object and reads `lo`/`hi` out of
+        // it, so an aligned reach that arrived here would round-trip into a
+        // `Bounded` carrying the *aligned* sides with the stride dropped — a
+        // halo narrower than the op needs, on a lattice nothing checked, in
+        // another process. `a_reach_survives_the_wire_in_every_variant` pins it.
+        if let Some(stride) = object.get("stride") {
+            let pair = |key: &str| -> Result<(usize, usize)> {
+                let entry = object.get(key).ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "an aligned reach states both of its answers; `{key}` is missing"
+                    ))
+                })?;
+                let values = entry
+                    .as_array()
+                    .filter(|row| row.len() == 2)
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(format!("`{key}` of an aligned reach is [lo, hi]"))
+                    })?;
+                Ok((number(&values[0])?, number(&values[1])?))
+            };
+            let aligned = pair("aligned")?;
+            let unaligned = pair("unaligned")?;
+            if unaligned.0 < aligned.0 || unaligned.1 < aligned.1 {
+                return Err(Error::InvalidArgument(format!(
+                    "an aligned reach's unaligned answer {unaligned:?} is narrower than its \
+                     aligned one {aligned:?}. The invariant is the whole safety of the variant: \
+                     a plan carrying it inverted would under-halo every block on every lattice \
+                     the stride does not divide."
+                )));
+            }
+            return Ok(Self::Aligned {
+                stride: number(stride)?,
+                aligned,
+                unaligned,
+            }
+            .normalised());
+        }
         Ok(Self::Bounded {
             lo: object.get("lo").map(number).transpose()?.unwrap_or(0),
             hi: object.get("hi").map(number).transpose()?.unwrap_or(0),
         })
     }
+}
+
+/// The least common multiple, or `None` on overflow.
+///
+/// **A common multiple beyond every candidate edge is not a failure**, which is
+/// why this does not clamp: no edge is then a multiple of it, the reach answers
+/// its unaligned form everywhere, and that is exactly the behaviour the fold
+/// replaced. The degradation is graceful and it is never wrong, only dearer.
+fn least_common_multiple(left: usize, right: usize) -> Option<usize> {
+    if left == 0 || right == 0 {
+        return None;
+    }
+    let (mut a, mut b) = (left, right);
+    while b != 0 {
+        let next = a % b;
+        a = b;
+        b = next;
+    }
+    (left / a).checked_mul(right)
 }
 
 fn number(value: &Value) -> Result<usize> {
@@ -704,7 +967,14 @@ impl Reach {
         for stated in 0..3 {
             let canonical = self.space.axes[stated];
             axes[canonical] = match self.space.units {
-                Units::Voxels => self.axes[stated].clone(),
+                // **The one place an `AxisReach::Aligned` is discounted.** This
+                // is handed the lattice and is called once per candidate grid by
+                // `decomposition::price_phase`, so the planner sees the cheaper
+                // halo on an aligned edge and prices it — a *preference* it can
+                // act on, rather than a mandate it would have to refuse against.
+                // Every other variant is unchanged by this call, which is why it
+                // was a `clone` before there was one that was not.
+                Units::Voxels => self.axes[stated].resolved(block[canonical]),
                 Units::Blocks => self.axes[stated].scaled(block[canonical].max(1)),
                 // Nothing. Not zero-because-we-do-not-know: a dependency in the
                 // image below's own lattice is satisfied by the fetch region,
@@ -1057,6 +1327,14 @@ mod tests {
                 AxisReach::All,
                 AxisReach::none(),
             ]),
+            // Added when the variant was: a hand-enumerated case list is
+            // exactly the assertion a new variant slips past, and this one
+            // would have — see the dedicated test below for what it slips into.
+            Reach::per_axis([
+                AxisReach::aligned(32, 4, 4),
+                AxisReach::aligned(3, 0, 2),
+                AxisReach::none(),
+            ]),
             Reach::from([1, 2, 3]).in_space(Space::source_voxels()),
             Reach::from([1, 2, 3]).in_space(Space::blocks()),
             Reach::from([1, 2, 3]).in_space(Space::default().with_axes([1, 2, 0]).unwrap()),
@@ -1066,6 +1344,220 @@ mod tests {
             assert_eq!(rebuilt, reach, "{}", reach.to_json());
             assert_eq!(rebuilt.digest(), reach.digest());
         }
+    }
+
+    /// **An aligned reach must not come back off the wire as a bounded one**,
+    /// and the shape of `from_json` is why this needs saying: its last arm
+    /// accepts *any* object and reads `lo`/`hi` out of it, so an aligned reach
+    /// whose `stride` key were not handled first would round-trip into a
+    /// `Bounded` carrying the **aligned** sides with the stride dropped — a halo
+    /// narrower than the op needs, on a lattice nothing would then check, in
+    /// another process.
+    #[test]
+    fn an_aligned_reach_does_not_come_back_as_the_halo_it_would_have_on_a_good_lattice() {
+        let aligned = AxisReach::aligned(32, 4, 4);
+        let rebuilt = AxisReach::from_json(&aligned.to_json()).unwrap();
+        assert_eq!(rebuilt, aligned);
+        // The specific wrong answer, named so that a regression is recognised
+        // rather than merely detected.
+        assert_ne!(
+            rebuilt,
+            AxisReach::Bounded { lo: 4, hi: 4 },
+            "an aligned reach that decoded as its own discounted sides would \
+             under-halo every block on every unaligned lattice"
+        );
+        // **Liveness.** The two are only distinguishable because `bound` reports
+        // the worst case; a variant whose `bound` had been written as the
+        // aligned sides would make the assertion above pass and mean nothing.
+        assert_eq!(aligned.bound(1024), (35, 35));
+        assert_eq!(AxisReach::Bounded { lo: 4, hi: 4 }.bound(1024), (4, 4));
+    }
+
+    /// The discount, and the four ways it is deliberately not taken.
+    #[test]
+    fn an_aligned_reach_is_discounted_only_against_a_lattice_that_earns_it() {
+        let aligned = AxisReach::aligned(32, 4, 4);
+        // Taken: the edge is a whole number of tiles.
+        for edge in [32, 64, 96, 128, 256] {
+            assert_eq!(
+                aligned.resolved(edge),
+                AxisReach::Bounded { lo: 4, hi: 4 },
+                "edge {edge} is a whole number of tiles"
+            );
+        }
+        // Not taken: the edge is not, or there is no edge at all.
+        for edge in [0, 1, 16, 24, 48, 80] {
+            assert_eq!(
+                aligned.resolved(edge),
+                AxisReach::Bounded { lo: 35, hi: 35 },
+                "edge {edge} is not a whole number of tiles"
+            );
+        }
+        // Not taken: nothing that cannot see a lattice may take it.
+        assert_eq!(aligned.bound(1024), (35, 35));
+        assert_eq!(aligned.at(7, 1024), (35, 35));
+        assert_eq!(aligned.widest(1024), 35);
+        // **Inverted, not deleted.** This block used to assert that a fold
+        // flattens — `aligned.add(&Bounded { lo: 1, hi: 1 })` was
+        // `Bounded { lo: 36, hi: 36 }` and `aligned.add(&aligned)` was
+        // `Bounded { lo: 70, hi: 70 }` — on the argument that two ops may state
+        // two strides. That was true of the second case and wrong about the
+        // first, and the first is the common one: fusing a transform
+        // convolution with a voxelwise map that reaches nothing lost the whole
+        // discount, **27 blocks against one on `96^3`**. A fold now carries
+        // both answers.
+        let other = AxisReach::Bounded { lo: 1, hi: 1 };
+        assert_eq!(aligned.add(&other), AxisReach::aligned(32, 5, 5));
+        assert_eq!(aligned.max(&other), AxisReach::aligned(32, 4, 4));
+        assert_eq!(
+            aligned.add(&AxisReach::none()),
+            aligned,
+            "adding nothing is the identity, which is the case the old rule got wrong"
+        );
+        // `narrowest` is the one direction that reports the aligned amount,
+        // because it answers "what is granted everywhere".
+        assert_eq!(aligned.narrowest(1024), 4);
+        // **Liveness.** Every assertion above would hold for a variant that
+        // ignored its stride entirely and always answered the worst case, so
+        // the discount has to be shown to happen at all.
+        assert_ne!(aligned.resolved(64), aligned.resolved(48));
+    }
+
+    /// **Two aligned reaches add on both answers, and the unaligned one is not
+    /// `stride - 1`.** The trap this is here for: a variant carrying one
+    /// `(lo, hi)` plus the rule "`stride - 1` when unaligned" would fold two
+    /// stride-32 reaches into something claiming `31 + lo` off-alignment, where
+    /// the truth is `31 + 31 + lo` — an **under-halo of 31 voxels**, silent, on
+    /// every lattice the stride does not divide.
+    #[test]
+    fn two_aligned_reaches_add_on_both_answers_and_not_on_the_stride() {
+        let one = AxisReach::aligned(32, 4, 4);
+        let sum = one.add(&one);
+        assert_eq!(
+            sum,
+            AxisReach::Aligned {
+                stride: 32,
+                aligned: (8, 8),
+                unaligned: (70, 70),
+            }
+        );
+        // The two answers, each checked against what the phase really reads.
+        assert_eq!(sum.resolved(64), AxisReach::Bounded { lo: 8, hi: 8 });
+        assert_eq!(sum.resolved(48), AxisReach::Bounded { lo: 70, hi: 70 });
+        // And the number the trap would have produced, named so a regression is
+        // recognised rather than merely detected.
+        assert_ne!(
+            sum.bound(1024),
+            (35, 35),
+            "an unaligned answer of `stride - 1 + lo + lo` would under-halo by 31 a side"
+        );
+        assert_eq!(sum.bound(1024), (70, 70));
+    }
+
+    /// A fold of two different strides uses their least common multiple, and
+    /// **degrades to the old behaviour rather than to a wrong one** when that
+    /// multiple is past every edge anybody would cut on.
+    #[test]
+    fn a_fold_of_two_strides_takes_their_common_multiple() {
+        let thirty_two = AxisReach::aligned(32, 1, 1);
+        let forty_eight = AxisReach::aligned(48, 1, 1);
+        let sum = thirty_two.add(&forty_eight);
+        assert_eq!(
+            sum,
+            AxisReach::Aligned {
+                stride: 96,
+                aligned: (2, 2),
+                unaligned: (80, 80),
+            }
+        );
+        // 96 divides 96 and 192 and nothing smaller that anyone would cut on.
+        assert_eq!(sum.resolved(96), AxisReach::Bounded { lo: 2, hi: 2 });
+        assert_eq!(sum.resolved(64), AxisReach::Bounded { lo: 80, hi: 80 });
+        // **The graceful-degradation claim, asserted.** Coprime strides give a
+        // multiple past any candidate edge, and the reach is then its unaligned
+        // answer everywhere — which is exactly what flattening gave, so the fold
+        // is never worse than the rule it replaced.
+        let coprime = AxisReach::aligned(31, 1, 1).add(&AxisReach::aligned(32, 1, 1));
+        // The unaligned answers the two would have carried alone, added — which
+        // is precisely what flattening used to produce.
+        let flattened =
+            AxisReach::Bounded { lo: 31, hi: 31 }.add(&AxisReach::Bounded { lo: 32, hi: 32 });
+        for edge in [16, 32, 48, 64, 96, 128, 256] {
+            assert_eq!(
+                coprime.resolved(edge),
+                flattened,
+                "at edge {edge} a coprime fold must cost exactly what flattening cost"
+            );
+        }
+        // Liveness: it is not simply always flattened — its own multiple works.
+        assert_eq!(
+            coprime.resolved(31 * 32),
+            AxisReach::Bounded { lo: 2, hi: 2 }
+        );
+    }
+
+    /// `max` is exact on a common multiple and **generous** off it, which is the
+    /// direction a halo may err in.
+    #[test]
+    fn max_of_two_aligned_reaches_is_exact_where_it_can_be_and_generous_where_it_cannot() {
+        let wide = AxisReach::aligned(32, 6, 6);
+        let narrow = AxisReach::aligned(16, 2, 2);
+        let joined = wide.max(&narrow);
+        assert_eq!(
+            joined,
+            AxisReach::Aligned {
+                stride: 32,
+                aligned: (6, 6),
+                unaligned: (37, 37),
+            }
+        );
+        // Exact where 32 divides: both branches take their aligned answer.
+        assert_eq!(joined.resolved(64), AxisReach::Bounded { lo: 6, hi: 6 });
+        // Generous where only 16 does: the truth is `max(37, 2) = 37` for the
+        // wide branch and 2 for the narrow, so 37 is exactly right here — the
+        // generosity shows where the *narrow* branch is the wider unaligned one.
+        assert_eq!(joined.resolved(48), AxisReach::Bounded { lo: 37, hi: 37 });
+        // Liveness: a `max` that had taken the minimum, or ignored one operand,
+        // would be caught here.
+        assert!(
+            joined.bound(1024).0 >= wide.bound(1024).0,
+            "a join must cover its widest branch"
+        );
+        assert!(joined.bound(1024).0 >= narrow.bound(1024).0);
+    }
+
+    /// The discount is taken **where a lattice exists**, which is
+    /// [`Reach::in_voxels`], and nowhere earlier.
+    #[test]
+    fn a_reach_in_voxels_takes_the_discount_the_lattice_earns() {
+        let reach = Reach::per_axis([
+            AxisReach::aligned(32, 4, 4),
+            AxisReach::aligned(32, 4, 4),
+            AxisReach::aligned(32, 4, 4),
+        ]);
+        assert_eq!(reach.bound([1024, 1024, 1024]), [35, 35, 35]);
+        assert_eq!(
+            reach.in_voxels([64, 48, 64]).bound([1024, 1024, 1024]),
+            [4, 35, 4],
+            "one unaligned axis discounts the other two and not itself"
+        );
+        // A grid's own arithmetic, so the figure is the crate's and not one
+        // written here: the discount is worth this much of read amplification.
+        let grid = BlockGrid::new([1024, 1024, 1024], [64, 64, 64]).unwrap();
+        let worst = grid.mean_read_voxels(&reach);
+        let taken = grid.mean_read_voxels(&reach.in_voxels(grid.block()));
+        assert!(
+            worst > taken * 5.0,
+            "the discount is worth {:.3}x at edge 64 and this test claims it is large",
+            worst / taken
+        );
+        // **Liveness.** At one block the two are the same fetch, so a test that
+        // had picked that lattice would be asserting nothing.
+        let whole = BlockGrid::new([1024, 1024, 1024], [1024, 1024, 1024]).unwrap();
+        assert_eq!(
+            whole.mean_read_voxels(&reach),
+            whole.mean_read_voxels(&reach.in_voxels(whole.block()))
+        );
     }
 
     #[test]

@@ -50,7 +50,7 @@ use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::op::{Anchor, BlockOp};
+use crate::op::{Anchor, BlockOp, Slicing};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
 
@@ -343,6 +343,24 @@ impl MorphologyOp {
 }
 
 impl BlockOp for MorphologyOp {
+    /// **A stencil.** This is a *binary* morphology — an `f64` buffer goes
+    /// through `is_set` on the way in — so an erosion is a conjunction and a
+    /// dilation a disjunction over a fixed neighbourhood read at fixed offsets.
+    /// Both are associative and commutative, so no order a cut could change is
+    /// visible in the answer, and nothing is carried along the scan.
+    ///
+    /// **Not "the extreme of a neighbourhood", which is what this comment said
+    /// first and would have been the grey morphology's reason.** The distinction
+    /// is not pedantic: it is what decides how a fixture can perturb this op at
+    /// all, and `tests/intra_block_slicing.rs` had to learn it — adding a large
+    /// value to a voxel moves a minimum and moves nothing here, because a value
+    /// made larger or smaller is set either way.
+    ///
+    /// Held to it by `tests/intra_block_slicing.rs`.
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
     fn name(&self) -> &'static str {
         self.name
     }

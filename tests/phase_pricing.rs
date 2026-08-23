@@ -197,11 +197,10 @@ fn the_reach_charges_error_is_a_property_of_the_candidate_not_a_constant() {
 // `fragments -> fragments` phase reads no pixel and writes no image, and was
 // charged a full traversal of the volume plus a full write of it.
 
-use blockflow::fragment::{
-    fragment_only, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput, PhaseWork,
-};
+use blockflow::fragment::{fragment_only, PhaseWork};
 use blockflow::iterate::{iterative_phase, IterativeOp, Substage, SubstageLimit, SubstageOperand};
 use blockflow::op::Chain;
+use blockflow::probes::NullFragmentOp;
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::predicted_makespan;
 use blockflow::voxels::Voxels;
@@ -239,28 +238,6 @@ impl IterativeOp for Thinning {
 
     fn cost_per_voxel(&self) -> f64 {
         self.cost
-    }
-}
-
-/// A `fragments -> fragments` merge: reads no pixel, writes no image, and its
-/// whole cost is per fragment rather than per voxel.
-struct Merge;
-
-impl FragmentOp for Merge {
-    fn name(&self) -> &'static str {
-        "merge"
-    }
-
-    fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            "merged",
-            Lifecycle::DeleteOnExit,
-            Coverage::Sparse,
-        )]
-    }
-
-    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
-        Ok(BlockOutput::nothing())
     }
 }
 
@@ -395,7 +372,7 @@ fn the_iterative_edge_is_flat_in_the_compute_at_one_worker_and_moves_above_it() 
 /// price now says so. The reference is `exact_read_voxels`, which reports zero.
 #[test]
 fn a_fragments_only_phase_is_not_charged_for_pixels_it_never_touches() {
-    let merge = Merge;
+    let merge = NullFragmentOp::new("merge", "merged", Lifecycle::DeleteOnExit);
     let plan = fragment_only(VOLUME, [16, 16, 16], Dtype::F64, &[&merge])
         .expect("a fragments-only decomposition");
     assert_eq!(
@@ -422,7 +399,7 @@ fn a_fragments_only_phase_is_not_charged_for_pixels_it_never_touches() {
 /// exists to remove, and it is invisible in the answer.
 #[test]
 fn a_slotless_phase_the_caller_did_not_describe_is_refused_by_name() {
-    let merge = Merge;
+    let merge = NullFragmentOp::new("merge", "merged", Lifecycle::DeleteOnExit);
     let plan = fragment_only(VOLUME, [16, 16, 16], Dtype::F64, &[&merge])
         .expect("a fragments-only decomposition");
     let message = blockflow::decomposition::predicted_cost(

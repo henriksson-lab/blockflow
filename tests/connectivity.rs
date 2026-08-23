@@ -360,10 +360,15 @@ fn the_ops_built_on_this_module_are_unmoved_and_still_face_connected() {
 /// The plans of the three ops built on this module, pinned.
 ///
 /// A fingerprint is what a resumed run compares against, so a plan that moves
-/// silently is a run that cannot be resumed. Nothing in this change touches an
-/// op's name, reach, streams or element types — the connectivity is consumed at
-/// execution time and appears in no declaration — and these three numbers are
-/// how that claim is checked rather than asserted.
+/// silently is a run that cannot be resumed. The **connectivity** is consumed at
+/// execution time and appears in no declaration, so it moves none of these
+/// numbers, and that is what this test was written to check.
+///
+/// **All three moved once**, when the ops migrated onto `FragmentOp::barrier`:
+/// a barrier is part of the plan and is hashed, and relieving the halo changes
+/// the phase's geometry, so the fingerprints *should* have moved and a test that
+/// had not noticed would have been the defect. They are pinned separately rather
+/// than as one tuple, so that the next op to move says which one it was.
 #[test]
 fn the_plans_of_the_ops_built_on_this_module_fingerprint_as_they_did() {
     const VOLUME: [usize; 3] = [24, 16, 12];
@@ -387,12 +392,19 @@ fn the_plans_of_the_ops_built_on_this_module_fingerprint_as_they_did() {
     let detecting = detect_phases(grid, Dtype::Bool, &regions, &points).expect("a plan");
 
     assert_eq!(
-        (
-            filling.fingerprint(),
-            regional.fingerprint(),
-            detecting.fingerprint()
-        ),
-        (FILL_FINGERPRINT, REGIONAL_FINGERPRINT, DETECT_FINGERPRINT)
+        filling.fingerprint(),
+        FILL_FINGERPRINT,
+        "ops::fill's plan moved"
+    );
+    assert_eq!(
+        regional.fingerprint(),
+        REGIONAL_FINGERPRINT,
+        "ops::regional's plan moved"
+    );
+    assert_eq!(
+        detecting.fingerprint(),
+        DETECT_FINGERPRINT,
+        "ops::detect's plan moved"
     );
 
     // and the three are genuinely different plans, so an accidental constant
@@ -408,9 +420,9 @@ fn the_plans_of_the_ops_built_on_this_module_fingerprint_as_they_did() {
     assert_eq!(sorted.len(), all.len());
 }
 
-const FILL_FINGERPRINT: u64 = 12_276_134_652_032_094_236;
-const REGIONAL_FINGERPRINT: u64 = 15_612_560_250_096_173_982;
-const DETECT_FINGERPRINT: u64 = 13_319_511_774_036_546_415;
+const FILL_FINGERPRINT: u64 = 1_507_721_539_040_108_903;
+const REGIONAL_FINGERPRINT: u64 = 4_161_838_864_743_738_177;
+const DETECT_FINGERPRINT: u64 = 15_254_762_488_441_970_327;
 
 // --------------------------------------------------------- discrimination --
 

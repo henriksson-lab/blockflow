@@ -23,7 +23,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -893,4 +893,229 @@ fn report_what_a_backwards_seek_costs() {
          round trip that asked for it.",
         "fold forward to the end", "seek back to the middle and poll",
     );
+}
+
+// ------------------------------------------------- connections at once --
+
+/// One keep-alive connection: `rounds` requests on it, and how long each answer
+/// took — or `None` for an answer that never came inside `deadline`.
+///
+/// HTTP/1.1 with the connection held open, which is what a browser does and
+/// what [`fetch`] deliberately does not: the defect this exists to catch is
+/// invisible to a client that closes after every request, because closing is
+/// what releases the connection that was stuck behind it.
+fn keepalive_probe(stream: TcpStream, rounds: usize, deadline: Duration) -> Vec<Option<Duration>> {
+    let mut stream = stream;
+    stream.set_read_timeout(Some(deadline)).unwrap();
+    let _ = stream.set_nodelay(true);
+    let mut out = Vec::new();
+    let mut buffer = Vec::new();
+    for _ in 0..rounds {
+        let at = Instant::now();
+        if write!(
+            stream,
+            "GET /api/state HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+        )
+        .is_err()
+        {
+            out.push(None);
+            break;
+        }
+        let _ = stream.flush();
+        let answered = loop {
+            if let Some(end) = find(&buffer, b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buffer[..end]).into_owned();
+                let length = head
+                    .split("\r\n")
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buffer.len() >= end + 4 + length {
+                    buffer.drain(..end + 4 + length);
+                    break true;
+                }
+            }
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk) {
+                Ok(0) => break false,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                Err(_) => break false,
+            }
+        };
+        out.push(answered.then(|| at.elapsed()));
+        if !answered {
+            break;
+        }
+    }
+    out
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// `n` connections opened as simultaneously as this machine permits, each then
+/// asking, and **none of them let go until all of them are finished**.
+///
+/// That last part is the whole instrument. A probe that closes as soon as it is
+/// served frees whatever was queued behind it, so a connection that would never
+/// have been read is served late instead and the defect reads as a delay of a
+/// few tens of milliseconds. Held open, it reads as what it is.
+///
+/// Returns how many connections were never answered at all, and the slowest
+/// first answer among those that were.
+fn burst(addr: SocketAddr, n: usize, deadline: Duration) -> (usize, Duration) {
+    let ready = Arc::new(Barrier::new(n));
+    let done = Arc::new(Barrier::new(n));
+    let mut probes = Vec::new();
+    for _ in 0..n {
+        let ready = ready.clone();
+        let done = done.clone();
+        probes.push(std::thread::spawn(move || {
+            ready.wait();
+            let stream = TcpStream::connect(addr).expect("the server is listening");
+            let rounds = keepalive_probe(stream.try_clone().unwrap(), 2, deadline);
+            done.wait();
+            drop(stream);
+            rounds
+        }));
+    }
+    let results: Vec<Vec<Option<Duration>>> =
+        probes.into_iter().map(|p| p.join().unwrap()).collect();
+    let starved = results
+        .iter()
+        .filter(|rounds| rounds.first().copied().flatten().is_none())
+        .count();
+    let worst = results
+        .iter()
+        .filter_map(|rounds| rounds.first().copied().flatten())
+        .max()
+        .unwrap_or_default();
+    (starved, worst)
+}
+
+/// How many connections a burst opens, and how many bursts.
+///
+/// Twelve because the defect this catches has a floor of four and the progress
+/// view goes past four with one browser tab; five bursts because the defect was
+/// a *race* — it struck 12 of 20 bursts at this width when it was here, so one
+/// burst would let it through a fifth of the time and five let it through
+/// three times in ten thousand.
+const AT_ONCE: usize = 12;
+const BURSTS: usize = 5;
+
+/// **Every connection is read, however many arrive together.**
+///
+/// The property the progress view lives or dies by and did not have: a
+/// connection that is accepted and never read does not fail, it *hangs*, and a
+/// browser waiting on a poll that will never be answered shows a healthy run as
+/// a frozen one. See the module header of `gui::server` for the before-figures
+/// and `a_pool_that_never_frees_a_thread_does_starve_someone` below for why
+/// this assertion is not vacuous.
+#[test]
+fn many_connections_at_once_are_all_answered() {
+    let (document, _) = exported(2);
+    let replay = Arc::new(ReplaySource::from_json(&document).unwrap());
+    let server = serve(replay, local(0)).unwrap();
+    let addr = server.addr();
+    for round in 0..BURSTS {
+        let (starved, worst) = burst(addr, AT_ONCE, Duration::from_secs(5));
+        assert_eq!(
+            starved, 0,
+            "burst {round}: {starved} of {AT_ONCE} connections were never answered at all"
+        );
+        assert!(
+            worst < Duration::from_secs(1),
+            "burst {round}: the slowest first answer was {worst:?}, which is a connection \
+             that waited for another to finish rather than one that was read"
+        );
+    }
+}
+
+/// The liveness check for the test above, and the shape of the defect it
+/// replaced.
+///
+/// A fixed pool of four threads, each running a connection task that does not
+/// return while the connection lives — which is `tiny_http` 0.12's accept path
+/// reduced to the part that mattered. Everything past the fourth connection is
+/// queued behind a task that never finishes, so it is never read at all.
+///
+/// **If this ever stops starving anybody, the test above is measuring
+/// nothing.** It is an assertion that the instrument can see a violation, not
+/// an assertion about this crate.
+#[test]
+fn a_pool_that_never_frees_a_thread_does_starve_someone() {
+    const POOL: usize = 4;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<TcpStream>();
+    let rx = Arc::new(std::sync::Mutex::new(rx));
+    let mut pool = Vec::new();
+    for _ in 0..POOL {
+        let rx = rx.clone();
+        pool.push(std::thread::spawn(move || loop {
+            let taken = rx.lock().unwrap().recv();
+            let Ok(mut stream) = taken else { return };
+            // The defect, in one line: this does not return while the
+            // connection lives, and the thread it holds is never given back.
+            let mut chunk = [0u8; 4096];
+            while let Ok(read) = stream.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{{}}");
+                let _ = stream.flush();
+            }
+        }));
+    }
+    let accepting = std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if tx.send(stream).is_err() {
+                return;
+            }
+        }
+    });
+
+    let (starved, _) = burst(addr, AT_ONCE, Duration::from_millis(500));
+    assert_eq!(
+        starved,
+        AT_ONCE - POOL,
+        "a pool of {POOL} threads that never frees one should read exactly {POOL} of \
+         {AT_ONCE} connections; if it read more, `burst` is not holding them open and \
+         `many_connections_at_once_are_all_answered` is asserting nothing"
+    );
+    drop(accepting);
+    drop(pool);
+}
+
+/// The sweep the decision to replace this server was taken on, kept so the
+/// before-figures in `gui::server`'s header can be reproduced against whatever
+/// server is here.
+#[test]
+#[ignore = "prints a measurement; run with --ignored --nocapture"]
+fn report_how_many_connections_at_once_are_read() {
+    let (document, _) = exported(2);
+    for n in [2usize, 3, 4, 5, 6, 8, 12, 24, 48] {
+        let mut bursts_with_starvation = 0;
+        let mut connections_starved = 0;
+        let mut worst = Duration::default();
+        let repeats = 20;
+        for _ in 0..repeats {
+            let replay = Arc::new(ReplaySource::from_json(&document).unwrap());
+            let server = serve(replay, local(0)).unwrap();
+            let (starved, slowest) = burst(server.addr(), n, Duration::from_secs(2));
+            connections_starved += starved;
+            bursts_with_starvation += usize::from(starved > 0);
+            worst = worst.max(slowest);
+            server.shutdown();
+        }
+        println!(
+            "{n:>3} connections at once: {bursts_with_starvation:>2}/{repeats} bursts left \
+             someone never answered ({connections_starved} connections), slowest first \
+             answer {worst:?}"
+        );
+    }
 }

@@ -5,20 +5,50 @@
 // The HTTP surface: four endpoints, some static files, and one security
 // decision.
 //
-// Why `tiny_http` and not `axum`
-// ------------------------------
+// Why this crate's own server and not `axum`, and not `tiny_http` either
+// ----------------------------------------------------------------------
 // The executor is synchronous and parallel over rayon. `axum` would bring
 // tokio, and with it a second concurrency model living inside a crate that has
 // exactly one — plus about forty transitive crates behind a feature flag on a
 // library whose whole `[dependencies]` section is four lines and is defended in
 // a comment. What that buys is routing, extractors and middleware, none of
-// which four JSON endpoints and a static directory need.
+// which four JSON endpoints and a static directory need. That argument is
+// unchanged and it is why this is a blocking server on ordinary threads.
 //
-// `tiny_http` is a blocking server on ordinary threads: four small transitive
-// dependencies, no runtime, no executor of its own, and a request loop that
-// reads like a request loop. The concurrency here is two threads answering
-// polls; a design that needed more than that would be a design that had stopped
-// being a progress view.
+// What *has* changed is which blocking server. This module used to be
+// `tiny_http`'s, and it is [`crate::http`]'s because of a measurement rather
+// than a preference: that crate's pool grows a thread only when it observes
+// none waiting, and its connection task never returns while the connection
+// lives, so connections arriving together queue behind tasks that never finish
+// and are read only when some *other* connection closes.
+//
+// **The progress view was believed too small for that to matter and it is
+// not.** The pool's floor is four threads, and a browser holding a page of
+// three files and two poll intervals goes past four without trying. Measured
+// here, bursts of simultaneous keep-alive connections held open, 20 bursts per
+// row:
+//
+// | connections | bursts leaving someone never answered |
+// |---|---|
+// | 2, 3, 4 | **0 / 20** |
+// | 5 | **14 / 20** |
+// | 8 | 16 / 20 |
+// | 48 | 15 / 20 |
+//
+// A loaded machine was no better (10, 18 and 19 of 20 on the same rows), so it
+// is not a scheduling accident that a quiet node would escape. A request that
+// is never read does not fail — it hangs, and a healthy run's progress view
+// freezes with it. `many_connections_at_once_are_all_answered` in `gui::tests`
+// is the assertion, and `a_pool_that_never_frees_a_thread_does_starve_someone`
+// beside it is what makes that assertion mean something.
+//
+// [`crate::http`] takes a thread per connection **at accept**, which is the
+// simplest dispatch that cannot queue a connection behind a task that never
+// finishes, and its header records the two repairs that failed before it.
+//
+// There is therefore no thread count to set here any more: there was one, it
+// defaulted to two, and two threads answering polls is exactly the shape that
+// could not be made safe.
 //
 // The bind default, which is the one thing here with consequences
 // ---------------------------------------------------------------
@@ -47,18 +77,14 @@
 // imply — and it is also the reason the public bind is gated rather than merely
 // discouraged.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::Duration;
 
 use serde_json::{json, Value};
-use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::error::{Error, Result};
+use crate::http::{param, Request, Response, Server};
 
 use super::source::{Control, ProgressSource, Window};
 use super::wire::{meta_to_json, state_to_json, timeline_to_json, WIRE_VERSION};
@@ -82,10 +108,6 @@ pub struct Options {
     pub allow_public: bool,
     /// Where the built browser files are. `None` searches; see [`find_assets`].
     pub assets: Option<PathBuf>,
-    /// Threads answering requests. Two is enough for a page that polls and
-    /// occasionally fetches a file; the work per request is a snapshot and a
-    /// serialisation.
-    pub threads: usize,
 }
 
 impl Default for Options {
@@ -94,7 +116,6 @@ impl Default for Options {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_PORT),
             allow_public: false,
             assets: None,
-            threads: 2,
         }
     }
 }
@@ -120,44 +141,34 @@ impl Options {
 }
 
 /// A running server. Dropping it stops it.
+///
+/// A thin name over [`crate::http::Server`], kept because what a caller of this
+/// module holds is a *progress view*, and because the address it reports is the
+/// one to forward.
 #[derive(Debug)]
 pub struct ServerHandle {
-    addr: SocketAddr,
-    stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
+    server: Server,
 }
 
 impl ServerHandle {
     /// What was actually bound, which is what to forward. Differs from
     /// `Options::bind` when the port was 0.
     pub fn addr(&self) -> SocketAddr {
-        self.addr
+        self.server.bound()
     }
 
     /// The address to paste into a browser once a forward is up.
     pub fn url(&self) -> String {
-        format!("http://{}/", self.addr)
+        format!("http://{}/", self.addr())
     }
 
-    /// Stop accepting and wait for the request threads to finish.
+    /// Stop accepting and wait for the connection threads to finish.
     ///
-    /// Takes up to one poll interval, because the threads wake on a timeout
-    /// rather than being interrupted — a request in flight is always finished,
-    /// never truncated.
-    pub fn shutdown(mut self) {
-        self.stop.store(true, Ordering::Release);
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for ServerHandle {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
+    /// Takes up to one [`crate::http::POLL`], because a connection thread wakes
+    /// on a read timeout rather than being interrupted — a request in flight is
+    /// always finished, never truncated.
+    pub fn shutdown(self) {
+        self.server.shutdown();
     }
 }
 
@@ -187,131 +198,41 @@ pub fn serve(source: Arc<dyn ProgressSource>, options: Options) -> Result<Server
         );
     }
 
-    let server = Server::http(options.bind).map_err(|err| {
+    let listener = TcpListener::bind(options.bind).map_err(|err| {
         Error::backend(format!(
             "could not listen on {}: {err}. If the port is in use, pass a \
              different one, or 0 to let the system choose.",
             options.bind
         ))
     })?;
-    let addr = server.server_addr().to_ip().unwrap_or(options.bind);
-    let server = Arc::new(server);
-    let assets = Arc::new(match &options.assets {
+    let assets = match &options.assets {
         Some(explicit) => Some(explicit.clone()),
         None => find_assets(),
-    });
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut threads = Vec::new();
-    for worker in 0..options.threads.max(1) {
-        let server = server.clone();
-        let source = source.clone();
-        let assets = assets.clone();
-        let stop = stop.clone();
-        threads.push(
-            std::thread::Builder::new()
-                .name(format!("blockflow-gui-{worker}"))
-                .spawn(move || request_loop(&server, source.as_ref(), assets.as_deref(), &stop))
-                .map_err(|err| Error::backend(format!("starting a request thread: {err}")))?,
-        );
-    }
-
-    Ok(ServerHandle {
-        addr,
-        stop,
-        threads,
-    })
-}
-
-fn request_loop(
-    server: &Server,
-    source: &dyn ProgressSource,
-    assets: Option<&Path>,
-    stop: &AtomicBool,
-) {
-    while !stop.load(Ordering::Acquire) {
-        // A timeout rather than a blocking receive, so shutdown does not depend
-        // on a request arriving to wake the thread up.
-        let request = match server.recv_timeout(Duration::from_millis(200)) {
-            Ok(Some(request)) => request,
-            Ok(None) => continue,
-            // The listener is gone; nothing this thread can do about it, and
-            // spinning on the error would burn a core.
-            Err(_) => break,
-        };
-        // A panic here must not take the thread with it: the view would go
-        // silently half-dead, and the run it is watching is entirely fine.
-        let handled = catch_unwind(AssertUnwindSafe(|| handle(request, source, assets)));
-        if handled.is_err() {
-            eprintln!("blockflow gui: a request handler panicked; the run is unaffected");
-        }
-    }
-}
-
-fn json_header() -> Header {
-    Header::from_bytes(
-        &b"Content-Type"[..],
-        &b"application/json; charset=utf-8"[..],
-    )
-    .expect("a constant header parses")
-}
-
-fn no_store() -> Header {
-    Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]).expect("a constant header parses")
-}
-
-fn respond_json(request: Request, status: u16, body: &Value) {
-    let text = body.to_string();
-    let response = Response::from_data(text.into_bytes())
-        .with_status_code(StatusCode(status))
-        .with_header(json_header())
-        .with_header(no_store());
-    let _ = request.respond(response);
-}
-
-fn respond_html(request: Request, status: u16, body: &str) {
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-        .expect("a constant header parses");
-    let response = Response::from_data(body.as_bytes().to_vec())
-        .with_status_code(StatusCode(status))
-        .with_header(header);
-    let _ = request.respond(response);
-}
-
-/// `?a=1&b=two` as pairs. Percent-decoding is deliberately not done: every
-/// parameter this API takes is a number or a short keyword, so a decoder would
-/// be code with no caller that still had to be got right.
-fn query(url: &str) -> Vec<(String, String)> {
-    let Some((_, tail)) = url.split_once('?') else {
-        return Vec::new();
     };
-    tail.split('&')
-        .filter(|part| !part.is_empty())
-        .map(|part| match part.split_once('=') {
-            Some((key, value)) => (key.to_string(), value.to_string()),
-            None => (part.to_string(), String::new()),
-        })
-        .collect()
+
+    let server = crate::http::serve(listener, move |request| {
+        handle(request, source.as_ref(), assets.as_deref())
+    })?;
+    Ok(ServerHandle { server })
 }
 
-fn param(pairs: &[(String, String)], name: &str) -> Option<String> {
-    pairs
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.clone())
+fn json_response(status: u16, body: &Value) -> Response {
+    Response::text(status, "application/json; charset=utf-8", &body.to_string())
+        // A progress view answers a different thing every time it is asked, and
+        // a cached poll is a view that has silently stopped.
+        .with_header("Cache-Control", "no-store")
 }
 
-fn path_of(url: &str) -> &str {
-    url.split('?').next().unwrap_or("/")
+fn html_response(status: u16, body: &str) -> Response {
+    Response::text(status, "text/html; charset=utf-8", body)
 }
 
-fn handle(request: Request, source: &dyn ProgressSource, assets: Option<&Path>) {
-    let url = request.url().to_string();
-    let path = path_of(&url).to_string();
-    let pairs = query(&url);
-    match path.as_str() {
-        "/api/meta" => respond_json(request, 200, &meta_to_json(&source.meta())),
-        "/api/state" => respond_json(request, 200, &state_to_json(&source.state())),
+fn handle(request: &Request, source: &dyn ProgressSource, assets: Option<&Path>) -> Response {
+    let path = request.path();
+    let pairs = request.query();
+    match path {
+        "/api/meta" => json_response(200, &meta_to_json(&source.meta())),
+        "/api/state" => json_response(200, &state_to_json(&source.state())),
         "/api/events" => {
             // `before` is what a view asks for — the window ending at the
             // playhead — and `since` is what a consumer accumulating the stream
@@ -327,16 +248,11 @@ fn handle(request: Request, source: &dyn ProgressSource, assets: Option<&Path>) 
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_TIMELINE_PAGE)
                 .clamp(1, MAX_TIMELINE_PAGE);
-            respond_json(
-                request,
-                200,
-                &timeline_to_json(&source.timeline(window, limit)),
-            )
+            json_response(200, &timeline_to_json(&source.timeline(window, limit)))
         }
         "/api/control" => {
             let Some(command) = control_from(&pairs) else {
-                return respond_json(
-                    request,
+                return json_response(
                     400,
                     &json!({"error": "action must be one of play, pause, seek, step, speed"}),
                 );
@@ -344,8 +260,7 @@ fn handle(request: Request, source: &dyn ProgressSource, assets: Option<&Path>) 
             let acted = source.control(command);
             let status = if acted { 200 } else { 409 };
             let state = source.state();
-            respond_json(
-                request,
+            json_response(
                 status,
                 &json!({
                     "wire": WIRE_VERSION,
@@ -355,7 +270,7 @@ fn handle(request: Request, source: &dyn ProgressSource, assets: Option<&Path>) 
                 }),
             )
         }
-        _ => serve_asset(request, &path, assets),
+        _ => serve_asset(path, assets),
     }
 }
 
@@ -448,34 +363,20 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-fn serve_asset(request: Request, path: &str, assets: Option<&Path>) {
+fn serve_asset(path: &str, assets: Option<&Path>) -> Response {
     let Some(root) = assets else {
         // No frontend built. The API still works, so say so and say how to
         // build the page, rather than 404ing at somebody who has done nothing
         // wrong. A panic here would be the worst of all: the run is fine.
-        return respond_html(request, 200, &missing_assets_page());
+        return html_response(200, &missing_assets_page());
     };
     let Some(file) = resolve(root, path) else {
-        return respond_json(
-            request,
-            400,
-            &json!({"error": "path leaves the asset directory"}),
-        );
+        return json_response(400, &json!({"error": "path leaves the asset directory"}));
     };
     match std::fs::read(&file) {
-        Ok(bytes) => {
-            let header = Header::from_bytes(&b"Content-Type"[..], content_type(&file).as_bytes())
-                .expect("a content type from the table parses");
-            let response = Response::from_data(bytes).with_header(header);
-            let _ = request.respond(response);
-        }
-        Err(_) if path == "/" || path.is_empty() => {
-            respond_html(request, 200, &missing_assets_page())
-        }
-        Err(_) => {
-            let response = Response::from_data(Vec::new()).with_status_code(StatusCode(404));
-            let _ = request.respond(response);
-        }
+        Ok(bytes) => Response::new(200, content_type(&file), bytes),
+        Err(_) if path == "/" || path.is_empty() => html_response(200, &missing_assets_page()),
+        Err(_) => Response::new(404, "text/plain; charset=utf-8", Vec::new()),
     }
 }
 
@@ -514,6 +415,12 @@ fn missing_assets_page() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The query reader moved to `crate::http` with the server. It is still
+    // asserted here, and deliberately: what this test protects is that *these
+    // endpoints* read a query string the way their documentation says, which is
+    // a different claim from the parser being correct.
+    use crate::http::{path_of, query};
 
     /// The policy moved to `net` when a second server started making the same
     /// decision. It is asserted here as well as there, and deliberately: what

@@ -44,16 +44,15 @@ use blockflow::dtype::Dtype;
 use blockflow::env::{ArrayEnvironment, Environment};
 use blockflow::error::Result;
 use blockflow::fragment::{
-    check_phase_work, fragment_only, neighbourhood_size, BlockOutput, BlockView, Coverage,
-    FragmentOp, FragmentOutput, PhaseWork,
+    check_phase_work, fragment_only, neighbourhood_size, BlockOutput, BlockView, FragmentOp,
+    PhaseWork,
 };
 use blockflow::geometry::BlockGrid;
 use blockflow::log::{Event, ExecutionLog};
 use blockflow::op::Chain;
 use blockflow::ops::element::{ElementShape, StepOrigin, StructuringElement};
-use blockflow::ops::voxelize::{
-    ball, encode_points, single_voxel, Point, VoxelizeOp, WORDS_PER_POINT,
-};
+use blockflow::ops::voxelize::{ball, single_voxel, Point, VoxelizeOp, WORDS_PER_POINT};
+use blockflow::points::PointSourceOp;
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
@@ -62,48 +61,18 @@ const STREAM: &str = "points";
 
 // ------------------------------------------------------------- the source --
 
-/// Writes a fixed point set out as one fragment per block: the producer half of
-/// the pair, and the thing a real detector would be.
+/// The producer half of the pair, and the thing a real detector would be.
 ///
-/// It keys each point by the block whose **core** contains it, which is the rule
-/// `ops::voxelize` states and the reason a point on a seam is written once. A
-/// block with no points writes a zero-length fragment rather than nothing, which
-/// is what `Coverage::EveryBlock` means and why it is declared here: "present
-/// and empty" is a different fact from "absent", and the coverage guard can only
-/// check the first.
-struct PointSourceOp {
-    points: Vec<Point>,
-}
-
-impl PointSourceOp {
-    fn new(points: Vec<Point>) -> Self {
-        Self { points }
-    }
-}
-
-impl FragmentOp for PointSourceOp {
-    fn name(&self) -> &'static str {
-        "points"
-    }
-
-    fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            STREAM,
-            Lifecycle::DeleteOnExit,
-            Coverage::EveryBlock,
-        )]
-    }
-
-    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
-        let edge = at.grid.block();
-        let mine: Vec<Point> = self
-            .points
-            .iter()
-            .copied()
-            .filter(|point| (0..3).all(|axis| point.at[axis] / edge[axis] == at.index[axis]))
-            .collect();
-        Ok(BlockOutput::fragment(STREAM, encode_points(&mine)))
-    }
+/// This file used to carry it — fifteen lines, keyed by the block whose core
+/// contains each point — and so did `tests/point_labels.rs`, character for
+/// character, and so did a consumer of this crate. `points::PointSourceOp` is
+/// now that op, and what is left here is the name and the stream. The rule it
+/// used to state is the library's: a point on a seam is written once, into the
+/// block the seam starts, and a block with no points writes a zero-length
+/// fragment rather than nothing, which is what `Coverage::EveryBlock` means and
+/// why declaring it is not free of meaning.
+fn source(points: Vec<Point>) -> PointSourceOp {
+    PointSourceOp::new("points", STREAM, Lifecycle::DeleteOnExit, points)
 }
 
 // ------------------------------------------------------------- the harness --
@@ -120,7 +89,7 @@ fn plan_for(
     let grid = BlockGrid::new(volume, block).expect("a lattice");
     let voxelize =
         VoxelizeOp::new("voxelize", STREAM, 0, element.clone(), &grid).expect("a voxelize op");
-    let source = PointSourceOp::new(Vec::new());
+    let source = source(Vec::new());
     let plan = fragment_only(volume, block, Dtype::F64, &[&source, &voxelize]).expect("a plan");
     (plan, voxelize)
 }
@@ -133,7 +102,7 @@ fn render_with_log(
     points: &[Point],
 ) -> (Vec<f64>, Arc<ExecutionLog>) {
     let (plan, voxelize) = plan_for(volume, block, element);
-    let source = PointSourceOp::new(points.to_vec());
+    let source = source(points.to_vec());
     let env = ArrayEnvironment::new(
         Voxels::zeros(Dtype::F64, volume).expect("an image"),
         plan.n_phases(),
@@ -439,7 +408,7 @@ fn a_halo_too_short_for_the_declared_block_reach_is_refused_before_the_run() {
     let element = ball([9, 0, 0]);
     let (plan, voxelize) = plan_for(volume, [8, 8, 8], &element);
     assert_eq!(voxelize.block_reach(), [2, 0, 0], "ceil(9 / 8)");
-    let source = PointSourceOp::new(Vec::new());
+    let source = source(Vec::new());
     let work = [
         PhaseWork::Fragments(&source),
         PhaseWork::Fragments(&voxelize),
@@ -516,7 +485,7 @@ fn under_declaring_the_block_reach_is_wrong_and_no_framework_guard_sees_it() {
         inner: honest,
         reach: [1, 0, 0],
     };
-    let source = PointSourceOp::new(points.clone());
+    let source = source(points.clone());
     let plan = fragment_only(volume, block, Dtype::F64, &[&source, &short]).expect("a plan");
 
     // Both guards pass. That is the finding.
@@ -618,7 +587,7 @@ fn a_block_with_no_points_still_writes_a_fragment() {
     let block = [8usize, 8, 8];
     let points = vec![Point::unit([1, 1, 1])];
     let (plan, voxelize) = plan_for(volume, block, &single_voxel());
-    let source = PointSourceOp::new(points.clone());
+    let source = source(points.clone());
     let env = ArrayEnvironment::new(
         Voxels::zeros(Dtype::F64, volume).expect("an image"),
         plan.n_phases(),

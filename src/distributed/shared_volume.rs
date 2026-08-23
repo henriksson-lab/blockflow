@@ -69,7 +69,7 @@ use crate::dtype::Dtype;
 use crate::env::{BlockBuf, EnvCounters, Environment};
 use crate::error::{Error, Result};
 use crate::geometry::chunks_touched;
-use crate::op::{Chain, Placement, SourceInputs};
+use crate::op::{Chain, Placement};
 use crate::region::Region;
 use crate::sidecar::{FileSidecars, Sidecars};
 use crate::voxels::Voxels;
@@ -363,6 +363,7 @@ impl Environment for SharedVolumes {
         Ok(BlockBuf::Array(array.into()))
     }
 
+    /// Both entry points, one body: see `crate::env::apply_chain_to_block`.
     fn apply(
         &self,
         slot: &Chain,
@@ -370,19 +371,21 @@ impl Environment for SharedVolumes {
         sources: &[(usize, BlockBuf)],
         at: &Placement,
     ) -> Result<BlockBuf> {
-        let array = input.as_array()?;
-        let stored = crate::env::as_source_arrays(sources)?;
-        let mut out = Voxels::zeros(
-            slot.produces(array.dtype())?,
-            slot.placed_output_shape(array.shape(), at)?,
-        )?;
-        slot.apply_placed(array, SourceInputs::new(&stored), &mut out, at)?;
-        self.counters.ops_applied.fetch_add(1, Ordering::SeqCst);
-        self.counters.estimated_work.fetch_add(
-            (array.len() as f64 * slot.cost_per_voxel()) as u64,
-            Ordering::SeqCst,
-        );
-        Ok(BlockBuf::Array(out))
+        self.apply_sliced(slot, input, sources, at, 1)
+            .map(|(out, _)| out)
+    }
+
+    fn apply_sliced(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Placement,
+        slabs: usize,
+    ) -> Result<(BlockBuf, usize)> {
+        let (out, ran) =
+            crate::env::apply_chain_to_block(&self.counters, slot, input, sources, at, slabs)?;
+        Ok((BlockBuf::Array(out), ran))
     }
 
     fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {

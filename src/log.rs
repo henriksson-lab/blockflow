@@ -399,6 +399,31 @@ impl ExecutionLog {
         out
     }
 
+    /// Every block the scheduler admitted, whatever kind of phase it belonged
+    /// to.
+    ///
+    /// Derived from [`Event::TaskAdmitted`], which is emitted for every task of
+    /// every phase — chain, fragment and iterative alike — and is therefore the
+    /// one statement in the log that does not depend on what a phase is made of.
+    /// [`Self::op_sequence_per_block`] is the *chain's* answer to a
+    /// deliberately different question: which blocks had a chain slot applied
+    /// to them, and in what order. The two agree exactly on a chain-only plan
+    /// and disagree on any plan with a fragment phase in it, where the second is
+    /// empty and the first is not.
+    ///
+    /// A block appears once however many phases admitted it, because the
+    /// question this answers is "which blocks did this run touch" — the count
+    /// of `(phase, block)` pairs is `Stats::tasks`.
+    pub fn blocks_admitted(&self) -> std::collections::BTreeSet<[usize; 3]> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::TaskAdmitted { index, .. } => Some(index),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The order blocks were first read, per phase. Advisory `visit_order` is
     /// only observable here, which is why it is recorded.
     pub fn visit_order(&self, phase: usize) -> Vec<[usize; 3]> {
@@ -459,6 +484,67 @@ impl ExecutionLog {
         Ok(())
     }
 
+    /// [`Self::check_coverage_and_order`] **without the order**: every block
+    /// appears, and each carries exactly the expected `(slot, name)` set, once
+    /// each.
+    ///
+    /// # Why a second criterion rather than a weaker one
+    ///
+    /// The order half of the criterion above is real and worth keeping — an
+    /// executor that applied a chain's slots out of order would produce a
+    /// well-formed wrong volume, and that log is the only place it shows. But it
+    /// is only *askable* of a stream that has an order.
+    ///
+    /// A merged multi-worker stream does not. Each worker posts its events over
+    /// HTTP from its own reporter thread as they happen, and the coordinator
+    /// appends them in arrival order (`distributed::worker::spawn_reporter`,
+    /// `Job::report`), so two workers running two phases of one block can land
+    /// their `OpApplied` events in either order however strictly the *work* was
+    /// ordered. The work's order is not in question and never was: the
+    /// coordinator's task accounting comes from completions, which are its own
+    /// state machine, and the events are observation. Asserting sequence over
+    /// arrival was asking the log a question it cannot answer, and it answered
+    /// wrongly about one run in five.
+    ///
+    /// So the distributed criterion is this one, and it still catches everything
+    /// a distributed run can get wrong here: a block that never ran, a block that
+    /// ran twice, a slot that was skipped, a slot applied twice. What it gives up
+    /// is a property that a single ordered stream still checks in full —
+    /// `check_coverage_and_order` is unchanged and every in-process caller keeps
+    /// it.
+    ///
+    /// **Recovering the order across workers would need a causal key**, not a
+    /// tighter assertion: a per-worker sequence number plus the happens-before
+    /// the task DAG already knows. That is a real feature and this is not it.
+    pub fn check_coverage_unordered(
+        &self,
+        expected: &[(usize, String)],
+        expected_blocks: usize,
+    ) -> Result<()> {
+        let per_block = self.op_sequence_per_block();
+        if per_block.len() != expected_blocks {
+            return Err(Error::InvalidArgument(format!(
+                "coverage: {} blocks appear in the log, expected {expected_blocks}",
+                per_block.len()
+            )));
+        }
+        let mut want = expected.to_vec();
+        want.sort();
+        for (index, applied) in &per_block {
+            let mut got = applied.clone();
+            got.sort();
+            if got != want {
+                return Err(Error::InvalidArgument(format!(
+                    "block {index:?}: ops applied {:?}, expected {:?} in any order. \
+                     (Arrival order across workers is not the order the work ran in; \
+                     see `check_coverage_unordered`.)",
+                    applied, expected
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `(block, slot)` pairs applied more than once.
     ///
     /// Should always be empty: a phase boundary recomputes a *halo margin*,
@@ -505,8 +591,57 @@ pub struct Stats {
     pub phases: usize,
     pub tasks: usize,
     pub tasks_short_circuited: usize,
+    /// Applications of a **chain slot**, in op-applications.
+    ///
+    /// A fragment phase owns no chain slot and so contributes nothing here —
+    /// see [`Stats::fragment_applications`], which is where its work is
+    /// counted. A run whose every phase is a fragment phase therefore reports
+    /// `ops_applied: 0`, and that zero is "no chain op ran" rather than
+    /// "nothing happened"; [`Stats::applications`] is the total that answers the
+    /// second question.
+    ///
+    /// **That split is a decision and not a gap.** A fragment phase could be
+    /// made to emit [`Event::OpApplied`] and land here, and it deliberately does
+    /// not: that event carries a chain slot index and the region the op was
+    /// computed *over*, and [`ExecutionLog::recomputed_margin_voxels`] sums
+    /// those regions against what was kept to measure a chain's halo redundancy.
+    /// A fragment op has no slot to name, and its read extent is not halo the
+    /// way a chain's is, so making it emit the event would put invented slot
+    /// numbers in the exported log and move a figure whose whole purpose is to
+    /// say whether a phase split bought anything. The two questions are
+    /// separated instead: `blocks_admitted` below counts blocks whatever kind of
+    /// phase they belonged to.
     pub ops_applied: usize,
+    /// Blocks that applied at least one **chain slot**, in blocks.
+    ///
+    /// Derived from the [`Event::OpApplied`] stream, which a fragment phase does
+    /// not emit, so this is zero for a fragment-only run for the same reason
+    /// `ops_applied` is. **Not** the count of blocks a run touched: that is
+    /// `blocks_admitted` immediately below, and the two agree only on a plan
+    /// with no fragment phase in it.
     pub blocks_visited: usize,
+    /// Blocks the scheduler admitted, in blocks, counting each block once
+    /// however many phases ran on it.
+    ///
+    /// The phase-kind-agnostic figure, and the one to read for "how many blocks
+    /// did this plan touch": derived from [`Event::TaskAdmitted`], which every
+    /// phase emits, rather than from `OpApplied`, which only a chain emits. It
+    /// is what the exported document's block table has always been counting, so
+    /// a consumer comparing the two now has a `Stats` field that matches it on
+    /// every plan rather than only on chain-only ones.
+    ///
+    /// Blocks, not tasks: `tasks` is the count of `(phase, block)` pairs and is
+    /// larger by roughly the phase count.
+    pub blocks_admitted: usize,
+    /// Applications of a fragment op to a block, in **block-applications**: one
+    /// per block per fragment phase, plus one more for each block re-applied to
+    /// check a `SeamFold::Unordered` claim.
+    ///
+    /// The figure that makes a fragment phase measurable from outside at all —
+    /// `ops_applied` and `blocks_visited` are both structurally zero for one.
+    /// Zero here means no fragment op was applied, which for a chain-only plan
+    /// is the truth rather than a gap.
+    pub fragment_applications: u64,
     /// Writes whose destination is an intermediate, not the workflow output.
     pub materialisations: usize,
     /// Substages each phase ran, and zero for every phase that is not an
@@ -557,6 +692,53 @@ pub struct Stats {
     /// against 158.6 MB written.
     pub side_writes: u64,
     pub side_bytes_written: u64,
+    /// Slabs run inside blocks, over the chain-slot applications the run made:
+    /// one per application that was not cut, and the slab count for one that
+    /// was. Zero for a run under an environment that holds no data, which
+    /// applies no chain and therefore runs no slab.
+    ///
+    /// **The magnitude half of the intra-block threading figure.** The other
+    /// half is `blocks_sliced` below, and neither answers the other's question:
+    /// see `crate::env::EnvCounters::blocks_sliced`.
+    pub slabs_run: u64,
+    /// Chain-slot applications that were **cut**, in applications.
+    ///
+    /// The figure the negative control reads: a plan whose block lattice
+    /// already has work for every worker must report **zero** here, because
+    /// intra-block threading was measured as a loss in that regime and the
+    /// policy's rule is written to answer one slab there. It is a count of
+    /// applications rather than of slabs precisely so that "nothing was cut"
+    /// has a value of its own rather than being inferred from an aggregate.
+    pub blocks_sliced: u64,
+    /// Sidecar traffic, in **fragments** and in bytes. One read is one fragment
+    /// asked for, whether or not one was there; one write is one fragment
+    /// stored.
+    ///
+    /// **Not to be confused with `side_writes` immediately above**, which counts
+    /// side *arrays* — a block's slice of an array an op writes beside its
+    /// pixels. A sidecar is a per-block opaque blob addressed by block index; a
+    /// side output is a region of a declared array. A fragment-only plan writes
+    /// sidecars and no side arrays, so `side_writes: 0` beside a non-zero
+    /// `sidecar_writes` is the normal reading and not a contradiction.
+    ///
+    /// This pair is what makes a hoisted merge visible: with the merge in
+    /// `FragmentOp::reduce` the phase reads the fragment set once, so
+    /// `sidecar_reads` is `O(blocks)`; with the same merge left in each block's
+    /// `apply` it is `O(blocks²)`, for the same plan and the same answer.
+    pub sidecar_reads: u64,
+    pub sidecar_writes: u64,
+    pub sidecar_bytes_read: u64,
+    pub sidecar_bytes_written: u64,
+    /// Sidecar key listings, in **listings**, and the keys they returned, in
+    /// **keys**. Neither is a fragment and neither moves a byte.
+    ///
+    /// Beside `sidecar_reads` rather than added to it because the cost has a
+    /// different shape: `fragment::check_fragment_coverage` lists a stream once
+    /// per declared every-block input and gets back one key per block, so
+    /// `sidecar_keys_listed` rises with the block count while
+    /// `sidecar_bytes_read` does not move at all.
+    pub sidecar_listings: u64,
+    pub sidecar_keys_listed: u64,
     pub peak_resident_bytes: u64,
     /// Sum over applied ops of `voxels x cost_per_voxel`. A modelled quantity,
     /// useful for ranking strategies against each other and for nothing else —
@@ -580,6 +762,19 @@ impl Stats {
             && self.ops_applied + self.skipped_op_applications()
                 == other.ops_applied + other.skipped_op_applications()
             && self.blocks_visited == other.blocks_visited
+            && self.blocks_admitted == other.blocks_admitted
+            && self.fragment_applications == other.fragment_applications
+    }
+
+    /// Every application of work to a block this run performed, chain slots and
+    /// fragment ops together, in applications.
+    ///
+    /// The figure that distinguishes "did nothing" from "not counted in the
+    /// field you were reading": `ops_applied` is zero for a fragment-only plan
+    /// and `fragment_applications` is zero for a chain-only one, and only their
+    /// sum being zero means no op was applied to any block.
+    pub fn applications(&self) -> u64 {
+        self.ops_applied as u64 + self.fragment_applications
     }
 
     fn skipped_op_applications(&self) -> usize {
@@ -665,6 +860,43 @@ mod tests {
             log.push(applied([0, 0, 0], slot, name));
         }
         let err = log.check_coverage_and_order(&expected(), 2).unwrap_err();
+        assert!(err.to_string().contains("1 blocks appear in the log"));
+    }
+
+    /// The distributed criterion accepts what arrival order can legitimately
+    /// scramble, and nothing else. Beside `ops_out_of_order_are_caught` above,
+    /// which is the same log under the criterion that does ask about order —
+    /// the pair is what says the two differ in exactly one property.
+    #[test]
+    fn out_of_order_ops_pass_the_unordered_criterion() {
+        let log = ExecutionLog::new();
+        log.push(applied([0, 0, 0], 0, "a"));
+        log.push(applied([0, 0, 0], 2, "c"));
+        log.push(applied([0, 0, 0], 1, "b"));
+        assert!(log.check_coverage_and_order(&expected(), 1).is_err());
+        log.check_coverage_unordered(&expected(), 1).unwrap();
+    }
+
+    /// And it gives up nothing else: a slot that never ran, a slot that ran
+    /// twice and a block that never appeared all still fail it.
+    #[test]
+    fn the_unordered_criterion_still_catches_a_missing_a_doubled_and_a_skipped_block() {
+        let missing = ExecutionLog::new();
+        missing.push(applied([0, 0, 0], 0, "a"));
+        missing.push(applied([0, 0, 0], 2, "c"));
+        assert!(missing.check_coverage_unordered(&expected(), 1).is_err());
+
+        let doubled = ExecutionLog::new();
+        for (slot, name) in [(0, "a"), (1, "b"), (1, "b"), (2, "c")] {
+            doubled.push(applied([0, 0, 0], slot, name));
+        }
+        assert!(doubled.check_coverage_unordered(&expected(), 1).is_err());
+
+        let short = ExecutionLog::new();
+        for (slot, name) in [(0, "a"), (1, "b"), (2, "c")] {
+            short.push(applied([0, 0, 0], slot, name));
+        }
+        let err = short.check_coverage_unordered(&expected(), 2).unwrap_err();
         assert!(err.to_string().contains("1 blocks appear in the log"));
     }
 

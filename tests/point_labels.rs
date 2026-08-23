@@ -48,6 +48,7 @@ use blockflow::op::Chain;
 use blockflow::ops::element::{ElementShape, StepOrigin, StructuringElement};
 use blockflow::ops::label::LabelPointsOp;
 use blockflow::ops::voxelize::{ball, encode_points, single_voxel, Point};
+use blockflow::points::PointSourceOp;
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
@@ -56,40 +57,22 @@ const STREAM: &str = "points";
 
 // ------------------------------------------------------------- the source --
 
-/// Writes a fixed point set out as one fragment per block, keyed by the block
-/// whose **core** contains the point — which is the rule both point-consuming
-/// ops state, and the reason a point on a seam is written once.
+/// A fixed point set out as one fragment per block, keyed by the block whose
+/// **core** contains the point.
 ///
-/// A block with no points writes a zero-length fragment rather than nothing, so
-/// `Coverage::EveryBlock` is honest: "present and empty" is a different fact
-/// from "absent", and only the first can be checked.
-struct PointSourceOp {
-    points: Vec<Point>,
-}
-
-impl FragmentOp for PointSourceOp {
-    fn name(&self) -> &'static str {
-        "points"
-    }
-
-    fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            STREAM,
-            Lifecycle::DeleteOnExit,
-            Coverage::EveryBlock,
-        )]
-    }
-
-    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
-        let edge = at.grid.block();
-        let mine: Vec<Point> = self
-            .points
-            .iter()
-            .copied()
-            .filter(|point| (0..3).all(|axis| point.at[axis] / edge[axis] == at.index[axis]))
-            .collect();
-        Ok(BlockOutput::fragment(STREAM, encode_points(&mine)))
-    }
+/// This file used to carry that producer, and so did `tests/voxelize.rs`,
+/// character for character, and so did a consumer of this crate.
+/// `points::PointSourceOp` is now that op. The rule is unchanged and is the
+/// library's: a point on a seam is written once, into the block the seam
+/// starts, and a block with no points writes a zero-length fragment rather than
+/// nothing, so `Coverage::EveryBlock` is honest — "present and empty" is a
+/// different fact from "absent", and only the first can be checked.
+///
+/// [`UnkeyedSourceOp`] below is deliberately **not** replaced by it: its whole
+/// purpose is to key *wrongly*, which is a thing no library op should be able
+/// to do.
+fn source(points: Vec<Point>) -> PointSourceOp {
+    PointSourceOp::new("points", STREAM, Lifecycle::DeleteOnExit, points)
 }
 
 /// A producer that writes every point into block `[0, 0, 0]`'s fragment
@@ -102,6 +85,13 @@ struct UnkeyedSourceOp {
 impl FragmentOp for UnkeyedSourceOp {
     fn name(&self) -> &'static str {
         "points"
+    }
+
+    /// Nothing crosses: it reads nothing. Writing every point into one block is
+    /// a keying choice — the one this fixture exists to make — and a keying
+    /// choice is not a reach.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
@@ -135,7 +125,7 @@ fn plan_for(
 ) -> (Decomposition, LabelPointsOp) {
     let grid = BlockGrid::new(volume, block).expect("a lattice");
     let label = LabelPointsOp::new("label", STREAM, 0, element.clone(), &grid).expect("a label op");
-    let source = PointSourceOp { points: Vec::new() };
+    let source = source(Vec::new());
     let plan = fragment_only(volume, block, Dtype::U32, &[&source, &label]).expect("a plan");
     (plan, label)
 }
@@ -186,9 +176,7 @@ fn stamped(
     element: &StructuringElement,
     points: &[Point],
 ) -> Vec<u32> {
-    let source = PointSourceOp {
-        points: points.to_vec(),
-    };
+    let source = source(points.to_vec());
     run(volume, block, element, &source).expect("a run")
 }
 
@@ -404,9 +392,7 @@ fn a_label_past_the_end_of_the_image_is_refused() {
     let element = single_voxel();
     let points = vec![Point::weighted([2, 2, 2], 5_000_000_000.0)];
     for block in CUTS {
-        let source = PointSourceOp {
-            points: points.clone(),
-        };
+        let source = source(points.clone());
         let error = run(VOLUME, block, &element, &source)
             .expect_err("a label past u32 must be refused")
             .to_string();

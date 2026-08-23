@@ -632,6 +632,14 @@ mod fragment_phase {
             "count"
         }
 
+        /// Nothing crosses: the operand is declared `voxelwise` in
+        /// [`Self::source_inputs`] and [`Self::seam_fold`] says the count is a
+        /// per-block fact. What this fixture varies is whether the operand's
+        /// *element type* is declared, which is a different declaration again.
+        fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+            0
+        }
+
         fn reads_pixels(&self) -> bool {
             false
         }

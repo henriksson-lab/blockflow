@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::decomposition::Decomposition;
 use crate::error::{Error, Result};
@@ -245,6 +245,10 @@ pub struct Job {
     /// left, and the only thing `placement` treats as scarce — see rule 1 there,
     /// and the measurement that made the distinction necessary.
     phase_tasks: Vec<usize>,
+    /// How many of each phase's tasks have reported done. The tally
+    /// [`Job::barrier_is_open`] reads, and the only thing enforcing a barrier on
+    /// this side.
+    phase_done: Vec<usize>,
     state: Vec<TaskState>,
     attempts: Vec<u32>,
     remaining_deps: Vec<usize>,
@@ -256,12 +260,52 @@ pub struct Job {
     /// `ExecutionLog` a single-node run produces — which is what lets one check
     /// answer for both.
     log: ExecutionLog,
+    /// The highest event sequence number accepted from each worker.
+    ///
+    /// The merged stream's **exactly-once** key, and it exists because delivery
+    /// is at-least-once. `Client::request` retries a request once on a dead
+    /// connection, which is right for a connection being reaped and wrong for a
+    /// request the coordinator had already processed — the response is what was
+    /// lost, and the retry then appends the same event a second time. Measured
+    /// on a loaded machine: a sixteen-task job whose stream must hold ninety-six
+    /// events held ninety-seven, which broke both the completeness check and the
+    /// worker-against-coordinator count that guards it.
+    ///
+    /// A per-worker counter is enough because a worker posts its events from one
+    /// thread over one connection, so they are ordered *within* a worker however
+    /// the merge interleaves them. This is also the first half of the causal key
+    /// `ExecutionLog::check_coverage_unordered` names as what recovering order
+    /// across workers would need; the other half is the happens-before the task
+    /// DAG already knows, and nothing here claims to have it.
+    reported: BTreeMap<String, u64>,
+    /// Events dropped for having been seen before. Not a fault — it is the
+    /// retry above doing its job — and reported so that a stream which is short
+    /// can be told from one that was deduplicated.
+    duplicate_events: usize,
     unknown_events: usize,
     done: usize,
     reissued: usize,
+    /// Pulls answered `Wait` **while the ready set was not empty** — a worker
+    /// sent away with work in the room.
+    ///
+    /// Legitimate exactly once: `placement::entitled` withholds a *scarce*
+    /// phase's task from an asker with a better-placed idle peer, and a barrier
+    /// phase is scarce by construction. Outside that, this is the regression
+    /// `DISTRIBUTION.md` names — a handout that answers only an idle worker
+    /// would raise it on every ordinary phase's tail, and it is exactly the
+    /// shape the momentary-ready-set version of `is_scarce` had.
+    ///
+    /// Counted here rather than inferred at the worker on purpose. A worker can
+    /// see only that its list ran empty; whether the coordinator had anything to
+    /// give is the coordinator's own state, and reading it here is a fact where
+    /// reading it there was a race. See `WorkerReport::starved` for the half
+    /// this does not answer: a list that ran empty with nobody refusing it.
+    withheld: usize,
     failed: usize,
     started: Instant,
     last_event: Instant,
+    /// When a task was last reported complete. See [`Job::quiet_for`].
+    last_completion: Instant,
     /// Whether a scarce task may be withheld from a worker with a better-placed
     /// idle peer. On, because a barrier phase is the only placement decision in
     /// its phase; off is here so the two can be measured against each other over
@@ -269,6 +313,15 @@ pub struct Job {
     scarce_placement: bool,
     /// Set once, by [`Job::worker_lost`], and never cleared. See [`Aborted`].
     aborted: Option<Aborted>,
+    /// Pulls this job answered, per worker.
+    ///
+    /// Diagnostic, and it exists to answer one question no other number can. A
+    /// worker that ran nothing either never asked, or asked and was told there
+    /// was nothing, or asked and was **never answered**. Its own report
+    /// separates the first two — `ready`, `refused` — and only this separates
+    /// the third, because a request that is never served leaves no trace at the
+    /// end that sent it.
+    pulls: BTreeMap<String, u64>,
 }
 
 impl Job {
@@ -293,6 +346,7 @@ impl Job {
             decomposition,
             graph,
             chunks,
+            phase_done: vec![0; phase_tasks.len()],
             phase_tasks,
             state: vec![TaskState::Pending; n],
             attempts: vec![0; n],
@@ -301,14 +355,19 @@ impl Job {
             claims: BTreeMap::new(),
             workers: BTreeMap::new(),
             log: ExecutionLog::new(),
+            reported: BTreeMap::new(),
+            duplicate_events: 0,
             unknown_events: 0,
             done: 0,
             reissued: 0,
+            withheld: 0,
             failed: 0,
             started: Instant::now(),
             last_event: Instant::now(),
+            last_completion: Instant::now(),
             scarce_placement: true,
             aborted: None,
+            pulls: BTreeMap::new(),
         })
     }
 
@@ -418,6 +477,16 @@ impl Job {
         self.reissued
     }
 
+    /// See [`Job::withheld`].
+    pub fn withheld(&self) -> usize {
+        self.withheld
+    }
+
+    /// See [`Job::pulls`].
+    pub fn pulls_per_worker(&self) -> BTreeMap<String, u64> {
+        self.pulls.clone()
+    }
+
     /// Chunk keys the coordinator *modelled* each worker as holding. Diagnostic
     /// only; the model is never authoritative about anything.
     pub fn modelled_cache_size(&self, worker: &str) -> Option<usize> {
@@ -519,12 +588,53 @@ impl Job {
         }
     }
 
+    /// Pending tasks whose dependencies are all done — **and**, for a barrier
+    /// phase, whose earlier phases are all finished.
+    ///
+    /// # The second half is not optional and is not derivable from the first
+    ///
+    /// [`TaskGraph::barriers`] is a phase-level fact that the edges deliberately
+    /// do not spell: a barrier phase's blocks fetch only their own cores, so
+    /// their `remaining_deps` reach zero long before the phase below has
+    /// finished. A coordinator that handed such a task out on the first half
+    /// alone would have a worker compute from an incomplete fragment set and
+    /// report a plausible wrong answer — and, being a distributed run, report it
+    /// differently on different machines.
+    ///
+    /// It is the same gate `strategy::execute_phases` applies in-process and it
+    /// is stated the same way: *every earlier phase's tasks are done*. Earlier
+    /// phases rather than only `p-1`, because a `FragmentInput` may name a
+    /// stream written further back.
+    ///
+    /// **It cannot deadlock**, on `strategy.rs`'s own argument: a task of phase
+    /// `p` waits only on earlier phases, so holding phase `p` back blocks
+    /// nothing phase `p` needs, and phase 0 is ready from the start.
+    ///
+    /// **Reissue is safe.** `phase_done` is bumped exactly where `done` is —
+    /// behind the same `TaskState::Done` early return — so a duplicate
+    /// completion counts once, and a task returned to `Pending` by a lost worker
+    /// or an expired lease was never counted.
+    ///
+    /// A hoisted `FragmentOp::reduce` is a different matter and is refused
+    /// rather than gated: see `strategy::execute_task_of`, which is what a
+    /// worker runs a block through.
     fn ready(&self) -> Vec<usize> {
         (0..self.graph.len())
             .filter(|&task| {
-                self.state[task] == TaskState::Pending && self.remaining_deps[task] == 0
+                self.state[task] == TaskState::Pending
+                    && self.remaining_deps[task] == 0
+                    && self.barrier_is_open(self.graph.tasks[task].phase)
             })
             .collect()
+    }
+
+    /// Whether a task of `phase` may start: `true` unless the phase declares a
+    /// barrier and some earlier phase still has work outstanding.
+    fn barrier_is_open(&self, phase: usize) -> bool {
+        if !self.graph.is_barrier(phase) {
+            return true;
+        }
+        (0..phase).all(|earlier| self.phase_done[earlier] >= self.phase_tasks[earlier])
     }
 
     fn residency<'a>(&self, model: &'a WorkerModel) -> Residency<'a> {
@@ -578,6 +688,7 @@ impl Job {
     /// one request per second across the whole cluster, so there is nothing to
     /// amortise and a batch would only add failure modes.
     pub fn pull(&mut self, worker: &str) -> Handout {
+        *self.pulls.entry(worker.to_string()).or_insert(0) += 1;
         self.admit(worker);
         self.expire_claims();
         // A survivor asking for work after the job has been abandoned is told
@@ -591,6 +702,8 @@ impl Job {
         }
         let ready = self.ready();
         if ready.is_empty() {
+            // Nothing to give, so nothing was withheld: this is a worker
+            // waiting on the plan, not on the handout.
             return Handout::Wait {
                 after_ms: WAIT_MS,
                 remaining: self.graph.len() - self.done,
@@ -634,9 +747,11 @@ impl Job {
             &view,
             &seeds,
         ) else {
-            // Either nothing is ready or everything ready has a better owner
-            // that is idle and asking. Both are the same answer to this worker,
-            // and it is answered immediately — a refused pull never blocks.
+            // Everything ready has a better owner that is idle and asking. It
+            // is the same answer to this worker as an empty ready set, and it
+            // is answered immediately — a refused pull never blocks — but it is
+            // not the same event, so it is counted apart. See `Job::withheld`.
+            self.withheld += 1;
             return Handout::Wait {
                 after_ms: WAIT_MS,
                 remaining: self.graph.len() - self.done,
@@ -705,6 +820,7 @@ impl Job {
             )));
         }
         self.admit(worker);
+        self.last_completion = Instant::now();
         if let Some(model) = self.workers.get_mut(worker) {
             model.completed += 1;
         }
@@ -718,6 +834,11 @@ impl Job {
         }
         self.state[task] = TaskState::Done;
         self.done += 1;
+        // Behind the same early return as `done`, so a duplicate completion
+        // counts once. `barrier_is_open` reads it.
+        if let Some(count) = self.phase_done.get_mut(self.graph.tasks[task].phase) {
+            *count += 1;
+        }
         for &next in &self.dependents[task] {
             self.remaining_deps[next] = self.remaining_deps[next].saturating_sub(1);
         }
@@ -750,23 +871,58 @@ impl Job {
     /// from a newer build reporting something this coordinator has never heard
     /// of must not fail the run, for the same reason a listener that panics is
     /// isolated rather than propagated.
-    pub fn report(&mut self, event: &Value) {
+    /// Append one worker's event to the merged stream, once.
+    ///
+    /// `seq` is the sender's own count of the events it has posted, starting at
+    /// one. `None` means the sender does not number them, in which case this
+    /// appends whatever it is given — the behaviour before numbering existed,
+    /// and the safe direction for a worker built against an older coordinator.
+    ///
+    /// Returns whether the event was accepted, so the sender can keep a count
+    /// that matches this one. See [`Job::reported`].
+    pub fn report(&mut self, worker: &str, seq: Option<u64>, event: &Value) -> bool {
         self.last_event = Instant::now();
+        if let Some(seq) = seq {
+            let last = self.reported.entry(worker.to_string()).or_insert(0);
+            if seq <= *last {
+                self.duplicate_events += 1;
+                return false;
+            }
+            *last = seq;
+        }
         let at = self.log.len();
         match event_from_json(event, at) {
             Ok(Some(event)) => self.log.push(event),
             Ok(None) => self.unknown_events += 1,
             Err(_) => self.unknown_events += 1,
         }
+        true
     }
 
     pub fn unknown_events(&self) -> usize {
         self.unknown_events
     }
 
-    /// How long since anything at all was reported.
+    /// See [`Job::duplicate_events`].
+    pub fn duplicate_events(&self) -> usize {
+        self.duplicate_events
+    }
+
+    /// How long since anything at all was reported — an event **or** a
+    /// completion.
+    ///
+    /// Both, because `linger` is there to let the tail of the event stream
+    /// arrive after the last task finishes, and measured from events alone it
+    /// gives a job that has sent *no* events no grace at all: `last_event` is
+    /// then the moment the job was created, the coordinator reads the stream as
+    /// having been quiet since before it started, and it leaves the instant the
+    /// work does — taking the whole record with it. Seen once here, on a machine
+    /// loaded enough for a reporter's first request to hit the client's own
+    /// timeout. It is not a fix for that stall, which is longer than any linger
+    /// worth having; it is the difference between a job that is quiet because it
+    /// has nothing more to say and one that has not managed to say anything yet.
     pub fn quiet_for(&self) -> Duration {
-        self.last_event.elapsed()
+        self.last_event.max(self.last_completion).elapsed()
     }
 
     /// Which tasks were handed out more than once, and how often.
@@ -785,7 +941,18 @@ impl Job {
     }
 
     /// The acceptance criterion, over the merged stream: every block affected by
-    /// every op, in the right order, once each.
+    /// every op, once each.
+    ///
+    /// **In any order, and that is not a weakening.** It asked for chain order
+    /// until an intermittent failure showed the question was unaskable here:
+    /// every worker posts its events from its own reporter thread and this
+    /// coordinator appends them as they arrive, so two workers running two phases
+    /// of one block can land their `OpApplied` events in either order however
+    /// strictly the work was ordered. The work's order is this state machine's,
+    /// not the log's — `remaining_deps` and `barrier_is_open` are what order it,
+    /// and `dependencies_cover_reads` is what checks the plan they come from.
+    /// See `ExecutionLog::check_coverage_unordered` for what is still caught and
+    /// what recovering the order would actually need.
     pub fn check_coverage(&self) -> Result<()> {
         let expected: Vec<(usize, String)> = self
             .decomposition
@@ -794,7 +961,7 @@ impl Job {
             .enumerate()
             .collect();
         let blocks = self.decomposition.phases[0].blocks.len();
-        self.log.check_coverage_and_order(&expected, blocks)
+        self.log.check_coverage_unordered(&expected, blocks)
     }
 }
 
@@ -809,6 +976,47 @@ pub struct Coordinator {
     /// one. Read by the serving loop; nothing in the job logic sees it.
     exit_when_done: bool,
     linger: Duration,
+    serving: Serving,
+}
+
+/// What the request threads spent their time on.
+///
+/// Not a performance counter for its own sake. The coordinator holds **one**
+/// mutex over the whole registry and every request takes it — a pull, a
+/// completion and every single event report alike — so "observation cannot slow
+/// the work down" is a claim about that lock and nothing else. These are the
+/// numbers that check it: how long the longest acquisition waited, how many
+/// waited more than a millisecond, and how long the slowest pull and the slowest
+/// report spent inside this process.
+#[derive(Debug, Default)]
+pub struct Serving {
+    pub pulls: AtomicU64,
+    pub reports: AtomicU64,
+    pub other: AtomicU64,
+    /// Microseconds the slowest pull spent between arriving here and being
+    /// answered. If a worker waited a whole job for a handout and this is
+    /// small, the wait was **not** in this process.
+    pub slowest_pull_us: AtomicU64,
+    pub slowest_report_us: AtomicU64,
+    /// Microseconds the longest wait for the registry mutex took.
+    pub slowest_lock_us: AtomicU64,
+    /// Acquisitions of the registry mutex that waited longer than a
+    /// millisecond.
+    pub slow_locks: AtomicU64,
+}
+
+impl Serving {
+    fn to_json(&self) -> Value {
+        json!({
+            "pulls": self.pulls.load(Ordering::Relaxed),
+            "reports": self.reports.load(Ordering::Relaxed),
+            "other": self.other.load(Ordering::Relaxed),
+            "slowest_pull_us": self.slowest_pull_us.load(Ordering::Relaxed),
+            "slowest_report_us": self.slowest_report_us.load(Ordering::Relaxed),
+            "slowest_lock_us": self.slowest_lock_us.load(Ordering::Relaxed),
+            "slow_locks": self.slow_locks.load(Ordering::Relaxed),
+        })
+    }
 }
 
 impl Coordinator {
@@ -818,6 +1026,7 @@ impl Coordinator {
             order: Mutex::new(Vec::new()),
             next_worker: AtomicU64::new(1),
             exit_when_done,
+            serving: Serving::default(),
             linger: Duration::from_millis(DEFAULT_LINGER_MS),
         }
     }
@@ -851,10 +1060,52 @@ impl Coordinator {
         Ok(id)
     }
 
+    /// The registry lock, timed.
+    ///
+    /// Every request in this process passes through here, so this is the one
+    /// place a queue can form between a worker asking and a worker being
+    /// answered. See [`Serving`].
     fn lock_jobs(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Job>> {
-        self.jobs
+        let waiting_since = Instant::now();
+        let guard = self
+            .jobs
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let waited = waiting_since.elapsed().as_micros() as u64;
+        self.serving
+            .slowest_lock_us
+            .fetch_max(waited, Ordering::Relaxed);
+        if waited > 1_000 {
+            self.serving.slow_locks.fetch_add(1, Ordering::Relaxed);
+        }
+        guard
+    }
+
+    /// Record what one request cost, by route. Called by the server.
+    pub fn served(&self, route: &str, took: Duration) {
+        let micros = took.as_micros() as u64;
+        match route {
+            super::protocol::path::PULL => {
+                self.serving.pulls.fetch_add(1, Ordering::Relaxed);
+                self.serving
+                    .slowest_pull_us
+                    .fetch_max(micros, Ordering::Relaxed);
+            }
+            super::protocol::path::REPORT => {
+                self.serving.reports.fetch_add(1, Ordering::Relaxed);
+                self.serving
+                    .slowest_report_us
+                    .fetch_max(micros, Ordering::Relaxed);
+            }
+            _ => {
+                self.serving.other.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// See [`Serving`].
+    pub fn serving_json(&self) -> Value {
+        self.serving.to_json()
     }
 
     pub fn job_ids(&self) -> Vec<String> {
@@ -938,11 +1189,8 @@ impl Coordinator {
             .find_map(|job| job.aborted().cloned())
     }
 
-    pub fn report(&self, job: &str, event: &Value) -> Result<()> {
-        self.with_job(job, |job| {
-            job.report(event);
-            Ok(())
-        })
+    pub fn report(&self, job: &str, worker: &str, seq: Option<u64>, event: &Value) -> Result<bool> {
+        self.with_job(job, |job| Ok(job.report(worker, seq, event)))
     }
 
     pub fn status(&self, named: Option<&str>) -> Result<JobStatus> {
@@ -1336,10 +1584,48 @@ mod tests {
     #[test]
     fn an_unfamiliar_event_is_counted_rather_than_failing_the_run() {
         let mut job = job(2, 1);
-        job.report(&serde_json::json!({"type": "something_new", "phase": 0}));
-        job.report(&serde_json::json!({"type": "phase_started", "phase": 0}));
+        job.report(
+            "a",
+            Some(1),
+            &serde_json::json!({"type": "something_new", "phase": 0}),
+        );
+        job.report(
+            "a",
+            Some(2),
+            &serde_json::json!({"type": "phase_started", "phase": 0}),
+        );
         assert_eq!(job.unknown_events(), 1);
         assert_eq!(job.log().len(), 1);
+    }
+
+    /// Delivery is at-least-once and the merged stream is exactly-once, and the
+    /// distance between those two is one number. See `Job::reported`.
+    #[test]
+    fn an_event_delivered_twice_is_appended_once() {
+        let mut job = job(2, 1);
+        let event = serde_json::json!({"type": "phase_started", "phase": 0});
+        assert!(job.report("a", Some(1), &event), "the first delivery");
+        assert!(
+            !job.report("a", Some(1), &event),
+            "the retry of the same one"
+        );
+        assert_eq!(job.log().len(), 1);
+        assert_eq!(job.duplicate_events(), 1);
+        // The negative control: the same worker, the same event, the next
+        // number — a second thing that happened, not a second delivery.
+        assert!(job.report("a", Some(2), &event));
+        assert_eq!(job.log().len(), 2);
+        assert_eq!(job.duplicate_events(), 1);
+        // And numbering is per worker, so two workers' first events are two
+        // events rather than a duplicate.
+        assert!(job.report("b", Some(1), &event));
+        assert_eq!(job.log().len(), 3);
+        assert_eq!(job.duplicate_events(), 1);
+        // A sender that numbers nothing is taken at its word, which is what a
+        // worker built against an older coordinator does.
+        assert!(job.report("c", None, &event));
+        assert!(job.report("c", None, &event));
+        assert_eq!(job.log().len(), 5);
     }
 
     // ------------------------------------------- placing a scarce task ------
@@ -1388,14 +1674,25 @@ mod tests {
             "the fixture did not make an unequal cluster: {heavy_overlap} against \
              {light_overlap} of {total}"
         );
+        assert_eq!(job.withheld(), 0, "nothing has been refused yet");
         assert!(
             matches!(job.pull("light"), Handout::Wait { .. }),
             "the barrier went to the worker holding less of it"
+        );
+        // The refusal is *recorded*, and this is the only place in the suite
+        // that makes `withheld` non-zero on purpose. It is what keeps the
+        // `withheld == 0` assertion in `tests/local_multi_node.rs` a statement
+        // about an ordinary phase rather than a number that cannot move.
+        assert_eq!(
+            job.withheld(),
+            1,
+            "a task was withheld and the coordinator did not say so"
         );
         let Handout::Task(assignment) = job.pull("heavy") else {
             panic!("the best-placed worker must be able to take it")
         };
         assert_eq!(assignment.task, barrier);
+        assert_eq!(job.withheld(), 1, "a handout is not a refusal");
     }
 
     /// The same, with the rule off: first come, first served. This is the
@@ -1410,6 +1707,13 @@ mod tests {
             panic!("claim order should have given it to the first asker")
         };
         assert_eq!(assignment.task, barrier);
+        // The negative control for the counter above: the same fixture and the
+        // same pull, with the one rule that can withhold turned off.
+        assert_eq!(
+            job.withheld(),
+            0,
+            "nothing may be withheld with the rule off"
+        );
     }
 
     /// A better-placed worker that is **busy** must not hold a scarce task away

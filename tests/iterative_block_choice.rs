@@ -135,6 +135,7 @@ fn constraints(model: CostModel, axes: Vec<usize>) -> Constraints {
         model,
         block_candidates: CANDIDATES.to_vec(),
         split_axes: axes,
+        ..Default::default()
     }
 }
 

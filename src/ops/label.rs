@@ -166,7 +166,7 @@ use crate::decomposition::Decomposition;
 use crate::dtype::Dtype;
 use crate::env::{BlockBuf, Environment};
 use crate::error::{Error, Result};
-use crate::fragment::{BlockOutput, BlockView, FragmentInput, FragmentOp};
+use crate::fragment::{BlockOutput, BlockView, FragmentInput, FragmentOp, PhaseView, SeamFold};
 use crate::geometry::BlockGrid;
 use crate::op::{Chain, Placement};
 use crate::points::{decode_points, Point};
@@ -774,29 +774,46 @@ fn store(labels: &Array3<u64>, at: [usize; 3], into: &mut Voxels) -> Result<()> 
 // materialiser rather than two mechanisms. What it costs is stated with the
 // type, and it is not lines of code — see [`RelabelledEnvironment`].
 //
-// **The materialising phase cannot be three phases**, and that is a framework
+// **The materialising phase is still not three phases**, and that is a framework
 // fact rather than a choice made here. The natural shape is label, merge,
 // relabel; `fragment::check_phase_work` refuses a pixel phase after a
 // fragment-only one, because the image that phase would read went unwritten. So
-// the merge folds into the relabelling phase, exactly as it does in
-// `ops::fill`, and every block re-runs the whole union-find — and, because a
-// whole-lattice fragment reach is also the halo, every block of that phase also
-// **reads the entire label image**. `ops::fill`'s header states that cost; this
-// op pays the same one, on an image four times as wide as a mask.
+// the merge belongs to the relabelling phase.
 //
-// The decorator does not pay it, and the reason is worth naming rather than
-// counting: the merge happens *outside* any phase, so nothing forces it to be a
-// halo. That is G7's barrier, obtained by not being in the plan.
+// **What has changed is where in that phase it sits, and what the phase fetches.**
+// This paragraph used to end: *every block re-runs the whole union-find — and,
+// because a whole-lattice fragment reach is also the halo, every block of that
+// phase also reads the entire label image.* Neither half is true any more, and
+// the two halves were two separate changes:
 //
-// **What that costs the caller, and it is an invariant no type enforces.** The
-// merge must run between two `execute_phases` calls, because phases pipeline: a
-// consumer block may begin before every producer block has written its fragment,
-// so a table built lazily on first read would be built from an incomplete
-// fragment set and the run would fail — or not — depending on the schedule. The
-// cheap arm is therefore correct by the caller's discipline. `docs/design/
-// barriers.md` specifies what the framework would need in order to state it
-// instead, prices what not stating it costs, and says what a barrier would and
-// would not fix.
+// * [`RelabelComponentsOp`] declares `barrier() == true`, so the dependency on
+//   the labelling phase is stated as an edge rather than bought with a
+//   whole-volume fetch. The halo drops to the reach, which is zero, and each
+//   block reads its own core;
+// * it declares [`FragmentOp::reduce`](crate::fragment::FragmentOp::reduce), so
+//   the merge runs **once for the phase** rather than once per block, and the
+//   fragment set is transmitted a number of times that does not grow with the
+//   lattice.
+//
+// The second is the larger of the two by a wide margin and the reason is not
+// traffic: one merge is small and there were `blocks` of them.
+// `docs/design/barriers.md` §7.2 is where that is timed and §7.4 is why the two
+// had to land in that order — without a barrier there is no moment at which the
+// fragment set is complete, so a hoisted reduction is not well defined.
+//
+// **The decorated design's advantage was G7's barrier, obtained by not being in
+// the plan. The plan can state one now**, so the two designs no longer differ in
+// kind — see the recommendation below.
+//
+// **What the decorated design costs the caller is unchanged, and it is an
+// invariant no type enforces.** Its merge must run between two `execute_phases`
+// calls, because phases pipeline: a consumer block may begin before every
+// producer block has written its fragment, so a table built lazily on first read
+// would be built from an incomplete fragment set and the run would fail — or not
+// — depending on the schedule. That arm is correct by the caller's discipline.
+// The materialising arm is the one that no longer is: the barrier is the
+// framework stating the same thing, and `strategy::reduce_phase` is where it is
+// enforced.
 //
 // What each design costs in invariants
 // -------------------------------------
@@ -821,16 +838,20 @@ fn store(labels: &Array3<u64>, at: [usize; 3], into: &mut Voxels) -> Result<()> 
 //    consumer.
 //
 // **Materialising adds two, both of them shaped like a wrong answer rather than
-// an error:**
+// an error, and the barrier shrank both:**
 //
-// 4. the relabelling phase's read extent is the **whole volume**, so its `apply`
-//    must write only its own core. Reading block 3's label 2 as this block's
-//    label 2 produces a complete, well-formed, wrong volume;
-//    `components::core_within_read` exists because this is the third op on the
-//    shape and it is the third op that had to remember;
-// 5. it holds a **second** whole-volume image of the label width, alive with the
-//    first, per concurrent block — which is a constraint on everything else the
-//    plan wants alive at that phase, and it is not local to this op.
+// 4. the relabelling phase's `apply` must write only its own core. Reading block
+//    3's label 2 as this block's label 2 produces a complete, well-formed, wrong
+//    volume; `components::core_within_read` exists because this is the third op
+//    on the shape and it is the third op that had to remember. **The read extent
+//    used to be the whole volume, and with the barrier it is the core**, so the
+//    slice is now the identity and the hazard is latent rather than live — which
+//    is exactly why the slice stays written out. An op that dropped it would be
+//    correct today and wrong the moment anything gave this phase a halo again;
+// 5. it holds a **second** image of the label width alive with the first. That
+//    used to be two *whole volumes* per concurrent block, because the halo was
+//    the volume; it is now two *blocks*. It is still a constraint on what else
+//    the plan wants alive at that phase, and it is no longer the dominant one.
 //
 // **Decorating adds three, and the first is the expensive one to keep true:**
 //
@@ -850,6 +871,35 @@ fn store(labels: &Array3<u64>, at: [usize; 3], into: &mut Voxels) -> Result<()> 
 // Five against six is not the comparison; **4 and 7 are the same kind of thing**
 // — an addressing scheme applied under the wrong numbering — and 6 is the one
 // with no analogue on the other side.
+//
+// Which to prefer, and what moved it
+// -----------------------------------
+// The recommendation used to rest on a factor of **25.4x** in bytes moved,
+// measured by `tests/label_materialisation_cost.rs` on a recorded volume at 256
+// blocks, and it was not close. `docs/design/barriers.md` §6.1 and §6.2 both
+// name themselves as the conditions under which that stops being the answer,
+// and both have now fired: the materialising phase declares a barrier and hoists
+// its reduction, so the gap it was losing by is the gap the design note projects
+// at **1.13x**, which is one extra read and one extra write of the label volume
+// and is the price of materialising at all rather than of anything in this
+// module.
+//
+// **That projection has not been re-measured on the recorded volume**, and the
+// honest statement of where this stands is that it has not.
+// `tests/label_materialisation_cost.rs` reads its fixture from
+// `BLOCKFLOW_LABEL_FIXTURE` and the recording is not on every machine; its four
+// arms are still the out-of-plan *simulations* they were written as, so they
+// price the shapes rather than these ops. What has been measured, on the shipped
+// ops and on a synthetic volume, is `tests/barrier_migration.rs`, and it agrees
+// with the projection's structure and not with its constants — as §8.8 says it
+// should, because a fragment there is a block face and the constants are a
+// property of what a fragment weighs.
+//
+// So: **materialising is now the better default**, for §6.2's reason rather than
+// for a number — a materialised volume is remapped once and a decorated one is
+// remapped per reader, and the write the decorated design avoids was never its
+// advantage. The decorator remains the answer for a label volume with no reader,
+// or one reader that reads a fraction of it.
 
 /// What one block tells the component merge about itself.
 ///
@@ -937,6 +987,33 @@ impl ComponentFaces {
 /// `"CMPN"` little-endian.
 const COMPONENT_MAGIC: u32 = 0x4e50_4d43;
 const COMPONENT_VERSION: u32 = 1;
+
+/// `"GLBL"` little-endian, and distinct from [`COMPONENT_MAGIC`] on purpose:
+/// the reduction blob and the fragment are both `u32` words written by one op,
+/// so the only thing that stops one being decoded as the other is that they say
+/// which they are.
+const TABLE_MAGIC: u32 = 0x4c42_4c47;
+const TABLE_VERSION: u32 = 1;
+
+fn push_usize(words: &mut Vec<u32>, value: usize) {
+    let value = value as u64;
+    words.push(value as u32);
+    words.push((value >> 32) as u32);
+}
+
+fn take_usize(words: &[u32], at: &mut usize, noun: &str, what: &str) -> Result<usize> {
+    let end = *at + 2;
+    if words.len() < end {
+        return Err(Error::InvalidArgument(format!("{noun} ends inside {what}")));
+    }
+    let value = words[*at] as u64 | ((words[*at + 1] as u64) << 32);
+    *at = end;
+    usize::try_from(value).map_err(|_| {
+        Error::InvalidArgument(format!(
+            "{noun} carries {value} as {what}, which this machine's `usize` does not hold"
+        ))
+    })
+}
 
 /// Per local label, the least row-major index in **volume** coordinates of a
 /// voxel carrying it.
@@ -1095,6 +1172,114 @@ impl GlobalLabels {
                 * (std::mem::size_of::<[usize; 3]>() + std::mem::size_of::<Vec<u32>>())
     }
 
+    /// The whole table as bytes, which is what [`RelabelComponentsOp::reduce`]
+    /// hands the phase.
+    ///
+    /// **A magic and a version, for the reason `barriers.md` §7.7 gives.** A
+    /// reduction that computes the wrong thing answers plausibly in every block
+    /// and no guard outside the op could catch it; the blob being the op's own
+    /// encoding makes the op's own [`Self::decode`] the one place a mismatch can
+    /// surface, so it is given something to refuse.
+    ///
+    /// **The lattice travels with the table** — the block edge, the lattice
+    /// counts and the volume — because the table is a function of the cut the
+    /// local labels were written under, and applying one cut's table to another
+    /// cut's labels is a complete, well-formed, wrong volume. That is hazard 7
+    /// of the module header, and carrying the three lets a reader refuse it
+    /// rather than reproduce it.
+    ///
+    /// Little-endian `u32` throughout, each `usize` as low word then high word,
+    /// which is `ComponentFaces::encode`'s convention and not a second one.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut words: Vec<u32> = vec![TABLE_MAGIC, TABLE_VERSION, self.components];
+        for value in self.block.iter().chain(&self.lattice).chain(&self.volume) {
+            push_usize(&mut words, *value);
+        }
+        push_usize(&mut words, self.per_block.len());
+        for (block, labels) in &self.per_block {
+            for axis in 0..3 {
+                push_usize(&mut words, block[axis]);
+            }
+            push_usize(&mut words, labels.len());
+            words.extend_from_slice(labels);
+        }
+        words_to_bytes(&words)
+    }
+
+    /// The inverse of [`Self::encode`].
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        const NOUN: &str = "a global-label table";
+        let words = bytes_to_words(bytes, NOUN)?;
+        let components = read_header(&words, TABLE_MAGIC, TABLE_VERSION, NOUN)?;
+        let mut at = 3usize;
+        let mut geometry = [0usize; 9];
+        for slot in geometry.iter_mut() {
+            *slot = take_usize(&words, &mut at, NOUN, "its geometry")?;
+        }
+        let block = [geometry[0], geometry[1], geometry[2]];
+        let lattice = [geometry[3], geometry[4], geometry[5]];
+        let volume = [geometry[6], geometry[7], geometry[8]];
+        let blocks = take_usize(&words, &mut at, NOUN, "its block count")?;
+        let mut per_block = BTreeMap::new();
+        for _ in 0..blocks {
+            let index = [
+                take_usize(&words, &mut at, NOUN, "a block index")?,
+                take_usize(&words, &mut at, NOUN, "a block index")?,
+                take_usize(&words, &mut at, NOUN, "a block index")?,
+            ];
+            let len = take_usize(&words, &mut at, NOUN, "a block's label count")?;
+            let end = at.checked_add(len).ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "{NOUN} declares more labels for block {index:?} than the address space holds"
+                ))
+            })?;
+            if words.len() < end {
+                return Err(Error::InvalidArgument(format!(
+                    "{NOUN} ends inside block {index:?}'s labels"
+                )));
+            }
+            per_block.insert(index, words[at..end].to_vec());
+            at = end;
+        }
+        expect_end(&words, at, NOUN)?;
+        Ok(Self {
+            per_block,
+            components,
+            block,
+            lattice,
+            volume,
+        })
+    }
+
+    /// Refuse a table built on a different cut of the volume from the one whose
+    /// labels it is about to be applied to.
+    ///
+    /// Hazard 7 of the module header, made checkable. The remap reads a voxel's
+    /// block off its coordinate, so a table from another lattice produces a
+    /// complete, well-formed, wrong volume; a reduction is exactly where that
+    /// could arrive, because the blob a block is handed is bytes and bytes carry
+    /// no provenance beyond what they say.
+    pub fn check_lattice(&self, grid: &BlockGrid) -> Result<()> {
+        if self.block == grid.block()
+            && self.lattice == grid.blocks_per_axis()
+            && self.volume == grid.volume()
+        {
+            return Ok(());
+        }
+        Err(Error::InvalidArgument(format!(
+            "a global-label table built on a {:?} lattice of {:?} blocks over a {:?} volume is \
+             being applied to a {:?} lattice of {:?} blocks over a {:?} volume. The table names \
+             a voxel's block by dividing its coordinate, so one built on another cut is a \
+             complete, well-formed, wrong answer rather than an error.",
+            self.lattice,
+            self.block,
+            self.volume,
+            grid.blocks_per_axis(),
+            grid.block(),
+            grid.volume()
+        )))
+    }
+
     /// What block `block`'s local labels are called in the volume, indexed
     /// `[local - 1]`.
     pub fn labels_of(&self, block: [usize; 3]) -> Result<&[u32]> {
@@ -1239,6 +1424,13 @@ impl FragmentOp for LabelComponentsOp {
         self.name
     }
 
+    /// Nothing crosses as **pixels**. Components are found in this block alone,
+    /// and the seam is stitched afterwards from the face fragments on
+    /// `self.stream`, whose reach belongs to the op that reads them.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn reads_pixels(&self) -> bool {
         true
     }
@@ -1289,16 +1481,21 @@ impl FragmentOp for LabelComponentsOp {
 
 /// Phase 1: close the components and write the **global** label volume.
 ///
-/// This is the *materialising* half of the pair, in the shape the framework
-/// admits. Declares a whole-lattice fragment reach, which is what makes it a
-/// planning barrier — and which is also its halo, so every block of this phase
-/// reads the whole `u32` local-label image. `ops::fill` pays exactly this and
-/// its header is where the coupling is argued; the difference here is only that
-/// the image being re-read per block is four bytes a voxel rather than one.
+/// This is the *materialising* half of the pair, and it is the shape the
+/// framework admits **now that it can state a barrier**. It declares three
+/// things and each of them replaces something this op used to pay:
 ///
-/// The merge is re-run per block for the same reason: the three-phase shape —
-/// label, merge, relabel — is refused by `fragment::check_phase_work`, because
-/// the fragment-only middle phase would leave its image unwritten.
+/// | it declares | it no longer pays |
+/// |---|---|
+/// | [`Self::barrier`] | a whole-volume halo, and therefore a whole re-read of the `u32` local-label image in every block |
+/// | [`Self::reduce`] | the union-find once per block, and the fragment set transmitted once per block |
+/// | [`Self::seam_fold`] | nothing — this one is a cost, and a small one; see the method |
+///
+/// **The merge still cannot be its own phase.** The three-phase shape — label,
+/// merge, relabel — is refused by `fragment::check_phase_work`, because the
+/// fragment-only middle phase would leave its image unwritten. What changed is
+/// that a phase's reduction no longer has to be a per-block quantity, so the
+/// merge lives in this phase without being re-derived in each of its blocks.
 pub struct RelabelComponentsOp {
     name: &'static str,
     stream: String,
@@ -1356,6 +1553,14 @@ impl FragmentOp for RelabelComponentsOp {
         self.name
     }
 
+    /// Nothing this block is authoritative for reaches past its core. The
+    /// whole-lattice halo is the **fragment** reach in [`Self::inputs`], not a
+    /// pixel one; the global numbering that makes two blocks agree arrives on
+    /// `self.stream` and `apply` rewrites the core only.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn reads_pixels(&self) -> bool {
         true
     }
@@ -1370,8 +1575,74 @@ impl FragmentOp for RelabelComponentsOp {
         Dtype::U32
     }
 
+    /// **Yes**, and it is the declaration this phase existed to be unable to
+    /// make. See the type's own documentation for what it buys and what it gives
+    /// up, which here is nothing: a whole-lattice fragment reach already waited
+    /// for every block of the phase below, and the barrier only changes how it
+    /// says so.
+    fn barrier(&self) -> bool {
+        true
+    }
+
+    /// **Nothing per block.** The merge is [`Self::reduce`]'s and the table
+    /// arrives in the blob, so a block that gathered anything would be holding a
+    /// fragment set it has no use for.
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    /// The stream, at **reach zero**.
+    ///
+    /// It is still declared, because that is what makes it resolvable in
+    /// [`Self::reduce`] — `PhaseView` offers the streams the plan records and no
+    /// others, for a block's reason: an undeclared stream is one the plan
+    /// neither orders nor prices. What changed is the reach. With the merge in
+    /// `apply` every block needed every fragment and said so, which is the
+    /// `(1 + blocks) x F` multiplier `barriers.md` §7.6 measures; with the merge
+    /// in `reduce` the *phase* needs them and no block does, so the set is
+    /// transmitted twice — written once, read once — at every lattice.
     fn inputs(&self) -> Vec<FragmentInput> {
-        vec![FragmentInput::own(self.stream.clone(), self.faces_phase).with_reach(self.lattice)]
+        vec![FragmentInput::own(self.stream.clone(), self.faces_phase).with_reach([0, 0, 0])]
+    }
+
+    /// The answer is a function of the **set** of fragments and not of the order
+    /// they arrive in, and this is the declaration that says so and gets it
+    /// checked.
+    ///
+    /// It matters more here than the variant's usual case. `PhaseView` walks the
+    /// lattice row-major, and **two lattices walk two different orders**, so a
+    /// reduction whose answer depended on the order would make the global
+    /// numbering a property of how the volume was cut — which is the one
+    /// property this op exists to not have. The executor reduces a second time
+    /// with the lattice reversed and requires the same bytes.
+    ///
+    /// It is true by construction here — [`GlobalLabels::merge`] is handed a
+    /// `BTreeMap`, the union-find folds with `min`, and the components are
+    /// numbered by their least voxel — and the declaration is the statement that
+    /// it must stay true.
+    ///
+    /// **It costs nothing per block**, and that is a consequence of the hoisting
+    /// rather than a coincidence: the same declaration makes the executor apply
+    /// each block a second time with its neighbourhood reversed, and it skips
+    /// that when the neighbourhood holds at most one fragment. [`Self::inputs`]
+    /// reaches zero, so it holds one.
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::Unordered)
+    }
+
+    /// The merge, **once for the phase**.
+    ///
+    /// This is where the union-find went, and `barriers.md` §7.2 is the argument
+    /// for moving it: one merge is small at every lattice, there was one per
+    /// block, and at a fine cut their sum exceeded the whole rest of the
+    /// pipeline. The table it produces is the same table every block used to
+    /// build for itself.
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        let mut reports = BTreeMap::new();
+        for (key, bytes) in at.fragments(&self.stream)? {
+            reports.insert(key.block, ComponentFaces::decode(&bytes)?);
+        }
+        Ok(GlobalLabels::merge(&reports, at.grid, self.connectivity)?.encode())
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
@@ -1381,15 +1652,17 @@ impl FragmentOp for RelabelComponentsOp {
         };
         let labels = pixels.view::<u32>()?;
 
-        let mut reports = BTreeMap::new();
-        for (key, bytes) in at.fragments(&self.stream) {
-            reports.insert(key.block, ComponentFaces::decode(bytes)?);
-        }
-        let global = GlobalLabels::merge(&reports, at.grid, self.connectivity)?;
+        // The phase's own reduction, decoded. `check_lattice` is the guard
+        // hazard 7 of the module header asks for and the blob is where it can
+        // finally be applied: a table is bytes, and bytes carry no provenance
+        // beyond what they say.
+        let global = GlobalLabels::decode(at.reduced)?;
+        global.check_lattice(at.grid)?;
 
-        // **Only the core.** The whole-lattice fragment reach is also the halo,
-        // so the buffer holds every block's labels under every block's own
-        // numbering; `components::core_within_read` states the argument.
+        // **Only the core.** With the halo relieved this is the whole buffer,
+        // and it stays written this way rather than being simplified away:
+        // `components::core_within_read` is the third op's worth of remembering
+        // that a per-block answer decodes that block's numbering and no other.
         let (offset, extent) = core_within_read(at)?;
         let window = ndarray::s![
             offset[0]..offset[0] + extent[0],
@@ -1436,10 +1709,16 @@ pub fn component_label_phases(
 /// and the whole of what it plans.
 ///
 /// The merge that closes the labels is not a phase here — it is
-/// [`GlobalLabels::merge`], run once over the fragments this phase left behind.
-/// That is the difference the measurement is about: a merge that is not a phase
-/// is not a halo either, so nothing re-reads the label image and nothing re-runs
-/// the union-find per block.
+/// [`GlobalLabels::merge`], run once over the fragments this phase left behind,
+/// by the caller, between two `execute_phases` calls.
+///
+/// **That used to be the whole of the difference the measurement was about**: a
+/// merge outside the plan is not a halo either, so nothing re-read the label
+/// image and nothing re-ran the union-find per block. Both of those are now true
+/// of [`component_label_phases`] as well, stated by the plan rather than by the
+/// caller's discipline. What is left of the difference is the extra read and
+/// write of the label volume that materialising *is*, and the fact that a
+/// decorated image is remapped once per reader.
 pub fn component_labelling_phase(
     grid: BlockGrid,
     mask_dtype: Dtype,
@@ -1625,6 +1904,20 @@ impl Environment for RelabelledEnvironment<'_> {
         self.inner.apply(slot, input, sources, at)
     }
 
+    /// Forwarded, because a wrapper that does not forward this declines every
+    /// cut the planner offers and does so silently. See
+    /// [`Environment::apply_sliced`].
+    fn apply_sliced(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Placement,
+        slabs: usize,
+    ) -> Result<(BlockBuf, usize)> {
+        self.inner.apply_sliced(slot, input, sources, at, slabs)
+    }
+
     fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
         self.inner.write(image, within, valid, buf)
     }
@@ -1785,6 +2078,70 @@ mod tests {
     use crate::fragment::fragment_phase;
     use crate::ops::element::ElementShape;
     use crate::ops::voxelize::{ball, single_voxel};
+
+    /// **The reduction blob round-trips, and every way of getting it wrong is
+    /// refused by name.**
+    ///
+    /// A phase reduction is the one thing in this crate with no external guard:
+    /// `barriers.md` §7.7 is explicit that the executor cannot know what the
+    /// reduction was supposed to be, so the op's own decode is the only place a
+    /// mismatch can surface. That makes these four refusals the whole of the
+    /// mitigation rather than defensive extras.
+    #[test]
+    fn the_reduction_blob_round_trips_and_a_wrong_one_is_refused() {
+        let grid = BlockGrid::new([4, 4, 4], [2, 4, 4]).expect("a lattice");
+        let mut per_block = BTreeMap::new();
+        per_block.insert([0usize, 0, 0], vec![1u32, 2]);
+        per_block.insert([1usize, 0, 0], vec![2u32]);
+        let table = GlobalLabels {
+            per_block,
+            components: 2,
+            block: grid.block(),
+            lattice: grid.blocks_per_axis(),
+            volume: grid.volume(),
+        };
+        let bytes = table.encode();
+        let back = GlobalLabels::decode(&bytes).expect("a round trip");
+        assert_eq!(back.components(), 2);
+        assert_eq!(back.block(), grid.block());
+        assert_eq!(back.lattice(), grid.blocks_per_axis());
+        assert_eq!(back.labels_of([0, 0, 0]).expect("block 0"), &[1, 2]);
+        assert_eq!(back.labels_of([1, 0, 0]).expect("block 1"), &[2]);
+        back.check_lattice(&grid).expect("the same lattice");
+
+        // A fragment of the *other* kind this module writes, decoded as this
+        // one. The magic is what stops it, and it is the reason there are two.
+        let faces = ComponentFaces::empty().encode();
+        let message = GlobalLabels::decode(&faces)
+            .err()
+            .expect("a component fragment is not a table")
+            .to_string();
+        assert!(message.contains("magic"), "{message}");
+
+        // Truncated inside the payload rather than at a field boundary.
+        let message = GlobalLabels::decode(&bytes[..bytes.len() - 4])
+            .err()
+            .expect("a short blob")
+            .to_string();
+        assert!(message.contains("global-label table"), "{message}");
+
+        // A byte count that is not a whole number of words.
+        let mut ragged = bytes.clone();
+        ragged.push(0);
+        assert!(
+            GlobalLabels::decode(&ragged).is_err(),
+            "a byte count that is not a whole number of words is a truncated blob"
+        );
+
+        // The lattice guard: hazard 7 of the module header, and the one a blob
+        // makes reachable because bytes carry no provenance.
+        let other = BlockGrid::new([4, 4, 4], [4, 4, 4]).expect("a lattice");
+        let message = back
+            .check_lattice(&other)
+            .expect_err("a table from another cut")
+            .to_string();
+        assert!(message.contains("wrong answer"), "{message}");
+    }
 
     fn window_of(volume: [usize; 3]) -> Region {
         Region::whole(&volume)

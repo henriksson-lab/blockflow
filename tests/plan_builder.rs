@@ -557,9 +557,22 @@ fn a_handle_addresses_the_phase_that_produced_it() {
         .expect("a fragment phase");
     assert_eq!(plateaux.index(), 1);
     let maxima = RegionalMaximaOp::reading("maxima", PLATEAUX, plateaux, Dtype::Bool, plan.grid());
+    // **The address is the point**, and it is what the handle carries. The
+    // *reach* beside it is a property of where the merge runs — since
+    // `docs/design/barriers.md` the shipped shape hoists it and needs no fragment
+    // per block — so it is asserted for both shapes rather than for one, and a
+    // handle that addressed the wrong phase would fail either way.
     assert_eq!(
         maxima.inputs(),
-        vec![FragmentInput::own(PLATEAUX, 1).with_reach(maxima.lattice())]
+        vec![FragmentInput::own(PLATEAUX, 1).with_reach([0, 0, 0])],
+        "the hoisted shape reads the phase the handle names and no fragment per block"
+    );
+    let in_plan = RegionalMaximaOp::reading("maxima", PLATEAUX, plateaux, Dtype::Bool, plan.grid())
+        .merging(blockflow::ops::components::Merge::PerBlock);
+    assert_eq!(
+        in_plan.inputs(),
+        vec![FragmentInput::own(PLATEAUX, 1).with_reach(in_plan.lattice())],
+        "and so does the shape that merges in every block"
     );
     plan.fragments(maxima).expect("a fragment phase");
     plan.finish().expect("a plan");

@@ -108,8 +108,12 @@
 //
 // The feature flag, and what it does and does not gate
 // ----------------------------------------------------
-// `distributed` pulls in the HTTP **server** and the three binaries, because the
-// server needs `tiny_http`. Everything else — the protocol, the coordinator's
+// `distributed` pulls in the HTTP **routing** and the three binaries. It needs
+// no dependency to do it and neither does anything else here: the transport is
+// `crate::http`, this crate's own, compiled with no feature at all, and
+// `Cargo.toml` names no HTTP package for any feature any more. What is behind
+// the flag here is the nine routes and the binaries, not a socket.
+// Everything else — the protocol, the coordinator's
 // whole state machine, the handout policy, the cache model, the rendezvous
 // backends, the client and the worker loop — compiles and is tested with no
 // feature at all. That split is deliberate: the parts that can be wrong in an

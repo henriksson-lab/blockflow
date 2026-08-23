@@ -176,6 +176,49 @@ A symmetric triple converts into a `Reach`, compares equal to one, **hashes as
 one** and is the same three numbers on the wire, so a plan that says nothing new
 is the plan it always was — fingerprint included.
 
+## Slicing: whether the answer survives a cut inside one block
+
+`BlockOp::slicing() -> Slicing` is the second declaration and it is **not**
+derivable from the first. It is defaulted to `Slicing::UNDECLARED`, which is
+today's behaviour exactly — one task per block, on one thread — and an op author
+who says nothing loses a speedup that was never there. `reach` has no default
+because a forgotten zero is a wrong answer; this one costs performance, and a
+default is affordable on the second where it is not on the first.
+
+**A reach says what an op reads; it does not say the answer is a function of
+what was read.** That sentence is the whole content of the declaration, and the
+demonstration is in the crate: `ops::sliding` computes the *same statistic* as
+`ops::rank`'s median, with the same reach and the same output shape, by carrying
+a histogram along the scan — so where the scan began is in the answer, and a cut
+moves where the scan began. No signal available to the framework separates the
+two. **Nothing here may derive a slicing; it may only read one**, and that
+prohibition is the condition on which the default being safe rests at all.
+
+Declare `Slicing::Stencil` when all three hold:
+
+1. the output at `v` is a function of the input within `reach_spec` of `v` and
+   of nothing else — not the block's extent, not an accumulator over it, not an
+   identifier handed out in traversal order;
+2. the output lattice is the input lattice, so a slab's core is the same index
+   range in both buffers;
+3. the answer is **bit-identical** whether or not the block was cut, which for a
+   kernel accumulating in floating point means no sum is reassociated.
+
+**A `Combine` declares separately, and a `Parallel` node is only as sliceable as
+its narrowest part.** Three declared arms under a sink that says nothing is a
+refused node, and the arms cannot speak for it. This is the shape that kept
+every fan-in in this crate unsliceable long after its filters were declared.
+
+**The bar is not the declaration.** An op is declared when somebody has put it in
+`tests/intra_block_slicing.rs` and watched bit-identity hold uncut against cut at
+every thread count, on a fixture that can *see its halo* — the file's three-way
+perturbation probe is there because a fixture whose fold saturated once left a
+test green under a halo-of-zero mutant. The bar is stated per element type and
+refuses the rest **by name** rather than widening to `f64`, so an op writing a
+type it has no arm for is a message and not a lossy comparison; the arm is the
+edit, never the relaxation. See `docs/design/intra-block.md` for the measurement,
+what the cut costs, and when a planner asks for one.
+
 ## Output that is not an image
 
 Some steps produce, per block, a **fragment** that a later global step merges —

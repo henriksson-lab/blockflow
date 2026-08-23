@@ -61,6 +61,7 @@ use blockflow::fragment::{
 };
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
+use blockflow::ops::coordinates::SetVoxelsOp;
 use blockflow::ops::rows::{
     collect_rows, gather_blob, gathered_schema, merge_rows, scaled_bound, scaled_index, ColumnTest,
     FilterRowsOp, GatherRowsOp, Limit, RowFilter, RowStreams, RowValues, ScaleRowsOp,
@@ -173,73 +174,31 @@ const CUTS: [[usize; 3]; 7] = [
 
 // ---------------------------------------------------------- the row source --
 
-/// One row per non-zero voxel of the block's core, carrying that voxel's value.
+/// The row source: one row per non-zero voxel of the block's core, carrying
+/// that voxel's value.
 ///
-/// A producer, not one of the ops on trial: `ops::rows` transforms rows and
-/// something has to make them. `ops::coordinates` would do for the scale, but
-/// its rows have **no payload column**, so a filter over them would have nothing
-/// to test — and a suite whose filter has no column is a suite with no filter in
-/// it.
+/// **This file used to write its own, and the sentence it wrote it under was a
+/// gap report.** `ops::rows` transforms rows and something has to make them;
+/// `ops::coordinates::SetVoxelsOp` was the right scale and its rows had **no
+/// payload column**, so a filter over them would have had nothing to test — and
+/// a suite whose filter has no column is a suite with no filter in it. The old
+/// producer's doc ended *"that is what needs the shell that does not exist
+/// yet"*, and the shell now exists: `SetVoxelsOp::with_values` adds the column
+/// and changes nothing else.
 ///
-/// It is also the honest statement of what a row op can and cannot be spared:
-/// this producer reads the image it emits values from, so where the value wanted
-/// *is* the array the rows came from, no gather is needed at all. The case the
-/// consumers have is the other one — rows from one array, values from a second —
-/// and that is what needs the shell that does not exist yet.
-struct SeedRowsOp;
-
-impl SeedRowsOp {
-    fn schema() -> Schema {
-        Schema::new(vec![Column::f64(VALUE)]).expect("one named column")
-    }
+/// The other half of that sentence is unchanged and is still the honest
+/// statement of what a row op can be spared: this producer reads the image it
+/// emits values from, so where the value wanted **is** the array the rows came
+/// from, no gather is needed at all. The case the consumers have is the other
+/// one — rows from one array, values from a second — and that is
+/// `GatherRowsOp`, which is a different op and remains one.
+fn seed_rows() -> SetVoxelsOp {
+    SetVoxelsOp::new("seed rows", SEEDED, Lifecycle::Persistent).with_values(VALUE)
 }
 
-impl FragmentOp for SeedRowsOp {
-    fn name(&self) -> &'static str {
-        "seed rows"
-    }
-
-    fn reads_pixels(&self) -> bool {
-        true
-    }
-
-    fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            SEEDED.to_string(),
-            Lifecycle::Persistent,
-            Coverage::EveryBlock,
-        )]
-    }
-
-    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
-        let mut rows = RowBuilder::new(std::sync::Arc::new(Self::schema()));
-        if let BlockBuf::Array(pixels) = at.pixels()? {
-            let array = pixels.view::<u16>()?;
-            for i in 0..at.core.shape[0] {
-                for j in 0..at.core.shape[1] {
-                    for k in 0..at.core.shape[2] {
-                        let local = [
-                            at.core.start[0] - at.read.start[0] + i,
-                            at.core.start[1] - at.read.start[1] + j,
-                            at.core.start[2] - at.read.start[2] + k,
-                        ];
-                        let value = array[local];
-                        if value != 0 {
-                            rows.push(
-                                [
-                                    at.core.start[0] + i,
-                                    at.core.start[1] + j,
-                                    at.core.start[2] + k,
-                                ],
-                                &[Value::F64(value as f64)],
-                            )?;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(BlockOutput::fragment(SEEDED.to_string(), rows.encode()))
-    }
+/// The schema those rows carry.
+fn seed_schema() -> Schema {
+    seed_rows().schema().expect("one named column")
 }
 
 // ------------------------------------------------------------- the harness --
@@ -348,9 +307,9 @@ fn the_predicate_rejects_at_both_ends() {
 fn the_seeded_rows_are_the_same_list_under_every_cut() {
     let want = seeded();
     for block in CUTS {
-        let (env, _) = run(block, &[&SeedRowsOp]).expect("a run");
+        let (env, _) = run(block, &[&seed_rows()]).expect("a run");
         assert_eq!(
-            collect_rows(&env, SEEDED, 0, VOLUME, SeedRowsOp::schema()).expect("the merge"),
+            collect_rows(&env, SEEDED, 0, VOLUME, seed_schema()).expect("the merge"),
             want,
             "the cut {block:?} seeded a different list"
         );
@@ -365,7 +324,7 @@ fn the_seeded_rows_are_the_same_list_under_every_cut() {
 fn every_cut_filters_to_one_list() {
     let filter = FilterRowsOp::new(
         "filter",
-        streams(SEEDED, 0, KEPT, SeedRowsOp::schema()),
+        streams(SEEDED, 0, KEPT, seed_schema()),
         predicate(),
     )
     .expect("the column exists");
@@ -373,9 +332,9 @@ fn every_cut_filters_to_one_list() {
     assert!(!want.is_empty());
 
     for block in CUTS {
-        let (env, _) = run(block, &[&SeedRowsOp, &filter]).expect("a run");
+        let (env, _) = run(block, &[&seed_rows(), &filter]).expect("a run");
         assert_eq!(
-            collect_rows(&env, KEPT, 1, VOLUME, SeedRowsOp::schema()).expect("the merge"),
+            collect_rows(&env, KEPT, 1, VOLUME, seed_schema()).expect("the merge"),
             want,
             "the cut {block:?} filtered to a different list"
         );
@@ -392,13 +351,13 @@ fn every_cut_filters_to_one_list() {
 fn filtering_keeps_a_subsequence_and_renumbers_it() {
     let filter = FilterRowsOp::new(
         "filter",
-        streams(SEEDED, 0, KEPT, SeedRowsOp::schema()),
+        streams(SEEDED, 0, KEPT, seed_schema()),
         predicate(),
     )
     .expect("the column exists");
-    let (env, _) = run([4, 4, 4], &[&SeedRowsOp, &filter]).expect("a run");
-    let before = collect_rows(&env, SEEDED, 0, VOLUME, SeedRowsOp::schema()).expect("the merge");
-    let after = collect_rows(&env, KEPT, 1, VOLUME, SeedRowsOp::schema()).expect("the merge");
+    let (env, _) = run([4, 4, 4], &[&seed_rows(), &filter]).expect("a run");
+    let before = collect_rows(&env, SEEDED, 0, VOLUME, seed_schema()).expect("the merge");
+    let after = collect_rows(&env, KEPT, 1, VOLUME, seed_schema()).expect("the merge");
 
     // A subsequence: every survivor appears in the input, in order, with nothing
     // moved past anything.
@@ -431,7 +390,7 @@ fn a_strict_bound_and_a_closed_one_differ_on_a_row_at_the_limit() {
     let count = |bound: Limit| {
         let filter = FilterRowsOp::new(
             "filter",
-            streams(SEEDED, 0, KEPT, SeedRowsOp::schema()),
+            streams(SEEDED, 0, KEPT, seed_schema()),
             RowFilter::new(vec![ColumnTest::new(
                 VALUE,
                 Some(bound),
@@ -441,8 +400,8 @@ fn a_strict_bound_and_a_closed_one_differ_on_a_row_at_the_limit() {
             .expect("one test"),
         )
         .expect("the column exists");
-        let (env, _) = run([4, 4, 4], &[&SeedRowsOp, &filter]).expect("a run");
-        collect_rows(&env, KEPT, 1, VOLUME, SeedRowsOp::schema())
+        let (env, _) = run([4, 4, 4], &[&seed_rows(), &filter]).expect("a run");
+        collect_rows(&env, KEPT, 1, VOLUME, seed_schema())
             .expect("the merge")
             .len()
     };
@@ -479,12 +438,8 @@ fn the_scale_rounds_ties_to_even_through_a_run() {
         "the two rules must disagree on this fixture or it tests nothing"
     );
 
-    let scale = ScaleRowsOp::new(
-        "scale",
-        streams(SEEDED, 0, SCALED, SeedRowsOp::schema()),
-        [0.5; 3],
-    )
-    .expect("a finite factor");
+    let scale = ScaleRowsOp::new("scale", streams(SEEDED, 0, SCALED, seed_schema()), [0.5; 3])
+        .expect("a finite factor");
     let out = scaled_bound(VOLUME, [0.5; 3]).expect("a finite factor");
 
     let mut want: Vec<RowValues> = seeded()
@@ -523,9 +478,9 @@ fn the_scale_rounds_ties_to_even_through_a_run() {
     assert!(want.iter().any(|row| row.at == [2, 2, 2]));
 
     for block in CUTS {
-        let (env, _) = run(block, &[&SeedRowsOp, &scale]).expect("a run");
+        let (env, _) = run(block, &[&seed_rows(), &scale]).expect("a run");
         assert_eq!(
-            collect_rows(&env, SCALED, 1, out, SeedRowsOp::schema()).expect("the merge"),
+            collect_rows(&env, SCALED, 1, out, seed_schema()).expect("the merge"),
             want,
             "the cut {block:?} scaled to a different list"
         );
@@ -555,7 +510,7 @@ fn gather_one_block(
         .to_owned();
     gather_blob(
         VOLUME,
-        &SeedRowsOp::schema(),
+        &seed_schema(),
         &rows,
         IMAGE,
         core,
@@ -567,7 +522,7 @@ fn gather_one_block(
 /// Every block's gather, merged, **with no executor anywhere in it**: the path
 /// the plan-driven one is measured against.
 fn gathered(block: [usize; 3]) -> Vec<RowValues> {
-    let (env, _) = run(block, &[&SeedRowsOp]).expect("a run");
+    let (env, _) = run(block, &[&seed_rows()]).expect("a run");
     let grid = BlockGrid::new(VOLUME, block).expect("a grid");
     let image = image();
     let blobs: Vec<([usize; 3], Vec<u8>)> = grid
@@ -582,7 +537,7 @@ fn gathered(block: [usize; 3]) -> Vec<RowValues> {
         .collect();
     merge_rows(
         VOLUME,
-        gathered_schema(&SeedRowsOp::schema(), IMAGE).expect("a fresh name"),
+        gathered_schema(&seed_schema(), IMAGE).expect("a fresh name"),
         blobs
             .iter()
             .map(|(index, bytes)| (*index, bytes.as_slice())),
@@ -603,8 +558,8 @@ fn gather_op(input: &str, phase: usize, schema: Schema) -> GatherRowsOp {
 
 /// The same gather, driven **through a plan** by the executor.
 fn gathered_by_plan(block: [usize; 3]) -> Vec<RowValues> {
-    let gather = gather_op(SEEDED, 0, SeedRowsOp::schema());
-    let (env, _) = run(block, &[&SeedRowsOp, &gather]).expect("a run");
+    let gather = gather_op(SEEDED, 0, seed_schema());
+    let (env, _) = run(block, &[&seed_rows(), &gather]).expect("a run");
     collect_rows(&env, GATHERED, 1, VOLUME, gather.schema().clone()).expect("the merge")
 }
 
@@ -697,12 +652,12 @@ fn a_row_on_a_block_seam_is_read_once_by_the_block_that_holds_it() {
 /// checks.
 #[test]
 fn every_blocks_gathered_fragment_is_a_function_of_its_own_core() {
-    let gather = gather_op(SEEDED, 0, SeedRowsOp::schema());
+    let gather = gather_op(SEEDED, 0, seed_schema());
     assert_eq!(gather.seam_fold(), Some(SeamFold::PerBlock));
     assert_eq!(gather.inputs()[0].reach, [0, 0, 0]);
 
     let block = [4, 4, 4];
-    let (env, plan) = run(block, &[&SeedRowsOp, &gather]).expect("a run");
+    let (env, plan) = run(block, &[&seed_rows(), &gather]).expect("a run");
     // The image is fetched at the block's own extent and nothing wider, which is
     // what makes "its own core" the whole story rather than most of it.
     assert_eq!(plan.phases[1].source_images, vec![0]);
@@ -750,7 +705,7 @@ fn every_blocks_gathered_fragment_is_a_function_of_its_own_core() {
 /// scale between the producer and the gather would do.
 #[test]
 fn a_gather_handed_another_blocks_rows_refuses_them() {
-    let (env, _) = run([4, 8, 8], &[&SeedRowsOp]).expect("a run");
+    let (env, _) = run([4, 8, 8], &[&seed_rows()]).expect("a run");
     let grid = BlockGrid::new(VOLUME, [4, 8, 8]).expect("a grid");
     let cores = grid.cores();
     let image = image();
@@ -789,6 +744,14 @@ impl MarkRowsOp {
 impl FragmentOp for MarkRowsOp {
     fn name(&self) -> &'static str {
         "mark rows"
+    }
+
+    /// Nothing crosses: a row is emitted for a set voxel of this block's core,
+    /// and a voxel is in exactly one core. `apply` indexes through
+    /// `at.core.start - at.read.start`, so it reads the core whatever extent it
+    /// is handed.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn reads_pixels(&self) -> bool {
@@ -932,14 +895,10 @@ fn a_gather_reads_a_second_array_the_rows_did_not_come_from() {
 /// well-formed.
 #[test]
 fn a_scale_before_a_gather_is_refused_by_the_row_it_moved() {
-    let scale = ScaleRowsOp::new(
-        "scale",
-        streams(SEEDED, 0, SCALED, SeedRowsOp::schema()),
-        [0.5; 3],
-    )
-    .expect("a finite factor");
-    let gather = gather_op(SCALED, 1, SeedRowsOp::schema());
-    let Err(error) = run([4, 4, 4], &[&SeedRowsOp, &scale, &gather]) else {
+    let scale = ScaleRowsOp::new("scale", streams(SEEDED, 0, SCALED, seed_schema()), [0.5; 3])
+        .expect("a finite factor");
+    let gather = gather_op(SCALED, 1, seed_schema());
+    let Err(error) = run([4, 4, 4], &[&seed_rows(), &scale, &gather]) else {
         panic!(
             "a scaled row is no longer in the block whose fragment carries it, and a gather \
              that read anyway would answer from the wrong voxel"
@@ -966,12 +925,12 @@ fn a_scale_before_a_gather_is_refused_by_the_row_it_moved() {
 fn a_gather_naming_an_image_nothing_wrote_is_refused_before_it_runs() {
     let gather = GatherRowsOp::new(
         "gather",
-        streams(SEEDED, 0, GATHERED, SeedRowsOp::schema()),
+        streams(SEEDED, 0, GATHERED, seed_schema()),
         1,
         IMAGE,
     )
     .expect("a fresh column name");
-    let Err(error) = run([4, 4, 4], &[&SeedRowsOp, &gather]) else {
+    let Err(error) = run([4, 4, 4], &[&seed_rows(), &gather]) else {
         panic!("an image nobody wrote is not a second array, it is whatever `prepare` allocated")
     };
     let text = format!("{error}");

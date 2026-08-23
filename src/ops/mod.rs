@@ -15,27 +15,60 @@
 // Read down the right-hand column rather than the left: each row is here
 // because it was the first thing that could not be said with what came before
 // it, and the bottom two rows are where the `BlockOp` shape itself ran out.
+//
+// **It is a narrative of firsts and not an inventory, and the difference has
+// cost something.** A family that added no new expressiveness is legitimately
+// absent — but so, for a while, was one that added a great deal: the row world
+// below had no entry at all while `coordinates`, `rows` and `tabulate` were
+// three of the largest modules here, so an op belonging to it had nowhere to be
+// announced and the missing *producer* went unnoticed through three separate
+// writings. If a module here is a first, it needs a row; if it is not, its
+// absence is the statement, and saying which is this list's job rather than a
+// reader's.
 // | module | ops | what it makes expressible |
 // |---|---|---|
 // | `voxelwise` | a general map, and the connectives over two inputs | the **sink of a diamond**: reach 0, two operands, which nothing here could express |
 // | `rank` | an order statistic of a neighbourhood, the median included | a reach derived from a filter size, and a constant algebra that is exact rather than approximate |
 // | `morphology` | erode, dilate, open, close | a reach that is **twice** the element, because two of the four are compositions |
+// | `background` | a large-scale background estimate, and its removal | **not an op, and that is the entry.** There is no sweep, no window and no accumulator in the file: an opening large enough that no object survives it, subtracted from the original, is `morphology` and `voxelwise` already — so what this contributes is a `Chain` and a combine step, and its header says outright that *"every piece of the arithmetic already existed; what did not exist was the **shape**"*. The first row here whose answer to "what does it make expressible" is a composition rather than a kernel, which is why it returns a `Chain` and not a `BlockOp` |
 // | `local` | windowed mean, deviation and rank on a sample lattice | a reach with **two terms**, and the globally anchored lattice that makes it decomposition-invariant at all |
 // | `local` | thresholding against a local statistic | a threshold that varies with position, and inherits every property above |
+// | `normalise` | removing a locally estimated level, and dividing by a locally estimated spread | the same estimator as `local`, called and not reimplemented, with a different combination step — and the first op that runs it **twice**, a centre and a spread on two independent lattices, which makes its reach a **maximum over two two-term reaches** rather than one. Nothing before it had a reach that was a fold over two derivations of the same kind |
 // | `smooth` | a separable Gaussian | a cost that is **linear in the sum** of the kernel lengths rather than in their product, which the model had no reason to distinguish before |
+// | `convolve` | a linear filter with a **caller-supplied** kernel | the first op whose kernel is a **parameter rather than a derivation**. `smooth` is the other linear filter and its weights come from a sigma, so a difference of Gaussians, a Laplacian, a Sobel and every hand-rolled stencil were one kernel each and unreachable. It is also the first op with a **parameter that has no default** — `Sense`, because correlation and convolution differ by a reflection, libraries disagree about which name computes which, and a crate that picked one silently would be wrong for half its readers on exactly the symmetric kernels everybody tests with |
+// | `ridge` | a multi-scale second-derivative structure filter | the first op whose answer at one voxel is a **maximum over several scales**, and the first that needs an eigen-decomposition to produce one number. The scale-normalisation term is the part worth the row: without `sigma^gamma` the derivatives of a wider Gaussian are uniformly smaller and the maximum always chooses the narrowest scale, *"which is not a preference but an artefact"* — the first place here where an op has to correct for its own parameterisation before a comparison across parameters means anything |
+// | `distance` | the exact Euclidean distance transform | the first op whose reach is [`crate::reach::AxisReach::All`] **on one axis at a time** — three independent 1-D sweeps, so it is a planning barrier per axis rather than for the whole op, which `watershed` below is not. It is also the only module here that ships a **deliberately wrong implementation as a control**: `chamfer_distance` is exact along the directions its offsets can represent and wrong in between, and `tests/distance_transform.rs` measures both halves on a fixture chosen so they differ. A parity test on a centred ball cannot tell the two apart, which is why the oblique slab is the fixture that ships |
+// | `resample` | resizing by an exact rational factor per axis | the first op here whose **output image is a different shape from its input image** — the capability `docs/design/BLOCK_OPS.md` opened and left unused until this. Everything above it writes the extent it was handed |
 // | `skeleton` | one thinning sub-iteration, and the sequence of them | an answer that depends on **where** the block is (the parity class is a fact about position), and a `Sequence` whose reach is the fold rather than a declaration |
 // | `directional` | a whole thinning pass, as one op, and the sequence of them | the first op whose **sub-iteration cannot be a slot**: it reads a second array — the border set taken once per pass — that a `Sequence` has nowhere to thread, so the indivisible unit is the pass and the reach of twelve is a derivation the op has to state rather than a fold |
 // | `fill` | hole filling, as two `FragmentOp` phases | the first operation here that **no halo can express**: reachability is transitive over the whole volume, so it is a fragment-and-join rather than a `BlockOp` at all |
 // | `regional` | the maxima of a greyscale volume, as the same two phases | the **second** op of that shape, which is what turned one op's internals into `components`: the same program with a different per-label fact, and a seam meeting that compares before it joins |
 // | `components` | the union-find, the six-face geometry and the seam walk | nothing on its own — it is the part of `fill` and `regional` that is the *program* rather than the question. Its one *choice* is `Connectivity`, re-exported here: `fill`, `regional` and `detect` each take it and each defaults to face connectivity, so nothing that predates it moved, and the wider ones are the same program over more seam pairs |
 // | `detect` | one point per connected region of a mask, at its centroid | the **producer** the point world had none of, and the first phase pair here that writes no image at all: a `fragments -> fragments` merge whose accumulators are integers, so a component split across four blocks totals *exactly* rather than nearly |
+// | `coordinates`, `rows`, `tabulate` | a coordinate list out of a mask; the maps and the grouped reduction over rows; a statistic per label read out of a volume | the first ops whose unit of decomposition is a **range of rows** rather than a neighbourhood of voxels — and where a halo is a **defect rather than a cost**, which is the reverse of everything above: an overlapping block recomputes, an overlapping row range emits a row *twice* and nothing downstream can tell that from a real row. With them the answer stops being an image, and the order stops being derivable from the assignment: a base index per block can only express a block-major order and a table's canonical order interleaves the blocks, so every row carries its own coordinate and the order is restored at the merge. `rows::RowSourceOp` and `crate::points::PointSourceOp` are the phase-0 producers that let a plan **start** from a table or a point set rather than derive one from an image — the half this family went without while three callers, one of them this crate's own test suite, wrote it for themselves; `docs/ops-survey/README.md` G17 |
+// | `adjacency` | a mask in, every adjacent **pair** of set voxels out | the first op whose row is a **relation rather than a thing**. `coordinates` emits one row per set voxel; this emits one per touching pair, and the two compose over the same mask with nothing needed to relate them. What that costs is an ownership rule with no centroid to appeal to — a pair can straddle a seam, so the block whose core holds the lexicographically lower endpoint emits it, and `tests/adjacent_pairs.rs` pins a fixture that puts pairs across every seam *before* anything else asserts against it |
+// | `walk` | rows in, the same rows with one more column: a distance read along a fixed path | the first row op that reads a **volume along a path** rather than at the row's own voxel. `ops::rows`' gather samples one voxel per row, so its reach is zero by construction; this walks an `OffsetSequence` until a `Limit` fails, so its reach is the **longest offset in the list** and is a property of a parameter rather than of the op |
 // | `voxelize` | scattered points into a dense volume | a `fragments -> volume` op whose reach is in **blocks** as well as voxels, and an accumulation order that has to be a function of the data rather than of the gather |
 // | `label` | scattered points into a volume as **names** rather than a sum | the same `fragments -> volume` shape as `voxelize` with a **stated collision rule** instead of an accumulation order: two points meeting on a voxel cannot be added, and `min` over the labels is invariant under every gather order by construction rather than by a sort |
 // | `sliding` | a windowed statistic over a histogram carried along a scan line | the first op whose kernel has **state between voxels**, so the answer depends on the order voxels are visited in — and the first with a stated *element type* constraint, since a histogram needs a bounded integer domain and refuses a float rather than binning it |
 // | `reconstruct` | grey reconstruction, and the h-maxima transform over it | the first `IterativeOp` here: a **fixed point** whose substage count is a function of the data, reached at the external reach of *one* substage — the third answer to transitivity, beside a wide halo and a fragment-and-join |
+// | `deconvolve` | iterative deconvolution against a **known** kernel | the first op whose reach is a function of a **parameter the caller chooses**: `2r` per axis per iteration, `2rn` after `n` of them. That is the price of declining the frequency-domain family, whose reach spans the volume and is therefore `AxisReach::All` by type — a single block, in memory at once, on one worker. Not a second `reconstruct`: that one is an `IterativeOp` whose substage count is data-dependent and reached at the external reach of *one* substage; this is a `BlockOp` that folds a **stated** iteration count into its own halo |
 // | `configuration` | a mask rewritten by a table indexed on the 3x3x3 neighbourhood | the first op whose rule is **data rather than code** — 2^27 entries the caller supplies — and the first written as *both* shells over one kernel, so what a stated pass count and a fixed point cost differently is a comparison rather than an argument |
+// | `mixing` | a K-ary reach-0 shell (`TupleOp`), its kernel trait and the per-voxel matrix | the first op parameterised by **arity** rather than by a window — K co-located arrays in, K' out, every value read at the voxel it is written to. A window is what `Reach` describes and needs an axis to be stated over; arity needs only somewhere for the operands to come from, which is why this became reachable when a run could be handed images it did not compute. This is the register's G10 closed |
 // | `watershed` | a cost volume partitioned into one basin per seed | the first op that **declares itself a planning barrier** rather than being one by arithmetic: its answer is a function of one global queue's pop order, so `AxisReach::All` is the honest reach and the cost of saying so is written down as memory per voxel rather than as an adjective |
 // | `fft` | a real plane's Fourier transform, and a squared-difference landscape over integer lags through the correlation theorem | the first thing here that is **not an op at all**, and could not be: two inputs of different extents, an output indexed by *lag* rather than by position, and a complex intermediate `Voxels` cannot hold. `watershed` declares the barrier and still fits the shape; this one does not fit the shape, so it is free functions and a plan, and the absent `BlockOp` is the statement |
+//
+// Four modules here have no row, and this is the list saying which and why —
+// under the rule above, an absence has to be a statement rather than a gap in
+// somebody's attention. `element` is the neighbourhood and the order statistic
+// that `rank`, `morphology` and `local` all share, so a row for it would be a
+// row for a parameter three families already carry. `cost` is where the
+// measured `cost_per_voxel` figures come from and makes nothing expressible.
+// `lattice` ships two ops but they are `local`'s fused statistic **split into
+// two phases** so its two dependencies can be priced separately — the same
+// answer, made visible, which is a fact about planning rather than about what
+// can be said. `scikitimage_watershed` is a translation carrying its own
+// BSD-3-Clause notice and exists to be compared against, not composed with.
 //
 // The shape every op in here has, and why
 // ---------------------------------------
@@ -195,7 +228,7 @@ pub use adjacency::{
 /// not one: `fill`'s names the **background**'s adjacency and `detect`'s the
 /// **foreground**'s, and the complementary-pair convention deliberately pairs a
 /// narrow one with a wide one. `components`'s own header has the table.
-pub use components::Connectivity;
+pub use components::{decode_block_flags_for, encode_block_flags, Connectivity, Merge};
 pub use configuration::{
     configuration_bit, configuration_index_at, configuration_pass_into, configuration_passes_into,
     configuration_to_fixed_point, cost_report as configuration_cost_report,
@@ -338,6 +371,12 @@ pub use convolve::{
     convolve_into, cost_report as convolve_cost_report, ConvolveOp, Kernel, Sense,
     CONVOLVE_COST_PER_TAP,
 };
+/// **The same filter through the Fourier transform**: overlap-save over a tile
+/// grid anchored to the volume, so it is an ordinary bounded-reach `BlockOp` and
+/// is byte-identical across lattices. Not bit-identical to [`ConvolveOp`] — the
+/// two sum the same products in different orders — which is why it is a separate
+/// op and not a flag on that one.
+pub use convolve::{transform_convolve_cost_report, TransformConvolveOp, TRANSFORM_CONVOLVE_COST};
 /// The arithmetic and selection sinks of a diamond, beside `voxelwise`'s
 /// Boolean ones: add, subtract, multiply, divide, per-voxel minimum and maximum
 /// between two images.

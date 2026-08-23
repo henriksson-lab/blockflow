@@ -37,22 +37,25 @@
 // phase 0 — and one addition to the fragment, which is the per-label **value**,
 // because a seam meeting cannot be resolved without it. See "The seam" below.
 //
-// Read `ops::fill`'s header for the two walls this shape ran into. Both apply
-// here unchanged and neither had to be re-solved: a fragment-only phase is
-// terminal as far as images go, so the merge is folded into phase 1 and every
-// block re-runs it; and the whole-lattice fragment reach of phase 1 is also its
-// halo, which is load-bearing because the halo is the dependency edge between
-// pipelined phases.
+// Read `ops::fill`'s header for the two walls this shape ran into and for what
+// was done about them; both apply here unchanged and neither had to be
+// re-solved. A fragment-only phase is still terminal as far as images go, so the
+// merge still lives in phase 1 — but it is no longer *in every block* of it.
 //
-// **The costs are `fill`'s costs and they are worse than that header used to
-// say**, which is why this points at the corrected version rather than
-// summarising it. Three of them, not one: the pixel re-reads, the fragment
-// transfers, and the union-find run once per block. The third was the one nobody
-// had priced — small at every lattice per invocation, and there is one per block
-// — and at a fine cut it is the largest of the three. This op pays all three,
-// like `fill` and unlike `ops::detect`, which escapes the pixels.
-// `docs/design/barriers.md` specifies the way out and measures what each part of
-// it would recover.
+// **Phase 1 declares a barrier and hoists its merge**, exactly as `fill`'s does
+// and through the same `Merge` switch, so all three of the costs that header
+// prices are removed together: the pixel re-reads with the halo, the fragment
+// re-transmissions and the per-block union-find with the hoisting. The
+// measurement runs this op beside `fill` in `tests/fragment_join_barrier.rs`, on
+// a `[16, 32, 32]` `f64` volume, and it comes out the same shape — at 256 blocks
+// **75.1x the traffic and 256 times the merges** for the in-plan arm against the
+// hoisted one, with the barrier alone worth 1.52x of that because at this cut the
+// fragment set is larger than the label image and the barrier removes only the
+// pixel half. The ratios are this volume's; the structure is `fill`'s header's.
+//
+// `ops::detect` escapes the pixel half by declaring `reads_pixels() == false`,
+// which is open to a reduction whose answer is not a volume and closed to this
+// one.
 //
 // The two adjacencies, which are one relation and must stay one
 // --------------------------------------------------------------
@@ -174,15 +177,16 @@ use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
     fragment_phase, BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput,
+    PhaseView, SeamFold,
 };
 use crate::geometry::BlockGrid;
 use crate::sidecar::Lifecycle;
 use crate::voxels::Voxels;
 
 use super::components::{
-    bytes_to_words, core_within_read, empty_planes, expect_end, offset_by, planes_of, push_planes,
-    read_header, take_planes, walk_seams_with, words_to_bytes, Connectivity, FacePlanes,
-    LabelIndex, Union, UNLABELLED,
+    bytes_to_words, core_within_read, decode_block_flags_for, empty_planes, encode_block_flags,
+    expect_end, offset_by, planes_of, push_planes, read_header, take_planes, walk_seams_with,
+    words_to_bytes, Connectivity, FacePlanes, LabelIndex, Merge, Union, UNLABELLED,
 };
 use super::fill::agree_on_connectivity;
 use super::shapes_agree;
@@ -536,6 +540,14 @@ impl PlateauFaces {
 const MAGIC: u32 = 0x5841_4d52;
 const VERSION: u32 = 1;
 
+/// `"RMXR"` little-endian — the **reduction** blob, not the fragment.
+///
+/// Distinct from this op's fragment magic and from `fill`'s reduction magic, for
+/// the same reason the fragment magics are distinct from each other: the two ops
+/// share one blob codec and differ only in what the flags mean, so a blob read
+/// under the wrong op would decode cleanly and answer wrongly.
+const REDUCTION_MAGIC: u32 = 0x5258_4d52;
+
 // ------------------------------------------------------------- the merge --
 
 /// Close every block's local plateaus into global ones and report, per block,
@@ -690,6 +702,13 @@ impl FragmentOp for LabelPlateauxOp {
         self.name
     }
 
+    /// Nothing crosses as **pixels**. Plateaus are grown inside this block from
+    /// this block's values; what a neighbour needs — the faces, the plateau
+    /// values, and which plateau ascends to which — leaves on `self.stream`.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn reads_pixels(&self) -> bool {
         true
     }
@@ -755,9 +774,15 @@ impl FragmentOp for LabelPlateauxOp {
 
 /// Phase 1: close the plateaus and write the mask.
 ///
-/// Declares a **whole-lattice** fragment reach, which is what makes it a
-/// planning barrier: nothing can be fused across it, because its answer depends
-/// on every block.
+/// **Declares a [barrier], and runs its merge once for the phase.** Its answer
+/// depends on every block — a plateau's ascent can be shown a lattice away — and
+/// that is now stated as the dependency it is rather than paid for as a
+/// whole-volume fetch: the phase waits for all of phase 0, fetches only its own
+/// core, and closes the plateaus in [`FragmentOp::reduce`] at the moment the
+/// barrier creates. [`Merge`] is the declaration; `ops::fill`'s header measures
+/// what each of its three shapes costs on the program both ops are.
+///
+/// [barrier]: crate::fragment::FragmentOp::barrier
 pub struct RegionalMaximaOp {
     name: &'static str,
     stream: String,
@@ -767,6 +792,9 @@ pub struct RegionalMaximaOp {
     /// The relation the seam is closed under, which has to be the one the
     /// labelling used. [`Connectivity::Faces`] unless a caller said otherwise.
     connectivity: Connectivity,
+    /// Where the merge runs. [`Merge::OnceForThePhase`] unless a measurement
+    /// asked for one of the other two.
+    merge: Merge,
 }
 
 impl RegionalMaximaOp {
@@ -795,7 +823,24 @@ impl RegionalMaximaOp {
             mask,
             lattice: grid.blocks_per_axis(),
             connectivity: Connectivity::Faces,
+            merge: Merge::default(),
         }
+    }
+
+    /// The same op with the merge somewhere else. See [`Merge`].
+    ///
+    /// **Nothing in a shipping plan should call this.** The default is the shape
+    /// that costs least in all three currencies; the other two exist so that the
+    /// difference can be measured out of one op, and so that the barrier has a
+    /// liveness control — the same op with it withheld must answer identically.
+    pub fn merging(mut self, merge: Merge) -> Self {
+        self.merge = merge;
+        self
+    }
+
+    /// Where this op's merge runs.
+    pub fn merge(&self) -> Merge {
+        self.merge
     }
 
     /// The same op, closing the seams under a stated [`Connectivity`].
@@ -845,6 +890,51 @@ impl FragmentOp for RegionalMaximaOp {
         self.name
     }
 
+    /// Nothing this block is authoritative for reaches past its core, and since
+    /// the barrier the read extent is that core: `fragment_phase` no longer
+    /// widens the halo to cover a fragment reach the barrier states directly. The
+    /// ascent relation that crosses the seam arrives as plateau faces on
+    /// `self.stream`.
+    ///
+    /// Under [`Merge::PerBlock`] the whole-lattice fragment reach in
+    /// [`Self::inputs`] is still a whole-volume halo, and `apply` slices back to
+    /// the core. That arm exists to be measured.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    /// **The answer depends on every block, and this is where that is said.**
+    ///
+    /// A plateau's ascent can be shown by a block on the far side of the volume,
+    /// so this phase has always waited for all of phase 0; before a barrier could
+    /// be declared, the only spelling of that was a whole-lattice fragment reach,
+    /// which `fragment_phase` turned into a whole-volume halo and a whole-volume
+    /// fetch as well as the ordering. Two of those three were never wanted.
+    fn barrier(&self) -> bool {
+        self.merge.is_barriered()
+    }
+
+    /// **The merge is a function of the set of fragments, not of their order**,
+    /// and this is the claim being checked rather than asserted.
+    ///
+    /// It holds here structurally, and the argument has one more step than
+    /// `fill`'s because this merge touches `f64`. It is driven off a `BTreeMap`
+    /// keyed by block index, so the fragments are put back into the lattice's own
+    /// order whatever order they arrived in; a union-find's partition does not
+    /// depend on the order the unions arrive in; and the per-label fact is a
+    /// boolean folded with `or`. The values are **compared** and never
+    /// accumulated — `==` and `>` on two `f64` are exact and order-free, and the
+    /// NaN case falls through both, which is the module header's rule — so
+    /// nothing here is a floating-point sum and there is nothing for an order to
+    /// change.
+    ///
+    /// That last clause is the one worth checking rather than believing, and the
+    /// executor does: it reduces a second time with the lattice walked backwards
+    /// and requires the same bytes.
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::Unordered)
+    }
+
     fn reads_pixels(&self) -> bool {
         true
     }
@@ -858,18 +948,61 @@ impl FragmentOp for RegionalMaximaOp {
         self.mask
     }
 
-    /// The whole lattice, stated as the lattice rather than as a large number.
+    /// **Nothing per block once the merge is hoisted**, and the whole lattice
+    /// when it is not.
     ///
-    /// This is why the constructor takes a grid. "Everything" is a different
-    /// integer on every lattice, and a saturating sentinel is not a way out: the
-    /// reach is multiplied by the block edge to get a halo, and a sentinel
-    /// overflows the geometry rather than clamping.
+    /// The stream is declared either way, because that is what makes it
+    /// resolvable — a `reduce` may read the streams the plan records and no
+    /// others. What the reach says is how much of the set *this block* needs, and
+    /// with the merge in [`FragmentOp::reduce`] the answer is none of it: the
+    /// phase needs the set, the block needs the phase's answer.
+    ///
+    /// Under the two per-block shapes the reach is the lattice, stated as the
+    /// lattice rather than as a large number — which is why the constructor takes
+    /// a grid. "Everything" is a different integer on every lattice, and a
+    /// saturating sentinel is not a way out: the reach is multiplied by the block
+    /// edge to get a halo, and a sentinel overflows the geometry rather than
+    /// clamping.
     fn inputs(&self) -> Vec<FragmentInput> {
-        vec![FragmentInput::own(self.stream.clone(), self.faces_phase).with_reach(self.lattice)]
+        let reach = if self.merge.is_hoisted() {
+            [0, 0, 0]
+        } else {
+            self.lattice
+        };
+        vec![FragmentInput::own(self.stream.clone(), self.faces_phase).with_reach(reach)]
+    }
+
+    /// Nothing to gather once the merge is hoisted: `apply` reads the phase's
+    /// answer, not the fragments it was derived from. Gathering a reach of
+    /// nothing would still fetch this block's own fragment, which is one whole
+    /// transmission of the set across the phase for bytes no block reads.
+    fn gathers(&self) -> bool {
+        !self.merge.is_hoisted()
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
         Vec::new()
+    }
+
+    /// **The merge, once for the phase.** Every block then reads its own row out
+    /// of the blob instead of re-deriving the whole table.
+    ///
+    /// Empty under the two per-block shapes, which is what makes them plannable
+    /// at all: `check_phase_work` probes `reduce` on every phase without a
+    /// barrier and refuses one that answers, and [`Merge::PerBlock`] has no
+    /// barrier.
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        if !self.merge.is_hoisted() {
+            return Ok(Vec::new());
+        }
+        let mut reports = BTreeMap::new();
+        at.stream_fragments(&self.stream, &mut |key, bytes| {
+            reports.insert(key.block, PlateauFaces::decode(bytes)?);
+            Ok(())
+        })?;
+        let counts = at.grid.blocks_per_axis();
+        let ascends = merge_plateaux_with(&reports, counts, self.connectivity)?;
+        encode_block_flags(&ascends, counts, REDUCTION_MAGIC)
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
@@ -878,21 +1011,36 @@ impl FragmentOp for RegionalMaximaOp {
         };
         let labels = pixels.view::<u32>()?;
 
-        let mut reports = BTreeMap::new();
-        for (key, bytes) in at.fragments(&self.stream) {
-            reports.insert(key.block, PlateauFaces::decode(bytes)?);
-        }
-        let ascends = merge_plateaux_with(&reports, at.grid.blocks_per_axis(), self.connectivity)?;
-        let mine = ascends.get(&at.index).ok_or_else(|| {
-            Error::InvalidArgument(format!(
-                "the merge produced no answer for block {:?}, which is the block asking",
-                at.index
-            ))
-        })?;
+        let counts = at.grid.blocks_per_axis();
+        let mine = if self.merge.is_hoisted() {
+            decode_block_flags_for(
+                at.reduced,
+                counts,
+                at.index,
+                REDUCTION_MAGIC,
+                "a regional-maxima reduction",
+            )?
+        } else {
+            let mut reports = BTreeMap::new();
+            for (key, bytes) in at.fragments(&self.stream) {
+                reports.insert(key.block, PlateauFaces::decode(bytes)?);
+            }
+            let ascends = merge_plateaux_with(&reports, counts, self.connectivity)?;
+            ascends.get(&at.index).cloned().ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "the merge produced no answer for block {:?}, which is the block asking",
+                    at.index
+                ))
+            })?
+        };
+        let mine = &mine[..];
 
-        // Only the core: the read extent is the whole volume, so `labels` holds
-        // every block's labels under every block's own numbering, and `mine`
-        // decodes one of them. See `components::core_within_read`.
+        // Only the core. Under [`Merge::PerBlock`] the read extent is the whole
+        // volume, so `labels` holds every block's labels under every block's own
+        // numbering and `mine` decodes one of them; with a barrier the read
+        // extent *is* the core and this slice is the identity. It stays because
+        // the geometry is read rather than assumed. See
+        // `components::core_within_read`.
         let (offset, extent) = core_within_read(at)?;
         let window = ndarray::s![
             offset[0]..offset[0] + extent[0],
@@ -926,10 +1074,11 @@ impl FragmentOp for RegionalMaximaOp {
 /// The two phases, on one lattice.
 ///
 /// Both are built with `fragment_phase`, so both halos come from the ops'
-/// declarations rather than from this function: zero for the labelling, the
-/// whole lattice for the maxima. `ops::fill`'s header explains why the second
-/// one has to be that and what it costs — the halo is the dependency edge
-/// between pipelined phases, not merely a fetch extent.
+/// declarations rather than from this function, and both are now zero: the
+/// labelling needs nothing outside its core, and the maxima phase states its
+/// dependency on the whole of the labelling as a barrier rather than buying it
+/// with a halo. `ops::fill`'s header explains what that halo used to cost and
+/// what removing it was worth.
 ///
 /// `input_dtype` is the element type of the image the volume arrives in, and is
 /// checked here rather than at the first block: a plan that cannot run is worth

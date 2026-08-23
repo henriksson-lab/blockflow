@@ -263,13 +263,18 @@ fn write_report(coordinator: &Coordinator, id: &str, path: &std::path::Path) -> 
             "status": status.to_json(),
             "aborted": aborted,
             "reissued": reissued,
+            "withheld": job.withheld(),
+            "pulls_per_worker": job.pulls_per_worker(),
             "unknown_events": job.unknown_events(),
+            "duplicate_events": job.duplicate_events(),
             "coverage_ok": job.check_coverage().is_ok(),
             "coverage": job.check_coverage().err().map(|error| error.to_string()),
             "elapsed_ms": job.elapsed().as_millis() as u64,
             "log": log,
         })
     })?;
+    let mut document = document;
+    document["serving"] = coordinator.serving_json();
     std::fs::write(path, document.to_string())
         .map_err(|err| Error::backend(format!("writing {}: {err}", path.display())))
 }

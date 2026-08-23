@@ -4,11 +4,53 @@
 //
 // The coordinator's HTTP surface: nine paths, one JSON body each.
 //
-// `tiny_http` for the same reason the progress view uses it — the executor is
-// synchronous, an async runtime would be a second concurrency model inside a
-// crate that has one, and what an async framework buys (routing, extractors,
-// middleware) is not what eight endpoints and a `match` need. It is a blocking
-// server on ordinary threads, and a request loop that reads like a request loop.
+// Blocking, on ordinary threads, for the reason the progress view uses
+// `tiny_http`: the executor is synchronous, an async runtime would be a second
+// concurrency model inside a crate that has one, and what an async framework
+// buys (routing, extractors, middleware) is not what eight endpoints and a
+// `match` need.
+//
+// Where the accept loop went, and why this file no longer has one
+// ----------------------------------------------------------------
+// It was `tiny_http`'s, then it was this file's, and it is now
+// [`crate::http`]'s. The middle step is the one with the measurement behind it
+// and it is recorded there in full: `tiny_http` dispatches each accepted
+// connection to a thread from a pool, running `for rq in connection { .. }` —
+// **a task that does not return while the connection lives** — and the pool
+// grows a thread only when it observes none waiting, so connections arriving
+// together queue behind tasks that never finish and are read only when some
+// *other* connection closes.
+//
+// Every client here holds a permanent connection — that is the design's
+// no-stall property, three per worker so none waits behind another — so "some
+// other connection closes" means "the job ends". Measured on this tree: a
+// worker ready to ask for work at 7 ms had its first pull answered at 270 ms,
+// while the coordinator reported its slowest *served* pull at 115 microseconds
+// and its longest wait for the registry lock at 17. Neither process was busy.
+// The worker ran nothing, and every test above it reported that as a spread
+// that did not happen or a death that did not occur.
+//
+// The third step is not a measurement, it is the same argument `net::check_bind`
+// already stands on. The progress view turned out to have the identical defect —
+// its own header has the rates — and repairing it produced a second accept loop,
+// a second connection reader and a second `query`. **A transport in two places
+// has two chances to drift and no way to notice**, so there is one:
+// [`crate::http`], one thread per connection taken at accept.
+//
+// **What did not move is the JSON**, and that is the seam rather than an
+// oversight. `crate::http` hands a handler a request whose body is bytes,
+// because the other consumer of it serves a quarter megabyte of WebAssembly to
+// a browser; this protocol's bodies are JSON objects or nothing, and
+// [`Incoming::of`] is the one line that says so. The coordinator's assumption
+// stays in the coordinator and the progress view's generality stays out of it.
+//
+// The acceptance criterion for all of this is not in this file and not a unit
+// test: `local::run` refuses any run in which a worker's first pull went
+// unanswered for longer than **a hundred times the slowest pull that
+// coordinator actually served**, floored at 50 ms so a job too short to have a
+// slow pull cannot set an impossible bound. It is self-calibrating, it runs on
+// every multi-node run, and it is what says a transport change did not cost
+// anything.
 //
 // The bind, which is the one decision here with consequences
 // ----------------------------------------------------------
@@ -23,23 +65,21 @@
 //
 // Threads
 // -------
-// A handful, and the number is not interesting: a request is a claim-table
-// update or a `Vec::push` under one lock, and the whole cluster generates under
-// one handout per second plus a few events per second. What matters is that no
-// handler ever waits on anything except that lock — in particular, no handler
-// asks a worker anything.
+// One per connection plus one accepting — [`crate::http`]'s, not this file's —
+// and the number is not interesting: a request is a claim-table update or a
+// `Vec::push` under one lock, and the whole cluster generates under one handout
+// per second plus a few events per second. What matters is that no handler ever
+// waits on anything except that lock — in particular, no handler asks a worker
+// anything — and that no connection waits to be *read*, which is the property a
+// pool cost us.
 
-use std::net::SocketAddr;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::Duration;
 
 use serde_json::{json, Value};
-use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::error::{Error, Result};
+use crate::http::{param, query, Request, Response};
 use crate::net::{advertised_addr, check_bind};
 
 use super::coordinator::Coordinator;
@@ -59,7 +99,6 @@ pub struct Options {
     pub allow_public: bool,
     /// What to publish to the rendezvous, when it differs from what was bound.
     pub advertise: Option<String>,
-    pub threads: usize,
 }
 
 impl Default for Options {
@@ -68,23 +107,24 @@ impl Default for Options {
             bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
             allow_public: false,
             advertise: None,
-            threads: 4,
         }
     }
 }
 
 /// A running coordinator. Dropping it stops it.
+///
+/// A thin name over [`crate::http::Server`], kept because a caller of this
+/// module holds a *coordinator* and because the address it publishes is not
+/// always the address it bound — see [`Self::advertised`].
 pub struct ServerHandle {
-    bound: SocketAddr,
+    server: crate::http::Server,
     advertised: SocketAddr,
-    stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
 }
 
 impl ServerHandle {
     /// What was actually bound. Differs from `Options::bind` when the port was 0.
     pub fn bound(&self) -> SocketAddr {
-        self.bound
+        self.server.bound()
     }
 
     /// What to write to a rendezvous — the address another node should use.
@@ -92,26 +132,22 @@ impl ServerHandle {
         self.advertised
     }
 
-    pub fn shutdown(mut self) {
-        self.stop.store(true, Ordering::Release);
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for ServerHandle {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
+    /// Stop, and wait for every connection thread.
+    ///
+    /// The accept loop blocks on `accept` on purpose, so nothing short of a
+    /// connection returns it; [`crate::http::Server`] wakes it by dialling the
+    /// port it bound, which is the one thing guaranteed to be listening. That
+    /// is the same repair this file used to carry itself, and
+    /// `a_coordinator_stops_without_waiting_for_a_connection` below still says
+    /// it works from this side.
+    pub fn shutdown(self) {
+        self.server.shutdown();
     }
 }
 
 pub fn serve(coordinator: Arc<Coordinator>, options: Options) -> Result<ServerHandle> {
     check_bind(&options.bind, options.allow_public)?;
-    let server = Server::http(options.bind).map_err(|err| {
+    let listener = TcpListener::bind(options.bind).map_err(|err| {
         Error::backend(format!(
             "could not listen on {}: {err}. If the port is in use, pass a different one, \
              or 0 to let the system choose — a rendezvous publishes whatever was bound, \
@@ -119,7 +155,7 @@ pub fn serve(coordinator: Arc<Coordinator>, options: Options) -> Result<ServerHa
             options.bind
         ))
     })?;
-    let bound = server.server_addr().to_ip().unwrap_or(options.bind);
+    let bound = listener.local_addr().unwrap_or(options.bind);
     let advertised = advertised_addr(bound, options.advertise.as_deref())?;
     if !bound.ip().is_loopback() {
         eprintln!(
@@ -128,85 +164,48 @@ pub fn serve(coordinator: Arc<Coordinator>, options: Options) -> Result<ServerHa
              can reach this host can read this job's plan and take work from it."
         );
     }
-    let server = Arc::new(server);
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut threads = Vec::new();
-    for worker in 0..options.threads.max(1) {
-        let server = server.clone();
-        let coordinator = coordinator.clone();
-        let stop = stop.clone();
-        threads.push(
-            std::thread::Builder::new()
-                .name(format!("blockflow-coordinator-{worker}"))
-                .spawn(move || request_loop(&server, coordinator.as_ref(), &stop))
-                .map_err(|err| Error::backend(format!("starting a request thread: {err}")))?,
-        );
-    }
-    Ok(ServerHandle {
-        bound,
-        advertised,
-        stop,
-        threads,
-    })
+    let server = crate::http::serve(listener, move |request| {
+        let incoming = Incoming::of(request);
+        let (status, body) = handle(&incoming, coordinator.as_ref());
+        // Every reply this protocol makes is a JSON body with a length, which
+        // is what `distributed::client` refuses to read anything else in place
+        // of. Nothing else is set: there is no cache to defeat here, because a
+        // coordinator is asked nothing twice.
+        Response::text(status, "application/json; charset=utf-8", &body.to_string())
+    })?;
+    Ok(ServerHandle { server, advertised })
 }
 
-fn request_loop(server: &Server, coordinator: &Coordinator, stop: &AtomicBool) {
-    while !stop.load(Ordering::Acquire) {
-        let request = match server.recv_timeout(Duration::from_millis(100)) {
-            Ok(Some(request)) => request,
-            Ok(None) => continue,
-            Err(_) => break,
-        };
-        // A panic in a handler must not take the thread with it: the run is
-        // fine, and a coordinator that quietly loses a request thread would
-        // degrade into a hang rather than an error.
-        let handled = catch_unwind(AssertUnwindSafe(|| handle(request, coordinator)));
-        if handled.is_err() {
-            eprintln!("coordinator: a request handler panicked; the job is unaffected");
+/// One request, as this coordinator needs it: where it was sent and what it
+/// carried.
+///
+/// **The one place this protocol's JSON assumption lives.** [`crate::http`]
+/// hands a handler a body of *bytes*, because its other consumer serves a
+/// quarter megabyte of WebAssembly to a browser and a shared transport that
+/// parsed every body as JSON could not. Here every body is a JSON object or
+/// nothing, so it is parsed once at the edge and every route below reads a
+/// [`Value`].
+struct Incoming {
+    url: String,
+    body: Value,
+}
+
+impl Incoming {
+    /// A body that is not JSON becomes `Null` rather than an error, which is
+    /// what a `GET` with no body has always produced and what every route below
+    /// already handles: they ask the body for named fields and refuse by name
+    /// when one is missing, which is a better message than "that was not JSON".
+    fn of(request: &Request) -> Self {
+        let body = request.body();
+        Self {
+            url: request.url().to_string(),
+            body: if body.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(body).unwrap_or(Value::Null)
+            },
         }
     }
-}
-
-fn respond(request: Request, status: u16, body: &Value) {
-    let text = body.to_string();
-    let response = Response::from_data(text.into_bytes())
-        .with_status_code(StatusCode(status))
-        .with_header(
-            Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"application/json; charset=utf-8"[..],
-            )
-            .expect("a constant header parses"),
-        );
-    let _ = request.respond(response);
-}
-
-fn body_of(request: &mut Request) -> Value {
-    let mut text = String::new();
-    if request.as_reader().read_to_string(&mut text).is_err() || text.is_empty() {
-        return Value::Null;
-    }
-    serde_json::from_str(&text).unwrap_or(Value::Null)
-}
-
-fn query(url: &str) -> Vec<(String, String)> {
-    let Some((_, tail)) = url.split_once('?') else {
-        return Vec::new();
-    };
-    tail.split('&')
-        .filter(|part| !part.is_empty())
-        .map(|part| match part.split_once('=') {
-            Some((key, value)) => (key.to_string(), value.to_string()),
-            None => (part.to_string(), String::new()),
-        })
-        .collect()
-}
-
-fn param(pairs: &[(String, String)], name: &str) -> Option<String> {
-    pairs
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.clone())
 }
 
 /// The `job` a request means: from the body, or from the query string, or
@@ -220,11 +219,13 @@ fn job_of(body: &Value, pairs: &[(String, String)]) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-fn handle(mut request: Request, coordinator: &Coordinator) {
-    let url = request.url().to_string();
+/// Route one request and produce its status and body.
+fn handle(request: &Incoming, coordinator: &Coordinator) -> (u16, Value) {
+    let arrived = std::time::Instant::now();
+    let url = &request.url;
     let route = url.split('?').next().unwrap_or("/").to_string();
-    let pairs = query(&url);
-    let body = body_of(&mut request);
+    let pairs = query(url);
+    let body = request.body.clone();
     let job = job_of(&body, &pairs);
 
     let outcome: Result<Value> = match route.as_str() {
@@ -248,10 +249,18 @@ fn handle(mut request: Request, coordinator: &Coordinator) {
         }
         path::REPORT => match (job.as_deref(), body.get("event")) {
             (_, None) => Err(Error::invalid("a report carries an \"event\"".to_string())),
-            (named, Some(event)) => coordinator
-                .status(named)
-                .and_then(|status| coordinator.report(&status.job, event))
-                .map(|()| json!({"ok": true})),
+            (named, Some(event)) => {
+                let worker = text_or(&body, "worker", "");
+                let seq = body.get("seq").and_then(Value::as_u64);
+                coordinator
+                    .status(named)
+                    .and_then(|status| coordinator.report(&status.job, &worker, seq, event))
+                    // `accepted` is false for an event this coordinator had
+                    // already taken, which is how a sender's count of what it
+                    // sent stays equal to the merged stream's length across a
+                    // retry. See `Job::reported`.
+                    .map(|accepted| json!({"ok": true, "accepted": accepted}))
+            }
         },
         path::COMPLETED => {
             let worker = text_or(&body, "worker", "");
@@ -332,9 +341,13 @@ fn handle(mut request: Request, coordinator: &Coordinator) {
         ))),
     };
 
+    // Timed before the response is written, so what is measured is what this
+    // process did rather than what the socket did with it. See
+    // `coordinator::Serving`.
+    coordinator.served(&route, arrived.elapsed());
     match outcome {
-        Ok(value) => respond(request, 200, &value),
-        Err(error) => respond(request, 400, &json!({"error": error.to_string()})),
+        Ok(value) => (200, value),
+        Err(error) => (400, json!({"error": error.to_string()})),
     }
 }
 
@@ -349,4 +362,117 @@ fn submit(coordinator: &Coordinator, body: &Value) -> Result<Value> {
     let id = coordinator.submit(spec, decomposition)?;
     let status = coordinator.status(Some(&id))?;
     Ok(status.to_json())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::super::client::Client;
+
+    /// **Every connection is read, however many arrive at once.**
+    ///
+    /// The property [`crate::http`] exists for, asserted here through *this*
+    /// coordinator's own client and handler rather than inferred from a job
+    /// finishing — which is a different claim from the transport being correct,
+    /// and the one a worker depends on. Sixteen connections are opened together
+    /// and *held*, which is what every client here does, and each one then has
+    /// to be answered. Under a dispatch that hands connections to a fixed pool
+    /// of threads and lets a task occupy its thread for the life of the
+    /// connection, the ones past the pool size are never read at all; that is
+    /// not a hypothetical, it is what `tiny_http` did here and what the header
+    /// describes.
+    ///
+    /// The premise is asserted too: the connections are all still open when the
+    /// last answer arrives, so this measured sixteen concurrent connections and
+    /// not sixteen consecutive ones.
+    #[test]
+    fn every_connection_is_answered_even_when_they_all_arrive_at_once() {
+        const CONNECTIONS: usize = 16;
+        let coordinator = Arc::new(Coordinator::new(false));
+        let handle = serve(
+            coordinator,
+            Options {
+                bind: "127.0.0.1:0".parse().expect("a loopback address"),
+                ..Default::default()
+            },
+        )
+        .expect("a coordinator on loopback");
+        let addr = handle.bound();
+
+        let (done, answered) = mpsc::channel();
+        let (release, go) = mpsc::channel::<()>();
+        let go = Arc::new(std::sync::Mutex::new(go));
+        let mut threads = Vec::new();
+        for which in 0..CONNECTIONS {
+            let done = done.clone();
+            let go = go.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut client = Client::new(addr);
+                // The first request opens the connection.
+                let first = client.get(path::JOBS).is_ok();
+                done.send((which, first)).ok();
+                // Hold it open until every peer has been answered, then use it
+                // again: a connection that was read once must stay readable.
+                let _ = go.lock().map(|go| go.recv_timeout(Duration::from_secs(10)));
+                client.get(path::JOBS).is_ok()
+            }));
+        }
+        drop(done);
+
+        let mut answers = Vec::new();
+        for _ in 0..CONNECTIONS {
+            let answer = answered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("every connection opened at once must be answered, not queued");
+            answers.push(answer);
+        }
+        assert_eq!(answers.len(), CONNECTIONS);
+        assert!(
+            answers.iter().all(|(_, ok)| *ok),
+            "some connection was answered with an error: {answers:?}"
+        );
+        // Every one of them was still open at this point, which is what makes
+        // the count above a count of *concurrent* connections.
+        for _ in 0..CONNECTIONS {
+            release.send(()).ok();
+        }
+        for thread in threads {
+            assert!(
+                thread.join().expect("a client thread"),
+                "a connection that had been served once stopped being readable"
+            );
+        }
+        handle.shutdown();
+    }
+
+    /// Shutting down does not depend on a connection arriving, and does not
+    /// leave the accept thread behind.
+    ///
+    /// The accept loop blocks on `accept` on purpose — a poll interval there is
+    /// the delay before a connection is served, and the first version of this
+    /// file proved that by reproducing the very stall it was written to remove.
+    /// So `shutdown` has to wake it, and this is what says it still does now
+    /// that the waking is [`crate::http::Server`]'s and not this file's.
+    #[test]
+    fn a_coordinator_stops_without_waiting_for_a_connection() {
+        let coordinator = Arc::new(Coordinator::new(false));
+        let handle = serve(
+            coordinator,
+            Options {
+                bind: "127.0.0.1:0".parse().expect("a loopback address"),
+                ..Default::default()
+            },
+        )
+        .expect("a coordinator on loopback");
+        let started = std::time::Instant::now();
+        handle.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutting down took {:?}, which means it waited for something",
+            started.elapsed()
+        );
+    }
 }

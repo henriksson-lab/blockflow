@@ -45,23 +45,23 @@
 // scene can be rendered with and without it and the difference between the two
 // renderings *is* the field.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use ndarray::Array3;
 
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::ArrayEnvironment;
 use blockflow::geometry::BlockGrid;
-use blockflow::op::{Anchor, BlockOp, Chain};
+use blockflow::op::{Anchor, Chain};
 use blockflow::ops::background::{
     background_estimate, background_reach, remove_background, DifferenceCombine,
 };
 use blockflow::ops::{ElementShape, StructuringElement, VoxelwiseMapOp};
+use blockflow::probes::CountingIdentityOp;
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
-use blockflow::{Dtype, Result};
+use blockflow::Dtype;
 
 const VOLUME: [usize; 3] = [28, 20, 16];
 const SEED: u64 = 20250812;
@@ -411,50 +411,6 @@ fn an_understated_reach_tiles_perfectly_and_produces_wrong_values() {
 
 // ------------------------------------------------------- 5. both arms --
 
-/// An identity that counts how many times it was applied.
-///
-/// The whole content of the bug this property is about is *which subtrees run*,
-/// and a value test can only see a branch that both ran and changed something.
-/// This sees the run itself. It is an identity, so inserting one at the head of
-/// an arm changes nothing about the answer, and its reach is zero, so it changes
-/// nothing about the plan either.
-struct CountingOp {
-    name: &'static str,
-    calls: Arc<AtomicUsize>,
-}
-
-impl CountingOp {
-    fn new(name: &'static str) -> (Self, Arc<AtomicUsize>) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        (
-            Self {
-                name,
-                calls: Arc::clone(&calls),
-            },
-            calls,
-        )
-    }
-}
-
-impl BlockOp for CountingOp {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
-        0
-    }
-
-    fn accepts(&self, _dtype: Dtype) -> bool {
-        true
-    }
-
-    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        out.assign(input)
-    }
-}
-
 /// **The assertion the 903 passing comparisons could not make.**
 ///
 /// The diamond rebuilt with a counter at the head of each arm — the same two
@@ -490,8 +446,8 @@ fn both_arms_of_the_diamond_run_once_per_block() {
     );
 
     // and then the arms themselves, counted
-    let (count_a, calls_a) = CountingOp::new("count_original");
-    let (count_b, calls_b) = CountingOp::new("count_estimate");
+    let (count_a, calls_a) = CountingIdentityOp::new("count_original");
+    let (count_b, calls_b) = CountingIdentityOp::new("count_estimate");
     let counted = Chain::parallel(
         vec![
             Chain::sequence(vec![

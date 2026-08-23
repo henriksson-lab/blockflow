@@ -1630,6 +1630,18 @@ impl FragmentOp for TabulateValuesOp {
         self.name
     }
 
+    /// **Zero, and it is the declaration that makes the core filter exact.**
+    /// Both operands are [`SourceInput::voxelwise`], so `fragment_phase` grants
+    /// no halo and the block's read extent is its core; [`Self::tally_block`]
+    /// then visits only the core, so every voxel is counted exactly once
+    /// however wide a halo a plan from elsewhere might have granted. Nothing
+    /// crosses a block boundary in this phase — a region split across blocks
+    /// crosses as a *partial*, one phase later, through the stream
+    /// [`MergeTabulationOp`] gathers in **blocks**.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
         vec![
             held(SourceInput::voxelwise(self.labels), self.labels_dtype),
@@ -1811,6 +1823,16 @@ impl MergeTabulationOp {
 impl FragmentOp for MergeTabulationOp {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// **Zero voxels; the whole lattice in blocks.** No image is read at all.
+    /// The dependency that makes every block's partial available to every other
+    /// one is a *fragment* reach and is declared on
+    /// [`FragmentInput::with_reach`] in [`Self::inputs`]. The units differ — a
+    /// phase reach is voxels of an image, a fragment reach is blocks of a
+    /// stream — and only the second one is what this op needs.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn inputs(&self) -> Vec<FragmentInput> {

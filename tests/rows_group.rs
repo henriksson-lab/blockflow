@@ -59,15 +59,13 @@ use blockflow::decomposition::Decomposition;
 use blockflow::dtype::Dtype;
 use blockflow::env::{ArrayEnvironment, Environment};
 use blockflow::error::Result;
-use blockflow::fragment::{
-    fold_fragments, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput,
-};
+use blockflow::fragment::fold_fragments;
 use blockflow::geometry::BlockGrid;
 use blockflow::ops::detect::owner_of;
 use blockflow::ops::rows::{
     append_group_phases, collect_groups, decode_groups, encode_groups, group_values, Aggregate,
-    GroupFold, GroupRowsOp, GroupValues, Grouping, MergeGroupsOp, Reduction, RowStreams,
-    GROUP_ROWS, MAX_PACKED_COORDINATE,
+    GroupFold, GroupRowsOp, GroupValues, Grouping, MergeGroupsOp, Reduction, RowSourceOp,
+    RowStreams, RowValues, GROUP_ROWS, MAX_PACKED_COORDINATE,
 };
 use blockflow::ops::tabulate::FixedPoint;
 use blockflow::region::Region;
@@ -456,12 +454,17 @@ fn a_partial_round_trips_and_a_truncated_one_is_refused() {
 
 // ------------------------------------------------------------- refusals --
 
-/// **The duplication refusal**, which is the module header's theorem being
-/// checked rather than assumed.
+/// **The duplication refusal**, and the case it does *not* catch, measured.
 ///
 /// Two partials that agree on a group's least row can only come from one row
-/// position reaching two blocks — and a duplicated row is indistinguishable from
-/// a real one once it is in the sum, so it is refused rather than folded.
+/// position reaching two blocks, and a duplicated row is indistinguishable from
+/// a real one once it is in the sum — so it is refused rather than folded.
+///
+/// The second half of this test is the honest limit: a duplicate *above* the
+/// group's least row leaves the two partials with different least rows and slips
+/// through, doubling the group's `rows`. What rules that out is the producer
+/// keying by `owner_of`, not this fold, and a test that only showed the refusal
+/// firing would read as though the fold were a complete duplication check.
 #[test]
 fn two_partials_claiming_one_least_row_are_refused_by_name() {
     let grouping = grouping(FixedPoint::default());
@@ -479,6 +482,26 @@ fn two_partials_claiming_one_least_row_are_refused_by_name() {
     // least rows differ. The refusal is about duplication and not about folding.
     let two = partial(&grouping, &rows[4..]);
     assert!(merge.fold([one.as_slice(), two.as_slice()]).is_ok());
+
+    // **What it does not catch.** Group 1's rows are at 0, 2, 4 and 6; give one
+    // partial the row at 0 and another the row at 4, then repeat the second. The
+    // least rows are 0 and 4, so the refusal does not fire and the group's count
+    // comes back with the duplicate in it — which is the producer's precondition
+    // doing the work and not this fold, and is why the doc says so.
+    let head = partial(&grouping, &rows[0..1]);
+    let above = partial(&grouping, &rows[4..5]);
+    let honest = merge
+        .fold([head.as_slice(), above.as_slice()])
+        .expect("the same rows once");
+    let slipped = merge
+        .fold([head.as_slice(), above.as_slice(), above.as_slice()])
+        .expect("a duplicate above the least row is not caught here");
+    let key = vec![1u64];
+    assert_eq!(honest[&key].rows, 2, "one row of group 1 in each partial");
+    assert_eq!(
+        slipped[&key].rows, 3,
+        "the duplicate is folded in silently, because its position is not the group's least"
+    );
 }
 
 /// **The overflow refusal, with what wrapping would have returned measured
@@ -734,7 +757,13 @@ fn the_phases_can_be_appended_to_an_existing_plan() {
     let grid = BlockGrid::new(VOLUME, [4, 4, 4]).expect("a grid");
     let mut builder = PlanBuilder::new(VOLUME, Dtype::F64, grid.clone());
     let source = builder
-        .fragments(RowSetOp::new(ROWS, fixture()))
+        .fragments(RowSourceOp::new(
+            "rows in",
+            ROWS,
+            Lifecycle::DeleteOnExit,
+            schema(),
+            source_rows(),
+        ))
         .expect("a producer phase");
     let base: Decomposition = builder.finish().expect("a plan").decomposition;
     assert_eq!(base.phases.len(), 1);
@@ -828,48 +857,22 @@ fn merge_op(grouping: &Grouping, lattice: [usize; 3]) -> MergeGroupsOp {
     .expect("two distinct streams")
 }
 
-/// Writes the fixture out as one fragment per block: the producer the row world
-/// has no general op for, and the smallest honest one.
+/// The fixture as the producer takes it.
 ///
-/// Keys by [`owner_of`] rather than by a division of its own, so the producer
-/// and the merge agree on which block a coordinate belongs to by construction
-/// rather than by two matching expressions.
-struct RowSetOp {
-    stream: String,
-    rows: Vec<([usize; 3], Vec<Value>)>,
-}
-
-impl RowSetOp {
-    fn new(stream: &str, rows: Vec<([usize; 3], Vec<Value>)>) -> Self {
-        Self {
-            stream: stream.to_string(),
-            rows,
-        }
-    }
-}
-
-impl FragmentOp for RowSetOp {
-    fn name(&self) -> &'static str {
-        "rows in"
-    }
-
-    fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            self.stream.clone(),
-            Lifecycle::DeleteOnExit,
-            Coverage::EveryBlock,
-        )]
-    }
-
-    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
-        let mut builder = RowBuilder::new(Arc::new(schema()));
-        for (position, values) in &self.rows {
-            if owner_of(at.grid, *position) == at.index {
-                builder.push(*position, values)?;
-            }
-        }
-        Ok(BlockOutput::fragment(self.stream.clone(), builder.encode()))
-    }
+/// This file used to carry its own producer — *"the producer the row world has
+/// no general op for, and the smallest honest one"* — and it was the third
+/// writing of the same fifteen lines, after two in a consumer of this crate.
+/// `ops::rows::RowSourceOp` is now that op, and this is what is left of the
+/// copy: a conversion, and no rule of its own. The keying
+/// it used to state — [`owner_of`], so the producer and the merge agree by
+/// construction rather than by two matching expressions — is the library's now,
+/// and `every_group_is_emitted_by_exactly_one_block` below still checks it from
+/// this side.
+fn source_rows() -> Vec<RowValues> {
+    fixture()
+        .into_iter()
+        .map(|(at, values)| RowValues::new(at, values))
+        .collect()
 }
 
 /// The three phases run, and the grouped table read back out.
@@ -877,7 +880,13 @@ fn run_plan(grouping: &Grouping, block: [usize; 3]) -> Result<Vec<GroupValues>> 
     let grid = BlockGrid::new(VOLUME, block)?;
     let lattice = grid.blocks_per_axis();
     let mut builder = PlanBuilder::new(VOLUME, Dtype::F64, grid);
-    let source = builder.fragments(RowSetOp::new(ROWS, fixture()))?;
+    let source = builder.fragments(RowSourceOp::new(
+        "rows in",
+        ROWS,
+        Lifecycle::DeleteOnExit,
+        schema(),
+        source_rows(),
+    ))?;
     let streams = RowStreams::new(
         ROWS,
         source.index(),

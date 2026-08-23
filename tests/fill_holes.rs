@@ -34,9 +34,10 @@ use blockflow::assemble::ImageId;
 use blockflow::decomposition::Decomposition;
 use blockflow::dtype::Dtype;
 use blockflow::env::{ArrayEnvironment, Environment};
-use blockflow::fragment::{neighbourhood_size, PhaseWork};
+use blockflow::fragment::{neighbourhood_size, FragmentOp, PhaseWork};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
+use blockflow::ops::components::Merge;
 use blockflow::ops::fill::{
     fill_from_labels_into, fill_phases, label_background_into, outside_flags, BlockFaces,
     FillHolesOp, LabelBackgroundOp,
@@ -116,9 +117,19 @@ fn reference(mask: &Array3<bool>) -> Array3<bool> {
 // ------------------------------------------------------------- the run --
 
 fn plan_for(block: [usize; 3]) -> (Decomposition, LabelBackgroundOp, FillHolesOp) {
+    plan_for_merging(block, Merge::default())
+}
+
+/// The same plan with the merge placed by hand. See [`Merge`]: the default is
+/// what ships and the other two are here so that what it buys can be measured
+/// and so that the barrier has a control.
+fn plan_for_merging(
+    block: [usize; 3],
+    merge: Merge,
+) -> (Decomposition, LabelBackgroundOp, FillHolesOp) {
     let grid = BlockGrid::new(VOLUME, block).expect("a lattice");
     let label = LabelBackgroundOp::new("label", STREAM, Lifecycle::DeleteOnExit);
-    let fill = FillHolesOp::new("fill", STREAM, 0, Dtype::Bool, &grid);
+    let fill = FillHolesOp::new("fill", STREAM, 0, Dtype::Bool, &grid).merging(merge);
     let plan = fill_phases(grid, Dtype::Bool, &label, &fill).expect("a plan");
     (plan, label, fill)
 }
@@ -271,20 +282,20 @@ fn the_merge_changes_the_answer_and_the_suite_says_by_how_much() {
     );
 }
 
-/// What a global reduction costs in *pixels*, measured rather than described.
+/// **The inverted assertion.** This test used to require that every block of the
+/// merge read the entire label image, and said in as many words that if a future
+/// change let a phase state "after all of phase 0" without a halo, it should
+/// fail and the reason it failed would be the improvement. That change landed —
+/// `docs/design/barriers.md` — so the requirement is turned round rather than
+/// deleted, and the shape it replaced is kept beside it as the control.
 ///
 /// Phase 0 is halo-free: a block-local labelling reads exactly its own core.
-/// Phase 1 is not, and cannot be — its whole-lattice fragment reach is also the
-/// dependency edge that makes it wait for phase 0's blocks, so its halo covers
-/// the volume and every block of it reads the entire label image.
-///
-/// The number is asserted because it is the argument for a barrier. If a future
-/// change lets a phase state "after all of phase 0" without a halo, this test
-/// fails and the reason it fails is the improvement.
+/// Phase 1 now is too, because the dependency it needs — *after all of phase 0*
+/// — is stated as a barrier instead of bought with a halo.
 #[test]
-fn the_labelling_is_halo_free_and_the_merge_reads_the_whole_image() {
-    let (plan, _, _) = plan_for([8, 8, 6]);
+fn the_merge_declares_a_barrier_instead_of_reading_the_whole_image() {
     let volume_voxels = VOLUME[0] * VOLUME[1] * VOLUME[2];
+    let (plan, _, _) = plan_for([8, 8, 6]);
 
     for block in &plan.phases[0].blocks {
         assert_eq!(
@@ -295,23 +306,50 @@ fn the_labelling_is_halo_free_and_the_merge_reads_the_whole_image() {
         assert_eq!(block.valid.ranges(), block.core.ranges());
     }
 
+    assert!(
+        !plan.phases[0].barrier,
+        "the labelling depends on nothing global and must not serialise the run"
+    );
+    assert!(
+        plan.phases[1].barrier,
+        "the merge's answer depends on every block, which is what a barrier says"
+    );
+
     let blocks = plan.phases[1].blocks.len();
     let mut read = 0usize;
     for block in &plan.phases[1].blocks {
         assert_eq!(
-            block.read.voxels(),
-            volume_voxels,
-            "the merge reads the whole image, which is what its halo says"
+            block.read.ranges(),
+            block.core.ranges(),
+            "with the dependency stated, the merge fetches its own core"
         );
-        // and it is still authoritative only for its own core, so the valid
-        // regions tile and the output is written once
         assert_eq!(block.valid.ranges(), block.core.ranges());
         read += block.read.voxels();
     }
     assert_eq!(
-        read,
+        read, volume_voxels,
+        "the whole phase reads the label image once, not {blocks} times"
+    );
+
+    // **The control**, and it is the assertion this test used to make. The same
+    // op with the merge left in every block is the shape the framework used to
+    // admit, and it still costs exactly what it cost — so the relief above is
+    // attributable to the declaration and not to some other change.
+    let (in_plan, _, _) = plan_for_merging([8, 8, 6], Merge::PerBlock);
+    assert!(!in_plan.phases[1].barrier);
+    let mut amplified = 0usize;
+    for block in &in_plan.phases[1].blocks {
+        assert_eq!(
+            block.read.voxels(),
+            volume_voxels,
+            "without the barrier the halo is the fragment reach and covers the volume"
+        );
+        amplified += block.read.voxels();
+    }
+    assert_eq!(
+        amplified,
         blocks * volume_voxels,
-        "the read amplification of the merge is the block count: {blocks}x"
+        "the read amplification a barrier removes is the block count: {blocks}x"
     );
 }
 
@@ -339,15 +377,20 @@ fn the_intermediate_labels_differ_between_decompositions_and_the_output_does_not
     );
 }
 
-/// Every block writes a faces fragment, and the merge reads every one of them.
-/// The fetch count is asserted against the analytic whole-lattice figure rather
-/// than against itself — a reach is a declaration, and this is the behaviour.
+/// Every block writes a faces fragment, and the **phase** reads every one of
+/// them — once, rather than once per block.
+///
+/// The fetch count is asserted against the analytic figure the declared reach
+/// produces rather than against itself: a reach is a declaration, and this is
+/// what it costs. The whole-lattice figure is kept as the control, because it is
+/// what the same op still asks for with the merge left in every block.
 #[test]
-fn the_merge_reads_every_block_of_the_lattice() {
+fn the_merge_reads_every_block_of_the_lattice_once_for_the_phase() {
     let mask = scene();
     let block = [8usize, 8, 6];
     let (_, env, plan) = run(&mask, block);
     let counts = plan.phases[0].grid.blocks_per_axis();
+    let n_blocks = counts[0] * counts[1] * counts[2];
 
     let mut stored = BTreeMap::new();
     for index in every_block(&plan.phases[0].grid) {
@@ -357,15 +400,37 @@ fn the_merge_reads_every_block_of_the_lattice() {
             .unwrap_or_else(|| panic!("block {index:?} wrote no faces fragment"));
         stored.insert(index, BlockFaces::decode(&bytes).expect("a faces fragment"));
     }
-    assert_eq!(stored.len(), counts[0] * counts[1] * counts[2]);
+    assert_eq!(stored.len(), n_blocks);
 
-    // what a whole-lattice reach asks each block for
-    let analytic = neighbourhood_size([0, 0, 0], counts, counts);
+    // what the hoisted shape asks each *block* for, from the op's own
+    // declaration rather than from a number written here
+    let (_, _, hoisted) = plan_for_merging(block, Merge::OnceForThePhase);
+    let reach = hoisted.inputs()[0].reach;
     assert_eq!(
-        analytic,
-        counts[0] * counts[1] * counts[2],
+        reach,
+        [0, 0, 0],
+        "a hoisted merge needs no fragment per block"
+    );
+    assert_eq!(
+        neighbourhood_size([0, 0, 0], reach, counts),
+        1,
+        "a reach of nothing is still the block itself, and `gathers() == false` \
+         is what keeps even that off the wire"
+    );
+    assert!(!hoisted.gathers());
+
+    // **The control.** With the merge in every block the reach is the lattice
+    // and the fetch is the whole set, per block — which is the `(1 + blocks) x F`
+    // multiplier the hoisting removes.
+    let (_, _, in_plan) = plan_for_merging(block, Merge::PerBlock);
+    let in_plan_reach = in_plan.inputs()[0].reach;
+    assert_eq!(in_plan_reach, counts);
+    assert_eq!(
+        neighbourhood_size([0, 0, 0], in_plan_reach, counts),
+        n_blocks,
         "a whole-lattice reach must ask for the whole lattice"
     );
+    assert!(in_plan.gathers());
 
     // and at least one block found more than one background component, which is
     // what makes the union-find do work rather than be an identity

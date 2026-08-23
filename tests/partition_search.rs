@@ -62,6 +62,10 @@ impl BlockOp for SweepOp {
             AxisReach::All => volume_len,
             AxisReach::Bounded { lo, hi } => *lo.max(hi),
             AxisReach::PerBlock(_) => volume_len,
+            // The unaligned answer, which is what a bound has to be: a bound
+            // that assumed the discount would be narrower than the reach it
+            // bounds on every lattice the stride does not divide.
+            AxisReach::Aligned { unaligned, .. } => unaligned.0.max(unaligned.1),
         }
     }
 
@@ -250,6 +254,7 @@ fn constraints(rng: &mut Rng, arithmetic: Arithmetic) -> Constraints {
             2 => vec![0, 1, 2],
             _ => vec![1],
         },
+        ..Default::default()
     }
 }
 

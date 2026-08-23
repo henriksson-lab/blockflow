@@ -89,6 +89,55 @@ pub(crate) fn as_source_arrays(
         .collect()
 }
 
+/// Allocate what `slot` declares and apply it to one block, cut into at most
+/// `slabs` slabs where the chain admits a cut, and count the application.
+///
+/// Answers the buffer and **how many slabs actually ran**; `1` is the uncut
+/// path, which is what every chain that has not declared itself sliceable gets
+/// and what this crate did before slabs existed.
+///
+/// **One body, three environments.** `ArrayEnvironment`, `ZarrEnvironment` and
+/// the distributed `SharedVolumes` all hold real arrays and all held their own
+/// copy of this body. Threading a planner's slab count through each of them
+/// separately is a place per copy for it to be dropped, and the copy that drops it is
+/// the one that quietly keeps the old behaviour while the plan says otherwise —
+/// which is the failure this whole feature exists to stop being invisible.
+///
+/// **Residency is deliberately not booked here.** Two of the three callers
+/// record the output's bytes against their resident total and one does not, and
+/// unifying the application is not a licence to change what an environment
+/// reports.
+pub(crate) fn apply_chain_to_block(
+    counters: &EnvCounters,
+    slot: &Chain,
+    input: &BlockBuf,
+    sources: &[(usize, BlockBuf)],
+    at: &Placement,
+    slabs: usize,
+) -> Result<(Voxels, usize)> {
+    let array = input.as_array()?;
+    let stored = as_source_arrays(sources)?;
+    // Allocated from what the chain **declares**, not from what it was handed.
+    // That one line is the difference between a phase that may translate its
+    // read and a phase that may resize it.
+    let mut out = Voxels::zeros(
+        slot.produces(array.dtype())?,
+        slot.placed_output_shape(array.shape(), at)?,
+    )?;
+    let ran =
+        crate::slab::apply_at_most(slot, array, SourceInputs::new(&stored), &mut out, at, slabs)?;
+    counters.ops_applied.fetch_add(1, Ordering::SeqCst);
+    counters.slabs_run.fetch_add(ran as u64, Ordering::SeqCst);
+    if ran > 1 {
+        counters.blocks_sliced.fetch_add(1, Ordering::SeqCst);
+    }
+    counters.estimated_work.fetch_add(
+        (array.len() as f64 * slot.cost_per_voxel()) as u64,
+        Ordering::SeqCst,
+    );
+    Ok((out, ran))
+}
+
 /// A block's worth of data, or a stand-in for one.
 ///
 /// The simulated variant carries no data at all — that is the point. It lets a
@@ -187,6 +236,31 @@ pub struct EnvCounters {
     pub sidecar_reads: AtomicU64,
     pub sidecar_bytes_written: AtomicU64,
     pub sidecar_bytes_read: AtomicU64,
+    /// Calls that **listed** a stream's keys, and the keys those calls
+    /// returned. In listings and in keys — not in fragments and not in bytes.
+    ///
+    /// Separate from `sidecar_reads` because a listing moves no fragment: it is
+    /// `O(keys)` with no payload, and folding it into the read count would make
+    /// a cost with no bytes look like a cost with bytes. The pair is the one
+    /// that shows what `fragment::check_fragment_coverage` costs — one listing
+    /// per declared every-block input stream, returning one key per block — so a
+    /// caller who cuts the volume more finely can see `sidecar_keys_listed` rise
+    /// with the block count while `sidecar_bytes_read` does not move.
+    pub sidecar_listings: AtomicU64,
+    pub sidecar_keys_listed: AtomicU64,
+    /// Calls into [`crate::fragment::FragmentOp::apply_with`], in
+    /// **block-applications**: one per block per fragment phase, plus one more
+    /// for each block re-applied to check a [`SeamFold::Unordered`] claim.
+    ///
+    /// The fragment-phase counterpart of `ops_applied`, and deliberately not the
+    /// same counter: `ops_applied` counts applications of a chain slot, and a
+    /// fragment phase owns no chain slot, so it can only ever contribute zero
+    /// there. Two counters rather than one sum because a reader meeting
+    /// `ops_applied == 0` has to be able to tell "no chain op ran" from "the
+    /// work of this run is not counted in this field".
+    ///
+    /// [`SeamFold::Unordered`]: crate::fragment::SeamFold::Unordered
+    pub fragment_applications: AtomicU64,
     /// Traffic to the arrays an op writes **beside** its primary result. Counted
     /// separately from `writes`/`write_voxels` for the same reason sidecars are:
     /// a side output has its own element type and its own rank, so its voxels
@@ -197,6 +271,25 @@ pub struct EnvCounters {
     pub side_writes: AtomicU64,
     pub side_elements: AtomicU64,
     pub side_bytes_written: AtomicU64,
+    /// Slabs run, over the chain-slot applications the executor made: one per
+    /// application that was **not** cut, and the slab count for one that was.
+    ///
+    /// The liveness control for intra-block threading, and it is here rather
+    /// than derived from wall time because wall time cannot tell a cut that did
+    /// not happen from a cut that did not pay. See
+    /// [`crate::decomposition::SlabPolicy`] for what decides the count and
+    /// [`crate::slab::apply_at_most`] for why an offered cut may be declined.
+    pub slabs_run: AtomicU64,
+    /// Chain-slot applications that were actually cut, in **applications**.
+    ///
+    /// Beside `slabs_run` rather than derived from it: a run of ten
+    /// applications reporting `slabs_run == 10` cut nothing, and one reporting
+    /// `slabs_run == 10` over five applications cut half of them into two. The
+    /// pair separates "how much" from "how often", and it is the second that
+    /// the negative control needs — **a plan with work for every worker must
+    /// report zero here**, which is a statement no aggregate of slab counts can
+    /// make on its own.
+    pub blocks_sliced: AtomicU64,
 }
 
 impl EnvCounters {
@@ -226,6 +319,18 @@ impl EnvCounters {
             self.sidecar_reads.load(Ordering::SeqCst),
             self.sidecar_bytes_written.load(Ordering::SeqCst),
             self.sidecar_bytes_read.load(Ordering::SeqCst),
+        )
+    }
+
+    /// `(listings, keys listed)` for the sidecar store.
+    ///
+    /// Its own accessor for the reason `sidecar_snapshot` is its own: that tuple
+    /// is destructured positionally by callers who want fragments and bytes, and
+    /// widening it would silently re-bind their names to a different quantity.
+    pub fn listing_snapshot(&self) -> (u64, u64) {
+        (
+            self.sidecar_listings.load(Ordering::SeqCst),
+            self.sidecar_keys_listed.load(Ordering::SeqCst),
         )
     }
 
@@ -309,6 +414,43 @@ pub trait Environment: Sync {
         sources: &[(usize, BlockBuf)],
         at: &Placement,
     ) -> Result<BlockBuf>;
+
+    /// [`Self::apply`], with a planner's permission to cut the block into at
+    /// most `slabs` slabs and run them on that many threads.
+    ///
+    /// Answers the buffer and **how many slabs actually ran** — `1` is the
+    /// uncut path, which is what every chain that has not declared itself a
+    /// stencil gets and what the default below always answers.
+    ///
+    /// **Defaulted, where `sources` deliberately was not, and the difference is
+    /// a property rather than a convenience.** An implementation that ignored
+    /// `sources` returns a complete, well-formed volume combined against
+    /// nothing — a wrong answer with no diagnostic, which is why that one is a
+    /// parameter of `apply` and not a second method. An implementation that
+    /// ignores `slabs` returns **the same bits**: `slab::apply_sliced`'s
+    /// acceptance bar is bit-identity against the uncut block at every count,
+    /// held by `tests/intra_block_slicing.rs`. So the worst a forgetful
+    /// environment can do here is run exactly as fast as it did before the
+    /// parameter existed, which is the shape of thing a default is for.
+    ///
+    /// An environment that **wraps** another must forward this as it forwards
+    /// `apply`, or the wrapper silently declines every cut the planner offers.
+    ///
+    /// `EnvCounters::slabs_run` is booked by whichever environment actually
+    /// applies the chain — `apply_chain_to_block`, for the three that hold
+    /// real arrays — and **not here**, so that a wrapper forwarding to an inner
+    /// environment counts the application once rather than twice. An
+    /// environment that holds no data runs no slabs and reports none.
+    fn apply_sliced(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Placement,
+        _slabs: usize,
+    ) -> Result<(BlockBuf, usize)> {
+        Ok((self.apply(slot, input, sources, at)?, 1))
+    }
 
     /// Write the sub-box `within` of `buf` to absolute position `valid`.
     fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()>;
@@ -744,8 +886,19 @@ pub trait Environment: Sync {
     }
 
     /// Every key in `stream`. Empty for a stream nobody wrote to.
+    ///
+    /// **Counts as a listing, not as a read**: no fragment is fetched and no
+    /// byte moves, but the call is `O(keys)` and its multiplier is the block
+    /// count, which the caller raises when they cut more finely.
     fn sidecar_keys(&self, stream: &str) -> Result<Vec<FragmentKey>> {
-        self.require_sidecars()?.keys(stream)
+        let keys = self.require_sidecars()?.keys(stream)?;
+        self.counters()
+            .sidecar_listings
+            .fetch_add(1, Ordering::SeqCst);
+        self.counters()
+            .sidecar_keys_listed
+            .fetch_add(keys.len() as u64, Ordering::SeqCst);
+        Ok(keys)
     }
 
     /// Every fragment in `stream`, in key order.
@@ -761,6 +914,15 @@ pub trait Environment: Sync {
     fn sidecar_fragments(&self, stream: &str) -> Result<Vec<(FragmentKey, Vec<u8>)>> {
         let fragments = self.require_sidecars()?.fragments(stream)?;
         let bytes: u64 = fragments.iter().map(|(_, value)| value.len() as u64).sum();
+        // One listing and one read per fragment: `Sidecars::fragments` lists the
+        // stream and then fetches every key, so it costs both and is counted as
+        // both rather than as a single opaque call.
+        self.counters()
+            .sidecar_listings
+            .fetch_add(1, Ordering::SeqCst);
+        self.counters()
+            .sidecar_keys_listed
+            .fetch_add(fragments.len() as u64, Ordering::SeqCst);
         self.counters()
             .sidecar_reads
             .fetch_add(fragments.len() as u64, Ordering::SeqCst);
@@ -1402,6 +1564,7 @@ impl Environment for ArrayEnvironment {
         Ok(BlockBuf::Array(array))
     }
 
+    /// Both entry points, one body: see `apply_chain_to_block`.
     fn apply(
         &self,
         slot: &Chain,
@@ -1409,24 +1572,21 @@ impl Environment for ArrayEnvironment {
         sources: &[(usize, BlockBuf)],
         at: &Placement,
     ) -> Result<BlockBuf> {
-        let array = input.as_array()?;
-        let stored = as_source_arrays(sources)?;
-        // Allocated from what the chain **declares**, not from what it was
-        // handed. That one line is the difference between a phase that may
-        // translate its read and a phase that may resize it.
-        let mut out = Voxels::zeros(
-            slot.produces(array.dtype())?,
-            slot.placed_output_shape(array.shape(), at)?,
-        )?;
-        slot.apply_placed(array, SourceInputs::new(&stored), &mut out, at)?;
-        self.counters.ops_applied.fetch_add(1, Ordering::SeqCst);
-        self.counters.estimated_work.fetch_add(
-            (array.len() as f64 * slot.cost_per_voxel()) as u64,
-            Ordering::SeqCst,
-        );
-        // The caller releases `input`; releasing it here too would double-count.
+        self.apply_sliced(slot, input, sources, at, 1)
+            .map(|(out, _)| out)
+    }
+
+    fn apply_sliced(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Placement,
+        slabs: usize,
+    ) -> Result<(BlockBuf, usize)> {
+        let (out, ran) = apply_chain_to_block(&self.counters, slot, input, sources, at, slabs)?;
         self.counters.add_resident(out.bytes());
-        Ok(BlockBuf::Array(out))
+        Ok((BlockBuf::Array(out), ran))
     }
 
     fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {

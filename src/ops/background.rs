@@ -192,7 +192,7 @@ use ndarray::{ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::op::{Anchor, BlockOp, Chain, Combine};
+use crate::op::{Anchor, BlockOp, Chain, Combine, Slicing};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
 
@@ -274,6 +274,26 @@ impl Combine for DifferenceCombine {
     /// has no default, and a fan-in's halo is its widest branch's plus this.
     fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
         0
+    }
+
+    /// **A stencil**, and this is the declaration a fan-in cannot get from its
+    /// branches. A `Parallel` node is only as sliceable as its narrowest part,
+    /// so a diamond whose arms are declared stencils is still refused while its
+    /// sink says nothing — which is the position every fan-in in this crate was
+    /// in until this line existed.
+    ///
+    /// The claim itself is [`difference_into`]'s: it writes each output voxel from the
+    /// co-located voxel of each operand, through one
+    /// `Zip` that reads no neighbour and carries no accumulator between voxels.
+    /// So the output at `v` is a function of the inputs at `v`, the reach is
+    /// zero on every axis, and the output lattice is the input lattice — the
+    /// three conditions [`Slicing::Stencil`] states.
+    ///
+    /// Held to it rather than believed: `tests/intra_block_slicing.rs` runs a
+    /// fan-in whose sink is this one uncut and then cut at every thread count
+    /// and requires the same bits.
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
     }
 
     /// Exactly two branches, of the same floating-point element type.

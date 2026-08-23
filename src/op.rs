@@ -446,12 +446,27 @@ pub enum InputMap {
 
 /// What an op's output space is, and what each input must supply to fill it.
 ///
-/// The declaration the F sketch in `forme.md` argued for, in the shape that
-/// migration allows: [`Geometry::same`] is today's behaviour exactly, so the
+/// The declaration the F sketch argued for, in the shape that migration allows:
+/// [`Geometry::same`] is today's behaviour exactly, so the
 /// defaulted [`BlockOp::geometry`] leaves every shipped op correct with no edit,
 /// and the quantities that are currently declared twice — `reach` beside
 /// `reach_spec`, `output_shape` beside a source mapping — become derivable from
 /// one place rather than checked against each other.
+///
+/// **Where the sketch is.** The session log kept **outside this repository**,
+/// under the heading *"F, sketched against every shape that exists"*; the staged
+/// migration the two methods below cite is under *"The output-side index map: a
+/// specification"* in the same file. It is not part of this crate and is pointed
+/// at only so the provenance is followable.
+///
+/// **Cited by heading, and the file deliberately not named.** By heading rather
+/// than by line because it is a live document rewritten under this one, and a
+/// line number rots silently where a heading does not. Not by path because
+/// `tests/no_domain_vocabulary.rs` forbids this crate's sources from naming the
+/// application it was extracted from — so a sweep that finds this citation bare
+/// and "fixes" it by adding the repository will turn that test red. A heading is
+/// the stronger anchor regardless: it survives the file being moved as well as
+/// rewritten.
 ///
 /// **Nothing consumes it yet.** It lands with the default so that the step which
 /// changes no behaviour is separate from the step that moves a declaration onto
@@ -582,6 +597,102 @@ impl SourceInput {
     }
 }
 
+/// Whether an operation's answer survives being cut into slabs **inside** one
+/// block.
+///
+/// The framework's unit of parallelism is the block. This is the declaration
+/// that says whether a second unit exists below it — whether a block may be cut
+/// into disjoint slabs, each grown by the op's own reach, and the slabs computed
+/// on separate threads. `docs/design/intra-block.md` is the measurement that
+/// motivates it, and §7 there is the regime in which it is worth anything: a
+/// pool the block count cannot fill.
+///
+/// Why this cannot be derived from [`BlockOp::reach`]
+/// -------------------------------------------------
+/// **A reach says what an op *reads*. It does not say the answer is a function
+/// of what was read.** An op may read strictly within its declared reach and
+/// still carry state along the buffer it was handed — a window maintained
+/// incrementally as it slides (`ops::sliding` keeps `joining` and `leaving`
+/// sets rather than re-summing), a running accumulator in `f64` — and then the
+/// answer at a voxel depends on where the scan began. Cutting the block moves
+/// where the scan begins. Where that state is integer the answer survives; where
+/// it is floating point it moves in the last place, on an interior stripe, in a
+/// volume that is otherwise complete and well formed. Nothing in a reach, an
+/// output shape or an element type separates those two cases, and no signal
+/// available to the framework could.
+///
+/// A **second** class comes apart the other way and is caught elsewhere: an op
+/// whose output lattice is not its input lattice — `ops::resample`,
+/// `ops::lattice` — has a perfectly ordinary bounded reach and no index
+/// correspondence between a slab's core in the two buffers. `slab::apply_sliced`
+/// refuses that by comparing the shapes rather than by trusting this
+/// declaration, because two guards over two different failures are two guards.
+///
+/// **What is deliberately *not* the argument here.** The labelling family —
+/// `ops::label`, `ops::components`, `ops::fill`, `ops::detect` — produces
+/// block-local identifiers that a fragment join reconciles, and a cut inside a
+/// block would make seams that join never sees. That is true and it is not this
+/// trait's problem: every one of them is a [`crate::fragment::FragmentOp`], a
+/// different trait on a different phase kind, which never reaches
+/// [`BlockOp::slicing`] at all. It is recorded because the reasoning transfers
+/// exactly, and because slab parallelism for fragment phases would need its own
+/// declaration rather than this one widened. *An earlier draft of
+/// `docs/design/intra-block.md` gave this as the reason `BlockOp` needed a
+/// declaration; it was the wrong trait, and the real reason is the paragraph
+/// above.*
+///
+/// So it is declared, and **nothing may infer it**. That prohibition is the
+/// condition on which [`Slicing::Whole`] being the default is safe at all; see
+/// [`BlockOp::slicing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slicing {
+    /// A **stencil**, in the strict sense the slicing primitive relies on:
+    ///
+    /// 1. the output at `v` is a function of the input within
+    ///    [`BlockOp::reach_spec`] of `v`, and of nothing else — not of the
+    ///    block's extent, not of any accumulator over it, not of an identifier
+    ///    handed out in traversal order;
+    /// 2. the output lattice is the input lattice and
+    ///    [`BlockOp::output_shape`] is the identity, so a slab's core in the
+    ///    output is the same index range as its core in the input;
+    /// 3. the answer is **bit-identical** whether or not the block was cut,
+    ///    which for a kernel accumulating in floating point means no sum is
+    ///    reassociated by the cut. A kernel that sums a fixed tap list per
+    ///    output voxel has this property for free; one that folds across the
+    ///    block does not, and is not a stencil under (1) either.
+    ///
+    /// Declaring this is a claim about the kernel, and
+    /// `tests/intra_block_slicing.rs` is what holds an op to it — bit-identity
+    /// against the uncut block, not a tolerance.
+    Stencil,
+    /// Not sliceable, **and why** — the reason is required rather than optional
+    /// because the interesting cases all look sliceable from outside. Written
+    /// for a maintainer deciding whether the answer could change, so
+    /// "not a stencil" is not an answer and "produces block-local labels that
+    /// only the fragment join reconciles" is.
+    Whole(&'static str),
+}
+
+impl Slicing {
+    /// What an op that has said nothing is taken to mean.
+    pub const UNDECLARED: Slicing = Slicing::Whole(
+        "the op did not declare a slicing, so it is taken to be unsliceable. That is the \
+         default and it is never wrong, only slow; see BlockOp::slicing.",
+    );
+
+    pub fn is_stencil(&self) -> bool {
+        matches!(self, Slicing::Stencil)
+    }
+
+    /// The refusal reason, or `None` when it is a stencil.
+    pub fn refusal(&self) -> Option<&'static str> {
+        match self {
+            Slicing::Stencil => None,
+            Slicing::Whole(why) => Some(why),
+        }
+    }
+}
+
 /// One operation in a block-processed chain.
 ///
 /// `Send + Sync` is required rather than incidental: the executor runs blocks
@@ -632,6 +743,44 @@ pub trait BlockOp: Send + Sync {
         ])
     }
 
+    /// Whether this op's answer survives a cut **inside** one block.
+    ///
+    /// **Defaulted to [`Slicing::UNDECLARED`], and that default is deliberate
+    /// where [`Self::reach`]'s absent one is equally deliberate.** The two look
+    /// like the same question and are not, because the two failures are not the
+    /// same failure.
+    ///
+    /// `reach` has no default because a forgotten zero is a *correctness*
+    /// failure with no diagnostic: the plan believes the halo is zero, allocates
+    /// none, and every block computes its edges from data it never read. The
+    /// comment beside `reach` puts it as "the one place a silent zero would
+    /// produce a complete, well-formed, wrong volume", and `FragmentOp::reach`
+    /// had its own silent zero removed this session for exactly that.
+    ///
+    /// A forgotten `slicing` cannot do that. Its default is **today's
+    /// behaviour, exactly**: one task per block on one thread, which is what
+    /// this framework has always done and what every measurement it has is taken
+    /// against. An op author who says nothing loses a speedup that was never
+    /// there. **Zero costs correctness; `Whole` costs performance**, and a
+    /// default is affordable on the second where it is not on the first.
+    ///
+    /// **That argument has one condition and it is load-bearing.** The default
+    /// is only safe while this declaration is the *sole* source of truth. The
+    /// moment anything infers sliceability from another signal — most
+    /// temptingly "the reach is bounded, so it must be a stencil" — the default
+    /// stops protecting anyone, because a bounded reach is exactly what an op
+    /// that carries a running window along the buffer also has. See [`Slicing`]
+    /// for the two classes that come apart. **Nothing in this crate may derive a
+    /// slicing; it may only read one.**
+    ///
+    /// An op that overrides this to [`Slicing::Stencil`] is making a claim about
+    /// its kernel that `tests/intra_block_slicing.rs` checks by bit-identity
+    /// against the uncut block, at every thread count, rather than by trusting
+    /// the declaration.
+    fn slicing(&self) -> Slicing {
+        Slicing::UNDECLARED
+    }
+
     /// Compute the op over the whole of `input`, writing into `out`.
     ///
     /// `out` is [`Self::output_shape`] of `input`'s shape and holds
@@ -648,7 +797,9 @@ pub trait BlockOp: Send + Sync {
     ///
     /// **Defaulted to exactly what [`Self::reach_spec`] already says**, so no
     /// shipped op changes and nothing about a plan moves. See [`Geometry`] for
-    /// what this is for and `forme.md` for the migration it is step one of: the
+    /// what this is for, and — for the migration this is step one of — the
+    /// outside session log cited there, under *"The output-side index map: a
+    /// specification"*: the
     /// quantities an op currently declares twice become derivable from here, and
     /// an op whose output lattice is neither its input's nor a fixed ratio of it
     /// gets somewhere to say so.
@@ -1036,6 +1187,17 @@ pub trait Combine: Send + Sync {
             self.reach(1, volume[1]),
             self.reach(2, volume[2]),
         ])
+    }
+
+    /// Whether this combine's answer survives a cut inside one block, on
+    /// exactly [`BlockOp::slicing`]'s argument and with the same default.
+    ///
+    /// A combine is asked separately from its branches because a `Parallel`
+    /// node is only as sliceable as its narrowest part: three stencil branches
+    /// joined by a combine that folds across the buffer is not a stencil, and
+    /// nothing about the branches would say so.
+    fn slicing(&self) -> Slicing {
+        Slicing::UNDECLARED
     }
 
     /// Can this combine be handed branch results of exactly these element
@@ -1743,6 +1905,54 @@ impl Chain {
     ///   quantity stated twice is checked rather than assumed. The bound is the
     ///   one the halo used to be derived from, so an op that quietly widened
     ///   past it would be under-halo'd by every plan built before it changed.
+    /// Whether this whole subtree survives a cut inside one block.
+    ///
+    /// The fold is a conjunction with the **first** refusal carried out, so the
+    /// caller is told which part refused rather than that something did.
+    ///
+    /// Three of the four nodes are the obvious rule; the fourth is a deliberate
+    /// choice recorded here rather than left to be inferred:
+    ///
+    /// * `Sequence` — every child, because each is handed what the one before
+    ///   wrote and one non-stencil anywhere in the line poisons the rest. The
+    ///   halo the cut then needs is the sequence's own reach, which already
+    ///   **adds** along the line; see [`Self::reach_spec`].
+    /// * `Parallel` — every branch **and** the combine, since a node is only as
+    ///   sliceable as its narrowest part.
+    /// * `Source` — a stencil. It reads the extent it is asked for and nothing
+    ///   around it, at reach zero, so a slab's read of it is exact by the same
+    ///   argument that makes its halo contribution zero. Whether the *primitive*
+    ///   can slice a chain containing one is a different question and a narrower
+    ///   one — see `slab::apply_sliced`, which refuses it today.
+    /// * `Alternative` — **every branch, not merely the one `taken`**, and this
+    ///   is the conservative direction on purpose. Only `taken` runs, so the
+    ///   narrower rule would be sound for the chain as it stands. It is refused
+    ///   because `taken` is a per-chain choice that callers rebuild and mutate,
+    ///   and a chain whose sliceability changed when its selector moved would be
+    ///   a property that a plan could not be checked against once. `reach_spec`
+    ///   already takes the same direction on the same node, folding with `max`
+    ///   over all branches rather than reading `taken`.
+    pub fn slicing(&self) -> Slicing {
+        match self {
+            Chain::Op(op) => op.slicing(),
+            Chain::Source { .. } => Slicing::Stencil,
+            Chain::Sequence(children)
+            | Chain::Alternative {
+                branches: children, ..
+            } => children
+                .iter()
+                .map(Chain::slicing)
+                .find(|slicing| !slicing.is_stencil())
+                .unwrap_or(Slicing::Stencil),
+            Chain::Parallel { branches, combine } => branches
+                .iter()
+                .map(Chain::slicing)
+                .chain(std::iter::once(combine.slicing()))
+                .find(|slicing| !slicing.is_stencil())
+                .unwrap_or(Slicing::Stencil),
+        }
+    }
+
     pub fn reach_spec(&self, volume: [usize; 3]) -> Result<Reach> {
         let spec = self.fold_reach_spec(volume)?;
         for axis in 0..3 {
@@ -1838,7 +2048,10 @@ impl Chain {
     fn fold_reach_spec(&self, volume: [usize; 3]) -> Result<Reach> {
         match self {
             // **Through `geometry`, not through `reach_spec`.** Step two of the
-            // migration in `forme.md`: the declaration becomes the one an op
+            // migration set out under *"The output-side index map: a
+            // specification"*, in the session log outside this repository —
+            // `Geometry` says why that file is cited by heading and not by
+            // name: the declaration becomes the one an op
             // makes, and the reach becomes something derived from it. Today
             // `BlockOp::geometry` defaults to `stencil(volume,
             // self.reach_spec(volume))`, so for every shipped op this is the

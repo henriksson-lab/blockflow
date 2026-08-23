@@ -40,6 +40,7 @@ fn constraints() -> Constraints {
         model: CostModel::default(),
         block_candidates: vec![64, 32, 16, 8],
         split_axes: vec![0, 1, 2],
+        ..Default::default()
     }
 }
 

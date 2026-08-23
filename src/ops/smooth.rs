@@ -108,7 +108,7 @@ use ndarray::ArrayViewMut3;
 
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::op::{Anchor, BlockOp};
+use crate::op::{Anchor, BlockOp, Slicing};
 use crate::voxels::Voxels;
 
 use super::ridge::{gaussian_radius, gaussian_smooth_into_with, gaussian_weights, Boundary};
@@ -320,6 +320,18 @@ impl SmoothOp {
 }
 
 impl BlockOp for SmoothOp {
+    /// **A stencil, and this one was verified rather than reasoned.** A
+    /// separable Gaussian is three passes over the buffer, and a multi-pass
+    /// implementation is exactly where "bounded reach" stops implying
+    /// "sliceable": pass two reads pass one's output, so a slab has to hold
+    /// enough of pass one to be right, which is a property of the
+    /// implementation rather than of the mathematics.
+    ///
+    /// `tests/intra_block_slicing.rs` is what settles it, and it is the bar.
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
     fn name(&self) -> &'static str {
         self.name
     }

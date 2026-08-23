@@ -194,10 +194,13 @@
 //
 // Which block owns a point, and why exactly one does
 // --------------------------------------------------
-// Phase 1 runs the same merge in every block — it has to, because a fragment
-// phase cannot hand its answer to a later phase without going through an image —
-// so every block computes every component's centroid. What stops the same point
-// being written N times is the ownership rule:
+// Phase 1 hands every block the same merge — the phase runs it once, in
+// [`RegionPointsOp::reduce`], and every block is handed the same bytes — so
+// every block sees every component's centroid. (It used to *run* the merge in
+// every block, for want of anywhere else to put a per-phase quantity; the
+// ownership rule below is unchanged by that having moved, because it was never
+// about who computed the centroid.) What stops the same point being written N
+// times is the ownership rule:
 //
 // > **the block whose core holds the component's centroid emits the point.**
 //
@@ -295,50 +298,49 @@
 //
 // What this costs
 // ---------------
-// `ops::fill`'s costs, minus the pixels. Phase 0 is halo-free and embarrassingly
-// parallel. Phase 1 declares a whole-lattice fragment reach, so on `N` blocks it
-// moves every block's fragment to each of `N` blocks and runs the same union-find
-// once per block; what it does *not* do is read an image, because it does not
-// need one — `reads_pixels` is `false`, so the executor performs no pixel IO for
-// the phase at all and the read amplification `fill`'s header measures is not
-// paid here.
+// Phase 0 is halo-free and embarrassingly parallel, and always was. Phase 1 used
+// to be `ops::fill`'s phase 1 minus the pixels: a whole-lattice fragment reach,
+// so on `N` blocks it moved every block's fragment to each of `N` blocks and ran
+// the same union-find once per block, without ever reading an image —
+// `reads_pixels` is `false`, so the executor performs no pixel IO for the phase
+// at all and the read amplification `fill`'s header measures was never paid here.
 //
-// **That escape is smaller than this paragraph used to imply, and the correction
-// matters more here than in `fill`.** What it says is true: the pixel half is not
-// paid. What it left the reader with is that this op therefore gets the cheap
-// version of the shape — and it does not. Of the three costs `fill`'s header now
-// separates, this op escapes **one** and pays the other two in full:
+// **Of the three costs that shape has, this op escaped one and paid two**, and
+// the two it paid are gone now. The table is kept because the middle column is
+// what the prediction was and the right column is what was measured:
 //
-// | | `ops::fill` | here |
-// |---|---|---|
-// | pixel re-reads, `N x` the label image | paid | **not paid** |
-// | fragment transfers, `(1 + N) x` the whole fragment set | paid | paid |
-// | the union-find, once per block | paid | paid |
+// | | `ops::fill`, before | here, before | here, now |
+// |---|---|---|---|
+// | pixel re-reads, `N x` the label image | paid | **never paid** | never paid |
+// | fragment transfers, `(1 + N) x` the whole fragment set | paid | paid | **`3 x` the set, flat in `N`** |
+// | the union-find, once per block | paid | paid | **once for the phase, twice with the order check** |
 //
-// And the third of those is the one that was measured last and turned out
-// largest. `fill`'s header has the figures and the sweep; the short form is that
-// one merge is small at every lattice, there is one per block, and at a fine cut
-// their sum exceeds the whole rest of the pipeline. This op runs the *larger*
-// merge of the two — face labels plus a count and three position sums per label,
-// folded over every component — so nothing here is cheaper than what was measured
-// there.
+// **A barrier alone recovers nothing at all for this op, and that was a
+// prediction that survived.** A barrier's whole traffic contribution is relieving
+// the halo, and a halo costs pixel reads; this phase fetches no pixels at any
+// halo. `tests/barrier_migration.rs` asserts it as an *equality* rather than a
+// bound — the in-plan and barrier-alone arms move the same bytes to the byte at
+// every lattice measured — and everything this op was paying turned out to sit
+// in the hoisting. Being the cheapest of the ops on this shape made it the one
+// with the least to gain from half the change and, proportionally, the most from
+// all of it: on the fixture measured, `101.4x` at 256 blocks, of which the
+// barrier is worth `1.00x` and the hoisting the rest.
+//
+// The barrier is still declared, and is not decoration: it is the **precondition**
+// the hoisting needs. Without it there is no moment at which the fragment set is
+// complete, so a reduction taken at any other moment is taken over whatever
+// fragments happened to exist — `barriers.md` §7.4 is the argument and
+// `check_phase_work` is where the pair is enforced.
 //
 // The old closing sentence said the fragment is six planes of labels plus eight
 // words per label, "against a block of pixels — the same shape, for the same
-// reason". That comparison is per block and it is the same false reassurance:
-// against a *block* of pixels a fragment is small, and the phase moves the whole
-// fragment set once per block rather than one fragment once. Past a fine enough
-// cut the fragment set exceeds the whole volume, measured, and this op has no
-// pixels to be small beside anyway.
-//
-// `docs/design/barriers.md` specifies the way out and prices it, and the way it
-// lands here is the opposite of what "minus the pixels" suggests. That note
-// separates two changes: a **barrier**, which relieves the halo, and a barrier
-// that additionally lets the phase run its **reduction once**. A barrier alone
-// recovers the pixel re-reads — so it recovers **nothing at all for this op**,
-// which does not pay them. Everything this op pays is in the second change.
-// Being the cheapest of the three ops today makes it the one with the least to
-// gain from half the fix and the most to gain, proportionally, from all of it.
+// reason". That comparison was per block and it was a false reassurance: against
+// a *block* of pixels a fragment is small, and the phase moved the whole fragment
+// set once per block rather than one fragment once. Past a fine enough cut the
+// fragment set exceeds the whole volume, measured. What the hoisting removes is
+// the multiplier and not the set: `F` itself is the total face area of the cut
+// and is geometry, so cutting more finely still costs more fragment bytes — just
+// not `N` times more.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -352,6 +354,7 @@ use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
     fragment_phase, BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput,
+    PhaseView, SeamFold,
 };
 use crate::geometry::BlockGrid;
 use crate::points::{encode_points, Point};
@@ -1081,6 +1084,108 @@ const VERSION: u32 = 2;
 /// words.
 const WORDS_PER_LABEL: usize = 20;
 
+/// `"DTCM"` little-endian — the **merged** accumulators, which is a different
+/// object from a block's fragment and says so.
+///
+/// [`MAGIC`] marks one block's partial report; this marks the whole lattice's
+/// totals. Both are `u32` words written by one op onto one machinery, so the
+/// only thing that keeps a reader from decoding one as the other is that they
+/// are distinguishable, which is `components::read_header`'s whole argument.
+const MERGED_MAGIC: u32 = 0x4d43_5444;
+const MERGED_VERSION: u32 = 1;
+
+/// The merge's whole answer as bytes: what [`RegionPointsOp::reduce`] hands the
+/// phase.
+///
+/// **A magic and a version**, for the reason `barriers.md` §7.7 gives: a
+/// reduction that computes the wrong thing answers plausibly in every block and
+/// nothing outside the op could catch it, so the op's own decode is made the one
+/// place a mismatch can surface.
+///
+/// Fallible for one reason and it is the header: the count travels in a single
+/// `u32` word, so a lattice with more live components than that would be a blob
+/// that decodes cleanly into the wrong number of accumulators.
+/// [`GlobalLabels::merge`](crate::ops::label::GlobalLabels::merge) refuses the
+/// same thing for the same reason.
+///
+/// The same twenty words per accumulator [`RegionMoments::encode`] writes, and
+/// exactly for [`RegionMoments::encode`]'s reason: the claim of this op is that
+/// the arithmetic is exact, and a lossy encoding on the way to a block would
+/// make the claim false in transit where nothing would look.
+///
+/// **Components with no voxels are not written.** They are the non-roots of the
+/// flat `(block, label)` numbering, which carry [`Moments::EMPTY`] and are
+/// dropped by [`moments_owned_by`]'s filter anyway — a component with no
+/// centroid is owned by no block. Dropping them here makes the blob grow with
+/// the *answer* rather than with the lattice, and changes nothing a block sees.
+pub fn encode_moments(components: &[Moments]) -> Result<Vec<u8>> {
+    let live = components.iter().filter(|part| part.count > 0);
+    let mut words: Vec<u32> = vec![MERGED_MAGIC, MERGED_VERSION, 0];
+    let mut written = 0u32;
+    for moments in live {
+        push_u64(&mut words, moments.count);
+        for axis in 0..3 {
+            push_u64(&mut words, moments.sums[axis]);
+        }
+        for axis in 0..3 {
+            push_u64(&mut words, moments.min[axis]);
+        }
+        for axis in 0..3 {
+            push_u64(&mut words, moments.max[axis]);
+        }
+        written = written.checked_add(1).ok_or_else(|| {
+            Error::invalid(
+                "more components than a `u32` count holds. The count travels in one header \
+                 word, so a wrap here would be a blob that decodes cleanly into the wrong \
+                 number of accumulators."
+                    .to_string(),
+            )
+        })?;
+    }
+    words[2] = written;
+    Ok(words_to_bytes(&words))
+}
+
+/// The inverse of [`encode_moments`].
+pub fn decode_moments(bytes: &[u8]) -> Result<Vec<Moments>> {
+    const NOUN: &str = "a merged-moments reduction";
+    let words = bytes_to_words(bytes, NOUN)?;
+    let count = read_header(&words, MERGED_MAGIC, MERGED_VERSION, NOUN)? as usize;
+    let payload = count.checked_mul(WORDS_PER_LABEL).ok_or_else(|| {
+        Error::invalid(format!(
+            "{NOUN} declares more components than the address space holds"
+        ))
+    })?;
+    if words.len() < 3 + payload {
+        return Err(Error::invalid(format!(
+            "{NOUN} ends inside its accumulators"
+        )));
+    }
+    let mut components = Vec::with_capacity(count);
+    for record in words[3..3 + payload].chunks_exact(WORDS_PER_LABEL) {
+        components.push(Moments {
+            count: take_u64(record, 0),
+            sums: [
+                take_u64(record, 2),
+                take_u64(record, 4),
+                take_u64(record, 6),
+            ],
+            min: [
+                take_u64(record, 8),
+                take_u64(record, 10),
+                take_u64(record, 12),
+            ],
+            max: [
+                take_u64(record, 14),
+                take_u64(record, 16),
+                take_u64(record, 18),
+            ],
+        });
+    }
+    expect_end(&words, 3 + payload, NOUN)?;
+    Ok(components)
+}
+
 fn push_u64(words: &mut Vec<u32>, value: u64) {
     words.push(value as u32);
     words.push((value >> 32) as u32);
@@ -1211,6 +1316,14 @@ impl LabelRegionsOp {
 impl FragmentOp for LabelRegionsOp {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// Nothing crosses as **pixels**. The labelling is grown inside this block
+    /// and reads only this block's mask; what a neighbour needs — the six faces
+    /// and the label count — leaves on `self.stream`, and a stream's reach is
+    /// declared in blocks on the reading op's `FragmentInput`.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn reads_pixels(&self) -> bool {
@@ -1389,6 +1502,14 @@ impl FragmentOp for RegionPointsOp {
         self.name
     }
 
+    /// Nothing, and there is no pixel to reach through: `reads_pixels` is
+    /// `false`, so this phase performs no pixel IO at all. Everything it reads
+    /// arrives on the moments stream over the whole-lattice reach declared in
+    /// [`Self::inputs`].
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn reads_pixels(&self) -> bool {
         false
     }
@@ -1397,16 +1518,25 @@ impl FragmentOp for RegionPointsOp {
         false
     }
 
-    /// The whole lattice, stated as the lattice rather than as a large number.
+    /// **Yes.**
+    fn barrier(&self) -> bool {
+        true
+    }
+
+    /// The stream, at **reach zero**.
     ///
-    /// This is why the constructor takes a grid. "Everything" is a different
-    /// integer on every lattice, and a saturating sentinel is not a way out: the
-    /// reach is multiplied by the block edge to get a halo, and a sentinel
-    /// overflows the geometry rather than clamping.
+    /// It is still declared, because that is what makes it resolvable in
+    /// [`Self::reduce`]: `PhaseView` offers the streams the plan records and no
+    /// others, for a block's reason — an undeclared stream is one the plan
+    /// neither orders nor prices. What changed is the reach, and it is the whole
+    /// of what this op had left to save. With the merge in `apply` every block
+    /// needed every fragment and said so, which is `barriers.md` §7.6's
+    /// `(1 + blocks) x F` multiplier; with the merge in [`Self::reduce`] the
+    /// *phase* needs them and no block does.
     fn inputs(&self) -> Vec<FragmentInput> {
         vec![
             FragmentInput::own(self.moments_stream.clone(), self.moments_phase)
-                .with_reach(self.lattice),
+                .with_reach([0, 0, 0]),
         ]
     }
 
@@ -1422,26 +1552,70 @@ impl FragmentOp for RegionPointsOp {
         )]
     }
 
-    /// Gathered rather than streamed, unlike the other whole-lattice reader in
-    /// this crate.
+    /// **Nothing per block.** The merge is [`Self::reduce`]'s and the totals
+    /// arrive in the blob, so a block that gathered anything would be holding a
+    /// fragment set it has no use for.
     ///
-    /// `FragmentReduceOp` streams because it folds one number and never needs two
-    /// fragments at once. The seam walk does: it compares block `b`'s high face
-    /// against block `b + 1`'s low face, so the merge holds every report anyway
-    /// and streaming would move the residency from the executor's gather into
-    /// this op's own map without removing it. Saying `true` keeps the fetch count
-    /// measurable from outside, which is what `fragment.rs` says the flag is for.
+    /// This said `true` until the merge moved, and the reason it gave was the
+    /// right reason for where the merge was: the seam walk compares block `b`'s
+    /// high face against block `b + 1`'s low face, so it holds every report at
+    /// once and streaming would have moved the residency into this op's own map
+    /// without removing it. That argument is now [`Self::reduce`]'s and is made
+    /// there; a *block* needs none of it.
     fn gathers(&self) -> bool {
-        true
+        false
     }
 
-    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+    /// The answer is a function of the **set** of fragments and not of the order
+    /// they arrive in, and this is the declaration that says so and gets it
+    /// checked.
+    ///
+    /// `PhaseView` walks the lattice row-major and **two lattices walk two
+    /// different orders**, so a reduction whose answer depended on the order
+    /// would make a component's centroid a property of how the volume was cut —
+    /// the one property this op exists to not have. The executor reduces a
+    /// second time with the lattice reversed and requires the same bytes.
+    ///
+    /// It is true by construction — the reports go into a `BTreeMap`, the
+    /// accumulators are exact integers under `+`, `min` and `max`, and the fold
+    /// onto the roots happens after every union rather than as they arrive — and
+    /// the declaration is the statement that it must stay true.
+    ///
+    /// **It costs nothing per block**, which is a consequence of the hoisting:
+    /// the same declaration makes the executor apply each block a second time
+    /// with its neighbourhood reversed, and it skips that when the neighbourhood
+    /// holds at most one fragment. [`Self::inputs`] reaches zero, so it holds
+    /// one.
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::Unordered)
+    }
+
+    /// The merge, **once for the phase**.
+    ///
+    /// This is where the union-find went, and `barriers.md` §7.2 is the argument
+    /// for moving it. It matters more here than anywhere: this op reads no
+    /// pixels, so a barrier alone recovers *nothing at all* for it — the pixel
+    /// re-reads it never paid are the only thing a barrier relieves — and every
+    /// byte and every CPU-second it was paying is in this method.
+    ///
+    /// Gathered rather than streamed, which is where the argument
+    /// [`Self::gathers`] used to make now belongs: the seam walk compares block
+    /// `b`'s high face against block `b + 1`'s low face, so the merge holds
+    /// every report at once and a streaming accessor would move the residency
+    /// into this map rather than removing it. What it costs is one resident
+    /// fragment set for the phase, against one per concurrent block before.
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
         let mut reports = BTreeMap::new();
-        for (key, bytes) in at.fragments(&self.moments_stream) {
-            reports.insert(key.block, RegionMoments::decode(bytes)?);
+        for (key, bytes) in at.fragments(&self.moments_stream)? {
+            reports.insert(key.block, RegionMoments::decode(&bytes)?);
         }
         let components =
             merge_moments_with(&reports, at.grid.blocks_per_axis(), self.connectivity)?;
+        encode_moments(&components)
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let components = decode_moments(at.reduced)?;
         // Ownership first, emission second: which block writes a component is a
         // property of the component, so it must not be able to depend on the
         // form it is written in.
@@ -1456,11 +1630,11 @@ impl FragmentOp for RegionPointsOp {
 /// The two phases, on one lattice.
 ///
 /// Both are built with `fragment_phase`, so both halos come from the ops'
-/// declarations rather than from this function: zero for the labelling, the whole
-/// lattice for the points. `ops::fill`'s header explains why the second one has
-/// to be that — the halo is the dependency edge between pipelined phases, not
-/// merely a fetch extent — and here it is *only* that, because this phase reads
-/// no pixels at all.
+/// declarations rather than from this function, and **both are now zero**. The
+/// second used to be the whole lattice, because a halo was the only spelling of
+/// "this phase waits for every block of the one below" — see `barriers.md` §1.2.
+/// [`RegionPointsOp`] declares that edge as a barrier instead, so the halo is
+/// free to be what the op actually fetches, which is nothing.
 ///
 /// Neither phase declares a `dtype`: neither writes an image, so there is no image
 /// whose width could be wrong, and `check_dtypes` skips both for that reason.
@@ -1596,6 +1770,65 @@ mod tests {
 
     use crate::points::decode_points;
     use crate::table::ColumnType;
+
+    /// **The reduction blob round-trips, and a wrong one is refused by name.**
+    ///
+    /// The same argument as `ops::label`'s: a phase reduction has no external
+    /// guard, so the op's own decode is the whole mitigation.
+    ///
+    /// It also pins the one thing [`encode_moments`] drops — the empty
+    /// non-roots — as a thing a reader cannot tell was dropped, which is why it
+    /// is safe to drop: [`moments_owned_by`] filters on a centroid and an empty
+    /// accumulator has none.
+    #[test]
+    fn the_merged_moments_blob_round_trips_and_a_wrong_one_is_refused() {
+        let live = Moments {
+            count: 3,
+            sums: [6, 9, 12],
+            min: [1, 2, 3],
+            max: [3, 4, 5],
+        };
+        let totals = vec![live, Moments::EMPTY, live, Moments::EMPTY];
+        let bytes = encode_moments(&totals).expect("an encode");
+        let back = decode_moments(&bytes).expect("a round trip");
+        assert_eq!(
+            back,
+            vec![live, live],
+            "the empty non-roots are not written"
+        );
+
+        let grid = BlockGrid::new([8, 8, 8], [4, 8, 8]).expect("a lattice");
+        assert_eq!(
+            moments_owned_by(&back, &grid, [0, 0, 0]),
+            moments_owned_by(&totals, &grid, [0, 0, 0]),
+            "dropping the empties must be invisible to every block"
+        );
+
+        // A block's own fragment decoded as the phase's totals. Two `u32` word
+        // streams written by one op, so the magic is the only thing between
+        // them.
+        let fragment = RegionMoments::empty().encode();
+        let message = decode_moments(&fragment)
+            .expect_err("a block fragment is not a reduction")
+            .to_string();
+        assert!(message.contains("magic"), "{message}");
+
+        let message = decode_moments(&bytes[..bytes.len() - 4])
+            .expect_err("a short blob")
+            .to_string();
+        assert!(message.contains("merged-moments"), "{message}");
+
+        let mut ragged = bytes.clone();
+        ragged.push(0);
+        decode_moments(&ragged).expect_err("a ragged blob");
+
+        assert!(
+            decode_moments(&encode_moments(&[]).expect("an encode"))
+                .expect("an empty round trip")
+                .is_empty(),
+            "a lattice with no components reduces to no accumulators"
+        );
+    }
 
     /// A mask with the named voxels set.
     fn mask_of(shape: [usize; 3], set: &[[usize; 3]]) -> Array3<bool> {

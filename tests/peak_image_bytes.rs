@@ -24,14 +24,11 @@
 //    and right as a comparison between plans.
 
 use blockflow::decomposition::{Decomposition, PhaseDecomposition, Visibility};
-use blockflow::fragment::{
-    fragment_only, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput, PhaseWork,
-};
+use blockflow::fragment::{fragment_only, PhaseWork};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
-use blockflow::probes::IdentityOp;
+use blockflow::probes::{IdentityOp, NullFragmentOp};
 use blockflow::sidecar::Lifecycle;
-use blockflow::Result;
 use blockflow::{Dtype, ImageId};
 
 const VOLUME: [usize; 3] = [32, 16, 8];
@@ -100,27 +97,6 @@ fn pixel_plan(n: usize, edge: usize) -> (Chain, Decomposition) {
     )
 }
 
-/// A `fragments -> fragments` op: reads no pixel, writes no image.
-struct Merge;
-
-impl FragmentOp for Merge {
-    fn name(&self) -> &'static str {
-        "merge"
-    }
-
-    fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            "merged",
-            Lifecycle::DeleteOnExit,
-            Coverage::Sparse,
-        )]
-    }
-
-    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
-        Ok(BlockOutput::nothing())
-    }
-}
-
 /// Promoting the walk moved nothing: for every plan the copies can express, the
 /// method is the copies.
 #[test]
@@ -175,7 +151,7 @@ fn a_chain_of_identities_holds_three_images_however_long_it_gets() {
 /// the record rather than the direction alone.
 #[test]
 fn a_phase_that_writes_no_image_is_not_charged_for_one() {
-    let merge = Merge;
+    let merge = NullFragmentOp::new("merge", "merged", Lifecycle::DeleteOnExit);
     let plan = fragment_only(VOLUME, [8, 8, 8], Dtype::F64, &[&merge])
         .expect("a fragments-only decomposition");
     let told = plan
@@ -233,7 +209,7 @@ fn a_supplied_input_is_counted_and_the_open_coded_walk_cannot_see_it() {
 /// it is the same question.
 #[test]
 fn an_undescribed_slotless_phase_is_refused_rather_than_assumed_to_write() {
-    let merge = Merge;
+    let merge = NullFragmentOp::new("merge", "merged", Lifecycle::DeleteOnExit);
     let plan = fragment_only(VOLUME, [8, 8, 8], Dtype::F64, &[&merge])
         .expect("a fragments-only decomposition");
     let message = plan

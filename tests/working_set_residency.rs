@@ -888,17 +888,32 @@ fn the_op_margin_is_the_smallest_tenth_that_covers_the_ops_measured() {
     );
 }
 
-/// **Neither margin can cost more than one step of the candidate ladder, at any
-/// budget.**
+/// **Neither margin can move the admitted block by more than `8x` in volume, at
+/// any budget.**
 ///
 /// This is what makes the policy affordable, and it is arithmetic rather than
-/// luck: a ladder of powers of two steps by **eight** in volume, and every
-/// margin here is under eight — `UNOBSERVED_SHAPE_MARGIN` on its own, and the
-/// widest measured framework figure times `UNOBSERVED_OP_MARGIN` for the exact
-/// branch. The sweep asserts it at every budget rather than trusting the
-/// arithmetic once.
+/// luck: every margin here is under eight — `UNOBSERVED_SHAPE_MARGIN` on its
+/// own, and the widest measured framework figure times `UNOBSERVED_OP_MARGIN`
+/// for the exact branch — so a block that fitted without a margin has a rung at
+/// an eighth of its volume that fits with one.
+///
+/// **The bound is stated in volume, and that is the correction this test carries
+/// rather than a flourish.** It was first written as "never more than one ladder
+/// step", which is true here and is *not* the same claim: these candidates are
+/// powers of two, where a rung is exactly `8x` in volume, so the step count and
+/// the volume ratio coincide. On `decomposition::refined_ladder` a rung is
+/// `2.37x` or `3.375x` and `UNOBSERVED_SHAPE_MARGIN` alone already spans two of
+/// them, while the volume bound is untouched — two consecutive refined rungs
+/// span exactly `2.37 x 3.375 = 8.0`. The step count was a proxy that happened
+/// to equal the volume ratio at one spacing.
+///
+/// Both assertions are kept, and that is the point: the step bound is asserted
+/// because it is true *at this spacing*, the volume bound because it is true at
+/// any. `tests/block_ladder.rs` asserts the same volume bound at the refined
+/// spacing, and an invariant that holds at two spacings is an invariant rather
+/// than a coincidence.
 #[test]
-fn a_margin_never_costs_more_than_one_ladder_step() {
+fn a_margin_never_moves_the_admitted_block_by_more_than_eight_times_in_volume() {
     const CANDIDATES: [usize; 6] = [512, 256, 128, 64, 32, 16];
     const PLANE: [usize; 3] = [1024, 1024, 1024];
     const CONCURRENCY: u64 = 40;
@@ -968,11 +983,30 @@ fn a_margin_never_costs_more_than_one_ladder_step() {
                 .iter()
                 .position(|e| *e == admitted[index])
                 .expect("on the ladder");
+            // **The bound that survives any spacing**: the admitted block's
+            // volume, which cannot fall by more than the margin rounded up to
+            // the next rung — and every margin here is under `8x`.
+            let moved = (admitted[0] as f64 / admitted[index] as f64).powi(3);
+            assert!(
+                moved <= 8.0 + 1e-9,
+                "at {} GiB, {name} moved the admitted block from edge {} to edge {} — \
+                 {moved:.3}x in volume. Every margin here is under 8x, so a correction that \
+                 moves more than that is a margin that grew past the arithmetic this claim \
+                 rests on.",
+                1u64 << power,
+                admitted[0],
+                admitted[index]
+            );
+
+            // **And the step bound, which is true at *this* spacing only.** These
+            // candidates are powers of two, so one rung is exactly the `8x`
+            // above; on a refined ladder the same margin spans two rungs and the
+            // same volume. Kept rather than replaced, because a bound that holds
+            // at two spacings is what makes the volume one an invariant.
             assert!(
                 step <= today + 1,
-                "at {} GiB, {name} fell {} ladder steps. A ladder step is 8x in volume and every \
-                 margin here is under 8, so more than one step means a margin grew past the \
-                 arithmetic this claim rests on.",
+                "at {} GiB, {name} fell {} rungs of a powers-of-two ladder, where one rung is \
+                 the 8x the assertion above allows.",
                 1u64 << power,
                 step - today
             );
@@ -988,7 +1022,52 @@ fn a_margin_never_costs_more_than_one_ladder_step() {
     // rots.
     assert_eq!(
         cold_start_steps, 6,
-        "the cold-start charge costs a ladder step at {cold_start_steps} of 9 budgets; \
-         `UNOBSERVED_SHAPE_MARGIN`'s documentation says six"
+        "the cold-start charge costs a rung at {cold_start_steps} of 9 budgets on this \
+         powers-of-two ladder; `UNOBSERVED_SHAPE_MARGIN`'s documentation says six. The count \
+         is a property of the spacing — see `tests/block_ladder.rs` for the refined one — \
+         where the volume bound above is a property of the margin."
+    );
+
+    // **The control: the volume bound has teeth.** Six of nine budgets move the
+    // block at all, so the assertion is exercised — but "exercised" is not
+    // "would fail if it should".
+    //
+    // **A margin of `9.0` does not break it, and that is worth knowing rather
+    // than hiding.** This control was written with `9.0` first, on the reasoning
+    // that nine is past the eight the arithmetic rests on. It moved the block by
+    // at most `8.000x` anyway: the block admitted *without* a margin sits below
+    // its rung's ceiling by whatever the ladder's coarseness left it — up to a
+    // full rung — and that headroom absorbs the extra `9/8` before any rung is
+    // lost. So the bound is genuinely slack at this spacing, which is the honest
+    // reading of a coarse ladder and is exactly why `tests/block_ladder.rs` at
+    // the refined spacing is the sharper of the two tests.
+    //
+    // `64.0` is the principled choice instead: two full rungs, which no headroom
+    // under one rung can absorb, so it must break the bound at every budget the
+    // ladder does not bottom out on.
+    let mut worst_when_doubled_past: f64 = 1.0;
+    for power in 0..9u32 {
+        let budget = (1u64 << power) * 1024 * 1024 * 1024;
+        let admit = |charge: &dyn Fn(f64) -> u64| {
+            CANDIDATES
+                .iter()
+                .copied()
+                .find(|&edge| {
+                    assumed_for(edge).is_some_and(|ws| charge(ws) * CONCURRENCY <= budget)
+                })
+                .unwrap_or(*CANDIDATES.last().expect("a ladder"))
+        };
+        let plain = admit(&|ws: f64| ws.round() as u64);
+        let over = admit(&|ws: f64| (ws * 64.0).round() as u64);
+        let moved = (plain as f64 / over as f64).powi(3);
+        if moved.total_cmp(&worst_when_doubled_past).is_gt() {
+            worst_when_doubled_past = moved;
+        }
+    }
+    assert!(
+        worst_when_doubled_past > 8.0,
+        "a margin of 64.0 — two full rungs — moved the admitted block by at most \
+         {worst_when_doubled_past:.3}x in volume, so the 8x assertion above cannot distinguish a margin \
+         that is within the arithmetic from one that is not"
     );
 }

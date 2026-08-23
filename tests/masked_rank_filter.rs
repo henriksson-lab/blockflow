@@ -43,12 +43,12 @@ use ndarray::{Array3, ArrayView3};
 
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::ArrayEnvironment;
-use blockflow::error::{Error, Result};
+use blockflow::error::Error;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain, SourceInputs};
 use blockflow::ops::{
     masked_rank_filter_into, masked_rank_filter_into_with, rank_filter_into, ElementShape,
-    ExcludedCentre, MaskedRankFilterOp, Rank, StructuringElement, Total,
+    ExcludedCentre, MaskedRankFilterOp, Rank, StructuringElement, Total, VoxelwiseMaskOp,
 };
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
@@ -108,38 +108,6 @@ fn reference() -> Array3<f64> {
 }
 
 // ------------------------------------------------------------- the op --
-
-/// `image > CUT`, into a `Bool` image. The mask producer, kept here rather than
-/// taken from `src/ops` because what is under test is the *consumer*.
-struct Binarize;
-
-impl BlockOp for Binarize {
-    fn name(&self) -> &'static str {
-        "binarize"
-    }
-
-    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
-        0
-    }
-
-    fn accepts(&self, dtype: Dtype) -> bool {
-        dtype == Dtype::F64
-    }
-
-    fn produces(&self, _input: Dtype) -> Dtype {
-        Dtype::Bool
-    }
-
-    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        let source = input.view::<f64>()?;
-        let mut out = out.view_mut::<bool>()?;
-        ndarray::Zip::from(&mut out)
-            .and(&source)
-            .for_each(|slot, &value| *slot = value > CUT);
-        Ok(())
-    }
-}
-
 // ------------------------------------- 1. the sentinel workaround fails --
 
 /// Replacing excluded voxels with a sentinel and running the ordinary filter is
@@ -253,7 +221,7 @@ fn a_window_with_no_population_writes_the_centre() {
 /// `SourceInputs` at once, which is where they could disagree.
 fn chain() -> Chain {
     Chain::sequence(vec![
-        Chain::op(Binarize),
+        Chain::op(VoxelwiseMaskOp::threshold("binarize", CUT)),
         Chain::source(0usize, Dtype::F64),
         Chain::op(MaskedRankFilterOp::new(
             "masked-percentile",
@@ -648,7 +616,7 @@ fn a_fill_that_is_not_the_constant_withdraws_the_short_circuit() {
 /// silently wrong volume, and the only thing that says otherwise is the sweep.
 fn chain_filling(fill: f64) -> Chain {
     Chain::sequence(vec![
-        Chain::op(Binarize),
+        Chain::op(VoxelwiseMaskOp::threshold("binarize", CUT)),
         Chain::source(0usize, Dtype::F64),
         Chain::op(
             MaskedRankFilterOp::new("masked-percentile", element(), rank(), MASK)

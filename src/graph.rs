@@ -104,6 +104,44 @@ pub struct TaskGraph {
     pub tasks: Vec<Task>,
     /// `phase_ranges[p]` is the half-open span of `tasks` belonging to phase p.
     pub phase_ranges: Vec<(usize, usize)>,
+    /// `barriers[p]` is [`PhaseDecomposition::barrier`]: no task of phase `p`
+    /// may start until **every** task of every earlier phase has finished.
+    ///
+    /// # The edges are not the whole ordering, and this is the exception
+    ///
+    /// Everywhere else in this file a dependency is a region intersection and a
+    /// scheduler that runs a task once its `deps` are done is correct. A barrier
+    /// phase is the one case where that is **not** enough: its blocks fetch only
+    /// their own cores, so their `deps` are the handful of tasks covering those
+    /// cores and can complete long before the rest of the phase below has. A
+    /// scheduler that ignores this field will start such a block early and the
+    /// op will answer from an incomplete fragment set — a plausible wrong answer
+    /// whose wrongness depends on the schedule.
+    ///
+    /// # Why it is a phase-level fact and not `blocks x blocks` edges
+    ///
+    /// It was the edges first, and they were correct and free for both
+    /// schedulers — the indegree machinery both already have enforced it with no
+    /// new code. What they cost is a **product where every other edge here is a
+    /// sum**. `a_barrier_at_a_large_block_count_is_priced` in
+    /// `tests/barrier_phase.rs` builds both forms side by side and prints what
+    /// each holds and how long each takes, so the figure is measured on the
+    /// machine that asks rather than quoted here; `docs/design/barriers.md` §8.2
+    /// has the run it was decided on. [`producers_of`] below rejected
+    /// `O(blocks^2)` at the scale this crate targets, about a different feature
+    /// and before this one existed, and that argument applies here unchanged.
+    ///
+    /// And a barrier exists **for** fine cuts: `docs/design/barriers.md` §2.2 is
+    /// that the toll it removes is worst precisely where cutting finely is most
+    /// wanted. Paying a quadratic to express one bit per phase, at the block
+    /// counts the feature is for, is the wrong side of that trade.
+    ///
+    /// "Every task of `p` waits for every task of `p-1`" is a statement about two
+    /// *phases*, and this is it, stated once. What it costs is that a scheduler
+    /// has to act on it; see [`Self::is_barrier`] for who does.
+    ///
+    /// [`PhaseDecomposition::barrier`]: crate::decomposition::PhaseDecomposition::barrier
+    pub barriers: Vec<bool>,
 }
 
 impl TaskGraph {
@@ -189,7 +227,42 @@ impl TaskGraph {
         Self {
             tasks,
             phase_ranges,
+            barriers: decomposition
+                .phases
+                .iter()
+                .map(|phase| phase.barrier)
+                .collect(),
         }
+    }
+
+    /// Whether phase `phase` may only start once every earlier phase is
+    /// complete. See [`Self::barriers`].
+    ///
+    /// # Every scheduler over this graph must consult it
+    ///
+    /// Two do, and they do the same two things, so a third has a shape to copy:
+    ///
+    /// * `strategy::execute_phases` holds such a phase's tasks out of the ready
+    ///   heap and releases them together when every earlier phase's remaining
+    ///   count reaches zero. That is also where `FragmentOp::reduce` runs, which
+    ///   is a second reason the gap has to exist.
+    /// * `distributed::coordinator::Job::ready` excludes them from the ready set
+    ///   on the same condition, counted from its own per-phase completion
+    ///   tallies.
+    ///
+    /// **Neither can deadlock**, on the argument `strategy.rs` already wrote for
+    /// an iterative phase: a task of phase `p` waits only on earlier phases, so
+    /// holding phase `p`'s tasks back blocks nothing that phase `p`'s tasks
+    /// need, phase 0's tasks are ready from the start, and the property carries
+    /// forward.
+    ///
+    /// **And it is the only enforcement**, which is worth saying plainly because
+    /// it briefly was not: while the barrier was `blocks x blocks` edges the
+    /// indegree enforced it too, and a property enforced in one place that reads
+    /// as though it is enforced in two is worse than one honestly enforced once.
+    /// It is enforced once, here, by whoever schedules.
+    pub fn is_barrier(&self, phase: usize) -> bool {
+        self.barriers.get(phase).copied().unwrap_or(false)
     }
 
     pub fn len(&self) -> usize {
@@ -241,6 +314,17 @@ impl TaskGraph {
     /// The quantity is `source`, for the reason given in `build`. A phase that
     /// changes shape is exactly where this check has to keep working, since it
     /// is the check that says the two halves of such a plan are one plan.
+    ///
+    /// # A barrier phase is checked exactly like every other, and that is the point
+    ///
+    /// There is no special case below for [`TaskGraph::barriers`] and the next
+    /// reader should not add one. A barrier changes *when a phase may start*, not
+    /// *what a block reads*: such a phase fetches its own core, its `deps` are
+    /// the tasks covering that core, and the sum below comes out exact for the
+    /// ordinary reason. That is what makes relieving the halo safe — the fetch
+    /// shrinks and the guard on the fetch keeps its full force, which it would
+    /// not if the deps had been widened to the whole phase to make the guard
+    /// pass.
     pub fn dependencies_cover_reads(&self, decomposition: &Decomposition) -> Result<(), String> {
         for task in &self.tasks {
             // Every image a source leaf reads, on the same argument and against

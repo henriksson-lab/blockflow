@@ -325,6 +325,23 @@ pub struct BlockView<'a> {
     /// buffer of the wrong width is a buffer the write refuses, and the executor
     /// is the only thing that knows which image this block is destined for.
     pub dtype: Dtype,
+    /// What [`FragmentOp::reduce`] returned for this phase, or empty.
+    ///
+    /// **One blob for the phase, not one per block**: every block of the phase
+    /// is handed the same bytes, computed once after the barrier and before any
+    /// block ran. Empty for every phase whose op takes the default `reduce`, and
+    /// empty for every phase that is not a [barrier], because a phase with no
+    /// barrier has no moment at which the fragment set is complete and therefore
+    /// nothing well defined to reduce — which is why declaring one without the
+    /// other is refused at plan time by [`check_phase_work`].
+    ///
+    /// It is the op's own encoding, so the op's own decode is where a mismatch
+    /// surfaces. Give it a magic and a version: nothing outside the op can know
+    /// what the reduction was supposed to be, so nothing outside the op can
+    /// check it.
+    ///
+    /// [barrier]: FragmentOp::barrier
+    pub reduced: &'a [u8],
     env: &'a dyn Environment,
     pixels: Option<&'a BlockBuf>,
     /// Stream -> (producing phase, the blocks the declaration asks for).
@@ -357,11 +374,19 @@ impl<'a> BlockView<'a> {
             valid,
             at,
             dtype,
+            reduced: &[],
             env,
             pixels,
             wanted,
             gathered,
         }
+    }
+
+    /// Hand this block the phase's reduction. The executor's, and only for a
+    /// phase whose op declared [`FragmentOp::barrier`].
+    pub(crate) fn with_reduced(mut self, reduced: &'a [u8]) -> Self {
+        self.reduced = reduced;
+        self
     }
 
     /// The block's pixels, or an error naming the declaration that would have
@@ -470,6 +495,193 @@ impl<'a> BlockView<'a> {
             }
         }
         Ok(seen)
+    }
+}
+
+/// The whole phase, at the one moment a [barrier] creates: every block of the
+/// phase below has finished, and no block of this phase has started.
+///
+/// What [`FragmentOp::reduce`] is handed, and it gives **fragments and not
+/// pixels**. A reduction that needed pixels would not be a reduction over
+/// fragments and belongs in a per-block `apply`; what a fragment reduction needs
+/// is every block's fragments and the lattice they are keyed on, which is
+/// exactly what is here.
+///
+/// **Every block of the lattice, not a declared neighbourhood.** A
+/// [`FragmentInput`]'s reach says what one *block* gathers; this is the phase,
+/// and the barrier is precisely the statement that the whole set exists. That
+/// separation is where the money is: with a reduction hoisted to here, the
+/// per-block reach can drop to zero, and the fragment set is transmitted twice —
+/// written once, read once — instead of once per block.
+///
+/// The streams offered are the ones the op declared in [`FragmentOp::inputs`],
+/// because an op that reduces over a stream it never declared is reading
+/// something the plan does not know it reads.
+///
+/// [barrier]: FragmentOp::barrier
+pub struct PhaseView<'a> {
+    /// The phase being reduced — the one whose blocks are about to run.
+    pub phase: usize,
+    /// This phase's lattice.
+    pub grid: &'a BlockGrid,
+    /// `None` at plan time; see [`Self::at_plan_time`].
+    env: Option<&'a dyn Environment>,
+    /// Stream -> the phase that wrote it.
+    streams: BTreeMap<String, usize>,
+    /// Every block of the lattice, row-major.
+    blocks: Vec<[usize; 3]>,
+}
+
+impl<'a> PhaseView<'a> {
+    pub(crate) fn new(
+        phase: usize,
+        grid: &'a BlockGrid,
+        env: &'a dyn Environment,
+        streams: BTreeMap<String, usize>,
+    ) -> Self {
+        let blocks = grid.cores().into_iter().map(|core| core.index).collect();
+        Self {
+            phase,
+            grid,
+            env: Some(env),
+            streams,
+            blocks,
+        }
+    }
+
+    /// A view that refuses everything, used to ask an op **at plan time**
+    /// whether its `reduce` computes anything.
+    ///
+    /// There is no way to observe that a trait method has been overridden, and
+    /// the alternative to this was a third boolean beside
+    /// [`FragmentOp::barrier`] — one an op author could override `reduce` and
+    /// forget, leaving the reduction silently never run. So the plan asks
+    /// instead: an op that takes the default answers `Ok(&[])` for free, and an
+    /// op that overrode `reduce` either touches this view, which errors, or
+    /// returns bytes, which is equally an answer. Either way
+    /// [`check_phase_work`] can name it.
+    ///
+    /// **What it does not catch**: an override that ignores the view and returns
+    /// empty, which is the default by another spelling and reduces to nothing.
+    /// **What it costs**, and the count is the part that matters: the op's
+    /// `reduce` is entered once per **non-barrier fragment phase** per
+    /// [`check_phase_work`], and `check_phase_work` runs once per
+    /// `execute_phases` — a call the conformance sweep makes thousands of times.
+    /// So the number of probes is (fragment phases) x (runs), and both are
+    /// things a caller is free to increase. That is affordable only because the
+    /// default answer is `Ok(Vec::new())`, which is a virtual call and an empty
+    /// `Vec`, and an empty `Vec` allocates nothing. An override pays whatever it
+    /// does before it touches the view, at that same multiplicity, and one that
+    /// unwraps rather than propagating panics there. All of it is visible; none
+    /// of it is silent.
+    pub(crate) fn at_plan_time(phase: usize, grid: &'a BlockGrid) -> Self {
+        Self {
+            phase,
+            grid,
+            env: None,
+            streams: BTreeMap::new(),
+            blocks: Vec::new(),
+        }
+    }
+
+    /// The volume this phase's lattice is cut from.
+    pub fn volume(&self) -> [usize; 3] {
+        self.grid.volume()
+    }
+
+    /// Every block of the lattice. Empty at plan time.
+    ///
+    /// Row-major, which is the lattice's own order and a function of the plan
+    /// rather than of the schedule — so a reduction is reproducible for a given
+    /// lattice whatever order the blocks *ran* in. It is **not** the same order
+    /// on two different lattices, which is why an op that declares
+    /// [`SeamFold::Unordered`] has its reduction checked the same way its blocks
+    /// are: the executor reduces a second time with the lattice walked backwards
+    /// and requires the same bytes.
+    pub fn blocks(&self) -> &[[usize; 3]] {
+        &self.blocks
+    }
+
+    /// The same view with the lattice walked backwards.
+    ///
+    /// The executor builds it for an op declaring [`SeamFold::Unordered`] and
+    /// requires the reduction to come out byte-identical, which is exactly what
+    /// it already does to such an op's *blocks*. The two checks are the same
+    /// check: a fold that does not associate answers differently when the
+    /// fragments arrive in a different order, and between two lattices they
+    /// always do.
+    ///
+    /// It costs one extra reduction for an op that opted in, against the one
+    /// extra `apply` per block the same declaration already costs.
+    pub(crate) fn reversed(&self) -> Self {
+        let mut blocks = self.blocks.clone();
+        blocks.reverse();
+        Self {
+            phase: self.phase,
+            grid: self.grid,
+            env: self.env,
+            streams: self.streams.clone(),
+            blocks,
+        }
+    }
+
+    /// Visit every fragment of `stream` over the whole lattice, one at a time.
+    ///
+    /// The primary accessor, and streaming rather than gathering for
+    /// [`BlockView::stream_fragments`]' reason: the whole set is what a
+    /// reduction is over, and holding it costs whatever it weighs. A block that
+    /// wrote no fragment does not appear; a hole is a normal outcome and the op
+    /// decides what it means. Returns how many were seen.
+    pub fn stream_fragments(
+        &self,
+        stream: &str,
+        visit: &mut dyn FnMut(&FragmentKey, &[u8]) -> Result<()>,
+    ) -> Result<usize> {
+        let (env, from) = self.resolve(stream)?;
+        let mut seen = 0usize;
+        for &block in &self.blocks {
+            if let Some(bytes) = env.read_sidecar(stream, from, block)? {
+                visit(&FragmentKey::new(stream, from, block), &bytes)?;
+                seen += 1;
+            }
+        }
+        Ok(seen)
+    }
+
+    /// Every fragment of `stream` over the whole lattice, in key order.
+    ///
+    /// The convenience form of [`Self::stream_fragments`], for a reduction whose
+    /// working set is the whole set anyway — a union-find over face labels is
+    /// one. It holds the set; [`Self::stream_fragments`] does not.
+    pub fn fragments(&self, stream: &str) -> Result<Vec<(FragmentKey, Vec<u8>)>> {
+        let mut found = Vec::new();
+        self.stream_fragments(stream, &mut |key, bytes| {
+            found.push((key.clone(), bytes.to_vec()));
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
+    fn resolve(&self, stream: &str) -> Result<(&'a dyn Environment, usize)> {
+        let Some(env) = self.env else {
+            return Err(Error::InvalidArgument(format!(
+                "a fragment op's `reduce` asked for stream {stream:?}, and there is no \
+                 fragment set to ask. `reduce` runs at one moment — after the phase below \
+                 has finished and before any block of this phase starts — and that moment \
+                 exists only for a phase whose op declares `barrier() == true`. This op does \
+                 not, so the plan is being asked what its `reduce` computes; see \
+                 `PhaseView::at_plan_time`."
+            )));
+        };
+        let from = *self.streams.get(stream).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "a fragment op's `reduce` asked for stream {stream:?}, which it did not \
+                 declare in `inputs`. A reduction reads the streams the plan records, for the \
+                 same reason a block does: an undeclared stream is one the plan neither \
+                 orders nor prices."
+            ))
+        })?;
+        Ok((env, from))
     }
 }
 
@@ -616,50 +828,54 @@ pub trait FragmentOp: Send + Sync {
     /// op whose answer depends on every block returns `volume_len`, and see the
     /// module header for exactly what the geometry then does.
     ///
-    /// # The default is `0`, and that contradicts the rule the sibling trait states
+    /// # There is no default, and the reason is not that a default was wrong
     ///
-    /// [`BlockOp::reach`] is the same quantity under the same contract and it has
-    /// **no default**, for a reason written out beside it: *it is the one place a
-    /// silent zero would produce a complete, well-formed, wrong volume.* Every
-    /// word of that applies here. An op that reads a neighbourhood and forgets to
-    /// say so gets valid regions wider than its answers support, the seam voxels
-    /// are wrong, and nothing anywhere reports it.
+    /// There was one, at `0`, and it was **correct for every implementor that
+    /// took it** — structurally rather than luckily: a fragment op resolves what
+    /// crosses a block boundary through the fragment *stream*, whose reach is
+    /// declared separately, and the pixel-reading ones — a plateau labeller, a
+    /// regional-maxima mask, a connected-component labeller, a hole filler — all
+    /// read their own block's pixels and reach across seams through that stream.
+    /// Nothing was found wrong at `0` when every implementor was migrated to
+    /// declare it, and each was checked against its own `apply` rather than
+    /// waved through.
     ///
-    /// **The guard is not the protection, and cannot be made into one.** The
-    /// check in [`Decomposition::check`] fires when the granted halo is narrower
-    /// than the declared reach. [`fragment_phase`] builds the halo *from* the
-    /// reach and only ever widens it, so for a plan this crate builds the guard
-    /// is structurally unable to fire — it exists for a plan that arrives from
-    /// elsewhere or off a wire, which is real but is a different failure. A reach
-    /// under-declared at zero satisfies every halo there is. `tests/fragment_ops.rs`
-    /// keeps the guard honest for the case it *can* see, a full reach against a
-    /// short halo; no test can be written for this one, because there is nothing
-    /// to observe.
+    /// It is gone because [`BlockOp::reach`] is the same quantity under the same
+    /// contract and has never had one, for a reason written out beside it: *it
+    /// is the one place a silent zero would produce a complete, well-formed,
+    /// wrong volume.* Every word of that applies here. **The value is that a
+    /// future op author is forced to think**, not that anything is being fixed.
+    /// An op that reads a neighbourhood and forgets to say so gets valid regions
+    /// wider than its answers support, the seam voxels are wrong, and nothing
+    /// anywhere reports it.
     ///
-    /// # Audited before it was left alone
+    /// # The guard cannot substitute for the type system here
     ///
-    /// Across this crate, its test suite and its caller, a minority of the
-    /// implementors override this method and the rest take the default. Every one
-    /// of the defaulting ones is **correct** at zero, and correct for a reason
-    /// that is structural rather than lucky: a fragment op resolves what crosses
-    /// a block boundary through the fragment stream, whose reach is declared
-    /// separately and in blocks on [`FragmentInput`], not through a pixel halo.
-    /// The pixel-reading ones — a plateau labeller, a regional-maxima mask, a
-    /// connected-component labeller, a hole filler — all read their own block's
-    /// pixels and reach across seams through a stream.
+    /// The check in [`Decomposition::check`] fires when the granted halo is
+    /// narrower than the declared reach. [`fragment_phase`] initialises
+    /// `halo = reach` and only ever widens it, so for a plan this crate builds
+    /// the guard is **structurally unable to fire** against an under-declared
+    /// reach — a reach under-declared at zero satisfies every halo there is. It
+    /// exists for a plan that arrives from elsewhere or off a wire, which is
+    /// real and is a different failure; `tests/fragment_ops.rs` keeps it honest
+    /// for the case it *can* see, a full reach against a short halo. No test can
+    /// be written for the under-declared case, because there is nothing to
+    /// observe. That absence is the whole argument for making the compiler carry
+    /// it.
     ///
-    /// So the default is not producing a wrong answer anywhere today. What it is
-    /// producing is *silence*, in the one place this crate has decided silence is
-    /// not allowed, and the fix is the one `BlockOp` already took: remove the
-    /// default. That is a change to every implementor, several of which are
-    /// outside this file, so it is stated here as the argument rather than made
-    /// here as an edit.
+    /// # A phase reach is voxels; a fragment reach is blocks
+    ///
+    /// The two live next to each other on the same op and are the mistake this
+    /// method's answer is most often confused with. **This one is voxels**, in
+    /// the phase's own coordinate space, and it is what gets shrunk off the read
+    /// extent. [`FragmentInput::reach`] is **blocks**, on the lattice, and it is
+    /// what decides which neighbours' fragments a task gathers. An op that
+    /// reaches a whole lattice through a stream and reads only its own pixels
+    /// answers `volume_len` to *that* and `0` to this.
     ///
     /// [`BlockOp::reach`]: crate::op::BlockOp::reach
     /// [`Decomposition::check`]: crate::decomposition::Decomposition::check
-    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
-        0
-    }
+    fn reach(&self, axis: usize, volume_len: usize) -> usize;
 
     /// Relative compute cost per voxel of the block this op is handed.
     ///
@@ -740,6 +956,119 @@ pub trait FragmentOp: Send + Sync {
     /// for a `fragments -> volume` op, which writes pixels instead.
     fn outputs(&self) -> Vec<FragmentOutput> {
         Vec::new()
+    }
+
+    /// Does this phase wait for **all** of the phase below it, rather than for
+    /// the blocks whose valid regions cover what it fetches?
+    ///
+    /// `false` by default, so nothing that ships today changes.
+    ///
+    /// # What it is for
+    ///
+    /// A dependency in this crate is a region intersection and nothing else,
+    /// which has one consequence nobody chose: *the region a phase fetches and
+    /// the set of tasks it waits for are the same number.* So an op whose answer
+    /// depends on every block — a component merge, a global threshold, a
+    /// whole-volume histogram a later phase consumes — could only say so by
+    /// **fetching the whole volume in every block**, and be charged for it. That
+    /// is `blocks x volume` of reads to compute a table of kilobytes;
+    /// `docs/design/barriers.md` measures it at 25.4x the traffic of the same
+    /// answer computed once.
+    ///
+    /// This says it instead. `fragment_phase` then stops widening the halo to
+    /// cover the fragment reach — `halo = reach`, so a reduction that reads only
+    /// its own core fetches its own core — and every scheduler over the plan
+    /// holds the phase's blocks until every earlier phase has finished, which is
+    /// what [`TaskGraph::barriers`](crate::graph::TaskGraph::barriers) records
+    /// and [`TaskGraph::is_barrier`](crate::graph::TaskGraph::is_barrier) is
+    /// consulted for. The *edges* stay what they always were — region
+    /// intersections — so the phase's dependency on the fetch shrinks with the
+    /// halo and the guard on that fetch keeps its full force.
+    ///
+    /// # It is a declaration and not a hint
+    ///
+    /// `Hints` is the advisory half of this crate — any strategy may ignore,
+    /// override or recompute all of it and still be correct. This is not
+    /// advisory. **A barrier ignored is a wrong answer**, and a
+    /// schedule-dependent one: the blocks that happened to run late would see a
+    /// complete fragment set and the ones that ran early would not. So it is
+    /// recorded on [`PhaseDecomposition::barrier`], hashed into the plan's
+    /// fingerprint and carried over the wire.
+    ///
+    /// # What it gives up, stated exactly
+    ///
+    /// Pipelining across phases is real here and is indegree-driven; a barrier
+    /// gives it up at **this phase's own start edge and nowhere else**. The
+    /// phases before it still pipeline among themselves, the phases after it
+    /// likewise, and the blocks *within* it still run concurrently — it
+    /// constrains when the phase may start, not how it runs.
+    ///
+    /// For the op this exists for it gives up nothing at all, because a phase
+    /// with a whole-lattice fragment reach already had a whole-volume halo and
+    /// therefore already waited for every block; the barrier changes only how it
+    /// says so.
+    ///
+    /// **The cost is a new way to be wrong.** An op that declares a barrier it
+    /// does not need serialises two phases that could have overlapped, and
+    /// nothing will tell it so — exactly as nothing tells an op that declares
+    /// too large a reach. `Decomposition::check` cannot catch either, because
+    /// both are statements about what an op needs and only the op knows.
+    ///
+    /// [`PhaseDecomposition::barrier`]: crate::decomposition::PhaseDecomposition::barrier
+    fn barrier(&self) -> bool {
+        false
+    }
+
+    /// Computed **once for the phase**, after the barrier and before any block
+    /// runs. Empty by default, so nothing that ships today changes.
+    ///
+    /// # Why it is not a per-block quantity, when everything else here is
+    ///
+    /// A phase is a function applied per block, and `apply` takes `&self` and a
+    /// [`BlockView`], so every quantity a `FragmentOp` can produce is per-block
+    /// by construction. The merge a fragment-and-join op performs is not: it is
+    /// a function of the whole fragment set, it is the same table for every
+    /// block, and today it is re-derived once per block because there is
+    /// nowhere else to put it. `docs/design/barriers.md` §7.2 times that at
+    /// **33.67 s at 256 blocks against a 3.80 s pipeline** — 0.13 s per
+    /// invocation, which is small, times the block count, which nobody had
+    /// multiplied.
+    ///
+    /// # It requires [`Self::barrier`], and the plan refuses it without one
+    ///
+    /// Without a barrier the blocks of this phase become ready individually, so
+    /// there is no moment at which "the fragment set is complete" exists to
+    /// hoist to, and a reduction computed at any other moment is computed from
+    /// whatever had been written — a schedule-dependent wrong answer.
+    /// [`check_phase_work`] refuses the pair rather than running it.
+    ///
+    /// # The currency is bytes
+    ///
+    /// `Vec<u8>` rather than an associated type, because a `FragmentOp` is used
+    /// as `&dyn FragmentOp` throughout and an associated type is not
+    /// object-safe. Bytes are also what fragments already travel in, so the
+    /// round trip is the machinery rather than new machinery. The blob reaches
+    /// every block as [`BlockView::reduced`].
+    ///
+    /// # Not a `OnceLock`, and this is the tempting version
+    ///
+    /// With a barrier, an op could fill a `OnceLock<T>` on its first `apply` and
+    /// every later block would find it, needing no framework change at all. It
+    /// is wrong: a method must be a total function of its operands rather than
+    /// of its operands plus what an earlier call left behind. A `OnceLock` makes
+    /// the op single-use — run the same op over a second lattice and it answers
+    /// with the first lattice's table, silently.
+    ///
+    /// # The way to be wrong here is worse than the barrier's
+    ///
+    /// An op that computes the wrong thing in `reduce` gets a plausible answer
+    /// in **every** block, and unlike a wrong halo there is no guard that could
+    /// catch it: the executor cannot know what the reduction was supposed to be.
+    /// The only mitigation is the one this crate already uses for fragments —
+    /// the blob is the op's own encoding, so the op's own decode is where a
+    /// mismatch surfaces. Give it a magic and a version.
+    fn reduce(&self, _at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        Ok(Vec::new())
     }
 
     /// Should the executor gather the declared neighbourhood before calling
@@ -976,9 +1305,25 @@ pub fn fragment_phase(op: &dyn FragmentOp, grid: BlockGrid) -> Result<PhaseDecom
     for (axis, value) in reach.iter_mut().enumerate() {
         *value = op.reach(axis, volume[axis]);
     }
+    // **This is where the amplification goes.** A fragment reach is a statement
+    // about which *blocks* this one needs to have heard from, and the only way
+    // to say that before `barrier` existed was to fetch their voxels — so a
+    // whole-lattice reach produced a whole-volume halo, a whole-volume fetch and
+    // an edge to every task below, all three at once and all three charged. A
+    // barrier says the third directly, so the first two are no longer the price
+    // of it: `halo = reach`, and a reduction that reads only its own core
+    // fetches its own core.
+    //
+    // The *source* reach below still widens the halo, and must: that is a
+    // genuine pixel window on a second array, and no barrier makes a buffer
+    // wider than it was read.
+    let barrier = op.barrier();
     let mut halo = reach;
     for input in op.inputs() {
         check_stream_name(&input.stream)?;
+        if barrier {
+            continue;
+        }
         for axis in 0..3 {
             halo[axis] = halo[axis].max(input.reach[axis].saturating_mul(edge[axis]));
         }
@@ -1022,7 +1367,8 @@ pub fn fragment_phase(op: &dyn FragmentOp, grid: BlockGrid) -> Result<PhaseDecom
         PhaseDecomposition::derive(Vec::new(), Vec::new(), reach, halo, grid)
             .with_source_images(images)
             .with_supplied_dtypes(supplied)
-            .reading_input_image(op.reads_pixels()),
+            .reading_input_image(op.reads_pixels())
+            .with_barrier(barrier),
     )
 }
 
@@ -1187,9 +1533,78 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                 entry.describe()
             )));
         }
+        // **The record against what can produce it.** `barrier` is set only by
+        // `fragment_phase`, from `FragmentOp::barrier`, so a barrier recorded on
+        // a phase that runs no fragment op is a barrier no op asked for — and
+        // its effect is to serialise two phases silently, which is precisely the
+        // failure this field's own documentation names. Nothing that shipped
+        // before the field existed records it, so nothing that shipped is
+        // refused.
+        if phase.barrier && !entry.is_fragments() {
+            return Err(Error::InvalidArgument(format!(
+                "decomposition phase {index} records a barrier — that it waits for every task \
+                 of the phase below rather than for the ones covering what it fetches — and it \
+                 runs {}. Only a fragment op can declare one (`FragmentOp::barrier`), so this \
+                 is a barrier nothing asked for, and what it does is serialise two phases that \
+                 could have overlapped, with no diagnostic anywhere.",
+                entry.describe()
+            )));
+        }
         let PhaseWork::Fragments(op) = entry else {
             continue;
         };
+        // The same disagreement in the direction that matters more. The plan's
+        // record is what `TaskGraph::build` takes its edges from and what
+        // `fragment_phase` sized the halo against; the op's declaration is what
+        // the op believes. A plan recording `false` for an op that declares
+        // `true` waits for the blocks covering its fetch — which, with the halo
+        // relieved, is its own core — and computes its answer from a fragment
+        // set that is however complete the schedule left it.
+        if phase.barrier != op.barrier() {
+            return Err(Error::InvalidArgument(format!(
+                "phase {index}: fragment op {:?} declares `barrier() == {}` and the \
+                 decomposition records {}. The record is what the DAG takes its edges from \
+                 and what the halo was sized against, so a plan that disagrees with its op \
+                 fetches one thing and waits for another. Build the phase with \
+                 `fragment_phase`, which records what the op says.",
+                op.name(),
+                op.barrier(),
+                phase.barrier
+            )));
+        }
+        // **`reduce` without `barrier` is refused here rather than run.** There
+        // is no moment in a phase without a barrier at which the fragment set is
+        // complete, so a reduction hoisted to one would be computed from
+        // whatever had been written — a wrong answer that depends on the
+        // schedule, and the same hazard the barrier exists to remove. The op is
+        // asked rather than believed, because a trait method's overriding cannot
+        // be observed; see `PhaseView::at_plan_time` for what that costs and
+        // what it misses.
+        if !op.barrier() {
+            let probe = PhaseView::at_plan_time(index, &phase.grid);
+            let answered = op.reduce(&probe);
+            if answered
+                .as_ref()
+                .map(|bytes| !bytes.is_empty())
+                .unwrap_or(true)
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index}: fragment op {:?} computes a phase reduction and declares \
+                     `barrier() == false`. `reduce` runs at one moment — after every block of \
+                     the phase below has finished and before any block of this phase starts — \
+                     and a phase without a barrier has no such moment: its blocks become ready \
+                     one at a time, so a reduction taken at any of them is taken over whatever \
+                     fragments happened to exist, which is a plausible answer that depends on \
+                     the schedule. Declare `barrier() == true`, or move the computation into \
+                     `apply` where it is a function of the block. (The op answered: {})",
+                    op.name(),
+                    match &answered {
+                        Ok(bytes) => format!("{} byte(s)", bytes.len()),
+                        Err(err) => err.to_string(),
+                    }
+                )));
+            }
+        }
         if !phase.slots.is_empty() {
             return Err(Error::InvalidArgument(format!(
                 "phase {index} runs fragment op {:?} but the decomposition gives it chain \
@@ -1519,6 +1934,26 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                     edge
                 )));
             }
+            // **A barrier phase is exempt, and for the reason the guard is
+            // about rather than by exemption.** What the halo buys below is the
+            // *ordering*: a wide halo makes a wide fetch, a wide fetch makes the
+            // neighbours' tasks dependencies of this one, and that is what stops
+            // a block reading a fragment nobody has written. A barrier states
+            // the ordering directly — no block of this phase runs until every
+            // earlier phase has finished, which every scheduler over the plan
+            // enforces from `TaskGraph::is_barrier` — so the fragments exist
+            // whatever the halo is, and requiring a halo here would re-impose
+            // exactly the whole-volume fetch the barrier exists to remove. The
+            // guard still binds for every phase that does not declare one, which
+            // is every phase this crate shipped.
+            //
+            // It does not follow that a barrier makes *any* stream readable. The
+            // reach still decides which blocks a task gathers, and
+            // `check_phase_work` above still requires the producing phase to be
+            // an earlier one on the same lattice.
+            if phase.barrier {
+                continue;
+            }
             // The narrowest side granted on the worst block, because the
             // question is whether every task can see its neighbours' fragments —
             // a halo that is generous somewhere else does not answer it.
@@ -1734,6 +2169,11 @@ mod tests {
             "nothing"
         }
 
+        /// Nothing is read at all, so nothing is read outside the core.
+        fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+            0
+        }
+
         fn outputs(&self) -> Vec<FragmentOutput> {
             vec![FragmentOutput::new(
                 "out",
@@ -1752,6 +2192,13 @@ mod tests {
     impl FragmentOp for Reaching {
         fn name(&self) -> &'static str {
             "reaching"
+        }
+
+        /// **Zero, and the reach in `inputs` is a different quantity.** This one
+        /// is voxels of the block's own image; that one is blocks of a fragment
+        /// stream. What crosses a seam here crosses it through the stream.
+        fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+            0
         }
 
         fn inputs(&self) -> Vec<FragmentInput> {

@@ -30,7 +30,16 @@
 // * reading the six label planes off a block and encoding them as words;
 // * the flat `(block, label)` numbering, the seam walk over the lattice, and the
 //   fold of a per-label boolean onto its component's root;
-// * the seeded flood fill itself, over a **per-voxel** membership test.
+// * the seeded flood fill itself, over a **per-voxel** membership test;
+// * **where the global merge runs** — [`Merge`] — and the encoding of what it
+//   produces, [`encode_block_flags`] and [`decode_block_flags_for`].
+//
+// The last pair arrived with `docs/design/barriers.md`. Phase 1 of every op here
+// declares `FragmentOp::barrier` and computes its union-find once for the phase
+// rather than once per block, and what it hands the blocks is one flag per label
+// per block — the same map all of these merges already returned. So the blob and
+// the declaration that selects it are shared for the same reason the seam walk
+// is: they are the program, not the question.
 //
 // The last one is here because two of the three ops built on this differ only in
 // that test — `fill` labels the voxels a mask leaves clear, `detect` labels the
@@ -555,6 +564,241 @@ pub fn expect_end(words: &[u32], at: usize, noun: &str) -> Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------- where the merge runs --
+
+/// Where a fragment-and-join op's global merge is computed, which is the whole
+/// of what `docs/design/barriers.md` is about.
+///
+/// The three shapes are not three algorithms. The merge is one function of the
+/// whole fragment set and every variant here computes the same one; what varies
+/// is **how many times it runs and what the phase must fetch to run it**, and
+/// that is a factor of the block count in three separate currencies. So the
+/// choice is stated as one word rather than as two booleans on the op, and the
+/// acceptance suite builds all three arms out of one op — a difference in the
+/// counters is then attributable to this declaration and to nothing else.
+///
+/// [`Self::OnceForThePhase`] is the default and is what ships. The other two
+/// exist so that what the default buys can be **measured** rather than asserted,
+/// and so that the liveness control the migration needs can be written: the same
+/// op with the barrier withheld must produce the same answer, or the barrier is
+/// doing something other than what it claims. `tests/fragment_join_barrier.rs`
+/// is where all three arms are built out of one op, and a downstream consumer
+/// uses [`Self::PerBlock`] the same way — to keep the `N + 1` read law the
+/// barrier retired measurable rather than remembered, from a suite that had
+/// asserted it since before the barrier existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Merge {
+    /// Once per block, inside `apply`, over a **whole-lattice fragment reach**.
+    ///
+    /// What this op was before a barrier could be declared, and the only shape
+    /// the framework admitted. The fragment reach is also the halo and the halo
+    /// is also the dependency edge, so this fetches the whole image in every
+    /// block, transmits the whole fragment set in every block, and runs the
+    /// union-find in every block. All three are linear in the block count *per
+    /// block*.
+    PerBlock,
+    /// Once per block, but behind a [barrier].
+    ///
+    /// The halo is relieved — the phase fetches its own core — and the pixel
+    /// amplification goes with it. The fragment set is still transmitted once
+    /// per block and the union-find still runs once per block, so this is the
+    /// middle arm and it is here to be measured, not to be used.
+    ///
+    /// [barrier]: crate::fragment::FragmentOp::barrier
+    PerBlockBehindABarrier,
+    /// Once for the phase, at the moment the barrier creates.
+    ///
+    /// The fragment reach drops to nothing, the phase gathers no fragments per
+    /// block, and the merge runs in [`FragmentOp::reduce`] over the whole set —
+    /// which the barrier is precisely the statement that it exists. Every block
+    /// reads its own answer out of the blob.
+    #[default]
+    OnceForThePhase,
+}
+
+impl Merge {
+    /// Does this shape declare a barrier?
+    pub fn is_barriered(self) -> bool {
+        !matches!(self, Merge::PerBlock)
+    }
+
+    /// Does this shape hoist the merge out of the per-block loop?
+    pub fn is_hoisted(self) -> bool {
+        matches!(self, Merge::OnceForThePhase)
+    }
+}
+
+// ------------------------------------------------------ the reduction --
+
+/// The version of the reduction blob's own encoding.
+const REDUCTION_VERSION: u32 = 1;
+
+/// A merge's whole answer — one flag per label per block — as bytes.
+///
+/// The shape both fragment-and-join ops in this file's family reduce to:
+/// `merge_faces_with` and `regional::merge_plateaux_with` return exactly this
+/// map, keyed by block index, one `Vec<bool>` in label order. The blob is what
+/// [`FragmentOp::reduce`] hands the phase and what every block then reads its
+/// own row out of with [`decode_block_flags_for`].
+///
+/// `magic` is the caller's, so two ops sharing this codec cannot decode each
+/// other's blob — `components::read_header`'s argument, applied to a second kind
+/// of byte string travelling through the same op.
+///
+/// # Layout
+///
+/// Little-endian `u32` throughout: `[magic, version, total flags, counts x 3]`,
+/// then one word per block giving that block's label count, then the flags
+/// themselves, blocks in the lattice's row-major order. The per-block lengths
+/// are held separately from the flags so that a block can seek to its own row
+/// without decoding anybody else's — the blob is read once per block and a
+/// linear scan would put the block count back into a cost the hoisting exists to
+/// remove.
+///
+/// **The lattice is in the blob and is checked on the way out.** A reduction is
+/// a function of the cut, and a blob from another cut would answer every block
+/// plausibly and wrongly, which is the failure `barriers.md` §7.7 says no guard
+/// could catch afterwards. This is the one place it can be caught, so it is.
+///
+/// Here rather than in an op for this module's own reason: every
+/// fragment-and-join op in the crate merges to exactly this map, so the encoding
+/// is the family's and not any one op's. It landed in `ops::fill` first, on
+/// `agree_on_connectivity`'s precedent, and was moved once the family had four
+/// members.
+pub fn encode_block_flags(
+    flags: &BTreeMap<[usize; 3], Vec<bool>>,
+    counts: [usize; 3],
+    magic: u32,
+) -> Result<Vec<u8>> {
+    let n_blocks = counts[0] * counts[1] * counts[2];
+    if flags.len() != n_blocks {
+        return Err(Error::InvalidArgument(format!(
+            "a merge over a lattice of {counts:?} produced answers for {} block(s) and the \
+             lattice has {n_blocks}. Every block's row is in the blob because every block \
+             reads one out of it.",
+            flags.len()
+        )));
+    }
+    let mut lengths: Vec<u32> = Vec::with_capacity(n_blocks);
+    let mut body: Vec<u32> = Vec::new();
+    for (position, (block, mine)) in flags.iter().enumerate() {
+        // A `BTreeMap<[usize; 3], _>` iterates in lexicographic key order, which
+        // *is* the lattice's row-major order — so the positions are already
+        // right and this checks the identity rather than establishing it.
+        let expected = linear_index(*block, counts).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "the merge answered for block {block:?}, which is not a block of a {counts:?} \
+                 lattice"
+            ))
+        })?;
+        if expected != position {
+            return Err(Error::InvalidArgument(format!(
+                "block {block:?} is at position {expected} of a {counts:?} lattice and arrived \
+                 {position} entries into the merge's answer. The blob is addressed by position, \
+                 so a map that does not iterate in the lattice's own order would be read back \
+                 under the wrong block."
+            )));
+        }
+        lengths.push(mine.len() as u32);
+        body.extend(mine.iter().map(|&flag| u32::from(flag)));
+    }
+    let mut words: Vec<u32> = vec![
+        magic,
+        REDUCTION_VERSION,
+        body.len() as u32,
+        counts[0] as u32,
+        counts[1] as u32,
+        counts[2] as u32,
+    ];
+    words.extend(lengths);
+    words.extend(body);
+    Ok(words_to_bytes(&words))
+}
+
+/// One block's row of a blob [`encode_block_flags`] wrote.
+///
+/// `noun` names the blob in whatever this op calls it, for the same reason the
+/// fragment decoders take one: the message a caller sees should say which byte
+/// string was wrong.
+pub fn decode_block_flags_for(
+    bytes: &[u8],
+    counts: [usize; 3],
+    block: [usize; 3],
+    magic: u32,
+    noun: &str,
+) -> Result<Vec<bool>> {
+    if bytes.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "{noun} is empty. That is what a block is handed when its phase computed no \
+             reduction — a phase with no barrier has no moment at which the fragment set is \
+             complete, and the plan refuses that pair, so an empty blob here means this block \
+             was run through an entry point that carries none. See \
+             `strategy::execute_task_with_reduction`."
+        )));
+    }
+    let words = bytes_to_words(bytes, noun)?;
+    let total = read_header(&words, magic, REDUCTION_VERSION, noun)? as usize;
+    const LATTICE_AT: usize = 3;
+    const BODY_AT: usize = 6;
+    if words.len() < BODY_AT {
+        return Err(Error::InvalidArgument(format!(
+            "{noun} ends inside its lattice"
+        )));
+    }
+    let recorded = [
+        words[LATTICE_AT] as usize,
+        words[LATTICE_AT + 1] as usize,
+        words[LATTICE_AT + 2] as usize,
+    ];
+    if recorded != counts {
+        return Err(Error::InvalidArgument(format!(
+            "{noun} was reduced over a lattice of {recorded:?} and is being read by a block of \
+             a {counts:?} one. A merge is a function of the cut, so a blob from another cut \
+             answers every block of this one plausibly and wrongly."
+        )));
+    }
+    let n_blocks = counts[0] * counts[1] * counts[2];
+    if words.len() != BODY_AT + n_blocks + total {
+        return Err(Error::InvalidArgument(format!(
+            "{noun} holds {} word(s) and a {counts:?} lattice with {total} flag(s) is {}",
+            words.len(),
+            BODY_AT + n_blocks + total
+        )));
+    }
+    let position = linear_index(block, counts).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "block {block:?} is not a block of a {counts:?} lattice, which is what {noun} was \
+             reduced over"
+        ))
+    })?;
+    let lengths = &words[BODY_AT..BODY_AT + n_blocks];
+    let start: usize = lengths[..position].iter().map(|&n| n as usize).sum();
+    let len = lengths[position] as usize;
+    let body = &words[BODY_AT + n_blocks..];
+    if start + len > body.len() {
+        return Err(Error::InvalidArgument(format!(
+            "{noun} says block {block:?} has {len} flag(s) starting at {start} and holds \
+             {} in all",
+            body.len()
+        )));
+    }
+    Ok(body[start..start + len]
+        .iter()
+        .map(|&word| word != 0)
+        .collect())
+}
+
+/// A block index's position in the lattice's row-major order, or `None` if it is
+/// not a block of that lattice.
+fn linear_index(block: [usize; 3], counts: [usize; 3]) -> Option<usize> {
+    for axis in 0..3 {
+        if block[axis] >= counts[axis] {
+            return None;
+        }
+    }
+    Some((block[0] * counts[1] + block[1]) * counts[2] + block[2])
+}
+
 // ------------------------------------------------------------ the merge --
 
 /// Disjoint sets over a flat node numbering, with path halving and union by
@@ -940,14 +1184,26 @@ fn unequal_faces(
 /// Where the block's core sits inside its read extent, as an offset and an
 /// extent, both in the read buffer's own indices.
 ///
-/// **Both phase-1 ops need this and neither of them is optimising.** A
-/// whole-lattice fragment reach is also a halo, so the read extent of such a
-/// phase is the whole volume and the buffer it is handed holds every block's
-/// labels — numbered per block. A per-block answer decodes that block's
-/// numbering and no other, so rewriting the whole read extent with it would read
+/// **Every phase-1 op on this shape needs this and none of them is optimising.**
+/// A block writes its own numbering and no other: a per-block answer decodes
+/// that block's labels, so rewriting the whole read extent with it would read
 /// block 3's label 2 as this block's label 2. The executor slices the valid
 /// sub-box out of what is returned, and valid is the core, so writing only the
 /// core is both correct and the whole of what is used.
+///
+/// **It used to be that the read extent was the whole volume**, because a
+/// whole-lattice fragment reach was also a halo — `docs/design/barriers.md` §1.2
+/// is that coupling — and so the buffer really did hold every block's labels. An
+/// op that declares `FragmentOp::barrier` fetches its own core instead, and this
+/// function then returns an offset of zero and the core's own extent: the slice
+/// is the identity.
+///
+/// **That is a reason to keep calling it, not to stop.** A caller that dropped
+/// the slice because it currently spans everything would be correct until
+/// something gave the phase a halo again — a second array read at a reach, a
+/// declaration reverted — and would then produce a complete, well-formed, wrong
+/// volume with nothing to refuse it. The cost of keeping it is three
+/// subtractions.
 pub fn core_within_read(at: &BlockView<'_>) -> Result<([usize; 3], [usize; 3])> {
     let mut offset = [0usize; 3];
     let mut extent = [0usize; 3];

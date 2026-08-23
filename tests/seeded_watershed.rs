@@ -52,7 +52,7 @@ use blockflow::op::{Anchor, BlockOp, Chain, SourceInputs};
 use blockflow::ops::scikitimage_watershed::reference_case;
 use blockflow::ops::{
     label_regions_into, seeded_watershed, seeded_watershed_into_reporting_peak, SeededWatershedOp,
-    Separation, WATERSHED_COST, WATERSHED_LINE_COST,
+    Separation, VoxelwiseMapOp, VoxelwiseMaskOp, WATERSHED_COST, WATERSHED_LINE_COST,
 };
 use blockflow::reach::{AxisReach, Reach};
 use blockflow::strategy::{execute, Enumerating, Hints, Strategy, Workflow};
@@ -1141,78 +1141,15 @@ impl BlockOp for SeedLattice {
     }
 }
 
-struct Binarize;
-
-impl BlockOp for Binarize {
-    fn name(&self) -> &'static str {
-        "mask"
-    }
-
-    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
-        0
-    }
-
-    fn accepts(&self, dtype: Dtype) -> bool {
-        dtype == Dtype::F64
-    }
-
-    fn produces(&self, _input: Dtype) -> Dtype {
-        Dtype::Bool
-    }
-
-    fn apply(
-        &self,
-        input: &Voxels,
-        out: &mut Voxels,
-        _at: &Anchor,
-    ) -> Result<(), blockflow::Error> {
-        let source = input.view::<f64>()?;
-        let mut out = out.view_mut::<bool>()?;
-        ndarray::Zip::from(&mut out)
-            .and(&source)
-            .for_each(|slot, &value| *slot = value > WORKFLOW_THRESHOLD);
-        Ok(())
-    }
-}
-
-/// Negate, so the flood runs toward the bright structure. Kept as its own op
-/// rather than folded into the watershed: the cost volume is the caller's, and
-/// this is what "the caller builds it" looks like.
-struct Negate;
-
-impl BlockOp for Negate {
-    fn name(&self) -> &'static str {
-        "negate"
-    }
-
-    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
-        0
-    }
-
-    fn apply(
-        &self,
-        input: &Voxels,
-        out: &mut Voxels,
-        _at: &Anchor,
-    ) -> Result<(), blockflow::Error> {
-        let source = input.view::<f64>()?;
-        let mut out = out.view_mut::<f64>()?;
-        ndarray::Zip::from(&mut out)
-            .and(&source)
-            .for_each(|slot, &value| *slot = -value);
-        Ok(())
-    }
-}
-
 /// Image 0 is the image, 1 the seeds, 2 the mask, 3 the negated cost, 4 the
 /// labels.
 fn chain() -> Chain {
     Chain::sequence(vec![
         Chain::op(SeedLattice),
         Chain::source(0usize, Dtype::F64),
-        Chain::op(Binarize),
+        Chain::op(VoxelwiseMaskOp::threshold("binarize", WORKFLOW_THRESHOLD)),
         Chain::source(0usize, Dtype::F64),
-        Chain::op(Negate),
+        Chain::op(VoxelwiseMapOp::new("negate", |value| -value)),
         Chain::op(SeededWatershedOp::new("watershed", SEEDS, Separation::Line).within(MASK)),
     ])
 }

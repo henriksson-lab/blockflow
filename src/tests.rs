@@ -76,6 +76,7 @@ fn constraints(split_axes: Vec<usize>, candidates: Vec<usize>) -> Constraints {
         model: CostModel::default(),
         block_candidates: candidates,
         split_axes,
+        ..Default::default()
     }
 }
 

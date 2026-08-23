@@ -8,15 +8,24 @@
 //
 // | op | what one row becomes | reads an image | its `FragmentOp` shell |
 // |---|---|---|---|
+// | **source** | **a row of the fragment of the block whose core holds it** | no | [`RowSourceOp`] |
 // | scale | the same row at a scaled coordinate | no | [`ScaleRowsOp`] |
 // | gather | the same row with one more column, read at the row's own coordinate | **yes — a declared second array** | [`GatherRowsOp`] |
 // | filter | itself, or nothing | no | [`FilterRowsOp`] |
 // | **group** | **part of one row of a smaller table** | no | [`GroupRowsOp`] + [`MergeGroupsOp`] |
 //
 // The last one is the odd member and the rest of this header is written about
-// the first three; see *"The reduction, which is the one that is not a map"*
+// the three maps; see *"The reduction, which is the one that is not a map"*
 // below for what it does not share with them and why it is here rather than in
 // a module of its own.
+//
+// The **first** is the odd member from the other end and the one this module
+// spent a while without. Every other op here reads a stream some earlier phase
+// wrote, so a plan whose input *is* a table had nothing to start it and three
+// separate consumers wrote the same producer for themselves — see
+// [`RowSourceOp`], which is now what they are all one of. It is not a map: it
+// reads no rows at all, and what it makes is the phase-0 stream the rest of
+// this table's `input` column names.
 //
 // One kernel, three ops, and why it is not one op
 // -----------------------------------------------
@@ -132,8 +141,15 @@
 // in its core, and cores are disjoint — so if two partials do agree on a least
 // coordinate, one row position was written into two blocks, which is the
 // duplication this module's *"an overlap here costs correctness"* paragraph is
-// about. [`GroupFold::merge`] **refuses** it by name rather than picking a side,
-// which turns the one silent failure a row reduction can have into a diagnostic.
+// about. [`GroupFold::merge`] **refuses** it by name rather than picking a side.
+//
+// That refusal is a *check* and not a proof, and the difference is measured
+// rather than glossed: it fires when the duplicated row is the group's least in
+// both partials, and a duplicate above the least slips through and inflates the
+// group's row count. What rules the general case out is the producer keying by
+// [`owner_of`], which every producer in this crate does. So the refusal is the
+// cheap half of the guarantee, costing one comparison at the seam, and the other
+// half is a property of how the rows were written.
 //
 // Two aggregates for one question, because two references disagree
 // ----------------------------------------------------------------
@@ -386,13 +402,16 @@ use super::tabulate::FixedPoint;
 
 // ------------------------------------------------------- the ordered list --
 
-/// One row, owned: the answer a merge returns.
+/// One row, owned: the answer a merge returns, and the form a producer is given.
 ///
 /// [`Row`] is a cursor into a live table and cannot outlive it, which is right
 /// for a streaming consumer and useless for an assertion. This is the value
 /// form, and it carries the coordinate and every column so that two runs can be
 /// compared **as a whole ordered list** rather than as a set — which is the only
 /// comparison that can see a permutation.
+///
+/// It is what [`RowSourceOp`] takes as well, so the type a reduction hands back
+/// is the type a producer accepts and the loop closes without a conversion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowValues {
     pub at: [usize; 3],
@@ -1077,6 +1096,153 @@ impl RowStreams {
     }
 }
 
+// ------------------------------------------------------------ the producer --
+
+/// A table already in memory, written into the block whose core holds each row.
+///
+/// The kernel of [`RowSourceOp`], and a free function for the module header's
+/// reason: the keying is the whole of the rule, and a rule spelled once inside
+/// a `FragmentOp::apply` can only be checked by building a block view.
+///
+/// **[`owner_of`] and not a division of its own**, so a producer and the
+/// consumers below it agree on which block a coordinate belongs to by
+/// construction rather than by two matching expressions. That agreement is the
+/// precondition the merge's duplication refusal rests on from the other side.
+fn block_rows(
+    grid: &BlockGrid,
+    index: [usize; 3],
+    schema: &Arc<Schema>,
+    rows: &[RowValues],
+) -> Result<Vec<u8>> {
+    let mut builder = RowBuilder::new(schema.clone());
+    for row in rows {
+        if owner_of(grid, row.at) == index {
+            builder.push(row.at, &row.values)?;
+        }
+    }
+    Ok(builder.encode())
+}
+
+/// **A table in, one fragment per block out** — the producer every consumer in
+/// this module assumes and none of them supplies.
+///
+/// Every other op here follows a phase that already emitted rows; the header's
+/// note on how a gather gets its image turns on exactly that. So a plan whose
+/// *input is a table* — a table of measurements from an earlier program, a
+/// coordinate list read off disk — had no op to start with and had to write
+/// one. It was written twice in this exact form: once by a consumer of this
+/// crate, and once by **this crate's own `tests/rows_group.rs`**, which is the
+/// sharper of the two facts. A library whose test suite has to supply the
+/// missing half of its own module is a library with a hole in it, and the copy
+/// sat there beside the very reduction it was feeding.
+///
+/// **The point-flavoured twin is not a case of this op**, and the difference is
+/// one line of [`crate::points`]' header rather than a matter of taste: *a
+/// point blob is headerless where a table blob carries its schema in front*. A
+/// `RowSourceOp` over [`Schema::points`] would write the same words behind a
+/// header `ops::voxelize` does not read. So a `points -> fragments` producer is
+/// a second general shape with a second home — `points`, which owns the type
+/// and the encoding — and it is written three times as this is being read:
+/// `tests/voxelize.rs`, `tests/point_labels.rs`, and once in a consumer.
+///
+/// Nothing in any of those copies depended on anything its caller knew, which
+/// is the definition of something that belongs in a library rather than in its
+/// consumers.
+///
+/// **Phase 0, and it can be nothing else usefully.** It declares no
+/// [`FragmentInput`] and reads no image, so there is nothing it can follow; it
+/// is the thing there is nothing before.
+///
+/// [`Coverage::EveryBlock`], because a block with no rows writes an **empty**
+/// fragment rather than none: present and empty is a different fact from
+/// absent, and only the first is checkable.
+///
+/// **Every block filters the whole table**, which is `blocks x rows` of work.
+/// That is the honest cost of a plan whose input is a table rather than a
+/// volume: a producer that already knew which rows were whose would be a
+/// detector, and a detector is the phase this one stands in for.
+pub struct RowSourceOp {
+    name: &'static str,
+    stream: String,
+    lifecycle: Lifecycle,
+    schema: Arc<Schema>,
+    rows: Vec<RowValues>,
+}
+
+impl RowSourceOp {
+    /// `rows` are not checked against `schema` here. A row that does not match
+    /// is refused by [`RowBuilder::push`] when its block runs, which is where
+    /// the message can say which row and which column — and checking twice
+    /// would mean two statements of what a well-formed row is.
+    pub fn new(
+        name: &'static str,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+        schema: Schema,
+        rows: Vec<RowValues>,
+    ) -> Self {
+        Self {
+            name,
+            stream: stream.into(),
+            lifecycle,
+            schema: Arc::new(schema),
+            rows,
+        }
+    }
+
+    /// The stream this writes, which is the `input` of a [`RowStreams`] naming
+    /// this phase.
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+
+    /// The schema of the rows this emits: the one it was given.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// How many rows it was handed. The number a consumer's total must come to,
+    /// and the only thing about the table this op will say.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+impl FragmentOp for RowSourceOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// **Zero, and it is a different quantity from a fragment reach.** This one
+    /// is voxels of the block's own image, and this op reads no image at all —
+    /// its rows come from a table it was handed before the run. Nothing crosses
+    /// a block boundary here either: every row is written into the one block
+    /// whose core holds it, which is what makes the consumers' own reach of
+    /// `[0, 0, 0]` honest.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            Coverage::EveryBlock,
+        )]
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            block_rows(at.grid, at.index, &self.schema, &self.rows)?,
+        ))
+    }
+}
+
 /// **Rows in, the same rows at scaled coordinates out.**
 ///
 /// Reads no pixels, writes no image, reach 0. The rows it emits are in the
@@ -1119,6 +1285,21 @@ impl ScaleRowsOp {
 impl FragmentOp for ScaleRowsOp {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// **Zero.** This op reads no image at all — its rows arrive on a fragment
+    /// stream and leave on one. What crosses a block boundary is a **row**, and
+    /// it crosses through that stream, whose reach is declared in *blocks* on
+    /// [`RowStreams::inputs`] and is `[0, 0, 0]` there for the module header's
+    /// reason: a row op reads one row to write one row, so an overlap would
+    /// duplicate rows rather than cost recomputation.
+    ///
+    /// A scale **moves** rows, and that is a fact about the output volume rather
+    /// than about a halo — see [`scaled_bound`], and see the header's warning
+    /// about a gather following this in the same lattice. Widening a reach here
+    /// would not help, because a scaled row can move arbitrarily far.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn inputs(&self) -> Vec<FragmentInput> {
@@ -1258,6 +1439,21 @@ impl FragmentOp for GatherRowsOp {
         self.name
     }
 
+    /// **Zero, and this is the one op here that reads pixels**, so it is the one
+    /// worth checking rather than asserting. It reads **one voxel per row, at
+    /// that row's own coordinate**, and every row it is handed lies in this
+    /// block's core — [`gather_into`] refuses a row outside the region it is
+    /// given, by name, rather than reading the wrong voxel. So nothing is read
+    /// outside the block's own fetch and a halo would buy nothing.
+    ///
+    /// The rows themselves cross block boundaries through the fragment stream,
+    /// at `[0, 0, 0]` blocks. **The two reaches are different units** — this one
+    /// is voxels of an image, that one is blocks of a stream — and conflating
+    /// them is the mistake this declaration exists to make impossible.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn inputs(&self) -> Vec<FragmentInput> {
         self.rows.inputs()
     }
@@ -1338,6 +1534,15 @@ impl FragmentOp for FilterRowsOp {
         self.name
     }
 
+    /// **Zero.** No image is read and no row moves: the output is a subsequence
+    /// of the input. What crosses a block boundary is a row, through the
+    /// fragment stream, at `[0, 0, 0]` blocks — and an overlap there would emit
+    /// a row twice, which is the header's *"an overlap here costs correctness"*
+    /// rather than a cost.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn inputs(&self) -> Vec<FragmentInput> {
         self.rows.inputs()
     }
@@ -1371,8 +1576,8 @@ pub const GROUP_ROWS: &str = "rows";
 
 /// What one column of a group is reduced to.
 ///
-/// See the module header for the presence rule, for why four of the six are
-/// refused on a `U64` column, and for why there are two `First`s.
+/// See the module header for the presence rule, for why the three that total or
+/// order are refused on a `U64` column, and for why there are two `First`s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Aggregate {
     /// How many rows of the group were **present** in this column, by its
@@ -1918,12 +2123,22 @@ impl GroupFold {
 
     /// Fold another block's partial for the same group into this one.
     ///
-    /// **Refuses two partials that report the same least coordinate**, which is
-    /// the module header's theorem being checked rather than assumed: a block's
-    /// rows lie in its core and cores are disjoint, so an agreement here means
-    /// one row position reached two blocks. That is the duplication a row op can
-    /// never recover from — the group's `rows` would be doubled and its total
-    /// with it — and it is the one silent failure this reduction can have.
+    /// **Refuses two partials that report the same least coordinate.** A
+    /// block's rows lie in its core and cores are disjoint, so an agreement
+    /// there means one row position reached two blocks — the duplication a row
+    /// reduction can never recover from, since a duplicated row is
+    /// indistinguishable from a real one once it is in the sum.
+    ///
+    /// **It is a check and not a proof, and the difference is worth stating.**
+    /// It fires when the duplicated row is the *least* row of the group in both
+    /// partials, and a duplicate anywhere above the least slips past it — a
+    /// group with rows at 0 and 5 whose row at 5 reached two blocks leaves the
+    /// two partials with least rows 0 and 5, which differ. What rules that out
+    /// is the producer's precondition rather than this fold: a producer that
+    /// keys by [`owner_of`] writes each position into exactly one block by
+    /// construction, and every producer in this crate does. So this refusal is
+    /// the cheap half of the guarantee, placed where it costs one comparison,
+    /// and the other half is a property of how the rows were written.
     pub fn merge(&mut self, other: &GroupFold) -> Result<()> {
         if self.columns.len() != other.columns.len() {
             return Err(Error::invalid(format!(
@@ -2132,6 +2347,14 @@ fn absorb_groups(
 /// [`SeamFold::PerBlock`], which is true of it: a partial is a function of the
 /// rows in one block, and the fold across the seam belongs to
 /// [`MergeGroupsOp`].
+///
+/// It carries a [`RowStreams`] for the plumbing the three maps share — the two
+/// stream names, the phase index and the input schema, with the same refusal of
+/// a stream that is both — and one thing about it reads differently here: the
+/// **output** stream carries partials rather than rows, in this module's own
+/// wire format rather than a `Table` blob. A consumer that pointed
+/// [`collect_rows`] at it would get a decode failure rather than plausible rows,
+/// which is the right outcome and is why the two streams must differ.
 pub struct GroupRowsOp {
     name: &'static str,
     rows: RowStreams,
@@ -2185,6 +2408,16 @@ fn schema_names(schema: &Schema) -> String {
 impl FragmentOp for GroupRowsOp {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// **Zero.** No image is read. A block folds **its own rows and nobody
+    /// else's**, so nothing crosses a boundary in this phase at all; what
+    /// crosses is a *partial*, one phase later, through the stream
+    /// [`MergeGroupsOp`] gathers at a whole-lattice reach in **blocks**. That
+    /// separation is the whole shape of the reduction — see the module header —
+    /// and it is why a voxel halo here would be meaningless as well as unused.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn inputs(&self) -> Vec<FragmentInput> {
@@ -2328,6 +2561,17 @@ impl MergeGroupsOp {
 impl FragmentOp for MergeGroupsOp {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// **Zero voxels, and the whole lattice in blocks** — the two numbers this
+    /// op carries, in the two different units, and the reason the pixel one is
+    /// zero is that no pixel is involved. This phase reads every block's
+    /// partial and writes rows; the dependency that makes it a merge is declared
+    /// on [`FragmentInput::with_reach`] in [`Self::inputs`], which is where a
+    /// fragment reach lives. A voxel reach here would widen the phase halo of an
+    /// op that never touches an image.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn inputs(&self) -> Vec<FragmentInput> {
@@ -2568,6 +2812,131 @@ mod tests {
                 ranges
             })
             .collect()
+    }
+
+    // ---------------------------------------------------- the producer ------
+
+    /// The producer's fixture, on a `[3, 3, 3]` cut of [`VOLUME`] whose last
+    /// core is short.
+    ///
+    /// Deliberately spread: rows on both sides of a seam, a row that *is* the
+    /// first voxel of a core, and rows in the short last block. What that buys
+    /// is asserted before anything else uses it — a fixture whose rows all fall
+    /// in one block cannot tell a correct keying rule from no rule at all.
+    fn scattered() -> Vec<RowValues> {
+        [
+            ([0, 0, 0], 1u64, 1.0),
+            ([2, 0, 0], 2, 2.0),
+            ([3, 0, 0], 3, 3.0),
+            ([3, 3, 3], 4, 4.0),
+            ([7, 7, 7], 5, 5.0),
+            ([6, 1, 0], 6, 6.0),
+            ([0, 7, 2], 7, 7.0),
+        ]
+        .into_iter()
+        .map(|(at, key, score)| RowValues::new(at, vec![Value::U64(key), Value::F64(score)]))
+        .collect()
+    }
+
+    /// **Every row is written once, into the block whose core holds it.**
+    ///
+    /// The producer's half of the ownership rule, and the precondition every
+    /// consumer in this module declares reach `[0, 0, 0]` on. Checked as a
+    /// partition rather than as a membership test: a row written into two
+    /// blocks and a row written into none are both invisible to "each row is in
+    /// the right block", and both are the failure that would matter.
+    #[test]
+    fn a_table_is_written_into_the_block_whose_core_holds_each_row() {
+        let grid = BlockGrid::new(VOLUME, [3, 3, 3]).expect("a cut of the volume");
+        let rows = scattered();
+
+        // The discriminator, first: the fixture must reach several blocks and
+        // must put rows on both sides of a seam, or nothing below is a check.
+        let owners: BTreeMap<[usize; 3], usize> =
+            rows.iter().fold(BTreeMap::new(), |mut counts, row| {
+                *counts.entry(owner_of(&grid, row.at)).or_default() += 1;
+                counts
+            });
+        assert!(
+            owners.len() >= 4,
+            "the fixture reaches only {} block(s), so a producer that ignored the \
+             coordinate entirely would pass: {owners:?}",
+            owners.len()
+        );
+        assert_ne!(
+            owner_of(&grid, [2, 0, 0]),
+            owner_of(&grid, [3, 0, 0]),
+            "the fixture must straddle a seam for the keying to be under test"
+        );
+
+        let schema = Arc::new(schema());
+        let counts = grid.blocks_per_axis();
+        let mut gathered: Vec<RowValues> = Vec::new();
+        let mut blocks_written = 0;
+        for z in 0..counts[0] {
+            for y in 0..counts[1] {
+                for x in 0..counts[2] {
+                    let index = [z, y, x];
+                    let blob = block_rows(&grid, index, &schema, &rows).expect("the fixture");
+                    blocks_written += 1;
+                    // Present even when empty: that is what `EveryBlock` claims
+                    // and what makes an absent fragment a detectable fault.
+                    let mine = merge_rows(VOLUME, schema.as_ref().clone(), [(index, &blob[..])])
+                        .expect("a blob this op wrote decodes");
+                    for row in &mine {
+                        assert_eq!(
+                            owner_of(&grid, row.at),
+                            index,
+                            "block {index:?} was given the row at {:?}, which belongs to {:?}",
+                            row.at,
+                            owner_of(&grid, row.at)
+                        );
+                    }
+                    assert_eq!(
+                        mine.len(),
+                        owners.get(&index).copied().unwrap_or(0),
+                        "block {index:?} got {} row(s) and owns {}",
+                        mine.len(),
+                        owners.get(&index).copied().unwrap_or(0)
+                    );
+                    gathered.extend(mine);
+                }
+            }
+        }
+        assert_eq!(blocks_written, counts.iter().product::<usize>());
+
+        // The partition: every row exactly once across the whole lattice.
+        let mut got: Vec<[usize; 3]> = gathered.iter().map(|row| row.at).collect();
+        got.sort_unstable();
+        let mut want: Vec<[usize; 3]> = rows.iter().map(|row| row.at).collect();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "the blocks together are not the table exactly once"
+        );
+    }
+
+    /// **A block with no rows writes an empty blob, not nothing.**
+    ///
+    /// [`Coverage::EveryBlock`] is the only guard a phase that writes no image
+    /// has, and it can only check a fragment that is there.
+    #[test]
+    fn a_block_with_no_rows_still_writes_a_readable_fragment() {
+        let grid = BlockGrid::new(VOLUME, [4, 4, 4]).expect("a cut of the volume");
+        let schema = Arc::new(schema());
+        let only = vec![RowValues::new(
+            [0, 0, 0],
+            vec![Value::U64(1), Value::F64(1.0)],
+        )];
+        let empty = block_rows(&grid, [1, 1, 1], &schema, &only).expect("an empty block");
+        assert!(
+            !empty.is_empty(),
+            "an empty fragment is still a header, so that a reader can tell it apart \
+             from an absent one"
+        );
+        let rows = merge_rows(VOLUME, schema.as_ref().clone(), [([1, 1, 1], &empty[..])])
+            .expect("an empty blob decodes");
+        assert!(rows.is_empty());
     }
 
     // ------------------------------------------------ decomposition ------

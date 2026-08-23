@@ -397,16 +397,39 @@ fn an_image_read_by_a_source_leaf_has_two_readers() {
     assert_eq!(plan.readers_of_image(3), Vec::<usize>::new(), "the output");
 
     // so nothing dies when phase 1 ends — image 1 is still wanted — and both
-    // intermediates die when phase 2 does
+    // intermediates die when phase 2 does.
+    //
+    // **Image 3 is named here too, and it is the output.** `images_dead_after`
+    // applies the zero-reader rule that `peak_image_bytes` always applied — *an
+    // image nothing reads dies as soon as it is written* — so an image with no
+    // reader inside the run is named by the phase that **wrote** it rather than
+    // by nobody at all. Before that rule moved into `images_dead_after`, an
+    // unread image was named by no phase and the executor never freed it, which
+    // is strictly worse than naming it here: naming it is harmless, because
+    // `image_visibility` is what decides whether an image may be freed and both
+    // `strategy.rs` and `peak_image_bytes` consult it before acting on this
+    // list. The output is `Published`, so it survives being named.
     assert_eq!(plan.images_dead_after(0), vec![0], "the input, never freed");
     assert_eq!(plan.images_dead_after(1), Vec::<usize>::new());
-    assert_eq!(plan.images_dead_after(2), vec![STORED, 2]);
+    assert_eq!(
+        plan.images_dead_after(2),
+        vec![STORED, 2, 3],
+        "the two intermediates, and the output, which no phase reads"
+    );
 
-    // and with no source leaf it is exactly the rule it generalises
+    // and with no source leaf it is exactly the rule it generalises: each phase
+    // frees the image it read, and the last one is also named with the output it
+    // wrote, for the reason above.
     let plain = Chain::sequence(vec![dilate(), erode(), computed_arm()]);
     let plain = one_phase_per_slot(&plain, &BlockGrid::along(VOLUME, &[0], 4).unwrap());
+    let last = plain.n_phases() - 1;
     for phase in 0..plain.n_phases() {
-        assert_eq!(plain.images_dead_after(phase), vec![phase], "phase {phase}");
+        let want = if phase == last {
+            vec![phase, phase + 1]
+        } else {
+            vec![phase]
+        };
+        assert_eq!(plain.images_dead_after(phase), want, "phase {phase}");
     }
 }
 

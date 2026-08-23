@@ -621,24 +621,53 @@ pub enum FrameworkFigure {
 ///   `tests/working_set_residency.rs`'s sweep, and worst exactly where the
 ///   planner has just fitted a large candidate, which is the situation a
 ///   memory-constrained run is in by definition. That is a killed run;
-/// * **too high** — the planner takes a block one step smaller down the
-///   candidate ladder. It costs read amplification and more tasks. It cannot
-///   make a run unrunnable and it cannot move a voxel. Counted over a sweep of
-///   nine budgets: the cold-start charge costs one step at **six** of them and
-///   nothing at the other three, and never two — see
-///   `a_margin_never_costs_more_than_one_ladder_step`, which asserts both.
+/// * **too high** — the planner takes a smaller block off the candidate ladder.
+///   It costs read amplification and more tasks. It cannot make a run
+///   unrunnable and it cannot move a voxel. Counted over a sweep of nine
+///   budgets **on a ladder of powers of two**: the cold-start charge costs one
+///   rung at **six** of them and nothing at the other three. That count is a
+///   property of that spacing rather than of the margin, which is the
+///   distinction the next paragraph exists to make.
 ///
-/// **And the ceiling on that cost is arithmetic rather than luck.** A ladder of
-/// powers of two steps by eight in volume, and every margin here is under eight
-/// — `3.6` on its own, and `3.5626 x 2.1 = 7.48` for the worst measured shape
-/// under the exact figure. So **neither branch can cost more than one ladder
-/// step, at any budget**, which `a_margin_never_costs_more_than_one_ladder_step`
-/// asserts across a sweep rather than arguing here.
+/// **And the ceiling on that cost is arithmetic rather than luck — but it is a
+/// ceiling on *volume*, not on rungs.** Every margin here is under eight: `3.6`
+/// on its own, and `3.5626 x 2.1 = 7.48` for the worst measured shape under the
+/// exact figure. A block that fitted without a margin either has a rung at an
+/// eighth of its volume, which then fits *with* one, or the ladder has bottomed
+/// out above that point and there is nothing smaller to fall to. Either way:
+/// **neither branch can move the admitted block by more than `8x` in volume, at
+/// any budget.**
+///
+/// **On a ladder of powers of two that is exactly one rung**, which is how this
+/// was first stated and why. It is **not** the same sentence on
+/// [`crate::decomposition::refined_ladder`], where a rung is `2.37x` or `3.375x`
+/// in volume and `3.6` alone already spans two of them. The step count was a
+/// proxy that happened to equal the volume ratio while the spacing was octaves;
+/// the volume ratio is what survives a change of spacing.
+///
+/// It is also the **better** bound and not merely the more durable one: the
+/// planner stops at the largest rung that fits, so a finer ladder lands the
+/// correction closer and never further — which is the refinement's own win, seen
+/// from the margin's side.
+///
+/// `tests/block_ladder.rs` asserts both halves against the real
+/// [`admission_bytes`] and the real `price_phase` at the refined spacing, and
+/// `a_margin_never_moves_the_admitted_block_by_more_than_eight_times_in_volume`
+/// asserts the same invariant at the coarse one. Two spacings is what makes it
+/// an invariant rather than a coincidence.
+///
+/// **At the coarse spacing the bound is slack, measurably so**, and the refined
+/// test is therefore the sharper of the two. A block admitted without a margin
+/// sits below its rung's ceiling by whatever the ladder's coarseness left it —
+/// up to a full rung — and that headroom absorbs a margin somewhat past eight
+/// before any rung is lost: a hypothetical `9.0` still moves nothing more than
+/// `8x`. The coarse test's negative control uses two full rungs for that reason,
+/// which is the amount no headroom under one rung can absorb.
 ///
 /// That headroom is thin, and deliberately so: it is what says the two margins
 /// cannot both be raised much further without the affordability argument
-/// changing shape. A future measurement that needs a wider margin needs this
-/// paragraph rewritten, not quietly exceeded.
+/// changing shape. A future measurement that needs a wider margin needs these
+/// paragraphs rewritten, not quietly exceeded.
 ///
 /// The two that were not chosen
 /// ----------------------------

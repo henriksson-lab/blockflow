@@ -195,6 +195,74 @@ pub const RETAINED_RUNS: usize = 8;
 
 // ---------------------------------------------------------------- terms --
 
+/// How many runs must have seen a term before its measurement is believed.
+///
+/// **Three, because three is where a majority starts**, and that is a derivation
+/// rather than a choice: [`Statistics::snapshot`] takes the *weighted median* of
+/// the retained runs, and a median needs three points to be a median rather than
+/// an average of two. Three is the smallest number at which one contaminated run
+/// can be outvoted. Two would leave the estimator a mean of two, where a single
+/// stalled run still carries half the answer.
+///
+/// # Why a term needs protecting at all, measured
+///
+/// A `CostModel`'s four coefficients are **not** fitted from comparable amounts
+/// of evidence, and it is not the unit counts that differ — it is the wall time.
+/// The three-op chain in `tests/statistics.rs`, 1120 fits from eight concurrent
+/// threads at a load average of 41:
+///
+/// ```text
+///   term        |  p50 |  p99 |   max | max/p50 | wall time behind it
+///   Read        | 2.89 | 8.66 | 54.11 |     19x |  0.40 ms
+///   Write       | 2.71 | 6.51 | 64.80 |     24x |  0.18 ms
+///   Materialise | 2.24 | 9.20 | 79.02 |     35x |  0.15 ms
+///   Compute     | 5.44 |10.83 | 12.63 |    2.3x | 50.0   ms
+/// ```
+///
+/// Every term in that plan is fitted from **two to four events**, so event count
+/// is not the discriminator either. What separates them is that a scheduler
+/// preemption costs about the same number of milliseconds whatever it
+/// interrupts: it is a rounding error against 50 ms of compute and it is *the
+/// entire measurement* against 0.15 ms of materialisation. So the three I/O
+/// terms are each one stall away from being wrong by a factor of 30.
+///
+/// That would be a curiosity if the fragile terms were unimportant. They are the
+/// opposite: `materialise` against `write` is exactly what pricing a **phase
+/// cut** compares, so the least reproducible coefficient in the model is the one
+/// that decides the shape of the plan. Measured, a fitted model re-planned
+/// differently in 4 of 1080 fits, every one of them fusing two phases into one,
+/// and every one with a materialise coefficient in the 63-83 band above.
+///
+/// # What this costs when it refuses something good, measured in both directions
+///
+/// Almost nothing, and that is the finding rather than the hope. A term without
+/// a usable measurement does not fall back to its shipped *number* —
+/// [`Snapshot::calibrate`] gives it the shipped **ratio** converted into
+/// nanoseconds by the anchor, which is the path an absent term has always taken.
+/// The anchor is work-weighted, so it is dominated by `Compute`: the one term
+/// this rule has no cause to refuse is also the one that sets the unit.
+///
+/// 480 held-out predictions, eight concurrent threads, load average 47:
+///
+/// ```text
+///   model                | p50    | p90    | max
+///   shipped constants    | 5.38x  | 6.09x  | 10.66x
+///   all four calibrated  | 1.03x  | 1.17x  |  2.04x
+///   Compute alone        | 1.03x  | 1.15x  |  2.02x
+/// ```
+///
+/// Refusing the three fragile terms is **free to two decimal places at the
+/// median and slightly better at the ninetieth**, because what they were
+/// contributing was mostly noise. The direction with a price on it is the other
+/// one: believing a thin coefficient moved a consumer's chosen block edge by a
+/// rung, and a stopwatch put the new rung **1.06x** slower.
+///
+/// The rule and the estimator are separate mechanisms and both are needed.
+/// Under the old pooled quotient a fitted model re-planned differently in **4 of
+/// 1080** fits; with the median and this rule, **0 of 480**, and a store holding
+/// one or two runs cannot re-plan at all because it calibrates nothing.
+pub const REPRODUCTIONS: usize = 3;
+
 /// What a coefficient is *per*.
 ///
 /// The four that `CostModel` can hold, plus two diagnostics it cannot. Each is
@@ -693,13 +761,14 @@ impl Statistics {
                     .filter_map(|(term, history)| {
                         let units: f64 = history.iter().map(|o| o.units).sum();
                         let nanos: f64 = history.iter().map(|o| o.nanos).sum();
-                        (units > 0.0 && nanos > 0.0).then(|| {
+                        weighted_median(history).map(|nanos_per_unit| {
                             (
                                 term.clone(),
                                 Coefficient {
-                                    nanos_per_unit: nanos / units,
+                                    nanos_per_unit,
                                     runs: history.len(),
                                     units,
+                                    total_nanos: nanos,
                                 },
                             )
                         })
@@ -902,6 +971,51 @@ impl Statistics {
     }
 }
 
+/// The **weighted median** of a term's retained runs: each run contributes its
+/// own nanoseconds-per-unit, weighted by the units behind it, and the answer is
+/// the quotient at the halfway point of the total weight.
+///
+/// **Median rather than pooled mean, and that is the whole robustness story.**
+/// The pooled quotient — `sum(nanos) / sum(units)` — is the estimator that
+/// reproduces the total, and it is also the estimator in which one stalled run
+/// contributes every one of its nanoseconds. A stall adds *time* and no *work*,
+/// so it inflates the numerator alone; against a term fitted from 0.15 ms of
+/// wall time it becomes the whole coefficient. See [`REPRODUCTIONS`] for the
+/// measurement.
+///
+/// **Weighted rather than plain, because the weighting is a documented design
+/// decision and this must not quietly undo it.** [`Observed`] stores the pair
+/// rather than the quotient precisely so that a run over eight thousand blocks
+/// is not equal evidence to a run over eight, and a plain median would throw
+/// that away. A stall does not change a run's weight, so weighting costs nothing
+/// here and keeps the property the store was built for.
+///
+/// `None` when nothing usable is recorded, which is what an
+/// `AccountingEnvironment`'s zero-nanosecond records produce.
+fn weighted_median(history: &VecDeque<Observed>) -> Option<f64> {
+    let mut samples: Vec<(f64, f64)> = history
+        .iter()
+        .filter(|o| o.is_evidence())
+        .map(|o| (o.nanos / o.units, o.units))
+        .collect();
+    if samples.is_empty() {
+        return None;
+    }
+    // `total_cmp`, never `f64::min`/`f64::max` or a partial comparator: a NaN
+    // would otherwise sort arbitrarily and pick a neighbour's value silently.
+    // `is_evidence` has already excluded them; this is the second lock.
+    samples.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let total: f64 = samples.iter().map(|(_, weight)| weight).sum();
+    let mut seen = 0.0_f64;
+    for (quotient, weight) in &samples {
+        seen += weight;
+        if seen * 2.0 >= total {
+            return Some(*quotient);
+        }
+    }
+    samples.last().map(|(quotient, _)| *quotient)
+}
+
 // ----------------------------------------------------------- snapshot --
 
 /// One coefficient, and how much evidence is behind it.
@@ -920,14 +1034,30 @@ impl Statistics {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Coefficient {
     /// Nanoseconds per one unit of whatever the [`Term`] is per.
+    ///
+    /// The **weighted median** over the retained runs, not the pooled quotient.
+    /// See `weighted_median` for why, and [`REPRODUCTIONS`] for the measurement
+    /// that forced it.
     pub nanos_per_unit: f64,
     /// Runs contributing, at most [`RETAINED_RUNS`]. Approximate; see above.
+    ///
+    /// **This is the field that decides whether the measurement is used at
+    /// all** — see [`Snapshot::calibrate`] and [`REPRODUCTIONS`].
     pub runs: usize,
-    /// Units of work behind it, summed over those runs. The honest measure of
-    /// evidence: a coefficient from eight tiny runs is worth less than one from
-    /// a single large one, and the run count alone cannot say so. Approximate;
-    /// see above.
+    /// Units of work behind it, summed over those runs. Approximate; see above.
     pub units: f64,
+    /// Nanoseconds behind it, summed over those runs.
+    ///
+    /// **Recorded because `units` turned out to be the wrong measure of how much
+    /// a coefficient can be trusted, and this is the right one.** Two terms of
+    /// one run can differ by 300x in the wall time behind them while differing
+    /// hardly at all in event count, and it is the wall time that says whether a
+    /// millisecond-scale stall could have been the whole measurement.
+    /// [`REPRODUCTIONS`] carries the table. Nothing in this crate *thresholds*
+    /// on it — no absolute figure separates a thin term from a fat one on a
+    /// machine nobody has measured — but a consumer deciding how much to believe
+    /// a number should be reading this rather than `units`.
+    pub total_nanos: f64,
 }
 
 /// Where a coefficient came from.
@@ -939,6 +1069,15 @@ pub enum Provenance {
     /// Measured, with this much behind it — approximately. See [`Coefficient`]
     /// for why these two figures are a weight rather than a count.
     Measured { runs: usize, units: f64 },
+    /// Seen, but not enough times to be believed: fewer than [`REPRODUCTIONS`]
+    /// runs, so [`Snapshot::calibrate`] treats it exactly as it treats a term it
+    /// has never seen.
+    ///
+    /// **A distinct state rather than folding into [`Provenance::Seeded`]**,
+    /// because "no evidence" and "evidence that has not been reproduced" are
+    /// different situations for whoever is deciding whether to run the pipeline
+    /// again. One of them is fixed by running it twice more.
+    Unreproduced { runs: usize },
 }
 
 /// A frozen view of the store, and the thing a plan is a function of.
@@ -1010,12 +1149,22 @@ impl Snapshot {
     /// Whether a term is measured here, and how strongly.
     pub fn provenance(&self, term: &Term) -> Provenance {
         match self.coefficient(term) {
-            Some(c) => Provenance::Measured {
+            Some(c) if c.runs >= REPRODUCTIONS => Provenance::Measured {
                 runs: c.runs,
                 units: c.units,
             },
+            Some(c) => Provenance::Unreproduced { runs: c.runs },
             None => Provenance::Seeded,
         }
+    }
+
+    /// The coefficient for `term` **if it may be believed** — measured, and
+    /// reproduced at least [`REPRODUCTIONS`] times.
+    ///
+    /// [`Snapshot::coefficient`] is the raw reading and stays raw, because a
+    /// report should show what was seen. This is what calibration uses.
+    pub fn believable(&self, term: &Term) -> Option<Coefficient> {
+        self.coefficient(term).filter(|c| c.runs >= REPRODUCTIONS)
     }
 
     /// The per-op-family compute coefficients, by family name.
@@ -1078,6 +1227,16 @@ impl Snapshot {
     /// term is measured the anchor is unused; where none is, there is no anchor
     /// and the model comes back untouched.
     ///
+    /// **A term seen fewer than [`REPRODUCTIONS`] times is not used**, and takes
+    /// exactly the path a term with no evidence at all takes: its seeded *ratio*,
+    /// converted by the anchor. That is the mechanism protecting the model from
+    /// its own thinnest coefficient, and [`REPRODUCTIONS`] carries the
+    /// measurement that motivates it and the price of being wrong in either
+    /// direction. Note what it means for a **cold store**: one run of a pipeline
+    /// changes no plan at all, and it takes three before anything is believed —
+    /// which is the store's own premise, since a measurement that has never been
+    /// reproduced is a fact about one run rather than about the machine.
+    ///
     /// `order_conflict_penalty` is scaled by the anchor rather than measured.
     /// It is charged per voxel like the rest, nothing in the event stream can
     /// see a traversal disagreement, and its default is **zero** — so an
@@ -1093,7 +1252,7 @@ impl Snapshot {
         let mut weighted = 0.0_f64;
         let mut weight = 0.0_f64;
         for (term, seed) in &seeded {
-            if let Some(measured) = self.coefficient(term) {
+            if let Some(measured) = self.believable(term) {
                 if *seed > 0.0 && measured.units > 0.0 {
                     weighted += (measured.nanos_per_unit / seed) * measured.units;
                     weight += measured.units;
@@ -1106,7 +1265,7 @@ impl Snapshot {
         }
         let anchor = weighted / weight;
         let resolve = |term: Term, seed: f64| {
-            self.coefficient(&term)
+            self.believable(&term)
                 .map(|c| c.nanos_per_unit)
                 .unwrap_or(seed * anchor)
         };
@@ -1125,7 +1284,7 @@ impl Snapshot {
     /// The snapshot as a table, for a report or a log line.
     pub fn describe(&self) -> String {
         let mut out = format!(
-            "statistics for {} ({} coefficient(s), fingerprint {:016x})\n{:<44} {:>14} {:>6} {:>16}\n",
+            "statistics for {} ({} coefficient(s), fingerprint {:016x})\n{:<44} {:>14} {:>6} {:>16}  {:>13}\n",
             self.machine.id(),
             self.coefficients.len(),
             self.fingerprint,
@@ -1133,14 +1292,25 @@ impl Snapshot {
             "ns per unit",
             "runs",
             "units",
+            "wall time",
         );
         for (term, coefficient) in &self.coefficients {
             out.push_str(&format!(
-                "{:<44} {:>14.4} {:>6} {:>16.0}\n",
+                "{:<44} {:>14.4} {:>6} {:>16.0}  {:>10.3} ms{}\n",
                 term.key(),
                 coefficient.nanos_per_unit,
                 coefficient.runs,
-                coefficient.units
+                coefficient.units,
+                // The wall time behind the term, because it is the figure that
+                // says how much to believe it and `units` is not — see
+                // [`REPRODUCTIONS`]. A table that showed only `units` is what
+                // made that mistake easy to keep making.
+                coefficient.total_nanos / 1.0e6,
+                if coefficient.runs >= REPRODUCTIONS {
+                    ""
+                } else {
+                    "  (not yet reproduced; calibration ignores it)"
+                },
             ));
         }
         out
@@ -1331,13 +1501,15 @@ mod tests {
     #[test]
     fn a_measured_term_replaces_its_seed_and_an_unmeasured_one_keeps_its_ratio() {
         let mut store = Statistics::new();
-        store.record(&run(
-            machine(),
-            &[
-                (Term::Read, 1000.0, 4000.0),
-                (Term::Compute, 1000.0, 8000.0),
-            ],
-        ));
+        for _ in 0..REPRODUCTIONS {
+            store.record(&run(
+                machine(),
+                &[
+                    (Term::Read, 1000.0, 4000.0),
+                    (Term::Compute, 1000.0, 8000.0),
+                ],
+            ));
+        }
         let snapshot = store.snapshot(&machine());
         let model = snapshot.calibrate(&CostModel::default());
         // measured outright
@@ -1478,7 +1650,8 @@ mod tests {
             Some(Coefficient {
                 nanos_per_unit: 2.0,
                 runs: 1,
-                units: 100.0
+                units: 100.0,
+                total_nanos: 200.0
             })
         );
         let _ = std::fs::remove_file(&path);
@@ -1496,14 +1669,29 @@ mod tests {
             Coefficient {
                 nanos_per_unit: 1.0,
                 runs: RETAINED_RUNS,
-                units: 100.0 * RETAINED_RUNS as f64
+                units: 100.0 * RETAINED_RUNS as f64,
+                total_nanos: 100.0 * RETAINED_RUNS as f64
             }
         );
-        // One outlying run moves it, and is diluted by the evidence beside it
+        // **One outlying run does not move it at all, and this assertion is
+        // inverted from the one that stood here.** It used to read "moves it,
+        // and is diluted by the evidence beside it" — `> 1.0 && < 9.0` — which
+        // was the truth about the pooled quotient this used to compute. The
+        // estimator is now the weighted median (see `weighted_median` and
+        // `REPRODUCTIONS`), and a median does not dilute an outlier, it outvotes
+        // it. That is the whole point of the change: a run that stalled adds
+        // nanoseconds and no units, so under pooling it moved the coefficient in
+        // proportion to how badly it stalled, without limit.
         store.record(&run(machine(), &[(Term::Read, 100.0, 900.0)]));
         let after = store.snapshot(&machine()).coefficient(&Term::Read).unwrap();
         assert_eq!(after.runs, RETAINED_RUNS);
-        assert!(after.nanos_per_unit > 1.0 && after.nanos_per_unit < 9.0);
+        assert_eq!(
+            after.nanos_per_unit, 1.0,
+            "a 9x outlier moved the coefficient; the median is supposed to outvote it"
+        );
+        // It is *recorded* rather than ignored, though — the totals still carry
+        // it, which is what lets a reader see that a run went strange.
+        assert!(after.total_nanos > 100.0 * RETAINED_RUNS as f64);
         // and once it is the only thing left, it is the answer
         for _ in 0..RETAINED_RUNS {
             store.record(&run(machine(), &[(Term::Read, 100.0, 900.0)]));
@@ -1530,19 +1718,123 @@ mod tests {
         );
     }
 
+    /// The three states a term can be in, and the one in the middle is the point.
     #[test]
-    fn provenance_says_whether_a_coefficient_is_seeded_or_measured() {
+    fn provenance_says_whether_a_coefficient_is_seeded_measured_or_merely_seen() {
         let mut store = Statistics::new();
-        store.record(&run(machine(), &[(Term::Read, 64.0, 128.0)]));
-        let snapshot = store.snapshot(&machine());
-        assert_eq!(
-            snapshot.provenance(&Term::Read),
-            Provenance::Measured {
-                runs: 1,
-                units: 64.0
+        for seen in 1..=REPRODUCTIONS {
+            store.record(&run(machine(), &[(Term::Read, 64.0, 128.0)]));
+            let snapshot = store.snapshot(&machine());
+            // Never seen at all is a different state from seen and not yet
+            // believed, and both differ from believed.
+            assert_eq!(snapshot.provenance(&Term::Write), Provenance::Seeded);
+            if seen < REPRODUCTIONS {
+                assert_eq!(
+                    snapshot.provenance(&Term::Read),
+                    Provenance::Unreproduced { runs: seen }
+                );
+                assert!(
+                    snapshot.believable(&Term::Read).is_none(),
+                    "a term seen {seen} time(s) was believed"
+                );
+            } else {
+                assert_eq!(
+                    snapshot.provenance(&Term::Read),
+                    Provenance::Measured {
+                        runs: seen,
+                        units: 64.0 * seen as f64
+                    }
+                );
+                assert!(snapshot.believable(&Term::Read).is_some());
             }
+            // The raw reading is available at every stage regardless — a report
+            // shows what was seen, and only calibration cares whether it is
+            // enough.
+            assert!(snapshot.coefficient(&Term::Read).is_some());
+        }
+    }
+
+    /// **The rule that protects the model from its thinnest coefficient**, at
+    /// the boundary and on both sides of it.
+    ///
+    /// A term seen fewer than [`REPRODUCTIONS`] times takes the path a term with
+    /// no evidence takes: its seeded ratio, converted by the anchor. So a store
+    /// that has seen one run of everything changes nothing at all — which is the
+    /// cold-start behaviour, and it is a *stronger* statement than the one an
+    /// empty store makes.
+    #[test]
+    fn a_term_is_not_believed_until_it_has_been_reproduced() {
+        let seeded = CostModel::default();
+        let mut store = Statistics::new();
+        let observations = [
+            (Term::Read, 1000.0, 4000.0),
+            (Term::Write, 1000.0, 4000.0),
+            (Term::Materialise, 1000.0, 4000.0),
+            (Term::Compute, 1000.0, 4000.0),
+        ];
+        for seen in 1..REPRODUCTIONS {
+            store.record(&run(machine(), &observations));
+            let snapshot = store.snapshot(&machine());
+            assert!(!snapshot.is_empty(), "the reading itself was discarded");
+            assert_eq!(
+                snapshot.calibrate(&seeded),
+                seeded,
+                "a store holding {seen} run(s) of every term calibrated anyway"
+            );
+        }
+        // And the run that makes it a reproduction changes everything at once,
+        // because the anchor is all-or-nothing about the unit.
+        store.record(&run(machine(), &observations));
+        let model = store.snapshot(&machine()).calibrate(&seeded);
+        assert_ne!(model, seeded);
+        assert_eq!(model.read_cost_per_voxel, 4.0);
+        assert_eq!(model.compute_scale, 4.0);
+    }
+
+    /// The liveness test beside it: with the rule satisfied, a **stalled** run
+    /// still cannot move the answer, because the estimator is a median.
+    ///
+    /// The two mechanisms are separate and this is what distinguishes them.
+    /// [`REPRODUCTIONS`] governs *whether* a term is used; `weighted_median`
+    /// governs *what value* it has. A test that only exercised the first would
+    /// pass against a store that pooled its runs and was moved by every outlier
+    /// the moment the third one arrived.
+    #[test]
+    fn a_stalled_run_does_not_move_a_reproduced_coefficient() {
+        let mut store = Statistics::new();
+        for _ in 0..REPRODUCTIONS {
+            store.record(&run(machine(), &[(Term::Read, 1000.0, 4000.0)]));
+        }
+        let before = store.snapshot(&machine()).believable(&Term::Read).unwrap();
+        assert_eq!(before.nanos_per_unit, 4.0);
+
+        // A run that did the same work and took 30x as long: a stall adds
+        // nanoseconds and no units, which is exactly what made pooling fragile.
+        store.record(&run(machine(), &[(Term::Read, 1000.0, 120_000.0)]));
+        let after = store.snapshot(&machine()).believable(&Term::Read).unwrap();
+        assert_eq!(
+            after.nanos_per_unit, 4.0,
+            "one stalled run moved a coefficient with {} runs behind it",
+            after.runs
         );
-        assert_eq!(snapshot.provenance(&Term::Write), Provenance::Seeded);
+        // Pooled, it would have been (3 x 4000 + 120000) / 4000 units = 33.
+        assert!(
+            after.total_nanos / after.units > 30.0,
+            "the totals stopped carrying what actually happened"
+        );
+        // A majority of stalls is not a stall, it is the machine, and then it
+        // *is* the answer — the rule must not be a permanent veto.
+        for _ in 0..REPRODUCTIONS {
+            store.record(&run(machine(), &[(Term::Read, 1000.0, 120_000.0)]));
+        }
+        assert_eq!(
+            store
+                .snapshot(&machine())
+                .believable(&Term::Read)
+                .unwrap()
+                .nanos_per_unit,
+            120.0
+        );
     }
 
     #[test]

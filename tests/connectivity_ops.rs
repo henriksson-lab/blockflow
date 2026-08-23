@@ -641,11 +641,16 @@ fn the_plans_fingerprint_as_they_did_and_the_connectivity_is_not_in_the_number()
         )
     };
 
-    // the numbers `connectivity.rs` pinned before any op took the parameter
+    // The numbers `connectivity.rs` pins, and this test's claim is that they do
+    // not depend on the connectivity — not that they never move. They moved once,
+    // when these three ops migrated onto `FragmentOp::barrier`: a barrier is part
+    // of the plan and is hashed, and relieving the halo changes the phase's
+    // geometry. Kept in step with `connectivity.rs` by hand, which is what a
+    // second pin of the same three plans costs.
     let pinned = (
-        12_276_134_652_032_094_236u64,
-        15_612_560_250_096_173_982u64,
-        13_319_511_774_036_546_415u64,
+        1_507_721_539_040_108_903u64,
+        4_161_838_864_743_738_177u64,
+        15_254_762_488_441_970_327u64,
     );
     for connectivity in EVERY {
         assert_eq!(

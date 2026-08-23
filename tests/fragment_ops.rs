@@ -222,42 +222,13 @@ fn a_volume_to_fragments_phase_leaves_one_fragment_per_block_and_they_reduce_to_
 
 // ---------------------------------------------- 2. fragments -> fragments --
 
-/// Produces a fragment from **nothing**: no pixels, no inputs. The seed for a
-/// run with no pixel volume behind it at all.
-struct SeedOp;
-
-impl FragmentOp for SeedOp {
-    fn name(&self) -> &'static str {
-        "seed"
-    }
-
-    fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            "seeds",
-            Lifecycle::DeleteOnExit,
-            Coverage::EveryBlock,
-        )]
-    }
-
-    fn apply(&self, at: &BlockView<'_>) -> blockflow::error::Result<BlockOutput> {
-        assert!(!at.has_pixels(), "the seed op declared no pixel access");
-        Ok(BlockOutput::fragment(
-            "seeds",
-            blockflow::fragment::pack_u64(&[
-                at.index[0] as u64,
-                at.index[1] as u64,
-                at.index[2] as u64,
-                at.valid.voxels() as u64,
-                0,
-                0,
-            ]),
-        ))
-    }
-}
-
 /// The measured fetch count against the analytic one, for every reach.
 fn fetch_counts_for(reach: [usize; 3]) -> (usize, usize) {
-    let seed = SeedOp;
+    // `with_pixels(false)` is the whole of what this phase is: a fragment from
+    // nothing, with no pixel volume behind it. The probe refuses from the
+    // inside if the executor hands it pixels anyway, which is the assertion
+    // this file used to make in a `SeedOp::apply` of its own.
+    let seed = BlockSummaryOp::new("seed", "seeds", Lifecycle::DeleteOnExit).with_pixels(false);
     let fold = NeighbourFoldOp::new("fold", "seeds", 0, reach, "folded", Lifecycle::DeleteOnExit);
     let plan = fragment_only(VOLUME, BLOCK, Dtype::F64, &[&seed, &fold]).expect("a plan");
     let env = ArrayEnvironment::new(ramp(), plan.n_phases(), [4, 4, 4]).expect("an environment");
@@ -333,7 +304,11 @@ fn a_declared_reach_reads_exactly_the_neighbours_it_should() {
 
 #[test]
 fn a_fragments_only_run_simulates_with_no_data_at_all() {
-    let seed = SeedOp;
+    // `with_pixels(false)` is the whole of what this phase is: a fragment from
+    // nothing, with no pixel volume behind it. The probe refuses from the
+    // inside if the executor hands it pixels anyway, which is the assertion
+    // this file used to make in a `SeedOp::apply` of its own.
+    let seed = BlockSummaryOp::new("seed", "seeds", Lifecycle::DeleteOnExit).with_pixels(false);
     let fold = NeighbourFoldOp::new(
         "fold",
         "seeds",
@@ -550,6 +525,13 @@ impl FragmentOp for HoleOp {
         "hole"
     }
 
+    /// Nothing crosses; it reads nothing. What this op is built to fail is the
+    /// *coverage* guard, which is a different defect from an under-declared
+    /// reach.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn outputs(&self) -> Vec<FragmentOutput> {
         vec![FragmentOutput::new(
             "holed",
@@ -600,6 +582,11 @@ fn a_phase_with_nothing_checkable_about_it_is_refused_rather_than_run() {
     impl FragmentOp for SparseOnly {
         fn name(&self) -> &'static str {
             "sparse"
+        }
+
+        /// Nothing crosses; it reads nothing and writes nothing.
+        fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+            0
         }
 
         fn outputs(&self) -> Vec<FragmentOutput> {

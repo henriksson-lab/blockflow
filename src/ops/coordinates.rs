@@ -154,7 +154,7 @@ use crate::fragment::{
 use crate::geometry::BlockGrid;
 use crate::region::Region;
 use crate::sidecar::Lifecycle;
-use crate::table::{RowBuilder, Schema, Table};
+use crate::table::{Column, RowBuilder, Schema, Table, Value};
 
 use super::fill::as_mask;
 
@@ -176,6 +176,67 @@ use super::fill::as_mask;
 pub fn coordinate_schema() -> Schema {
     // No columns, so none can be unnamed and none can repeat.
     Schema::new(Vec::new()).expect("a schema with no columns names nothing twice")
+}
+
+/// The schema of a **valued** coordinate table: one `f64` column, named by the
+/// caller.
+///
+/// [`coordinate_schema`] answers "which voxels are set" and has no columns at
+/// all, deliberately — the module header's argument that the merged order is a
+/// function of the coordinate set alone rests on there being no payload to
+/// tiebreak on. This answers a different question, *"which voxels are set and
+/// what does the image hold there"*, and pays for it in exactly one place: two
+/// rows on one coordinate would now tiebreak on the value's bits, and no two
+/// rows here share a coordinate because a voxel is in exactly one core.
+///
+/// **Why `f64` and not the image's own type.** The value is read through
+/// [`Voxels::widened`], which is what every other consumer of an arbitrary
+/// element type in this crate does, so one column type serves every input dtype
+/// and a consumer's schema does not change when the input's does. A column that
+/// followed the input would make a downstream `Grouping` depend on a decision
+/// taken upstream of it.
+pub fn valued_coordinate_schema(column: &str) -> Result<Schema> {
+    Schema::new(vec![Column::f64(column)])
+}
+
+/// Push one row per set voxel of `values`, carrying that voxel's value.
+///
+/// The **same walk** as [`set_voxels_into`] — axis 0 slowest, axis 2 fastest —
+/// and set means the same thing it means there: not zero. Written beside it
+/// rather than sharing a body, because sharing would mean a closure per row on
+/// the path that has no payload at all, and that path is the one every
+/// `ops::coordinates` consumer is on.
+pub fn set_voxel_values_into(
+    values: ArrayView3<'_, f64>,
+    offset: [usize; 3],
+    rows: &mut RowBuilder,
+) -> Result<()> {
+    let shape = [values.shape()[0], values.shape()[1], values.shape()[2]];
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let value = values[[i, j, k]];
+                if value != 0.0 {
+                    rows.push(
+                        [offset[0] + i, offset[1] + j, offset[2] + k],
+                        &[Value::F64(value)],
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One array's set voxels and their values as the bytes a block writes.
+pub fn encode_set_voxel_values(
+    values: ArrayView3<'_, f64>,
+    offset: [usize; 3],
+    column: &str,
+) -> Result<Vec<u8>> {
+    let mut rows = RowBuilder::new(Arc::new(valued_coordinate_schema(column)?));
+    set_voxel_values_into(values, offset, &mut rows)?;
+    Ok(rows.encode())
 }
 
 /// A blob with no rows in it: what a block that found no set voxel writes.
@@ -443,6 +504,9 @@ pub struct SetVoxelsOp {
     name: &'static str,
     stream: String,
     lifecycle: Lifecycle,
+    /// The value column's name, when one was asked for. See
+    /// [`Self::with_values`].
+    value_column: Option<String>,
 }
 
 impl SetVoxelsOp {
@@ -454,18 +518,61 @@ impl SetVoxelsOp {
             name,
             stream: stream.into(),
             lifecycle,
+            value_column: None,
         }
+    }
+
+    /// Also carry each voxel's **own value**, in a column of this name.
+    ///
+    /// **A column, not a mechanism.** Everything this op already decides is
+    /// unchanged: reach 0, [`Coverage::EveryBlock`], and the ownership rule that
+    /// a voxel belongs to exactly one core and its coordinate is a volume
+    /// coordinate. What changes is the schema, from [`coordinate_schema`] to
+    /// [`valued_coordinate_schema`], and what a row carries beside its position.
+    ///
+    /// It exists because a plan that wants to *filter or group rows by something
+    /// the image holds* had no producer at all: this op's rows had no payload,
+    /// and `ops::rows::RowSourceOp` takes a table the caller already has. So a
+    /// suite testing a row filter had nothing to filter **on**, and wrote its own
+    /// producer to get one — see `docs/ops-survey/README.md`, G19, and note that
+    /// the test reporting it said so in its own words.
+    ///
+    /// **Not a substitute for `GatherRowsOp`, and the distinction is the useful
+    /// half.** This reads the value out of *the image the rows came from*, at the
+    /// voxel the row is about, so where those are the same array no gather is
+    /// needed at all. A gather samples a **second** array at rows that already
+    /// exist, which is the other case and the one a consumer usually has.
+    pub fn with_values(mut self, column: impl Into<String>) -> Self {
+        self.value_column = Some(column.into());
+        self
     }
 
     /// The stream the coordinate rows are written to.
     pub fn stream(&self) -> &str {
         &self.stream
     }
+
+    /// The schema of the rows this writes — which a consumer needs before any
+    /// block has run, to plan against.
+    pub fn schema(&self) -> Result<Schema> {
+        match &self.value_column {
+            Some(column) => valued_coordinate_schema(column),
+            None => Ok(coordinate_schema()),
+        }
+    }
 }
 
 impl FragmentOp for SetVoxelsOp {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// Nothing crosses this block's boundary. The op reports the set voxels of
+    /// its own core, and a voxel is in exactly one core — no answer here is a
+    /// function of a neighbour, so there is nothing to shrink off the read
+    /// extent.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn reads_pixels(&self) -> bool {
@@ -495,7 +602,12 @@ impl FragmentOp for SetVoxelsOp {
             // nothing would measure a different program.
             return Ok(BlockOutput::fragment(
                 self.stream.clone(),
-                empty_coordinates(),
+                match &self.value_column {
+                    Some(column) => {
+                        RowBuilder::new(Arc::new(valued_coordinate_schema(column)?)).encode()
+                    }
+                    None => empty_coordinates(),
+                },
             ));
         };
         let mask = as_mask(pixels)?;
@@ -517,6 +629,21 @@ impl FragmentOp for SetVoxelsOp {
             origin[2]..origin[2] + extent[2],
         ]);
         let offset = [at.core.start[0], at.core.start[1], at.core.start[2]];
+        if let Some(column) = &self.value_column {
+            // The same core, sliced the same way, read as values rather than as
+            // a mask. `widened` is what makes one column type serve every input
+            // dtype; see `valued_coordinate_schema`.
+            let widened = pixels.widened();
+            let values = widened.slice(s![
+                origin[0]..origin[0] + extent[0],
+                origin[1]..origin[1] + extent[1],
+                origin[2]..origin[2] + extent[2],
+            ]);
+            return Ok(BlockOutput::fragment(
+                self.stream.clone(),
+                encode_set_voxel_values(values, offset, column)?,
+            ));
+        }
         Ok(BlockOutput::fragment(
             self.stream.clone(),
             encode_set_voxels(core, offset)?,

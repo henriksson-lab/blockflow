@@ -261,6 +261,133 @@ pub fn read_task_fragment(bytes: &[u8]) -> Result<([usize; 3], usize)> {
     Ok(([values[0], values[1], values[2]], values[3]))
 }
 
+/// **The distributed barrier probe**: a `fragments -> volume` reduction that
+/// declares [`FragmentOp::barrier`] and hoists its fold into
+/// [`FragmentOp::reduce`].
+///
+/// It is [`FragmentReduceOp`](crate::probes::FragmentReduceOp) with the fold
+/// moved, so the two are directly comparable and the only thing that differs is
+/// where the work happens: that one re-derives the total in every block over a
+/// whole-lattice fragment reach, this one derives it once for the phase and
+/// reaches zero blocks. The answer is the same number and the test suite asserts
+/// so.
+///
+/// **Why it lives here and not with the other probes.** It exists to exercise
+/// the *distributed* half of a barrier — that every worker computes the same
+/// blob from the shared fragment set with nothing transported — and the wiring
+/// that makes that reachable is [`FragmentPhaseSpec`] and
+/// [`ProbeWorkflows::fragment_ops`], both in this file. A probe whose whole
+/// purpose is one path is easiest to read beside that path.
+///
+/// The payload is the summed voxel count, packed as one word, with a magic and
+/// a version in front of it. That framing is not decoration: it is the mitigation
+/// `FragmentOp::reduce` names, because a blob is the op's own encoding and the
+/// op's own decode is the only place a mismatch can surface.
+pub struct HoistedReduceOp {
+    name: &'static str,
+    input: String,
+    input_phase: usize,
+}
+
+impl HoistedReduceOp {
+    /// Magic and version, so a block that is handed the wrong bytes says so
+    /// rather than reading a plausible number out of them.
+    const MAGIC: u64 = 0x6862_6172_7231; // "hbarr1"
+
+    pub fn new(name: &'static str, input: impl Into<String>, input_phase: usize) -> Self {
+        Self {
+            name,
+            input: input.into(),
+            input_phase,
+        }
+    }
+
+    /// The blob's fields, for whoever reads one.
+    pub fn read(bytes: &[u8]) -> Result<u64> {
+        let words = crate::fragment::unpack_u64(bytes)?;
+        match words.as_slice() {
+            [magic, total] if *magic == Self::MAGIC => Ok(*total),
+            [magic, ..] => Err(Error::invalid(format!(
+                "a hoisted reduction begins {:#x}; this blob begins {magic:#x}",
+                Self::MAGIC
+            ))),
+            _ => Err(Error::invalid(format!(
+                "a hoisted reduction is two words; this blob is {}. An empty blob is what a \
+                 block is handed when its phase declares no barrier, or when it was run \
+                 through an entry point that carries no reduction.",
+                words.len()
+            ))),
+        }
+    }
+}
+
+impl FragmentOp for HoistedReduceOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// **Zero, and that is the point.** The pixel reach of the op this replaces
+    /// is the whole volume, which is what forces a whole-volume halo and a
+    /// whole-volume fetch in every block. With the answer computed once for the
+    /// phase, a block needs nothing outside its own core.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn writes_pixels(&self) -> bool {
+        true
+    }
+
+    fn barrier(&self) -> bool {
+        true
+    }
+
+    /// Nothing is gathered per block: the reach below is zero and the fold is in
+    /// [`Self::reduce`].
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    /// **Reach zero, and the stream still declared.** The declaration is what
+    /// puts the stream in the plan and what lets `PhaseView` offer it; the reach
+    /// is what a *block* gathers, and a block gathers none of it.
+    fn inputs(&self) -> Vec<crate::fragment::FragmentInput> {
+        vec![
+            crate::fragment::FragmentInput::own(self.input.clone(), self.input_phase)
+                .with_reach([0, 0, 0]),
+        ]
+    }
+
+    /// Integer addition over the whole set: associative in the type it
+    /// accumulates in, so the answer does not depend on the order the lattice is
+    /// walked and the phase is decomposition-invariant. The executor checks that
+    /// claim by reducing a second time over the reversed lattice.
+    fn seam_fold(&self) -> Option<crate::fragment::SeamFold> {
+        Some(crate::fragment::SeamFold::Unordered)
+    }
+
+    fn reduce(&self, at: &crate::fragment::PhaseView<'_>) -> Result<Vec<u8>> {
+        let mut total = 0u64;
+        let mut failed: Option<Error> = None;
+        at.stream_fragments(&self.input, &mut |_, bytes| {
+            match BlockSummaryOp::read(bytes) {
+                Ok((_, voxels, _, _)) => total += voxels as u64,
+                Err(err) => failed = Some(err),
+            }
+            Ok(())
+        })?;
+        if let Some(err) = failed {
+            return Err(err);
+        }
+        Ok(crate::fragment::pack_u64(&[Self::MAGIC, total]))
+    }
+
+    fn apply(&self, at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
+        let total = Self::read(at.reduced)?;
+        Ok(crate::fragment::BlockOutput::nothing().with_pixels(at.output_buffer(total as f64)?))
+    }
+}
+
 /// A fragment phase appended to the job's chain, named in terms a factory
 /// resolves.
 ///
@@ -336,6 +463,24 @@ impl FragmentPhaseSpec {
         }
     }
 
+    /// [`Self::reduce`] with a barrier and the fold hoisted: the same answer,
+    /// derived once for the phase instead of once per block, over a fragment
+    /// reach of zero instead of the whole lattice. See [`HoistedReduceOp`].
+    ///
+    /// No `reach` argument, and that absence is the declaration: this phase
+    /// reaches nothing, which is what the barrier buys.
+    pub fn hoisted(name: &str, input: &str, input_phase: usize) -> Self {
+        Self {
+            kind: "hoisted".to_string(),
+            name: name.to_string(),
+            stream: String::new(),
+            lifecycle: Lifecycle::DeleteOnExit,
+            input: input.to_string(),
+            input_phase,
+            reach: [0, 0, 0],
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "op": self.kind,
@@ -396,10 +541,16 @@ impl FragmentPhaseSpec {
                 self.input_phase,
                 self.reach,
             )),
+            "hoisted" => Box::new(HoistedReduceOp::new(
+                static_name(&self.name),
+                self.input.clone(),
+                self.input_phase,
+            )),
             other => {
                 return Err(Error::invalid(format!(
-                    "{other:?} is not a fragment probe. Built in: summary, fold, reduce. A \
-                     deployment with its own fragment ops registers its own workflow factory."
+                    "{other:?} is not a fragment probe. Built in: summary, fold, reduce, \
+                     hoisted. A deployment with its own fragment ops registers its own \
+                     workflow factory."
                 )))
             }
         })

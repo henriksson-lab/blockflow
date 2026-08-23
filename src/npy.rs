@@ -37,6 +37,43 @@
 // offer is reading a Fortran file as C, because that is the answer that looks
 // right.
 //
+// What comes back: three readers, and which to reach for
+// ------------------------------------------------------
+// The element type is a static parameter, a runtime tag, or a rank-3 runtime
+// tag, and which of those a caller wants is a fact about the caller:
+//
+// | reader | element type | rank |
+// |---|---|---|
+// | [`read_array`] and friends | the caller's `T`, checked against the header | any |
+// | [`read_elements`] and friends | whatever the file says, as an [`Elements`] | any |
+// | [`read_voxels`] and friends | whatever the file says, as a [`Voxels`] | 3, checked |
+//
+// The middle row was added after the fact and is worth explaining, because it
+// looks at first like the third with a check removed. It is not. A caller
+// reading a *volume* whose dtype it does not know has [`read_voxels`]; a caller
+// reading a *table* whose dtype it does not know had nothing, and had to write
+// `match header.dtype { .. }` with one arm per type it might meet — which one
+// consumer, migrating its private readers onto this module, duly wrote in most
+// of the files it touched. [`Elements`] is what those collapse to, and it keeps
+// the rank check where the rank check belongs — on [`Elements::into_voxels`],
+// which is the only place a rank is a claim.
+//
+// Widening is a request, never a default
+// --------------------------------------
+// Every reader above refuses an element type that is not the one it was asked
+// for, because a reader that widened silently turns a wrong `descr` into
+// plausible numbers. A caller that *wants* a wider type asks in the signature:
+// [`Elements::widened`] for `f64`, [`Elements::widened_i64`] for the exact
+// integer widening that refuses `uint64` past `i64::MAX` and refuses the float
+// types outright, and [`read_array_mapped_from`] to convert inside the decode
+// loop so the narrow array is never held beside the wide one.
+//
+// The two integer widenings are not a redundancy. `f64` has no exact
+// representation past 2^53, so a `int64` identifier widened through it becomes
+// an identifier that compares equal to its neighbours — silently, and only for
+// large values. Which of "identifier" and "measurement" a file holds is the
+// caller's knowledge, so both exist and neither is the default.
+//
 // Streaming, and why the writer never holds a second copy
 // ------------------------------------------------------
 // A single tile is 1.775 GB as `bool`, and one consumer counts non-zeros without
@@ -785,7 +822,8 @@ pub fn read_array_mapped_from<Src: NpyElement, Dst>(
     let header = Header::read_from(reader, what)?;
     policy.check(header.order, what)?;
     header.check_element::<Src>(what)?;
-    let values = decode_mapped::<Src, Dst>(reader, header.elements(), header.endian, what, &mut map)?;
+    let values =
+        decode_mapped::<Src, Dst>(reader, header.elements(), header.endian, what, &mut map)?;
     assemble(&header.shape, header.order, values, what)
 }
 
@@ -894,14 +932,7 @@ macro_rules! voxels_by_dtype {
                 type $element = f64;
                 $body
             }
-            Dtype::F16 => {
-                return Err(Error::invalid(format!(
-                    "{}: the file holds `float16`, and `Voxels` has no variant for it — Rust has \
-                     no native 16-bit float. Reading it would mean widening, and a reader that \
-                     widened would hand back numbers no file contains.",
-                    $what
-                )))
-            }
+            Dtype::F16 => return Err(refuse_float16($what)),
         }
     };
 }
@@ -964,9 +995,7 @@ pub fn read_voxels_file(path: &Path, policy: OrderPolicy) -> Result<Voxels> {
 /// so a `float16` file says `float16` whatever its rank is.
 fn check_holdable(header: &Header, what: &str) -> Result<()> {
     if header.dtype == Dtype::F16 {
-        return Err(Error::invalid(format!(
-            "{what}: the file holds `float16`, and `Voxels` has no variant for it — Rust has no              native 16-bit float. Reading it would mean widening, and a reader that widened would              hand back numbers no file contains."
-        )));
+        return Err(refuse_float16(what));
     }
     Ok(())
 }
@@ -1006,9 +1035,10 @@ where
 /// type it might meet.
 ///
 /// That was measured rather than supposed. A consumer of this crate migrating
-/// twenty-three private `.npy` readers onto this module had to add that ladder
-/// to fifteen files, nine arms in two of them — which traded one duplication for
-/// a smaller one of the same kind. This type is what those ladders collapse to.
+/// its private `.npy` readers onto this module had to write that ladder in most
+/// of the files it touched, the widest of them naming nearly every type below —
+/// which traded one duplication for a smaller one of the same kind. This type is
+/// what those ladders collapse to.
 ///
 /// **There is no `F16` variant**, for the reason [`descr_of`] gives: Rust has no
 /// native 16-bit float, so `Dtype::F16` is a byte-width tag for storage and not
@@ -1028,8 +1058,8 @@ pub enum Elements {
     F64(ArrayD<f64>),
 }
 
-/// The one `float16` refusal, written once so the two erasing readers cannot
-/// drift apart in what they say about it.
+/// The one `float16` refusal, written once so that no reader here can drift
+/// apart from another in what it says about it.
 fn refuse_float16(what: &str) -> Error {
     Error::invalid(format!(
         "{what}: the file holds `float16`, and there is no variant for it here — Rust has no \
@@ -1464,7 +1494,6 @@ pub fn write_elements_file(path: &Path, elements: &Elements, order: Order) -> Re
     out.flush().map_err(Error::backend)?;
     Ok(())
 }
-
 
 // ----------------------------------------------------------------- writing --
 
@@ -2223,7 +2252,6 @@ mod tests {
         );
     }
 
-
     /// An array of any rank comes back as itself, and comes back out again.
     #[test]
     fn an_elements_holds_what_the_file_named_at_any_rank() {
@@ -2316,7 +2344,10 @@ mod tests {
         let text = read_elements(&bytes, "t.npy", OrderPolicy::Only(Order::C))
             .unwrap_err()
             .to_string();
-        assert!(text.contains("Fortran order") && text.contains("C order"), "{text}");
+        assert!(
+            text.contains("Fortran order") && text.contains("C order"),
+            "{text}"
+        );
     }
 
     /// The exact integer widening is exact, and refuses everything it cannot do
@@ -2327,7 +2358,11 @@ mod tests {
         let past = 9_007_199_254_740_993i64; // 2^53 + 1
         let held = Elements::I64(ArrayD::from_elem(IxDyn(&[1]), past));
         assert_eq!(held.widened_i64("<memory>").unwrap()[[0]], past);
-        assert_ne!(held.widened()[[0]] as i64, past, "the f64 path does lose it");
+        assert_ne!(
+            held.widened()[[0]] as i64,
+            past,
+            "the f64 path does lose it"
+        );
 
         // Every integer type, and `bool` as zero and one.
         assert_eq!(
@@ -2339,11 +2374,23 @@ mod tests {
             vec![0i64, 1]
         );
         for (held, expected) in [
-            (Elements::U8(ArrayD::from_elem(IxDyn(&[1]), u8::MAX)), 255i64),
-            (Elements::U32(ArrayD::from_elem(IxDyn(&[1]), u32::MAX)), 4_294_967_295),
+            (
+                Elements::U8(ArrayD::from_elem(IxDyn(&[1]), u8::MAX)),
+                255i64,
+            ),
+            (
+                Elements::U32(ArrayD::from_elem(IxDyn(&[1]), u32::MAX)),
+                4_294_967_295,
+            ),
             (Elements::I8(ArrayD::from_elem(IxDyn(&[1]), i8::MIN)), -128),
-            (Elements::I32(ArrayD::from_elem(IxDyn(&[1]), i32::MIN)), -2_147_483_648),
-            (Elements::U64(ArrayD::from_elem(IxDyn(&[1]), i64::MAX as u64)), i64::MAX),
+            (
+                Elements::I32(ArrayD::from_elem(IxDyn(&[1]), i32::MIN)),
+                -2_147_483_648,
+            ),
+            (
+                Elements::U64(ArrayD::from_elem(IxDyn(&[1]), i64::MAX as u64)),
+                i64::MAX,
+            ),
         ] {
             assert_eq!(held.widened_i64("<memory>").unwrap()[[0]], expected);
         }
@@ -2358,8 +2405,14 @@ mod tests {
 
         // The float types are refused by name, both of them.
         for (held, name) in [
-            (Elements::F64(ArrayD::from_elem(IxDyn(&[1]), 1.0f64)), "float64"),
-            (Elements::F32(ArrayD::from_elem(IxDyn(&[1]), 1.0f32)), "float32"),
+            (
+                Elements::F64(ArrayD::from_elem(IxDyn(&[1]), 1.0f64)),
+                "float64",
+            ),
+            (
+                Elements::F32(ArrayD::from_elem(IxDyn(&[1]), 1.0f32)),
+                "float32",
+            ),
         ] {
             let text = held.widened_i64("x.npy").unwrap_err().to_string();
             assert!(text.contains(name), "{text}");
@@ -2379,12 +2432,17 @@ mod tests {
 
         let table = Elements::U16(ArrayD::zeros(IxDyn(&[5, 3])));
         let text = table.into_voxels("t.npy").unwrap_err().to_string();
-        assert!(text.contains("2-dimensional") && text.contains("rank 3"), "{text}");
+        assert!(
+            text.contains("2-dimensional") && text.contains("rank 3"),
+            "{text}"
+        );
 
         // And the other direction is free and exact.
         let voxels: Voxels = Array3::<i32>::from_elem((2, 2, 2), -3).into();
         assert_eq!(
-            Elements::from(voxels.clone()).into_voxels("<memory>").unwrap(),
+            Elements::from(voxels.clone())
+                .into_voxels("<memory>")
+                .unwrap(),
             voxels
         );
     }
@@ -2402,7 +2460,48 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(text.contains("half.npy"), "{text}");
-        assert!(text.contains("float16") && text.contains("no variant"), "{text}");
+        assert!(
+            text.contains("float16") && text.contains("no variant"),
+            "{text}"
+        );
+    }
+
+    /// A file that does not match its own header is refused, in both
+    /// directions.
+    ///
+    /// The trailing-byte direction is the one that otherwise succeeds — a shape
+    /// that parses to fewer elements than the file holds reads happily and
+    /// returns an array — so it is the one worth a test.
+    #[test]
+    fn an_elements_refuses_a_file_that_contradicts_its_own_header() {
+        let good = write_array(&Array1::<u16>::from_elem(6, 3), Order::C, "<memory>").unwrap();
+        assert_eq!(
+            read_elements(&good, "<memory>", OrderPolicy::Either)
+                .unwrap()
+                .len(),
+            6
+        );
+
+        let text = read_elements(&good[..good.len() - 2], "short.npy", OrderPolicy::Either)
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("short.npy"), "{text}");
+        assert!(text.contains("bytes with its header"), "{text}");
+
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(&[0, 0]);
+        let text = read_elements(&trailing, "long.npy", OrderPolicy::Either)
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("bytes with its header"), "{text}");
+
+        // Not a `.npy` at all, which the erasing reader must refuse as loudly as
+        // the typed one: an erasing reader that returned an empty array here
+        // would turn every comparison built on it into a tautology.
+        let text = read_elements(b"not numpy at all!!!!!!!!", "junk.npy", OrderPolicy::Either)
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("magic"), "{text}");
     }
 
     /// The mapping reader converts inside the decode and still checks the file's

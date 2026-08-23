@@ -247,10 +247,17 @@ fn demo(args: &Args) -> Result<()> {
     let stats = execute_observed("live", &workflow, &decomposition, &hints, &env, &listeners)?;
     live.finished();
 
+    // `applications` rather than `ops_applied`: this demo drives a chain, where
+    // the two are equal, but the figure a reader wants from a line labelled
+    // "applications" is "did anything run", and `ops_applied` answers that with
+    // zero for a plan whose phases are fragment phases. `blocks` is beside it
+    // for the same reason — it is the admitted count, which every kind of phase
+    // contributes to.
     println!(
-        "done: {} tasks, {} ops, {} events, {} listener faults",
+        "done: {} tasks, {} applications over {} blocks, {} events, {} listener faults",
         stats.tasks,
-        stats.ops_applied,
+        stats.applications(),
+        stats.blocks_admitted,
         stats.log.len(),
         stats.listener_faults
     );

@@ -325,6 +325,13 @@ impl FragmentOp for ForgetfulOp {
         "forgetful"
     }
 
+    /// Nothing crosses on this op's own account. The second array it declares
+    /// is fetched over the reach on its `SourceInput`, which is a separate
+    /// declaration — and the one this test exists to see refused.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
         vec![SourceInput::voxelwise(0)]
     }
@@ -461,6 +468,13 @@ impl FragmentOp for SilentMergeOp {
         "silent-merge"
     }
 
+    /// Nothing crosses as pixels. The block this op folds across arrives on the
+    /// `partials` stream over the **fragment** reach in `inputs`, which is the
+    /// distinction the phase reach must not absorb.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn inputs(&self) -> Vec<FragmentInput> {
         vec![FragmentInput::own("partials", 1).with_reach([1, 0, 0])]
     }
@@ -516,6 +530,12 @@ struct ContradictoryOp;
 impl FragmentOp for ContradictoryOp {
     fn name(&self) -> &'static str {
         "contradictory"
+    }
+
+    /// Nothing crosses as pixels; the block it reaches for is a **fragment**
+    /// reach, declared on the stream in `inputs`.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn inputs(&self) -> Vec<FragmentInput> {
@@ -576,6 +596,14 @@ struct WindowedOperandOp;
 impl FragmentOp for WindowedOperandOp {
     fn name(&self) -> &'static str {
         "windowed-operand"
+    }
+
+    /// Nothing crosses on the phase's own account. The one-voxel window belongs
+    /// to the operand and is declared on the `SourceInput`; the test below
+    /// asserts exactly that separation — the halo widens to `[1, 1, 1]` while
+    /// the phase reach stays zero.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {

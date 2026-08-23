@@ -89,8 +89,12 @@
 // node would take; it is the next problem and not this one.
 
 use crate::error::{Error, Result};
-use crate::fragment::{pack_u64, unpack_u64};
+use crate::fragment::{
+    pack_u64, unpack_u64, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput,
+};
+use crate::geometry::BlockGrid;
 use crate::region::Region;
+use crate::sidecar::Lifecycle;
 use crate::table::{RowBuffer, Schema, Table, Value};
 
 // The store's surface keeps these names, because they are what a caller of a
@@ -247,6 +251,145 @@ fn canonical(left: &Point, right: &Point) -> Ordering {
     left.at
         .cmp(&right.at)
         .then_with(|| left.weight.to_bits().cmp(&right.weight.to_bits()))
+}
+
+// --------------------------------------------------------------- producer --
+
+/// A point set already in memory, written into the block whose **core**
+/// contains each point.
+///
+/// The kernel of [`PointSourceOp`], and a free function so the keying rule —
+/// which is the whole of what this op does — can be checked without building a
+/// block view.
+///
+/// **The division is not clamped, and that is the rule rather than an
+/// oversight.** A point whose coordinate lies outside the volume divides to a
+/// block index the lattice does not have, so it is written into **no**
+/// fragment at all. `ops::voxelize` requires every point in block `B`'s
+/// fragment to lie in `B`'s core and refuses anything else; keying such a point
+/// into the last block instead would hand that op a fragment it must reject, so
+/// the honest answer is that this producer has nowhere to put it. That is the
+/// difference from `ops::rows::RowSourceOp`, whose `ops::detect::owner_of`
+/// **is** clamped because a table refuses an out-of-volume row later and by
+/// name. Two producers, two rules, and neither is a case of the other — see
+/// [`PointSourceOp`] for the other half of why.
+fn block_points(grid: &BlockGrid, index: [usize; 3], points: &[Point]) -> Vec<u8> {
+    let edge = grid.block();
+    let mine: Vec<Point> = points
+        .iter()
+        .copied()
+        .filter(|point| (0..3).all(|axis| point.at[axis] / edge[axis] == index[axis]))
+        .collect();
+    encode_points(&mine)
+}
+
+/// **A point set in, one fragment per block out** — the producer the point
+/// world had, three times, in three different files.
+///
+/// `ops::detect` produces points *from an image*, which is a detector; this
+/// produces them from a list somebody already has — a coordinate file, a set
+/// from an earlier run, a fixture. Every consumer of points in this crate
+/// follows a phase that emitted some, so a plan whose input *is* a point set
+/// had nothing to start it and each caller wrote the same fifteen lines:
+/// `tests/voxelize.rs` and `tests/point_labels.rs` here, character for
+/// character, and once more in a consumer of this crate.
+///
+/// **Why this is not `ops::rows::RowSourceOp` over the point schema.** The
+/// words are the same — a point blob's four words *are* a row of
+/// [`Schema::points`], which is what makes this module the four-word case of
+/// [`crate::table`] — but a table blob carries its schema **in front** and a
+/// point blob is headerless, for the reason [`encode_points`] gives: any
+/// four-word blob is a valid point set, so the header would be a constant the
+/// reader already knows, and it is the format `ops::detect` writes and
+/// `ops::voxelize` reads today. A general row producer here would write the
+/// right words behind a header those two ops do not read. That is a
+/// parity-visible change to two ops in exchange for deleting a struct, and this
+/// module already declined it once.
+///
+/// So there are two producers of the same *shape* over two encodings, and the
+/// encoding is the half with consumers. The keying differs too, and
+/// deliberately: see [`block_points`].
+///
+/// Reads no image and declares no fragment input, so it is a **phase-0 op** —
+/// the thing there is nothing before. [`Coverage::EveryBlock`], because a block
+/// with no points writes an **empty** fragment rather than none: present and
+/// empty is a different fact from absent, and only the first is checkable.
+/// `ops::voxelize` tolerates either and declaring the stronger one is free.
+///
+/// Every block filters the whole set, which is `blocks x points` of work — the
+/// honest cost of a plan whose input is a list rather than an image. A producer
+/// that already knew which points were whose would be a detector.
+pub struct PointSourceOp {
+    name: &'static str,
+    stream: String,
+    lifecycle: Lifecycle,
+    points: Vec<Point>,
+}
+
+impl PointSourceOp {
+    /// `points` are taken as given. A coordinate this op cannot place is not
+    /// refused here — it is written nowhere, which is what [`block_points`]
+    /// documents and what `ops::voxelize`'s own coverage check is positioned to
+    /// notice.
+    pub fn new(
+        name: &'static str,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+        points: Vec<Point>,
+    ) -> Self {
+        Self {
+            name,
+            stream: stream.into(),
+            lifecycle,
+            points,
+        }
+    }
+
+    /// The stream this writes, which is the one a consumer names as its input.
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+
+    /// How many points it was handed — the number a consumer's total must come
+    /// to, and the only thing about the set this op will say.
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+}
+
+impl FragmentOp for PointSourceOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// **Zero, and it is a different quantity from a block reach.** This one is
+    /// voxels of the block's own image, and this op reads no image at all — the
+    /// points are held in memory and filtered to this block's index. What
+    /// crosses a block boundary is a *point*, and none does: each is written
+    /// into the one block whose core contains it, once, which is what makes
+    /// `ops::voxelize`'s reach in blocks derivable at all.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            Coverage::EveryBlock,
+        )]
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            block_points(at.grid, at.index, &self.points),
+        ))
+    }
 }
 
 // ------------------------------------------------------------------ store --
@@ -439,6 +582,160 @@ impl std::fmt::Debug for PointStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------- the producer ------
+
+    /// The producer's fixture: points on both sides of every seam, one that
+    /// *is* the first voxel of a core, and one in the short last block.
+    fn scattered() -> Vec<Point> {
+        vec![
+            Point::unit([0, 0, 0]),
+            Point::weighted([2, 0, 0], 2.5),
+            Point::unit([3, 0, 0]),
+            Point::weighted([3, 3, 3], -1.0),
+            Point::unit([7, 7, 7]),
+            Point::weighted([6, 1, 0], 0.25),
+            Point::unit([0, 7, 2]),
+        ]
+    }
+
+    /// **Every point inside the volume is written once, into the block whose
+    /// core contains it.**
+    ///
+    /// The producer's half of the rule `ops::voxelize` checks from the reading
+    /// side, and the precondition that makes that op's reach in *blocks*
+    /// derivable at all. Asserted as a partition rather than as a membership
+    /// test: a point written into two blocks is counted twice and a point
+    /// written into none disappears, and neither is visible to "each point is
+    /// in the right block".
+    ///
+    /// Membership is checked against `BlockGrid::cores`, not against the
+    /// division the producer itself uses — an oracle that recomputed the code
+    /// under test would assert nothing.
+    #[test]
+    fn a_point_set_is_written_into_the_block_whose_core_contains_each_point() {
+        for block in [[4, 4, 4], [3, 3, 3]] {
+            let grid = BlockGrid::new([8, 8, 8], block).expect("a cut of the volume");
+            let points = scattered();
+            let cores = grid.cores();
+
+            // The discriminator, first. A fixture whose points fall in one
+            // block, or none of which straddles a seam, cannot tell a correct
+            // keying rule from no rule at all.
+            let reached: std::collections::BTreeSet<[usize; 3]> = cores
+                .iter()
+                .filter(|core| {
+                    let (lo, hi) = (core.core.ranges(), core.core.end());
+                    points.iter().any(|point| {
+                        (0..3).all(|axis| point.at[axis] >= lo[axis].0 && point.at[axis] < hi[axis])
+                    })
+                })
+                .map(|core| core.index)
+                .collect();
+            assert!(
+                reached.len() >= 4,
+                "at {block:?} the fixture reaches only {} core(s), so a producer that \
+                 ignored the coordinate would pass",
+                reached.len()
+            );
+
+            let mut gathered: Vec<Point> = Vec::new();
+            for core in &cores {
+                let blob = block_points(&grid, core.index, &points);
+                let mine = decode_points(&blob).expect("a blob this op wrote decodes");
+                let (lo, hi) = (core.core.ranges(), core.core.end());
+                for point in &mine {
+                    assert!(
+                        (0..3)
+                            .all(|axis| point.at[axis] >= lo[axis].0 && point.at[axis] < hi[axis]),
+                        "at {block:?}, block {:?} was given the point at {:?}, which its core \
+                         {:?}..{:?} does not contain",
+                        core.index,
+                        point.at,
+                        core.core
+                            .ranges()
+                            .iter()
+                            .map(|&(lo, _)| lo)
+                            .collect::<Vec<_>>(),
+                        hi
+                    );
+                }
+                gathered.extend(mine);
+            }
+
+            let mut got: Vec<[usize; 3]> = gathered.iter().map(|point| point.at).collect();
+            got.sort_unstable();
+            let mut want: Vec<[usize; 3]> = points.iter().map(|point| point.at).collect();
+            want.sort_unstable();
+            assert_eq!(
+                got, want,
+                "at {block:?} the blocks together are not the point set exactly once"
+            );
+        }
+    }
+
+    /// **A point the lattice cannot place is written nowhere — not into the
+    /// last block.**
+    ///
+    /// This is the whole difference between this producer and
+    /// `ops::rows::RowSourceOp`, and it is the reason the two are not one op
+    /// with a parameter. That one keys by `ops::detect::owner_of`, which
+    /// **clamps**, because a table refuses an out-of-volume row later and by
+    /// name. Clamping here would hand `ops::voxelize` a fragment holding a
+    /// point outside the block's core, which is precisely what that op refuses
+    /// — so the honest answer is that this producer has nowhere to put it.
+    ///
+    /// The cut tiles exactly, so "past the volume" and "past the lattice" are
+    /// the same coordinate. Under a cut that does *not* tile exactly they are
+    /// not, and the producer's guarantee is the weaker one it states: into the
+    /// block the division names. The consumer's core check is what catches the
+    /// rest, which is why it is there.
+    #[test]
+    fn a_point_the_lattice_cannot_place_is_written_nowhere() {
+        let grid = BlockGrid::new([8, 8, 8], [4, 4, 4]).expect("a cut that tiles exactly");
+        let inside = Point::unit([7, 7, 7]);
+        let outside = Point::unit([8, 0, 0]);
+        let points = vec![inside, outside];
+
+        let mut written = 0;
+        for core in grid.cores() {
+            let blob = block_points(&grid, core.index, &points);
+            let mine = decode_points(&blob).expect("a blob this op wrote decodes");
+            assert!(
+                !mine.iter().any(|point| point.at == outside.at),
+                "block {:?} was given the point at {:?}, which no core contains; a clamped \
+                 keying would put it in the last block and `ops::voxelize` would refuse \
+                 that fragment",
+                core.index,
+                outside.at
+            );
+            written += mine.len();
+        }
+        // The premise: the *other* point was placed, so this measured a keying
+        // rule and not a producer that writes nothing.
+        assert_eq!(
+            written, 1,
+            "the point inside the volume must still be written exactly once"
+        );
+    }
+
+    /// **A block with no points writes an empty blob, not nothing.**
+    ///
+    /// `Coverage::EveryBlock` is the only guard a phase that writes no image
+    /// has, and it can only check a fragment that is there.
+    #[test]
+    fn a_block_with_no_points_still_writes_a_readable_fragment() {
+        let grid = BlockGrid::new([8, 8, 8], [4, 4, 4]).expect("a cut of the volume");
+        let only = vec![Point::unit([0, 0, 0])];
+        let empty = block_points(&grid, [1, 1, 1], &only);
+        assert!(
+            empty.is_empty(),
+            "a point blob is headerless; empty is zero bytes"
+        );
+        assert!(decode_points(&empty)
+            .expect("an empty blob decodes")
+            .is_empty());
+    }
 
     /// A SplitMix64 stream. The tests want *many* regions and *many* points and
     /// want the same ones every run; a named constant seed is what makes a

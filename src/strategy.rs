@@ -54,15 +54,17 @@ use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::region::Region;
 use crate::tiling::boxes_tile_exactly;
+use crate::voxels::Voxels;
 
 use super::decomposition::{
     check_block_constraints, check_dtypes, check_output_shapes, check_source_images,
     compute_per_voxel, constraint_for, cuttable_axes, groups_for, is_planning_barrier, price_phase,
-    region_to_ranges, Constraints, Decomposition, PhaseDecomposition, Visibility,
+    region_to_ranges, Constraints, Decomposition, PhaseDecomposition, SlabPolicy, Visibility,
 };
 use super::env::{block_shape, BlockBuf, Environment};
 use super::fragment::{
-    check_phase_work, neighbourhood, BlockOutput, BlockView, PhaseWork, SeamFold, SourceBlocks,
+    check_phase_work, neighbourhood, BlockOutput, BlockView, Coverage, PhaseWork, SeamFold,
+    SourceBlocks,
 };
 use super::geometry::{chunks_touched, BlockGrid};
 use super::graph::{Task, TaskGraph};
@@ -166,6 +168,31 @@ pub struct Hints {
     /// Naming image 0 or the output image is harmless and does nothing; neither
     /// is ever freed.
     pub keep_images: BTreeSet<ImageId>,
+    /// Whether a block may be cut into slabs and run on several threads, and by
+    /// what rule. See [`SlabPolicy`].
+    ///
+    /// **Advisory, and it belongs here for a stronger reason than the rest of
+    /// this struct has.** Everything in `Hints` may be ignored at no cost to the
+    /// answer; a slab count is the one where that is not a convention but a
+    /// property somebody checks. `slab::apply_sliced`'s acceptance bar is
+    /// bit-identity against the uncut block at every slab count, held by
+    /// `tests/intra_block_slicing.rs`, so an executor that ignored this field
+    /// entirely would produce the same bytes more slowly — which is exactly what
+    /// "advisory" is supposed to mean and rarely gets to mean this literally.
+    ///
+    /// **What it is not: a second statement of the block count.** The rule reads
+    /// `concurrency` above and the plan's own block count and answers `1`
+    /// whenever the lattice already has work for every worker, which is the
+    /// common case and the case this feature must not touch. See
+    /// [`SlabPolicy::slabs_for`].
+    ///
+    /// **How a caller's [`Constraints::slab_policy`] reaches it.**
+    /// [`Strategy::plan`] copies it, because that is the one method that holds
+    /// the constraints and the hints at once. [`Strategy::run`] is handed a
+    /// decomposition and no constraints, so it gets whatever the strategy's own
+    /// [`Strategy::hints`] advises — the default. A caller who wants a run
+    /// switched off takes the plan, or overrides the field.
+    pub slab_policy: SlabPolicy,
 }
 
 impl Default for Hints {
@@ -176,6 +203,7 @@ impl Default for Hints {
             concurrency: 1,
             prefetch_depth: 0,
             keep_images: BTreeSet::new(),
+            slab_policy: SlabPolicy::default(),
         }
     }
 }
@@ -226,9 +254,20 @@ pub trait Strategy: Sync {
         execute_observed(self.name(), workflow, decomposition, &hints, env, listeners)
     }
 
+    /// The plan: the binding half and the advisory half, built together.
+    ///
+    /// **The one line that carries [`Constraints::slab_policy`] into the run**,
+    /// and it is here rather than in [`Self::hints`] because this is the only
+    /// method that holds a `Constraints` and a `Hints` at the same time. A
+    /// strategy advises a slab policy the way it advises a concurrency — from
+    /// its own fields — and a caller who has stated one overrides that advice,
+    /// which is the same direction every other constraint travels.
     fn plan(&self, workflow: &Workflow, constraints: &Constraints) -> Result<Plan> {
         let decomposition = self.decompose(workflow, constraints)?;
-        let hints = self.hints(workflow, &decomposition);
+        let hints = Hints {
+            slab_policy: constraints.slab_policy,
+            ..self.hints(workflow, &decomposition)
+        };
         Ok(Plan {
             decomposition,
             hints,
@@ -247,6 +286,54 @@ pub fn execute(
     env: &dyn Environment,
 ) -> Result<Stats> {
     execute_observed(strategy, workflow, decomposition, hints, env, &[])
+}
+
+/// [`execute`], with the run's **CPU-seconds against its wall-seconds**.
+///
+/// **The question wall time cannot answer.** A run that takes ten seconds on a
+/// pool of forty tells a caller nothing about whether it used the forty;
+/// `CpuLedger::mean_cores_busy` is the mean number of cores actually kept busy,
+/// and against `Hints::concurrency` it is the acceptance bar for every threading
+/// change this crate makes — including whether a block is worth cutting into
+/// slabs at all, which is only ever worth it when this figure is *below* the
+/// pool.
+///
+/// **A wrapper rather than a change to `execute`, and the two readings are at
+/// the run boundary rather than per phase.** Two reasons, both about not
+/// perturbing the thing being measured. The instrument costs one small file read
+/// and two integer parses — nothing at a boundary, far too much on a block — and
+/// `crate::cpu`'s header records what happened the last time this project
+/// allocated inside a timed region. And a per-phase figure needs a phase
+/// *finish*, which this executor's task graph does not have a single point for;
+/// inventing one to hang an instrument on would be changing the schedule to
+/// measure it. Per-phase is the natural next step and it needs that boundary
+/// first.
+///
+/// The ledger reads zero ticks where `/proc` is absent, which
+/// [`crate::cpu::CpuTime::now`] reports as `None` and this folds to a recorded
+/// zero — so a caller on such a machine sees `mean_cores_busy` of zero rather
+/// than a plausible wrong number.
+pub fn execute_accounted(
+    strategy: &'static str,
+    workflow: &Workflow,
+    decomposition: &Decomposition,
+    hints: &Hints,
+    env: &dyn Environment,
+) -> Result<(Stats, crate::cpu::CpuLedger)> {
+    let before = crate::cpu::CpuTime::now();
+    let started = std::time::Instant::now();
+    let stats = execute_observed(strategy, workflow, decomposition, hints, env, &[])?;
+    // **Both readings taken before anything is formatted or allocated.** The
+    // ledger's `record` is two atomic adds.
+    let elapsed = started.elapsed();
+    let after = crate::cpu::CpuTime::now();
+    let ledger = crate::cpu::CpuLedger::new();
+    let ticks = match (before, after) {
+        (Some(before), Some(after)) => after.since(before),
+        _ => 0,
+    };
+    ledger.record(ticks, elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
+    Ok((stats, ledger))
 }
 
 /// `execute`, with observers attached.
@@ -396,6 +483,56 @@ pub fn execute_phases(
     let iterative: Vec<bool> = work.iter().map(|entry| entry.is_iterative()).collect();
     let mut iterative_ready: Vec<usize> = vec![0; n_phases];
     let mut iterative_run: Vec<bool> = vec![false; n_phases];
+    // A **barrier** phase is held back by the same mechanism, and here it is
+    // holding the property up rather than merely tidying it away.
+    //
+    // **This is the only thing enforcing a barrier in this executor**, and that
+    // is said plainly because it briefly was not: while a barrier was
+    // `blocks x blocks` edges in the graph, the indegree above enforced it too,
+    // and a correctness property enforced in one place that reads as though it
+    // is enforced in two is worse than one honestly enforced once. The edges are
+    // gone (`TaskGraph::barriers` has the measurement that removed them) and the
+    // gate is here.
+    //
+    // A barrier phase's own `deps` are the ordinary region-derived ones — its
+    // blocks fetch their own cores — so they go to zero long before the phase
+    // below has finished. The condition below is therefore **stated rather than
+    // derived**: every earlier phase's remaining count is zero. An earlier
+    // version released when every task of the phase had become ready, which is
+    // the same moment in any plan whose valid regions tile, but it arrived there
+    // through an invariant proved elsewhere instead of through the sentence the
+    // barrier is.
+    //
+    // **Earlier phases and not only `p-1`, and the difference is unobservable.**
+    // A `FragmentInput` may name a stream written further back, so the sentence
+    // has to be true of that stream too — but in any plan that passed
+    // `Decomposition::check` the two conditions are the same moment, because
+    // every task has a non-empty valid region and those regions tile, so every
+    // task of phase `q` is a dependency of some task of `q+1` and all of `p-1`
+    // done implies all of `p-2` done. Mutating this to `p-1` alone was tried
+    // against a three-phase plan whose barrier reduces over phase 0's stream and
+    // **nothing failed**, which is the induction working rather than a hole in
+    // the test.
+    //
+    // It is written broadly anyway, because the cost is one comparison per phase
+    // per wave and what it buys is that this line *says* the property instead of
+    // depending on a proof that lives in another file. If the tiling invariant
+    // is ever relaxed, this does not quietly become wrong.
+    //
+    // **This cannot deadlock**, on the argument already written above for an
+    // iterative phase and unchanged by this: a task of phase `p` waits only on
+    // earlier phases, so holding phase `p`'s tasks back blocks nothing that
+    // phase `p`'s tasks need.
+    let barrier: Vec<bool> = decomposition
+        .phases
+        .iter()
+        .map(|phase| phase.barrier)
+        .collect();
+    let mut barrier_held: Vec<Vec<usize>> = vec![Vec::new(); n_phases];
+    let mut barrier_released: Vec<bool> = vec![false; n_phases];
+    // One blob per phase, empty for every phase whose op takes the default
+    // `reduce` and for every phase that is not a barrier.
+    let mut reduced: Vec<Vec<u8>> = vec![Vec::new(); n_phases];
     // A heap rather than a sorted vector: the ready set is re-ranked on every
     // wave, and re-sorting it was O(waves x ready x log ready) — around 3 x 10^8
     // comparisons at full scale, which would have made the *scheduler* the
@@ -407,8 +544,11 @@ pub fn execute_phases(
                 &graph.tasks[id],
                 hints,
                 &iterative,
+                &barrier,
                 &mut ready,
                 &mut iterative_ready,
+                &mut barrier_held,
+                &barrier_released,
             );
         }
     }
@@ -435,6 +575,33 @@ pub fn execute_phases(
     let mut short_circuited = 0usize;
 
     while done < graph.len() {
+        // **The gate, and the one thing that goes in the gap it creates.**
+        // Every earlier phase has finished and no block of this phase has
+        // started. That is the only moment at which the fragment set is complete
+        // and untouched, so it is where `FragmentOp::reduce` runs: once, for the
+        // phase, rather than once per block from inside `apply` where the op
+        // would have nowhere to put the answer and would re-derive it `blocks`
+        // times.
+        //
+        // Then the held tasks join the ready heap like any others. They are
+        // ranked by the same priority key, popped in the same waves and run
+        // concurrently with each other and with whatever else is ready: a
+        // barrier constrains when a phase may *start*, not how it runs. Anything
+        // admitted after this point goes straight to the heap, because `admit`
+        // consults `barrier_released`.
+        for phase in 0..n_phases {
+            if !barrier[phase]
+                || barrier_released[phase]
+                || (0..phase).any(|earlier| phase_remaining[earlier] > 0)
+            {
+                continue;
+            }
+            reduced[phase] = reduce_phase(decomposition, phase, work, env)?;
+            barrier_released[phase] = true;
+            for id in std::mem::take(&mut barrier_held[phase]) {
+                ready.push(Reverse((priority_key(&graph.tasks[id], hints), id)));
+            }
+        }
         // An iterative phase whose every task is ready runs now, as a whole,
         // before anything is popped: it is a barrier by construction and there is
         // no benefit to interleaving other work around it in a serial executor.
@@ -504,14 +671,41 @@ pub fn execute_phases(
                 }
 
                 let run = |id: usize| {
+                    let phase = graph.tasks[id].phase;
+                    // **The planner's rule, evaluated per phase and nowhere
+                    // else.** `n_blocks` is the phase's own lattice, from the
+                    // plan rather than from how many tasks happen to be ready:
+                    // the question the rule answers is "does this lattice leave
+                    // workers parked", which is a property of the plan and must
+                    // give the same answer whatever order the heap emptied in.
+                    // On a plan with work for every worker this is `1` and the
+                    // block runs exactly as it did before slabs existed.
+                    //
+                    // **One budget, not two, and the arithmetic is why.** The
+                    // design note's §10 flags that threads spawned inside a task
+                    // are not the pool's, so `n_blocks x slabs` could exceed the
+                    // machine with nothing noticing. It cannot here: the wave is
+                    // at most `min(concurrency, ready)` tasks, a phase of `n`
+                    // blocks contributes at most `n` ready tasks, and each is
+                    // allotted `floor(concurrency / n)` slabs — so one phase's
+                    // wave spends at most `concurrency` threads. Two phases
+                    // cannot both be one-block and both ready, because a
+                    // one-block phase's task depends on the whole of the phase
+                    // below it. The bound is the plan's shape rather than a
+                    // clamp, which is why there is no clamp.
+                    let slabs = hints
+                        .slab_policy
+                        .slabs_for(concurrency, decomposition.phases[phase].blocks.len());
                     run_task(
                         &graph.tasks[id],
                         decomposition,
                         &slots,
-                        &work[graph.tasks[id].phase],
+                        &work[phase],
                         env,
                         &events,
                         n_phases,
+                        &reduced[phase],
+                        slabs,
                     )
                 };
                 let outcomes: Vec<Result<TaskOutcome>> = match &pool {
@@ -583,6 +777,14 @@ pub fn execute_phases(
                     // The tiling check below runs over valid regions, which for
                     // a fragment phase are the cores and therefore tile
                     // whatever happened; this is the check that can fail.
+                    //
+                    // A later barrier that reduces over this phase's stream runs
+                    // the same check again from `reduce_phase`, and that
+                    // repetition is deliberate — see `reduce_phase`'s own doc
+                    // for what it costs and why the alternatives are worse. This
+                    // is the copy that runs for a phase *no* barrier reads, and
+                    // the copy that fails at the phase which made the hole
+                    // rather than at whatever comes after it.
                     super::fragment::check_fragment_coverage(env, decomposition, phase, *op)?;
                 }
             }
@@ -593,8 +795,11 @@ pub fn execute_phases(
                         &graph.tasks[next],
                         hints,
                         &iterative,
+                        &barrier,
                         &mut ready,
                         &mut iterative_ready,
+                        &mut barrier_held,
+                        &barrier_released,
                     );
                 }
             }
@@ -637,7 +842,11 @@ pub fn execute_phases(
     let (reads, writes, read_voxels, write_voxels, chunks_read, estimated_work, peak) =
         env.counters().snapshot();
     let (side_writes, _, side_bytes_written) = env.counters().side_snapshot();
+    let (sidecar_writes, sidecar_reads, sidecar_bytes_written, sidecar_bytes_read) =
+        env.counters().sidecar_snapshot();
+    let (sidecar_listings, sidecar_keys_listed) = env.counters().listing_snapshot();
     let blocks_visited = events.log().op_sequence_per_block().len();
+    let blocks_admitted = events.log().blocks_admitted().len();
     let listener_faults = events.faults();
     let log = events.into_log();
     Ok(Stats {
@@ -651,6 +860,11 @@ pub fn execute_phases(
             .ops_applied
             .load(std::sync::atomic::Ordering::SeqCst) as usize,
         blocks_visited,
+        blocks_admitted,
+        fragment_applications: env
+            .counters()
+            .fragment_applications
+            .load(std::sync::atomic::Ordering::SeqCst),
         materialisations: written
             .iter()
             .take(n_phases.saturating_sub(1))
@@ -665,6 +879,20 @@ pub fn execute_phases(
         chunks_read,
         side_writes,
         side_bytes_written,
+        slabs_run: env
+            .counters()
+            .slabs_run
+            .load(std::sync::atomic::Ordering::SeqCst),
+        blocks_sliced: env
+            .counters()
+            .blocks_sliced
+            .load(std::sync::atomic::Ordering::SeqCst),
+        sidecar_reads,
+        sidecar_writes,
+        sidecar_bytes_read,
+        sidecar_bytes_written,
+        sidecar_listings,
+        sidecar_keys_listed,
         peak_resident_bytes: peak,
         estimated_work,
         listener_faults,
@@ -672,8 +900,194 @@ pub fn execute_phases(
     })
 }
 
+/// A barrier phase's reduction: computed **once for the phase**, in the gap the
+/// barrier creates.
+///
+/// Public because two schedulers need it and there must not be two copies.
+/// `execute_phases` calls it when its gate opens; a distributed worker calls it
+/// on the first task it is handed of a barrier phase. Both reach the same moment
+/// — every earlier phase complete, no block of this one started — and both must
+/// therefore reach the same bytes.
+///
+/// # Every node computes this, and nothing transports it
+///
+/// A distributed run does **not** ship the blob. It does not need to: the blob
+/// is *derived* from the fragment set rather than observed, the fragment set is
+/// already on storage every node can read, and
+/// [`PhaseView`](crate::fragment::PhaseView) walks the lattice in an order that
+/// is a function of the plan. So every worker that runs this over the same
+/// complete set gets byte-identical bytes with no agreement protocol, no
+/// election, and nothing added to a coordinator whose whole design is that it
+/// holds no data. `docs/design/barriers.md` §9 has the measurement and the two
+/// arms it was decided between.
+///
+/// What that costs is `nodes` reads of the fragment set and `nodes` folds
+/// instead of one of each — and the count is the point: **`nodes` is set by the
+/// machines a caller has, not by how finely they cut the volume.** The whole
+/// case against re-deriving per block was that the multiplier was `blocks`,
+/// which a caller raises to make a stage fit in memory. This multiplier does not
+/// move when they do.
+///
+/// # The set is checked before it is reduced
+///
+/// A reduction over a partial fragment set is the plausible-wrong-answer shape
+/// this feature exists to remove, so the completeness the barrier promises is
+/// **verified** rather than assumed, for every declared input stream whose
+/// producer said [`Coverage::EveryBlock`](crate::fragment::Coverage). In-process
+/// that guard has always run at the end of the producing phase; in a distributed
+/// run nothing ran it, because `execute_task_of` is per task and there is no
+/// end-of-phase moment on a worker. Running it here closes that gap and catches
+/// the one failure mode this design has: a sidecar store that is not in fact
+/// shared between nodes, where each worker would otherwise reduce over its own
+/// fragments and answer plausibly and differently on every machine.
+///
+/// In a single-node run that check is the *second* one on the same stream:
+/// `execute_phases` runs the same `check_fragment_coverage` on a fragment
+/// phase's outputs the moment that phase's last task completes, and every
+/// producer named here is an earlier phase, so it has already completed and
+/// already been checked. **That duplication is kept deliberately**, and what it
+/// costs is one extra listing per producing phase, returning one key per block.
+///
+/// It is kept because the alternative is worse in the direction that matters.
+/// The check cannot simply move to `reduce_phase`: `execute_phases` checks
+/// *every* fragment phase, including those no barrier ever reduces over, and it
+/// checks at the phase that made the hole rather than at whatever runs next, so
+/// dropping it would let a doomed run keep going through the phases in between.
+/// And it cannot be *conditionally* skipped by handing this function a
+/// caller-supplied "already verified" set: that turns a guard against a
+/// plausible-wrong-answer into something a caller can switch off by getting one
+/// argument wrong, on the path — the distributed one — where nothing else runs
+/// it at all.
+///
+/// The cost is bounded by the thing the standing rule asks about. `blocks` is
+/// the multiplier a caller raises to make a stage fit in memory, and the extra
+/// listing is `O(blocks)` keys against a phase that irreducibly writes `blocks`
+/// fragments and reads at least `blocks` more — so the ratio is fixed and does
+/// not move when they cut more finely. `Stats::sidecar_listings` and
+/// `sidecar_keys_listed` report both figures, and `tests/fragment_stats.rs`
+/// pins the listing count against the block count so a change that made it grow
+/// would be caught rather than argued about.
+///
+/// Refuses a phase the plan does not mark as a barrier: without one there is no
+/// moment at which the fragment set is complete, so there is nothing well
+/// defined to compute.
+pub fn reduce_phase(
+    decomposition: &Decomposition,
+    phase: usize,
+    work: &[PhaseWork<'_>],
+    env: &dyn Environment,
+) -> Result<Vec<u8>> {
+    if !decomposition
+        .phases
+        .get(phase)
+        .map(|entry| entry.barrier)
+        .unwrap_or(false)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "phase {phase} is not a barrier, so there is no moment at which its fragment \
+             set is complete and nothing well defined for `FragmentOp::reduce` to be \
+             computed over. A reduction taken at any other moment is taken over whatever \
+             fragments happened to exist."
+        )));
+    }
+    let PhaseWork::Fragments(op) = &work[phase] else {
+        return Ok(Vec::new());
+    };
+    let inputs = op.inputs();
+    // The completeness the barrier promises, verified. Only for a stream whose
+    // producer declared every-block coverage: where a hole is legitimate there
+    // is nothing to compare against, and the op decides what absence means.
+    //
+    // **Grouped by producing phase, and checked once per phase rather than once
+    // per input.** `check_fragment_coverage` lists *every* output stream of the
+    // op it is handed, so one call already covers each of that producer's
+    // streams whichever input brought us here. Run per input it repeated the
+    // whole check — and every listing in it — once for each stream this barrier
+    // reads from that phase, and a listing returns one key per block. So the
+    // duplicated cost was the product of two figures the caller sets: how many
+    // streams the op joins and how finely the volume is cut. Grouping removes
+    // the first factor outright.
+    let mut by_producer: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+    for input in &inputs {
+        let Some(PhaseWork::Fragments(producer)) = work.get(input.phase) else {
+            continue;
+        };
+        let declares_every_block = producer
+            .outputs()
+            .iter()
+            .any(|out| out.stream == input.stream && out.coverage == Coverage::EveryBlock);
+        if !declares_every_block {
+            continue;
+        }
+        by_producer
+            .entry(input.phase)
+            .or_default()
+            .push(&input.stream);
+    }
+    for (from, streams) in &by_producer {
+        let Some(PhaseWork::Fragments(producer)) = work.get(*from) else {
+            continue;
+        };
+        super::fragment::check_fragment_coverage(env, decomposition, *from, *producer).map_err(
+            |err| {
+                Error::InvalidArgument(format!(
+                    "phase {phase}: fragment op {:?} declares a barrier and is about to \
+                     reduce over stream(s) {streams:?} from phase {from}, and that phase's \
+                     fragment set is not complete: {err} A barrier is the statement that \
+                     every block of the phase below has finished, so a hole here is either a \
+                     scheduler that released this phase early or — in a distributed run — a \
+                     sidecar store that is not actually shared between nodes, in which case \
+                     every worker would reduce over its own fragments and answer plausibly \
+                     and differently on each machine.",
+                    op.name(),
+                ))
+            },
+        )?;
+    }
+    let streams: BTreeMap<String, usize> = inputs
+        .into_iter()
+        .map(|input| (input.stream, input.phase))
+        .collect();
+    let view =
+        super::fragment::PhaseView::new(phase, &decomposition.phases[phase].grid, env, streams);
+    let answer = op.reduce(&view)?;
+    // **`SeamFold::Unordered` is checked here too, and for the same reason it is
+    // checked per block.** The claim is that the fold is a function of the *set*
+    // of fragments rather than of their order; the lattice is walked row-major,
+    // which is one order out of many, and two different lattices walk two
+    // different ones. An `f64` accumulation over three or more fragments answers
+    // differently and would make the phase's answer a property of how the volume
+    // was cut. Skipped for a one-block lattice, which has no order.
+    //
+    // It is *not* what makes two nodes agree — they walk the same lattice, so
+    // they see the same order and agree for any deterministic op, associative or
+    // not. This is about two *lattices*, which is decomposition invariance.
+    if op.seam_fold() == Some(SeamFold::Unordered) && view.blocks().len() > 1 {
+        let again = op.reduce(&view.reversed())?;
+        if again != answer {
+            return Err(Error::InvalidArgument(format!(
+                "fragment op {:?} declares `SeamFold::Unordered` — that its answer is a \
+                 function of the set of fragments it is handed and not of their order — and \
+                 its `reduce` over phase {phase}'s {} block(s) produced {} byte(s) walking \
+                 the lattice forwards and {} byte(s) walking it backwards. A reduction is \
+                 folded in the lattice's own order, and two lattices are two orders, so a \
+                 fold that does not associate makes the phase's answer a property of how the \
+                 volume was cut. Accumulate in a type where the combine associates — an \
+                 integer or a fixed-point sum — or declare `SeamFold::OrderDependent` and \
+                 give up decomposition invariance for this phase.",
+                op.name(),
+                view.blocks().len(),
+                answer.len(),
+                again.len(),
+            )));
+        }
+    }
+    Ok(answer)
+}
+
 /// A task whose dependencies are all done joins the ready heap — unless its
-/// phase is an iteration, in which case it is counted instead.
+/// phase is an iteration, in which case it is counted instead, or a barrier
+/// whose reduction has not run, in which case it is held until it has.
 ///
 /// One function rather than the same three lines at the two places a task
 /// becomes ready, because the two are exactly the same decision and a scheduler
@@ -683,11 +1097,16 @@ fn admit(
     task: &super::graph::Task,
     hints: &Hints,
     iterative: &[bool],
+    barrier: &[bool],
     ready: &mut BinaryHeap<Reverse<([usize; 5], usize)>>,
     iterative_ready: &mut [usize],
+    barrier_held: &mut [Vec<usize>],
+    barrier_released: &[bool],
 ) {
     if iterative[task.phase] {
         iterative_ready[task.phase] += 1;
+    } else if barrier[task.phase] && !barrier_released[task.phase] {
+        barrier_held[task.phase].push(task.id);
     } else {
         ready.push(Reverse((priority_key(task, hints), task.id)));
     }
@@ -800,6 +1219,111 @@ pub fn execute_task_of(
             decomposition.n_phases()
         )));
     }
+    // **A hoisted reduction is refused on this entry point rather than handed
+    // nothing.** `FragmentOp::reduce` is computed once for the phase and reaches
+    // the blocks through `BlockView::reduced`; nothing in a single task's
+    // arguments carries it, so running one block here would hand the op an empty
+    // slice and get a plausible answer from an empty table in every block —
+    // which `barriers.md` §7.7 says no guard could catch afterwards.
+    //
+    // **It is not refused because the blob cannot be had.** A caller with a
+    // barrier phase computes it with [`reduce_phase`] and passes it to
+    // [`execute_task_with_reduction`], which is exactly what
+    // `distributed::worker` does — once per phase, from the same fragment set,
+    // with no transport. This entry point is the one that has no blob, so it
+    // refuses to pretend it does.
+    if let PhaseWork::Fragments(op) = work {
+        if op.barrier() {
+            let probe = crate::fragment::PhaseView::at_plan_time(
+                task.phase,
+                &decomposition.phases[task.phase].grid,
+            );
+            let answered = op.reduce(&probe);
+            if answered
+                .as_ref()
+                .map(|bytes| !bytes.is_empty())
+                .unwrap_or(true)
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "task (phase {}, block {:?}) belongs to fragment op {:?}, which computes a \
+                     phase reduction with `reduce`. That blob is computed once for the whole \
+                     phase and handed to every block as `BlockView::reduced`, and this entry \
+                     point takes no blob — so running one block through it would hand the op \
+                     an empty reduction and get a plausible answer from an empty table. \
+                     Compute it with `strategy::reduce_phase` once the barrier has opened and \
+                     pass it to `strategy::execute_task_with_reduction`; nothing has to travel \
+                     to do that, because the fragment set the reduction is derived from is \
+                     already on storage every node reads.",
+                    task.phase,
+                    task.index,
+                    op.name()
+                )));
+            }
+        }
+    }
+    // **One slab**, which is what makes this the convenience layer: a caller
+    // wanting threads inside a block is stating a machine's resources, and wants
+    // the entry point that takes them.
+    execute_task_with_reduction(chain, decomposition, task, work, &[], env, listeners, 1)
+}
+
+/// [`execute_task_of`], with the phase's reduction supplied and the threads the
+/// caller will let one block have.
+///
+/// The entry point a distributed worker uses for a barrier phase whose op hoists
+/// a reduction. `reduced` is what [`reduce_phase`] returned for `task.phase`,
+/// computed once by that worker rather than shipped to it — see `reduce_phase`
+/// for why the blob is derived rather than transported.
+///
+/// Pass `&[]` for any phase that is not a barrier, or whose op takes the default
+/// `reduce`; that is what [`execute_task_of`] does, and it is the whole
+/// difference between the two.
+///
+/// # `slabs`, and why it is a parameter here and nowhere else in this family
+///
+/// **`1` is today's behaviour exactly**: one block, on this thread, uncut. Above
+/// one it is the most the block may be cut into, and it is an *offer* — a chain
+/// that has not declared itself sliceable declines it and runs uncut, which is
+/// every chain this crate shipped before the declarations existed. See
+/// [`crate::slab::apply_at_most`].
+///
+/// **It is the regime the whole feature is for, and the only one in which this
+/// crate has no other parallelism to offer.** `execute_phases` runs a wave of
+/// blocks, and slabs are what it does with the workers a block lattice left
+/// parked; a distributed worker's main loop computes **one task at a time**, so
+/// on a node with cores to spare every one of them is parked and there is no
+/// block-level alternative competing for them. `docs/design/intra-block.md` §7
+/// measured that row at 4.6-5.4x, and §13.7 is the note that this was the last
+/// place it had not reached.
+///
+/// **What the parameter costs, since this is a public entry point.** One call
+/// site in this crate — `distributed::worker` — and a compile error naming the
+/// line for anybody outside it, where `1` is the answer that keeps their
+/// behaviour identical. It is a parameter rather than a fourth entry point
+/// because this function is called *for a real run* and never as a convenience,
+/// which is this crate's own test for when exhaustiveness is worth paying:
+/// somebody has to decide how many threads a node spends on one block, and that
+/// is exactly the decision that should not be inheritable from a default. The
+/// two wrappers above are the convenience layer and keep their arity.
+///
+/// **It cannot disturb a hoisted reduction, and that is structural rather than
+/// careful.** [`reduce_phase`] is computed by the caller before this is entered
+/// and reads the fragment set; slabs are offered inside `run_task` only after it
+/// has dispatched a [`PhaseWork::Fragments`] phase elsewhere, so a fragment
+/// phase — the only kind that has a reduction — never reaches the offer at all.
+/// `tests/intra_block_slicing.rs` asserts that rather than restating it.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_task_with_reduction(
+    chain: &Chain,
+    decomposition: &Decomposition,
+    task: &super::graph::Task,
+    work: &PhaseWork<'_>,
+    reduced: &[u8],
+    env: &dyn Environment,
+    listeners: &[Arc<dyn EventListener>],
+    slabs: usize,
+) -> Result<TaskOutcome> {
+    let slots = chain.slots();
     let events = Dispatch::new(listeners);
     let mut outcome = run_task(
         task,
@@ -809,6 +1333,8 @@ pub fn execute_task_of(
         env,
         &events,
         decomposition.n_phases(),
+        reduced,
+        slabs,
     )?;
     outcome.listener_faults = events.faults();
     Ok(outcome)
@@ -823,9 +1349,11 @@ fn run_task(
     env: &dyn Environment,
     events: &Dispatch,
     n_phases: usize,
+    reduced: &[u8],
+    slabs: usize,
 ) -> Result<TaskOutcome> {
     if let PhaseWork::Fragments(op) = work {
-        return run_fragment_task(task, decomposition, *op, env, events, n_phases);
+        return run_fragment_task(task, decomposition, *op, env, events, n_phases, reduced);
     }
     if let PhaseWork::Iterate(op) = work {
         // Refused rather than fallen through. An iterative phase owns no chain
@@ -1009,7 +1537,13 @@ fn run_task(
         }
         for (&slot, place) in phase.slots.iter().zip(&places) {
             let started = Instant::now();
-            let next = env.apply(slots[slot], &buf, &sources, place)?;
+            // **The offer, not a demand.** `slabs` is what the policy allots
+            // from the pool and the lattice; whether it is taken is the chain's
+            // to say, and a chain that has not declared itself sliceable runs
+            // uncut on this thread exactly as it always has. See
+            // `slab::apply_at_most`, and `EnvCounters::blocks_sliced` for what
+            // says afterwards which way it went.
+            let (next, _ran) = env.apply_sliced(slots[slot], &buf, &sources, place, slabs)?;
             let duration_ns = started.elapsed().as_nanos() as u64;
             // Side outputs, before the input buffer is released, because the op
             // is handed both what it read and what it produced. The regions come
@@ -1142,6 +1676,7 @@ fn order_disagreement(first: &BlockOutput, second: &BlockOutput) -> Option<Strin
 ///   an algebra over pixel values, and a fragment's bytes are not pixel values.
 ///   An op that could skip cheaply skips inside `apply`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_fragment_task(
     task: &super::graph::Task,
     decomposition: &Decomposition,
@@ -1149,6 +1684,7 @@ fn run_fragment_task(
     env: &dyn Environment,
     events: &Dispatch,
     n_phases: usize,
+    reduced: &[u8],
 ) -> Result<TaskOutcome> {
     let phase = &decomposition.phases[task.phase];
     // As in `run_task`: `fetch` is in the read image's space, `read` in this
@@ -1291,7 +1827,14 @@ fn run_fragment_task(
             pixels.as_ref(),
             wanted,
             gathered,
-        );
+        )
+        .with_reduced(reduced);
+        // One atomic add per application, and nothing else: the counter must not
+        // become part of what it measures. Nothing is formatted, nothing is
+        // allocated, and the block's buffers are untouched.
+        env.counters()
+            .fragment_applications
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         op.apply_with(&view, SourceBlocks::new(&borrowed))?
     };
     if verify_order {
@@ -1309,7 +1852,14 @@ fn run_fragment_task(
                 pixels.as_ref(),
                 reversed_wanted,
                 reversed_gathered,
-            );
+            )
+            .with_reduced(reduced);
+            // Counted, because it happened. The order check applies the op a
+            // second time to the same block, and a `fragment_applications` that
+            // quietly excluded it would report a cost the run did not have.
+            env.counters()
+                .fragment_applications
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             op.apply_with(&view, SourceBlocks::new(&borrowed))?
         };
         let disagreement = order_disagreement(&produced, &again);
@@ -1595,7 +2145,7 @@ fn run_iterative_phase(
                             // difference it has already reported, and it can only be
                             // taken where `same` could answer at all.
                             changed_voxels.fetch_add(
-                                differing_voxels(&core, &before).unwrap_or(0),
+                                differing_block_voxels(&core, &before)?.unwrap_or(0),
                                 Ordering::SeqCst,
                             );
                         }
@@ -1698,25 +2248,46 @@ fn run_iterative_phase(
 ///
 /// A free function rather than a method for the same reason: an environment has
 /// nothing to say about it that it does not already say through `same`.
-fn differing_voxels(left: &BlockBuf, right: &BlockBuf) -> Option<u64> {
-    let (BlockBuf::Array(left), BlockBuf::Array(right)) = (left, right) else {
-        return None;
-    };
-    fn count<T: crate::voxels::VoxelElement>(
-        left: &crate::voxels::Voxels,
-        right: &crate::voxels::Voxels,
-    ) -> Option<u64> {
-        let left = left.view::<T>().ok()?;
-        let right = right.view::<T>().ok()?;
-        Some(
-            left.iter()
-                .zip(right.iter())
-                .filter(|(one, other)| one != other)
-                .count() as u64,
-        )
+///
+/// **`pub`, over [`Voxels`], and fallible — and each of those three was a
+/// defect.** It was private, so thirteen consumer test files re-derived it in
+/// three incompatible shapes; it took the executor's `BlockBuf`, which is not
+/// what a consumer holds; and it answered `None` for mismatched extents, which
+/// the one call site turned into **zero** with `unwrap_or(0)`. Ten of the
+/// thirteen copies used a bare `zip`, which truncates — so two volumes of
+/// *different* extents were reported as differing in a small number of voxels,
+/// and in a parity suite that is the failure reading as a pass. A count that
+/// cannot fail is a check that cannot fail.
+///
+/// So the extent and element-type mismatches are **refused by name** rather than
+/// folded into an absence. The one thing that is legitimately absent — a
+/// half-precision buffer, which no [`Voxels`] variant holds — is refused by name
+/// too, for the same reason: `same` cannot answer there either, and saying so is
+/// not the same as answering zero.
+pub fn differing_voxels(left: &Voxels, right: &Voxels) -> Result<u64> {
+    fn count<T: crate::voxels::VoxelElement>(left: &Voxels, right: &Voxels) -> Result<u64> {
+        let left = left.view::<T>()?;
+        let right = right.view::<T>()?;
+        Ok(left
+            .iter()
+            .zip(right.iter())
+            .filter(|(one, other)| one != other)
+            .count() as u64)
     }
-    if left.dtype() != right.dtype() || left.shape() != right.shape() {
-        return None;
+    if left.shape() != right.shape() {
+        return Err(Error::ShapeMismatch {
+            expected: left.shape().to_vec(),
+            got: right.shape().to_vec(),
+        });
+    }
+    if left.dtype() != right.dtype() {
+        return Err(Error::InvalidArgument(format!(
+            "counting differing voxels: one volume holds {} and the other holds {}. Two element \
+             types are not comparable voxel by voxel, and answering a count for them would be a \
+             number about nothing.",
+            left.dtype().numpy_name(),
+            right.dtype().numpy_name()
+        )));
     }
     match left.dtype() {
         Dtype::Bool => count::<bool>(left, right),
@@ -1732,7 +2303,90 @@ fn differing_voxels(left: &BlockBuf, right: &BlockBuf) -> Option<u64> {
         Dtype::F64 => count::<f64>(left, right),
         // No `Voxels` variant holds one, so there is nothing to view and
         // nothing to count. `same` is in the same position.
-        Dtype::F16 => None,
+        Dtype::F16 => Err(Error::InvalidArgument(
+            "counting differing voxels: no buffer holds half-precision, so there is nothing to \
+             compare. `Environment::same` cannot answer here either."
+                .to_string(),
+        )),
+    }
+}
+
+/// [`differing_voxels`] over the executor's own buffers.
+///
+/// `Ok(None)` is the one honest absence: an accounting environment holds no
+/// values, so there is nothing to difference. A mismatch of extent or element
+/// type is an **error** and is propagated, because the executor guarantees
+/// neither can happen here and a zero in their place would hide the day one
+/// does.
+fn differing_block_voxels(left: &BlockBuf, right: &BlockBuf) -> Result<Option<u64>> {
+    let (BlockBuf::Array(left), BlockBuf::Array(right)) = (left, right) else {
+        return Ok(None);
+    };
+    differing_voxels(left, right).map(Some)
+}
+
+#[cfg(test)]
+mod differing_voxels_tests {
+    use super::*;
+
+    /// **The count refuses two volumes of different extents, by name** — which
+    /// is the whole of G21, because the shape it replaces did not.
+    ///
+    /// The fixture is chosen so that the wrong implementation returns a
+    /// *plausible* answer rather than an obviously silly one: the two volumes
+    /// agree everywhere the smaller one reaches, so a bare `zip` — which
+    /// truncates to the shorter iterator — answers **zero differing voxels** for
+    /// a pair that do not even have the same shape. In a parity suite that reads
+    /// as a pass. The assertion below is that we refuse instead, and the
+    /// liveness partner is the `zip` itself, run here so the number it would
+    /// have produced is on the record rather than described.
+    #[test]
+    fn counting_differing_voxels_refuses_two_extents_by_name() {
+        use crate::voxels::Voxels;
+        use ndarray::Array3;
+
+        let small: Voxels = Array3::<u16>::from_elem((2, 3, 4), 7).into();
+        let large: Voxels = Array3::<u16>::from_elem((2, 3, 8), 7).into();
+
+        let error = differing_voxels(&small, &large).unwrap_err().to_string();
+        assert!(
+            error.contains("2, 3, 4") && error.contains("2, 3, 8"),
+            "the refusal must name both extents, got {error}"
+        );
+        assert!(
+            differing_voxels(&large, &small).is_err(),
+            "and in either order"
+        );
+
+        // **Liveness: what the shape this replaces would have answered.**
+        let truncating = small
+            .view::<u16>()
+            .unwrap()
+            .iter()
+            .zip(large.view::<u16>().unwrap().iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            truncating, 0,
+            "the fixture must be one a truncating count answers plausibly, or this test is not \
+             about truncation"
+        );
+
+        // The element type is refused by name too, and for the same reason.
+        let other: Voxels = Array3::<u8>::from_elem((2, 3, 4), 7).into();
+        let error = differing_voxels(&small, &other).unwrap_err().to_string();
+        assert!(
+            error.contains("uint16") && error.contains("uint8"),
+            "the refusal must name both element types, got {error}"
+        );
+
+        // And it still counts when it can: the ordinary case, and one voxel of
+        // it, so that a function returning zero unconditionally would fail here.
+        let mut changed = Array3::<u16>::from_elem((2, 3, 4), 7);
+        changed[[1, 2, 3]] = 8;
+        let changed: Voxels = changed.into();
+        assert_eq!(differing_voxels(&small, &small).unwrap(), 0);
+        assert_eq!(differing_voxels(&small, &changed).unwrap(), 1);
     }
 }
 
@@ -2064,6 +2718,12 @@ impl Strategy for Trivial {
             concurrency: 1,
             prefetch_depth: 0,
             keep_images: BTreeSet::new(),
+            // **The policy every strategy advises, and the one that answers
+            // `1` under this strategy's own concurrency.** A slab count is
+            // derived from the pool and the block lattice, so a strategy states
+            // the rule and not a number; see `SlabPolicy` for why the rule is
+            // "fill idle workers" rather than a tuning curve.
+            slab_policy: SlabPolicy::default(),
         }
     }
 }
@@ -2327,6 +2987,11 @@ impl Default for Enumerating {
 /// An exact prune is therefore still available — it has to restart its bound
 /// whenever the chosen grid changes, which happens at most a few times per axis
 /// as the reach grows. That is design work, not a one-line guard.
+/// **A parameter of the planner rather than of the answer**, and the first entry
+/// in that space; [`crate::decomposition::BlockLadder`] is the second and
+/// carries the space's definition and its acceptance bar. Every variant here
+/// computes the same volume; what differs is which decomposition is chosen and
+/// what the choosing costs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PartitionSearch {
     /// `best[i] = min over j < i of best[j] + price(j..i)`, at `O(n^2)` priced
@@ -3216,6 +3881,7 @@ impl Strategy for Enumerating {
             // Nothing kept: a strategy advising on speed has no reason to want
             // an intermediate afterwards. A caller who does overrides it.
             keep_images: BTreeSet::new(),
+            slab_policy: SlabPolicy::default(),
         }
     }
 }
@@ -3485,6 +4151,7 @@ impl Strategy for Greedy {
             concurrency: self.concurrency,
             prefetch_depth: 2,
             keep_images: BTreeSet::new(),
+            slab_policy: SlabPolicy::default(),
         }
     }
 }
@@ -3736,6 +4403,7 @@ impl Strategy for Materialising {
             concurrency: self.concurrency,
             prefetch_depth: 1,
             keep_images: BTreeSet::new(),
+            slab_policy: SlabPolicy::default(),
         }
     }
 }
@@ -4064,6 +4732,7 @@ mod block_floor_tests {
             model: CostModel::default(),
             block_candidates: vec![3],
             split_axes: vec![0, 1, 2],
+            ..Default::default()
         };
         let reach = Reach::from(RADIUS);
         let unfloored = Decomposition {
@@ -4123,6 +4792,7 @@ mod block_floor_tests {
             model: CostModel::default(),
             block_candidates: vec![3],
             split_axes: vec![0, 1, 2],
+            ..Default::default()
         };
         assert_eq!(
             run(&Enumerating::default()
@@ -4210,6 +4880,7 @@ mod block_floor_tests {
             model: CostModel::default(),
             block_candidates: vec![1024],
             split_axes: vec![0],
+            ..Default::default()
         };
         let plan = Enumerating::default()
             .decompose(&Workflow::new(chain, volume, Dtype::F64), &constraints)
@@ -4425,6 +5096,7 @@ mod chain_floor_measurement {
             model: CostModel::default(),
             block_candidates: vec![32],
             split_axes: vec![0, 1, 2],
+            ..Default::default()
         };
         let amplification = |plan: &Decomposition| {
             let read: usize = plan.exact_read_voxels().iter().sum();

@@ -634,6 +634,20 @@ fn the_points_a_run_writes_go_into_a_store_and_come_back_by_region() {
 /// reads the whole volume once per block — a read amplification equal to the
 /// block count. This op's phase 1 reads no pixels at all, because everything it
 /// needs is in the fragments, so the whole run reads each voxel exactly once.
+///
+/// **Both phases are halo-free now, and the second assertion is inverted rather
+/// than deleted.** It used to read `block.read.voxels() == the whole volume`,
+/// with a comment saying that the whole-volume halo *was* the dependency edge
+/// and cost nothing here because no pixel was fetched through it. That is the
+/// coupling `docs/design/barriers.md` §1.2 is about, and it is gone: phase 1
+/// declares `barrier() == true`, so the edge is stated directly and the halo
+/// drops to the reach. The claim the assertion was making — that this op is
+/// unusual in paying no read amplification — is now true of the *plan* and not
+/// only of the counters, so it is asserted there.
+///
+/// It cost this op nothing to lose, which is the other half of the record: a
+/// barrier's whole traffic contribution is relieving pixel re-reads, and this op
+/// never paid any. `tests/barrier_migration.rs` measures that as an equality.
 #[test]
 fn the_labelling_is_halo_free_and_the_merge_reads_no_pixels_at_all() {
     let mask = scene();
@@ -645,11 +659,16 @@ fn the_labelling_is_halo_free_and_the_merge_reads_no_pixels_at_all() {
             "the labelling must read exactly its core"
         );
     }
-    // Phase 1's halo is the whole volume — that is the dependency edge, and
-    // `fill`'s header is where it is argued for — but the read extent costs
-    // nothing here because the op declares it reads no pixels.
+    assert!(
+        plan.phases[1].barrier,
+        "phase 1's dependency on phase 0 is the barrier, and nothing else states it"
+    );
     for block in &plan.phases[1].blocks {
-        assert_eq!(block.read.voxels(), VOLUME.iter().product::<usize>());
+        assert_eq!(
+            block.read.ranges(),
+            block.core.ranges(),
+            "with the edge stated as a barrier the merge fetches its own core"
+        );
         assert_eq!(block.valid.ranges(), block.core.ranges());
     }
 

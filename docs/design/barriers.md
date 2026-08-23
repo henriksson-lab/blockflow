@@ -1,10 +1,17 @@
 # Barriers
 
-*A specification, not an implementation.* It is written by the work that
-measured the cost of not having one — `tests/label_materialisation_cost.rs`, and
-`docs/ops-survey/README.md`'s **G7** row, which this note is the long form of.
-Figures are cross-referenced there rather than restated, except where an
-argument needs one in the line.
+*Sections 1-7 were a specification and are now the specification of something
+that exists. §8 is written by the implementation of it; §9 by the work that
+closed the one thing §8 left open; §10 by the work that migrated the shipped ops
+onto it, which is where the cost §2 measures is actually collected. Nothing in §1-7 has been edited and §8 is
+edited only where §9 supersedes it, by name — a note that quietly agrees with
+itself afterwards is not evidence, so where a later section contradicts an
+earlier one it says so by number.*
+
+This note is written by the work that measured the cost of not having one —
+`tests/label_materialisation_cost.rs`, and `docs/ops-survey/README.md`'s **G7**
+row, which this note is the long form of. Figures are cross-referenced there
+rather than restated, except where an argument needs one in the line.
 
 The standing rule on this project is to stop when the design does not permit
 what is needed and say so, rather than build around it. This is that call. What
@@ -550,3 +557,679 @@ sweep found it.
 * **A reduction that is genuinely per-block loses nothing either**, because
   `reduce` is defaulted empty and an op that does not override it is unchanged in
   every respect.
+
+---
+
+## 8. What was built, and what the specification got wrong
+
+*Written by the implementation, and the only part of this note that was added
+after there was one.*
+
+Both changes landed, in §7.4's order. `FragmentOp::barrier` and
+`FragmentOp::reduce` are both defaulted, so no shipped op changes; the record is
+`PhaseDecomposition::barrier`, hashed into the fingerprint when set and written
+to the wire when set, so a plan with no barrier in it fingerprints and serialises
+exactly as it did before. `tests/barrier_phase.rs` is the executable half.
+
+### 8.1 §3.2 named three consequences and there are five
+
+The second and third are as specified and are built; the first was built as
+specified, measured, and then replaced by something that says the same thing for
+free — §8.2. Two more consequences were found only by building it, and both are
+guards that would otherwise have refused the very plan the barrier exists to make
+expressible:
+
+4. **`fragment::check_phase_work`'s halo-against-fragment-reach guard.** It
+   refuses a phase whose halo is narrower than its fragment reach, and its stated
+   reason is exactly Rule B: *"the halo is what makes the neighbours' tasks
+   dependencies of this one, so a short halo would read fragments nobody has
+   written yet."* A barrier phase has `halo = 0` and a whole-lattice fragment
+   reach, so it fails this guard by construction. It is skipped for a barrier
+   phase, and skipped for the reason the guard is about rather than by exemption:
+   the barrier states the edge directly, so the fragments exist whatever the halo
+   is.
+5. **The record must be checked against the op.** §3.1 says a plan whose record
+   disagrees with its ops fetches one thing and waits for another; nothing in §3
+   says where that is checked. It is `check_phase_work`, in both directions, plus
+   a refusal of a barrier recorded on a phase that runs no fragment op at all —
+   nothing could have declared that one, and what it does is serialise two phases
+   silently.
+
+§3.2's second consequence — that `dependencies_cover_reads` passes without a
+special case — is confirmed, and by a shorter route than §3.2 expected. §3.2
+reasoned that a barrier task's deps are the whole previous phase, whose valid
+regions tile, so the areas sum for any fetch. Since §8.2 the deps are the
+ordinary region-derived ones, so the guard passes for the ordinary reason and
+there is nothing special to explain at all — the phase fetches its own core and
+the tasks covering that core cover it.
+
+That turns out to be the better arrangement for a second reason §3.2 did not
+raise: **it keeps the guard's full force on the thing that shrank.** Widening a
+barrier phase's deps to the whole phase below would have made the coverage check
+pass for *any* fetch, including a wrong one, at exactly the moment the halo was
+relieved. It now cannot.
+
+### 8.2 §3.2's *first* consequence did not survive, and was replaced
+
+> "for a barrier phase, `deps` is *every* task of phase `p - 1`"
+
+**Built exactly as written, measured, and then withdrawn.** It was correct and it
+was free for both schedulers — the in-process executor and the distributed
+coordinator both drive readiness off `Task::n_dependencies` and
+`TaskGraph::dependents`, so the cross product enforced the barrier with no new
+code anywhere. What §3.2 does not price is that it is `blocks(p) x blocks(p-1)`
+edges, **a product where every other edge in the graph is a sum**:
+
+`a_barrier_at_a_large_block_count_is_priced` builds both, side by side, on one
+plan — `deps` plus `dependents`, which are the two things a scheduler holds:
+
+| blocks | shipped (edges + dependents) | in time | withdrawn (edges + dependents) | in time | usize held by the withdrawn form |
+|---|---|---|---|---|---|
+| 64 | 64 + 64 | 0.000 s | 4 096 + 4 096 | 0.000 s | < 1 MiB |
+| 512 | 512 + 512 | 0.003 s | 262 144 + 262 144 | 0.018 s | 4 MiB |
+| 4 096 | 4 096 + 4 096 | 0.027 s | 16 777 216 + 16 777 216 | 0.421 s | **256 MiB** |
+
+Extrapolating to the 6 700 blocks `graph.rs` names: some 45 M edges, around 720
+MiB and over a second, to express one bit per phase — against a whole hoisted
+pipeline that runs in 3.80 s.
+
+Two things decide it against the edges:
+
+* **`graph.rs` had already rejected `O(blocks^2)` at that scale**, in
+  `producers_of`'s own header, on the grounds that it makes the DAG cost more to
+  build than the work it schedules. That argument was made before this feature
+  existed, about a different one, and it applies here unchanged.
+* **A barrier exists *for* fine cuts.** §2.2 is that the toll it removes is worst
+  precisely where cutting finely is most wanted. Paying a quadratic at the block
+  counts the feature is for is the wrong side of that trade.
+
+**What replaced it.** "Every task of `p` waits for every task of `p-1`" is a
+statement about two *phases*, so it is stated once: `TaskGraph::barriers` is one
+bool per phase, `Task::deps` stays the ordinary region-derived edges for every
+phase, and each scheduler gates. A barrier now costs the graph **nothing** —
+`a_barrier_costs_the_graph_nothing` asserts the graph is the same size with and
+without one.
+
+This changes what a `TaskGraph` *is*, and that is said rather than slipped in:
+**the edges are no longer the whole ordering.** A consumer that runs a task once
+its `deps` are done is correct for every phase except a barrier phase, whose
+blocks fetch their own cores and whose deps therefore clear long before the phase
+below has finished. `TaskGraph::is_barrier` is the method such a consumer must
+consult, and its documentation names the two schedulers that do and the shape
+they share.
+
+**What it costs when wrong, in each direction.** With the edges: a quadratic
+paid unconditionally for a property only a distributed scheduler needs
+*spelled*, at the block counts the feature targets. Without them: a scheduler
+that ignores `barriers` starts a block early and the op answers from an
+incomplete fragment set — a plausible wrong answer, schedule-dependent, and in a
+distributed run a different one on each machine. The second is worse per
+occurrence, which is why it is guarded by tests on both schedulers and why each
+gate is mutation-tested: removing either fails the correctness arm, not only an
+ordering assertion.
+
+### 8.3 The barrier is enforced once, in the scheduler, and that is now said
+
+The executor holds a barrier phase's tasks out of the ready heap and releases
+them together, exactly as an iterative phase's are held. §3 said the ready heap
+was **not** on the list of things to touch. It had to be, for two reasons that
+turned out to be independent:
+
+* **`reduce` needs a place to stand** — a moment after the phase below has
+  finished and before any block of this phase starts. That moment is not a task,
+  so no per-task hook could have been it.
+* **Since §8.2, it is the whole enforcement.** While the barrier was edges, the
+  hold-back was redundant with the indegree; mutation-testing found that with the
+  edges removed and the hold-back kept, every correctness test still passed. That
+  redundancy is gone deliberately: *a correctness property enforced in one place
+  that reads as though it is enforced in two is worse than one honestly enforced
+  once.* Both `strategy.rs` and `coordinator.rs` say in the code that the gate is
+  the only thing holding the property.
+
+**The release condition is stated rather than derived.** Both gates ask *has
+every earlier phase finished*, not *has every task of this phase become ready*.
+The second is the same moment in any plan whose valid regions tile — the
+induction is real, and mutating the executor's gate from "every earlier phase" to
+"phase `p-1` only" leaves even a three-phase plan reducing over phase 0's stream
+passing — but it arrives there through an invariant proved in another file. The
+broad form costs one comparison per phase per wave and buys a line that says the
+property. If the tiling invariant is ever relaxed, it does not quietly become
+wrong.
+
+**Neither gate can deadlock**, on the argument `strategy.rs` already wrote for an
+iterative phase and which this does not change: a task of phase `p` waits only on
+earlier phases, so holding phase `p` back blocks nothing phase `p` needs; phase 0
+is ready from the start, and the property carries forward.
+
+### 8.4 The plan-time refusal of `reduce` without `barrier`
+
+§7.5 requires it and does not say how, and there is a real obstacle: **a trait
+method's being overridden cannot be observed.** Three shapes were available and
+the third was taken.
+
+* *A third boolean* — `fn reduces(&self) -> bool` — is the crate's usual
+  convention, and it is the one an op author can override `reduce` and forget,
+  leaving the reduction silently never run and every block answering from an
+  empty blob.
+* *Nothing at plan time*, relying on the op's own decode to fail on an empty
+  blob. That is a run-time failure and a loud one, but it is not what §7.5 asks
+  for.
+* **A probe.** `check_phase_work` calls `reduce` on every non-barrier fragment
+  phase with a `PhaseView` that holds no environment and refuses every accessor.
+  The default answers `Ok(&[])` for free; an override either touches the view,
+  which errors, or returns bytes, which is equally an answer. Either way the plan
+  is refused by name.
+
+What the probe misses: an override that ignores the view and returns empty, which
+is the default by another spelling. What it costs, with the count named because
+the caller controls it: one virtual call per **non-barrier fragment phase** per
+`check_phase_work`, and `check_phase_work` runs once per `execute_phases` — a
+call the conformance sweep makes thousands of times. That is affordable only
+because the default answers `Ok(Vec::new())` and an empty `Vec` allocates
+nothing. An override pays whatever it does before it touches the view at that
+same multiplicity, and one that unwraps rather than propagating panics there
+instead of erroring. All of it is visible; none of it is silent.
+
+**Re-examined after §8.2 and unchanged.** Moving the barrier from edges to a
+phase-level fact changes how the *schedule* is expressed and touches nothing
+about how an op *declares*, so it opened no cleaner spelling here. This is a
+decision §7.5 did not make and it should be revisited if a fourth shape appears —
+the most likely being something the compiler could see, which Rust does not offer
+for a defaulted trait method.
+
+### 8.5 A reduction is order-checked, which §7 did not ask for and should have
+
+*The price this section quotes is corrected by §10.2: the check costs one extra
+reduction **and one extra pass over the whole fragment set**, because `PhaseView`
+reads from the store on every walk.*
+
+`SeamFold::Unordered` is the claim that an op's answer is a function of the
+**set** of fragments it is handed and not of their order, and the executor
+already checks it per block by applying the block a second time with the
+neighbourhood reversed. A hoisted reduction has exactly the same exposure and §7
+does not mention it: `PhaseView` walks the lattice row-major, which is one order
+out of many, and **two different lattices walk two different ones** — so an `f64`
+accumulation in `reduce` makes the phase's answer a property of how the volume
+was cut, which is the one property this crate is arranged around.
+
+So the same check is applied: an op declaring `SeamFold::Unordered` has its
+reduction run a second time over the reversed lattice and the two must be
+byte-identical. It costs one extra reduction for an op that opted in, against the
+one extra `apply` **per block** the same declaration already costs — so hoisting
+makes this check cheaper too, by the same multiplier it makes everything else
+cheaper by. `a_reduction_that_does_not_associate_is_refused` is the executable
+half, with an integer fold beside it as the liveness control.
+
+This is not a guard on whether the reduction computes the *right* thing. §7.7 is
+right that nothing could be: the executor cannot know what the reduction was
+supposed to be. It is a guard on whether the answer is a function of the
+decomposition, which is a different question and is checkable.
+
+### 8.6 §7.5.3's transmission cost does not exist in this executor
+
+§7.5 point 3 prices the whole-phase blob at `blocks x table` in transmission —
+0.036 GiB at the finest lattice measured — and argues that this is affordable
+against the 34.6 GiB it removes. **In-process it is not transmitted at all.**
+The executor holds one `Vec<u8>` per phase and every block is handed a `&[u8]`
+borrowed from it, so the count is one encode and zero copies whatever the block
+count is. The argument was right and the number it was defending against turns
+out to be zero.
+
+It becomes real the moment the blob has to travel to another process, which is
+exactly §8.7's gap. So §7.5.3's arithmetic should be read as the price of
+*distributing* a hoisted reduction rather than of having one, and it is still the
+right arithmetic for that.
+
+### 8.7 A hoisted reduction was refused in a distributed run — see §9
+
+`strategy::execute_task_of` is a single-task entry point that takes no blob, so
+a worker calling it for a barrier phase would hand the op an empty
+`BlockView::reduced` and get the plausible-in-every-block wrong answer §7.7 says
+no guard could catch. It is refused there, by the same probe, with a message
+naming the gap.
+
+**A barrier without a reduction distributes perfectly well** — it is an ordering
+the scheduler enforces and the block itself is an ordinary block — so only the
+pair was refused.
+
+*This section is superseded by §9, which closed it. The refusal on
+`execute_task_of` remains and is still right: that entry point has no blob. What
+changed is that there is now `execute_task_with_reduction`, which does, and that
+nothing has to be shipped to fill it.*
+
+### 8.8 The measurement, and what transfers from it
+
+`tests/barrier_phase.rs` builds the three in-plan arms out of **one op with two
+booleans**, so that every other line is the same line and a difference in the
+counters is attributable to the declaration. Volume `[16, 16, 16]`, `f64`, the
+framework's own `EnvCounters`, every column predicted from a formula and then
+compared:
+
+| blocks | arm | read | write | fragments | total | folds |
+|---|---|---|---|---|---|---|
+| 32 | in-plan | 1 081 344 | 65 536 | 8 448 | 1 155 328 | 32 |
+| 32 | barrier alone | 65 536 | 65 536 | 8 448 | 139 520 | 32 |
+| 32 | barrier, hoisted | 65 536 | 65 536 | 512 | 131 584 | **1** |
+| 256 | in-plan | 8 421 376 | 65 536 | 526 336 | 9 013 248 | 256 |
+| 256 | barrier alone | 65 536 | 65 536 | 526 336 | 657 408 | 256 |
+| 256 | barrier, hoisted | 65 536 | 65 536 | 4 096 | 135 168 | **1** |
+| 512 | in-plan | 16 809 984 | 65 536 | 2 101 248 | 18 976 768 | 512 |
+| 512 | barrier alone | 65 536 | 65 536 | 2 101 248 | 2 232 320 | 512 |
+| 512 | barrier, hoisted | 65 536 | 65 536 | 8 192 | 139 264 | **1** |
+
+Ratios to the hoisted arm: **66.7x / 4.9x / 1.00** at 256 blocks, **136.3x /
+16.0x / 1.00** at 512.
+
+**What transfers to §7.1's table and what does not.** The *structure* transfers
+and every term of it is asserted rather than read off:
+
+* pixel reads are `(1 + blocks) x volume` without a barrier and `2 x volume` with
+  — §1.2's coupling and §3.2.3's relief, term for term;
+* fragment traffic is `(1 + blocks) x F` per block and `2 x F` hoisted — §7.6's
+  multiplier, and the hoisted arm transmits the set exactly twice at every
+  lattice, as §7.6 predicted;
+* the fold runs `blocks` times per block and **once** hoisted, which is §7.2's
+  quantity and the one no byte column shows.
+
+**The absolute ratios do not transfer, and the reason is worth stating because it
+is the same lesson §7.6 recorded.** A fragment is eight bytes here and a block
+*face* there, so `F` is a rounding error at this scale and a third of the total at
+that one. That is why the barrier-alone arm is worth 4.9x here and 2.7x there,
+and why the residual after a barrier is 4.9x here and 9.4x there. The direction,
+the decomposition and the formulae are the same; the constants are a property of
+what a fragment weighs, and quoting one table's constants against the other's
+volume would be exactly the error §7.6 caught twice.
+
+The residual **1.13x** of §7.1 — the fully out-of-plan arm — does not appear
+here, and should not: it is the price of materialising at all, which all three
+in-plan arms pay identically.
+
+### 8.9 §6's expiry conditions, revisited
+
+*Closed by §10.3 and §10.4: the measurement this section records as not having
+been run has been run.*
+
+§6.1 and §6.2 both fire. A barrier has landed and so has the hoisting, so the
+decorate-versus-materialise recommendation in `ops::label` moves — but the
+figures it moves to are §7.1's, and **`tests/label_materialisation_cost.rs` has
+not been re-run against this implementation**, because it reads a machine-local
+recording that is not on the machine this was built on. The four arms there are
+still the out-of-plan simulations they were written as. Re-running them with
+`ops::label` migrated onto `barrier` and `reduce` is the measurement that would
+close §6.1 and §6.2 properly, and it is not this change.
+
+§6.3 is untouched: Rule A is where it was, and §7.5's whole-phase blob is
+specifically the version that does not need it.
+
+§6.4 is untouched and is worth repeating: nothing here has been measured against
+`ZarrEnvironment`, and every ratio above is in-memory.
+
+### 8.10 What is not built
+
+*The first bullet is inverted by §10.1 — all four ops now declare both halves.*
+
+* **No shipped op declares a barrier.** `ops::fill`, `ops::regional`,
+  `ops::detect` and `ops::label` are all still the in-plan shape; migrating them
+  is where the 25.4x is actually collected, and it is a change to files this note
+  does not own.
+* ~~**The blob is not on the distributed wire**~~ — **closed by §9**, and not the
+  way this line expected: the blob never goes on the wire because every node
+  derives it from a fragment set they all read. A barrier *alone* already
+  distributed, through `distributed::coordinator::Job::ready`'s gate; a hoisted
+  reduction now does too, through `strategy::reduce_phase` on each worker.
+* **The planner still prices neither fragment traffic nor merge CPU**, which is
+  §7.6's parting observation and is unaffected by anything here: a barrier makes
+  the cheap lattice cheaper without making the cost model able to see it.
+* **Residency is unmeasured**, exactly as §7.7 said. `PhaseView` offers a
+  streaming accessor for the reduction's own working set and a gathering one
+  beside it; which a reduction needs is the reduction's business and nothing here
+  bounds it.
+* **G8 is untouched.** §5 guessed that a barrier's declaration might be the same
+  declaration a *substage* reduction needs one level down. Nothing here tests
+  that and `src/iterate.rs` is unchanged; the guess is still a guess.
+
+
+---
+
+## 9. The blob does not go on the wire
+
+*Written by the work that closed §8.7. The section it closes framed the remaining
+gap as "putting the blob on the wire", and that framing is the thing that did not
+survive.*
+
+### 9.1 The question, and why the obvious answer is the wrong one
+
+§7.5 makes `reduce` produce one `Vec<u8>` for the phase, consumed by every block.
+In-process that is one allocation and a borrowed `&[u8]` per block — §8.6 records
+that §7.5.3's `blocks x table` transmission cost turns out to be zero there.
+Across processes it looked as though the cost must become real, and the work was
+framed as a transport: one node reduces, the blob travels, the others consume it.
+
+**It does not have to travel, because it is derived rather than observed.** Three
+facts, each already true of this crate before the question was asked:
+
+1. **The fragment set is on storage every node reads.** `SharedVolume` puts
+   sidecars under the job's own directory through `FileSidecars`, and
+   `fragments_written_by_several_worker_processes_are_readable_by_one_merging_reader`
+   has asserted for some time that a fragment written by one process is readable
+   by another.
+2. **`PhaseView` walks the lattice in an order that is a function of the plan**,
+   not of the schedule — `grid.cores()`, row-major. Two workers therefore feed
+   their `reduce` the identical sequence of identical bytes.
+3. **The barrier already tells a worker when the set is whole.** The coordinator's
+   gate (§8.3) does not hand out a task of a barrier phase until every earlier
+   phase has been *reported* complete, and a worker writes its fragments before it
+   reports. `FileSidecars::put` is write-then-rename, so there is no prefix for a
+   peer to read.
+
+So every worker computes the blob itself, on the first task of a barrier phase it
+is handed, and reaches byte-identical bytes with **nothing sent between them**.
+
+### 9.2 The two arms, and what each costs when wrong
+
+| | every node reduces | one node reduces, blob shipped |
+|---|---|---|
+| fragment reads | `nodes x F` | `F` |
+| folds | `nodes` | 1 |
+| bytes on the wire | **0** | `nodes x table` |
+| wall clock at the barrier | one fold, in parallel | one fold, then a fetch, serialised |
+| new protocol state | none | upload, download, an election, a reducer-death path |
+| new state in a component that holds no data | none | all of it |
+
+The right-hand column is cheaper in bytes — `table` is kilobytes and `F` is the
+whole fragment set, so shipping wins on traffic by three orders of magnitude per
+node. **It loses on everything else**, and two of those are not tradeable:
+
+* **The coordinator holds no data.** That is not an accident of the
+  implementation; it is written into `coordinator.rs` — the cache model *"is never
+  authoritative about anything"*, the completions are its whole accounting, and
+  events are observation. Making it a data plane for one feature is a larger
+  change to this system than the feature is.
+* **Shipping adds a failure mode with no existing answer.** If the reducing worker
+  dies between computing the blob and posting it, every other worker is blocked on
+  a fetch that will never complete, and the job's recovery story — reissue the
+  task — does not cover it, because the reduction is not a task.
+
+Deriving costs `nodes x F` reads and `nodes` folds, and **the count is the whole
+argument**. The case against re-deriving per block was never that re-deriving is
+expensive; it is that the multiplier was `blocks`, which a caller raises to make a
+stage fit in memory — §7.2's 33.67 s at 256 blocks is 0.13 s multiplied by
+something the caller controls in the direction of *more*. This multiplier is
+`nodes`, which a caller sets from the machines they have. **It does not move when
+the lattice does.** At the finest lattice §7.6 measured, one transmission of the
+fragment set is 0.1355 GiB, so eight workers pay about 0.95 GiB more than a
+single-process run — against the 34.6 GiB the hoisting removed, and flat in the
+block count.
+
+**When each is wrong.** Deriving is wrong if the sidecar store is not in fact
+shared between nodes: every worker then reduces over its own fragments and answers
+plausibly and differently on each machine. That is the failure this design has, it
+is the exact shape §7.7 says no guard could catch *afterwards*, and so it is
+guarded *before*: `strategy::reduce_phase` verifies the completeness the barrier
+promises, for every declared input stream whose producer said
+`Coverage::EveryBlock`, and refuses by name. Shipping is wrong if the reducer
+dies, and that has no guard at all — it is a liveness failure in a protocol that
+does not model the reduction as work.
+
+**A side effect worth naming.** Nothing ran `check_fragment_coverage` in a
+distributed run before this: `execute_task_of` is per task and a worker has no
+end-of-phase moment. Putting the check in `reduce_phase` closes that gap for
+barrier phases as well as guarding the reduction.
+
+### 9.3 Determinism has two axes and only one of them is `SeamFold`
+
+§8.5 added an order check because `PhaseView` walks row-major and **two lattices
+are two orders**, so an `f64` fold in `reduce` is as decomposition-dependent as one
+in `apply`. A distributed run looks as though it adds a second axis, and it does
+not:
+
+* **Across nodes**, the lattice is the same, so the walk is the same, so any
+  *deterministic* `reduce` agrees — associative or not. `SeamFold` does not enter.
+* **Across lattices**, the walk differs, and that is exactly what
+  `SeamFold::Unordered` declares and what the reversed-lattice check tests.
+
+So there is no new declaration and no new check. What there is instead is a test
+that two processes agree, and it agrees on the **output volume** rather than on a
+reported blob size, because the op writes the reduction into every voxel: a worker
+that reduced differently writes a different volume.
+`a_hoisted_reduction_is_byte_identical_however_many_workers_run_it` is that test,
+and it is mutation-tested — making `reduce` depend on the process id makes it fail
+with `12288 of 65536 byte(s) differ`, which is the disagreement it exists to
+catch.
+
+### 9.4 What landed
+
+* `strategy::reduce_phase` — public, one implementation, called by
+  `execute_phases` when its gate opens and by `distributed::worker` on the first
+  task of a barrier phase. It carries the completeness guard and the
+  reversed-lattice order check, so the two schedulers cannot drift.
+* `strategy::execute_task_with_reduction` — the single-task entry point that takes
+  a blob. `execute_task_of` delegates to it with `&[]` and keeps its refusal,
+  which is still right: **that** entry point has none.
+* `distributed::worker` holds one blob per barrier phase for the life of the job —
+  on the worker, not in the op, for `reduce`'s own reason: an op that cached its
+  answer would answer a second lattice with the first lattice's table.
+* `WorkerReport::reductions` and `reduced_bytes`, reported per worker, so "once per
+  phase, not once per task" is measured across processes rather than asserted from
+  the design.
+* `distributed::spec::HoistedReduceOp`, the probe that exercises it, with a magic
+  and a version in its blob — the mitigation `reduce` names, since a blob is the
+  op's own encoding and the op's own decode is the only place a mismatch surfaces.
+
+Measured, on a 16-block lattice with four workers: **one reduction per worker that
+saw a block of the phase, 16 bytes each, halo `[0, 0, 0]` with a barrier against
+the whole volume without one.** Three workers reducing independently produce the
+same volume as one worker, byte for byte.
+
+### 9.5 What is still refused, and why
+
+`execute_task_of` still refuses a reducing op, and should: it is the entry point
+that carries no blob, and handing one an empty slice is the wrong answer in every
+block. A caller with a barrier phase calls `reduce_phase` and then
+`execute_task_with_reduction` — which needs no transport, so the refusal costs
+nobody anything they cannot have.
+
+**A worker whose store is not shared is refused rather than answered**, by name,
+naming the unshared store as the likely cause. That is the honest form of the one
+thing this design depends on.
+
+---
+
+## 10. Collected
+
+*Written by the work that migrated the four shipped ops onto §8's mechanism.
+§8.10's first line was that no op declared either half; this section is that line
+inverted, and the three corrections the migration produced. Nothing above is
+edited; where this contradicts an earlier section it says so by number.*
+
+### 10.1 §8.10's first bullet is inverted
+
+> "**No shipped op declares a barrier.** `ops::fill`, `ops::regional`,
+> `ops::detect` and `ops::label` are all still the in-plan shape; migrating them
+> is where the 25.4x is actually collected."
+
+All four now declare `barrier()` and a hoisted `reduce()`, and
+`grep -rn "fn barrier(&self)" src/` returns them, the trait default and the
+distributed probe. The 25.4x is collected: §10.3 has the recorded-volume
+measurement and the per-op numbers are in each op's own header.
+
+`ops::components` is where the shared half landed — `Merge`, which selects the
+shape, and `encode_block_flags`/`decode_block_flags_for`, which are the blob.
+That the blob is *one* encoding across four ops is not a tidiness argument: every
+one of these merges produces one flag per label per block, which is what made
+§7.5's `Vec<u8>` cheap rather than a compromise.
+
+### 10.2 §8.5 undercounts, and the missing term is a whole transmission of the fragment set
+
+§8.5 prices the reversed-lattice order check at **"one extra reduction for an op
+that opted in"**. That is right about the fold and silent about the reads.
+`PhaseView` reads its fragments out of the store on every walk, so a second
+reduction over the reversed lattice **re-reads the whole fragment set**. The
+hoisted arm of an op declaring `SeamFold::Unordered` therefore transmits `F`
+**three** times — written once, read by the reduction, read again by the check —
+and not twice.
+
+This corrects two sentences elsewhere by name:
+
+* **§7.6**: *"the hoisted arm transmits the set exactly twice — written once,
+  read once — at every lattice"*. True of an op that does not declare
+  `Unordered`; three times for one that does.
+* **§8.8**: the fragment column of the hoisted rows is `2 x F`, and it is right
+  for the op measured there, which declares no `seam_fold`. It is not the general
+  figure.
+
+**It is the whole of why §7.1's projected 1.13x came out at 1.16x**, which is the
+most useful thing about it: the difference is `0.407` against `0.271` GiB of
+fragment traffic on the recorded volume, exactly one `F = 0.136 GiB`, and it was
+attributable only because every other column reproduced to the digit.
+
+The check is still worth it and the arithmetic is the same shape as before: 0.14
+GiB against the 34.5 removed, and it is checking the one property this crate is
+arranged around. What changes is that the price should be quoted as *one extra
+reduction and one extra pass over the fragment set*, so that an op whose `F` is
+large can see it.
+
+### 10.3 §8.9's open measurement is closed
+
+§8.9 recorded that `tests/label_materialisation_cost.rs` "has not been re-run
+against this implementation", because it reads a machine-local recording. It has
+been. Same recording, same `D = 16`, same four lattices; the left-hand column is
+the shipped ops and therefore moved when they were migrated, and every other
+column reproduced to the digit, which is what makes the one that moved
+attributable:
+
+| blocks | in-plan, as shipped now | barrier | barrier + hoisted | merge outside the plan |
+|---|---|---|---|---|
+| 1 | 1.26 | 1.26 | 1.26 | 0.74 |
+| 4 | 1.33 | 1.40 | 1.30 | 0.77 |
+| 32 | 1.74 | 3.78 | 1.67 | 1.15 |
+| 256 | **4.84** | 39.29 | 4.70 | 4.18 |
+| | **1.16x** | 9.41x | 1.13x | 1.00 |
+
+**106.07 GiB became 4.84, a factor of 21.9**, with 23 627 components agreeing at
+every lattice in all four arms. The merge CPU re-timed on that machine is 0.08 /
+0.12 / 3.00 / **48.86** s, and the shipped arm's entire run at 256 blocks is 4.45
+s against the barrier-alone arm's 53.47.
+
+### 10.4 §6.1 and §6.2 have fired
+
+Both were expiry conditions on the decorate-versus-materialise recommendation and
+both are now spent. §6.2's is the one that matters — *"if a barrier lands **and** a
+barrier phase's reduction is allowed to run once, the gap closes to 1.13x"* — and
+it closed to **1.16x**, measured, for §10.2's reason. Its conclusion stands
+unchanged: at that gap materialising is the better default, because a
+materialised volume is remapped once and a decorated one per reader.
+
+§6.3 is untouched — Rule A is exactly where it was, and see §10.5. §6.4 is
+untouched and still worth repeating: nothing here has been measured against
+`ZarrEnvironment`.
+
+### 10.5 Four things the migration found that this note did not predict
+
+1. **"A barrier alone is worth about a third of the gap" is not a property of the
+   mechanism.** §3.3 measured 2.7x of 25.4x on the recorded volume and §8.8
+   measured 4.9x of 66.7x on the fixture, and both are quoted as though they
+   describe the barrier. They describe a **ratio of `F` to the volume**. A barrier
+   removes the pixel half and leaves the fragment half, so what it is worth is
+   whatever fraction the pixels were: on `ops::fill` over `[16, 32, 32]` at 256
+   blocks it is **1.56x of 91.3x**, because at that cut the fragment set is 175%
+   of the label image — the regime §7.6 predicted and nothing had landed in. On
+   `ops::detect` it is **1.00x**, exactly, at every lattice, because that op
+   fetches no pixels at any halo. The number must be measured per op and per
+   lattice and never quoted bare.
+2. **The plan cannot tell a hoisted phase from a non-hoisted one.** `barrier` is
+   recorded on `PhaseDecomposition`, hashed and carried over the wire, for §3.1's
+   reason. `reduce` is not, and neither is a `FragmentInput`'s reach — both are
+   read off the op by `check_phase_work` on every run, which is where a
+   disagreement surfaces. So the two barriered shapes **fingerprint identically**.
+   That is correct rather than a gap, since they compute the same answer and
+   differ only in cost, but a fingerprint is not evidence about which of them ran.
+3. **A wrong fragment reach is invisible once `gathers() == false`.** §4 says the
+   cost of a reach declared too wide is reads. That does not cover a hoisted op:
+   restoring the whole-lattice reach on one moves **no byte** and changes **no
+   answer**, because nothing gathers it — but it takes the per-block neighbourhood
+   above one element, which turns `SeamFold::Unordered`'s per-block order check
+   back on, so every block applies twice. The currency is CPU and no counter shows
+   it. The ops that hoist assert their own `inputs()` reach and `gathers()`
+   directly, and count applications, for exactly this reason.
+4. **"Barrier" now means two different things one call apart.**
+   `reach::Reach::is_barrier` means *this reach spans a whole axis*, which is a
+   statement about fusion; `FragmentOp::barrier` means *this phase waits for all of
+   the phase below*, which is a statement about ordering. Every op migrated here
+   used to be the first and is now the second and is the first no longer, so a
+   reader meeting both in one file has every reason to conflate them. Renaming is
+   a change to `src/reach.rs` and is not this note's; naming the collision is.
+
+---
+
+## 11. The completeness check, priced
+
+*Written by the work that closed the three deferrals recorded in the session
+log kept outside this repository — `clearmap-rs/forme2.md` §24, which is not
+part of this crate and is named here only so the provenance is followable.
+Nothing above is edited.*
+
+### 11.1 The check ran once per input stream, and should run once per phase
+
+`check_fragment_coverage` lists **every** output stream of the op it is handed, so
+one call already covers all of a producing phase's streams. `reduce_phase` ran it
+once per declared *input*, so a barrier joining two streams of one producer ran
+the whole check twice and listed each of that producer's streams twice. The
+duplicated cost was the product of two figures the caller sets — how many streams
+the op joins, and how finely the volume is cut, since a listing returns one key
+per block. It is now grouped by producing phase and runs once per phase.
+`tests/fragment_coverage_listings.rs` measures it, with the liveness control
+beside it: a hole in the *second* declared stream is still refused, which is what
+separates deduplicating the check from deleting it.
+
+### 11.2 The single-node repetition is kept, and here is what it costs
+
+`execute_phases` runs the same check on a fragment phase's outputs when that
+phase's last task completes, and every producer `reduce_phase` names is an
+earlier phase — so in-process the check at the barrier is the second one on the
+same stream. That repetition is **kept**, and the two ways to remove it are both
+worse:
+
+* **Move it to the barrier.** `execute_phases` checks every fragment phase,
+  including those no barrier ever reduces over, and it checks at the phase that
+  made the hole rather than at whatever runs next. Deferring it lets a doomed run
+  continue through the phases in between and reports the failure somewhere else.
+* **Let the caller say what is already verified.** That turns a guard against a
+  plausible-wrong-answer into something a caller disables by getting one argument
+  wrong — on the distributed path, where nothing else runs it at all.
+
+The bound is what makes keeping it defensible rather than a shrug. The extra cost
+is one listing per producing phase, `O(blocks)` keys and no bytes, against a
+phase that irreducibly writes `blocks` fragments and reads at least `blocks` more.
+The ratio is fixed: it does not move when a caller cuts more finely, which is the
+question `PhaseCost`'s standing rule asks of any per-item reassurance.
+`Stats::sidecar_listings` and `sidecar_keys_listed` report both figures and
+`tests/fragment_stats.rs` pins them.
+
+### 11.3 A fragment phase stays out of `ops_applied`, and the other question gets its own field
+
+`ops_applied` and `blocks_visited` are structurally zero for a fragment-only plan,
+and that is now a decision rather than a deferral. Making a fragment phase emit
+`Event::OpApplied` would close it, and the event is the wrong shape: it carries a
+chain **slot index** and the region the op was computed **over**, and
+`ExecutionLog::recomputed_margin_voxels` sums those regions against what was kept
+to measure a *chain's* halo redundancy — the figure that says whether a phase
+split bought anything. A fragment op has no slot to name and no halo of that kind,
+so emitting the event would put invented slot numbers in the exported log and move
+a number whose whole purpose is a different measurement.
+
+The conflation was the actual defect: *how many chain ops ran* and *how many
+blocks did this plan touch* are two questions and only the first had a field.
+`Stats::blocks_admitted` is the second, derived from `Event::TaskAdmitted`, which
+every kind of phase emits. It is what the exported document's block table has
+always counted, so a consumer comparing the two now has a field that matches it on
+every plan instead of only on chain-only ones.
+
+### 11.4 The hoisting check is available multi-node
+
+`WorkerReport` gained `sidecar_reads` and `fragment_applications` beside
+`fragments`, which counted only writes. Summed over a job's workers they are what
+one node would have reported, so the in-process discriminator works across
+processes: measured on a 16-block lattice with three workers, the in-plan arm
+reads **256** fragments — `blocks²` exactly — and the hoisted arm **96**, with
+both arms applying the op **32** times and writing identical volumes.

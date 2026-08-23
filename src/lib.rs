@@ -95,6 +95,7 @@ pub mod animate;
 pub mod assemble;
 pub mod budget;
 pub mod cache;
+pub mod cpu;
 pub mod decomposition;
 /// Multi-node execution: a coordinator, workers that pull, and pluggable
 /// rendezvous. The HTTP *server* half is behind the `distributed` feature; the
@@ -117,6 +118,11 @@ pub mod graph;
 /// is unchanged and pulls no extra dependency.
 #[cfg(feature = "gui")]
 pub mod gui;
+/// A blocking HTTP/1.1 server on ordinary threads: one thread per connection,
+/// taken at accept. Not behind a feature — it has no dependency and the
+/// no-feature configuration is the one everything else is measured against —
+/// and see its header for the measured defect it exists instead of.
+pub mod http;
 /// One phase that runs an unknown number of substages, with more than one
 /// operand available at every substage. The shape an iteration takes when its
 /// step depends on both a running estimate and something fixed — which
@@ -158,6 +164,10 @@ pub mod region;
 /// bytes`, on the environment beside the region writes. Storage only; what
 /// produces and consumes fragments is `fragment`.
 pub mod sidecar;
+/// Cutting one block into slabs run on separate threads: the mechanism below
+/// the block, and the arithmetic that says what a cut costs. Not a policy —
+/// nothing here decides when to slice. See `docs/design/intra-block.md`.
+pub mod slab;
 /// Measured cost coefficients, accumulated from real runs and fed back into
 /// planning. Nanoseconds per unit of *declared* cost, keyed by machine and
 /// persisted across runs; an absent or empty store leaves the shipped constants
@@ -202,8 +212,8 @@ pub use cache::{
 pub use decomposition::{
     check_block_constraints, check_chunk_exclusive_writes, check_output_shapes,
     check_source_images, constraint_for, cuttable_axes, halo_spans_axis, is_planning_barrier,
-    predicted_cost, reaches_whole_axis, splittable_axes, Constraints, CostModel, Decomposition,
-    PhaseDecomposition, PhaseTraffic,
+    predicted_cost, reaches_whole_axis, refined_ladder, splittable_axes, BlockLadder, Constraints,
+    CostModel, Decomposition, PhaseDecomposition, PhaseTraffic,
 };
 pub use distributed::{
     Assignment, ChunkGrid, Coordinator, Handout, HandoutPolicy, JobSpec, JobStatus, ModelledCache,
@@ -230,10 +240,12 @@ pub use iterate::{
 pub use listener::{BlockProgress, EventListener, LatestOpPerChunk, OrderLog, ProgressKind};
 pub use log::{Event, ExecutionLog, Stats};
 pub use npy::{
-    descr_of, read_array, read_array_file, read_array_from, read_header_file, read_voxels,
-    read_voxels_file, read_voxels_from, write_array, write_array_file, write_array_to,
-    write_voxels, write_voxels_file, write_voxels_to, Endian, Header, NpyElement, NpySink,
-    NpySource, Order, OrderPolicy,
+    descr_of, read_array, read_array_file, read_array_file_as, read_array_from, read_array_mapped,
+    read_array_mapped_file, read_array_mapped_from, read_elements, read_elements_file,
+    read_elements_from, read_header_file, read_voxels, read_voxels_file, read_voxels_from,
+    write_array, write_array_file, write_array_to, write_elements, write_elements_file,
+    write_elements_to, write_voxels, write_voxels_file, write_voxels_to, Elements, ElementsVariant,
+    Endian, Header, NpyElement, NpySink, NpySource, Order, OrderPolicy,
 };
 pub use observed_io::{ObservedSink, ObservedSource};
 pub use op::{
@@ -271,6 +283,6 @@ pub use table::{
     encoded_schema, Column, ColumnType, Row, RowBuilder, Schema, Table, TableIndex, Value,
 };
 pub use tiling::boxes_tile_exactly;
-pub use voxels::{SideBuf, VoxelElement, Voxels};
+pub use voxels::{SideBuf, VoxelElement, Voxels, VoxelsMut};
 #[cfg(feature = "zarr")]
 pub use zarr_env::{chunk_for_block, zarr_data_type, AttachedImage, Window, ZarrEnvironment};

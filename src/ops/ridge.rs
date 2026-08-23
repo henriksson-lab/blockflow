@@ -1051,7 +1051,7 @@ impl RatioResponse {
         if !(middle < 0.0 && low < 0.0) {
             return 0.0;
         }
-        let cross = (middle / low).powf(self.cross);
+        let cross = powf_exact(middle / low, self.cross);
         let along = if high <= 0.0 {
             // `high` is between `middle` and zero, so this is in `[0, 1]` and
             // is one exactly where there is no curvature along the structure.
@@ -1070,7 +1070,35 @@ impl RatioResponse {
             }
             1.0 - opposed
         };
-        low.abs() * cross * along.powf(self.along_power)
+        low.abs() * cross * powf_exact(along, self.along_power)
+    }
+}
+
+/// `base.powf(exponent)`, with the two exponents this filter is nearly always
+/// given taken out of the library call.
+///
+/// **Bit-identical, not approximately so, and that is what licenses it.**
+/// IEEE-754 requires `pow(x, 1)` to be exactly `x` and `pow(x, 0)` to be exactly
+/// `1` for every finite `x`, including the signed zeros and including a `NaN`
+/// base for the second — so these two arms return what the call would have
+/// returned, to the bit, rather than what it would have returned to a tolerance.
+/// Every other exponent goes to the library untouched.
+///
+/// It is worth taking out because [`RatioResponse`] is evaluated **once per
+/// voxel** and the ordinary parameterisation gives both exponents as one:
+/// `powf` is a generic transcendental that cannot know that, and the branch
+/// costs a comparison. Measured by the worker that found it at `2.7x` to `9.0x`
+/// on this fold in isolation — **and that is the fold and not the filter**, of
+/// whose per-voxel cost the eigenvalue solve is the larger part, so the figure
+/// must not be read as a speed-up of `ops::ridge`.
+#[inline]
+fn powf_exact(base: f64, exponent: f64) -> f64 {
+    if exponent == 1.0 {
+        base
+    } else if exponent == 0.0 {
+        1.0
+    } else {
+        base.powf(exponent)
     }
 }
 
@@ -2844,5 +2872,64 @@ mod tests {
     #[ignore = "a measurement, not an assertion"]
     fn print_the_smoothing_table() {
         println!("{}", smoothing_report([64, 64, 64], 5));
+    }
+
+    /// **`powf_exact` is the library call, to the bit** — which is the whole
+    /// licence for taking it out, since a filter that agreed to a tolerance
+    /// would break the decomposition invariance every other test here asserts.
+    ///
+    /// The exponents are the two the short circuit claims, and the bases include
+    /// the values a `powf` is allowed to be surprising at: the signed zeros, one,
+    /// the subnormals, the infinities and a `NaN`.
+    #[test]
+    fn the_exponent_short_circuit_is_the_library_call_to_the_bit() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut bases: Vec<f64> = vec![
+            0.0,
+            -0.0,
+            1.0,
+            0.5,
+            f64::MIN_POSITIVE,
+            f64::MIN_POSITIVE / 2.0,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bases.push((state >> 11) as f64 / (1u64 << 53) as f64);
+        }
+        let mut checked = 0usize;
+        for &base in &bases {
+            for exponent in [0.0f64, 1.0] {
+                let short = powf_exact(base, exponent);
+                let library = base.powf(exponent);
+                assert_eq!(
+                    short.to_bits(),
+                    library.to_bits(),
+                    "powf_exact({base}, {exponent}) is {short} and powf is {library}"
+                );
+                checked += 1;
+            }
+            // And an exponent the short circuit does not claim must be handed
+            // straight through, which is the liveness partner: a `powf_exact`
+            // that returned its base unconditionally would pass every assertion
+            // above.
+            let other = powf_exact(base, 0.75);
+            assert_eq!(other.to_bits(), base.powf(0.75).to_bits());
+        }
+        assert!(
+            checked > 40_000,
+            "only {checked} pairs checked, which is not the sweep this claims"
+        );
+        // Liveness on the fixtures themselves: a base of 1.0 is a fixed point of
+        // every exponent, so a sweep of only such bases would prove nothing.
+        assert!(
+            bases.iter().filter(|&&b| b != 1.0 && b.is_finite()).count() > 20_000,
+            "the sweep must contain bases that distinguish one exponent from another"
+        );
     }
 }

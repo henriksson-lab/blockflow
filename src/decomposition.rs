@@ -162,6 +162,42 @@ pub struct PhaseDecomposition {
     /// the plan. A plan that arrives with it wrong is a plan whose read figure
     /// is wrong, which is exactly the fault it is here to make visible.
     pub reads_input_image: bool,
+    /// Whether this phase waits for **all** of the previous phase rather than
+    /// for the tasks whose valid regions cover what it fetches.
+    ///
+    /// `false` for every phase this crate shipped before the field existed, and
+    /// it is set only by `fragment::fragment_phase`, from
+    /// `FragmentOp::barrier`.
+    ///
+    /// **A declaration, not a hint.** Everything in `Hints` may be ignored,
+    /// overridden or recomputed by a strategy and the run is still correct; this
+    /// may not. A phase whose answer depends on every block of the phase below
+    /// it, and which is run without waiting for every block of the phase below
+    /// it, computes a plausible wrong answer whose wrongness depends on the
+    /// schedule. So it is in the binding half of the plan: hashed into
+    /// [`Decomposition::fingerprint`] when it is set, carried over the
+    /// distributed wire, and checked against the op by
+    /// `fragment::check_phase_work` — a plan whose record disagrees with its ops
+    /// is a plan that fetches one thing and waits for another.
+    ///
+    /// **What it buys, and it is the reason it exists.** Without it, the only
+    /// way to say "every block of the phase below has finished" is to *fetch*
+    /// the whole volume, because [`crate::graph::TaskGraph::build`] derives the
+    /// edges from the fetch and from nothing else. The fetch is then charged, per
+    /// block, and the traffic is the block count times the volume. With it the
+    /// ordering and the fetch stop being the same statement — the ordering is
+    /// this bool, carried to every scheduler through
+    /// [`crate::graph::TaskGraph::barriers`], and the fetch shrinks to what the
+    /// op actually reads. See `docs/design/barriers.md`.
+    ///
+    /// **What it costs.** A barrier declared where it is not needed serialises
+    /// two phases that could have overlapped, silently — the same class of
+    /// mistake as a halo declared wider than an op needs, and no guard can catch
+    /// either, because both are statements about what an op needs and only the
+    /// op knows. It is *not* a general loss of pipelining: the phases before it
+    /// still pipeline among themselves, the phases after it likewise, and the
+    /// blocks within it still run concurrently.
+    pub barrier: bool,
     /// Cores, read extents and valid regions, derived and recorded.
     pub blocks: Vec<BlockGeometry>,
 }
@@ -207,6 +243,7 @@ impl PhaseDecomposition {
             source_images: Vec::new(),
             supplied_dtypes: Vec::new(),
             reads_input_image: true,
+            barrier: false,
             blocks,
         }
     }
@@ -263,6 +300,15 @@ impl PhaseDecomposition {
     /// [`PhaseDecomposition::reads_input_image`].
     pub fn reading_input_image(mut self, reads: bool) -> Self {
         self.reads_input_image = reads;
+        self
+    }
+
+    /// Say whether this phase waits for all of the previous phase.
+    ///
+    /// Only a fragment phase ever passes `true`; see
+    /// [`PhaseDecomposition::barrier`].
+    pub fn with_barrier(mut self, barrier: bool) -> Self {
+        self.barrier = barrier;
         self
     }
 
@@ -516,30 +562,61 @@ impl Decomposition {
         dtype
     }
 
-    /// Every phase that reads `image`, ascending: the phase it is the input of,
-    /// plus every later phase naming it in `source_images`.
+    /// Every phase that reads `image`, ascending.
+    ///
+    /// One predicate, applied to every phase: **phase `p` reads image `i` when
+    /// `i == p` and the phase reads its input image at all, or when the phase's
+    /// `source_images` names `i`.** No special case, and the loop is ascending
+    /// by construction so nothing is sorted afterwards.
     ///
     /// **The refcount.** Before source leaves existed this was always a single
     /// phase — image `p` is phase `p`'s input and nobody else's — and the whole
     /// lifetime rule was written to that special case. A source leaf is a
     /// second reader, so the general statement is the one the design record
-    /// asks for: *an image dies after its last reader*. With no source leaf
-    /// anywhere this returns `vec![image]` for every image a phase reads, and
-    /// [`Self::images_dead_after`] reduces to exactly what it replaced.
+    /// asks for: *an image dies after its last reader*.
     ///
-    /// The last image has no reader at all, which is why it is `Published`.
+    /// # Why `reads_input_image` and not "phase `p` reads image `p`"
+    ///
+    /// It used to be the latter, unconditionally, and that is false for exactly
+    /// one kind of phase: a fragment phase whose op declares
+    /// `reads_pixels() == false` is handed an image and never touches it. The
+    /// plan already records the truth in
+    /// [`PhaseDecomposition::reads_input_image`], which `fragment_phase` put
+    /// there. The over-count was **one image for one phase** — image `p`'s only
+    /// credited reader was phase `p` and its writer is phase `p - 1`, so the
+    /// claim could be wrong but not wrong by two — and what it cost was one
+    /// whole image at the plan's element type, held for one phase: kilobytes at
+    /// a test lattice, gigabytes at a real one.
+    ///
+    /// # The two things that had to move with it
+    ///
+    /// Narrowing this alone is wrong twice, and both were found by running the
+    /// suite against a candidate rather than by reading the call sites.
+    ///
+    /// * The old `phase != image` guard on the `source_images` loop skipped a
+    ///   phase that reads an image through a source leaf *and* is the phase that
+    ///   image is the input of. That reader existed only by the unconditional
+    ///   push, so narrowing the push without widening the loop drops it, and
+    ///   every run in `tests/region_tabulation.rs` fails with *image 1 was
+    ///   discarded after phase 0*. The guard is gone and the predicate above is
+    ///   what replaces both halves.
+    /// * An image with no reader at all would then be named by **no** phase, so
+    ///   [`Self::images_dead_after`] would never free it — strictly worse than
+    ///   the over-count. That is where the zero-reader rule went.
+    ///
+    /// The last image has no reader either, which is why it is `Published`;
+    /// [`Self::images_dead_after`] now names it after its writer, and
+    /// [`Self::image_visibility`] is what keeps it alive.
     pub fn readers_of_image(&self, image: usize) -> Vec<usize> {
-        let mut readers = Vec::new();
-        if image < self.n_phases() {
-            readers.push(image);
-        }
-        for (phase, decomposition) in self.phases.iter().enumerate() {
-            if phase != image && decomposition.source_images.contains(&image) {
-                readers.push(phase);
-            }
-        }
-        readers.sort_unstable();
-        readers
+        self.phases
+            .iter()
+            .enumerate()
+            .filter(|(phase, decomposition)| {
+                (*phase == image && decomposition.reads_input_image)
+                    || decomposition.source_images.contains(&image)
+            })
+            .map(|(phase, _)| phase)
+            .collect()
     }
 
     /// The images whose **last** reader is `phase`: what dies when this phase
@@ -554,9 +631,25 @@ impl Decomposition {
     /// Whether an image may be freed at all is still [`Self::image_visibility`]'s
     /// question, and pinning is still the caller's; neither is folded in here,
     /// because this is a fact about the plan and those two are policy.
+    ///
+    /// # An image nothing reads dies as soon as it is written
+    ///
+    /// The same rule — *after its last reader* — at zero readers, and it is the
+    /// half [`Self::peak_image_bytes`] already applied while this one did not.
+    /// Without it an unread image is named by no phase at all and is never
+    /// freed, which is worse than any over-count; and unread images are not
+    /// exotic, because the run's output is one and a fragment phase that reads
+    /// no pixels leaves one behind it.
+    ///
+    /// The writer of image `i` is phase `i - 1`. Image 0 has no writer, is the
+    /// run's input and is `Published`, so it is named by nobody when nothing
+    /// reads it — which is right: there is no phase after which it becomes dead.
     pub fn images_dead_after(&self, phase: usize) -> Vec<usize> {
         (0..self.n_images())
-            .filter(|&image| self.readers_of_image(image).last() == Some(&phase))
+            .filter(|&image| match self.readers_of_image(image).last() {
+                Some(&last) => last == phase,
+                None => image > 0 && image - 1 == phase,
+            })
             .collect()
     }
 
@@ -825,15 +918,23 @@ impl Decomposition {
     /// [`PhaseDecomposition::reads_input_image`] is what `fragment_phase` put
     /// there and what [`Self::exact_read_voxels`] already counts with.
     ///
-    /// # Why this does not call `images_dead_after`
+    /// # Why this does not call `images_dead_after`, and why it no longer
+    /// # disagrees with it
     ///
-    /// Because [`Self::readers_of_image`] counts phase `p` as a reader of image
-    /// `p` unconditionally, and a fragment phase that reads no pixels is not one.
-    /// Correcting that there would change which images the **executor frees**,
-    /// which is a residency behaviour change wanting its own measurement; the
-    /// walk here is a statement about a plan and can be exact today. An image
-    /// nothing reads dies as soon as it is written, which is the same rule —
-    /// *after its last reader* — at zero readers.
+    /// It used to say something the other could not: [`Self::readers_of_image`]
+    /// counted phase `p` as a reader of image `p` unconditionally, and a
+    /// fragment phase that reads no pixels is not one, so the walk here was
+    /// exact and [`Self::images_dead_after`] was not. The zero-reader rule this
+    /// walk applied — *an image nothing reads dies as soon as it is written*,
+    /// which is the same rule at zero readers — was likewise only here.
+    ///
+    /// **Both have moved to where they belong.** `readers_of_image` now consults
+    /// [`PhaseDecomposition::reads_input_image`] and `images_dead_after` applies
+    /// the zero-reader rule, so the two agree and the executor frees what this
+    /// predicts. The `retain` below is still written out rather than delegated,
+    /// because it asks the question in the walk's own terms — *is there a reader
+    /// after this phase* — and that is one comparison rather than a vector per
+    /// image per phase.
     pub fn peak_image_bytes(&self, work: &[crate::fragment::PhaseWork<'_>]) -> Result<u64> {
         let bytes_of = |image: usize| -> u64 {
             let volume = self.volume_at(image);
@@ -921,6 +1022,19 @@ impl Decomposition {
             }
             if !phase.source_images.is_empty() {
                 phase.source_images.hash(&mut hasher);
+            }
+            // Hashed only when it is set, on `source_images`' argument: a
+            // plan with no barrier in it fingerprints exactly as it did before
+            // the field existed, so the frozen fingerprints every op is pinned
+            // by are unmoved. It *is* hashed when set, unlike
+            // `reads_input_image` below, and the difference is the one that
+            // matters: this changes which tasks a task waits for, and two plans
+            // that wait for different things may answer differently. A plan
+            // that arrives off the wire with it dropped would run, produce a
+            // schedule-dependent answer, and agree with the sender's
+            // fingerprint.
+            if phase.barrier {
+                phase.barrier.hash(&mut hasher);
             }
             // `reads_input_image` is deliberately **not** hashed. Every other
             // field here can change a voxel: which images an arm reads, what
@@ -1122,6 +1236,7 @@ impl Decomposition {
                 rebuilt.source_images = phase.source_images.clone();
                 rebuilt.supplied_dtypes = phase.supplied_dtypes.clone();
                 rebuilt.reads_input_image = phase.reads_input_image;
+                rebuilt.barrier = phase.barrier;
                 if phase.reads_across_grids() {
                     for (block, original) in rebuilt.blocks.iter_mut().zip(&phase.blocks) {
                         block.source = original.source.clone();
@@ -1235,6 +1350,39 @@ pub(crate) fn region_to_ranges(region: &Region) -> Vec<(usize, usize)> {
 /// intermediates land, not what is computed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostModel {
+    /// Per voxel of the **read extent** — core plus halo — over every image the
+    /// phase reads.
+    ///
+    /// **It charges a halo voxel at core price, and that is a decision now
+    /// rather than an accident.** A voxel fetched again because it fell in a
+    /// neighbour's halo may cost very much less than one fetched for the first
+    /// time, or rather more, and this weight cannot tell them apart. The
+    /// measurements are in `docs/ops-survey/README.md`'s **G20** row and in
+    /// `tests/halo_cost.rs` and `tests/halo_io_cost.rs`; the summary is:
+    ///
+    /// | path | halo bytes | halo time | effective weight |
+    /// |---|---|---|---|
+    /// | flat file, cold | `3.48x` | `1.32x` | `0.38` |
+    /// | flat file, warm | `3.48x` | `2.98x` | `0.86` |
+    /// | in memory, by region shape | — | — | `0.31`-`0.72` |
+    /// | chunked store, gzip, halo 4 | `1.31x` | `5.33x` | **above `4`** |
+    ///
+    /// So a single weight **over**-charges a cold sequential read — the safe
+    /// direction, since it biases against the fine cuts with wide halos that
+    /// `docs/design/barriers.md` exists to prevent — is about right warm, and
+    /// **under**-charges a chunked store.
+    ///
+    /// **Why a second weight is not the fix.** The plan is made before the
+    /// storage path exists: [`crate::strategy::Strategy::decompose`] takes no
+    /// `Environment` and is `data-blind` by contract, so no constant here can be
+    /// chosen by path. And the coefficient this model is really missing is not
+    /// halo against core but **cold against warm**, measured at `42x` at one
+    /// block — twenty times larger, and supplied by nothing the planner can see.
+    /// Refining the smaller term under an unmodelled larger one would make the
+    /// price look better calibrated than it is.
+    ///
+    /// [`crate::statistics`] fits this from real runs, which is the only route
+    /// by which a halo weight could ever be honest, and it fits one term today.
     pub read_cost_per_voxel: f64,
     pub write_cost_per_voxel: f64,
     pub compute_scale: f64,
@@ -1266,6 +1414,14 @@ impl Default for CostModel {
 /// What a strategy is allowed to spend.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Constraints {
+    /// Whether a block may be cut into slabs for intra-block threading, and how
+    /// many. See [`SlabPolicy`].
+    ///
+    /// **The default asks for one slab under the default concurrency**, so
+    /// adding this field moved no recorded figure — asserted in
+    /// `the_default_policy_asks_for_one_slab_under_the_default_constraints`
+    /// rather than reasoned.
+    pub slab_policy: SlabPolicy,
     /// Bytes available for in-flight blocks. `None` means unbounded.
     pub budget_bytes: Option<u64>,
     /// How many blocks a run is expected to hold at once. Part of the budget
@@ -1274,6 +1430,16 @@ pub struct Constraints {
     pub model: CostModel,
     /// Block edges the planner may choose between, per phase. Small by design —
     /// the search is `partitions x candidates^phases`, so this must stay short.
+    ///
+    /// **One consequence of the list being scalars and powers of two that is
+    /// worth knowing before changing it.** An op may declare
+    /// [`crate::reach::AxisReach::Aligned`] — a halo that shrinks when the block
+    /// edge is a whole number of some stride of its own — and the discount is
+    /// available exactly on the rungs the stride divides. The default ladder is
+    /// `[32, 64, 128]`, so a power-of-two stride up to 32 is aligned on **every**
+    /// rung and one of 64 on two of three. A ladder with rungs at odd multiples
+    /// would silently deny the discount to every such op, which is a cost rather
+    /// than an error and would show up as a phase that suddenly cannot be cut.
     ///
     /// # Why this is a list of scalars and not of `[usize; 3]`
     ///
@@ -1304,6 +1470,16 @@ pub struct Constraints {
     /// reachable today. The same result holds on an isotropic `1024^3`, which is
     /// what says it is not about the volume's aspect ratio.
     ///
+    /// **That finer ladder is [`BlockLadder::Refined`]**, computed by
+    /// [`refined_ladder`] and selected by [`Constraints::with_ladder`]. It is a
+    /// named setting rather than the default, and the reason is not the search
+    /// cost the sentence above would suggest — that was measured at `1.06x` and
+    /// retired. It is that this project intends to pick planners by running them
+    /// against each other, and a context-dependent gain belongs in that
+    /// competition rather than in a default. `refined_ladder`'s header carries
+    /// the measurement, the decision, and the one guarantee elsewhere that this
+    /// ladder changes the wording of.
+    ///
     /// # What this does not price, and what that is worth
     ///
     /// **Fragment traffic, which can prefer the opposite lattice.** In-plan
@@ -1324,9 +1500,433 @@ pub struct Constraints {
     pub split_axes: Vec<usize>,
 }
 
+/// The ladder above with a rung at **three quarters** of each entry: the
+/// granularity the sweep in [`Constraints::block_candidates`] measured and
+/// nothing had built.
+///
+/// `[16, 32, 64, 128]` becomes `[16, 24, 32, 48, 64, 96, 128]`. Sorted
+/// ascending, de-duplicated, and **the floor is not lowered**: `3/4` of the
+/// smallest entry is dropped, because the smallest rung is a caller's statement
+/// about how small a block they will accept and quietly going below it is a
+/// change they did not ask for. That is also what the sweep's own ladder did —
+/// its rungs are `24, 48, 96, 192, 384`, which are `3/4` of `32` upwards on a
+/// ladder whose floor is `16`, and it lists no `12`.
+///
+/// **It is a fixed point**, and that is load-bearing rather than tidy. Three
+/// quarters of a power of two is never itself a power of two, so a second
+/// application finds nothing to insert. An earlier version refined every entry
+/// instead — `3/4` of `48` is `36` — which made it an *operator*: applying it
+/// twice gave a third ladder, so "which ladder is this" could not be answered
+/// from the value. A setting a planner competition sweeps has to be answerable
+/// from its value, and [`BlockLadder`] is that setting.
+///
+/// # What it buys
+///
+/// The working-set step between neighbours falls from `8x` to about `2.4x`. The
+/// planner admits the largest candidate that fits, so a coarse ladder can drop a
+/// whole factor of eight and land far under the budget where a `3/4` rung would
+/// have used it. Swept over two volumes, three reaches, three worker counts and
+/// five budgets, the finer ladder beat the coarse one by up to **2.7x** —
+/// against at most **1.4x** for full per-axis freedom over the same coarse
+/// rungs, which is the comparison that says the gap is granularity rather than
+/// anisotropy.
+///
+/// # What it costs: entries, and one restated guarantee
+///
+/// **Entries.** The search is `partitions x candidates^phases`, so refining a
+/// three-rung ladder to six squares the per-phase factor. That is the reason
+/// this is a function a caller applies rather than the default: the default
+/// stays where every recorded parity figure was measured, and a caller who wants
+/// the finer grid says so and pays the search for it.
+///
+/// **And a guarantee elsewhere that this changes the wording of.**
+/// `budget::UNOBSERVED_SHAPE_MARGIN`'s header argues that an admission margin
+/// can cost *at most one ladder step*, and calls that arithmetic rather than
+/// luck: a ladder of powers of two steps by `8x` in volume, and every margin is
+/// under eight — `3.6` alone, and `3.5626 x 2.1 = 7.48` for the worst measured
+/// shape. **That wording does not survive this ladder.** A step here is
+/// `(4/3)^3 = 2.37x` or `(3/2)^3 = 3.375x`, alternating, so a margin of `3.6`
+/// already spans two of them.
+///
+/// **The arithmetic survives; only the unit it was stated in does not.** Any two
+/// consecutive rungs of this ladder span exactly `2.37 x 3.375 = 8.0` in volume
+/// — it interleaves one rung into each octave and changes nothing else — so
+/// every margin under eight costs **at most two rungs here, which is at most the
+/// same `8x` in block volume the one-step bound guaranteed.** The bound that
+/// survives any spacing is therefore the volume ratio, and the step count was a
+/// proxy that happened to equal it while the ladder was powers of two.
+///
+/// It is also the *better* bound to state, and not only the more durable one:
+/// the planner stops at the largest rung that fits, so on a finer ladder the
+/// correction lands **closer**, never further. That is the same fact the `2.7x`
+/// win is, seen from the margin's side.
+/// [`a_finer_ladder_never_admits_a_smaller_block_than_a_coarse_one`] measures
+/// both halves.
+///
+/// [`a_finer_ladder_never_admits_a_smaller_block_than_a_coarse_one`]: https://docs.rs/blockflow
+/// # Should this be the default? The two reasons it is not, measured
+///
+/// It was made opt-in for two stated reasons. Both have now been tested rather
+/// than inherited, and **neither survives as originally stated**. The decision
+/// is recorded here rather than acted on, because flipping a default changes
+/// every consumer's plan and that is not a change to make from inside the
+/// function that would benefit from it.
+///
+/// **Reason one — the search cost — is retired.** The framing was
+/// `partitions x candidates^phases`, which makes refining a three-rung ladder to
+/// five look like `81 -> 625` at four phases. Two things are wrong with it.
+/// `boxes_tile_exactly` became a linear separating pass, taking
+/// `PlanBuilder::finish` from 445 ms to 4.2 ms at 8192 blocks, so one candidate
+/// costs a fraction of what it did when that multiplier last looked expensive.
+/// And the exponent is not real: [`crate::strategy::PartitionSearch`] is a
+/// dynamic program over prefixes, so the objective is additive over phases and
+/// the candidate loop runs once per (run, candidate) rather than once per
+/// combination. Measured end to end by `tests/ladder_planning_cost.rs`:
+/// **`1.06x` to `1.13x` of the coarse ladder's planning time, sub-millisecond
+/// throughout, at phase counts where the nominal combination count reaches seven
+/// figures.** The measured ratio stays under the bare `5/3` candidate ratio,
+/// which is the observable form of "it scales with the count, not the power".
+///
+/// **Reason two — the recorded parity figures — is narrower than it sounded, and
+/// it is the one that still decides.** Surveyed across both crates, splitting
+/// what a plan change would move into *answers* (voxel values, digests,
+/// component and row counts, reference comparisons) and *plan-shape
+/// measurements* (phase counts, chosen edges, fingerprints, read counters):
+///
+/// * **No answer is exposed.** Nothing that guarantees decomposition invariance
+///   reaches the planner through this default. The oracle comparisons build
+///   their plans with `Trivial`, which discards the candidate list, or with an
+///   explicit list of their own.
+/// * **The sibling crate is entirely immune** — it generates its own ladder from
+///   the caller's block and never consumes this default.
+/// * **The one frozen fingerprint literal is immune**, being built under an
+///   explicit four-rung list. Every other fingerprint assertion is relational.
+/// * What would move is a handful of **ladder-shape literals** and one recorded
+///   paragraph in the ops survey.
+///
+/// # It was recommended as a default, and the project decided otherwise
+///
+/// **The recommendation is kept rather than deleted, because a recommendation
+/// reversed by a decision should keep its reasoning visible.** On the two
+/// reasons above it was: *flip the default, once the volume-bound restatement
+/// lands in `budget.rs` and once the opt-in method goes with it.* Both
+/// prerequisites were real; the first has since landed.
+///
+/// **The decision was not to flip it, and the reason is better than the
+/// question.** This project intends to run several planners against simulated
+/// data and pick between them by what wins in a given context. A `1.06x`
+/// planning cost buying a larger block in 15 of 27 cells is exactly the kind of
+/// finding that should become a **competitor** rather than a default: the gain
+/// is real, it is context-dependent, and it is not large enough to justify
+/// moving the ground under every consumer of this crate on an average that
+/// nobody can defend in every context.
+///
+/// So what the measurement above is *for* changed. It is no longer the case for
+/// a default; it is the evidence a competition starts from, and the thing that
+/// had to change was how a caller **says which ladder** — see [`BlockLadder`],
+/// which replaced the opt-in method for three reasons that all bite when
+/// planners are compared rather than argued about.
+///
+/// **What [`BlockLadder::Refined`] buys, and it is modest and real**: a larger
+/// admitted block in 15 of 27 (budget, charge) cells at up to `3.38x` in volume,
+/// never a smaller one; and over a (chain, budget) sweep, a different plan in 6
+/// of 16 cells, two of which planned *fewer phases* — one less materialisation,
+/// which is a second-order win nobody was claiming.
+///
+/// **What it does not buy, and should not be sold as:** feasibility.
+/// `the_refined_ladder_never_plans_where_the_coarse_one_cannot` measures it —
+/// whether a plan exists at all is decided by the ladder's **floor**, which this
+/// refinement does not move, so it changes *which* block is chosen and never
+/// *whether* there is one.
+pub fn refined_ladder(coarse: &[usize]) -> Vec<usize> {
+    let Some(&floor) = coarse.iter().min() else {
+        return Vec::new();
+    };
+    let mut out: Vec<usize> = coarse
+        .iter()
+        .flat_map(|&edge| {
+            // **Three quarters of each power of two**, which is what the sweep
+            // named — `24, 48, 96, 192, 384` — and not three quarters of every
+            // entry. The distinction is invisible on an octave ladder, where
+            // every entry is a power of two, and it is what makes this a **fixed
+            // point**: `3k/4` for a power of two `k` is `3 * 2^(k-2)`, never
+            // itself a power of two, so a second application finds nothing new
+            // to insert.
+            //
+            // That idempotence is not tidiness. A setting whose value cannot be
+            // read back — where "which ladder is this" is unanswerable because
+            // applying it twice gives a third thing — is a bad thing for a
+            // planner competition to sweep, and [`BlockLadder`] is that
+            // competition's first entry.
+            [
+                edge,
+                if edge.is_power_of_two() {
+                    edge * 3 / 4
+                } else {
+                    0
+                },
+            ]
+        })
+        .filter(|&edge| edge >= floor)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// **Which ladder of block edges a planner is offered.** A named setting, not a
+/// transformation.
+///
+/// # The shape, and why it is this one
+///
+/// The precedent is [`crate::strategy::PartitionSearch`], and this is
+/// deliberately its twin: a small enumerable choice carried in the constraints,
+/// with a default, and with the alternative kept as a **named value** rather
+/// than as the absence of a call. That matters for one reason —
+/// `docs/design/barriers.md` is full of settings that are choices, and this
+/// crate now intends to pick planners by running them against each other rather
+/// than by arguing. **A competition needs settings it can put in a list**, and
+/// [`Self::ALL`] is that list.
+///
+/// It replaced a method — `with_refined_ladder()` — which was wrong for three
+/// reasons that all bite exactly when planners compete. It named a
+/// *transformation*, so there was no domain to enumerate. It could not be swept.
+/// And it was not idempotent, so "which ladder is this plan using" was not
+/// answerable from the value: applying it twice gave a third ladder. The first
+/// two are fixed by being an enum; the third is fixed in [`refined_ladder`],
+/// which is now a fixed point.
+///
+/// # The parameter space this belongs to, which is a second one
+///
+/// The consumer of this crate keeps a disciplined parameter space for anything
+/// that can change **the answer**: an arbitrary choice is an *axis*, a *synonym*
+/// cannot change the answer and is not one, and a *transcription decision*
+/// changes the answer but no reference parameter reaches it. The block ladder is
+/// placed there already, and placed correctly — a consumer's `LADDER_FLOOR`
+/// calls it *"arbitrary, and therefore a synonym rather than an axis — it cannot
+/// change an answer, only which decomposition computes it."*
+///
+/// **That is true and it is not the whole placement.** A synonym in the answer's
+/// space can be a genuine axis in a second space that has had no name: the
+/// **planner's**. Its parameters are the ones that change which decomposition is
+/// chosen and cannot change what the decomposition computes —
+/// [`crate::strategy::PartitionSearch`] and this are its first two entries.
+///
+/// **Its acceptance bar is different, and that is the point of naming it.** For
+/// the answer's space the bar is "the answer does not move", and here that bar
+/// is met *by construction* — the survey behind [`refined_ladder`]'s header
+/// found no voxel, digest, component count or reference comparison exposed to
+/// this choice at all, because decomposition invariance is what the whole crate
+/// guarantees. A bar that is satisfied before the experiment starts is not a
+/// bar. The bar in the planner's space is **"which is faster, and in what
+/// context"** — a question only measurement answers, and the one a competition
+/// between planners over simulated data exists to ask.
+///
+/// The discipline that space needs is already visible in `PartitionSearch`:
+/// `Exhaustive` is kept although `Dp` supersedes it, because *"the DP's licence
+/// is the additivity above, and a cost model that breaks it needs a search that
+/// never assumed it. It is also the oracle the DP is tested against."* A
+/// planner's-space parameter keeps a variant when it is somebody's oracle or
+/// somebody's context, not when it wins on average.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockLadder {
+    /// The rungs as the caller stated them, which for every ladder this crate
+    /// and its consumers build is powers of two. **The default**, and the
+    /// spacing every recorded parity figure was measured under.
+    ///
+    /// A step here is `8x` in block volume, which is the spacing
+    /// `budget::UNOBSERVED_SHAPE_MARGIN`'s bound was first stated against.
+    ///
+    /// **It is the identity on the rungs it is given, not a reduction to powers
+    /// of two.** A ladder names the *spacing* a caller wants offered, not the
+    /// set — so selecting this one never discards a rung a caller deliberately
+    /// stated, which a "round back down to octaves" rule would. A sweep
+    /// therefore applies each of [`Self::ALL`] to the same **base** list rather
+    /// than chaining them, and that is the pattern a competition wants anyway.
+    #[default]
+    Octave,
+    /// [`Octave`](Self::Octave) with a rung at three quarters of each power of
+    /// two above the floor: `[32, 64, 128]` becomes `[32, 48, 64, 96, 128]`.
+    ///
+    /// Steps of `2.37x` and `3.375x` alternating instead of `8x`, so the
+    /// planner's correction lands closer. Measured: a larger admitted block in
+    /// 15 of 27 (budget, charge) cells at up to `3.38x` in volume and never a
+    /// smaller one, for `1.06x` to `1.13x` of the planning time. See
+    /// [`refined_ladder`] for the measurement, for what it does **not** buy —
+    /// feasibility — and for the guarantee it restates.
+    Refined,
+}
+
+impl BlockLadder {
+    /// Every ladder, for a caller that wants to try them all.
+    ///
+    /// The reason this is a `const` rather than something a caller writes out:
+    /// a competition that enumerates by hand silently stops covering a variant
+    /// the day one is added.
+    pub const ALL: [BlockLadder; 2] = [BlockLadder::Octave, BlockLadder::Refined];
+
+    /// The rungs this ladder offers over `base`.
+    ///
+    /// **Idempotent in the ladder and in the value**: applying the same ladder
+    /// twice gives the same list, so a caller may set it without knowing what
+    /// was set before. That is what makes it a setting rather than an operator.
+    pub fn rungs(self, base: &[usize]) -> Vec<usize> {
+        match self {
+            BlockLadder::Octave => {
+                let mut out = base.to_vec();
+                out.sort_unstable();
+                out.dedup();
+                out
+            }
+            BlockLadder::Refined => refined_ladder(base),
+        }
+    }
+
+    /// For a message or a report column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockLadder::Octave => "octave",
+            BlockLadder::Refined => "refined",
+        }
+    }
+}
+
+/// How many **slabs** a block is cut into for intra-block threading.
+///
+/// A planner's-space parameter beside [`BlockLadder`] and
+/// `strategy::PartitionSearch`, and for the same reason: it is a decision about
+/// how to search, enumerable so a competition covers every variant, with a
+/// default, and **it must be possible to turn off**.
+///
+/// **It is a field of [`Constraints`], and getting it there answered a design
+/// question rather than just costing an edit.** Adding one breaks every struct
+/// literal of that type — seven in the library and six in the integration tests
+/// — and a struct constructed by literal in thirteen places is a struct whose
+/// every future field is a tree-wide edit. The case *for* the literal is
+/// exhaustiveness: a new field is a compile error at each site, so somebody has
+/// to decide rather than inherit a default. That is worth paying **where the
+/// struct is built for a real run**, and worth nothing where it is a test
+/// fixture stating three knobs it cares about.
+///
+/// So the sites were read rather than rewritten, and **all thirteen turned out
+/// to be test fixtures**: every one sits inside a `#[cfg(test)]` module or a
+/// `tests/` file. No production path in this crate constructs `Constraints` by
+/// literal — real callers take [`Constraints::default`] and a `with_*`. The
+/// exhaustiveness was therefore being paid entirely by fixtures, where a new
+/// planner knob is noise and not a decision, so they now end
+/// `..Default::default()` and the next field costs them nothing. **The compiler
+/// named every site**; no pattern was matched against `Constraints {`, which
+/// matches things that are not literals and corrupted four files the first time
+/// it was tried. Deliberately not an
+/// operator — see [`BlockLadder`]'s own note on why a setting a caller states
+/// once beats a method that compounds.
+///
+/// **What it is for, and the measurement is the whole argument.** Cutting a
+/// block into slabs was measured at **`5.39x` at one block and nothing once
+/// `n_blocks >= workers`**. That is not a better way to spend threads; it is the
+/// only way to spend threads that would otherwise be **parked**. So the rule
+/// below is not a tuning curve, it is a description of when there are idle
+/// workers: `floor(workers / n_blocks)`, which is `1` exactly when the block
+/// lattice already has work for everyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SlabPolicy {
+    /// Cut a block into `floor(workers / n_blocks)` slabs, capped at
+    /// [`Self::CAP`]. **The default**, and it changes nothing under the default
+    /// [`Constraints`], whose `expected_concurrency` is one — asserted below,
+    /// because a default that quietly altered every recorded figure would be the
+    /// wrong kind of safe.
+    #[default]
+    FillIdleWorkers,
+    /// Never cut. One slab per block, whatever the concurrency.
+    ///
+    /// The off switch, and it is required rather than a convenience: an
+    /// intra-block cut changes which code runs, and a caller reproducing a
+    /// recorded run needs to be able to say "not that".
+    Off,
+}
+
+impl SlabPolicy {
+    /// Every policy, so a competition that enumerates cannot silently stop
+    /// covering one. [`BlockLadder::ALL`]'s reason.
+    pub const ALL: [SlabPolicy; 2] = [SlabPolicy::FillIdleWorkers, SlabPolicy::Off];
+
+    /// **Four**, and the cap is about halo rather than about threads.
+    ///
+    /// A block already pays a halo on every side; a slab pays another one on the
+    /// cut axis, so the redundant read grows with the slab count while the
+    /// parallel speed-up saturates against memory bandwidth. It is a constant
+    /// rather than a field because a caller who wants a different number wants a
+    /// different policy, and adding one is one variant here rather than a knob
+    /// everywhere.
+    pub const CAP: usize = 4;
+
+    /// How many slabs a block should be cut into, given the pool and the
+    /// lattice.
+    ///
+    /// **Never zero and never more than [`Self::CAP`].** `workers = 0` and
+    /// `n_blocks = 0` are both answered `1` rather than refused: they are what an
+    /// empty plan and an unset concurrency look like, and one slab is the
+    /// behaviour this crate had before slabs existed.
+    pub fn slabs_for(self, workers: usize, n_blocks: usize) -> usize {
+        match self {
+            SlabPolicy::Off => 1,
+            SlabPolicy::FillIdleWorkers => {
+                if n_blocks == 0 || workers == 0 {
+                    return 1;
+                }
+                (workers / n_blocks).clamp(1, Self::CAP)
+            }
+        }
+    }
+
+    /// For a message or a report column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlabPolicy::FillIdleWorkers => "fill-idle-workers",
+            SlabPolicy::Off => "off",
+        }
+    }
+}
+
+impl Constraints {
+    /// The same constraints with `policy`.
+    ///
+    /// **The one way to ask for a slab policy**, so a caller that sweeps
+    /// [`SlabPolicy::ALL`] and a caller that names one go through the same line.
+    /// Idempotent, because the field is replaced rather than combined.
+    ///
+    /// **What carries it into a run** is `strategy::Strategy::plan`, which
+    /// copies it into `strategy::Hints::slab_policy` — the one method that holds
+    /// a `Constraints` and a `Hints` at once. A caller who builds a
+    /// decomposition and executes it directly is advising the hints themselves
+    /// and states the policy there.
+    pub fn with_slab_policy(mut self, policy: SlabPolicy) -> Self {
+        self.slab_policy = policy;
+        self
+    }
+
+    /// The same constraints with `ladder`'s rungs.
+    ///
+    /// **The one way to ask for a ladder**, so that a caller that sweeps
+    /// [`BlockLadder::ALL`] and a caller that names one variant go through the
+    /// same line. Idempotent, because [`BlockLadder::rungs`] is: setting the
+    /// same ladder twice is setting it once, and setting a different one is
+    /// answering a different question rather than compounding two.
+    ///
+    /// **There is one effective list and it is [`Self::block_candidates`].** The
+    /// ladder is applied to it here rather than stored beside it, so nothing in
+    /// this struct can disagree with anything else in it — a plan is priced
+    /// against the rungs the field holds, whichever call put them there.
+    pub fn with_ladder(mut self, ladder: BlockLadder) -> Self {
+        self.block_candidates = ladder.rungs(&self.block_candidates);
+        self
+    }
+}
+
 impl Default for Constraints {
     fn default() -> Self {
         Self {
+            slab_policy: SlabPolicy::default(),
             budget_bytes: None,
             expected_concurrency: 1,
             model: CostModel::default(),
@@ -1541,7 +2141,22 @@ pub fn cuttable_axes(
             // The widest halo over every block, which is what the read extent is
             // sized by. Saturating because a reach may exceed the volume, which
             // is exactly the case this exists for.
-            let (lo, hi) = reach.axis(axis).bound(volume[axis]);
+            //
+            // **`resolved(edge)` before `bound`, and this function is the reason
+            // that ordering had to be found rather than assumed.** It is the
+            // identity for every reach but [`crate::reach::AxisReach::Aligned`],
+            // so no plan that existed before it changes. For an aligned reach it
+            // is decisive: the unresolved halo is `stride - 1` wider per side, so
+            // an op whose true halo leaves an axis comfortably cuttable is judged
+            // on its worst case, the axis is **dropped here**, and the phase
+            // degenerates to one block — reading the whole volume per block,
+            // which is the cost `docs/design/barriers.md` exists to remove. The
+            // discount taken in `price_phase` never gets a chance, because this
+            // runs first and decides there is nothing to price. Measured: a
+            // 32-voxel-tile transform convolution over `96^3` planned as a
+            // *single block* at both edge 32 and edge 48 before this line
+            // resolved.
+            let (lo, hi) = reach.axis(axis).resolved(edge).bound(volume[axis]);
             edge.saturating_add(lo).saturating_add(hi) < volume[axis]
         })
         .collect()
@@ -3743,5 +4358,61 @@ mod tests {
         assert_eq!(compute, 3.5);
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
         assert!(orders.is_empty());
+    }
+
+    /// **The rule, and the boundary it is a description of.**
+    ///
+    /// Intra-block slicing was measured at `5.39x` at one block and nothing once
+    /// `n_blocks >= workers`, so the rule is not a curve to tune — it is a
+    /// statement of when a worker would otherwise be parked.
+    #[test]
+    fn the_slab_rule_asks_for_threads_only_where_the_lattice_left_some_idle() {
+        use super::SlabPolicy::{FillIdleWorkers as Fill, Off};
+
+        // The whole point: a lattice with work for everyone gets one slab.
+        for (workers, blocks) in [(40, 40), (40, 41), (40, 400), (8, 8), (2, 3)] {
+            assert_eq!(
+                Fill.slabs_for(workers, blocks),
+                1,
+                "{workers} workers over {blocks} blocks have nothing spare"
+            );
+        }
+        // And one that does not gets the spare threads, up to the cap.
+        assert_eq!(Fill.slabs_for(40, 20), 2);
+        assert_eq!(Fill.slabs_for(40, 14), 2);
+        assert_eq!(Fill.slabs_for(40, 10), 4);
+        assert_eq!(Fill.slabs_for(40, 1), SlabPolicy::CAP, "capped, not forty");
+        assert_eq!(Fill.slabs_for(1, 1), 1);
+        // Degenerate inputs answer one rather than zero or a panic.
+        assert_eq!(Fill.slabs_for(0, 0), 1);
+        assert_eq!(Fill.slabs_for(0, 8), 1);
+        assert_eq!(Fill.slabs_for(8, 0), 1);
+        // The off switch is off at every input, which is what makes it an off
+        // switch rather than a hint.
+        for (workers, blocks) in [(40, 1), (40, 10), (1, 1), (0, 0)] {
+            assert_eq!(Off.slabs_for(workers, blocks), 1);
+        }
+        // **Liveness.** Every assertion above would hold for a policy that
+        // answered one unconditionally, so the two must be shown to differ
+        // somewhere.
+        assert_ne!(Fill.slabs_for(40, 1), Off.slabs_for(40, 1));
+        assert_eq!(SlabPolicy::ALL.len(), 2, "a sweep must cover both");
+    }
+
+    /// **The default changes nothing**, which is what makes it safe to be the
+    /// default: `Constraints::default()`'s concurrency is one, so the rule
+    /// answers one slab and no recorded figure moves.
+    #[test]
+    fn the_default_policy_asks_for_one_slab_under_the_default_constraints() {
+        let constraints = Constraints::default();
+        assert_eq!(constraints.expected_concurrency, 1);
+        assert_eq!(
+            SlabPolicy::default().slabs_for(constraints.expected_concurrency, 1),
+            1,
+            "the default policy at the default concurrency must not cut"
+        );
+        // And it is the filling one rather than the off one, so a caller who
+        // raises the concurrency gets the behaviour without asking twice.
+        assert_eq!(SlabPolicy::default(), SlabPolicy::FillIdleWorkers);
     }
 }

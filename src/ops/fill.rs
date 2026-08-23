@@ -22,12 +22,22 @@
 // | phase | shape | what it does |
 // |---|---|---|
 // | 0 | `volume -> fragments`, and writes pixels | label each block's background locally; write the labels as an image; emit the block's six faces and which of its labels touch the volume's outside |
-// | 1 | `fragments -> volume` | read every block's faces, close the labels into global components, and rewrite this block's labels into the filled mask |
+// | 1 | `fragments -> volume`, **behind a barrier** | close every block's faces into global components **once for the phase**, then rewrite each block's labels into the filled mask from that one answer |
 //
 // Phase 0 is embarrassingly parallel with **reach zero** — a block-local
 // component labelling reads nothing outside its own core. Everything global is
 // paid for exactly once, in phase 1, and what crosses between them is six
 // planes of labels per block rather than any volume of pixels.
+//
+// **"Exactly once" is now literally true**, and for most of this file's life it
+// was not. Phase 1 declares `FragmentOp::barrier` — its dependency on phase 0 is
+// completion rather than region coverage — and computes the union-find in
+// `FragmentOp::reduce`, which runs at the one moment a barrier creates. Before
+// that declaration existed the only way to say "after all of phase 0" was to
+// fetch the whole volume in every block, and the merge had nowhere to live but
+// `apply`, which is per block. "What this costs" below is the measurement of
+// the difference, and `ops::components::Merge` is the switch the three arms of it are
+// built from.
 //
 // The intermediate image is decomposition-dependent, and the output is not
 // -----------------------------------------------------------------------------
@@ -87,16 +97,23 @@
 //
 // Two walls this op ran into, and what was done about each
 // --------------------------------------------------------
-// **A fragment-only phase is terminal as far as images go.** The natural
-// three-phase shape — label, merge, relabel — puts a `fragments -> fragments`
-// merge between two pixel phases, and that cannot be planned: `fragment.rs`'s
-// `check_phase_work` refuses it in as many words, because image `p+1` would go
-// unwritten and phase `p+1` would read an image nobody produced. The merge is
-// therefore folded into phase 1, which reads the fragments *and* the labels and
-// writes the answer. The cost of the fold is that **every block re-runs the same
-// global union-find**, and what that costs is "What this costs" below — where it
-// is now measured, because this sentence used to reason about it and reasoned
-// wrong. `docs/design/barriers.md` is the specification for the way out.
+// **A fragment-only phase is terminal as far as images go, and that is still
+// true.** The natural three-phase shape — label, merge, relabel — puts a
+// `fragments -> fragments` merge between two pixel phases, and that cannot be
+// planned: `fragment.rs`'s `check_phase_work` refuses it in as many words,
+// because image `p+1` would go unwritten and phase `p+1` would read an image
+// nobody produced. The merge is therefore folded into phase 1, which reads the
+// fragments *and* the labels and writes the answer.
+//
+// **What has changed is what the fold costs.** The sentence that stood here said
+// the cost of it is that every block re-runs the same global union-find, and that
+// was right; it is no longer the case, and the wall it names is not the reason.
+// `FragmentOp::reduce` gives the phase somewhere to put an answer that belongs to
+// the phase rather than to a block, so the merge runs once inside a two-phase
+// plan and Rule A is not in the way of anything. `docs/design/barriers.md` §7.5
+// is the argument for why the whole-phase blob is specifically the shape that
+// does not need the third phase — and §7.3 is the record of why the merge was
+// ever per block, which was never a choice anybody made.
 //
 // **A fragment op could not change the element type of the image it writes.**
 // Phase 0 reads a `bool` mask and writes `u32` labels, and `check_dtypes` folds
@@ -110,9 +127,17 @@
 //
 // What this costs, stated rather than discovered
 // ------------------------------------------------
-// Phase 1 declares a whole-lattice fragment reach, so on a lattice of `N` blocks
-// it transfers every block's fragment to each of `N` blocks, and each fragment is
-// the block's six face planes. **Hold the block edge fixed and grow the volume**
+// **Read in the past tense down to "What the declarations bought".** Everything
+// below is the analysis that produced `docs/design/barriers.md`, and it is the
+// analysis of the shape this op *had*: a whole-lattice fragment reach, a
+// whole-volume halo, and a merge in every block. That shape is still buildable —
+// it is `Merge::PerBlock` — and it is what the measurement at the end compares
+// against. Nothing here has been deleted, because the argument is what makes the
+// numbers at the end mean anything.
+//
+// Under `Merge::PerBlock` phase 1 declares a whole-lattice fragment reach, so on
+// a lattice of `N` blocks it transfers every block's fragment to each of `N`
+// blocks, and each fragment is the block's six face planes. **Hold the block edge fixed and grow the volume**
 // and that is quadratic in the block count, because each block contributes a
 // fixed amount of face: a lattice of a thousand 256-cube blocks moves on the
 // order of a terabyte of face planes to do a merge whose answer is one boolean
@@ -171,43 +196,93 @@
 // per-block multiplier. "The fragments are small beside the pixels" is a
 // statement about coarse lattices and nobody had swept it.
 //
-// **And that reach is also a halo, which costs pixels as well as fragments.**
-// `fragment_phase` sets `halo = max(reach, fragment reach * block edge)`, so
-// phase 1's halo is the whole volume, so phase 1's *read extent* is the whole
-// volume, so every block of it reads the entire label image. That looked at
-// first like a convenience constructor conflating two quantities — the executor
-// gathers fragments from `neighbourhood(index, input.reach, counts)` and never
-// consults the halo — and building the phases by hand with a zero halo was the
-// obvious fix. The guard refuses it, and is right to: **the halo is also the
-// dependency edge.** Phases here are pipelined, not barriered, so what makes
-// block `b` of phase 1 wait for the blocks of phase 0 whose fragments it reads
-// is precisely the halo. A zero halo would have block `b` read fragments nobody
-// had written yet. The coupling is load-bearing and the two costs are one cost.
+// **And that reach was also a halo, which cost pixels as well as fragments.**
+// `fragment_phase` sets `halo = max(reach, fragment reach * block edge)` for a
+// phase with no barrier, so phase 1's halo was the whole volume, so its *read
+// extent* was the whole volume, so every block of it read the entire label
+// image. That looked at first like a convenience constructor conflating two
+// quantities — the executor gathers fragments from `neighbourhood(index,
+// input.reach, counts)` and never consults the halo — and building the phases by
+// hand with a zero halo was the obvious fix. The guard refused it, and was right
+// to: **the halo was also the dependency edge.** Phases here are pipelined, so
+// what made block `b` of phase 1 wait for the blocks of phase 0 whose fragments
+// it reads was precisely the halo, and a zero halo would have had block `b` read
+// fragments nobody had written yet. The coupling was load-bearing and the two
+// costs were one cost.
 //
-// So the read amplification is real and is the price of a global reduction in a
-// pipelined plan: `N` blocks each reading the whole label image. The acceptance
-// suite measures it rather than describing it. The way out is a **barrier**
-// rather than a halo — a phase that is declared to start only when the previous
-// one has finished needs no halo to express the same dependency — and
-// `docs/design/barriers.md` is now the specification for it, with all three
-// costs above measured against the alternatives. The short form: a barrier
-// removes the pixel amplification and leaves the other two, and a barrier that
-// also lets the phase run its reduction **once** removes all three, taking the
-// whole pipeline to within a few per cent of not decomposing the merge at all.
+// What the declarations bought, measured
+// ----------------------------------------
+// Both declarations landed and `tests/fragment_join_barrier.rs` is the evidence.
+// It builds three arms out of **one op with one word changed** — `Merge` — so
+// every other line is the same line and a difference in the counters is
+// attributable to the declaration and to nothing else, and it runs `ops::regional`
+// beside this op, which is the same program with a different per-label fact.
+// Every byte column is predicted from a formula and then compared; the answer is
+// checked byte-for-byte against a whole-volume reference in all three arms at
+// every lattice, which is what makes the arm with the barrier *withheld* the
+// liveness control rather than a second implementation.
 //
-// The alternative is the classic one — propagate labels to immediate neighbours
-// only, `fragments -> fragments` at block reach 1, and iterate until nothing
-// changes. That is expressible here *except* for the stopping rule: the number
-// of rounds depends on how crooked the components are, which is a property of
-// the data, and a `Decomposition` is data-blind on purpose. Bounding it by the
-// lattice diameter is correct and is usually far more rounds than needed. This
-// is the same gap the design record names as the one open architectural
-// question, and this op is the first thing in the crate that would spend real
-// bytes on it.
+// On `[16, 32, 32]` of `bool`, in bytes, with the merge count beside them:
 //
-// Until then the honest mitigation is placement rather than propagation: the
-// merge is a reduction whose input is already resident somewhere, and
-// `distributed::placement` exists to run such a phase where the data is.
+// | blocks | arm | pixel reads | fragments | total | merges |
+// |---|---|---|---|---|---|
+// | 32 | in every block | 2 113 536 | 1 691 316 | 3 886 772 | 64 |
+// | 32 | + a barrier | 81 920 | 1 691 316 | 1 855 156 | 64 |
+// | 32 | + hoisted | 81 920 | 153 756 | **317 596** | **2** |
+// | 256 | in every block | 16 793 600 | 29 508 740 | 46 384 260 | 512 |
+// | 256 | + a barrier | 81 920 | 29 508 740 | 29 672 580 | 512 |
+// | 256 | + hoisted | 81 920 | 344 460 | **508 300** | **2** |
+//
+// **91.3x the traffic at 256 blocks, and 256 times the merges**, to compute a
+// table of one boolean per label. Two things in that table are worth more than
+// the ratio:
+//
+// * **The barrier alone is worth 1.56x here and the specification's own example
+//   is worth 2.7x.** Not a contradiction and not a constant: a barrier removes
+//   the *pixel* half and leaves the fragment half, so what it is worth is
+//   whatever fraction of the traffic the pixels were. At 256 blocks of this
+//   volume the fragment set is 175% of the label image — the regime "The byte
+//   half fails too" above predicts and this measurement lands inside — so the
+//   pixel half it removes is the smaller half. **The fraction is a property of
+//   the cut and must be measured per op and per lattice, never quoted.**
+// * **The merge column is `2 x blocks`, not `blocks`.** Phase 1 declares
+//   `SeamFold::Unordered`, which is true of it and is checked rather than
+//   believed — the executor applies each block a second time with the
+//   neighbourhood reversed. Under `Merge::PerBlock` that doubles the union-find,
+//   which is a cost this header never named because the declaration was never
+//   made. Hoisted it costs one extra reduction for the phase and no extra
+//   application at all, because the per-block fragment reach is then nothing and
+//   a one-element sequence has no order to check. So the check is a per-block
+//   cost that hoisting turns into a per-phase one, by the same multiplier it
+//   removes from everything else.
+//
+// The wall clock moves with the merges rather than with the bytes, which is
+// §7.2's whole point: at 256 blocks and one thread the in-plan arm takes on the
+// order of ninety times the hoisted one, tracking the merge column rather than
+// the byte column. That figure is **reported by the test and not asserted**, and
+// no absolute seconds are quoted here, because it moves with what else the
+// machine is doing while the byte columns reproduce to the digit.
+//
+// **What is left, and it is geometry.** The floor is `F` itself — the total face
+// area of the cut, transmitted a fixed small number of times — and no
+// declaration removes it: telling one block about another's boundary costs the
+// boundary. `barriers.md` §7.6 swept that and found the growth intrinsic and the
+// *multiplier* an artefact, and it is the multiplier that has gone.
+//
+// The classic alternative would reduce nothing further and is recorded because
+// it used to be the way out: propagate labels to immediate neighbours only,
+// `fragments -> fragments` at block reach 1, and iterate until nothing changes.
+// It is expressible here *except* for the stopping rule — the number of rounds
+// depends on how crooked the components are, which is a property of the data, and
+// a `Decomposition` is data-blind on purpose. It was the answer while the merge
+// was per block, because it would have shrunk what each block had to see; with
+// the merge hoisted there is one merge over the whole set and nothing for the
+// rounds to save.
+//
+// Placement is still worth what it was worth: the reduction's input is a set of
+// small objects somewhere, and `distributed::placement` runs a phase where the
+// data is. In a distributed run the blob is not shipped at all — every worker
+// derives it from the same fragment set, which is `barriers.md` §9.
 //
 // What is here and what is in `components`
 // ----------------------------------------
@@ -223,6 +298,16 @@
 // the volume", and a seam meeting always unions because two background labels
 // that touch are one background component. The fragment type, its magic, its
 // public functions and its error messages are where they were.
+//
+// **Two more things joined it while this op was migrated onto the barrier.**
+// `components::Merge` — where the global merge runs — and the reduction blob's
+// codec, `components::encode_block_flags` and `decode_block_flags_for`. Both
+// were written here, because this is the op that needed them first, and both
+// were moved: every fragment-and-join op merges to exactly one flag per label
+// per block, so the declaration and the encoding are the family's and not this
+// op's. `agree_on_connectivity` is the one that did **not** move, and the
+// asymmetry is deliberate — it is a refusal about a pair of *this* file's ops
+// that two other files happen to reuse, not a shared representation.
 
 use std::collections::BTreeMap;
 
@@ -235,15 +320,17 @@ use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
     fragment_phase, BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput,
+    PhaseView, SeamFold,
 };
 use crate::geometry::BlockGrid;
 use crate::sidecar::Lifecycle;
 use crate::voxels::Voxels;
 
 use super::components::{
-    bytes_to_words, core_within_read, empty_planes, expect_end, face_axes, label_members_into,
-    label_members_into_with, planes_of, push_planes, read_header, take_planes, walk_seams_with,
-    words_to_bytes, Connectivity, FacePlanes, LabelIndex, Union, UNLABELLED,
+    bytes_to_words, core_within_read, decode_block_flags_for, empty_planes, encode_block_flags,
+    expect_end, face_axes, label_members_into, label_members_into_with, planes_of, push_planes,
+    read_header, take_planes, walk_seams_with, words_to_bytes, Connectivity, FacePlanes,
+    LabelIndex, Merge, Union, UNLABELLED,
 };
 use super::shapes_agree;
 use super::voxelwise::is_set;
@@ -415,6 +502,15 @@ impl BlockFaces {
 const MAGIC: u32 = 0x4c4c_4946;
 const VERSION: u32 = 1;
 
+/// `"FILR"` little-endian — the **reduction** blob, not the fragment.
+///
+/// A separate magic rather than a second version of `MAGIC`, for the reason
+/// `components::read_header` gives about the fragment magic: neither a
+/// fragment's address nor a reduction blob's says what its bytes mean, and these
+/// two travel through the same op. A blob decoded as a fragment, or the reverse,
+/// is refused on the first word.
+const REDUCTION_MAGIC: u32 = 0x524c_4946;
+
 // ------------------------------------------------------------- the merge --
 
 /// Close every block's local labels into global components and report, per
@@ -529,6 +625,14 @@ impl FragmentOp for LabelBackgroundOp {
         self.name
     }
 
+    /// Nothing crosses as **pixels**. The background is labelled inside this
+    /// block from this block's mask alone; the six faces and the label count a
+    /// neighbour needs leave on `self.stream`, whose reach is declared in blocks
+    /// by whoever reads it.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn reads_pixels(&self) -> bool {
         true
     }
@@ -632,9 +736,15 @@ pub fn outside_flags(
 
 /// Phase 1: close the components and write the filled mask.
 ///
-/// Declares a **whole-lattice** fragment reach, which is what makes it the
-/// planning barrier the design record describes: nothing can be fused across it,
-/// because its answer depends on every block.
+/// **Declares a [barrier], and runs its merge once for the phase.** Its answer
+/// depends on every block, and that is now stated as the dependency it is rather
+/// than paid for as a whole-volume fetch: the phase waits for all of phase 0,
+/// fetches only its own core, and computes the union-find in
+/// [`FragmentOp::reduce`] at the moment the barrier creates. [`Merge`] is the
+/// declaration and the module header measures what each of its three shapes
+/// costs.
+///
+/// [barrier]: crate::fragment::FragmentOp::barrier
 pub struct FillHolesOp {
     name: &'static str,
     stream: String,
@@ -645,6 +755,9 @@ pub struct FillHolesOp {
     /// be what the labelling used within a block. [`Connectivity::Faces`] unless
     /// a caller said otherwise.
     connectivity: Connectivity,
+    /// Where the union-find runs. [`Merge::OnceForThePhase`] unless a
+    /// measurement asked for one of the other two.
+    merge: Merge,
 }
 
 impl FillHolesOp {
@@ -670,7 +783,24 @@ impl FillHolesOp {
             filled,
             lattice: grid.blocks_per_axis(),
             connectivity: Connectivity::Faces,
+            merge: Merge::default(),
         }
+    }
+
+    /// The same op with the merge somewhere else. See [`Merge`].
+    ///
+    /// **Nothing in a shipping plan should call this.** The default is the shape
+    /// that costs least in all three currencies; the other two exist so that the
+    /// difference can be measured out of one op, and so that the barrier has a
+    /// liveness control — the same op with it withheld must answer identically.
+    pub fn merging(mut self, merge: Merge) -> Self {
+        self.merge = merge;
+        self
+    }
+
+    /// Where this op's merge runs.
+    pub fn merge(&self) -> Merge {
+        self.merge
     }
 
     /// The same op, closing the components under a stated [`Connectivity`].
@@ -716,6 +846,50 @@ impl FragmentOp for FillHolesOp {
         self.name
     }
 
+    /// Nothing this block is authoritative for reaches past its core, and since
+    /// the barrier the read extent is that core: `fragment_phase` no longer
+    /// widens the halo to cover a fragment reach the barrier states directly.
+    /// The question that crosses the seam — *is this cavity connected to the
+    /// outside* — is answered on the stream.
+    ///
+    /// Under [`Merge::PerBlock`] the whole-lattice fragment reach in
+    /// [`Self::inputs`] is still a whole-volume halo, and `apply` slices back to
+    /// the core before it writes. That arm exists to be measured.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    /// **The answer depends on every block, and this is where that is said.**
+    ///
+    /// Before it could be said, the only spelling was a whole-lattice fragment
+    /// reach, which `fragment_phase` turned into a whole-volume halo, a
+    /// whole-volume fetch and an edge to every task below — three costs to
+    /// express one ordering. The module header measures what dropping the first
+    /// two is worth on this op.
+    fn barrier(&self) -> bool {
+        self.merge.is_barriered()
+    }
+
+    /// **The union-find is a function of the set of fragments, not of their
+    /// order**, and this is the claim being checked rather than asserted.
+    ///
+    /// It is true here structurally rather than by luck: the merge is driven off
+    /// a `BTreeMap` keyed by block index, so the fragments are put back into the
+    /// lattice's own order whatever order they arrived in; the seam walk unions
+    /// pairs, and a union-find's partition does not depend on the order the
+    /// unions arrive in; and the per-label fact is a boolean folded with `or`,
+    /// which associates exactly. Nothing here accumulates in `f64`.
+    ///
+    /// What the declaration buys is that a future edit which broke any of those
+    /// three is caught: the executor reduces a second time with the lattice
+    /// walked backwards and requires the same bytes. What it costs is one extra
+    /// reduction per phase — against the one extra `apply` **per block** the same
+    /// declaration costs under [`Merge::PerBlock`], which is the multiplier
+    /// hoisting removes from this check as well as from everything else.
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::Unordered)
+    }
+
     fn reads_pixels(&self) -> bool {
         true
     }
@@ -729,19 +903,63 @@ impl FragmentOp for FillHolesOp {
         self.filled
     }
 
-    /// The whole lattice, stated as the lattice rather than as a large number.
+    /// **Nothing per block once the merge is hoisted**, and the whole lattice
+    /// when it is not.
     ///
-    /// This is why the constructor takes a grid. "Everything" is a different
-    /// integer on every lattice, and a saturating sentinel is not a way out: the
-    /// reach is multiplied by the block edge to get a halo, and a sentinel
-    /// overflows the geometry rather than clamping. `FragmentInput::whole` takes
-    /// a grid for the same reason.
+    /// The stream is declared either way, because that is what makes it
+    /// resolvable — a `reduce` may read the streams the plan records and no
+    /// others, for the same reason a block may. What the reach says is how much
+    /// of the set *this block* needs, and with the merge in
+    /// [`FragmentOp::reduce`] the answer is none of it: the phase needs the set,
+    /// the block needs the phase's answer. That is where the `(1 + blocks) x F`
+    /// multiplier goes.
+    ///
+    /// Under the two per-block shapes the reach is the lattice, stated as the
+    /// lattice rather than as a large number — which is why the constructor
+    /// takes a grid. "Everything" is a different integer on every lattice, and a
+    /// saturating sentinel is not a way out: the reach is multiplied by the block
+    /// edge to get a halo, and a sentinel overflows the geometry rather than
+    /// clamping. `FragmentInput::whole` takes a grid for the same reason.
     fn inputs(&self) -> Vec<FragmentInput> {
-        vec![FragmentInput::own(self.stream.clone(), self.faces_phase).with_reach(self.lattice)]
+        let reach = if self.merge.is_hoisted() {
+            [0, 0, 0]
+        } else {
+            self.lattice
+        };
+        vec![FragmentInput::own(self.stream.clone(), self.faces_phase).with_reach(reach)]
+    }
+
+    /// Nothing to gather once the merge is hoisted: `apply` reads the phase's
+    /// answer, not the fragments it was derived from. Gathering a reach of
+    /// nothing would still fetch this block's own fragment, which is one whole
+    /// transmission of the set across the phase for bytes no block reads.
+    fn gathers(&self) -> bool {
+        !self.merge.is_hoisted()
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
         Vec::new()
+    }
+
+    /// **The merge, once for the phase.** Every block then reads its own row out
+    /// of the blob instead of re-deriving the whole table.
+    ///
+    /// Empty under the two per-block shapes, which is what makes them plannable
+    /// at all: `check_phase_work` probes `reduce` on every phase without a
+    /// barrier and refuses one that answers, and [`Merge::PerBlock`] has no
+    /// barrier.
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        if !self.merge.is_hoisted() {
+            return Ok(Vec::new());
+        }
+        let mut reports = BTreeMap::new();
+        at.stream_fragments(&self.stream, &mut |key, bytes| {
+            reports.insert(key.block, BlockFaces::decode(bytes)?);
+            Ok(())
+        })?;
+        let counts = at.grid.blocks_per_axis();
+        let outside = merge_faces_with(&reports, counts, self.connectivity)?;
+        encode_block_flags(&outside, counts, REDUCTION_MAGIC)
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
@@ -750,22 +968,37 @@ impl FragmentOp for FillHolesOp {
         };
         let labels = pixels.view::<u32>()?;
 
-        let mut reports = BTreeMap::new();
-        for (key, bytes) in at.fragments(&self.stream) {
-            reports.insert(key.block, BlockFaces::decode(bytes)?);
-        }
-        let outside = merge_faces_with(&reports, at.grid.blocks_per_axis(), self.connectivity)?;
-        let mine = outside.get(&at.index).ok_or_else(|| {
-            Error::InvalidArgument(format!(
-                "the merge produced no answer for block {:?}, which is the block asking",
-                at.index
-            ))
-        })?;
+        let counts = at.grid.blocks_per_axis();
+        let mine = if self.merge.is_hoisted() {
+            decode_block_flags_for(
+                at.reduced,
+                counts,
+                at.index,
+                REDUCTION_MAGIC,
+                "a hole-filling reduction",
+            )?
+        } else {
+            let mut reports = BTreeMap::new();
+            for (key, bytes) in at.fragments(&self.stream) {
+                reports.insert(key.block, BlockFaces::decode(bytes)?);
+            }
+            let outside = merge_faces_with(&reports, counts, self.connectivity)?;
+            outside.get(&at.index).cloned().ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "the merge produced no answer for block {:?}, which is the block asking",
+                    at.index
+                ))
+            })?
+        };
+        let mine = &mine[..];
 
-        // **Only the core, and this is not an optimisation.** The read extent
-        // here is the whole volume — the whole-lattice fragment reach is also
-        // the halo — so `labels` holds every block's labels, numbered per block,
-        // while `mine` answers for this block's numbering and no other. See
+        // **Only the core, and this is not an optimisation.** Under
+        // [`Merge::PerBlock`] the read extent is the whole volume — the
+        // whole-lattice fragment reach is also the halo — so `labels` holds every
+        // block's labels, numbered per block, while `mine` answers for this
+        // block's numbering and no other. With a barrier the read extent *is* the
+        // core and this slice is the identity; it stays because the op is one op
+        // and the geometry is read rather than assumed. See
         // `components::core_within_read`, which states the whole argument.
         let (offset, extent) = core_within_read(at)?;
         let window = ndarray::s![
@@ -800,10 +1033,11 @@ impl FragmentOp for FillHolesOp {
 /// The two phases, on one lattice.
 ///
 /// Both are built with `fragment_phase`, so both halos come from the ops'
-/// declarations rather than from this function: zero for the labelling, the
-/// whole lattice for the filling. The preamble explains why the second one has
-/// to be that and what it costs — the halo is the dependency edge between
-/// pipelined phases, not merely a fetch extent.
+/// declarations rather than from this function, and both are now zero: the
+/// labelling needs nothing outside its core, and the filling states its
+/// dependency on the whole of the labelling as a barrier rather than buying it
+/// with a halo. The preamble explains what that halo used to cost and what
+/// removing it was worth.
 ///
 /// `mask_dtype` is the element type of the image the mask arrives in; the width
 /// of the answer comes from `fill`, which is where a caller states it.

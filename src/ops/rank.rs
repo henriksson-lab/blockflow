@@ -84,7 +84,7 @@ use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::op::{Anchor, BlockOp};
+use crate::op::{Anchor, BlockOp, Slicing};
 use crate::reach::Reach;
 use crate::voxels::{VoxelElement, Voxels};
 
@@ -447,6 +447,462 @@ fn selecting<T: Ord + Copy>(
     Ok(())
 }
 
+// ------------------------------------------- the run-decomposed candidate --
+
+/// Which of the four arms of the rank-kernel experiment to run.
+///
+/// **An experiment, not a setting.** The two changes are separable and the whole
+/// point of building them beside each other is to price them apart: a fast path
+/// for the extremes that never selects, and a run decomposition of the element
+/// so that the per-voxel cost stops scaling with its population. Attributing one
+/// to the other is exactly the mistake the arms exist to prevent.
+///
+/// **Both arms live here, in the library**, and that is a design decision about
+/// the *measurement* rather than about the code. A previous attempt at this
+/// comparison put the candidate in the test and left the incumbent in the crate,
+/// and the test-local arm won in both arrangements — the signature of the
+/// compiler being free to inline one and not the other. Two library functions in
+/// one module, called the same way, cannot differ in that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankPath {
+    /// What ships: gather every offset into a scratch buffer, then select.
+    Gather,
+    /// Gather as before, but answer a minimum or a maximum without selecting.
+    GatherExtreme,
+    /// Gather along the element's contiguous runs, then select.
+    Runs,
+    /// Both.
+    RunsExtreme,
+}
+
+impl RankPath {
+    fn runs(self) -> bool {
+        matches!(self, RankPath::Runs | RankPath::RunsExtreme)
+    }
+
+    fn extreme(self) -> bool {
+        matches!(self, RankPath::GatherExtreme | RankPath::RunsExtreme)
+    }
+}
+
+/// Which end of the window a rank asks for, when it asks for an end at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extreme {
+    Lowest,
+    Highest,
+}
+
+/// Is this rank an extreme **for every window size**, so the question can be
+/// settled once rather than per voxel?
+///
+/// `Rank::resolve` is the authority and this must agree with it exactly, so the
+/// reasoning is written out rather than assumed. For `Nth(k)` with `k = 0` the
+/// resolved index is `(0 * (m - 1) + d / 2) / d`, which is `0` for every `m`.
+/// For `k = full - 1` it is `((full - 1)(m - 1) + d/2) / d` with `d = full - 1`,
+/// which is `m - 1` for every `m`. Those are exactly `Rank::lowest()` and
+/// `Rank::highest(element)`. A percentile of `0` resolves to `0` and one of `1`
+/// to `m - 1` by the ceiling rule. Nothing else is an extreme at every size, and
+/// `the_extreme_fast_path_agrees_with_selection_everywhere` checks the whole
+/// claim against `resolve` rather than trusting this comment.
+fn extreme_of(rank: Rank, full: usize) -> Option<Extreme> {
+    match rank {
+        Rank::Nth(0) => Some(Extreme::Lowest),
+        Rank::Nth(k) if full > 0 && k >= full - 1 => Some(Extreme::Highest),
+        Rank::CeilingPercentile(percentile) if percentile.fraction() <= 0.0 => {
+            Some(Extreme::Lowest)
+        }
+        Rank::CeilingPercentile(percentile) if percentile.fraction() >= 1.0 => {
+            Some(Extreme::Highest)
+        }
+        _ => None,
+    }
+}
+
+/// The element's offsets grouped into **runs contiguous along the fastest
+/// axis**: `(o0, o1, first_o2, length)`.
+///
+/// `StructuringElement::offsets` is ascending lexicographic by contract, so
+/// offsets sharing `(o0, o1)` are adjacent and their `o2` ascends; a run is a
+/// maximal span where `o2` increments by one. A **stepped** element decimates
+/// that axis, so its runs are all of length one and this decomposition costs a
+/// little and buys nothing — which is the honest behaviour rather than a special
+/// case, and is why the report below includes a stepped row.
+fn runs_of(offsets: &[[isize; 3]]) -> Vec<(isize, isize, isize, usize)> {
+    let mut runs: Vec<(isize, isize, isize, usize)> = Vec::new();
+    for offset in offsets {
+        match runs.last_mut() {
+            Some(last)
+                if last.0 == offset[0]
+                    && last.1 == offset[1]
+                    && last.2 + last.3 as isize == offset[2] =>
+            {
+                last.3 += 1;
+            }
+            _ => runs.push((offset[0], offset[1], offset[2], 1)),
+        }
+    }
+    runs
+}
+
+/// The experiment's kernel: [`selecting`] with either change, both, or neither.
+///
+/// Byte for byte the same answer as [`selecting`] on every arm — asserted, not
+/// intended, because a rank filter selects an existing value and so agreement is
+/// exact rather than approximate.
+///
+/// The run path applies only where the offsets are one fixed list — an element
+/// whose step counts from the clipped start re-phases per voxel, so its runs
+/// cannot be precomputed and it falls through to the gather. Masked windows take
+/// the runs too, but pay a mask test per voxel inside them, so the run's saving
+/// there is the index arithmetic and not the branch.
+#[allow(clippy::too_many_arguments)]
+pub fn selecting_by<T: Ord + Copy>(
+    input: ArrayView3<'_, T>,
+    at: &Anchor,
+    mask: Option<ArrayView3<'_, bool>>,
+    element: &StructuringElement,
+    rank: Rank,
+    centre: ExcludedCentre<T>,
+    mut out: ArrayViewMut3<'_, T>,
+    path: RankPath,
+    what: &str,
+) -> Result<()> {
+    shapes_agree(input.shape(), out.shape(), what)?;
+    if element.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "{what}: an empty element selects nothing"
+        )));
+    }
+    let extent = [
+        input.shape()[0] as isize,
+        input.shape()[1] as isize,
+        input.shape()[2] as isize,
+    ];
+    if element.origin() == StepOrigin::ClippedStart {
+        for axis in 0..3 {
+            if at.offset[axis] + extent[axis] as usize > at.volume[axis] {
+                return Err(Error::InvalidArgument(format!(
+                    "{what}: a buffer of {:?} at {:?} does not fit a volume of {:?}, and this \
+                     element's step counts from the clipped start of the window, so where the \
+                     buffer sits in the volume is part of the filter",
+                    input.shape(),
+                    at.offset,
+                    at.volume
+                )));
+            }
+        }
+    }
+    let full = element.len();
+    let fixed = (element.origin() == StepOrigin::Anchor).then(|| element.offsets());
+    let runs = match (path.runs(), fixed) {
+        (true, Some(offsets)) => Some(runs_of(offsets)),
+        _ => None,
+    };
+    let ends = path.extreme().then(|| extreme_of(rank, full)).flatten();
+    let mut window: Vec<T> = Vec::with_capacity(full);
+    let mut offsets: Vec<[isize; 3]> = Vec::new();
+
+    for i in 0..input.shape()[0] {
+        for j in 0..input.shape()[1] {
+            for k in 0..input.shape()[2] {
+                if let (Some(mask), ExcludedCentre::Fill(value)) = (mask.as_ref(), centre) {
+                    if !mask[[i, j, k]] {
+                        out[[i, j, k]] = value;
+                        continue;
+                    }
+                }
+                let anchor = [i as isize, j as isize, k as isize];
+                // The two reductions are written as one walk each so that a
+                // voxel pays for exactly one of them.
+                let mut best: Option<T> = None;
+                window.clear();
+                let mut take = |value: T, window: &mut Vec<T>| match ends {
+                    Some(Extreme::Lowest) => {
+                        best = Some(match best {
+                            Some(seen) if seen <= value => seen,
+                            _ => value,
+                        })
+                    }
+                    Some(Extreme::Highest) => {
+                        best = Some(match best {
+                            Some(seen) if seen >= value => seen,
+                            _ => value,
+                        })
+                    }
+                    None => window.push(value),
+                };
+                match &runs {
+                    Some(runs) => {
+                        for &(o0, o1, o2, length) in runs {
+                            let a = anchor[0] + o0;
+                            let b = anchor[1] + o1;
+                            if a < 0 || b < 0 || a >= extent[0] || b >= extent[1] {
+                                continue;
+                            }
+                            let low = (anchor[2] + o2).max(0);
+                            let high = (anchor[2] + o2 + length as isize).min(extent[2]);
+                            if low >= high {
+                                continue;
+                            }
+                            let (a, b) = (a as usize, b as usize);
+                            for c in low as usize..high as usize {
+                                if let Some(mask) = mask.as_ref() {
+                                    if !mask[[a, b, c]] {
+                                        continue;
+                                    }
+                                }
+                                take(input[[a, b, c]], &mut window);
+                            }
+                        }
+                    }
+                    None => {
+                        let gathered = match fixed {
+                            Some(offsets) => offsets,
+                            None => {
+                                let placed = [
+                                    anchor[0] + at.offset[0] as isize,
+                                    anchor[1] + at.offset[1] as isize,
+                                    anchor[2] + at.offset[2] as isize,
+                                ];
+                                element.offsets_at(placed, at.volume, &mut offsets)
+                            }
+                        };
+                        for offset in gathered {
+                            let a = anchor[0] + offset[0];
+                            let b = anchor[1] + offset[1];
+                            let c = anchor[2] + offset[2];
+                            if a < 0
+                                || b < 0
+                                || c < 0
+                                || a >= extent[0]
+                                || b >= extent[1]
+                                || c >= extent[2]
+                            {
+                                continue;
+                            }
+                            let at = [a as usize, b as usize, c as usize];
+                            if let Some(mask) = mask.as_ref() {
+                                if !mask[at] {
+                                    continue;
+                                }
+                            }
+                            take(input[at], &mut window);
+                        }
+                    }
+                }
+                let chosen = match ends {
+                    Some(_) => best,
+                    None => {
+                        let index = rank.resolve(full, window.len());
+                        select_nth(&mut window, index)
+                    }
+                };
+                match chosen {
+                    Some(value) => out[[i, j, k]] = value,
+                    None if mask.is_some() => out[[i, j, k]] = input[[i, j, k]],
+                    None => {
+                        return Err(Error::InvalidArgument(format!(
+                            "{what}: an element that misses its own centre"
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Time the incumbent kernel against the four experimental arms, interleaved.
+///
+/// **The first row of every block is an A/A control.** `RankPath::Gather` is the
+/// candidate function reproducing the incumbent's own path, so it should cost
+/// what `selecting` costs. If it does not, the two are not comparable and no
+/// ratio below means anything — which is the failure the previous attempt at
+/// this comparison had and could not see, because its two arms were in
+/// different crates.
+///
+/// Arms are interleaved **in a randomised order**: every arm is timed once
+/// before any arm is timed twice, and the order within a repeat is shuffled. The
+/// reported figure is the best of `repeats`, and nothing here asserts on an
+/// absolute time.
+///
+/// The `[noise floor]` row is the harness's own error bar, measured rather than
+/// assumed: where the rank is not an extreme, `extreme_of` declines and the two
+/// `*Extreme` arms execute exactly the code of their twins, so the gap between
+/// them is two identical programs disagreeing.
+///
+/// What it measured, and what it does **not** support
+/// -------------------------------------------------
+/// ```text
+/// 64 x 96 x 96 u16, best of 9, randomised order, machine at ~2x its core count in load
+/// element             taps  rank    incumbent  A/A gather  extreme   runs  runs+extreme  noise
+/// disk 11x11 (2-D)      81  lowest      1.000       1.025    1.073  0.690         0.462      -
+/// disk 11x11 (2-D)      81  median      1.000       1.107    1.111  0.925         0.820  0.114
+/// ball 5x5x5            33  lowest      1.000       1.498    0.997  1.015         0.760      -
+/// ball 5x5x5            33  median      1.000       1.219    1.299  1.518         1.459  0.065
+/// stepped box           25  lowest      1.000       1.041    1.023  1.046         1.037      -
+/// stepped box           25  median      1.000       1.057    1.141  1.248         1.219  0.079
+/// ```
+///
+/// **The A/A control fails, and that bounds everything else.** `A/A gather` is
+/// the candidate reproducing the incumbent's own path and should read `1.000`;
+/// it reads `1.025` to **`1.498`**. So the candidate carries a structural
+/// penalty — the runtime dispatch between arms and the closure that feeds
+/// either reduction — that a shipped, specialised version would not have, and
+/// no ratio here is a clean measurement of either change.
+///
+/// **The noise floor is `6.5%`-`11.4%`**, and against it most of the table is
+/// nothing. Worse, a first run of this report at `repeats = 5` and a *fixed* arm
+/// order **reversed the sign** of the `ball / median / runs+extreme` cell —
+/// `0.669` then `1.459` — which is two runs of the same code disagreeing about
+/// its direction. Randomising the order fixed the mechanism that was suspected
+/// (the last arm always read the warmest input) and did not make the cell
+/// reproducible.
+///
+/// **One cell reproduces and it is the one the consumer's chain uses.** The
+/// `11x11` disk at `Rank::lowest` — the erosion inside a Disk opening — came out
+/// at `0.515` and `0.462` of the incumbent across two independent runs, both far
+/// outside the noise floor, and `runs` alone at `0.730` and `0.690`. So **run
+/// decomposition is worth about `1.4x` on a large element and the two changes
+/// together about `2.1x`**, and the extreme path alone is worth nothing at all
+/// (`1.073`, `0.997`, `1.023`).
+///
+/// **That is not the `10x` the reading predicted, and nothing is shipped on it.**
+/// The diagnosis that motivated this experiment reasoned from a `12.4x` chain
+/// gap to a per-voxel cost scaling with the element's population; the experiment
+/// says the kernel has about `2.1x` in it on the best case and nothing on the
+/// others. A `2.1x` on one arm of one chain is worth having, but claiming it
+/// needs three things this measurement does not have: a specialised
+/// implementation with no dispatch, its own A/A control passing, and a machine
+/// that is not at twice its core count. **Both arms stay here as the fixture for
+/// that experiment** — which is what a hypothesis filed for measurement is for —
+/// and `RankFilterOp` still calls [`selecting`].
+///
+/// **The stepped row is the honest negative and it behaved as predicted.** An
+/// element whose step decimates the fastest axis has runs of length one, so the
+/// decomposition costs a little and buys nothing: `1.046` and `1.248`.
+pub fn cost_report(shape: [usize; 3], repeats: usize) -> String {
+    use std::time::Instant;
+
+    let voxels = (shape[0] * shape[1] * shape[2]) as f64;
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let input = Array3::from_shape_fn((shape[0], shape[1], shape[2]), |_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 48) as u16
+    });
+    let at = crate::op::Anchor::whole(shape);
+    let mut out = Array3::<u16>::zeros((shape[0], shape[1], shape[2]));
+
+    let disk = StructuringElement::from_radius(super::element::ElementShape::Ellipsoid, [0, 5, 5]);
+    let ball = StructuringElement::from_radius(super::element::ElementShape::Ellipsoid, [2, 2, 2]);
+    let stepped = StructuringElement::from_sides_stepped(
+        super::element::ElementShape::Box,
+        [0, 4, 4],
+        [0, 4, 4],
+        [1, 2, 2],
+    )
+    .expect("a stepped element");
+
+    let mut report = String::from(
+        "element                 taps  rank      arm            ns/voxel   x incumbent\n",
+    );
+    for (name, element) in [
+        ("disk 11x11 (2-D)", &disk),
+        ("ball 5x5x5", &ball),
+        ("stepped box", &stepped),
+    ] {
+        for (rank_name, rank) in [
+            ("lowest", Rank::lowest()),
+            ("median", Rank::median(element)),
+        ] {
+            let arms: [(&str, Option<RankPath>); 5] = [
+                ("incumbent", None),
+                ("A/A gather", Some(RankPath::Gather)),
+                ("extreme", Some(RankPath::GatherExtreme)),
+                ("runs", Some(RankPath::Runs)),
+                ("runs+extreme", Some(RankPath::RunsExtreme)),
+            ];
+            let mut best = [f64::INFINITY; 5];
+            // **Arm order is randomised per repeat, not fixed.** A fixed order
+            // gives every arm a different cache history — the last arm always
+            // reads an input four passes warm — and the first run of this report
+            // showed two arms that execute *identical* code differing by 39%,
+            // which is that confound and not a result. A cheap linear
+            // congruential shuffle costs nothing and removes it.
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            for _ in 0..repeats.max(1) {
+                let mut order = [0usize, 1, 2, 3, 4];
+                for slot in (1..order.len()).rev() {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    order.swap(slot, (seed >> 33) as usize % (slot + 1));
+                }
+                for index in order {
+                    let (_, path) = &arms[index];
+                    let started = Instant::now();
+                    match path {
+                        None => selecting(
+                            input.view(),
+                            &at,
+                            None,
+                            element,
+                            rank,
+                            ExcludedCentre::Select,
+                            out.view_mut(),
+                            "report",
+                        ),
+                        Some(path) => selecting_by(
+                            input.view(),
+                            &at,
+                            None,
+                            element,
+                            rank,
+                            ExcludedCentre::Select,
+                            out.view_mut(),
+                            *path,
+                            "report",
+                        ),
+                    }
+                    .expect("a pass");
+                    let elapsed = started.elapsed().as_secs_f64() * 1e9 / voxels;
+                    if elapsed.total_cmp(&best[index]).is_lt() {
+                        best[index] = elapsed;
+                    }
+                }
+            }
+            // **The noise floor, measured rather than assumed.** Where the rank
+            // is not an extreme, `extreme_of` declines and the two `*Extreme`
+            // arms execute exactly the code of their non-extreme twins. The gap
+            // between two identical programs is this harness's own error bar,
+            // and no ratio below it means anything.
+            let twins = extreme_of(rank, element.len()).is_none();
+            if twins {
+                report.push_str(&format!(
+                    "{name:22}  {:4}  {rank_name:8}  {:13}  {:8.2}   {:9.3}\n",
+                    element.len(),
+                    "[noise floor]",
+                    0.0,
+                    ((best[2] / best[1]) - 1.0)
+                        .abs()
+                        .max(((best[4] / best[3]) - 1.0).abs()),
+                ));
+            }
+            for (index, (arm, _)) in arms.iter().enumerate() {
+                report.push_str(&format!(
+                    "{name:22}  {:4}  {rank_name:8}  {arm:13}  {:8.2}   {:9.3}\n",
+                    element.len(),
+                    best[index],
+                    best[index] / best[0],
+                ));
+            }
+        }
+    }
+    report
+}
+
 /// `rank_filter_into` over a `f64` volume, through the total order.
 ///
 /// The copy into `Total` is what **floating point** costs: `f64` is not `Ord`,
@@ -521,6 +977,22 @@ impl RankFilterOp {
 }
 
 impl BlockOp for RankFilterOp {
+    /// **A stencil, and the family it belongs to is not** — which is why this
+    /// declaration is on the op and not on the family.
+    ///
+    /// `ops::rank`'s kernel gathers a window per voxel and selects from it; it
+    /// carries nothing from one voxel to the next, so where the scan starts
+    /// cannot be seen in the answer. `ops::sliding` computes the same statistic
+    /// by carrying a histogram along the scan with joining and leaving sets, and
+    /// that one is **not** a stencil however similar its reach looks. A reach
+    /// says what an op reads; it does not say the answer is a function only of
+    /// what was read.
+    ///
+    /// Held to it by `tests/intra_block_slicing.rs`.
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
     fn name(&self) -> &'static str {
         self.name
     }
@@ -1439,5 +1911,177 @@ mod tests {
         rank_filter_into(input.view(), &element, Rank::lowest(), out.view_mut()).unwrap();
         assert_eq!(out[[0, 0, 0]], 0);
         assert_eq!(out[[2, 0, 0]], 16);
+    }
+
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn the_cost_of_the_four_arms() {
+        println!("{}", cost_report([64, 96, 96], 9));
+    }
+
+    /// **Every arm of the experiment is the incumbent, byte for byte.**
+    ///
+    /// A rank filter selects a value it read, so agreement here is exact rather
+    /// than to a tolerance, and anything less is a different filter. The sweep
+    /// covers the two things the run decomposition and the extreme path can each
+    /// get wrong: an element whose runs are long (a disk), one whose runs are all
+    /// of length one (a stepped box, where the decomposition buys nothing and
+    /// must still be correct), a masked window, and a rank that is *not* an
+    /// extreme so the fast path must decline to take itself.
+    #[test]
+    fn every_arm_of_the_experiment_answers_what_the_incumbent_answers() {
+        use crate::ops::element::ElementShape;
+
+        let shape = [7usize, 11, 13];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let input = Array3::from_shape_fn((shape[0], shape[1], shape[2]), |_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 55) as u16
+        });
+        let mask = Array3::from_shape_fn((shape[0], shape[1], shape[2]), |(a, b, c)| {
+            (a * 7 + b * 3 + c) % 5 != 0
+        });
+        let at = crate::op::Anchor::whole(shape);
+        let elements = [
+            StructuringElement::from_radius(ElementShape::Ellipsoid, [1, 3, 3]),
+            StructuringElement::from_radius(ElementShape::Box, [1, 2, 2]),
+            StructuringElement::from_sides_stepped(
+                ElementShape::Box,
+                [0, 2, 2],
+                [0, 2, 2],
+                [1, 2, 2],
+            )
+            .expect("a stepped element"),
+        ];
+        let mut compared = 0usize;
+        let mut moved = 0usize;
+        for element in &elements {
+            let ranks = [
+                Rank::lowest(),
+                Rank::highest(element),
+                Rank::median(element),
+                Rank::Nth(1),
+            ];
+            for rank in ranks {
+                for masked in [false, true] {
+                    let view = masked.then(|| mask.view());
+                    let mut expected = Array3::<u16>::zeros((shape[0], shape[1], shape[2]));
+                    selecting(
+                        input.view(),
+                        &at,
+                        view,
+                        element,
+                        rank,
+                        ExcludedCentre::Select,
+                        expected.view_mut(),
+                        "expected",
+                    )
+                    .expect("the incumbent runs");
+                    for path in [
+                        RankPath::Gather,
+                        RankPath::GatherExtreme,
+                        RankPath::Runs,
+                        RankPath::RunsExtreme,
+                    ] {
+                        let mut got = Array3::<u16>::zeros((shape[0], shape[1], shape[2]));
+                        selecting_by(
+                            input.view(),
+                            &at,
+                            view,
+                            element,
+                            rank,
+                            ExcludedCentre::Select,
+                            got.view_mut(),
+                            path,
+                            "candidate",
+                        )
+                        .expect("the candidate runs");
+                        assert_eq!(got, expected, "{path:?} disagrees at rank {rank:?}");
+                        compared += 1;
+                    }
+                    // **Liveness.** Equality proves nothing if every arm writes
+                    // the same trivial volume, so the fixture must actually be
+                    // filtered: the answer has to differ from the input.
+                    moved += input
+                        .iter()
+                        .zip(expected.iter())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                }
+            }
+        }
+        assert!(
+            compared >= 90,
+            "only {compared} comparisons, which is not the sweep this claims"
+        );
+        assert!(
+            moved > shape.iter().product::<usize>(),
+            "the filters moved only {moved} voxels in total, so the fixtures are not being filtered"
+        );
+    }
+
+    /// **The extreme fast path takes itself exactly where `Rank::resolve` says
+    /// it may, and nowhere else.**
+    ///
+    /// `extreme_of` decides once per call what `resolve` decides per voxel, so
+    /// the two are one quantity stated twice — checked here against `resolve`
+    /// itself over every window size, rather than against the comment that
+    /// derives it.
+    #[test]
+    fn the_extreme_fast_path_agrees_with_selection_everywhere() {
+        use crate::ops::element::Percentile;
+
+        for full in [1usize, 2, 7, 40, 121] {
+            for (rank, expected) in [
+                (Rank::Nth(0), Some(Extreme::Lowest)),
+                (
+                    Rank::Nth(full.saturating_sub(1)),
+                    if full <= 1 {
+                        Some(Extreme::Lowest)
+                    } else {
+                        Some(Extreme::Highest)
+                    },
+                ),
+                (
+                    Rank::CeilingPercentile(Percentile::new(0.0).unwrap()),
+                    Some(Extreme::Lowest),
+                ),
+                (
+                    Rank::CeilingPercentile(Percentile::new(1.0).unwrap()),
+                    Some(Extreme::Highest),
+                ),
+            ] {
+                let taken = extreme_of(rank, full);
+                assert_eq!(taken, expected, "full {full}, rank {rank:?}");
+                // And it is right: for every window size the resolved index is
+                // the end it claims.
+                for available in 1..=full.max(1) {
+                    let index = rank.resolve(full, available);
+                    match expected {
+                        Some(Extreme::Lowest) => {
+                            assert_eq!(index, 0, "full {full} available {available}")
+                        }
+                        Some(Extreme::Highest) => {
+                            assert_eq!(index, available - 1, "full {full} available {available}")
+                        }
+                        None => {}
+                    }
+                }
+            }
+            // **The declining half, which is the one a fast path gets wrong.** A
+            // middle rank is not an extreme at any size above two, and must not
+            // be taken.
+            if full > 3 {
+                let middle = Rank::Nth(full / 2);
+                assert_eq!(extreme_of(middle, full), None, "a median is not an extreme");
+                let index = middle.resolve(full, full);
+                assert!(
+                    index > 0 && index < full - 1,
+                    "and its index is interior: {index}"
+                );
+            }
+        }
     }
 }

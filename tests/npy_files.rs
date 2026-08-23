@@ -50,8 +50,9 @@
 use std::path::{Path, PathBuf};
 
 use blockflow::npy::{
-    read_array, read_array_file, read_header_file, read_voxels, write_array, write_voxels, Endian,
-    Header, NpyElement, NpySink, NpySource, Order, OrderPolicy,
+    read_array, read_array_file, read_array_file_as, read_array_mapped, read_elements,
+    read_header_file, read_voxels, write_array, write_elements, write_voxels, Endian, Header,
+    NpyElement, NpySink, NpySource, Order, OrderPolicy,
 };
 use blockflow::{Dtype, Region, RegionSink, RegionSource, Voxels};
 use ndarray::{Array1, Array2, Array3, ArrayD, IxDyn};
@@ -246,6 +247,312 @@ fn a_fortran_table_read_as_c_order_is_a_permutation_that_passes_every_count() {
     theirs.sort_unstable();
     assert_eq!(mine, theirs, "the multiset is no witness either");
     assert_ne!(wrong, table, "and yet the arrays differ");
+}
+
+// ------------------------------------------- the same files, dtype-erased --
+//
+// `Elements` is the reader for a caller that does not know a file's element type
+// in advance and cannot use `read_voxels` because the file is not rank 3. Every
+// test below runs it against the same bytes numpy wrote, for the same reason the
+// rest of this file does: a round trip through this crate's own writer would
+// only prove the two halves agree.
+//
+// The two capabilities it adds — reading below rank 3, and the exact integer
+// widening — are both paths **no recorded file in any consumer's fixture set
+// exercises**, because every such file is little-endian and most are volumes.
+// So each is tested here with a negative control beside it: a value that comes
+// out *differently* if the path is wrong, rather than an assertion that it comes
+// out at all. Untested acceptance would be worse than refusal.
+
+/// Every embedded file reads as an `Elements` of the type and shape numpy gave
+/// it, at every rank including the two `Voxels` cannot hold.
+#[test]
+fn an_elements_reads_each_recorded_file_at_its_own_rank_and_type() {
+    let expected: &[(&[u8], Dtype, &[usize], usize)] = &[
+        (C_ORDER_U16_2X3X4, Dtype::U16, &[2, 3, 4], 24),
+        (FORTRAN_ORDER_F64_5X3, Dtype::F64, &[5, 3], 15),
+        (FORTRAN_ORDER_BOOL_2X3X4, Dtype::Bool, &[2, 3, 4], 24),
+        (BIG_ENDIAN_I32_5, Dtype::I32, &[5], 5),
+        (VERSION_2_0_I64_2X3, Dtype::I64, &[2, 3], 6),
+        // Rank 0 and a shape with a zero in it: an `Elements` holds both, and
+        // `read_voxels` holds neither.
+        (ZERO_RANK_F64, Dtype::F64, &[], 1),
+        (EMPTY_F32_0X3, Dtype::F32, &[0, 3], 0),
+        (EMPTY_I16_2X0X4, Dtype::I16, &[2, 0, 4], 0),
+        (F64_EXTREMES_7, Dtype::F64, &[7], 7),
+        (U64_EXTREMES_2, Dtype::U64, &[2], 2),
+        (I64_EXTREMES_2, Dtype::I64, &[2], 2),
+    ];
+    for (bytes, dtype, shape, count) in expected {
+        let held = read_elements(bytes, "recorded", OrderPolicy::Either)
+            .unwrap_or_else(|error| panic!("{:?}: {error}", dtype));
+        assert_eq!(held.dtype(), *dtype);
+        assert_eq!(held.shape(), *shape, "{dtype:?}");
+        assert_eq!(held.ndim(), shape.len(), "{dtype:?}");
+        assert_eq!(held.len(), *count, "{dtype:?}");
+        assert_eq!(held.is_empty(), *count == 0, "{dtype:?}");
+    }
+
+    // The values, not only the tags — a reader that returned an empty array of
+    // the right shape would pass everything above.
+    let scalar = read_elements(ZERO_RANK_F64, "()", OrderPolicy::Either).expect("read");
+    assert_eq!(scalar.get::<f64>("()").expect("f64")[IxDyn(&[])], 3.5);
+    let volume = read_elements(C_ORDER_U16_2X3X4, "vol", OrderPolicy::Either).expect("read");
+    assert_eq!(
+        volume
+            .get::<u16>("vol")
+            .expect("u16")
+            .iter()
+            .copied()
+            .collect::<Vec<u16>>(),
+        (0..24u16).collect::<Vec<u16>>()
+    );
+}
+
+/// The Fortran table read through `Elements` indexes the writer's way, and the
+/// same bytes under `Only(Order::C)` are refused rather than permuted.
+///
+/// The dtype-erasing reader has to make the same order decision the typed one
+/// does; a reader that erased the type and quietly fixed the order would put
+/// each row's three components on three different rows.
+#[test]
+fn an_elements_of_a_fortran_table_indexes_the_way_numpy_wrote_it() {
+    let held = read_elements(FORTRAN_ORDER_F64_5X3, "table", OrderPolicy::Either).expect("read");
+    let table = held.get::<f64>("table").expect("f64");
+    for row in 0..5 {
+        for column in 0..3 {
+            assert_eq!(
+                table[[row, column]],
+                (row * 3 + column) as f64,
+                "{row},{column}"
+            );
+        }
+    }
+
+    let text = read_elements(
+        FORTRAN_ORDER_F64_5X3,
+        "table.npy",
+        OrderPolicy::Only(Order::C),
+    )
+    .expect_err("refused")
+    .to_string();
+    assert!(text.contains("table.npy"), "{text}");
+    assert!(
+        text.contains("Fortran order") && text.contains("C order"),
+        "{text}"
+    );
+}
+
+/// `Elements` swaps a big-endian file's bytes, and the negative control is that
+/// ignoring the `>` would give numbers rather than an error.
+///
+/// The same claim `a_big_endian_file_is_swapped_rather_than_read_as_this_machine_writes`
+/// makes for the typed reader, made again for the erasing one because it is a
+/// different code path to the same `read_element` and nothing but a test says
+/// they agree. **No fixture set exercises this**: every recorded file any
+/// consumer reads is little-endian, so this file's bytes are the only witness.
+#[test]
+fn an_elements_swaps_a_big_endian_file_and_a_reader_that_did_not_would_not_error() {
+    let held = read_elements(BIG_ENDIAN_I32_5, "big-endian", OrderPolicy::Either).expect("read");
+    assert_eq!(held.dtype(), Dtype::I32);
+    let values: Vec<i32> = held
+        .get::<i32>("big-endian")
+        .expect("i32")
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(values, vec![i32::MIN, -1, 0, 1, i32::MAX]);
+    // The negative control: what the same bytes are if the `>` is ignored. Five
+    // plausible integers, no error, and none of them equal to the right answer
+    // except the two palindromes.
+    let unswapped: Vec<i32> = values.iter().map(|value| value.swap_bytes()).collect();
+    assert_eq!(unswapped, vec![128, -1, 0, 16_777_216, -129]);
+    assert_ne!(values[0], unswapped[0]);
+    assert_ne!(values[4], unswapped[4]);
+
+    // And the swap reaches the exact widening, which is a third path through
+    // `read_element`.
+    assert_eq!(
+        held.widened_i64("big-endian")
+            .expect("exact")
+            .iter()
+            .copied()
+            .collect::<Vec<i64>>(),
+        vec![i64::from(i32::MIN), -1, 0, 1, i64::from(i32::MAX)]
+    );
+
+    // A big-endian file does not write back byte-identically, because this
+    // crate writes little-endian — it writes the *same values* under `<i4`.
+    let written = write_elements(&held, Order::C, "<memory>").expect("written");
+    assert_ne!(written, BIG_ENDIAN_I32_5.to_vec());
+    assert_eq!(
+        read_elements(&written, "round trip", OrderPolicy::Either).expect("read"),
+        held
+    );
+}
+
+/// The exact integer widening, on the integer extremes numpy wrote.
+///
+/// `[0, u64::MAX]` and `[i64::MIN, i64::MAX]` are the two files that decide
+/// this, and neither is reachable through `f64`: `u64::MAX` has no `i64` at all
+/// and `i64::MAX` has no exact `f64`.
+#[test]
+fn the_exact_widening_is_exact_on_the_recorded_extremes_and_refuses_the_rest() {
+    // `int64` at both ends, exactly — and demonstrably not through `f64`.
+    let held = read_elements(I64_EXTREMES_2, "i64", OrderPolicy::Either).expect("read");
+    let exact: Vec<i64> = held
+        .widened_i64("i64")
+        .expect("exact")
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(exact, vec![i64::MIN, i64::MAX]);
+    // And the `f64` path loses it, which is why the two widenings both exist.
+    // The loss does not show as a wrong number after a round trip — the `as`
+    // cast back saturates and hides it — it shows as two *different*
+    // identifiers becoming one: `i64::MAX` and its neighbour have the same
+    // `f64`, so a comparison through `widened` cannot tell them apart.
+    let through_f64 = held.widened();
+    assert_eq!(through_f64[[1]], (i64::MAX - 1) as f64);
+    assert_ne!(exact[1], i64::MAX - 1);
+
+    // `uint64` past `i64::MAX` is refused, with the value in the message.
+    let held = read_elements(U64_EXTREMES_2, "u64", OrderPolicy::Either).expect("read");
+    assert_eq!(
+        held.get::<u64>("u64")
+            .expect("u64")
+            .iter()
+            .copied()
+            .collect::<Vec<u64>>(),
+        vec![0, u64::MAX]
+    );
+    let text = held
+        .widened_i64("labels.npy")
+        .expect_err("refused")
+        .to_string();
+    assert!(text.contains("labels.npy"), "{text}");
+    assert!(text.contains("18446744073709551615"), "{text}");
+    // Wrapping would have given `-1`, which is a label a caller would believe.
+    assert_eq!(u64::MAX as i64, -1);
+
+    // The float extremes are refused by name rather than truncated. `NaN` and
+    // the infinities in this file are exactly the values a truncating reader
+    // turns into an arbitrary integer.
+    let held = read_elements(F64_EXTREMES_7, "f64", OrderPolicy::Either).expect("read");
+    let text = held
+        .widened_i64("field.npy")
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        text.contains("field.npy") && text.contains("float64"),
+        "{text}"
+    );
+    let held = read_elements(F32_EXTREMES_7, "f32", OrderPolicy::Either).expect("read");
+    let text = held
+        .widened_i64("field.npy")
+        .expect_err("refused")
+        .to_string();
+    assert!(text.contains("float32"), "{text}");
+}
+
+/// A table is not a volume, whichever reader asks.
+///
+/// The negative control for the rank-free reader: erasing the element type must
+/// not erase the rank check as well, because the mistake that check exists to
+/// stop — an `(n, 3)` table read as a volume — is exactly the one an erasing
+/// reader makes easier to reach.
+#[test]
+fn an_elements_below_rank_three_still_refuses_to_be_a_volume() {
+    for (bytes, rank) in [
+        (FORTRAN_ORDER_F64_5X3, "2-dimensional"),
+        (BIG_ENDIAN_I32_5, "1-dimensional"),
+        (ZERO_RANK_F64, "0-dimensional"),
+    ] {
+        let held = read_elements(bytes, "t", OrderPolicy::Either).expect("read");
+        let text = held.into_voxels("t.npy").expect_err("refused").to_string();
+        assert!(text.contains("t.npy"), "{text}");
+        assert!(text.contains(rank) && text.contains("rank 3"), "{text}");
+    }
+
+    // And a rank-3 file becomes one, so the check is a check and not a wall.
+    let held = read_elements(C_ORDER_U16_2X3X4, "vol", OrderPolicy::Either).expect("read");
+    let voxels = held.into_voxels("vol.npy").expect("a volume");
+    assert_eq!(voxels.shape(), [2, 3, 4]);
+    assert_eq!(
+        voxels,
+        read_voxels(C_ORDER_U16_2X3X4, "vol", OrderPolicy::Either).expect("read")
+    );
+}
+
+/// The mapping reader converts inside the decode, byte swap included.
+///
+/// `read_array_mapped` is a fourth path to `read_element`, and the big-endian
+/// file is the only witness that it swaps: a mapped read that widened before
+/// swapping would give `[128, -1, 0, 16777216, -129]` widened, which is five
+/// plausible `i64`s.
+#[test]
+fn a_mapped_read_swaps_before_it_converts() {
+    let wide: ArrayD<i64> = read_array_mapped::<i32, i64>(
+        BIG_ENDIAN_I32_5,
+        "big-endian",
+        OrderPolicy::Either,
+        i64::from,
+    )
+    .expect("read");
+    assert_eq!(
+        wide.iter().copied().collect::<Vec<i64>>(),
+        vec![i64::from(i32::MIN), -1, 0, 1, i64::from(i32::MAX)]
+    );
+
+    // The `From`-only convenience form, on a file with no byte order to get
+    // wrong, and the widening it gives is the one `From` licenses.
+    let temporary = std::env::temp_dir().join("blockflow_npy_mapped_read.npy");
+    std::fs::write(&temporary, C_ORDER_U16_2X3X4).expect("a temporary file");
+    let wide: ArrayD<f64> =
+        read_array_file_as::<u16, f64>(&temporary, OrderPolicy::Either).expect("read");
+    assert_eq!(wide.shape(), &[2, 3, 4]);
+    assert_eq!(
+        wide.iter().copied().collect::<Vec<f64>>(),
+        (0..24).map(f64::from).collect::<Vec<f64>>()
+    );
+    let _ = std::fs::remove_file(&temporary);
+
+    // The negative control: `Src` is checked against the header, so a mapped
+    // read is not a way to read one type as another.
+    let text =
+        read_array_mapped::<i16, i64>(C_ORDER_U16_2X3X4, "vol.npy", OrderPolicy::Either, i64::from)
+            .expect_err("refused")
+            .to_string();
+    assert!(text.contains("uint16") && text.contains("int16"), "{text}");
+}
+
+/// The `Elements` writer reproduces numpy's bytes, for the files numpy wrote in
+/// this machine's byte order.
+///
+/// The same claim the typed writer makes, extended to the erasing one: a writer
+/// that took its header from the enum rather than from the element type would
+/// pass a round trip and fail this.
+#[test]
+fn writing_an_elements_reproduces_the_bytes_numpy_wrote() {
+    for (bytes, order) in [
+        (C_ORDER_U16_2X3X4, Order::C),
+        (FORTRAN_ORDER_F64_5X3, Order::Fortran),
+        (FORTRAN_ORDER_BOOL_2X3X4, Order::Fortran),
+        (ZERO_RANK_F64, Order::C),
+        (EMPTY_F32_0X3, Order::C),
+        (EMPTY_I16_2X0X4, Order::C),
+        (F64_EXTREMES_7, Order::C),
+        (U64_EXTREMES_2, Order::C),
+        (I64_EXTREMES_2, Order::C),
+    ] {
+        let held = read_elements(bytes, "recorded", OrderPolicy::Either).expect("read");
+        assert_eq!(
+            write_elements(&held, order, "<memory>").expect("written"),
+            bytes.to_vec(),
+            "{:?} {order}",
+            held.dtype()
+        );
+    }
 }
 
 /// The big-endian file is byte-swapped rather than refused, and the values it

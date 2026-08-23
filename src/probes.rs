@@ -31,6 +31,8 @@
 //   show that, because it never reads its halo.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use ndarray::{ArrayD, Axis};
 
@@ -353,6 +355,65 @@ impl BlockOp for WindowSumOp {
     }
 }
 
+/// An identity that **counts how many times it was applied**.
+///
+/// `IdentityOp` proves that a value survives a decomposition. This proves that
+/// a *subtree ran*, which is a different claim and one no value test can make:
+/// a branch that both ran and changed nothing is indistinguishable, in the
+/// answer, from a branch that never ran at all. Put one at the head of an arm
+/// and the count says which.
+///
+/// It is an identity, so inserting it changes nothing about the answer, and its
+/// reach is zero, so it changes nothing about the plan either — which is what
+/// makes it safe to insert into a fixture that is *also* asserting values.
+///
+/// **Here rather than in `ops`, and the rule is worth restating where it
+/// lands**: this makes nothing expressible. It computes no new answer and no
+/// caller would ever want one in a real chain. Scaffolding does not go in the
+/// catalogue — `ops` is what a chain is composed out of, `probes` is what the
+/// framework is proved with, and a counter is the second.
+pub struct CountingIdentityOp {
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+impl CountingIdentityOp {
+    /// The op and the counter it will increment, which the caller keeps.
+    ///
+    /// A pair rather than an accessor because the op is moved into a chain and
+    /// the count is read after the run, so the two have different lifetimes and
+    /// the caller needs the half the chain does not take.
+    pub fn new(name: &'static str) -> (Self, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                name,
+                calls: Arc::clone(&calls),
+            },
+            calls,
+        )
+    }
+}
+
+impl BlockOp for CountingIdentityOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn accepts(&self, _dtype: Dtype) -> bool {
+        true
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        out.assign(input)
+    }
+}
+
 // ------------------------------------------------------- fragment probes --
 //
 // The same idea one layer over: synthetic ops that prove the *fragment*
@@ -384,6 +445,7 @@ pub struct BlockSummaryOp {
     stream: String,
     lifecycle: crate::sidecar::Lifecycle,
     tag: u64,
+    pixels: bool,
 }
 
 impl BlockSummaryOp {
@@ -397,6 +459,7 @@ impl BlockSummaryOp {
             stream: stream.into(),
             lifecycle,
             tag: 0,
+            pixels: true,
         }
     }
 
@@ -404,6 +467,28 @@ impl BlockSummaryOp {
     /// header for what it is for.
     pub fn with_tag(mut self, tag: u64) -> Self {
         self.tag = tag;
+        self
+    }
+
+    /// Whether this phase declares that it reads its block's pixels. `true`
+    /// unless said otherwise, which is what every caller before this knob had.
+    ///
+    /// **A knob and not a second probe, because the difference is one
+    /// declaration.** `reads_pixels` decides whether the executor fetches a
+    /// block at all, so "the same phase, with and without pixel IO" is the
+    /// comparison a residency or a fetch-count measurement is made of — and it
+    /// was being made by writing the op twice and promising the two stayed
+    /// identical. With this it is one op and one flipped bool, so the premise
+    /// *"the same op with one thing changed"* is structural rather than a
+    /// comment. `image_lifetime.rs` is where that pair lived.
+    ///
+    /// With pixels off the summary's `sum` field is `0`, which is what it
+    /// already was under an accounting environment — and the op **refuses**
+    /// rather than summing if the executor hands it pixels it did not ask for,
+    /// because a probe whose job is to prove a declaration must not quietly
+    /// survive that declaration being ignored.
+    pub fn with_pixels(mut self, pixels: bool) -> Self {
+        self.pixels = pixels;
         self
     }
 
@@ -431,8 +516,18 @@ impl crate::fragment::FragmentOp for BlockSummaryOp {
         self.name
     }
 
+    /// Nothing crosses this block's boundary. The summary is a function of this
+    /// block alone — its index, its valid voxel count, the sum over what it was
+    /// handed — and every block's is independent of every other's; the fold
+    /// *across* blocks is `NeighbourFoldOp`'s, over the stream this writes. Zero
+    /// is also what makes the read extent be the core, which is why summing the
+    /// whole buffer below and summing the core are the same sum.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn reads_pixels(&self) -> bool {
-        true
+        self.pixels
     }
 
     fn outputs(&self) -> Vec<crate::fragment::FragmentOutput> {
@@ -444,9 +539,24 @@ impl crate::fragment::FragmentOp for BlockSummaryOp {
     }
 
     fn apply(&self, at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
-        let sum = match at.pixels()? {
-            crate::env::BlockBuf::Array(array) => array.view::<f64>()?.iter().sum::<f64>(),
-            crate::env::BlockBuf::Accounted { .. } => 0.0,
+        let sum = if self.pixels {
+            match at.pixels()? {
+                crate::env::BlockBuf::Array(array) => array.view::<f64>()?.iter().sum::<f64>(),
+                crate::env::BlockBuf::Accounted { .. } => 0.0,
+            }
+        } else {
+            // The declaration, checked from inside rather than asserted beside
+            // the plan: a phase that said it reads no pixels and is handed some
+            // has had its declaration ignored, and a probe that summed them
+            // anyway would report success for exactly that failure.
+            if at.has_pixels() {
+                return Err(Error::InvalidArgument(format!(
+                    "{}: this phase declared `reads_pixels() == false` and was handed a \
+                     block's pixels anyway",
+                    self.name
+                )));
+            }
+            0.0
         };
         Ok(crate::fragment::BlockOutput::fragment(
             self.stream.clone(),
@@ -459,6 +569,67 @@ impl crate::fragment::FragmentOp for BlockSummaryOp {
                 self.tag,
             ]),
         ))
+    }
+}
+
+/// A fragment phase that reads nothing, writes no image and emits **no
+/// fragment**.
+///
+/// The degenerate member of the fragment family, and it exists because two
+/// different measurements need a phase that *is* one: `peak_image_bytes` needs
+/// a phase that writes no image, and `phase_pricing` needs a phase that reads
+/// no pixels. Both were written as a local `Merge` and the two were
+/// byte-for-byte identical below their doc comments.
+///
+/// [`Coverage::Sparse`](crate::fragment::Coverage::Sparse) is structural rather
+/// than a default: an op that declared `EveryBlock` and then returned
+/// [`BlockOutput::nothing`](crate::fragment::BlockOutput::nothing) would be
+/// refused by the coverage guard, correctly. Writing nothing and promising
+/// nothing is the whole of what this is.
+///
+/// **`probes` and not `ops`**, on the rule this module's header states: it
+/// makes nothing expressible. A chain would never want it; only a measurement
+/// of what a *phase* costs does.
+pub struct NullFragmentOp {
+    name: &'static str,
+    stream: String,
+    lifecycle: crate::sidecar::Lifecycle,
+}
+
+impl NullFragmentOp {
+    pub fn new(
+        name: &'static str,
+        stream: impl Into<String>,
+        lifecycle: crate::sidecar::Lifecycle,
+    ) -> Self {
+        Self {
+            name,
+            stream: stream.into(),
+            lifecycle,
+        }
+    }
+}
+
+impl crate::fragment::FragmentOp for NullFragmentOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Nothing crosses, because nothing is read.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn outputs(&self) -> Vec<crate::fragment::FragmentOutput> {
+        vec![crate::fragment::FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            crate::fragment::Coverage::Sparse,
+        )]
+    }
+
+    fn apply(&self, _at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
+        Ok(crate::fragment::BlockOutput::nothing())
     }
 }
 
@@ -521,6 +692,15 @@ impl NeighbourFoldOp {
 impl crate::fragment::FragmentOp for NeighbourFoldOp {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// Nothing crosses as pixels, because none are read. The neighbours this
+    /// folds arrive on `self.input`, over the reach declared on that stream's
+    /// [`crate::fragment::FragmentInput`] in [`Self::inputs`]. The two numbers
+    /// are independent and are not even in the same unit: this one is voxels,
+    /// that one is blocks.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn inputs(&self) -> Vec<crate::fragment::FragmentInput> {
@@ -737,6 +917,16 @@ impl crate::fragment::FragmentOp for RegionSumOp {
         self.name
     }
 
+    /// Nothing crosses. The operand is declared `voxelwise` in
+    /// [`Self::source_inputs`], `apply_with` drops every voxel outside
+    /// `at.core`, and [`Self::seam_fold`] states the same fact in the vocabulary
+    /// the planner checks: a partial is a function of this block's core and of
+    /// nothing else. What crosses the seam is the *addition*, and that belongs
+    /// to `RegionMergeOp`.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<crate::op::SourceInput> {
         vec![crate::op::SourceInput::voxelwise(self.image)]
     }
@@ -882,6 +1072,14 @@ impl crate::fragment::FragmentOp for RegionMergeOp {
         self.name
     }
 
+    /// Nothing crosses as pixels, because none are read. The partials this adds
+    /// across the seam arrive on `self.input` over the whole-lattice reach in
+    /// [`Self::inputs`] — a fragment reach, counted in blocks, where this one is
+    /// counted in voxels.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
     fn inputs(&self) -> Vec<crate::fragment::FragmentInput> {
         vec![
             crate::fragment::FragmentInput::own(self.input.clone(), self.input_phase)
@@ -984,6 +1182,14 @@ impl DriftingSumOp {
 impl crate::fragment::FragmentOp for DriftingSumOp {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// Nothing crosses as pixels, because none are read. The per-block sums this
+    /// folds arrive on `self.input` over the whole-lattice fragment reach in
+    /// [`Self::inputs`]. What this probe varies is [`Self::seam_fold`]; the
+    /// reach is not the knob and must not move with it.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
     }
 
     fn inputs(&self) -> Vec<crate::fragment::FragmentInput> {

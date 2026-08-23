@@ -60,6 +60,7 @@ fn constraints(split_axes: Vec<usize>, candidates: Vec<usize>) -> Constraints {
         model: CostModel::default(),
         block_candidates: candidates,
         split_axes,
+        ..Default::default()
     }
 }
 
@@ -571,6 +572,7 @@ fn a_run_with_listeners_computes_exactly_what_a_run_without_them_computes() {
     assert_eq!(watched.tasks, plain.tasks);
     assert_eq!(watched.ops_applied, plain.ops_applied);
     assert_eq!(watched.blocks_visited, plain.blocks_visited);
+    assert_eq!(watched.blocks_admitted, plain.blocks_admitted);
     assert_eq!(watched.reads, plain.reads);
     assert_eq!(watched.writes, plain.writes);
     assert_eq!(watched.log.len(), plain.log.len());
@@ -601,7 +603,16 @@ fn the_export_describes_the_run_it_came_from() {
         decomposition.phases[0].grid.blocks_per_axis()[0]
     );
     let blocks = document["blocks"].as_array().unwrap();
-    assert_eq!(blocks.len(), stats.blocks_visited);
+    // The exported block table is the set of blocks the scheduler *admitted*,
+    // which is what `blocks_admitted` counts. This is a chain-only run, so
+    // `blocks_visited` is the same number here; the assertion below says so
+    // rather than leaving the two silently interchangeable.
+    assert_eq!(blocks.len(), stats.blocks_admitted);
+    assert_eq!(
+        stats.blocks_admitted, stats.blocks_visited,
+        "on a chain-only plan every admitted block applies a chain slot, so the two agree; \
+         they do not on a plan with a fragment phase in it"
+    );
 
     // The valid regions tile the volume: a consumer drawing them gets no gaps.
     let mut covered = 0u64;
@@ -640,6 +651,7 @@ fn the_export_describes_the_run_it_came_from() {
     }
     let want: Vec<String> = expected.iter().map(|(_, name)| name.clone()).collect();
     assert_eq!(per_block.len(), stats.blocks_visited);
+    assert_eq!(per_block.len(), stats.blocks_admitted);
     for (index, ops) in per_block {
         assert_eq!(ops, want, "block {index:?}");
     }

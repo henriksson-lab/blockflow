@@ -113,7 +113,17 @@ mod tests {
         ] {
             assert_eq!(Dtype::from_numpy_name(dtype.numpy_name()), Some(dtype));
         }
+        // **The absence is deliberate and argued, not pending.** A complex
+        // element is refused at the root rather than merely unwritten:
+        // `VoxelElement` requires `into_f64` and `from_f64`, `Voxels::filled`
+        // takes an `f64`, and `Voxels::uniform` reports one to a short circuit —
+        // so a complex block could only project to a real and lie about what it
+        // holds. `docs/ops-survey/README.md`'s G3 row carries the argument and
+        // the operation that was built without it. This assertion is the pin on
+        // that decision; if a complex variant is ever added it is **inverted**
+        // here rather than deleted.
         assert_eq!(Dtype::from_numpy_name("complex64"), None);
+        assert_eq!(Dtype::from_numpy_name("complex128"), None);
     }
 
     #[test]

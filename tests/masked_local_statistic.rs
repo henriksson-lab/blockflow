@@ -51,14 +51,14 @@ use ndarray::{Array3, ArrayView3};
 
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::ArrayEnvironment;
-use blockflow::error::{Error, Result};
+use blockflow::error::Error;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain, SourceInputs};
 use blockflow::ops::sliding::{sliding_histogram_into, Domain, RankQuery};
 use blockflow::ops::{
     masked_rank_filter_into_with, AdaptiveThresholdOp, ElementShape, EmptyPopulation,
     ExcludedCentre, LocalStatistic, LocalStatisticOp, Population, Rank, Sampling,
-    StructuringElement, Total,
+    StructuringElement, Total, VoxelwiseMaskOp,
 };
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
@@ -528,35 +528,18 @@ fn an_excluded_centre_and_an_empty_window_are_asked_separately() {
 
 // --------------------- 6. decomposition invariance on a lattice --
 
-/// `image > 8`, into a `Bool` image. The population producer, kept here rather
-/// than taken from `src/ops` because what is under test is the *consumer*.
-struct Binarize;
-
-impl BlockOp for Binarize {
-    fn name(&self) -> &'static str {
-        "binarize"
-    }
-
-    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
-        0
-    }
-
-    fn accepts(&self, dtype: Dtype) -> bool {
-        dtype == Dtype::F64
-    }
-
-    fn produces(&self, _input: Dtype) -> Dtype {
-        Dtype::Bool
-    }
-
-    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        let source = input.view::<f64>()?;
-        let mut out = out.view_mut::<bool>()?;
-        ndarray::Zip::from(&mut out)
-            .and(&source)
-            .for_each(|slot, &value| *slot = value > 8.0);
-        Ok(())
-    }
+/// The population producer: `image > 8`, into a `Bool` image.
+///
+/// **This was hand-written here, and the reason it gave has gone.** It said it
+/// was *"kept here rather than taken from `src/ops` because what is under test
+/// is the consumer"* — and when it was written that was the only option, since
+/// `src/ops` had a threshold that produced `1.0` / `0.0` in an `f64` buffer and
+/// none that produced a `Bool` one. `VoxelwiseMaskOp::threshold` is that op, it
+/// is the register's G15 closed, and it makes the same comparison through the
+/// same `ThresholdMask`. What is under test is still the consumer; the producer
+/// is now the library's.
+fn binarize() -> VoxelwiseMaskOp<blockflow::ops::voxelwise::ThresholdMask> {
+    VoxelwiseMaskOp::threshold("binarize", 8.0)
 }
 
 fn masked_lattice_op(population: Population) -> LocalStatisticOp {
@@ -573,7 +556,7 @@ fn masked_lattice_op_over(element: StructuringElement, population: Population) -
 /// leaf and evaluates the lattice statistic against it.
 fn chain_over(element: StructuringElement, population: Population) -> Chain {
     Chain::sequence(vec![
-        Chain::op(Binarize),
+        Chain::op(binarize()),
         Chain::source(0usize, Dtype::F64),
         Chain::op(masked_lattice_op_over(element, population)),
     ])
@@ -724,7 +707,7 @@ fn the_masked_threshold_is_decomposition_invariant_too() {
     let plain = AdaptiveThresholdOp::new("threshold", sampled_statistic(element()), 1.0, 0.0);
 
     let chain = Chain::sequence(vec![
-        Chain::op(Binarize),
+        Chain::op(binarize()),
         Chain::source(0usize, Dtype::F64),
         Chain::op(op),
     ]);
@@ -781,7 +764,7 @@ fn the_masked_threshold_is_decomposition_invariant_too() {
         decomposition.declare_source_images(&chain).unwrap();
         let workflow = Workflow::new(
             Chain::sequence(vec![
-                Chain::op(Binarize),
+                Chain::op(binarize()),
                 Chain::source(0usize, Dtype::F64),
                 Chain::op(
                     AdaptiveThresholdOp::new(

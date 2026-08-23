@@ -1454,6 +1454,7 @@ mod planned_phases {
             model: CostModel::default(),
             block_candidates: candidates,
             split_axes: vec![0, 1, 2],
+            ..Default::default()
         }
     }
 

@@ -50,6 +50,17 @@ blockflow-worker — pulls block tasks from a coordinator and executes them.
   --wait SECONDS        How long to wait for the coordinator. Default 60.
   --stop-after N        Exit after N tasks without reporting. For showing that a
                         worker's death is survivable; never for real work.
+  --abort-after N       Die by unhandled signal having computed N tasks, with
+                        the last one's completion never sent. The same purpose
+                        as --stop-after and a harder death: nothing is flushed
+                        and every claim is still held, which is what a lost node
+                        looks like from the coordinator. Never for real work.
+  --threads N           Threads to spend inside one block. Default 1, which is
+                        uncut and is what this worker has always done. A worker
+                        computes one task at a time, so on a node with cores to
+                        spare this is its only parallelism; set it to the node's
+                        cores divided by the worker processes sharing them. A
+                        chain that has not declared itself sliceable ignores it.
   --report PATH         Write this worker's counters here on exit.
   --verbose
   --help
@@ -101,6 +112,18 @@ fn go() -> Result<()> {
                         .map_err(|_| Error::invalid("--stop-after takes a number".to_string()))?,
                 )
             }
+            "--abort-after" => {
+                options.abort_after = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| Error::invalid("--abort-after takes a number".to_string()))?,
+                )
+            }
+            "--threads" => {
+                options.threads = value()?
+                    .parse()
+                    .map_err(|_| Error::invalid("--threads takes a number".to_string()))?
+            }
             "--report" => report = Some(PathBuf::from(value()?)),
             "--verbose" => options.verbose = true,
             other => return Err(Error::invalid(format!("unknown flag {other:?}\n\n{USAGE}"))),
@@ -135,14 +158,24 @@ fn go() -> Result<()> {
                 "tasks": done.tasks,
                 "short_circuited": done.short_circuited,
                 "fragments": done.fragments,
+                "sidecar_reads": done.sidecar_reads,
+                "fragment_applications": done.fragment_applications,
                 "events": done.events,
                 "started_ready": done.started_ready,
                 "started_after_waiting": done.started_after_waiting,
                 "starved": done.starved,
+                "told_to_wait": done.told_to_wait,
                 "reads": done.reads,
                 "chunks_read": done.chunks_read,
+                "reductions": done.reductions,
+                "reduced_bytes": done.reduced_bytes,
                 "listener_faults": done.listener_faults,
                 "elapsed_ms": done.elapsed.as_millis() as u64,
+                "joined_ms": done.joined.as_millis() as u64,
+                "ready_ms": done.ready.as_millis() as u64,
+                "refused": done.refused,
+                "first_pull_ms": done.first_pull.as_millis() as u64,
+                "pull_connect_ms": done.pull_connect.as_millis() as u64,
                 "ok": true,
             }),
         ),

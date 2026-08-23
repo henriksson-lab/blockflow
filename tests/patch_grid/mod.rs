@@ -535,6 +535,20 @@ impl Environment for RegridEnvironment {
         self.inner.apply(slot, input, sources, at)
     }
 
+    /// Forwarded, because a wrapper that does not forward this declines every
+    /// cut the planner offers and does so silently. See
+    /// [`Environment::apply_sliced`].
+    fn apply_sliced(
+        &self,
+        slot: &Chain,
+        input: &BlockBuf,
+        sources: &[(usize, BlockBuf)],
+        at: &Placement,
+        slabs: usize,
+    ) -> Result<(BlockBuf, usize)> {
+        self.inner.apply_sliced(slot, input, sources, at, slabs)
+    }
+
     fn write(&self, image: usize, within: &Region, valid: &Region, buf: &BlockBuf) -> Result<()> {
         self.inner.write(image, within, valid, buf)?;
         if valid.voxels() == 0 {

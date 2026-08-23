@@ -48,6 +48,18 @@
 // establish as acceptable for work the block lattice cannot express. Nothing
 // here implements `BlockOp`, and the absence is the statement.
 //
+// **What that absence is not evidence of, and this has been measured since.**
+// It says these three *types* cannot be a phase; it was read for a while as
+// saying the frequency domain cannot be one, and that reading is wrong. Only
+// reason 3 above is about the element type, and it is the weakest of the three:
+// an operation whose *answer* is real needs no complex image, because the
+// spectrum lives inside one `apply` and dies there.
+// [`crate::ops::convolve::TransformConvolveOp`] is exactly that — a linear
+// filter through this module's transform, an ordinary `BlockOp` with an
+// ordinary bounded reach, byte-identical across lattices — and it is built on
+// [`RealTransform3`] below. The ops survey's G3 row carries the argument and the
+// three findings against adding a `Dtype::Complex*` at all.
+//
 // Composition, and why there is no `rayon` inside
 // -----------------------------------------------
 // The consumer's parallelism is **across planes**: one landscape per plane of a
@@ -310,7 +322,7 @@
 
 use std::sync::Arc;
 
-use ndarray::{Array2, ArrayView2};
+use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use rustfft::{Fft, FftPlanner};
 
@@ -816,6 +828,328 @@ fn transform_lanes(
             }
         }
         base += width;
+    }
+}
+
+// ---------------------------------------------------------- the third axis --
+
+/// The half-spectrum of a real `d0 x d1 x d2` volume: `[d0, d1, d2 / 2 + 1]`.
+///
+/// [`Spectrum`] one rank up and under the same convention — only the **last**
+/// axis is halved. A real input's spectrum is conjugate-symmetric under
+/// negation of *all three* indices at once, so halving a second axis would need
+/// the sign of the other two carried beside it; one halved axis is the whole of
+/// the redundancy that comes for free.
+pub type Spectrum3 = Array3<Complex<f64>>;
+
+/// A discrete Fourier transform of a real **volume**.
+///
+/// [`RealTransform2`] with the axis [`crate::ops::deconvolve`]'s table calls
+/// missing — "the same twenty lines, over `Array3`" — and it is the same lines:
+/// a real transform along the last axis, then [`transform_lanes`] along axis 1
+/// within each plane, then [`transform_lanes`] along axis 0 over the whole
+/// buffer, because a `[d0, d1, w]` row-major buffer **is** a `[d0, d1 * w]` one
+/// to a first-axis pass. Nothing new is planned for the outermost axis and
+/// nothing new is scratch-managed; only the loop bounds differ.
+///
+/// **The normalisation is this module's**: the forward direction is
+/// unnormalised and the inverse carries `1 / (d0 d1 d2)`. The round trip is the
+/// identity to a bound and not to the bit, exactly as the two-dimensional one
+/// is, and [`RealTransform3`]'s tests state the achieved figure.
+///
+/// **One backend, and that is deliberate rather than pending.** The `fftw`
+/// feature's transform is a two-dimensional `r2c` plan and is not a
+/// three-dimensional one; a `TransformBackend` argument here would be a
+/// parameter with one legal setting that reads as a choice. [`RealTransform2`]
+/// keeps its enum because it really has two; this one says what it is.
+///
+/// **Clone shares the plans and allocates fresh scratch**, so a clone is a
+/// second working set over one set of twiddles. That is what makes a
+/// [`crate::op::BlockOp`] able to hold one: `apply` takes `&self` and the
+/// transform needs `&mut`, so the op clones its template per block rather than
+/// planning per block or locking.
+pub struct RealTransform3 {
+    shape: [usize; 3],
+    row_forward: Arc<dyn RealToComplex<f64>>,
+    row_inverse: Arc<dyn ComplexToReal<f64>>,
+    plane_forward: Arc<dyn Fft<f64>>,
+    plane_inverse: Arc<dyn Fft<f64>>,
+    volume_forward: Arc<dyn Fft<f64>>,
+    volume_inverse: Arc<dyn Fft<f64>>,
+    row_forward_scratch: Vec<Complex<f64>>,
+    row_inverse_scratch: Vec<Complex<f64>>,
+    plane_scratch: Vec<Complex<f64>>,
+    volume_scratch: Vec<Complex<f64>>,
+    plane_lanes: Vec<Complex<f64>>,
+    volume_lanes: Vec<Complex<f64>>,
+    real_row: Vec<f64>,
+}
+
+impl Clone for RealTransform3 {
+    fn clone(&self) -> Self {
+        Self {
+            shape: self.shape,
+            row_forward: Arc::clone(&self.row_forward),
+            row_inverse: Arc::clone(&self.row_inverse),
+            plane_forward: Arc::clone(&self.plane_forward),
+            plane_inverse: Arc::clone(&self.plane_inverse),
+            volume_forward: Arc::clone(&self.volume_forward),
+            volume_inverse: Arc::clone(&self.volume_inverse),
+            row_forward_scratch: vec![Complex::new(0.0, 0.0); self.row_forward_scratch.len()],
+            row_inverse_scratch: vec![Complex::new(0.0, 0.0); self.row_inverse_scratch.len()],
+            plane_scratch: vec![Complex::new(0.0, 0.0); self.plane_scratch.len()],
+            volume_scratch: vec![Complex::new(0.0, 0.0); self.volume_scratch.len()],
+            plane_lanes: vec![Complex::new(0.0, 0.0); self.plane_lanes.len()],
+            volume_lanes: vec![Complex::new(0.0, 0.0); self.volume_lanes.len()],
+            real_row: vec![0.0; self.real_row.len()],
+        }
+    }
+}
+
+impl std::fmt::Debug for RealTransform3 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RealTransform3")
+            .field("shape", &self.shape)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RealTransform3 {
+    /// Plan a transform of `shape`. Every extent must be non-zero.
+    pub fn new(shape: [usize; 3]) -> Result<Self> {
+        let [d0, d1, d2] = shape;
+        if d0 == 0 || d1 == 0 || d2 == 0 {
+            return Err(Error::invalid(format!(
+                "a transform needs a non-empty shape, got {d0} x {d1} x {d2}"
+            )));
+        }
+        let mut real = RealFftPlanner::<f64>::new();
+        let row_forward = real.plan_fft_forward(d2);
+        let row_inverse = real.plan_fft_inverse(d2);
+        let mut complex = FftPlanner::<f64>::new();
+        let plane_forward = complex.plan_fft_forward(d1);
+        let plane_inverse = complex.plan_fft_inverse(d1);
+        let volume_forward = complex.plan_fft_forward(d0);
+        let volume_inverse = complex.plan_fft_inverse(d0);
+        let plane_scratch = vec![
+            Complex::new(0.0, 0.0);
+            plane_forward
+                .get_inplace_scratch_len()
+                .max(plane_inverse.get_inplace_scratch_len())
+        ];
+        let volume_scratch = vec![
+            Complex::new(0.0, 0.0);
+            volume_forward
+                .get_inplace_scratch_len()
+                .max(volume_inverse.get_inplace_scratch_len())
+        ];
+        Ok(Self {
+            shape,
+            row_forward_scratch: vec![Complex::new(0.0, 0.0); row_forward.get_scratch_len()],
+            row_inverse_scratch: vec![Complex::new(0.0, 0.0); row_inverse.get_scratch_len()],
+            plane_scratch,
+            volume_scratch,
+            plane_lanes: vec![Complex::new(0.0, 0.0); d1 * LANE_BLOCK],
+            volume_lanes: vec![Complex::new(0.0, 0.0); d0 * LANE_BLOCK],
+            real_row: vec![0.0; d2],
+            row_forward,
+            row_inverse,
+            plane_forward,
+            plane_inverse,
+            volume_forward,
+            volume_inverse,
+        })
+    }
+
+    /// The real volume's shape.
+    pub fn shape(&self) -> [usize; 3] {
+        self.shape
+    }
+
+    /// `[d0, d1, d2 / 2 + 1]`.
+    pub fn spectrum_shape(&self) -> [usize; 3] {
+        [self.shape[0], self.shape[1], spectrum_width(self.shape[2])]
+    }
+
+    /// A zeroed spectrum of the right shape, for a caller that wants to reuse
+    /// one across many transforms.
+    pub fn spectrum(&self) -> Spectrum3 {
+        let [a, b, c] = self.spectrum_shape();
+        Array3::from_elem((a, b, c), Complex::new(0.0, 0.0))
+    }
+
+    /// Forward transform of `input` placed at the origin of a zeroed volume of
+    /// [`Self::shape`], into `out`.
+    ///
+    /// The padding is the caller's whole reason for a transform longer than the
+    /// data — see this module's header on wrap-around — so it is done here
+    /// rather than asking every caller to allocate and zero the larger volume
+    /// itself. An `input` larger than the transform on any axis is refused.
+    pub fn forward_zero_padded(
+        &mut self,
+        input: ArrayView3<f64>,
+        out: &mut Spectrum3,
+    ) -> Result<()> {
+        let [d0, d1, d2] = self.shape;
+        let width = spectrum_width(d2);
+        let (in0, in1, in2) = input.dim();
+        if in0 > d0 || in1 > d1 || in2 > d2 {
+            return Err(Error::invalid(format!(
+                "a {in0} x {in1} x {in2} volume does not fit in a {d0} x {d1} x {d2} transform"
+            )));
+        }
+        let expected = self.spectrum_shape();
+        if out.shape() != expected {
+            return Err(Error::invalid(format!(
+                "this transform's spectrum is {expected:?} and was given {:?}",
+                out.shape()
+            )));
+        }
+        let data = out
+            .as_slice_mut()
+            .ok_or_else(|| Error::invalid("a spectrum must be contiguous".to_string()))?;
+        let Self {
+            row_forward,
+            row_forward_scratch,
+            real_row,
+            plane_forward,
+            plane_scratch,
+            plane_lanes,
+            volume_forward,
+            volume_scratch,
+            volume_lanes,
+            ..
+        } = self;
+        for i0 in 0..d0 {
+            for i1 in 0..d1 {
+                if i0 < in0 && i1 < in1 {
+                    for (k, slot) in real_row.iter_mut().enumerate() {
+                        *slot = if k < in2 { input[[i0, i1, k]] } else { 0.0 };
+                    }
+                } else {
+                    real_row.fill(0.0);
+                }
+                let base = (i0 * d1 + i1) * width;
+                row_forward
+                    .process_with_scratch(
+                        real_row,
+                        &mut data[base..base + width],
+                        row_forward_scratch,
+                    )
+                    .map_err(|error| Error::invalid(format!("forward row transform: {error}")))?;
+            }
+        }
+        for i0 in 0..d0 {
+            let base = i0 * d1 * width;
+            transform_lanes(
+                &mut data[base..base + d1 * width],
+                d1,
+                width,
+                &**plane_forward,
+                plane_lanes,
+                plane_scratch,
+            );
+        }
+        transform_lanes(
+            data,
+            d0,
+            d1 * width,
+            &**volume_forward,
+            volume_lanes,
+            volume_scratch,
+        );
+        Ok(())
+    }
+
+    /// Inverse transform of `spectrum`, carrying the `1 / (d0 d1 d2)` this
+    /// convention puts on this side. `spectrum` is consumed — it is transformed
+    /// in place — and `out` must be [`Self::shape`].
+    pub fn inverse(&mut self, spectrum: &mut Spectrum3, out: &mut Array3<f64>) -> Result<()> {
+        let [d0, d1, d2] = self.shape;
+        let width = spectrum_width(d2);
+        let expected = self.spectrum_shape();
+        if spectrum.shape() != expected {
+            return Err(Error::invalid(format!(
+                "this transform's spectrum is {expected:?} and was given {:?}",
+                spectrum.shape()
+            )));
+        }
+        if out.shape() != self.shape {
+            return Err(Error::invalid(format!(
+                "this transform writes {:?} and was given {:?}",
+                self.shape,
+                out.shape()
+            )));
+        }
+        let data = spectrum
+            .as_slice_mut()
+            .ok_or_else(|| Error::invalid("a spectrum must be contiguous".to_string()))?;
+        let sink = out
+            .as_slice_mut()
+            .ok_or_else(|| Error::invalid("an output volume must be contiguous".to_string()))?;
+        let Self {
+            row_inverse,
+            row_inverse_scratch,
+            real_row,
+            plane_inverse,
+            plane_scratch,
+            plane_lanes,
+            volume_inverse,
+            volume_scratch,
+            volume_lanes,
+            ..
+        } = self;
+        transform_lanes(
+            data,
+            d0,
+            d1 * width,
+            &**volume_inverse,
+            volume_lanes,
+            volume_scratch,
+        );
+        for i0 in 0..d0 {
+            let base = i0 * d1 * width;
+            transform_lanes(
+                &mut data[base..base + d1 * width],
+                d1,
+                width,
+                &**plane_inverse,
+                plane_lanes,
+                plane_scratch,
+            );
+        }
+        let scale = 1.0 / (d0 as f64 * d1 as f64 * d2 as f64);
+        let even = d2 % 2 == 0;
+        for i0 in 0..d0 {
+            for i1 in 0..d1 {
+                let base = (i0 * d1 + i1) * width;
+                // The exact values of these two bins are real; the passes above
+                // leave rounding noise on them and `realfft` refuses the row
+                // rather than ignoring it. Asserting the symmetry is correct —
+                // this module's header argues it for the two-dimensional case
+                // and the argument does not depend on the rank.
+                data[base].im = 0.0;
+                if even {
+                    data[base + width - 1].im = 0.0;
+                }
+                row_inverse
+                    .process_with_scratch(
+                        &mut data[base..base + width],
+                        real_row,
+                        row_inverse_scratch,
+                    )
+                    .map_err(|error| Error::invalid(format!("inverse row transform: {error}")))?;
+                let out_base = (i0 * d1 + i1) * d2;
+                for (slot, &value) in sink[out_base..out_base + d2]
+                    .iter_mut()
+                    .zip(real_row.iter())
+                {
+                    *slot = value * scale;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2311,5 +2645,251 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -------------------------------------------------------- the third axis --
+
+    /// A deterministic volume with no symmetry on any axis, for the same reason
+    /// [`plane`] has none: a transpose, a reflection and a one-voxel shift must
+    /// all change it, or a test comparing two transforms of it says nothing.
+    fn volume(shape: [usize; 3], seed: u64) -> Array3<f64> {
+        let mut state = seed | 1;
+        Array3::from_shape_fn((shape[0], shape[1], shape[2]), |(a, b, c)| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let noise = (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+            noise + 0.01 * a as f64 - 0.003 * b as f64 + 0.007 * c as f64
+        })
+    }
+
+    /// The transform written from its definition: one sum per coefficient over
+    /// every voxel. The oracle, and the only thing in this file that does not
+    /// go through a library.
+    fn dft3_direct(input: &Array3<f64>, index: [usize; 3]) -> Complex<f64> {
+        let (d0, d1, d2) = input.dim();
+        let mut total = Complex::new(0.0, 0.0);
+        for a in 0..d0 {
+            for b in 0..d1 {
+                for c in 0..d2 {
+                    let phase = -2.0
+                        * std::f64::consts::PI
+                        * ((index[0] * a) as f64 / d0 as f64
+                            + (index[1] * b) as f64 / d1 as f64
+                            + (index[2] * c) as f64 / d2 as f64);
+                    total += input[[a, b, c]] * Complex::new(phase.cos(), phase.sin());
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn the_volume_transform_is_the_definition_coefficient_by_coefficient() {
+        // Odd on two axes and prime on one, so no axis is a size a radix-2
+        // transform would flatter and no two axes can be confused for each
+        // other.
+        let shape = [5usize, 7, 6];
+        let source = volume(shape, 0x51ED_270F_A2C1_0003);
+        let mut transform = RealTransform3::new(shape).unwrap();
+        let mut spectrum = transform.spectrum();
+        transform
+            .forward_zero_padded(source.view(), &mut spectrum)
+            .unwrap();
+
+        let mut worst = 0.0f64;
+        for a in 0..shape[0] {
+            for b in 0..shape[1] {
+                for c in 0..spectrum_width(shape[2]) {
+                    let expected = dft3_direct(&source, [a, b, c]);
+                    let got = spectrum[[a, b, c]];
+                    worst = larger(worst, (got - expected).norm());
+                }
+            }
+        }
+        println!("volume transform worst coefficient deviation: {worst:e}");
+        assert!(
+            worst < 1.0e-11,
+            "the transform deviates from its definition by {worst:e}"
+        );
+        // **Liveness.** The comparison above is only a claim if the oracle can
+        // tell two volumes apart at all; a direct transform with a sign error in
+        // the phase, or one that ignored its index, would agree with itself.
+        let other = volume(shape, 0x51ED_270F_A2C1_0004);
+        let mut apart = 0.0f64;
+        for a in 0..shape[0] {
+            for b in 0..shape[1] {
+                for c in 0..spectrum_width(shape[2]) {
+                    apart = larger(
+                        apart,
+                        (dft3_direct(&source, [a, b, c]) - dft3_direct(&other, [a, b, c])).norm(),
+                    );
+                }
+            }
+        }
+        assert!(
+            apart > 1.0,
+            "the oracle gives two different volumes the same spectrum, so the \
+             agreement above is not evidence"
+        );
+    }
+
+    #[test]
+    fn the_volume_round_trip_is_the_identity_to_a_bound_and_the_bound_is_stated() {
+        let shape = [17usize, 23, 30];
+        let source = volume(shape, 0x9E37_79B9_7F4A_7C17);
+        let mut transform = RealTransform3::new(shape).unwrap();
+        let mut spectrum = transform.spectrum();
+        transform
+            .forward_zero_padded(source.view(), &mut spectrum)
+            .unwrap();
+        let mut back = Array3::zeros((shape[0], shape[1], shape[2]));
+        transform.inverse(&mut spectrum, &mut back).unwrap();
+
+        let mut worst = 0.0f64;
+        for (&expected, &got) in source.iter().zip(back.iter()) {
+            worst = larger(worst, (expected - got).abs());
+        }
+        println!("volume round trip worst absolute deviation: {worst:e}");
+        // Measured: 1.4e-15 on the machine this was written on, which is the
+        // same order the two-dimensional round trip reports over a comparable
+        // element count. Two orders looser here so it is a bound and not a
+        // fingerprint.
+        assert!(
+            worst < 1.0e-13,
+            "round trip deviated by {worst:e}, which is not a rounding"
+        );
+        assert!(
+            worst > 0.0,
+            "an exactly zero deviation means the round trip was not computed at \
+             all — this assertion would pass on a pair of no-ops"
+        );
+    }
+
+    #[test]
+    fn the_volume_inverse_carries_the_one_over_n_and_the_forward_does_not() {
+        let shape = [4usize, 5, 6];
+        // A **positive** field, not the zero-mean fixture the other cases use:
+        // a volume whose sum is near zero cannot tell an unnormalised forward
+        // transform from a scaled one, which the liveness assertion below
+        // enforces and which the plain fixture fails.
+        let source = volume(shape, 0xDEAD_BEEF_CAFE_0007).mapv(|value| value + 5.0);
+        let mut transform = RealTransform3::new(shape).unwrap();
+        let mut spectrum = transform.spectrum();
+        transform
+            .forward_zero_padded(source.view(), &mut spectrum)
+            .unwrap();
+        let sum: f64 = source.iter().sum();
+        let zero = spectrum[[0, 0, 0]];
+        assert!(
+            (zero.re - sum).abs() < 1.0e-12 * larger(sum.abs(), 1.0) && zero.im.abs() < 1.0e-12,
+            "the forward zero bin is {zero} and the plain sum is {sum}: the \
+             forward direction must be unnormalised"
+        );
+        // **Liveness.** A volume whose sum is zero cannot tell an unnormalised
+        // forward transform from one carrying any scale at all, so the fixture
+        // above has to have a sum far from zero — asserted, not assumed.
+        let count = (shape[0] * shape[1] * shape[2]) as f64;
+        assert!(
+            sum.abs() > count / 4.0,
+            "the fixture's sum is {sum} over {count} voxels, which is too near \
+             zero for the zero bin to be evidence of a normalisation"
+        );
+    }
+
+    #[test]
+    fn zero_padding_a_volume_is_the_transform_of_the_padded_volume() {
+        // The whole reason `forward_zero_padded` exists: a wrap-free length is
+        // longer than the data, and a caller must not have to allocate and zero
+        // the larger volume itself.
+        let small = [3usize, 4, 5];
+        let large = [8usize, 9, 12];
+        let source = volume(small, 0x0BAD_F00D_1234_5679);
+        let mut padded = Array3::zeros((large[0], large[1], large[2]));
+        for a in 0..small[0] {
+            for b in 0..small[1] {
+                for c in 0..small[2] {
+                    padded[[a, b, c]] = source[[a, b, c]];
+                }
+            }
+        }
+        let mut transform = RealTransform3::new(large).unwrap();
+        let mut from_small = transform.spectrum();
+        transform
+            .forward_zero_padded(source.view(), &mut from_small)
+            .unwrap();
+        let mut from_padded = transform.spectrum();
+        transform
+            .forward_zero_padded(padded.view(), &mut from_padded)
+            .unwrap();
+        for (&a, &b) in from_small.iter().zip(from_padded.iter()) {
+            assert_eq!(
+                (a.re.to_bits(), a.im.to_bits()),
+                (b.re.to_bits(), b.im.to_bits()),
+                "padding inside the transform must be the same arithmetic as \
+                 padding outside it, to the bit"
+            );
+        }
+        // **Liveness.** Byte-equality above proves nothing if both spectra are
+        // zero, which is what a `forward_zero_padded` that ignored its input
+        // would produce.
+        let energy: f64 = from_small.iter().map(|value| value.norm_sqr()).sum();
+        assert!(
+            energy > 1.0,
+            "both spectra are ~zero ({energy:e}), so their equality is not evidence"
+        );
+    }
+
+    #[test]
+    fn a_cloned_volume_transform_computes_the_same_answer() {
+        // The property the block op below depends on: `apply` takes `&self` and
+        // a transform needs `&mut`, so the op clones a template per block. A
+        // clone that re-planned, or that shared scratch, would make the answer a
+        // function of which thread ran it.
+        let shape = [6usize, 6, 8];
+        let source = volume(shape, 0x0102_0304_0506_0709);
+        let mut original = RealTransform3::new(shape).unwrap();
+        let mut copy = original.clone();
+        let mut left = original.spectrum();
+        let mut right = copy.spectrum();
+        original
+            .forward_zero_padded(source.view(), &mut left)
+            .unwrap();
+        copy.forward_zero_padded(source.view(), &mut right).unwrap();
+        for (&a, &b) in left.iter().zip(right.iter()) {
+            assert_eq!(
+                (a.re.to_bits(), a.im.to_bits()),
+                (b.re.to_bits(), b.im.to_bits()),
+                "a clone must be a second working set over one set of twiddles"
+            );
+        }
+        let energy: f64 = left.iter().map(|value| value.norm_sqr()).sum();
+        assert!(
+            energy > 1.0,
+            "both spectra are ~zero, so equality says nothing"
+        );
+    }
+
+    #[test]
+    fn an_empty_extent_is_refused_and_an_oversized_input_is_refused() {
+        assert!(RealTransform3::new([0, 4, 4]).is_err());
+        assert!(RealTransform3::new([4, 0, 4]).is_err());
+        assert!(RealTransform3::new([4, 4, 0]).is_err());
+        let mut transform = RealTransform3::new([4, 4, 4]).unwrap();
+        let mut spectrum = transform.spectrum();
+        let too_big = Array3::<f64>::zeros((5, 4, 4));
+        let message = transform
+            .forward_zero_padded(too_big.view(), &mut spectrum)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("does not fit"),
+            "an input longer than the transform must be refused by name, got {message}"
+        );
+        let mut wrong = Array3::from_elem((4, 4, 4), Complex::new(0.0, 0.0));
+        let fits = Array3::<f64>::zeros((4, 4, 4));
+        assert!(transform
+            .forward_zero_padded(fits.view(), &mut wrong)
+            .is_err());
     }
 }

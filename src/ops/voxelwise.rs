@@ -97,7 +97,7 @@ use ndarray::{ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::op::{Anchor, BlockOp, Combine};
+use crate::op::{Anchor, BlockOp, Combine, Slicing};
 use crate::voxels::{VoxelElement, Voxels};
 
 use super::local::Narrowing;
@@ -916,6 +916,58 @@ impl<M: MapFn> BlockOp for VoxelwiseMapOp<M> {
         map_into(input, out, |&value| self.map.map(value))
     }
 
+    /// **A stencil**, and the argument is one this crate has already made and
+    /// already depends on.
+    ///
+    /// [`MapFn`] states purity as a *precondition of implementing it* — "if a map
+    /// consulted anything but its argument, the answer for a short-circuited
+    /// block and for a computed one would differ" — and that precondition is what
+    /// licenses [`Self::constant_maps_to`] immediately below.
+    ///
+    /// It licenses this too, and for a **stronger** reason than the short circuit
+    /// has: *a block boundary is already a cut*. This op reaches zero, so every
+    /// block grid a planner may choose already partitions the volume into pieces
+    /// the map is applied to separately, and this crate's conformance suite
+    /// asserts that the answer does not move across those grids. A slab cut is
+    /// one more partition of exactly that kind. It rests on no assumption the
+    /// block cut was not already resting on, which is why declaring it here does
+    /// not widen the bet an out-of-crate `MapFn` is trusted on.
+    ///
+    /// **Why it matters that this one is declared and not only the filters.** A
+    /// `Parallel` node is only as sliceable as its narrowest part, and the
+    /// diamond this crate ships for background removal —
+    /// [`super::background::remove_background`] — is an *identity map* on one arm
+    /// against a grey opening on the other. With the rank filters and the sink
+    /// declared and this left undeclared, the whole node still refused, and the
+    /// declarations on the other three would have been assertions about a chain
+    /// nothing could cut. `tests/intra_block_slicing.rs` runs that composite
+    /// diamond uncut and then cut at every thread count and requires the same
+    /// bits.
+    ///
+    /// **What it costs, and it is the one declared op that made a cut lose.** A
+    /// reach-0 cut creates no redundant arithmetic — the amplification is
+    /// exactly `1.000` — but a slab still copies, and a voxelwise op is bound by
+    /// that same memory rather than by what it computes ([`IDENTITY_COST`] is
+    /// the measurement). When the cut ended with one serial pass placing every
+    /// core, a one-block voxelwise phase ran **6-7% slower** cut than uncut, and
+    /// `mean_cores_busy` at 1.1-1.4 on four slabs is what identified it: the
+    /// threads were waiting, not working. That pass is now threaded through
+    /// [`crate::voxels::VoxelsMut`] and the same arms measure **1.18-1.37x** at
+    /// `224^3` and break-even at `160^3`.
+    ///
+    /// **No cost threshold guards this, and the reason is that the obvious one
+    /// gets it wrong.** Amdahl with [`IDENTITY_COST`] declines a single map
+    /// correctly and admits a three-map sequence that measured `0.93x`, because
+    /// `cost_per_voxel` is a compute figure and this regime is not
+    /// compute-bound. `docs/design/intra-block.md` §13.3.1 has the tables, what
+    /// the remaining copies are, and why a borrowed *output* could not remove
+    /// them all.
+    ///
+    /// [`super::background::remove_background`]: crate::ops::background::remove_background
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
     /// Whatever the map says, which for a map that says nothing is the map
     /// applied to the constant. True because the map is pure and the op reads
     /// nothing else.
@@ -1052,6 +1104,30 @@ impl<M: MaskFn> BlockOp for VoxelwiseMaskOp<M> {
             return Ok(());
         }
         map_into(input, out, |&value| self.mask.holds(value))
+    }
+
+    /// **A stencil**, on [`VoxelwiseMapOp::slicing`]'s argument in full: the
+    /// predicate is required to be pure, it reads the voxel it writes and
+    /// nothing else, and *a block boundary is already a cut* — this op reaches
+    /// zero, so every block grid a planner may choose already partitions the
+    /// volume into pieces it is applied to separately, and the conformance suite
+    /// asserts the answer does not move across those grids.
+    ///
+    /// **It was declared later than its sibling, and the reason is the bar
+    /// rather than the argument.** It writes `Bool` where the map writes `f64`,
+    /// and `tests/intra_block_slicing.rs`'s two bar helpers read `f64` — so
+    /// declaring it would have meant either a case with no bit-identity check
+    /// behind it or a relaxed bar. The helpers were generalised instead, per
+    /// element type and refusing the rest by name rather than widening
+    /// everything to `f64`, because a bar that is bit-identity cannot rest on a
+    /// lossy comparison.
+    ///
+    /// Nothing here costs what the map's declaration does: a masking op writes
+    /// **one byte a voxel**, so a slab's placement moves an eighth of the bytes
+    /// a map's does, and the copy that made a one-block voxelwise phase slower
+    /// is an eighth the size before the join was threaded at all.
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
     }
 
     /// Whatever the predicate says, in the short circuit's own currency.
@@ -1452,6 +1528,26 @@ impl Combine for LogicCombine {
     /// the halo.
     fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
         0
+    }
+
+    /// **A stencil**, and this is the declaration a fan-in cannot get from its
+    /// branches. A `Parallel` node is only as sliceable as its narrowest part,
+    /// so a diamond whose arms are declared stencils is still refused while its
+    /// sink says nothing — which is the position every fan-in in this crate was
+    /// in until this line existed.
+    ///
+    /// The claim itself is [`mask_logic_into`]'s: it writes each output voxel from the
+    /// co-located voxel of each operand and the carrier conversion `MaskElement::set`, through one
+    /// `Zip` that reads no neighbour and carries no accumulator between voxels.
+    /// So the output at `v` is a function of the inputs at `v`, the reach is
+    /// zero on every axis, and the output lattice is the input lattice — the
+    /// three conditions [`Slicing::Stencil`] states.
+    ///
+    /// Held to it rather than believed: `tests/intra_block_slicing.rs` runs a
+    /// fan-in whose sink is this one uncut and then cut at every thread count
+    /// and requires the same bits.
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
     }
 
     /// At least two branches, every one of them a mask carrier, and — unless
@@ -1908,6 +2004,26 @@ impl Combine for ArithmeticCombine {
     /// because [`Combine::reach`] has no default.
     fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
         0
+    }
+
+    /// **A stencil**, and this is the declaration a fan-in cannot get from its
+    /// branches. A `Parallel` node is only as sliceable as its narrowest part,
+    /// so a diamond whose arms are declared stencils is still refused while its
+    /// sink says nothing — which is the position every fan-in in this crate was
+    /// in until this line existed.
+    ///
+    /// The claim itself is [`arithmetic_into`]'s: it writes each output voxel from the
+    /// co-located voxel of each operand, or selects one of them, through one
+    /// `Zip` that reads no neighbour and carries no accumulator between voxels.
+    /// So the output at `v` is a function of the inputs at `v`, the reach is
+    /// zero on every axis, and the output lattice is the input lattice — the
+    /// three conditions [`Slicing::Stencil`] states.
+    ///
+    /// Held to it rather than believed: `tests/intra_block_slicing.rs` runs a
+    /// fan-in whose sink is this one uncut and then cut at every thread count
+    /// and requires the same bits.
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
     }
 
     /// The arity rule is the operation's and the element-type rule is the
