@@ -329,7 +329,7 @@ impl Combine for DifferenceCombine {
         }
     }
 
-    fn apply(&self, inputs: &[Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
+    fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
         let (minuend, subtrahend) = match inputs {
             [minuend, subtrahend] => (minuend, subtrahend),
             other => {
@@ -359,6 +359,14 @@ impl Combine for DifferenceCombine {
             ))),
         }
     }
+
+    // **No `fold_carrier`, deliberately.** The default `None` says this combine
+    // is handed every branch at once, and here that is the whole truth rather
+    // than an omission: a difference has a minuend and a subtrahend, `accepts`
+    // refuses a third branch, and there is no fold over a longer list that is
+    // not a convention about where the parentheses went. Declaring one would
+    // buy nothing either — at two branches the walk holds both results whichever
+    // path it takes, so the residency is the same figure.
 
     /// `+0.0` where the two operands are the same finite value, and nothing
     /// anywhere else. The three-line proof, and the two exclusions, are in the
@@ -555,7 +563,8 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
         rows.push((
             "difference combine (two branch results)".to_string(),
             best_of(Box::new(move || {
-                combine.apply(&operands, &mut out, &anchor).unwrap();
+                let refs: Vec<&Voxels> = operands.iter().collect();
+                combine.apply(&refs, &mut out, &anchor).unwrap();
             })),
             1.0,
         ));
@@ -965,7 +974,7 @@ mod tests {
             let mut out = Voxels::zeros(Dtype::F32, [3, 3, 3]).unwrap();
             combine
                 .apply(
-                    &[operand.clone(), operand],
+                    &[&operand.clone(), &operand],
                     &mut out,
                     &Anchor::whole([3, 3, 3]),
                 )

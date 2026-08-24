@@ -70,10 +70,12 @@
 //
 // [`MaskFn`] and [`VoxelwiseMaskOp`] are [`MapFn`] and [`VoxelwiseMapOp`] with
 // the codomain changed, and they exist because the intermediate buffer is the
-// cost rather than the second pass: `Chain::apply_placed` allocates one buffer
-// per fan-in branch at the branch's own declared width, so a verdict computed as
+// cost rather than the second pass: `Chain::apply_placed` allocates a buffer per
+// fan-in branch at the branch's own declared width, so a verdict computed as
 // `1.0` and `0.0` costs its eight bytes a voxel whatever is done to it
-// afterwards.
+// afterwards. Folding a fan-in as its branches are computed took down how *many*
+// of those buffers are alive at once; it did not touch how wide each one is,
+// which is what this is about.
 //
 // [`LogicCombine`] then joins branches in **either** carrier, with the carrier
 // of its answer stated by the caller where the branches disagree — its own
@@ -138,6 +140,34 @@ pub fn combine_into<A, B, C>(
         .and(left)
         .and(right)
         .for_each(|slot, left, right| *slot = combine(left, right));
+    Ok(())
+}
+
+/// Apply `combine` to every pair of co-located voxels, **writing over the
+/// accumulator**.
+///
+/// The same kernel as [`combine_into`] with the left operand and the output
+/// being one buffer, which is the whole point: a left fold over `n` branches
+/// that writes each partial into a fresh buffer holds **three** block buffers at
+/// its worst moment — the partial, the branch just computed, and their join —
+/// where accumulating in place holds two.
+///
+/// # The operand this must never be handed
+///
+/// **A buffer the run did not allocate for this fold.** `BranchResult::Stored`
+/// is a source leaf's answer: an input image of the run, at the block's read
+/// extent, which other phases read. Accumulating into one would overwrite it.
+/// That discriminant is what a caller has to consult, and `Chain::apply_tallied`
+/// consults it — this kernel cannot, because by here it has only a view.
+pub fn combine_in_place<A, B>(
+    mut acc: ArrayViewMut3<'_, A>,
+    right: ArrayView3<'_, B>,
+    combine: impl Fn(&A, &B) -> A,
+) -> Result<()> {
+    shapes_agree(acc.shape(), right.shape(), "combine_in_place")?;
+    ndarray::Zip::from(&mut acc)
+        .and(right)
+        .for_each(|slot, right| *slot = combine(slot, right));
     Ok(())
 }
 
@@ -274,6 +304,18 @@ pub fn mask_logic_into<L: MaskElement, R: MaskElement, O: MaskElement>(
 ) -> Result<()> {
     combine_into(left, right, out, |&left, &right| {
         O::of(logic.apply(L::set(left), R::set(right)))
+    })
+}
+
+/// [`mask_logic_into`], accumulating over the left operand. See
+/// [`combine_in_place`].
+pub fn mask_logic_in_place<A: MaskElement, R: MaskElement>(
+    acc: ArrayViewMut3<'_, A>,
+    right: ArrayView3<'_, R>,
+    logic: Logic,
+) -> Result<()> {
+    combine_in_place(acc, right, |&acc, &right| {
+        A::of(logic.apply(A::set(acc), R::set(right)))
     })
 }
 
@@ -992,8 +1034,9 @@ impl<M: MapFn> BlockOp for VoxelwiseMapOp<M> {
 /// same voxels, and it is what a chain had to write before this. It is two ops,
 /// and the cost is not the second pass: it is the buffer **between** them, which
 /// is the `f64` image the narrowing exists to avoid and which a fan-in allocates
-/// per branch (`Chain::apply_placed`'s `Parallel` arm allocates one buffer per
-/// branch at the branch's own declared width). A threshold whose branch result
+/// per branch (`Chain::apply_placed`'s `Parallel` arm allocates each branch's
+/// buffer at the branch's own declared width, however many of them it holds at
+/// once). A threshold whose branch result
 /// is `f64` therefore costs the eight bytes a voxel whatever is done to it
 /// afterwards, and inserting the narrowing after it does not take them back.
 ///
@@ -1480,6 +1523,24 @@ impl LogicCombine {
         self
     }
 
+    /// **The element type a partial fold is carried in: `Bool`**, whatever the
+    /// branches and the output are.
+    ///
+    /// What a partial fold holds is a bit, and it is the one buffer in the node
+    /// whose width nothing outside the node can observe. Under the mask
+    /// convention it carries the same information an `f64` one did — `from_set`
+    /// writes what `is_set` reads — at an eighth of the bytes, at the block
+    /// sizes where a fan-in's own buffers are what a run is holding.
+    ///
+    /// One function rather than a literal in each place, because
+    /// [`Combine::fold_carrier`] and [`Combine::apply`] must agree about it: the
+    /// walk allocates the partial from the first and the collected path from the
+    /// second, and the two answers being one fact is what makes them the same
+    /// bytes.
+    fn carrier(&self) -> Dtype {
+        Dtype::Bool
+    }
+
     /// One pair, through this module's kernels and nothing else.
     ///
     /// The three carriers are resolved here, once per pair rather than once per
@@ -1488,6 +1549,10 @@ impl LogicCombine {
     /// look at. A tag that is neither carrier reaches `view` and is named there,
     /// which is the same failure it has always been — [`Self::accepts`] refuses
     /// it when the plan is made.
+    ///
+    /// **Both paths through a fan-in end here**, which is what makes them one
+    /// answer: [`Combine::apply`] folds the collected list through it and
+    /// [`Combine::fold_pair`] hands the walk the same step.
     fn pair(&self, left: &Voxels, right: &Voxels, out: &mut Voxels) -> Result<()> {
         macro_rules! into_out {
             ($left:ty, $right:ty) => {
@@ -1600,7 +1665,7 @@ impl Combine for LogicCombine {
         Ok(first)
     }
 
-    fn apply(&self, inputs: &[Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
+    fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
         if inputs.len() < 2 {
             return Err(Error::InvalidArgument(format!(
                 "{}: a connective joins at least two results and was handed {}",
@@ -1616,14 +1681,10 @@ impl Combine for LogicCombine {
             if last {
                 self.pair(folded.as_ref().unwrap_or(&inputs[0]), &inputs[index], out)?;
             } else {
-                // **The intermediate is a `Bool`**, whatever the branches and
-                // the output are: what a partial fold holds is a bit, and this
-                // is the one buffer in the node whose width nothing outside the
-                // node can observe. Under the mask convention it carries the
-                // same information an `f64` one did — `from_set` writes what
-                // `is_set` reads — at an eighth of the bytes, at the block sizes
-                // where a fan-in's own buffers are what a run is holding.
-                let mut next = Voxels::zeros(Dtype::Bool, inputs[0].shape())?;
+                // The intermediate is [`Self::carrier`]'s answer, which is also
+                // what `Combine::fold_carrier` tells the walk to allocate when
+                // the walk drives this fold itself.
+                let mut next = Voxels::zeros(self.carrier(), inputs[0].shape())?;
                 self.pair(
                     folded.as_ref().unwrap_or(&inputs[0]),
                     &inputs[index],
@@ -1633,6 +1694,56 @@ impl Combine for LogicCombine {
             }
         }
         Ok(())
+    }
+
+    /// **A left fold over pairs, carried in [`Self::carrier`].**
+    ///
+    /// `And`, `Or` and `Xor` are associative, which is the same property the
+    /// type's header rests the arity on, so `apply` over `n` results and the
+    /// walk's own fold over the same `n` are one expression evaluated the same
+    /// way — both reach [`Self::pair`], in branch order, with the same
+    /// intermediate width.
+    ///
+    /// It is answered for every accepted list, arity two included. There is
+    /// nothing to save at two — the walk holds both results either way — and one
+    /// path is worth more than a saving: a combine whose two- and n-branch cases
+    /// go through different code is a combine with a place for them to differ.
+    fn fold_carrier(&self, _inputs: &[Dtype]) -> Option<Dtype> {
+        Some(self.carrier())
+    }
+
+    fn fold_pair(
+        &self,
+        left: &Voxels,
+        right: &Voxels,
+        out: &mut Voxels,
+        _at: &Anchor,
+    ) -> Result<()> {
+        self.pair(left, right, out)
+    }
+
+    /// The same connective, over the accumulator. See
+    /// [`Combine::fold_in_place`].
+    ///
+    /// The accumulator is in [`Self::carrier`] — the walk only offers a partial
+    /// whose element type is the declared carrier — so the match here is over
+    /// the *right* operand's width alone, where [`Self::pair`] has to match
+    /// over three.
+    fn fold_in_place(&self, acc: &mut Voxels, right: &Voxels, _at: &Anchor) -> Option<Result<()>> {
+        Some((|| -> Result<()> {
+            match (acc.dtype(), right.dtype()) {
+                (Dtype::Bool, Dtype::Bool) => {
+                    mask_logic_in_place(acc.view_mut::<bool>()?, right.view::<bool>()?, self.logic)
+                }
+                (Dtype::Bool, _) => {
+                    mask_logic_in_place(acc.view_mut::<bool>()?, right.view::<f64>()?, self.logic)
+                }
+                (_, Dtype::Bool) => {
+                    mask_logic_in_place(acc.view_mut::<f64>()?, right.view::<bool>()?, self.logic)
+                }
+                _ => mask_logic_in_place(acc.view_mut::<f64>()?, right.view::<f64>()?, self.logic),
+            }
+        })())
     }
 
     /// The exact fold, because *every* operand is known.
@@ -1877,12 +1988,47 @@ pub fn arithmetic_into<T: Arithmetical>(
     combine_into(left, right, out, |&left, &right| op.apply(left, right))
 }
 
+/// [`arithmetic_into`], accumulating over the left operand. See
+/// [`combine_in_place`].
+///
+/// **The operand order is preserved and that is not cosmetic**: subtraction and
+/// division are not commutative, so `acc = op(acc, right)` and
+/// `acc = op(right, acc)` are different volumes. The accumulator is the *left*
+/// operand because a left fold's partial is its left operand, which is what
+/// makes this step identical to the one [`arithmetic_into`] takes.
+pub fn arithmetic_in_place<T: Arithmetical>(
+    acc: ArrayViewMut3<'_, T>,
+    right: ArrayView3<'_, T>,
+    op: Arithmetic,
+) -> Result<()> {
+    combine_in_place(acc, right, |&acc, &right| op.apply(acc, right))
+}
+
 /// `out = op(left, right)` where `op` is a **selection** and the element type
 /// has an order of its own.
 ///
 /// Refuses the four arithmetic operations by name rather than silently doing
 /// something: an integer sum is what [`Arithmetic::admits`] declines and this is
 /// the kernel that would have had to invent a rule for it.
+/// [`selection_into`], accumulating over the left operand. See
+/// [`combine_in_place`].
+pub fn selection_in_place<T: Ord + Copy>(
+    acc: ArrayViewMut3<'_, T>,
+    right: ArrayView3<'_, T>,
+    op: Arithmetic,
+) -> Result<()> {
+    if !matches!(op, Arithmetic::Minimum | Arithmetic::Maximum) {
+        return Err(Error::InvalidArgument(format!(
+            "selection_in_place: `{}` is arithmetic rather than a selection, and this kernel is \
+             stated over an ordered element type that need not be closed under it",
+            op.label()
+        )));
+    }
+    combine_in_place(acc, right, |&acc, &right| {
+        op.select(acc, right).expect("a selection, checked above")
+    })
+}
+
 pub fn selection_into<T: Ord + Copy>(
     left: ArrayView3<'_, T>,
     right: ArrayView3<'_, T>,
@@ -1951,6 +2097,10 @@ impl ArithmeticCombine {
     }
 
     /// One pair, through this module's kernels and nothing else.
+    ///
+    /// **Both paths through a fan-in end here**, which is what makes them one
+    /// answer: [`Combine::apply`] folds the collected list through it and
+    /// [`Combine::fold_pair`] hands the walk the same step.
     fn pair(&self, left: &Voxels, right: &Voxels, out: &mut Voxels) -> Result<()> {
         macro_rules! selected {
             ($type:ty) => {
@@ -2081,7 +2231,7 @@ impl Combine for ArithmeticCombine {
         Ok(first)
     }
 
-    fn apply(&self, inputs: &[Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
+    fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
         if inputs.len() < 2 || (!self.op.folds_over_many() && inputs.len() != 2) {
             return Err(Error::InvalidArgument(format!(
                 "{}: `{}` joins {} results and was handed {}",
@@ -2115,6 +2265,89 @@ impl Combine for ArithmeticCombine {
             }
         }
         Ok(())
+    }
+
+    /// **A left fold over pairs, carried in the branches' own element type —
+    /// but only for the four operations that are one.**
+    ///
+    /// [`Arithmetic::folds_over_many`] is the whole of the condition, and it is
+    /// the same one `accepts` and `output_shape` already use: `subtract` and
+    /// `divide` have a left operand and a right operand and are refused above
+    /// two branches, so there is no fold of them to declare. Declaring one
+    /// anyway would not be a residency saving, it would be a convention about
+    /// where the parentheses went — which is what those two refusals exist to
+    /// prevent.
+    ///
+    /// **Associativity is not what licenses this, and `add` is why.** `f64`
+    /// addition is not associative, so `(a + b) + c` and `a + (b + c)` are
+    /// different volumes. What is being promised is narrower and exact: the walk
+    /// folds *left*, in *branch order*, which is what [`Self::apply`] does over
+    /// the collected list. Same pairs, same order, same rounding, same bytes.
+    /// The carrier is the branches' own type for the same reason — a partial
+    /// fold widened to `f64` and narrowed back would be a double rounding, and
+    /// a double rounding is not a rounding.
+    fn fold_carrier(&self, inputs: &[Dtype]) -> Option<Dtype> {
+        self.op.folds_over_many().then(|| inputs[0])
+    }
+
+    fn fold_pair(
+        &self,
+        left: &Voxels,
+        right: &Voxels,
+        out: &mut Voxels,
+        _at: &Anchor,
+    ) -> Result<()> {
+        self.pair(left, right, out)
+    }
+
+    /// The same step, over the accumulator. See [`Combine::fold_in_place`].
+    ///
+    /// **This is the combine where accumulating pays**, and the reason is
+    /// [`Self::fold_carrier`] two methods up: it returns `inputs[0]`, the
+    /// branches' own element type, so the partial is in the carrier from
+    /// **branch 0** and every join can accumulate. `LogicCombine`'s carrier is
+    /// `Bool` while its arms generally produce `f64`, so its first join must
+    /// allocate — and the first join is the moment two branch buffers and a
+    /// fresh join buffer are all live, which is the peak. Same method, and it
+    /// removes a buffer from one of the two.
+    ///
+    /// The width match is over the accumulator, which is also the right
+    /// operand's: a fold whose operands disagreed would have been refused by
+    /// [`Combine::accepts`] before the run started.
+    fn fold_in_place(&self, acc: &mut Voxels, right: &Voxels, _at: &Anchor) -> Option<Result<()>> {
+        if acc.dtype() != right.dtype() {
+            return None;
+        }
+        macro_rules! selected {
+            ($type:ty) => {
+                selection_in_place(acc.view_mut::<$type>()?, right.view::<$type>()?, self.op)
+            };
+        }
+        Some((|| -> Result<()> {
+            match acc.dtype() {
+                Dtype::F64 => {
+                    arithmetic_in_place(acc.view_mut::<f64>()?, right.view::<f64>()?, self.op)
+                }
+                Dtype::F32 => {
+                    arithmetic_in_place(acc.view_mut::<f32>()?, right.view::<f32>()?, self.op)
+                }
+                Dtype::Bool => selected!(bool),
+                Dtype::U8 => selected!(u8),
+                Dtype::U16 => selected!(u16),
+                Dtype::U32 => selected!(u32),
+                Dtype::U64 => selected!(u64),
+                Dtype::I8 => selected!(i8),
+                Dtype::I16 => selected!(i16),
+                Dtype::I32 => selected!(i32),
+                Dtype::I64 => selected!(i64),
+                other => Err(Error::InvalidArgument(format!(
+                    "{}: `{}` is not stated over {}. `accepts` refuses it before a run starts.",
+                    self.name,
+                    self.op.label(),
+                    other.numpy_name()
+                ))),
+            }
+        })())
     }
 
     /// The fold, **only where it is the same value in every element type this
@@ -3323,7 +3556,7 @@ mod arithmetic_tests {
         let combine = ArithmeticCombine::new("arithmetic", op);
         let mut out = Voxels::zeros(left.dtype(), left.shape()).unwrap();
         combine
-            .apply(&[left, right], &mut out, &Anchor::whole([1, 1, 1]))
+            .apply(&[&left, &right], &mut out, &Anchor::whole([1, 1, 1]))
             .unwrap();
         out
     }

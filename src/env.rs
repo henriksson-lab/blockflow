@@ -805,6 +805,39 @@ pub trait Environment: Sync {
         self.discard_image(image)
     }
 
+    /// **Declare reads that are coming, so they can be started early.**
+    ///
+    /// `regions` are future reads of `image`, **in the plan's own visit order**,
+    /// and the position in the slice is the rank. An environment that can act on
+    /// this fetches them ahead; the default does nothing, which is the correct
+    /// behaviour for every environment that has nothing to fetch from.
+    ///
+    /// # Why the rank is the plan's order and must not be recency
+    ///
+    /// `docs/design/cache-and-prefetch.md` §4.1 makes the argument and it is the
+    /// reason this is safe to call from a greedy scheduler: **a prefetcher
+    /// ranking on the plan is immune to the compute scheduler's myopia, because
+    /// it is not consulting the throughput criterion at all.** A prefetcher that
+    /// re-ranked on what was read most recently would inherit exactly the
+    /// short-horizon blindness the separation exists to avoid.
+    ///
+    /// # Nothing here is predicted
+    ///
+    /// The block plan is enumerated up front, so these are not guesses about
+    /// what might be read — they are the reads the plan will make.
+    /// `Decomposition::exact_read_voxels` was measured against a real tile-scale
+    /// run **to the voxel**: 3 549 686 208 predicted, 3 549 686 208 asked for.
+    ///
+    /// # Advisory, entirely
+    ///
+    /// A wrong answer here costs a fetch and never a voxel: whatever is
+    /// prefetched is still read through the same path, and whatever is not is
+    /// read on demand. An implementation may ignore it, truncate it, or decline
+    /// it under memory pressure.
+    fn prefetch(&self, _image: usize, _regions: &[Region]) -> Result<()> {
+        Ok(())
+    }
+
     fn counters(&self) -> &EnvCounters;
 
     fn chunk_shape(&self) -> [usize; 3] {
@@ -1049,6 +1082,20 @@ impl ImageStore {
     /// `discard_image` already documented: the flag is what carries the meaning.
     fn release(&mut self) {
         self.data = None;
+    }
+
+    /// [`Self::whole`], **moving the buffer out** instead of copying it.
+    ///
+    /// Same answer, one allocation fewer. `whole` has to clone because it reads
+    /// through a shared borrow and the store outlives the call; this one takes
+    /// the store, so the buffer can be handed straight over. The unwritten case
+    /// is unchanged — there is nothing to move and the sentinel is built the
+    /// same way.
+    fn into_whole(self) -> Result<Voxels> {
+        match self.data {
+            Some(data) => Ok(data),
+            None => Voxels::unwritten(self.dtype, self.shape),
+        }
     }
 }
 
@@ -1402,11 +1449,51 @@ impl ArrayEnvironment {
         self.image_guard(image).dtype
     }
 
+    /// [`Self::output`], **consuming the environment** so the answer is moved
+    /// out rather than copied.
+    ///
+    /// # Why this exists beside `output`
+    ///
+    /// `output` reads through `&self` and therefore has to clone: the
+    /// environment survives the call and the image has to survive with it. For
+    /// the caller that is done — a stage whose last line is `Ok(env.output())`,
+    /// which is most of them — that copy is a **whole-volume allocation that
+    /// exists for the length of one move**. Both the image and the copy are
+    /// live at the moment of the return, so it is a doubling of the answer at
+    /// exactly the point a stage's residency is already at its highest.
+    ///
+    /// This spelling takes `self`, so there is nothing left to share the buffer
+    /// with and it is handed over instead. The answer is the same array; what
+    /// changes is that it is not built twice.
+    ///
+    /// `output` stays, and is right wherever the environment is read more than
+    /// once — a caller reading two answers out of one run cannot consume it for
+    /// the first.
+    pub fn into_output(mut self) -> Voxels {
+        let last = self.n_written - 1;
+        // Truncating rather than indexing: `Vec::remove` would shift, and the
+        // only thing that must hold is that this is the last image. Everything
+        // before it is dropped with `self`.
+        let store = self
+            .images
+            .drain(last..)
+            .next()
+            .expect("`n_written` counts the images this environment was built with");
+        store
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .into_whole()
+            .expect("an image's element type was checked when it was declared")
+    }
+
     /// The last image: the workflow output.
     ///
     /// A workflow whose last phase never ran hands back the unwritten sentinel
     /// over the whole image, which is what a caller reading an unwritten output
     /// always got.
+    ///
+    /// **[`Self::into_output`] where the environment is finished with**, which
+    /// is a whole-volume allocation cheaper.
     pub fn output(&self) -> Voxels {
         self.images[self.n_written - 1]
             .read()
@@ -2306,6 +2393,68 @@ mod tests {
             f64::NAN.to_bits(),
             f64::from_bits(0x7ff8_0000_dead_beef).to_bits(),
             "the float comparison cannot tell two NaNs apart"
+        );
+    }
+
+    /// **Consuming the environment hands back the same answer, and the buffer
+    /// it hands back is the environment's own.**
+    ///
+    /// Two halves, and the second is what makes the first worth having.
+    ///
+    /// * *The same voxels.* `into_output` and `output` agree, on a written
+    ///   image and on an unwritten one — the sentinel path has nothing to move
+    ///   and must still answer.
+    /// * *The liveness control.* Before the consuming call, the environment
+    ///   holds the image; `allocated_image_bytes` says how many. If the move
+    ///   were a copy the total would be paid twice, and there is no way to see
+    ///   that from outside once the environment is gone — so what is asserted
+    ///   is the thing that *can* be seen: the pointer the caller ends up with is
+    ///   the one the environment held. `Voxels` owns its buffer and nothing here
+    ///   shares one, so equal pointers can only mean the buffer was moved.
+    #[test]
+    fn consuming_the_environment_moves_its_answer_out_rather_than_copying_it() {
+        let extent = [4, 5, 6];
+
+        // Written: the move path.
+        let input = Voxels::zeros(Dtype::F64, extent).unwrap();
+        let env = ArrayEnvironment::new(input, 1, [4, 4, 4]).unwrap();
+        let region = Region::whole(&extent);
+        let buf = env.read(0, &region).unwrap();
+        env.write(1, &region, &region, &buf).unwrap();
+        assert_eq!(
+            env.allocated_image_bytes(),
+            2 * (4 * 5 * 6 * 8) as u64,
+            "the input and the written output, so the environment does hold the answer and the \
+             assertion below is about something"
+        );
+        let copied = env.output();
+        let address = |voxels: &Voxels| match voxels {
+            Voxels::F64(array) => array.as_ptr() as usize,
+            other => panic!("this fixture is f64, not {:?}", other.dtype()),
+        };
+        let held = address(&env.image_guard(1).data.as_ref().expect("written"));
+        let moved = env.into_output();
+        assert_eq!(copied, moved, "the two spellings answer differently");
+        assert_eq!(
+            address(&moved),
+            held,
+            "`into_output` handed back a different buffer, so it copied where it should have \
+             moved"
+        );
+
+        // Unwritten: the sentinel path, which has nothing to move. `u8` rather
+        // than `f64` because the float sentinel is a NaN and `NaN != NaN`, so
+        // an equality here would be comparing two values that are unequal to
+        // themselves — `an_unwritten_image_reads_as_the_sentinel_it_would_have_
+        // been_filled_with` is where the float case is checked, through the
+        // property the sentinel is defined by rather than through equality.
+        let input = Voxels::zeros(Dtype::U8, extent).unwrap();
+        let env = ArrayEnvironment::new(input, 1, [4, 4, 4]).unwrap();
+        let copied = env.output();
+        assert_eq!(
+            copied,
+            env.into_output(),
+            "an unwritten output must read the same whichever spelling asks for it"
         );
     }
 

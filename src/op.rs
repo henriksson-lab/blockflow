@@ -1225,7 +1225,138 @@ pub trait Combine: Send + Sync {
     /// input the branches were handed, which is also the anchor of their
     /// results: every branch of a fan-in reads the same buffer at the same
     /// position, which is what makes it a fan-in rather than two chains.
-    fn apply(&self, inputs: &[Voxels], out: &mut Voxels, at: &Anchor) -> Result<()>;
+    ///
+    /// **`&[&Voxels]`, so that a source arm costs no buffer.** A
+    /// `Chain::Source` branch's answer is a buffer the executor fetched and
+    /// owns for the whole call. An owned slice would oblige `Chain::Parallel`
+    /// to copy each one into a `Voxels` of its own before it could call this,
+    /// and at one block that copy is a whole volume — once per source arm, and
+    /// a caller adds source arms freely.
+    ///
+    /// It used to be `&[Voxels]`, and the asymmetry that produced was the tell:
+    /// a combine declaring a [`Self::fold_carrier`] went through
+    /// [`Self::fold_pair`], which takes references, and paid nothing for its
+    /// source arms; a combine without one paid for every arm. Nothing about
+    /// what a combine *computes* differs between those two, so nothing about
+    /// what it holds should have.
+    ///
+    /// Two arms may name the **same** image, and then this is handed one buffer
+    /// twice. That is what those two arms mean — an image is one thing, which is
+    /// why `SourceInputs` is keyed by image and not by leaf — and it is what the
+    /// two copies said before, at twice the bytes.
+    fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, at: &Anchor) -> Result<()>;
+
+    /// Is [`Self::apply`] over `n` results the **left fold** of [`Self::apply`]
+    /// over two — `f(f(f(b0, b1), b2), b3)` — and if so, what element type does
+    /// a partial fold live in?
+    ///
+    /// **Why the walk asks at all.** A `Chain::Parallel` that must hand the
+    /// combine every result at once holds `n` block buffers, and at one block a
+    /// block buffer is a whole volume. A combine that answers here is folded
+    /// incrementally instead and never holds more than two branch results and a
+    /// partial — a figure that does not grow with the arity. The buffers this
+    /// removes were **computed and then not read**: branch 0's result is
+    /// nothing but bytes from the moment it is written until the combine runs,
+    /// so folding it early gives up no locality and no cache.
+    ///
+    /// **`None` is the default, and unlike [`Combine::reach`] that is safe.** A
+    /// combine that says nothing is collected, which is what every combine got
+    /// before this method existed; the cost of forgetting is memory, not a
+    /// wrong volume. A combine that is genuinely n-ary — a median across
+    /// branches, a rank, anything that must see the whole list to answer for
+    /// one voxel — says `None` and means it.
+    ///
+    /// **Answering is a promise about bits.** The fold the walk drives must be
+    /// the same bytes as `apply` over the whole list, at every arity. Order is
+    /// part of that promise: `f64` addition is not associative, so a combine
+    /// that sums must be folded left in branch order and nothing here is
+    /// licensed to reorder. `tests/dead_block_buffers.rs` compares the two
+    /// paths byte for byte, per combine and per arity.
+    ///
+    /// **Two orders are being promised and only one of them is visible from
+    /// this crate.** The *association* order — which pair is folded first — is
+    /// pinned by `add` over `f64`, where it moves the answer. The order of the
+    /// two arguments *within* one pair is not: every folding combine this crate
+    /// ships is commutative pairwise, so a step that swapped `left` and `right`
+    /// computes the same volume and no fixture over `and`, `or`, `xor`, `add`,
+    /// `multiply`, `minimum` or `maximum` can fail on it — measured, by writing
+    /// that mutant and watching it survive. An implementor whose combine is
+    /// associative and *not* commutative is relying on an order this crate's own
+    /// ops cannot check, so the test file keeps one such combine of its own for
+    /// exactly that purpose.
+    ///
+    /// `inputs` is what the branches produce, in branch order — the same list
+    /// [`Self::accepts`] and [`Self::produces`] are asked about, because the
+    /// carrier may depend on it.
+    fn fold_carrier(&self, _inputs: &[Dtype]) -> Option<Dtype> {
+        None
+    }
+
+    /// One step of the fold [`Self::fold_carrier`] declared.
+    ///
+    /// `left` is the partial fold — branch 0's own result at the first step and
+    /// a buffer of the declared carrier at every step after it — and `right` is
+    /// the next branch's result. `out` is a fresh carrier buffer, or this
+    /// node's own output at the last step.
+    ///
+    /// Only ever called where [`Self::fold_carrier`] answered. The default
+    /// refuses by name rather than doing something: declaring a fold and not
+    /// implementing it is a combine that would otherwise be joined by whatever
+    /// this default invented.
+    /// [`Self::fold_pair`] with the left operand **and the output being one
+    /// buffer**, or `None` where the combine cannot do that.
+    ///
+    /// # What it is worth
+    ///
+    /// The fold holds **three** block buffers at its worst moment — the
+    /// partial, the branch just computed, and the buffer their join is written
+    /// into. Accumulating over the partial removes the third. Against the
+    /// residency table in `budget.rs`, that is a fan-in's floor moving from
+    /// `4.00x` a one-in-one-out phase to `3.00x`, whatever the arity.
+    ///
+    /// # The operand it must never be handed, and who checks
+    ///
+    /// **A buffer the run did not allocate for this fold.** A `Chain::Source`
+    /// branch's answer is an input image of the run at the block's read extent,
+    /// which other phases read; accumulating into one would overwrite data the
+    /// plan still needs. `BranchResult::Stored`'s own doc anticipated exactly
+    /// this — *"a fold step that wrote into one of its operands must never
+    /// accumulate into this variant... if something ever does, this
+    /// discriminant is what it has to consult"*. It does, in
+    /// `Chain::apply_tallied`, which offers this only for a `Computed` partial.
+    /// An implementation of this method cannot check it and must not try: by
+    /// the time it is called the provenance is gone.
+    ///
+    /// # Why `Option` rather than a `bool` beside it
+    ///
+    /// The same reason [`Self::fold_carrier`] returns one: a combine that can
+    /// accumulate says so *by being able to*, and there is no second field to
+    /// fall out of agreement with the implementation. `None` is the default and
+    /// leaves the out-of-place fold exactly as it was, so every combine written
+    /// before this existed keeps its recorded figures.
+    fn fold_in_place(
+        &self,
+        _acc: &mut Voxels,
+        _right: &Voxels,
+        _at: &Anchor,
+    ) -> Option<Result<()>> {
+        None
+    }
+
+    fn fold_pair(
+        &self,
+        _left: &Voxels,
+        _right: &Voxels,
+        _out: &mut Voxels,
+        _at: &Anchor,
+    ) -> Result<()> {
+        Err(Error::InvalidArgument(format!(
+            "combine {:?} declared a fold carrier and did not implement `fold_pair`. The two \
+             are one statement: the carrier says the answer over n branches is the left fold \
+             of the answer over two, and this is that fold.",
+            self.name()
+        )))
+    }
 
     /// If branch `i` would produce the constant `values[i]` everywhere, is the
     /// result a known constant? `None` — the default — disables the short
@@ -1326,6 +1457,106 @@ impl<'a> SourceInputs<'a> {
     }
 }
 
+/// The buffer a [`Chain::Source`] leaf answers with, checked against what the
+/// leaf declares.
+///
+/// **One function because there are now three call sites and one meaning.** A
+/// source leaf's answer is the stored image at the block's read extent — a
+/// buffer the executor fetched before the chain was entered and keeps alive for
+/// the whole of it. Writing that answer into a caller's `out` is a copy
+/// ([`Chain::apply_tallied`]'s `Source` arm); using it as an *operand* is not,
+/// and the two arms that do so hand this reference straight on. Three copies of
+/// the two checks below would have been three places for the operand paths to
+/// drift from the one that copies.
+///
+/// **Both checks are the ones that were already here**, in the same order and
+/// with the same words: the leaf's declared element type against what the
+/// buffer holds, and the extent the caller expects against the extent that was
+/// read. `expected` is the shape the node would have written — `out.shape()`
+/// for the copying arm, the branch's declared output shape for a fan-in
+/// operand — and they are the same quantity, since a source leaf produces the
+/// shape it is handed.
+fn stored_source<'a>(
+    image: ImageId,
+    dtype: Dtype,
+    sources: SourceInputs<'a>,
+    expected: [usize; 3],
+) -> Result<&'a Voxels> {
+    let stored = sources.get(image)?;
+    if stored.dtype() != dtype {
+        return Err(Error::InvalidArgument(format!(
+            "a source leaf declares image {image} holds {} and the buffer read from it holds \
+             {}. The declaration is what every fold of this chain was built from, so the two \
+             have to be one fact.",
+            dtype.numpy_name(),
+            stored.dtype().numpy_name()
+        )));
+    }
+    if stored.shape() != expected {
+        return Err(Error::ShapeMismatch {
+            expected: expected.to_vec(),
+            got: stored.shape().to_vec(),
+        });
+    }
+    Ok(stored)
+}
+
+/// One branch's contribution to a fan-in fold: a buffer this walk allocated, or
+/// one the run already holds.
+///
+/// **The distinction is carried in the type rather than in a flag**, so that
+/// the tally cannot get it wrong: [`Self::allocated_bytes`] is what *this walk*
+/// took, and a stored buffer took nothing. A tally that charged for a borrowed
+/// buffer would report residency the walk did not cause, which is the same
+/// class of error as one that skipped a buffer it did cause.
+enum BranchResult<'a> {
+    /// A branch that computed its answer, into a buffer allocated here.
+    Computed(Voxels),
+    /// A [`Chain::Source`] leaf, whose answer is a buffer the executor fetched
+    /// and owns for the length of this call.
+    ///
+    /// **Read-only, and that is load-bearing rather than incidental.** This is
+    /// an input image of the run, which other phases read; a fold step that
+    /// wrote into one of its operands — the in-place accumulation that would
+    /// take a fan-in's floor below its current three buffers — must never
+    /// accumulate into this variant. That check does not exist because nothing
+    /// accumulates in place today; if something ever does, this discriminant is
+    /// what it has to consult, and the two changes are safe together only
+    /// because of it.
+    Stored(&'a Voxels),
+}
+
+/// The owned buffer of a `Computed` branch result, or `None` for a borrowed one.
+///
+/// **A free function taking `&mut BranchResult` rather than a method**, so that
+/// the one place an accumulator can be obtained is the one place the
+/// `Computed`/`Stored` distinction is made. A method named `buffer_mut` would
+/// read as the mutable twin of `buffer`, which returns something for both
+/// variants — and the whole point here is that this must not.
+fn partial_slot<'a>(result: &'a mut BranchResult<'_>) -> Option<&'a mut Voxels> {
+    match result {
+        BranchResult::Computed(voxels) => Some(voxels),
+        BranchResult::Stored(_) => None,
+    }
+}
+
+impl BranchResult<'_> {
+    fn buffer(&self) -> &Voxels {
+        match self {
+            BranchResult::Computed(voxels) => voxels,
+            BranchResult::Stored(voxels) => voxels,
+        }
+    }
+
+    /// What this walk allocated for it — nothing, for a buffer it borrowed.
+    fn allocated_bytes(&self) -> u64 {
+        match self {
+            BranchResult::Computed(voxels) => voxels.bytes(),
+            BranchResult::Stored(_) => 0,
+        }
+    }
+}
+
 // ---------------------------------------------- what a block actually held --
 
 /// A running count of the block buffers one [`Chain::apply_tallied`] walk holds.
@@ -1360,15 +1591,31 @@ impl Tally {
 /// one block buffer:
 ///
 /// ```text
-/// one in, one out                2.00x        fan-in, 3 computed arms    5.13x
-/// sequence of four maps          4.00x        fan-in, 1 arm + 1 source   5.00x
-/// fan-in, 2 computed arms        4.00x        fan-in, 1 arm + 2 sources  7.13x
+/// one in, one out                2.00x        fan-in, 3 computed arms    4.12x
+/// sequence of two maps           3.00x        fan-in, 7 computed arms    4.12x
+/// sequence from a source         3.00x        fan-in, 1 arm + 1 source   4.00x
+/// sequence of four maps          4.00x        fan-in, 2 source arms      4.00x
+/// fan-in, 2 computed arms        4.00x        fan-in, 1 arm + 2 sources  5.13x
 /// ```
 ///
-/// The excess is buffers [`Chain::apply_placed`] allocates — a `Sequence` clones
-/// its input and holds an intermediate, a `Parallel` holds one buffer per branch
-/// **at once**, a `Chain::Source` arm is handed a fetched buffer besides. This
-/// type is that walk reporting its own high-water mark.
+/// The excess is buffers [`Chain::apply_placed`] allocates — a `Sequence` holds
+/// the intermediate it is reading and the one it is writing, a `Parallel` holds
+/// branch buffers, a `Chain::Source` arm is handed a fetched buffer besides.
+/// This type is that walk reporting its own high-water mark.
+///
+/// **Three arms and seven arms measure the same, and that is the row to read.**
+/// A `Parallel` held one buffer per branch until the combine had read them all,
+/// so the figure grew with the arity. Where the combine declares itself a left
+/// fold over pairs ([`Combine::fold_carrier`]) the walk folds as the branches
+/// are computed and holds three buffers at its worst moment whatever the arity.
+///
+/// **And the source rows fell because a source arm is no longer copied.** A
+/// [`Chain::Source`] leaf's answer is a buffer the executor fetched and owns for
+/// the whole call; where that answer is an *operand* — a fan-in branch, the head
+/// of a sequence — the walk hands the reference on and allocates nothing, so
+/// `fan-in, 2 source arms` holds only the input, the output and the two fetched
+/// buffers. A leaf that writes a caller's `out` still copies, because a copy is
+/// what writing means.
 ///
 /// Why observed and not derived
 /// ----------------------------
@@ -1395,16 +1642,28 @@ impl Tally {
 ///   chain shape and the same block, two framework buffers in every case: a
 ///   voxelwise map holds `2.00x`, a `5^3` morphological open `2.38x`, a `5^3`
 ///   rank filter `4.00x`;
-/// * whatever a [`Combine`] allocates inside its own `apply` — `LogicCombine`'s
-///   fold intermediate, one `Bool` block, once it has three branches to fold;
+/// * whatever a [`Combine`] allocates inside its own `apply`. **`LogicCombine`'s
+///   fold intermediate used to be the example here and is not any more**: the
+///   walk drives that fold itself, so the buffer is allocated where it can be
+///   counted. What is left outside is a combine that declares no fold carrier
+///   and allocates scratch of its own;
 /// * the `Region` [`Voxels::assign`] builds, which is how a [`Chain::Source`]
-///   arm finishes: two three-element `Vec<usize>`, 48 bytes.
+///   arm finishes when it *copies*: two three-element `Vec<usize>`, 48 bytes.
+///   A source leaf used as an **operand** is borrowed and never assigns, so
+///   this is now only the arm that writes a caller's `out`;
+/// * what the walk allocates **before the tally exists** — the shape and
+///   element-type folds at the top of [`Chain::apply_tallied`], which are
+///   `placed_output_shape` and `produces` and are asked of a plan as readily as
+///   of a run. There is no tally to write them to and putting one in a planning
+///   method would be measurement apparatus in an API about plans.
 ///
-/// **Those are transient, and a peak takes the largest rather than their sum.**
-/// Every `assign` has finished before a combine allocates, so a chain with both
-/// is short by the larger of the two and not by both. The test asserts that
-/// exactly; writing it as a sum was wrong by precisely one of them, and the
-/// equality is what said so.
+/// **Those are all transient, so what is missing is a question about *when* the
+/// peak falls and not only about what is allocated.** The preamble's folds are
+/// freed before the first block buffer, so they reach the high-water mark only
+/// for a chain that allocates no block buffer at all — which a fan-in became
+/// only once every arm could be borrowed. `tests/working_set_residency.rs`
+/// asserts each row exactly rather than allowing a window for any of it, which
+/// is how that term was found rather than assumed away.
 ///
 /// So this narrows the gap and does not close it. A figure claiming to close it
 /// would be worse than the one it replaced, because the one it replaced is at
@@ -2547,24 +2806,14 @@ impl Chain {
             // copy and not a slice: the executor already asked for exactly the
             // extent, at reach 0, and anything else would mean the plan and the
             // read disagreed.
+            //
+            // **The copy is here because `out` is what the caller asked to be
+            // written**, and only here. Where a source leaf's answer is an
+            // *operand* — a fan-in branch, the head of a sequence — the two
+            // arms below hand [`stored_source`]'s reference straight on and
+            // allocate nothing; see the comment on each.
             Chain::Source { image, dtype } => {
-                let stored = sources.get(*image)?;
-                if stored.dtype() != *dtype {
-                    return Err(Error::InvalidArgument(format!(
-                        "a source leaf declares image {image} holds {} and the buffer read from \
-                         it holds {}. The declaration is what every fold of this chain was built \
-                         from, so the two have to be one fact.",
-                        dtype.numpy_name(),
-                        stored.dtype().numpy_name()
-                    )));
-                }
-                if stored.shape() != out.shape() {
-                    return Err(Error::ShapeMismatch {
-                        expected: out.shape().to_vec(),
-                        got: stored.shape().to_vec(),
-                    });
-                }
-                out.assign(stored)
+                out.assign(stored_source(*image, *dtype, sources, out.shape())?)
             }
             Chain::Alternative { branches, taken } => {
                 branches[*taken].apply_tallied(input, sources, out, at, tally)
@@ -2576,33 +2825,203 @@ impl Chain {
             // position-dependent branch see the position it actually has.
             //
             // The results live here, in this frame, for the length of this
-            // call: `branches.len()` buffers of the branch's own declared shape
-            // and element type, allocated exactly the way `Sequence` allocates
-            // its intermediates a few lines below. They never reach an image and
+            // call: buffers of the branch's own declared shape and element
+            // type, allocated exactly the way `Sequence` allocates its
+            // intermediates a few lines below. They never reach an image and
             // never reach the environment, because an image is a phase's output
             // and this whole node is one slot of one phase.
+            //
+            // **How many of them are alive at once is the combine's answer, not
+            // this node's.** A combine that declares itself a left fold over
+            // pairs ([`Combine::fold_carrier`]) is folded as the branches are
+            // computed and never holds more than two results and a partial; one
+            // that must see the whole list at once is handed the whole list.
+            // The first path exists because a collected branch result is
+            // **computed and then not read** — from the moment a branch finishes
+            // until the combine runs it is bytes and nothing else — so folding
+            // it early gives up no locality, and at one block each of those
+            // buffers is a whole volume.
             Chain::Parallel { branches, combine } => {
-                let mut results: Vec<Voxels> = Vec::with_capacity(branches.len());
+                // Scoped so it is freed before the first branch buffer is
+                // allocated: it is `branches.len()` bytes and it is deliberately
+                // **not** tallied, because it can never be part of the walk's
+                // high-water mark. `tests/working_set_residency.rs` checks that
+                // claim rather than trusting it — it accounts for every byte the
+                // allocator saw as an equality, so a transient that did reach
+                // the peak would show up there as a residual.
+                let carrier = {
+                    let produced = branches
+                        .iter()
+                        .map(|branch| branch.produces(input.dtype()))
+                        .collect::<Result<Vec<Dtype>>>()?;
+                    combine.fold_carrier(&produced)
+                };
+                if let Some(carrier) = carrier {
+                    // **The left fold, in branch order, and the order is the
+                    // answer.** `f64` addition is not associative, so a fold
+                    // that visited the branches in any other order would be a
+                    // different volume for a combine that sums; this one visits
+                    // them exactly as the collected path presents them, which is
+                    // what makes the two paths byte-identical rather than merely
+                    // close. `tests/dead_block_buffers.rs` compares them at
+                    // every arity and keeps a fixture whose answer moves if the
+                    // order does.
+                    //
+                    // Three block buffers at the worst moment — the partial, the
+                    // branch just computed, and the buffer their join is written
+                    // into — whatever the arity. The last join writes this
+                    // node's own output, so it needs no buffer of its own.
+                    let mut partial: Option<BranchResult<'_>> = None;
+                    for (index, branch) in branches.iter().enumerate() {
+                        let shape = branch.placed_output_shape(input.shape(), at)?;
+                        let result = match branch {
+                            // **The one branch that needs no buffer.** Its
+                            // answer is the stored image at the block's read
+                            // extent, which the executor fetched before this
+                            // walk started and owns until after it returns, so
+                            // a buffer here would hold a second copy of bytes
+                            // the run already has — and at one block that copy
+                            // is a whole volume, once per source arm. The copy
+                            // was never read in place of anything: the combine
+                            // reads whichever buffer it is handed.
+                            //
+                            // Two arms may name the **same** image, and then
+                            // the combine is handed one buffer twice. That is
+                            // what those two arms mean — an image is one thing,
+                            // which is why `SourceInputs` is keyed by image and
+                            // not by leaf — and it is what the two copies said
+                            // before, at twice the bytes.
+                            Chain::Source { image, dtype } => {
+                                BranchResult::Stored(stored_source(*image, *dtype, sources, shape)?)
+                            }
+                            _ => {
+                                let mut computed =
+                                    Voxels::zeros(branch.produces(input.dtype())?, shape)?;
+                                tally.take(computed.bytes());
+                                branch.apply_tallied(input, sources, &mut computed, at, tally)?;
+                                BranchResult::Computed(computed)
+                            }
+                        };
+                        let Some(mut left) = partial.take() else {
+                            // Branch 0's own result *is* the first partial, in
+                            // its own element type. Nothing is joined yet, so
+                            // nothing is converted yet.
+                            partial = Some(result);
+                            continue;
+                        };
+                        let left_bytes = left.allocated_bytes();
+                        let result_bytes = result.allocated_bytes();
+                        if index + 1 == branches.len() {
+                            let done =
+                                combine.fold_pair(left.buffer(), result.buffer(), out, &at.output);
+                            tally.give(left_bytes);
+                            tally.give(result_bytes);
+                            return done;
+                        }
+                        // **Accumulate over the partial where the combine can,
+                        // which removes the third buffer.**
+                        //
+                        // Offered **only for a `Computed` partial**, and that is
+                        // the whole safety argument. A `Stored` one is a source
+                        // leaf's answer — an input image of the run at the
+                        // block's read extent, which other phases read — so
+                        // writing into it would overwrite data the plan still
+                        // needs. `BranchResult::Stored`'s doc named this
+                        // discriminant as the thing such a change would have to
+                        // consult; this is that consultation, and it is a match
+                        // arm rather than an assertion because the type already
+                        // carries the fact.
+                        //
+                        // The element type must already be the carrier, because
+                        // an in-place fold cannot change the buffer's width. At
+                        // branch 0 the partial is the branch's own result in the
+                        // branch's own type, so the first join generally falls
+                        // through to the out-of-place path and every one after
+                        // it accumulates.
+                        let folded_in_place = match &mut partial_slot(&mut left) {
+                            Some(acc) if acc.dtype() == carrier => {
+                                match combine.fold_in_place(acc, result.buffer(), &at.output) {
+                                    Some(done) => {
+                                        done?;
+                                        true
+                                    }
+                                    None => false,
+                                }
+                            }
+                            _ => false,
+                        };
+                        if folded_in_place {
+                            // Only the right operand dies; the accumulator is
+                            // the partial and lives on.
+                            drop(result);
+                            tally.give(result_bytes);
+                            partial = Some(left);
+                            continue;
+                        }
+                        let mut next = Voxels::zeros(carrier, left.buffer().shape())?;
+                        let next_bytes = next.bytes();
+                        tally.take(next_bytes);
+                        combine.fold_pair(left.buffer(), result.buffer(), &mut next, &at.output)?;
+                        // Both operands die here, at the moment they really do:
+                        // the join has read every voxel of each and nothing
+                        // below reads either again. A borrowed one dies as a
+                        // reference and gives back nothing, because it took
+                        // nothing.
+                        drop(left);
+                        drop(result);
+                        tally.give(left_bytes);
+                        tally.give(result_bytes);
+                        partial = Some(BranchResult::Computed(next));
+                    }
+                    // Fewer than two branches, which `Chain::parallel` refuses
+                    // and `Combine::accepts` refuses again through `produces` at
+                    // the top of this function. Reached only by a `Parallel`
+                    // built from the variant's own fields past both, and it must
+                    // be an error rather than a silent success: the loop above
+                    // never wrote `out`.
+                    return Err(Error::InvalidArgument(format!(
+                        "combine {:?} declares a fold and was handed {} branches. A fold over \
+                         fewer than two results never writes its output, so there is \
+                         nothing this node could return that would be an answer.",
+                        combine.name(),
+                        branches.len()
+                    )));
+                }
+                let mut results: Vec<BranchResult<'_>> = Vec::with_capacity(branches.len());
                 // Every branch's result is held until the combine has read them
                 // all, so they are taken and not released one at a time. This is
-                // the term the byte budget's `x 2.0` is most wrong about.
+                // the term the byte budget's `x 2.0` is most wrong about, and it
+                // is what a combine avoids by declaring a fold carrier.
                 //
                 // The vector's own spine is counted with them. It is three
                 // orders smaller than what it holds and it is still a real
                 // allocation this walk makes; a tally that skipped it would be a
                 // tally with a rounding error in it, and a rounding error is
                 // where a real regression hides.
-                let mut held = (results.capacity() * std::mem::size_of::<Voxels>()) as u64;
+                let mut held =
+                    (results.capacity() * std::mem::size_of::<BranchResult<'_>>()) as u64;
                 tally.take(held);
                 for branch in branches {
-                    let mut result = Voxels::zeros(
-                        branch.produces(input.dtype())?,
-                        branch.placed_output_shape(input.shape(), at)?,
-                    )?;
-                    let bytes = result.bytes();
-                    tally.take(bytes);
-                    held += bytes;
-                    branch.apply_tallied(input, sources, &mut result, at, tally)?;
+                    let shape = branch.placed_output_shape(input.shape(), at)?;
+                    // The same two cases the fold path above distinguishes, for
+                    // the same reason and with the same type carrying it: a
+                    // source leaf's answer is already in memory and borrowing it
+                    // costs nothing, while `allocated_bytes` keeps the tally
+                    // honest about which of the two this walk paid for.
+                    let result = match branch {
+                        Chain::Source { image, dtype } => {
+                            BranchResult::Stored(stored_source(*image, *dtype, sources, shape)?)
+                        }
+                        _ => {
+                            let mut computed =
+                                Voxels::zeros(branch.produces(input.dtype())?, shape)?;
+                            let bytes = computed.bytes();
+                            tally.take(bytes);
+                            held += bytes;
+                            branch.apply_tallied(input, sources, &mut computed, at, tally)?;
+                            BranchResult::Computed(computed)
+                        }
+                    };
                     results.push(result);
                 }
                 // The combine writes this node's output, so it is anchored where
@@ -2615,7 +3034,8 @@ impl Chain {
                 // op's is not: it is allocated inside `Combine::apply` and
                 // nothing here can see it. See `BlockResidency`, which says so
                 // where a reader will meet the number.
-                let done = combine.apply(&results, out, &at.output);
+                let buffers: Vec<&Voxels> = results.iter().map(BranchResult::buffer).collect();
+                let done = combine.apply(&buffers, out, &at.output);
                 tally.give(held);
                 done
             }
@@ -2630,31 +3050,69 @@ impl Chain {
                     let book = (std::mem::size_of_val(&parts[..])
                         + std::mem::size_of_val(&places[..])) as u64;
                     tally.take(book);
-                    // The clone is a buffer too, and an easy one to forget: a
-                    // sequence of `n` children holds its input twice over before
-                    // it has computed anything.
-                    let mut current = input.clone();
-                    let mut held = current.bytes();
-                    tally.take(held);
-                    for (position, child) in children.iter().enumerate() {
+                    // **The first child reads the caller's block, borrowed.**
+                    // This used to be `input.clone()`, so a sequence of `n`
+                    // children held its input twice over before it had computed
+                    // anything — at one block, a second whole volume that was
+                    // written once and never read, because every read of it went
+                    // to bytes the caller already owned. The clone bought only
+                    // the type: `current` has to be owned from the first
+                    // intermediate onwards, and an `Option` says "not yet" where
+                    // a copy used to.
+                    //
+                    // `None` therefore means *the input*, and it is the only
+                    // difference between the two. Nothing about what any child is
+                    // handed changes: the same bytes at the same placement in the
+                    // same order.
+                    let mut current: Option<Voxels> = None;
+                    let mut held = 0u64;
+                    // **A sequence that *starts* at a source leaf starts at a
+                    // buffer the run already holds.** The leaf ignores the block
+                    // it is handed and answers with the stored image, so running
+                    // it would allocate an intermediate and copy the image into
+                    // it for the next child to read — a whole volume at one
+                    // block, to hold what `sources` is already holding. The
+                    // child is skipped and its answer is borrowed, which is the
+                    // same trade the fan-in arm above makes and for the same
+                    // reason: a source leaf is the only node whose answer exists
+                    // before the walk runs.
+                    //
+                    // The placements are untouched by the skip. A source leaf
+                    // produces the shape it is handed, so `places[1..]` are
+                    // derived from the same extent either way.
+                    let mut head: Option<&Voxels> = None;
+                    let mut first = 0usize;
+                    if let Chain::Source { image, dtype } = &children[0] {
+                        let shape = children[0].placed_output_shape(input.shape(), &places[0])?;
+                        head = Some(stored_source(*image, *dtype, sources, shape)?);
+                        first = 1;
+                    }
+                    for (position, child) in children.iter().enumerate().skip(first) {
+                        // An intermediate this walk computed beats the borrowed
+                        // head, which beats the caller's own block — the order
+                        // the stream actually takes, written as one expression
+                        // so there is nowhere for the three cases to disagree.
+                        let source = current.as_ref().or(head).unwrap_or(input);
                         let place = &places[position];
                         if position + 1 == n {
-                            let done = child.apply_tallied(&current, sources, out, place, tally);
+                            let done = child.apply_tallied(source, sources, out, place, tally);
                             tally.give(held);
                             tally.give(book);
                             return done;
                         }
                         let mut next = Voxels::zeros(
-                            child.produces(current.dtype())?,
-                            child.placed_output_shape(current.shape(), place)?,
+                            child.produces(source.dtype())?,
+                            child.placed_output_shape(source.shape(), place)?,
                         )?;
                         let next_bytes = next.bytes();
                         tally.take(next_bytes);
-                        child.apply_tallied(&current, sources, &mut next, place, tally)?;
-                        // `current` is dropped by the assignment below, so its
-                        // bytes come back at exactly the moment they really do.
+                        child.apply_tallied(source, sources, &mut next, place, tally)?;
+                        // The previous intermediate is dropped by the assignment
+                        // below, so its bytes come back at exactly the moment
+                        // they really do. `held` is zero on the first pass, when
+                        // there was no intermediate and the source was borrowed.
                         tally.give(held);
-                        current = next;
+                        current = Some(next);
                         held = next_bytes;
                     }
                     tally.give(held);
@@ -3359,7 +3817,7 @@ mod tests {
         fn output_shape(&self, inputs: &[[usize; 3]]) -> Result<[usize; 3]> {
             Ok(inputs[0])
         }
-        fn apply(&self, inputs: &[Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
             out.assign(&inputs[0])
         }
     }

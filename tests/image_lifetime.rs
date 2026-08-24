@@ -647,3 +647,95 @@ fn a_phase_that_reads_no_pixels_is_not_a_reader_of_its_input_image() {
         "and the two plans are distinguishable, which is the point of the fix"
     );
 }
+
+/// **A caller can release the input, and the bytes come back.**
+///
+/// [`Visibility`] is derived from *position* — image 0 is the run's input, so it
+/// is `Published` and the executor never frees it. That is the right default and
+/// it is not a statement about whether anybody wants it. `Hints::release_images`
+/// is how a caller says it does not, and it is the only way the input's bytes
+/// are ever returned during a run: at one block an image is a whole volume, and
+/// image 0 is then the largest single thing the executor holds.
+///
+/// Three assertions and the last two are what make the first mean something.
+///
+/// * The bytes fall. `allocated_image_bytes` sums only images that hold a
+///   buffer, so it is a measurement of occupancy rather than of a flag —
+///   `resident_images` counts non-discarded images and would say the same thing
+///   whether or not anything was freed.
+/// * **The control.** The identical run without the hint holds image 0 to the
+///   end. Without this the first assertion would pass just as well against an
+///   environment that never allocated image 0 in the first place.
+/// * **Not one voxel moves.** Releasing an image after its last reader cannot
+///   change an answer, and this is where that is checked rather than argued.
+#[test]
+fn releasing_the_input_frees_it_after_its_last_reader_and_moves_no_voxel() {
+    let released = Hints {
+        release_images: [ImageId::from(0usize)].into_iter().collect(),
+        ..Hints::default()
+    };
+    let (with_answer, with) = run(&released);
+    let (without_answer, without) = run(&Hints::default());
+
+    let image_bytes = (VOLUME.iter().product::<usize>() * Dtype::F64.size_of()) as u64;
+
+    // The control first, so that a fall measured below is a fall from somewhere.
+    assert!(!without.is_discarded(0), "the default must still hold image 0");
+    assert_eq!(
+        without.allocated_image_bytes(),
+        2 * image_bytes,
+        "the default ends holding the input and the output"
+    );
+
+    assert!(with.is_discarded(0), "the hint did not reach the executor");
+    assert_eq!(
+        with.allocated_image_bytes(),
+        image_bytes,
+        "releasing the input must give back exactly one whole image's bytes, and \
+         `allocated_image_bytes` counts buffers rather than flags"
+    );
+    assert_eq!(
+        without.allocated_image_bytes() - with.allocated_image_bytes(),
+        image_bytes
+    );
+
+    // And the answer is the answer.
+    assert_eq!(with_answer, without_answer);
+    assert_eq!(with_answer, input());
+
+    // Reading it back is loud, for `reading_a_freed_image_fails_and_says_why`'s
+    // reason: a released image that came back as zeros would be the defect this
+    // crate fills unwritten images with NaN to prevent.
+    let region = blockflow::region::Region::new(&[0, 0, 0], &[4, 4, 4]);
+    let message = with.read(0, &region).unwrap_err().to_string();
+    assert!(message.contains("discarded"), "{message}");
+}
+
+/// **`keep_images` wins over `release_images`.**
+///
+/// A caller that names one image in both has contradicted itself, and the
+/// reading that cannot lose data is the one to take. Asserted rather than left
+/// to the reader of the guard, because it is the kind of precedence that gets
+/// inverted by a refactor and noticed by nobody.
+#[test]
+fn keeping_an_image_beats_releasing_it() {
+    let both = Hints {
+        keep_images: [ImageId::from(0usize)].into_iter().collect(),
+        release_images: [ImageId::from(0usize)].into_iter().collect(),
+        ..Hints::default()
+    };
+    let (_, env) = run(&both);
+    assert!(
+        !env.is_discarded(0),
+        "`release_images` overrode `keep_images`, so a caller that asked to keep an image lost it"
+    );
+
+    // The liveness half: releasing alone does free it, so the assertion above is
+    // about the precedence and not about a hint that does nothing.
+    let released = Hints {
+        release_images: [ImageId::from(0usize)].into_iter().collect(),
+        ..Hints::default()
+    };
+    let (_, alone) = run(&released);
+    assert!(alone.is_discarded(0));
+}

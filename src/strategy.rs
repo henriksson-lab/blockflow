@@ -131,9 +131,33 @@ impl Workflow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulePriority {
     /// Every block through phase 1, then phase 2. Phase-major materialisation.
+    ///
+    /// **The default, and simulation says it should stay the default.** See
+    /// [`Self::BlockMajor`], whose advertised advantage measures backwards.
     PhaseMajor,
     /// Advance one block as far through the phases as its dependencies allow.
-    /// Fusion, and the smaller working set.
+    ///
+    /// **This said "Fusion, and the smaller working set". Neither half holds in
+    /// this executor**, and `blockflow`'s `tests/simulate_ranks.rs` measures
+    /// both:
+    ///
+    /// * *The working set.* Advancing one block through every phase means
+    ///   **every phase's image is live at once from early in the run**, where
+    ///   [`Self::PhaseMajor`] finishes a phase — and frees what dies with it —
+    ///   before starting the next. At one worker on a three-phase chain that is
+    ///   `8.48 MiB` against `6.38`: a third **more**, not less.
+    /// * *The fusion.* There is none to have. This enum reorders a heap; the
+    ///   environment allocates an image per phase either way. The claim
+    ///   described an execution model this crate does not implement.
+    ///
+    /// It is also slower — across a sweep of two cuts, four worker counts and
+    /// four cache sizes it loses in twelve of the sixteen configurations that
+    /// can tell the two apart, by up to **41%** — and wins by 1-2% only at forty
+    /// workers, where ordering barely moves anything at all.
+    ///
+    /// Kept, because it is a caller-visible option and removing it is a
+    /// separate decision from correcting what it claims. A caller reproducing a
+    /// recorded run needs to be able to name it.
     BlockMajor,
 }
 
@@ -168,6 +192,50 @@ pub struct Hints {
     /// Naming image 0 or the output image is harmless and does nothing; neither
     /// is ever freed.
     pub keep_images: BTreeSet<ImageId>,
+    /// Images the caller will **not** read back, so the executor may free them
+    /// at their last reader even though the plan calls them
+    /// [`Visibility::Published`].
+    ///
+    /// # Why this exists, and why it is not just a wider `Visibility`
+    ///
+    /// [`Visibility`] is *derived from position*: image 0 is the run's input and
+    /// the last image is its output, so both are `Published` and neither is ever
+    /// discarded. That is the right default and it is not a statement about
+    /// whether anybody wants them. A caller that hands its volume to the run and
+    /// never looks at it again holds the input for the whole run for nothing —
+    /// and at one block, where an image is a whole volume, that is the largest
+    /// single thing the executor holds.
+    ///
+    /// The plan cannot know this. Whether the input is wanted afterwards is a
+    /// property of the *caller*, not of the workflow, which is exactly what
+    /// makes it a hint. So it is stated the way [`Self::keep_images`] states its
+    /// mirror image: a named set, empty by default, and empty means today's
+    /// behaviour to the byte.
+    ///
+    /// # It is safe in the direction that matters
+    ///
+    /// Naming an image here cannot move a voxel. Every phase that *reads* it
+    /// still reads it — the freeing is at its last reader, by the same
+    /// [`Decomposition::images_dead_after`] walk everything else uses — so the
+    /// only thing that changes is whether it is still there when the run ends.
+    /// A caller that names an image and then reads it gets
+    /// [`crate::env::ArrayEnvironment::try_image`]'s named refusal, which says
+    /// which image, which phase freed it, and how to keep it. That is the good
+    /// failure: loud, immediate and self-describing, rather than a silent wrong
+    /// answer.
+    ///
+    /// [`Self::keep_images`] wins where both name the same image, because a
+    /// caller that has said both things has contradicted itself and the
+    /// conservative reading is the one that cannot lose data.
+    ///
+    /// # It is worth having only because ownership was fixed first
+    ///
+    /// Freeing image 0 gives bytes back only if the environment's copy is the
+    /// *only* copy. While a stage cloned its input into the environment, the
+    /// caller's own array was still live and freeing image 0 bought nothing.
+    /// A stage that takes its volume by value has given it away, and this is
+    /// then the only way those bytes ever come back.
+    pub release_images: BTreeSet<ImageId>,
     /// Whether a block may be cut into slabs and run on several threads, and by
     /// what rule. See [`SlabPolicy`].
     ///
@@ -203,6 +271,7 @@ impl Default for Hints {
             concurrency: 1,
             prefetch_depth: 0,
             keep_images: BTreeSet::new(),
+            release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
         }
     }
@@ -663,6 +732,41 @@ pub fn execute_phases(
                     if !phase_started[phase] {
                         phase_started[phase] = true;
                         events.emit(Event::PhaseStarted { phase });
+                        // **Declare the phase's reads, once, in plan order.**
+                        //
+                        // Here rather than per wave because the rank *is* the
+                        // plan's order and does not change as waves are
+                        // dispatched — re-submitting each wave would re-rank on
+                        // what has just run, which is recency, and
+                        // `Environment::prefetch` documents why that is the one
+                        // thing the rank must not be. The environment truncates
+                        // to its own lookahead; nothing is predicted, since
+                        // these are the reads the plan will make.
+                        //
+                        // Advisory in the strongest sense: the default
+                        // implementation does nothing, an error here would be
+                        // an error about a fetch nobody has waited for, and a
+                        // demand read serves every one of these anyway. So it
+                        // is not allowed to fail the run.
+                        //
+                        // **Image `phase` only, which is a stated limitation
+                        // rather than the whole story.** A phase reads its own
+                        // input image and, through a source leaf, whichever
+                        // images `PhaseDecomposition::source_images` lists. The
+                        // second set is not declared here. It is not an
+                        // oversight to fix silently: a source arm's regions are
+                        // that leaf's, not this phase's, so declaring them means
+                        // asking each leaf what it will read — worth doing, and
+                        // worth doing with a measurement rather than by
+                        // extending this loop with a guess.
+                        if hints.prefetch_depth > 0 {
+                            let regions: Vec<Region> = graph
+                                .tasks_in_phase(phase)
+                                .iter()
+                                .map(|task| task.geometry.source.clone())
+                                .collect();
+                            let _ = env.prefetch(phase, &regions);
+                        }
                     }
                     events.emit(Event::TaskAdmitted {
                         phase,
@@ -751,9 +855,20 @@ pub fn execute_phases(
                 // `N`-phase chain holds `N + 1` full images for the length of
                 // the run, and only ever two of them are live.
                 for image in decomposition.images_dead_after(phase) {
-                    if decomposition.image_visibility(image) == Visibility::Internal
-                        && !hints.keep_images.contains(&ImageId::from(image))
-                    {
+                    let id = ImageId::from(image);
+                    // `Internal` **or** released. The first is the plan's
+                    // answer — an image that exists only to get from one phase
+                    // to the next — and the second is the caller's, for an image
+                    // the plan calls `Published` because of where it sits and
+                    // that this caller does not want back. See
+                    // `Hints::release_images` for why the plan cannot know that
+                    // and the caller can.
+                    let freeable = decomposition.image_visibility(image) == Visibility::Internal
+                        || hints.release_images.contains(&id);
+                    // `keep_images` wins over `release_images`: a caller that
+                    // named the same image in both has contradicted itself, and
+                    // the reading that cannot lose data is the one to take.
+                    if freeable && !hints.keep_images.contains(&id) {
                         // The phase goes with the image, so that a reader who
                         // wanted it back is told which `keep_images` entry they
                         // needed rather than only that it is gone.
@@ -2480,7 +2595,13 @@ fn distinct_side_outputs(per_phase: &[Vec<Output>]) -> Result<Vec<Output>> {
 /// A flat `[usize; 5]` so both policies are one comparable type: the *only*
 /// difference between fusion and phase-major materialisation is where `phase`
 /// sits in this key.
-fn priority_key(task: &super::graph::Task, hints: &Hints) -> [usize; 5] {
+///
+/// **Public because [`crate::simulate::ExecutorOrder`] calls it**, and calling
+/// it is the point: a simulator claiming to model the executor's dispatch order
+/// must not carry its own copy of that order. The alternative was a transcribed
+/// key and a test comparing the two, which is a drift detector where sharing the
+/// definition is a drift *impossibility*.
+pub fn priority_key(task: &super::graph::Task, hints: &Hints) -> [usize; 5] {
     let axes = hints.visit_order.unwrap_or([0, 1, 2]);
     let spatial = [
         task.index[axes[0]],
@@ -2545,10 +2666,7 @@ pub fn planned_block(
             constraints.model.materialise_cost_per_voxel,
             traffic,
         );
-        let fits = constraints.budget_bytes.is_none_or(|budget| {
-            cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
-                <= budget as f64
-        });
+        let fits = constraints.affords_working_set(&cost);
         if fits {
             return Ok(grid.block());
         }
@@ -2718,6 +2836,11 @@ impl Strategy for Trivial {
             concurrency: 1,
             prefetch_depth: 0,
             keep_images: BTreeSet::new(),
+            // **Nothing released, and that is the safe default a strategy can
+            // take.** Whether the caller wants its input back afterwards is a
+            // property of the caller and not of the plan, so a strategy has
+            // nothing to say about it; see `Hints::release_images`.
+            release_images: BTreeSet::new(),
             // **The policy every strategy advises, and the one that answers
             // `1` under this strategy's own concurrency.** A slab count is
             // derived from the pool and the block lattice, so a strategy states
@@ -3490,13 +3613,8 @@ impl PhasePricer<'_> {
                 traffic,
             )
         };
-        let affordable = |cost: &super::decomposition::PhaseCost| {
-            self.constraints.budget_bytes.is_none_or(|budget| {
-                cost.working_set_bytes_per_block
-                    * self.constraints.expected_concurrency.max(1) as f64
-                    <= budget as f64
-            })
-        };
+        let affordable =
+            |cost: &super::decomposition::PhaseCost| self.constraints.affords_working_set(cost);
         let mut chosen: Option<(f64, usize, BlockGrid)> = None;
         // The halo this phase grants. Equal to the reach unless an op mandates
         // an input extent, in which case it is the per-block window that hands
@@ -3879,8 +3997,11 @@ impl Strategy for Enumerating {
             concurrency: self.concurrency,
             prefetch_depth: 1,
             // Nothing kept: a strategy advising on speed has no reason to want
-            // an intermediate afterwards. A caller who does overrides it.
+            // an intermediate afterwards. A caller who does overrides it. And
+            // nothing released, for `Hints::release_images`'s reason — the
+            // input's fate belongs to whoever owns it.
             keep_images: BTreeSet::new(),
+            release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
         }
     }
@@ -4147,10 +4268,34 @@ impl Strategy for Greedy {
     fn hints(&self, workflow: &Workflow, decomposition: &Decomposition) -> Hints {
         Hints {
             visit_order: consensus_order(workflow, decomposition),
+            // **Both of the next two lines are advice simulation says is
+            // wrong**, and both are left standing until there is something real
+            // to measure them against.
+            //
+            // `BlockMajor`: see [`SchedulePriority::BlockMajor`], whose claimed
+            // "smaller working set" measures a third **larger** at one worker,
+            // and which loses on the clock in twelve of sixteen configurations.
+            //
+            // `prefetch_depth: 2`: `blockflow`'s own simulator sweeps depths 0
+            // to 64 across three worker counts and three cache sizes and finds
+            // **depth 1 optimal in every configuration where prefetch can act
+            // at all** (1.4% to 3.1%), depth 2 already behind it, and depth 4
+            // and up worse than no prefetching. Two mechanisms, both real: a
+            // prefetched chunk evicts one that was about to be used, and a run
+            // of fetches ahead makes the next demand fetch queue behind all of
+            // it.
+            //
+            // **Not changed here, because `prefetch_depth` currently reaches
+            // nothing** — `cache::ChunkCache` has no non-test construction site,
+            // so no `Environment::read` is served from one and this field is
+            // inert in production. Changing an inert number on a model's word
+            // would be a change nobody could have measured. It is the first
+            // thing to measure when the prefetcher is wired.
             priority: SchedulePriority::BlockMajor,
             concurrency: self.concurrency,
             prefetch_depth: 2,
             keep_images: BTreeSet::new(),
+            release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
         }
     }
@@ -4403,6 +4548,7 @@ impl Strategy for Materialising {
             concurrency: self.concurrency,
             prefetch_depth: 1,
             keep_images: BTreeSet::new(),
+            release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
         }
     }

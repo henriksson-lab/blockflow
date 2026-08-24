@@ -181,6 +181,9 @@ use zarrs::array::{
 use zarrs::filesystem::FilesystemStore;
 use zarrs::storage::{StorePrefix, WritableStorageTraits};
 
+use crate::budget::MemoryBudget;
+use crate::cache::{ArrayPolicy, CacheElement, CacheStats, CachingSource, ChunkCache};
+use crate::prefetch::{BlockPlan, Prefetcher};
 use crate::assemble::{describe_image, is_supplied_image, ImageId};
 use crate::decomposition::{check_chunk_exclusive_writes, Decomposition, Visibility};
 use crate::dtype::Dtype;
@@ -188,7 +191,7 @@ use crate::env::{block_shape, BlockBuf, EnvCounters, Environment};
 use crate::error::{Error, Result};
 use crate::geometry::{chunks_touched, region_within};
 use crate::op::{Chain, Output, Placement};
-use crate::region::Region;
+use crate::region::{Region, RegionSource};
 use crate::sidecar::{FileSidecars, Sidecars};
 use crate::voxels::{SideBuf, VoxelElement, Voxels};
 
@@ -698,6 +701,57 @@ struct StoredArray {
     compression: Compression,
 }
 
+/// A [`StoredArray`] as a [`RegionSource`], so that [`CachingSource::attach`]
+/// has something to attach to.
+///
+/// **This is the adapter `docs/design/cache-and-prefetch.md` §1.2 says is the
+/// only missing piece.** That note settles the placement question — the cache
+/// sits *below* `Voxels`, at the per-array chunk lattice, because a cache keyed
+/// by the extent a caller asked for gives "different keys over the same data"
+/// and a halo re-read is precisely two overlapping boxes — and then observes
+/// that `CachingSource` "does not meet the executor" only because nothing
+/// converts an environment's storage call into a `RegionSource<T>`. This does.
+struct StoredArraySource<T> {
+    array: Arc<StoredArray>,
+    element: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> StoredArraySource<T> {
+    fn new(array: Arc<StoredArray>) -> Self {
+        Self {
+            array,
+            element: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> RegionSource<T> for StoredArraySource<T>
+where
+    T: ElementOwned + VoxelElement + Send + Sync + 'static,
+{
+    fn shape(&self) -> &[usize] {
+        &self.array.shape
+    }
+
+    fn read_region(&self, region: &Region) -> Result<ArrayD<T>> {
+        let subset = self.array.subset(region)?;
+        let data: Vec<T> = self
+            .array
+            .array
+            .retrieve_array_subset(&subset)
+            .map_err(Error::backend)?;
+        let shape = block_shape(region)?;
+        ArrayD::from_shape_vec(ndarray::IxDyn(&shape), data).map_err(|_| Error::ShapeMismatch {
+            expected: region.shape.clone(),
+            got: vec![],
+        })
+    }
+
+    fn describe(&self) -> String {
+        format!("zarr array {} {:?}", self.array.id, self.array.shape)
+    }
+}
+
 impl StoredArray {
     fn create(
         store: &Arc<Store>,
@@ -1093,6 +1147,27 @@ pub struct ZarrEnvironment {
     /// On disk, to match the images. An environment whose volumes are shared
     /// between processes must not offer fragments that are not.
     sidecars: Sidecars,
+    /// The read-through chunk cache, or `None` for the unwired default.
+    ///
+    /// **Off unless asked for**, because turning it on changes what a read
+    /// costs and what the process holds, and neither is a thing to acquire by
+    /// upgrading. [`Self::with_cache`] is the one way in.
+    cache: Option<Arc<ChunkCache>>,
+    /// The [`CachingSource`] registered for each cacheable image, type-erased
+    /// because its element type is the image's `Dtype` and that is not known
+    /// until the `by_dtype!` dispatch inside [`Environment::read`].
+    ///
+    /// Erased with `Any` rather than an enum over the eleven widths: the
+    /// downcast is checked, it happens where `T` is already fixed statically by
+    /// the macro, and an enum here would be a second place the dtype list has to
+    /// be kept complete.
+    cached: RwLock<BTreeMap<usize, (crate::cache::ArrayId, Arc<dyn std::any::Any + Send + Sync>)>>,
+    /// The prefetcher, or `None`. Requires a cache: there is nowhere to put a
+    /// chunk fetched ahead without one.
+    prefetcher: Option<Prefetcher>,
+    /// How far down a submitted plan to reach. See [`Self::with_prefetch`] for
+    /// why this is a different number from the prefetcher's thread count.
+    lookahead: usize,
 }
 
 impl ZarrEnvironment {
@@ -1113,6 +1188,185 @@ impl ZarrEnvironment {
     /// [`Self::create_with_compression`] to say otherwise.
     pub fn create(root: impl Into<PathBuf>, input: &Voxels, chunk: [usize; 3]) -> Result<Self> {
         Self::create_with_compression(root, input, chunk, CompressionPolicy::derived())
+    }
+
+    /// Read through a chunk cache of at most `capacity_bytes`.
+    ///
+    /// # What is cached, and why it is not everything
+    ///
+    /// **Only images this run never writes**: image 0 and the supplied inputs.
+    /// Every other image is written by the phase below it and read by the phase
+    /// above, and [`ChunkCache`] has **no per-array invalidation** — only
+    /// [`ChunkCache::clear`], which throws away the source's chunks too. Caching
+    /// a written image would therefore mean either serving stale chunks, or
+    /// clearing the whole cache at every phase boundary and keeping almost
+    /// nothing.
+    ///
+    /// That is a restriction discovered from the API rather than one
+    /// `docs/design/cache-and-prefetch.md` anticipated, and it is stated here
+    /// rather than worked around. **It is also where most of the value is**: a
+    /// halo re-read of the source volume is the repeated read a block plan
+    /// actually makes, and the source is exactly what this does cache. Adding
+    /// per-array invalidation and extending to intermediates is the next step,
+    /// and it is a change to `cache.rs` rather than to this file.
+    ///
+    /// # Why this exists on `ZarrEnvironment` and on no other
+    ///
+    /// The same note's §1.3 refuses the alternatives by name, and both refusals
+    /// are kept:
+    ///
+    /// * **`ArrayEnvironment` must not be cached at all.** Its read is a slice
+    ///   copy out of a volume already entirely resident, so a cache over it
+    ///   would hold a second copy of bytes the process has — the opposite of
+    ///   the purpose. `tests/halo_cost.rs` measured what warmth is worth there
+    ///   (`0.309x` at `32^3`, `0.687x` at `64^3`) and that discount belongs to
+    ///   the **CPU** cache, which no software cache can add to.
+    /// * **`AccountingEnvironment` must not be cached**, because it fabricates:
+    ///   a cache in front of it would report hits against data never read, and
+    ///   the distributed locality harness would start measuring the cache
+    ///   instead of the handout.
+    pub fn with_cache(mut self, capacity_bytes: u64) -> Self {
+        self.cache = Some(Arc::new(ChunkCache::new(
+            MemoryBudget::new(capacity_bytes),
+            capacity_bytes,
+        )));
+        self
+    }
+
+    /// Fetch coming reads ahead, on `depth` threads.
+    ///
+    /// **Requires a cache**, and refuses without one by name rather than
+    /// silently doing nothing: there is nowhere to put a chunk fetched ahead,
+    /// so a prefetcher without a cache is a thread pool that discards its work.
+    ///
+    /// # Two levers, and they are not the same number
+    ///
+    /// This is worth stating because one word covers both and they behave
+    /// differently:
+    ///
+    /// * **`threads`** — how many fetches are in flight at once.
+    ///   [`Prefetcher::new`]'s own `depth`. One thread hides latency against
+    ///   compute; several are genuinely several concurrent requests to storage,
+    ///   which on a networked filesystem is a throughput gain and not only a
+    ///   latency one.
+    /// * **`lookahead`** — how far down the plan a submission reaches, through
+    ///   [`BlockPlan::head`]. This is what decides how early a chunk arrives,
+    ///   and therefore how likely it is to be evicted before the block that
+    ///   wanted it runs.
+    ///
+    /// **The simulator's answer is about `lookahead` and not about `threads`.**
+    /// `tests/simulate_ranks.rs` sweeps a lookahead of 0 to 64 across three
+    /// worker counts and three cache sizes and finds **1 optimal in every
+    /// configuration where prefetch can act at all** (1.4% to 3.1%), 2 already
+    /// behind it, and 4 and up worse than not prefetching — two mechanisms, a
+    /// prefetched chunk evicting one that was about to be used, and a run of
+    /// fetches ahead making the next demand fetch queue behind all of it. That
+    /// model has **one serial IO channel and therefore cannot say anything about
+    /// `threads` at all**, which is exactly the quantity a real store's
+    /// concurrency would decide.
+    ///
+    /// So: take the lookahead figure as a starting point and measure `threads`
+    /// here, against `PrefetchStats` and the cache's waste counters.
+    pub fn with_prefetch(mut self, threads: usize, lookahead: usize) -> Result<Self> {
+        let Some(cache) = self.cache.as_ref() else {
+            return Err(Error::InvalidArgument(
+                "a prefetcher needs a cache to fetch into — without one it is a pool of threads                  that read bytes and discard them. Call `with_cache` first, with the budget the                  prefetched chunks are to be held in."
+                    .to_string(),
+            ));
+        };
+        self.prefetcher = Some(Prefetcher::new(Arc::clone(cache), threads));
+        self.lookahead = lookahead;
+        Ok(self)
+    }
+
+    /// What the prefetcher has done, or `None` where there is none.
+    pub fn prefetch_stats(&self) -> Option<crate::prefetch::PrefetchStats> {
+        self.prefetcher.as_ref().map(|p| p.stats())
+    }
+
+    /// What the cache has done, or `None` where there is no cache.
+    ///
+    /// **The counter that makes a cached run checkable.** A cached run and an
+    /// uncached one must produce identical voxels, which is necessary and not
+    /// sufficient: identical voxels are also what a cache that never serves
+    /// anything produces. `hits` is what separates the two.
+    pub fn cache_stats(&self) -> Option<CacheStats> {
+        self.cache.as_ref().map(|cache| cache.stats())
+    }
+
+    /// Whether `image` may be read through the cache: one this run never writes.
+    fn cacheable(&self, image: usize) -> bool {
+        self.cache.is_some() && (image == 0 || is_supplied_image(image))
+    }
+
+    /// The registered [`CachingSource`] for `image`, registering it on first use.
+    ///
+    /// Returns `None` where there is no cache or the image is written, which is
+    /// the caller's signal to read directly.
+    fn caching_source<T>(&self, image: usize, array: &Arc<StoredArray>) -> Option<Arc<CachingSource<T>>>
+    where
+        T: ElementOwned + VoxelElement + CacheElement + Send + Sync + 'static,
+    {
+        if !self.cacheable(image) {
+            return None;
+        }
+        {
+            let registered = self
+                .cached
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((_, any)) = registered.get(&image) {
+                // The downcast cannot fail: `T` is fixed by the `by_dtype!`
+                // dispatch on this array's own `dtype`, and an array's dtype
+                // does not change. It is still checked rather than assumed —
+                // a `None` here reads as "not cached" and costs a direct read,
+                // where an `unwrap` would cost the run.
+                return any.clone().downcast::<CachingSource<T>>().ok();
+            }
+        }
+        let cache = self.cache.as_ref()?;
+        let source = CachingSource::<T>::attach(
+            Arc::clone(cache),
+            &format!("image-{image}"),
+            // **The array's own chunk shape, and it has to be.** A cache whose
+            // lattice differs from the store's decodes units the store does not
+            // hold, so every entry would be a partial chunk assembled from
+            // several — which is the shape `cache.rs` refuses by name. The value
+            // exists here because `StoredArray` keeps it.
+            &array.chunk,
+            // `Tier::Decoded`, `retain: true` — the default, and stated rather
+            // than taken.
+            //
+            // **Decoded is right for the read this serves.** A halo re-read
+            // wants the neighbour's chunks back without paying the codec again,
+            // and this cache only ever holds the source, which is read many
+            // times over.
+            //
+            // The alternative is real and is not chosen: `Tier::Encoded` holds
+            // roughly **19.7x** more chunks in the same bytes on a compressed
+            // `bool` volume, per `cache.rs`'s own figure, at a decode per hit.
+            // That trade is worth making where the volume is far larger than
+            // the budget and the codec is cheap, and it is a per-array decision
+            // — which is exactly why `ArrayPolicy` is a parameter. Choosing it
+            // per image needs a measurement this file does not have.
+            ArrayPolicy::default(),
+            StoredArraySource::<T>::new(Arc::clone(array)),
+        )
+        .ok()?;
+        let source = Arc::new(source);
+        let mut registered = self
+            .cached
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Another thread may have registered while this one built; keep theirs,
+        // so the cache holds one entry per image rather than one per race.
+        let entry = registered.entry(image).or_insert_with(|| {
+            (
+                source.array(),
+                source.clone() as Arc<dyn std::any::Any + Send + Sync>,
+            )
+        });
+        entry.1.clone().downcast::<CachingSource<T>>().ok()
     }
 
     /// [`Self::create`], with the codec of every image said explicitly.
@@ -1166,6 +1420,10 @@ impl ZarrEnvironment {
             unaligned_reads: AtomicU64::new(0),
             counters: EnvCounters::default(),
             sidecars,
+            cache: None,
+            cached: RwLock::new(BTreeMap::new()),
+            prefetcher: None,
+            lookahead: 0,
         })
     }
 
@@ -1256,6 +1514,10 @@ impl ZarrEnvironment {
             unaligned_reads: AtomicU64::new(0),
             counters: EnvCounters::default(),
             sidecars,
+            cache: None,
+            cached: RwLock::new(BTreeMap::new()),
+            prefetcher: None,
+            lookahead: 0,
         })
     }
 
@@ -1889,7 +2151,26 @@ impl Environment for ZarrEnvironment {
         if !self.aligned(&array.stored_region(region), &array.chunk) {
             self.unaligned_reads.fetch_add(1, Ordering::SeqCst);
         }
-        let block = by_dtype!(array.dtype, |Element| array.read_as::<Element>(region))?;
+        // **The one line the cache changes.** `caching_source` answers `None`
+        // for an image this run writes and for a run with no cache at all, and
+        // then this is exactly the read it always was. See
+        // [`Self::with_cache`] for why the written images are excluded.
+        let block = by_dtype!(array.dtype, |Element| {
+            match self.caching_source::<Element>(image, &array) {
+                Some(source) => source
+                    .read_region(region)
+                    .and_then(|values| {
+                        values
+                            .into_dimensionality::<ndarray::Ix3>()
+                            .map_err(|_| Error::ShapeMismatch {
+                                expected: region.shape.clone(),
+                                got: vec![],
+                            })
+                    })
+                    .map(Element::wrap),
+                None => array.read_as::<Element>(region),
+            }
+        })?;
         self.counters.reads.fetch_add(1, Ordering::SeqCst);
         self.counters
             .read_voxels
@@ -2151,6 +2432,53 @@ impl Environment for ZarrEnvironment {
     }
 
     fn finish(&self, _image: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fetch coming reads of `image` ahead, ranked by their position here.
+    ///
+    /// **Only for images the cache holds**, which is the same set
+    /// [`Self::with_cache`] describes: those this run never writes. Prefetching
+    /// into an array the cache refuses would read bytes and drop them.
+    ///
+    /// Registration is lazy — a `CachingSource` is created on first read — so
+    /// this registers on the way past, through the same `by_dtype!` dispatch
+    /// the read uses. Otherwise the very reads that most want warming, the ones
+    /// before the first demand read, would be the ones that could not be.
+    fn prefetch(&self, image: usize, regions: &[Region]) -> Result<()> {
+        let Some(prefetcher) = self.prefetcher.as_ref() else {
+            return Ok(());
+        };
+        if regions.is_empty() || !self.cacheable(image) {
+            return Ok(());
+        }
+        let array = self.image_array(image)?;
+        // Registers on first call, and the returned handle is discarded: what
+        // is wanted from it here is the side effect of registration, so that
+        // `ArrayId` below resolves.
+        by_dtype!(array.dtype, |Element| {
+            let _ = self.caching_source::<Element>(image, &array);
+            Ok::<(), Error>(())
+        })?;
+        let registered = self
+            .cached
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some((id, _)) = registered.get(&image) else {
+            // Registration declined — a duplicate name from a racing thread, or
+            // a dtype the cache cannot hold. A demand read still serves it.
+            return Ok(());
+        };
+        // `in_order` ranks by position, which is the plan's visit order, which
+        // is what `Environment::prefetch` documents this slice to be.
+        // `head` is the lookahead, and it is bounded rather than "submit
+        // everything": the queue is rank-ordered, so an unbounded submission
+        // still fetches in plan order — but it fetches *early*, and a chunk
+        // that arrives long before the block that wants it is a chunk the cache
+        // evicts before it is used. That is `prefetch_wasted_evicted`, and it
+        // is the cost the lookahead bounds.
+        let plan = BlockPlan::in_order(*id, regions.iter().cloned()).head(self.lookahead);
+        prefetcher.submit(&plan);
         Ok(())
     }
 

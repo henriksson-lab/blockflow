@@ -50,6 +50,7 @@
 // free, and a policy that can be *read* is worth more here than one that is
 // asymptotically better.
 
+use crate::error::{Error, Result};
 use crate::graph::TaskGraph;
 
 use super::cache_model::{ChunkGrid, ModelledCache};
@@ -71,8 +72,26 @@ pub enum HandoutPolicy {
     /// *believes* the worker would have to fetch.
     ///
     /// The cache model is an estimate fed only by assignments; see
-    /// `cache_model`. Distance is the tiebreak, so with an empty or useless
-    /// model this degrades exactly to `NearestFirst`.
+    /// `cache_model`. Distance is the tiebreak, so with an **empty** model this
+    /// degrades exactly to `NearestFirst`.
+    ///
+    /// **"or useless" used to be in that sentence and is measured false.** An
+    /// empty model misses every key of every candidate, so the primary sort term
+    /// is constant and distance decides — that half holds. A *thrashing* model
+    /// returns a miss count that **varies without carrying information**, and
+    /// because `misses` outranks distance it dominates rather than defers.
+    /// `super::tests::the_two_policies_are_indistinguishable_until_the_model_evicts`
+    /// measures the cliff: holding two tasks' reads or more this policy is
+    /// `NearestFirst` to the digit, and holding one task's or fewer it duplicates
+    /// **22 fetches against 6** — a third of the way back to the naive pull the
+    /// whole handout design exists to beat. It is never better at any capacity.
+    ///
+    /// **Not selectable today — [`HandoutPolicy::refusal`] says why and what
+    /// would lift it.** The variant is kept, and kept constructible in-crate, so
+    /// that the measurement which would lift the refusal can be taken: see
+    /// `super::tests`. What is refused is a *caller* naming it, at
+    /// [`HandoutPolicy::select`], which is the one boundary both the operator
+    /// flag and a submitted `JobSpec` cross.
     CacheModelled,
 }
 
@@ -85,6 +104,13 @@ impl HandoutPolicy {
         }
     }
 
+    /// Which variant a name spells, whether or not a caller may select it.
+    ///
+    /// **Spelling, not admission.** [`Self::select`] is the admission boundary
+    /// and is what anything reaching this crate from outside should call. The
+    /// two are separate so that a refused variant still round-trips through its
+    /// own name — a `JobSpec` recorded before a refusal landed stays readable,
+    /// and a diagnostic can still print what a job asked for.
     pub fn parse(text: &str) -> Option<Self> {
         Some(match text {
             "naive" => Self::Naive,
@@ -92,6 +118,66 @@ impl HandoutPolicy {
             "cache-modelled" | "cache" => Self::CacheModelled,
             _ => return None,
         })
+    }
+
+    /// Why a caller may not select this policy today, or `None` if it may.
+    ///
+    /// A property of the **variant** rather than of the string, so that a caller
+    /// holding one it obtained some other way can still ask, and so that a new
+    /// entry point cannot acquire a policy without a way to find out.
+    pub fn refusal(self) -> Option<&'static str> {
+        match self {
+            Self::Naive | Self::NearestFirst => None,
+            // The argument, in the order the evidence came in. The *set* the
+            // model carries is real — chunks this worker was assigned to read is
+            // derived from assignments the coordinator genuinely made, and it is
+            // exactly the quantity a duplicated fetch is made of. Two things
+            // about the ranking are not, and they compound:
+            //
+            //  * `nearest` sorts on `(misses, distance, task)`, so a modelled
+            //    hit outranks distance outright, and the property `NearestFirst`
+            //    was measured to buy — 62 duplicated chunks down to 6 on the
+            //    harness in `super::tests` — is the thing a wrong model undoes.
+            //    Unlike `placement::entitled`, which expresses the same
+            //    preference as a *filter* and is therefore wrong in the cheap
+            //    direction by construction, nothing bounds this one.
+            //  * the LRU is sized by `WorkflowSpec::cache_bytes` and models
+            //    `cache::ChunkCache`, which has **no non-test construction
+            //    site**. What can physically serve a re-read on a node is the
+            //    page cache, sized by free RAM — so the model understates
+            //    residency most of the time, which is harmless, and *overstates*
+            //    it exactly under memory pressure, which is not.
+            //
+            // And the measurement, which is what turns this from a caution
+            // into a refusal: the two are indistinguishable until the model
+            // thrashes, and then this one loses — 22 duplicated fetches against
+            // 6 — while never winning at any capacity. A policy whose best case
+            // is a tie with the thing it replaces has not earned a name.
+            Self::CacheModelled => Some(
+                "it ranks a modelled cache hit above distance while the cache it models does not exist — `cache::ChunkCache` has no non-test construction site, so no `Environment::read` is served from one. Its chunk *set* is real, and while the model holds two tasks' reads or more this policy is `nearest-first` to the digit. Below that it is measurably worse rather than merely uninformative: at a modelled capacity of one chunk it duplicates 22 fetches against `nearest-first`'s 6, a third of the way back to naive pull's 62, because a miss count that varies without carrying information still outranks distance. It is never better at any capacity. Lifted by a chunk cache on a read path whose real size is what the model is given — see `distributed::tests::the_two_policies_are_indistinguishable_until_the_model_evicts`, which is that measurement and which fails if this stops being true",
+            ),
+        }
+    }
+
+    /// The policy a caller **may** select, refused by name where it may not.
+    ///
+    /// The single admission boundary: `blockflow_local --policy` and
+    /// `JobSpec::from_json` both come through here, so one refusal covers both
+    /// entry points. It deliberately does **not** guard `Job::new`, because a
+    /// policy set in Rust is a measurement taking it, and the measurement is
+    /// what would lift the refusal.
+    pub fn select(text: &str) -> Result<Self> {
+        let policy = Self::parse(text).ok_or_else(|| {
+            Error::invalid(format!(
+                "{text:?} is not a handout policy: naive, nearest-first"
+            ))
+        })?;
+        match policy.refusal() {
+            None => Ok(policy),
+            Some(why) => Err(Error::invalid(format!(
+                "the handout policy {text:?} is not selectable: {why}"
+            ))),
+        }
     }
 }
 
@@ -461,5 +547,65 @@ mod tests {
             assert_eq!(HandoutPolicy::parse(policy.as_str()), Some(policy));
         }
         assert_eq!(HandoutPolicy::parse("territories"), None);
+    }
+
+    /// **The refusal, and the two things that make it a stated state rather than
+    /// a wall.**
+    ///
+    /// A refused policy still *spells*, so a recorded job stays readable and the
+    /// error can name what was asked for; and the reason travels with the
+    /// refusal, so a caller learns why here rather than in a document.
+    #[test]
+    fn the_cache_modelled_policy_is_refused_at_the_admission_boundary() {
+        // It is still a name, and still that variant.
+        assert_eq!(
+            HandoutPolicy::parse("cache-modelled"),
+            Some(HandoutPolicy::CacheModelled)
+        );
+        assert_eq!(
+            HandoutPolicy::parse("cache"),
+            Some(HandoutPolicy::CacheModelled)
+        );
+
+        // And it is not selectable, under either spelling.
+        for name in ["cache-modelled", "cache"] {
+            let error = HandoutPolicy::select(name).expect_err("refused");
+            let message = error.to_string();
+            assert!(
+                message.contains("not selectable"),
+                "the refusal must say it is a refusal: {message}"
+            );
+            // The reason, not merely the fact. Each clause is one of the three
+            // things a reader needs: what is wrong, what is *not* wrong, and
+            // what would lift it.
+            for clause in ["ChunkCache", "nearest-first", "evict", "Lifted by"] {
+                assert!(
+                    message.contains(clause),
+                    "the refusal must carry {clause:?}: {message}"
+                );
+            }
+        }
+
+        // The two that are selectable, are — this is the control, and without it
+        // a `select` that refused everything would pass every assertion above.
+        for policy in [HandoutPolicy::Naive, HandoutPolicy::NearestFirst] {
+            assert_eq!(policy.refusal(), None);
+            assert_eq!(
+                HandoutPolicy::select(policy.as_str()).expect("selectable"),
+                policy
+            );
+        }
+        assert!(HandoutPolicy::CacheModelled.refusal().is_some());
+
+        // An unknown name is a different error from a refused one, and says so.
+        let unknown = HandoutPolicy::select("territories").expect_err("not a policy");
+        assert!(
+            unknown.to_string().contains("is not a handout policy"),
+            "{unknown}"
+        );
+        assert!(
+            !unknown.to_string().contains("not selectable"),
+            "an unknown name is not a refusal: {unknown}"
+        );
     }
 }

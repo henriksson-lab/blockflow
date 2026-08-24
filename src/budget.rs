@@ -47,23 +47,87 @@
 //
 // ```text
 // one in, one out                2.00x   (the shape the formula is for)
+// sequence of two maps           3.00x
+// sequence from a source         3.00x
 // sequence of four maps          4.00x
 // fan-in, 2 computed arms        4.00x
-// fan-in, 3 computed arms        5.13x
-// fan-in, 1 arm + 1 source       5.00x
-// fan-in, 1 arm + 2 sources      7.13x
+// fan-in, 3 computed arms        4.12x
+// fan-in, 7 computed arms        4.12x
+// fan-in, 1 arm + 1 source       4.00x
+// fan-in, 2 source arms          4.00x
+// fan-in, 1 arm + 2 sources      5.13x
 // ```
 //
-// The excess is `Chain::apply_placed`'s own allocations — a `Sequence` clones
-// its input and holds an intermediate, a `Parallel` holds **one buffer per
-// branch at once** plus a fold intermediate, and a `Chain::Source` arm is handed
-// a fetched buffer besides. None of it is in the `x 2.0`.
+// The excess is `Chain::apply_placed`'s own allocations — a `Sequence` holds the
+// intermediate it is reading and the one it is writing, a `Parallel` holds
+// branch buffers, and a `Chain::Source` arm is handed a fetched buffer besides.
+// None of it is in the `x 2.0`.
+//
+// **A source arm is no longer one of them.** A `Chain::Source` leaf's answer is
+// the stored image at the block's read extent — a buffer the executor fetched
+// before the chain was entered and owns until after it returns. Where that
+// answer is an *operand* rather than an output (a fan-in branch, the head of a
+// sequence) the walk hands the reference on and allocates nothing, so a fan-in
+// of two source arms holds the input, the output and the two fetched buffers
+// and not one byte besides. It is the same category as the two below: bytes
+// that were written once and then stood in for bytes the run already had. The
+// fetched buffer itself is of course still resident, and it is the executor's,
+// which is why the source rows fall by exactly the copies and not to nothing:
+//
+// ```text
+//                                 copying   borrowing
+// fan-in, 1 arm + 1 source          5.00x       4.00x
+// fan-in, 1 arm + 2 sources         6.13x       5.13x
+// fan-in, 2 source arms             6.00x       4.00x
+// sequence from a source            4.00x       3.00x
+// ```
+//
+// Both columns are the same table run twice, the left one with the copy put
+// back. **`fan-in, 2 source arms` is the shape to read**: every branch's answer
+// already existed, so the walk now allocates nothing at all and what is left is
+// the executor's four buffers. It is also the shape that made the harness's
+// accounting find a term nobody had needed before — with no block buffer of its
+// own, the tallest thing that chain allocates is the shape fold
+// `Chain::apply_tallied` does before its tally exists.
+//
+// **One shape did not move and is worth as much as the ones that did.**
+// `fan-in, rank arm + 2 sources` measures `7.00x` either way, because for that
+// chain the copies were never the peak: the worst moment is the rank filter's
+// own scratch while its branch buffer is live, and the source arms are joined
+// after it has finished. A fix that removes bytes does not always remove the
+// bytes that bound the figure.
+//
+// **The two sequence rows differ, and they used to be one number: `4.00x` and
+// `4.00x`, measured.** A `Sequence` began with `input.clone()` — a whole block
+// buffer, written once and then read only where the caller's own block would
+// have served. It is gone, and what that is worth is a two-child sequence:
+// `4.00x` to `3.00x`. From three children on, the intermediate being read and
+// the one being written are the tall term and the clone had already been freed,
+// so `sequence of four maps` is `4.00x` either way. A whole block buffer off
+// every two-child sequence and nothing off a longer one, which is not what "a
+// sequence clones its input" would have suggested — the before figures are the
+// same table run with the clone put back.
+//
+// **The two fan-in rows that measure the same are the point of the fourth and
+// the sixth.** A `Parallel` used to hold **one buffer per branch at once**, so
+// its figure grew with the arity and at one block each of those buffers was a
+// whole volume. It now folds as its branches are computed wherever the combine
+// declares itself a left fold over pairs (`Combine::fold_carrier`), and holds
+// three buffers whatever the arity: the partial, the branch just finished, and
+// the buffer their join goes into. Seven arms therefore measure exactly what
+// three do. The buffers that went away were **computed and then not read** —
+// from the moment a branch finished until the combine ran they were bytes and
+// nothing else — so this is not a trade against locality, and
+// `tests/dead_block_buffers.rs` is the byte-for-byte identity it is only allowed under.
+// Two combines decline the declaration and say why in their own words:
+// `Arithmetic::Subtract` and `Arithmetic::Divide` are not folds, and neither is
+// a difference.
 //
 // **So a lease granted against that figure is not a bound on what the block
 // holds, and this module must not be read as if it were.** Two consequences,
 // both stated here because this is where the promise is made:
 //
-// * the shortfall is **shape-dependent**, `2.00x` to `3.56x` across ordinary
+// * the shortfall is **shape-dependent**, `2.00x` to `2.56x` across ordinary
 //   chains, so it is not a constant a caller can pre-multiply away and have the
 //   planner still rank candidates on comparable numbers;
 // * even a figure corrected for every buffer above would still not be a bound,
@@ -514,12 +578,13 @@ pub fn auto_budget_bytes() -> Option<u64> {
 /// multiples of that assumed charge**, which is the unit this constant is in:
 ///
 /// ```text
-/// one in, one out                 1.00x     rank filter alone           2.00x
-/// sequence of four maps           2.00x     morphological open alone    1.19x
-/// fan-in, 2 computed arms         2.00x     fan-in, rank arm + 2 src    3.56x
-/// fan-in, 3 computed arms         2.56x     sequence of four ranks      3.00x
-/// fan-in, 1 arm + 1 source        2.50x
-/// fan-in, 1 arm + 2 sources     3.5626x  <- widest
+/// one in, one out                 1.00x     fan-in, 1 arm + 1 source    2.00x
+/// sequence of two maps            1.50x     fan-in, 2 source arms       2.00x
+/// sequence from a source          1.50x     fan-in, 1 arm + 2 sources   2.56x
+/// sequence of four maps           2.00x     rank filter alone           2.00x
+/// fan-in, 2 computed arms         2.00x     morphological open alone    1.19x
+/// fan-in, 3 computed arms         2.06x     sequence of four ranks      3.00x
+/// fan-in, 7 computed arms         2.06x     fan-in, rank arm + 2 src  3.5003x <- widest
 /// ```
 ///
 /// `3.6` is the **smallest tenth that covers every shape measured**, which is
@@ -535,15 +600,32 @@ pub fn auto_budget_bytes() -> Option<u64> {
 /// ten-thousandths of evidence. A tenth is fine enough that the rounding is not
 /// an argument and coarse enough that a constant does not move on noise.
 ///
-/// **The last two rows are combinations, and they are why the margin is derived
-/// from a measurement rather than from the parts.** A chain may be expensive in
-/// its framework buffers *and* in its op, and a margin justified by the worse of
-/// two separate measurements need not cover one that is both. In the event
-/// neither combination is the worst: putting a rank filter on the widest fan-in
-/// left it at `3.56x`, because an op's scratch is transient and that chain's
-/// peak falls at the combine instead. That is a fact about these chains and not
-/// a rule — which is exactly why the combinations are measured rather than
-/// reasoned about.
+/// **The right-hand rows include combinations, and they are why the margin is
+/// derived from a measurement rather than from the parts.** A chain may be
+/// expensive in its framework buffers *and* in its op, and a margin justified by
+/// the worse of two separate measurements need not cover one that is both.
+///
+/// **A combination is now the worst, and it was not before.** While a fan-in
+/// held every branch result at once, its own buffers were the tall term: the
+/// peak of `fan-in, rank arm + 2 src` fell at the combine, the rank filter's
+/// transient scratch never showed, and that chain measured the same `3.56x` as
+/// the cheap-arm fan-in beside it. Folding a fan-in's branches as they are
+/// computed took its own buffers down, the peak moved to the arm, and the
+/// combination is the widest shape here by nearly a unit. Nothing about the rank
+/// filter changed. That is the argument for measuring combinations rather than
+/// reasoning about the parts, stated by the one time the reasoning was wrong.
+///
+/// **It then survived a second fix that should have moved it, and that is the
+/// same lesson from the other side.** Borrowing a source arm instead of copying
+/// it took a whole block buffer off every source row here — and left
+/// `fan-in, rank arm + 2 src` at `3.5003x`, unmoved, because for *that* chain
+/// the copies were never the peak: the worst moment is the rank filter's own
+/// scratch while its branch buffer is live, and the source arms are joined after
+/// it has finished. So this constant has now been re-derived across two fixes,
+/// and the shape that binds it is the same one for a reason that has changed
+/// twice. **A margin defined as "the smallest tenth covering every shape
+/// measured" has to be re-derived whenever a fix relocates a peak**, whether or
+/// not the number comes out the same.
 ///
 /// It is a **margin fitted to those measurements, not a bound**. An op that
 /// allocates more, at a moment when the rest of the chain is also at its

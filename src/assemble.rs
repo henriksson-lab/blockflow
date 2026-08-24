@@ -371,10 +371,7 @@ pub enum Materialisation {
 /// read extent for exactly this reason: a budget checked against an
 /// over-charged read invents infeasibility.
 fn affordable(cost: &PhaseCost, constraints: &Constraints) -> bool {
-    constraints.budget_bytes.is_none_or(|budget| {
-        cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
-            <= budget as f64
-    })
+    constraints.affords_working_set(cost)
 }
 
 /// The phase one [`PlanBuilder::iterate_priced`] call made, the lattice it was

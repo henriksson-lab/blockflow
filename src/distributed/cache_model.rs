@@ -17,6 +17,26 @@
 // so reporting each insert and eviction would about double it, for information
 // the coordinator could have derived.
 //
+// What this models, and what exists
+// ---------------------------------
+// **The set is a fact; the eviction is not.** Which chunks a worker has been
+// assigned to read is something the coordinator genuinely knows, and it is
+// exactly the quantity a *duplicated fetch* is made of — a chunk two workers
+// both read costs two fetches whatever either node caches. That much needs no
+// cache to be true, and it is the whole of what the handout and the placement
+// filter are entitled to lean on.
+//
+// The LRU below is a different claim. It is sized by `WorkflowSpec::cache_bytes`
+// and was written as a model of `cache::ChunkCache` — which has **no non-test
+// construction site**, so no `Environment::read` is served from one. What can
+// physically serve a re-read on a node is the page cache, sized by free RAM.
+// So the eviction understates residency most of the time, which is harmless,
+// and **overstates it exactly under memory pressure**, which is not.
+//
+// That is why `HandoutPolicy::CacheModelled`, which ranks on the eviction, is
+// refused at `HandoutPolicy::select`, while `placement::entitled`, which uses
+// the set as a strictly-better filter on scarce phases, is unchanged.
+//
 // The model will drift, and that is *why* this works
 // --------------------------------------------------
 // A worker's real cache can differ: a lease refused under memory pressure, a

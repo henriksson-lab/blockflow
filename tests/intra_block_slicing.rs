@@ -261,7 +261,7 @@ impl Combine for Mean {
         Ok(inputs[0])
     }
 
-    fn apply(&self, inputs: &[Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
+    fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
         let left = inputs[0].view::<f64>()?;
         let right = inputs[1].view::<f64>()?;
         let mut sink = out.view_mut::<f64>()?;
@@ -292,7 +292,7 @@ impl Combine for UndeclaredCombine {
     fn output_shape(&self, inputs: &[[usize; 3]]) -> Result<[usize; 3]> {
         Ok(inputs[0])
     }
-    fn apply(&self, inputs: &[Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
+    fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
         out.assign(&inputs[0])
     }
 }

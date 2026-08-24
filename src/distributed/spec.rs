@@ -698,8 +698,11 @@ impl JobSpec {
 
     pub fn from_json(value: &Value) -> Result<Self> {
         let policy_name = text_or(value, "policy", HandoutPolicy::default().as_str());
-        let policy = HandoutPolicy::parse(&policy_name)
-            .ok_or_else(|| Error::invalid(format!("{policy_name:?} is not a handout policy")))?;
+        // `select` and not `parse`: this is a submitted job naming a policy, so
+        // it is one of the two boundaries a caller crosses, and a policy that is
+        // built but not calibrated is refused here with its reason rather than
+        // accepted and scheduled against.
+        let policy = HandoutPolicy::select(&policy_name)?;
         Ok(Self {
             id: text_or(value, "id", "job"),
             workflow: WorkflowSpec::from_json(get(value, "workflow")?)?,

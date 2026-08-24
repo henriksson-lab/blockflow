@@ -41,10 +41,11 @@
 // has a message and cannot be forgotten at a new call site. The only change to
 // `block_processing.rs` is that the function is now `pub(crate)`.
 
+use std::collections::BTreeSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::assemble::{describe_image, is_supplied_image};
+use crate::assemble::{describe_image, is_supplied_image, ImageId};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::reach::{AxisReach, Frame, Reach};
@@ -488,7 +489,7 @@ impl Decomposition {
     /// [`Self::n_supplied_inputs`] is the other half, and the two are added by
     /// nobody, deliberately.
     ///
-    /// [`ImageId::SUPPLIED_BASE`]: crate::assemble::ImageId::SUPPLIED_BASE
+    /// [`ImageId::SUPPLIED_BASE`]: ImageId::SUPPLIED_BASE
     pub fn n_images(&self) -> usize {
         self.phases.len() + 1
     }
@@ -935,7 +936,123 @@ impl Decomposition {
     /// because it asks the question in the walk's own terms — *is there a reader
     /// after this phase* — and that is one comparison rather than a vector per
     /// image per phase.
+    /// **The two halves of what a run is resident in, named together.**
+    ///
+    /// A budget question has two terms and they behave differently, which is
+    /// why one number was never enough and why
+    /// [`Constraints::affords_working_set`] deliberately answers only half of
+    /// it:
+    ///
+    /// * [`Residency::working_set_bytes`] — the block tiles in flight. **Scales
+    ///   with the block and the concurrency**, so a finer cut reduces it, and a
+    ///   refusal on it is actionable.
+    /// * [`Residency::image_bytes`] — the whole-volume images alive at the
+    ///   worst phase, from [`Self::peak_image_bytes`]. **Invariant to the cut**:
+    ///   images are allocated at the phase's volume, so a finer grid is an
+    ///   iteration order and not a residency policy. It moves for a narrower
+    ///   dtype, an out-of-core environment or `Hints::release_images`, and for
+    ///   nothing the partition search can choose.
+    ///
+    /// Reported rather than enforced, and that is the point. Peak residency is a
+    /// **soft boundary**: memory that is held and being read is a run going
+    /// fast, and only memory that is held and dead is a defect. A hard gate here
+    /// would refuse plans whose residency is entirely working, and — because the
+    /// image half answers the same for every candidate — it would refuse them
+    /// with no candidate to suggest.
+    ///
+    /// `work` is the fragment work, as [`Self::peak_image_bytes`] takes it;
+    /// `&[]` is correct and exact for an all-pixel plan.
+    ///
+    /// # Two ways this understates, both stated rather than fixed
+    ///
+    /// **It is a report, and the gate is elsewhere.** Nothing is admitted on
+    /// this figure — [`Constraints::affords_working_set`] decides that, and it
+    /// charges `working_set x concurrency` *unclamped*, which over-states. So
+    /// the safe direction is preserved where it matters and these two limits
+    /// cost a reader accuracy rather than costing a run its memory.
+    ///
+    /// * **The working-set term is a max over phases, and the executor can have
+    ///   two phases in flight.** `strategy::execute` fills a wave from whatever
+    ///   is ready, and a phase's successor becomes ready long before the phase
+    ///   finishes, so blocks of two phases really do coexist. The true figure is
+    ///   bounded by the sum of the two largest phases rather than by the
+    ///   largest. Not summed here because "how many of each" is a scheduling
+    ///   fact and this type is the binding half of a plan; the simulator is
+    ///   where that question has an answer.
+    /// * **A phase reading three images is charged as if it read one**, which is
+    ///   [`PhaseCost::working_set_bytes_per_block`]'s own recorded gap and
+    ///   travels with the `x 2.0` this reuses.
+    ///
+    /// The image term has neither problem: it is exact, and a consumer suite
+    /// pins it against a measured run to the byte — `56.200 GiB` of images
+    /// predicted where a process watching `VmHWM` measured `56.200`.
+    pub fn residency(
+        &self,
+        constraints: &Constraints,
+        work: &[crate::fragment::PhaseWork<'_>],
+        released: &BTreeSet<ImageId>,
+        kept: &BTreeSet<ImageId>,
+    ) -> Result<Residency> {
+        let workers = constraints.expected_concurrency.max(1);
+        // The worst phase's, because residency is a peak and the phases do not
+        // overlap. Two bytes a voxel — one image in, one out — which is
+        // `PhaseCost::working_set_bytes_per_block`'s own factor, and it carries
+        // that field's known gap verbatim: a phase reading three images is
+        // charged as if it read one. Recorded there rather than corrected here.
+        let working_set_bytes = self
+            .phases
+            .iter()
+            .map(|phase| {
+                let bytes = phase.dtype.unwrap_or(self.dtype).size_of() as f64;
+                // **Clamped to the blocks that exist.** `affords_working_set`
+                // multiplies by the concurrency unclamped, which is the safe
+                // direction for a budget — over-charging refuses a plan that
+                // would have run — but it is simply wrong for a report: at one
+                // block it said `1057.889 GiB` for forty workers, forty copies
+                // of a block only one worker can hold. A phase runs
+                // `min(workers, n_blocks)` blocks at once and no more.
+                let in_flight = workers.min(phase.grid.n_blocks()).max(1) as f64;
+                resident_voxels_per_block(&phase.grid, &phase.halo) * bytes * 2.0 * in_flight
+            })
+            .fold(0.0_f64, f64::max)
+            .max(0.0) as u64;
+        Ok(Residency {
+            image_bytes: self.peak_image_bytes_with(work, released, kept)?,
+            working_set_bytes,
+        })
+    }
+
     pub fn peak_image_bytes(&self, work: &[crate::fragment::PhaseWork<'_>]) -> Result<u64> {
+        self.peak_image_bytes_with(work, &BTreeSet::new(), &BTreeSet::new())
+    }
+
+    /// [`Self::peak_image_bytes`], told what the caller releases and keeps.
+    ///
+    /// **The plain form predicts a run nobody makes.** The executor frees an
+    /// image after its last reader when it is `Internal` **or** named in
+    /// `Hints::release_images`, and never when it is named in
+    /// `Hints::keep_images`; the walk here applied only the first clause, so it
+    /// over-stated any plan whose caller released a `Published` image and
+    /// under-stated any plan that kept one.
+    ///
+    /// The size of that gap on the shipped binarisation at the `404 x 1304 x
+    /// 3369` tile over `float64` is **13.223 GiB** — image 0, the run's own
+    /// input, which is `Published` because of where it sits rather than because
+    /// anything reads it back. Predicting **56.200 GiB** where
+    /// `tests/residency_across_cuts.rs` measures **42.977** is not a margin; it
+    /// is the walk answering about a different run.
+    ///
+    /// `released` and `kept` are `Hints::release_images` and
+    /// `Hints::keep_images`. They are passed rather than reached for because a
+    /// `Decomposition` is the binding half of a plan and a `Hints` is the
+    /// advisory half — this crate does not let the first depend on the second,
+    /// and a caller holding a `Plan` holds both.
+    pub fn peak_image_bytes_with(
+        &self,
+        work: &[crate::fragment::PhaseWork<'_>],
+        released: &BTreeSet<ImageId>,
+        kept: &BTreeSet<ImageId>,
+    ) -> Result<u64> {
         let bytes_of = |image: usize| -> u64 {
             let volume = self.volume_at(image);
             volume.iter().product::<usize>() as u64 * self.dtype_at(image).size_of() as u64
@@ -964,7 +1081,16 @@ impl Decomposition {
             // rule at zero readers. `readers_of_image` is asked about the plan's
             // own images only; a supplied input has no producer to die after.
             live.retain(|&(image, _)| {
-                if self.image_visibility(image) != Visibility::Internal {
+                let id = ImageId::from(image);
+                // Word for word the executor's rule at `strategy.rs`'s
+                // `images_dead_after` loop: `Internal` **or** released, and
+                // `keep_images` wins over both because a caller that named an
+                // image in each has contradicted itself and the reading that
+                // cannot lose data is the one to take.
+                let freeable = (self.image_visibility(image) == Visibility::Internal
+                    || released.contains(&id))
+                    && !kept.contains(&id);
+                if !freeable {
                     return true;
                 }
                 match self.readers_of_image(image).last() {
@@ -1889,6 +2015,50 @@ impl SlabPolicy {
 }
 
 impl Constraints {
+    /// Whether one candidate phase's **block working set** fits the budget at
+    /// the concurrency the caller expects.
+    ///
+    /// **The one copy.** This predicate existed three times — `assemble::
+    /// affordable`, the block-candidate loop in `strategy.rs` and the
+    /// partition search's own closure — and the first of them carried a comment
+    /// explaining that it had been lifted out of the sweep so that "a second
+    /// copy that drifted would let this builder accept a lattice the search
+    /// would have refused". There were three. They agreed, which is luck rather
+    /// than structure.
+    ///
+    /// # What it bounds, and what it does not
+    ///
+    /// It bounds **what the cut controls**: the input and output tiles of one
+    /// block in flight, times the number of blocks in flight. Refusing here is
+    /// actionable — a smaller block candidate makes the same plan fit.
+    ///
+    /// It does **not** bound what the run is resident in. A plan also holds its
+    /// whole-volume images, and that quantity is
+    /// [`Decomposition::peak_image_bytes`], not this. The two are different in
+    /// kind and not merely in size:
+    ///
+    /// * the working set **scales with the block and the concurrency**;
+    /// * the image residency is **invariant to both** — images are allocated at
+    ///   the phase's volume, so a finer grid is an iteration order and not a
+    ///   residency policy, and the image total does not move when the cut does.
+    ///
+    /// That is why the image term is reported by
+    /// [`Decomposition::peak_image_bytes`] rather than added in here. A budget
+    /// that charged it would refuse **every** candidate identically, since no
+    /// candidate can change it — a feasibility gate with no feasible answer and
+    /// no advice to give. The remedies for image residency are a narrower
+    /// dtype, an out-of-core environment, or `Hints::release_images`, and all
+    /// three live above the partition search.
+    ///
+    /// A caller that wants one number for both adds them; it must not expect
+    /// this to have done it.
+    pub fn affords_working_set(&self, cost: &PhaseCost) -> bool {
+        self.budget_bytes.is_none_or(|budget| {
+            cost.working_set_bytes_per_block * self.expected_concurrency.max(1) as f64
+                <= budget as f64
+        })
+    }
+
     /// The same constraints with `policy`.
     ///
     /// **The one way to ask for a slab policy**, so a caller that sweeps
@@ -2294,6 +2464,60 @@ pub struct PhaseCost {
     pub cost_per_block: f64,
 }
 
+/// What a run is resident in, in its two terms. See
+/// [`Decomposition::residency`], which is the only thing that builds one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Residency {
+    /// Whole-volume images alive at the worst phase. **Invariant to the block.**
+    pub image_bytes: u64,
+    /// Block tiles in flight: the worst phase's working set times the expected
+    /// concurrency. **Scales with the block and the concurrency.**
+    pub working_set_bytes: u64,
+}
+
+impl Residency {
+    /// Both terms. The number to compare against a machine.
+    pub fn total_bytes(self) -> u64 {
+        self.image_bytes.saturating_add(self.working_set_bytes)
+    }
+
+    /// [`Self::total_bytes`] in GiB, for a message or a table.
+    pub fn total_gib(self) -> f64 {
+        self.total_bytes() as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+}
+
+/// Voxels resident while one block of `grid` is in flight, under `halo`.
+///
+/// **Extracted rather than copied.** It is the sole definition of the quantity
+/// [`PhaseCost::working_set_bytes_per_block`] is bytes of, and
+/// [`Decomposition::residency`] needs the same number from a decomposition that
+/// no longer holds the `PhaseCost` it was priced with. A second spelling would
+/// drift, and the budget predicate three lines from here has already been that
+/// bug once — see [`Constraints::affords_working_set`].
+///
+/// Clamped per axis: the grown block can never exceed the volume, because a
+/// read cannot.
+fn resident_voxels_per_block(grid: &BlockGrid, halo: &Reach) -> f64 {
+    let block = grid.block();
+    let volume = grid.volume();
+    let halo = halo.in_voxels(block);
+    let mut resident = 1.0_f64;
+    for axis in 0..3 {
+        let (lo, hi) = halo.axis(axis).bound(volume[axis]);
+        let grown = block[axis] as f64 + lo as f64 + hi as f64;
+        // `total_cmp`, not `f64::min`: the crate does not select between two
+        // `f64`s through a partial order, here or anywhere.
+        let extent = volume[axis] as f64;
+        resident *= if grown.total_cmp(&extent).is_gt() {
+            extent
+        } else {
+            grown
+        };
+    }
+    resident
+}
+
 /// Price one candidate phase.
 ///
 /// **Which axes are charged.** `BlockGrid` drops an axis from `split_axes` when
@@ -2427,9 +2651,11 @@ pub fn price_phase(
     let core_voxels = grid.mean_core_voxels();
     let block = grid.block();
     let volume = grid.volume();
+    // Before the shadowing below, because the helper takes the `Reach` and does
+    // its own `in_voxels`.
+    let resident_voxels = resident_voxels_per_block(grid, halo);
     let halo = halo.in_voxels(block);
     let mut read_per_block = 1.0_f64;
-    let mut resident_voxels = 1.0_f64;
     for axis in 0..3 {
         // The widest block's halo, because the model is stated on the infinite
         // grid: a per-block halo is charged at its worst block, the same
@@ -2452,14 +2678,6 @@ pub fn price_phase(
             grown
         } else {
             grid.mean_read_extent(axis, lo, hi)
-        };
-        // `total_cmp`, not `f64::min`: the crate does not select between two
-        // `f64`s through a partial order, here or anywhere.
-        let extent = volume[axis] as f64;
-        resident_voxels *= if grown.total_cmp(&extent).is_gt() {
-            extent
-        } else {
-            grown
         };
     }
     // One traversal of the read extent per stored image the phase reads. Zero

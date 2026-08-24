@@ -163,6 +163,10 @@ pub mod region;
 /// Block-keyed output that is not a pixel region: `(stream, phase, block) ->
 /// bytes`, on the environment beside the region writes. Storage only; what
 /// produces and consumes fragments is `fragment`.
+/// A discrete-event simulator for scheduler design. **Ranks designs; does not
+/// predict runtimes** — see the module header for what it models and, more
+/// importantly, for the list of what it deliberately does not.
+pub mod simulate;
 pub mod sidecar;
 /// Cutting one block into slabs run on separate threads: the mechanism below
 /// the block, and the arithmetic that says what a cut costs. Not a policy —

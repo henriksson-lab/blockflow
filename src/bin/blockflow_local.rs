@@ -40,7 +40,8 @@ blockflow-local — a coordinator and N workers, as separate processes, here.
   --workers N       How many worker processes. Default 2.
   --blocks N        Blocks along the split axis. Default 16.
   --phases N        Phases in the chain. Default 1.
-  --policy NAME     naive | nearest-first | cache-modelled. Default nearest-first.
+  --policy NAME     naive | nearest-first. Default nearest-first.
+                    (cache-modelled is built and refused; --policy cache says why)
   --ahead N         Tasks each worker keeps in hand. Default 2.
   --kill I:N        SIGKILL worker I once the job reports N tasks done. The
                     process is taken wherever it is — possibly inside a task,
@@ -99,13 +100,10 @@ fn go() -> Result<()> {
             "--phases" => phases = number(value()?, "--phases")?,
             "--ahead" => ahead = number(value()?, "--ahead")?,
             "--policy" => {
-                let name = value()?;
-                policy = HandoutPolicy::parse(&name).ok_or_else(|| {
-                    Error::invalid(format!(
-                        "{name:?} is not a handout policy: naive, nearest-first, \
-                         cache-modelled"
-                    ))
-                })?;
+                // `select`, which refuses a policy that is built but not
+                // calibrated and says why. The list used to be spelled out here
+                // and would have gone stale the moment one was refused.
+                policy = HandoutPolicy::select(&value()?)?;
             }
             "--kill" => {
                 let text = value()?;

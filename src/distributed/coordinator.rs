@@ -209,11 +209,15 @@ struct WorkerModel {
     /// reason: it is derived from assignments and never reported.
     ///
     /// A second tier rather than more entries in `cache`, because it is a claim
-    /// about a different thing and the two must not be confused. `cache` models
-    /// this crate's own chunk cache, which holds what was *read*. `produced`
-    /// models whatever on the node holds what was recently *written* — the page
-    /// cache under a filesystem store, a local scratch tier, a write-back cache
-    /// if one is ever added — none of which this crate owns. It is kept separate
+    /// about a different thing and the two must not be confused. `cache` holds
+    /// what this worker was assigned to **read**; `produced` holds what it was
+    /// assigned to **write**. Neither names a cache this crate owns — see
+    /// `placement::Residency::resident`, where the correction is argued: this
+    /// line used to say `cache` modelled "this crate's own chunk cache", and
+    /// `cache::ChunkCache` is on no read path. What either tier can serve a
+    /// re-read from is whatever the node holds — the page cache under a
+    /// filesystem store, a local scratch tier, a write-back cache if one is ever
+    /// added — none of which this crate owns. It is kept separate
     /// so that the handout's own scoring, and the numbers already measured for
     /// it, are untouched; only `placement` reads it.
     ///

@@ -122,6 +122,32 @@ pub struct Residency<'a> {
     /// tie on it, because an equal score means the asker keeps the task.
     pub id: &'a str,
     /// Chunks the coordinator models this worker as having **read**.
+    ///
+    /// **What this claims physically, because an earlier version of this line
+    /// claimed something the codebase does not have.** It said the tier modelled
+    /// *"this crate's own chunk cache"*. There is no such cache on any read
+    /// path: `cache::ChunkCache` has no non-test construction site, so nothing
+    /// anywhere skips a fetch on the strength of an earlier one. What can
+    /// physically serve a re-read is whatever the node happens to hold — the
+    /// page cache under a filesystem store, and nothing this crate owns —
+    /// which is exactly what `produced` already says of its own tier, and the
+    /// two should be read the same way.
+    ///
+    /// **The set is real and that is why the tier is kept.** A chunk two workers
+    /// both read costs two fetches whatever either node caches, so preferring
+    /// the worker that already read it is a claim about **duplicated fetches**
+    /// and needs no cache to be true. What the model cannot claim is the
+    /// **eviction**: its LRU is sized by `WorkflowSpec::cache_bytes` where the
+    /// page cache is sized by free RAM, so it understates residency most of the
+    /// time and overstates it exactly under memory pressure.
+    ///
+    /// That asymmetry is survivable *here* and is why this consumer is unchanged
+    /// while `HandoutPolicy::CacheModelled` is refused: `entitled` expresses the
+    /// preference as a **filter**, on scarce phases only, refusing the asker only
+    /// where a contender is **strictly** better — so an uninformative model
+    /// refuses nobody and a wrong one costs a poll interval and a re-read the
+    /// asker would have paid anyway. `handout::nearest` ranks on it instead, above
+    /// distance, and nothing bounds that.
     pub resident: Option<&'a ModelledCache>,
     /// Chunks the coordinator models this worker as having **written**.
     pub produced: Option<&'a ModelledCache>,

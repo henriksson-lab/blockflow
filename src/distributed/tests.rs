@@ -139,8 +139,28 @@ impl Locality {
 /// handout, the real dependency release, and a real `execute_task` per task
 /// against a per-worker environment that counts what it read.
 fn measure(policy: HandoutPolicy, workers: usize, blocks: usize, phases: usize) -> Locality {
+    measure_at(policy, workers, blocks, phases, None)
+}
+
+/// [`measure`], with the coordinator's modelled cache budget stated.
+///
+/// `None` keeps `probe_job`'s own `cache_bytes`, which is roomy enough that the
+/// model never evicts — see
+/// [`the_two_policies_are_indistinguishable_until_the_model_evicts`], which is
+/// the only caller that passes anything else and the reason this parameter
+/// exists at all.
+fn measure_at(
+    policy: HandoutPolicy,
+    workers: usize,
+    blocks: usize,
+    phases: usize,
+    cache_bytes: Option<u64>,
+) -> Locality {
     let (mut spec, decomposition) = probe_job(blocks, phases, ChainSpec::identity());
     spec.policy = policy;
+    if let Some(bytes) = cache_bytes {
+        spec.workflow.cache_bytes = bytes;
+    }
     let chunk = spec.workflow.chunk;
     let volume = spec.workflow.shape;
     let chain = ProbeWorkflows.chain(&spec.workflow).expect("a probe chain");
@@ -239,6 +259,33 @@ fn nearest_first_handout_costs_fewer_duplicated_fetches_than_naive_pull() {
         nearest.redundancy(),
         modelled.redundancy()
     );
+    // **Asserted rather than printed, and this line used to be printed.** A
+    // harness that computes a figure and asserts nothing about it reports that
+    // the assertions ran, not that the figure is what anybody believes — the
+    // shape this project has been caught by repeatedly. The claim being pinned
+    // is `CacheModelled`'s own documented degradation, *"with an empty or
+    // useless model this degrades exactly to `NearestFirst`"*: here the model is
+    // roomy enough that it never evicts, so `misses` is a monotone proxy for
+    // distance, the `(misses, distance, task)` tiebreak never fires, and the two
+    // policies make the same assignment on every task.
+    //
+    // `fetched` and `distinct` rather than `redundancy()`, because the ratio is
+    // derived from exactly those two and asserting the ratio would let both move
+    // together unnoticed.
+    assert_eq!(
+        (modelled.duplicated, modelled.fetched, modelled.distinct),
+        (nearest.duplicated, nearest.fetched, nearest.distinct),
+        "with a model that never evicts, cache-modelled must be nearest-first exactly: \
+         cache-modelled {} duplicated / {} fetched / {} distinct against nearest-first \
+         {} / {} / {}",
+        modelled.duplicated,
+        modelled.fetched,
+        modelled.distinct,
+        nearest.duplicated,
+        nearest.fetched,
+        nearest.distinct,
+    );
+
     // Recorded rather than asserted tightly: the point of the measurement is
     // the ordering, and the magnitude depends on the decomposition.
     println!(
@@ -257,6 +304,159 @@ fn nearest_first_handout_costs_fewer_duplicated_fetches_than_naive_pull() {
         modelled.duplicated,
         modelled.redundancy(),
         modelled.chunk_reads,
+    );
+}
+
+/// **The one regime `CacheModelled` can differ in, which had never been run.**
+///
+/// `nearest_first_handout_costs_fewer_duplicated_fetches_than_naive_pull`
+/// measures all three policies and the cache-modelled column is identical to
+/// nearest-first on every one. That is not the model agreeing with reality; it
+/// is the model never being asked. `probe_job` carries `cache_bytes` of 1 MiB
+/// against a 2 048-byte chunk, so `ModelledCache::capacity` is 512 entries and
+/// the whole run touches 64 distinct chunks — **the model never evicts.** With
+/// no eviction, "chunks this worker was assigned" is a monotone proxy for "near
+/// this worker's anchor", the two criteria agree everywhere, and the
+/// `(misses, distance, task)` tiebreak never fires.
+///
+/// So the only thing that can make the two policies differ is the eviction —
+/// which is the half that models `cache::ChunkCache`, a type with no non-test
+/// construction site. This runs that regime.
+///
+/// **What it is allowed to conclude.** The metric is a property of the
+/// *assignment*: `redundancy` is the sum over workers of the distinct chunks
+/// each touched, over the distinct chunks overall, so 1.0 is perfect and a
+/// higher figure is bytes crossing the wire twice. That is real whatever any
+/// node caches, which is what makes it the right yardstick for a policy whose
+/// modelled cache does not exist. It is **counted, not timed** — no clock
+/// appears in this file — which is the same discipline the halo measurement uses
+/// (`ZarrEnvironment::unaligned_reads`) and the only kind of evidence available
+/// while there is no cache to time.
+#[test]
+fn the_two_policies_are_indistinguishable_until_the_model_evicts() {
+    let workers = 4;
+    let blocks = 32;
+
+    // `probe_job`'s own geometry, restated so the arithmetic below is checkable
+    // without reading that function: chunk [4, 8, 8] of `f64`.
+    let chunk_bytes = 4 * 8 * 8 * 8u64;
+    // A worker takes `blocks / workers` tasks and each identity task reads one
+    // block of 8 planes, which is two chunks, so a worker accumulates about this
+    // many distinct keys. A capacity at or above it evicts nothing.
+    let touched_per_worker = 2 * blocks / workers;
+
+    let naive = measure(HandoutPolicy::Naive, workers, blocks, 1);
+    let nearest = measure(HandoutPolicy::NearestFirst, workers, blocks, 1);
+
+    // The whole sweep is collected before anything is asserted. A sweep that
+    // aborts on its first bad row hides its own shape, and the shape is the
+    // finding here.
+    let sweep: Vec<(usize, Locality)> = [1usize, 2, 4, 8, 16, 512]
+        .into_iter()
+        .map(|capacity| {
+            let budget = capacity as u64 * chunk_bytes;
+            let arm = measure_at(
+                HandoutPolicy::CacheModelled,
+                workers,
+                blocks,
+                1,
+                Some(budget),
+            );
+            (capacity, arm)
+        })
+        .collect();
+
+    println!(
+        "eviction sweep, {} tasks, {workers} workers, {} distinct chunks, chunk {chunk_bytes} B, \
+         a worker touches ~{touched_per_worker}\n  \
+         naive                              duplicated {:4}  redundancy {:.3}\n  \
+         nearest-first                      duplicated {:4}  redundancy {:.3}",
+        nearest.tasks,
+        nearest.distinct,
+        naive.duplicated,
+        naive.redundancy(),
+        nearest.duplicated,
+        nearest.redundancy(),
+    );
+    for (capacity, arm) in &sweep {
+        println!(
+            "  cache-modelled, cap {capacity:3}{}  duplicated {:4}  redundancy {:.3}",
+            if *capacity < touched_per_worker {
+                " EVICTS"
+            } else {
+                "       "
+            },
+            arm.duplicated,
+            arm.redundancy(),
+        );
+    }
+
+    // The job is the same job at every budget. Without this a policy that
+    // dropped tasks would read as a locality win.
+    for (capacity, arm) in &sweep {
+        assert_eq!(arm.tasks, nearest.tasks, "capacity {capacity}");
+        assert_eq!(arm.distinct, nearest.distinct, "capacity {capacity}");
+    }
+
+    // **The liveness control.** Without it the sweep could pass by never
+    // reaching the regime it exists to reach, which is exactly how the roomy
+    // measurement in `nearest_first_handout_costs_fewer_duplicated_fetches_than_
+    // naive_pull` came to say nothing about this policy.
+    let evicting = sweep
+        .iter()
+        .filter(|(capacity, _)| *capacity < touched_per_worker)
+        .count();
+    assert!(
+        evicting >= 3,
+        "the sweep must actually force eviction; only {evicting} of its budgets did"
+    );
+
+    // **The roomy end: exactly `NearestFirst`.** This is `CacheModelled`'s own
+    // documented degradation, pinned. With the model holding everything,
+    // `misses` is a monotone proxy for distance and the tiebreak never fires.
+    let (roomy_capacity, roomy) = sweep.last().expect("a sweep");
+    assert!(*roomy_capacity > touched_per_worker);
+    assert_eq!(
+        (roomy.duplicated, roomy.fetched),
+        (nearest.duplicated, nearest.fetched),
+        "a model that never evicts must reproduce nearest-first exactly"
+    );
+
+    // **The tight end, and it is the finding: it is worse, and by a lot.**
+    //
+    // The variant's own doc says *"distance is the tiebreak, so with an empty or
+    // useless model this degrades exactly to `NearestFirst`"*. That is true of an
+    // **empty** model — every task misses all of its keys, the count is the same
+    // for every candidate here, and distance decides — and **false of a useless
+    // one**. A thrashing model returns a *varying* miss count that carries no
+    // information, and because `misses` is the primary sort key it dominates
+    // distance rather than deferring to it. So a useless model does not degrade
+    // to `NearestFirst`; it degrades toward noise, and noise costs the locality
+    // the policy was supposed to protect.
+    //
+    // Asserted as an inequality with the measured figures in the message rather
+    // than as the figures themselves: the magnitude is a property of this
+    // decomposition, the *direction* is the property of the policy.
+    let (tight_capacity, tight) = sweep.first().expect("a sweep");
+    assert!(*tight_capacity < touched_per_worker);
+    assert!(
+        tight.duplicated > nearest.duplicated,
+        "the tight arm is the reason `HandoutPolicy::CacheModelled` is refused; if it has \
+         stopped being worse than nearest-first, the refusal in `HandoutPolicy::refusal` \
+         should be revisited. cache-modelled at capacity {tight_capacity} duplicated {} \
+         against nearest-first's {}",
+        tight.duplicated,
+        nearest.duplicated,
+    );
+    // And it is a large fraction of the way back to the baseline the whole
+    // handout design exists to beat, which is what makes the direction matter
+    // rather than merely holding.
+    assert!(
+        tight.duplicated >= nearest.duplicated * 2,
+        "cache-modelled at capacity {tight_capacity} duplicated {}, nearest-first {}, naive {}",
+        tight.duplicated,
+        nearest.duplicated,
+        naive.duplicated,
     );
 }
 

@@ -218,10 +218,12 @@ fn priced_images(assembly: &Assembly) -> u64 {
 /// Two block sizes, because they answer different halves of the question. At one
 /// block the images *are* the residency and the saving is the four sink images'
 /// seven-eighths. At a small block the images are unchanged but every fan-in
-/// allocates a buffer per branch at the branch's own declared width — see
+/// allocates each branch's buffer at that branch's own declared width — see
 /// `Chain::apply_placed`'s `Parallel` arm — so the branch carrying the sink
 /// forward narrows too, and that part is invisible to every figure a
-/// decomposition can produce.
+/// decomposition can produce. Folding a fan-in incrementally changed how many of
+/// those buffers are alive at once and not how wide each is, so it takes nothing
+/// away from this: the two savings are on different axes and compose.
 #[test]
 fn the_narrow_sink_holds_fewer_bytes_than_the_wide_one() {
     const VOLUME: [usize; 3] = [128, 128, 96];

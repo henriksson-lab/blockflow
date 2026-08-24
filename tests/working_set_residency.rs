@@ -20,12 +20,22 @@
 // ------------------------------------
 // The buffers a block holds are not all the phase's to declare. The executor
 // allocates the input block and the output block; `Chain::Sequence` clones its
-// input and allocates an intermediate; `Chain::Parallel` allocates **one buffer
-// per branch, all alive at once**, plus a fold intermediate; a `Chain::Source`
-// arm is handed a buffer the executor fetched. Only the first two are in the
-// `x 2.0`. So the question "how far out is it" cannot be answered from the plan
-// — every term that is missing is missing *because* no `Decomposition` can see
-// it — and the honest instrument is to count the allocator.
+// input and allocates an intermediate; `Chain::Parallel` allocates branch
+// buffers; a `Chain::Source` arm is handed a buffer the executor fetched. Only
+// the first two are in the `x 2.0`. So the question "how far out is it" cannot
+// be answered from the plan — every term that is missing is missing *because*
+// no `Decomposition` can see it — and the honest instrument is to count the
+// allocator.
+//
+// **How many branch buffers are alive at once is a property of the combine.**
+// It used to be all of them: a fan-in held one buffer per branch until the
+// combine had read them all, so the figure grew with the arity and at one block
+// each of those buffers was a whole volume. A combine that declares itself a
+// left fold over pairs (`Combine::fold_carrier`) is now folded as its branches
+// are computed and holds three buffers whatever the arity — the partial, the
+// branch just finished, and the buffer their join is written into. The rows
+// below are that change measured; `tests/dead_block_buffers.rs` is the bit-identity it
+// is only allowed under.
 //
 // The measurement is one `apply` of one block, because that is the quantity the
 // budget is denominated in. It is not the whole-run peak: `tests/
@@ -48,7 +58,7 @@ use blockflow::budget::{
 };
 use blockflow::decomposition::{price_phase, CostModel, PhaseTraffic};
 use blockflow::geometry::BlockGrid;
-use blockflow::op::{Anchor, BlockResidency, Chain, SourceInputs};
+use blockflow::op::{Anchor, BlockResidency, Chain, Placement, SourceInputs};
 use blockflow::ops::{
     ElementShape, Logic, LogicCombine, Morphology, MorphologyOp, RankFilterOp, StructuringElement,
     VoxelwiseMapOp,
@@ -240,6 +250,32 @@ fn measure(chain: &Chain, sources: &[ImageId]) -> (usize, BlockResidency, usize)
     (peak, observed, spines)
 }
 
+/// **What `Chain::apply_tallied` allocates before its tally exists.**
+///
+/// The first two statements of that function are `placed_output_shape` and
+/// `produces` — the checks that the buffer it was handed is the one the chain
+/// writes. Both fold over the tree and both allocate small `Vec`s on the way;
+/// neither is tallied, and neither can be, because both are planning methods
+/// asked of a `Decomposition` as readily as of a run and threading a tally into
+/// them would put measurement apparatus in an API about plans.
+///
+/// **Measured here rather than predicted**, and that is deliberate: the figure
+/// is `Vec`'s growth policy, not the chain's shape. A fallible `collect` cannot
+/// use its iterator's size hint, so a two-branch fan-in's shape list is four
+/// slots and not two — 96 bytes where arithmetic over the branch count says 48.
+/// A constant written here would have been a guess with a plausible derivation
+/// behind it, which is the worst kind.
+///
+/// The arguments are the ones `measure` runs the chain at, so this is the same
+/// call the walk makes and not an analogue of it.
+fn preamble_bytes(chain: &Chain) -> usize {
+    peak_of(|| {
+        let _ = chain.placed_output_shape(BLOCK, &Placement::same(Anchor::whole(BLOCK)));
+        let _ = chain.produces(Dtype::F64);
+    })
+    .1
+}
+
 fn fan_in(computed: usize, sources: &[ImageId]) -> Chain {
     let mut branches: Vec<Chain> = (0..computed).map(|_| map("arm")).collect();
     for &image in sources {
@@ -263,6 +299,16 @@ fn what_a_block_holds_against_what_the_budget_charges_for_it() {
 
     let cases: Vec<(&str, Chain, Vec<ImageId>, usize)> = vec![
         ("one in, one out", map("only"), vec![], 1),
+        // **Two children and four, because they differ and only one of them
+        // used to.** A sequence holds the intermediate it is reading and the one
+        // it is writing; at two children the first of those is the caller's own
+        // block, borrowed. It used to be a copy of it.
+        (
+            "sequence of two maps",
+            Chain::sequence(vec![map("a"), map("b")]),
+            vec![],
+            1,
+        ),
         (
             "sequence of four maps",
             Chain::sequence(vec![map("a"), map("b"), map("c"), map("d")]),
@@ -271,12 +317,33 @@ fn what_a_block_holds_against_what_the_budget_charges_for_it() {
         ),
         ("fan-in, 2 computed arms", fan_in(2, &[]), vec![], 1),
         ("fan-in, 3 computed arms", fan_in(3, &[]), vec![], 1),
+        // **The row the fold exists for.** Seven arms hold what three do, and
+        // the assertion below is that they hold *exactly* what three do rather
+        // than merely less than seven would have.
+        ("fan-in, 7 computed arms", fan_in(7, &[]), vec![], 1),
         ("fan-in, 1 arm + 1 source", fan_in(1, &[one]), vec![one], 2),
         (
             "fan-in, 1 arm + 2 sources",
             fan_in(1, &[one, two]),
             vec![one, two],
             3,
+        ),
+        // **Two source arms and nothing computed**, which is the shape a source
+        // arm's own buffer used to dominate: every branch's answer already
+        // existed and the walk copied both of them.
+        (
+            "fan-in, 2 source arms",
+            fan_in(0, &[one, two]),
+            vec![one, two],
+            3,
+        ),
+        // The other place a source leaf's answer is an operand rather than an
+        // output: the head of a sequence, whose next child reads it.
+        (
+            "sequence from a source",
+            Chain::sequence(vec![Chain::source(one, Dtype::F64), map("b")]),
+            vec![one],
+            2,
         ),
     ];
 
@@ -311,6 +378,27 @@ fn what_a_block_holds_against_what_the_budget_charges_for_it() {
          block buffers, charged as two. Not a tolerance — this row is what says the rest of the \
          table is the gap and not the harness, and a window here would let the harness drift \
          into the number it is supposed to be validating."
+    );
+
+    // **The second control, and the one this change is answerable to.** A fan-in
+    // of seven arms holds what a fan-in of three does, to the byte. Before the
+    // fold it held four more whole block buffers; the figure is now a property
+    // of the node's shape and not of its arity, which is what makes it safe for
+    // a plan to run a wide join at one block.
+    let three = rows
+        .iter()
+        .find(|(name, _, _)| *name == "fan-in, 3 computed arms")
+        .expect("the three-arm row");
+    let seven = rows
+        .iter()
+        .find(|(name, _, _)| *name == "fan-in, 7 computed arms")
+        .expect("the seven-arm row");
+    assert_eq!(
+        three.1 as u64, seven.1 as u64,
+        "three arms held {} and seven held {}. A fan-in whose combine declares a fold \
+         holds the partial, the branch it is computing and their join — three buffers, \
+         whatever the arity — so these are one number or the fold is not being taken.",
+        three.1, seven.1
     );
 
     // Every other shape holds more than it is charged for, and the excess is not
@@ -410,7 +498,7 @@ fn an_ops_own_working_buffers_are_not_visible_to_any_declaration() {
 /// The admission rule is `strategy`'s own: the largest candidate edge for which
 /// `working_set_bytes_per_block x expected_concurrency <= budget_bytes`. The
 /// factors are measured above — `1.00` is what the formula charges today,
-/// `2.00` a sequence or a two-arm fan-in, `3.56` the widest framework shape
+/// `2.00` a sequence or a two-arm fan-in, `3.06` the widest framework shape
 /// here, `4.00` a one-in-one-out phase whose op is a rank filter.
 ///
 /// **The affordability cost is bounded at one step of the ladder, and that is
@@ -421,7 +509,7 @@ fn an_ops_own_working_buffers_are_not_visible_to_any_declaration() {
 /// What it said, at 40 workers on a ladder of powers of two:
 ///
 /// ```text
-///  budget | admitted edge: map  2.00x  3.56x  4.00x | over-hold: 1.00x 2.00x 3.56x 4.00x
+///  budget | admitted edge: map  2.00x  3.06x  4.00x | over-hold: 1.00x 2.00x 3.06x 4.00x
 ///   1 GiB |                 64     64     64     64 |            0.16x 0.31x 0.56x 0.62x
 ///   2 GiB |                128     64     64     64 |            0.62x 1.25x 2.23x 2.50x
 ///   4 GiB |                128    128     64     64 |            0.31x 0.62x 1.11x 1.25x
@@ -453,7 +541,7 @@ fn what_a_corrected_figure_would_cost_in_affordable_plans() {
     const FACTORS: [(&str, f64); 4] = [
         ("map", 1.00),
         ("seq / 2-arm", 2.00),
-        ("1 arm + 2 src", 3.56),
+        ("1 arm + 2 src", 3.06),
         ("rank filter", 4.00),
     ];
 
@@ -497,7 +585,7 @@ fn what_a_corrected_figure_would_cost_in_affordable_plans() {
         FACTORS[3].0,
         "1.00x",
         "2.00x",
-        "3.56x",
+        "3.06x",
         "4.00x"
     );
 
@@ -571,11 +659,34 @@ fn what_a_corrected_figure_would_cost_in_affordable_plans() {
 /// around the *same* call, so nothing between the two can differ.
 ///
 /// **Where the two agree, the observation is exact.** Where they do not, the
-/// residual is a `Combine`'s own scratch: `LogicCombine` folds three or more
-/// branches through an intermediate it allocates inside `Combine::apply`, which
-/// no walk over the chain can see. That residual is asserted to be exactly one
-/// `Bool` block, because a residual nobody has accounted for is the thing this
-/// whole review exists to stop happening.
+/// residual is named and computed rather than left as a window, because a
+/// residual nobody has accounted for is the thing this whole review exists to
+/// stop happening.
+///
+/// **One term used to be here and is not any more.** `LogicCombine` folded three
+/// or more branches through an intermediate it allocated inside `Combine::apply`
+/// — invisible to any walk over the chain, and one whole `Bool` block. The walk
+/// now drives that fold itself, so the buffer is allocated where it can be
+/// counted and the row it used to hide in is an equality with nothing on the
+/// callee side at all. It is the same buffer; what changed is who allocates it,
+/// and therefore whether a plan can see it.
+///
+/// **A second went the same way and a third appeared because of it.** The
+/// `Region` a source arm's `Voxels::assign` built is gone, because a source arm
+/// that is an *operand* is borrowed and never assigns. And with every arm of a
+/// two-source fan-in borrowed, that chain allocates no block buffer at all — so
+/// for the first time the largest thing it allocates is what
+/// `Chain::apply_tallied` folds over the tree **before its tally exists**, to
+/// check the buffer it was handed. Nothing about those `Vec`s changed. What
+/// changed is that there is no longer a block buffer standing over them.
+///
+/// That term is [`preamble_bytes`], measured rather than predicted, and it
+/// enters as `max(preamble, walk)` written as a saturating difference — one
+/// expression for every row, which saturates to nothing for every row that
+/// holds a block buffer. **It was found by this equality and not by reading the
+/// code**: a window wide enough to absorb 264 bytes would have absorbed it
+/// silently, and the two rows it appears in are exactly the two the borrow
+/// created.
 #[test]
 fn the_walks_own_figure_matches_the_allocator_except_for_what_it_says_it_omits() {
     let unit = buffer_bytes() as f64;
@@ -586,22 +697,23 @@ fn the_walks_own_figure_matches_the_allocator_except_for_what_it_says_it_omits()
     // scope — so the walk is right not to count them, and this test is what says
     // how much they are rather than leaving a window for them to hide in.
     //
-    // `fold`: one `Bool` block, the intermediate `LogicCombine` allocates once
-    // it has three or more branches to fold, inside `Combine::apply`.
-    let fold = BLOCK.iter().product::<usize>();
     // `region`: `Chain::Source` finishes with `Voxels::assign`, which builds a
     // `Region::whole` — two three-element `Vec<usize>`. Only one is ever live,
-    // because each `assign` frees its own before the next arm runs.
-    let region = 2 * 3 * std::mem::size_of::<usize>();
-    // **And where a chain has both, the peak takes the larger and not the sum.**
-    // They are transient, in different callees, at different moments: every
-    // `assign` has finished by the time the combine allocates. Summing them
-    // would over-account by exactly one of them — which is what the equality
-    // below said, the first time this was written as `fold + region`.
-    let both = std::cmp::max(fold, region);
+    // because each `assign` frees its own before the next arm runs. **No row
+    // carries it any more**: the arms that used to assign now borrow, and the
+    // one place a source leaf still copies is when it writes a caller's `out`,
+    // which no row here is. It is left named because the term is real and a
+    // future row may meet it again.
+    let _ = 2 * 3 * std::mem::size_of::<usize>();
 
     let cases: Vec<(&str, Chain, Vec<ImageId>, usize)> = vec![
         ("one in, one out", map("only"), vec![], 0),
+        (
+            "sequence of two maps",
+            Chain::sequence(vec![map("a"), map("b")]),
+            vec![],
+            0,
+        ),
         (
             "sequence of four maps",
             Chain::sequence(vec![map("a"), map("b"), map("c"), map("d")]),
@@ -609,34 +721,58 @@ fn the_walks_own_figure_matches_the_allocator_except_for_what_it_says_it_omits()
             0,
         ),
         ("fan-in, 2 computed arms", fan_in(2, &[]), vec![], 0),
-        ("fan-in, 3 computed arms", fan_in(3, &[]), vec![], fold),
-        (
-            "fan-in, 1 arm + 1 source",
-            fan_in(1, &[one]),
-            vec![one],
-            region,
-        ),
+        ("fan-in, 3 computed arms", fan_in(3, &[]), vec![], 0),
+        ("fan-in, 7 computed arms", fan_in(7, &[]), vec![], 0),
+        // **Every source row's callee scratch is now zero, and that is the
+        // change rather than a coincidence.** The `Region` counted here was
+        // built by `Voxels::assign`, which is how a source leaf used to finish;
+        // a borrowed source arm does not assign at all, so there is no `Region`
+        // to be short by. The row that carried 48 bytes carries none.
+        ("fan-in, 1 arm + 1 source", fan_in(1, &[one]), vec![one], 0),
         (
             "fan-in, 1 arm + 2 sources",
             fan_in(1, &[one, two]),
             vec![one, two],
-            both,
+            0,
+        ),
+        (
+            "fan-in, 2 source arms",
+            fan_in(0, &[one, two]),
+            vec![one, two],
+            0,
+        ),
+        (
+            "sequence from a source",
+            Chain::sequence(vec![Chain::source(one, Dtype::F64), map("b")]),
+            vec![one],
+            0,
         ),
     ];
 
     eprintln!(
-        "\n{:<26} {:>9} {:>9} {:>8} {:>7} {:>9}",
-        "phase shape", "allocator", "observed", "callee", "spines", "residual"
+        "\n{:<26} {:>9} {:>9} {:>8} {:>7} {:>8} {:>9}",
+        "phase shape", "allocator", "observed", "callee", "spines", "preamble", "residual"
     );
     for (name, chain, sources, expected_scratch) in &cases {
+        // **The preamble counts only where it is the tallest thing there is.**
+        // It is freed before the first block buffer, so a chain that allocates
+        // one never sees it — the walk's own peak stands over it and the
+        // subtraction saturates to nothing. A chain that allocates *no* block
+        // buffer has nothing standing over it, and then the high-water mark of
+        // the whole application is a handful of `Vec` slots. That is not a
+        // second rule for two rows: it is `max(preamble, walk)` written as the
+        // difference, and it is the same expression for every row.
+        let preamble = preamble_bytes(chain);
         let (allocator, observed, spines) = measure(chain, sources);
-        let accounted = observed.peak_bytes() as usize + spines + expected_scratch;
+        let over = preamble.saturating_sub(observed.chain_bytes() as usize);
+        let accounted = observed.peak_bytes() as usize + spines + expected_scratch + over;
         eprintln!(
-            "{name:<26} {:>7.2}x {:>7.2}x {:>8} {:>7} {:>9}",
+            "{name:<26} {:>7.2}x {:>7.2}x {:>8} {:>7} {:>8} {:>9}",
             allocator as f64 / unit,
             observed.peak_bytes() as f64 / unit,
             expected_scratch,
             spines,
+            over,
             allocator as i64 - accounted as i64
         );
 
@@ -751,10 +887,20 @@ fn fan_in_of(arms: Vec<Chain>, sources: &[ImageId]) -> Chain {
 ///
 /// **The shapes include combinations**, which is the correction this test forced.
 /// The tables above measure framework cost and op cost on *separate* chains —
-/// `3.56x` for a fan-in of cheap maps with two source arms, `2.00x` for a rank
+/// `3.06x` for a fan-in of cheap maps with two source arms, `2.00x` for a rank
 /// filter in a one-in-one-out chain — and a margin justified by the larger of
 /// those two would not cover a chain that has both at once. So the worst case is
 /// measured rather than argued from the parts.
+///
+/// **And it is now a combination that is worst, where it was not before.** While
+/// a fan-in held every branch at once, its own buffers were tall enough that the
+/// peak of `fan-in, rank arm + 2 sources` fell at the combine and the rank
+/// filter's transient scratch never showed: the chain measured the same `3.56x`
+/// as the cheap-arm fan-in beside it, and this file said so. Folding the branches
+/// took the fan-in's own buffers down, the peak moved to the arm, and the
+/// combination is now the widest shape here by half a unit. Nothing about the
+/// rank filter changed — which is the whole argument for measuring the
+/// combinations rather than reasoning about the parts.
 #[test]
 fn the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured() {
     let unit = buffer_bytes();
@@ -766,17 +912,35 @@ fn the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured() {
     let shapes: Vec<(&str, Chain, Vec<ImageId>)> = vec![
         ("one in, one out", map("only"), vec![]),
         (
+            "sequence of two maps",
+            Chain::sequence(vec![map("a"), map("b")]),
+            vec![],
+        ),
+        (
             "sequence of four maps",
             Chain::sequence(vec![map("a"), map("b"), map("c"), map("d")]),
             vec![],
         ),
         ("fan-in, 2 computed arms", fan_in(2, &[]), vec![]),
         ("fan-in, 3 computed arms", fan_in(3, &[]), vec![]),
+        // Included so the arity axis is covered by the shape the margin is
+        // fitted to, and not only by the table above.
+        ("fan-in, 7 computed arms", fan_in(7, &[]), vec![]),
         ("fan-in, 1 arm + 1 source", fan_in(1, &[one]), vec![one]),
         (
             "fan-in, 1 arm + 2 sources",
             fan_in(1, &[one, two]),
             vec![one, two],
+        ),
+        (
+            "fan-in, 2 source arms",
+            fan_in(0, &[one, two]),
+            vec![one, two],
+        ),
+        (
+            "sequence from a source",
+            Chain::sequence(vec![Chain::source(one, Dtype::F64), map("b")]),
+            vec![one],
         ),
         ("rank filter alone", heavy(), vec![]),
         (
