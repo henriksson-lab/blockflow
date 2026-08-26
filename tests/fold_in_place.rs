@@ -21,7 +21,7 @@
 //!   joins accumulate and change nothing this can measure.
 //!
 //! Both are asserted. Reporting only the first would be reporting the fixture.
-use blockflow::op::{BlockOp, Chain, Combine};
+use blockflow::op::{Chain, Combine};
 use blockflow::ops::voxelwise::{
     Arithmetic, ArithmeticCombine, Logic, LogicCombine, VoxelwiseMapOp,
 };
@@ -53,7 +53,12 @@ fn held(arity: usize, combine: Box<dyn Combine>) -> (u64, Voxels) {
     .expect("an output block");
     let empty = [];
     let tally = chain
-        .apply_observing(&block, SourceInputs::new(&empty), &mut out, &Anchor::whole(BLOCK))
+        .apply_observing(
+            &block,
+            SourceInputs::new(&empty),
+            &mut out,
+            &Anchor::whole(BLOCK),
+        )
         .expect("one block");
     (tally.chain_bytes(), out)
 }
@@ -75,7 +80,10 @@ fn an_arithmetic_fan_in_holds_two_buffers_not_three() {
     for arity in 2..=6usize {
         let (bytes, _) = held(arity, maximum());
         figures.push(bytes);
-        eprintln!("arithmetic arity {arity}: {bytes} bytes ({} buffers)", bytes / buffer);
+        eprintln!(
+            "arithmetic arity {arity}: {bytes} bytes ({} buffers)",
+            bytes / buffer
+        );
     }
     for window in figures.windows(2) {
         assert_eq!(
@@ -142,7 +150,12 @@ fn accumulating_in_place_is_the_same_answer() {
             .expect("a buffer");
             let empty = [];
             branch
-                .apply_observing(&block, SourceInputs::new(&empty), &mut buffer, &Anchor::whole(BLOCK))
+                .apply_observing(
+                    &block,
+                    SourceInputs::new(&empty),
+                    &mut buffer,
+                    &Anchor::whole(BLOCK),
+                )
                 .expect("a branch");
             results.push(buffer);
         }
@@ -199,7 +212,9 @@ fn a_non_commutative_operation_declares_no_carrier_and_never_reaches_the_fold() 
     // rather than about `fold_carrier` answering `None` to everything.
     for op in [Arithmetic::Maximum, Arithmetic::Minimum] {
         assert!(
-            ArithmeticCombine::new("op", op).fold_carrier(&four).is_some(),
+            ArithmeticCombine::new("op", op)
+                .fold_carrier(&four)
+                .is_some(),
             "{op:?} declared no carrier, so the control above proves nothing"
         );
     }

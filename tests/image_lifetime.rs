@@ -680,7 +680,10 @@ fn releasing_the_input_frees_it_after_its_last_reader_and_moves_no_voxel() {
     let image_bytes = (VOLUME.iter().product::<usize>() * Dtype::F64.size_of()) as u64;
 
     // The control first, so that a fall measured below is a fall from somewhere.
-    assert!(!without.is_discarded(0), "the default must still hold image 0");
+    assert!(
+        !without.is_discarded(0),
+        "the default must still hold image 0"
+    );
     assert_eq!(
         without.allocated_image_bytes(),
         2 * image_bytes,

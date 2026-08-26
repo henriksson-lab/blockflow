@@ -1107,8 +1107,11 @@ fn a_borrowed_source_arm_costs_the_walk_nothing() {
     // with a tally that sees no buffers at all and would mean nothing.
     let mut computing = Vec::new();
     for computed in 1..=3usize {
-        let holding = Chain::parallel(fan_in_over(computed, &[one()], Logic::Or).0, Box::new(Collected))
-            .expect("a fan-in");
+        let holding = Chain::parallel(
+            fan_in_over(computed, &[one()], Logic::Or).0,
+            Box::new(Collected),
+        )
+        .expect("a fan-in");
         computing.push(chain_bytes(&holding));
     }
     eprintln!("computed arms (collected): {computing:?}");

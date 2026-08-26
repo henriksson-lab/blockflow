@@ -41,8 +41,8 @@
 // has a message and cannot be forgotten at a new call site. The only change to
 // `block_processing.rs` is that the function is now `pub(crate)`.
 
-use std::collections::BTreeSet;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
 use crate::assemble::{describe_image, is_supplied_image, ImageId};
@@ -2897,6 +2897,7 @@ pub(crate) fn phase_compute_per_voxel(
     match work {
         Some(crate::fragment::PhaseWork::Fragments(op)) => Ok(op.cost_per_voxel()),
         Some(crate::fragment::PhaseWork::Iterate(op)) => Ok(op.cost_per_voxel()),
+        Some(crate::fragment::PhaseWork::IterateReduce(op)) => Ok(op.cost_per_voxel()),
         Some(crate::fragment::PhaseWork::Pixels) | None => {
             if phase.slots.is_empty() {
                 return Err(Error::InvalidArgument(format!(

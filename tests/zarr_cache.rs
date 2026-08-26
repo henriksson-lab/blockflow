@@ -20,16 +20,18 @@
 //! 3. **A written image is not cached**, because `ChunkCache` has no per-array
 //!    invalidation and serving a stale chunk would be a wrong answer rather
 //!    than a slow one.
+#![cfg(feature = "zarr")]
+
 use blockflow::cache::CacheStats;
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+use blockflow::env::Environment;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::ops::voxelwise::VoxelwiseMapOp;
-use blockflow::strategy::{execute, Hints, Workflow};
-use blockflow::Dtype;
-use blockflow::env::Environment;
 use blockflow::region::Region;
+use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::zarr_env::ZarrEnvironment;
+use blockflow::Dtype;
 use blockflow::Voxels;
 use ndarray::Array3;
 
@@ -70,11 +72,9 @@ fn regions() -> Vec<Region> {
 fn read_all(env: &ZarrEnvironment, regions: &[Region]) -> Vec<Voxels> {
     regions
         .iter()
-        .map(|region| {
-            match env.read(0, region).expect("image 0 reads") {
-                blockflow::env::BlockBuf::Array(voxels) => voxels,
-                other => panic!("a real environment must return voxels, got {other:?}"),
-            }
+        .map(|region| match env.read(0, region).expect("image 0 reads") {
+            blockflow::env::BlockBuf::Array(voxels) => voxels,
+            other => panic!("a real environment must return voxels, got {other:?}"),
         })
         .collect()
 }
@@ -90,7 +90,10 @@ fn root(tag: &str) -> std::path::PathBuf {
 #[test]
 fn a_cached_read_is_the_same_read_and_the_cache_serves_it() {
     let regions = regions();
-    assert!(regions.len() > 8, "the fixture needs a traversal to revisit");
+    assert!(
+        regions.len() > 8,
+        "the fixture needs a traversal to revisit"
+    );
 
     let cold_root = root("cold");
     let cold = ZarrEnvironment::create(&cold_root, &source(), CHUNK).expect("a store");
@@ -128,7 +131,9 @@ fn a_cached_read_is_the_same_read_and_the_cache_serves_it() {
 
     // **The control.** Everything above passes just as well against a cache
     // that is never consulted, which is what the unwired state looked like.
-    let stats: CacheStats = warm.cache_stats().expect("the warm environment has a cache");
+    let stats: CacheStats = warm
+        .cache_stats()
+        .expect("the warm environment has a cache");
     assert!(
         stats.hits() > 0,
         "the cache served {} hits against {} misses. Identical voxels is necessary and not \
@@ -138,7 +143,9 @@ fn a_cached_read_is_the_same_read_and_the_cache_serves_it() {
     );
     eprintln!(
         "cache: {} hits, {} misses, {} resident bytes",
-        stats.hits(), stats.misses, stats.resident_bytes
+        stats.hits(),
+        stats.misses,
+        stats.resident_bytes
     );
 }
 
@@ -192,9 +199,8 @@ fn a_written_image_is_not_cached() {
          from an uncached one and the assertion below means nothing"
     );
 
-    let block = blockflow::env::BlockBuf::Array(
-        Voxels::zeros(Dtype::U16, [16, 16, 16]).expect("a block"),
-    );
+    let block =
+        blockflow::env::BlockBuf::Array(Voxels::zeros(Dtype::U16, [16, 16, 16]).expect("a block"));
     env.write(1, &region, &region, &block)
         .expect("image 1 is writable");
     let _ = env.read(1, &region).expect("image 1 reads");

@@ -80,6 +80,8 @@
 // index past `available - 1` at either sign; the window buffer is sized from
 // `full` as a hint and grows once if a phase exceeds it.
 
+use std::collections::BTreeMap;
+
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
@@ -374,9 +376,72 @@ fn selecting<T: Ord + Copy>(
     // and could not separate them above the noise of the machine it ran on, so
     // this is the shape of the thing rather than a measured saving.
     let fixed = (element.origin() == StepOrigin::Anchor).then(|| element.offsets());
+    // **Asked once for the whole volume**, by the function that already owns
+    // this question: it is a property of the rank and the element, not of any
+    // voxel's truncated window, and `extreme_of`'s own header carries the
+    // arithmetic that makes it agree with `Rank::resolve` at every truncation.
+    let ends = extreme_of(rank, full);
+    // **The flat path**, for the case that is almost every call this kernel gets
+    // from a morphology: one fixed offset list, reduced to an end, no mask, and
+    // an input whose memory is one contiguous run in C order.
+    //
+    // What it removes is not the compare — that stays — but everything around
+    // it: the per-tap clamp against the volume, and `ndarray`'s own index
+    // arithmetic and bounds check on `[[a, b, c]]`. A tap becomes one add and
+    // one slice read.
+    //
+    // It applies only to the **interior**, where the whole element fits inside
+    // the volume, because that is exactly where the clamp is known to be a
+    // no-op. Every boundary voxel falls through to the general path, which is
+    // the one that has always been right about truncation — see
+    // `Rank::resolve`, whose rescaling rule is the thing a fast path must not
+    // reimplement.
+    let flat = match (ends, fixed, mask.is_some(), input.as_slice()) {
+        (Some(_), Some(offsets), false, Some(values)) if !offsets.is_empty() => {
+            let strides = input.strides();
+            let mut lo = [isize::MAX; 3];
+            let mut hi = [isize::MIN; 3];
+            for offset in offsets {
+                for axis in 0..3 {
+                    lo[axis] = lo[axis].min(offset[axis]);
+                    hi[axis] = hi[axis].max(offset[axis]);
+                }
+            }
+            let steps: Vec<isize> = offsets
+                .iter()
+                .map(|offset| {
+                    offset[0] * strides[0] + offset[1] * strides[1] + offset[2] * strides[2]
+                })
+                .collect();
+            Some((values, strides.to_vec(), steps, lo, hi))
+        }
+        _ => None,
+    };
+    // **The interior, by running extrema**, where the element is planar and the
+    // rank is an end. This writes the interior outright and hands back what it
+    // wrote, so the loop below owns only the boundary shell — the part whose
+    // truncation rule is `Rank::resolve`'s and must not be reimplemented.
+    //
+    // It is tried before the flat path rather than instead of it: an element
+    // with depth, or a row the runs cannot span, still gets the flat interior.
+    let running = match (ends, flat.as_ref()) {
+        (Some(take), Some((values, _, _, lo, hi))) => {
+            let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+            let offsets = fixed.expect("the flat path is built from one fixed offset list");
+            by_separable_box(values, shape, offsets, take, *lo, *hi, &mut out)
+                .or_else(|| by_running_extremes(values, shape, offsets, take, *lo, *hi, &mut out))
+        }
+        _ => None,
+    };
     for i in 0..input.shape()[0] {
         for j in 0..input.shape()[1] {
             for k in 0..input.shape()[2] {
+                // Already written, by the running kernel above.
+                if let Some([[i0, i1], [j0, j1], [k0, k1]]) = running {
+                    if i >= i0 && i < i1 && j >= j0 && j < j1 && k >= k0 && k < k1 {
+                        continue;
+                    }
+                }
                 // The one place the *centre's* own membership is consulted. It
                 // is asked before the window is gathered, because under a fill
                 // there is nothing to gather it for — and it is asked of the
@@ -407,24 +472,80 @@ fn selecting<T: Ord + Copy>(
                         element.offsets_at(placed, at.volume, &mut offsets)
                     }
                 };
-                for offset in gathered {
+                // **The neighbour, or nothing.** One place where a voxel is
+                // clamped to the buffer and tested against the mask, so that
+                // the two paths below cannot drift on either rule.
+                let value_at = |offset: &[isize; 3]| -> Option<T> {
                     let a = anchor[0] + offset[0];
                     let b = anchor[1] + offset[1];
                     let c = anchor[2] + offset[2];
                     if a < 0 || b < 0 || c < 0 || a >= extent[0] || b >= extent[1] || c >= extent[2]
                     {
-                        continue;
+                        return None;
                     }
                     let at = [a as usize, b as usize, c as usize];
                     if let Some(mask) = mask.as_ref() {
                         if !mask[at] {
-                            continue;
+                            return None;
                         }
                     }
-                    window.push(input[at]);
-                }
-                let index = rank.resolve(full, window.len());
-                match select_nth(&mut window, index) {
+                    Some(input[at])
+                };
+                // **A min or a max is folded as the neighbours are read.** The
+                // window exists to be *selected over*; an end needs no selection,
+                // so gathering into it would be building a buffer to throw away.
+                // `Rank::extreme` can answer this before the gather — that is
+                // what it is for — where `Rank::resolve` cannot, since it needs
+                // the count the gather produces.
+                //
+                // An erosion is `Rank::lowest` and a dilation is `Rank::highest`,
+                // so a grey opening takes this path twice, and the cell chain's
+                // background arm is exactly one opening.
+                // The interior, flat. `gathered` is the same offset list the
+                // general path walks, so this is the same set of taps read a
+                // cheaper way.
+                let interior = flat.as_ref().and_then(|(values, strides, steps, lo, hi)| {
+                    let inside = (0..3).all(|axis| {
+                        anchor[axis] + lo[axis] >= 0 && anchor[axis] + hi[axis] < extent[axis]
+                    });
+                    if !inside {
+                        return None;
+                    }
+                    let base =
+                        anchor[0] * strides[0] + anchor[1] * strides[1] + anchor[2] * strides[2];
+                    let mut best = values[(base + steps[0]) as usize];
+                    match ends {
+                        Some(Extreme::Lowest) => {
+                            for step in &steps[1..] {
+                                let value = values[(base + step) as usize];
+                                if value < best {
+                                    best = value;
+                                }
+                            }
+                        }
+                        _ => {
+                            for step in &steps[1..] {
+                                let value = values[(base + step) as usize];
+                                if value > best {
+                                    best = value;
+                                }
+                            }
+                        }
+                    }
+                    Some(best)
+                });
+                let selected = match ends {
+                    _ if interior.is_some() => interior,
+                    Some(Extreme::Lowest) => gathered.iter().filter_map(&value_at).min(),
+                    Some(Extreme::Highest) => gathered.iter().filter_map(&value_at).max(),
+                    None => {
+                        window.clear();
+                        window.extend(gathered.iter().filter_map(&value_at));
+                        let index = rank.resolve(full, window.len());
+                        select_nth(&mut window, index)
+                    }
+                };
+                match selected {
                     Some(value) => out[[i, j, k]] = value,
                     // Unmasked, an empty window means the element does not
                     // contain its own centre, which is a malformed element and
@@ -542,6 +663,468 @@ fn runs_of(offsets: &[[isize; 3]]) -> Vec<(isize, isize, isize, usize)> {
         }
     }
     runs
+}
+
+/// One end of a pair, chosen by which end the rank asked for.
+///
+/// Written once so that the running kernel below cannot fold a min where the
+/// gather folds a max: every comparison in this file's fast paths goes through
+/// either this or [`fold_into`].
+fn pick<T: Ord>(take: Extreme, a: T, b: T) -> T {
+    match take {
+        Extreme::Lowest => a.min(b),
+        Extreme::Highest => a.max(b),
+    }
+}
+
+/// Fold `from` into `into`, elementwise, at the end the rank asked for.
+///
+/// **The shape of this loop is most of the point.** The same comparisons
+/// written per voxel — walk the element, gather what each offset contributes —
+/// measured `119 ns/voxel` for work that is a few dozen operations. Written over
+/// two aligned slices it is one instruction a lane, and the branch on `take` is
+/// hoisted out of the loop rather than taken inside it.
+fn fold_into<T: Ord + Copy>(into: &mut [T], from: &[T], take: Extreme) {
+    match take {
+        Extreme::Lowest => {
+            for (slot, &value) in into.iter_mut().zip(from) {
+                if value < *slot {
+                    *slot = value;
+                }
+            }
+        }
+        Extreme::Highest => {
+            for (slot, &value) in into.iter_mut().zip(from) {
+                if value > *slot {
+                    *slot = value;
+                }
+            }
+        }
+    }
+}
+
+/// One run of an element, taken along **axis 1**: every offset it holds shares
+/// an axis-0 step of `d0` and an axis-2 step of `d2`, and its axis-1 steps are
+/// the contiguous span `start ..= start + len - 1`.
+#[derive(Clone, Copy, Debug)]
+struct RowRun {
+    d0: isize,
+    d2: isize,
+    start: isize,
+    len: usize,
+}
+
+/// The element's offsets as runs along **axis 1**.
+///
+/// # Why axis 1 and not the fastest axis
+///
+/// The obvious axis to run along is the fastest one, where a run is a
+/// contiguous span of memory. That was the first thing written here, and it was
+/// **inert on the element that motivated it**: a background disk stated as
+/// `10 x 10 x 1` puts its flat axis last, so every offset shares `d2 == 0` and
+/// every run along axis 2 has length one. A decomposition that turns an
+/// eighty-tap element into eighty runs of one is the gather with extra
+/// arithmetic, and it measured as exactly that — a `1.7x` faster kernel that
+/// moved the chain it was written for by nothing.
+///
+/// Running along axis 1 costs nothing for it: the running pass folds whole
+/// **rows** of the fastest axis into each other, so every inner loop is still
+/// contiguous and still one instruction a lane. It is the *outer* index that
+/// steps, not the inner one.
+///
+/// # It does not need a planar element
+///
+/// Grouping by `(d0, d2)` says nothing about depth, so a three-dimensional
+/// element decomposes too — it simply has more groups. Runs are emitted maximal
+/// rather than required contiguous, so an element with gaps decomposes as well;
+/// it just gets more of them, and [`by_running_extremes`] declines when there
+/// are so many that the gather would be cheaper.
+fn row_runs_of(offsets: &[[isize; 3]]) -> Vec<RowRun> {
+    let mut by_key: BTreeMap<(isize, isize), Vec<isize>> = BTreeMap::new();
+    for offset in offsets {
+        by_key
+            .entry((offset[0], offset[2]))
+            .or_default()
+            .push(offset[1]);
+    }
+    let mut runs = Vec::new();
+    for ((d0, d2), mut steps) in by_key {
+        steps.sort_unstable();
+        steps.dedup();
+        let mut start = steps[0];
+        let mut len = 1;
+        for pair in steps.windows(2) {
+            if pair[1] == pair[0] + 1 {
+                len += 1;
+            } else {
+                runs.push(RowRun { d0, d2, start, len });
+                start = pair[1];
+                len = 1;
+            }
+        }
+        runs.push(RowRun { d0, d2, start, len });
+    }
+    runs
+}
+
+/// The running extremum over **every window of `len` consecutive chunks**.
+///
+/// The data is `n1` chunks of `n2` elements each; `out`'s chunk `j` is the
+/// elementwise extremum of chunks `j ..= j + len - 1`, for every `j` where that
+/// window fits. Chunks past `n1 - len` are written but hold no promise, and no
+/// caller reads them.
+///
+/// A chunk is a **row** when this walks a plane and a **plane** when it walks a
+/// volume, which is what lets one function serve both of the slow axes: the
+/// inner loop is contiguous either way, because it is the *outer* index that
+/// steps.
+///
+/// This is van Herk's algorithm, and the reason it is worth having is that its
+/// cost **does not depend on `len`**. Cut the rows into blocks of `len` and
+/// take, for each row, the extremum from its block's start down to it
+/// (`forward`) and from it to its block's end (`out`, folded in place). A window
+/// of exactly `len` rows straddles exactly one block boundary, so it is covered
+/// by one suffix and one prefix, and the answer is those two folded together —
+/// three row-folds a row, whatever `len` is, against `len` for the gather.
+///
+/// The two halves meet without a gap: for a window starting at block offset
+/// `r > 0` the suffix covers `[j, j + len - r - 1]` and the prefix covers
+/// `[j + len - r, j + len - 1]`; at `r == 0` both cover the whole block, which
+/// is the same answer twice rather than a hole.
+fn running_extreme_strided<T: Ord + Copy>(
+    plane: &[T],
+    n1: usize,
+    n2: usize,
+    len: usize,
+    take: Extreme,
+    forward: &mut [T],
+    out: &mut [T],
+) {
+    if len == 0 || len > n1 {
+        return;
+    }
+    // The suffix within each block, folded in place. Walked block by block
+    // rather than tested per row: the obvious spelling of "is this the last row
+    // of its block" is a modulo, and a division in the innermost loop of the
+    // innermost kernel is most of what this algorithm was supposed to save.
+    out.copy_from_slice(plane);
+    let mut start = 0;
+    while start < n1 {
+        let end = (start + len).min(n1);
+        for j in (start..end.saturating_sub(1)).rev() {
+            let (head, tail) = out.split_at_mut((j + 1) * n2);
+            fold_into(&mut head[j * n2..], &tail[..n2], take);
+        }
+        start = end;
+    }
+    // The prefix within each block.
+    forward.copy_from_slice(plane);
+    let mut start = 0;
+    while start < n1 {
+        let end = (start + len).min(n1);
+        for j in start + 1..end {
+            let (head, tail) = forward.split_at_mut(j * n2);
+            fold_into(&mut tail[..n2], &head[(j - 1) * n2..j * n2], take);
+        }
+        start = end;
+    }
+    for j in 0..=(n1 - len) {
+        let source = (j + len - 1) * n2;
+        let (head, tail) = if source > j * n2 {
+            let (a, b) = out.split_at_mut(source);
+            (&mut a[j * n2..j * n2 + n2], &b[..n2])
+        } else {
+            // `len == 1`: the window is the row itself and the prefix is a copy
+            // of it, so there is nothing to fold.
+            continue;
+        };
+        fold_into(head, &forward[source..source + n2], take);
+        let _ = tail;
+    }
+}
+
+/// The running extremum of one **contiguous line**, over every window of `len`.
+///
+/// [`running_extreme_strided`] with a chunk of one element would answer this,
+/// and would spend the whole of its inner loop on slices of length one. The
+/// fastest axis gets its own spelling for that reason and no other; the
+/// algorithm is the same.
+fn running_extreme_line<T: Ord + Copy>(
+    row: &[T],
+    len: usize,
+    take: Extreme,
+    forward: &mut [T],
+    out: &mut [T],
+) {
+    let n = row.len();
+    if len == 0 || len > n {
+        return;
+    }
+    out.copy_from_slice(row);
+    let mut start = 0;
+    while start < n {
+        let end = (start + len).min(n);
+        for k in (start..end.saturating_sub(1)).rev() {
+            out[k] = pick(take, out[k], out[k + 1]);
+        }
+        start = end;
+    }
+    forward.copy_from_slice(row);
+    let mut start = 0;
+    while start < n {
+        let end = (start + len).min(n);
+        for k in start + 1..end {
+            forward[k] = pick(take, forward[k - 1], forward[k]);
+        }
+        start = end;
+    }
+    for k in 0..=(n - len) {
+        out[k] = pick(take, out[k], forward[k + len - 1]);
+    }
+}
+
+/// The element as a **full rectangular box**, or nothing.
+///
+/// Returns the per-axis window widths when the offsets are exactly the Cartesian
+/// product of three contiguous ranges. Offsets are distinct, so counting them
+/// against the bounding box's volume settles it — no search, and no way for a
+/// box with a hole in it to pass.
+fn box_widths(offsets: &[[isize; 3]], lo: [isize; 3], hi: [isize; 3]) -> Option<[usize; 3]> {
+    let widths = [
+        (hi[0] - lo[0] + 1) as usize,
+        (hi[1] - lo[1] + 1) as usize,
+        (hi[2] - lo[2] + 1) as usize,
+    ];
+    (offsets.len() == widths[0] * widths[1] * widths[2]).then_some(widths)
+}
+
+/// Fill the **interior** of a **box** element by three separable passes.
+///
+/// # Why a box is worth its own path
+///
+/// An extremum over a box factorises. `max` over `w0 x w1 x w2` offsets is `max`
+/// along axis 2, then along axis 1, then along axis 0 — in any order, because
+/// each is an extremum over a set and the box is a product of sets. Each pass is
+/// van Herk's, which costs the same whatever its window is, so the whole filter
+/// is **about a dozen operations a voxel no matter how large the box is**,
+/// against one per tap for the gather.
+///
+/// The general run decomposition below already handles a box — it just handles
+/// it as `w0 x w2` runs of `w1`, which is `w0 x w2` folds a voxel where this is
+/// three passes. For the `5 x 5 x 5` window a local-maximum test uses, that is
+/// twenty-five folds against three: the difference between a path worth taking
+/// and the one worth taking instead.
+///
+/// # What it costs
+///
+/// Two scratch volumes, where the gather needs none — and the gather's `125`
+/// reads all land in cache, being a `5 x 5 x 5` neighbourhood, where these
+/// stream. The trade is real and it is why the guard below is a *tap count*
+/// rather than "is it a box": a `3 x 3 x 3` box is twenty-seven cache-resident
+/// reads, and three streaming passes over two volumes would be the slower way
+/// to get the same answer.
+#[allow(clippy::too_many_arguments)]
+fn by_separable_box<T: Ord + Copy>(
+    values: &[T],
+    shape: [usize; 3],
+    offsets: &[[isize; 3]],
+    take: Extreme,
+    lo: [isize; 3],
+    hi: [isize; 3],
+    out: &mut ArrayViewMut3<'_, T>,
+) -> Option<[[usize; 2]; 3]> {
+    let widths = box_widths(offsets, lo, hi)?;
+    // Below this the gather's taps are cache-resident and cheaper than three
+    // passes over memory. Measured on the two boxes this crate's consumers
+    // use — `3 x 3 x 3` keeps the gather, `5 x 5 x 5` does not.
+    if offsets.len() < 64 {
+        return None;
+    }
+    let [n0, n1, n2] = shape;
+    if widths[0] > n0 || widths[1] > n1 || widths[2] > n2 {
+        return None;
+    }
+    let bound = |axis: usize, extent: usize| {
+        let low = (-lo[axis]).max(0) as usize;
+        let high = (extent as isize - hi[axis]).max(0) as usize;
+        (low < high).then_some([low, high])
+    };
+    let inside = [bound(0, n0)?, bound(1, n1)?, bound(2, n2)?];
+    let out = out.as_slice_mut()?;
+    let plane = n1 * n2;
+    let volume = n0 * plane;
+    let mut first: Vec<T> = vec![values[0]; volume];
+    let mut second: Vec<T> = vec![values[0]; volume];
+    let mut forward: Vec<T> = vec![values[0]; volume];
+    // Axis 2, along each contiguous line.
+    for line in 0..n0 * n1 {
+        let base = line * n2;
+        running_extreme_line(
+            &values[base..base + n2],
+            widths[2],
+            take,
+            &mut forward[base..base + n2],
+            &mut first[base..base + n2],
+        );
+    }
+    // Axis 1, across the rows of each plane.
+    for i in 0..n0 {
+        let base = i * plane;
+        running_extreme_strided(
+            &first[base..base + plane],
+            n1,
+            n2,
+            widths[1],
+            take,
+            &mut forward[base..base + plane],
+            &mut second[base..base + plane],
+        );
+    }
+    // Axis 0, across the planes of the volume.
+    running_extreme_strided(
+        &second,
+        n0,
+        plane,
+        widths[0],
+        take,
+        &mut forward,
+        &mut first,
+    );
+    // The composed volume answers at the window's **start**; the element answers
+    // at its anchor, which sits `lo` inside it.
+    let [[i0, i1], [j0, j1], [k0, k1]] = inside;
+    let width = k1 - k0;
+    for i in i0..i1 {
+        for j in j0..j1 {
+            let source = (((i as isize + lo[0]) as usize) * n1 + (j as isize + lo[1]) as usize)
+                * n2
+                + (k0 as isize + lo[2]) as usize;
+            let target = (i * n1 + j) * n2 + k0;
+            out[target..target + width].copy_from_slice(&first[source..source + width]);
+        }
+    }
+    Some(inside)
+}
+
+/// Fill the **interior** by running extrema, or decline.
+///
+/// Returns the half-open ranges on each axis that it wrote, so the caller can
+/// skip them; `None` means the caller's own loop owns every voxel, unchanged.
+///
+/// It applies to the interior only, where the whole element fits inside the
+/// buffer and the gather's per-tap clamp is therefore known to be a no-op —
+/// exactly the predicate the flat path applies per voxel, hoisted into a range.
+/// Every boundary voxel falls through to the general path, which is the one
+/// that has always been right about truncation.
+///
+/// **It declines an element it cannot beat.** One running pass per run is three
+/// row-folds; one run of length `len` costs the gather `len`. So the
+/// decomposition pays whenever the runs are longer than about three on average,
+/// and an element that decomposes into short runs — a stepped one, whose runs
+/// are all of length one — is left to the gather rather than given a slower
+/// path with a nicer name.
+#[allow(clippy::too_many_arguments)]
+fn by_running_extremes<T: Ord + Copy>(
+    values: &[T],
+    shape: [usize; 3],
+    offsets: &[[isize; 3]],
+    take: Extreme,
+    lo: [isize; 3],
+    hi: [isize; 3],
+    out: &mut ArrayViewMut3<'_, T>,
+) -> Option<[[usize; 2]; 3]> {
+    let runs = row_runs_of(offsets);
+    if runs.is_empty() {
+        return None;
+    }
+    let [n0, n1, n2] = shape;
+    if runs.iter().any(|run| run.len > n1) {
+        return None;
+    }
+    // Three row-folds a run against `len` taps a run: below this the gather is
+    // the cheaper answer, and saying so here is what keeps a stepped element off
+    // a path that would only slow it down.
+    if offsets.len() < 4 * runs.len() {
+        return None;
+    }
+    let bound = |axis: usize, extent: usize| {
+        let low = (-lo[axis]).max(0) as usize;
+        let high = (extent as isize - hi[axis]).max(0) as usize;
+        (low < high).then_some([low, high])
+    };
+    let inside = [bound(0, n0)?, bound(1, n1)?, bound(2, n2)?];
+    // The destination as one run of memory, or nothing. Writing through
+    // `out[[i, j, k]]` would put `ndarray`'s index arithmetic back into the loop
+    // this exists to take it out of, and a caller whose output is not one run is
+    // rare enough to keep the gather.
+    let out = out.as_slice_mut()?;
+    let [[i0, i1], [j0, j1], [k0, k1]] = inside;
+    let width = k1 - k0;
+    let plane = n1 * n2;
+    // **A cache of running planes, keyed by the plane and the window.**
+    //
+    // The straightforward loop recomputes one running pass per run per output
+    // plane — ten passes over a plane to produce one, and the scratch traffic
+    // that generates dominates everything else the kernel does. It does not have
+    // to: run `g` reads source plane `i + d0_g` with window `L_g`, so advancing
+    // the output plane by one asks for `(i + 1 + d0_g, L_g)`, and the previous
+    // output plane computed `(i + d0_{g'}, L_{g'})` for every `g'`. Those meet
+    // whenever two rows one apart have the **same length** — which, for a disk,
+    // most of the middle rows do.
+    //
+    // So the passes that are repeated are skipped and the rest are not, which is
+    // the whole of it. One slot per run is always enough: a round asks for at
+    // most that many keys, so a slot not yet used this round is always free.
+    let slots = runs.len();
+    let mut keys: Vec<Option<(usize, usize)>> = vec![None; slots];
+    let mut used: Vec<bool> = vec![false; slots];
+    let mut cache: Vec<Vec<T>> = vec![vec![values[0]; plane]; slots];
+    let mut forward: Vec<T> = vec![values[0]; plane];
+    for i in i0..i1 {
+        used.iter_mut().for_each(|flag| *flag = false);
+        for (ordinal, run) in runs.iter().enumerate() {
+            let source_plane = (i as isize + run.d0) as usize;
+            let key = (source_plane, run.len);
+            let slot = match keys.iter().position(|held| *held == Some(key)) {
+                Some(slot) => slot,
+                None => {
+                    let slot = used
+                        .iter()
+                        .position(|flag| !flag)
+                        .expect("one slot per run leaves one unused every round");
+                    let base = source_plane * plane;
+                    running_extreme_strided(
+                        &values[base..base + plane],
+                        n1,
+                        n2,
+                        run.len,
+                        take,
+                        &mut forward,
+                        &mut cache[slot],
+                    );
+                    keys[slot] = Some(key);
+                    slot
+                }
+            };
+            used[slot] = true;
+            for j in j0..j1 {
+                let source =
+                    ((j as isize + run.start) as usize) * n2 + (k0 as isize + run.d2) as usize;
+                let target = (i * n1 + j) * n2 + k0;
+                if ordinal == 0 {
+                    out[target..target + width]
+                        .copy_from_slice(&cache[slot][source..source + width]);
+                } else {
+                    fold_into(
+                        &mut out[target..target + width],
+                        &cache[slot][source..source + width],
+                        take,
+                    );
+                }
+            }
+        }
+    }
+    Some(inside)
 }
 
 /// The experiment's kernel: [`selecting`] with either change, both, or neither.
@@ -1469,6 +2052,155 @@ mod tests {
                         "{shape:?} {radius:?} {rank:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The running kernel against the definition, on shapes that reach it.
+    ///
+    /// `the_filter_agrees_with_the_definition_for_every_rank_and_shape` cannot:
+    /// its input is `9 x 7 x 6` and a disk of any size fills it, so there is no
+    /// interior and the running path declines every time. These inputs are
+    /// large enough to have one, and the radii are chosen so that the runs have
+    /// **several distinct lengths** — an ellipsoid's rows are `5, 7, 9, 9, 9, 7,
+    /// 5` and a box's are all equal, which are the two ways the length table can
+    /// go wrong.
+    ///
+    /// Both ends, because the kernel folds a min and a max through one `pick`,
+    /// and the odd/even window sizes because van Herk's blocks are `len` long
+    /// and a window that divides the row evenly is the case where its prefix and
+    /// suffix coincide.
+    #[test]
+    fn the_running_extremum_agrees_with_the_definition() {
+        let input = ramp((4, 21, 23));
+        for shape in [ElementShape::Ellipsoid, ElementShape::Box] {
+            for radius in [
+                [0, 4, 4],
+                [0, 3, 5],
+                [0, 1, 6],
+                [0, 5, 1],
+                [0, 0, 4],
+                [0, 2, 2],
+            ] {
+                let element = StructuringElement::from_radius(shape, radius);
+                for rank in [Rank::lowest(), Rank::highest(&element)] {
+                    let mut got = Array3::zeros(input.dim());
+                    rank_filter_f64_into(input.view(), &element, rank, got.view_mut()).unwrap();
+                    assert_eq!(
+                        got,
+                        by_definition(&input, &element, rank),
+                        "{shape:?} {radius:?} {rank:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The separable box path, against the definition.
+    ///
+    /// Only boxes of at least sixty-four taps reach it, so the radii here are
+    /// chosen to clear that: `[2, 2, 2]` is the `5 x 5 x 5` window a local
+    /// maximum test uses and the reason the path exists. The uneven ones are
+    /// where a per-axis width could be applied to the wrong axis and a symmetric
+    /// cube would never show it.
+    ///
+    /// `ExtentEllipsoid` at the same sizes is included deliberately: it is *not*
+    /// a box, so it must take the run decomposition instead, and an element that
+    /// slipped through `box_widths` would answer a rectangle where a disk was
+    /// asked for.
+    #[test]
+    fn the_separable_box_agrees_with_the_definition() {
+        let input = ramp((17, 19, 21));
+        for radius in [
+            [2, 2, 2],
+            [2, 2, 1],
+            [1, 3, 2],
+            [3, 1, 2],
+            [2, 1, 3],
+            [4, 4, 4],
+        ] {
+            for shape in [ElementShape::Box, ElementShape::Ellipsoid] {
+                let element = StructuringElement::from_radius(shape, radius);
+                for rank in [Rank::lowest(), Rank::highest(&element)] {
+                    let mut got = Array3::zeros(input.dim());
+                    rank_filter_f64_into(input.view(), &element, rank, got.view_mut()).unwrap();
+                    assert_eq!(
+                        got,
+                        by_definition(&input, &element, rank),
+                        "{shape:?} {radius:?} {rank:?}"
+                    );
+                }
+            }
+        }
+        // An even extent, where the element is not symmetric about its anchor and
+        // the shift the composed volume needs is not `w / 2`.
+        for size in [[6, 6, 6], [4, 8, 5], [8, 4, 5]] {
+            let element =
+                StructuringElement::from_size(ElementShape::Box, size).expect("a stated size");
+            for rank in [Rank::lowest(), Rank::highest(&element)] {
+                let mut got = Array3::zeros(input.dim());
+                rank_filter_f64_into(input.view(), &element, rank, got.view_mut()).unwrap();
+                assert_eq!(
+                    got,
+                    by_definition(&input, &element, rank),
+                    "{size:?} {rank:?}"
+                );
+            }
+        }
+    }
+
+    /// A **deeper** element still agrees, by declining the running path.
+    ///
+    /// The guard is `run.0 != 0`, and a filter that silently took the planar
+    /// path for a depth-3 element would answer a different question, so this
+    /// asserts the decline rather than trusting it.
+    /// The shipped background element's own **orientation**, against the
+    /// definition.
+    ///
+    /// `size = [10, 10, 1]` states a disk whose flat axis is the *fastest* one,
+    /// which is the orientation the first version of the running path could not
+    /// decompose and silently declined. An assertion that only ever saw disks in
+    /// the last two axes would not have noticed, so this states the shape the
+    /// caller actually uses — even extents included, which is where the element
+    /// is not symmetric about its own centre.
+    #[test]
+    fn the_shipped_orientation_agrees_with_the_definition() {
+        let input = ramp((23, 21, 19));
+        for size in [
+            [10, 10, 1],
+            [9, 9, 1],
+            [6, 10, 1],
+            [10, 1, 6],
+            [1, 10, 10],
+            [5, 5, 5],
+        ] {
+            let element = StructuringElement::from_size(ElementShape::ExtentEllipsoid, size)
+                .expect("a stated size");
+            for rank in [Rank::lowest(), Rank::highest(&element)] {
+                let mut got = Array3::zeros(input.dim());
+                rank_filter_f64_into(input.view(), &element, rank, got.view_mut()).unwrap();
+                assert_eq!(
+                    got,
+                    by_definition(&input, &element, rank),
+                    "{size:?} {rank:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_element_with_depth_agrees_too() {
+        let input = ramp((11, 13, 17));
+        for radius in [[1, 2, 2], [2, 0, 3], [3, 3, 3]] {
+            let element = StructuringElement::from_radius(ElementShape::Ellipsoid, radius);
+            for rank in [Rank::lowest(), Rank::highest(&element)] {
+                let mut got = Array3::zeros(input.dim());
+                rank_filter_f64_into(input.view(), &element, rank, got.view_mut()).unwrap();
+                assert_eq!(
+                    got,
+                    by_definition(&input, &element, rank),
+                    "{radius:?} {rank:?}"
+                );
             }
         }
     }

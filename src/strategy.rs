@@ -68,10 +68,10 @@ use super::fragment::{
 };
 use super::geometry::{chunks_touched, BlockGrid};
 use super::graph::{Task, TaskGraph};
-use super::iterate::{IterativeOp, Operand};
+use super::iterate::{IterativeOp, IterativeReduceOp, Operand, Partial, ReduceBlock};
 use super::listener::{Dispatch, EventListener};
 use super::log::{Event, Stats};
-use super::op::{place_parts, Anchor, Chain, Output, Placement};
+use super::op::{place_parts, Anchor, Chain, Output, Placement, SourceInputs};
 use super::reach::Reach;
 
 /// Names an array the injected `Environment` resolves.
@@ -509,6 +509,8 @@ pub fn execute_phases(
             for output in op.outputs() {
                 env.declare_sidecar(&output.stream, output.lifecycle)?;
             }
+        } else if let PhaseWork::IterateReduce(op) = entry {
+            env.declare_sidecar(op.state_stream(), op.state_lifecycle())?;
         }
     }
     // The same arrangement for the arrays an op writes beside its result: the
@@ -692,19 +694,28 @@ pub fn execute_phases(
                         index: task.index,
                     });
                 }
-                let PhaseWork::Iterate(op) = &work[phase] else {
-                    unreachable!("`iterative` is derived from `work`");
+                let (ran, changes, outcomes) = match &work[phase] {
+                    PhaseWork::Iterate(op) => run_iterative_phase(
+                        &graph,
+                        phase,
+                        decomposition,
+                        *op,
+                        env,
+                        &events,
+                        n_phases,
+                        pool.as_deref(),
+                    )?,
+                    PhaseWork::IterateReduce(op) => run_iterative_reduce_phase(
+                        &graph,
+                        phase,
+                        decomposition,
+                        *op,
+                        env,
+                        &events,
+                        pool.as_deref(),
+                    )?,
+                    _ => unreachable!("`iterative` is derived from `work`"),
                 };
-                let (ran, changes, outcomes) = run_iterative_phase(
-                    &graph,
-                    phase,
-                    decomposition,
-                    *op,
-                    env,
-                    &events,
-                    n_phases,
-                    pool.as_deref(),
-                )?;
                 substages[phase] = ran;
                 substage_changes[phase] = changes;
                 graph
@@ -1482,6 +1493,17 @@ fn run_task(
              block at a time: every block of substage k+1 reads cores its neighbours wrote at \
              substage k, so the phase advances in lockstep and `execute_phases` runs all of it \
              at once.",
+            task.phase,
+            task.index,
+            op.name()
+        )));
+    }
+    if let PhaseWork::IterateReduce(op) = work {
+        return Err(Error::InvalidArgument(format!(
+            "task (phase {}, block {:?}) belongs to iterative reduce op {:?}, which cannot be \
+             run one block at a time: every block must see the same state, then the whole \
+             partial set is reduced before the next state exists. `execute_phases` runs the \
+             whole phase at once.",
             task.phase,
             task.index,
             op.name()
@@ -2348,6 +2370,150 @@ fn run_iterative_phase(
     env.release(&current);
     env.release(&next);
     produced
+}
+
+/// One iterative map-reduce phase: broadcast state, map every block, reduce once,
+/// update state, repeat.
+///
+/// This is the small-state sibling of [`run_iterative_phase`]. The carried value
+/// is a byte blob, not a private image buffer, and the exchange point is the
+/// deterministic reduction of every block's partial. Blocks never mutate the
+/// state directly; the op sees `state[k]` in every `map_block` call and
+/// `state[k + 1]` only after `update` returns it.
+#[allow(clippy::too_many_arguments)]
+fn run_iterative_reduce_phase(
+    graph: &TaskGraph,
+    phase_index: usize,
+    decomposition: &Decomposition,
+    op: &dyn IterativeReduceOp,
+    env: &dyn Environment,
+    events: &Dispatch,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<(usize, Vec<u64>, Vec<TaskOutcome>)> {
+    let phase = &decomposition.phases[phase_index];
+    let tasks = graph.tasks_in_phase(phase_index);
+    let volume = phase.volume();
+    let dtype = decomposition.dtype_at(phase_index);
+    let bytes_per_voxel = dtype.size_of() as u64;
+    let mut state = op.initial_state(volume)?;
+    let mut ran = 0usize;
+    let mut changes = Vec::new();
+
+    loop {
+        if ran == op.limit().substages() {
+            return Err(Error::InvalidArgument(format!(
+                "iterative reduce op {:?} did not converge in {} substage(s) over a {volume:?} \
+                 volume. The partially updated state is deliberately not written: it is a \
+                 plausible, well-formed, wrong answer.",
+                op.name(),
+                op.limit().substages()
+            )));
+        }
+
+        let one_block = |task: &Task| -> Result<Partial> {
+            let fetch = &task.geometry.source;
+            let read = &task.geometry.read;
+            let pixels = if op.reads_pixels() {
+                let started = Instant::now();
+                let buf = env.read(phase_index, fetch)?;
+                let read_ns = started.elapsed().as_nanos() as u64;
+                let chunks = chunks_touched(fetch, &env.chunk_shape());
+                events.emit(Event::RegionRead {
+                    source: format!("level {phase_index}"),
+                    image: phase_index,
+                    index: Some(task.index),
+                    region: fetch.clone(),
+                    voxels: fetch.voxels(),
+                    bytes: fetch.voxels() as u64 * bytes_per_voxel,
+                    chunks,
+                    duration_ns: read_ns,
+                });
+                events.emit(Event::BlockRead {
+                    phase: phase_index,
+                    index: task.index,
+                    region: fetch.clone(),
+                    voxels: fetch.voxels(),
+                    chunks,
+                });
+                Some(buf)
+            } else {
+                None
+            };
+            let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_images.len());
+            for &image in &phase.source_images {
+                let started = Instant::now();
+                let stored = env.read(image, fetch)?;
+                let read_ns = started.elapsed().as_nanos() as u64;
+                events.emit(Event::RegionRead {
+                    source: format!("level {image}"),
+                    image,
+                    index: Some(task.index),
+                    region: fetch.clone(),
+                    voxels: fetch.voxels(),
+                    bytes: fetch.voxels() as u64 * decomposition.dtype_at(image).size_of() as u64,
+                    chunks: chunks_touched(fetch, &env.chunk_shape()),
+                    duration_ns: read_ns,
+                });
+                sources.push((image, stored));
+            }
+            let borrowed: Vec<(ImageId, &Voxels)> = sources
+                .iter()
+                .map(|(image, buf)| Ok((ImageId::from(*image), buf.as_array()?)))
+                .collect::<Result<_>>()?;
+            let at = Anchor::of_region(fetch, decomposition.volume_at(phase_index))?;
+            let view = ReduceBlock::new(
+                phase_index,
+                task.index,
+                &phase.grid,
+                &task.geometry.core,
+                read,
+                &task.geometry.valid,
+                at,
+                pixels.as_ref(),
+                SourceInputs::new(&borrowed),
+            );
+            let bytes = op.map_block(ran, &state, &view)?;
+            for (_, stored) in &sources {
+                env.release(stored);
+            }
+            if let Some(buf) = &pixels {
+                env.release(buf);
+            }
+            Ok(Partial {
+                index: task.index,
+                bytes,
+            })
+        };
+
+        let mut partials: Vec<Partial> = match pool {
+            None => tasks.iter().map(one_block).collect::<Result<_>>()?,
+            Some(pool) => {
+                pool.install(|| tasks.par_iter().map(one_block).collect::<Result<_>>())?
+            }
+        };
+        partials.sort_by_key(|partial| partial.index);
+        let update = op.update(ran, &state, &partials)?;
+        let changed = update.state != state;
+        state = update.state;
+        ran += 1;
+        changes.push(u64::from(changed));
+        if update.converged {
+            break;
+        }
+    }
+
+    env.write_sidecar(op.state_stream(), phase_index, [0, 0, 0], &state)?;
+
+    let outcomes = tasks
+        .iter()
+        .map(|task| TaskOutcome {
+            valid: task.geometry.valid.clone(),
+            short_circuited: false,
+            side_written: Vec::new(),
+            listener_faults: 0,
+        })
+        .collect();
+    Ok((ran, changes, outcomes))
 }
 
 /// How many voxels two buffers of one extent differ in, or `None` where there

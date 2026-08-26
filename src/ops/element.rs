@@ -1226,7 +1226,6 @@ impl Ord for Total {
 
 #[cfg(test)]
 mod tests {
-
     /// The extension point: an element this crate has no name for, built from a
     /// hand-written offset list.
     ///

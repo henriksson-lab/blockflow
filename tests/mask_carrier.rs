@@ -365,7 +365,11 @@ fn joined(logic: Logic, carriers: &[Dtype], output: Dtype, operands: &[Vec<bool>
     assert_eq!(combine.produces(carriers), output);
     let mut out = Voxels::zeros(output, shape).unwrap();
     combine
-        .apply(&inputs.iter().collect::<Vec<_>>(), &mut out, &Anchor::whole(shape))
+        .apply(
+            &inputs.iter().collect::<Vec<_>>(),
+            &mut out,
+            &Anchor::whole(shape),
+        )
         .expect("a join over mask carriers");
     match output {
         Dtype::Bool => out.view::<bool>().unwrap().iter().copied().collect(),

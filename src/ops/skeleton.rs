@@ -514,18 +514,41 @@ pub fn thin_subfield_into(
 ) -> Result<()> {
     shapes_agree(input.shape(), out.shape(), "thin_subfield_into")?;
     let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
-    for i in 0..shape[0] {
-        for j in 0..shape[1] {
-            for k in 0..shape[2] {
-                out[[i, j, k]] = if input[[i, j, k]]
-                    && subfield.contains([origin[0] + i, origin[1] + j, origin[2] + k])
-                {
-                    !is_deletable(&gather(input, [i, j, k]))
-                } else {
-                    input[[i, j, k]]
-                };
+    // **Every voxel this pass does not delete comes out as it went in**, so the
+    // output starts as a copy and the loop's only job is to find the deletions.
+    // Written as a bulk assign rather than a voxel a time: it is the same bytes
+    // by the same rule, moved by a memcpy instead of by `ndarray`'s indexing.
+    out.assign(&input);
+    // **The subfield is reached, not tested for.** A class is the parity of the
+    // *global* position on each axis, so the buffer indices in it are an
+    // arithmetic progression of stride two — one iteration in eight. The loop
+    // used to visit all eight eighths and discard seven, and that discarding was
+    // where the time went: with only a subfield's object voxels reaching
+    // `is_deletable`, about **one iteration in a hundred** did any of the work
+    // this function is for.
+    //
+    // `the_cost_of_the_border_early_exit` is what made that visible, by failing
+    // to find anything: four different neighbourhood kernels measured the same,
+    // because none of them was what the time was going to. Worth `1.12-1.19x`
+    // against an A/A control of `0.95-0.98`, on both a filament and a blob.
+    let first = |axis: usize| -> usize {
+        let wanted = (subfield.index() >> (2 - axis)) & 1;
+        wanted ^ (origin[axis] & 1)
+    };
+    let mut i = first(0);
+    while i < shape[0] {
+        let mut j = first(1);
+        while j < shape[1] {
+            let mut k = first(2);
+            while k < shape[2] {
+                if input[[i, j, k]] && is_deletable(&gather(input, [i, j, k])) {
+                    out[[i, j, k]] = false;
+                }
+                k += 2;
             }
+            j += 2;
         }
+        i += 2;
     }
     Ok(())
 }
@@ -1134,6 +1157,373 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Is the centre a border point, asked of the **array** rather than of a
+    /// gathered neighbourhood?
+    ///
+    /// [`is_border_point`] is the same question and is already the first clause
+    /// [`is_deletable`] evaluates — but it is asked of a `[bool; 27]` that
+    /// [`gather`] has to fill first, so the twenty-seven reads are paid before the
+    /// six that decide the answer. Asking the array directly is what turns a
+    /// documented "early exit" into one.
+    ///
+    /// **The rewrite is an identity, not an approximation.** `is_deletable` is
+    /// `n[CENTRE] && is_border_point(n) && ...`, so a voxel that is not a border
+    /// point is not deletable, and the caller writes `!is_deletable(..) == true`
+    /// for it — which is exactly what the arm that skips the test writes, because
+    /// the voxel is in the object. No neighbourhood answers differently; there is
+    /// no case to check for.
+    ///
+    /// Outside the array reads as background, which is [`gather`]'s convention and
+    /// the operation's: a voxel against a face of the buffer is on a border by
+    /// that alone, and gets the answer without touching memory.
+    fn on_a_border(input: ArrayView3<'_, bool>, at: [usize; 3], shape: [usize; 3]) -> bool {
+        for axis in 0..3 {
+            if at[axis] == 0 || at[axis] + 1 == shape[axis] {
+                return true;
+            }
+        }
+        let mut position = at;
+        for axis in 0..3 {
+            for step in [usize::wrapping_sub(0, 1), 1] {
+                position[axis] = at[axis].wrapping_add(step);
+                if !input[position] {
+                    return true;
+                }
+            }
+            position[axis] = at[axis];
+        }
+        false
+    }
+
+    // --------------------------------------------- the cost of the early exit --
+
+    /// A deterministic binary volume with a stated **thickness**.
+    ///
+    /// Thickness is what decides this measurement, because the border test's
+    /// whole value is skipping voxels that are not on a border — and a thin tube
+    /// has almost none of those. `radius` 1 is a filament a voxel or two across,
+    /// where nearly nine in ten object voxels are on a border; `radius` 6 packs
+    /// most of them inside, where under four in ten are. Both are run, because a benchmark on one of them would
+    /// recommend the opposite of what a benchmark on the other does.
+    fn blobs(shape: [usize; 3], seeds: usize, radius: isize) -> Array3<bool> {
+        let mut out = Array3::from_elem((shape[0], shape[1], shape[2]), false);
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..seeds {
+            let centre = [
+                (next() as usize) % shape[0],
+                (next() as usize) % shape[1],
+                (next() as usize) % shape[2],
+            ];
+            for di in -radius..=radius {
+                for dj in -radius..=radius {
+                    for dk in -radius..=radius {
+                        if di * di + dj * dj + dk * dk > radius * radius {
+                            continue;
+                        }
+                        let at = [
+                            centre[0] as isize + di,
+                            centre[1] as isize + dj,
+                            centre[2] as isize + dk,
+                        ];
+                        if (0..3).all(|axis| at[axis] >= 0 && (at[axis] as usize) < shape[axis]) {
+                            out[[at[0] as usize, at[1] as usize, at[2] as usize]] = true;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// [`gather`] without the per-neighbour bounds test, for a centre whose whole
+    /// neighbourhood is inside the buffer.
+    ///
+    /// The shipped gather asks, for each of twenty-seven neighbours, whether each
+    /// of three coordinates is in range, and then indexes through `ndarray`. For
+    /// an interior voxel every one of those answers is yes, and the buffer is one
+    /// contiguous run, so the whole neighbourhood is twenty-seven loads at fixed
+    /// offsets from one base.
+    fn gather_flat(values: &[bool], strides: [isize; 3], base: isize) -> [bool; NEIGHBOURHOOD] {
+        let mut n = [false; NEIGHBOURHOOD];
+        for di in -1..=1isize {
+            for dj in -1..=1isize {
+                for dk in -1..=1isize {
+                    let at = base + di * strides[0] + dj * strides[1] + dk * strides[2];
+                    n[neighbour_index(di, dj, dk)] = values[at as usize];
+                }
+            }
+        }
+        n
+    }
+
+    /// The arms, over one volume, **interleaved and repeated**.
+    ///
+    /// `gathering` is the kernel as it stood before the border test was hoisted:
+    /// gather twenty-seven, then let `is_deletable` decide. The others are the
+    /// two changes and their combination, and the last is `gather always` a
+    /// second time — the **A/A control**, which is the whole reason this is
+    /// shaped the way it is. Run once each in order, the first arm pays for
+    /// bringing the volume into cache and every later arm looks faster than it
+    /// is; the first version of this measurement reported a `1.84x` that was
+    /// entirely that. Rounds are interleaved and the best of each arm is kept,
+    /// so a difference has to survive being measured in every position.
+    fn arms(input: &Array3<bool>, subfield: Subfield) -> Vec<(&'static str, f64, Array3<bool>)> {
+        let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+        let view = input.view();
+        let values = input.as_slice().expect("a standard-layout volume");
+        let strides = [(shape[1] * shape[2]) as isize, shape[2] as isize, 1];
+        let interior =
+            |at: [usize; 3]| (0..3).all(|axis| at[axis] > 0 && at[axis] + 1 < shape[axis]);
+        let kernels: Vec<(&'static str, Box<dyn Fn([usize; 3], isize) -> bool>)> = vec![
+            (
+                "gather always",
+                Box::new(move |at, _| !is_deletable(&gather(view, at))),
+            ),
+            (
+                "border, then gather",
+                Box::new(move |at, _| {
+                    !(on_a_border(view, at, shape) && is_deletable(&gather(view, at)))
+                }),
+            ),
+            (
+                "flat gather",
+                Box::new(move |at, base| {
+                    let n = if interior(at) {
+                        gather_flat(values, strides, base)
+                    } else {
+                        gather(view, at)
+                    };
+                    !is_deletable(&n)
+                }),
+            ),
+            (
+                "border, then flat gather",
+                Box::new(move |at, base| {
+                    if !on_a_border(view, at, shape) {
+                        return true;
+                    }
+                    let n = if interior(at) {
+                        gather_flat(values, strides, base)
+                    } else {
+                        gather(view, at)
+                    };
+                    !is_deletable(&n)
+                }),
+            ),
+            (
+                "gather always (A/A)",
+                Box::new(move |at, _| !is_deletable(&gather(view, at))),
+            ),
+        ];
+        let once = |kernel: &dyn Fn([usize; 3], isize) -> bool| {
+            let mut out = Array3::from_elem((shape[0], shape[1], shape[2]), false);
+            let started = std::time::Instant::now();
+            for i in 0..shape[0] {
+                for j in 0..shape[1] {
+                    for k in 0..shape[2] {
+                        let base = i as isize * strides[0] + j as isize * strides[1] + k as isize;
+                        out[[i, j, k]] = if input[[i, j, k]] && subfield.contains([i, j, k]) {
+                            kernel([i, j, k], base)
+                        } else {
+                            input[[i, j, k]]
+                        };
+                    }
+                }
+            }
+            (started.elapsed().as_secs_f64(), out)
+        };
+        // A warm-up round, discarded: the first pass over the volume is paying
+        // for the volume, not for the kernel.
+        for (_, kernel) in &kernels {
+            once(kernel.as_ref());
+        }
+        let mut best: Vec<(&'static str, f64, Array3<bool>)> = Vec::new();
+        for _ in 0..7 {
+            for (slot, (name, kernel)) in kernels.iter().enumerate() {
+                let (seconds, out) = once(kernel.as_ref());
+                match best.get_mut(slot) {
+                    None => best.push((name, seconds, out)),
+                    Some(held) => {
+                        if seconds < held.1 {
+                            held.1 = seconds;
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// The sub-iteration as it stood: **every** voxel visited, the subfield
+    /// tested for, and the output written a voxel at a time.
+    fn thin_subfield_visiting_all(
+        input: ArrayView3<'_, bool>,
+        subfield: Subfield,
+        origin: [usize; 3],
+        mut out: ArrayViewMut3<'_, bool>,
+    ) {
+        let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+        for i in 0..shape[0] {
+            for j in 0..shape[1] {
+                for k in 0..shape[2] {
+                    out[[i, j, k]] = if input[[i, j, k]]
+                        && subfield.contains([origin[0] + i, origin[1] + j, origin[2] + k])
+                    {
+                        !is_deletable(&gather(input, [i, j, k]))
+                    } else {
+                        input[[i, j, k]]
+                    };
+                }
+            }
+        }
+    }
+
+    /// The strided loop **without** the border early-exit, to price the exit
+    /// itself now that it is no longer hidden under a loop a hundred times its
+    /// size.
+    fn thin_subfield_strided_with_border_exit(
+        input: ArrayView3<'_, bool>,
+        subfield: Subfield,
+        origin: [usize; 3],
+        mut out: ArrayViewMut3<'_, bool>,
+    ) {
+        let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+        out.assign(&input);
+        let first = |axis: usize| -> usize {
+            let wanted = (subfield.index() >> (2 - axis)) & 1;
+            wanted ^ (origin[axis] & 1)
+        };
+        let mut i = first(0);
+        while i < shape[0] {
+            let mut j = first(1);
+            while j < shape[1] {
+                let mut k = first(2);
+                while k < shape[2] {
+                    if input[[i, j, k]]
+                        && on_a_border(input, [i, j, k], shape)
+                        && is_deletable(&gather(input, [i, j, k]))
+                    {
+                        out[[i, j, k]] = false;
+                    }
+                    k += 2;
+                }
+                j += 2;
+            }
+            i += 2;
+        }
+    }
+
+    /// **What reaching the subfield is worth against testing for it.**
+    ///
+    /// Same shape of measurement as `the_cost_of_the_border_early_exit`, and for
+    /// the same reason: interleaved rounds, a discarded warm-up, and the old
+    /// kernel run twice so an A/A control says what a difference has to beat.
+    /// The answers are asserted identical before any time is reported.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn the_cost_of_visiting_every_voxel() {
+        println!();
+        for (what, radius, seeds) in [("filament", 1isize, 9000usize), ("blob", 6, 120)] {
+            let input = blobs([96, 96, 96], seeds, radius);
+            let shape = (96, 96, 96);
+            let subfield = Subfield::of([0, 0, 0]);
+            let mut old = Array3::from_elem(shape, false);
+            let mut new = Array3::from_elem(shape, false);
+            thin_subfield_visiting_all(input.view(), subfield, [0, 0, 0], old.view_mut());
+            thin_subfield_into(input.view(), subfield, [0, 0, 0], new.view_mut()).unwrap();
+            assert_eq!(old, new, "{what}: the two loops thin differently");
+
+            let mut times = [f64::MAX; 4];
+            for round in 0..8 {
+                let mut scratch = Array3::from_elem(shape, false);
+                let started = std::time::Instant::now();
+                thin_subfield_visiting_all(input.view(), subfield, [0, 0, 0], scratch.view_mut());
+                let all = started.elapsed().as_secs_f64();
+                let started = std::time::Instant::now();
+                thin_subfield_into(input.view(), subfield, [0, 0, 0], scratch.view_mut()).unwrap();
+                let strided = started.elapsed().as_secs_f64();
+                let started = std::time::Instant::now();
+                thin_subfield_strided_with_border_exit(
+                    input.view(),
+                    subfield,
+                    [0, 0, 0],
+                    scratch.view_mut(),
+                );
+                let bare = started.elapsed().as_secs_f64();
+                let started = std::time::Instant::now();
+                thin_subfield_visiting_all(input.view(), subfield, [0, 0, 0], scratch.view_mut());
+                let control = started.elapsed().as_secs_f64();
+                if round > 0 {
+                    times[0] = times[0].min(all);
+                    times[1] = times[1].min(strided);
+                    times[2] = times[2].min(control);
+                    times[3] = times[3].min(bare);
+                }
+            }
+            println!("  {what}:");
+            for (name, seconds) in [
+                ("every voxel, parity tested", times[0]),
+                ("the subfield, reached", times[1]),
+                ("the subfield, border exit", times[3]),
+                ("every voxel (A/A)", times[2]),
+            ] {
+                println!(
+                    "    {name:>28}  {seconds:>8.4} s  {:>6.2}x",
+                    times[0] / seconds
+                );
+            }
+        }
+    }
+
+    /// **What the border early-exit costs and buys, against a straight gather.**
+    ///
+    /// An early exit is a branch, and a branch whose outcome follows the data is
+    /// worse than a longer straight line when it mispredicts. Whether it does
+    /// depends on the object: on a filament nearly every object voxel is on a
+    /// border, so the test is taken almost always and buys nothing; in a blob
+    /// most are interior, so it is taken almost never and skips twenty-seven
+    /// reads. Both are measured, and the answers of all four arms are asserted
+    /// equal first — a faster kernel that thins differently is not a faster
+    /// kernel.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn the_cost_of_the_border_early_exit() {
+        println!();
+        for (what, radius, seeds) in [("filament", 1isize, 9000usize), ("blob", 6, 120)] {
+            let input = blobs([96, 96, 96], seeds, radius);
+            let object = input.iter().filter(|value| **value).count();
+            let border = {
+                let shape = [96, 96, 96];
+                input
+                    .indexed_iter()
+                    .filter(|((i, j, k), value)| {
+                        **value && on_a_border(input.view(), [*i, *j, *k], shape)
+                    })
+                    .count()
+            };
+            let measured = arms(&input, Subfield::of([0, 0, 0]));
+            for arm in &measured[1..] {
+                assert_eq!(arm.2, measured[0].2, "{} thins differently", arm.0);
+            }
+            println!(
+                "  {what}: {object} object voxels, {border} on a border ({:.0}%)",
+                100.0 * border as f64 / object.max(1) as f64
+            );
+            for (name, seconds, _) in &measured {
+                println!(
+                    "    {name:>24}  {seconds:>8.4} s  {:>6.2}x",
+                    measured[0].1 / seconds
+                );
+            }
+        }
+    }
     /// A limit no test shape can reach, so a test that hits it has found a real
     /// failure to converge rather than a limit set too low.
     fn generous() -> PassLimit {

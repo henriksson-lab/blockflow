@@ -32,8 +32,8 @@ use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::{ArrayEnvironment, Environment};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
-use blockflow::ops::{ElementShape, StructuringElement};
 use blockflow::ops::rank::RankFilterOp;
+use blockflow::ops::{ElementShape, StructuringElement};
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
@@ -156,8 +156,8 @@ fn a_chain_over_an_attached_array_answers_what_the_same_chain_answers_in_memory(
     let workflow = median_workflow(VOLUME);
     let decomposition = plan(&workflow, VOLUME, 7);
 
-    let memory = ArrayEnvironment::for_decomposition(input.clone(), &decomposition, [8, 8, 8])
-        .unwrap();
+    let memory =
+        ArrayEnvironment::for_decomposition(input.clone(), &decomposition, [8, 8, 8]).unwrap();
     execute(
         "memory",
         &workflow,
@@ -173,7 +173,14 @@ fn a_chain_over_an_attached_array_answers_what_the_same_chain_answers_in_memory(
 
     let work = Scratch::new("work");
     let env = ZarrEnvironment::attach(work.path(), &[AttachedImage::at(&array)]).unwrap();
-    execute("attached", &workflow, &decomposition, &Hints::default(), &env).unwrap();
+    execute(
+        "attached",
+        &workflow,
+        &decomposition,
+        &Hints::default(),
+        &env,
+    )
+    .unwrap();
 
     assert_same(&expected, &env.output().unwrap(), "attached against memory");
 }
@@ -328,7 +335,14 @@ fn a_run_over_a_window_is_a_run_over_that_sub_box() {
         &[AttachedImage::at(&array).window(start, shape)],
     )
     .unwrap();
-    execute("windowed", &workflow, &decomposition, &Hints::default(), &env).unwrap();
+    execute(
+        "windowed",
+        &workflow,
+        &decomposition,
+        &Hints::default(),
+        &env,
+    )
+    .unwrap();
 
     assert_same(
         &memory.output(),

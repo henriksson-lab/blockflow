@@ -70,9 +70,12 @@
 
 use crate::decomposition::PhaseDecomposition;
 use crate::dtype::Dtype;
+use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::geometry::BlockGrid;
-use crate::op::Anchor;
+use crate::op::{Anchor, SourceInput, SourceInputs};
+use crate::region::Region;
+use crate::sidecar::Lifecycle;
 use crate::voxels::Voxels;
 
 /// Where one of a substage's operands comes from.
@@ -386,6 +389,203 @@ pub fn iterative_phase(op: &dyn IterativeOp, grid: BlockGrid) -> Result<PhaseDec
         reach,
         grid,
     ))
+}
+
+/// One block's view of an iterative map-reduce substage.
+///
+/// The state is deliberately not stored here: every block is handed the same
+/// byte slice by `IterativeReduceOp::map_block`, so the common operand is in
+/// the method signature rather than hidden in the view. The view is the block's
+/// geometry and, when the op asks for it, the pixels read for that geometry.
+pub struct ReduceBlock<'a> {
+    pub phase: usize,
+    pub index: [usize; 3],
+    pub grid: &'a BlockGrid,
+    pub core: &'a Region,
+    pub read: &'a Region,
+    pub valid: &'a Region,
+    pub at: Anchor,
+    pixels: Option<&'a BlockBuf>,
+    sources: SourceInputs<'a>,
+}
+
+impl<'a> ReduceBlock<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        phase: usize,
+        index: [usize; 3],
+        grid: &'a BlockGrid,
+        core: &'a Region,
+        read: &'a Region,
+        valid: &'a Region,
+        at: Anchor,
+        pixels: Option<&'a BlockBuf>,
+        sources: SourceInputs<'a>,
+    ) -> Self {
+        Self {
+            phase,
+            index,
+            grid,
+            core,
+            read,
+            valid,
+            at,
+            pixels,
+            sources,
+        }
+    }
+
+    pub fn pixels(&self) -> Result<&BlockBuf> {
+        self.pixels.ok_or_else(|| {
+            Error::InvalidArgument(
+                "this iterative reduce op asked for pixels, but it declares \
+                 `reads_pixels() == false`, so the executor read none. An op that needs \
+                 pixels says so."
+                    .to_string(),
+            )
+        })
+    }
+
+    pub fn sources(&self) -> &SourceInputs<'a> {
+        &self.sources
+    }
+}
+
+/// The result of one global update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateUpdate {
+    pub state: Vec<u8>,
+    pub converged: bool,
+}
+
+impl StateUpdate {
+    pub fn continuing(state: Vec<u8>) -> Self {
+        Self {
+            state,
+            converged: false,
+        }
+    }
+
+    pub fn converged(state: Vec<u8>) -> Self {
+        Self {
+            state,
+            converged: true,
+        }
+    }
+}
+
+/// One block's partial contribution to an iterative global update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Partial {
+    pub index: [usize; 3],
+    pub bytes: Vec<u8>,
+}
+
+/// An iteration whose carried value is a small global state, not an image.
+///
+/// Each substage has the shape:
+///
+/// ```text
+/// state[k + 1] = update(state[k], reduce(map(block, state[k])))
+/// ```
+///
+/// The executor owns the barriers: every block sees the same state, partials
+/// are reduced in lattice order, and the next state is visible only after the
+/// whole set has been reduced.
+pub trait IterativeReduceOp: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn limit(&self) -> SubstageLimit;
+
+    fn reach(&self) -> [usize; 3] {
+        [0, 0, 0]
+    }
+
+    fn reads_pixels(&self) -> bool {
+        true
+    }
+
+    fn accepts(&self, dtype: Dtype) -> bool {
+        dtype == Dtype::F64
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        Vec::new()
+    }
+
+    fn initial_state(&self, volume: [usize; 3]) -> Result<Vec<u8>>;
+
+    fn map_block(&self, substage: usize, state: &[u8], block: &ReduceBlock<'_>) -> Result<Vec<u8>>;
+
+    fn update(&self, substage: usize, state: &[u8], partials: &[Partial]) -> Result<StateUpdate>;
+
+    /// Where the converged state is written.
+    ///
+    /// One sidecar fragment is written, under block index `[0, 0, 0]`. A stream
+    /// rather than `Stats` makes the result data, not telemetry, and lets a
+    /// later phase or caller read it through the same sidecar store as other
+    /// small objects.
+    fn state_stream(&self) -> &'static str;
+
+    fn state_lifecycle(&self) -> Lifecycle {
+        Lifecycle::Persistent
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        1.0
+    }
+}
+
+pub fn check_iterative_reduce(op: &dyn IterativeReduceOp) -> Result<()> {
+    if op.state_stream().is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "iterative reduce op {:?} declares an empty state stream; the final state would be \
+             unreachable.",
+            op.name()
+        )));
+    }
+    crate::sidecar::check_stream_name(op.state_stream())?;
+    Ok(())
+}
+
+pub fn iterative_reduce_phase(
+    op: &dyn IterativeReduceOp,
+    grid: BlockGrid,
+) -> Result<PhaseDecomposition> {
+    check_iterative_reduce(op)?;
+    let volume = grid.volume();
+    let edge = grid.block();
+    let reach = op.reach();
+    let mut halo = reach;
+    let mut images = Vec::new();
+    let mut supplied = Vec::new();
+    for input in op.source_inputs(volume) {
+        let wanted = input.reach.in_voxels(edge);
+        for (axis, value) in halo.iter_mut().enumerate() {
+            let (lo, hi) = wanted.axis(axis).bound(volume[axis]);
+            *value = (*value).max(lo).max(hi);
+        }
+        if input.image.is_supplied() {
+            let dtype = input.dtype.ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "iterative reduce op {:?} reads {}, and nothing says what it holds. An image \
+                     the run writes has its element type in the fold of the chain that wrote it; \
+                     a supplied input is produced by no phase, so the reader is the only \
+                     statement there is.",
+                    op.name(),
+                    crate::assemble::describe_image(input.image.index())
+                ))
+            })?;
+            supplied.push((input.image.index(), dtype));
+        }
+        images.push(input.image.index());
+    }
+    Ok(
+        PhaseDecomposition::derive(Vec::new(), Vec::new(), reach, halo, grid)
+            .with_source_images(images)
+            .with_supplied_dtypes(supplied)
+            .reading_input_image(op.reads_pixels()),
+    )
 }
 
 #[cfg(test)]

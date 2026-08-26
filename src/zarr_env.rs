@@ -181,16 +181,16 @@ use zarrs::array::{
 use zarrs::filesystem::FilesystemStore;
 use zarrs::storage::{StorePrefix, WritableStorageTraits};
 
+use crate::assemble::{describe_image, is_supplied_image, ImageId};
 use crate::budget::MemoryBudget;
 use crate::cache::{ArrayPolicy, CacheElement, CacheStats, CachingSource, ChunkCache};
-use crate::prefetch::{BlockPlan, Prefetcher};
-use crate::assemble::{describe_image, is_supplied_image, ImageId};
 use crate::decomposition::{check_chunk_exclusive_writes, Decomposition, Visibility};
 use crate::dtype::Dtype;
 use crate::env::{block_shape, BlockBuf, EnvCounters, Environment};
 use crate::error::{Error, Result};
 use crate::geometry::{chunks_touched, region_within};
 use crate::op::{Chain, Output, Placement};
+use crate::prefetch::{BlockPlan, Prefetcher};
 use crate::region::{Region, RegionSource};
 use crate::sidecar::{FileSidecars, Sidecars};
 use crate::voxels::{SideBuf, VoxelElement, Voxels};
@@ -1303,7 +1303,11 @@ impl ZarrEnvironment {
     ///
     /// Returns `None` where there is no cache or the image is written, which is
     /// the caller's signal to read directly.
-    fn caching_source<T>(&self, image: usize, array: &Arc<StoredArray>) -> Option<Arc<CachingSource<T>>>
+    fn caching_source<T>(
+        &self,
+        image: usize,
+        array: &Arc<StoredArray>,
+    ) -> Option<Arc<CachingSource<T>>>
     where
         T: ElementOwned + VoxelElement + CacheElement + Send + Sync + 'static,
     {
@@ -2160,12 +2164,12 @@ impl Environment for ZarrEnvironment {
                 Some(source) => source
                     .read_region(region)
                     .and_then(|values| {
-                        values
-                            .into_dimensionality::<ndarray::Ix3>()
-                            .map_err(|_| Error::ShapeMismatch {
+                        values.into_dimensionality::<ndarray::Ix3>().map_err(|_| {
+                            Error::ShapeMismatch {
                                 expected: region.shape.clone(),
                                 got: vec![],
-                            })
+                            }
+                        })
                     })
                     .map(Element::wrap),
                 None => array.read_as::<Element>(region),

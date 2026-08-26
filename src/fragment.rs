@@ -1185,6 +1185,10 @@ pub enum PhaseWork<'a> {
     /// than one operand. See `crate::iterate` for why that cannot be a
     /// `Chain::sequence`.
     Iterate(&'a dyn crate::iterate::IterativeOp),
+    /// An iteration whose running value is a small global state. The phase owns
+    /// no chain slots, reads its input image only as evidence, and writes the
+    /// final state as one sidecar object.
+    IterateReduce(&'a dyn crate::iterate::IterativeReduceOp),
 }
 
 impl PhaseWork<'_> {
@@ -1193,13 +1197,14 @@ impl PhaseWork<'_> {
     }
 
     pub fn is_iterative(&self) -> bool {
-        matches!(self, PhaseWork::Iterate(_))
+        matches!(self, PhaseWork::Iterate(_) | PhaseWork::IterateReduce(_))
     }
 
     /// Whether this phase produces the image after it.
     pub fn writes_an_image(&self) -> bool {
         match self {
             PhaseWork::Pixels | PhaseWork::Iterate(_) => true,
+            PhaseWork::IterateReduce(_) => false,
             PhaseWork::Fragments(op) => op.writes_pixels(),
         }
     }
@@ -1208,6 +1213,7 @@ impl PhaseWork<'_> {
     pub fn reads_an_image(&self) -> bool {
         match self {
             PhaseWork::Pixels | PhaseWork::Iterate(_) => true,
+            PhaseWork::IterateReduce(op) => op.reads_pixels(),
             PhaseWork::Fragments(op) => op.reads_pixels(),
         }
     }
@@ -1218,6 +1224,7 @@ impl PhaseWork<'_> {
             PhaseWork::Pixels => "pixels".to_string(),
             PhaseWork::Fragments(op) => format!("fragments({})", op.name()),
             PhaseWork::Iterate(op) => format!("iterate({})", op.name()),
+            PhaseWork::IterateReduce(op) => format!("iterate-reduce({})", op.name()),
         }
     }
 }
@@ -1513,6 +1520,32 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                 )));
             }
         }
+        if let PhaseWork::IterateReduce(op) = entry {
+            crate::iterate::check_iterative_reduce(*op)?;
+            if !phase.slots.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index} runs iterative reduce op {:?} but the decomposition gives it \
+                     chain slots {:?}. An iterative reduce phase owns no slot of the chain; \
+                     blocks emit evidence and one phase update owns the state.",
+                    op.name(),
+                    phase.slots
+                )));
+            }
+            let read_volume = plan.volume_at(index);
+            let declared_sources = op.source_inputs(read_volume);
+            if !declared_sources.is_empty()
+                && (phase.volume() != read_volume || phase.reads_across_grids())
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index}: iterative reduce op {:?} reads a second image and the phase \
+                     reads a {read_volume:?} image to work in {:?}. A source image is fetched at \
+                     the block's own fetch region, so an op that reads one must be on one \
+                     lattice in one coordinate space.",
+                    op.name(),
+                    phase.volume()
+                )));
+            }
+        }
         // **The half of `check_source_images` a chain cannot make.** That guard
         // folds the *slots* of a phase, so it can only speak for a phase that
         // owns some, and it skips the ones that do not. The two kinds that own
@@ -1521,7 +1554,11 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
         // `Operand::Fixed`, which is its own input image and not a second one.
         // Either recording a source image is a plan that would fetch an array
         // nothing consumes, and be priced for it.
-        if phase.slots.is_empty() && !entry.is_fragments() && !phase.source_images.is_empty() {
+        if phase.slots.is_empty()
+            && !entry.is_fragments()
+            && !matches!(entry, PhaseWork::IterateReduce(_))
+            && !phase.source_images.is_empty()
+        {
             return Err(Error::InvalidArgument(format!(
                 "decomposition phase {index} ({}) owns no chain slot and records that it also \
                  reads image(s) {:?}. Only a fragment op can read a second image without a \
@@ -1901,6 +1938,11 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                     Some(PhaseWork::Iterate(producer)) => format!(
                         "runs iterative op {:?}, which writes an image and no stream",
                         producer.name()
+                    ),
+                    Some(PhaseWork::IterateReduce(producer)) => format!(
+                        "runs iterative reduce op {:?}, which writes final state stream {:?}",
+                        producer.name(),
+                        producer.state_stream()
                     ),
                     None => "is not in the work list at all".to_string(),
                 };

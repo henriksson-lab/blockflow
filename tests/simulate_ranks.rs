@@ -9,15 +9,15 @@
 //! improvement must rank as one, a change known to be neutral must rank as
 //! neutral, and a quantity known to be invariant must come out invariant.** A
 //! simulator that fails those ranks nothing, however plausible its numbers.
+use blockflow::assemble::PlanBuilder;
 use blockflow::decomposition::Constraints;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::probes::IdentityOp;
 use blockflow::simulate::{
-    simulate, BoundedHorizonThroughput, Machine, PlanOrder, ExecutorOrder, RateBasis, Rates, ReleaseAware,
-    RunAhead, Scheduler, WarmestFirst,
+    simulate, BoundedHorizonThroughput, ExecutorOrder, Machine, PlanOrder, RateBasis, Rates,
+    ReleaseAware, RunAhead, Scheduler, WarmestFirst,
 };
-use blockflow::assemble::PlanBuilder;
 use blockflow::Dtype;
 use std::collections::BTreeSet;
 
@@ -54,7 +54,11 @@ fn rates() -> Rates {
     }
 }
 
-fn run(edge: usize, machine: Machine, scheduler: &mut dyn Scheduler) -> blockflow::simulate::Outcome {
+fn run(
+    edge: usize,
+    machine: Machine,
+    scheduler: &mut dyn Scheduler,
+) -> blockflow::simulate::Outcome {
     let assembly = plan(edge);
     simulate(
         &assembly.decomposition,
@@ -90,7 +94,15 @@ const TILE_PHASE_RATES: [f64; 3] = [3.541, 98.329, 201.397];
 #[test]
 fn workers_shorten_a_cuttable_run_and_do_nothing_to_a_single_block() {
     let one = |w: usize| {
-        run(64, Machine { workers: w, ..Machine::default() }, &mut PlanOrder).makespan_ns
+        run(
+            64,
+            Machine {
+                workers: w,
+                ..Machine::default()
+            },
+            &mut PlanOrder,
+        )
+        .makespan_ns
     };
     assert_eq!(
         one(1),
@@ -100,7 +112,15 @@ fn workers_shorten_a_cuttable_run_and_do_nothing_to_a_single_block() {
     );
 
     let cut = |w: usize| {
-        run(16, Machine { workers: w, ..Machine::default() }, &mut PlanOrder).makespan_ns
+        run(
+            16,
+            Machine {
+                workers: w,
+                ..Machine::default()
+            },
+            &mut PlanOrder,
+        )
+        .makespan_ns
     };
     assert!(
         cut(8) < cut(1),
@@ -126,14 +146,21 @@ fn workers_shorten_a_cuttable_run_and_do_nothing_to_a_single_block() {
 /// not.
 #[test]
 fn ordering_does_not_change_the_work() {
-    let machine = Machine { workers: 1, cache_bytes: 0, prefetch_depth: 0 };
+    let machine = Machine {
+        workers: 1,
+        cache_bytes: 0,
+        prefetch_depth: 0,
+    };
     let compute_only = |scheduler: &mut dyn Scheduler| {
         let assembly = plan(16);
         simulate(
             &assembly.decomposition,
             &assembly.work(),
             &machine,
-            &Rates { io_ns_per_byte: 0.0, ..rates() },
+            &Rates {
+                io_ns_per_byte: 0.0,
+                ..rates()
+            },
             &BTreeSet::new(),
             &BTreeSet::new(),
             &TILE_PHASE_RATES,
@@ -170,7 +197,11 @@ fn ordering_does_not_change_the_work() {
 fn a_cache_only_helps_when_it_is_large_enough_to_hold_something() {
     let cold = run(
         16,
-        Machine { workers: 1, cache_bytes: 0, prefetch_depth: 0 },
+        Machine {
+            workers: 1,
+            cache_bytes: 0,
+            prefetch_depth: 0,
+        },
         &mut PlanOrder,
     );
     let warm = run(
@@ -208,7 +239,10 @@ fn a_cache_only_helps_when_it_is_large_enough_to_hold_something() {
 /// buys residency. Only the in-flight term moves.
 #[test]
 fn a_finer_cut_does_not_lower_the_image_floor() {
-    let machine = Machine { workers: 1, ..Machine::default() };
+    let machine = Machine {
+        workers: 1,
+        ..Machine::default()
+    };
     let coarse = run(64, machine, &mut PlanOrder);
     let fine = run(16, machine, &mut PlanOrder);
     assert!(
@@ -244,7 +278,10 @@ fn a_finer_cut_does_not_lower_the_image_floor() {
     let ceiling = assembly
         .decomposition
         .residency(
-            &Constraints { expected_concurrency: 1, ..Constraints::default() },
+            &Constraints {
+                expected_concurrency: 1,
+                ..Constraints::default()
+            },
             &assembly.work(),
             &BTreeSet::new(),
             &BTreeSet::new(),
@@ -276,8 +313,22 @@ fn a_misbehaving_scheduler_cannot_lose_work() {
             usize::MAX
         }
     }
-    let sane = run(16, Machine { workers: 4, ..Machine::default() }, &mut PlanOrder);
-    let silly = run(16, Machine { workers: 4, ..Machine::default() }, &mut OutOfRange);
+    let sane = run(
+        16,
+        Machine {
+            workers: 4,
+            ..Machine::default()
+        },
+        &mut PlanOrder,
+    );
+    let silly = run(
+        16,
+        Machine {
+            workers: 4,
+            ..Machine::default()
+        },
+        &mut OutOfRange,
+    );
     assert_eq!(
         sane.tasks_run, silly.tasks_run,
         "both schedulers ran the same plan, so the same tasks were run. Cache misses are \
@@ -324,7 +375,10 @@ fn prefetch_pays_at_depth_one_and_is_a_cliff_after_it() {
     };
     let (none, one, two, deep) = (at(0), at(1), at(2), at(64));
 
-    assert_eq!(none.prefetched_bytes, 0, "depth zero must fetch nothing ahead");
+    assert_eq!(
+        none.prefetched_bytes, 0,
+        "depth zero must fetch nothing ahead"
+    );
     assert!(
         one.makespan_ns < none.makespan_ns,
         "depth one took {} against no prefetch at {}; if it has stopped paying, this fixture \
@@ -377,11 +431,9 @@ fn the_schedulers_compared() {
         cache_bytes: chunk_bytes * 16,
         prefetch_depth: 0,
     };
-    let horizon = BoundedHorizonThroughput::new(
-        BoundedHorizonThroughput::floor_ns(&rates()) * 4,
-        &rates(),
-    )
-    .expect("a horizon above the floor");
+    let horizon =
+        BoundedHorizonThroughput::new(BoundedHorizonThroughput::floor_ns(&rates()) * 4, &rates())
+            .expect("a horizon above the floor");
 
     let naive = BoundedHorizonThroughput::with_basis(
         horizon.horizon_ns(),
@@ -408,7 +460,13 @@ fn the_schedulers_compared() {
         eprintln!(
             "{:<26} {:>7} {:>11} {:>11} {:>9} {:>6.1}",
             scheduler.name(),
-            if results.len() == 2 { "block" } else if results.len() == 3 { "phase" } else { "-" },
+            if results.len() == 2 {
+                "block"
+            } else if results.len() == 3 {
+                "phase"
+            } else {
+                "-"
+            },
             outcome.makespan_ns,
             outcome.cache_misses,
             outcome.io_wait_ns,
@@ -553,7 +611,11 @@ fn ordering_moves_the_peak_only_at_low_concurrency() {
     let peak = |w: usize, sched: &mut dyn Scheduler| {
         run(
             16,
-            Machine { workers: w, cache_bytes: rates().chunk_bytes * 16, prefetch_depth: 0 },
+            Machine {
+                workers: w,
+                cache_bytes: rates().chunk_bytes * 16,
+                prefetch_depth: 0,
+            },
             sched,
         )
         .peak_bytes as f64
@@ -624,7 +686,11 @@ fn block_major_does_not_have_the_smaller_working_set() {
     let at = |w: usize, sched: &mut dyn Scheduler| {
         run(
             16,
-            Machine { workers: w, cache_bytes: rates().chunk_bytes * 16, prefetch_depth: 0 },
+            Machine {
+                workers: w,
+                cache_bytes: rates().chunk_bytes * 16,
+                prefetch_depth: 0,
+            },
             sched,
         )
     };
