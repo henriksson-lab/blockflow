@@ -58,7 +58,6 @@ use blockflow::{
     AccountingEnvironment, Anchor, BlockBuf, BlockGrid, BlockOp, Chain, Decomposition, Dtype,
     Environment, Error, Lifecycle, PhaseDecomposition, Placement, Reach, Region, Result, Voxels,
 };
-use ndarray::ArrayD;
 
 // ------------------------------------------------------------- lattice --
 

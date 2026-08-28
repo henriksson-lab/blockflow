@@ -1087,6 +1087,122 @@ impl AttachedImage {
     }
 }
 
+/// A storage-level image pyramid.
+///
+/// This is deliberately not a list of plan images. A [`Decomposition`] image is
+/// an execution value; a multiscale level is a stored view of the same scene at a
+/// different lattice, usable by a later run and by a viewer. Keeping the two
+/// words apart is what lets an optimizer run one blockflow plan per level
+/// without making OME-Zarr level numbering collide with workflow image
+/// numbering.
+#[derive(Clone, Debug)]
+pub struct MultiscaleImage {
+    levels: Vec<AttachedImage>,
+    scale: Vec<[usize; 3]>,
+}
+
+impl MultiscaleImage {
+    pub fn new(levels: Vec<AttachedImage>, scale: Vec<[usize; 3]>) -> Result<Self> {
+        if levels.is_empty() {
+            return Err(Error::InvalidArgument(
+                "a multiscale image needs at least level 0".to_string(),
+            ));
+        }
+        if levels.len() != scale.len() {
+            return Err(Error::InvalidArgument(format!(
+                "a multiscale image has {} level path(s) but {} scale entry(s)",
+                levels.len(),
+                scale.len()
+            )));
+        }
+        if scale[0] != [1, 1, 1] {
+            return Err(Error::InvalidArgument(format!(
+                "multiscale level 0 must have scale [1, 1, 1], got {:?}",
+                scale[0]
+            )));
+        }
+        for (index, factor) in scale.iter().enumerate() {
+            if factor.iter().any(|&axis| axis == 0) {
+                return Err(Error::InvalidArgument(format!(
+                    "multiscale level {index} has scale {factor:?}; scale factors are positive"
+                )));
+            }
+        }
+        Ok(Self { levels, scale })
+    }
+
+    pub fn levels(&self) -> &[AttachedImage] {
+        &self.levels
+    }
+
+    pub fn scale(&self) -> &[[usize; 3]] {
+        &self.scale
+    }
+
+    pub fn len(&self) -> usize {
+        self.levels.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.levels.is_empty()
+    }
+
+    pub fn level(&self, index: usize) -> Option<&AttachedImage> {
+        self.levels.get(index)
+    }
+}
+
+/// How to build storage pyramid levels from a full-resolution image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PyramidSpec {
+    factors: Vec<[usize; 3]>,
+    chunk: Option<[usize; 3]>,
+}
+
+impl PyramidSpec {
+    /// Per-step decimation factors. Level 0 is implicit, so `[[2, 2, 2]; 3]`
+    /// builds levels 0, 1, 2 and 3.
+    pub fn new(factors: Vec<[usize; 3]>) -> Result<Self> {
+        if factors
+            .iter()
+            .enumerate()
+            .any(|(_, factor)| factor.iter().any(|&axis| axis == 0) || factor == &[1, 1, 1])
+        {
+            return Err(Error::InvalidArgument(format!(
+                "pyramid decimation factors must be positive and must shrink at least one axis, \
+                 got {factors:?}"
+            )));
+        }
+        Ok(Self {
+            factors,
+            chunk: None,
+        })
+    }
+
+    pub fn powers_of_two(levels: usize) -> Result<Self> {
+        if levels == 0 {
+            return Err(Error::InvalidArgument(
+                "a pyramid with zero levels has no base image".to_string(),
+            ));
+        }
+        Self::new(vec![[2, 2, 2]; levels.saturating_sub(1)])
+    }
+
+    #[must_use]
+    pub fn with_chunk(mut self, chunk: [usize; 3]) -> Self {
+        self.chunk = Some(chunk);
+        self
+    }
+
+    pub fn levels(&self) -> usize {
+        self.factors.len() + 1
+    }
+
+    pub fn factors(&self) -> &[[usize; 3]] {
+        &self.factors
+    }
+}
+
 // ---------------------------------------------------------- the environment --
 
 /// Images as Zarr v3 arrays under one root.
@@ -1188,6 +1304,109 @@ impl ZarrEnvironment {
     /// [`Self::create_with_compression`] to say otherwise.
     pub fn create(root: impl Into<PathBuf>, input: &Voxels, chunk: [usize; 3]) -> Result<Self> {
         Self::create_with_compression(root, input, chunk, CompressionPolicy::derived())
+    }
+
+    /// Build a storage-level multiscale image rooted at `root`.
+    ///
+    /// The arrays are written as `root/0`, `root/1`, ... and a root
+    /// `zarr.json` records OME-Zarr-style `multiscales` metadata. This is not a
+    /// workflow environment: no plan image is named here, and no execution image
+    /// path (`level<N>`) is created. A caller that wants to process one level
+    /// attaches the returned [`MultiscaleImage`] level into a separate
+    /// [`ZarrEnvironment::attach`] run.
+    pub fn build_multiscale(
+        root: impl Into<PathBuf>,
+        input: &Voxels,
+        spec: &PyramidSpec,
+    ) -> Result<MultiscaleImage> {
+        Self::build_multiscale_with_compression(root, input, spec, CompressionPolicy::derived())
+    }
+
+    /// [`Self::build_multiscale`], with an explicit compression policy.
+    pub fn build_multiscale_with_compression(
+        root: impl Into<PathBuf>,
+        input: &Voxels,
+        spec: &PyramidSpec,
+        compression: CompressionPolicy,
+    ) -> Result<MultiscaleImage> {
+        let root = root.into();
+        std::fs::create_dir_all(&root).map_err(Error::backend)?;
+        let store = Arc::new(FilesystemStore::new(&root).map_err(Error::backend)?);
+        let locks = ChunkLocks::new();
+        let mut shape = input.shape();
+        let mut chunk = spec
+            .chunk
+            .unwrap_or_else(|| chunk_for_block(shape, input.dtype()));
+        let image0 = StoredArray::create(
+            &store,
+            "/0",
+            0,
+            input.dtype(),
+            &shape,
+            &chunk,
+            compression.at(0, input.dtype()),
+        )?;
+        let whole = Region::whole(&shape);
+        by_dtype!(input.dtype(), |Element| {
+            let view = input.view::<Element>()?;
+            let standard = view.as_standard_layout();
+            let data = standard.as_slice().expect("standard layout is contiguous");
+            image0.write_as::<Element>(&whole, data, Some(&locks))?;
+        });
+        let mut previous = Arc::new(image0);
+        let mut levels = vec![AttachedImage::at(root.join("0"))];
+        let mut scales = vec![[1, 1, 1]];
+
+        for (index, factor) in spec.factors.iter().copied().enumerate() {
+            let next_shape = downsampled_shape(shape, factor, index + 1)?;
+            chunk = spec
+                .chunk
+                .unwrap_or_else(|| chunk_for_block(next_shape, input.dtype()));
+            let next = StoredArray::create(
+                &store,
+                &format!("/{}", index + 1),
+                (index + 1) as u64,
+                input.dtype(),
+                &next_shape,
+                &chunk,
+                compression.at(index + 1, input.dtype()),
+            )?;
+            write_downsampled_level(&previous, &next, factor, &next_shape, &chunk, &locks)?;
+            previous = Arc::new(next);
+            shape = next_shape;
+            let mut cumulative = *scales.last().expect("level 0 exists");
+            for axis in 0..3 {
+                cumulative[axis] *= factor[axis];
+            }
+            scales.push(cumulative);
+            levels.push(AttachedImage::at(root.join((index + 1).to_string())));
+        }
+
+        write_multiscales_metadata(&root, &scales)?;
+        MultiscaleImage::new(levels, scales)
+    }
+
+    /// Attach one level of each multiscale image as a normal run input.
+    ///
+    /// `inputs[0]` becomes image 0; `inputs[1..]` become supplied inputs in the
+    /// usual order. The selected level of every image must have the same shape,
+    /// exactly as [`Self::attach`] requires.
+    pub fn attach_multiscale_level(
+        work: impl Into<PathBuf>,
+        inputs: &[&MultiscaleImage],
+        level: usize,
+    ) -> Result<Self> {
+        let mut images = Vec::with_capacity(inputs.len());
+        for (which, image) in inputs.iter().enumerate() {
+            let Some(attached) = image.level(level) else {
+                return Err(Error::InvalidArgument(format!(
+                    "multiscale input {which} has {} level(s), so level {level} is absent",
+                    image.len()
+                )));
+            };
+            images.push(attached.clone());
+        }
+        Self::attach(work, &images)
     }
 
     /// Read through a chunk cache of at most `capacity_bytes`.
@@ -1933,6 +2152,152 @@ fn side_path(name: &str) -> String {
 /// touches part of one re-encodes all of it. Four megabytes is roughly where a
 /// single chunk is still one sequential read on any store this is pointed at.
 const MAX_CHUNK_BYTES: u128 = 4 << 20;
+
+fn downsampled_shape(shape: [usize; 3], factor: [usize; 3], level: usize) -> Result<[usize; 3]> {
+    let mut out = [0usize; 3];
+    for axis in 0..3 {
+        out[axis] = shape[axis] / factor[axis];
+        if out[axis] == 0 {
+            return Err(Error::InvalidArgument(format!(
+                "pyramid level {level} would shrink axis {axis} from {} by factor {} to zero \
+                 voxels",
+                shape[axis], factor[axis]
+            )));
+        }
+    }
+    Ok(out)
+}
+
+fn write_downsampled_level(
+    source: &StoredArray,
+    target: &StoredArray,
+    factor: [usize; 3],
+    target_shape: &[usize],
+    target_chunk: &[usize],
+    locks: &ChunkLocks,
+) -> Result<()> {
+    let regions = chunk_regions(target_shape, target_chunk);
+    by_dtype!(source.dtype, |Element| {
+        for target_region in &regions {
+            let source_region = source_region_for_decimation(target_region, factor);
+            let input = source.read_as::<Element>(&source_region)?;
+            let output = downsample_region::<Element>(&input, factor, &target_region.shape)?;
+            let standard = output.as_standard_layout();
+            let data = standard.as_slice().expect("standard layout is contiguous");
+            target.write_as::<Element>(target_region, data, Some(locks))?;
+        }
+        Ok(())
+    })
+}
+
+fn chunk_regions(shape: &[usize], chunk: &[usize]) -> Vec<Region> {
+    let mut regions = Vec::new();
+    let mut z = 0;
+    while z < shape[2] {
+        let mut y = 0;
+        let dz = chunk[2].min(shape[2] - z);
+        while y < shape[1] {
+            let mut x = 0;
+            let dy = chunk[1].min(shape[1] - y);
+            while x < shape[0] {
+                let dx = chunk[0].min(shape[0] - x);
+                regions.push(Region::new(&[x, y, z], &[dx, dy, dz]));
+                x += dx;
+            }
+            y += dy;
+        }
+        z += dz;
+    }
+    regions
+}
+
+fn source_region_for_decimation(target: &Region, factor: [usize; 3]) -> Region {
+    Region::new(
+        &[
+            target.start[0] * factor[0],
+            target.start[1] * factor[1],
+            target.start[2] * factor[2],
+        ],
+        &[
+            target.shape[0] * factor[0],
+            target.shape[1] * factor[1],
+            target.shape[2] * factor[2],
+        ],
+    )
+}
+
+fn downsample_region<T>(input: &Voxels, factor: [usize; 3], output: &[usize]) -> Result<Array3<T>>
+where
+    T: VoxelElement,
+{
+    let values = T::peek(input).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "pyramid builder read {:?}, but the typed decimator was asked for {:?}",
+            input.dtype(),
+            T::DTYPE
+        ))
+    })?;
+    Ok(Array3::from_shape_fn(
+        (output[0], output[1], output[2]),
+        |(x, y, z)| {
+            if T::DTYPE == Dtype::Bool {
+                return values[[x * factor[0], y * factor[1], z * factor[2]]];
+            }
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for dz in 0..factor[2] {
+                for dy in 0..factor[1] {
+                    for dx in 0..factor[0] {
+                        sum += values[[x * factor[0] + dx, y * factor[1] + dy, z * factor[2] + dz]]
+                            .into_f64();
+                        count += 1;
+                    }
+                }
+            }
+            T::from_f64(sum / count as f64)
+        },
+    ))
+}
+
+fn write_multiscales_metadata(root: &Path, scales: &[[usize; 3]]) -> Result<()> {
+    let datasets = scales
+        .iter()
+        .enumerate()
+        .map(|(index, scale)| {
+            serde_json::json!({
+                "path": index.to_string(),
+                "coordinateTransformations": [
+                    {
+                        "type": "scale",
+                        "scale": [scale[2], scale[1], scale[0]]
+                    }
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    let metadata = serde_json::json!({
+        "zarr_format": 3,
+        "node_type": "group",
+        "attributes": {
+            "ome": {
+                "version": "0.5",
+                "multiscales": [
+                    {
+                        "version": "0.5",
+                        "axes": [
+                            {"name": "z", "type": "space", "unit": "voxel"},
+                            {"name": "y", "type": "space", "unit": "voxel"},
+                            {"name": "x", "type": "space", "unit": "voxel"}
+                        ],
+                        "datasets": datasets
+                    }
+                ]
+            }
+        }
+    });
+    let bytes = serde_json::to_vec_pretty(&metadata).map_err(Error::backend)?;
+    std::fs::write(root.join("zarr.json"), bytes).map_err(Error::backend)
+}
 
 /// The size below which a chunk stops being worth splitting further.
 ///

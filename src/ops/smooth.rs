@@ -607,9 +607,9 @@ mod tests {
         // At voxel 0 the taps land on -2, -1, 0, 1, 2. Reflected, that reads
         // samples 1, 0, 0, 1, 2 — the edge sample repeated once and the run
         // then reversed. Summed lowest offset first, as the kernel is.
-        let want = ((((taps[0] * samples[1] + taps[1] * samples[0]) + taps[2] * samples[0])
+        let want = (((taps[0] * samples[1] + taps[1] * samples[0]) + taps[2] * samples[0])
             + taps[3] * samples[1])
-            + taps[4] * samples[2]);
+            + taps[4] * samples[2];
         assert_eq!(
             out[[0, 0, 0]].to_bits(),
             want.to_bits(),
@@ -617,9 +617,9 @@ mod tests {
         );
 
         // and at the far face: taps on 2, 3, 4, 5, 6 read samples 2, 3, 4, 4, 3
-        let want = ((((taps[0] * samples[2] + taps[1] * samples[3]) + taps[2] * samples[4])
+        let want = (((taps[0] * samples[2] + taps[1] * samples[3]) + taps[2] * samples[4])
             + taps[3] * samples[4])
-            + taps[4] * samples[3]);
+            + taps[4] * samples[3];
         assert_eq!(out[[4, 0, 0]].to_bits(), want.to_bits());
 
         // the clamped answer at the same voxel is a different number, which is

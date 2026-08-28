@@ -58,7 +58,6 @@ use blockflow::decomposition::{refined_ladder, Constraints, CostModel, Decomposi
 use blockflow::dtype::Dtype;
 use blockflow::error::Result;
 use blockflow::op::{Anchor, BlockOp, Chain};
-use blockflow::reach::Reach;
 use blockflow::strategy::{Enumerating, PartitionSearch, Strategy, Workflow};
 use blockflow::voxels::Voxels;
 

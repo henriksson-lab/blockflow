@@ -55,7 +55,9 @@ use blockflow::probes::{NonZeroOp, SideOutputOp};
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
-use blockflow::zarr_env::{chunk_for_block, Compression, CompressionPolicy, ZarrEnvironment};
+use blockflow::zarr_env::{
+    chunk_for_block, Compression, CompressionPolicy, PyramidSpec, ZarrEnvironment,
+};
 use blockflow::{Dtype, Region};
 
 const VOLUME: [usize; 3] = [32, 24, 20];
@@ -241,6 +243,72 @@ fn assert_same(left: &Voxels, right: &Voxels, what: &str) {
             "{what}: element {index} is {a} in memory and {b} in storage"
         );
     }
+}
+
+#[test]
+fn a_multiscale_store_is_built_as_storage_levels_not_workflow_images() {
+    let scratch = Scratch::new("multiscale");
+    let input = Array3::from_shape_fn((8, 6, 4), |(x, y, z)| (x + 10 * y + 100 * z) as f64);
+    let spec = PyramidSpec::powers_of_two(3).unwrap().with_chunk([2, 2, 2]);
+
+    let pyramid = ZarrEnvironment::build_multiscale(scratch.path(), &input.clone().into(), &spec)
+        .expect("pyramid builds");
+
+    assert_eq!(pyramid.len(), 3);
+    assert_eq!(pyramid.scale(), &[[1, 1, 1], [2, 2, 2], [4, 4, 4]]);
+    assert!(scratch.path().join("0").join("zarr.json").exists());
+    assert!(scratch.path().join("1").join("zarr.json").exists());
+    assert!(!scratch.path().join("level1").exists());
+
+    let metadata = std::fs::read_to_string(scratch.path().join("zarr.json")).unwrap();
+    assert!(metadata.contains("\"multiscales\""));
+    assert!(metadata.contains("\"path\": \"2\""));
+
+    let work = Scratch::new("multiscale-level1-work");
+    let level1 = ZarrEnvironment::attach(work.path(), &[pyramid.level(1).unwrap().clone()])
+        .expect("level attaches");
+    let image = level1.image(0).expect("level reads");
+    assert_eq!(image.shape(), [4, 3, 2]);
+    let values = image.view::<f64>().unwrap();
+    assert_eq!(
+        values[[0, 0, 0]],
+        (input[[0, 0, 0]]
+            + input[[1, 0, 0]]
+            + input[[0, 1, 0]]
+            + input[[1, 1, 0]]
+            + input[[0, 0, 1]]
+            + input[[1, 0, 1]]
+            + input[[0, 1, 1]]
+            + input[[1, 1, 1]])
+            / 8.0
+    );
+}
+
+#[test]
+fn a_multiscale_level_can_seed_a_run_with_a_supplied_peer() {
+    let fixed_root = Scratch::new("multiscale-fixed");
+    let moving_root = Scratch::new("multiscale-moving");
+    let work = Scratch::new("multiscale-run");
+    let fixed = Array3::from_shape_fn((8, 6, 4), |(x, y, z)| (x + 10 * y + 100 * z) as f64);
+    let moving = fixed.mapv(|value| value + 1.0);
+    let spec = PyramidSpec::powers_of_two(2).unwrap().with_chunk([2, 2, 2]);
+    let fixed_pyramid =
+        ZarrEnvironment::build_multiscale(fixed_root.path(), &fixed.into(), &spec).unwrap();
+    let moving_pyramid =
+        ZarrEnvironment::build_multiscale(moving_root.path(), &moving.into(), &spec).unwrap();
+
+    let env = ZarrEnvironment::attach_multiscale_level(
+        work.path(),
+        &[&fixed_pyramid, &moving_pyramid],
+        1,
+    )
+    .expect("multiscale level attaches");
+
+    assert_eq!(env.image_shape(0).unwrap(), [4, 3, 2]);
+    assert_eq!(
+        env.image_shape(ImageId::supplied(0).index()).unwrap(),
+        [4, 3, 2]
+    );
 }
 
 /// One chain per op family, with the element type its `accepts` requires.

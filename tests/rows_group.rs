@@ -57,7 +57,7 @@ use std::sync::Arc;
 use blockflow::assemble::PlanBuilder;
 use blockflow::decomposition::Decomposition;
 use blockflow::dtype::Dtype;
-use blockflow::env::{ArrayEnvironment, Environment};
+use blockflow::env::ArrayEnvironment;
 use blockflow::error::Result;
 use blockflow::fragment::fold_fragments;
 use blockflow::geometry::BlockGrid;

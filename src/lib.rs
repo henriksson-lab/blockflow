@@ -133,6 +133,8 @@ pub mod http;
 pub mod iterate;
 pub mod listener;
 pub mod log;
+#[cfg(feature = "model-segment")]
+pub mod model_segment;
 pub mod net;
 /// The `.npy` array file format: a header, an element type, a memory order and
 /// a flat contiguous buffer. Whole arrays of any rank, `Voxels` for the rank-3
@@ -156,6 +158,7 @@ pub mod ops;
 pub mod points;
 pub mod prefetch;
 pub mod probes;
+pub mod pyramid;
 /// What an operation reads beyond what it writes, and in which coordinate
 /// space it is counted. See [`reach::Reach`].
 pub mod reach;
@@ -192,6 +195,8 @@ pub mod tiling;
 /// dynamic-rank buffer a side output goes to, which is a different question and
 /// says so.
 pub mod voxels;
+#[cfg(feature = "yolo")]
+pub mod yolo;
 /// Images as Zarr v3 arrays on a filesystem store: the `Environment` that moves
 /// bytes. Behind the `zarr` feature; with it off this crate is unchanged and
 /// pulls no extra dependency.

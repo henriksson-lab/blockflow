@@ -141,18 +141,6 @@ fn time_pass(env: &ArrayEnvironment, regions: &[Region]) -> f64 {
     started.elapsed().as_secs_f64()
 }
 
-/// Best of `repeats`, arms interleaved by the caller.
-fn best(env: &ArrayEnvironment, regions: &[Region], repeats: usize) -> f64 {
-    let mut seen = f64::INFINITY;
-    for _ in 0..repeats.max(1) {
-        let elapsed = time_pass(env, regions);
-        if elapsed.total_cmp(&seen).is_lt() {
-            seen = elapsed;
-        }
-    }
-    seen
-}
-
 /// The table: for one block edge, what each halo costs in voxels and in time.
 pub fn report(edge: usize, repeats: usize) -> String {
     let env = ArrayEnvironment::new(source(), 1, [64, 64, 64]).expect("an environment");

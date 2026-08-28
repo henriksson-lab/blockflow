@@ -25,9 +25,7 @@ use std::time::{Duration, Instant};
 use ndarray::{ArrayD, IxDyn};
 
 use crate::budget::MemoryBudget;
-use crate::cache::{
-    ArrayId, ArrayPolicy, CacheElement, CachingSource, ChunkCache, RegionSourceFetcher, Tier,
-};
+use crate::cache::{ArrayId, ArrayPolicy, CachingSource, ChunkCache, RegionSourceFetcher, Tier};
 use crate::dtype::Dtype;
 use crate::error::Result;
 use crate::listener::EventListener;
