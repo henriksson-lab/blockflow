@@ -57,6 +57,7 @@
 // | `mixing` | a K-ary reach-0 shell (`TupleOp`), its kernel trait and the per-voxel matrix | the first op parameterised by **arity** rather than by a window — K co-located arrays in, K' out, every value read at the voxel it is written to. A window is what `Reach` describes and needs an axis to be stated over; arity needs only somewhere for the operands to come from, which is why this became reachable when a run could be handed images it did not compute. This is the register's G10 closed |
 // | `watershed` | a cost volume partitioned into one basin per seed | the first op that **declares itself a planning barrier** rather than being one by arithmetic: its answer is a function of one global queue's pop order, so `AxisReach::All` is the honest reach and the cost of saying so is written down as memory per voxel rather than as an adjective |
 // | `fft` | a real plane's Fourier transform, and a squared-difference landscape over integer lags through the correlation theorem | the first thing here that is **not an op at all**, and could not be: two inputs of different extents, an output indexed by *lag* rather than by position, and a complex intermediate `Voxels` cannot hold. `watershed` declares the barrier and still fits the shape; this one does not fit the shape, so it is free functions and a plan, and the absent `BlockOp` is the statement |
+// | `align` | block-reduced fitting of a 3-D coordinate map between two scalar volumes | the first op whose output is a small global state rather than a volume or row set. Each iteration maps blocks to local evidence, reduces it, and performs one global update before the next iteration. |
 //
 // Four modules here have no row, and this is the list saying which and why —
 // under the rule above, an absence has to be a statement rather than a gap in
@@ -172,6 +173,7 @@
 use crate::error::{Error, Result};
 
 pub mod adjacency;
+pub mod align;
 pub mod background;
 pub mod components;
 pub mod configuration;

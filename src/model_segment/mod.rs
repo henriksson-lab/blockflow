@@ -325,9 +325,8 @@ impl InstanceSegment {
 
     /// Accumulate measured values as fixed point, `round(value * 2^scale)`.
     ///
-    /// `0` — the default — is exact for an integer image and is what a
-    /// fluorescence acquisition wants: a `u8` or `u16` sample is a whole number
-    /// and its sum over an object is a whole number.
+    /// `0` — the default — is exact for an integer acquisition: a `u8` or `u16`
+    /// sample is a whole number and its sum over an object is a whole number.
     ///
     /// It is a parameter and not an inference from the element type because the
     /// caller is the only one who knows the *range*: `2^scale` times the largest
