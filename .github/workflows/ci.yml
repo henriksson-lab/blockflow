@@ -1,0 +1,123 @@
+# Does this crate still build on the three platforms it claims to run on?
+#
+# Build only — `cargo build --all-targets`, so the tests are compiled and linked
+# but not run. The suite here measures times, resident bytes and `/proc`
+# counters, and a shared CI runner is the wrong instrument for all three; a red
+# run should mean the code does not build, never that a runner was busy.
+#
+# `build` and not `check` because the question is whether it *builds*: `check`
+# stops before codegen and before the linker, and the linker is exactly what has
+# something to say on a platform this crate has not been tried on — see the
+# `fftw` job, whose whole failure mode is a missing `-lfftw3`.
+#
+# The toolchain is `stable` and not a pinned version because the floor moves and
+# is not ours: `burn 0.22.0-pre.2` demands rustc **1.95** and `stardist-rs` is
+# edition 2024, so an older toolchain fails at resolution with a clear message.
+#
+# **What is not here, and why.** The `*-cuda` features need a CUDA toolkit and a
+# device, and a hosted runner has neither. Everything else in `Cargo.toml` is
+# built by one of the jobs below.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing here is debugged, and on the model jobs this is the difference
+  # between a cache that fits and one that does not.
+  CARGO_PROFILE_DEV_DEBUG: none
+
+jobs:
+  build:
+    name: ${{ matrix.features.name }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        features:
+          # The configuration everything else in `Cargo.toml` is measured
+          # against: no feature at all.
+          - { name: no features, key: default, flags: "" }
+          # `gui` and `distributed` add no packages of their own; `zarr` adds a
+          # C toolchain requirement through `libz-sys`, which every runner has.
+          - { name: gui+distributed+zarr, key: gui-dist-zarr, flags: "--features gui,distributed,zarr" }
+          # The reason this workflow exists. `stardist-rs` is no longer a path
+          # on one developer's machine but a git revision, so whether it builds
+          # anywhere else is now a question CI can answer. `--all-targets` also
+          # compiles `tests/model_segment_*.rs`, which are gated on
+          # `model-segment` and invisible to the two rows above.
+          - { name: stardist, key: stardist, flags: "--features stardist" }
+          # The other two model adapters, git dependencies for the same reason
+          # and at the same risk. Together in one row because they share `burn`,
+          # which is most of what either costs to build.
+          - { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo" }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the stable toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+      - run: rustc --version --verbose
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # No `Cargo.lock` is committed, so the key is over the manifest: the
+          # cache is a warm start, not a promise of the same dependency graph.
+          key: ${{ runner.os }}-cargo-${{ matrix.features.key }}-${{ hashFiles('Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.features.key }}-
+      - run: cargo build --all-targets ${{ matrix.features.flags }}
+
+  # `fftw` links the system `libfftw3`, and when there is none the failure is a
+  # link error rather than a fallback to the portable backend — deliberately, and
+  # the `fftw-sys` block in `Cargo.toml` says why. Linux and macOS can install
+  # the library in one line; Windows has no such line, which is why this job has
+  # two platforms where the one above has three.
+  fftw:
+    name: fftw (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install FFTW (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfftw3-dev
+      - name: Install FFTW (macOS)
+        if: runner.os == 'macOS'
+        # Homebrew is not on the linker's default search path on Apple silicon,
+        # and `fftw-sys` with `system` has no build script to add it.
+        run: |
+          brew install fftw
+          echo "RUSTFLAGS=-L $(brew --prefix fftw)/lib" >> "$GITHUB_ENV"
+      - name: Install the stable toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+      - run: rustc --version --verbose
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-fftw-${{ hashFiles('Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-fftw-
+      # `--all-targets` picks up `tests/fft_correlation.rs`, and compiling it is
+      # the point: it is the file that names both backends at once.
+      - run: cargo build --all-targets --features fftw

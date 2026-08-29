@@ -226,7 +226,7 @@ csv = { version = "1", optional = true }
 image = { version = "0.25", optional = true }
 ndarray16 = { package = "ndarray", version = "0.16", optional = true }
 cellpose = { git = "https://github.com/henriksson-lab/cellpose-rs.git", rev = "e4b8d4c3dd1370eb29d9705c82010f4cd2d41bbe", optional = true }
-stardist-rs = { path = "/home/mahogny/github/claude/stardist-rs", optional = true }
+stardist-rs = { git = "https://github.com/henriksson-lab/stardist-rs.git", rev = "20cb2375f53540ad0f2b490d4e8a7f65d96c95ee", optional = true }
 burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["std", "safetensors"], optional = true }
 candle-core = { version = "0.11", optional = true }
