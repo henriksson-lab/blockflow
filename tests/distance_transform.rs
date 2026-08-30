@@ -27,7 +27,7 @@
 // |---|---|
 // | the field is exact | 0 differing from a brute-force nearest-background search over 90 904 voxels across five fixtures at two samplings |
 // | the field is *SciPy's* | four recorded FNV-1a digests of `scipy.ndimage.distance_transform_edt` 1.15.2, reproduced bit for bit |
-// | the block lattice is a synonym | eleven decompositions of a `29 x 23 x 19` volume, all byte-identical to the resident answer, with the negative control measured beside them |
+// | the block lattice is a synonym | eleven decompositions of a `29 x 23 x 19` volume, all byte-identical to the resident answer, with the negative control measured beside them — and, separately, four decompositions of an **all-foreground** volume, which is the only fixture that reaches the phantom-origin rule at all |
 // | the pass order is a synonym | all six orders bit-identical |
 //
 // What could not follow the op into this crate
@@ -776,6 +776,73 @@ fn the_degenerate_volumes_are_pinned() {
     println!(
         "the degenerate volumes are pinned; the all-foreground one is where the two references \
          disagree and both readings are recorded"
+    );
+}
+
+/// **The phantom-origin rule under decomposition**, which the whole-volume test
+/// above cannot reach.
+///
+/// The phantom background voxel sits at `(-1, 0, 0)` of the **volume**, not of
+/// the block, so `DistanceFinishOp` reads `Anchor::offset` and adds it to the
+/// voxel's index. A block that re-anchored to itself would place one phantom per
+/// block and produce a field that is right in the block holding the volume's
+/// origin and wrong everywhere else — a plausible answer, and one every other
+/// test in this file misses.
+///
+/// It misses it because the rule only fires where the *squared* field is
+/// infinite, which happens exactly when the whole volume is foreground, and no
+/// other fixture here is: `oblique_sheet` is background on a plane and
+/// `lcg_mask` is background at one voxel in seven, so the branch is never
+/// entered under blocking anywhere else. That is why this test exists and why
+/// its fixture is `from_elem(.., true)` and nothing else.
+///
+/// Byte identity, not a tolerance: both paths take the same square root of the
+/// same sum, so a difference of any size is a difference in the offset.
+#[test]
+fn the_phantom_origin_is_the_volumes_and_not_the_blocks() {
+    let volume = (7usize, 5usize, 6usize);
+    let foreground = Array3::from_elem(volume, true);
+    let mask: Voxels = foreground.clone().into();
+
+    for unbounded in [Unbounded::PhantomOrigin, Unbounded::Infinite] {
+        let params = DistanceParams::default().with_unbounded(unbounded);
+        let resident =
+            distance_transform(foreground.view(), &params).expect("the resident transform");
+        for block in [2usize, 3, 4, 7] {
+            let blocked = run_blocked(&params, &mask, block).expect("the blocked run");
+            let field = blocked.view::<f64>().expect("an f64 field").to_owned();
+            let apart = field
+                .iter()
+                .zip(resident.iter())
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                apart,
+                0,
+                "{unbounded:?} at block {block}: {apart} of {} voxels differ from the resident \
+                 answer",
+                field.len()
+            );
+        }
+    }
+
+    // And the fixture really does enter the branch: a volume with one background
+    // voxel does not, which is the control that says the assertion above is
+    // about the phantom rule rather than about blocking in general.
+    let params = DistanceParams::default();
+    let mut nearly = foreground.clone();
+    nearly[[3, 2, 3]] = false;
+    assert!(
+        differing(
+            &distance_transform(nearly.view(), &params).expect("the transform"),
+            &distance_transform(foreground.view(), &params).expect("the transform")
+        ) > 0,
+        "the two fixtures agree, so the all-foreground one is not reaching the phantom branch"
+    );
+
+    println!(
+        "the all-foreground field is byte-identical under four block edges at both unbounded \
+         rules, which is what makes the phantom a point of the volume"
     );
 }
 

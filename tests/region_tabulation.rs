@@ -2260,16 +2260,35 @@ fn an_off_axis_region_reports_the_direction_it_is_elongated_along() {
     for (length, variance) in slab_axes.length.into_iter().zip(slab_axes.variance) {
         assert!((length - 2.0 * (5.0 * variance).sqrt()).abs() < 1e-12);
     }
+    // **The eccentricity, against its own definition.** `sqrt(1 - (minor /
+    // major)^2)`, recomputed here from the two lengths the same struct reports.
+    //
+    // This assertion used to read `(eccentricity - (1 - r^2)).sqrt().abs() <
+    // 1.0`, with the square root outside the difference rather than on
+    // `1 - r^2`, and a bound of one. Since `eccentricity` *is* `sqrt(1 - r^2)`,
+    // that expression was `sqrt(e - e^2)`, which is below `0.5` for every `e` in
+    // `[0, 1]` — so it held for any eccentricity the code could produce, the
+    // `e^2`-for-`e` confusion very much included. It could not fail and was
+    // measuring nothing.
+    //
+    // The liveness is measured rather than argued: `1 - r^2` — the value
+    // without the square root, which is the natural thing to write by mistake —
+    // is asserted to be far outside the bound, so the `1e-12` is a tolerance on
+    // arithmetic and not a tolerance on being wrong.
     let eccentricity = slab.eccentricity().expect("a region with extent");
+    let ratio = slab_axes.length[2] / slab_axes.length[0];
+    let from_the_lengths = (1.0 - ratio * ratio).sqrt();
     assert!(
-        (eccentricity
-            - (1.0
-                - slab_axes.length[2] * slab_axes.length[2]
-                    / (slab_axes.length[0] * slab_axes.length[0])))
-            .sqrt()
-            .abs()
-            < 1.0,
-        "eccentricity {eccentricity} is not the ratio of the axis lengths"
+        (eccentricity - from_the_lengths).abs() < 1e-12,
+        "the eccentricity is {eccentricity} and sqrt(1 - (minor/major)^2) over the reported \
+         lengths is {from_the_lengths}"
+    );
+    let unrooted = 1.0 - ratio * ratio;
+    assert!(
+        (eccentricity - unrooted).abs() > 1e-3,
+        "the squared form is only {} from the eccentricity here, so this fixture cannot tell \
+         the two apart and the assertion above is not discriminating",
+        (eccentricity - unrooted).abs()
     );
     assert!(eccentricity > 0.9 && eccentricity < 1.0);
 }

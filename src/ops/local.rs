@@ -3362,6 +3362,80 @@ mod tests {
         }
     }
 
+    /// **The deviation is the population one, `/ n`, and this is the only place
+    /// that is asserted rather than documented.**
+    ///
+    /// [`Statistic::Deviation`] is documented as the population standard
+    /// deviation. Every other test that reaches it — `tests/image_ops.rs`,
+    /// `ops::normalise`'s suite, the lattice statistic's — is a decomposition,
+    /// reach or short-circuit test whose reference is this same reducer, so the
+    /// choice of divisor is invisible to all of them and a `/ (n - 1)` would
+    /// pass the lot.
+    ///
+    /// The fixture is chosen so the answer is **exact in binary** and the
+    /// assertion can be an equality: over `{0, 0, 4, 4}` the mean is `2`, each
+    /// deviation is `2`, the sum of squares is `16`, and `16 / 4` is `4` whose
+    /// root is `2`. Under the sample convention it would be `16 / 3`, whose root
+    /// is `2.309…` — measured beside it, so the equality is known to
+    /// discriminate rather than merely to hold.
+    ///
+    /// A second window with an odd count is included because `n` and `n - 1`
+    /// differ by a larger fraction on a small window, and because a divisor
+    /// written as `len() & !1` or similar would agree on the even one.
+    #[test]
+    fn the_deviation_divides_by_n_and_not_by_n_minus_one() {
+        let mut scratch = Vec::new();
+
+        // Even count, exact in binary.
+        let mut window = [0i32, 0, 4, 4];
+        let full = window.len();
+        let population = Statistic::Deviation.reduce_with(&mut window, full, &mut scratch);
+        assert_eq!(population, 2.0, "sqrt(16 / 4) is exactly 2");
+        let sample = (16.0f64 / 3.0).sqrt();
+        assert!(
+            (population - sample).abs() > 0.3,
+            "the two conventions differ by only {} here, so this window does not discriminate \
+             them",
+            (population - sample).abs()
+        );
+
+        // Odd count, where the gap between the two is wider.
+        let mut window = [0i32, 0, 3];
+        let full = window.len();
+        let population = Statistic::Deviation.reduce_with(&mut window, full, &mut scratch);
+        assert!(
+            (population - 2.0f64.sqrt()).abs() < 1e-15,
+            "the mean is 1, the squares are 1, 1 and 4, and sqrt(6 / 3) is sqrt(2); got \
+             {population}"
+        );
+        assert!(
+            (population - 3.0f64.sqrt()).abs() > 0.3,
+            "the sample convention would give sqrt(6 / 2) = sqrt(3), and this window does not \
+             separate the two"
+        );
+
+        // And the mean it is centred about, pinned in the same place so that a
+        // deviation that was right about its divisor and wrong about its centre
+        // could not pass here.
+        let mut window = [0i32, 0, 4, 4];
+        let full = window.len();
+        assert_eq!(
+            Statistic::Mean.reduce_with(&mut window, full, &mut scratch),
+            2.0
+        );
+
+        // A constant window has no deviation at all, exactly, in every count.
+        for count in 1..6 {
+            let mut window = vec![7i32; count];
+            let full = window.len();
+            assert_eq!(
+                Statistic::Deviation.reduce_with(&mut window, full, &mut scratch),
+                0.0,
+                "a constant window of {count}"
+            );
+        }
+    }
+
     /// The mean's mapping is withheld for a reason, and the reason is
     /// demonstrable rather than theoretical.
     #[test]
