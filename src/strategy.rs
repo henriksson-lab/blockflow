@@ -3731,6 +3731,67 @@ pub struct CandidateTally {
     pub priced: usize,
 }
 
+/// **The search's objective, for one phase and one grid** — what a phase of
+/// `slots[group]` on this grid and halo is predicted to cost on `workers`.
+///
+/// `(the phase's cost, its predicted makespan)`. The second is the number the
+/// partition search minimises and the first is what a budget is checked
+/// against, and they are returned together because they are one derivation:
+/// [`phase_makespan`]'s channel bound has to be stated in the same voxels and
+/// at the same write charge [`price_phase`] used, or the `max` is a maximum over
+/// two different units.
+///
+/// **This exists so that a plan can be priced by the planner's own objective
+/// without being produced by it.** `PhasePricer` sweeps candidate grids and
+/// keeps the argmin; `crate::arena` prices a *given* plan, including one another
+/// strategy produced or one nobody would choose. Both call this, so the two
+/// cannot drift into two objectives — which is the whole reason it is a function
+/// here rather than a second expression there. `the_arena_prices_the_edge_the
+/// _search_chose` is the check that says they have not.
+///
+/// `traffic` is passed rather than derived because deriving it can fail — a run
+/// whose `Chain::Source` leaves name an image of another volume is refused as a
+/// *run*, before any grid is priced — and that refusal belongs to the caller
+/// that knows what a refusal means to it. [`crate::decomposition::images_read_by`]
+/// is where it comes from on both sides.
+pub fn phase_price(
+    slots: &[&Chain],
+    group: &[usize],
+    grid: &BlockGrid,
+    halo: &Reach,
+    bytes_per_voxel: f64,
+    distinct_orders: usize,
+    is_materialised: bool,
+    traffic: super::decomposition::PhaseTraffic,
+    constraints: &Constraints,
+    workers: usize,
+) -> (super::decomposition::PhaseCost, f64) {
+    let cost = price_phase(
+        grid,
+        halo,
+        // Re-asked at this grid rather than carried, because an op may declare
+        // a term whose denominator is a block extent — see
+        // `decomposition::compute_per_voxel`. For every op that does not, this
+        // is the same number by the same route.
+        compute_per_voxel(slots, group, grid.block()),
+        distinct_orders,
+        is_materialised,
+        bytes_per_voxel,
+        &constraints.model,
+        constraints.model.materialise_cost_per_voxel,
+        traffic,
+    );
+    // The per-voxel write charge `price_phase` applied, re-derived so that
+    // `phase_makespan` puts the same number on the channel bound.
+    let write_cost = if is_materialised {
+        constraints.model.materialise_cost_per_voxel
+    } else {
+        constraints.model.write_cost_per_voxel
+    };
+    let makespan = phase_makespan(&cost, grid, workers, &constraints.model, write_cost);
+    (cost, makespan)
+}
+
 /// Everything needed to price one contiguous run of slots.
 struct PhasePricer<'a> {
     slots: &'a [&'a Chain],
@@ -3743,16 +3804,6 @@ struct PhasePricer<'a> {
 }
 
 impl PhasePricer<'_> {
-    /// The per-voxel write charge [`price_phase`] applies, re-derived so
-    /// [`phase_makespan`] can put the same number on the channel bound.
-    fn write_cost(&self, is_materialised: bool) -> f64 {
-        if is_materialised {
-            self.constraints.model.materialise_cost_per_voxel
-        } else {
-            self.constraints.model.write_cost_per_voxel
-        }
-    }
-
     /// Price the run `fold` covers, choosing its block edge.
     ///
     /// `is_materialised` is the whole of this function's dependence on the rest
@@ -3801,17 +3852,20 @@ impl PhasePricer<'_> {
             writes_an_image: true,
             repeats: 1,
         };
+        // One function with the sweep below and with `crate::arena`, so that
+        // "what the search minimises" is one expression in the crate.
         let price = |grid: &BlockGrid, halo: &Reach| {
-            price_phase(
+            phase_price(
+                self.slots,
+                &group,
                 grid,
                 halo,
-                compute_per_voxel(self.slots, &group, grid.block()),
+                self.bytes,
                 fold.orders.len(),
                 is_materialised,
-                self.bytes,
-                &self.constraints.model,
-                self.constraints.model.materialise_cost_per_voxel,
                 traffic,
+                self.constraints,
+                self.workers,
             )
         };
         let affordable =
@@ -3830,18 +3884,11 @@ impl PhasePricer<'_> {
             // not fit — but there is nothing to choose between.
             match constraint.lattice(self.volume, &reach) {
                 Ok(Some((grid, window))) => {
-                    let cost = price(&grid, &window);
+                    let (cost, makespan) = price(&grid, &window);
                     tally.offered += 1;
                     if affordable(&cost) {
                         tally.priced += 1;
                         halo = window;
-                        let makespan = phase_makespan(
-                            &cost,
-                            &grid,
-                            self.workers,
-                            &self.constraints.model,
-                            self.write_cost(is_materialised),
-                        );
                         chosen = Some((makespan, 0, grid));
                     } else {
                         tally.over_budget += 1;
@@ -3872,26 +3919,20 @@ impl PhasePricer<'_> {
                         continue;
                     }
                 };
-                let cost = price(&grid, &reach);
+                let (cost, phase_total) = price(&grid, &reach);
                 if !affordable(&cost) {
                     tally.over_budget += 1;
                     continue;
                 }
                 tally.priced += 1;
-                // **The objective.** Not `cost_per_block * n_blocks`, which is
-                // the phase's serial *work* and falls monotonically as the block
-                // grows — under it this loop always answers "the largest
-                // candidate" and the per-phase freedom is freedom on paper. This
-                // is the phase's predicted *wall clock*: the same per-block cost
-                // over `ceil(n_blocks / workers)` rounds. At `workers == 1` the
-                // two are the same expression and the same bits.
-                let phase_total = phase_makespan(
-                    &cost,
-                    &grid,
-                    self.workers,
-                    &self.constraints.model,
-                    self.write_cost(is_materialised),
-                );
+                // **The objective** is `phase_total`, from `phase_price` above.
+                // Not `cost_per_block * n_blocks`, which is the phase's serial
+                // *work* and falls monotonically as the block grows — under it
+                // this loop always answers "the largest candidate" and the
+                // per-phase freedom is freedom on paper. It is the phase's
+                // predicted *wall clock*: the same per-block cost over
+                // `ceil(n_blocks / workers)` rounds. At `workers == 1` the two
+                // are the same expression and the same bits.
                 // deterministic: lower cost, then the larger block edge
                 let better = match &chosen {
                     None => true,

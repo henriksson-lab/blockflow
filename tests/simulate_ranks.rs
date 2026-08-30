@@ -2259,3 +2259,117 @@ fn the_gather_is_budgeted_and_rises_as_the_cut_gets_finer() {
         0
     );
 }
+
+/// **A barrier phase starts when its barrier clears, and the simulator's ready
+/// set has to notice.**
+///
+/// `TaskGraph::is_barrier` is checked in the event loop rather than encoded as
+/// edges — *"a barrier changes when a phase may start, not what it depends
+/// on"* — so a barrier phase's tasks can have every dependency satisfied and
+/// still not be runnable. The ready set is maintained rather than rescanned, so
+/// those tasks are parked when they are admitted and released when the phase
+/// they wait on completes, and **that release is a code path no other fixture
+/// in this file reaches**: every plan here is pixel phases, and a pixel phase
+/// is never a barrier.
+///
+/// It is not a hypothetical path. The first version of the maintained set
+/// released phases `0..finished_phases` where the rule is `finished_phases >=
+/// phase`, which is off by exactly one and is off by it in the **ordinary**
+/// case — a barrier cleared by the phase immediately before it, whose tasks are
+/// admitted during that phase's last completion, while `finished_phases` still
+/// reads the old value. Nothing here caught it, because nothing here had a
+/// barrier. Now something does.
+///
+/// Two assertions and a third that comes for free:
+///
+/// * the run **completes**. With the tasks parked for ever the loop reaches
+///   "none is ready and none is running" and `simulate` returns an error, so
+///   this is the assertion that would have caught the defect;
+/// * every task of the barrier phase is picked **after** every task of the
+///   phase before it, which is what the barrier means;
+/// * and in a debug build the maintained set is compared against the full scan
+///   at every dispatch, so this fixture is also what puts that oracle over a
+///   barrier.
+#[test]
+fn a_barrier_phase_is_released_when_the_phase_before_it_completes() {
+    use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+    use blockflow::reach::Reach;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let volume = [16usize, 16, 16];
+    let grid = BlockGrid::new(volume, [8, 8, 8]).expect("a grid");
+    let phase = |slot: usize, barrier: bool| {
+        PhaseDecomposition::derive(
+            vec![slot],
+            vec![format!("phase {slot}")],
+            Reach::symmetric([0, 0, 0]),
+            Reach::symmetric([0, 0, 0]),
+            grid.clone(),
+        )
+        .with_barrier(barrier)
+    };
+    let decomposition = Decomposition {
+        volume,
+        dtype: Dtype::F64,
+        // The middle phase waits for the whole of the first, and the last waits
+        // for nothing — so the fixture has a barrier to clear *and* a phase
+        // after it, which is what makes the release observable rather than
+        // merely terminal.
+        phases: vec![phase(0, false), phase(1, true), phase(2, false)],
+        chain_reach: [0, 0, 0],
+    };
+    decomposition.check().expect("an honest plan must tile");
+    let blocks = grid.n_blocks();
+
+    /// Records what it picked, and picks in plan order.
+    struct Recording {
+        picked: Rc<RefCell<Vec<(usize, usize)>>>,
+    }
+    impl Scheduler for Recording {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn pick(&mut self, decision: &blockflow::simulate::Decision<'_>) -> usize {
+            let id = decision.ready[0];
+            self.picked
+                .borrow_mut()
+                .push((decision.graph.tasks[id].phase, id));
+            0
+        }
+    }
+
+    let picked = Rc::new(RefCell::new(Vec::new()));
+    let outcome = simulate(
+        &decomposition,
+        &[blockflow::fragment::PhaseWork::Pixels; 3],
+        &Machine {
+            workers: 4,
+            ..Machine::default()
+        },
+        &rates(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        PerPhase::default(),
+        &mut Recording {
+            picked: picked.clone(),
+        },
+    )
+    .expect("a plan whose barrier clears must run to completion");
+    assert_eq!(outcome.tasks_run as usize, 3 * blocks);
+
+    let picked = picked.borrow();
+    let last_of_first = picked
+        .iter()
+        .rposition(|&(phase, _)| phase == 0)
+        .expect("the first phase ran");
+    let first_of_barrier = picked
+        .iter()
+        .position(|&(phase, _)| phase == 1)
+        .expect("the barrier phase ran");
+    assert!(
+        last_of_first < first_of_barrier,
+        "a block of the barrier phase started at pick {first_of_barrier}, before the phase it \
+         waits on finished dispatching at {last_of_first}"
+    );
+}

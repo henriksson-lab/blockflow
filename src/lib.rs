@@ -106,6 +106,11 @@
 /// because label ids never agree between two labellings of the same volume.
 pub mod agreement;
 pub mod animate;
+/// **The planner arena**: plans entered into a competition and judged by the
+/// simulator, beside the price the planner's own cost model puts on each. The
+/// path from a `Strategy`-produced `Decomposition` into `simulate` — see
+/// `docs/design/planner-gaps.md`, whose first finding is that it did not exist.
+pub mod arena;
 /// Assembling a plan: the slot cursor, the names, the per-phase reach, the
 /// element type a fragment phase writes, what each phase runs, and the images a
 /// phase reads besides its own input. **Assembly, not planning** — it decides

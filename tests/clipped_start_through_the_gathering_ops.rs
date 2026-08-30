@@ -122,9 +122,21 @@ fn image() -> Array3<f64> {
 }
 
 /// A mask volume, for the ops that take one.
+///
+/// **Chosen so that the two origins are two answers through the *composition*
+/// as well as through the primitive**, which is a stronger demand than it
+/// looks. The mask this file first used — `(i * 5 + j * 3 + k) % 4 != 0` — gives
+/// erosions that differ at 144 voxels and openings that are identical: an
+/// opening is the union of the element's placements that fit inside the mask,
+/// and on a mask that regular the re-phased placements land on the same union.
+/// A fixture like that would let `Case::Open` pass the invariance sweep below
+/// while quietly being the anchored element's answer, which is what
+/// `the_two_origins_are_different_operations_through_every_op_that_honours_them`
+/// exists to catch. This one differs at 24 voxels after the erosion and 80
+/// after the opening.
 fn mask() -> Array3<bool> {
     Array3::from_shape_fn((VOLUME[0], VOLUME[1], VOLUME[2]), |(i, j, k)| {
-        (i * 5 + j * 3 + k) % 4 != 0
+        (i * 7 + j * 3 + k * 5) % 5 != 0
     })
 }
 

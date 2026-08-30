@@ -513,9 +513,41 @@ pub struct Outcome {
     /// law: it is a property of the plan and the data, so two schedulers agree
     /// on it, but two *decompositions* of one volume do not.
     pub tasks_short_circuited: u64,
+    /// The sum over phases of each phase's own **span**: from its first task
+    /// starting to its last task finishing.
+    ///
+    /// **The quantity the planner's objective assumes it knows.**
+    /// `strategy::phase_makespan` prices a phase on its own and the partition
+    /// search adds the phases up, which is the wall clock only if no two phases
+    /// are ever running at once. The `TaskGraph` says otherwise: a block of
+    /// phase `p + 1` depends on the blocks of phase `p` that cover its read
+    /// extent and on nothing else, so it starts while the rest of phase `p` is
+    /// still going. `docs/design/planner-gaps.md` carries this as **G2**, and
+    /// this field is what puts a number on it — see [`Outcome::phase_overlap`].
+    ///
+    /// A span is not a phase's busy time: it contains whatever idleness fell
+    /// inside it. That is the right shape for the comparison, because the term
+    /// it is being compared against — a phase priced alone — contains the same
+    /// idleness by construction.
+    pub phase_span_ns: u64,
 }
 
 impl Outcome {
+    /// **How much the phases overlapped**: [`Self::phase_span_ns`] over the
+    /// makespan.
+    ///
+    /// `1.0` is a run whose phases were strictly sequential, which is what the
+    /// planner's objective assumes every run is; above `1.0` is a run that
+    /// pipelined, and the excess is the wall clock the sequential-phase
+    /// assumption over-charges. Below `1.0` is possible and means the spans did
+    /// not cover the run — a plan that spent time between phases rather than
+    /// inside one.
+    ///
+    /// `None` for a run of no length, where the ratio is not a number.
+    pub fn phase_overlap(self) -> Option<f64> {
+        (self.makespan_ns > 0).then(|| self.phase_span_ns as f64 / self.makespan_ns as f64)
+    }
+
     /// Worker-seconds of idleness as a fraction of the whole run. A scheduler
     /// that starves is visible here before it is visible in the makespan.
     pub fn idle_fraction(self, workers: usize) -> f64 {
@@ -1287,6 +1319,11 @@ pub fn simulate(
     let mut block_bytes: Vec<u64> = vec![0; graph.tasks.len()];
     let mut in_flight_bytes: u64 = 0;
     let mut done_in_phase: Vec<usize> = vec![0; graph.n_phases()];
+    // When each phase's first task started and its last one finished, for
+    // `Outcome::phase_span_ns`. `None` for a phase that never started, which is
+    // a phase with no tasks — its span is nothing rather than zero-to-zero.
+    let mut phase_started: Vec<Option<u64>> = vec![None; graph.n_phases()];
+    let mut phase_finished: Vec<u64> = vec![0; graph.n_phases()];
     let mut finished_phases: usize = 0;
     let mut remaining = graph.tasks.len();
     // Phases whose output image has been counted as allocated.
@@ -1304,18 +1341,68 @@ pub fn simulate(
         })
         .collect::<Result<Vec<bool>>>()?;
 
+    // --- the ready set, maintained rather than rebuilt ----------------------
+    //
+    // **Which tasks may start**: indegree zero, not started, and — for a barrier
+    // phase — every earlier phase complete. The barrier is checked here rather
+    // than encoded as edges because that is where the real graph puts it; see
+    // `TaskGraph::barriers`.
+    //
+    // This used to be a `(0..graph.tasks.len()).filter(..)` **per dispatch**,
+    // which is `O(T)` predicate evaluations at every one of the `2T` events a
+    // run has: fine at the `4^3` fixtures the simulator shipped with, and
+    // `docs/design/planner-gaps.md` names it as the one thing G1 needed before
+    // an arena could sweep. It is now maintained incrementally — a task is
+    // admitted when its last dependency completes, or when the barrier its
+    // phase waits on clears — so the per-event cost is the *ready* set rather
+    // than the whole graph.
+    //
+    // **Ascending task id, exactly as the scan produced.** A `Scheduler` is
+    // handed `Decision::ready` as a slice and several of them break a tie by the
+    // first entry they see, so the order is part of the interface and not an
+    // implementation detail: `PlanOrder` is documented as "the lowest ready task
+    // id", and `CacheAware` returns the first of an equal-hit set. Every
+    // insertion is therefore a `partition_point` and every removal takes the
+    // element out in place. That the two agree is checked rather than argued —
+    // see the debug assertion at the head of the loop.
+    let mut ready: Vec<usize> = Vec::new();
+    // Tasks whose dependencies are all done and whose phase is a barrier that
+    // has not cleared. One list per phase, so a phase's tasks come back in the
+    // order they went in — which is ascending, because that is the order they
+    // are admitted in.
+    let mut barrier_held: Vec<Vec<usize>> = vec![Vec::new(); graph.n_phases()];
+    for id in 0..graph.tasks.len() {
+        if indegree[id] == 0 {
+            let phase = graph.tasks[id].phase;
+            if !graph.is_barrier(phase) || finished_phases >= phase {
+                ready.push(id);
+            } else {
+                barrier_held[phase].push(id);
+            }
+        }
+    }
+
     while remaining > 0 {
-        // Which tasks may start: indegree zero, not started, and — for a
-        // barrier phase — every earlier phase complete. The barrier is checked
-        // here rather than encoded as edges because that is where the real
-        // graph puts it; see `TaskGraph::barriers`.
-        let ready: Vec<usize> = (0..graph.tasks.len())
-            .filter(|&id| indegree[id] == 0)
-            .filter(|&id| {
-                let phase = graph.tasks[id].phase;
-                !graph.is_barrier(phase) || finished_phases >= phase
-            })
-            .collect();
+        // **The scan the maintained set replaced, kept as its oracle.** Every
+        // test in this crate that runs a simulation runs this comparison — the
+        // suite is built in the dev profile — and a release build pays nothing
+        // for it. If the two ever part, the incremental admission has missed an
+        // edge or a barrier and the finding is here rather than in a ranking
+        // that quietly changed.
+        #[cfg(debug_assertions)]
+        {
+            let scanned: Vec<usize> = (0..graph.tasks.len())
+                .filter(|&id| indegree[id] == 0)
+                .filter(|&id| {
+                    let phase = graph.tasks[id].phase;
+                    !graph.is_barrier(phase) || finished_phases >= phase
+                })
+                .collect();
+            debug_assert_eq!(
+                ready, scanned,
+                "the maintained ready set and the full scan disagree"
+            );
+        }
 
         if ready.is_empty() || running.len() >= machine.workers {
             // Advance to the next completion. Nothing can start before then.
@@ -1346,11 +1433,43 @@ pub fn simulate(
                 outcome.tasks_run += 1;
                 for &next in &dependents[id] {
                     indegree[next] -= 1;
+                    // Its last dependency: admit it, to the ready set or to the
+                    // barrier its phase is still waiting on.
+                    if indegree[next] == 0 {
+                        let phase = graph.tasks[next].phase;
+                        if !graph.is_barrier(phase) || finished_phases >= phase {
+                            let at = ready.partition_point(|&other| other < next);
+                            ready.insert(at, next);
+                        } else {
+                            barrier_held[phase].push(next);
+                        }
+                    }
                 }
                 let phase = graph.tasks[id].phase;
+                phase_finished[phase] = phase_finished[phase].max(now);
                 done_in_phase[phase] += 1;
                 if done_in_phase[phase] == graph.tasks_in_phase(phase).len() {
                     finished_phases = finished_phases.max(phase + 1);
+                    // The barrier this completion cleared, for every phase it
+                    // cleared it for. `finished_phases` only grows, so a phase
+                    // drained here is never held again.
+                    //
+                    // **`+ 1`, because the test is `finished_phases >= phase`
+                    // and not `>`.** A phase whose barrier is cleared by the
+                    // phase immediately before it is the ordinary case — its
+                    // tasks are admitted during that phase's last completion,
+                    // while `finished_phases` still reads the old value — and
+                    // `take(finished_phases)` would leave exactly those held for
+                    // ever. The debug oracle above catches it, but only on a
+                    // fixture that has a barrier phase, which is why
+                    // `simulate_ranks` grew one.
+                    let cleared = finished_phases + 1;
+                    for held in barrier_held.iter_mut().take(cleared) {
+                        for id in held.drain(..) {
+                            let at = ready.partition_point(|&other| other < id);
+                            ready.insert(at, id);
+                        }
+                    }
                     // **The gather.** A barrier reduces over every contributing
                     // block's fragment, which means holding them all at once —
                     // `n_blocks x payload` resident at one instant, with no term
@@ -1407,8 +1526,15 @@ pub fn simulate(
             };
             scheduler.pick(&decision).min(ready.len() - 1)
         };
-        let id = ready[slot];
+        // Out of the set as it starts. The scan's equivalent is `indegree[id] =
+        // usize::MAX` below, which is still done — it is what the oracle above
+        // compares against and what keeps a completed task's decrement from
+        // re-admitting a started one.
+        let id = ready.remove(slot);
         let task = &graph.tasks[id];
+        // Time only advances at the head of the loop, so the first dispatch of a
+        // phase is its earliest start.
+        phase_started[task.phase].get_or_insert(now);
 
         // The image this phase writes is allocated when its first block starts.
         //
@@ -1744,6 +1870,16 @@ pub fn simulate(
         outcome.peak_bytes = outcome.peak_bytes.max(resident);
         outcome.makespan_ns = outcome.makespan_ns.max(finish);
     }
+
+    // The phase spans, summed. A phase that never started contributes nothing,
+    // which is a phase with no tasks; `saturating_sub` rather than a subtraction
+    // because a phase whose every task was short-circuited can finish in the
+    // nanosecond it started.
+    outcome.phase_span_ns = phase_started
+        .iter()
+        .zip(phase_finished.iter())
+        .filter_map(|(started, finished)| started.map(|started| finished.saturating_sub(started)))
+        .sum();
 
     Ok(outcome)
 }

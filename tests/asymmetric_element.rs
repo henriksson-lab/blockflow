@@ -48,7 +48,8 @@ use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
 /// Long on axis 0, where the elements below are widest and where the biggest
-/// reach — an opening's `(10, 8)` — has to leave room for several blocks;
+/// reach — an opening's `(9, 9)`, which is `lo + hi` on both sides — has to
+/// leave room for several blocks;
 /// deliberately short on the other two, because the sweep's cost is the product
 /// of the three and the property being tested is per axis.
 const VOLUME: [usize; 3] = [30, 16, 12];
@@ -122,9 +123,12 @@ fn cases(input: &Array3<f64>) -> Vec<(String, Chain, Array3<f64>)> {
             masked.clone(),
         ));
         cases.push((
-            // The doubled reach, which is the composition most likely to be
-            // wrong per side: `sweep` does not reflect between the two passes,
-            // so an element reading `(5, 4)` makes an opening reading `(10, 8)`.
+            // The composition, which is the reach most likely to be wrong per
+            // side: an opening reflects between its two passes — see
+            // `ops::morphology::dilate_placed_into` — so an element reading
+            // `(5, 4)` makes an opening reading `(9, 9)` and not `(10, 8)`.
+            // Both numbers are wrong for a crate that assumed symmetry, and
+            // only one of them belongs to an operation that is idempotent.
             format!("open, {name}"),
             Chain::op(MorphologyOp::new("open", Morphology::Open, element.clone())),
             masked.clone(),
@@ -222,12 +226,15 @@ fn an_even_element_derives_an_asymmetric_reach_and_a_symmetric_bound() {
         "the bound is the wider side"
     );
 
-    // and the composition doubles each side rather than symmetrising them
+    // and the composition **reflects**, so it reads `lo + hi` on both sides:
+    // symmetric again, and narrower than the `(10, 8)` an unreflected repetition
+    // would read. The two rules agree for every centred element, which is why
+    // this is the file the difference shows up in.
     let open = Chain::op(MorphologyOp::new("open", Morphology::Open, element));
     let spec = open.reach_spec(VOLUME).unwrap();
-    assert_eq!(spec.at(0, 0, VOLUME[0]), (10, 8));
-    assert_eq!(spec.at(2, 0, VOLUME[2]), (4, 2));
-    assert_eq!(open.reach3(&VOLUME), [10, 4, 4]);
+    assert_eq!(spec.at(0, 0, VOLUME[0]), (9, 9));
+    assert_eq!(spec.at(2, 0, VOLUME[2]), (3, 3));
+    assert_eq!(open.reach3(&VOLUME), [9, 4, 3]);
 }
 
 // -------------------------------------------------- 1. the ordinary bar --

@@ -628,6 +628,95 @@ impl StructuringElement {
         ])
     }
 
+    /// What a composition of this element with **its own reflection** reads,
+    /// per side and per axis — the reach of an opening or a closing.
+    ///
+    /// `lo + hi` on **both** sides of every axis, and symmetric however
+    /// asymmetric the element is. The erosion reads `centre + o` and the
+    /// dilation is by the element rather than by its reflection, so it consumes
+    /// the erosion at `centre - o'`; the composed offset is `o - o'` with both
+    /// drawn from this element, and it spans `-(lo + hi) ..= lo + hi`.
+    ///
+    /// For a centred window this is the same number
+    /// [`Self::reach_spec_after`] gives at `passes = 2`, which is why the
+    /// difference between the two was invisible in this crate until an element
+    /// without a centre voxel was built. For an element reading `(5, 4)` they
+    /// disagree: `(10, 8)` there and `(9, 9)` here, and only one of the two
+    /// belongs to an operation that is idempotent.
+    ///
+    /// This is the method an operation that **reflects** must use, which is
+    /// `src/ops/morphology.rs`'s `Open` and `Close`;
+    /// [`Self::reach_spec_after`] is the one for a repetition that does not.
+    pub fn reach_spec_reflected_pair(&self) -> Reach {
+        Reach::asymmetric([
+            (self.reach_reflected_pair(0), self.reach_reflected_pair(0)),
+            (self.reach_reflected_pair(1), self.reach_reflected_pair(1)),
+            (self.reach_reflected_pair(2), self.reach_reflected_pair(2)),
+        ])
+    }
+
+    /// [`Self::reach_spec_reflected_pair`] as the single integer per axis that
+    /// `BlockOp::reach` carries.
+    ///
+    /// A bound that is **exact**, unlike [`Self::reach`]: the reflected pair is
+    /// symmetric, so one integer loses nothing. `reach(axis) * 2` would be a
+    /// bound too, and a wasteful one — it fetches `2 * max(lo, hi)` where the
+    /// operation reads `lo + hi`, which for an element reading `(5, 0)` is ten
+    /// planes a block pays for and never looks at.
+    pub fn reach_reflected_pair(&self, axis: usize) -> usize {
+        self.lo[axis] + self.hi[axis]
+    }
+
+    /// The element reflected through its anchor: `{ -o : o in B }`, written
+    /// `B̌`.
+    ///
+    /// **What a dilation is by, and an erosion is not.** A gather that reads
+    /// `input[centre + o]` and takes the disjunction is a dilation by the
+    /// *reflected* element, so an operation that wants `X + B` from such a
+    /// gather hands it this. The two are the same element exactly when
+    /// [`Self::is_symmetric`] holds on the offsets — every centred shape here —
+    /// and are two elements for every even extent.
+    ///
+    /// The sides swap, which is the whole of the geometry: an element reading
+    /// five below and four above reflects to one reading four below and five
+    /// above.
+    ///
+    /// **Refused for [`StepOrigin::ClippedStart`]**, and that refusal is the
+    /// honest answer rather than a gap. Such an element is not one offset set
+    /// but a set per position, and the reflection of a position-dependent
+    /// window is not a window: the dilation that is its erosion's adjoint reads
+    /// the element **at the source voxel**, which no per-destination offset list
+    /// can express. `ops::morphology` dilates by placing the element at each set
+    /// voxel for exactly this reason and therefore never asks for this; an
+    /// operation built out of gathers has to refuse the element instead of
+    /// silently gathering a different one.
+    pub fn reflected(&self) -> Result<Self> {
+        if self.origin != StepOrigin::Anchor {
+            return Err(Error::InvalidArgument(format!(
+                "this element's step counts from {:?}, so what it reads depends on where it is \
+                 evaluated and it has no reflection that is itself an element. The dilation \
+                 adjoint to an erosion by such an element places the element at the source \
+                 voxel, which `ops::morphology::dilate_placed_into` does and a gather cannot.",
+                self.origin
+            )));
+        }
+        let mut offsets: Vec<[isize; 3]> = self
+            .offsets
+            .iter()
+            .map(|offset| [-offset[0], -offset[1], -offset[2]])
+            .collect();
+        offsets.sort_unstable();
+        Ok(Self {
+            shape: self.shape,
+            lo: self.hi,
+            hi: self.lo,
+            step: self.step,
+            origin: self.origin,
+            window: None,
+            offsets,
+        })
+    }
+
     /// Voxels read beyond the anchor, along `axis`, **on the wider side**.
     ///
     /// The symmetric bound: what a caller that can only hold one integer per

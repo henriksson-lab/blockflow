@@ -19,11 +19,15 @@
 // symmetric 3x3x3 box.
 //
 // An opening is not "erode then dilate". It is the operation defined by three
-// properties — **anti-extensive**, **increasing**, **idempotent** — and
-// "erode by `B` then dilate by `B`" only has them when `B` is symmetric. That is
-// the distinction nothing here was measuring, and
-// `an_asymmetric_opening_translates_the_image_which_is_a_defect` records what
-// happened when it was.
+// properties — **anti-extensive**, **increasing**, **idempotent** — and "erode
+// by `B` then dilate by the *neighbourhood gather*" only has them when `B` is
+// symmetric, because that gather is a dilation by `B̌`. That is the distinction
+// nothing here was measuring; when this file first measured it, `Open` over an
+// element with no centre voxel obeyed none of the three and translated the
+// image once per application. `ops::morphology::dilate_placed_into` is the fix —
+// the dilation that is the erosion's adjoint — and
+// `the_dilation_that_makes_an_opening_is_the_reflected_one` is the
+// counterexample kept as a regression.
 //
 // What is asserted
 // ----------------
@@ -31,9 +35,9 @@
 // | claim | how |
 // |---|---|
 // | erosion and dilation are the gathered definition | a triple loop over the element's offsets with the clamp written out, on six elements x three masks — 49 896 voxels, exact |
-// | an opening by a symmetric element is an opening | anti-extensive, increasing and idempotent, on four symmetric elements x three masks; the closing dual beside it |
+// | an opening is an opening | anti-extensive, increasing and idempotent, on six elements — four symmetric, two not — x three masks; the closing dual beside it |
 // | the laws are not vacuous | the same three properties are checked to *fail* for a deliberately wrong composition, so a fixture on which everything is an opening is caught |
-// | **an opening by an asymmetric element is not one** | a defect, recorded with a minimal counterexample and the corrected composition computed beside it |
+// | **the composition is the one that reflects** | the minimal counterexample the defect was found on, asserted the right way round, with the unreflected composition computed beside it and measured to move the image |
 //
 // What is deliberately not asserted
 // ---------------------------------
@@ -124,14 +128,26 @@ fn asymmetric_elements() -> Vec<(&'static str, StructuringElement)> {
 /// about what the reflected element *does*, not about how a reflection is
 /// spelled.
 fn reflection_of(element: &StructuringElement) -> StructuringElement {
-    StructuringElement::from_offsets(
+    let built = StructuringElement::from_offsets(
         element
             .offsets()
             .iter()
             .map(|offset| [-offset[0], -offset[1], -offset[2]])
             .collect::<Vec<_>>(),
     )
-    .expect("a reflected offset set is still an offset set")
+    .expect("a reflected offset set is still an offset set");
+    // and the crate's own reflection is that set, which is the one line that
+    // keeps this file's oracle and `StructuringElement::reflected` from being
+    // two different reflections.
+    assert_eq!(
+        element
+            .reflected()
+            .expect("an anchored element reflects")
+            .offsets(),
+        built.offsets(),
+        "the crate's reflection is not the negated offset set"
+    );
+    built
 }
 
 fn eroded(mask: &Array3<bool>, element: &StructuringElement) -> Array3<bool> {
@@ -308,12 +324,13 @@ fn laws_of_opening(mask: &Array3<bool>, open: impl Fn(&Array3<bool>) -> Array3<b
 /// computing something else. That is what makes them an outside witness even
 /// though nothing outside the crate is consulted.
 #[test]
-fn an_opening_by_a_symmetric_element_obeys_the_three_laws() {
-    for (element_name, element) in symmetric_elements() {
-        assert!(
-            element.is_symmetric(),
-            "{element_name} is in the symmetric list and is not symmetric"
-        );
+fn an_opening_obeys_the_three_laws_over_every_element() {
+    let mut asymmetric_seen = 0usize;
+    for (element_name, element) in symmetric_elements()
+        .into_iter()
+        .chain(asymmetric_elements())
+    {
+        asymmetric_seen += !element.is_symmetric() as usize;
         for (mask_name, mask) in masks() {
             let laws = laws_of_opening(&mask, |m| opened(m, &element));
             assert_eq!(
@@ -363,7 +380,15 @@ fn an_opening_by_a_symmetric_element_obeys_the_three_laws() {
             );
         }
     }
-    println!("four symmetric elements x three masks: anti-extensive, idempotent and increasing");
+    assert!(
+        asymmetric_seen >= 2,
+        "the sweep saw {asymmetric_seen} elements without a centre voxel, and those are the \
+         ones the three laws were failing on"
+    );
+    println!(
+        "six elements ({asymmetric_seen} of them without a centre voxel) x three masks: \
+         anti-extensive, idempotent and increasing"
+    );
 }
 
 /// **The laws are not vacuous**, which is the thing a suite of algebraic
@@ -398,50 +423,38 @@ fn the_laws_reject_a_composition_that_is_not_an_opening() {
     );
 }
 
-// ------------------------------------------------- the defect, recorded --
+// --------------------------------- claim 4: the composition that reflects --
 
-/// **A DEFECT, recorded here rather than fixed, and this test asserts the
-/// current wrong behaviour so that fixing it fails loudly.**
+/// **The dilation an opening is made of is the one by the element, not the one
+/// by its reflection** — the minimal counterexample the defect was found on,
+/// kept as a regression and asserted the right way round.
 ///
-/// `Morphology::Open` over an **asymmetric** element is not an opening. It is
-/// anti-extensive for nobody, it is not idempotent, and what it actually does is
-/// **translate the image** by the element's own asymmetry.
-///
-/// The minimal case, on one axis, with
-/// `StructuringElement::from_size(ElementShape::Box, [4, 1, 1])` — sides
-/// `(2, 1)`, an ordinary even extent, and the very element
-/// `tests/asymmetric_element.rs` is built around:
+/// The element is `from_size(ElementShape::Box, [4, 1, 1])`: sides `(2, 1)`, an
+/// ordinary even extent, and the element `tests/asymmetric_element.rs` is built
+/// around. On one axis, with `X` a run of four and one isolated voxel:
 ///
 /// ```text
-///     X          0 0 0 1 1 1 1 0 0 0 0 0
-///     open(X)    0 0 0 0 1 1 1 1 0 0 0 0     <- moved one voxel up
-///     open^2(X)  0 0 0 0 0 1 1 1 1 0 0 0     <- and again
+///     X                 0 0 0 1 1 1 1 0 0 0 1 0
+///     open(X)           0 0 0 1 1 1 1 0 0 0 0 0   <- the run survives, the speck goes
+///     gather-composed   0 0 0 0 1 1 1 1 0 0 0 0   <- moved a voxel: 7 gained, 3 lost
 /// ```
 ///
-/// **Why.** `sweep` reads `input[centre + offset]` for both primitives
-/// (`src/ops/morphology.rs`), so its dilation is a dilation by the *reflected*
-/// element, and `dilate(erode(X))` is `(X ⊖ B) ⊕ B̌` rather than `(X ⊖ B) ⊕ B`.
-/// The two coincide exactly when `B = B̌`. The module is aware of the
-/// non-reflection and states it at `MorphologyOp::reach_spec` — *"`sweep`
-/// applies the element as written for both erosion and dilation — it does not
-/// reflect it between the two passes"* — where it is treated as a fact about the
-/// **reach**; what is not stated anywhere is that it also means `Open` and
-/// `Close` are not an opening and a closing.
+/// The second line is what ships. The third is `dilate_into(erode_into(X))` —
+/// the composition this module had until `dilate_placed_into` existed — computed
+/// here from the same two public primitives so that the difference between them
+/// is visible in one test rather than described in a comment. It is
+/// `(X ⊖ B) ⊕ B̌`, it is anti-extensive for nobody, and applying it again moves
+/// the run again.
 ///
-/// **The fix, and the evidence for it.** This test computes
-/// `dilate(erode(X, B), B̌)` from the same two public primitives and shows that
-/// it *is* anti-extensive, *is* idempotent, and gives the textbook answer — the
-/// run of four survives unmoved and the isolated voxel is removed. So the defect
-/// is the missing reflection and nothing else. `reach_spec`'s own note says what
-/// else has to move: *"If `sweep`'s dilation is ever reflected, this becomes
-/// `lo + hi` on both sides and `StructuringElement::reach_spec_after` stops
-/// being the right method to call."*
-///
-/// **When this is fixed, delete this test** and add the asymmetric elements to
-/// `an_opening_by_a_symmetric_element_obeys_the_three_laws`, which is where they
-/// belong once they pass.
+/// **Why an opening cannot be built from the neighbourhood gather.**
+/// `ops::morphology::sweep` reads `input[centre + offset]` for both primitives,
+/// which is what makes its dilation a dilation by `B̌` and what makes it equal to
+/// `ops::rank`'s extreme rank over the same element — an equality
+/// `ops::background` builds a grey opening on and which is worth keeping. So the
+/// composition reflects instead, in `dilate_placed_into`, which places the
+/// element at each set voxel and is the erosion's adjoint.
 #[test]
-fn an_asymmetric_opening_translates_the_image_which_is_a_defect() {
+fn the_dilation_that_makes_an_opening_is_the_reflected_one() {
     let element = StructuringElement::from_size(ElementShape::Box, [4, 1, 1]).expect("an even box");
     assert_eq!(
         element.sides(0),
@@ -454,9 +467,7 @@ fn an_asymmetric_opening_translates_the_image_which_is_a_defect() {
     for index in 3..7 {
         input[[index, 0, 0]] = true;
     }
-    // and one isolated voxel, which a real opening removes
-    let mut with_speck = input.clone();
-    with_speck[[10, 0, 0]] = true;
+    input[[10, 0, 0]] = true;
 
     let line = |volume: &Array3<bool>| -> Vec<u8> {
         (0..volume.shape()[0])
@@ -464,72 +475,85 @@ fn an_asymmetric_opening_translates_the_image_which_is_a_defect() {
             .collect()
     };
 
-    // What ships today, asserted exactly.
-    let shipped = opened(&input, &element);
     assert_eq!(
-        line(&shipped),
+        line(&opened(&input, &element)),
+        vec![0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+        "the run of four survives where it is and the isolated voxel is removed, which is what \
+         an opening by a four-wide element does"
+    );
+    assert_eq!(
+        line(&opened(&opened(&input, &element), &element)),
+        line(&opened(&input, &element)),
+        "and it is idempotent"
+    );
+
+    // The composition that does not reflect, from the same two primitives.
+    let unreflected = dilated(&eroded(&input, &element), &element);
+    assert_eq!(
+        line(&unreflected),
         vec![0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0],
-        "the recorded defect has changed; if it was fixed, see this test's documentation"
+        "the unreflected composition moves the run, which is the defect this test records"
     );
     assert_eq!(
-        line(&opened(&shipped, &element)),
+        line(&dilated(&eroded(&unreflected, &element), &element)),
         vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0],
-        "and it moves again, so it is not idempotent"
-    );
-    let laws = laws_of_opening(&input, |m| opened(m, &element));
-    assert_eq!(
-        laws.anti_extensive, 1,
-        "one voxel appears that was not in the input"
-    );
-    assert_eq!(
-        laws.idempotent, 2,
-        "opening twice differs from opening once"
+        "and moves it again, so it is not idempotent either"
     );
 
-    // What the reflected composition gives, from the same two primitives.
-    let reflected = reflection_of(&element);
-    let correct = |volume: &Array3<bool>| dilated(&eroded(volume, &element), &reflected);
-    assert_eq!(
-        line(&correct(&input)),
-        vec![0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0],
-        "reflecting the element for the dilation leaves the run where it was"
-    );
-    assert_eq!(
-        line(&correct(&correct(&input))),
-        line(&correct(&input)),
-        "and is idempotent"
-    );
-    assert_eq!(
-        line(&correct(&with_speck)),
-        vec![0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0],
-        "and removes the isolated voxel, which is what an opening by a four-wide element does"
-    );
+    // The same, over the whole fixture set, so neither claim is one example.
+    for (element_name, element) in asymmetric_elements() {
+        for (mask_name, mask) in masks() {
+            let shipped = laws_of_opening(&mask, |m| opened(m, &element));
+            assert_eq!(
+                (shipped.anti_extensive, shipped.idempotent),
+                (0, 0),
+                "{element_name} on {mask_name}: the opening breaks its own laws"
+            );
+            let unreflected = laws_of_opening(&mask, |m| dilated(&eroded(m, &element), &element));
+            assert!(
+                unreflected.anti_extensive > 0 || unreflected.idempotent > 0,
+                "{element_name} on {mask_name}: the unreflected composition obeys the laws \
+                 here, so this fixture cannot tell the two compositions apart"
+            );
+            println!(
+                "{element_name} on {mask_name}: the opening is (0, 0) against the laws; the \
+                 unreflected composition is ({}, {})",
+                unreflected.anti_extensive, unreflected.idempotent
+            );
+        }
+    }
+}
 
-    // The same, over the whole fixture set, so the diagnosis is not one example.
+/// **The two dilations are two filters**, which is what the claim above rests
+/// on: if they were the same volume everywhere, the composition would not care
+/// which one it called and the test above would pass for nothing.
+#[test]
+fn the_placed_dilation_and_the_neighbourhood_gather_are_two_filters() {
     for (element_name, element) in asymmetric_elements() {
         let reflected = reflection_of(&element);
         for (mask_name, mask) in masks() {
-            let shipped = laws_of_opening(&mask, |m| opened(m, &element));
-            let corrected = laws_of_opening(&mask, |m| dilated(&eroded(m, &element), &reflected));
+            let placed = dilated(&mask, &reflected);
+            let gathered = dilated(&mask, &element);
+            let apart = placed
+                .iter()
+                .zip(gathered.iter())
+                .filter(|(a, b)| a != b)
+                .count();
             assert!(
-                shipped.anti_extensive > 0 || shipped.idempotent > 0,
-                "{element_name} on {mask_name}: the shipped opening obeys the laws here, so \
-                 this fixture does not show the defect"
+                apart > 0,
+                "{element_name} on {mask_name}: the two dilations agree everywhere"
             );
+            println!("{element_name} on {mask_name}: the two dilations differ at {apart} voxels");
+        }
+    }
+    for (element_name, element) in symmetric_elements() {
+        let reflected = reflection_of(&element);
+        for (mask_name, mask) in masks() {
             assert_eq!(
-                corrected.anti_extensive, 0,
-                "{element_name} on {mask_name}: the reflected composition is not anti-extensive \
-                 either, so the diagnosis is wrong"
-            );
-            assert_eq!(
-                corrected.idempotent, 0,
-                "{element_name} on {mask_name}: the reflected composition is not idempotent \
-                 either, so the diagnosis is wrong"
-            );
-            println!(
-                "{element_name} on {mask_name}: shipped opening adds {} voxels and is \
-                 non-idempotent at {}; reflecting the dilation gives 0 and 0",
-                shipped.anti_extensive, shipped.idempotent
+                dilated(&mask, &reflected),
+                dilated(&mask, &element),
+                "{element_name} on {mask_name}: a symmetric element is its own reflection and \
+                 the two dilations must be one filter"
             );
         }
     }

@@ -201,7 +201,8 @@ fn cases() -> Vec<(&'static str, Chain, [usize; 3])> {
         ),
         (
             "the estimate alone",
-            background_estimate(&element(ElementShape::Ellipsoid, [2, 2, 2])),
+            background_estimate(&element(ElementShape::Ellipsoid, [2, 2, 2]))
+                .expect("a centred element reflects"),
             [4, 4, 4],
         ),
     ]
@@ -437,7 +438,7 @@ fn both_arms_of_the_diamond_run_once_per_block() {
     let plain = remove_background(&element).unwrap();
     let both = reference(&plain, &input);
     let only_original = reference(&Chain::op(VoxelwiseMapOp::new("id", |value| value)), &input);
-    let only_estimate = reference(&background_estimate(&element), &input);
+    let only_estimate = reference(&background_estimate(&element).expect("a chain"), &input);
     assert_ne!(both, only_original, "the answer is the original arm alone");
     assert_ne!(both, only_estimate, "the answer is the estimate arm alone");
     assert!(
@@ -454,7 +455,10 @@ fn both_arms_of_the_diamond_run_once_per_block() {
                 Chain::op(count_a),
                 Chain::op(VoxelwiseMapOp::new("original", |value| value)),
             ]),
-            Chain::sequence(vec![Chain::op(count_b), background_estimate(&element)]),
+            Chain::sequence(vec![
+                Chain::op(count_b),
+                background_estimate(&element).expect("a chain"),
+            ]),
         ],
         Box::new(DifferenceCombine::new("difference")),
     )

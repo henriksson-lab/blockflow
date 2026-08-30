@@ -23,6 +23,12 @@ Nothing in `src/` calls `simulate`; only `tests/simulate_ranks.rs` and
 hand-built with `PlanBuilder`. The `Scheduler` trait picks among *ready tasks*,
 so it ranks **schedulers over one plan**; nothing ranks **plans**.
 
+> **Update, 2026-08-30.** The first sentence of this section is no longer true:
+> `src/arena.rs` calls `simulate`, and `Arena::enter` takes a `&dyn Strategy`.
+> The rest of the paragraph still stands — the `Scheduler` trait still ranks
+> schedulers over one plan — and the arena is the other axis rather than a
+> replacement for it. See **G1** and **What the arena found first**.
+
 The crate has already decided that the way to settle a planner question is a
 competition — `BlockLadder::ALL`, `SlabPolicy::ALL` and `PartitionSearch`'s three
 variants all exist so that "a competition that enumerates cannot silently stop
@@ -125,14 +131,28 @@ New in this report:
 Full argument, proposed approach, expected payoff, validation plan and cost for
 each is in the report this file summarises. In short:
 
-- **G1 — no planner→simulator path.** The arena. Prerequisite for accepting any
-  other change. ~1 week, including making `simulate`'s ready set incremental
-  (it is an `O(T^2)` full scan per dispatch today, fine for a 4^3 fixture and not
-  for an arena).
+- **G1 — no planner→simulator path. BUILT, 2026-08-30.** `src/arena.rs`, held
+  by `tests/planner_arena.rs`. A `Strategy`, a `Workflow` and a `Constraints` go
+  in; a plan comes out priced twice — by the planner's own objective and by
+  `simulate` — with the disagreement between the two rankings as the finding.
+  See **What the arena found first**, below. The ready set is now maintained
+  rather than rescanned (2.2x at 98 304 tasks, and the old scan survives as a
+  `debug_assertions` oracle that every simulating test in the suite runs), which
+  exposed the **larger** `O(T^2)` underneath it — see **The next thing in the
+  way**.
 - **G2 — `phase_makespan` assumes phases are sequential; `TaskGraph` makes them
-  pipeline.** Measure the bias first (cheap, falls out of G1). It also exposes
-  two under-charges in the budget, and under-charging is the one direction this
-  crate says it may not be wrong in.
+  pipeline. MEASURED, 2026-08-30, and it is smaller than this report thought.**
+  Under `SchedulePriority::PhaseMajor` — the shipped default and the order
+  `execute`'s heap pops — the phases of a two-phase plan are sequential to
+  within 3%, so the sum-over-phases objective is a correct description of that
+  dispatcher rather than a bias. Under `BlockMajor` they overlap at 1.6–1.9
+  phase-spans to the makespan, which *is* the pipelining predicted — and it
+  moves the makespan by **0.2%** and the peak bytes by 2–5%, because four
+  saturated workers do the same work either way. On that evidence this belongs
+  below G3, not above it. Caveat, stated in the test: one chain, one volume,
+  four workers, no contention, a pool that never starves. Pipelining pays where
+  a phase *cannot* fill the pool, and no such phase is in the fixture yet. The
+  two budget under-charges are untouched and still open.
 - **G3 — per-phase compute rates, plus the dtype/volume prefix fold.** Tier-1
   wiring: coefficients measured, consumer exists, additivity already proven to
   survive, effect on the argmin already measured.
@@ -150,14 +170,76 @@ each is in the report this file summarises. In short:
   different claims and the crate conflates them; a `StorageModel` in
   `Constraints` would be data-blind, deterministic and hashable.
 
+## What the arena found first
+
+One chain, four plans differing only in the block edge, judged at one worker and
+at four. `priced` is the planner's objective and `simulated` the simulator's
+makespan, each as a ratio to the best in its own column:
+
+| | 1 worker priced | 1 worker simulated | 4 workers priced | 4 workers simulated |
+|---|---|---|---|---|
+| edge 8 (1024 blocks) | 3.068 | 7.506 | 2.530 | 4.663 |
+| edge 16 (128 blocks) | 1.760 | 3.641 | 1.457 | 2.285 |
+| edge 32 (8–16 blocks) | 1.326 | 2.448 | **1.000** | **1.000** |
+| edge 64 (1 block) | **1.000** | **1.000** | 2.660 | 2.479 |
+| Kendall tau | 1.000 | | 0.667 | |
+
+**At one worker the two judges order the field identically. At four they do
+not** — the cost model prices the 1024-block plan *below* the single-block one
+and the simulator makes it nearly twice as slow. Both still choose edge 32, so
+the regret (the simulated cost of trusting the model) is 1.000: the model's
+argmin survives and its ordering does not.
+
+That is **item C above with a number on it**, reached from the other side: the
+cost model's `rounds()` divides a whole per-block cost by the pool, the
+simulator dispatches continuously, and the difference is invisible at the
+shipped default concurrency of one — which is also the configuration
+`Enumerating` calls its own negative control. It is not the chunk grid: the same
+pair is discordant at chunk edges 8, 16, 32 and 64, and the tau at one worker is
+1.000 at all four.
+
+The figures are pinned in
+`the_two_judges_agree_at_one_worker_and_part_at_four`, which says in its own
+doc that a change to either judge is expected to move them and that the test is
+where the new ones get written down.
+
+## The next thing in the way
+
+Making the ready set incremental moved `simulate` from 79.2 s to 36.3 s on a
+98 304-task plan and left it quadratic, so the scan was the *smaller* of two
+`O(T^2)` terms. The other is the **`Scheduler` interface itself**: `pick` is
+handed `Decision::ready` as a slice and every scheduler in the crate walks all
+of it, so a dispatch costs `O(ready)` however cheap the loop around it is.
+Measured against an `O(1)` control that takes the first ready task:
+
+| tasks | `ExecutorOrder` | first-ready | share inside the scheduler |
+|---|---|---|---|
+| 1 536 | 13.9 ms | 9.0 ms | 35 % |
+| 12 288 | 424.4 ms | 35.6 ms | 92 % |
+| 98 304 | 36 298.9 ms | 567.2 ms | 98 % |
+
+At the scale an arena sweep works at, **98% of a simulation is the scheduler
+scanning the ready set.** Fixing it is a change to the trait, not to the loop:
+`ExecutorOrder` only ever wants the minimum of a fixed key and could be served
+by a heap the loop maintains, but `CacheAware`, `WarmestFirst` and the handout
+policies want the whole set by design — their key depends on cache state that
+changes under them. A plausible shape is an optional `fn key(&self, task) ->
+Option<[usize; 5]>` that a stateless scheduler implements and the loop uses to
+keep a heap, falling back to the scan for the ones that cannot. Not attempted
+here; measured, so that it can be.
+
 ## If we can do three things
 
 1. **Build the planner arena (G1).**
 2. **Per-phase compute rates plus the dtype/volume prefix fold (G3).** Highest
    evidence-to-effort ratio here, and it would be the first planner change ever
    adjudicated by the simulator.
-3. **Settle the sequential-phases assumption (G2), and the two budget
-   under-charges it exposes.**
+3. ~~**Settle the sequential-phases assumption (G2)**~~ — **done, and it
+   settled small**: 0.2% of makespan, and only under a policy the default does
+   not use. See G2 above. The two budget under-charges it was expected to expose
+   are still open and are now the whole of what is left of that item. The
+   vacancy is best filled by **the `Scheduler`'s `O(T^2)`** above, which now
+   gates how large a field the arena can judge.
 
 Deliberately **not** in the top three: GPU placement (nothing to build on),
 anisotropic blocks (measured, correctly declined), op reordering (forbidden by
