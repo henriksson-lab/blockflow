@@ -1476,7 +1476,7 @@ impl RowBuilder {
 pub fn encoded_header_bytes(schema: &Schema) -> u64 {
     let mut words = 4u64;
     for column in schema.columns() {
-        words += 2 + column.name().as_bytes().len().div_ceil(8) as u64;
+        words += 2 + column.name().len().div_ceil(8) as u64;
     }
     words * 8
 }
@@ -1614,7 +1614,7 @@ impl Table {
     }
 
     pub(crate) fn named(volume: [usize; 3], schema: Schema, noun: &'static str) -> Result<Self> {
-        if volume.iter().any(|&length| length == 0) {
+        if volume.contains(&0) {
             return Err(Error::invalid(format!(
                 "a {noun} over {volume:?} has no voxels for a row to be at, so every write would \
                  be refused and every query would answer nothing. A volume with a zero-length \
@@ -1731,12 +1731,12 @@ impl Table {
     pub fn write(&mut self, block: [usize; 3], bytes: &[u8]) -> Result<()> {
         self.refuse_if_sealed(Some(block), bytes.len())?;
 
-        let words = unpack_u64(bytes).map_err(|err| self.from_block(block, err))?;
+        let words = unpack_u64(bytes).map_err(|err| self.unusable_blob(block, err))?;
         let (schema, rows, start) =
-            decode_header(&words).map_err(|err| self.from_block(block, err))?;
+            decode_header(&words).map_err(|err| self.unusable_blob(block, err))?;
         self.schema
             .check_against(&schema, "the blob")
-            .map_err(|err| self.from_block(block, err))?;
+            .map_err(|err| self.unusable_blob(block, err))?;
 
         let width = self.schema.width();
         let payload = &words[start..];
@@ -1745,7 +1745,7 @@ impl Table {
         // overflow here would be a wrapped comparison that a truncated blob
         // could pass.
         if payload.len() % width != 0 || payload.len() / width != rows {
-            return Err(self.from_block(
+            return Err(self.unusable_blob(
                 block,
                 Error::invalid(format!(
                     "the blob declares {rows} row(s) of {width} word(s) each and carries {} word(s)",
@@ -1764,7 +1764,7 @@ impl Table {
             let mut at = [0usize; 3];
             for axis in 0..3 {
                 at[axis] = usize::try_from(row[axis]).map_err(|_| {
-                    self.from_block(
+                    self.unusable_blob(
                         block,
                         Error::invalid(format!(
                             "row {index} has coordinate {} on axis {axis}, which does not fit \
@@ -1783,7 +1783,7 @@ impl Table {
                 if definition.kind() == ColumnType::F64 {
                     let value = f64::from_bits(row[POSITION_WORDS + column]);
                     if !value.is_finite() {
-                        return Err(self.from_block(
+                        return Err(self.unusable_blob(
                             block,
                             Error::invalid(format!(
                                 "row {index} has {value} in column {column}, named {:?}, which is \
@@ -1937,7 +1937,11 @@ impl Table {
         ))
     }
 
-    fn from_block(&self, block: [usize; 3], err: Error) -> Error {
+    /// An error naming the block whose blob could not be read.
+    ///
+    /// Not `from_block`: a `from_*` method is a conversion taking `self` by
+    /// value, and this takes `&self` and builds a message *about* a block.
+    fn unusable_blob(&self, block: [usize; 3], err: Error) -> Error {
         Error::invalid(format!(
             "the blob written by block {block:?} is unusable for this {}: {err}",
             self.noun

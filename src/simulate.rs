@@ -1472,10 +1472,11 @@ pub fn simulate(
             // fetched is a duplicated fetch — the thing a handout policy exists
             // to avoid, and invisible under one shared pool.
             for key in &keys {
-                if !caches[pool].holds(*key) && !encodeds[pool].holds(*key) {
-                    if !ever_fetched.insert(*key) {
-                        outcome.duplicated_fetches += 1;
-                    }
+                if !caches[pool].holds(*key)
+                    && !encodeds[pool].holds(*key)
+                    && !ever_fetched.insert(*key)
+                {
+                    outcome.duplicated_fetches += 1;
                 }
             }
             caches[pool].note_assigned(&keys);
@@ -1660,7 +1661,7 @@ pub fn simulate(
         busy[worker] = Some(id);
         running.push((finish, id));
         // Descending by finish time, so the earliest completion is `last`.
-        running.sort_by(|a, b| b.0.cmp(&a.0));
+        running.sort_by_key(|&(finish, _)| std::cmp::Reverse(finish));
 
         // **Prefetch fills idle channel time and nothing else.**
         //

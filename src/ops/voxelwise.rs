@@ -1679,15 +1679,15 @@ impl Combine for LogicCombine {
         for index in 1..inputs.len() {
             let last = index + 1 == inputs.len();
             if last {
-                self.pair(folded.as_ref().unwrap_or(&inputs[0]), &inputs[index], out)?;
+                self.pair(folded.as_ref().unwrap_or(inputs[0]), inputs[index], out)?;
             } else {
                 // The intermediate is [`Self::carrier`]'s answer, which is also
                 // what `Combine::fold_carrier` tells the walk to allocate when
                 // the walk drives this fold itself.
                 let mut next = Voxels::zeros(self.carrier(), inputs[0].shape())?;
                 self.pair(
-                    folded.as_ref().unwrap_or(&inputs[0]),
-                    &inputs[index],
+                    folded.as_ref().unwrap_or(inputs[0]),
+                    inputs[index],
                     &mut next,
                 )?;
                 folded = Some(next);
@@ -2253,12 +2253,12 @@ impl Combine for ArithmeticCombine {
         for index in 1..inputs.len() {
             let last = index + 1 == inputs.len();
             if last {
-                self.pair(folded.as_ref().unwrap_or(&inputs[0]), &inputs[index], out)?;
+                self.pair(folded.as_ref().unwrap_or(inputs[0]), inputs[index], out)?;
             } else {
                 let mut next = Voxels::zeros(inputs[0].dtype(), inputs[0].shape())?;
                 self.pair(
-                    folded.as_ref().unwrap_or(&inputs[0]),
-                    &inputs[index],
+                    folded.as_ref().unwrap_or(inputs[0]),
+                    inputs[index],
                     &mut next,
                 )?;
                 folded = Some(next);

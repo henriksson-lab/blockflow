@@ -2985,7 +2985,7 @@ mod tests {
     /// completion order would break.
     #[test]
     fn merging_is_insensitive_to_the_order_blobs_arrive() {
-        let rows = vec![
+        let rows = [
             row([5, 1, 1], 10, 1.0),
             row([2, 2, 2], 20, 2.0),
             row([0, 7, 3], 30, 5.0),
@@ -3279,7 +3279,7 @@ mod tests {
         let low = Region::new(&[0, 0, 0], &[4, VOLUME[1], VOLUME[2]]);
         let high = Region::new(&[4, 0, 0], &[4, VOLUME[1], VOLUME[2]]);
         // 3 is the last coordinate of the low core, 4 is the first of the high.
-        let boundary = vec![row([3, 1, 1], 0, 0.0), row([4, 1, 1], 1, 0.0)];
+        let boundary = [row([3, 1, 1], 0, 0.0), row([4, 1, 1], 1, 0.0)];
         let pixels = ramp();
 
         for (region, mine, theirs) in [(&low, 0, 1), (&high, 1, 0)] {

@@ -2142,28 +2142,6 @@ impl Chain {
         ]
     }
 
-    /// The full statement of the whole subtree's reach, folded over the same
-    /// tree [`Self::reach`] walks and by the same rules — sequential reaches
-    /// **add**, exclusive and concurrent branches take the **wider**, a
-    /// combine's own reach adds on top — now per side, per block and per
-    /// coordinate space.
-    ///
-    /// **This is what the plan is built from.** `Chain::reach` remains the
-    /// symmetric bound, and is what a caller holding one integer per axis must
-    /// use; everything that derives geometry uses this.
-    ///
-    /// Two ways it can fail, and both are facts about the chain rather than
-    /// about the caller:
-    ///
-    /// * two ops state their reaches in **different coordinate spaces**, which
-    ///   cannot be folded without a grid to convert with. A planner turns that
-    ///   into "these two cannot share a phase", which is the right answer: a
-    ///   change of coordinate space is a phase boundary.
-    /// * an op's `reach_spec` is **wider than its own `reach`**. The two are one
-    ///   quantity stated twice, and the whole crate is arranged so that a
-    ///   quantity stated twice is checked rather than assumed. The bound is the
-    ///   one the halo used to be derived from, so an op that quietly widened
-    ///   past it would be under-halo'd by every plan built before it changed.
     /// Whether this whole subtree survives a cut inside one block.
     ///
     /// The fold is a conjunction with the **first** refusal carried out, so the
@@ -2212,6 +2190,28 @@ impl Chain {
         }
     }
 
+    /// The full statement of the whole subtree's reach, folded over the same
+    /// tree [`Self::reach`] walks and by the same rules — sequential reaches
+    /// **add**, exclusive and concurrent branches take the **wider**, a
+    /// combine's own reach adds on top — now per side, per block and per
+    /// coordinate space.
+    ///
+    /// **This is what the plan is built from.** `Chain::reach` remains the
+    /// symmetric bound, and is what a caller holding one integer per axis must
+    /// use; everything that derives geometry uses this.
+    ///
+    /// Two ways it can fail, and both are facts about the chain rather than
+    /// about the caller:
+    ///
+    /// * two ops state their reaches in **different coordinate spaces**, which
+    ///   cannot be folded without a grid to convert with. A planner turns that
+    ///   into "these two cannot share a phase", which is the right answer: a
+    ///   change of coordinate space is a phase boundary.
+    /// * an op's `reach_spec` is **wider than its own `reach`**. The two are one
+    ///   quantity stated twice, and the whole crate is arranged so that a
+    ///   quantity stated twice is checked rather than assumed. The bound is the
+    ///   one the halo used to be derived from, so an op that quietly widened
+    ///   past it would be under-halo'd by every plan built before it changed.
     pub fn reach_spec(&self, volume: [usize; 3]) -> Result<Reach> {
         let spec = self.fold_reach_spec(volume)?;
         for axis in 0..3 {
@@ -3818,7 +3818,7 @@ mod tests {
             Ok(inputs[0])
         }
         fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
-            out.assign(&inputs[0])
+            out.assign(inputs[0])
         }
     }
 

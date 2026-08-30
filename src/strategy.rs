@@ -1807,8 +1807,6 @@ fn order_disagreement(first: &BlockOutput, second: &BlockOutput) -> Option<Strin
 /// * there is no short circuit. It is licensed by `constant_maps_to`, which is
 ///   an algebra over pixel values, and a fragment's bytes are not pixel values.
 ///   An op that could skip cheaply skips inside `apply`.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_fragment_task(
     task: &super::graph::Task,
     decomposition: &Decomposition,
@@ -2335,7 +2333,7 @@ fn run_iterative_phase(
                 };
                 match pool {
                     None => tasks.iter().try_for_each(&one_block)?,
-                    Some(pool) => pool.install(|| tasks.par_iter().try_for_each(&one_block))?,
+                    Some(pool) => pool.install(|| tasks.par_iter().try_for_each(one_block))?,
                 }
             }
             // The exchange point. Everything below reads `current`, so the swap is
@@ -3473,6 +3471,13 @@ impl PricedGroup {
 }
 
 /// What pricing one contiguous run came to.
+///
+/// **Not boxed, deliberately.** Clippy sees a large variant beside a small one
+/// and suggests a `Box`. This value is returned by `price` and consumed
+/// immediately; it is never collected. The DP prices `O(n^2)` runs, so boxing
+/// would buy a smaller `enum` nobody stores at the price of an allocation per
+/// run on the search's hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum GroupPrice {
     Priced(PricedGroup),

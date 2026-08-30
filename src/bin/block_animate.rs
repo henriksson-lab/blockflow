@@ -85,7 +85,7 @@ fn parse_grid(text: &str) -> Result<[usize; 3]> {
             )))
         }
     };
-    if numbers.iter().any(|&n| n == 0) {
+    if numbers.contains(&0) {
         return Err(Error::InvalidArgument(
             "--grid: a lattice with no blocks on an axis has nothing to draw".to_string(),
         ));

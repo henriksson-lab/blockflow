@@ -344,7 +344,7 @@ fn resamplings() -> Vec<(&'static str, Resample)> {
 #[test]
 fn the_resample_map_states_the_reach_the_op_already_declared() {
     for (name, resample) in resamplings() {
-        let op = ResampleOp::new("resample", resample.clone());
+        let op = ResampleOp::new("resample", resample);
         assert_eq!(
             op.geometry(VOLUME).primary_reach(),
             Some(&resample.reach_spec()),
@@ -356,7 +356,7 @@ fn the_resample_map_states_the_reach_the_op_already_declared() {
 #[test]
 fn the_resample_map_states_the_volume_the_op_already_wrote() {
     for (name, resample) in resamplings() {
-        let op = ResampleOp::new("resample", resample.clone());
+        let op = ResampleOp::new("resample", resample);
         assert_eq!(
             op.geometry(VOLUME).output_volume(),
             resample.output_volume(VOLUME).unwrap(),
@@ -375,7 +375,7 @@ fn the_resample_map_states_the_volume_the_op_already_wrote() {
 #[test]
 fn the_resample_map_carries_the_factor_it_was_built_from() {
     for (name, resample) in resamplings() {
-        let op = ResampleOp::new("resample", resample.clone());
+        let op = ResampleOp::new("resample", resample);
         let geometry = op.geometry(VOLUME);
         match &geometry.inputs()[0] {
             InputMap::Affine { up, down, .. } => {
@@ -399,7 +399,7 @@ fn the_resample_map_carries_the_factor_it_was_built_from() {
 #[test]
 fn a_large_factor_does_not_imply_a_large_reach() {
     let resample = Resample::uniform(Ratio::smaller(8).unwrap(), Interpolation::Linear);
-    let op = ResampleOp::new("decimate", resample.clone());
+    let op = ResampleOp::new("decimate", resample);
     let geometry = op.geometry(VOLUME);
     assert_eq!(geometry.output_volume()[0], VOLUME[0] / 8);
     let reach = geometry
@@ -421,7 +421,7 @@ fn a_large_factor_does_not_imply_a_large_reach() {
 #[test]
 fn the_chain_folds_the_resample_map() {
     for (name, resample) in resamplings() {
-        let chain = Chain::op(ResampleOp::new("resample", resample.clone()));
+        let chain = Chain::op(ResampleOp::new("resample", resample));
         assert_eq!(
             chain.reach_spec(VOLUME).expect("a valid chain"),
             resample.reach_spec(),

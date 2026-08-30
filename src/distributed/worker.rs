@@ -549,10 +549,7 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
     // that owns it.
     let slabs = SlabPolicy::FillIdleWorkers.slabs_for(options.threads, 1);
 
-    loop {
-        let Some(assignment) = next_task(&shared, &mut report) else {
-            break;
-        };
+    while let Some(assignment) = next_task(&shared, &mut report) {
         check_agreement(&graph, &assignment, &decomposition)?;
         let task = &graph.tasks[assignment.task];
         if decomposition.phases[task.phase].barrier && !reduced.contains_key(&task.phase) {

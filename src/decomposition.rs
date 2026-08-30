@@ -3945,7 +3945,27 @@ mod tests {
         assert_eq!(groups_for(0b01, 3), vec![vec![0], vec![1, 2]]);
         assert_eq!(groups_for(0b10, 3), vec![vec![0, 1], vec![2]]);
         assert_eq!(groups_for(0b11, 3), vec![vec![0], vec![1], vec![2]]);
-        assert_eq!((0..1u32 << 7).map(|m| groups_for(m, 8).len()).count(), 128);
+        // **Every mask is a *different* partition**, which is what "enumerate"
+        // claims and what the line here used to look like it checked. It was
+        // `(0..1 << 7).map(..).count() == 128` — the count of a range, true by
+        // construction whatever `groups_for` returned, so a `groups_for` that
+        // answered the same partition every time passed it.
+        let partitions: std::collections::BTreeSet<Vec<Vec<usize>>> =
+            (0..1u32 << 7).map(|mask| groups_for(mask, 8)).collect();
+        assert_eq!(
+            partitions.len(),
+            128,
+            "eight slots have 2^7 contiguous partitions and every mask must give a distinct one"
+        );
+        // And a mask's cut count is its population count: one more group than
+        // cuts, which is the other half of "contiguous".
+        for mask in 0..1u32 << 7 {
+            assert_eq!(
+                groups_for(mask, 8).len(),
+                mask.count_ones() as usize + 1,
+                "mask {mask:#09b}"
+            );
+        }
     }
 
     fn decomposition(halo: [usize; 3], reach: [usize; 3]) -> Decomposition {

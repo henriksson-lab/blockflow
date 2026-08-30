@@ -2155,7 +2155,7 @@ mod tests {
                 // and the next block is already on the lattice on both sides,
                 // so it pays the reach and nothing more — one number valid for
                 // every block would have to be the widest of these
-                assert_eq!(table[1], (1 + 0, 1 + 0));
+                assert_eq!(table[1], (1, 1));
                 for entry in table {
                     assert!(entry.0 >= lo && entry.1 >= hi);
                 }

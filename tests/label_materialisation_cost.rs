@@ -288,7 +288,7 @@
 // `--release --ignored --nocapture` and read the table.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -479,7 +479,7 @@ fn fixture() -> Option<PathBuf> {
 }
 
 /// A crop of the recording, taken on axis 0 so that the read is contiguous.
-fn crop(path: &PathBuf, depth: usize) -> (Array3<bool>, [usize; 3]) {
+fn crop(path: &Path, depth: usize) -> (Array3<bool>, [usize; 3]) {
     let source: NpySource<bool> =
         NpySource::open(path, OrderPolicy::Either).expect("the recording opens");
     let shape = source.shape().to_vec();
@@ -1354,8 +1354,9 @@ impl TotalCmpMax for f64 {
 ///   8, 8]` the fragment set is **101.9%** of the label image — one transmission
 ///   of the fragments costs more than one transmission of the whole volume. That
 ///   sentence appears in `ops::fill`'s header and in earlier drafts of this file,
-///   and it is a statement about coarse lattices that nobody swept. All four sweeps
-/// above cut roughly cubically. A `1 x 1 x n` slab cut and an `n^(1/3)` cube cut
+///   and it is a statement about coarse lattices that nobody swept.
+///
+/// All four sweeps above cut roughly cubically. A `1 x 1 x n` slab cut and an `n^(1/3)` cube cut
 /// at the *same block count* are not the same amount of face, and an argument
 /// that treats "the number of blocks" as the variable is resting on an unswept
 /// assumption. Two rows below have equal block counts and are named so that the

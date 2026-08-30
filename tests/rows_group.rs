@@ -735,7 +735,7 @@ fn exactly_one_block_emits_each_group() {
         let mut table = Table::new(VOLUME, grouping.output().clone()).expect("a table");
         table.write(index, &bytes).expect("a write");
         table.seal().expect("a seal");
-        if table.len() > 0 {
+        if !table.is_empty() {
             owners.push((index, table.len()));
         }
         written += table.len();

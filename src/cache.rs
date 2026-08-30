@@ -693,7 +693,7 @@ impl ChunkCache {
                 got: chunk.to_vec(),
             });
         }
-        if chunk.iter().any(|&extent| extent == 0) || shape.iter().any(|&extent| extent == 0) {
+        if chunk.contains(&0) || shape.contains(&0) {
             return Err(Error::invalid(format!(
                 "{name}: shape {shape:?} and chunk {chunk:?} must both be positive on every axis"
             )));

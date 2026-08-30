@@ -817,11 +817,11 @@ pub fn order_log_to_json(log: &ExecutionLog, meta: &ExportMeta) -> Value {
         phases: Vec<usize>,
     }
     let mut blocks: BTreeMap<[usize; 3], BlockEntry> = BTreeMap::new();
-    fn note<'a>(
-        blocks: &'a mut BTreeMap<[usize; 3], BlockEntry>,
+    fn note(
+        blocks: &mut BTreeMap<[usize; 3], BlockEntry>,
         index: [usize; 3],
         phase: usize,
-    ) -> &'a mut BlockEntry {
+    ) -> &mut BlockEntry {
         let entry = blocks.entry(index).or_insert_with(|| BlockEntry {
             read: None,
             valid: None,

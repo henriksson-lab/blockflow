@@ -473,12 +473,12 @@ fn landscape_into_gives_the_same_answer_as_the_allocating_form_and_survives_reus
         let a = plane(
             SHAPE_A[0],
             SHAPE_A[1],
-            0x9E37_79B9_7F4A_7C15 ^ (round * 0x1234_5),
+            0x9E37_79B9_7F4A_7C15 ^ (round * 0x0001_2345),
         );
         let b = plane(
             SHAPE_B[0],
             SHAPE_B[1],
-            0x1234_5678_9ABC_DEF1 ^ (round * 0x9_ABCD),
+            0x1234_5678_9ABC_DEF1 ^ (round * 0x0009_ABCD),
         );
         let allocated = plan.landscape(a.view(), b.view()).unwrap();
         plan.landscape_into(a.view(), b.view(), &mut buffer)
@@ -714,7 +714,7 @@ fn normalising_by_a_constant_count_moves_the_minimum() {
             // every total is the same, only the divisor changes.
             let total = landscape.mean_squared()[[row, col]] * count as f64;
             let value = total / largest;
-            if best.map_or(true, |(_, incumbent)| value.total_cmp(&incumbent).is_lt()) {
+            if best.is_none_or(|(_, incumbent)| value.total_cmp(&incumbent).is_lt()) {
                 best = Some((window().shift_at([row, col]), value));
             }
         }
@@ -824,12 +824,12 @@ fn a_plan_reused_over_many_pairs_gives_the_same_answers_as_fresh_ones() {
             let a = plane(
                 SHAPE_A[0],
                 SHAPE_A[1],
-                0x9E37_79B9_7F4A_7C15 ^ (round * 0x1234_5),
+                0x9E37_79B9_7F4A_7C15 ^ (round * 0x0001_2345),
             );
             let b = plane(
                 SHAPE_B[0],
                 SHAPE_B[1],
-                0x1234_5678_9ABC_DEF1 ^ (round * 0x9_ABCD),
+                0x1234_5678_9ABC_DEF1 ^ (round * 0x0009_ABCD),
             );
             let reused = plan.landscape(a.view(), b.view()).unwrap();
             let fresh = SquaredDifference::with_backend(

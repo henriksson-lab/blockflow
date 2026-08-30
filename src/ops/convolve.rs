@@ -356,7 +356,7 @@ where
 {
     shapes_agree(input.shape(), out.shape(), "convolve_into")?;
     let extent = [input.shape()[0], input.shape()[1], input.shape()[2]];
-    if extent.iter().any(|&length| length == 0) {
+    if extent.contains(&0) {
         return Ok(());
     }
     let plan = TapPlan::build(kernel, sense, boundary, extent);
@@ -1039,7 +1039,7 @@ impl TransformConvolveOp {
         boundary: Boundary,
         tile: [usize; 3],
     ) -> Result<Self> {
-        if tile.iter().any(|&edge| edge == 0) {
+        if tile.contains(&0) {
             return Err(Error::InvalidArgument(format!(
                 "a transform convolution's tile is the extent it computes at once and must be \
                  non-empty on every axis, got {tile:?}"
@@ -1216,7 +1216,7 @@ impl TransformConvolveOp {
     {
         shapes_agree(input.shape(), out.shape(), "transform convolution")?;
         let extent = [input.shape()[0], input.shape()[1], input.shape()[2]];
-        if extent.iter().any(|&length| length == 0) {
+        if extent.contains(&0) {
             return Ok(());
         }
         let mut transform = self.transform.clone();

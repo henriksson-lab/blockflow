@@ -1099,8 +1099,8 @@ impl Tally {
     /// anisotropy on a cube — and it is **removed exactly** where the moment
     /// becomes a measurement: `RegionShape::covariance` subtracts it, from
     /// `position` and `count`, both of which are columns. So the integer stored
-    /// is about the rounded centre, the covariance read off it is about the
-    /// exact mean, and the two differ by a quantity the row determines.
+    ///   is about the rounded centre, the covariance read off it is about the
+    ///   exact mean, and the two differ by a quantity the row determines.
     ///
     /// Checked throughout, on this module's rule that a wrapped total is a
     /// plausible number and therefore the expensive kind of wrong.
@@ -2326,10 +2326,8 @@ impl PrincipalAxes {
                 _ => null_direction(matrix, variance[1]),
             };
         }
-        for direction in axis.iter_mut() {
-            if let Some(found) = direction {
-                *found = oriented(*found);
-            }
+        for found in axis.iter_mut().flatten() {
+            *found = oriented(*found);
         }
 
         let mut length = [0.0f64; 3];

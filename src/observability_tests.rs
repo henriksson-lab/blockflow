@@ -145,7 +145,7 @@ fn every_event_the_executor_emits_reaches_every_registered_listener() {
     first.check_coverage_and_order(&expected, blocks).unwrap();
     assert!(first.duplicate_applications().is_empty());
     second.check_coverage_and_order(&expected, blocks).unwrap();
-    assert!(first.len() > 0);
+    assert!(!first.is_empty());
 
     // Same events, same count, same per-block order — the three properties a
     // consumer may rely on. Not the same *global* interleaving: dispatch is

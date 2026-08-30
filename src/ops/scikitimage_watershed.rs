@@ -125,7 +125,7 @@ impl Heap {
         }
         let mut child = self.data.len() - 1;
         while child > 0 {
-            let parent = (child + 1) / 2 - 1;
+            let parent = child.div_ceil(2) - 1;
             if smaller(&self.data[child], &self.data[parent]) {
                 self.data.swap(parent, child);
                 child = parent;

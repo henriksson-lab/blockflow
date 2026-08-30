@@ -39,6 +39,10 @@
 # is not ours: `burn 0.22.0-pre.2` demands rustc **1.95** and `stardist-rs` is
 # edition 2024, so an older toolchain fails at resolution with a clear message.
 #
+# **Lints are gated**, `-D warnings` over every target, in the `lint` job. The
+# crate's exceptions to clippy are in `Cargo.toml`'s `[lints.clippy]`, each with
+# the reason it is one; anything not listed there is a failure.
+#
 # **What is not here, and why.** The `*-cuda` features need a CUDA toolkit and a
 # device, and a hosted runner has neither. Everything else in `Cargo.toml` is
 # built by one of the jobs below.
@@ -115,6 +119,39 @@ jobs:
       - name: Test
         if: matrix.features.test == 'everywhere' || (matrix.features.test == 'linux' && runner.os == 'Linux')
         run: cargo test --no-fail-fast ${{ matrix.features.flags }}
+
+  # **The lint gate.** `-D warnings` over every target, which is why the crate's
+  # exceptions live in `Cargo.toml`'s `[lints.clippy]` rather than in `lib.rs`:
+  # a crate-root `#![allow]` covers the library and not the integration tests,
+  # and the tests are two thirds of this repository, so gating on the library
+  # alone would be a gate that says nothing about most of the code.
+  #
+  # Linux only — a lint is not a platform — and beside `cargo fmt --check`,
+  # because the two fail for the same reason and a contributor wants both
+  # answers in one job rather than one after the other.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the stable toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add clippy rustfmt
+      - run: rustc --version --verbose
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
 
   # `fftw` links the system `libfftw3`, and when there is none the failure is a
   # link error rather than a fallback to the portable backend — deliberately, and

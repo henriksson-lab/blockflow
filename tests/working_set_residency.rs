@@ -230,12 +230,7 @@ fn measure(chain: &Chain, sources: &[ImageId]) -> (usize, BlockResidency, usize)
     let (observed, peak) = peak_of(|| {
         let input = block();
         let held: Vec<Voxels> = sources.iter().map(|_| block()).collect();
-        let entries: Vec<(ImageId, &Voxels)> = sources
-            .iter()
-            .copied()
-            .zip(held.iter())
-            .map(|(image, buffer)| (image, buffer))
-            .collect();
+        let entries: Vec<(ImageId, &Voxels)> = sources.iter().copied().zip(held.iter()).collect();
         let mut out = Voxels::zeros(Dtype::F64, BLOCK).expect("an output block");
         // The observing form, so the allocator's figure and the walk's own come
         // from **one** execution rather than two — nothing between them can

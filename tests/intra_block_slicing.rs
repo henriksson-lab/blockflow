@@ -293,7 +293,7 @@ impl Combine for UndeclaredCombine {
         Ok(inputs[0])
     }
     fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        out.assign(&inputs[0])
+        out.assign(inputs[0])
     }
 }
 

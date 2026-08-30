@@ -350,6 +350,65 @@ distributed = []
 #
 # This is `dev` and not `test` because `test` inherits from `dev`, so one entry
 # covers both, and because `cargo build` of the binaries wants the same trade.
+# What this crate thinks of clippy, and why each exception is one.
+#
+# **Here rather than in `lib.rs`** because `#![allow]` at a crate root covers the
+# library and not the integration tests, which are separate crates — and the
+# tests are two thirds of this repository. `[lints]` applies to every target of
+# the package, so one statement covers all of them and CI can gate on
+# `-D warnings` without the gate being a lie about half the code.
+#
+# The rule for adding to this list: an exception is a lint this crate violates
+# **on purpose**, with the purpose written down. Everything else gets fixed, and
+# 130-odd of them were.
+[lints.clippy]
+# **The `for axis in 0..3` idiom, which is this crate's whole vocabulary.**
+# `Reach::axis(axis)`, `volume[axis]`, `block[axis]`, `halo[axis]` — a loop body
+# here typically indexes several parallel arrays by one axis, which is exactly
+# what an index expresses and a zip does not. Clippy would turn
+# `for axis in 0..3 { grown[axis] = block[axis] + lo[axis] + hi[axis] }` into a
+# three-way zip that reads worse and says less. 100 sites, and they are all the
+# same site.
+needless_range_loop = "allow"
+# **`!(x > 0.0)` is NaN-safe and `x <= 0.0` is not.** The exception it would be a
+# *bug* to follow: this crate uses NaN as a sentinel — see
+# `distributed::shared_volume`'s `UNWRITTEN` — and every guard of the form
+# `if !(sigma > 0.0) || !sigma.is_finite()` refuses one by construction.
+# Rewriting to the "clearer" comparison would silently accept it. 14 sites, all
+# guards, all deliberate.
+neg_cmp_op_on_partial_ord = "allow"
+# **The cost constants' ordering, asserted.** `DISTANCE_SWEEP_COST >
+# DISTANCE_SEED_SWEEP_COST` is const-foldable, which is the point: it is a
+# compile-time-checkable invariant about a shipped table, and the only thing
+# about that table that can be checked without measuring. Clippy reads a
+# constant assertion as a mistake; here it is the whole idea.
+assertions_on_constants = "allow"
+# **`x % 8 == 0` and `chunks_exact(8)`.** Both are legible everywhere and both
+# suggestions are recently-stabilised APIs rather than clearer code. The
+# `as_chunks` one is also the wrong shape for these call sites: each is preceded
+# by a length check that *refuses* a bad blob, so the remainder is handled by
+# returning an error rather than by being dropped on the floor.
+manual_is_multiple_of = "allow"
+chunks_exact_to_as_chunks = "allow"
+# **A one-use tuple is not clearer for having a name.** This crate explains a
+# type in prose beside it; inventing an alias for a single return adds
+# indirection and no meaning. A type used twice already has a name.
+type_complexity = "allow"
+# **Each argument is a distinct fact, and the bundling has been done where it
+# helps.** `simulate` takes a `Machine`, a `Rates` and a `PerPhase` precisely
+# because those three groupings are real; what is left — the plan, the work,
+# what is released, what is kept, the scheduler — groups with nothing.
+# `price_phase` is the same shape.
+too_many_arguments = "allow"
+# **The clone is an unsizing coercion, not a copy.** `&[log.clone()]` where the
+# parameter is `&[Arc<dyn EventListener>]` builds a one-element array whose
+# element type is inferred as the trait object, so the clone is where
+# `Arc<ExecutionLog>` becomes `Arc<dyn EventListener>`. Clippy's
+# `std::slice::from_ref(&log)` gives `&[Arc<ExecutionLog>]`, which does not
+# coerce — the suggestion does not compile here, which is how this exception was
+# found rather than argued.
+cloned_ref_to_slice_refs = "allow"
+
 [profile.dev]
 opt-level = 1
 debug = "line-tables-only"

@@ -2543,7 +2543,7 @@ fn moments_about_the_volume_origin_overflow_by_name_where_the_regions_own_do_not
     // sixteen thousandths of the way across an axis a `usize` can address, and
     // five voxels wide.
     let edge = 1usize << 31;
-    let partials = vec![
+    let partials = [
         planted_partial(&op, [edge, 0, 0], [true, true]),
         planted_partial(&op, [edge + 4, 0, 0], [true, true]),
     ];

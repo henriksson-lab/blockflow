@@ -2432,7 +2432,7 @@ mod tests {
             Voxels::F64(array) => array.as_ptr() as usize,
             other => panic!("this fixture is f64, not {:?}", other.dtype()),
         };
-        let held = address(&env.image_guard(1).data.as_ref().expect("written"));
+        let held = address(env.image_guard(1).data.as_ref().expect("written"));
         let moved = env.into_output();
         assert_eq!(copied, moved, "the two spellings answer differently");
         assert_eq!(

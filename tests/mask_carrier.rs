@@ -361,7 +361,7 @@ fn joined(logic: Logic, carriers: &[Dtype], output: Dtype, operands: &[Vec<bool>
         .map(|(&carrier, values)| mask_block(carrier, values))
         .collect();
     let shape = inputs[0].shape();
-    assert!(combine.accepts(&carriers.to_vec()));
+    assert!(combine.accepts(carriers));
     assert_eq!(combine.produces(carriers), output);
     let mut out = Voxels::zeros(output, shape).unwrap();
     combine

@@ -232,7 +232,7 @@ impl Combine for Collected {
             if index == 0 {
                 sink.assign(&arm);
             } else {
-                sink.zip_mut_with(&arm, |total, value| *total = *total + *value);
+                sink.zip_mut_with(&arm, |total, value| *total += *value);
             }
         }
         Ok(())
@@ -338,7 +338,7 @@ impl Combine for HalfDeclared {
         Some(Dtype::F64)
     }
     fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        out.assign(&inputs[0])
+        out.assign(inputs[0])
     }
 }
 

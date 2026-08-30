@@ -23,7 +23,7 @@ pub struct LevelRecipe {
 
 impl LevelRecipe {
     pub fn new(factor: [usize; 3], ops: Chain) -> Result<Self> {
-        if factor.iter().any(|&axis| axis == 0) || factor == [1, 1, 1] {
+        if factor.contains(&0) || factor == [1, 1, 1] {
             return Err(Error::InvalidArgument(format!(
                 "pyramid level factor {factor:?} must be positive and must shrink at least one \
                  axis"

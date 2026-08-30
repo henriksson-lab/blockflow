@@ -245,14 +245,11 @@ fn the_same_points_label_the_same_volume_under_every_decomposition() {
 
     let want = expected(VOLUME, &element, &points);
     assert!(
-        want.iter().any(|&value| value == 5),
+        want.contains(&5),
         "the low label of the straddling pair must survive somewhere, or this \
          fixture discriminates nothing"
     );
-    assert!(
-        want.iter().any(|&value| value == 0),
-        "and some voxel is unmarked"
-    );
+    assert!(want.contains(&0), "and some voxel is unmarked");
 
     for block in CUTS {
         let got = stamped(VOLUME, block, &element, &points);

@@ -407,9 +407,10 @@ const LANE_BLOCK: usize = 8;
 /// rather than an oversight to be tidied away: it lets a test say "run this bar
 /// over every backend this build has" and get exactly the old behaviour when
 /// there is only one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TransformBackend {
     /// `rustfft` and `realfft`: pure Rust, no C toolchain, no build script.
+    #[default]
     Portable,
     /// The system's FFTW 3. The `fftw` feature only.
     #[cfg(feature = "fftw")]
@@ -417,12 +418,6 @@ pub enum TransformBackend {
 }
 
 #[cfg(not(feature = "fftw"))]
-impl Default for TransformBackend {
-    fn default() -> Self {
-        Self::Portable
-    }
-}
-
 #[cfg(feature = "fftw")]
 impl Default for TransformBackend {
     fn default() -> Self {
@@ -1666,7 +1661,7 @@ fn overlap_in_second(a: usize, b: usize, shift: isize) -> (usize, usize) {
 /// negative control this module's tests use — it reproduces every count and
 /// every shape and moves the answer, because the contamination is a wrap rather
 /// than an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Padding {
     /// [`minimal_wrap_free_length`] exactly. Correct, and often a hostile length
     /// for a mixed-radix transform.
@@ -1674,16 +1669,11 @@ pub enum Padding {
     /// `Minimal` rounded up per axis to the next `5`-smooth integer. Correct for
     /// the same reason — any length at or above the minimum is — and several
     /// times faster. The default.
+    #[default]
     Smooth,
     /// A length the caller chose. **Below [`minimal_wrap_free_length`] the
     /// answer wraps**, and [`Correlation2::wraps`] says whether it does.
     Exact([usize; 2]),
-}
-
-impl Default for Padding {
-    fn default() -> Self {
-        Self::Smooth
-    }
 }
 
 /// The shortest padded length, per axis, at which every lag in `window` is free

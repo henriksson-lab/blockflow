@@ -423,7 +423,7 @@ impl PyramidSchedule {
     pub fn new(factors: Vec<[usize; 3]>) -> Result<Self> {
         if factors
             .iter()
-            .any(|factor| factor.iter().any(|&axis| axis == 0) || factor == &[1, 1, 1])
+            .any(|factor| factor.contains(&0) || factor == &[1, 1, 1])
         {
             return Err(Error::InvalidArgument(format!(
                 "volume pyramid factors must be positive and must shrink at least one \
@@ -485,7 +485,7 @@ impl VolumePyramidLevel {
         scale: [usize; 3],
         geometry: SpatialFrame,
     ) -> Result<Self> {
-        if scale.iter().any(|axis| *axis == 0) {
+        if scale.contains(&0) {
             return Err(Error::InvalidArgument(format!(
                 "volume pyramid level scale {scale:?} must be positive on every axis"
             )));
@@ -1699,7 +1699,7 @@ pub fn run(
     moving: &Voxels,
     block: usize,
 ) -> Result<FittedTransform> {
-    Ok(run_with_workers(params, fixed, moving, block, 1)?)
+    run_with_workers(params, fixed, moving, block, 1)
 }
 
 pub fn run_with_workers(
@@ -1761,7 +1761,6 @@ pub fn run_with_seed_diagnostics(
 /// This is the compatibility surface for downstream tooling: callers that need
 /// a `TransformParameters.0.txt` can write this string verbatim, and the normal
 /// point-transform reader must be able to consume it again.
-
 fn run_with_initial(
     params: &VolumeFitParams,
     fixed: &Voxels,
@@ -1858,7 +1857,7 @@ pub fn validate_config(params: &VolumeFitParams) -> Result<()> {
         validate_bspline_final_grid_spacing(spacing)?;
     }
     if let Sampling::Stride(stride) = params.sampling {
-        if stride.iter().any(|axis| *axis == 0) {
+        if stride.contains(&0) {
             return Err(Error::InvalidArgument(format!(
                 "volume fit: sampling stride {stride:?} must be positive on every axis"
             )));
@@ -1868,7 +1867,7 @@ pub fn validate_config(params: &VolumeFitParams) -> Result<()> {
 }
 
 fn validate_images(fixed: &Voxels, moving: &Voxels, shape: [usize; 3]) -> Result<()> {
-    if shape.iter().any(|axis| *axis == 0) {
+    if shape.contains(&0) {
         return Err(Error::InvalidArgument(format!(
             "volume fit: empty image shape {shape:?} has no samples to fit"
         )));
@@ -2205,7 +2204,7 @@ fn validate_pyramid_levels(params: &VolumeFitParams, levels: &[VolumePyramidLeve
                 level.moving.dtype()
             )));
         }
-        if level.scale.iter().any(|axis| *axis == 0) {
+        if level.scale.contains(&0) {
             return Err(Error::InvalidArgument(format!(
                 "volume pyramid level {index} scale {:?} must be positive on every axis",
                 level.scale

@@ -128,7 +128,7 @@ impl<T, S: RegionSource<T>> ObservedSource<T, S> {
 /// chunking is not known.
 fn chunks_touched(region: &Region, chunk: Option<&Vec<usize>>) -> u64 {
     let Some(chunk) = chunk else { return 0 };
-    if chunk.len() != region.ndim() || chunk.iter().any(|&c| c == 0) {
+    if chunk.len() != region.ndim() || chunk.contains(&0) {
         return 0;
     }
     let mut total: u64 = 1;
