@@ -187,6 +187,10 @@ pub mod pyramid;
 /// space it is counted. See [`reach::Reach`].
 pub mod reach;
 pub mod region;
+/// **Cost scenarios**: a measured baseline and the plausible machines around
+/// it — slower disk, less memory, fewer cores — as files, so that a planner
+/// change can be held to more than the machine it was written on.
+pub mod scenario;
 /// Block-keyed output that is not a pixel region: `(stream, phase, block) ->
 /// bytes`, on the environment beside the region writes. Storage only; what
 /// produces and consumes fragments is `fragment`.

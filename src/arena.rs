@@ -465,9 +465,43 @@ pub fn price_plan(
     constraints: &Constraints,
     workers: usize,
 ) -> Result<f64> {
+    Ok(phase_prices(workflow, decomposition, constraints, workers)?
+        .iter()
+        .map(|(_, makespan)| makespan)
+        .sum())
+}
+
+/// **The largest working set any phase of this plan demands**, in bytes, on the
+/// same arithmetic `Constraints::affords_working_set` tests a candidate with:
+/// one block's resident bytes times the concurrency.
+///
+/// **What the makespan cannot say.** A plan that is fast on the machine it was
+/// planned for may not *fit* on another one at all, and a transfer sweep that
+/// reported only durations would rank an impossible plan against feasible ones.
+/// `tests/cost_scenarios.rs` uses this to mark those cells rather than time
+/// them.
+pub fn working_set_bytes(
+    workflow: &Workflow,
+    decomposition: &Decomposition,
+    constraints: &Constraints,
+    workers: usize,
+) -> Result<f64> {
+    Ok(phase_prices(workflow, decomposition, constraints, workers)?
+        .iter()
+        .map(|(cost, _)| cost.working_set_bytes_per_block * workers.max(1) as f64)
+        .fold(0.0, f64::max))
+}
+
+/// Every phase's cost and predicted makespan, in phase order.
+fn phase_prices(
+    workflow: &Workflow,
+    decomposition: &Decomposition,
+    constraints: &Constraints,
+    workers: usize,
+) -> Result<Vec<(crate::decomposition::PhaseCost, f64)>> {
     let slots = workflow.chain.slots();
     let phases = decomposition.n_phases();
-    let mut total = 0.0;
+    let mut priced = Vec::with_capacity(phases);
     for (index, phase) in decomposition.phases.iter().enumerate() {
         for &slot in &phase.slots {
             if slot >= slots.len() {
@@ -505,7 +539,7 @@ pub fn price_plan(
                 }
             }
         }
-        let (_, makespan) = phase_price(
+        priced.push(phase_price(
             &slots,
             &phase.slots,
             &phase.grid,
@@ -516,10 +550,9 @@ pub fn price_plan(
             traffic,
             constraints,
             workers,
-        );
-        total += makespan;
+        ));
     }
-    Ok(total)
+    Ok(priced)
 }
 
 #[cfg(test)]

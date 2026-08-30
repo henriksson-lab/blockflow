@@ -325,6 +325,10 @@ fn the_prefetch_sweep_has_a_control_at_both_ends() {
         execute("sweep", &workflow, &plan, &hints, &env).expect("the run");
         // The prefetcher's threads are asynchronous; drain so the counters are
         // about a finished run rather than about when this line was reached.
+        // **This line said so before it existed**, and the counters were a race
+        // in the meantime: a fast machine had the fetch landed by the time it
+        // read `prefetch_issued`, and a loaded CI runner did not.
+        env.drain_prefetch();
         let stats = env.cache_stats().expect("a cache");
         let issued = env.prefetch_stats().expect("a prefetcher").submitted;
         (issued, stats)

@@ -1503,6 +1503,27 @@ impl ZarrEnvironment {
         self.prefetcher.as_ref().map(|p| p.stats())
     }
 
+    /// Block until the prefetcher has nothing queued or in flight.
+    ///
+    /// **For a caller reading counters, and for nothing else.** `Prefetcher`
+    /// runs on its own threads and its own doc is explicit that a reader which
+    /// waited for it would be the coupling the component exists to avoid — so
+    /// this is not on the read path and must not become one. What it is for is
+    /// the other thing that doc names: a test, where the counters have to be
+    /// about a *finished* run rather than about the instant the assertion was
+    /// reached.
+    ///
+    /// Without it a stats assertion is a race against a background thread, and
+    /// one that a fast machine wins and a loaded CI runner loses:
+    /// `the_prefetch_sweep_has_a_control_at_both_ends` passed here and failed
+    /// there, on the arm whose whole claim is that *something* was fetched
+    /// ahead. Its own comment said to drain; there was nothing to call.
+    pub fn drain_prefetch(&self) {
+        if let Some(prefetcher) = &self.prefetcher {
+            prefetcher.drain();
+        }
+    }
+
     /// What the cache has done, or `None` where there is no cache.
     ///
     /// **The counter that makes a cached run checkable.** A cached run and an

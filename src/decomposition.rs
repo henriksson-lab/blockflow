@@ -1690,6 +1690,48 @@ pub struct CostModel {
     /// hashable: a hash over a `HashMap`'s iteration order is not a function of
     /// its contents.
     pub compute_of: BTreeMap<String, f64>,
+    /// How much a worker's compute slows for each *other* worker running on its
+    /// own machine — the same quantity, the same coefficient and the same
+    /// Amdahl form as `simulate::Machine::contention`, and `0.0` is the
+    /// perfectly-scaling pool this model assumed before the field existed.
+    ///
+    /// # Why the planner needs it
+    ///
+    /// [`crate::strategy::phase_makespan`]'s pool term is `cost_per_block x
+    /// ceil(n / workers)`, which says forty workers are forty times one. The
+    /// simulator says they are **2.41 times** one — that is the figure
+    /// `simulate::MEASURED_CONTENTION` was fitted to — and the difference is not
+    /// a scale factor, because the pool term is one side of a `max`. Measured on
+    /// `costs/forty-cores`: the model priced the coarsest grid at **3.045** times
+    /// its own argmin where the simulator put it at **1.018**, so it chose a grid
+    /// with more, smaller blocks on the strength of workers that do not exist.
+    /// That was the largest planner error in the whole scenario sweep.
+    ///
+    /// # Not a coefficient
+    ///
+    /// It is a property of the machine, like the worker count, and
+    /// [`crate::statistics::Snapshot::calibrate`] does not fit it: nothing in an
+    /// event stream separates "this block was slow because the machine was busy"
+    /// from "this block was slow". It is carried through calibration untouched,
+    /// and a caller who knows their machine states it —
+    /// `scenario::Scenario::model` sets it from the machine the scenario
+    /// describes.
+    pub contention: f64,
+    /// How many computers the run will use. `1` is one machine, and is what
+    /// every figure this crate has recorded was taken on.
+    ///
+    /// The planner needs it for two terms and neither is a coefficient:
+    /// [`Self::contention`] counts the workers of **one** node, and the channel
+    /// bound is per node because each computer has its own link to storage. See
+    /// [`crate::strategy::phase_makespan`], which is the only place either is
+    /// read.
+    ///
+    /// **What it does not yet buy** is the term the node boundary most obviously
+    /// wants: a charge for the chunks two machines both fetch, which
+    /// `tests/multiple_computers.rs` measures at 3.26x the bytes on eight nodes
+    /// and which nothing here prices. `docs/design/planner-gaps.md` carries that
+    /// as the next item.
+    pub nodes: usize,
     /// Charged per extra distinct `preferred_iteration` inside one phase.
     pub order_conflict_penalty: f64,
     /// Cost of writing a voxel at a **phase boundary**, where the result is an
@@ -1724,6 +1766,10 @@ impl Default for CostModel {
             // Empty, so the default model is the one this crate shipped with
             // and every recorded figure taken under it still stands.
             compute_of: BTreeMap::new(),
+            // Off, and one machine: the perfectly-scaling single computer this
+            // model assumed before either field existed.
+            contention: 0.0,
+            nodes: 1,
             order_conflict_penalty: 0.0,
             materialise_cost_per_voxel: 1.0,
         }

@@ -93,7 +93,41 @@ use crate::graph::TaskGraph;
 /// rather than a property of the hardware, except `workers`, which is both.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Machine {
-    /// Slots. Tasks beyond this queue.
+    /// **Computers.** `1` is one machine and is everything this simulator
+    /// modelled before the field existed.
+    ///
+    /// # What a node is, and what it is not
+    ///
+    /// A node is a boundary that three things do not cross, and each of the
+    /// three was previously modelled as if it did:
+    ///
+    /// * **the page cache.** Two computers reading the same chunk fetch it
+    ///   twice, whatever either caches. `distributed::cache_model` calls that
+    ///   duplicated fetch "the whole of what the handout and the placement
+    ///   filter are entitled to lean on", and a simulator with one pool cannot
+    ///   see it at all;
+    /// * **the IO channel.** Each computer has its own link to storage, so `n`
+    ///   nodes fetch on `n` sets of [`Self::io_channels`] rather than
+    ///   contending for one;
+    /// * **memory bandwidth.** [`Self::contention`] is a worker slowing for the
+    ///   *other workers on its own machine*, which is what the coefficient was
+    ///   fitted to.
+    ///
+    /// What it is not is a scheduling unit: [`Self::workers`] is still the total
+    /// number of slots, and **worker `w` lives on node `w % nodes`**. Round
+    /// robin rather than contiguous blocks so that a worker count which is not a
+    /// multiple of the node count spreads rather than piling the remainder onto
+    /// one machine, and so that `nodes == 1` leaves every worker where it was.
+    ///
+    /// The shape to have in mind is 2 to 4, and the field is not bounded: ten
+    /// is a cluster this crate is meant to plan for and the arithmetic does not
+    /// care.
+    pub nodes: usize,
+    /// Slots, **over all nodes**. Tasks beyond this queue.
+    ///
+    /// Unchanged in meaning by [`Self::nodes`], deliberately: every figure this
+    /// crate has recorded is at some worker count, and a field that quietly
+    /// became per-node would move all of them.
     pub workers: usize,
     /// The byte budget of whatever physically serves a re-read.
     ///
@@ -123,13 +157,16 @@ pub struct Machine {
     /// becomes that cache's budget and does become a lever. The doc moves then;
     /// the field does not.
     ///
-    /// Shared across workers, which is the optimistic reading.
+    /// **Per node.** Each computer has its own memory, so `nodes` of them have
+    /// `nodes` times this — not a share of it. At [`Self::nodes`] `== 1` that
+    /// is the same sentence it always was.
     ///
-    /// Shared and not per-worker, which is the optimistic reading: two workers
-    /// reading the same chunk pay for it once. The pessimistic reading is one
-    /// cache per worker and no sharing at all. The truth is the page cache and
-    /// is neither; this is the reading that makes ordering *matter*, which is
-    /// what the simulator is for.
+    /// Shared across the workers *of a node*, which is the optimistic reading:
+    /// two threads on one machine reading the same chunk pay for it once. The
+    /// pessimistic reading is one cache per worker and no sharing at all, which
+    /// is [`Self::cache_shared`] `== false`. The truth is the page cache and is
+    /// neither; this is the reading that makes ordering *matter*, which is what
+    /// the simulator is for.
     pub cache_bytes: u64,
     /// How many blocks ahead the prefetcher runs, in plan rank.
     ///
@@ -137,6 +174,9 @@ pub struct Machine {
     /// mirrors.
     pub prefetch_depth: usize,
     /// How many fetches the storage serves at once. `0` and `1` both mean one.
+    ///
+    /// **Per node**, because each computer has its own link to storage: `n`
+    /// nodes fetch on `n` sets of these rather than contending for one.
     ///
     /// **The channel used to be singular and that was a statement about a
     /// device that does not exist.** One serial channel is the least structure
@@ -156,13 +196,49 @@ pub struct Machine {
     /// are entitled to lean on" — and a simulator that shares one cache cannot
     /// see it at all, so it cannot rank a handout policy.
     ///
-    /// `false` gives each worker `cache_bytes / workers` and counts a chunk
-    /// fetched by a second worker as [`Outcome::duplicated_fetches`].
+    /// **Within a node.** With [`Self::nodes`] above one there is a pool per
+    /// node whatever this says; this decides whether the workers *of* a node
+    /// share theirs. So the three arrangements are: one pool (one node,
+    /// shared), one pool per computer (many nodes, shared — the physical one),
+    /// and one pool per slot (not shared), which is the pessimistic reading.
+    ///
+    /// `false` gives each worker `cache_bytes / workers-per-node` and counts a
+    /// chunk fetched by a second **pool** as [`Outcome::duplicated_fetches`].
     pub cache_shared: bool,
     /// The share of [`Self::cache_bytes`] held as **encoded** chunks, whose hits
     /// cost a decode. See [`Machine::with_encoded_fraction`].
     pub encoded_fraction: f64,
-    /// How much a worker's compute slows for each *other* worker running.
+    /// Whether a phase waits for **all** of the one before it.
+    ///
+    /// `false` — the default, and everything this simulator has ever modelled —
+    /// dispatches continuously: a task starts the moment its own dependencies
+    /// are met, so phases overlap. `true` is what `strategy::execute` actually
+    /// does: it pops a wave, runs it, and **joins the whole wave** before the
+    /// next.
+    ///
+    /// # Why the difference is a field and not a detail
+    ///
+    /// `docs/design/planner-gaps.md` carries it as item **C** — "the simulator
+    /// and the executor have different concurrency models, and neither states
+    /// it" — and until there was a field, only one of them could be simulated.
+    /// It is not benign: measured at **0.2%** of makespan when nothing contends
+    /// and **47%** when something does, because overlapping phases put more
+    /// workers on a node and every one of them slows the others through
+    /// [`Self::contention`]. A plan the continuous model calls bad can be the
+    /// plan the executor runs fastest.
+    ///
+    /// The mechanism is the one [`crate::graph::TaskGraph::barriers`] already
+    /// has: a barrier phase waits for every earlier phase to finish. This makes
+    /// **every** phase such a phase, which is why it costs nothing to model — the
+    /// ready set already knew how to hold a task back and release it.
+    pub wave_synchronous: bool,
+    /// How much a worker's compute slows for each *other* worker running **on
+    /// its own node**.
+    ///
+    /// Per node because that is what the coefficient measures: memory bandwidth
+    /// and last-level cache are a computer's, and a worker on another computer
+    /// takes none of either. At [`Self::nodes`] `== 1` this is the count it
+    /// always was.
     ///
     /// `0.0` is the shipped default and is the old behaviour exactly: concurrent
     /// workers do not contend, and wall clock scales down with worker count far
@@ -226,6 +302,8 @@ impl Machine {
 impl Default for Machine {
     fn default() -> Self {
         Self {
+            nodes: 1,
+            wave_synchronous: false,
             workers: 1,
             cache_bytes: 0,
             prefetch_depth: 0,
@@ -486,13 +564,22 @@ pub struct Outcome {
     /// which is the whole reason a scheduler can matter — so this is the
     /// invariant to assert a scheduler against.
     pub tasks_run: u64,
-    /// Chunks fetched by a worker when another worker already held them.
+    /// Chunks one cache pool fetched that **another pool had already fetched**.
     ///
-    /// Always zero when [`Machine::cache_shared`] is true, because then there is
-    /// only one cache and the question does not arise. **The quantity a handout
-    /// policy exists to reduce**, and the one
+    /// Zero when there is only one pool — one node with a shared cache — because
+    /// then the question does not arise. **The quantity a handout policy exists
+    /// to reduce**, and the one
     /// `nearest_first_handout_costs_fewer_duplicated_fetches_than_naive_pull`
     /// measures on the real coordinator.
+    ///
+    /// **A re-fetch by the *same* pool is not one of these.** That is capacity
+    /// pressure — the pool evicted it and had to go back — and it is already
+    /// counted in [`Self::cache_misses`]. This counted it too until
+    /// `Machine::nodes` existed, at which point the conflation stopped being
+    /// harmless: on the fixture in `tests/multiple_computers.rs` a single node
+    /// with a small cache reported 270 "duplicated" fetches, which would have
+    /// made two thirds of the two-node figure eviction rather than duplication
+    /// and the whole measurement unreadable.
     pub duplicated_fetches: u64,
     /// Sidecar bytes a fragment phase's blocks wrote, from the **declared**
     /// bound on each stream.
@@ -643,10 +730,18 @@ pub struct Decision<'a> {
     pub running: &'a [usize],
     /// Which worker this choice is for.
     ///
-    /// A shared cache makes this uninteresting and it is `0` throughout; with
-    /// `Machine::cache_shared` false it is the identity a handout policy ranks
-    /// against, and [`Decision::cache`] is that worker's own cache.
+    /// One node with a shared cache makes this uninteresting and it is `0`
+    /// throughout; otherwise it is the identity a handout policy ranks against,
+    /// and [`Decision::cache`] is that worker's own pool.
     pub worker: usize,
+    /// How many computers there are; see [`Machine::nodes`].
+    ///
+    /// **The worker's node is `worker % nodes`**, and [`Self::node`] is that
+    /// arithmetic written once. A policy that wants to keep a chunk on the
+    /// machine that already holds it needs both: the cache it is handed is its
+    /// node's, and which node that is decides what the *other* nodes are
+    /// holding.
+    pub nodes: usize,
     /// Where each worker last finished, for a policy that seeds workers apart.
     /// `None` for a worker that has finished nothing.
     pub anchors: &'a [Option<[f64; 3]>],
@@ -677,6 +772,11 @@ pub struct Decision<'a> {
 }
 
 impl Decision<'_> {
+    /// The computer this choice is for: [`Self::worker`] `%` [`Self::nodes`].
+    pub fn node(&self) -> usize {
+        self.worker % self.nodes.max(1)
+    }
+
     /// Every chunk key one task fetches: each image the phase reads, at
     /// [`crate::geometry::BlockGeometry::source`], on that image's own grid.
     ///
@@ -1159,6 +1259,21 @@ impl Scheduler for Handout {
     }
 }
 
+/// The earliest-free channel **on one node**, as an index into the flat table.
+///
+/// One function rather than the two `min_by_key`s it replaced, because a demand
+/// fetch and a prefetch that disagreed about which channels a node owns would be
+/// a node with a private link for one and a shared one for the other.
+fn earliest_channel(io_free_at: &[u64], node: usize, channels: usize) -> usize {
+    let base = node * channels;
+    io_free_at[base..base + channels]
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, free)| *free)
+        .map(|(index, _)| base + index)
+        .unwrap_or(base)
+}
+
 /// Run the plan and report what it did.
 ///
 /// # The event loop, and the one assumption in it
@@ -1271,12 +1386,38 @@ pub fn simulate(
     // old behaviour; per-worker is what `distributed` actually has, and is the
     // only arrangement in which a chunk two workers both read costs two fetches
     // — which is the quantity a handout policy is ranked on.
-    let pools = if machine.cache_shared {
-        1
-    } else {
-        machine.workers.max(1)
+    // **A pool per node, and within a node one or one per slot.** The three
+    // arrangements `Machine::cache_shared` names, and the middle one — a
+    // computer's page cache, shared by its threads and by nobody else — is the
+    // one that only exists once there are nodes.
+    let nodes = machine.nodes.max(1);
+    let workers = machine.workers.max(1);
+    // Round robin; see `Machine::nodes`. Written once, here, because three
+    // separate pieces of accounting below ask it and a second spelling of it
+    // would be a second topology.
+    let node_of = |worker: usize| worker % nodes;
+    // Slots on the busiest node, which is what a node's cache is divided among
+    // when it is not shared. `div_ceil` rather than a division, so a worker
+    // count that does not divide evenly gives every node the smaller share
+    // rather than giving one node an over-large one.
+    let workers_per_node = workers.div_ceil(nodes);
+    let pools = if machine.cache_shared { nodes } else { workers };
+    let pool_of = |worker: usize| {
+        if machine.cache_shared {
+            node_of(worker)
+        } else {
+            worker
+        }
     };
-    let per_pool = machine.cache_bytes / pools as u64;
+    // **`cache_bytes` is per node**, so it is divided among the pools *of a
+    // node* and not among all of them: four computers with 16 GiB each have 64,
+    // not 16 shared four ways. At one node this is the expression it was.
+    let per_pool = machine.cache_bytes
+        / if machine.cache_shared {
+            1
+        } else {
+            workers_per_node.max(1) as u64
+        };
     let encoded_bytes = (per_pool as f64 * machine.encoded_fraction) as u64;
     let mut caches: Vec<ModelledCache> = (0..pools)
         .map(|_| ModelledCache::new(per_pool - encoded_bytes, rates.chunk_bytes))
@@ -1284,11 +1425,13 @@ pub fn simulate(
     let mut encodeds: Vec<ModelledCache> = (0..pools)
         .map(|_| ModelledCache::new(encoded_bytes * ENCODED_RESIDENCY, rates.chunk_bytes))
         .collect();
-    // Every chunk any worker has been assigned, for counting the duplicated
-    // fetches a second worker causes. A *set*, not an eviction model: which
-    // chunks a worker has read is something a coordinator genuinely knows, and
-    // it is exactly what a duplicated fetch is made of.
-    let mut ever_fetched: BTreeSet<u64> = BTreeSet::new();
+    // Which pool first fetched each chunk, for counting the duplicated fetches a
+    // *second* pool causes. A map and not a set, so that a pool going back for
+    // something it evicted is not counted as another machine's copy — see
+    // `Outcome::duplicated_fetches`. Not an eviction model: which chunks a node
+    // has read is something a coordinator genuinely knows, and it is exactly
+    // what a duplicated fetch is made of.
+    let mut ever_fetched: BTreeMap<u64, usize> = BTreeMap::new();
     let mut anchors: Vec<Option<[f64; 3]>> = vec![None; machine.workers.max(1)];
     let mut busy: Vec<Option<usize>> = vec![None; machine.workers.max(1)];
 
@@ -1312,7 +1455,11 @@ pub fn simulate(
     // **One free-at time per channel.** A fetch takes the earliest-free one, so
     // `channels == 1` is exactly the serial model this had and anything above it
     // lets concurrent fetches overlap the way real storage does.
-    let mut io_free_at: Vec<u64> = vec![0; machine.io_channels.max(1)];
+    // **Channels per node**, flat: node `n`'s channels are
+    // `n * channels .. (n + 1) * channels`. A fetch takes the earliest-free one
+    // *on its own node*, so two computers never queue behind each other.
+    let channels = machine.io_channels.max(1);
+    let mut io_free_at: Vec<u64> = vec![0; channels * nodes];
     let mut now: u64 = 0;
     // (finish_ns, task id), kept sorted so the earliest completion is last.
     let mut running: Vec<(u64, usize)> = Vec::new();
@@ -1365,6 +1512,14 @@ pub fn simulate(
     // insertion is therefore a `partition_point` and every removal takes the
     // element out in place. That the two agree is checked rather than argued —
     // see the debug assertion at the head of the loop.
+    // **Whether a phase waits for the whole of the one before it.** A barrier
+    // phase always does; under `Machine::wave_synchronous` every phase does,
+    // which is the executor's own dispatch. One closure rather than three
+    // spellings of it — the seed, the admission on completion and the debug
+    // oracle all ask, and a topology that differed between them would be two
+    // executors.
+    let waits_for_the_phase_below =
+        |phase: usize| machine.wave_synchronous || graph.is_barrier(phase);
     let mut ready: Vec<usize> = Vec::new();
     // Tasks whose dependencies are all done and whose phase is a barrier that
     // has not cleared. One list per phase, so a phase's tasks come back in the
@@ -1374,7 +1529,7 @@ pub fn simulate(
     for id in 0..graph.tasks.len() {
         if indegree[id] == 0 {
             let phase = graph.tasks[id].phase;
-            if !graph.is_barrier(phase) || finished_phases >= phase {
+            if !waits_for_the_phase_below(phase) || finished_phases >= phase {
                 ready.push(id);
             } else {
                 barrier_held[phase].push(id);
@@ -1395,7 +1550,7 @@ pub fn simulate(
                 .filter(|&id| indegree[id] == 0)
                 .filter(|&id| {
                     let phase = graph.tasks[id].phase;
-                    !graph.is_barrier(phase) || finished_phases >= phase
+                    !waits_for_the_phase_below(phase) || finished_phases >= phase
                 })
                 .collect();
             debug_assert_eq!(
@@ -1437,7 +1592,7 @@ pub fn simulate(
                     // barrier its phase is still waiting on.
                     if indegree[next] == 0 {
                         let phase = graph.tasks[next].phase;
-                        if !graph.is_barrier(phase) || finished_phases >= phase {
+                        if !waits_for_the_phase_below(phase) || finished_phases >= phase {
                             let at = ready.partition_point(|&other| other < next);
                             ready.insert(at, next);
                         } else {
@@ -1505,11 +1660,13 @@ pub fn simulate(
             .iter()
             .position(|slot| slot.is_none())
             .expect("a free worker, since the loop only reaches here below the worker count");
-        let pool = if machine.cache_shared { 0 } else { worker };
+        let pool = pool_of(worker);
+        let node = node_of(worker);
         let slot = {
             let running_ids: Vec<usize> = running.iter().map(|&(_, id)| id).collect();
             let decision = Decision {
                 now_ns: now,
+                nodes,
                 graph: &graph,
                 decomposition,
                 ready: &ready,
@@ -1594,15 +1751,22 @@ pub fn simulate(
                 .filter(|key| !caches[pool].holds(**key) && !encodeds[pool].holds(**key))
                 .count() as u64;
             encoded_hits += missed_decoded - not_in_either;
-            // A chunk this worker must fetch that some worker has already
+            // A chunk this pool must fetch that **another** pool has already
             // fetched is a duplicated fetch — the thing a handout policy exists
             // to avoid, and invisible under one shared pool.
             for key in &keys {
-                if !caches[pool].holds(*key)
-                    && !encodeds[pool].holds(*key)
-                    && !ever_fetched.insert(*key)
-                {
-                    outcome.duplicated_fetches += 1;
+                if caches[pool].holds(*key) || encodeds[pool].holds(*key) {
+                    continue;
+                }
+                match ever_fetched.entry(*key) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(pool);
+                    }
+                    std::collections::btree_map::Entry::Occupied(first) => {
+                        if *first.get() != pool {
+                            outcome.duplicated_fetches += 1;
+                        }
+                    }
                 }
             }
             caches[pool].note_assigned(&keys);
@@ -1628,12 +1792,7 @@ pub fn simulate(
         // waited behind every prior task's store and the makespan stopped
         // responding to the worker count at all.
         let io_done = if transfer > 0 {
-            let channel = io_free_at
-                .iter()
-                .enumerate()
-                .min_by_key(|&(_, free)| *free)
-                .map(|(index, _)| index)
-                .unwrap_or(0);
+            let channel = earliest_channel(&io_free_at, node, channels);
             let done = now.max(io_free_at[channel]) + transfer;
             io_free_at[channel] = done;
             done
@@ -1689,11 +1848,20 @@ pub fn simulate(
         // costs. Truncating per substage and then multiplying differs by up to
         // one nanosecond per task — 8 ns over this suite's fixture — which is
         // nothing to a ranking and everything to an identity worth asserting.
-        // **Contention: a worker's compute slows for each other worker
-        // running.** One coefficient, fitted to the one figure there is — see
-        // `MEASURED_CONTENTION`. `running` has not yet been pushed, so the count
-        // includes this task.
-        let concurrent = (running.len() + 1) as f64;
+        // **Contention: a worker's compute slows for each other worker running
+        // on its own node.** One coefficient, fitted to the one figure there is
+        // — see `MEASURED_CONTENTION`. Counted from `busy`, which is the slot
+        // table, because `running` is task ids and a task does not say which
+        // machine it is on; this slot has not been filled yet, so the `+ 1` is
+        // this task. At one node it is `running.len() + 1`, the expression this
+        // replaced, and `contention_counts_only_the_workers_of_one_node` is what
+        // says so.
+        let concurrent = (busy
+            .iter()
+            .enumerate()
+            .filter(|&(slot, held)| held.is_some() && node_of(slot) == node)
+            .count()
+            + 1) as f64;
         let slowdown = 1.0 + machine.contention * (concurrent - 1.0);
         let compute = if skipped {
             0
@@ -1815,7 +1983,11 @@ pub fn simulate(
                 // most one outstanding fetch" and every depth above 1 would be
                 // inert. That was this model's first form, and a sweep of
                 // depths 1 to 64 returned the identical row seven times.
-                if issued == 0 && io_free_at.iter().all(|&free| free > now) {
+                if issued == 0
+                    && io_free_at[node * channels..(node + 1) * channels]
+                        .iter()
+                        .all(|&free| free > now)
+                {
                     break;
                 }
                 // **Only a task whose dependencies are met.** `usize::MAX`
@@ -1853,12 +2025,7 @@ pub fn simulate(
                 // queues behind all of it. That delay is the cost of depth, and
                 // without accumulating here there is no cost and deeper would
                 // be better without bound.
-                let channel = io_free_at
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|&(_, free)| *free)
-                    .map(|(index, _)| index)
-                    .unwrap_or(0);
+                let channel = earliest_channel(&io_free_at, node, channels);
                 io_free_at[channel] = io_free_at[channel].max(now)
                     + (ahead_misses as f64 * rates.io_latency_ns
                         + bytes as f64 * rates.io_ns_per_byte) as u64;

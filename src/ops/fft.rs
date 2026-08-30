@@ -407,17 +407,28 @@ const LANE_BLOCK: usize = 8;
 /// rather than an oversight to be tidied away: it lets a test say "run this bar
 /// over every backend this build has" and get exactly the old behaviour when
 /// there is only one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// **The default is the derived one only when there is one backend.** With the
+/// `fftw` feature there are two and the feature's whole job is to swap which is
+/// chosen, so the impl below takes over — and the derive has to be conditional
+/// or the two would collide.
+///
+/// It was written as a `#[derive(Default)]` plus a manual impl carrying
+/// **both** `cfg(not(feature = "fftw"))` and `cfg(feature = "fftw")`, which is a
+/// contradiction: the manual impl compiled under no configuration at all, the
+/// derived `Portable` was the default in every build, and the feature swapped
+/// nothing. `the_feature_is_the_only_thing_that_chooses_the_backend` says so,
+/// and said so on Linux and macOS alike the first time the `fftw` job ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(not(feature = "fftw"), derive(Default))]
 pub enum TransformBackend {
     /// `rustfft` and `realfft`: pure Rust, no C toolchain, no build script.
-    #[default]
+    #[cfg_attr(not(feature = "fftw"), default)]
     Portable,
     /// The system's FFTW 3. The `fftw` feature only.
     #[cfg(feature = "fftw")]
     Fftw,
 }
 
-#[cfg(not(feature = "fftw"))]
 #[cfg(feature = "fftw")]
 impl Default for TransformBackend {
     fn default() -> Self {

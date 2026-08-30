@@ -543,3 +543,109 @@ fn a_per_family_correction_reaches_the_price_and_only_its_own_family() {
         "a run that does not contain the family is unaffected"
     );
 }
+
+// ------------------------------------------- the machine the model is on --
+
+/// **The pool does not scale perfectly, and the model can now say so.**
+///
+/// `phase_makespan`'s pool term was `cost_per_block * ceil(n / workers)`, which
+/// says forty workers are forty times one. `simulate::MEASURED_CONTENTION` was
+/// fitted to a run where forty were **2.41** times one, and the difference is
+/// not a scale factor because the pool is one side of a `max`.
+///
+/// Three claims, and the first is the one that makes the term safe to add:
+///
+/// * at `contention == 0.0` — the shipped default — the price is unchanged, bit
+///   for bit, so every plan and every recorded figure taken under the old model
+///   still stands;
+/// * the slowdown is the concurrency actually reached, `min(blocks, workers)`,
+///   not the worker count: a phase with four blocks on forty workers runs four
+///   at a time and is charged for four;
+/// * and it is **per node** — eight workers on eight computers contend with
+///   nobody, which is what `simulate` charges and what the coefficient means.
+#[test]
+fn the_pool_is_charged_for_the_workers_that_contend_with_each_other() {
+    use blockflow::strategy::phase_makespan;
+
+    let volume = [64usize, 64, 64];
+    let grid = BlockGrid::new(volume, [16, 16, 16]).expect("a grid");
+    assert_eq!(grid.n_blocks(), 64);
+    // **Compute-heavy on purpose.** `phase_makespan` is a `max` of a pool term
+    // and a channel bound, and contention is a property of the pool: on a phase
+    // whose channel binds, a slowdown on the workers changes nothing and the
+    // test would assert on the wrong side of the roofline.
+    let cost = price_phase(
+        &grid,
+        &Reach::symmetric([1, 1, 1]),
+        1_000.0,
+        1,
+        false,
+        8.0,
+        &CostModel::default(),
+        1.0,
+        PhaseTraffic {
+            images_read: 1,
+            writes_an_image: true,
+            repeats: 1,
+        },
+    );
+
+    let free = CostModel::default();
+    let contended = CostModel {
+        contention: 0.4,
+        ..CostModel::default()
+    };
+    let spread = CostModel {
+        contention: 0.4,
+        nodes: 8,
+        ..CostModel::default()
+    };
+
+    let at = |model: &CostModel, workers: usize| phase_makespan(&cost, &grid, workers, model, 1.0);
+
+    // 1. The default is the expression it always was.
+    for workers in [1usize, 8, 40] {
+        let pool = cost.cost_per_block * blockflow::strategy::rounds(64, workers) as f64;
+        let channel = at(&free, workers);
+        assert!(
+            channel >= pool || (channel - pool).abs() < 1e-9,
+            "{workers} workers: the roofline is below its own pool term"
+        );
+    }
+    assert_eq!(
+        at(&free, 8),
+        phase_makespan(&cost, &grid, 8, &CostModel::default(), 1.0),
+        "the default model must be a pure function of its inputs"
+    );
+
+    // 2. Contention costs, and costs more the more slots contend.
+    let eight = at(&contended, 8);
+    let forty = at(&contended, 40);
+    assert!(
+        eight > at(&free, 8),
+        "contention on eight workers cost nothing"
+    );
+    assert!(
+        forty > at(&free, 40),
+        "contention on forty workers cost nothing"
+    );
+    // Forty workers over sixty-four blocks: `min(64, 40) = 40` contend, so the
+    // slowdown is `1 + 0.4 * 39`, against `1 + 0.4 * 7` at eight.
+    let ratio = (forty / at(&free, 40)) / (eight / at(&free, 8));
+    assert!(
+        ratio > 1.0,
+        "the slowdown did not grow with the slot count: {ratio:.3}"
+    );
+
+    // 3. Spread over eight computers, the same forty workers contend in fives.
+    assert!(
+        at(&spread, 40) < forty,
+        "workers on separate computers were charged for each other"
+    );
+    println!(
+        "40 workers: {:.0} free, {:.0} contended on one machine, {:.0} spread over eight",
+        at(&free, 40),
+        forty,
+        at(&spread, 40)
+    );
+}

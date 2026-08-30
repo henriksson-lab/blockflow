@@ -101,7 +101,36 @@ New in this report:
   executor is wave-synchronous. So the simulator **cannot see** the
   wave-straggler cost — which is precisely the cost a scheduling change would try
   to remove. The differential test compares order, counts, chunks and bytes, all
-  invariant to this.
+  invariant to this. **Measured, 2026-08-30, and it is not benign:** the
+  divergence is worth 0.2% of makespan when nothing contends and **47%** when
+  something does. `costs/two-nodes` is where it shows — the search's mixed grid
+  `[48, 24, 48]` lets a phase's small blocks start while the previous phase's
+  expensive ones are still running, which doubles the workers per node and slows
+  them through contention. Switch the simulator's contention off and the penalty
+  vanishes (1.520 against the uniform grid's 1.534).
+
+  **`Machine::wave_synchronous` now models the executor's own dispatch**, and it
+  cost nothing to add: the ready set already knew how to hold a task until an
+  earlier phase finished, because a barrier phase does exactly that. Under it,
+  on the machine and the plan where this was found:
+
+  | contention | mixed / uniform, continuous | mixed / uniform, in waves |
+  |---|---|---|
+  | 0.00 | 0.991 | 0.996 |
+  | 0.40 | **1.467** | **0.997** |
+
+  The two models **rank the two plans oppositely**, and only once workers
+  contend — at `contention: 0.0`, where every figure recorded before today was
+  taken, they agree to within 1%. The simulator is the pessimistic one, which is
+  the direction that matters: a planner tuned against it avoids a plan the
+  executor would run well. So `costs/two-nodes`' 1.467 "regret" is this
+  divergence and not a planner error.
+
+  **What is still open is which model an arena should judge under.** The sweep
+  runs on the continuous one, because that is what every recorded number used
+  and `Machine::default` still says; flipping it would move all of them. It is
+  no longer an unnoticed difference between two modules, which is what item C
+  was about. `tests/wave_dispatch.rs` carries the measurement.
 * **D. `admission_bytes` has no caller.** `budget.rs` derives a measured 3.6x
   admission margin over the plan-only working-set figure, with a test asserting
   it is the smallest tenth covering every measured shape — and
@@ -238,6 +267,137 @@ The figures are pinned in
 `the_two_judges_agree_at_one_worker_and_part_at_four`, which says in its own
 doc that a change to either judge is expected to move them and that the test is
 where the new ones get written down.
+
+## Overfitting: what the planner does on machines this is not
+
+Every figure above was taken on one machine, which is how a search gets tuned to
+a host without anyone being able to tell. `costs/` is now a directory of
+scenario files — the measured baseline and nine plausible neighbours of it
+(slower disk, slower memory, less memory, two cores, forty cores, fine chunks, a
+compressed store) — and `tests/cost_scenarios.rs` runs the planner against all of
+them. Both judges are told the same coefficients: the planner through
+`Snapshot::calibrate`, the simulator through `Rates::from_snapshot`.
+
+**Two findings, and neither is the one that was expected.**
+
+1. **The plan does not depend on the disk, the memory speed, the chunk shape or
+   the compression.** All six of those scenarios choose the *same* plan — two
+   phases at edge 48 — and transfer to each other at exactly `1.000`. What moves
+   the search's answer is the **worker count** and the **budget**, and nothing
+   else in the sweep. So the crate is not overfitted to this host's storage; it
+   is close to blind to storage. Worth knowing before anyone calibrates a read
+   coefficient expecting the plan to move.
+2. **Where it is sensitive, it is wrong.** On `forty-cores` the planner's own
+   choice is **1.230x** the best block edge available there, and the same defect
+   shows in the transfer matrix from the other side: a plan chosen for *any
+   other* machine runs **0.828x** — 17% faster — on forty cores than the plan
+   chosen for it. Every other column is at or below 1.007.
+
+And one operational finding: on `less-memory` every plan chosen elsewhere is
+**inadmissible**, not merely slow. A transfer sweep that compared only durations
+would have ranked an impossible plan against feasible ones, which is why the
+harness checks the working set against the budget before it times anything.
+
+The tables are recorded in the tests' own docs, with per-scenario ceilings, so a
+change that degrades one machine while leaving this one alone fails with that
+machine's name in the message.
+
+## More than one computer
+
+`simulate` modelled a worker pool: `workers` slots, one page cache, one set of
+IO channels, one contention coefficient over all of them. That is a thread pool
+on one machine, and it is not what `distributed` runs. `Machine::nodes` is the
+field that says how many computers there are — `worker % nodes` is the topology
+— and three of the model's quantities now stop at the boundary: **the page
+cache**, **the IO channel** and **memory bandwidth**. At one node every
+expression is the one it was, which `one_node_is_the_machine_this_crate_has_
+always_simulated` asserts over both shipped schedulers.
+
+`Outcome::duplicated_fetches` changed meaning in the same edit, and had to.
+It counted any chunk fetched twice by anyone, so a pool going back for something
+it had evicted was indistinguishable from a second machine's copy — on the
+fixture below, a single node with a small cache reported **270** "duplicated"
+fetches, which would have made two thirds of the two-node figure eviction rather
+than duplication. It now counts a fetch by a pool that another pool had already
+fetched, which is the sentence its own doc always claimed.
+
+**What separate caches cost**, with the worker count held at eight and only
+their distribution varied (`tests/multiple_computers.rs`):
+
+| nodes | misses | duplicated | fetched MiB | hits |
+|---|---|---|---|---|
+| 1 | 462 | 0 | 14.4 | 2538 |
+| 2 | 805 | 421 | 25.2 | 2195 |
+| 4 | 1195 | 900 | 37.3 | 1805 |
+| 8 | 1508 | 1290 | 47.1 | 1492 |
+
+**3.26x the bytes off storage at eight computers for the same tasks.** Against
+it, each node brings its own link: with the cache off, so that every arrangement
+fetches the same chunks, the channel wait falls from 636 ms on one node to 96 ms
+on eight.
+
+**What it costs the planner.** `costs/` now carries `two-nodes`, `four-nodes`
+and `ten-nodes` — the measured machine, two, four and ten times over — and the
+transfer matrix says a plan chosen for **one** machine costs **1.86x** on ten.
+That is the largest cell in the table and it is a term no `CostModel` can
+express: the node count and the slot count are one axis to this planner, and
+they differ in precisely the thing that matters, which is whether a fetch can be
+shared. `Constraints` has no `nodes`, `price_phase` has no duplication term, and
+the budget is per node only because `Scenario::constraints` divides the
+concurrency by hand.
+
+**And placement starts paying.** `distributed::handout`'s policies could only
+be ranked under `cache_shared: false` — one cache per *slot*, the pessimistic
+reading and a machine nobody has. With a pool per computer they have something
+real to save: on four nodes, `NearestFirst` duplicates **342** fetches against
+`Naive`'s **900**, the same plan and the same tasks either way. On one node both
+duplicate nothing, which is what says the saving is the boundary and not the
+policy.
+
+### The node-aware terms that exist now
+
+`CostModel` gained two fields, both machine properties rather than coefficients
+and both inert at their defaults:
+
+* **`contention`**, the same Amdahl coefficient `simulate::Machine::contention`
+  carries. `phase_makespan`'s pool term said forty workers were forty times one;
+  the measured figure is 2.41. On `costs/forty-cores` the model priced the
+  coarsest grid at **3.045** times its own argmin where the simulator put it at
+  **1.018**, and chose a finer grid on the strength of workers that do not
+  exist. With the term, that scenario's regret went **1.230 → 1.000**, and the
+  per-rung prices now track the simulator within a few percent on every machine
+  in `costs/`;
+* **`nodes`**, which the contention term needs (workers contend with the ones on
+  their own machine) and which divides the channel bound (each computer has its
+  own link).
+
+**What it did not fix**, and the sweep says so: the largest cell in the transfer
+matrix is still a single-machine plan costing **1.83x** on ten computers, and
+that is fetch duplication, not contention.
+
+### A node-aware read term, declined on the evidence
+
+The obvious next move was a cost term for the chunks two machines both fetch —
+3.26x the bytes at eight nodes, and nothing prices it. **The measurement says
+not to.** On `costs/ten-nodes` the model's per-rung prices already track the
+simulator's:
+
+| | edge 16 | edge 24 | edge 32 | edge 48 |
+|---|---|---|---|---|
+| priced | 1.261 | 1.000 | 1.106 | 1.821 |
+| simulated | 1.184 | 1.000 | 1.134 | 1.827 |
+
+— including the 1.82 penalty on the coarse grid, which is exactly where the
+duplication bites, and the planner's regret there is **1.000**. A duplication
+term could only perturb a ranking that is already right. The 1.83x cell in the
+transfer matrix is not a planner error either: it is the cost of *reusing* a
+plan across machines, which the planner does not do when it is asked to plan for
+the machine it is on.
+
+Declined for now, in the same spirit as the anisotropic blocks item above:
+measured, and not warranted on the evidence. What would warrant it is a case
+where the *ranking* on a cluster is wrong, and none of the thirteen committed
+scenarios produces one.
 
 ## The next thing in the way
 

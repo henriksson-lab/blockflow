@@ -3693,14 +3693,39 @@ pub fn phase_makespan(
     write_cost_per_voxel: f64,
 ) -> f64 {
     let n = grid.n_blocks() as f64;
-    let pool = cost.cost_per_block * rounds(grid.n_blocks(), workers) as f64;
+    let nodes = model.nodes.max(1);
+    // **Workers that are actually running, on one machine.** A phase with fewer
+    // blocks than slots cannot fill them, and the slots it does fill are spread
+    // over the nodes — so the number that contends is `min(n, workers)` divided
+    // by the machines they sit on. `div_ceil`, so the busiest node is the one
+    // priced, which is the one the phase waits for.
+    let concurrent = grid.n_blocks().min(workers.max(1)).div_ceil(nodes);
+    // **The pool does not scale perfectly and the model used to say it did.**
+    // `rounds` divides the work by the slots; this multiplies it back up by what
+    // the slots cost each other, on the same Amdahl form and with the same
+    // coefficient as `simulate::Machine::contention`. At `contention == 0.0` —
+    // the shipped default — the expression is `cost_per_block * rounds`, bit for
+    // bit, and every plan built under it is unmoved. See `CostModel::contention`
+    // for the measurement that motivates it.
+    let slowdown = 1.0 + model.contention * (concurrent.max(1) - 1) as f64;
+    let pool = cost.cost_per_block * rounds(grid.n_blocks(), workers) as f64 * slowdown;
     // `mean_core_voxels`, so that `core * n` is the volume the phase writes
     // rather than the volume plus the grid's padding. `price_phase` charges the
     // same core, and the channel bound is meant to be the same bytes counted a
     // second way — a bound stated in a different unit from the term it is
     // maxed against would not be one.
-    let channel = cost.read_voxels_per_block * n * model.read_cost_per_voxel
-        + grid.mean_core_voxels() * n * write_cost_per_voxel;
+    //
+    // **Divided by the node count**, because each computer has its own link to
+    // storage: the bound is a bandwidth, and `n` machines have `n` of them. One
+    // node leaves it exactly as it was. What this does *not* model is the extra
+    // bytes those machines fetch because they cannot share a page cache —
+    // measured at 3.26x on eight nodes in `tests/multiple_computers.rs`, priced
+    // nowhere, and the next item in `docs/design/planner-gaps.md`. So the
+    // channel bound is optimistic on a cluster, and knowing in which direction
+    // is the point of writing it down.
+    let channel = (cost.read_voxels_per_block * n * model.read_cost_per_voxel
+        + grid.mean_core_voxels() * n * write_cost_per_voxel)
+        / nodes as f64;
     // `total_cmp`, not `f64::max`: the crate's arithmetic never selects between
     // two `f64`s through a partial order.
     if pool.total_cmp(&channel).is_lt() {

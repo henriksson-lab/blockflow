@@ -1348,6 +1348,10 @@ fn a_multiplier_on_the_whole_price_moves_nothing_and_one_on_its_repeated_half_mo
                         // rebuilt, so this stays true if the table is ever
                         // non-empty here.
                         compute_of: base.compute_of.clone(),
+                        // Machine properties, not coefficients: scaling every
+                        // cost by a factor leaves the machine the same machine.
+                        contention: base.contention,
+                        nodes: base.nodes,
                     };
                     let scaled = choose(
                         reach,

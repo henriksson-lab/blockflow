@@ -1167,6 +1167,16 @@ impl Snapshot {
         self.coefficients.get(term).copied()
     }
 
+    /// Every coefficient, in the order [`Term::key`] sorts them.
+    ///
+    /// **For a writer**, which is what a reader of a snapshot cannot otherwise
+    /// be: [`Self::coefficient`] answers about a term a caller already knows to
+    /// ask for, and `crate::scenario` has to write out the ones it does not.
+    /// The order is the map's, so a file written twice is the same file.
+    pub fn coefficients(&self) -> &BTreeMap<Term, Coefficient> {
+        &self.coefficients
+    }
+
     /// Whether a term is measured here, and how strongly.
     pub fn provenance(&self, term: &Term) -> Provenance {
         match self.coefficient(term) {
@@ -1341,6 +1351,12 @@ impl Snapshot {
             } else {
                 model.compute_of.clone()
             },
+            // Machine properties, not coefficients: nothing in an event stream
+            // separates a block that was slow because the machine was busy from
+            // one that was slow. Carried through untouched, which is what makes
+            // a caller's statement about their machine survive calibration.
+            contention: model.contention,
+            nodes: model.nodes,
             order_conflict_penalty: model.order_conflict_penalty * anchor,
         }
     }
@@ -1624,6 +1640,8 @@ mod tests {
             // and evidence nobody has is not a reason to discard evidence
             // somebody stated.
             compute_of: [("smooth".to_string(), 4.0)].into_iter().collect(),
+            contention: 0.4,
+            nodes: 4,
         };
         assert_eq!(snapshot.calibrate(&custom), custom);
     }

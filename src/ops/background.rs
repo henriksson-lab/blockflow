@@ -477,7 +477,7 @@ const DIFFERENCE: &str = "background.difference";
 /// [`StructuringElement::reflected`] says why, and the dilation that *is* the
 /// adjoint there has to place the element at the source voxel, which a rank
 /// filter does not do. The maximum is then
-/// [`GreyDilateOp`](super::morphology::GreyDilateOp), the scatter. Such an
+/// [`GreyDilateOp`], the scatter. Such an
 /// element once produced a composition that was not an opening at all: on the
 /// same ramp, 52 anti-extensivity violations for a `9x5x1` box stepped by two,
 /// whose two sides are equal.
