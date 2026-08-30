@@ -491,3 +491,55 @@ fn a_phase_that_reads_a_second_array_is_charged_for_both() {
         "the geometry says two traversals, so the price should be built on two"
     );
 }
+
+// ------------------------------------------- the per-family compute table --
+
+/// **A per-family correction reaches the price, and reaches only its own
+/// family.**
+///
+/// `CostModel::compute_of` holds one dimensionless multiplier per op family,
+/// filled by `Snapshot::calibrate` from the `Term::ComputeOf` coefficients that
+/// were recorded for years under a doc saying they were not used
+/// (`docs/design/planner-gaps.md`, G3). This is the arithmetic that uses them:
+/// the charge for a run is `sum over slots of declared x correction`, so a
+/// table entry moves exactly one slot's contribution and an absent one moves
+/// nothing.
+///
+/// The third case is the one that makes the table safe to ship: an **empty**
+/// table must give the number this crate has always given, bit for bit, or
+/// every recorded figure in it would have to be retaken.
+#[test]
+fn a_per_family_correction_reaches_the_price_and_only_its_own_family() {
+    use blockflow::decomposition::{compute_charge_per_voxel, compute_per_voxel};
+    use blockflow::op::Chain;
+    use blockflow::probes::IdentityOp;
+
+    let cheap = Chain::op(IdentityOp::new("cheap", [0, 0, 0]).with_cost(1.0));
+    let dear = Chain::op(IdentityOp::new("dear", [0, 0, 0]).with_cost(4.0));
+    let slots: Vec<&Chain> = vec![&cheap, &dear];
+    let group = [0usize, 1];
+    let block = [32usize, 32, 32];
+
+    let empty = CostModel::default();
+    assert_eq!(
+        compute_charge_per_voxel(&slots, &group, block, &empty),
+        compute_per_voxel(&slots, &group, block),
+        "an empty table must be the figure this crate priced with before it existed"
+    );
+    assert_eq!(compute_per_voxel(&slots, &group, block), 5.0);
+
+    let corrected = CostModel {
+        compute_of: [("dear".to_string(), 10.0)].into_iter().collect(),
+        ..CostModel::default()
+    };
+    assert_eq!(
+        compute_charge_per_voxel(&slots, &group, block, &corrected),
+        1.0 + 4.0 * 10.0,
+        "the correction multiplies its own family's declared cost and nothing else"
+    );
+    assert_eq!(
+        compute_charge_per_voxel(&slots, &[0], block, &corrected),
+        1.0,
+        "a run that does not contain the family is unaffected"
+    );
+}

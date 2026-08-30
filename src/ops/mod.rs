@@ -282,9 +282,9 @@ pub use local::{
 };
 pub use mixing::{LinearMap, TupleKernel, TupleOp};
 pub use morphology::{
-    close_into, close_into_at, dilate_into, dilate_into_at, dilate_placed_into,
-    dilate_placed_into_at, erode_into, erode_into_at, open_into, open_into_at, Morphology,
-    MorphologyOp,
+    close_into, close_into_at, dilate_into, dilate_into_at, dilate_placed_grey_into,
+    dilate_placed_grey_into_at, dilate_placed_into, dilate_placed_into_at, erode_into,
+    erode_into_at, open_into, open_into_at, GreyDilateOp, Morphology, MorphologyOp,
 };
 pub use normalise::{
     bounded_gain_into, bounded_gain_value, normalise_against_into, normalise_value,

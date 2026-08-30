@@ -116,7 +116,7 @@ fn constraints(model: CostModel) -> Constraints {
 /// a stopwatch reach it** — see [`paired_trial`].
 fn plan_for(model: CostModel) -> Decomposition {
     Enumerating::default()
-        .decompose(&workflow(), &constraints(model))
+        .decompose(&workflow(), &constraints(model.clone()))
         .expect("a plan")
 }
 
@@ -161,7 +161,7 @@ fn run(plan: &Decomposition) -> Outcome {
 /// plan is a function of a constant. [`paired_trial`] deliberately does not use
 /// this.
 fn plan_and_run(model: CostModel) -> Outcome {
-    run(&plan_for(model))
+    run(&plan_for(model.clone()))
 }
 
 /// How wrong a prediction is, scale-free. `1.0` is exact.
@@ -571,7 +571,7 @@ fn an_absent_store_plans_exactly_as_the_shipped_constants_do() {
     let seeded = CostModel::default();
 
     let untouched = strategy
-        .decompose(&workflow, &constraints(seeded))
+        .decompose(&workflow, &constraints(seeded.clone()))
         .expect("a plan");
 
     for snapshot in [
@@ -582,9 +582,9 @@ fn an_absent_store_plans_exactly_as_the_shipped_constants_do() {
     ] {
         assert!(snapshot.is_empty());
         let model = snapshot.calibrate(&seeded);
-        assert_eq!(model, seeded, "an empty snapshot changed the model");
+        assert_eq!(model.clone(), seeded, "an empty snapshot changed the model");
         let planned = strategy
-            .decompose(&workflow, &constraints(model))
+            .decompose(&workflow, &constraints(model.clone()))
             .expect("a plan");
         assert_eq!(planned.fingerprint(), untouched.fingerprint());
         assert_eq!(planned, untouched);
@@ -649,10 +649,10 @@ fn one_snapshot_plans_one_way_and_the_identity_shows_it() {
     let model = snapshot.calibrate(&CostModel::default());
 
     let first = strategy
-        .decompose(&workflow, &constraints(model))
+        .decompose(&workflow, &constraints(model.clone()))
         .expect("a plan");
     let second = strategy
-        .decompose(&workflow, &constraints(model))
+        .decompose(&workflow, &constraints(model.clone()))
         .expect("a plan");
     assert_eq!(first, second);
     assert_eq!(
@@ -854,7 +854,7 @@ fn a_store_round_trips_through_a_file() {
 #[ignore = "a measurement, not an assertion"]
 fn print_what_calibration_changed() {
     let seeded = CostModel::default();
-    let plan = plan_for(seeded);
+    let plan = plan_for(seeded.clone());
     let _ = run(&plan);
 
     // One run first, to show what a store that cannot yet be believed looks
@@ -885,7 +885,10 @@ fn print_what_calibration_changed() {
         fit.stats.phases
     );
     println!("held-out observation {observed:.4e} ns");
-    for (name, model) in [("seeded    ", seeded), ("calibrated", calibrated)] {
+    for (name, model) in [
+        ("seeded    ", seeded.clone()),
+        ("calibrated", calibrated.clone()),
+    ] {
         let predicted = price(&plan, &model);
         println!(
             "{name}: predicted {predicted:.4e}  off by {:.2}x  gap {:.4e}",
@@ -898,7 +901,7 @@ fn print_what_calibration_changed() {
     // The plan the fitted model *would* have chosen, printed and not asserted.
     // It is allowed to differ, and `paired_trial`'s header is about why an
     // earlier version of this file asserted that it could not.
-    let replanned = plan_for(calibrated);
+    let replanned = plan_for(calibrated.clone());
     println!(
         "the fitted model would plan {:016x} ({})",
         replanned.fingerprint(),

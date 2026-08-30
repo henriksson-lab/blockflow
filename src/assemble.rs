@@ -982,7 +982,7 @@ impl PlanBuilder {
         let ranking_model = Constraints {
             model: crate::decomposition::CostModel {
                 read_cost_per_voxel: constraints.model.read_cost_per_voxel * repeats,
-                ..constraints.model
+                ..constraints.model.clone()
             },
             ..constraints.clone()
         };

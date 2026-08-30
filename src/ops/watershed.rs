@@ -251,13 +251,11 @@ fn flood(
     };
 
     match out.as_slice_mut() {
-        Some(labels) => Ok(watershed_raveled_reporting_peak(
-            image, &shape, &mut flags, labels, line,
-        )),
+        Some(labels) => watershed_raveled_reporting_peak(image, &shape, &mut flags, labels, line),
         None => {
             let mut labels: Vec<u32> = out.iter().copied().collect();
             let peak =
-                watershed_raveled_reporting_peak(image, &shape, &mut flags, &mut labels, line);
+                watershed_raveled_reporting_peak(image, &shape, &mut flags, &mut labels, line)?;
             for (slot, label) in out.iter_mut().zip(labels) {
                 *slot = label;
             }

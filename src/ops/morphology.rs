@@ -399,6 +399,129 @@ fn sweep(
     Ok(())
 }
 
+/// The **grey** dilation by the element: `(f ⊕ B)[c] = max over the sources
+/// whose element covers `c`.
+///
+/// **The one kernel in this file that reads its input as values rather than as
+/// a mask**, and it is here because it is the grey twin of
+/// [`dilate_placed_into`] — the same scatter, the same adjunction, the same
+/// argument — and splitting the two would put one explanation in two files.
+/// Everything else in this module thresholds an `f64` through `is_set` and
+/// answers about a mask; this does not.
+///
+/// # Why it exists at all, when `ops::rank` already has a maximum
+///
+/// A grey erosion is the minimum over the element and a grey dilation by the
+/// *reflected* element is the maximum over it — `ops::rank` at
+/// [`Rank::lowest`](super::element::Rank::lowest) and
+/// [`Rank::highest`](super::element::Rank::highest) — and for every element
+/// with a reflection that is the whole story: `ops::background` composes its
+/// grey opening out of exactly those two, and does so over a **box**, where the
+/// rank filter is separable and costs about a dozen operations a voxel whatever
+/// the element's size. This kernel is `|B|` operations a voxel and must not
+/// replace it.
+///
+/// What it is for is the element that has **no reflection**: a step counted
+/// from [`StepOrigin::ClippedStart`] re-phases near a low face, so what the
+/// element reads is a set per position, and
+/// [`StructuringElement::reflected`] refuses. There is then no offset list a
+/// gather can be handed that computes the erosion's adjoint, and without the
+/// adjoint the composition is not an opening — measured, before this existed:
+/// a `9x5x1` box stepped by two, an element whose two sides are *equal*, gave
+/// an "opening" standing above its own image at 52 voxels of a `[14, 11, 9]`
+/// ramp.
+///
+/// # The empty window, and the rule it borrows
+///
+/// A voxel that **no** source reaches keeps its own value. That is not a choice
+/// made here: `ops::rank` writes the centre's own value where the gathered
+/// window came out empty — *"the only value there is to write"* — and the two
+/// have to agree, because for an anchored element they are the same filter and
+/// `the_grey_scatter_is_the_gathered_maximum_over_the_reflected_element` says
+/// so. A voxel can go unreached under a re-phasing element even in the deep
+/// interior: the clipped lattice need not contain the anchor's own offset.
+///
+/// **`reached` is a `bool` per voxel rather than a sentinel**, at one byte a
+/// voxel of the *buffer*. A sentinel of `NEG_INFINITY` would be indistinguishable
+/// from a source that genuinely carries one, and "the data cannot contain that"
+/// is exactly the assumption this crate does not get to make about a caller's
+/// volume.
+pub fn dilate_placed_grey_into(
+    input: ArrayView3<'_, f64>,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, f64>,
+) -> Result<()> {
+    let at = whole(input.shape());
+    dilate_placed_grey_into_at(input, &at, element, out)
+}
+
+/// [`dilate_placed_grey_into`] with the buffer's place in its volume stated;
+/// see [`erode_into_at`].
+pub fn dilate_placed_grey_into_at(
+    input: ArrayView3<'_, f64>,
+    at: &Anchor,
+    element: &StructuringElement,
+    mut out: ArrayViewMut3<'_, f64>,
+) -> Result<()> {
+    let what = "dilate_placed_grey_into";
+    let extent = preflight(input.shape(), at, element, out.shape(), what)?;
+    let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+    let mut reached = Array3::from_elem(input.raw_dim(), false);
+    let mut offsets: Vec<[isize; 3]> = Vec::new();
+    let fixed = (element.origin() == StepOrigin::Anchor).then(|| element.offsets());
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let source = [i as isize, j as isize, k as isize];
+                let value = input[[i, j, k]];
+                let placed = match fixed {
+                    Some(offsets) => offsets,
+                    // The element at **the source's** position in the volume,
+                    // which is what makes this the erosion's adjoint; see
+                    // `dilate_placed_into`, where the same argument is made at
+                    // length for the mask.
+                    None => {
+                        let at_source = [
+                            source[0] + at.offset[0] as isize,
+                            source[1] + at.offset[1] as isize,
+                            source[2] + at.offset[2] as isize,
+                        ];
+                        element.offsets_at(at_source, at.volume, &mut offsets)
+                    }
+                };
+                for offset in placed {
+                    let a = source[0] + offset[0];
+                    let b = source[1] + offset[1];
+                    let c = source[2] + offset[2];
+                    if a < 0 || b < 0 || c < 0 || a >= extent[0] || b >= extent[1] || c >= extent[2]
+                    {
+                        continue;
+                    }
+                    let slot = [a as usize, b as usize, c as usize];
+                    // `total_cmp`, not `f64::max`: this crate's arithmetic never
+                    // selects between two `f64`s through a partial order, and a
+                    // maximum is a selection.
+                    if !reached[slot] || out[slot].total_cmp(&value).is_lt() {
+                        out[slot] = value;
+                        reached[slot] = true;
+                    }
+                }
+            }
+        }
+    }
+    // What no source covered: the voxel's own value, which is `ops::rank`'s
+    // rule for an empty window and is stated once, above.
+    ndarray::Zip::from(&mut out)
+        .and(&reached)
+        .and(&input)
+        .for_each(|slot, &covered, &value| {
+            if !covered {
+                *slot = value;
+            }
+        });
+    Ok(())
+}
+
 /// Which of the four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Morphology {
@@ -601,6 +724,126 @@ impl BlockOp for MorphologyOp {
     /// loss of information, since the op writes a mask whatever it was given.
     fn constant_maps_to(&self, value: f64) -> Option<f64> {
         Some(from_set(is_set(value)))
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+}
+
+/// [`dilate_placed_grey_into`] as an op a chain can hold.
+///
+/// **The second pass of a grey opening, for the element that cannot have one
+/// built out of `ops::rank`.** `ops::background` uses it for exactly that and
+/// for nothing else; see [`dilate_placed_grey_into`] for why the rank filter
+/// stays the path for every element with a reflection, and
+/// `super::background::background_estimate` for the branch.
+pub struct GreyDilateOp {
+    name: &'static str,
+    element: StructuringElement,
+    cost: f64,
+}
+
+impl GreyDilateOp {
+    pub fn new(name: &'static str, element: StructuringElement) -> Self {
+        let cost = MORPHOLOGY_COST_PER_ELEMENT_VOXEL * element.len() as f64;
+        Self {
+            name,
+            element,
+            cost,
+        }
+    }
+
+    pub fn element(&self) -> &StructuringElement {
+        &self.element
+    }
+
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+impl BlockOp for GreyDilateOp {
+    /// **A stencil**, and a scatter rather than a gather — which is the same
+    /// thing to a decomposition: what a block writes depends on a bounded
+    /// neighbourhood of what it reads, and nothing is carried along the scan.
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The element's wider side. The **bound**; [`Self::reach_spec`] is the
+    /// exact statement and the two differ for an element with an even extent.
+    fn reach(&self, axis: usize, _volume_len: usize) -> usize {
+        self.element.reach(axis)
+    }
+
+    /// **The element's two sides, swapped**, and that is the whole of what
+    /// makes this a dilation rather than a gather.
+    ///
+    /// `out[c]` takes its value from the sources `p` whose element covers `c` —
+    /// `c - p` in `B(p)` — so `p` runs over `[c - hi, c + lo]` where the element
+    /// reads `lo` below its anchor and `hi` above. A gather over the same
+    /// element reads `(lo, hi)`; this reads `(hi, lo)`. For a centred element
+    /// the two are one number, which is why nothing in this crate had to say it
+    /// until an element without a centre voxel existed.
+    ///
+    /// A halo built from the gather's pair would be short on exactly one side
+    /// per axis, and short at a block seam is the failure `docs/design/
+    /// BLOCK_OPS.md` exists to remove.
+    fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+        let sides = |axis: usize| {
+            let (lo, hi) = self.element.sides(axis);
+            (hi, lo)
+        };
+        Reach::asymmetric([sides(0), sides(1), sides(2)])
+    }
+
+    /// `F64`, and `F32` as the type the top-hat's own subtraction accepts.
+    ///
+    /// Narrower than [`super::rank::RankFilterOp`], which takes every type but
+    /// `F16`, and deliberately: this op exists to finish a **grey opening**
+    /// whose consumer is a subtraction, and a chain that reaches it holding
+    /// integers is a chain that wanted the rank filter. Widening it is a
+    /// dispatch arm and a comparator, the day something needs one.
+    fn accepts(&self, dtype: Dtype) -> bool {
+        matches!(dtype, Dtype::F64 | Dtype::F32)
+    }
+
+    /// **`at` is read rather than ignored**, so that an element whose step
+    /// counts from the clipped start re-phases at the volume's faces and not at
+    /// a block seam — which is the whole reason this op exists.
+    fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
+        match input.dtype() {
+            Dtype::F64 => dilate_placed_grey_into_at(
+                input.view::<f64>()?,
+                at,
+                &self.element,
+                out.view_mut::<f64>()?,
+            ),
+            _ => {
+                let widened = input.view::<f32>()?.mapv(f64::from);
+                let mut result = Array3::zeros(widened.raw_dim());
+                dilate_placed_grey_into_at(widened.view(), at, &self.element, result.view_mut())?;
+                let mut out = out.view_mut::<f32>()?;
+                ndarray::Zip::from(&mut out)
+                    .and(&result)
+                    .for_each(|slot, &value| *slot = value as f32);
+                Ok(())
+            }
+        }
+    }
+
+    /// A dilation of a constant field is that constant, and so is the value at
+    /// a voxel no source reached — it carries its own, which is the constant
+    /// too. One answer for both halves of the kernel, which is why this is
+    /// declarable at all.
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        Some(value)
     }
 
     fn cost_per_voxel(&self) -> f64 {
@@ -945,6 +1188,93 @@ mod tests {
             dilate_into(input.view(), &reflected, gathered.view_mut()).unwrap();
             assert_eq!(placed, gathered);
         }
+    }
+
+    /// **The grey scatter is the gathered maximum over the reflected element**,
+    /// wherever both exist.
+    ///
+    /// The branch in `ops::background` picks between them by whether the
+    /// element reflects, and picks on cost: at an extreme rank over a box the
+    /// rank filter is separable and the scatter is one operation per member. A
+    /// branch on cost is only legitimate if the two arms are the **same
+    /// filter**, and this is where that is pinned — over elements with no centre
+    /// voxel, where a gather over the element and a gather over its reflection
+    /// are two different volumes.
+    ///
+    /// The two must agree at the boundary as well as in the interior, which is
+    /// the half that is easy to get wrong: the scatter's clamp is "a source
+    /// outside the buffer never wrote", the gather's is "an offset outside the
+    /// buffer is not read", and they are the same statement seen from the two
+    /// ends only because the empty case carries the voxel's own value on both
+    /// sides.
+    #[test]
+    fn the_grey_scatter_is_the_gathered_maximum_over_the_reflected_element() {
+        let shape = (9, 8, 7);
+        let field = Array3::from_shape_fn(shape, |(i, j, k)| {
+            ((i * 37 + j * 11 + k * 5) % 29) as f64 + (i % 3) as f64 * 0.25
+        });
+        let mut compared = 0usize;
+        for element in [
+            StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]),
+            StructuringElement::from_size(ElementShape::Box, [4, 3, 2]).unwrap(),
+            StructuringElement::from_sides(ElementShape::Box, [3, 0, 1], [1, 2, 1]),
+            StructuringElement::from_offsets([[0, 0, 0], [2, 1, 0], [-1, 0, 1]]).unwrap(),
+        ] {
+            let reflected = element.reflected().expect("an anchored element reflects");
+            let mut scattered = Array3::zeros(field.raw_dim());
+            dilate_placed_grey_into(field.view(), &element, scattered.view_mut()).unwrap();
+
+            let mut gathered = Array3::zeros(field.raw_dim());
+            super::super::rank::rank_filter_f64_into(
+                field.view(),
+                &reflected,
+                Rank::highest(&reflected),
+                gathered.view_mut(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                scattered, gathered,
+                "the scatter and the gather over the reflection are two filters"
+            );
+            compared += field.len();
+        }
+        assert_eq!(compared, 4 * 9 * 8 * 7);
+    }
+
+    /// **A voxel no source reaches keeps its own value**, which is
+    /// `ops::rank`'s rule for an empty window and has to be this file's too.
+    ///
+    /// Reachable in the deep interior, not merely at a face: under a re-phasing
+    /// element the clipped lattice need not contain the anchor's own offset, so
+    /// a voxel can be covered by nobody with the whole volume around it. The
+    /// element below is built to do exactly that, and the test asserts both that
+    /// it happens — or it would be measuring nothing — and what is written when
+    /// it does.
+    #[test]
+    fn a_voxel_no_source_covers_keeps_its_own_value() {
+        // No centre: every offset moves. Nothing covers a voxel whose neighbours
+        // at those offsets are all out of the field.
+        let element = StructuringElement::from_offsets([[3, 0, 0], [4, 0, 0]]).unwrap();
+        let field = Array3::from_shape_fn((6, 1, 1), |(i, _, _)| (i * 10) as f64);
+        let mut out = Array3::zeros(field.raw_dim());
+        dilate_placed_grey_into(field.view(), &element, out.view_mut()).unwrap();
+
+        let line: Vec<f64> = (0..6).map(|i| out[[i, 0, 0]]).collect();
+        // Source `p` writes at `p + 3` and `p + 4`, so voxel 3 takes source 0's
+        // value, voxel 4 the larger of sources 0 and 1, voxel 5 the larger of 1
+        // and 2, and voxels 0, 1 and 2 are covered by nobody.
+        assert_eq!(line, vec![0.0, 10.0, 20.0, 0.0, 10.0, 20.0]);
+        assert_eq!(
+            line[..3],
+            [0.0, 10.0, 20.0],
+            "the uncovered voxels carry their own value"
+        );
+        assert_ne!(
+            line[3], 30.0,
+            "and a covered voxel takes its source's value, not its own — or the carry above \
+             would be indistinguishable from an identity"
+        );
     }
 
     /// **The adjunction**, over the one element that has no reflection at all.

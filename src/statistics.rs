@@ -285,10 +285,13 @@ pub enum Term {
     /// and is the term that makes the shipped `MAP_COST` family's absolute
     /// scale irrelevant.
     Compute,
-    /// `Compute`, for one op family in isolation. **Recorded and reported, not
-    /// used**: `CostModel` has one `compute_scale` and nowhere to put a
-    /// per-family correction. It is kept because it is the evidence for that
-    /// gap — see `Snapshot::families`.
+    /// `Compute`, for one op family in isolation. **Recorded, reported and —
+    /// since `CostModel::compute_of` existed to hold it — used**:
+    /// `Snapshot::calibrate` turns each believable one into a dimensionless
+    /// correction, its rate over the run-wide `Compute`, and the planner
+    /// multiplies the family's declared cost by it. It was kept for a long time
+    /// as the evidence for a gap it now fills; `Snapshot::families` is the raw
+    /// reading and `Snapshot::family_spread` the size of what it corrects.
     ComputeOf(String),
     /// Nanoseconds per **byte** read. Diagnostic, for the same reason:
     /// `CostModel` prices reads per voxel, and a run whose images have
@@ -1116,6 +1119,24 @@ impl Snapshot {
         Snapshot::new(machine, BTreeMap::new())
     }
 
+    /// This snapshot with one coefficient stated outright.
+    ///
+    /// **For a caller whose evidence did not come from a run of this crate** —
+    /// a test constructing the case it wants to reason about, or a deployment
+    /// carrying figures measured elsewhere. Everything else here is built by
+    /// `Store::record` from an `ExecutionLog`, which is the route that keeps a
+    /// coefficient tied to the work that produced it; this one is deliberately
+    /// the other kind, and `Coefficient::runs` is what a reader checks to tell
+    /// them apart, exactly as [`Self::believable`] does.
+    ///
+    /// The fingerprint is recomputed, so a snapshot built this way is as
+    /// comparable as any other.
+    pub fn with(self, term: Term, coefficient: Coefficient) -> Self {
+        let mut coefficients = self.coefficients;
+        coefficients.insert(term, coefficient);
+        Snapshot::new(self.machine, coefficients)
+    }
+
     pub fn machine(&self) -> &MachineKey {
         &self.machine
     }
@@ -1169,8 +1190,10 @@ impl Snapshot {
 
     /// The per-op-family compute coefficients, by family name.
     ///
-    /// **Recorded, not used.** See [`Term::ComputeOf`] and
-    /// [`Snapshot::family_spread`].
+    /// **Recorded, and — since `CostModel::compute_of` existed to hold them —
+    /// used.** [`Self::calibrate`] turns each believable one into a correction,
+    /// as a ratio to the run-wide `Term::Compute`; this is the raw reading, for
+    /// a report. See [`Term::ComputeOf`] and [`Snapshot::family_spread`].
     pub fn families(&self) -> BTreeMap<String, Coefficient> {
         self.coefficients
             .iter()
@@ -1184,14 +1207,21 @@ impl Snapshot {
     /// The ratio between the dearest and cheapest op family's coefficient, or
     /// `None` with fewer than two families.
     ///
-    /// **This is the number that says what `CostModel` cannot express.** Every
+    /// **This is the number that said what `CostModel` could not express**, and
+    /// the measurement that motivated giving it somewhere to put them:
+    /// `CostModel::compute_of` now holds one correction per family and
+    /// [`Self::calibrate`] fills it, so a spread above one is a plan the model
+    /// can now price differently rather than a defect it cannot see. The
+    /// paragraph below is why the number is worth reporting either way. Every
     /// family's coefficient is nanoseconds per unit of *declared* cost, so a
     /// spread of 1.0 would mean the shipped constants have every family's
     /// relative cost exactly right and one `compute_scale` serves all of them.
     /// A spread of 3 means the planner is charging one family three times what
-    /// it costs relative to another, and there is nowhere in the model to say
-    /// so — `compute_scale` is a scalar, and the best it can be is the
-    /// work-weighted blend that `Term::Compute` already is.
+    /// it costs relative to another — and until `CostModel::compute_of` existed
+    /// there was nowhere in the model to say so, `compute_scale` being a scalar
+    /// whose best value is the work-weighted blend that `Term::Compute` already
+    /// is. The spread is now what [`Self::calibrate`] turns into corrections,
+    /// so it is the size of the *correction* rather than the size of a defect.
     pub fn family_spread(&self) -> Option<f64> {
         let families = self.families();
         if families.len() < 2 {
@@ -1261,7 +1291,7 @@ impl Snapshot {
         }
         if weight <= 0.0 || !weighted.is_finite() {
             // No evidence at all, or none usable. Today's behaviour, exactly.
-            return *model;
+            return model.clone();
         }
         let anchor = weighted / weight;
         let resolve = |term: Term, seed: f64| {
@@ -1269,6 +1299,7 @@ impl Snapshot {
                 .map(|c| c.nanos_per_unit)
                 .unwrap_or(seed * anchor)
         };
+        let compute_scale = resolve(Term::Compute, model.compute_scale);
         CostModel {
             read_cost_per_voxel: resolve(Term::Read, model.read_cost_per_voxel),
             write_cost_per_voxel: resolve(Term::Write, model.write_cost_per_voxel),
@@ -1276,7 +1307,40 @@ impl Snapshot {
                 Term::Materialise,
                 model.materialise_cost_per_voxel,
             ),
-            compute_scale: resolve(Term::Compute, model.compute_scale),
+            compute_scale,
+            // **The per-family corrections, which is the half that was measured
+            // and never used.** `Term::ComputeOf` is keyed by slot name and has
+            // been recorded since it existed under a doc saying it is not
+            // consumed, because `CostModel` had one `compute_scale` and nowhere
+            // to put a per-family figure. It has one now.
+            //
+            // A *ratio*: the family's own nanoseconds per unit over the run-wide
+            // figure, so the table is dimensionless and its neutral value is
+            // `1.0`. A family exactly at the run-wide rate contributes nothing,
+            // which is what makes filling this in unable to move a plan it has
+            // no evidence about.
+            //
+            // `believable` only, on the same argument as every other term: a
+            // coefficient seen fewer than `REPRODUCTIONS` times is a fact about
+            // one run rather than about the machine. And a run-wide figure of
+            // zero would make every ratio infinite, so the table stays empty
+            // there rather than carrying one.
+            compute_of: if compute_scale > 0.0 && compute_scale.is_finite() {
+                self.coefficients
+                    .keys()
+                    .filter_map(|term| match term {
+                        Term::ComputeOf(family) => Some(family.clone()),
+                        _ => None,
+                    })
+                    .filter_map(|family| {
+                        let measured = self.believable(&Term::ComputeOf(family.clone()))?;
+                        let correction = measured.nanos_per_unit / compute_scale;
+                        correction.is_finite().then_some((family, correction))
+                    })
+                    .collect()
+            } else {
+                model.compute_of.clone()
+            },
             order_conflict_penalty: model.order_conflict_penalty * anchor,
         }
     }
@@ -1437,6 +1501,82 @@ mod tests {
         }
     }
 
+    /// A coefficient stated outright, at a run count that decides whether it is
+    /// believed.
+    fn coefficient(nanos_per_unit: f64, runs: usize) -> Coefficient {
+        Coefficient {
+            nanos_per_unit,
+            runs,
+            units: 1000.0,
+            total_nanos: nanos_per_unit * 1000.0,
+        }
+    }
+
+    /// **The per-family corrections are filled as ratios**, which is what makes
+    /// them dimensionless and their neutral value one.
+    ///
+    /// Three families against a run-wide figure: one dearer, one cheaper, one
+    /// exactly at it. The third is the one worth asserting — a family that
+    /// matches the blend must come out at `1.0` and change no plan, which is the
+    /// property that makes filling this table safe on a model nobody has
+    /// measured.
+    #[test]
+    fn calibration_fills_the_per_family_corrections_as_ratios() {
+        let snapshot = Snapshot::empty(machine())
+            .with(Term::Compute, coefficient(10.0, REPRODUCTIONS))
+            .with(
+                Term::ComputeOf("skeletonize".to_string()),
+                coefficient(200.0, REPRODUCTIONS),
+            )
+            .with(
+                Term::ComputeOf("combine".to_string()),
+                coefficient(2.5, REPRODUCTIONS),
+            )
+            .with(
+                Term::ComputeOf("average".to_string()),
+                coefficient(10.0, REPRODUCTIONS),
+            );
+        let model = snapshot.calibrate(&CostModel::default());
+
+        assert_eq!(model.compute_scale, 10.0);
+        assert_eq!(model.correction_for("skeletonize"), 20.0);
+        assert_eq!(model.correction_for("combine"), 0.25);
+        assert_eq!(
+            model.correction_for("average"),
+            1.0,
+            "a family at the run-wide rate is neutral"
+        );
+        assert_eq!(
+            model.correction_for("never measured"),
+            1.0,
+            "and so is one nobody has measured"
+        );
+    }
+
+    /// **An unreproduced family is not believed**, on exactly the argument
+    /// every other term is held to: a coefficient seen once is a fact about one
+    /// run rather than about the machine. `REPRODUCTIONS` is the line and this
+    /// is where the new table is put on the right side of it.
+    #[test]
+    fn a_family_measured_once_moves_no_plan() {
+        let snapshot = Snapshot::empty(machine())
+            .with(Term::Compute, coefficient(10.0, REPRODUCTIONS))
+            .with(
+                Term::ComputeOf("smooth".to_string()),
+                coefficient(500.0, REPRODUCTIONS - 1),
+            );
+        let model = snapshot.calibrate(&CostModel::default());
+        assert_eq!(
+            model.correction_for("smooth"),
+            1.0,
+            "a family reproduced fewer than {REPRODUCTIONS} times is evidence about one run"
+        );
+        assert!(
+            model.compute_of.is_empty(),
+            "and it is absent rather than present at one"
+        );
+    }
+
     fn elsewhere() -> MachineKey {
         MachineKey {
             host: "b".to_string(),
@@ -1479,6 +1619,11 @@ mod tests {
             compute_scale: 7.0,
             order_conflict_penalty: 0.5,
             materialise_cost_per_voxel: 2.0,
+            // A table a caller wrote by hand, which an empty snapshot must also
+            // leave alone — the corrections are evidence like every other term,
+            // and evidence nobody has is not a reason to discard evidence
+            // somebody stated.
+            compute_of: [("smooth".to_string(), 4.0)].into_iter().collect(),
         };
         assert_eq!(snapshot.calibrate(&custom), custom);
     }

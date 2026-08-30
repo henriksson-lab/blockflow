@@ -77,7 +77,11 @@
 use crate::decomposition::{images_read_by, Constraints, Decomposition, PhaseTraffic};
 use crate::error::{Error, Result};
 use crate::fragment::PhaseWork;
-use crate::simulate::{simulate, ExecutorOrder, Machine, Outcome, PerPhase, Rates, Scheduler};
+use crate::simulate::{
+    phase_rates_from_snapshot, simulate, ExecutorOrder, Machine, Outcome, PerPhase, Rates,
+    Scheduler,
+};
+use crate::statistics::Snapshot;
 use crate::strategy::{phase_price, Plan, Strategy, Workflow};
 
 /// One plan entered into the competition, and what it was planned under.
@@ -259,6 +263,20 @@ impl Judgement {
 pub struct Arena {
     pub machine: Machine,
     pub rates: Rates,
+    /// Measurements the **simulator** is told about, per phase.
+    ///
+    /// `None` charges every phase [`Rates::compute_ns_per_voxel`], which is one
+    /// number against a measured 57x spread and is the simulator's own stated
+    /// weakest point. With a snapshot, each entrant's phases are priced by
+    /// [`phase_rates_from_snapshot`] — `sum over slots of declared x measured`.
+    ///
+    /// **The point of having it here is that the other judge can be told the
+    /// same thing.** `CostModel::compute_of` carries the same evidence to the
+    /// planner, through `Snapshot::calibrate`; a field judged with a snapshot
+    /// here and priced under a model calibrated from it is the two judges given
+    /// one set of measurements, which is the only arrangement in which their
+    /// disagreement is about the *models* rather than about what each was told.
+    snapshot: Option<Snapshot>,
     entrants: Vec<Entrant>,
 }
 
@@ -267,8 +285,15 @@ impl Arena {
         Self {
             machine,
             rates,
+            snapshot: None,
             entrants: Vec::new(),
         }
+    }
+
+    /// Tell the simulator what a run measured; see [`Self::snapshot`].
+    pub fn with_snapshot(mut self, snapshot: Snapshot) -> Self {
+        self.snapshot = Some(snapshot);
+        self
     }
 
     /// Ask a strategy for a plan and enter it.
@@ -358,6 +383,18 @@ impl Arena {
             // Every phase a `Strategy` produces is a run of chain slots; see the
             // module header for why the arena holds no other kind.
             let work = vec![PhaseWork::Pixels; decomposition.n_phases()];
+            // Per-phase compute rates, where a run has measured them. Derived
+            // per entrant because a rate is per *phase* and two entrants are two
+            // partitions — the same measurement, folded onto different phases.
+            let phase_rates: Vec<f64> = match &self.snapshot {
+                Some(snapshot) => phase_rates_from_snapshot(
+                    snapshot,
+                    decomposition,
+                    &workflow.chain.slots(),
+                    self.rates.compute_ns_per_voxel,
+                ),
+                None => Vec::new(),
+            };
             let mut scheduler = make_scheduler();
             let outcome = simulate(
                 decomposition,
@@ -366,7 +403,10 @@ impl Arena {
                 &self.rates,
                 &entrant.plan.hints.release_images,
                 &entrant.plan.hints.keep_images,
-                PerPhase::default(),
+                PerPhase {
+                    ns_per_voxel: &phase_rates,
+                    ..PerPhase::default()
+                },
                 scheduler.as_mut(),
             )?;
             verdicts.push(Verdict {
@@ -406,10 +446,13 @@ impl Arena {
 ///   deliberately: a re-priced plan has to be priced the way the planner prices
 ///   one, or the comparison is between two objectives rather than between an
 ///   objective and a simulation;
-/// * **every phase at `workflow.dtype`**, which is what the search does and
-///   which `planner-gaps.md` names as a defect (a chain that binarizes halfway
-///   is priced as if the second half still moved eight bytes a voxel). Same
-///   argument: reproduce it, do not quietly fix it here;
+/// * **every phase at the element type it reads**, which is what the search
+///   does since G3 and what `Decomposition::predicted_cost` always did. It is
+///   read off the plan with `dtype_at` rather than folded again here: the plan
+///   is where the fold's answer was recorded, and a second fold would be a
+///   second opinion about it. Before G3 the search priced every phase at
+///   `workflow.dtype` and this reproduced that, defect and all, because the
+///   arena's job is to price what the planner prices;
 /// * **materialised except the last**, which is what a phase boundary *is*;
 /// * **`workers`** is the arena's, not the strategy's. A plan is chosen under
 ///   the concurrency its strategy was configured with and judged at the machine
@@ -424,7 +467,6 @@ pub fn price_plan(
 ) -> Result<f64> {
     let slots = workflow.chain.slots();
     let phases = decomposition.n_phases();
-    let bytes = workflow.dtype.size_of() as f64;
     let mut total = 0.0;
     for (index, phase) in decomposition.phases.iter().enumerate() {
         for &slot in &phase.slots {
@@ -468,7 +510,7 @@ pub fn price_plan(
             &phase.slots,
             &phase.grid,
             &phase.halo,
-            bytes,
+            decomposition.dtype_at(index).size_of() as f64,
             orders.len(),
             index + 1 < phases,
             traffic,

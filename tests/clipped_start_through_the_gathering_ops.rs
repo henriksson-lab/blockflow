@@ -29,7 +29,7 @@
 // | `ops::rank`, plain and masked | honours | here, and in its own tests |
 // | `ops::morphology`, all four | honours | here, and `the_extreme_ranks_agree_over_a_re_phasing_element_too` |
 // | `ops::reconstruct`'s step | honours | its own tests |
-// | `ops::background` | honours, by being two rank filters and a subtraction | its own tests |
+// | `ops::background` | honours, and **changes kernel** for it: the maximum becomes `morphology`'s scatter, because a re-phasing element has no reflection for a gather to be over | here, and its own tests |
 // | `ops::lattice`'s windowed statistic | honours, at each sample's position in the volume | at the end of this file |
 // | `ops::label`'s stamp | honours, at the point's position in the volume | at the end of this file, and its own tests |
 // | `ops::voxelize`'s deposit | honours, at the point's position in the volume | at the end of this file, and its own tests |
@@ -80,6 +80,7 @@ use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::ArrayEnvironment;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, Chain};
+use blockflow::ops::background::remove_background;
 use blockflow::ops::voxelize::{voxelize_into, Point};
 use blockflow::ops::{
     label_points_into, lattice_statistic_into, ElementShape, Morphology, MorphologyOp, Rank,
@@ -153,17 +154,29 @@ enum Case {
     Percentile,
     Erode,
     Open,
+    /// The grey opening, as a top-hat: a min-filter that gathers, a max that
+    /// **scatters**, and a subtraction. The one case here whose second pass
+    /// reads the element at the *source* rather than at the destination, so it
+    /// is the one that would break if `GreyDilateOp` declared a gather's reach —
+    /// `(lo, hi)` where a scatter reads `(hi, lo)`.
+    TopHat,
 }
 
 impl Case {
-    const ALL: [Case; 4] = [Case::Median, Case::Percentile, Case::Erode, Case::Open];
+    const ALL: [Case; 5] = [
+        Case::Median,
+        Case::Percentile,
+        Case::Erode,
+        Case::Open,
+        Case::TopHat,
+    ];
 
     /// `Bool` for the morphology, which is what that op is for; `f64` for the
     /// filter, where a differing bit is a differing value rather than a flipped
     /// flag.
     fn dtype(self) -> Dtype {
         match self {
-            Case::Median | Case::Percentile => Dtype::F64,
+            Case::Median | Case::Percentile | Case::TopHat => Dtype::F64,
             Case::Erode | Case::Open => Dtype::Bool,
         }
     }
@@ -179,6 +192,7 @@ impl Case {
             )),
             Case::Erode => Chain::op(MorphologyOp::new("erode", Morphology::Erode, element)),
             Case::Open => Chain::op(MorphologyOp::new("open", Morphology::Open, element)),
+            Case::TopHat => remove_background(&element).expect("a top-hat"),
         }
     }
 }
@@ -294,7 +308,7 @@ fn every_decomposition_gives_the_whole_volume_answer() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 4 * 8);
+    assert_eq!(checked, 5 * 8);
 }
 
 /// The sweep above is not an invariance test of the anchored element wearing

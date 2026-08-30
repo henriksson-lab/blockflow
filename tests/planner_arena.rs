@@ -531,6 +531,270 @@ fn the_phases_overlap_only_under_the_policy_that_fuses() {
     );
 }
 
+// ----------------------------- claim 5: the price is the planner's, still --
+
+/// **The arena's price and the plan evaluator's agree, on a chain that
+/// binarizes half way through** — which is the chain they used to disagree
+/// about.
+///
+/// Two statements of one quantity, from two directions. `arena::price_plan`
+/// walks a plan's phases and calls `strategy::phase_price`, the function the
+/// partition search itself minimises with; `strategy::predicted_makespan` walks
+/// the same phases through `Decomposition`'s own accounting, with
+/// `phase_traffic` and `phase_compute_per_voxel`. Neither is a summary of the
+/// other and both are `sum over phases of phase_makespan`, so they have to come
+/// out equal.
+///
+/// **They did not, and the chain below is why.** The search handed
+/// `workflow.dtype` to every phase while `predicted_cost` read the plan's own
+/// `dtype_at`, so any chain that changed element type mid-way was priced two
+/// ways by two parts of one planner — `docs/design/planner-gaps.md`'s G3, and a
+/// defect `Materialising` had already fixed for itself while naming it. The
+/// first op here turns `f64` into `bool`, so the second phase reads one byte a
+/// voxel where the workflow's own type is eight: an **8x** disagreement on
+/// every term built from the byte count.
+///
+/// The plain chain beside it is the control. The two prices agreed on it before
+/// the fold as well, so a test that used only that chain would have passed
+/// throughout and said nothing.
+#[test]
+fn the_arena_prices_a_binarising_chain_as_the_plan_evaluator_does() {
+    use blockflow::fragment::PhaseWork;
+    use blockflow::probes::NonZeroOp;
+    use blockflow::strategy::predicted_makespan;
+
+    let constraints = constraints(vec![16, 32, 64]);
+    let cases: Vec<(&str, Chain)> = vec![
+        (
+            "binarizing",
+            Chain::sequence(vec![
+                Chain::op(NonZeroOp::new("binarize", [1, 1, 1])),
+                Chain::op(IdentityOp::new("after", [2, 2, 2]).with_cost(4.0)),
+                Chain::op(IdentityOp::new("last", [1, 1, 1]).with_cost(8.0)),
+            ]),
+        ),
+        ("plain", chain()),
+    ];
+    for (name, chain) in cases {
+        let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
+        let plan = Enumerating {
+            concurrency: 4,
+            ..Enumerating::default()
+        }
+        .plan(&workflow, &constraints)
+        .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let phases = plan.decomposition.n_phases();
+        let dtypes: Vec<blockflow::Dtype> = (0..phases)
+            .map(|index| plan.decomposition.dtype_at(index))
+            .collect();
+
+        let arena = price_plan(&workflow, &plan.decomposition, &constraints, 4)
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let evaluator = predicted_makespan(
+            &workflow.chain,
+            &plan.decomposition,
+            &vec![PhaseWork::Pixels; phases],
+            &constraints.model,
+            4,
+        )
+        .unwrap_or_else(|err| panic!("{name}: {err}"));
+
+        println!("{name}: {phases} phases reading {dtypes:?}, priced {arena:.1} / {evaluator:.1}");
+        if name == "binarizing" {
+            assert!(
+                dtypes.contains(&Dtype::Bool),
+                "the fixture must actually change element type, or it is the control twice"
+            );
+        }
+        assert_eq!(
+            arena, evaluator,
+            "{name}: the search's objective and the plan evaluator's price the same plan \
+             differently"
+        );
+    }
+}
+
+/// **A chain that hands an op an element type it does not accept is refused
+/// when the plan is made**, which is a consequence of the same fold.
+///
+/// The search folds `Chain::produces` along the slots to learn what each run
+/// reads, and that fold is the check: `produces` refuses an op handed a type it
+/// does not accept. So a chain that binarizes and then applies an `f64`-only op
+/// no longer reaches `check_dtypes` at execute time — it is refused by the
+/// planner, naming both the op and the type.
+///
+/// Worth its own test because it is a **new refusal**: before the fold the
+/// search never asked, and the same chain planned happily and failed later.
+#[test]
+fn the_search_refuses_a_chain_that_narrows_into_an_op_that_cannot_take_it() {
+    use blockflow::probes::NonZeroOp;
+
+    let workflow = Workflow::new(
+        Chain::sequence(vec![
+            Chain::op(NonZeroOp::new("binarize", [1, 1, 1])),
+            // `f64` only, by its own `accepts`.
+            Chain::op(AffineOp::new("scale", 1.5, 0.5, [1, 1, 1])),
+        ]),
+        VOLUME,
+        Dtype::F64,
+    );
+    let err = Enumerating::default()
+        .plan(&workflow, &constraints(vec![32]))
+        .expect_err("an op handed a type it does not accept must be refused")
+        .to_string();
+    assert!(
+        err.contains("scale") && err.contains("bool"),
+        "the refusal must name the op and the type: {err}"
+    );
+}
+
+// ------------------------ claim 6: a planner change, adjudicated by the sim --
+
+/// **G3, adjudicated: the per-family compute corrections change the plan, and
+/// the simulator prefers the plan they choose.**
+///
+/// This is what the arena was built for. `docs/design/planner-gaps.md` opens on
+/// the finding that no `Strategy`-produced plan had ever reached `simulate`, so
+/// every planner change in this crate's history was accepted or rejected by
+/// argument and by the cost model's own opinion of itself. This one is not.
+///
+/// **The setup.** Two ops with *equal declared cost* and different reaches —
+/// a wide-reach one and a narrow-reach one — and a snapshot saying their true
+/// rates are 64x apart. Both judges are told the same measurements: the planner
+/// through `CostModel::compute_of`, filled by `Snapshot::calibrate`; the
+/// simulator through `PerPhase::ns_per_voxel`, filled by
+/// `simulate::phase_rates_from_snapshot`. The uncorrected model sees two ops it
+/// believes cost the same, so it fuses them and gives both one grid; the
+/// corrected model can see that the dear op wants a fine grid and the cheap one
+/// a coarse grid, and cuts between them.
+///
+/// ```text
+///     workers   plain plan                     corrected plan                  simulated
+///        1      1 phase,  block 64             1 phase,  block 64              1.00x
+///        4      1 phase,  block 32             2 phases, blocks 64 and 32      1.28x
+///       40      1 phase,  block 32             2 phases, blocks 64 and 16      2.86x
+/// ```
+///
+/// **2.86x at forty workers**, and nothing at one — the negative control, where
+/// `Enumerating`'s objective collapses to serial work and the per-phase freedom
+/// it is given is freedom on paper. That is the same boundary every other
+/// measurement in this file falls on, and it is the reason the shipped default
+/// of `concurrency = 1` hid all of this.
+///
+/// **What it is not.** Evidence that the corrections are *right* — the snapshot
+/// here is constructed, not measured, and the simulator is told the same
+/// numbers the planner is, so this cannot check whether either matches a
+/// machine. What it checks is that the planner can now *act* on evidence it has
+/// been recording for years and could not use, and that acting on it is not
+/// harmful in the model of the run that is independent of the cost model.
+#[test]
+fn the_per_family_corrections_change_the_plan_and_the_simulator_prefers_it() {
+    use blockflow::decomposition::CostModel;
+    use blockflow::statistics::{Coefficient, Snapshot, Term};
+
+    /// A coefficient stated outright, reproduced often enough to be believed.
+    fn coefficient(nanos_per_unit: f64) -> Coefficient {
+        Coefficient {
+            nanos_per_unit,
+            runs: 8,
+            units: 1000.0,
+            total_nanos: nanos_per_unit * 1000.0,
+        }
+    }
+
+    // Equal declared costs, so the uncorrected model cannot tell them apart;
+    // different reaches, so which grid suits which op is a real question.
+    let workflow = Workflow::new(
+        Chain::sequence(vec![
+            Chain::op(IdentityOp::new("cheap", [4, 4, 4]).with_cost(1.0)),
+            Chain::op(IdentityOp::new("dear", [1, 1, 1]).with_cost(1.0)),
+        ]),
+        VOLUME,
+        Dtype::F64,
+    );
+    let snapshot = Snapshot::default()
+        .with(Term::Compute, coefficient(10.0))
+        .with(Term::ComputeOf("cheap".to_string()), coefficient(1.0))
+        .with(Term::ComputeOf("dear".to_string()), coefficient(640.0));
+    let plain = CostModel::default();
+    let corrected = snapshot.calibrate(&plain);
+    assert_eq!(corrected.correction_for("cheap"), 0.1);
+    assert_eq!(corrected.correction_for("dear"), 64.0);
+
+    let ladder = vec![8usize, 16, 32, 64];
+    let mut differed = 0usize;
+    println!(
+        "{:>8} {:<34} {:<34} {:>10}",
+        "workers", "plain plan", "corrected plan", "simulated"
+    );
+    for workers in [1usize, 4, 40] {
+        let mut arena = Arena::new(machine(workers), rates()).with_snapshot(snapshot.clone());
+        let mut shapes = Vec::new();
+        for (name, model) in [("plain", plain.clone()), ("corrected", corrected.clone())] {
+            let pinned = Constraints {
+                block_candidates: ladder.clone(),
+                split_axes: vec![0, 1, 2],
+                model,
+                ..Default::default()
+            };
+            let plan = Enumerating {
+                concurrency: workers,
+                ..Enumerating::default()
+            }
+            .plan(&workflow, &pinned)
+            .unwrap_or_else(|err| panic!("{workers} workers, {name}: {err}"));
+            shapes.push(format!(
+                "{} phase(s), blocks {:?}",
+                plan.decomposition.n_phases(),
+                plan.decomposition
+                    .phases
+                    .iter()
+                    .map(|phase| phase.grid.block()[0])
+                    .collect::<Vec<_>>()
+            ));
+            arena
+                .enter_plan(name.to_string(), plan, pinned)
+                .expect("a plan the arena can hold");
+        }
+        let judgement = arena.judge(&workflow).expect("both plans simulate");
+        let plain_ns = judgement.verdicts[0].simulated_ns();
+        let corrected_ns = judgement.verdicts[1].simulated_ns();
+        let speedup = plain_ns / corrected_ns;
+        println!(
+            "{workers:>8} {:<34} {:<34} {speedup:>9.2}x",
+            shapes[0], shapes[1]
+        );
+
+        if workers == 1 {
+            assert_eq!(
+                shapes[0], shapes[1],
+                "at the negative control the objective is monotone in the edge and the \
+                 corrections cannot move it; if they now do, this test is where the new \
+                 behaviour gets written down"
+            );
+            assert_eq!(plain_ns, corrected_ns, "the same plan is the same run");
+            continue;
+        }
+
+        assert_ne!(
+            shapes[0], shapes[1],
+            "{workers} workers: the corrections changed no plan, so nothing here is being \
+             adjudicated"
+        );
+        differed += 1;
+        assert!(
+            speedup > 1.0,
+            "{workers} workers: the plan the corrections chose is {speedup:.3}x the plain \
+             one — the simulator says acting on the measurements made the run slower, which \
+             is a finding and not a passing test"
+        );
+    }
+    assert_eq!(
+        differed, 2,
+        "both worker counts above the control must move"
+    );
+}
+
 // ------------------------------------------------- claim 4: deterministic --
 
 /// The same field judged twice is the same table.

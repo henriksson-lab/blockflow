@@ -42,7 +42,7 @@
 // `block_processing.rs` is that the function is now `pub(crate)`.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
 use crate::assemble::{describe_image, is_supplied_image, ImageId};
@@ -1607,7 +1607,7 @@ pub(crate) fn region_to_ranges(region: &Region) -> Vec<(usize, usize)> {
 ///
 /// None of this can produce a wrong voxel. The partition decides where
 /// intermediates land, not what is computed.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CostModel {
     /// Per voxel of the **read extent** — core plus halo — over every image the
     /// phase reads.
@@ -1645,6 +1645,51 @@ pub struct CostModel {
     pub read_cost_per_voxel: f64,
     pub write_cost_per_voxel: f64,
     pub compute_scale: f64,
+    /// **Per-op-family corrections to the declared compute cost**, keyed by the
+    /// slot's display name. Absent means `1.0`, and an empty table is
+    /// [`Self::compute_scale`] alone — which is what this crate shipped with,
+    /// bit for bit.
+    ///
+    /// # Why one scalar was not enough
+    ///
+    /// `compute_scale` is one number against a measured **57x** per-phase
+    /// spread: the tile run put `combine` at 3.541, `smooth` at 98.329 and
+    /// `skeletonize` at 201.397 nanoseconds per voxel. The declared
+    /// `cost_per_voxel` each op carries is meant to capture that ratio, and it
+    /// is a *seed* — nothing had ever compared it against a measurement, and
+    /// `statistics::Term::ComputeOf` has recorded the per-family evidence all
+    /// along under a doc that says outright it is "recorded and reported, **not
+    /// used**", because there was nowhere in this struct to put it.
+    ///
+    /// This is that somewhere. `docs/design/planner-gaps.md` carries it as
+    /// **G3** and the reason it matters is the shape of the objective:
+    /// `strategy::phase_makespan` is a **roofline**, a max of a pool term and a
+    /// channel term, so an error on one phase's compute does not scale the
+    /// answer — it flips which side of the max binds, and with it which
+    /// candidate wins. `assemble.rs` measured exactly that, sweeping declared
+    /// compute over `1e-3..1e3` and watching the argmin walk from the coarsest
+    /// candidate to the finest at every `workers > 1`.
+    ///
+    /// # Relative, not absolute, and that is deliberate
+    ///
+    /// A value here multiplies the slot's **declared** cost, alongside
+    /// `compute_scale` rather than instead of it: the charge for a run is
+    /// `sum over slots of declared x correction`, all of it times
+    /// `compute_scale`. So `compute_scale` stays the single carrier of the
+    /// unit — which is what `Term::Compute` means — and this table holds
+    /// dimensionless corrections whose neutral value is `1.0`. A family whose
+    /// measured rate matches the run-wide one contributes nothing, an absent
+    /// family costs nothing to look up, and a model built by hand is unchanged.
+    ///
+    /// [`crate::statistics::Snapshot::calibrate`] fills it as
+    /// `ComputeOf(family) / Compute`, from believable coefficients only — so a
+    /// family measured once does not move a plan, on the same argument
+    /// `REPRODUCTIONS` makes for every other term.
+    ///
+    /// A `BTreeMap` because a `Decomposition` must be deterministic and
+    /// hashable: a hash over a `HashMap`'s iteration order is not a function of
+    /// its contents.
+    pub compute_of: BTreeMap<String, f64>,
     /// Charged per extra distinct `preferred_iteration` inside one phase.
     pub order_conflict_penalty: f64,
     /// Cost of writing a voxel at a **phase boundary**, where the result is an
@@ -1658,12 +1703,27 @@ pub struct CostModel {
     pub materialise_cost_per_voxel: f64,
 }
 
+impl CostModel {
+    /// The correction for one op family: the table's entry, or `1.0`.
+    ///
+    /// **A method rather than a `get(..).unwrap_or(1.0)` at each call site**,
+    /// so that "absent means neutral" is one statement. It is the property that
+    /// makes the table safe to add to a shipped model: a family nobody has
+    /// measured must cost exactly what it costed before the table existed.
+    pub fn correction_for(&self, family: &str) -> f64 {
+        self.compute_of.get(family).copied().unwrap_or(1.0)
+    }
+}
+
 impl Default for CostModel {
     fn default() -> Self {
         Self {
             read_cost_per_voxel: 1.0,
             write_cost_per_voxel: 1.0,
             compute_scale: 1.0,
+            // Empty, so the default model is the one this crate shipped with
+            // and every recorded figure taken under it still stands.
+            compute_of: BTreeMap::new(),
             order_conflict_penalty: 0.0,
             materialise_cost_per_voxel: 1.0,
         }
@@ -2990,7 +3050,7 @@ pub fn predicted_cost(
         let (_, _, _, orders) = summarise_slots(&slots, &phase.slots, volume)?;
         // At the grid the plan actually holds, which is the same figure the
         // search priced this candidate with. See `compute_per_voxel`.
-        let compute = phase_compute_per_voxel(&slots, phase, work.get(index))?;
+        let compute = phase_compute_per_voxel(&slots, phase, work.get(index), model)?;
         let traffic = phase_traffic(index, phase, work.get(index))?;
         // The last phase writes the workflow's output; every other writes an
         // intermediate. Exactly the test the enumeration makes.
@@ -3086,11 +3146,21 @@ pub(crate) fn phase_compute_per_voxel(
     slots: &[&Chain],
     phase: &PhaseDecomposition,
     work: Option<&crate::fragment::PhaseWork<'_>>,
+    model: &CostModel,
 ) -> Result<f64> {
     match work {
-        Some(crate::fragment::PhaseWork::Fragments(op)) => Ok(op.cost_per_voxel()),
-        Some(crate::fragment::PhaseWork::Iterate(op)) => Ok(op.cost_per_voxel()),
-        Some(crate::fragment::PhaseWork::IterateReduce(op)) => Ok(op.cost_per_voxel()),
+        // A fragment or iterative op is one op and its own family, so the
+        // correction is looked up by its own name rather than folded over slots
+        // it does not have.
+        Some(crate::fragment::PhaseWork::Fragments(op)) => {
+            Ok(op.cost_per_voxel() * model.correction_for(op.name()))
+        }
+        Some(crate::fragment::PhaseWork::Iterate(op)) => {
+            Ok(op.cost_per_voxel() * model.correction_for(op.name()))
+        }
+        Some(crate::fragment::PhaseWork::IterateReduce(op)) => {
+            Ok(op.cost_per_voxel() * model.correction_for(op.name()))
+        }
         Some(crate::fragment::PhaseWork::Pixels) | None => {
             if phase.slots.is_empty() {
                 return Err(Error::InvalidArgument(format!(
@@ -3098,7 +3168,12 @@ pub(crate) fn phase_compute_per_voxel(
                     phase.names
                 )));
             }
-            Ok(compute_per_voxel(slots, &phase.slots, phase.grid.block()))
+            Ok(compute_charge_per_voxel(
+                slots,
+                &phase.slots,
+                phase.grid.block(),
+                model,
+            ))
         }
     }
 }
@@ -3166,6 +3241,35 @@ pub fn compute_per_voxel(slots: &[&Chain], group: &[usize], block: [usize; 3]) -
     group
         .iter()
         .map(|&slot| slots[slot].cost_per_voxel_in(block))
+        .sum()
+}
+
+/// [`compute_per_voxel`] with the model's **per-family corrections** applied:
+/// `sum over slots of declared x correction`.
+///
+/// The figure [`price_phase`] wants, and the one that reduces to
+/// [`compute_per_voxel`] exactly when [`CostModel::compute_of`] is empty —
+/// which is the shipped model, so every plan and every recorded figure taken
+/// under it is unchanged.
+///
+/// **Keyed by the slot's display name**, which is the same key
+/// `statistics::Term::ComputeOf` records against and the same one
+/// `simulate::phase_rates_from_snapshot` looks a phase's rate up by. Three
+/// places, one key, and no translation between them: a family that is spelled
+/// differently in any of the three is a family that silently falls back, so
+/// they share the string rather than a convention about it.
+pub fn compute_charge_per_voxel(
+    slots: &[&Chain],
+    group: &[usize],
+    block: [usize; 3],
+    model: &CostModel,
+) -> f64 {
+    group
+        .iter()
+        .map(|&slot| {
+            let chain = slots[slot];
+            chain.cost_per_voxel_in(block) * model.correction_for(&chain.display_name())
+        })
         .sum()
 }
 

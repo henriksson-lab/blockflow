@@ -23,7 +23,7 @@
 //
 // | piece | what it is | where it comes from |
 // |---|---|---|
-// | the estimate | a grey opening: the minimum over the element, then the maximum | [`RankFilterOp`] twice, at [`Rank::lowest`] and [`Rank::highest`] — **no new kernel** |
+// | the estimate | a grey opening: the minimum over the element, then the maximum over its reflection | [`RankFilterOp`] twice, at [`Rank::lowest`] and [`Rank::highest`] — **no new kernel**, except for the one element that has no reflection; see below |
 // | the original | an identity | [`VoxelwiseMapOp`] over [`Identity`](super::voxelwise::Identity) — **no new kernel** |
 // | the shape | one input, two arms, one sink: a **diamond** | [`Chain::Parallel`] |
 // | the sink | a voxelwise subtraction | [`combine_into`] existed; a [`Combine`] over it did not. **This is the new code, and it is one `-`.** |
@@ -96,26 +96,40 @@
 // gave an "estimate" that stood *above* the image at 136 voxels and moved under
 // a second application at 440, which is not a background and not an opening.
 //
-// What this file does about the element's step origin: it refuses one
-// -------------------------------------------------------------------
+// What this file does about the element's step origin: it changes kernel
+// ----------------------------------------------------------------------
 // An element whose step counts from `StepOrigin::ClippedStart` reads a different
 // set of offsets where the window is clipped at a low face of the volume. Both
-// arms **are** [`RankFilterOp`], which asks the element what it reads at each
+// arms would be [`RankFilterOp`], which asks the element what it reads at each
 // voxel's position in the volume, so the origin is honoured within each filter
 // and nothing here has to carry the rule. What such an element does not have is
 // a **reflection**: a position-dependent window has none that is itself a
 // window, and the dilation adjoint to a min-filter by it must place the element
-// at the source voxel, which no gather can do. So the composition cannot be an
-// opening, and it was not one — 52 anti-extensivity violations on that same ramp
-// for a `9x5x1` box stepped by two, an element whose two sides are *equal*, so
-// it is the re-phasing and not the asymmetry doing it.
+// at the source voxel, which no gather can do. So two gathers cannot compose to
+// an opening, and they did not — 52 anti-extensivity violations on that same
+// ramp for a `9x5x1` box stepped by two, an element whose two sides are
+// *equal*, so it is the re-phasing and not the asymmetry doing it.
 //
-// `background_estimate` therefore refuses that element rather than composing
-// two filters into something that is not an opening.
-// `the_estimate_refuses_an_element_that_has_no_reflection` pins the refusal, and
-// making it work is a grey placed dilation — a kernel this module deliberately
-// does not have, and the one thing that would change the "no new kernel" row of
-// the table above.
+// So `background_estimate` **branches**: the maximum is a `RankFilterOp` over
+// `B̌` where the element reflects, and `morphology::GreyDilateOp` — the scatter
+// — where it does not.
+//
+// **The branch is on cost, and it is legitimate only because the two arms are
+// one filter.** At an extreme rank over a box the rank filter is *separable*:
+// three van Herk passes, about a dozen operations a voxel however large the
+// element, where the scatter is one operation per member. A background element
+// is large by definition — large enough that no object of interest survives it
+// — so that difference is the whole running time of the estimate, and taking
+// the scatter everywhere for tidiness would be paying it on every call to avoid
+// a two-line match. That the two agree wherever both are defined is pinned in
+// `morphology`, by
+// `the_grey_scatter_is_the_gathered_maximum_over_the_reflected_element`, over
+// elements with no centre voxel where a gather over `B` and a gather over `B̌`
+// are two different volumes.
+//
+// `the_estimate_of_a_re_phasing_element_is_an_opening_through_the_scatter` is
+// the acceptance, and it measures the two-gather composition beside it so that
+// the fixture is one where the question arises.
 //
 // The reach
 // ---------
@@ -218,7 +232,7 @@ use crate::reach::Reach;
 use crate::voxels::Voxels;
 
 use super::element::{Rank, StructuringElement};
-use super::morphology::Morphology;
+use super::morphology::{GreyDilateOp, Morphology};
 use super::rank::RankFilterOp;
 use super::voxelwise::{combine_into, VoxelwiseMapOp};
 
@@ -457,27 +471,43 @@ const DIFFERENCE: &str = "background.difference";
 /// rather than an error: the element is a parameter, and an element of one voxel
 /// opens nothing.
 ///
-/// **Fallible for one element and one only**: a step counted from
+/// **One element takes the other kernel.** A step counted from
 /// `StepOrigin::ClippedStart` re-phases near a low face, so the element is a set
 /// per position and has no reflection that is itself an element —
 /// [`StructuringElement::reflected`] says why, and the dilation that *is* the
 /// adjoint there has to place the element at the source voxel, which a rank
-/// filter does not do. Such an element used to be accepted here and produce a
-/// composition that was not an opening: on the same ramp, 52 anti-extensivity
-/// violations for a `9x5x1` box stepped by two, whose two sides are equal.
-/// Refusing is the honest form of "this file is two rank filters"; making it
-/// work means a grey placed dilation, which is a kernel this module does not
-/// have.
-pub fn background_estimate(element: &StructuringElement) -> Result<Chain> {
-    let reflected = element.reflected()?;
-    Ok(Chain::sequence(vec![
-        Chain::op(RankFilterOp::new(LOWEST, element.clone(), Rank::lowest())),
-        Chain::op(RankFilterOp::new(
+/// filter does not do. The maximum is then
+/// [`GreyDilateOp`](super::morphology::GreyDilateOp), the scatter. Such an
+/// element once produced a composition that was not an opening at all: on the
+/// same ramp, 52 anti-extensivity violations for a `9x5x1` box stepped by two,
+/// whose two sides are equal.
+///
+/// **Infallible again.** It was briefly `Result<Chain>`, for the window between
+/// the reflection being needed and the scatter existing to supply it; there is
+/// now an arm for every element, so there is nothing to report.
+pub fn background_estimate(element: &StructuringElement) -> Chain {
+    let highest = match element.reflected() {
+        // The element has a reflection, so the dilation is a **gather** over it
+        // and the kernel is the one this module already has. Worth the branch on
+        // its own: at an extreme rank over a box, `RankFilterOp` is separable
+        // and costs about a dozen operations a voxel whatever the element's
+        // size, where the scatter below costs one per member. A background
+        // element is large by definition — large enough that no object survives
+        // it — so that difference is the whole running time of the estimate.
+        Ok(reflected) => Chain::op(RankFilterOp::new(
             HIGHEST,
             reflected.clone(),
             Rank::highest(&reflected),
         )),
-    ]))
+        // It has none, so no offset list a gather can be handed computes the
+        // erosion's adjoint, and only the scatter does. See
+        // `morphology::dilate_placed_grey_into`.
+        Err(_) => Chain::op(GreyDilateOp::new(HIGHEST, element.clone())),
+    };
+    Chain::sequence(vec![
+        Chain::op(RankFilterOp::new(LOWEST, element.clone(), Rank::lowest())),
+        highest,
+    ])
 }
 
 /// The removal: **the original minus [`background_estimate`]**, as a diamond.
@@ -494,7 +524,7 @@ pub fn remove_background(element: &StructuringElement) -> Result<Chain> {
     Chain::parallel(
         vec![
             Chain::op(VoxelwiseMapOp::identity(ORIGINAL)),
-            background_estimate(element)?,
+            background_estimate(element),
         ],
         Box::new(DifferenceCombine::new(DIFFERENCE)),
     )
@@ -629,7 +659,7 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
             StructuringElement::from_radius(super::element::ElementShape::Ellipsoid, [radius; 3]);
         let passes = Morphology::Open.passes() as f64;
         for (label, chain) in [
-            ("estimate", background_estimate(&element).unwrap()),
+            ("estimate", background_estimate(&element)),
             ("remove", remove_background(&element).unwrap()),
         ] {
             let mut out = Voxels::zeros(Dtype::F64, shape).unwrap();
@@ -753,23 +783,31 @@ mod tests {
         }
     }
 
-    /// **An element that has no reflection is refused**, rather than composed
-    /// into something that is not an opening.
+    /// **An element with no reflection makes an opening too, through the
+    /// scatter** — the case this module refused between two commits, and the
+    /// reason `morphology::dilate_placed_grey_into` exists.
     ///
-    /// A step counted from `StepOrigin::ClippedStart` re-phases where the window
-    /// is clipped at a low face of the volume, so what the element reads is a set
-    /// per position. Each `RankFilterOp` honours that within itself — it asks
-    /// `offsets_at` at each voxel — and the composition still cannot be an
+    /// A step counted from `StepOrigin::ClippedStart` re-phases where the
+    /// window is clipped at a low face, so what the element reads is a set per
+    /// position and it has no reflection that is itself an element. Each
+    /// `RankFilterOp` honours the re-phasing *within itself* — it asks
+    /// `offsets_at` at every voxel — and two of them still do not compose to an
     /// opening, because the dilation adjoint to a min-filter by such an element
     /// places the element at the **source** voxel and no gather does that.
     ///
-    /// This is measured rather than argued: the second half of the test composes
-    /// the two filters by hand, over the same element the module used to build
-    /// the estimate from, and counts the voxels where the result stands above the
-    /// image it was meant to sit under. The element's two sides are equal, so
-    /// what the count is measuring is the re-phasing and not an asymmetry.
+    /// Three things are asserted, and the middle one is the one that failed
+    /// before:
+    ///
+    /// * the estimate **builds**, where it used to be refused by name;
+    /// * it is **anti-extensive and idempotent** — an opening — over an element
+    ///   whose two sides are equal, so what is being tested is the re-phasing
+    ///   and not an asymmetry;
+    /// * and the composition this module *would* have built out of two gathers,
+    ///   computed here from the same offsets, is measured to break both laws on
+    ///   the same fixture. Without that last part the first two would pass on a
+    ///   fixture where the question does not arise.
     #[test]
-    fn the_estimate_refuses_an_element_that_has_no_reflection() {
+    fn the_estimate_of_a_re_phasing_element_is_an_opening_through_the_scatter() {
         use super::super::element::StepOrigin;
 
         let size = [9, 5, 1];
@@ -782,41 +820,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(clipped.sides(0), (4, 4), "the element itself is symmetric");
-
-        let err = match background_estimate(&clipped) {
-            Ok(_) => panic!("an element with no reflection must be refused"),
-            Err(err) => err.to_string(),
-        };
         assert!(
-            err.contains("ClippedStart") && err.contains("source"),
-            "the refusal must say which element and what would be needed: {err}"
-        );
-        assert!(
-            remove_background(&clipped).is_err(),
-            "and through the diamond"
+            clipped.reflected().is_err(),
+            "and it has no reflection, which is what makes this the case it is"
         );
 
-        // The same element under the other origin is accepted, so the refusal is
-        // about the rule and not about the size, the step or the shape.
-        let anchored = StructuringElement::from_size_stepped_at(
-            ElementShape::Box,
-            size,
-            step,
-            StepOrigin::Anchor,
-        )
-        .unwrap();
         let input = speckle();
-        let estimate = applied(&background_estimate(&anchored).unwrap(), &input);
-        for (want, got) in input.iter().zip(estimate.iter()) {
-            assert!(
-                got <= want,
-                "the anchored estimate is an opening: {got} > {want}"
-            );
-        }
+        let estimate = background_estimate(&clipped);
+        let once = applied(&estimate, &input);
+        let twice = applied(&estimate, &once);
+        let above = input
+            .iter()
+            .zip(once.iter())
+            .filter(|(image, estimate)| estimate > image)
+            .count();
+        assert_eq!(
+            above, 0,
+            "the estimate stands above the image at {above} voxels, so it is not an opening"
+        );
+        assert_eq!(once, twice, "and it is not idempotent");
+        assert!(
+            remove_background(&clipped).is_ok(),
+            "and the diamond builds on it"
+        );
 
-        // and what the refusal is refusing: the two gathers this module would
-        // have composed, over the re-phasing element, put through the law they
-        // would have to obey.
+        // What it would have been out of two gathers, from the same offsets at
+        // the same positions.
         let at = Anchor::whole(SHAPE);
         let mut scratch = Vec::new();
         let mut sweep = |source: &Array3<f64>, take_max: bool| {
@@ -855,19 +884,19 @@ mod tests {
             out
         };
         let low = sweep(&input, false);
-        let would_have_been = sweep(&low, true);
-        let above = input
+        let two_gathers = sweep(&low, true);
+        let broken = input
             .iter()
-            .zip(would_have_been.iter())
+            .zip(two_gathers.iter())
             .filter(|(image, estimate)| estimate > image)
             .count();
         assert!(
-            above > 0,
-            "the composition this refuses is anti-extensive here, so the refusal is refusing \
-             a case that worked"
+            broken > 0,
+            "two gathers are anti-extensive on this fixture too, so it cannot tell the \
+             composition that is an opening from the one that is not"
         );
         println!(
-            "the refused composition stands above the image at {above} of {} voxels",
+            "two gathers stand above the image at {broken} of {} voxels; the scatter at 0",
             input.len()
         );
     }
@@ -894,7 +923,7 @@ mod tests {
                     );
                 }
 
-                let estimate = applied(&background_estimate(&element).unwrap(), &input);
+                let estimate = applied(&background_estimate(&element), &input);
                 let difference = applied(&remove_background(&element).unwrap(), &input);
                 for (position, value) in difference.indexed_iter() {
                     assert!(
@@ -930,8 +959,8 @@ mod tests {
             StructuringElement::from_sides(ElementShape::Box, [3, 0, 1], [1, 2, 1]),
         ] {
             off_centre += !element.is_symmetric() as usize;
-            let once = applied(&background_estimate(&element).unwrap(), &input);
-            let twice = applied(&background_estimate(&element).unwrap(), &once);
+            let once = applied(&background_estimate(&element), &input);
+            let twice = applied(&background_estimate(&element), &once);
             assert_eq!(once, twice, "the estimate is not idempotent");
             for (image, estimate) in input.iter().zip(once.iter()) {
                 assert!(
@@ -964,10 +993,7 @@ mod tests {
                     [radius[0] * 2, radius[1] * 2, radius[2] * 2],
                     "{shape:?} {radius:?}"
                 );
-                assert_eq!(
-                    background_estimate(&element).unwrap().reach3(&volume),
-                    declared
-                );
+                assert_eq!(background_estimate(&element).reach3(&volume), declared);
                 assert_eq!(
                     remove_background(&element).unwrap().reach3(&volume),
                     declared,
@@ -1003,10 +1029,7 @@ mod tests {
                     assert_eq!(declared.at(axis, 0, volume[axis]), (lo + hi, lo + hi));
                 }
                 assert_eq!(
-                    background_estimate(&element)
-                        .unwrap()
-                        .reach_spec(volume)
-                        .unwrap(),
+                    background_estimate(&element).reach_spec(volume).unwrap(),
                     declared,
                     "{shape:?} {size:?}"
                 );
@@ -1040,7 +1063,7 @@ mod tests {
         let backwards = applied(
             &Chain::parallel(
                 vec![
-                    background_estimate(&element).unwrap(),
+                    background_estimate(&element),
                     Chain::op(VoxelwiseMapOp::identity(ORIGINAL)),
                 ],
                 Box::new(DifferenceCombine::new(DIFFERENCE)),

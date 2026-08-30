@@ -352,7 +352,7 @@ fn sweep(
             }
         }
 
-        let model = subject.constraints.model;
+        let model = subject.constraints.model.clone();
         let dp = plan(subject, PartitionSearch::Dp);
         let exhaustive = plan(
             case(seed, min_slots, span, arithmetic),

@@ -153,9 +153,45 @@ each is in the report this file summarises. In short:
   four workers, no contention, a pool that never starves. Pipelining pays where
   a phase *cannot* fill the pool, and no such phase is in the fixture yet. The
   two budget under-charges are untouched and still open.
-- **G3 — per-phase compute rates, plus the dtype/volume prefix fold.** Tier-1
-  wiring: coefficients measured, consumer exists, additivity already proven to
-  survive, effect on the argmin already measured.
+- **G3 — per-phase compute rates, plus the dtype prefix fold. DONE, 2026-08-30,
+  and adjudicated by the arena.** `CostModel::compute_of` holds one
+  dimensionless correction per op family; `Snapshot::calibrate` fills it from the
+  `Term::ComputeOf` coefficients this crate has recorded for years under a doc
+  saying they were "recorded and reported, **not used**". An empty table is the
+  old model bit for bit, so nothing recorded under it moved.
+
+  **The adjudication.** Two ops with equal *declared* cost, different reaches,
+  and a snapshot saying their true rates are 64x apart; both judges told the same
+  measurements — the planner through `compute_of`, the simulator through
+  `PerPhase::ns_per_voxel`:
+
+  | workers | plain plan | corrected plan | simulated |
+  |---|---|---|---|
+  | 1 | 1 phase, block 64 | 1 phase, block 64 | 1.00x |
+  | 4 | 1 phase, block 32 | 2 phases, 64 and 32 | **1.28x** |
+  | 40 | 1 phase, block 32 | 2 phases, 64 and 16 | **2.86x** |
+
+  The uncorrected model believes the two ops cost the same, so it fuses them and
+  gives both one grid; the corrected one sees that the dear op wants a fine grid
+  and the cheap one a coarse grid, and cuts. Nothing moves at one worker, which
+  is where every other measurement in this file also stops.
+  `the_per_family_corrections_change_the_plan_and_the_simulator_prefers_it`.
+
+  **The dtype half** is folded too: `Enumerating` walks `Chain::produces` along
+  the slots and prices each run at the type it reads, where it used to hand
+  `workflow.dtype` to every phase — an 8x error on every byte-derived term of a
+  chain that binarizes half way. `Materialising` had already fixed it for itself
+  while naming the defect, and `predicted_cost` had always read `dtype_at`; the
+  search was the last place holding one number, and the two prices now agree on
+  a binarising chain where they used to differ. A side effect worth knowing: the
+  fold *is* a type check, so a chain that narrows into an op which cannot accept
+  the narrower type is now refused when the plan is made rather than when a
+  block reaches it.
+
+  **The volume half is not done.** `Chain::output_shape` folds the same way, but
+  a per-run volume means each phase's `BlockGrid` is built on its own extent,
+  which is a change to what the search *produces* rather than to how it prices.
+  Left, and named.
 - **G4 — greedy dispatch instead of wave-synchronous.** Measure in the simulator
   before touching the executor; `PerPhase::constant_fraction` already exists to
   make the fixture.
@@ -231,9 +267,10 @@ here; measured, so that it can be.
 ## If we can do three things
 
 1. **Build the planner arena (G1).**
-2. **Per-phase compute rates plus the dtype/volume prefix fold (G3).** Highest
-   evidence-to-effort ratio here, and it would be the first planner change ever
-   adjudicated by the simulator.
+2. ~~**Per-phase compute rates plus the dtype/volume prefix fold (G3)**~~ —
+   **done**, and it was the first planner change ever adjudicated by the
+   simulator: 2.86x at forty workers. See G3 above. What is left of the item is
+   the *volume* half of the fold.
 3. ~~**Settle the sequential-phases assumption (G2)**~~ — **done, and it
    settled small**: 0.2% of makespan, and only under a policy the default does
    not use. See G2 above. The two budget under-charges it was expected to expose

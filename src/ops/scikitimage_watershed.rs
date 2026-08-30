@@ -72,15 +72,55 @@
 // instead, which is equivalent (an out-of-range neighbour is exactly a
 // `mask == 0` neighbour) and avoids copying the whole block.
 
+use crate::error::{Error, Result};
+
 const MAX_NDIM: usize = 8;
 
 #[derive(Clone, Copy)]
 struct HeapItem {
     value: f64,
+    /// The push counter, **`i32` because skimage's `Heapitem` is** — see
+    /// [`AGE_LIMIT`] for what happens at the end of it and why this file
+    /// refuses rather than widening the field.
     age: i32,
     index: usize,
     source: usize,
 }
+
+/// The largest push counter this port can represent, and therefore the largest
+/// flood it will run.
+///
+/// **The field is `i32` because skimage's is.** `heap_general.pxi` declares
+/// `DTYPE_INT32_t age` and `_watershed_cy.pyx` increments a `Py_ssize_t` into
+/// it, so the original truncates here too — and, being C, truncates into a
+/// *signed* type. Past this point `age` goes negative, `smaller` inverts on
+/// every tie, and the flood stops being a watershed by anybody's definition:
+/// a later push sorts *before* an earlier one, so a seed reaches a basin it
+/// never should.
+///
+/// **So this refuses instead of widening, and that is the parity argument
+/// rather than a limitation of the port.** Widening to `i64` would produce a
+/// *better* algorithm than skimage's above the limit and a different one, which
+/// is exactly what a file whose whole reason for existing is exact parity must
+/// not do quietly — see this file's header. Above the limit there is no
+/// behaviour to be in parity *with*: the original's is C signed overflow.
+/// (It would even be free in memory: the struct pads to 32 bytes either way.
+/// It is declined on the parity ground, not a cost one.)
+///
+/// **When this is reachable.** `age` counts pushes, not voxels, and the two
+/// differ by the mode:
+///
+/// * `watershed_line = false` labels a voxel *at push time*, so no voxel is
+///   ever pushed twice and the count is bounded by the voxels — 2.1 G of them,
+///   about `1290^3`;
+/// * `watershed_line = true` settles labels at pop, so a voxel can be pushed
+///   once per neighbour: `2 * ndim` times, which for a 3-D volume is six. The
+///   bound is then about `710^3`.
+///
+/// `super::watershed`'s own header contemplates volumes above both. The refusal
+/// is what makes that a stated limit rather than a silently different
+/// partition.
+const AGE_LIMIT: i64 = i32::MAX as i64;
 
 /// The bytes one queued item occupies, which is what the working-set arithmetic
 /// in `super::watershed` is stated in. Asserted below rather than asserted in
@@ -274,8 +314,9 @@ pub fn watershed_raveled(
     mask: &mut [bool],
     output: &mut [u32],
     watershed_line: bool,
-) {
-    watershed_raveled_reporting_peak(image, shape, mask, output, watershed_line);
+) -> Result<()> {
+    watershed_raveled_reporting_peak(image, shape, mask, output, watershed_line)?;
+    Ok(())
 }
 
 /// [`watershed_raveled`], returning the largest number of items the queue ever
@@ -287,7 +328,26 @@ pub fn watershed_raveled_reporting_peak(
     mask: &mut [bool],
     output: &mut [u32],
     watershed_line: bool,
-) -> usize {
+) -> Result<usize> {
+    flood(image, shape, mask, output, watershed_line, AGE_LIMIT)
+}
+
+/// [`watershed_raveled_reporting_peak`] with the push limit stated.
+///
+/// The limit is a parameter for one reason: **so that the refusal can be
+/// reached by a test.** Reaching it for real takes 2.1 billion pushes, which is
+/// minutes of flooding and gigabytes of volume, so a suite that could only
+/// trigger it honestly would not trigger it at all — and an untriggered guard
+/// is a guard nobody knows is wired. Every caller outside this file passes
+/// [`AGE_LIMIT`]; the test passes a small one and checks the same code path.
+fn flood(
+    image: &[f64],
+    shape: &[usize],
+    mask: &mut [bool],
+    output: &mut [u32],
+    watershed_line: bool,
+    age_limit: i64,
+) -> Result<usize> {
     debug_assert_eq!(image.len(), output.len());
     debug_assert_eq!(image.len(), mask.len());
 
@@ -345,6 +405,25 @@ pub fn watershed_raveled_reporting_peak(
                 continue;
             }
             age += 1;
+            if age > age_limit {
+                // See `AGE_LIMIT`. One predictable comparison per push, against
+                // a tie-break that inverts silently and a partition that is
+                // then wrong everywhere two floods meet.
+                return Err(Error::InvalidArgument(format!(
+                    "watershed: the flood pushed more than {age_limit} voxels onto the queue. \
+                     The push counter is the `i32` skimage's `Heapitem` declares, so beyond \
+                     this it wraps negative, the `(value, age)` tie-break inverts, and the \
+                     partition stops being a watershed. Flood a smaller region: this is \
+                     {} voxels{}.",
+                    image.len(),
+                    if watershed_line {
+                        ", and a separating line lets a voxel be queued once per neighbour \
+                         rather than once"
+                    } else {
+                        ""
+                    }
+                )));
+            }
             let mut value = image[neighbour];
             if !watershed_line {
                 // Without separating lines a voxel can be labelled the moment it
@@ -364,7 +443,7 @@ pub fn watershed_raveled_reporting_peak(
             });
         }
     }
-    heap.peak
+    Ok(heap.peak)
 }
 
 /// The one checked-in case that separates this algorithm from a plausible
@@ -445,7 +524,7 @@ mod tests {
             output[index] = label;
         }
 
-        watershed_raveled(&image, &shape, &mut mask, &mut output, true);
+        watershed_raveled(&image, &shape, &mut mask, &mut output, true).expect("a flood");
 
         assert_eq!(output, EXPECTED);
         let sizes = (1..=3)
@@ -455,6 +534,101 @@ mod tests {
         assert_ne!(
             SIZES, NAIVE_SIZES,
             "if these agreed the case would pin nothing"
+        );
+    }
+
+    /// **The push counter runs out, and the flood says so instead of wrapping.**
+    ///
+    /// `age` is the `i32` skimage declares, so past [`AGE_LIMIT`] it goes
+    /// negative and `smaller` inverts on every tie — a later push sorting before
+    /// an earlier one, which is a different partition and not a slightly
+    /// different boundary. Reaching that honestly takes 2.1 billion pushes, so
+    /// `flood` takes the limit as a parameter and this test hands it a small
+    /// one: the refusal is the same branch on the same counter, reached in
+    /// microseconds.
+    ///
+    /// Both halves are asserted. The refusal, and that the *same* volume floods
+    /// to the *same* labels under the real limit — otherwise a guard that
+    /// refused everything would pass the first half.
+    #[test]
+    fn a_flood_that_outruns_the_push_counter_is_refused_rather_than_wrapped() {
+        use reference_case::*;
+
+        let shape = SHAPE;
+        let image = SOURCE.iter().map(|value| -value).collect::<Vec<_>>();
+        let seed = |mask: &mut Vec<bool>, output: &mut Vec<u32>| {
+            for (label, coords) in SEEDS {
+                let index = (coords[0] * shape[1] + coords[1]) * shape[2] + coords[2];
+                assert!(mask[index]);
+                output[index] = label;
+            }
+        };
+        let fresh = || {
+            let mask = SOURCE
+                .iter()
+                .map(|value| *value > THRESHOLD)
+                .collect::<Vec<bool>>();
+            let output = vec![0u32; SOURCE.len()];
+            (mask, output)
+        };
+
+        let (mut mask, mut output) = fresh();
+        seed(&mut mask, &mut output);
+        let err = flood(&image, &shape, &mut mask, &mut output, true, 8)
+            .expect_err("a limit of eight pushes must be reached by this fixture")
+            .to_string();
+        assert!(
+            err.contains("pushed more than 8") && err.contains("wraps negative"),
+            "the refusal must say what ran out and what it would have cost: {err}"
+        );
+
+        // and the same fixture under the real limit is the reference partition,
+        // so the guard is a ceiling and not a change to the flood.
+        let (mut mask, mut output) = fresh();
+        seed(&mut mask, &mut output);
+        watershed_raveled(&image, &shape, &mut mask, &mut output, true).expect("a flood");
+        assert_eq!(output, EXPECTED);
+    }
+
+    /// **Which volumes reach the limit**, computed rather than guessed, because
+    /// the answer decides whether the refusal above is a formality or a
+    /// ceiling this crate's own stated target crosses.
+    ///
+    /// `age` counts pushes and the two modes push differently: with no
+    /// separating line a voxel is labelled *at push time* and is never queued
+    /// twice, so the bound is the voxel count; with one, labels settle at pop
+    /// and a voxel can be queued once per neighbour — `2 * ndim`, six in 3-D.
+    ///
+    /// `super::super::watershed`'s header contemplates volumes above both
+    /// figures, which is what makes this worth a guard rather than a comment.
+    #[test]
+    fn the_limit_is_reachable_at_the_volumes_this_crate_contemplates() {
+        let limit = AGE_LIMIT as f64;
+        let voxels = |edge: f64| edge * edge * edge;
+
+        // No line: one push per voxel.
+        assert!(voxels(1024.0) < limit, "a 1024^3 flood without a line fits");
+        assert!(
+            voxels(1400.0) > limit,
+            "and one at 1400^3 does not: {} pushes against {limit}",
+            voxels(1400.0)
+        );
+
+        // With a line: up to six pushes per voxel in three dimensions.
+        assert!(
+            6.0 * voxels(1024.0) > limit,
+            "a 1024^3 flood with a separating line runs out: {} pushes against {limit}",
+            6.0 * voxels(1024.0)
+        );
+        assert!(
+            6.0 * voxels(512.0) < limit,
+            "and a 512^3 one does not, so the ceiling is between them"
+        );
+        println!(
+            "the push limit is {AGE_LIMIT}; a 1024^3 flood pushes up to {} without a \
+             separating line and {} with one",
+            voxels(1024.0),
+            6.0 * voxels(1024.0)
         );
     }
 
@@ -512,7 +686,7 @@ mod tests {
         let mut output = vec![0u32; image.len()];
         output[0] = 1;
         output[6] = 2;
-        watershed_raveled(&image, &[7], &mut mask, &mut output, true);
+        watershed_raveled(&image, &[7], &mut mask, &mut output, true).expect("a flood");
         assert_eq!(output[0], 1);
         assert_eq!(output[1], 1);
         assert_eq!(output[5], 2);
@@ -528,7 +702,7 @@ mod tests {
         let mut output = vec![0u32; image.len()];
         output[0] = 1;
         output[6] = 2;
-        watershed_raveled(&image, &[7], &mut mask, &mut output, false);
+        watershed_raveled(&image, &[7], &mut mask, &mut output, false).expect("a flood");
         assert!(output.iter().all(|&label| label != 0));
     }
 
@@ -539,7 +713,7 @@ mod tests {
         let mut output = vec![0u32; image.len()];
         output[0] = 1;
         output[6] = 2;
-        watershed_raveled(&image, &[7], &mut mask, &mut output, true);
+        watershed_raveled(&image, &[7], &mut mask, &mut output, true).expect("a flood");
         assert_eq!(output, vec![1, 1, 0, 0, 0, 2, 2]);
     }
 

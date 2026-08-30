@@ -58,8 +58,8 @@ use crate::voxels::Voxels;
 
 use super::decomposition::{
     check_block_constraints, check_dtypes, check_output_shapes, check_source_images,
-    compute_per_voxel, constraint_for, cuttable_axes, groups_for, is_planning_barrier, price_phase,
-    region_to_ranges, Constraints, Decomposition, PhaseDecomposition, SlabPolicy,
+    compute_charge_per_voxel, constraint_for, cuttable_axes, groups_for, is_planning_barrier,
+    price_phase, region_to_ranges, Constraints, Decomposition, PhaseDecomposition, SlabPolicy,
 };
 use super::env::{block_shape, BlockBuf, Environment};
 use super::fragment::{
@@ -3186,7 +3186,7 @@ impl Default for Enumerating {
 /// * [`crate::decomposition::summarise_slots`] and [`constraint_for`] fold over
 ///   the group alone, so the reach, the traversal preferences and the mandate
 ///   are the group's own;
-/// * [`compute_per_voxel`] is asked at the grid *this* phase chose, and the
+/// * [`compute_charge_per_voxel`] is asked at the grid *this* phase chose, and the
 ///   budget is checked against that phase's own working set — so the block edge
 ///   is an inner loop, not a coupling between phases;
 /// * and the one term that looks positional — `is_materialised`, "this phase
@@ -3269,7 +3269,7 @@ impl Default for Enumerating {
 /// * **A mandating op joining the group.** Its extent replaces the candidate
 ///   list entirely ([`crate::op::BlockConstraint::lattice`]), so the new grid
 ///   bears no relation to the old one and the price may go either way.
-/// * **[`compute_per_voxel`] at a changed block**, for an op whose cost has a
+/// * **[`compute_charge_per_voxel`] at a changed block**, for an op whose cost has a
 ///   block extent in its denominator.
 /// * **[`rounds`] crossing a step**, once the objective is a makespan: a
 ///   widening that costs a phase one more round is a jump the fixed-grid
@@ -3535,7 +3535,7 @@ pub fn predicted_makespan(
         let (_, _, _, orders) =
             super::decomposition::summarise_slots(&slots, &phase.slots, volume)?;
         let compute =
-            super::decomposition::phase_compute_per_voxel(&slots, phase, work.get(index))?;
+            super::decomposition::phase_compute_per_voxel(&slots, phase, work.get(index), model)?;
         let traffic = super::decomposition::phase_traffic(index, phase, work.get(index))?;
         let is_materialised = index + 1 < decomposition.phases.len();
         let cost = price_phase(
@@ -3773,7 +3773,7 @@ pub fn phase_price(
         // a term whose denominator is a block extent — see
         // `decomposition::compute_per_voxel`. For every op that does not, this
         // is the same number by the same route.
-        compute_per_voxel(slots, group, grid.block()),
+        compute_charge_per_voxel(slots, group, grid.block(), &constraints.model),
         distinct_orders,
         is_materialised,
         bytes_per_voxel,
@@ -3796,7 +3796,25 @@ pub fn phase_price(
 struct PhasePricer<'a> {
     slots: &'a [&'a Chain],
     volume: [usize; 3],
-    bytes: f64,
+    /// Bytes per voxel of the image the run **starting at this slot** reads,
+    /// one entry per slot: the element type folded along the chain with
+    /// [`Chain::produces`].
+    ///
+    /// **Not `workflow.dtype` for every phase**, which is what this was and what
+    /// `docs/design/planner-gaps.md` records as half of G3: a chain that
+    /// binarizes half way through was priced as if the second half still moved
+    /// eight bytes a voxel, so every term built on the byte count — the working
+    /// set the budget tests, the traffic the roofline's channel bound is made of
+    /// — was wrong by the ratio of the two types, which for `f64` to `bool` is
+    /// **eight**. `Materialising` already folded it and its own comment names
+    /// the defect; `Decomposition::predicted_cost` already reads it back with
+    /// `dtype_at`. The search was the last place still holding one number.
+    ///
+    /// Indexed by the run's **first** slot, because that is the image the phase
+    /// reads and therefore the traversal every term here is stated over. What it
+    /// writes is a different type again, and `is_materialised` is what prices
+    /// that — see `price_phase`.
+    bytes_at: Vec<f64>,
     constraints: &'a Constraints,
     /// Blocks the run will hold in flight, from [`Enumerating::concurrency`] —
     /// the same number [`Strategy::hints`] hands the executor. See [`rounds`].
@@ -3860,7 +3878,7 @@ impl PhasePricer<'_> {
                 &group,
                 grid,
                 halo,
-                self.bytes,
+                self.bytes_at[fold.start],
                 fold.orders.len(),
                 is_materialised,
                 traffic,
@@ -4303,10 +4321,21 @@ impl Enumerating {
         // barrier, so it is its own phase whatever the cost model thinks. See
         // `is_planning_barrier`.
         let forced_cuts = barrier_cuts(&slots, volume);
+        // The element type each run reads, folded once along the chain. Fallible
+        // where the fold is: `Chain::produces` refuses an op handed a type it
+        // does not accept, which is a plan that could not run and is better
+        // refused here than at the block that reaches it. `check_dtypes` makes
+        // the same check on a finished plan; this makes it before there is one.
+        let mut reads = workflow.dtype;
+        let mut bytes_at = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            bytes_at.push(reads.size_of() as f64);
+            reads = slot.produces(reads)?;
+        }
         let pricer = PhasePricer {
             slots: &slots,
             volume,
-            bytes: workflow.dtype.size_of() as f64,
+            bytes_at,
             constraints,
             workers: self.concurrency.max(1),
         };
@@ -4596,7 +4625,7 @@ fn phase_for_group(
             &candidate,
             // The granted window, not the reach; see `price_phase`.
             &halo,
-            compute_per_voxel(slots, group, candidate.block()),
+            compute_charge_per_voxel(slots, group, candidate.block(), &constraints.model),
             orders.len(),
             is_materialised,
             bytes,
@@ -4625,7 +4654,7 @@ fn phase_for_group(
             let cost = price_phase(
                 &candidate,
                 &reach,
-                compute_per_voxel(slots, group, candidate.block()),
+                compute_charge_per_voxel(slots, group, candidate.block(), &constraints.model),
                 orders.len(),
                 is_materialised,
                 bytes,
