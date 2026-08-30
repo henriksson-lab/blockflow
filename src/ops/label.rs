@@ -1451,7 +1451,9 @@ impl FragmentOp for LabelComponentsOp {
             self.stream.clone(),
             self.lifecycle,
             crate::fragment::Coverage::EveryBlock,
-        )]
+            // The six-faces shape, as `fill` and `regional` write.
+        )
+        .sized(crate::fragment::SidecarSize::block_faces())]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {

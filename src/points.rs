@@ -90,7 +90,7 @@
 
 use crate::error::{Error, Result};
 use crate::fragment::{
-    pack_u64, unpack_u64, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput,
+    pack_u64, unpack_u64, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput, SidecarSize,
 };
 use crate::geometry::BlockGrid;
 use crate::region::Region;
@@ -377,11 +377,12 @@ impl FragmentOp for PointSourceOp {
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            self.stream.clone(),
-            self.lifecycle,
-            Coverage::EveryBlock,
-        )]
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                // `encode_points` is headerless: four words a point — three coordinates and
+                //             // a weight — and a block holds at most one point per voxel.
+                .sized(SidecarSize::per_read_voxel(0, 32)),
+        ]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {

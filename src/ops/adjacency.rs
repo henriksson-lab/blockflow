@@ -152,6 +152,7 @@ use crate::env::{BlockBuf, Environment};
 use crate::error::{Error, Result};
 use crate::fragment::{
     fold_fragments, fragment_phase, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput,
+    SidecarSize,
 };
 use crate::geometry::BlockGrid;
 use crate::region::Region;
@@ -614,7 +615,14 @@ impl FragmentOp for AdjacentPairsOp {
             // only guard there is — and a block that owns no pair is the common
             // case on a sparse mask rather than an oddity.
             Coverage::EveryBlock,
-        )]
+            // A row table of ordered label pairs. A voxel can contribute at most one pair
+            // per lexicographically-later neighbour, and `Connectivity::offsets`
+            // is exactly that list — the same one `encode_adjacent_pairs` steps over.
+        )
+        .sized(SidecarSize::row_table(
+            &pair_schema(),
+            forward_offsets(self.connectivity).len() as u64,
+        ))]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {

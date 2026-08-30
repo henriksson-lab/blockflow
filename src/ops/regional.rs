@@ -177,7 +177,7 @@ use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
     fragment_phase, BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput,
-    PhaseView, SeamFold,
+    PhaseView, SeamFold, SidecarSize,
 };
 use crate::geometry::BlockGrid;
 use crate::sidecar::Lifecycle;
@@ -734,7 +734,10 @@ impl FragmentOp for LabelPlateauxOp {
             // nought, and the merge needs to see that rather than infer it from
             // an absence.
             Coverage::EveryBlock,
-        )]
+            // The six-faces shape **plus** an `ascends` flag per label, which is a
+            // second per-label word on top of the one `block_faces` counts.
+        )
+        .sized(SidecarSize::plateau_faces())]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {

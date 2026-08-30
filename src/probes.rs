@@ -535,7 +535,10 @@ impl crate::fragment::FragmentOp for BlockSummaryOp {
             self.stream.clone(),
             self.lifecycle,
             crate::fragment::Coverage::EveryBlock,
-        )]
+        )
+        // `pack_u64` of six `u64`s, whatever the block holds: a fixed 48 bytes.
+        // Tight, so `check_fragment_coverage` compares it against what landed.
+        .sized(crate::fragment::SidecarSize::per_block(48))]
     }
 
     fn apply(&self, at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
@@ -625,7 +628,10 @@ impl crate::fragment::FragmentOp for NullFragmentOp {
             self.stream.clone(),
             self.lifecycle,
             crate::fragment::Coverage::Sparse,
-        )]
+        )
+        // Writes nothing at all — `BlockOutput::nothing`, which is what makes this
+        //             // the `Coverage::Sparse` probe.
+        .sized(crate::fragment::SidecarSize::fixed(0))]
     }
 
     fn apply(&self, _at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
@@ -717,7 +723,9 @@ impl crate::fragment::FragmentOp for NeighbourFoldOp {
             self.stream.clone(),
             self.lifecycle,
             crate::fragment::Coverage::EveryBlock,
-        )]
+        )
+        // `pack_u64` of six words, whatever the block holds.
+        .sized(crate::fragment::SidecarSize::per_block(48))]
     }
 
     fn apply(&self, at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
@@ -947,7 +955,10 @@ impl crate::fragment::FragmentOp for RegionSumOp {
             self.stream.clone(),
             self.lifecycle,
             crate::fragment::Coverage::EveryBlock,
-        )]
+        )
+        // Three words a region — the id, its voxels and its sum — and a block
+        // holds no more regions than it read voxels.
+        .sized(crate::fragment::SidecarSize::per_read_voxel(0, 24))]
     }
 
     fn apply(&self, _at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
@@ -1103,7 +1114,10 @@ impl crate::fragment::FragmentOp for RegionMergeOp {
             self.stream.clone(),
             self.lifecycle,
             crate::fragment::Coverage::EveryBlock,
-        )]
+        )
+        // Three words per region — the id, its voxels and its sum — and a block
+        //             // holds no more regions than voxels.
+        .sized(crate::fragment::SidecarSize::per_read_voxel(0, 24))]
     }
 
     fn apply(&self, at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {
@@ -1218,7 +1232,9 @@ impl crate::fragment::FragmentOp for DriftingSumOp {
             self.stream.clone(),
             self.lifecycle,
             crate::fragment::Coverage::EveryBlock,
-        )]
+        )
+        // `pack_u64` of one word: the block's total.
+        .sized(crate::fragment::SidecarSize::per_block(8))]
     }
 
     fn apply(&self, at: &crate::fragment::BlockView<'_>) -> Result<crate::fragment::BlockOutput> {

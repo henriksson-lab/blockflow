@@ -82,6 +82,20 @@ impl Region {
     }
 
     /// Voxels in the region.
+    /// The extent as a fixed array, defaulting a missing axis to `1`.
+    ///
+    /// For callers that need the *shape* rather than the voxel count — a
+    /// surface term is not a function of a volume, and
+    /// the six-faces shape `crate::fragment::SidecarSize::block_faces`
+    /// describes is one.
+    pub fn shape3(&self) -> [usize; 3] {
+        let mut shape = [1usize; 3];
+        for axis in 0..3 {
+            shape[axis] = self.shape.get(axis).copied().unwrap_or(1);
+        }
+        shape
+    }
+
     pub fn voxels(&self) -> usize {
         self.shape.iter().product()
     }

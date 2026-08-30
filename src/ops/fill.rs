@@ -320,7 +320,7 @@ use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
     fragment_phase, BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput,
-    PhaseView, SeamFold,
+    PhaseView, SeamFold, SidecarSize,
 };
 use crate::geometry::BlockGrid;
 use crate::sidecar::Lifecycle;
@@ -657,7 +657,10 @@ impl FragmentOp for LabelBackgroundOp {
             // six faces of zeros and a label count of nought, and the merge
             // needs to see that rather than infer it from an absence.
             Coverage::EveryBlock,
-        )]
+            // The six-faces shape: a header, a word per label, and the block's six
+            //         // boundary planes.
+        )
+        .sized(SidecarSize::block_faces())]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {

@@ -32,6 +32,9 @@
 //!   simulator of a different executor, and the divergence would be invisible;
 //!   * per-phase **barriers**, which are the ordering the edges do not carry;
 //! * **worker slots**, and therefore queueing;
+//! * **stored bytes**, both to the output and to an intermediate, priced
+//!   separately and charged on the same channel the reads use — so a strategy
+//!   whose payoff is fewer writes has somewhere to show it;
 //! * **image residency** — allocation at first write, freeing under the
 //!   executor's own rule (`Internal` or released, minus kept), so that the
 //!   held-and-dead distinction is visible to a scheduler;
@@ -75,24 +78,52 @@
 //! [`Scheduler`]: crate::simulate::Scheduler
 //! [`Rates::io_ns_per_byte`]: crate::simulate::Rates::io_ns_per_byte
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::assemble::ImageId;
-use crate::decomposition::{Decomposition, Visibility};
+use crate::decomposition::Decomposition;
 use crate::distributed::cache_model::{ChunkGrid, ModelledCache};
 use crate::error::Result;
-use crate::fragment::PhaseWork;
+use crate::fragment::{PhaseWork, SidecarSize};
 use crate::graph::TaskGraph;
 
 /// The machine, as the simulator understands one.
 ///
 /// Every field is a **planner lever** — something a plan or a caller chooses —
 /// rather than a property of the hardware, except `workers`, which is both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Machine {
     /// Slots. Tasks beyond this queue.
     pub workers: usize,
-    /// The chunk cache's byte budget, shared across workers.
+    /// The byte budget of whatever physically serves a re-read.
+    ///
+    /// # Which cache this is, decided
+    ///
+    /// It used to be `cache::ChunkCache`'s budget, and that was a model of a
+    /// component nobody constructs: `distributed::cache_model` says so outright
+    /// — "`cache::ChunkCache` … has **no non-test construction site**, so no
+    /// `Environment::read` is served from one. What can physically serve a
+    /// re-read on a node is the page cache, sized by free RAM." So the
+    /// simulator's central mechanism — ordering changes hit rate — was
+    /// parameterised by an axis that does not exist on the machine.
+    ///
+    /// **The decision taken here is to model what physically serves the
+    /// re-read**, which today is the page cache. Two consequences follow and
+    /// both matter:
+    ///
+    /// * it is **not a planner lever**. A plan cannot choose it, a strategy
+    ///   cannot trade against it, and a scheduler tuned to a number the run
+    ///   cannot set is tuned to nothing. [`Machine::with_page_cache`] sizes it
+    ///   from free RAM, which is where it comes from.
+    /// * it stays a *field* rather than a constant, because a sweep over it is
+    ///   how one finds out how much the answer depends on it — which is a
+    ///   different question from what to set it to.
+    ///
+    /// If `ChunkCache` ever acquires a construction site on the read path, this
+    /// becomes that cache's budget and does become a lever. The doc moves then;
+    /// the field does not.
+    ///
+    /// Shared across workers, which is the optimistic reading.
     ///
     /// Shared and not per-worker, which is the optimistic reading: two workers
     /// reading the same chunk pay for it once. The pessimistic reading is one
@@ -105,6 +136,91 @@ pub struct Machine {
     /// `0` disables it. See [`crate::prefetch::Prefetcher`], whose depth this
     /// mirrors.
     pub prefetch_depth: usize,
+    /// How many fetches the storage serves at once. `0` and `1` both mean one.
+    ///
+    /// **The channel used to be singular and that was a statement about a
+    /// device that does not exist.** One serial channel is the least structure
+    /// that makes prefetch a trade rather than free money — that argument
+    /// stands — but it also says concurrency never helps, which is false of
+    /// every filesystem and emphatically false of object storage, where
+    /// parallel requests are the only way bandwidth is reached at all.
+    pub io_channels: usize,
+    /// Whether the cache is one pool or one per worker.
+    ///
+    /// `true` — the default and the old behaviour — is the **optimistic**
+    /// reading, and `Self::cache_bytes`'s own doc says so: two workers reading
+    /// the same chunk pay for it once. That is right for threads on one machine
+    /// and wrong for `distributed`, where a chunk two nodes both read costs two
+    /// fetches whatever either caches. `distributed::cache_model` calls that
+    /// duplicated fetch "the whole of what the handout and the placement filter
+    /// are entitled to lean on" — and a simulator that shares one cache cannot
+    /// see it at all, so it cannot rank a handout policy.
+    ///
+    /// `false` gives each worker `cache_bytes / workers` and counts a chunk
+    /// fetched by a second worker as [`Outcome::duplicated_fetches`].
+    pub cache_shared: bool,
+    /// The share of [`Self::cache_bytes`] held as **encoded** chunks, whose hits
+    /// cost a decode. See [`Machine::with_encoded_fraction`].
+    pub encoded_fraction: f64,
+    /// How much a worker's compute slows for each *other* worker running.
+    ///
+    /// `0.0` is the shipped default and is the old behaviour exactly: concurrent
+    /// workers do not contend, and wall clock scales down with worker count far
+    /// more cleanly than a real machine's does.
+    ///
+    /// **The number to put here is measured and is not small.** The tile run
+    /// realised a concurrency of **`2.41x` against forty requested**; under
+    /// Amdahl's form — a worker's duration scaled by `1 + a x (running - 1)` —
+    /// that is `a` near [`MEASURED_CONTENTION`]. A scheduler tuned at `0.0`
+    /// against forty independent workers is tuned against a machine nobody has.
+    ///
+    /// It stays off by default because every figure this crate has recorded
+    /// about the simulator was taken without it, and a default that silently
+    /// moved them would make the record unreadable. Turn it on deliberately.
+    pub contention: f64,
+}
+
+/// The contention coefficient the tile run implies, for callers who want the
+/// measured machine rather than the ideal one.
+///
+/// From `2.41x` realised against forty requested: Amdahl's `S(n) = n / (1 + a x
+/// (n - 1))` at `S(40) = 2.41` gives `a = (40 / 2.41 - 1) / 39`, near `0.40`.
+/// **One parameter, fitted to one figure**, which is all the evidence there is —
+/// it is not a model of caches, memory bandwidth or NUMA, and calling it one
+/// would be claiming a shape nobody measured.
+pub const MEASURED_CONTENTION: f64 = 0.40;
+
+impl Machine {
+    /// This machine's own free memory as the cache budget, because that is what
+    /// serves a re-read here.
+    ///
+    /// Deliberately **not** `Default`: a figure taken from the machine the test
+    /// happens to run on would make every recorded simulator number
+    /// unreproducible, and the whole file is figures compared against other
+    /// figures. A caller who wants the real machine asks for it.
+    pub fn with_page_cache(self) -> Self {
+        Self {
+            cache_bytes: crate::budget::default_budget_bytes(),
+            ..self
+        }
+    }
+
+    /// How much of [`Self::cache_bytes`] holds **encoded** chunks.
+    ///
+    /// See [`Rates::decode_ns_per_byte`] and `cache::Tier`: the real cache has
+    /// two, and `cache.rs` records an encoded hit at **962 us — ~100x a decoded
+    /// hit**, still ~40x cheaper than storage. A simulator with one tier and
+    /// free hits makes a cache-size sweep monotone by construction, where the
+    /// real curve has a knee — more capacity buys more *encoded* residency and
+    /// hits get two orders of magnitude dearer.
+    ///
+    /// `0.0` is the old behaviour: one tier, hits free.
+    pub fn with_encoded_fraction(self, fraction: f64) -> Self {
+        Self {
+            encoded_fraction: fraction.clamp(0.0, 1.0),
+            ..self
+        }
+    }
 }
 
 impl Default for Machine {
@@ -113,6 +229,10 @@ impl Default for Machine {
             workers: 1,
             cache_bytes: 0,
             prefetch_depth: 0,
+            io_channels: 1,
+            cache_shared: true,
+            encoded_fraction: 0.0,
+            contention: 0.0,
         }
     }
 }
@@ -138,6 +258,43 @@ pub struct Rates {
     pub compute_ns_per_voxel: f64,
     /// Fetch time per byte, charged only on a cache miss.
     pub io_ns_per_byte: f64,
+    /// Fixed cost of one fetch, whatever its size.
+    ///
+    /// `0.0` is the old behaviour: cost proportional to bytes and nothing else,
+    /// under which a small chunk is free and a chunk-size sweep improves
+    /// monotonically toward zero. On a filesystem, and far more so on object
+    /// storage, the per-request cost is what decides the floor.
+    ///
+    /// Charged **per chunk fetched**, because that is what the store serves: a
+    /// Zarr read of a block spanning `N` chunks is `N` objects, however few
+    /// `Environment::read` calls the caller made.
+    ///
+    /// It is therefore finer than the executor's own observability — `RegionRead`
+    /// is emitted once per `read`, carrying `chunks` as a count — which is why
+    /// this is a rate a caller states rather than a figure
+    /// `tests/simulator_against_the_executor.rs` can compare against a run.
+    pub io_latency_ns: f64,
+    /// Decode time per fetched byte, on the CPU, between the transfer and the
+    /// compute.
+    ///
+    /// `zarr_env` reads gzip, so a fetched chunk costs a decode proportional to
+    /// its bytes. `0.0` is the old behaviour, under which a codec's ratio is
+    /// free and choosing one is not a trade.
+    pub decode_ns_per_byte: f64,
+    /// Store time per byte, for a write whose destination is the **workflow
+    /// output**.
+    ///
+    /// Separate from [`Self::materialise_ns_per_byte`] for the reason
+    /// `statistics::Term` keeps `Write` and `Materialise` apart: an intermediate
+    /// compresses differently from an output, so one number over-values fusing
+    /// late stages. The planner's `CostModel` has carried both since before this
+    /// field existed; the simulator charged neither, which made every decision
+    /// whose payoff is *fewer writes* — fusion against materialisation, keep
+    /// against release, block-major against phase-major — invisible to it.
+    pub write_ns_per_byte: f64,
+    /// Store time per byte, for a write whose destination is an
+    /// **intermediate**. See [`Self::write_ns_per_byte`].
+    pub materialise_ns_per_byte: f64,
     /// The stored chunk, which decides both the cache's granularity and how
     /// much a misaligned read over-fetches.
     ///
@@ -157,10 +314,135 @@ impl Default for Rates {
             // than in a round-number one.
             compute_ns_per_voxel: 98.329,
             io_ns_per_byte: 1.0,
+            io_latency_ns: 0.0,
+            decode_ns_per_byte: 0.0,
+            // The same seeds `CostModel` ships for `Write` and `Materialise`:
+            // chosen for having the ordering right against the read, not the
+            // scale. `Snapshot::calibrate` is what moves them.
+            write_ns_per_byte: 1.0,
+            materialise_ns_per_byte: 1.0,
             chunk: [64, 64, 64],
             chunk_bytes: 64 * 64 * 64 * 8,
         }
     }
+}
+
+impl Rates {
+    /// Measured rates, from a recorded [`crate::statistics::Snapshot`].
+    ///
+    /// **The loop, closed.** `Snapshot::calibrate` has always refitted the
+    /// planner's `CostModel` from real runs; nothing turned the same evidence
+    /// into a `Rates`, so a simulation ran on constants somebody typed out of a
+    /// table — `TILE_PHASE_RATES` in the acceptance suite was three numbers from
+    /// a run dated `2026-08-23` — which will rot without anything failing.
+    ///
+    /// Each field falls back to the corresponding field of `seed` when the
+    /// snapshot has no **believable** coefficient for it, on
+    /// [`crate::statistics::Snapshot::believable`]'s definition: fewer than
+    /// [`crate::statistics::REPRODUCTIONS`] runs is treated exactly as never
+    /// having seen it, because "seen once" and "reproduced" are different
+    /// claims. [`crate::statistics::Snapshot::provenance`] is how a caller finds
+    /// out which it got, and this function deliberately does not fold that away.
+    ///
+    /// **`bytes_per_voxel` is an argument because a rate is per byte and the
+    /// terms are per voxel.** `Term::ReadBytes` is the one exception and is used
+    /// directly where it exists — it is documented as diagnostic-only, and it is
+    /// exactly `io_ns_per_byte`. `Write` and `Materialise` are per voxel, so
+    /// they are divided by the width of the element the run stored. A run whose
+    /// images have different widths has no single answer, which is the same
+    /// caveat `Term::ReadBytes`'s own doc records.
+    pub fn from_snapshot(
+        snapshot: &crate::statistics::Snapshot,
+        seed: &Rates,
+        bytes_per_voxel: f64,
+    ) -> Self {
+        use crate::statistics::Term;
+        let per_byte = |term: Term, fallback: f64| -> f64 {
+            match snapshot.believable(&term) {
+                Some(c) if bytes_per_voxel > 0.0 && c.nanos_per_unit.is_finite() => {
+                    c.nanos_per_unit / bytes_per_voxel
+                }
+                _ => fallback,
+            }
+        };
+        Rates {
+            compute_ns_per_voxel: snapshot
+                .believable(&Term::Compute)
+                .map(|c| c.nanos_per_unit)
+                .filter(|n| n.is_finite())
+                .unwrap_or(seed.compute_ns_per_voxel),
+            io_ns_per_byte: snapshot
+                .believable(&Term::ReadBytes)
+                .map(|c| c.nanos_per_unit)
+                .filter(|n| n.is_finite())
+                .unwrap_or_else(|| per_byte(Term::Read, seed.io_ns_per_byte)),
+            write_ns_per_byte: per_byte(Term::Write, seed.write_ns_per_byte),
+            materialise_ns_per_byte: per_byte(Term::Materialise, seed.materialise_ns_per_byte),
+            // Not measurements: the chunk geometry and the two terms a
+            // snapshot has no coefficient for are carried from the seed.
+            io_latency_ns: seed.io_latency_ns,
+            decode_ns_per_byte: seed.decode_ns_per_byte,
+            chunk: seed.chunk,
+            chunk_bytes: seed.chunk_bytes,
+        }
+    }
+}
+
+/// Per-phase compute rates from the **per-op-family** coefficients a run
+/// recorded.
+///
+/// `Term::ComputeOf` is keyed by slot name and documents itself as "recorded and
+/// reported, **not used**" — because `CostModel` has one `compute_scale` and
+/// nowhere to put a per-family correction. `simulate` is the consumer that does
+/// have somewhere: it takes one rate per phase, and the tile run measured phases
+/// spanning a factor of **57**, which one uniform rate cannot express at all.
+///
+/// A phase's rate is `sum over its slots of declared x measured`, where
+/// `declared` is the slot's own `cost_per_voxel` — so the shipped constants'
+/// absolute scale stays irrelevant, exactly as `Term::Compute` intends, while
+/// their *ratios* carry through. A slot whose family has no believable
+/// coefficient falls back to the run-wide `Term::Compute`, and if that is
+/// missing too to `seed`.
+pub fn phase_rates_from_snapshot(
+    snapshot: &crate::statistics::Snapshot,
+    decomposition: &Decomposition,
+    slots: &[&crate::op::Chain],
+    seed: f64,
+) -> Vec<f64> {
+    use crate::statistics::Term;
+    let overall = snapshot
+        .believable(&Term::Compute)
+        .map(|c| c.nanos_per_unit)
+        .filter(|n| n.is_finite())
+        .unwrap_or(seed);
+    decomposition
+        .phases
+        .iter()
+        .map(|phase| {
+            let mut rate = 0.0;
+            for (position, &slot) in phase.slots.iter().enumerate() {
+                let declared = slots
+                    .get(slot)
+                    .map(|chain| chain.cost_per_voxel())
+                    .unwrap_or(1.0);
+                let measured = phase
+                    .names
+                    .get(position)
+                    .and_then(|name| snapshot.believable(&Term::ComputeOf(name.clone())))
+                    .map(|c| c.nanos_per_unit)
+                    .filter(|n| n.is_finite())
+                    .unwrap_or(overall);
+                rate += declared * measured;
+            }
+            // A phase with no chain slot — fragment, iterative — has no family
+            // to look up, so it gets the run-wide figure rather than zero.
+            if rate > 0.0 {
+                rate
+            } else {
+                overall
+            }
+        })
+        .collect()
 }
 
 /// What one simulated run did.
@@ -175,6 +457,17 @@ pub struct Outcome {
     /// Bytes actually fetched — misses only. This is the **induced IO** an
     /// ordering causes, which is the quantity an IO penalty is made of.
     pub fetched_bytes: u64,
+    /// Bytes stored to the **workflow output**.
+    ///
+    /// **A property of the plan, not of the schedule**, like
+    /// [`Self::tasks_run`]: every block's valid region is written exactly once
+    /// whatever the order. Two schedulers on one plan must agree on it, which is
+    /// what makes it an invariant to assert against rather than a finding.
+    pub written_bytes: u64,
+    /// Bytes stored to an **intermediate** image. The same invariant as
+    /// [`Self::written_bytes`], and separate for the reason
+    /// [`Rates::materialise_ns_per_byte`] is separate.
+    pub materialised_bytes: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     /// Slot-nanoseconds where a worker had no ready task. The scheduler's own
@@ -193,6 +486,33 @@ pub struct Outcome {
     /// which is the whole reason a scheduler can matter — so this is the
     /// invariant to assert a scheduler against.
     pub tasks_run: u64,
+    /// Chunks fetched by a worker when another worker already held them.
+    ///
+    /// Always zero when [`Machine::cache_shared`] is true, because then there is
+    /// only one cache and the question does not arise. **The quantity a handout
+    /// policy exists to reduce**, and the one
+    /// `nearest_first_handout_costs_fewer_duplicated_fetches_than_naive_pull`
+    /// measures on the real coordinator.
+    pub duplicated_fetches: u64,
+    /// Sidecar bytes a fragment phase's blocks wrote, from the **declared**
+    /// bound on each stream.
+    ///
+    /// Zero for a stream that declares `SidecarSize::Unstated`, which is most of
+    /// them: an undeclared stream is one nothing can budget, and counting it as
+    /// nothing is the visible form of that rather than a claim it is empty.
+    pub sidecar_bytes_written: u64,
+    /// The largest total a barrier held at once — every contributing block's
+    /// fragment, resident together, which is the peak nothing was budgeting.
+    pub sidecar_gather_peak: u64,
+    /// Chunks served from the **encoded** tier: a hit, but one that paid a
+    /// decode. Part of [`Self::cache_hits`], not additional to it.
+    pub encoded_hits: u64,
+    /// Tasks whose read extent was uniform, so the executor skipped their work.
+    ///
+    /// The counterpart of `Stats::tasks_short_circuited`. **Not** a conservation
+    /// law: it is a property of the plan and the data, so two schedulers agree
+    /// on it, but two *decompositions* of one volume do not.
+    pub tasks_short_circuited: u64,
 }
 
 impl Outcome {
@@ -205,6 +525,74 @@ impl Outcome {
         }
         self.idle_slot_ns as f64 / total as f64
     }
+}
+
+/// The per-phase figures that come from a **measurement**, not from the plan.
+///
+/// Both are functions of the data, and neither can be declared: a rate is a
+/// property of the machine and the op together, and a substage count is a fixed
+/// point over the volume. `statistics::Snapshot` is where they come from —
+/// `Stats::substages` reports the second on every real run — and the two travel
+/// together because they are consumed together, and because `simulate` was
+/// already at the argument count clippy complains about.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PerPhase<'a> {
+    /// Compute nanoseconds per voxel of a task's read extent, per phase.
+    ///
+    /// Empty falls back to [`Rates::compute_ns_per_voxel`] for every phase.
+    /// Supplying one matters more than any other rate: the tile run measured
+    /// phases spanning **`3.541` to `201.397` ns per voxel, a factor of 57**,
+    /// and under one uniform rate a throughput term can discriminate nothing.
+    pub ns_per_voxel: &'a [f64],
+    /// Substages each phase ran, as [`crate::log::Stats::substages`] reports
+    /// them. Empty, or a zero, means one.
+    ///
+    /// **Measured and not declared, and the crate has the evidence for why that
+    /// is enough.** An iterative phase runs to convergence, so its count is in
+    /// no reach, no image allocation and no phase structure —
+    /// `IterativeOp::limit` is a *bound*, deliberately, and there is no method
+    /// for the count. But `iterate`'s own sweep found the count **does not vary
+    /// with the block edge**: thirteen lattices including `[1, 1, 1]`, four
+    /// reaches and two data shapes, the whole-volume count every time. So it is
+    /// constant across every lever a comparison varies, cancels between arms the
+    /// way `Rates`'s wrong coefficient does, and needs no model of the op — one
+    /// integer per phase, from a run.
+    pub substages: &'a [usize],
+    /// The fraction of a phase's blocks whose read extent is uniform, so that
+    /// `BlockOp::constant_maps_to` lets the executor skip the work.
+    ///
+    /// **A model of the data, and it cannot be anything else.** Whether a block
+    /// short-circuits depends on the volume *and* on the grid — a finer cut
+    /// produces more uniform blocks — so no single measured number transfers
+    /// between two decompositions, which is exactly the lever a block ladder
+    /// sweeps. A phase whose ops decline `constant_maps_to` has a fraction of
+    /// zero, and empty means zero everywhere, which is what this modelled
+    /// before the field existed: every task charged in full, so the simulator
+    /// could not see the thing `constant_maps_to` exists to buy and over-charged
+    /// finer cuts systematically.
+    ///
+    /// **Which blocks** is a deterministic function of the block index, so two
+    /// runs of one plan skip the same set and a scheduler cannot be rewarded for
+    /// reordering into luck.
+    pub constant_fraction: &'a [f64],
+}
+
+/// Whether a block short-circuits, from a fraction and its index.
+///
+/// A hash rather than a stride, so that the skipped set is not a plane or a
+/// lattice a traversal order could exploit; deterministic, so the same plan
+/// skips the same blocks in every run and under every scheduler.
+fn short_circuits(index: [usize; 3], fraction: f64) -> bool {
+    if fraction <= 0.0 {
+        return false;
+    }
+    if fraction >= 1.0 {
+        return true;
+    }
+    let mixed = (index[0].wrapping_mul(73_856_093)
+        ^ index[1].wrapping_mul(19_349_663)
+        ^ index[2].wrapping_mul(83_492_791)) as u64;
+    (mixed % 10_000) < (fraction * 10_000.0) as u64
 }
 
 /// What a [`Scheduler`] may look at when it chooses.
@@ -221,18 +609,60 @@ pub struct Decision<'a> {
     pub ready: &'a [usize],
     /// Task ids currently occupying a slot.
     pub running: &'a [usize],
+    /// Which worker this choice is for.
+    ///
+    /// A shared cache makes this uninteresting and it is `0` throughout; with
+    /// `Machine::cache_shared` false it is the identity a handout policy ranks
+    /// against, and [`Decision::cache`] is that worker's own cache.
+    pub worker: usize,
+    /// Where each worker last finished, for a policy that seeds workers apart.
+    /// `None` for a worker that has finished nothing.
+    pub anchors: &'a [Option<[f64; 3]>],
     /// Images alive right now, and their sizes.
     pub live_images: &'a [(usize, u64)],
     /// Bytes resident right now: images plus in-flight block buffers.
     pub resident_bytes: u64,
     /// The cache, for a scheduler that wants to prefer a warm task.
     pub cache: &'a ModelledCache,
-    pub grid: &'a ChunkGrid,
+    /// One chunk grid per image the plan reads, keyed by image id.
+    ///
+    /// **A map and not one grid**, because the images of a plan do not share a
+    /// volume — a resampling phase writes a different extent — and a scheduler
+    /// asking about warmth has to ask on the right lattice. Most schedulers want
+    /// [`Decision::chunks_of`] rather than this.
+    pub grids: &'a BTreeMap<usize, ChunkGrid>,
+    /// The images each phase's blocks fetch, by phase. See
+    /// [`crate::decomposition::PhaseDecomposition::images_read`].
+    pub images_read: &'a [Vec<usize>],
     /// Compute nanoseconds per voxel, per phase. Always as long as the phase
     /// count — [`simulate`] fills it from [`Rates::compute_ns_per_voxel`] where
     /// the caller supplied nothing, so a scheduler never has to ask which it
     /// got.
     pub phase_ns_per_voxel: &'a [f64],
+    /// Substages each phase runs. Always as long as the phase count; see
+    /// [`PerPhase::substages`].
+    pub phase_substages: &'a [u64],
+}
+
+impl Decision<'_> {
+    /// Every chunk key one task fetches: each image the phase reads, at
+    /// [`crate::geometry::BlockGeometry::source`], on that image's own grid.
+    ///
+    /// The same walk the event loop performs, exposed so that a scheduler
+    /// reasoning about warmth asks the question the run will actually ask. A
+    /// scheduler that assembled the keys itself would be a fourth statement of
+    /// what a block fetches, and the first one to go stale.
+    pub fn chunks_of(&self, task: &crate::graph::Task) -> Vec<u64> {
+        self.images_read[task.phase]
+            .iter()
+            .flat_map(|&image| {
+                self.grids
+                    .get(&image)
+                    .map(|grid| grid.keys(image, &task.geometry.source))
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
 }
 
 /// Choose which ready task runs next.
@@ -285,7 +715,7 @@ impl Scheduler for WarmestFirst {
         let mut fewest = usize::MAX;
         for (slot, &id) in decision.ready.iter().enumerate() {
             let task = &decision.graph.tasks[id];
-            let keys = decision.grid.keys(task.phase, &task.geometry.read);
+            let keys = decision.chunks_of(task);
             let misses = decision.cache.misses(&keys);
             // Strictly fewer, so ties keep plan order and the comparison
             // against `PlanOrder` isolates the cache term rather than mixing in
@@ -613,7 +1043,7 @@ impl Scheduler for BoundedHorizonThroughput {
                 }
             };
             let rate = voxels / cost.min(self.horizon_ns as f64).max(1.0);
-            let keys = decision.grid.keys(task.phase, &task.geometry.read);
+            let keys = decision.chunks_of(task);
             let misses = decision.cache.misses(&keys);
             // Strict on the throughput term; the IO term decides only what it
             // leaves equal. `total_cmp` rather than `>`, because this crate does
@@ -630,6 +1060,70 @@ impl Scheduler for BoundedHorizonThroughput {
             }
         }
         best
+    }
+}
+
+/// The **real handout policy**, as a scheduler.
+///
+/// `distributed::handout::choose` is a free function over a `TaskGraph`, a
+/// `ChunkGrid` and a `WorkerView`, so the simulator can *call* the coordinator's
+/// policy rather than carry a second copy of it — the same move
+/// `strategy::priority_key` makes for the executor's dispatch order, and for the
+/// same reason: sharing the definition is a drift impossibility where a
+/// transcription is only a drift detector.
+///
+/// **Only meaningful with `Machine::cache_shared` false.** A policy that ranks
+/// on which worker already holds a chunk has nothing to rank when every worker
+/// shares one pool, and `Outcome::duplicated_fetches` — the quantity it exists
+/// to reduce — is zero by construction there.
+pub struct Handout {
+    pub policy: crate::distributed::handout::HandoutPolicy,
+}
+
+impl Handout {
+    pub fn new(policy: crate::distributed::handout::HandoutPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl Scheduler for Handout {
+    fn name(&self) -> &'static str {
+        self.policy.as_str()
+    }
+
+    fn pick(&mut self, decision: &Decision<'_>) -> usize {
+        // The grid of the image the first ready task reads. `choose` takes one
+        // grid and this crate now has one per image; on a plan whose phases
+        // share a lattice they are the same grid, and where they are not the
+        // policy is ranking distances rather than reading bytes, so the choice
+        // of lattice moves nothing it decides.
+        let first = decision.graph.tasks[decision.ready[0]].phase;
+        let image = decision.images_read[first].first().copied().unwrap_or(0);
+        let Some(grid) = decision.grids.get(&image) else {
+            return 0;
+        };
+        let seeds: Vec<[f64; 3]> = decision
+            .anchors
+            .iter()
+            .enumerate()
+            .filter(|&(worker, _)| worker != decision.worker)
+            .filter_map(|(_, anchor)| *anchor)
+            .collect();
+        let view = crate::distributed::handout::WorkerView {
+            anchor: decision.anchors[decision.worker],
+            cache: Some(decision.cache),
+        };
+        let chosen = crate::distributed::handout::choose(
+            self.policy,
+            decision.ready,
+            decision.graph,
+            grid,
+            &view,
+            &seeds,
+        );
+        chosen
+            .and_then(|task| decision.ready.iter().position(|&id| id == task))
+            .unwrap_or(0)
     }
 }
 
@@ -653,29 +1147,118 @@ pub fn simulate(
     rates: &Rates,
     released: &BTreeSet<ImageId>,
     kept: &BTreeSet<ImageId>,
-    phase_ns_per_voxel: &[f64],
+    per_phase: PerPhase<'_>,
     scheduler: &mut dyn Scheduler,
 ) -> Result<Outcome> {
-    if !phase_ns_per_voxel.is_empty() && phase_ns_per_voxel.len() != decomposition.n_phases() {
-        return Err(crate::error::Error::InvalidArgument(format!(
-            "simulate: {} per-phase compute rates for a {}-phase plan. A partial list would \
-             silently charge some phases the fallback rate, and which ones would depend on the \
-             order the plan happened to be assembled in.",
-            phase_ns_per_voxel.len(),
-            decomposition.n_phases()
-        )));
+    let n = decomposition.n_phases();
+    for (what, len) in [
+        ("compute rates", per_phase.ns_per_voxel.len()),
+        ("substage counts", per_phase.substages.len()),
+        ("constant fractions", per_phase.constant_fraction.len()),
+    ] {
+        if len != 0 && len != n {
+            return Err(crate::error::Error::InvalidArgument(format!(
+                "simulate: {len} per-phase {what} for a {n}-phase plan. A partial list would \
+                 silently charge some phases the fallback, and which ones would depend on the \
+                 order the plan happened to be assembled in."
+            )));
+        }
     }
-    let phase_rates: Vec<f64> = if phase_ns_per_voxel.is_empty() {
-        vec![rates.compute_ns_per_voxel; decomposition.n_phases()]
+    let phase_rates: Vec<f64> = if per_phase.ns_per_voxel.is_empty() {
+        vec![rates.compute_ns_per_voxel; n]
     } else {
-        phase_ns_per_voxel.to_vec()
+        per_phase.ns_per_voxel.to_vec()
+    };
+    // What one block of each phase writes to its sidecar streams, from the
+    // declaration. `work` carries the op, so this needs nothing the plan does not
+    // already hand over; a phase that is not a fragment phase writes none.
+    let sidecar_per_block: Vec<Vec<SidecarSize>> = (0..n)
+        .map(|phase| match work.get(phase) {
+            Some(crate::fragment::PhaseWork::Fragments(op)) => {
+                op.outputs().iter().map(|output| output.size).collect()
+            }
+            _ => Vec::new(),
+        })
+        .collect();
+    let constant_fraction: Vec<f64> = if per_phase.constant_fraction.is_empty() {
+        vec![0.0; n]
+    } else {
+        per_phase.constant_fraction.to_vec()
+    };
+    // Zero means one: a phase that is not an iteration reports `0` in
+    // `Stats::substages`, and charging it nothing would be reading "not an
+    // iteration" as "no work".
+    let substages: Vec<u64> = if per_phase.substages.is_empty() {
+        vec![1; n]
+    } else {
+        per_phase
+            .substages
+            .iter()
+            .map(|&s| s.max(1) as u64)
+            .collect()
     };
     let graph = TaskGraph::build(decomposition);
     let dependents = graph.dependents();
     let mut indegree: Vec<usize> = graph.tasks.iter().map(|t| t.n_dependencies()).collect();
 
-    let grid = ChunkGrid::new(decomposition.volume, rates.chunk);
-    let mut cache = ModelledCache::new(machine.cache_bytes, rates.chunk_bytes);
+    // **A grid per image, not one per plan.** `ChunkGrid` is built from a
+    // volume, and the images of a plan do not share one: a resampling phase
+    // writes an image of a different extent, and a pyramid level is a different
+    // extent by construction. One grid over `decomposition.volume` keyed every
+    // image against the full-resolution lattice, so the hit rate reported for
+    // any phase below the top was fiction.
+    //
+    // `BTreeMap` rather than a `Vec` because a supplied input's id is not an
+    // index into `0..n_images()`.
+    let images_read: Vec<Vec<usize>> = decomposition
+        .phases
+        .iter()
+        .enumerate()
+        .map(|(index, phase)| phase.images_read(index))
+        .collect();
+    let mut grids: BTreeMap<usize, ChunkGrid> = BTreeMap::new();
+    for images in &images_read {
+        for &image in images {
+            grids
+                .entry(image)
+                .or_insert_with(|| ChunkGrid::new(decomposition.volume_at(image), rates.chunk));
+        }
+    }
+    // **Two tiers, because the real cache has two.** The decoded tier is what a
+    // hit used to be — free. The encoded tier holds more for the same bytes and
+    // charges a decode for every hit, which is what gives a cache-size sweep the
+    // knee the real one has instead of improving monotonically for ever.
+    //
+    // `cache.rs` sizes the trade: an encoded entry "survives roughly twenty
+    // times longer" for the same bytes, and an encoded hit is **962 us, ~100x a
+    // decoded hit** and still ~40x cheaper than storage. So the encoded tier's
+    // capacity is its share of the budget times that ratio.
+    const ENCODED_RESIDENCY: u64 = 20;
+    //
+    // **One pool, or one per worker.** Shared is the optimistic reading and the
+    // old behaviour; per-worker is what `distributed` actually has, and is the
+    // only arrangement in which a chunk two workers both read costs two fetches
+    // — which is the quantity a handout policy is ranked on.
+    let pools = if machine.cache_shared {
+        1
+    } else {
+        machine.workers.max(1)
+    };
+    let per_pool = machine.cache_bytes / pools as u64;
+    let encoded_bytes = (per_pool as f64 * machine.encoded_fraction) as u64;
+    let mut caches: Vec<ModelledCache> = (0..pools)
+        .map(|_| ModelledCache::new(per_pool - encoded_bytes, rates.chunk_bytes))
+        .collect();
+    let mut encodeds: Vec<ModelledCache> = (0..pools)
+        .map(|_| ModelledCache::new(encoded_bytes * ENCODED_RESIDENCY, rates.chunk_bytes))
+        .collect();
+    // Every chunk any worker has been assigned, for counting the duplicated
+    // fetches a second worker causes. A *set*, not an eviction model: which
+    // chunks a worker has read is something a coordinator genuinely knows, and
+    // it is exactly what a duplicated fetch is made of.
+    let mut ever_fetched: BTreeSet<u64> = BTreeSet::new();
+    let mut anchors: Vec<Option<[f64; 3]>> = vec![None; machine.workers.max(1)];
+    let mut busy: Vec<Option<usize>> = vec![None; machine.workers.max(1)];
 
     // --- image residency, on the executor's own rule -------------------------
     let bytes_of = |image: usize| -> u64 {
@@ -694,7 +1277,10 @@ pub fn simulate(
     // than free money. Without it, deeper prefetch would improve every run
     // without bound, and a scheduler tuned against that would be tuned against
     // a machine with infinite bandwidth.
-    let mut io_free_at: u64 = 0;
+    // **One free-at time per channel.** A fetch takes the earliest-free one, so
+    // `channels == 1` is exactly the serial model this had and anything above it
+    // lets concurrent fetches overlap the way real storage does.
+    let mut io_free_at: Vec<u64> = vec![0; machine.io_channels.max(1)];
     let mut now: u64 = 0;
     // (finish_ns, task id), kept sorted so the earliest completion is last.
     let mut running: Vec<(u64, usize)> = Vec::new();
@@ -751,6 +1337,10 @@ pub fn simulate(
                     break;
                 }
                 running.pop();
+                if let Some(slot) = busy.iter().position(|held| *held == Some(id)) {
+                    busy[slot] = None;
+                    anchors[slot] = Some(crate::distributed::handout::position(&graph, id));
+                }
                 in_flight_bytes -= block_bytes[id];
                 remaining -= 1;
                 outcome.tasks_run += 1;
@@ -761,26 +1351,42 @@ pub fn simulate(
                 done_in_phase[phase] += 1;
                 if done_in_phase[phase] == graph.tasks_in_phase(phase).len() {
                     finished_phases = finished_phases.max(phase + 1);
-                    // Free what the executor would free after this phase.
-                    live.retain(|&(image, _)| {
-                        let image_id = ImageId::from(image);
-                        let freeable = (decomposition.image_visibility(image)
-                            == Visibility::Internal
-                            || released.contains(&image_id))
-                            && !kept.contains(&image_id);
-                        if !freeable {
-                            return true;
-                        }
-                        match decomposition.readers_of_image(image).last() {
-                            Some(&last) => last > phase,
-                            None => false,
-                        }
-                    });
+                    // **The gather.** A barrier reduces over every contributing
+                    // block's fragment, which means holding them all at once —
+                    // `n_blocks x payload` resident at one instant, with no term
+                    // in `Residency` for it. Recorded here as a peak rather than
+                    // added to `peak_bytes`, because a figure the byte budget
+                    // does not yet know about must not silently start moving the
+                    // number strategies are compared on.
+                    if graph.is_barrier(phase) || !sidecar_per_block[phase].is_empty() {
+                        let gathered: u64 = graph
+                            .tasks_in_phase(phase)
+                            .iter()
+                            .map(|task| {
+                                let core = task.geometry.core.shape3();
+                                let read = task.geometry.read.shape3();
+                                sidecar_per_block[phase]
+                                    .iter()
+                                    .filter_map(|size| size.bytes_at_most(core, read))
+                                    .sum::<u64>()
+                            })
+                            .sum();
+                        outcome.sidecar_gather_peak = outcome.sidecar_gather_peak.max(gathered);
+                    }
+                    // Free what the executor frees after this phase — by
+                    // calling the executor's rule, not by restating it.
+                    let freed = decomposition.images_freed_after(phase, released, kept);
+                    live.retain(|&(image, _)| !freed.contains(&image));
                 }
             }
             continue;
         }
 
+        let worker = busy
+            .iter()
+            .position(|slot| slot.is_none())
+            .expect("a free worker, since the loop only reaches here below the worker count");
+        let pool = if machine.cache_shared { 0 } else { worker };
         let slot = {
             let running_ids: Vec<usize> = running.iter().map(|&(_, id)| id).collect();
             let decision = Decision {
@@ -791,9 +1397,13 @@ pub fn simulate(
                 running: &running_ids,
                 live_images: &live,
                 resident_bytes: live.iter().map(|&(_, b)| b).sum::<u64>() + in_flight_bytes,
-                cache: &cache,
-                grid: &grid,
+                cache: &caches[pool],
+                worker,
+                anchors: &anchors,
+                grids: &grids,
+                images_read: &images_read,
                 phase_ns_per_voxel: &phase_rates,
+                phase_substages: &substages,
             };
             scheduler.pick(&decision).min(ready.len() - 1)
         };
@@ -817,33 +1427,237 @@ pub fn simulate(
         // behind whatever the channel is already carrying — including a
         // prefetch issued for a task that has not started, which is exactly how
         // a too-deep prefetch hurts.
-        let keys = grid.keys(task.phase, &task.geometry.read);
-        let misses = cache.misses(&keys) as u64;
-        cache.note_assigned(&keys);
-        outcome.cache_hits += keys.len() as u64 - misses;
-        outcome.cache_misses += misses;
+        //
+        // **Every image the phase reads, at the region the executor reads it
+        // at.** Two corrections in one, and both were charging the wrong thing
+        // rather than charging too little of the right one:
+        //
+        // * `PhaseDecomposition::images_read` instead of the phase's own image
+        //   alone. A phase with a `Chain::Source` arm really does traverse two
+        //   arrays, and `PhaseTraffic::images_read` has counted them since
+        //   before this loop existed.
+        // * `BlockGeometry::source` instead of `read`. `source` is what the
+        //   block fetches, in the read image's space; `read` is the phase's own
+        //   extent. `strategy` reads at `source` — for the input image and for
+        //   each source image alike — and the two differ exactly when a phase
+        //   changes shape.
+        // **A short-circuited block, by the executor's own sequence.** It still
+        // fetches its own image — the uniformity test is `env.uniform(&buf)`, so
+        // the bytes have to arrive before anything can be skipped — and it still
+        // writes, because "the block the work would have produced" is a constant
+        // block that must exist. What it skips is the **compute**, and the
+        // **source images**, which `strategy` reads inside `if !short_circuited`.
+        let skipped = short_circuits(task.index, constant_fraction[task.phase]);
+        if skipped {
+            outcome.tasks_short_circuited += 1;
+        }
+        let fetches: &[usize] = if skipped {
+            &images_read[task.phase][..1.min(images_read[task.phase].len())]
+        } else {
+            &images_read[task.phase]
+        };
+        let mut misses = 0u64;
+        let mut encoded_hits = 0u64;
+        for &image in fetches {
+            let keys = grids[&image].keys(image, &task.geometry.source);
+            let missed_decoded = caches[pool].misses(&keys) as u64;
+            // A chunk the decoded tier does not hold may still be in the encoded
+            // one, where it is a hit that costs a decode rather than a fetch.
+            let not_in_either = keys
+                .iter()
+                .filter(|key| !caches[pool].holds(**key) && !encodeds[pool].holds(**key))
+                .count() as u64;
+            encoded_hits += missed_decoded - not_in_either;
+            // A chunk this worker must fetch that some worker has already
+            // fetched is a duplicated fetch — the thing a handout policy exists
+            // to avoid, and invisible under one shared pool.
+            for key in &keys {
+                if !caches[pool].holds(*key) && !encodeds[pool].holds(*key) {
+                    if !ever_fetched.insert(*key) {
+                        outcome.duplicated_fetches += 1;
+                    }
+                }
+            }
+            caches[pool].note_assigned(&keys);
+            encodeds[pool].note_assigned(&keys);
+            outcome.cache_hits += keys.len() as u64 - not_in_either;
+            outcome.cache_misses += not_in_either;
+            outcome.encoded_hits += missed_decoded - not_in_either;
+            misses += not_in_either;
+        }
         let fetched = misses * rates.chunk_bytes;
         outcome.fetched_bytes += fetched;
-        let transfer = (fetched as f64 * rates.io_ns_per_byte) as u64;
-        let io_starts = now.max(io_free_at);
-        let io_done = io_starts + transfer;
-        io_free_at = io_done;
+        // A request per chunk, plus the bytes. This is what puts a floor under a
+        // small chunk: without it, halving the chunk halves the over-fetch and
+        // nothing pays for the extra objects, so a chunk-size sweep improves
+        // without bound toward zero.
+        let transfer =
+            (misses as f64 * rates.io_latency_ns + fetched as f64 * rates.io_ns_per_byte) as u64;
+        // **A task that fetches nothing does not touch the channel**, and
+        // therefore does not wait for it. This used to be `now.max(io_free_at)`
+        // unconditionally, which was invisible while the only thing advancing
+        // `io_free_at` was a fetch that a hit had already made rare — and became
+        // a bug the moment writes began reserving it, because then every task
+        // waited behind every prior task's store and the makespan stopped
+        // responding to the worker count at all.
+        let io_done = if transfer > 0 {
+            let channel = io_free_at
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, free)| *free)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            let done = now.max(io_free_at[channel]) + transfer;
+            io_free_at[channel] = done;
+            done
+        } else {
+            now
+        };
         outcome.io_wait_ns += io_done - now;
+        // The decode is CPU work between the transfer and the compute, so it
+        // does not occupy a channel and does not overlap with the fetch that
+        // produced its bytes. An **encoded hit** pays the same decode without
+        // the fetch, which is the whole of what the second tier trades.
+        let decoded_bytes = fetched + encoded_hits * rates.chunk_bytes;
+        let decoded = io_done + (decoded_bytes as f64 * rates.decode_ns_per_byte) as u64;
 
         let read_voxels = task.geometry.read.voxels() as u64;
-        let bytes_per_voxel = decomposition.dtype_at(task.phase).size_of() as u64;
-        // Input tile plus output tile, the same two-buffer figure
+        // One input tile per image the block fetches, at the extent it fetches
+        // it at, plus the output tile at the extent the op writes — which is the
+        // *read* extent, because `BlockOutput::pixels` is over the read extent
+        // and the executor slices the valid sub-box out of it.
+        //
+        // This used to be `read_voxels x dtype x 2` — the same two-buffer figure
         // `PhaseCost::working_set_bytes_per_block` carries, and with the same
-        // known gap: a phase reading three images is charged as if it read one.
-        block_bytes[id] = read_voxels * bytes_per_voxel * 2;
+        // recorded gap: a phase reading three images was charged as if it read
+        // one. That gap remains on `PhaseCost`; closing it there is a change to
+        // what the planner *chooses* on and wants its own measurement.
+        let fetch_voxels = task.geometry.source.voxels() as u64;
+        let input_bytes: u64 = fetches
+            .iter()
+            .map(|&image| fetch_voxels * decomposition.dtype_at(image).size_of() as u64)
+            .sum();
+        let output_bytes = if writes[task.phase] {
+            read_voxels * decomposition.dtype_at(task.phase + 1).size_of() as u64
+        } else {
+            0
+        };
+        block_bytes[id] = input_bytes + output_bytes;
         in_flight_bytes += block_bytes[id];
 
-        let compute = (read_voxels as f64 * phase_rates[task.phase]) as u64;
+        // **`S x compute`, one fetch and one store.** The shape `iterate`'s own
+        // header states is `S x (read + compute) + write`, and its `read` is the
+        // block re-traversing its private buffers rather than the storage read:
+        // the substages ping-pong two buffers and `run_iterative_phase` writes
+        // only after the loop. So the traversal is inside the compute term, and
+        // what repeats here is the compute alone.
+        //
+        // Pricing at `S == 1` — which this did, and which the planner still does
+        // — over-weights the store against the rest by a residual that varies
+        // with the block edge, and `iterate.rs` measured the resulting choice at
+        // up to **1.125x** the right one.
+        //
+        // The count folds into the rate rather than multiplying the truncated
+        // product, so that `S` substages cost exactly what `S` times the rate
+        // costs. Truncating per substage and then multiplying differs by up to
+        // one nanosecond per task — 8 ns over this suite's fixture — which is
+        // nothing to a ranking and everything to an identity worth asserting.
+        // **Contention: a worker's compute slows for each other worker
+        // running.** One coefficient, fitted to the one figure there is — see
+        // `MEASURED_CONTENTION`. `running` has not yet been pushed, so the count
+        // includes this task.
+        let concurrent = (running.len() + 1) as f64;
+        let slowdown = 1.0 + machine.contention * (concurrent - 1.0);
+        let compute = if skipped {
+            0
+        } else {
+            (read_voxels as f64 * phase_rates[task.phase] * substages[task.phase] as f64 * slowdown)
+                as u64
+        };
         // Indegree is decremented on completion, so mark the task started by
         // making it un-ready. `usize::MAX` cannot be reached by decrementing.
         indegree[id] = usize::MAX;
         // Compute starts when the bytes have landed, not when the slot opened.
-        let finish = io_done + compute.max(1);
+        let computed = decoded + compute.max(1);
+
+        // **The write, on the same channel the read came over.**
+        //
+        // The extent and the element type are the executor's own accounting —
+        // `strategy`'s `phase_bytes` is `outcome.valid.voxels() x
+        // dtype_at(phase + 1)` — rather than a second opinion about what a block
+        // stores. `writes_an_image` is asked of the work, so a fragment phase
+        // that writes no image is charged nothing.
+        //
+        // **The write costs the task its own time, and does not touch the
+        // channel.** That is a smaller claim than it looks, and both halves were
+        // arrived at by getting it wrong first.
+        //
+        // The worker really does block on its store — `strategy` writes inside
+        // the task — so the duration belongs to the slot, and a plan that stores
+        // more finishes later. That is the whole of what this item is for, and it
+        // is enough for the ranking: makespan responds to write bytes, and
+        // `written_bytes` and `materialised_bytes` record them exactly.
+        //
+        // Charging the store to the **serial channel** is the part left undone,
+        // and deliberately. A store joins the channel when the compute ends, so
+        // `io_free_at` would have to move past that compute — and then the next
+        // task's *read* queues behind it, and the channel becomes a global lock
+        // through which every task's compute is serialised. Measured on the
+        // suite's own fixture: a plan that took `203.9 ms` on one worker took
+        // `203.9 ms` on eight, to the nanosecond, which is a simulator with no
+        // worker axis at all. Accounting it from dispatch instead avoids that
+        // and breaks the other end — the channel is then never idle, and the
+        // prefetcher, whose whole rule is "only into idle channel time", stops
+        // issuing at every depth.
+        //
+        // Both failures are the same missing thing: a serial channel with an
+        // arrival order needs a **request queue**, not another placement of one
+        // scalar. That is the IO model being replaced rather than patched — see
+        // the `IO latency and IO parallelism` item in
+        // `docs/design/simulator-fidelity.md`, which is where read and write
+        // contention become one question with one answer.
+        let written = task.phase + 1;
+        let write_bytes = if writes[task.phase] && written < decomposition.n_images() {
+            task.geometry.valid.voxels() as u64 * decomposition.dtype_at(written).size_of() as u64
+        } else {
+            0
+        };
+        // The sidecar a fragment block writes, on the same terms as the image
+        // write: the worker blocks on it, and the bytes are the declared bound.
+        let sidecar_bytes: u64 = sidecar_per_block[task.phase]
+            .iter()
+            .filter_map(|size| {
+                size.bytes_at_most(task.geometry.core.shape3(), task.geometry.read.shape3())
+            })
+            .sum();
+        outcome.sidecar_bytes_written += sidecar_bytes;
+        let finish = if write_bytes + sidecar_bytes > 0 {
+            let intermediate =
+                decomposition.image_kind(written) == crate::decomposition::ImageKind::Intermediate;
+            let rate = if intermediate {
+                rates.materialise_ns_per_byte
+            } else {
+                rates.write_ns_per_byte
+            };
+            // The image bytes are counted as image bytes and the sidecar bytes
+            // as sidecar bytes — they share the *duration*, because the worker
+            // blocks on both, and nothing else. Folding them into one counter
+            // was the first version and it made `written_bytes` disagree with
+            // the executor's `RegionWritten` by exactly the sidecar payload.
+            if intermediate {
+                outcome.materialised_bytes += write_bytes;
+            } else {
+                outcome.written_bytes += write_bytes;
+            }
+            // A sidecar is an intermediate by nature: nothing outside the run
+            // reads one, and `Lifecycle` is how it goes.
+            computed
+                + (write_bytes as f64 * rate) as u64
+                + (sidecar_bytes as f64 * rates.materialise_ns_per_byte) as u64
+        } else {
+            computed
+        };
+        busy[worker] = Some(id);
         running.push((finish, id));
         // Descending by finish time, so the earliest completion is `last`.
         running.sort_by(|a, b| b.0.cmp(&a.0));
@@ -874,18 +1688,34 @@ pub fn simulate(
                 // most one outstanding fetch" and every depth above 1 would be
                 // inert. That was this model's first form, and a sweep of
                 // depths 1 to 64 returned the identical row seven times.
-                if issued == 0 && io_free_at > now {
+                if issued == 0 && io_free_at.iter().all(|&free| free > now) {
                     break;
                 }
-                if indegree[ahead.id] == usize::MAX {
+                // **Only a task whose dependencies are met.** `usize::MAX`
+                // marks a task already started; `0` is the readiness test the
+                // dispatcher itself uses. Anything else names a task whose
+                // input image the producing phase has not written, and a fetch
+                // of bytes that do not exist yet is not a prefetch — it is a
+                // hit banked against data the run has not produced. Tasks are
+                // laid out phase-major (`TaskGraph::build`), so without this
+                // every depth past the end of the current phase was doing
+                // exactly that.
+                if indegree[ahead.id] != 0 {
                     continue;
                 }
-                let ahead_keys = grid.keys(ahead.phase, &ahead.geometry.read);
-                let ahead_misses = cache.misses(&ahead_keys) as u64;
+                let ahead_keys: Vec<u64> = images_read[ahead.phase]
+                    .iter()
+                    .flat_map(|&image| grids[&image].keys(image, &ahead.geometry.source))
+                    .collect();
+                let ahead_misses = ahead_keys
+                    .iter()
+                    .filter(|key| !caches[pool].holds(**key) && !encodeds[pool].holds(**key))
+                    .count() as u64;
                 if ahead_misses == 0 {
                     continue;
                 }
-                cache.note_assigned(&ahead_keys);
+                caches[pool].note_assigned(&ahead_keys);
+                encodeds[pool].note_assigned(&ahead_keys);
                 let bytes = ahead_misses * rates.chunk_bytes;
                 outcome.fetched_bytes += bytes;
                 outcome.prefetched_bytes += bytes;
@@ -896,7 +1726,15 @@ pub fn simulate(
                 // queues behind all of it. That delay is the cost of depth, and
                 // without accumulating here there is no cost and deeper would
                 // be better without bound.
-                io_free_at = io_free_at.max(now) + (bytes as f64 * rates.io_ns_per_byte) as u64;
+                let channel = io_free_at
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, free)| *free)
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                io_free_at[channel] = io_free_at[channel].max(now)
+                    + (ahead_misses as f64 * rates.io_latency_ns
+                        + bytes as f64 * rates.io_ns_per_byte) as u64;
                 issued += 1;
             }
         }

@@ -242,11 +242,17 @@ impl Coverage {
 /// Both fields are decisions with no default. The lifecycle says whether the
 /// fragments survive the run; the coverage says what the guard is allowed to
 /// assert about them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FragmentOutput {
     pub stream: String,
     pub lifecycle: Lifecycle,
     pub coverage: Coverage,
+    /// An **upper bound** on what one block writes to this stream.
+    ///
+    /// See [`SidecarSize`]. Stated with [`FragmentOutput::sized`]; a stream that
+    /// has not stated one is [`SidecarSize::Unstated`], which is a fact about
+    /// the declaration rather than a claim that the stream is empty.
+    pub size: SidecarSize,
 }
 
 impl FragmentOutput {
@@ -255,7 +261,237 @@ impl FragmentOutput {
             stream: stream.into(),
             lifecycle,
             coverage,
+            size: SidecarSize::Unstated,
         }
+    }
+
+    /// The same output, with an upper bound on what a block writes to it.
+    pub fn sized(mut self, size: SidecarSize) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// The bound in bytes for a block of `core_voxels`, or `None` when the
+    /// stream has not stated one.
+    pub fn bound_bytes(&self, core: [usize; 3], read: [usize; 3]) -> Option<u64> {
+        self.size.bytes_at_most(core, read)
+    }
+}
+
+/// An upper bound on what one block writes to one sidecar stream.
+///
+/// # Why a bound, and why a bound is not the whole answer
+///
+/// Sidecars are **completely measured** — `Event::SidecarWritten`,
+/// `Stats::sidecar_bytes_written` — and, until this existed, **entirely
+/// undeclared**: `Decomposition::exact_read_voxels` says outright that it "has
+/// never counted those", and `Residency` had no term for them. That matters
+/// because of where the bytes are: at a barrier the gather holds **every
+/// contributing block's fragment at once**, and under `Coverage::EveryBlock`
+/// that is `n_blocks x payload` resident at one instant with nothing budgeting
+/// it. The block-count scaling runs the wrong way, too — a fixed per-block
+/// component totals *more* as the cut gets finer, while the two terms the budget
+/// does model both fall.
+///
+/// So the shape is the one `IterativeOp::limit` and `Coverage` already use:
+/// **declare a bound that is always true, check it against the run, and measure
+/// the quantity the bound is too loose to serve.** The bound is what a
+/// *refusal* rests on, because a bound is always true. The measurement — from
+/// `Stats::sidecar_bytes_written` — is what a *choice* rests on, because a
+/// choice only has to be right relative to another choice.
+///
+/// The check is what stops this becoming a second copy of a truth:
+/// [`check_fragment_coverage`] already walks the store after every fragment
+/// phase and enumerates each stream's keys, so comparing the bytes against the
+/// bound costs one field and fails by name, on the run that breaks it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SidecarSize {
+    /// Not declared. **Not zero** — a stream that says nothing is a stream
+    /// nothing can budget, and the honest rendering of that is a state of its
+    /// own rather than a plausible number.
+    Unstated,
+    /// A header, plus terms over the block's core, its read extent, and its read
+    /// extent's boundary.
+    ///
+    /// **One shape rather than one variant per encoder**, and that was arrived
+    /// at by adding variants until the pattern was obvious: every sidecar in
+    /// this crate is a header followed by some combination of a per-voxel body,
+    /// a per-object body and a set of boundary planes, and `detect`'s report is
+    /// two of those at once. Use the constructors — [`SidecarSize::fixed`],
+    /// [`SidecarSize::per_block`], [`SidecarSize::row_table`],
+    /// [`SidecarSize::block_faces`], [`SidecarSize::component_report`] — which
+    /// carry each encoder's own arithmetic in one place.
+    ///
+    /// **Read and not core, for anything an emitter searches for.** An op finds
+    /// its objects in the volume it was handed and only then keeps the ones its
+    /// core owns; `components::planes_of` reads `labels.shape()`, which is the
+    /// read extent. Bounding by the core refused eighteen tests, the ratio being
+    /// exactly the halo.
+    Terms {
+        /// Bytes whatever the block holds: magic, version, counts.
+        fixed: u64,
+        /// Bytes per voxel of the block's **core**.
+        per_core_voxel: f64,
+        /// Bytes per voxel of the block's **read** extent — one per voxel the op
+        /// looked at, which is the honest ceiling for an object count.
+        per_read_voxel: f64,
+        /// Bytes per voxel of the read extent's six boundary planes,
+        /// `2(xy + yz + zx)`.
+        ///
+        /// **A surface is not a function of a volume**: a `[1, 32, 32]` slab and
+        /// an `[8, 8, 16]` brick hold the same voxels and have very different
+        /// boundaries, so no per-volume coefficient bounds this at any value.
+        per_face_voxel: f64,
+        /// Whether the bound is tight enough for a budget to refuse on, and
+        /// therefore for the write-site guard to enforce.
+        ///
+        /// Stated rather than inferred: `block_faces` has a per-read-voxel term
+        /// and is exact, while a row table has one and is a ceiling of one row
+        /// per voxel that refuses nothing useful. The difference is in what the
+        /// encoder does, which only its own constructor knows.
+        tight: bool,
+    },
+}
+
+impl SidecarSize {
+    /// One object of known size, whatever the block holds.
+    pub fn fixed(bytes: u64) -> Self {
+        SidecarSize::Terms {
+            fixed: bytes,
+            per_core_voxel: 0.0,
+            per_read_voxel: 0.0,
+            per_face_voxel: 0.0,
+            tight: true,
+        }
+    }
+
+    /// Constant per block — a header, a per-block scalar.
+    ///
+    /// **The shape that makes a finer cut cost more**, and the one the budget
+    /// most needs: `n_blocks x bytes` grows as the edge shrinks, against every
+    /// other residency term.
+    pub fn per_block(bytes: u64) -> Self {
+        SidecarSize::fixed(bytes)
+    }
+
+    /// The bound for a **row-table** stream — the shape `RowBuilder::encode`
+    /// writes, which is most of the sidecars this crate produces.
+    ///
+    /// `rows_per_read_voxel` is the op's own ceiling on how many rows one voxel
+    /// of the read extent can produce: `1` for an emitter that writes at most a
+    /// row per voxel, the neighbour-offset count for a pair emitter, and `1`
+    /// again for anything keyed by object, since a block finds no more objects
+    /// than it looked at voxels.
+    ///
+    /// The header comes from the schema rather than from a constant, so a column
+    /// added to the schema moves the bound with it. **Not tight**: one row per
+    /// voxel is true and refuses nothing, which is the case this whole mechanism
+    /// exists to make visible rather than to solve.
+    pub fn row_table(schema: &crate::table::Schema, rows_per_read_voxel: u64) -> Self {
+        SidecarSize::Terms {
+            fixed: crate::table::encoded_header_bytes(schema),
+            per_core_voxel: 0.0,
+            per_read_voxel: (crate::table::encoded_row_bytes(schema)
+                .saturating_mul(rows_per_read_voxel.max(1))) as f64,
+            per_face_voxel: 0.0,
+            tight: false,
+        }
+    }
+
+    /// The **six-faces** shape `fill`, `label` and `regional` share:
+    /// `3 + labels + 12 + 2(xy + yz + zx)` words over the read extent, at four
+    /// bytes a word. Exact, and therefore enforced.
+    pub fn block_faces() -> Self {
+        SidecarSize::Terms {
+            fixed: (3 + 12) * 4,
+            per_core_voxel: 0.0,
+            // One word per label, and `labels <= read voxels`.
+            per_read_voxel: 4.0,
+            per_face_voxel: 4.0,
+            tight: true,
+        }
+    }
+
+    /// `regional`'s plateau report: the six faces, one word per label for the
+    /// plateau **value**, and a second per label for the `ascends` flag.
+    ///
+    /// A word wider per label than [`SidecarSize::block_faces`], which is what
+    /// the write-site guard reported as `declares at most 236 ... wrote 256`.
+    pub fn plateau_faces() -> Self {
+        SidecarSize::Terms {
+            fixed: (3 + 12) * 4,
+            per_core_voxel: 0.0,
+            // Three words a label — the value, the flag, and the one
+            // `block_faces` already counts — and `labels <= read voxels`.
+            per_read_voxel: 3.0 * 4.0,
+            per_face_voxel: 4.0,
+            tight: true,
+        }
+    }
+
+    /// `detect`'s component report: the six faces **and** ten `u64` of moments
+    /// per component — count, three sums, three minima, three maxima — written
+    /// as pairs of `u32`.
+    ///
+    /// Two shapes at once, which is what made a variant per encoder untenable.
+    pub fn component_report() -> Self {
+        SidecarSize::Terms {
+            fixed: (3 + 12) * 4,
+            per_core_voxel: 0.0,
+            // Twenty words a component, and `components <= read voxels`.
+            per_read_voxel: 20.0 * 4.0,
+            per_face_voxel: 4.0,
+            tight: true,
+        }
+    }
+
+    /// A headerless stream of `bytes` per item, bounded by one item per **read**
+    /// voxel. Not tight, for the same reason [`SidecarSize::row_table`] is not.
+    pub fn per_read_voxel(fixed: u64, bytes: u64) -> Self {
+        SidecarSize::Terms {
+            fixed,
+            per_core_voxel: 0.0,
+            per_read_voxel: bytes as f64,
+            per_face_voxel: 0.0,
+            tight: false,
+        }
+    }
+
+    /// The bound in bytes for a block, from its `core` and `read` extents.
+    pub fn bytes_at_most(self, core: [usize; 3], read: [usize; 3]) -> Option<u64> {
+        let SidecarSize::Terms {
+            fixed,
+            per_core_voxel,
+            per_read_voxel,
+            per_face_voxel,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let volume = |e: [usize; 3]| {
+            (e[0] as u64)
+                .saturating_mul(e[1] as u64)
+                .saturating_mul(e[2] as u64)
+        };
+        let [x, y, z] = [read[0] as u64, read[1] as u64, read[2] as u64];
+        let surface = 2 * (x * y + y * z + z * x);
+        Some(
+            fixed
+                + (volume(core) as f64 * per_core_voxel) as u64
+                + (volume(read) as f64 * per_read_voxel) as u64
+                + (surface as f64 * per_face_voxel) as u64,
+        )
+    }
+
+    /// Whether the bound is tight enough for a budget to refuse on, and for the
+    /// write-site guard to enforce.
+    ///
+    /// A ceiling of one item per voxel is true and refuses nothing; failing a
+    /// run against it would be theatre. Callers that need a number for a
+    /// *choice* rather than a refusal read `Stats::sidecar_bytes_written`.
+    pub fn is_tight(self) -> bool {
+        matches!(self, SidecarSize::Terms { tight: true, .. })
     }
 }
 
@@ -2031,8 +2267,11 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
 // -------------------------------------------------------- coverage guard --
 
 /// What one stream of a fragment phase actually holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamCoverage {
+    /// What the stream declared one block writes at most. `Unstated` where it
+    /// said nothing, which is what most shipped streams still say.
+    pub declared_size: SidecarSize,
     pub stream: String,
     pub phase: usize,
     pub declared: Coverage,
@@ -2127,6 +2366,7 @@ pub fn check_fragment_coverage(
             stream: output.stream.clone(),
             phase,
             declared: output.coverage,
+            declared_size: output.size,
             blocks: written.len(),
             lattice: lattice.len(),
         });

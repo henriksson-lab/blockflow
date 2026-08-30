@@ -257,7 +257,13 @@ impl FragmentOp for YoloBlockDetector {
             STREAM.to_string(),
             Lifecycle::Persistent,
             Coverage::EveryBlock,
-        )]
+        )
+        // One row per detection, and a block cannot detect more objects than it
+        //             // holds voxels.
+        .sized(match self.schema() {
+            Ok(schema) => crate::fragment::SidecarSize::row_table(&schema, 1),
+            Err(_) => crate::fragment::SidecarSize::Unstated,
+        })]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> crate::error::Result<BlockOutput> {

@@ -489,7 +489,7 @@ use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
     fragment_phase, pack_u64, unpack_u64, BlockOutput, BlockView, Coverage, FragmentInput,
-    FragmentOp, FragmentOutput, SourceBlocks,
+    FragmentOp, FragmentOutput, SidecarSize, SourceBlocks,
 };
 use crate::geometry::BlockGrid;
 use crate::op::SourceInput;
@@ -1654,11 +1654,11 @@ impl FragmentOp for TabulateValuesOp {
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            self.stream.clone(),
-            self.lifecycle,
-            Coverage::EveryBlock,
-        )]
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                // One row per object, and a block finds no more objects than it read voxels.
+                .sized(SidecarSize::row_table(&tabulation_schema(self.fixed), 1)),
+        ]
     }
 
     fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
@@ -1849,11 +1849,11 @@ impl FragmentOp for MergeTabulationOp {
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            self.stream.clone(),
-            self.lifecycle,
-            Coverage::EveryBlock,
-        )]
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                // One row per object, and a block holds no more objects than voxels.
+                .sized(SidecarSize::row_table(&tabulation_schema(self.fixed), 1)),
+        ]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {

@@ -197,6 +197,8 @@ fn charged(images_read: usize) -> f64 {
         PhaseTraffic {
             images_read,
             writes_an_image: true,
+            // A pixel phase reads and computes once.
+            repeats: 1,
         },
     )
     .working_set_bytes_per_block

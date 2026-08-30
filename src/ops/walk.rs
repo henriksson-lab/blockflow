@@ -139,7 +139,7 @@ use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
     BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput, SeamFold,
-    SourceBlocks,
+    SidecarSize, SourceBlocks,
 };
 use crate::op::SourceInput;
 use crate::ops::rows::{value_at, Limit, RowStreams};
@@ -765,7 +765,13 @@ impl FragmentOp for OffsetWalkOp {
             // check has nothing to bite on and this declaration is the only
             // guard there is.
             Coverage::EveryBlock,
-        )]
+        )
+        // A walk emits at most one row per input row, and the input is keyed by
+        //             // position, so one per core voxel bounds it.
+        .sized(match self.schema() {
+            Ok(schema) => SidecarSize::row_table(&schema, 1),
+            Err(_) => SidecarSize::Unstated,
+        })]
     }
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {

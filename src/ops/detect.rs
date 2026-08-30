@@ -354,7 +354,7 @@ use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
     fragment_phase, BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput,
-    PhaseView, SeamFold,
+    PhaseView, SeamFold, SidecarSize,
 };
 use crate::geometry::BlockGrid;
 use crate::points::{encode_points, Point};
@@ -1342,7 +1342,10 @@ impl FragmentOp for LabelRegionsOp {
             // faces of zeros and a label count of nought, and the merge needs to
             // see that rather than infer it from an absence.
             Coverage::EveryBlock,
-        )]
+            // The six faces **and** ten words of moments per component: this
+            // stream carries both, which is why it has its own constructor.
+        )
+        .sized(SidecarSize::component_report())]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
@@ -1549,7 +1552,16 @@ impl FragmentOp for RegionPointsOp {
             // that owns no component writes a zero-length blob, which is present
             // and therefore checkable.
             Coverage::EveryBlock,
-        )]
+        )
+        // Two shapes, because this op emits two — and a bound that covered only one
+        //             // of them would be a bound that is false half the time.
+        .sized(match self.emission {
+            // `Emission::Point` is `encode_points`: headerless, four words a
+            // centroid, one centroid per component.
+            Emission::Point => SidecarSize::per_read_voxel(0, 32),
+            // `Emission::Measured` is a row table, one row per component.
+            Emission::Measured => SidecarSize::row_table(&measurement_schema(), 1),
+        })]
     }
 
     /// **Nothing per block.** The merge is [`Self::reduce`]'s and the totals

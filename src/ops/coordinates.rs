@@ -150,6 +150,7 @@ use crate::env::{BlockBuf, Environment};
 use crate::error::{Error, Result};
 use crate::fragment::{
     fold_fragments, fragment_phase, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput,
+    SidecarSize,
 };
 use crate::geometry::BlockGrid;
 use crate::region::Region;
@@ -594,7 +595,15 @@ impl FragmentOp for SetVoxelsOp {
             // A block that found no set voxel writes a header and no rows, which
             // is present and therefore checkable.
             Coverage::EveryBlock,
-        )]
+        )
+        // One row per **set** voxel, so at most one per core voxel.
+        .sized(match self.schema() {
+            Ok(schema) => SidecarSize::row_table(&schema, 1),
+            // A schema this op cannot build is a plan that will not run;
+            // saying nothing here is honest and the failure comes from the
+            // guard that owns it.
+            Err(_) => SidecarSize::Unstated,
+        })]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {

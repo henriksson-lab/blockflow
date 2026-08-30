@@ -304,6 +304,31 @@ impl PhaseDecomposition {
         self
     }
 
+    /// The images one block of this phase fetches: its own input image if it
+    /// reads one, then every entry of [`Self::source_images`].
+    ///
+    /// **`index` is the phase's own position**, because a phase reads image
+    /// `index` and writes image `index + 1`; the type does not carry its own
+    /// number and inventing one here would be a second answer to a question the
+    /// caller already knows.
+    ///
+    /// One home for the list, so that a caller counting fetches and a caller
+    /// performing them cannot disagree: `phase_traffic` takes its
+    /// `images_read` count from `.len()` of this, `strategy` reads exactly these
+    /// images at `BlockGeometry::source`, and `simulate` charges exactly these.
+    /// Before this existed the simulator charged for one image whatever the
+    /// phase read, which under-priced every fused multi-input phase — the
+    /// arrangement a scheduler would otherwise prefer.
+    pub fn images_read(&self, index: usize) -> Vec<usize> {
+        let mut images =
+            Vec::with_capacity(usize::from(self.reads_input_image) + self.source_images.len());
+        if self.reads_input_image {
+            images.push(index);
+        }
+        images.extend(self.source_images.iter().copied());
+        images
+    }
+
     /// Say whether this phase waits for all of the previous phase.
     ///
     /// Only a fragment phase ever passes `true`; see
@@ -651,6 +676,74 @@ impl Decomposition {
                 Some(&last) => last == phase,
                 None => image > 0 && image - 1 == phase,
             })
+            .collect()
+    }
+
+    /// Whether policy permits freeing `image` at all — the half
+    /// [`Self::images_dead_after`] deliberately leaves out.
+    ///
+    /// `Internal` **or** released, and `keep_images` wins over both. The first
+    /// is the plan's answer — an image that exists only to get from one phase to
+    /// the next — and the second is the caller's, for an image the plan calls
+    /// [`Visibility::Published`] because of where it sits and that this caller does not want
+    /// back. A caller that named the same image in `release_images` and
+    /// `keep_images` has contradicted itself, and the reading that cannot lose
+    /// data is the one taken.
+    ///
+    /// **One function because it used to be three.** This predicate was written
+    /// out at `strategy`'s discard loop, inside
+    /// [`Self::peak_image_bytes_with`]'s residency walk, and again in
+    /// `simulate`'s — the middle one describing itself as "word for word the
+    /// executor's rule", which is an accurate confession rather than a
+    /// reassurance. Two of the three then disagreed with the first about an
+    /// image nothing reads; see [`Self::images_freed_after`].
+    pub fn image_freeable(
+        &self,
+        image: usize,
+        released: &BTreeSet<ImageId>,
+        kept: &BTreeSet<ImageId>,
+    ) -> bool {
+        let id = ImageId::from(image);
+        (self.image_visibility(image) == Visibility::Internal || released.contains(&id))
+            && !kept.contains(&id)
+    }
+
+    /// The images a run may free once `phase` has finished: dead after it
+    /// ([`Self::images_dead_after`]) **and** freeable ([`Self::image_freeable`]).
+    ///
+    /// The one place the two halves are put together, and therefore the one
+    /// statement of what the executor does. `strategy`'s discard loop, this
+    /// type's residency walk and `simulate`'s all call it.
+    ///
+    /// # The reconciliation, stated rather than left to an invariant
+    ///
+    /// The three former copies did not agree about **an image nothing reads**.
+    /// [`Self::images_dead_after`] answers `i - 1 == phase` for one — it dies
+    /// after the phase that wrote it — while both residency walks matched on
+    /// `readers_of_image(..).last()` and treated `None` as *drop now*. Those are
+    /// different rules. They agreed in practice only because an image enters the
+    /// live set when its writer starts, which made the difference unreachable —
+    /// agreement resting on an invariant stated in another function, which is
+    /// the failure mode transcription produces.
+    ///
+    /// **`images_dead_after`'s answer is the one kept**, because the executor
+    /// is what actually runs and that is the rule it followed. Two edge cases
+    /// move as a result, both in the safe direction: **image 0** and a
+    /// **supplied input**, each unread and named in `release_images`, were
+    /// dropped by the residency walks at the first phase boundary and are not
+    /// freed by the executor at all — `images_dead_after` excludes image 0 by
+    /// construction and never names a supplied input, which `n_images` does not
+    /// count. The walks now report those bytes as resident, which is what the
+    /// run holds.
+    pub fn images_freed_after(
+        &self,
+        phase: usize,
+        released: &BTreeSet<ImageId>,
+        kept: &BTreeSet<ImageId>,
+    ) -> Vec<usize> {
+        self.images_dead_after(phase)
+            .into_iter()
+            .filter(|&image| self.image_freeable(image, released, kept))
             .collect()
     }
 
@@ -1019,7 +1112,63 @@ impl Decomposition {
         Ok(Residency {
             image_bytes: self.peak_image_bytes_with(work, released, kept)?,
             working_set_bytes,
+            sidecar_bytes: self.gathered_sidecar_bytes(work),
         })
+    }
+
+    /// The largest a **barrier gather** gets: every contributing block's
+    /// fragment, resident at once, from the declared
+    /// [`crate::fragment::SidecarSize`] of each stream.
+    ///
+    /// # Why this is a residency term at all
+    ///
+    /// A barrier reduces over the whole phase, so the blob it folds holds one
+    /// fragment per block simultaneously. Under `Coverage::EveryBlock` that is
+    /// `n_blocks x payload` at one instant — and until this existed, nothing
+    /// budgeted it: `exact_read_voxels` says outright that it "has never counted
+    /// those", and `Residency` had two terms, both of which **fall** as the cut
+    /// gets finer. A fixed per-block payload totals *more* as it gets finer, so
+    /// a planner shrinking the working set was free to grow an unbudgeted peak.
+    ///
+    /// # What an undeclared stream contributes, and why it is zero
+    ///
+    /// Zero, and that is a statement about the declaration rather than about the
+    /// stream: `SidecarSize::Unstated` means nobody said, and inventing a number
+    /// here would be the plausible constant this whole mechanism exists to
+    /// avoid. `tests/one_freeing_rule.rs` is what keeps a shipped stream from
+    /// being in that state.
+    ///
+    /// # And why it is a bound rather than a measurement
+    ///
+    /// A budget refuses on it, and a refusal has to rest on something always
+    /// true. `Stats::sidecar_bytes_written` is the measurement, and it is what a
+    /// *choice* between two plans should read; the two are kept apart on purpose.
+    /// See `SidecarSize::is_tight` for the streams whose bound is loose enough
+    /// that only the measurement is usable.
+    pub fn gathered_sidecar_bytes(&self, work: &[crate::fragment::PhaseWork<'_>]) -> u64 {
+        self.phases
+            .iter()
+            .enumerate()
+            .map(|(index, phase)| {
+                let Some(crate::fragment::PhaseWork::Fragments(op)) = work.get(index) else {
+                    return 0;
+                };
+                let outputs = op.outputs();
+                phase
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        let core = block.core.shape3();
+                        let read = block.read.shape3();
+                        outputs
+                            .iter()
+                            .filter_map(|output| output.size.bytes_at_most(core, read))
+                            .sum::<u64>()
+                    })
+                    .sum()
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn peak_image_bytes(&self, work: &[crate::fragment::PhaseWork<'_>]) -> Result<u64> {
@@ -1076,28 +1225,12 @@ impl Decomposition {
             if now > peak {
                 peak = now;
             }
-            // Freed after this phase: an internal image whose last reader was
-            // this phase, and an internal image nothing reads at all — the same
-            // rule at zero readers. `readers_of_image` is asked about the plan's
-            // own images only; a supplied input has no producer to die after.
-            live.retain(|&(image, _)| {
-                let id = ImageId::from(image);
-                // Word for word the executor's rule at `strategy.rs`'s
-                // `images_dead_after` loop: `Internal` **or** released, and
-                // `keep_images` wins over both because a caller that named an
-                // image in each has contradicted itself and the reading that
-                // cannot lose data is the one to take.
-                let freeable = (self.image_visibility(image) == Visibility::Internal
-                    || released.contains(&id))
-                    && !kept.contains(&id);
-                if !freeable {
-                    return true;
-                }
-                match self.readers_of_image(image).last() {
-                    Some(&last) => last > index,
-                    None => false,
-                }
-            });
+            // Freed after this phase, by the executor's own rule and not by a
+            // second statement of it. See `images_freed_after`, which is the
+            // only place the two halves — dead after this phase, and freeable
+            // at all — are put together.
+            let freed = self.images_freed_after(index, released, kept);
+            live.retain(|&(image, _)| !freed.contains(&image));
         }
         Ok(peak)
     }
@@ -2365,15 +2498,45 @@ pub struct PhaseTraffic {
     /// the op's rather than the plan's: a fragment phase writes an image only if
     /// its op says it does, and the plan records no such field.
     pub writes_an_image: bool,
+    /// How many times the phase's **read and compute** happen, where its write
+    /// happens once.
+    ///
+    /// `1` for everything but an iteration. An iterative phase runs `S`
+    /// substages that read and compute, ping-ponging two private buffers, and
+    /// `strategy::run_iterative_phase` writes the image **once**, after the
+    /// loop. So the shape is `S x (read + compute) + write`, and pricing at
+    /// `S == 1` over-weights the write against the rest by a residual that
+    /// varies with the block edge — measured at up to **1.125x** the right
+    /// choice, and departing from it at counts as ordinary as two and four. See
+    /// `crate::iterate::IterativeOp::cost_per_voxel`.
+    ///
+    /// **Measured, never declared.** `IterativeOp::limit` is a runaway *bound*
+    /// and deliberately not an estimate; the count is a fixed point over data,
+    /// so no plan holds it and `phase_traffic` answers `1`. A caller with a real
+    /// run's `Stats::substages` says so with [`PhaseTraffic::repeating`].
+    pub repeats: u64,
 }
 
 impl PhaseTraffic {
-    /// One image in, one image out — every pixel phase with no second array,
-    /// which is what the price assumed before the distinction existed.
+    /// One image in, one image out, once — every pixel phase with no second
+    /// array, which is what the price assumed before the distinctions existed.
     pub fn one_in_one_out() -> Self {
         PhaseTraffic {
             images_read: 1,
             writes_an_image: true,
+            repeats: 1,
+        }
+    }
+
+    /// The same traffic, with the read-and-compute happening `substages` times.
+    ///
+    /// `0` is read as `1`: `Stats::substages` reports zero for a phase that is
+    /// not an iteration, and charging that phase nothing would be reading "not
+    /// an iteration" as "no work".
+    pub fn repeating(self, substages: usize) -> Self {
+        PhaseTraffic {
+            repeats: (substages as u64).max(1),
+            ..self
         }
     }
 }
@@ -2461,6 +2624,10 @@ pub struct PhaseCost {
     /// extent: input plus output. This is what the byte budget is checked
     /// against, so it must be physical — a read can never exceed the volume.
     pub working_set_bytes_per_block: f64,
+    /// How many times the read-and-compute terms of [`Self::cost_per_block`]
+    /// were charged. `1` for everything but a measured iteration; see
+    /// [`PhaseTraffic::repeats`].
+    pub repeats: u64,
     pub cost_per_block: f64,
 }
 
@@ -2473,12 +2640,22 @@ pub struct Residency {
     /// Block tiles in flight: the worst phase's working set times the expected
     /// concurrency. **Scales with the block and the concurrency.**
     pub working_set_bytes: u64,
+    /// The worst barrier gather: every contributing block's fragment at once,
+    /// from each stream's declared bound. See
+    /// [`Decomposition::gathered_sidecar_bytes`].
+    ///
+    /// **The only term that grows as the cut gets finer**, which is why it had
+    /// to be a term rather than a footnote: the other two fall, so a planner
+    /// optimising against them alone walks toward a peak nothing was watching.
+    pub sidecar_bytes: u64,
 }
 
 impl Residency {
     /// Both terms. The number to compare against a machine.
     pub fn total_bytes(self) -> u64 {
-        self.image_bytes.saturating_add(self.working_set_bytes)
+        self.image_bytes
+            .saturating_add(self.working_set_bytes)
+            .saturating_add(self.sidecar_bytes)
     }
 
     /// [`Self::total_bytes`] in GiB, for a message or a table.
@@ -2737,8 +2914,24 @@ pub fn price_phase(
         // rather than half-fixed: correcting it changes which plans are
         // *affordable*, and that is a budget review with its own measurements.
         working_set_bytes_per_block: resident_voxels * bytes_per_voxel * 2.0,
-        cost_per_block: read_voxels * model.read_cost_per_voxel
-            + compute_voxels * model.compute_scale * compute_per_voxel
+        repeats: traffic.repeats,
+        // **`S x (read + compute) + write`, and the split is the point.**
+        //
+        // A constant multiplier on the *whole* price would be neutral to an
+        // argmin, which is why pricing an iteration at one substage looked free.
+        // It is not: the substages read and compute, and the image is written
+        // once after the loop, so the residual `(S - 1) x (read + compute)` is a
+        // function of the block edge through the read amplification. `iterate`
+        // measured the one-substage choice at up to **1.125x** the right one,
+        // departing at counts as ordinary as two and four and at every worker
+        // count above two.
+        //
+        // The conflict term is outside the repeat too: it prices *ordering*
+        // between slots of a group, which happens once however many substages
+        // one of them runs.
+        cost_per_block: traffic.repeats as f64
+            * (read_voxels * model.read_cost_per_voxel
+                + compute_voxels * model.compute_scale * compute_per_voxel)
             + core_voxels * write
             + conflict,
     }
@@ -2921,6 +3114,27 @@ pub(crate) fn phase_compute_per_voxel(
 /// [`phase_compute_per_voxel`] makes: `reads_input_image` defaults true and
 /// `writes_an_image` would default true, so such a phase would be priced for a
 /// read and a write it may do neither of, silently.
+/// [`PhaseTraffic`] for one phase of a plan — what it reads, whether it writes,
+/// and how many times its read-and-compute happen.
+///
+/// Public where `phase_traffic` is `pub(crate)` because a caller pricing a plan
+/// needs the answer and has no business constructing one: `images_read` is
+/// derived from the phase and `repeats` is `1` until a measurement says
+/// otherwise, and both are facts about the plan rather than choices.
+pub fn phase_traffic_of(
+    index: usize,
+    decomposition: &Decomposition,
+    work: &[crate::fragment::PhaseWork<'_>],
+) -> Result<PhaseTraffic> {
+    let phase = decomposition.phases.get(index).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "phase {index} of a decomposition with {}",
+            decomposition.n_phases()
+        ))
+    })?;
+    phase_traffic(index, phase, work.get(index))
+}
+
 pub(crate) fn phase_traffic(
     index: usize,
     phase: &PhaseDecomposition,
@@ -2938,8 +3152,13 @@ pub(crate) fn phase_traffic(
         }
     };
     Ok(PhaseTraffic {
-        images_read: usize::from(phase.reads_input_image) + phase.source_images.len(),
+        images_read: phase.images_read(index).len(),
         writes_an_image,
+        // One, always, and a caller who has measured otherwise says so with
+        // `PhaseTraffic::repeating`. The plan cannot know: an iteration runs to
+        // convergence over data, which is why `IterativeOp` has a `limit` and no
+        // count.
+        repeats: 1,
     })
 }
 

@@ -1467,6 +1467,25 @@ impl RowBuilder {
     }
 }
 
+/// How many bytes [`RowBuilder::encode`] writes before the first row.
+///
+/// **Computed from the schema rather than stated as a constant**, so that a
+/// column added to a schema moves the figure with it. This is the `fixed` term
+/// of a row stream's [`crate::fragment::SidecarSize`]: four header words, then
+/// two words per column plus its name padded to whole words.
+pub fn encoded_header_bytes(schema: &Schema) -> u64 {
+    let mut words = 4u64;
+    for column in schema.columns() {
+        words += 2 + column.name().as_bytes().len().div_ceil(8) as u64;
+    }
+    words * 8
+}
+
+/// Bytes per encoded row: one word per column.
+pub fn encoded_row_bytes(schema: &Schema) -> u64 {
+    schema.width() as u64 * 8
+}
+
 /// The schema a blob was written under, without needing one to read it.
 ///
 /// Here so that a consumer handed an unfamiliar stream can say what it is rather

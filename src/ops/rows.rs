@@ -388,7 +388,7 @@ use crate::env::{BlockBuf, Environment};
 use crate::error::{Error, Result};
 use crate::fragment::{
     fold_fragments, fragment_phase, pack_u64, unpack_u64, BlockOutput, BlockView, Coverage,
-    FragmentInput, FragmentOp, FragmentOutput, SeamFold, SourceBlocks,
+    FragmentInput, FragmentOp, FragmentOutput, SeamFold, SidecarSize, SourceBlocks,
 };
 use crate::geometry::BlockGrid;
 use crate::op::SourceInput;
@@ -1081,7 +1081,9 @@ impl RowStreams {
             // guard there is; a range whose every row was filtered out writes a
             // header and no rows, which is present and therefore checkable.
             Coverage::EveryBlock,
-        )]
+        )
+        // A row stream keyed by position: at most one row per voxel read.
+        .sized(SidecarSize::row_table(&self.schema, 1))]
     }
 
     /// This block's blob, or the empty one.
@@ -1228,11 +1230,11 @@ impl FragmentOp for RowSourceOp {
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            self.stream.clone(),
-            self.lifecycle,
-            Coverage::EveryBlock,
-        )]
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                // The input's rows, keyed by position, so at most one per core voxel.
+                .sized(SidecarSize::row_table(&self.schema, 1)),
+        ]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
@@ -2588,11 +2590,11 @@ impl FragmentOp for MergeGroupsOp {
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            self.output.clone(),
-            self.lifecycle,
-            Coverage::EveryBlock,
-        )]
+        vec![
+            FragmentOutput::new(self.output.clone(), self.lifecycle, Coverage::EveryBlock)
+                // One merged row per group, and a block holds no more groups than voxels.
+                .sized(SidecarSize::row_table(self.schema(), 1)),
+        ]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {

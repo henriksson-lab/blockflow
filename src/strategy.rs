@@ -59,7 +59,7 @@ use crate::voxels::Voxels;
 use super::decomposition::{
     check_block_constraints, check_dtypes, check_output_shapes, check_source_images,
     compute_per_voxel, constraint_for, cuttable_axes, groups_for, is_planning_barrier, price_phase,
-    region_to_ranges, Constraints, Decomposition, PhaseDecomposition, SlabPolicy, Visibility,
+    region_to_ranges, Constraints, Decomposition, PhaseDecomposition, SlabPolicy,
 };
 use super::env::{block_shape, BlockBuf, Environment};
 use super::fragment::{
@@ -194,11 +194,12 @@ pub struct Hints {
     pub keep_images: BTreeSet<ImageId>,
     /// Images the caller will **not** read back, so the executor may free them
     /// at their last reader even though the plan calls them
-    /// [`Visibility::Published`].
+    /// [`Visibility::Published`](crate::decomposition::Visibility::Published).
     ///
     /// # Why this exists, and why it is not just a wider `Visibility`
     ///
-    /// [`Visibility`] is *derived from position*: image 0 is the run's input and
+    /// [`Visibility`](crate::decomposition::Visibility) is *derived from
+    /// position*: image 0 is the run's input and
     /// the last image is its output, so both are `Published` and neither is ever
     /// discarded. That is the right default and it is not a statement about
     /// whether anybody wants them. A caller that hands its volume to the run and
@@ -865,26 +866,20 @@ pub fn execute_phases(
                 // The saving is the whole point of `Visibility`: without this an
                 // `N`-phase chain holds `N + 1` full images for the length of
                 // the run, and only ever two of them are live.
-                for image in decomposition.images_dead_after(phase) {
-                    let id = ImageId::from(image);
-                    // `Internal` **or** released. The first is the plan's
-                    // answer — an image that exists only to get from one phase
-                    // to the next — and the second is the caller's, for an image
-                    // the plan calls `Published` because of where it sits and
-                    // that this caller does not want back. See
-                    // `Hints::release_images` for why the plan cannot know that
-                    // and the caller can.
-                    let freeable = decomposition.image_visibility(image) == Visibility::Internal
-                        || hints.release_images.contains(&id);
-                    // `keep_images` wins over `release_images`: a caller that
-                    // named the same image in both has contradicted itself, and
-                    // the reading that cannot lose data is the one to take.
-                    if freeable && !hints.keep_images.contains(&id) {
-                        // The phase goes with the image, so that a reader who
-                        // wanted it back is told which `keep_images` entry they
-                        // needed rather than only that it is gone.
-                        env.discard_image_after(image, phase)?;
-                    }
+                //
+                // `Internal` **or** released, with `keep_images` winning over
+                // both, is `Decomposition::image_freeable`, and it is asked
+                // there rather than here so that the residency walks that
+                // predict this moment cannot answer it differently. The phase
+                // goes with the image, so that a reader who wanted it back is
+                // told which `keep_images` entry they needed rather than only
+                // that it is gone.
+                for image in decomposition.images_freed_after(
+                    phase,
+                    &hints.release_images,
+                    &hints.keep_images,
+                ) {
+                    env.discard_image_after(image, phase)?;
                 }
                 if work[phase].writes_an_image() {
                     // A phase that wrote no image has nothing to flush and
@@ -2043,19 +2038,46 @@ fn run_fragment_task(
         env.release(buf);
     }
 
-    let declared: Vec<String> = op
-        .outputs()
-        .into_iter()
-        .map(|output| output.stream)
-        .collect();
+    let declared = op.outputs();
     for (stream, bytes) in &produced.fragments {
-        if !declared.iter().any(|name| name == stream) {
+        let Some(output) = declared.iter().find(|output| &output.stream == stream) else {
+            let names: Vec<&str> = declared.iter().map(|o| o.stream.as_str()).collect();
             return Err(Error::InvalidArgument(format!(
                 "fragment op {:?} wrote to stream {stream:?}, which it did not declare. \
-                 Declared: {declared:?}. The declaration is what says a stream exists and \
+                 Declared: {names:?}. The declaration is what says a stream exists and \
                  what becomes of it, so an undeclared write has no lifecycle behind it.",
                 op.name()
             )));
+        };
+        // **The declared size, checked where the bytes are.**
+        //
+        // Here rather than in `check_fragment_coverage`, which is the walk that
+        // looks like the right place and is not: that walk enumerates keys, and
+        // reading each fragment back to measure it would make the guard a
+        // *reader* — `sidecar_reads` counts those, and three tests that measure
+        // fetch counts would then be measuring the checker. Here the bytes are
+        // already in hand, the check is free, and it names the block that broke
+        // the bound at the moment it breaks it rather than after the phase.
+        //
+        // Only where the bound is tight: `SidecarSize::PerItem`'s ceiling is one
+        // item per core voxel, which is true and refuses nothing.
+        if output.size.is_tight() {
+            if let Some(bound) = output
+                .size
+                .bytes_at_most(task.geometry.core.shape3(), task.geometry.read.shape3())
+            {
+                if bytes.len() as u64 > bound {
+                    return Err(Error::InvalidArgument(format!(
+                        "fragment op {:?} declares at most {bound} byte(s) per block on stream \
+                         {stream:?} and block {:?} wrote {}. The bound is what a budget refuses \
+                         on, so an op that exceeds it has made every residency figure \
+                         downstream of it wrong rather than merely optimistic.",
+                        op.name(),
+                        task.index,
+                        bytes.len()
+                    )));
+                }
+            }
         }
         env.write_sidecar(stream, task.phase, task.index, bytes)?;
     }
@@ -2810,6 +2832,8 @@ pub fn planned_block(
     let traffic = super::decomposition::PhaseTraffic {
         images_read: super::decomposition::images_read_by(&slots, &group, volume)?,
         writes_an_image: true,
+        // A run of chain slots is a pixel phase: it reads and computes once.
+        repeats: 1,
     };
     let mut candidates = constraints.block_candidates.clone();
     candidates.sort_unstable_by(|a, b| b.cmp(a));
@@ -3768,8 +3792,9 @@ impl PhasePricer<'_> {
         let traffic = super::decomposition::PhaseTraffic {
             images_read,
             // A run of chain slots is a pixel phase, and a pixel phase writes
-            // the image after it.
+            // the image after it — once, having read and computed once.
             writes_an_image: true,
+            repeats: 1,
         };
         let price = |grid: &BlockGrid, halo: &Reach| {
             price_phase(
@@ -4504,6 +4529,7 @@ fn phase_for_group(
     let traffic = super::decomposition::PhaseTraffic {
         images_read: super::decomposition::images_read_by(slots, group, volume)?,
         writes_an_image: true,
+        repeats: 1,
     };
     let mut grid = None;
     let mut halo = reach.clone();

@@ -526,7 +526,12 @@ impl FragmentOp for InstanceSegment {
             // empty blob, and the difference between "owned nothing" and "never
             // ran" is exactly what the coverage check is for.
             Coverage::EveryBlock,
-        )]
+        )
+        // One row per segmented object, bounded by the block's voxels.
+        .sized(match self.schema() {
+            Ok(schema) => crate::fragment::SidecarSize::row_table(&schema, 1),
+            Err(_) => crate::fragment::SidecarSize::Unstated,
+        })]
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
