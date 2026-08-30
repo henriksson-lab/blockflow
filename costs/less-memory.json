@@ -1,0 +1,65 @@
+{
+  "budget_bytes": 8388608,
+  "format": "blockflow-scenario",
+  "machine": {
+    "cache_bytes": 8388608,
+    "cache_shared": true,
+    "contention": 0.4,
+    "encoded_fraction": 0.0,
+    "io_channels": 4,
+    "nodes": 1,
+    "prefetch_depth": 1,
+    "wave_synchronous": false,
+    "workers": 8
+  },
+  "name": "less-memory",
+  "note": "measured, with 8 MiB where the baseline has 4 GiB — both the planner's budget and the page cache, because 'less memory' is not one of the two. **The figure is chosen to bind** at the volumes the suite plans over: a budget that no candidate ever exceeds is not a scenario, it is the baseline with a smaller number in it. This is the machine on which the block edge is decided by what fits rather than by what the cost model prefers, and the one on which a plan chosen elsewhere may not be admissible at all.",
+  "storage": {
+    "bytes_per_voxel": 8.0,
+    "chunk": [
+      64,
+      64,
+      64
+    ],
+    "decode_ns_per_byte": 0.0,
+    "io_latency_ns": 0.0
+  },
+  "terms": {
+    "compute.ns_per_unit": {
+      "nanos_per_unit": 98.329,
+      "runs": 3,
+      "units": 1.0
+    },
+    "compute.ns_per_unit/combine": {
+      "nanos_per_unit": 3.541,
+      "runs": 3,
+      "units": 1.0
+    },
+    "compute.ns_per_unit/skeletonize": {
+      "nanos_per_unit": 201.397,
+      "runs": 3,
+      "units": 1.0
+    },
+    "compute.ns_per_unit/smooth": {
+      "nanos_per_unit": 98.329,
+      "runs": 3,
+      "units": 1.0
+    },
+    "materialise.ns_per_voxel": {
+      "nanos_per_unit": 1.0,
+      "runs": 3,
+      "units": 1.0
+    },
+    "read.ns_per_voxel": {
+      "nanos_per_unit": 2.0,
+      "runs": 3,
+      "units": 1.0
+    },
+    "write.ns_per_voxel": {
+      "nanos_per_unit": 2.0,
+      "runs": 3,
+      "units": 1.0
+    }
+  },
+  "version": 1
+}

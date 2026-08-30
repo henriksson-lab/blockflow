@@ -1,0 +1,65 @@
+{
+  "budget_bytes": 4294967296,
+  "format": "blockflow-scenario",
+  "machine": {
+    "cache_bytes": 4294967296,
+    "cache_shared": true,
+    "contention": 0.4,
+    "encoded_fraction": 0.0,
+    "io_channels": 4,
+    "nodes": 2,
+    "prefetch_depth": 1,
+    "wave_synchronous": false,
+    "workers": 16
+  },
+  "name": "two-nodes",
+  "note": "measured, on 2 computers of it: 16 workers over 2 nodes, each with its own page cache, its own IO channels and its own memory budget. A chunk two nodes both read is fetched twice, which is the term a single-machine simulation cannot see and the one a handout policy exists to reduce.",
+  "storage": {
+    "bytes_per_voxel": 8.0,
+    "chunk": [
+      64,
+      64,
+      64
+    ],
+    "decode_ns_per_byte": 0.0,
+    "io_latency_ns": 0.0
+  },
+  "terms": {
+    "compute.ns_per_unit": {
+      "nanos_per_unit": 98.329,
+      "runs": 3,
+      "units": 1.0
+    },
+    "compute.ns_per_unit/combine": {
+      "nanos_per_unit": 3.541,
+      "runs": 3,
+      "units": 1.0
+    },
+    "compute.ns_per_unit/skeletonize": {
+      "nanos_per_unit": 201.397,
+      "runs": 3,
+      "units": 1.0
+    },
+    "compute.ns_per_unit/smooth": {
+      "nanos_per_unit": 98.329,
+      "runs": 3,
+      "units": 1.0
+    },
+    "materialise.ns_per_voxel": {
+      "nanos_per_unit": 1.0,
+      "runs": 3,
+      "units": 1.0
+    },
+    "read.ns_per_voxel": {
+      "nanos_per_unit": 2.0,
+      "runs": 3,
+      "units": 1.0
+    },
+    "write.ns_per_voxel": {
+      "nanos_per_unit": 2.0,
+      "runs": 3,
+      "units": 1.0
+    }
+  },
+  "version": 1
+}
