@@ -728,6 +728,14 @@ pub struct Decision<'a> {
     pub ready: &'a [usize],
     /// Task ids currently occupying a slot.
     pub running: &'a [usize],
+    /// The same, restricted to **this worker's own computer**.
+    ///
+    /// What a node is about to have in its pool, which is a different thing from
+    /// what every machine in the cluster is doing. A policy that wants a node's
+    /// workers to converge on shared chunks needs this and not
+    /// [`Self::running`]: see `distributed::handout::WorkerView::in_flight`,
+    /// which is where it goes.
+    pub node_running: &'a [usize],
     /// Which worker this choice is for.
     ///
     /// One node with a shared cache makes this uninteresting and it is `0`
@@ -745,6 +753,25 @@ pub struct Decision<'a> {
     /// Where each worker last finished, for a policy that seeds workers apart.
     /// `None` for a worker that has finished nothing.
     pub anchors: &'a [Option<[f64; 3]>],
+    /// The same, **per computer**: where any worker of each node last finished.
+    ///
+    /// **This is the one a locality policy wants, and the per-worker list is
+    /// not.** What must be kept apart is the *nodes* — they cannot share a page
+    /// cache, so two of them working the same region fetch every shared chunk
+    /// twice. What must be kept *together* is the workers of one node, which
+    /// share theirs and lose the sharing the moment they are scattered.
+    ///
+    /// Seeding by worker does both jobs at once and gets the second one
+    /// backwards. Measured on a `96^3` plan in `16^3` chunks: at one worker per
+    /// computer, farthest-point seeding is **1.24x** faster than plan order and
+    /// fetches a third of the bytes; at ten workers per computer the same policy
+    /// is **1.14x slower** than plan order, because it scatters each machine's
+    /// own threads. The two are the same policy told to separate the wrong
+    /// things.
+    ///
+    /// Identical to [`Self::anchors`] when there is one worker per node, which
+    /// is why the good case stays exactly as good.
+    pub node_anchors: &'a [Option<[f64; 3]>],
     /// Images alive right now, and their sizes.
     pub live_images: &'a [(usize, u64)],
     /// Bytes resident right now: images plus in-flight block buffers.
@@ -1234,15 +1261,29 @@ impl Scheduler for Handout {
         let Some(grid) = decision.grids.get(&image) else {
             return 0;
         };
+        // **Other computers, not other workers.** The seeds are what this choice
+        // stays away from, and what it must stay away from is the machines that
+        // cannot share its page cache — never the threads that can. See
+        // `Decision::node_anchors` for the measurement that separates the two.
+        let node = decision.node();
         let seeds: Vec<[f64; 3]> = decision
-            .anchors
+            .node_anchors
             .iter()
             .enumerate()
-            .filter(|&(worker, _)| worker != decision.worker)
+            .filter(|&(other, _)| other != node)
             .filter_map(|(_, anchor)| *anchor)
             .collect();
         let view = crate::distributed::handout::WorkerView {
-            anchor: decision.anchors[decision.worker],
+            in_flight: decision.node_running,
+            // The **node's** last block, so a thread with no history of its own
+            // still follows its machine rather than seeding away from it — which
+            // is what scattered a node's workers when this was per worker.
+            anchor: decision
+                .node_anchors
+                .get(node)
+                .copied()
+                .flatten()
+                .or(decision.anchors[decision.worker]),
             cache: Some(decision.cache),
         };
         let chosen = crate::distributed::handout::choose(
@@ -1433,6 +1474,9 @@ pub fn simulate(
     // what a duplicated fetch is made of.
     let mut ever_fetched: BTreeMap<u64, usize> = BTreeMap::new();
     let mut anchors: Vec<Option<[f64; 3]>> = vec![None; machine.workers.max(1)];
+    // Where each computer last finished. One entry per node, and identical to
+    // `anchors` when there is one worker per node; see `Decision::node_anchors`.
+    let mut node_anchors: Vec<Option<[f64; 3]>> = vec![None; machine.nodes.max(1)];
     let mut busy: Vec<Option<usize>> = vec![None; machine.workers.max(1)];
 
     // --- image residency, on the executor's own rule -------------------------
@@ -1581,7 +1625,9 @@ pub fn simulate(
                 running.pop();
                 if let Some(slot) = busy.iter().position(|held| *held == Some(id)) {
                     busy[slot] = None;
-                    anchors[slot] = Some(crate::distributed::handout::position(&graph, id));
+                    let at = crate::distributed::handout::position(&graph, id);
+                    anchors[slot] = Some(at);
+                    node_anchors[slot % machine.nodes.max(1)] = Some(at);
                 }
                 in_flight_bytes -= block_bytes[id];
                 remaining -= 1;
@@ -1664,6 +1710,15 @@ pub fn simulate(
         let node = node_of(worker);
         let slot = {
             let running_ids: Vec<usize> = running.iter().map(|&(_, id)| id).collect();
+            // The tasks held by slots on this worker's own node, from the slot
+            // table rather than from `running`, which is task ids and does not
+            // say which machine holds one.
+            let node_running: Vec<usize> = busy
+                .iter()
+                .enumerate()
+                .filter(|&(slot, _)| node_of(slot) == node_of(worker))
+                .filter_map(|(_, held)| *held)
+                .collect();
             let decision = Decision {
                 now_ns: now,
                 nodes,
@@ -1671,11 +1726,13 @@ pub fn simulate(
                 decomposition,
                 ready: &ready,
                 running: &running_ids,
+                node_running: &node_running,
                 live_images: &live,
                 resident_bytes: live.iter().map(|&(_, b)| b).sum::<u64>() + in_flight_bytes,
                 cache: &caches[pool],
                 worker,
                 anchors: &anchors,
+                node_anchors: &node_anchors,
                 grids: &grids,
                 images_read: &images_read,
                 phase_ns_per_voxel: &phase_rates,

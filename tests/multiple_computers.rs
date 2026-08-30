@@ -424,3 +424,296 @@ fn which_computer_gets_a_block_matters_only_when_they_do_not_share_a_cache() {
         );
     }
 }
+
+// ------------------------------ 6. and when spreading them apart pays --
+
+/// **Seeding the computers apart pays where the cache is scarce and the threads
+/// are few — and inverts where it is scarce and they are many.**
+///
+/// `HandoutPolicy::NearestFirst` — farthest-point seeding, then
+/// nearest-unclaimed — is the coordinator's default and is exactly the right
+/// shape for the boundary above: put each machine in its own region, so no
+/// chunk is wanted by two of them. Against plan order, on four computers over a
+/// `96^3` volume in `16^3` chunks, as the speed-up of seeded over bunched:
+///
+/// ```text
+///     threads per computer   2 MiB   8 MiB   32 MiB
+///                        1   1.239   1.034    1.035
+///                        2   1.149   1.016    1.024
+///                        4   1.071   1.017    1.017
+///                       10   0.875   0.998    1.008
+/// ```
+///
+/// Read it as **cache per thread**, which is the quantity that orders the whole
+/// table:
+///
+/// * **2 MiB and one thread** — two megabytes for one thread's working set — is
+///   the policy's best case, and it is worth 1.24x and two thirds of the
+///   traffic. The pool holds what the thread is working on, so keeping the
+///   machines apart is pure saving;
+/// * **2 MiB and ten threads** — a fifth of a megabyte each — **inverts**, to
+///   0.875x. Each machine's own threads thrash their shared pool, and plan
+///   order, which marches every worker through adjacent blocks together, keeps
+///   a tighter joint working set and wins despite duplicating more *across*
+///   machines;
+/// * **32 MiB** recovers it at ten threads (1.008) and simultaneously flattens
+///   the gain at one (1.035): when a pool holds everything, there is nothing
+///   for a policy to save.
+///
+/// So the rule is not "spread the workers out". It is **spread the computers
+/// apart, provided each computer's cache can hold roughly one read extent per
+/// thread it runs** — and below that, the tighter global order is worth more
+/// than the separation. The knee here is between 2 and 8 MiB for ten threads:
+/// about a quarter of a megabyte each, which is what one block's read extent
+/// spans in `16^3` chunks.
+///
+/// **What this test is not.** It is not a claim that one policy is better. It is
+/// the boundary between them, measured, because "spread the workers out" is the
+/// first thing anyone proposes about a cluster and it is right only on one side
+/// of a line nobody had drawn.
+///
+/// **A prediction that failed, recorded because it was expensive to give up.**
+/// The inversion looked like a policy bug: `Handout` seeded from every *other
+/// worker's* anchor, so with ten threads per machine it was separating threads
+/// that share a cache as eagerly as machines that do not. Keying the seeds and
+/// the view anchor by **node** instead — which is what `Decision::node_anchors`
+/// is for, and which is right on its own terms — changed the inverted case by
+/// nothing at all. The axis is the cache, not the seeding target.
+#[test]
+fn seeding_the_computers_apart_pays_when_each_can_hold_what_its_threads_touch() {
+    use blockflow::distributed::handout::HandoutPolicy;
+    use blockflow::simulate::Handout;
+
+    // **Its own fixture, wider and larger than this file's.** The plan above
+    // reaches one voxel, so a `16^3` block's read extent spans the same eight
+    // `16^3` chunks whichever neighbour it sits by and no ordering can change
+    // what is fetched — measured, that fixture's answer does not move across a
+    // sixteen-fold cache range. A reach of two spans two or three chunks per
+    // axis, so neighbours genuinely share. And `64^3` is sixty-four chunks —
+    // two megabytes, which fits in every cache the sweep tries, so the cache
+    // axis would be flat by construction; `96^3` is 216.
+    const WIDE: [usize; 3] = [96, 96, 96];
+    let assembly = {
+        let grid = BlockGrid::new(WIDE, [16, 16, 16]).expect("a grid");
+        let mut builder = PlanBuilder::new(WIDE, Dtype::F64, grid);
+        for name in ["first", "second", "third"] {
+            builder
+                .pixels(Chain::op(IdentityOp::new(name, [2, 2, 2]).with_cost(2.0)))
+                .expect("a pixel phase");
+        }
+        builder.finish().expect("an assembly")
+    };
+    let at = |threads: usize, cache_bytes: u64| {
+        let machine = Machine {
+            nodes: 4,
+            workers: 4 * threads,
+            cache_bytes,
+            contention: MEASURED_CONTENTION,
+            ..eight_workers(4)
+        };
+        let bunched = run(&assembly, machine, &mut ExecutorOrder::phase_major());
+        let seeded = run(
+            &assembly,
+            machine,
+            &mut Handout::new(HandoutPolicy::NearestFirst),
+        );
+        assert_eq!(
+            bunched.tasks_run, seeded.tasks_run,
+            "a handout policy chooses the order, never the work"
+        );
+        bunched.makespan_ns as f64 / seeded.makespan_ns as f64
+    };
+
+    println!(
+        "{:>8} {:>8} {:>8} {:>8}",
+        "threads", "2 MiB", "8 MiB", "32 MiB"
+    );
+    let mut table = Vec::new();
+    for threads in [1usize, 2, 4, 10] {
+        let row: Vec<f64> = [2u64 << 20, 8 << 20, 32 << 20]
+            .into_iter()
+            .map(|cache| at(threads, cache))
+            .collect();
+        println!(
+            "{threads:>8} {:>8.3} {:>8.3} {:>8.3}",
+            row[0], row[1], row[2]
+        );
+        table.push(row);
+    }
+
+    // One thread per computer, a cache that holds its working set: the case the
+    // policy exists for, and the largest number in the table.
+    assert!(
+        table[0][0] > 1.15,
+        "seeding four computers apart is worth only {:.3}x at one thread each on a tight \
+         cache, where the recorded figure is 1.239",
+        table[0][0]
+    );
+    // Ten threads on the same cache: it inverts, and that is the finding.
+    assert!(
+        table[3][0] < 1.0,
+        "ten threads on a 2 MiB cache gained {:.3}x from seeding; the recorded figure is \
+         0.875, and the inversion is what this test is for",
+        table[3][0]
+    );
+    // The axis is the cache: give those ten threads room and it comes back.
+    assert!(
+        table[3][2] > table[3][0] && table[3][2] > 0.99,
+        "a 32 MiB cache did not recover the inverted case: {:.3} against {:.3} at 2 MiB. The \
+         axis is the cache, not the thread count.",
+        table[3][2],
+        table[3][0]
+    );
+    // And the gain falls monotonically with the threads on a tight cache, which
+    // is the shape of the whole finding rather than two endpoints of it.
+    for threads in 1..table.len() {
+        assert!(
+            table[threads][0] < table[threads - 1][0] + 0.02,
+            "the gain from seeding grew with the threads per computer: {:.3} against {:.3} \
+             below it",
+            table[threads][0],
+            table[threads - 1][0]
+        );
+    }
+}
+
+// ------------------------------------- 7. a policy that reads the pool --
+
+/// **`HandoutPolicy::Coalescing`: score the candidates, don't prescribe a
+/// route** — and the term that earns its place is the one no existing policy
+/// has.
+///
+/// A locality-preserving traversal (Hilbert, Morton) is the textbook answer to
+/// "what order should a node walk its region in", and it is the wrong shape
+/// here: a prescribed curve marches into holes left by stolen blocks, blocks
+/// that short-circuited, and neighbours that finished early. What survives noise
+/// is a *score* recomputed from the state at hand, and the curve is then
+/// whatever the scores trace out.
+///
+/// The score is two counts of chunks and no weight:
+///
+/// * chunks this block needs that my node's pool **does not hold**;
+/// * minus those a task my node **already has in flight** is bringing in —
+///   because the workers of one computer share a page cache, so a block beside
+///   what a neighbour is doing is nearly free.
+///
+/// Distance to the node's anchor breaks ties, and only ties: it has no cost
+/// units, so it cannot be added to a chunk count without a constant, and there
+/// is no evidence for one.
+///
+/// Measured against plan order and against `NearestFirst`, four computers over
+/// a `96^3` volume in `16^3` chunks — as the speed-up over plan order, so above
+/// one is better:
+///
+/// ```text
+///     threads   cache    nearest-first   coalescing
+///           1   2 MiB            1.239        1.277
+///           1   8 MiB            1.034        1.070
+///           1  32 MiB            1.035        1.070
+///           2   2 MiB            1.149        1.219
+///           4   2 MiB            1.071        1.171
+///          10   2 MiB            0.875        1.093
+///          10   8 MiB            0.998        1.022
+///          10  32 MiB            1.008        1.022
+/// ```
+///
+/// **It is better in every cell, and it removes the inversion.** The case where
+/// seeding the computers apart was actively harmful — ten threads sharing two
+/// megabytes, where `NearestFirst` runs at 0.875 of plan order — comes back to
+/// 1.093. Nothing was prescribed to make that happen: the threads of a node
+/// converge because a block their neighbours are already fetching for scores
+/// cheap, which is a fact the policy reads rather than a rule it follows.
+///
+/// **What it costs.** 122.8 microseconds a handout against `NearestFirst`'s
+/// 8.1 — fifteen times more, and the cause is the chunk-key walk over *every*
+/// ready candidate, not the arithmetic. Two readings, and they differ:
+///
+/// * on a real coordinator it is free. A block is tens to hundreds of
+///   milliseconds of work, so a hundred microseconds to place it is under a
+///   tenth of a percent;
+/// * in **this simulator** it is not, because a handout is simulated in
+///   nanoseconds. The scheduler's scan of the ready set is already 98% of a
+///   large simulation, and this multiplies it.
+///
+/// The bound, if that ever matters, is to score a shortlist rather than the
+/// whole ready set — the same fix the dispatch loop wants for the same reason.
+/// Not done here: it would be tuning a cost nobody is paying yet.
+#[test]
+fn scoring_the_candidates_beats_prescribing_a_route() {
+    use blockflow::distributed::handout::HandoutPolicy;
+    use blockflow::simulate::Handout;
+
+    // The fixture of the test above, for the same reasons: a reach that makes
+    // neighbours share chunks, and a volume larger than one cache.
+    const WIDE: [usize; 3] = [96, 96, 96];
+    let assembly = {
+        let grid = BlockGrid::new(WIDE, [16, 16, 16]).expect("a grid");
+        let mut builder = PlanBuilder::new(WIDE, Dtype::F64, grid);
+        for name in ["first", "second", "third"] {
+            builder
+                .pixels(Chain::op(IdentityOp::new(name, [2, 2, 2]).with_cost(2.0)))
+                .expect("a pixel phase");
+        }
+        builder.finish().expect("an assembly")
+    };
+    let against_plan_order = |threads: usize, cache_bytes: u64, policy: HandoutPolicy| {
+        let machine = Machine {
+            nodes: 4,
+            workers: 4 * threads,
+            cache_bytes,
+            contention: MEASURED_CONTENTION,
+            ..eight_workers(4)
+        };
+        let bunched = run(&assembly, machine, &mut ExecutorOrder::phase_major());
+        let scored = run(&assembly, machine, &mut Handout::new(policy));
+        assert_eq!(
+            bunched.tasks_run, scored.tasks_run,
+            "a handout policy chooses the order, never the work"
+        );
+        bunched.makespan_ns as f64 / scored.makespan_ns as f64
+    };
+
+    println!(
+        "{:>8} {:>8} {:>14} {:>12}",
+        "threads", "cacheMiB", "nearest-first", "coalescing"
+    );
+    let mut beaten = 0usize;
+    for threads in [1usize, 2, 4, 10] {
+        for cache in [2u64 << 20, 8 << 20, 32 << 20] {
+            let nearest = against_plan_order(threads, cache, HandoutPolicy::NearestFirst);
+            let coalescing = against_plan_order(threads, cache, HandoutPolicy::Coalescing);
+            println!(
+                "{threads:>8} {:>8} {nearest:>14.3} {coalescing:>12.3}",
+                cache >> 20
+            );
+            assert!(
+                coalescing > nearest - 0.01,
+                "at {threads} threads on {} MiB, coalescing scored {coalescing:.3} against \
+                 nearest-first's {nearest:.3}. It is recorded as better in every cell; a \
+                 change that makes it worse somewhere is a trade, and trades get written down.",
+                cache >> 20
+            );
+            beaten += usize::from(coalescing > nearest + 0.01);
+        }
+    }
+    assert!(
+        beaten >= 10,
+        "coalescing beat nearest-first in only {beaten} of twelve cells, where the record is \
+         twelve"
+    );
+
+    // The cell the whole policy exists for: separating the computers is
+    // *harmful* there under the old policy, and must not be under this one.
+    let inverted = against_plan_order(10, 2 << 20, HandoutPolicy::NearestFirst);
+    let fixed = against_plan_order(10, 2 << 20, HandoutPolicy::Coalescing);
+    assert!(
+        inverted < 1.0,
+        "ten threads on a 2 MiB pool no longer inverts under nearest-first ({inverted:.3}); \
+         the case this policy was written for has gone, and so has the reason for it"
+    );
+    assert!(
+        fixed > 1.05,
+        "coalescing scored {fixed:.3} in the inverted cell, where the record is 1.093. That \
+         cell is the whole point of the imminent-warmth term."
+    );
+}

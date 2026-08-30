@@ -739,6 +739,10 @@ impl Job {
         let view = {
             let model = self.workers.get(worker).expect("admitted above");
             WorkerView {
+                // The coordinator does not track which tasks a *node* has in
+                // flight as a set, and only `Coalescing` reads it — which is not
+                // selectable here. Empty is the honest value: see the field.
+                in_flight: &[],
                 anchor: model.anchor,
                 cache: Some(&model.cache),
             }

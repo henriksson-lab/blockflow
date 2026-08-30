@@ -364,9 +364,27 @@ fn the_prefetch_sweep_has_a_control_at_both_ends() {
     );
 
     // 2. Something fetched ahead was consumed.
+    //
+    // **On the deep arm, because the shallow one is a race and loses it on a
+    // loaded machine.** At a lookahead of one the prefetcher is exactly one
+    // block in front of the demand path; where the machine is slow enough that
+    // the reader reaches the chunk first, the prefetch is not refused and not
+    // wasted — the prefetcher simply finds it resident and does nothing, so
+    // `prefetch_issued` stays at zero with no counter recording why. That is a
+    // legitimate outcome of a depth of one rather than a defect, and asserting
+    // against it made this test pass on a fast machine and fail on a hosted
+    // runner. `env.drain_prefetch()` above removes the *other* half of that race
+    // — a prefetch submitted and not yet finished — and cannot remove this half,
+    // because there is nothing pending to wait for.
+    //
+    // The deep arm carries the claim structurally: with a lookahead of 48 the
+    // prefetcher is far enough ahead that its targets are blocks the reader has
+    // not reached, so what it fetches is genuinely fetched *ahead*.
     assert!(
-        shallow.prefetch_issued > 0,
-        "the shallow arm issued no prefetch into the cache at all"
+        deep.prefetch_issued > 0,
+        "the deep arm issued no prefetch into the cache at all, having submitted \
+         {issued_deep}. With a lookahead of 48 the prefetcher is ahead of the reader by \
+         construction, so this is not the race the shallow arm has."
     );
 
     // 3. Waste rises with depth.

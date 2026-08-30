@@ -346,6 +346,90 @@ shared. `Constraints` has no `nodes`, `price_phase` has no duplication term, and
 the budget is per node only because `Scenario::constraints` divides the
 concurrency by hand.
 
+**Where spreading the computers apart pays, and where it inverts.** The obvious
+proposal about a cluster — start the machines at different corners rather than
+all at one — is right, and `HandoutPolicy::NearestFirst` (farthest-point
+seeding, then nearest-unclaimed) is already the coordinator's default. What was
+not known is the boundary. Against plan order, four computers over a `96^3`
+volume in `16^3` chunks:
+
+| threads per computer | 2 MiB cache | 8 MiB | 32 MiB |
+|---|---|---|---|
+| 1 | **1.239x** | 1.034 | 1.035 |
+| 2 | **1.149x** | 1.016 | 1.024 |
+| 4 | 1.071 | 1.017 | 1.017 |
+| 10 | **0.875x** | 0.998 | 1.008 |
+
+The ordering quantity is **cache per thread**. With room for a thread's working
+set, separating the machines is pure saving — 1.24x and two thirds of the
+traffic. With a fifth of a megabyte each it **inverts**: a machine's own threads
+thrash their shared pool, and plan order, which marches every worker through
+adjacent blocks together, keeps a tighter joint working set and wins despite
+duplicating more across machines. Give them room and it comes back — and
+simultaneously flattens the gain at one thread, because a pool that holds
+everything leaves a policy nothing to save.
+
+So the rule is **spread the computers apart, provided each computer's cache can
+hold about one read extent per thread it runs** — not "spread the workers out".
+
+A prediction that failed, recorded because giving it up was not obvious:
+`Handout` seeded from every *other worker's* anchor, so with ten threads per
+machine it separated threads that share a cache as eagerly as machines that do
+not. Keying the seeds and the view anchor by node instead — `Decision::
+node_anchors`, right on its own terms and kept — changed the inverted case by
+nothing. The axis is the cache, not the seeding target.
+
+**A policy that reads the pool instead of following a route.**
+`HandoutPolicy::Coalescing` scores candidates by chunks rather than walking a
+prescribed curve — a Hilbert or Morton order is the textbook answer and the
+wrong shape here, because a route marches into the holes left by stolen blocks,
+short-circuited blocks and neighbours that finish early. The score is two counts
+and no weight: chunks this block needs that my node's pool does not hold, minus
+those a task my node **already has in flight** is bringing in. Distance breaks
+ties and only ties, because it has no cost units and cannot be added to a chunk
+count without a constant.
+
+That second term is the one no existing policy has, and it is what fixes the
+inversion. Against plan order, four computers on `96^3` in `16^3` chunks:
+
+| threads | cache | `nearest-first` | `coalescing` |
+|---|---|---|---|
+| 1 | 2 MiB | 1.239 | 1.277 |
+| 2 | 2 MiB | 1.149 | 1.219 |
+| 4 | 2 MiB | 1.071 | 1.171 |
+| 10 | 2 MiB | **0.875** | **1.093** |
+| 10 | 32 MiB | 1.008 | 1.022 |
+
+Better in every cell, and the harmful case is gone. Nothing was prescribed to
+make a node's threads converge: a block a neighbour is already fetching for
+scores cheap, which is a fact the policy reads rather than a rule it follows.
+
+**A repulsion term, built twice and rejected both times.** Charging a candidate
+for standing near another computer is the obvious third term. Built once as a
+tuned penalty and once *derived* — two regions growing at equal rate meet at the
+perpendicular bisector, the chunks fetched twice are those within a halo of it,
+so the expected duplication is the block's chunk count times a risk running 0 to
+1 across a shell of width `2H`. The derivation is sound and dissolves the weight,
+since the result is in chunks like everything else. **Both measured worse than
+no term**, and worst in the cell the policy exists for: 1.093 without it, 1.003
+tuned, 0.986 derived. The reason is double-counting — a block another computer
+works near is a block whose chunks are not in my pool and not in my node's
+in-flight set, so it is already expensive by the warmth term, which measures the
+fact directly instead of inferring it from geometry. Repulsion belongs at
+*seeding*, where there is no warmth to read yet, and the seeding rule already
+does it.
+
+**What it costs**: 122.8 microseconds a handout against `nearest-first`'s 8.1,
+from the chunk-key walk over every ready candidate. Free on a real coordinator —
+a block is tens to hundreds of milliseconds — and not free in this simulator,
+where the scheduler's scan is already 98% of a large run. The bound, if it ever
+matters, is to score a shortlist rather than the whole ready set, which is the
+same fix the dispatch loop wants.
+
+Not selectable by a caller: it is held at the same admission boundary
+`cache-modelled` is, and for the same reason — it scores against a modelled
+cache, and `cache::ChunkCache` has no non-test construction site.
+
 **And placement starts paying.** `distributed::handout`'s policies could only
 be ranked under `cache_shared: false` — one cache per *slot*, the pessimistic
 reading and a machine nobody has. With a pool per computer they have something
