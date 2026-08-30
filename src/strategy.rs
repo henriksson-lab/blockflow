@@ -2856,6 +2856,9 @@ pub fn planned_block(
 /// depends on the block it is given, [`BlockOp::cost_per_voxel_in`]. Both are
 /// declared by the op; nothing here knows what any branch does.
 ///
+/// [`BlockOp::cost_per_voxel`]: crate::op::BlockOp::cost_per_voxel
+/// [`BlockOp::cost_per_voxel_in`]: crate::op::BlockOp::cost_per_voxel_in
+///
 /// **Why choosing is safe, in the two senses that matter.**
 ///
 /// * *It cannot invalidate a plan.* Every fold a plan is built from treats an
@@ -3281,6 +3284,8 @@ impl Default for Enumerating {
 /// carries the space's definition and its acceptance bar. Every variant here
 /// computes the same volume; what differs is which decomposition is chosen and
 /// what the choosing costs.
+///
+/// [`splittable_axes`]: crate::decomposition::splittable_axes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PartitionSearch {
     /// `best[i] = min over j < i of best[j] + price(j..i)`, at `O(n^2)` priced

@@ -195,6 +195,8 @@ pub fn coordinate_schema() -> Schema {
 /// and a consumer's schema does not change when the input's does. A column that
 /// followed the input would make a downstream `Grouping` depend on a decision
 /// taken upstream of it.
+///
+/// [`Voxels::widened`]: crate::voxels::Voxels::widened
 pub fn valued_coordinate_schema(column: &str) -> Result<Schema> {
     Schema::new(vec![Column::f64(column)])
 }

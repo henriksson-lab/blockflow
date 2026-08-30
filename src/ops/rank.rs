@@ -104,7 +104,7 @@ use super::shapes_agree;
 ///
 /// **`input` is read as the whole volume**, which is what a caller handing over a
 /// bare array is saying. That matters for exactly one element — one whose step
-/// counts from [`StepOrigin::ClippedStart`](super::StepOrigin::ClippedStart),
+/// counts from [`StepOrigin::ClippedStart`],
 /// whose window re-phases at a low face — and [`rank_filter_into_at`] is the form
 /// that says where the array sits in a larger volume. For every other element the
 /// two are the same call.
@@ -122,7 +122,7 @@ pub fn rank_filter_into<T: Ord + Copy>(
 ///
 /// `at` is not decoration, and it is not decoration for the same reason it is
 /// not in `ops::local`: an element whose decimation counts from
-/// [`StepOrigin::ClippedStart`](super::StepOrigin::ClippedStart) reads a
+/// [`StepOrigin::ClippedStart`] reads a
 /// different set of offsets where the window is clipped at a **low face of the
 /// volume**, and a block holding the middle of a volume has no such face. Asking
 /// the element at `at.offset + voxel` inside `at.volume` is what makes a block's

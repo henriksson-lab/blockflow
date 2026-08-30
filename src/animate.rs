@@ -361,7 +361,7 @@ pub fn renderer_available(request: &RenderRequest) -> bool {
 /// already about an hour at the default step count and exists to stop somebody
 /// starting an overnight render by accident. A round number, not a threshold
 /// anything changes at; the renderer's header carries the measurement and
-/// [`the_block_ceiling_matches_the_renderer`] keeps the two equal.
+/// `the_block_ceiling_matches_the_renderer` keeps the two equal.
 pub const VOLUME3D_BLOCK_CEILING: usize = 512;
 
 /// Whether a lattice of `grid` blocks is within the ceiling.

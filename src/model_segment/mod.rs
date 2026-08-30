@@ -20,7 +20,7 @@
 //!
 //! So the measurement happens **inside the op**, where the whole object is
 //! present in the halo'd buffer, and what comes out is rows rather than pixels.
-//! That is `blockflow`'s [`FragmentOp`](blockflow::FragmentOp), and it is the
+//! That is `blockflow`'s [`FragmentOp`], and it is the
 //! same program `blockflow::ops::detect` runs.
 //!
 //! # The two rules that make the answer independent of the cut

@@ -67,6 +67,13 @@
 //! scheduler tuned in here to exploit forty independent workers is tuned
 //! against a machine that does not exist. Compare schedulers at a fixed worker
 //! count; do not read the worker-count axis as a speed-up curve.
+//!
+//! `simulate` carries its own outer documentation on `pub mod simulate;` in
+//! `lib.rs`, and a merged doc comment resolves its links in the scope of the
+//! item rather than of this file, so these two are spelled from the crate root.
+//!
+//! [`Scheduler`]: crate::simulate::Scheduler
+//! [`Rates::io_ns_per_byte`]: crate::simulate::Rates::io_ns_per_byte
 
 use std::collections::BTreeSet;
 

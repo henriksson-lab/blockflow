@@ -699,6 +699,8 @@ impl crate::fragment::FragmentOp for NeighbourFoldOp {
     /// [`crate::fragment::FragmentInput`] in [`Self::inputs`]. The two numbers
     /// are independent and are not even in the same unit: this one is voxels,
     /// that one is blocks.
+    ///
+    /// [`Self::inputs`]: crate::fragment::FragmentOp::inputs
     fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
         0
     }
@@ -923,6 +925,9 @@ impl crate::fragment::FragmentOp for RegionSumOp {
     /// the planner checks: a partial is a function of this block's core and of
     /// nothing else. What crosses the seam is the *addition*, and that belongs
     /// to `RegionMergeOp`.
+    ///
+    /// [`Self::source_inputs`]: crate::fragment::FragmentOp::source_inputs
+    /// [`Self::seam_fold`]: crate::fragment::FragmentOp::seam_fold
     fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
         0
     }
@@ -1076,6 +1081,8 @@ impl crate::fragment::FragmentOp for RegionMergeOp {
     /// across the seam arrive on `self.input` over the whole-lattice reach in
     /// [`Self::inputs`] — a fragment reach, counted in blocks, where this one is
     /// counted in voxels.
+    ///
+    /// [`Self::inputs`]: crate::fragment::FragmentOp::inputs
     fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
         0
     }
@@ -1188,6 +1195,9 @@ impl crate::fragment::FragmentOp for DriftingSumOp {
     /// folds arrive on `self.input` over the whole-lattice fragment reach in
     /// [`Self::inputs`]. What this probe varies is [`Self::seam_fold`]; the
     /// reach is not the knob and must not move with it.
+    ///
+    /// [`Self::inputs`]: crate::fragment::FragmentOp::inputs
+    /// [`Self::seam_fold`]: crate::fragment::FragmentOp::seam_fold
     fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
         0
     }

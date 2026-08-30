@@ -612,6 +612,8 @@ pub enum Merge {
     /// block, and the merge runs in [`FragmentOp::reduce`] over the whole set —
     /// which the barrier is precisely the statement that it exists. Every block
     /// reads its own answer out of the blob.
+    ///
+    /// [`FragmentOp::reduce`]: crate::fragment::FragmentOp::reduce
     #[default]
     OnceForThePhase,
 }
@@ -640,6 +642,8 @@ const REDUCTION_VERSION: u32 = 1;
 /// map, keyed by block index, one `Vec<bool>` in label order. The blob is what
 /// [`FragmentOp::reduce`] hands the phase and what every block then reads its
 /// own row out of with [`decode_block_flags_for`].
+///
+/// [`FragmentOp::reduce`]: crate::fragment::FragmentOp::reduce
 ///
 /// `magic` is the caller's, so two ops sharing this codec cannot decode each
 /// other's blob — `components::read_header`'s argument, applied to a second kind

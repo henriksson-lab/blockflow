@@ -1,9 +1,34 @@
-# Does this crate still build on the three platforms it claims to run on?
+# Does this crate still build on the three platforms it claims to run on, and
+# does its own test suite still pass?
 #
-# Build only — `cargo build --all-targets`, so the tests are compiled and linked
-# but not run. The suite here measures times, resident bytes and `/proc`
-# counters, and a shared CI runner is the wrong instrument for all three; a red
-# run should mean the code does not build, never that a runner was busy.
+# **What runs, and what deliberately does not.** `cargo test` runs the tests that
+# assert; it never passes `--ignored`. That flag is the line between the two
+# kinds of test this crate has, and the line is already drawn in the source: the
+# 39 `#[ignore]`d tests are *measurements* — they print tables of nanoseconds per
+# voxel and resident bytes — and a shared CI runner is the wrong instrument for
+# every one of them. A red run must mean the code is wrong, never that a runner
+# was busy. Nothing in the crate asserts on a duration, which is what makes the
+# rest of the suite safe to run here at all.
+#
+# **The tests that do run are not heavy, and that is measured rather than
+# assumed.** With the `[profile.dev]` this crate now ships, at `--test-threads=4`
+# to imitate a hosted runner:
+#
+# | | binaries | total wall | slowest one | peak RSS |
+# |---|---|---|---|---|
+# | no features | 104 | 70.6 s | 14.0 s (`barrier_migration`) | 126 MB |
+# | `gui,distributed,zarr,model-segment` | 111 | 87.4 s | 15.3 s (`barrier_migration`) | 128 MB |
+# | `fftw` (`fft_correlation` alone) | 1 | 0.4 s | — | 23 MB |
+#
+# A 16 GB runner is not troubled by 128 MB, and the whole suite is under two
+# minutes. The `local_multi_node` suite — which starts real coordinator and
+# worker *processes* over loopback — is 3.3 s of that and binds `:0`, never a
+# fixed port, so it does not collide with anything else on the runner.
+#
+# **The test step is nearly free**, which is why it sits inside the build job
+# rather than beside it: `cargo build --all-targets` has already compiled every
+# test binary, so `cargo test` only runs them. A separate job would pay for the
+# whole compile again.
 #
 # `build` and not `check` because the question is whether it *builds*: `check`
 # stops before codegen and before the linker, and the linker is exactly what has
@@ -31,35 +56,40 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Nothing here is debugged, and on the model jobs this is the difference
-  # between a cache that fits and one that does not.
-  CARGO_PROFILE_DEV_DEBUG: none
+  # A failing test on a machine nobody can attach a debugger to is worth a
+  # backtrace; `[profile.dev]` ships `line-tables-only`, so it has line numbers.
+  RUST_BACKTRACE: 1
 
 jobs:
   build:
     name: ${{ matrix.features.name }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         features:
           # The configuration everything else in `Cargo.toml` is measured
-          # against: no feature at all.
-          - { name: no features, key: default, flags: "" }
-          # `gui` and `distributed` add no packages of their own; `zarr` adds a
-          # C toolchain requirement through `libz-sys`, which every runner has.
-          - { name: gui+distributed+zarr, key: gui-dist-zarr, flags: "--features gui,distributed,zarr" }
-          # The reason this workflow exists. `stardist-rs` is no longer a path
-          # on one developer's machine but a git revision, so whether it builds
-          # anywhere else is now a question CI can answer. `--all-targets` also
-          # compiles `tests/model_segment_*.rs`, which are gated on
-          # `model-segment` and invisible to the two rows above.
-          - { name: stardist, key: stardist, flags: "--features stardist" }
+          # against: no feature at all. Tested on all three platforms, because
+          # this is the one whose behaviour the rest are described relative to.
+          - { name: no features, key: default, flags: "", test: everywhere }
+          # `gui`, `distributed` and `model-segment` add no packages of their
+          # own; `zarr` adds a C toolchain requirement through `libz-sys`, which
+          # every runner has. Tested on Linux only — widening it is one word,
+          # and worth doing the first time anyone runs this crate elsewhere.
+          - { name: gui+distributed+zarr+model-segment, key: wide, flags: "--features gui,distributed,zarr,model-segment", test: linux }
+          # The reason this workflow exists. `stardist-rs` is no longer a path on
+          # one developer's machine but a git revision, so whether it builds
+          # anywhere else is now a question CI can answer. Built and not tested:
+          # its tests are the `model-segment` ones the row above already runs,
+          # and the compile — `burn`, and a patched `candle` — is the expensive
+          # part.
+          - { name: stardist, key: stardist, flags: "--features stardist", test: "no" }
           # The other two model adapters, git dependencies for the same reason
           # and at the same risk. Together in one row because they share `burn`,
           # which is most of what either costs to build.
-          - { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo" }
+          - { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo", test: "no" }
     steps:
       - uses: actions/checkout@v5
       - name: Install the stable toolchain
@@ -78,7 +108,13 @@ jobs:
           # cache is a warm start, not a promise of the same dependency graph.
           key: ${{ runner.os }}-cargo-${{ matrix.features.key }}-${{ hashFiles('Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-${{ matrix.features.key }}-
-      - run: cargo build --all-targets ${{ matrix.features.flags }}
+      - name: Build
+        run: cargo build --all-targets ${{ matrix.features.flags }}
+      # `--no-fail-fast` so one broken suite does not hide the state of the other
+      # hundred. No `--ignored`: see the header.
+      - name: Test
+        if: matrix.features.test == 'everywhere' || (matrix.features.test == 'linux' && runner.os == 'Linux')
+        run: cargo test --no-fail-fast ${{ matrix.features.flags }}
 
   # `fftw` links the system `libfftw3`, and when there is none the failure is a
   # link error rather than a fallback to the portable backend — deliberately, and
@@ -88,6 +124,7 @@ jobs:
   fftw:
     name: fftw (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -118,6 +155,40 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-fftw-${{ hashFiles('Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-fftw-
-      # `--all-targets` picks up `tests/fft_correlation.rs`, and compiling it is
-      # the point: it is the file that names both backends at once.
       - run: cargo build --all-targets --features fftw
+      # This is the configuration in which `tests/fft_correlation.rs` compares
+      # the two backends *in one process*, which is the only way that comparison
+      # is worth anything. 22 assertions, 0.4 s; the timing half of that file is
+      # `#[ignore]`d and stays that way here.
+      - run: cargo test --no-fail-fast --features fftw
+
+  # The documentation is this crate's design record, so a link in it that no
+  # longer resolves is drift. `src/lib.rs` denies `broken_intra_doc_links`
+  # crate-wide, which catches it wherever docs are built; this job is what makes
+  # "wherever" include every push.
+  #
+  # Default features only, deliberately: the deny attribute travels with the
+  # crate, so a developer running `cargo doc --features …` gets the same failure
+  # without CI paying to compile `burn` a fifth time.
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the stable toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-docs-
+      - run: cargo doc --no-deps

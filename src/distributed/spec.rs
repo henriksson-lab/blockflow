@@ -265,7 +265,7 @@ pub fn read_task_fragment(bytes: &[u8]) -> Result<([usize; 3], usize)> {
 /// declares [`FragmentOp::barrier`] and hoists its fold into
 /// [`FragmentOp::reduce`].
 ///
-/// It is [`FragmentReduceOp`](crate::probes::FragmentReduceOp) with the fold
+/// It is [`FragmentReduceOp`] with the fold
 /// moved, so the two are directly comparable and the only thing that differs is
 /// where the work happens: that one re-derives the total in every block over a
 /// whole-lattice fragment reach, this one derives it once for the phase and

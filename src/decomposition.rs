@@ -3460,8 +3460,8 @@ pub fn check_dtypes(
 ///   maintained. Nothing is owed.
 /// * **They differ.** The op answered out of the plan, the per-block comparison
 ///   has gone vacuous, and that is allowed — but only if the op
-///   [`declares`](BlockOp::takes_extent_from_placement) it. An op that has not is
-///   refused by name, here, before a block is read.
+///   [`declares`][`BlockOp::takes_extent_from_placement`] it. An op that has
+///   not is refused by name, here, before a block is read.
 ///
 /// The declaration is not a formality: it is what makes the obligation in
 /// `placed_output_shape`'s doc — *the op then owes a check of its own, in its

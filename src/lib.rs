@@ -83,6 +83,25 @@
 // that is enforced by the compiler rather than by discipline — there is no
 // translated code in this crate to import.
 
+// The documentation is this crate's design record and is read as source at
+// least as often as it is rendered, so a link in it is a claim like any other
+// and is checked like one.
+//
+// * **Broken links are denied.** A link that no longer resolves names an item
+//   that was renamed or removed, and the sentence around it is then describing
+//   something that is not there. That is drift, and it is exactly the kind that
+//   accumulates silently — the same argument `tests/no_domain_vocabulary.rs`
+//   makes for a rule a grep can check.
+// * **Links to private items are allowed**, deliberately. `[`ImageStore`]` in a
+//   public item's documentation is an accurate reference to a real type that
+//   the public API does not expose; rustdoc renders it as plain text and the
+//   source keeps the cross-reference. Denying it would only push the prose into
+//   naming items it is not allowed to point at. This does not weaken the rule
+//   above: a link to an item that does not exist at all is still broken, at any
+//   visibility.
+#![deny(rustdoc::broken_intra_doc_links)]
+#![allow(rustdoc::private_intra_doc_links)]
+
 /// How a produced labelling relates to a known-correct one. Overlap-based,
 /// because label ids never agree between two labellings of the same volume.
 pub mod agreement;
@@ -163,10 +182,10 @@ pub mod pyramid;
 /// space it is counted. See [`reach::Reach`].
 pub mod reach;
 pub mod region;
-pub mod sidecar;
 /// Block-keyed output that is not a pixel region: `(stream, phase, block) ->
 /// bytes`, on the environment beside the region writes. Storage only; what
 /// produces and consumes fragments is `fragment`.
+pub mod sidecar;
 /// A discrete-event simulator for scheduler design. **Ranks designs; does not
 /// predict runtimes** — see the module header for what it models and, more
 /// importantly, for the list of what it deliberately does not.

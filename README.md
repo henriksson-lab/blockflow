@@ -120,8 +120,26 @@ learn what a block is.
 
 ```
 cargo test
-cargo test --features gui,distributed
+cargo test --features gui,distributed,zarr,model-segment
 ```
+
+Both are what CI runs, and both take about a minute — `[profile.dev]` compiles
+this crate at `opt-level = 1` and its dependencies at `2`, which is the
+difference between a suite of 2002 tests that takes **63 s** and one that takes
+**622 s**. The manifest has the measurements.
+
+The suite that asserts is the suite that runs. The 39 `#[ignore]`d tests are
+**measurements** — tables of nanoseconds per voxel, of resident bytes, of how
+far repetitions moved — and they print rather than assert, because nothing in
+this crate asserts on a duration. Run them deliberately, on a quiet machine:
+
+```
+cargo test --release -- --ignored --nocapture
+```
+
+The features CI does not cover are the ones a hosted runner cannot: `fftw`
+wants a system `libfftw3` (Linux and macOS jobs install one; there is no
+Windows job), and everything `*-cuda` wants a device.
 
 ## License
 

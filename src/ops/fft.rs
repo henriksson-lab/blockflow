@@ -398,9 +398,10 @@ const LANE_BLOCK: usize = 8;
 ///
 /// [`Portable`](Self::Portable) is `rustfft` and `realfft`, is always compiled,
 /// and is what every number in this module's header was measured against.
-/// [`Fftw`](Self::Fftw) exists only when the crate's `fftw` feature is on, links
-/// the system's FFTW 3, and is [`Default`] when it is on — swapping the default
-/// is the whole of what the feature does.
+/// `Fftw` exists only when the crate's `fftw` feature is on, links the system's
+/// FFTW 3, and is [`Default`] when it is on — swapping the default is the whole
+/// of what the feature does. It is a plain code span and not a link because the
+/// variant is not there to link to in a build without the feature.
 ///
 /// **The enum has one variant in the default build**, and that is the point
 /// rather than an oversight to be tidied away: it lets a test say "run this bar

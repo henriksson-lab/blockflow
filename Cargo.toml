@@ -317,6 +317,46 @@ yolo-cuda = ["yolo", "burn/cuda", "yolov11/cuda"]
 # accepts and reads its own connections; see `src/distributed/server.rs`.
 distributed = []
 
+# **Tests are compiled to run, not to build.** This crate is developed against
+# its own test suite — 2002 tests over 105 binaries — and at `opt-level = 0` that
+# suite takes over ten minutes, which is long enough that it stops being run.
+#
+# Measured on a 40-core machine, default features, cold `cargo test --no-run`
+# followed by `cargo test`, nothing else on the machine:
+#
+# | `[profile.dev]` | cold build | `cargo test` | build + run | `target/` |
+# |---|---|---|---|---|
+# | **none — what this file had** | **39.2 s** | **621.8 s** | 661 s | 11 GB |
+# | `opt-level = 1`, dependencies at `2` — **this** | 55.7 s | **63.1 s** | **119 s** | 6.2 GB |
+# | `opt-level = 2`, dependencies at `2` | 75.2 s | 54.2 s | 129 s | 5.2 GB |
+#
+# So the suite is **9.9x** faster to run and the whole cold cycle **5.6x**, for
+# 16 s of first build.
+#
+# **`1` for this crate and `2` for everything under it**, which is the row that
+# wins rather than the obvious one. Going to `2` here buys 9 s of run time and
+# costs 20 s of build — a bad trade for CI, where each happens once, and a worse
+# one in a loop where the 140k lines of this crate recompile on every edit and
+# the dependencies do not recompile at all. The dependencies are the opposite
+# case: `ndarray`, `rustfft` and `rayon` are built once per `target/` and then do
+# real arithmetic in every test, so they are worth optimising properly and the
+# `2` is free after the first build.
+#
+# **`line-tables-only` rather than the default `true`.** A backtrace still names
+# the file and line of every frame, which is what a failing test is read for; what
+# goes is the variable-level information a debugger would use, and 4.8 GB of
+# `target/` with it — the table above is measured with it on, and the directory is
+# *smaller* than the unoptimised one it replaces.
+#
+# This is `dev` and not `test` because `test` inherits from `dev`, so one entry
+# covers both, and because `cargo build` of the binaries wants the same trade.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+
 [patch.crates-io]
 burn = { git = "https://github.com/mahogny/burn.git", rev = "1d6ef1b6f23a5a884dd1576d019f7a34ee93974c" }
 burn-store = { git = "https://github.com/mahogny/burn.git", rev = "1d6ef1b6f23a5a884dd1576d019f7a34ee93974c" }

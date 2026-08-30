@@ -1897,7 +1897,7 @@ impl Chain {
 
     /// A leaf that reads image `image`, which holds `dtype`.
     ///
-    /// **`image` is an [`ImageId`](crate::assemble::ImageId) and not a phase index**,
+    /// **`image` is an [`ImageId`] and not a phase index**,
     /// and the two are different types for the reason that motivated the
     /// distinction: phase `p` writes image `p + 1`, so the two numbers are
     /// adjacent, both in range, and swapping them reads a real image that is the

@@ -865,7 +865,7 @@ impl RegionalMaximaOp {
     /// producing phase's index, which is a `usize` a caller can write as a
     /// literal — and a literal that is off by one is not refused, it reads a
     /// different generation of the same stream and answers differently. A
-    /// [`Phase`] can only come from the [`PlanBuilder`](crate::PlanBuilder) call
+    /// [`Phase`] can only come from the [`PlanBuilder`] call
     /// that created the phase, so there is no number to write. `new` stays for
     /// hand-assembled plans, and `check_phase_work` refuses a phase that does
     /// not write the stream by name.

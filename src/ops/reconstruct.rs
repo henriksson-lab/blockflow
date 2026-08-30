@@ -325,7 +325,7 @@ impl Reconstruction {
 /// bare arrays is saying. [`reconstruct_step_into_at`] is the form that says
 /// where the buffers sit in a larger volume, and the two differ for exactly one
 /// element — one whose step counts from
-/// [`StepOrigin::ClippedStart`](super::StepOrigin::ClippedStart), whose window
+/// [`StepOrigin::ClippedStart`], whose window
 /// re-phases at a low face.
 pub fn reconstruct_step_into<T: Copy + PartialOrd>(
     running: ArrayView3<'_, T>,

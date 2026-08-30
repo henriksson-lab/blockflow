@@ -456,6 +456,8 @@ pub mod net {
 /// [`interleave`] and this function together answer "how much is on the table"
 /// without committing anyone to a refactor of somebody else's inner loop. If
 /// the number is worth it, this is the shape the change would take.
+///
+/// [`interleave`]: steps::interleave
 pub mod steps {
     /// The flow field as `(dy, dx)` pairs, which is the layout the follower
     /// wants and the one `Array3` does not have.

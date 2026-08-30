@@ -2449,6 +2449,8 @@ pub const IDENTITY_COST: f64 = 0.95;
 /// which is the same asymmetry [`MAP_COST`] already has: a predicate with real
 /// arithmetic in it overrides [`MaskFn::cost`], and one that has not been asked
 /// says what the *shape* costs.
+///
+/// [`COST_MEASUREMENT`]: super::COST_MEASUREMENT
 pub const MASK_COST: f64 = 0.65;
 
 /// Measured; see `super::COST_MEASUREMENT`.

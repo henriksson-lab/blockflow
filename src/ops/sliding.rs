@@ -507,7 +507,7 @@ impl ScanPlan {
 /// how the window's contents are reached.
 ///
 /// **An element whose step counts from
-/// [`StepOrigin::ClippedStart`](super::StepOrigin::ClippedStart) is refused**,
+/// [`StepOrigin::ClippedStart`] is refused**,
 /// and the refusal is what keeps the sentence above true rather than mostly
 /// true: that element is a different window at every phase, a carried histogram
 /// is a decomposition of one window, and the dense filter honours the origin.
@@ -856,7 +856,7 @@ fn resolve_offset(
 /// window and not a second traversal.
 ///
 /// **This op refuses an element whose step counts from
-/// [`StepOrigin::ClippedStart`](super::StepOrigin::ClippedStart)**, and refuses
+/// [`StepOrigin::ClippedStart`]**, and refuses
 /// it when the kernel runs rather than when the op is built: the constructors
 /// below return a `Self` a caller composes into a `Chain`, so there is nowhere
 /// earlier to say it without changing a signature every consumer writes. The
