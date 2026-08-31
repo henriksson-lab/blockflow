@@ -175,6 +175,7 @@ use crate::error::{Error, Result};
 pub mod adjacency;
 pub mod align;
 pub mod background;
+pub mod classify;
 pub mod components;
 pub mod configuration;
 pub mod coordinates;
@@ -188,6 +189,7 @@ pub mod element;
 /// block-local form that approaches one. That module's header says what shape it
 /// took instead and why the three obvious ways of wrapping it in this crate's
 /// lattice do not exist.
+pub mod features;
 pub mod fft;
 pub mod fill;
 pub mod label;
@@ -209,6 +211,7 @@ pub mod scikitimage_watershed;
 pub mod skeleton;
 pub mod sliding;
 pub mod smooth;
+pub mod structure_tensor;
 pub mod tabulate;
 pub mod voxelize;
 pub mod voxelwise;
@@ -219,6 +222,9 @@ pub use adjacency::{
     adjacent_pair_rows, adjacent_pairs, adjacent_pairs_into, adjacent_pairs_phase, collect_pairs,
     empty_pairs, encode_adjacent_pairs, forward_offsets, merge_pairs, pair_schema,
     walk_adjacent_pairs, AdjacentPairsOp, Pair, HIGHER_COLUMNS,
+};
+pub use classify::{
+    gather_samples, predict_workflow, train_workflow, ClassMap, ForestPredictor, Prediction,
 };
 /// The only thing in `components` a *caller* chooses rather than a builder of
 /// ops uses. The rest of that module stays behind its own path, because it is
@@ -256,6 +262,7 @@ pub use directional::{
 pub use element::{
     select_nth, ElementShape, Percentile, Rank, StepOrigin, StructuringElement, Total,
 };
+pub use features::{Family, FeatureChannel, FeatureStack, Geometry};
 pub use fft::{
     correlate_direct, minimal_wrap_free_length, next_smooth_length, spectrum_width,
     squared_difference_direct, Complex, Correlation2, Landscape, Padding, RealTransform2,
@@ -311,8 +318,8 @@ pub use resample::{
 };
 pub use ridge::{
     gaussian_radius, gaussian_smooth_into, gaussian_smooth_into_with, gaussian_weights, hessian_at,
-    ridge_response_into, symmetric_eigenvalues, Boundary, EigenResponse, Polarity, RatioResponse,
-    Response, RidgeFilterOp, RidgeResponse, ScaleSpace,
+    ridge_response_into, symmetric_eigenvalues, Boundary, EigenResponse, HessianEigenvalueOp,
+    Polarity, RatioResponse, Response, RidgeFilterOp, RidgeResponse, ScaleSpace,
 };
 pub use rows::{
     append_group_phases, collect_groups, collect_rows, decode_groups, encode_groups, filter_blob,
@@ -328,6 +335,9 @@ pub use sliding::{
     RankQuery, ScanPlan, SlidingHistogramOp,
 };
 pub use smooth::{Gaussian, SmoothOp};
+pub use structure_tensor::{
+    gradient_at, Eigenvalue, GradientMagnitudeOp, StructureTensor, StructureTensorOp,
+};
 pub use tabulate::{
     append_tabulate_phases, collect_tabulation, decode_partial, encode_partial, merge_tabulation,
     region_values, tabulate_phases, tabulation_schema, FixedPoint, MergeTabulationOp, RegionValues,

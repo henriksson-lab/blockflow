@@ -124,10 +124,12 @@ use ndarray::{Array3, ArrayD, ArrayView3, ArrayViewMut3, Axis, Slice};
 
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::op::{Anchor, BlockOp, Output, SideBlock, SourceInputs};
+use crate::op::{Anchor, BlockOp, Output, SideBlock, Slicing, SourceInputs};
+use crate::reach::Reach;
 use crate::voxels::Voxels;
 
 use super::shapes_agree;
+use super::structure_tensor::Eigenvalue;
 
 // ------------------------------------------------------------ smoothing --
 
@@ -1416,6 +1418,197 @@ where
     Ok(())
 }
 
+// --------------------------------------------- the eigenvalues, unfolded --
+
+/// **One eigenvalue of the Hessian at one scale**, emitted as a number rather
+/// than folded into a response.
+///
+/// [`RidgeFilterOp`] answers "how ridge-like is this voxel", which is three
+/// eigenvalues put through an [`EigenResponse`] and reduced to one. A pixel
+/// classifier wants the opposite: the three numbers themselves, as three
+/// separate features, so that a forest can learn its own fold from labelled
+/// data instead of being handed one. Labkit's stack lists exactly that — "Hessian
+/// eigenvalues, 3 outputs per scale" — and `docs/design/pixel-classification.md`
+/// counts on it.
+///
+/// **Not a new [`Response`], which is where it might have gone.** A response is
+/// by construction a fold of all three into one, and `Response` is a closed enum
+/// so that the set of folds is a vocabulary rather than a hook. Selecting one of
+/// three is not a fold, and pretending it was would have made every existing
+/// response's documentation — which is written about *shape* — describe
+/// something that no longer has one.
+///
+/// One scale, not a [`ScaleSpace`]: the argmax over scales is the thing a
+/// response needs and a feature is per scale by definition. A caller who wants
+/// three scales builds three ops, and the planner sees three arms it can
+/// schedule rather than one it cannot.
+pub struct HessianEigenvalueOp {
+    name: &'static str,
+    sigma: [f64; 3],
+    truncate: f64,
+    boundary: Boundary,
+    which: Eigenvalue,
+    cost: f64,
+}
+
+impl HessianEigenvalueOp {
+    pub fn new(
+        name: &'static str,
+        sigma: [f64; 3],
+        truncate: f64,
+        which: Eigenvalue,
+    ) -> Result<Self> {
+        // **Validated against `gaussian_weights` and deliberately not against
+        // `ScaleSpace`.** A scale space refuses a zero on any axis, and its
+        // message says why: it is a list of alternatives folded by a maximum,
+        // and an axis nobody smooths is one the maximum cannot be taken over
+        // meaningfully. That reasoning does not reach a single-scale feature. A
+        // zero here is how a caller says *this axis is not blurred*, which is
+        // exactly Labkit's plane-wise mode — `gaussian_weights` accepts it,
+        // documents it, and returns the one-tap identity — and refusing it here
+        // would have made `ops::features::Geometry::PlaneWise` unbuildable for
+        // this one family out of eight.
+        for axis in 0..3 {
+            let _ = gaussian_weights(sigma[axis], truncate)?;
+        }
+        if !truncate.is_finite() || truncate <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "a truncation must be a positive, finite multiple of the scale; got {truncate}"
+            )));
+        }
+        Ok(Self {
+            name,
+            sigma,
+            truncate,
+            boundary: Boundary::Clamp,
+            which,
+            cost: SMOOTH_COST_PER_TAP
+                * (0..3)
+                    .map(|axis| 2 * gaussian_radius(sigma[axis], truncate) + 1)
+                    .sum::<usize>() as f64
+                + DECOMPOSITION_COST,
+        })
+    }
+
+    pub fn which(&self) -> Eigenvalue {
+        self.which
+    }
+
+    pub fn sigma(&self) -> [f64; 3] {
+        self.sigma
+    }
+
+    pub fn with_boundary(mut self, boundary: Boundary) -> Self {
+        self.boundary = boundary;
+        self
+    }
+
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+
+    /// `radius(sigma) + 1`: the smoothing, and the one voxel the second-difference
+    /// stencil adds. The same rule [`ScaleSpace::reach`] states, at one scale.
+    pub fn reach_on(&self, axis: usize) -> usize {
+        gaussian_radius(self.sigma[axis], self.truncate) + 1
+    }
+
+    fn eigenvalue_into<T>(
+        &self,
+        input: ArrayView3<'_, T>,
+        mut out: ArrayViewMut3<'_, f64>,
+    ) -> Result<()>
+    where
+        T: Copy + Into<f64>,
+    {
+        let dim = (input.shape()[0], input.shape()[1], input.shape()[2]);
+        let mut smoothed = Array3::<f64>::zeros(dim);
+        let kernels = [
+            gaussian_weights(self.sigma[0], self.truncate)?,
+            gaussian_weights(self.sigma[1], self.truncate)?,
+            gaussian_weights(self.sigma[2], self.truncate)?,
+        ];
+        gaussian_smooth_into_with(input, &kernels, self.boundary, smoothed.view_mut())?;
+        let index = self.which.index();
+        for i in 0..dim.0 {
+            for j in 0..dim.1 {
+                for k in 0..dim.2 {
+                    let hessian = hessian_at(smoothed.view(), [i, j, k]);
+                    out[[i, j, k]] = symmetric_eigenvalues(hessian)[index];
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BlockOp for HessianEigenvalueOp {
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, axis: usize, _volume_len: usize) -> usize {
+        self.reach_on(axis)
+    }
+
+    fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+        Reach::symmetric([self.reach_on(0), self.reach_on(1), self.reach_on(2)])
+    }
+
+    fn accepts(&self, dtype: Dtype) -> bool {
+        dtype != Dtype::F16
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::F64
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        let out = out.view_mut::<f64>()?;
+        macro_rules! direct {
+            ($type:ty) => {
+                self.eigenvalue_into(input.view::<$type>()?, out)
+            };
+        }
+        match input.dtype() {
+            Dtype::U8 => direct!(u8),
+            Dtype::U16 => direct!(u16),
+            Dtype::U32 => direct!(u32),
+            Dtype::I8 => direct!(i8),
+            Dtype::I16 => direct!(i16),
+            Dtype::I32 => direct!(i32),
+            Dtype::F32 => direct!(f32),
+            Dtype::F64 => direct!(f64),
+            Dtype::Bool | Dtype::U64 | Dtype::I64 => {
+                let widened = input.widened();
+                self.eigenvalue_into(widened.view(), out)
+            }
+            Dtype::F16 => Err(Error::InvalidArgument(format!(
+                "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
+                self.name
+            ))),
+        }
+    }
+
+    /// A constant field has a zero Hessian, so every eigenvalue of it is zero —
+    /// and a clamped neighbour of a constant is the same constant, so the edge
+    /// is no exception. Note this is a stronger claim than [`RidgeFilterOp`]'s
+    /// only because that one has a response in the way; the underlying fact is
+    /// the same one.
+    fn constant_maps_to(&self, _value: f64) -> Option<f64> {
+        Some(0.0)
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+}
+
 // --------------------------------------------------------------- shell --
 
 /// A multi-scale Hessian ridge filter as a [`BlockOp`].
@@ -1901,6 +2094,140 @@ pub fn smoothing_report(shape: [usize; 3], repetitions: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The Hessian eigenvalues' closed form.** Over the quadratic
+    /// `q = (c1 x^2 + c2 y^2 + c3 z^2) / 2` the Hessian is `diag(c1, c2, c3)`
+    /// exactly — a central second difference of a quadratic is its coefficient,
+    /// with no truncation error at all, and Gaussian smoothing adds only a
+    /// constant, which second differences annihilate. So the three eigenvalues
+    /// are the three coefficients in descending order.
+    ///
+    /// The coefficients are chosen with mixed signs and no repeats: a repeated
+    /// root would cost half the mantissa (see [`symmetric_eigenvalues`]) and
+    /// weaken the tolerance, and an all-positive set would not distinguish
+    /// descending *algebraic* order from descending magnitude — which is a real
+    /// distinction here, because `RidgeFilterOp`'s responses sort by magnitude
+    /// and this op does not.
+    #[test]
+    fn the_hessian_eigenvalues_of_a_quadratic_are_its_coefficients() {
+        let coefficients = [0.5, -1.25, 0.125];
+        let dim = (19, 19, 19);
+        let centre = [9.0, 9.0, 9.0];
+        let input = Array3::from_shape_fn(dim, |(i, j, k)| {
+            let at = [
+                i as f64 - centre[0],
+                j as f64 - centre[1],
+                k as f64 - centre[2],
+            ];
+            0.5 * (coefficients[0] * at[0] * at[0]
+                + coefficients[1] * at[1] * at[1]
+                + coefficients[2] * at[2] * at[2])
+        });
+
+        let mut want = coefficients;
+        want.sort_by(|left, right| right.total_cmp(left));
+        assert_eq!(
+            want,
+            [0.5, 0.125, -1.25],
+            "descending algebraic, not by magnitude"
+        );
+
+        let source: Voxels = input.into();
+        for (index, which) in Eigenvalue::ALL.into_iter().enumerate() {
+            let op = HessianEigenvalueOp::new("hessian", [1.0; 3], 3.0, which).unwrap();
+            assert_eq!(op.reach_on(0), 4);
+            let mut out = Voxels::zeros(Dtype::F64, [dim.0, dim.1, dim.2]).unwrap();
+            op.apply(&source, &mut out, &Anchor::whole([dim.0, dim.1, dim.2]))
+                .unwrap();
+            let got = out.view::<f64>().unwrap();
+            let reach = op.reach_on(0);
+            let mut checked = 0;
+            for i in reach..dim.0 - reach {
+                for j in reach..dim.1 - reach {
+                    for k in reach..dim.2 - reach {
+                        assert!(
+                            (got[[i, j, k]] - want[index]).abs() < 1e-9,
+                            "{:?}: {} at {i},{j},{k}, want {}",
+                            which,
+                            got[[i, j, k]],
+                            want[index]
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            assert!(checked > 0);
+        }
+    }
+
+    /// **The three eigenvalues sum to the Laplacian**, because the trace of a
+    /// matrix is the sum of its eigenvalues and the trace of a Hessian is the
+    /// Laplacian. An independent invariant: it holds voxel by voxel on an
+    /// arbitrary field, where the quadratic oracle above holds only on a fixture
+    /// built to satisfy it.
+    #[test]
+    fn the_three_hessian_eigenvalues_sum_to_the_laplacian() {
+        let dim = (15, 13, 11);
+        let mut state: u64 = 20260831;
+        let input = Array3::from_shape_fn(dim, |_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f64 / (1u64 << 31) as f64) - 1.0
+        });
+        let source: Voxels = input.into();
+        let shape = [dim.0, dim.1, dim.2];
+
+        let mut sum = Array3::<f64>::zeros(dim);
+        for which in Eigenvalue::ALL {
+            let op = HessianEigenvalueOp::new("hessian", [1.0; 3], 3.0, which).unwrap();
+            let mut out = Voxels::zeros(Dtype::F64, shape).unwrap();
+            op.apply(&source, &mut out, &Anchor::whole(shape)).unwrap();
+            sum = sum + out.view::<f64>().unwrap();
+        }
+
+        // The Laplacian read straight off the same smoothed field, which is the
+        // trace of exactly the matrix `symmetric_eigenvalues` was handed.
+        let kernels = [
+            gaussian_weights(1.0, 3.0).unwrap(),
+            gaussian_weights(1.0, 3.0).unwrap(),
+            gaussian_weights(1.0, 3.0).unwrap(),
+        ];
+        let mut smoothed = Array3::<f64>::zeros(dim);
+        gaussian_smooth_into(source.view::<f64>().unwrap(), &kernels, smoothed.view_mut()).unwrap();
+        let mut worst = 0.0f64;
+        for i in 0..dim.0 {
+            for j in 0..dim.1 {
+                for k in 0..dim.2 {
+                    let hessian = hessian_at(smoothed.view(), [i, j, k]);
+                    let laplacian = hessian[0] + hessian[1] + hessian[2];
+                    worst = worst.max((sum[[i, j, k]] - laplacian).abs());
+                }
+            }
+        }
+        assert!(worst < 1e-12, "the trace is off by {worst:e}");
+    }
+
+    /// **A zero on one axis is accepted and a negative one is not**, which is
+    /// `gaussian_weights`' rule rather than [`ScaleSpace`]'s — see the comment
+    /// in `new` for why the two differ.
+    ///
+    /// A zero on *every* axis is accepted too, and is not degenerate: it is the
+    /// unsmoothed Hessian, the second differences of the raw volume. It reaches
+    /// one voxel and no more.
+    #[test]
+    fn a_hessian_eigenvalue_op_takes_the_zero_scale_a_scale_space_refuses() {
+        let plane_wise =
+            HessianEigenvalueOp::new("h", [0.0, 1.0, 1.0], 3.0, Eigenvalue::Largest).unwrap();
+        assert_eq!(plane_wise.reach_on(0), 1, "only the stencil, on the normal");
+        assert_eq!(plane_wise.reach_on(1), 4);
+        assert!(ScaleSpace::new(vec![[0.0, 1.0, 1.0]], 3.0, 1.0).is_err());
+
+        let unsmoothed = HessianEigenvalueOp::new("h", [0.0; 3], 3.0, Eigenvalue::Largest).unwrap();
+        assert_eq!(unsmoothed.reach_on(2), 1);
+
+        assert!(HessianEigenvalueOp::new("h", [-1.0; 3], 3.0, Eigenvalue::Largest).is_err());
+        assert!(HessianEigenvalueOp::new("h", [1.0; 3], 0.0, Eigenvalue::Largest).is_err());
+        assert!(HessianEigenvalueOp::new("h", [f64::NAN; 3], 3.0, Eigenvalue::Largest).is_err());
+    }
 
     fn ramp(dim: (usize, usize, usize)) -> Array3<f64> {
         let mut array = Array3::zeros(dim);

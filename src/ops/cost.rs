@@ -39,6 +39,7 @@ use super::local::{AdaptiveThresholdOp, Isodata, LocalStatistic, LocalStatisticO
 use super::morphology::{Morphology, MorphologyOp};
 use super::rank::RankFilterOp;
 use super::smooth::{Gaussian, SmoothOp};
+use super::structure_tensor::{Eigenvalue, StructureTensor, StructureTensorOp};
 use super::voxelwise::{CombineOp, Logic, VoxelwiseMapOp};
 
 /// One measured op.
@@ -216,6 +217,41 @@ pub fn measure(shape: [usize; 3], repetitions: usize) -> Vec<Sample> {
             Box::new(SmoothOp::new("smooth", wide.clone())),
             wide.taps() as f64,
         ),
+        // **Three rows, because the structure tensor's cost has two terms and a
+        // shape.** One separable smoothing of the intensity, then *six* of the
+        // tensor's components, then a fixed per-voxel slab — the gradient
+        // stencil, the six products and a cubic root-finder. Two unknowns and an
+        // asymmetry: a single row would fit any of them.
+        //
+        // The rows are chosen so the three questions are separable. The first
+        // and second differ only in the derivative scale, the first and third
+        // only in the integration scale, and the second and third have the same
+        // total kernel width — so the gap between them is the six-fold factor
+        // and nothing else. The divisor is the tap count `cost_for` charges,
+        // `taps(sigma) + 6 taps(rho)`, so the `per element` column is directly
+        // comparable with the smoothing rows above it: if it does not land near
+        // their per-tap figure, the model is the wrong shape rather than the
+        // constant being off.
+        // **The anchor.** `ops::ridge` decomposes the same six numbers with the
+        // same closed form, so the ratio between these two rows is what decides
+        // whether the structure tensor's per-voxel slab is priced consistently
+        // with its only sibling. Without it the constant below would be in the
+        // units of whatever day it was taken, and `mod.rs` is explicit that the
+        // *relative* weighting between op families is the part a re-measurement
+        // cannot repair.
+        (
+            "ridge, sigmas [1.0], truncate 3 (21 taps)".to_string(),
+            Box::new(super::ridge::RidgeFilterOp::new(
+                "ridge",
+                super::ridge::ScaleSpace::isotropic(&[1.0], 3.0, 1.0).unwrap(),
+                super::ridge::RidgeResponse::new(0.5, 0.5, 0.05, super::ridge::Polarity::Ridge)
+                    .unwrap(),
+            )),
+            21.0,
+        ),
+        structure_tensor_case("sigma 1, rho 1", [1.0; 3], [1.0; 3]),
+        structure_tensor_case("sigma 3, rho 1", [3.0; 3], [1.0; 3]),
+        structure_tensor_case("sigma 1, rho 3", [1.0; 3], [3.0; 3]),
     ];
 
     let mut raw = Vec::new();
@@ -270,6 +306,32 @@ pub fn report(shape: [usize; 3], repetitions: usize) -> String {
         ));
     }
     out
+}
+
+/// One structure tensor row: the op, and the tap count `cost_for` charges for
+/// it. `Largest` because which eigenvalue is emitted cannot change the cost —
+/// all three come out of the same decomposition and one is copied out.
+fn structure_tensor_case(
+    label: &str,
+    sigma: [f64; 3],
+    rho: [f64; 3],
+) -> (String, Box<dyn BlockOp>, f64) {
+    let truncate = 3.0;
+    let taps = |scale: [f64; 3]| -> usize {
+        (0..3)
+            .map(|axis| 2 * super::ridge::gaussian_radius(scale[axis], truncate) + 1)
+            .sum::<usize>()
+    };
+    let charged = taps(sigma) + 6 * taps(rho);
+    (
+        format!("structure tensor, {label} truncate 3 ({charged} taps charged)"),
+        Box::new(StructureTensorOp::new(
+            "structure tensor",
+            StructureTensor::new(sigma, rho, truncate).unwrap(),
+            Eigenvalue::Largest,
+        )),
+        charged as f64,
+    )
 }
 
 fn ramp(shape: [usize; 3]) -> crate::voxels::Voxels {

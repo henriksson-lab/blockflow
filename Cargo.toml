@@ -468,3 +468,17 @@ required-features = ["model-segment"]
 name = "model_segment_rows"
 path = "tests/model_segment_rows.rs"
 required-features = ["model-segment"]
+
+[dev-dependencies]
+# **An agreement oracle for `forest`, and nothing else.** `blockflow` fits its
+# own random forest — `docs/design/pixel-classification.md` sets out why, and the
+# short version is that this workload is inference-dominated by orders of
+# magnitude and `smartcore`'s fitted trees are private with no access to the node
+# structure, so a model cannot be converted into a layout we control. What it can
+# do is be fitted to the same rows and scored on the same held-out ones, which is
+# the witness `tests/forest_predict.rs` takes and the same shape
+# `ops::scikitimage_watershed` uses against skimage.
+#
+# A dev-dependency, so it is not in anything this crate ships, and pure Rust, so
+# it adds no system requirement to CI.
+smartcore = "0.6.14"

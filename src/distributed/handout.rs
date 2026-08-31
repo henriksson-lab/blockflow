@@ -264,6 +264,18 @@ pub fn position(graph: &TaskGraph, task: usize) -> [f64; 3] {
     out
 }
 
+/// The chunks one task will **fetch**.
+///
+/// `source` and not `read`, and the distinction is the reason this is a function
+/// rather than an expression written at each of the three places that need it:
+/// the two regions differ for a phase that reads across grids, and a policy
+/// keyed on the wrong one would be ranking chunks nobody asks for. Stated once,
+/// it cannot be got right in two places and wrong in a third.
+fn fetch_keys(graph: &TaskGraph, chunks: &ChunkGrid, task: usize) -> Vec<u64> {
+    let entry = &graph.tasks[task];
+    chunks.keys(entry.phase, &entry.geometry.source)
+}
+
 fn distance_squared(left: [f64; 3], right: [f64; 3]) -> f64 {
     (0..3)
         .map(|axis| {
@@ -382,12 +394,7 @@ fn nearest(
     for &task in ready {
         let misses = match (policy, worker.cache) {
             (HandoutPolicy::CacheModelled, Some(cache)) => {
-                let entry = &graph.tasks[task];
-                // What the task will *fetch*, which is `source`: the two differ
-                // only for a phase that reads across grids, and a cache model
-                // keyed on the wrong region would be modelling chunks nobody
-                // asks for.
-                cache.misses(&chunks.keys(entry.phase, &entry.geometry.source))
+                cache.misses(&fetch_keys(graph, chunks, task))
             }
             _ => 0,
         };
@@ -445,8 +452,7 @@ fn coalescing(
     // question per candidate is "is *this* chunk coming anyway".
     let mut incoming: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     for &task in worker.in_flight {
-        let entry = &graph.tasks[task];
-        incoming.extend(chunks.keys(entry.phase, &entry.geometry.source));
+        incoming.extend(fetch_keys(graph, chunks, task));
     }
 
     // **The cost of each candidate, in chunks fetched**, which is the unit both
@@ -454,8 +460,7 @@ fn coalescing(
     let cost_in_chunks: Vec<f64> = ready
         .iter()
         .map(|&task| {
-            let entry = &graph.tasks[task];
-            let keys = chunks.keys(entry.phase, &entry.geometry.source);
+            let keys = fetch_keys(graph, chunks, task);
             // What I must fetch: not in my node's pool and not already on its
             // way there.
             let mine = keys

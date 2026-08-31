@@ -83,6 +83,35 @@ fn run(assembly: &Assembly, machine: Machine, scheduler: &mut dyn Scheduler) -> 
     .expect("a simulable plan")
 }
 
+/// A plan whose neighbouring blocks genuinely **share chunks**, on a volume no
+/// small cache can hold — the fixture for every question about ordering.
+///
+/// Both of those are load-bearing and neither is true of [`plan`] above, which
+/// is why this exists rather than reusing it:
+///
+/// * **a reach of two, not one.** At reach one a `16^3` block's read extent
+///   spans the same eight `16^3` chunks whichever neighbour it sits by, so no
+///   ordering can change what is fetched — measured, that fixture's answer does
+///   not move across a sixteen-fold cache range. Two spans two or three chunks
+///   per axis, so neighbours overlap and an ordering has something to win;
+/// * **`96^3`, not this file's `64^3`.** Sixty-four `16^3` chunks is two
+///   megabytes, which fits in every cache the sweeps try, so the cache axis
+///   would be flat by construction. `96^3` is 216 chunks.
+///
+/// Equal costs across the three phases, so that a short-circuited block is a
+/// real saving rather than a rounding one.
+fn sharing_fixture() -> Assembly {
+    const WIDE: [usize; 3] = [96, 96, 96];
+    let grid = BlockGrid::new(WIDE, [16, 16, 16]).expect("a grid");
+    let mut builder = PlanBuilder::new(WIDE, Dtype::F64, grid);
+    for name in ["first", "second", "third"] {
+        builder
+            .pixels(Chain::op(IdentityOp::new(name, [2, 2, 2]).with_cost(2.0)))
+            .expect("a pixel phase");
+    }
+    builder.finish().expect("an assembly")
+}
+
 /// Eight workers, a cache big enough to hold a useful part of the volume, and
 /// nothing else set — the machine every test below varies one field of.
 fn eight_workers(nodes: usize) -> Machine {
@@ -487,25 +516,7 @@ fn seeding_the_computers_apart_pays_when_each_can_hold_what_its_threads_touch() 
     use blockflow::distributed::handout::HandoutPolicy;
     use blockflow::simulate::Handout;
 
-    // **Its own fixture, wider and larger than this file's.** The plan above
-    // reaches one voxel, so a `16^3` block's read extent spans the same eight
-    // `16^3` chunks whichever neighbour it sits by and no ordering can change
-    // what is fetched — measured, that fixture's answer does not move across a
-    // sixteen-fold cache range. A reach of two spans two or three chunks per
-    // axis, so neighbours genuinely share. And `64^3` is sixty-four chunks —
-    // two megabytes, which fits in every cache the sweep tries, so the cache
-    // axis would be flat by construction; `96^3` is 216.
-    const WIDE: [usize; 3] = [96, 96, 96];
-    let assembly = {
-        let grid = BlockGrid::new(WIDE, [16, 16, 16]).expect("a grid");
-        let mut builder = PlanBuilder::new(WIDE, Dtype::F64, grid);
-        for name in ["first", "second", "third"] {
-            builder
-                .pixels(Chain::op(IdentityOp::new(name, [2, 2, 2]).with_cost(2.0)))
-                .expect("a pixel phase");
-        }
-        builder.finish().expect("an assembly")
-    };
+    let assembly = sharing_fixture();
     let at = |threads: usize, cache_bytes: u64| {
         let machine = Machine {
             nodes: 4,
@@ -646,19 +657,7 @@ fn scoring_the_candidates_beats_prescribing_a_route() {
     use blockflow::distributed::handout::HandoutPolicy;
     use blockflow::simulate::Handout;
 
-    // The fixture of the test above, for the same reasons: a reach that makes
-    // neighbours share chunks, and a volume larger than one cache.
-    const WIDE: [usize; 3] = [96, 96, 96];
-    let assembly = {
-        let grid = BlockGrid::new(WIDE, [16, 16, 16]).expect("a grid");
-        let mut builder = PlanBuilder::new(WIDE, Dtype::F64, grid);
-        for name in ["first", "second", "third"] {
-            builder
-                .pixels(Chain::op(IdentityOp::new(name, [2, 2, 2]).with_cost(2.0)))
-                .expect("a pixel phase");
-        }
-        builder.finish().expect("an assembly")
-    };
+    let assembly = sharing_fixture();
     let against_plan_order = |threads: usize, cache_bytes: u64, policy: HandoutPolicy| {
         let machine = Machine {
             nodes: 4,
