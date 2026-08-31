@@ -303,7 +303,17 @@ fn every_committed_scenario_loads_and_round_trips() {
         // edit that the generator would undo is caught here rather than at the
         // next regeneration.
         let path = format!("{COSTS}/{name}.json");
-        let on_disk = std::fs::read_to_string(&path).expect("the file this came from");
+        // **Newlines normalised, and only newlines.** `.gitattributes` pins
+        // these files to LF in the working tree so that this comparison is
+        // portable at the source; this strips CR as well, so that a checkout
+        // made before that attribute existed — or one whose `core.autocrlf`
+        // says otherwise — compares its *content* rather than its platform's
+        // line ending. A newline is not something `to_json` decides, and a test
+        // that failed on one was reporting the checkout rather than the file,
+        // which is what it did the first time this crate's CI ran on Windows.
+        let on_disk = std::fs::read_to_string(&path)
+            .expect("the file this came from")
+            .replace("\r\n", "\n");
         // The first differing line, rather than two thousand characters of
         // `assert_eq!`. It is how the `preserve_order` difference below was
         // found: every line differed, which said "the key order moved" where a
@@ -458,14 +468,25 @@ fn run(scenario: &Scenario) -> Ran {
 /// marginally ahead. The whole penalty is the overlap, and it exists only when
 /// workers contend.
 ///
-/// **And the executor would not overlap them.** `strategy::execute` pops a wave
-/// and joins it before the next, so its phases are sequential; `simulate`
-/// dispatches continuously. That is item **C** of `docs/design/planner-gaps.md`
-/// — "the simulator and the executor have different concurrency models, and
-/// neither states it" — and this is the first number on it: measured at 0.2% of
-/// makespan when nothing contends, and **47%** here when something does. So the
-/// 1.467 is the divergence between the two models of a run, and which of them
-/// to believe about a mixed grid is a question this crate has not settled.
+/// **And one of the two executors would not overlap them.**
+/// `strategy::execute_phases` pops a wave and joins it before the next, so its
+/// phases are sequential; `distributed`'s coordinator does not — its
+/// `barrier_is_open` returns true for any phase that is not a declared barrier
+/// — and neither does `simulate` by default. That is item **C** of
+/// `docs/design/planner-gaps.md`, and this is the number on it: 0.2% of
+/// makespan when nothing contends and **47%** here when something does.
+///
+/// **Settled: the sweep is judged under the continuous model, by decision.**
+/// The plans this file ranks are cluster plans and the cluster path is the
+/// continuous one, so that is the faithful model for them. This row's 1.467 is
+/// therefore the divergence between two models of a run rather than a planner
+/// error, and it is measured at 0.997 under the other one — see
+/// `tests/wave_dispatch.rs`.
+///
+/// The other half of the decision is a bill on the single-process path, which
+/// that file also measures: joining each wave costs nothing when tasks are
+/// equal and up to **1.41x** when they are not. That makes its wave discipline
+/// something to remove rather than a model to rank plans against.
 ///
 /// The bound below is deliberately loose. A fix that *improves* a scenario must
 /// not fail here, and the figure that matters is not "is it exactly one" but

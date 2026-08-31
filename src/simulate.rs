@@ -254,6 +254,118 @@ pub struct Machine {
     /// about the simulator was taken without it, and a default that silently
     /// moved them would make the record unreadable. Turn it on deliberately.
     pub contention: f64,
+    /// How many ready tasks a [`Scheduler`] is shown at one dispatch. **`0`
+    /// means all of them**, and `0` is the default.
+    ///
+    /// # The term this bounds
+    ///
+    /// [`Decision::ready`] is *every* task that could start, and every
+    /// scheduler in this crate walks the whole of it: [`ExecutorOrder`] keys
+    /// each candidate, [`WarmestFirst`] asks the cache about each,
+    /// [`BoundedHorizonThroughput`] walks each task's chunk keys, [`Handout`]
+    /// hands the entire slice to `distributed::handout::choose`. One dispatch
+    /// therefore costs `O(ready)` and a run of `T` tasks costs `O(T x R)`
+    /// however cheap the loop around it is.
+    ///
+    /// That is the *second* quadratic term in the event loop. The first — the
+    /// readiness scan, a `(0..tasks).filter(..)` per dispatch — is gone, and
+    /// removing it exposed this one as the larger. Measured on a three-phase
+    /// pixel chain over a `128^3` volume at four workers, release build, by
+    /// `tests/planner_arena.rs::print_the_cost_of_the_dispatch_loop`:
+    ///
+    /// ```text
+    ///      tasks   ExecutorOrder (ms)   an O(1) control (ms)   inside the scheduler
+    ///      1 536                 13.9                    9.0                   35 %
+    ///     12 288                424.4                   35.6                   92 %
+    ///     98 304             36 298.9                  567.2                   98 %
+    /// ```
+    ///
+    /// A window caps `R`. A dispatch costs `O(min(ready, window))`, so a run
+    /// stops being quadratic the moment the ready set outgrows the window, and
+    /// the saving is the whole of the 98% above minus what the window keeps.
+    ///
+    /// # Why this is the right place to cut, and not the `Scheduler` trait
+    ///
+    /// The alternative is to make each scheduler cheaper — an index, an
+    /// incremental heap, a per-policy shortcut. That is one change per
+    /// scheduler, it is a different change for each, and it would have to be
+    /// re-argued for every policy added afterwards. A window is one change that
+    /// bounds all of them, and it bounds the ones not written yet.
+    ///
+    /// It is also the constraint a **real** coordinator has. `Decision` is
+    /// documented as deliberately narrow — "everything here is something the
+    /// real coordinator knows at handout time" — and a coordinator that must
+    /// rank every runnable block in a million-block plan before handing one out
+    /// is not a coordinator anybody would ship. A window is that limit written
+    /// down, and a policy measured under one is a policy that survives it.
+    ///
+    /// # `0` is the machine this crate has always simulated
+    ///
+    /// Bit for bit: at `0` the scheduler is handed exactly the slice it was
+    /// handed before this field existed, so every figure recorded anywhere in
+    /// this crate stands unmoved. That is the whole reason the default is `0`
+    /// and not a number somebody liked: a default that quietly re-ordered runs
+    /// would make the recorded corpus unreadable, and there would be no way to
+    /// tell which figures were taken under which machine.
+    ///
+    /// The same argument as [`Self::contention`], which is off by default for
+    /// exactly this reason and is not off because zero contention is realistic.
+    ///
+    /// # Which n, and why it must be stated
+    ///
+    /// The **first** `n` in **ascending task id**, which is the order the ready
+    /// set is maintained in. Not a sample, not the most recently admitted, not
+    /// the tail: a window whose membership depended on admission order or on a
+    /// hash would make two runs of one plan schedule differently, and the
+    /// simulator's whole use is comparing one run against another. Ascending id
+    /// is also the order a truncation degrades *gracefully* in — it is plan
+    /// order, which is what the executor does today, so the tasks a window hides
+    /// are the ones the executor would have run last anyway.
+    ///
+    /// A scheduler is not told it is windowed and does not need to be: it sees
+    /// a shorter `ready` and picks an index into it, which is the same contract.
+    /// A term computed *over* `ready` — [`ReleaseAware`]'s count of a phase's
+    /// outstanding tasks is the one in this crate — is computed over the window,
+    /// which is the point rather than a defect: a windowed scheduler is one that
+    /// reasons about the part of the machine it can see.
+    ///
+    /// # What it costs, in numbers
+    ///
+    /// `tests/candidate_window.rs::print_what_a_window_costs` is the
+    /// measurement and carries the whole table. The three figures a caller
+    /// setting this field needs, from a three-phase pixel chain over a `128^3`
+    /// volume at 98 304 tasks, four computers of one worker:
+    ///
+    /// ```text
+    ///            scheduler   window   wall (ms)     makespan   misses
+    /// executor:phase-major     none     39293.2    807820792    35328   identical
+    /// executor:phase-major      256       797.7    807820792    35328   identical
+    ///        nearest-first     none     35935.8    621438131    12569   identical
+    ///        nearest-first     4096      8000.5    616873687    12016   makespan  -0.73%
+    ///        nearest-first     1024      1608.3    648578620    15889   makespan  +4.37%
+    ///        nearest-first      256       812.0    737693332    26765   makespan +18.71%
+    /// ```
+    ///
+    /// * **49x, for nothing**, on [`ExecutorOrder::phase_major`] — whose argmin
+    ///   is the lowest ready id, which every prefix contains, so its schedule is
+    ///   bit-identical at every window;
+    /// * **the safe window is not a constant.** The same `256` improves the
+    ///   12 288-task run by 4% and costs the 98 304-task run 19%, because a
+    ///   window is a fraction of the ready set whether or not it is written as
+    ///   one. That is the reason the default is `0` rather than a number: there
+    ///   is no constant that is right at two plan sizes;
+    /// * **a window is a locality prior, not an optimisation.** It confines a
+    ///   scheduler to tasks adjacent in plan order, which improves the policies
+    ///   that scatter — `block_major` and [`ReleaseAware`] gain ~30% of makespan
+    ///   and ~80% of misses — and penalises the ones that were already local.
+    ///   Two policies may therefore be compared only at the **same** window.
+    ///
+    /// `scenario::Scenario` deliberately does not carry this field through its
+    /// JSON: the committed `costs/` files are compared byte for byte against
+    /// what `Scenario::to_json` writes, every one of them was recorded
+    /// unbounded, and a serialiser change would rewrite all of them to state the
+    /// default.
+    pub candidate_window: usize,
 }
 
 /// The contention coefficient the tile run implies, for callers who want the
@@ -311,6 +423,9 @@ impl Default for Machine {
             cache_shared: true,
             encoded_fraction: 0.0,
             contention: 0.0,
+            // Unbounded, so that a `Machine` nobody has configured is the one
+            // every recorded figure was taken on. See the field.
+            candidate_window: 0,
         }
     }
 }
@@ -1325,6 +1440,10 @@ fn earliest_channel(io_free_at: &[u64], node: usize, channels: usize) -> usize {
 /// `running` before making the next. That is the property that lets a scheduler
 /// reason about a *set* it is assembling rather than one task at a time.
 ///
+/// A scheduler is shown [`Machine::candidate_window`] of the ready set — all of
+/// it at `0`, which is the default and is what every recorded figure was taken
+/// under.
+///
 /// `released` and `kept` are `Hints::release_images` and `Hints::keep_images`;
 /// the image walk applies the executor's rule with them, exactly as
 /// [`Decomposition::peak_image_bytes_with`] does.
@@ -1719,12 +1838,25 @@ pub fn simulate(
                 .filter(|&(slot, _)| node_of(slot) == node_of(worker))
                 .filter_map(|(_, held)| *held)
                 .collect();
+            // **The candidate window**: the first `candidate_window` ready
+            // tasks, or all of them at `0`. A prefix of a slice that is already
+            // maintained in ascending task id, so it costs a bounds check and
+            // nothing else — no sort, no copy, no second set to keep in step
+            // with this one.
+            //
+            // `ready` is non-empty here and a window of `0` is the unbounded
+            // case, so `candidates` is never empty and the `- 1` below is never
+            // an underflow.
+            let candidates = match machine.candidate_window {
+                0 => &ready[..],
+                window => &ready[..window.min(ready.len())],
+            };
             let decision = Decision {
                 now_ns: now,
                 nodes,
                 graph: &graph,
                 decomposition,
-                ready: &ready,
+                ready: candidates,
                 running: &running_ids,
                 node_running: &node_running,
                 live_images: &live,
@@ -1738,10 +1870,16 @@ pub fn simulate(
                 phase_ns_per_voxel: &phase_rates,
                 phase_substages: &substages,
             };
-            scheduler.pick(&decision).min(ready.len() - 1)
+            // Clamped to the **window** and not to the ready set, so a
+            // scheduler that returns an index it was not offered still cannot
+            // reach past what it was shown.
+            scheduler.pick(&decision).min(candidates.len() - 1)
         };
-        // Out of the set as it starts. The scan's equivalent is `indegree[id] =
-        // usize::MAX` below, which is still done — it is what the oracle above
+        // Out of the set as it starts. `slot` indexes the window, and the
+        // window is a *prefix* of `ready`, so the two indices are the same
+        // number and no translation is needed — which is the reason the window
+        // is a prefix rather than a selection. The scan's equivalent is
+        // `indegree[id] = usize::MAX` below, which is still done — it is what the oracle above
         // compares against and what keeps a completed task's decrement from
         // re-admitting a started one.
         let id = ready.remove(slot);

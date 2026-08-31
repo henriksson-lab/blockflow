@@ -107,8 +107,18 @@ pub struct VolumeFitParams {
     pub tolerance: f64,
     /// Diagonal Levenberg damping added to the normal equations.
     pub damping: f64,
-    /// Fixed-image geometry written to the emitted transform and used to convert
-    /// the optimized voxel-space parameters to physical coordinates.
+    /// Fixed-image geometry, carried through to the emitted transform.
+    ///
+    /// **It is metadata here, not something the fit is expressed in.** The
+    /// optimizer works entirely in voxel coordinates — `transform_point` and
+    /// `parameter_jacobian` take voxel positions and return voxel positions —
+    /// and [`FittedTransform`] says so: its parameters are in the
+    /// full-resolution voxel frame. The spacing is validated, and a coarse
+    /// pyramid level's frame is required to be this one scaled by the level's
+    /// factor, but no conversion to physical coordinates happens anywhere; an
+    /// anisotropic frame produces bit-identical parameters to a unit one, which
+    /// `tests/align.rs` asserts. A caller who wants physical units applies this
+    /// frame themselves.
     pub geometry: SpatialFrame,
     /// Optional resident coarse-to-fine schedule used by [`resident`].
     pub pyramid: Option<PyramidSchedule>,
@@ -1071,11 +1081,18 @@ impl IterativeReduceOp for FitByMoments {
             total.combine(unpack_evidence(&partial.bytes, &self.params)?);
         }
         if substage == 0 {
-            let translation = self
-                .initial_translation()
-                .unwrap_or(total.moments.translation()?);
+            // A seeded run starts **at the seed, in full**. Reducing the seed to
+            // its translation and rebuilding the parameter vector around that
+            // would discard everything else it carries — the linear part of an
+            // affine, every control coefficient of a B-spline — which is
+            // precisely what the coarse level of a pyramid seeds the level below
+            // it with. `tests/align.rs` carries the readout that measures it.
+            let params = match self.initial.as_ref() {
+                Some(seed) => seed.clone(),
+                None => params_with_translation(&self.params, total.moments.translation()?),
+            };
             let next = OptimizerState {
-                params: params_with_translation(&self.params, translation),
+                params,
                 cost: f64::INFINITY,
                 substage: 0,
                 step_norm: f64::INFINITY,
@@ -1151,14 +1168,6 @@ impl IterativeReduceOp for FitByMoments {
     }
 }
 
-impl FitByMoments {
-    fn initial_translation(&self) -> Option<[f64; 3]> {
-        self.initial
-            .as_ref()
-            .map(|params| translation_from_params(self.params.model, params))
-    }
-}
-
 fn zero_params(params: &VolumeFitParams) -> Vec<f64> {
     match params.model {
         TransformModel::Translation => vec![0.0; 3],
@@ -1177,14 +1186,6 @@ fn params_with_translation(params: &VolumeFitParams, translation: [f64; 3]) -> V
         }
     }
     values
-}
-
-fn translation_from_params(model: TransformModel, params: &[f64]) -> [f64; 3] {
-    match model {
-        TransformModel::Translation => [params[0], params[1], params[2]],
-        TransformModel::Affine => [params[9], params[10], params[11]],
-        TransformModel::BSpline => [0.0, 0.0, 0.0],
-    }
 }
 
 fn transform_point(
@@ -2363,4 +2364,611 @@ fn scale_params(model: TransformModel, params: &[f64], scale: [usize; 3], up: bo
         }
     }
     next
+}
+
+// ------------------------------------------------------------------ tests --
+
+/// The numerical kernels underneath the fitter, against derivatives and
+/// solutions computed here.
+///
+/// The linear solve, the trilinear sampler, the interpolation gradient, the
+/// parameter Jacobian, the spline basis and the packed symmetric index are all
+/// private, so this is where they can be reached. Everything the integration file
+/// `tests/align.rs` asserts rests on them being right, and it can only see them
+/// through a whole optimisation: a Jacobian with two columns swapped still
+/// converges on a symmetric fixture, and a gradient scaled by a constant still
+/// converges, more slowly. Neither survives a finite difference.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A volume that is a function of its shape alone, from a 64-bit LCG with
+    /// Knuth's MMIX constants. Values in `[0.5, 1.5)`: bounded away from zero so
+    /// that a relative error is a meaningful thing to quote, and of order one so
+    /// that an absolute finite-difference bound and a relative one agree.
+    fn lcg_volume(shape: (usize, usize, usize)) -> Array3<f64> {
+        let mut state: u64 = 0x2026_0830;
+        Array3::from_shape_fn(shape, |_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            0.5 + (state >> 40) as f64 / 16_777_216.0
+        })
+    }
+
+    /// The step a central difference is taken with, everywhere below.
+    ///
+    /// **Not a compromise between truncation and rounding, because there is no
+    /// truncation to trade against.** The trilinear interpolant is multilinear
+    /// inside one cell, so along any one coordinate it is a *straight line* and
+    /// a central difference of it is exact in exact arithmetic. What is left is
+    /// cancellation: `eps * |f| / h`, which at `|f| ~ 1` and `h = 1e-6` is
+    /// `2e-10`; measured over every fixture below the worst gap is `3.1e-10`.
+    /// Every bound below is `1e-8`, thirty times that, and every fixture keeps
+    /// its sample at least `1e-3` from a cell boundary — and off a cell face
+    /// entirely — so that the two evaluations stay on the same linear piece.
+    const H: f64 = 1.0e-6;
+
+    // ------------------------------------------------------ solve_linear --
+
+    /// **The solve is a solve, and it pivots.**
+    ///
+    /// The first system has a **zero in the leading position**, which is the
+    /// case partial pivoting exists for: without the row search the first thing
+    /// the elimination does is divide by zero. Its coefficients and its solution
+    /// are small integers and dyadic rationals, so every operation the
+    /// elimination performs is exact in binary and the answer is asserted on
+    /// `==` rather than within a tolerance — an equality that would not survive
+    /// a solver that had drifted.
+    ///
+    /// The second is a 6 x 6 symmetric positive-definite matrix, which is the
+    /// shape the normal equations actually have, checked by residual because its
+    /// solution has no closed form worth writing down. Its entries are of order
+    /// ten and its diagonal is lifted by one, so it is well conditioned and
+    /// `n * eps * cond` is a few units in the last place: the measured residual
+    /// is `1.8e-15` relative and the bound is `1e-12`. The liveness for that
+    /// bound is in the test — a `1e-3` perturbation of the answer moves the
+    /// residual to `4.2e-3`, nine decades above it, so the residual check can
+    /// see a wrong answer.
+    #[test]
+    fn the_linear_solve_pivots_and_its_answer_satisfies_the_system() {
+        // 2y +  z = 3
+        //  x + y + z = 3
+        // 2x + y     = 3
+        let matrix = vec![
+            vec![0.0, 2.0, 1.0],
+            vec![1.0, 1.0, 1.0],
+            vec![2.0, 1.0, 0.0],
+        ];
+        assert_eq!(matrix[0][0], 0.0, "the leading pivot is the zero");
+        let solved = solve_linear(matrix, vec![3.0, 3.0, 3.0]).expect("a non-singular system");
+        assert_eq!(
+            solved,
+            vec![1.0, 1.0, 1.0],
+            "the dyadic system is solved exactly or the elimination has drifted"
+        );
+
+        // A symmetric positive-definite system of the shape the fitter builds.
+        let n = 6;
+        let seed = lcg_volume((n, n, 1));
+        let mut matrix = vec![vec![0.0; n]; n];
+        for row in 0..n {
+            for col in 0..n {
+                for k in 0..n {
+                    matrix[row][col] += seed[[k, row, 0]] * seed[[k, col, 0]];
+                }
+            }
+            matrix[row][row] += 1.0;
+        }
+        let rhs: Vec<f64> = (0..n).map(|index| 1.0 + index as f64).collect();
+        let solved = solve_linear(matrix.clone(), rhs.clone()).expect("an SPD system is solvable");
+        let mut worst = 0.0f64;
+        for row in 0..n {
+            let product: f64 = (0..n).map(|col| matrix[row][col] * solved[col]).sum();
+            worst = worst.max((product - rhs[row]).abs() / rhs[row].abs());
+        }
+        assert!(
+            worst <= 1.0e-12,
+            "the residual of the 6 x 6 solve is {worst:e} relative, so what came back is not \
+             the solution"
+        );
+
+        // The liveness for the residual check: a deliberately wrong answer is
+        // rejected by it. Without this the check would pass for a solver that
+        // returned its own right-hand side on a matrix near the identity.
+        let mut wrong = solved.clone();
+        wrong[2] += 1.0e-3;
+        let mut wrong_residual = 0.0f64;
+        for row in 0..n {
+            let product: f64 = (0..n).map(|col| matrix[row][col] * wrong[col]).sum();
+            wrong_residual = wrong_residual.max((product - rhs[row]).abs() / rhs[row].abs());
+        }
+        assert!(
+            wrong_residual > 1.0e-6,
+            "perturbing the answer by 1e-3 moves the residual only to {wrong_residual:e}, so \
+             the residual test above cannot see a wrong answer"
+        );
+
+        // A singular system is refused by name rather than answered.
+        let singular = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
+        assert!(solve_linear(singular, vec![1.0, 2.0]).is_err());
+        // and so is one that is singular only after the first elimination
+        let rank_two = vec![
+            vec![1.0, 0.0, 1.0],
+            vec![0.0, 1.0, 1.0],
+            vec![1.0, 1.0, 2.0],
+        ];
+        assert!(solve_linear(rank_two, vec![1.0, 1.0, 2.0]).is_err());
+
+        println!("the 6 x 6 SPD residual is {worst:e} relative; a 1e-3 perturbation gives {wrong_residual:e}");
+    }
+
+    /// **The Gauss-Newton step solves the damped normal equations**, which is
+    /// the one thing `solve_step` adds to `solve_linear`: it unpacks the
+    /// symmetric storage, adds the damping to the diagonal and negates the
+    /// gradient.
+    ///
+    /// Checked by substituting the step back into `(H + lambda I) s = -g` with
+    /// `H` reassembled here from the packed form. The damping is `0.5` rather
+    /// than the shipped `1e-6` so that its presence is visible: with `1e-6` the
+    /// same assertion would pass for an implementation that dropped it.
+    #[test]
+    fn the_gauss_newton_step_solves_the_damped_normal_equations() {
+        let n = 3;
+        let jacobians = [
+            [1.0, 0.5, -0.25],
+            [0.0, 2.0, 1.0],
+            [-1.5, 0.25, 0.75],
+            [0.5, -0.5, 2.0],
+        ];
+        let mut hessian = vec![0.0; symmetric_len(n)];
+        let mut gradient = vec![0.0; n];
+        for jacobian in &jacobians {
+            add_outer(&mut hessian, jacobian);
+            for (slot, value) in gradient.iter_mut().zip(jacobian) {
+                *slot += 0.3 * value;
+            }
+        }
+        let damping = 0.5;
+        let step = solve_step(
+            TransformModel::Translation,
+            hessian.clone(),
+            gradient.clone(),
+            damping,
+        )
+        .expect("the normal equations are not singular here");
+
+        let mut worst = 0.0f64;
+        for row in 0..n {
+            let mut product = damping * step[row];
+            for (col, value) in step.iter().enumerate() {
+                product += hessian[symmetric_index(row, col)] * value;
+            }
+            worst = worst.max((product + gradient[row]).abs());
+        }
+        assert!(
+            worst <= 1.0e-12,
+            "(H + {damping} I) s + g is {worst:e} away from zero, so {step:?} is not the \
+             damped Gauss-Newton step"
+        );
+
+        // Liveness: the undamped step does *not* satisfy the damped equations,
+        // so the assertion above is measuring the damping and not just the solve.
+        let undamped = solve_step(
+            TransformModel::Translation,
+            hessian.clone(),
+            gradient.clone(),
+            0.0,
+        )
+        .expect("and neither are the undamped ones");
+        let mut undamped_residual = 0.0f64;
+        for row in 0..n {
+            let mut product = damping * undamped[row];
+            for (col, value) in undamped.iter().enumerate() {
+                product += hessian[symmetric_index(row, col)] * value;
+            }
+            undamped_residual = undamped_residual.max((product + gradient[row]).abs());
+        }
+        assert!(
+            undamped_residual > 1.0e-3,
+            "the undamped step is only {undamped_residual:e} from satisfying the damped \
+             equations, so this fixture cannot see the damping"
+        );
+
+        // The B-spline branch is the diagonal of the same equations, and it is a
+        // different answer here, which is what makes it worth branching on.
+        let diagonal = solve_step(TransformModel::BSpline, hessian, gradient.clone(), damping)
+            .expect("a diagonal solve never fails");
+        for axis in 0..n {
+            let expected = -gradient[axis]
+                / (jacobians.iter().map(|j| j[axis] * j[axis]).sum::<f64>() + damping);
+            assert!((diagonal[axis] - expected).abs() <= 1.0e-15);
+        }
+        assert!(
+            (0..n).any(|axis| (diagonal[axis] - step[axis]).abs() > 0.01),
+            "the diagonal solve and the full solve agree on this system, so the branch is \
+             untested by it"
+        );
+    }
+
+    // ------------------------------------------------ the trilinear sampler --
+
+    /// **The gradient the sampler returns is the derivative of the value it
+    /// returns**, to `1e-8`, at points spread over a whole cell.
+    ///
+    /// This is the claim the whole optimiser rests on and the one no
+    /// end-to-end fit can make: the metric's descent direction is this gradient,
+    /// and a gradient that is off by a constant factor, or has two axes
+    /// exchanged, still converges on the symmetric fixtures a registration test
+    /// tends to use. A central difference of the sampler's own value cannot be
+    /// fooled by either.
+    ///
+    /// The offsets within the cell are asymmetric and none is `0.5`, because a
+    /// half-cell sample makes the three axes' bilinear weights equal and would
+    /// hide an axis exchange. Each is at least `0.1` from a face, which is a
+    /// hundred thousand times [`H`].
+    ///
+    /// The liveness is in the same test: nowhere in this fixture do two
+    /// components of the gradient come within `0.0415` of each other — asserted
+    /// at `0.02`, half the measured worst — so an exchanged pair of axes is a
+    /// difference six orders of magnitude above the `1e-8` the agreement is
+    /// asserted at, and could not pass.
+    #[test]
+    fn the_trilinear_gradient_is_the_derivative_of_the_value_the_sampler_returns() {
+        let volume = lcg_volume((9, 8, 7));
+        let view = volume.view();
+        let mut worst = 0.0f64;
+        let mut smallest_spread = f64::INFINITY;
+        for offset in [
+            [0.1, 0.3, 0.7],
+            [0.4, 0.9, 0.2],
+            [0.8, 0.15, 0.45],
+            [0.25, 0.6, 0.85],
+        ] {
+            for cell in [[2usize, 3, 1], [5, 1, 4], [1, 6, 2]] {
+                let point = [
+                    cell[0] as f64 + offset[0],
+                    cell[1] as f64 + offset[1],
+                    cell[2] as f64 + offset[2],
+                ];
+                let (_, gradient) = sample_value_and_gradient(Interpolator::Linear, &view, point)
+                    .expect("an interior point");
+                for axis in 0..3 {
+                    let mut up = point;
+                    let mut down = point;
+                    up[axis] += H;
+                    down[axis] -= H;
+                    let high = value_and_gradient(&view, up).expect("still in the cell").0;
+                    let low = value_and_gradient(&view, down)
+                        .expect("still in the cell")
+                        .0;
+                    let difference = (high - low) / (2.0 * H);
+                    worst = worst.max((gradient[axis] - difference).abs());
+                }
+                let spread = (0..3)
+                    .flat_map(|a| (0..3).map(move |b| (a, b)))
+                    .filter(|(a, b)| a != b)
+                    .map(|(a, b)| (gradient[a] - gradient[b]).abs())
+                    .fold(f64::INFINITY, f64::min);
+                smallest_spread = smallest_spread.min(spread);
+            }
+        }
+        assert!(
+            worst <= 1.0e-8,
+            "the returned gradient is {worst:e} from a central difference of the returned \
+             value, which is far past the {:e} that cancellation can explain",
+            2.0e-16 / H
+        );
+        assert!(
+            smallest_spread > 0.02,
+            "two components of the gradient come within {smallest_spread} of each other \
+             somewhere in this fixture, so an exchanged pair of axes could pass it"
+        );
+        println!(
+            "the trilinear gradient matches a central difference to {worst:e}; the closest two \
+             components ever come is {smallest_spread:.3}"
+        );
+    }
+
+    /// **The sampler reproduces a genuinely trilinear field exactly, and its
+    /// gradient is that field's analytic derivative** — an oracle that is not a
+    /// finite difference of the implementation, so the two claims are
+    /// independent.
+    ///
+    /// `f(x, y, z) = (a0 + a1 x)(b0 + b1 y)(c0 + c1 z)` is in the span the
+    /// trilinear interpolant reproduces, so `value` must return it to the last
+    /// bit or two and `d f / d x = a1 (b0 + b1 y)(c0 + c1 z)` in closed form.
+    /// The three per-axis slopes are different and none is zero, so the three
+    /// partial derivatives are three different numbers at every sample.
+    ///
+    /// The bound is `1e-12` absolute, not zero: the interpolant computes the
+    /// same quantity by seven `lerp`s where the closed form computes it by two
+    /// multiplications, and those do not round identically. Values here reach
+    /// 60, so `1e-12` is about `1e-14` relative.
+    #[test]
+    fn the_sampler_is_exact_on_a_trilinear_field_and_so_is_its_gradient() {
+        let line = |base: f64, slope: f64, at: f64| base + slope * at;
+        let (a0, a1) = (2.0, 0.75);
+        let (b0, b1) = (-1.0, 0.5);
+        let (c0, c1) = (3.0, -0.25);
+        let volume = Array3::from_shape_fn((9, 8, 7), |(x, y, z)| {
+            line(a0, a1, x as f64) * line(b0, b1, y as f64) * line(c0, c1, z as f64)
+        });
+        let view = volume.view();
+
+        let mut worst_value = 0.0f64;
+        let mut worst_gradient = 0.0f64;
+        for point in [
+            [1.3, 2.7, 1.1],
+            [4.5, 0.25, 3.75],
+            [6.9, 5.4, 4.2],
+            [0.0, 0.0, 0.0],
+        ] {
+            let (value, gradient) =
+                value_and_gradient(&view, point).expect("every point here is interior");
+            let (fx, fy, fz) = (
+                line(a0, a1, point[0]),
+                line(b0, b1, point[1]),
+                line(c0, c1, point[2]),
+            );
+            worst_value = worst_value.max((value - fx * fy * fz).abs());
+            let analytic = [a1 * fy * fz, b1 * fx * fz, c1 * fx * fy];
+            for axis in 0..3 {
+                worst_gradient = worst_gradient.max((gradient[axis] - analytic[axis]).abs());
+            }
+            assert!(
+                (0..3).all(|a| (0..3).all(|b| a == b || (analytic[a] - analytic[b]).abs() > 0.1)),
+                "the analytic partials {analytic:?} are too close together at {point:?} for a \
+                 permuted gradient to be caught"
+            );
+        }
+        assert!(
+            worst_value <= 1.0e-12,
+            "the interpolant is {worst_value:e} from a field it reproduces exactly"
+        );
+        assert!(
+            worst_gradient <= 1.0e-12,
+            "the gradient is {worst_gradient:e} from the analytic derivative"
+        );
+        println!(
+            "on a trilinear field the sampler is exact to {worst_value:e} and its gradient to \
+             {worst_gradient:e}"
+        );
+    }
+
+    /// **The sampler refuses a point whose interpolation cell would leave the
+    /// array**, and it refuses it on the *upper* face too.
+    ///
+    /// The upper face is the interesting one: `floor(point) + 1` has to be a
+    /// valid index, so the last voxel on each axis is not a legal base cell even
+    /// though it is a legal index. An implementation that only checked
+    /// `floor(point) < extent` would read one past the end there, and the moving
+    /// image is fetched with a halo precisely so that this refusal is what
+    /// bounds the sample set rather than a fault.
+    #[test]
+    fn the_sampler_refuses_a_cell_that_leaves_the_array() {
+        let volume = lcg_volume((5, 4, 3));
+        let view = volume.view();
+        // The last legal base cell on every axis, and just past it.
+        assert!(value_and_gradient(&view, [3.999, 2.999, 1.999]).is_some());
+        assert!(value_and_gradient(&view, [4.0, 2.0, 1.0]).is_none());
+        assert!(value_and_gradient(&view, [3.0, 3.0, 1.0]).is_none());
+        assert!(value_and_gradient(&view, [3.0, 2.0, 2.0]).is_none());
+        // and below zero, where the floor is negative rather than merely large
+        assert!(value_and_gradient(&view, [-0.001, 1.0, 1.0]).is_none());
+        assert!(value_and_gradient(&view, [0.0, 0.0, 0.0]).is_some());
+    }
+
+    // ------------------------------------------------ the parameter Jacobian --
+
+    /// **For every one of the three models, the parameter Jacobian is the
+    /// derivative of the sampled moving-image value with respect to the
+    /// parameters** — the chain rule that connects `transform_point` to
+    /// `parameter_jacobian`, measured against central differences.
+    ///
+    /// This is the one relation a converging fit cannot witness. If a column of
+    /// the affine Jacobian used the wrong coordinate, or the B-spline Jacobian
+    /// used the wrong control point, the optimiser would still descend — just
+    /// towards something else — and every end-to-end assertion in
+    /// `tests/align.rs` that lands on a symmetric fixture would still pass.
+    /// Here each of the 12 affine and 192 B-spline parameters is perturbed on
+    /// its own and the resulting change in the sampled value is compared with
+    /// the column claimed for it.
+    ///
+    /// The sample point is placed at an unequal fractional offset well inside
+    /// the volume, so a perturbation of `H` — which for the affine moves the
+    /// mapped point by at most `H * 8`, the largest coordinate in play — stays
+    /// inside one interpolation cell and inside one B-spline cell. The bound is
+    /// `1e-8`, as everywhere else here.
+    #[test]
+    fn the_parameter_jacobian_is_the_derivative_of_the_sampled_value_for_every_model() {
+        let volume = lcg_volume((16, 15, 14));
+        let view = volume.view();
+        let shape = [16usize, 15, 14];
+        let points = [[6.3, 5.7, 4.1], [8.4, 7.15, 6.6]];
+
+        for model in [
+            TransformModel::Translation,
+            TransformModel::Affine,
+            TransformModel::BSpline,
+        ] {
+            let mut config = VolumeFitParams::new();
+            config.model = model;
+            let base = match model {
+                // No component is chosen to land the mapped point on an integer:
+                // the interpolant's slope changes at a cell face, so a central
+                // difference taken across one measures two different linear
+                // pieces and would fail for a reason that has nothing to do with
+                // the Jacobian.
+                TransformModel::Translation => vec![0.35, -0.23, 0.17],
+                // Near identity, so the mapped point stays where the sampler can
+                // read it, but off it on every entry so that no column of the
+                // Jacobian is being evaluated at a degenerate configuration.
+                TransformModel::Affine => vec![
+                    1.01, 0.02, -0.01, 0.015, 0.99, 0.02, -0.02, 0.01, 1.005, 0.3, -0.25, 0.2,
+                ],
+                TransformModel::BSpline => {
+                    let mut params = vec![0.0; 3 * config.bspline.control_points()];
+                    for (index, slot) in params.iter_mut().enumerate() {
+                        *slot = 0.1 * ((index % 7) as f64 - 3.0) / 3.0;
+                    }
+                    params
+                }
+            };
+
+            let mut worst = 0.0f64;
+            let mut largest = 0.0f64;
+            for point in points {
+                let mapped = transform_point(&config, shape, &base, point);
+                let (_, image_gradient) =
+                    value_and_gradient(&view, mapped).expect("the mapped point is interior");
+                let jacobian = parameter_jacobian(&config, shape, image_gradient, point);
+                assert_eq!(jacobian.len(), base.len());
+
+                for index in 0..base.len() {
+                    let sample = |delta: f64| {
+                        let mut moved = base.clone();
+                        moved[index] += delta;
+                        let at = transform_point(&config, shape, &moved, point);
+                        value_and_gradient(&view, at)
+                            .expect("a perturbed point stays in the same cell")
+                            .0
+                    };
+                    let difference = (sample(H) - sample(-H)) / (2.0 * H);
+                    worst = worst.max((jacobian[index] - difference).abs());
+                    largest = largest.max(jacobian[index].abs());
+                }
+            }
+            assert!(
+                worst <= 1.0e-8,
+                "{model:?}: the parameter Jacobian is {worst:e} from a central difference of \
+                 the value it is supposed to be the derivative of"
+            );
+            assert!(
+                largest > 0.01,
+                "{model:?}: every Jacobian entry is smaller than {largest:e}, so agreeing with \
+                 a finite difference says nothing — an all-zero Jacobian would pass"
+            );
+            println!("{model:?}: {} parameters, worst finite-difference gap {worst:e}, largest entry {largest:.4}", base.len());
+        }
+    }
+
+    // ---------------------------------------------------- the spline basis --
+
+    /// **The cubic B-spline basis is a partition of unity with support two**,
+    /// which is what makes a constant displacement representable — and a
+    /// constant displacement is the answer
+    /// `a_uniform_shift_is_recovered_as_a_uniform_bspline_displacement_field`
+    /// asserts the fitter finds.
+    ///
+    /// The four taps that overlap any position must sum to `1` exactly, or a
+    /// field with every coefficient set to `d` would not displace by `d`. The
+    /// sum is asserted to `1e-15` at a spread of positions across a cell — not
+    /// on `==`, because the four basis values are not dyadic — and the support
+    /// is checked at and past `2`, where an implementation that used the wrong
+    /// piecewise branch would leak.
+    #[test]
+    fn the_cubic_basis_is_a_partition_of_unity_with_support_two() {
+        for step in 0..64 {
+            let u = step as f64 / 64.0;
+            let sum: f64 = (-1..3).map(|tap| cubic_basis(u - tap as f64)).sum();
+            assert!(
+                (sum - 1.0).abs() <= 1.0e-15,
+                "the four taps at u = {u} sum to {sum}, so a constant field would not be a \
+                 constant displacement"
+            );
+        }
+        assert_eq!(cubic_basis(2.0), 0.0);
+        assert_eq!(cubic_basis(-2.0), 0.0);
+        assert_eq!(cubic_basis(3.5), 0.0);
+        assert!(cubic_basis(1.999) > 0.0);
+        // symmetric, and peaked at the centre
+        for t in [0.0f64, 0.25, 0.75, 1.5] {
+            assert_eq!(cubic_basis(t), cubic_basis(-t));
+        }
+        assert!(cubic_basis(0.0) > cubic_basis(0.5));
+        assert!(cubic_basis(0.5) > cubic_basis(1.5));
+
+        // and the same, through the weights the fitter actually uses: the 64
+        // weights at any supported point sum to one.
+        let grid = ControlGrid::default();
+        let shape = [24usize, 20, 16];
+        for point in [[1.0, 1.0, 1.0], [11.5, 9.25, 7.75], [20.0, 16.0, 13.0]] {
+            let weights = bspline_weights(grid, shape, point).expect("a supported point");
+            let sum: f64 = weights.iter().map(|(_, weight)| weight).sum();
+            assert!(
+                (sum - 1.0).abs() <= 1.0e-14,
+                "the control weights at {point:?} sum to {sum}"
+            );
+        }
+        // Outside the grid's supported region there are no weights at all, and
+        // the displacement is zero rather than an extrapolation.
+        assert!(bspline_weights(grid, shape, [-1.0, 5.0, 5.0]).is_none());
+        assert_eq!(
+            bspline_displacement(
+                grid,
+                shape,
+                &vec![7.0; 3 * grid.control_points()],
+                [-1.0, 5.0, 5.0]
+            ),
+            [0.0, 0.0, 0.0]
+        );
+        // and a uniform coefficient field displaces by exactly that coefficient
+        let uniform = vec![2.5; 3 * grid.control_points()];
+        let displacement = bspline_displacement(grid, shape, &uniform, [11.5, 9.25, 7.75]);
+        for axis in 0..3 {
+            assert!(
+                (displacement[axis] - 2.5).abs() <= 1.0e-14,
+                "a uniform 2.5 field displaces by {displacement:?}"
+            );
+        }
+    }
+
+    /// **The packed symmetric storage addresses each pair exactly once**, and
+    /// the outer product written into it is the symmetric matrix it claims.
+    ///
+    /// `symmetric_index` is what both the accumulation and the solve index the
+    /// Hessian through, so a collision — two different pairs landing on the same
+    /// slot — would silently add one parameter's curvature to another's, and
+    /// nothing downstream could tell. The check is that the map from the
+    /// `n(n+1)/2` unordered pairs onto slots is a bijection, and that it is
+    /// order-independent.
+    #[test]
+    fn the_packed_symmetric_index_is_a_bijection_onto_its_slots() {
+        for n in [1usize, 2, 3, 12] {
+            let mut seen = vec![0usize; symmetric_len(n)];
+            for col in 0..n {
+                for row in 0..=col {
+                    let index = symmetric_index(row, col);
+                    assert_eq!(
+                        index,
+                        symmetric_index(col, row),
+                        "n = {n}: ({row}, {col}) and ({col}, {row}) are different slots"
+                    );
+                    assert!(
+                        index < seen.len(),
+                        "n = {n}: ({row}, {col}) is out of range"
+                    );
+                    seen[index] += 1;
+                }
+            }
+            assert!(
+                seen.iter().all(|count| *count == 1),
+                "n = {n}: the pair-to-slot map is not a bijection: {seen:?}"
+            );
+        }
+
+        // and the outer product accumulated through it is J J^T
+        let jacobian = [1.5, -0.5, 2.0, 0.25];
+        let mut hessian = vec![0.0; symmetric_len(4)];
+        add_outer(&mut hessian, &jacobian);
+        for row in 0..4 {
+            for col in 0..4 {
+                assert_eq!(
+                    hessian[symmetric_index(row, col)],
+                    jacobian[row] * jacobian[col]
+                );
+            }
+        }
+    }
 }

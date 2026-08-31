@@ -1,0 +1,13 @@
+# **`costs/` is compared byte for byte against its own serialiser.**
+#
+# `tests/cost_scenarios.rs` asserts that every committed scenario is exactly what
+# `Scenario::to_json` writes, which is what stops a hand edit from drifting away
+# from the generator. On Windows git's `core.autocrlf` translates a checkout to
+# CRLF, the serialiser emits LF, and the comparison then fails on the platform's
+# newline rather than on anything in the file — which is what it did the first
+# time this crate's CI ran on Windows.
+#
+# So these files are LF in the working tree on every platform. They are data read
+# by a program, not source anybody edits by hand: the generator writes them, and
+# `regenerate_the_scenario_files` is the only thing that should.
+costs/*.json text eol=lf

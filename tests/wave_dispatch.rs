@@ -78,6 +78,9 @@ fn machine(contention: f64, wave_synchronous: bool) -> Machine {
         encoded_fraction: 0.0,
         contention,
         wave_synchronous,
+        // Unbounded, which is what every figure in this file was measured
+        // under; see `Machine::candidate_window`.
+        candidate_window: 0,
     }
 }
 
@@ -266,5 +269,162 @@ fn the_two_models_rank_a_mixed_grid_oppositely_once_workers_contend() {
          two models used to rank these oppositely; if they now agree, item C of \
          `docs/design/planner-gaps.md` is settled and this is where the new numbers go.",
         contended[1]
+    );
+}
+
+/// **What the wave discipline costs when the tasks are not equal** — the
+/// straggler bill, measured.
+///
+/// `execute_phases` joins a wave before starting the next, so a wave costs its
+/// **slowest** task; the coordinator in `distributed` does not, and neither does
+/// `simulate` by default. Nothing had put a number on the difference, because
+/// with identical tasks there is nothing to measure — a wave of equal blocks
+/// costs exactly what a continuous dispatch of them does.
+///
+/// Tasks stop being equal as soon as blocks **short-circuit**, which is not
+/// exotic: `BlockOp::constant_maps_to` exists precisely because a constant
+/// region can be answered without reading it, and a real volume is mostly
+/// background. `PerPhase::constant_fraction` is the crate's own knob for that,
+/// and it is the straggler generator here.
+///
+/// Recorded, as wave-synchronous over continuous, so above one is what the join
+/// costs:
+///
+/// ```text
+///     nodes x workers   0% skipped    30%     60%     90%
+///               1 x 8        1.000  1.007   1.026   1.119
+///              1 x 40        1.007  1.050   1.033   1.233
+///              4 x 32        1.008  1.047   1.103   1.317
+///             10 x 80        1.037  1.093   1.158   1.413
+/// ```
+///
+/// **Free when the tasks are equal, and up to 1.41x when they are not** — and
+/// it grows with the worker count, because a wide wave has more chances to
+/// contain a straggler and every idle slot waits for it.
+///
+/// # What this says about which model to use, which is not what it looks like
+///
+/// It is *not* an argument for judging plans under the continuous model on the
+/// grounds that it is nicer. It is an argument about **the executor**:
+///
+/// * `distributed`'s coordinator already dispatches continuously — its
+///   `barrier_is_open` returns true for any phase that is not a declared barrier
+///   — so the many-computer case, where this bill is largest, does not pay it;
+/// * `strategy::execute_phases` does join, so the **single-process** path pays
+///   it: 1.23x at forty threads with most blocks short-circuiting. That is the
+///   row to act on, and acting on it is a change to the executor rather than to
+///   any model of it.
+///
+/// The arena judges under continuous because that is what the cluster path does,
+/// which is the deployment the plans being ranked are for. This test is the
+/// evidence for the other half: that the single-process path's discipline is
+/// worth removing.
+#[test]
+fn joining_each_wave_costs_more_the_more_unequal_the_tasks_are() {
+    // **Its own fixture, not this file's.** `plan` above is built for the
+    // overlap question and has a middle phase costing 0.05 — nearly free, so
+    // skipping its blocks saves nothing and the straggler signal is swamped.
+    // Here the three phases cost the same, so a short-circuited block is a real
+    // saving and the blocks that remain are the stragglers. Chunks of `16^3`
+    // for the same reason as elsewhere: at `64^3` a block's read extent spans
+    // one chunk and the fetch pattern stops varying.
+    let assembly = {
+        let grid = BlockGrid::new(VOLUME, [16, 16, 16]).expect("a grid");
+        let mut builder = PlanBuilder::new(VOLUME, Dtype::F64, grid);
+        for name in ["smooth", "combine", "skeletonize"] {
+            builder
+                .pixels(Chain::op(IdentityOp::new(name, [2, 2, 2]).with_cost(2.0)))
+                .expect("a pixel phase");
+        }
+        builder.finish().expect("an assembly")
+    };
+    let phases = assembly.decomposition.n_phases();
+    let at = |nodes: usize, workers: usize, fraction: f64| {
+        let fractions = vec![fraction; phases];
+        let makespan = |wave_synchronous: bool| {
+            simulate(
+                &assembly.decomposition,
+                &assembly.work(),
+                &Machine {
+                    nodes,
+                    workers,
+                    cache_bytes: 1 << 24,
+                    prefetch_depth: 0,
+                    io_channels: 4,
+                    cache_shared: true,
+                    encoded_fraction: 0.0,
+                    contention: MEASURED_CONTENTION,
+                    wave_synchronous,
+                    candidate_window: 0,
+                },
+                &Rates {
+                    chunk: [16, 16, 16],
+                    chunk_bytes: 16 * 16 * 16 * 8,
+                    ..Rates::default()
+                },
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                PerPhase {
+                    constant_fraction: &fractions,
+                    ..PerPhase::default()
+                },
+                &mut ExecutorOrder::phase_major(),
+            )
+            .expect("a simulable plan")
+            .makespan_ns as f64
+        };
+        makespan(true) / makespan(false)
+    };
+
+    println!(
+        "{:>16} {:>10} {:>8} {:>8} {:>8}",
+        "nodes x workers", "0%", "30%", "60%", "90%"
+    );
+    let mut equal_tasks = Vec::new();
+    let mut worst = 1.0f64;
+    for (nodes, workers) in [(1usize, 8usize), (1, 40), (4, 32), (10, 80)] {
+        let row: Vec<f64> = [0.0, 0.3, 0.6, 0.9]
+            .into_iter()
+            .map(|fraction| at(nodes, workers, fraction))
+            .collect();
+        println!(
+            "{:>16} {:>10.3} {:>8.3} {:>8.3} {:>8.3}",
+            format!("{nodes} x {workers}"),
+            row[0],
+            row[1],
+            row[2],
+            row[3]
+        );
+        equal_tasks.push(row[0]);
+        worst = worst.max(row[3]);
+        // The bill rises with the inequality, which is the claim. Not
+        // monotonically at every step — which blocks skip is a hash of the block
+        // index, so a particular fraction can happen to spare the straggler —
+        // so the ends are what is asserted.
+        assert!(
+            row[3] > row[0] + 0.05,
+            "{nodes} nodes x {workers} workers: joining each wave cost {:.3} with nine tenths \
+             of the blocks short-circuiting against {:.3} with none. The join is supposed to \
+             cost more exactly when the tasks it waits on are unequal.",
+            row[3],
+            row[0]
+        );
+    }
+
+    // With equal tasks the two dispatch models are the same run, which is why
+    // this went unmeasured for as long as it did.
+    for (index, ratio) in equal_tasks.iter().enumerate() {
+        assert!(
+            (*ratio - 1.0).abs() < 0.05,
+            "row {index}: with identical tasks the wave discipline cost {ratio:.3}, where it \
+             should cost nothing — a wave of equal blocks finishes when a continuous dispatch \
+             of them does"
+        );
+    }
+    assert!(
+        worst > 1.25,
+        "the worst straggler bill measured {worst:.3}, where the record is 1.413. If it has \
+         fallen, either the simulator stopped modelling the join or the fixture stopped \
+         producing unequal tasks."
     );
 }

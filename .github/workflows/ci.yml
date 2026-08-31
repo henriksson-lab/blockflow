@@ -101,7 +101,16 @@ jobs:
           rustup update --no-self-update stable
           rustup default stable
       - run: rustc --version --verbose
-      - uses: actions/cache@v4
+      # **`v5` because `v4` runs on Node 20**, which the runner now forces onto
+      # Node 24 and warns about on every job — "Node 20 is being deprecated" —
+      # and whose bundled dependencies raise a `punycode` deprecation of their
+      # own inside the tar step. `v5` is the first release on the Node 24
+      # runtime; `v6` exists and is also Node 24, and both are backward
+      # compatible for a workflow that passes only `path`, `key` and
+      # `restore-keys`, which is every use of it here. The smaller step is taken
+      # because the warning is what wanted fixing, not the version number.
+      # `actions/checkout@v5` is already Node 24 and needs nothing.
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -141,7 +150,7 @@ jobs:
           rustup default stable
           rustup component add clippy rustfmt
       - run: rustc --version --verbose
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -183,7 +192,7 @@ jobs:
           rustup update --no-self-update stable
           rustup default stable
       - run: rustc --version --verbose
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index
@@ -219,7 +228,7 @@ jobs:
         run: |
           rustup update --no-self-update stable
           rustup default stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index

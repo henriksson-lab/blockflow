@@ -437,6 +437,14 @@ impl Scenario {
                 .unwrap_or(true),
             encoded_fraction: field("machine", "encoded_fraction").unwrap_or(0.0),
             contention: field("machine", "contention").unwrap_or(0.0),
+            // **Not read from the file, and not written to one.** A scenario is
+            // a machine and a set of costs; `Machine::candidate_window` is how
+            // much of the ready set a *scheduler* is shown, which is a property
+            // of the coordinator being simulated rather than of the machine it
+            // runs on. Every committed scenario was recorded unbounded, and
+            // `to_json` is compared byte for byte against `costs/`, so carrying
+            // it would rewrite all of them to state the default.
+            candidate_window: 0,
         };
         let chunk = value
             .get("storage")
@@ -595,6 +603,9 @@ pub fn measured_baseline() -> Scenario {
             // requested. Off in `Machine::default` so that older figures stay
             // readable; on here, because this scenario is the machine.
             contention: crate::simulate::MEASURED_CONTENTION,
+            // Unbounded, which is what this baseline's figures were measured
+            // under. See `Machine::candidate_window`.
+            candidate_window: 0,
         },
         storage: Storage {
             chunk: [64, 64, 64],

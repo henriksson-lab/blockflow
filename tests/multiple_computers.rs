@@ -100,6 +100,9 @@ fn eight_workers(nodes: usize) -> Machine {
         cache_shared: true,
         encoded_fraction: 0.0,
         contention: 0.0,
+        // Unbounded: the scheduler sees every ready task, which is what every
+        // figure in this file was recorded under.
+        candidate_window: 0,
     }
 }
 

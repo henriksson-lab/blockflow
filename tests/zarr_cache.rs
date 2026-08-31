@@ -407,3 +407,167 @@ fn the_prefetch_sweep_has_a_control_at_both_ends() {
         deep.evictions
     );
 }
+
+// ------------------------------------------ what the cache is actually worth --
+
+/// **What a chunk cache saves on a real blocked run**, which nothing had
+/// measured.
+///
+/// The tests above establish that the cache is *correct* — a cached read is the
+/// same read, it really serves hits, a written image is excluded, a `bool`
+/// volume round-trips. None of them says what it is **for**, and that gap is
+/// load-bearing well outside this file:
+///
+/// * `simulate::Machine::cache_bytes` is the simulator's central lever, and
+///   ordering-changes-hit-rate is the mechanism the whole module exists to
+///   rank;
+/// * `HandoutPolicy::CacheModelled` and `HandoutPolicy::Coalescing` are both
+///   **refused at the caller boundary** on the grounds that "`cache::ChunkCache`
+///   has no non-test construction site, so no `Environment::read` is served from
+///   one";
+/// * `distributed::placement` and `distributed::cache_model` repeat the same
+///   sentence.
+///
+/// That sentence is exactly true and narrower than it sounds. `ChunkCache` *is*
+/// constructed on the read path — `ZarrEnvironment::with_cache` does it, and
+/// `read` is served through it for image 0 and supplied images. What is missing
+/// is a **caller**: the only four call sites of `with_cache` in the repository
+/// are in this file. So a cache exists, is reachable, is opt-in, and nobody opts
+/// in.
+///
+/// The reason nobody opts in is that its value was never measured, and this is
+/// that measurement: the same plan through the same environment, at a range of
+/// budgets, reporting the bytes that actually left the store.
+///
+/// **The claim asserted here is byte counts, not time.** The store reads are
+/// deterministic; a wall clock on a shared machine is not, and this crate does
+/// not assert on durations. `print_what_the_cache_saves` beside it prints the
+/// timing for a human.
+#[test]
+fn a_bigger_cache_reads_strictly_fewer_bytes_from_the_store() {
+    let regions = regions();
+    let bytes_at = |capacity: u64| -> (u64, u64, u64) {
+        let path = root(&format!("worth-{capacity}"));
+        let env = ZarrEnvironment::create(&path, &source(), CHUNK)
+            .expect("a store")
+            .with_cache(capacity);
+        read_all(&env, &regions);
+        let stats = env.cache_stats().expect("a cache");
+        (stats.source_bytes, stats.hits(), stats.misses)
+    };
+
+    // One chunk of `16^3` `u16` is 8192 bytes. The sweep runs from a cache that
+    // can hold a single chunk — no reuse is possible across the overlapping
+    // windows, which is the no-cache baseline in everything but name — to one
+    // that holds the whole volume.
+    let chunk_bytes = (CHUNK.iter().product::<usize>() * 2) as u64;
+    let volume_bytes = (VOLUME.iter().product::<usize>() * 2) as u64;
+    println!(
+        "{:>12} {:>14} {:>8} {:>8}  chunk {chunk_bytes} B, volume {volume_bytes} B",
+        "capacity", "store bytes", "hits", "misses"
+    );
+    let mut previous: Option<(u64, u64)> = None;
+    let mut smallest = 0u64;
+    let mut largest = 0u64;
+    for multiple in [1u64, 4, 16, 64, 256] {
+        let capacity = chunk_bytes * multiple;
+        let (source_bytes, hits, misses) = bytes_at(capacity);
+        println!("{capacity:>12} {source_bytes:>14} {hits:>8} {misses:>8}");
+        if multiple == 1 {
+            smallest = source_bytes;
+        }
+        largest = source_bytes;
+        if let Some((before, _)) = previous {
+            assert!(
+                source_bytes <= before,
+                "a cache of {capacity} bytes read {source_bytes} from the store against the \
+                 smaller cache's {before}. More room must not cost more reads."
+            );
+        }
+        previous = Some((source_bytes, hits));
+    }
+
+    assert!(
+        smallest > largest,
+        "the store read {smallest} bytes at one chunk of capacity and {largest} at 256 — the \
+         cache saved nothing, so either this traversal does not revisit a chunk or the cache \
+         is not on the read path"
+    );
+    let saved = smallest as f64 / largest as f64;
+    println!(
+        "a cache that holds the volume reads {saved:.2}x fewer bytes than one that holds a chunk"
+    );
+    assert!(
+        saved > 1.5,
+        "the cache saved only {saved:.2}x, where the overlapping windows this file reads \
+         should share far more than that"
+    );
+}
+
+/// The same sweep with a clock on it, for a human deciding whether to turn a
+/// cache on. **Ignored, because it is a measurement**: this crate asserts on
+/// byte counts and never on durations, and the assertion above is the part that
+/// belongs in a suite.
+///
+/// Recorded, release, best of three over this file's overlapping windows:
+///
+/// ```text
+///     capacity        wall (ms)   store bytes
+///     none                  7.9      uncached
+///     one chunk            17.9     4 866 048
+///     sixteen chunks        9.6     2 359 296
+///     the whole volume      1.5       524 288
+/// ```
+///
+/// Two things, and the second is the one nobody would guess:
+///
+/// * a cache that holds the working set is **5.3x faster** than none, and reads
+///   each chunk exactly once — 524 288 bytes is the volume, so the halo re-reads
+///   are entirely absorbed;
+/// * a cache that is **too small is worse than none at all**: 17.9 ms against
+///   7.9, because it pays the bookkeeping on every read and never reuses
+///   anything. The same shape as every other locality mechanism this crate has
+///   measured — below a threshold set by the working set, the machinery costs
+///   more than the sharing saves.
+///
+/// So "turn the cache on" is not the whole recommendation. It is "turn it on
+/// with a budget that holds a block's read extent times the blocks in flight",
+/// and below that leave it off.
+#[test]
+#[ignore = "a measurement, not an assertion"]
+fn print_what_the_cache_saves() {
+    use std::time::Instant;
+
+    let regions = regions();
+    let chunk_bytes = (CHUNK.iter().product::<usize>() * 2) as u64;
+    println!(
+        "{:>14} {:>12} {:>14}",
+        "capacity", "wall (ms)", "store bytes"
+    );
+    for capacity in [0u64, chunk_bytes, chunk_bytes * 16, chunk_bytes * 256] {
+        let path = root(&format!("worth-timed-{capacity}"));
+        let mut env = ZarrEnvironment::create(&path, &source(), CHUNK).expect("a store");
+        if capacity > 0 {
+            env = env.with_cache(capacity);
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let started = Instant::now();
+            read_all(&env, &regions);
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        let bytes = env
+            .cache_stats()
+            .map(|stats| stats.source_bytes.to_string())
+            .unwrap_or_else(|| "uncached".to_string());
+        println!(
+            "{:>14} {:>12.1} {bytes:>14}",
+            if capacity == 0 {
+                "none".to_string()
+            } else {
+                capacity.to_string()
+            },
+            best * 1e3
+        );
+    }
+}

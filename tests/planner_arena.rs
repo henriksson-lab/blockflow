@@ -899,6 +899,14 @@ impl Scheduler for FirstReady {
 /// the whole set by design. Recorded in `docs/design/planner-gaps.md` as the
 /// next thing in the way.
 ///
+/// **What was done about it**: `Machine::candidate_window` bounds how much of
+/// the ready set a scheduler is shown, which caps the term rather than making
+/// any one scheduler cheaper. `tests/candidate_window.rs` is what it costs —
+/// 49x at 98 304 tasks with a bit-identical schedule for `ExecutorOrder`, and
+/// not free for a policy that looks past the front of the set. The window is
+/// `0` by default, so every figure above is still the figure this loop
+/// produces.
+///
 /// **Ignored, because it is a measurement.** It also has to be run
 /// `--release`: the maintained set carries a `debug_assertions` oracle that
 /// runs the old scan on every dispatch and compares, so a debug build times

@@ -508,6 +508,36 @@ Option<[usize; 5]>` that a stateless scheduler implements and the loop uses to
 keep a heap, falling back to the scan for the ones that cannot. Not attempted
 here; measured, so that it can be.
 
+**What was done instead: `Machine::candidate_window`** — the shortlist this
+page's `Coalescing` note already asked for ("score a shortlist rather than the
+whole ready set"), taken at the loop rather than at the trait. A scheduler is
+shown the first `n` ready tasks in ascending id, so a dispatch is `O(min(ready,
+window))`; one change bounds every policy, including the ones not written yet,
+where a per-scheduler heap is a different change for each. `0` is unbounded and
+is the default, because every figure on this page was taken that way.
+
+`tests/candidate_window.rs` is the measurement. At 98 304 tasks:
+
+| scheduler | window | wall | makespan | misses |
+|---|---|---|---|---|
+| `executor:phase-major` | none | 39.3 s | 807 820 792 | 35 328 |
+| `executor:phase-major` | 256 | 0.80 s | 807 820 792 | 35 328 |
+| `nearest-first` | none | 35.9 s | 621 438 131 | 12 569 |
+| `nearest-first` | 4096 | 8.00 s | 616 873 687 | 12 016 |
+| `nearest-first` | 1024 | 1.61 s | 648 578 620 | 15 889 |
+| `nearest-first` | 256 | 0.81 s | 737 693 332 | 26 765 |
+
+**49x for nothing** on the executor's own dispatch order — its argmin is the
+lowest ready id, which every prefix contains, so the schedule is bit-identical
+at every window. Not free for a policy that looks past the front of the set:
+`nearest-first`'s knee is between 4096 and 1024, and the *same* window of 256 is
+an improvement at 12 288 tasks and a 19% regression at 98 304. **The safe window
+is a fraction of the ready set, so no constant is right at two plan sizes** —
+which is why the default stays `0` and a sweep that wants the speed states its
+window beside its figures. A window is also a locality prior in its own right:
+it improves `block_major` and `ReleaseAware` by ~30% of makespan, so two
+policies may be compared only at the same window.
+
 ## If we can do three things
 
 1. **Build the planner arena (G1).**
