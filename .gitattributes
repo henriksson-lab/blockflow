@@ -1,13 +1,8 @@
-# **`costs/` is compared byte for byte against its own serialiser.**
+# **`costs/*.json` are generated data files, so their line endings are pinned.**
 #
-# `tests/cost_scenarios.rs` asserts that every committed scenario is exactly what
-# `Scenario::to_json` writes, which is what stops a hand edit from drifting away
-# from the generator. On Windows git's `core.autocrlf` translates a checkout to
-# CRLF, the serialiser emits LF, and the comparison then fails on the platform's
-# newline rather than on anything in the file — which is what it did the first
-# time this crate's CI ran on Windows.
-#
-# So these files are LF in the working tree on every platform. They are data read
-# by a program, not source anybody edits by hand: the generator writes them, and
-# `regenerate_the_scenario_files` is the only thing that should.
+# Nothing compares them byte for byte any more — `tests/cost_scenarios.rs`
+# checks that they parse and round-trip, not that they match a serialiser — so
+# this is hygiene rather than a correctness requirement. What it buys is that a
+# regeneration on Windows does not rewrite every line of every file with a
+# different newline and produce a diff that is entirely invisible.
 costs/*.json text eol=lf

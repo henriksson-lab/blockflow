@@ -102,12 +102,21 @@ fn scenarios() -> BTreeMap<String, Scenario> {
 /// regenerate_the_scenario_files` after changing the baseline or adding a
 /// machine shape, and commit what it writes.
 ///
-/// **Why the files are committed rather than built here.** Two reasons, and the
-/// second is the one that matters. A file can be read by a person, diffed, and
-/// pointed at in a bug report; and a scenario built fresh by the test that
-/// consumes it would move whenever the code that builds it moved, which is
-/// exactly the property a regression bound must not have. The generator is the
-/// convenience; the files are the record.
+/// **Why the files are committed rather than built here**, given that building
+/// one costs microseconds and nothing else. Two reasons, and the second is the
+/// one that matters. A file can be read by a person, diffed, and pointed at in a
+/// bug report; and a scenario built fresh by the test that consumes it would
+/// move whenever the code that builds it moved, which is exactly the property a
+/// regression bound must not have. The generator is the convenience; the files
+/// are the record.
+///
+/// Which is also why nothing checks that the files still equal what this
+/// function emits. A record that had to agree with today's generator would be
+/// rewritten by every change to the generator, and a bound recorded against a
+/// machine six months ago would quietly become a bound against this month's
+/// idea of it. Running this is a decision to replace the record, not a step in
+/// keeping it valid — see `every_committed_scenario_loads_and_round_trips`,
+/// which checks the things that do have to hold.
 ///
 /// **Every derived scenario is a ratio against the measured baseline.** None of
 /// the numbers below is a measurement of a machine nobody has run on — they are
@@ -299,41 +308,28 @@ fn every_committed_scenario_loads_and_round_trips() {
             &back, scenario,
             "{name} changed on the way through JSON, so the file is not the scenario"
         );
-        // and the file on disk is what the generator would write, so a hand
-        // edit that the generator would undo is caught here rather than at the
-        // next regeneration.
-        let path = format!("{COSTS}/{name}.json");
-        // **Newlines normalised, and only newlines.** `.gitattributes` pins
-        // these files to LF in the working tree so that this comparison is
-        // portable at the source; this strips CR as well, so that a checkout
-        // made before that attribute existed — or one whose `core.autocrlf`
-        // says otherwise — compares its *content* rather than its platform's
-        // line ending. A newline is not something `to_json` decides, and a test
-        // that failed on one was reporting the checkout rather than the file,
-        // which is what it did the first time this crate's CI ran on Windows.
-        let on_disk = std::fs::read_to_string(&path)
-            .expect("the file this came from")
-            .replace("\r\n", "\n");
-        // The first differing line, rather than two thousand characters of
-        // `assert_eq!`. It is how the `preserve_order` difference below was
-        // found: every line differed, which said "the key order moved" where a
-        // whole-string diff said only "not equal".
-        if let Some((line, (a, b))) = on_disk
-            .lines()
-            .zip(text.lines())
-            .enumerate()
-            .find(|(_, (a, b))| a != b)
-        {
-            panic!(
-                "{path} line {line} is not what `to_json` writes.\n  on disk:   {a}\n  \
-                 generated: {b}\nRegenerate with `cargo test --test cost_scenarios -- \
-                 --ignored regenerate_the_scenario_files`."
-            );
-        }
-        assert_eq!(
-            on_disk, text,
-            "{path} and `to_json` agree line by line and differ in length"
-        );
+        // **What is deliberately *not* checked: that the file equals what
+        // today's generator writes.**
+        //
+        // It was, and the check contradicted the reason these files exist. A
+        // record must not move when the code moves — that is the whole of why
+        // they are committed rather than built here — and a byte-for-byte
+        // comparison against `to_json` forces the opposite: every change to
+        // `measured_baseline`, and every new `Machine` field, made the whole
+        // directory stale until it was regenerated, and regenerating overwrites
+        // the record. It failed three times in one afternoon on exactly that,
+        // twice for a field being added and once for a line ending.
+        //
+        // What guards the files instead is that they **parse and round-trip**,
+        // which is the property that actually matters and the one that catches a
+        // serialiser bug. A file that predates a field loads with that field's
+        // documented default — `nodes: 1`, `wave_synchronous: false` — which is
+        // the correct reading of a scenario written before computers were
+        // countable, and is why the coupling was unnecessary in the first place.
+        //
+        // A hand edit is therefore allowed. It is a legitimate way to state a
+        // machine; the generator is a convenience for producing a family of
+        // them, not a definition they must agree with.
     }
 }
 

@@ -39,12 +39,26 @@ here.
 
 ## Changing them
 
-Do not hand-edit: `cargo test --test cost_scenarios -- --ignored
-regenerate_the_scenario_files` writes this directory from
-`scenario::measured_baseline` and the transform list in that test, and
-`every_committed_scenario_loads_and_round_trips` fails if a file on disk is not
-what the generator would write. Add a machine shape by adding a `write(...)` to
-the generator, regenerate, and commit what it produces.
+**These files are the record, not a rendering of the generator.** Nothing checks
+that they still equal what `regenerate_the_scenario_files` would write, and that
+is deliberate: a record which had to agree with today's code would be rewritten
+by every change to that code, and a bound recorded against a machine six months
+ago would quietly become a bound against this month's idea of it. What is
+checked is that they parse, round-trip, and are named consistently.
+
+So there are two ways to change one, and they are different acts:
+
+* **edit the file**, to correct or add a machine. Legitimate. It has to parse
+  and round-trip; the suite says so;
+* **regenerate the family**: `cargo test --test cost_scenarios -- --ignored
+  regenerate_the_scenario_files`, which writes this directory from
+  `scenario::measured_baseline` and the transform list in that test. This
+  *replaces* the record, so it is a decision rather than a tidy-up. Add a new
+  machine shape by adding a `write(...)` there and committing what it produces.
+
+A file that predates a field loads with that field's documented default — a
+scenario written before `nodes` existed is a single-computer scenario — so an
+old record stays readable rather than needing a migration.
 
 **Keep the old files when the numbers move.** They are a record of what the
 planner was held to; a regression bound is only meaningful against a scenario
