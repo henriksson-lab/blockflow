@@ -4,11 +4,32 @@
 # **What runs, and what deliberately does not.** `cargo test` runs the tests that
 # assert; it never passes `--ignored`. That flag is the line between the two
 # kinds of test this crate has, and the line is already drawn in the source: the
-# 39 `#[ignore]`d tests are *measurements* — they print tables of nanoseconds per
-# voxel and resident bytes — and a shared CI runner is the wrong instrument for
-# every one of them. A red run must mean the code is wrong, never that a runner
-# was busy. Nothing in the crate asserts on a duration, which is what makes the
-# rest of the suite safe to run here at all.
+# 65 `#[ignore]`d tests are *measurements* — they print tables of nanoseconds per
+# voxel and resident bytes — plus a handful that read a machine-local recorded
+# volume or regenerate a committed file. A shared CI runner is the wrong
+# instrument for every one of them.
+#
+# **A red run must mean the code is wrong, never that a runner was busy**, and
+# that is a rule this file used to state as already true — "nothing in the crate
+# asserts on a duration" — while three tests in `src/cache_tests.rs` did. One of
+# them failed exactly as predicted, on macOS, at 177 ms against a 160 ms bound
+# where the failure it was built to catch is twelve times the bound. `cargo test`
+# runs tests in parallel and the fixtures sleep, so an oversubscribed three-core
+# runner reaches those numbers by being busy.
+#
+# All three are gone, and the way they went is worth knowing because it is the
+# pattern for the next one:
+#
+# * two had an exact **structural** form and did not need a clock at all — "the
+#   prefetch queue had not drained when the demand read returned", and "submit
+#   returned having done at most one of the 32 reads it queued", where doing the
+#   IO itself would have meant all 32;
+# * the latency claim that had no structural form moved to an `#[ignore]`d
+#   measurement beside the other 64.
+#
+# What remains is one **liveness** bound — a coordinator shuts down within five
+# seconds — and that is a different kind of claim: it separates "finished" from
+# "hung", not "fast" from "slow", and no busy runner reaches it.
 #
 # **The tests that do run are not heavy, and that is measured rather than
 # assumed.** With the `[profile.dev]` this crate now ships, at `--test-threads=4`

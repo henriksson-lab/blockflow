@@ -416,6 +416,33 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 2
 
+# **The profile to run the suite under, and why it is not `dev` or `release`.**
+#
+# `target/debug` for this crate is **144 GB** against `target/release`'s 4.6 GB —
+# 109 GB of it in `deps` and 34 GB of incremental artifacts — because there are
+# over a hundred `[[test]]` targets, each linking the crate whole, and a full
+# artifact set is kept per feature combination. At `opt-level = 1` with debug
+# info that is about 900 MB per test binary against 38 MB optimised.
+#
+# Plain `--release` would fix the space and quietly cost something: this crate
+# has 19 `debug_assert!`s and a `cfg(debug_assertions)` block in `simulate.rs` —
+# the incremental ready-set oracle, which is what caught the `barrier_held`
+# off-by-one — and every one of them compiles out of a release build. A test run
+# that silently stops checking its own invariants is worse than a large target
+# directory.
+#
+# So: release codegen, debug assertions kept.
+#
+#     cargo test --profile suite
+#
+# `inherits = "release"` rather than editing `[profile.release]`, because release
+# is what a consumer of this crate builds and its assertions are not this file's
+# to turn on. CI still runs the suite at `dev` — see `.github/workflows/ci.yml`,
+# whose timings and RSS figures are quoted against that profile.
+[profile.suite]
+inherits = "release"
+debug-assertions = true
+
 [patch.crates-io]
 burn = { git = "https://github.com/mahogny/burn.git", rev = "1d6ef1b6f23a5a884dd1576d019f7a34ee93974c" }
 burn-store = { git = "https://github.com/mahogny/burn.git", rev = "1d6ef1b6f23a5a884dd1576d019f7a34ee93974c" }

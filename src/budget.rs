@@ -657,13 +657,59 @@ pub const UNOBSERVED_OP_MARGIN: f64 = 2.1;
 /// [`admission_bytes`] is a function of which one a caller can supply.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FrameworkFigure {
-    /// `PhaseCost::working_set_bytes_per_block`, which assumes one image in and
-    /// one out. Wrong by `1.00x` to `3.56x` depending on the phase's shape, and
-    /// the only figure a plan can produce today.
+    /// `PhaseCost::working_set_bytes_per_block`, which counts **every block
+    /// buffer alive while one block is in flight**: the phase's own input and
+    /// output, one per source image, and one per buffer the chain holds between
+    /// them.
+    ///
+    /// **It used to assume one image in and one out — a literal `x 2.0` — and
+    /// this doc used to record how wrong that was**, at `1.00x` to `3.56x` over
+    /// the shapes then measured. What closed it was a shape nobody had measured:
+    /// a fan-in whose combine cannot declare a
+    /// [`Combine::fold_carrier`](crate::op::Combine::fold_carrier) holds one
+    /// block buffer **per arm**, so the 91-arm feature stack of
+    /// `docs/design/pixel-classification.md` held 93 where the budget charged 2.
+    /// A 46.5x under-charge, in the direction that admits a plan the run cannot
+    /// afford, is not a gap a margin absorbs — `UNOBSERVED_SHAPE_MARGIN` is 3.6.
+    ///
+    /// The count is [`Chain::resident_block_buffers`](crate::op::Chain::resident_block_buffers),
+    /// derived from the chain's shape and held to a global allocator as an
+    /// **equality** over fourteen shapes in `tests/working_set_residency.rs`.
+    ///
+    /// **It is computed where the price is taken, not recorded on the plan**,
+    /// and that is a decision worth stating because the other way was tried
+    /// first. A field on `PhaseDecomposition` with a `declare`/`check` pair —
+    /// the arrangement `dtype` and `source_images` have — has no safe default:
+    /// zero under-charges, so `check` has to refuse every plan that did not
+    /// declare, and that made eighteen test files' hand-built plans invalid at a
+    /// stroke. The quantity is a function of the chain and every caller that
+    /// prices a budget already holds the chain, so it is derived like
+    /// `compute_per_voxel` rather than recorded like `source_images`. Nothing
+    /// downstream reads `working_set_bytes_per_block` except
+    /// `Constraints::affords_working_set`, and every path to it has the slots.
+    ///
+    /// **What it still does not know is the op's own scratch**, which is why
+    /// this is `Assumed` and still takes a margin. See [`Self::Exact`].
     Assumed(f64),
     /// The framework's half, exact: a [`crate::op::BlockResidency`] observed for
-    /// this chain at this block, or the shape-derived figure that would stand in
-    /// for one before a first run.
+    /// this chain at this block, or the shape-derived figure that stands in for
+    /// one before a first run.
+    ///
+    /// **The shape-derived figure now exists and is wired in**, and did not when
+    /// this was written:
+    /// [`Chain::resident_block_buffers`](crate::op::Chain::resident_block_buffers)
+    /// counts what a chain holds inside itself from its structure alone. The
+    /// whole quantity a plan can now state is
+    ///
+    /// ```text
+    /// buffers = images_read + writes_an_image + resident_buffers
+    /// ```
+    ///
+    /// and [`Self::Assumed`] is that, priced. So the gap between the two
+    /// variants is no longer the framework's arithmetic — it is only what an
+    /// **op** allocates inside its own `apply`, which no declaration reaches and
+    /// which `an_ops_own_working_buffers_are_not_visible_to_any_declaration`
+    /// measures.
     ///
     /// **Exact about the framework and silent about the op**, which is why it
     /// still takes a margin.

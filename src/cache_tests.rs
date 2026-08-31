@@ -883,16 +883,39 @@ fn prefetch_populates_the_cache_and_the_read_that_follows_is_a_hit() {
     assert_eq!(stats.prefetch_used, 8, "{stats:?}");
 }
 
-/// **Measured, not asserted.** With the prefetch queue saturated against a slow
-/// source, a demand read for something else must still complete in about one
-/// source read — not behind the backlog.
+/// **A demand read is not serialised behind a saturated prefetch queue.**
 ///
-/// The numbers: the source takes `DELAY` per read and the plan is 24 chunks, so
-/// the queue holds well over a second of work at depth 2. If a demand read were
-/// serialised behind it the measurement would be hundreds of milliseconds. The
-/// bound is deliberately loose (4 delays) because this runs on a shared CI
-/// machine; the failure it is built to catch is an order of magnitude away from
-/// the threshold, not a few percent.
+/// The failure this catches: a demand read that takes the same lock or queue the
+/// prefetcher is working through, and so returns only once the backlog has been
+/// worked off. At 24 chunks and depth 2 that is twelve rounds of a slow source,
+/// where an independent read is one.
+///
+/// # It used to assert on wall-clock time, and that was wrong twice over
+///
+/// The bound was `elapsed < DELAY * 4` — 160 ms — and it failed on a macOS CI
+/// runner at **177 ms**, which is not the order-of-magnitude failure it was
+/// built to catch but a busy machine. `cargo test` runs tests in parallel, the
+/// slow source is a `thread::sleep`, and a 40 ms sleep on an oversubscribed
+/// three-core runner is comfortably 100 ms of wall clock.
+///
+/// More to the point, `.github/workflows/ci.yml` states as the reason the whole
+/// suite is safe to run on a shared runner that **"nothing in the crate asserts
+/// on a duration"** — and this test's own first line said "Measured, not
+/// asserted" while asserting. Both claims are now true.
+///
+/// # What is asserted instead, and what that does and does not cover
+///
+/// The structural fact: **the queue had not drained when the demand read
+/// returned.** A read serialised behind the backlog returns only after it, so
+/// this catches the failure exactly, and it catches it on any machine at any
+/// speed.
+///
+/// What it does not catch is a demand read that waits for only the *in-flight*
+/// prefetch reads rather than the whole queue — two of them, at depth 2. That is
+/// a real failure mode and it is a latency claim, so it belongs with the
+/// measurements: `print_the_demand_read_latency_under_a_saturated_queue` below,
+/// `#[ignore]`d like the crate's other 39, because a shared runner is the wrong
+/// instrument for it.
 #[test]
 fn a_demand_read_does_not_queue_behind_a_saturated_prefetcher() {
     const DELAY: Duration = Duration::from_millis(40);
@@ -920,28 +943,101 @@ fn a_demand_read_does_not_queue_behind_a_saturated_prefetcher() {
     let handle = prefetcher.submit(&plan_over(prefetched.array(), 24, 8));
 
     // A read of a *different* array, so it can share nothing with the queue.
-    let started = Instant::now();
     let got = urgent
         .read_region(&Region::new(&[0, 0, 0], &[1, 1, 8]))
         .expect("the demand read must not fail");
-    let elapsed = started.elapsed();
-
     assert_eq!(got.len(), 8);
+
+    // **The assertion.** A read serialised behind the backlog returns only once
+    // the backlog is gone; this one returned while work remained.
+    let stats = prefetcher.stats();
     assert!(
-        prefetcher.queued() > 0 || prefetcher.stats().started < prefetcher.stats().submitted,
-        "the prefetch queue drained before the measurement; the test proved nothing"
-    );
-    assert!(
-        elapsed < DELAY * 4,
-        "a demand read took {elapsed:?} with a saturated prefetch queue; \
-         one source read is {DELAY:?}, so it queued behind the prefetcher"
+        prefetcher.queued() > 0 || stats.started < stats.submitted,
+        "the demand read returned only after the prefetch queue had drained — \
+         {} of {} submitted chunks started, {} still queued. Either it was serialised \
+         behind the backlog, which is the failure this test exists for, or the source \
+         is no longer slow enough for 24 chunks to outlast one read.",
+        stats.started,
+        stats.submitted,
+        prefetcher.queued()
     );
 
     prefetcher.cancel(handle);
 }
 
-/// Submission itself must be cheap — a worker declaring its future reads is on
+/// The latency half of the test above, as a measurement.
+///
+/// ```text
+/// cargo test --release -- --ignored --nocapture demand_read_latency
+/// ```
+///
+/// An independent demand read is one source read. Serialised behind the two
+/// in-flight prefetch reads it is three, and behind the whole 24-chunk backlog
+/// it is twelve. On the machine this crate was developed on it is one; on a busy
+/// shared runner it has been seen at four, which is why this is not an
+/// assertion.
+#[test]
+#[ignore = "a measurement, not an assertion"]
+fn print_the_demand_read_latency_under_a_saturated_queue() {
+    const DELAY: Duration = Duration::from_millis(40);
+    let shape = [1usize, 1, 256];
+    let cache = Arc::new(ChunkCache::new(roomy(), 1 << 22));
+    let prefetched = CachingSource::<u16>::attach(
+        Arc::clone(&cache),
+        "queued",
+        &[1, 1, 8],
+        ArrayPolicy::default(),
+        Probe::new(ramp_u16(shape)).slow(DELAY),
+    )
+    .expect("attach");
+    let urgent = CachingSource::<u16>::attach(
+        Arc::clone(&cache),
+        "urgent",
+        &[1, 1, 8],
+        ArrayPolicy::default(),
+        Probe::new(ramp_u16(shape)).slow(DELAY),
+    )
+    .expect("attach");
+
+    // The control: the same read with nothing else going on, so the figure below
+    // is in units of this machine's own source read rather than of a constant.
+    let started = Instant::now();
+    let _ = urgent
+        .read_region(&Region::new(&[0, 0, 0], &[1, 1, 8]))
+        .expect("the control read");
+    let control = started.elapsed();
+
+    let prefetcher = Prefetcher::new(Arc::clone(&cache), 2);
+    let handle = prefetcher.submit(&plan_over(prefetched.array(), 24, 8));
+    let started = Instant::now();
+    let _ = urgent
+        .read_region(&Region::new(&[0, 0, 8], &[1, 1, 8]))
+        .expect("the demand read");
+    let elapsed = started.elapsed();
+    prefetcher.cancel(handle);
+
+    println!(
+        "demand read: {elapsed:?} under a saturated queue, {control:?} idle \
+         ({:.1} source reads; independent is 1, behind the in-flight pair is 3, \
+         behind the whole backlog is 12)",
+        elapsed.as_secs_f64() / control.as_secs_f64().max(1e-9)
+    );
+}
+
+/// Submission itself must be cheap/// Submission itself must be cheap — a worker declaring its future reads is on
 /// the critical path even though the reads are not.
+///
+/// **Counted, not timed.** This asserted `elapsed < DELAY` — that submit took
+/// less than one source read — which is the same wall-clock claim that failed on
+/// a macOS runner in `a_demand_read_does_not_queue_behind_a_saturated_prefetcher`
+/// above, and for the same reason a shared machine can break it.
+///
+/// The property has an exact structural form and does not need a clock: if
+/// submit did the IO, it did **all** of it, so the probe would record 32 reads
+/// before returning. It records at most one — the single worker may have picked
+/// up the head of the queue while submit was returning, and that is the
+/// prefetcher working, which is the whole point. Thirty-two against one is not a
+/// margin a busy runner can close.
 #[test]
 fn submitting_a_plan_returns_without_doing_any_io() {
     const DELAY: Duration = Duration::from_millis(50);
@@ -957,14 +1053,15 @@ fn submitting_a_plan_returns_without_doing_any_io() {
     .expect("attach");
 
     let prefetcher = Prefetcher::new(Arc::clone(&cache), 1);
-    let started = Instant::now();
     prefetcher.submit(&plan_over(source.array(), 32, 8));
-    let elapsed = started.elapsed();
+    let reads = handle.reads();
     assert!(
-        elapsed < DELAY,
-        "submit took {elapsed:?}, which is at least one source read; it is doing IO"
+        reads <= 1,
+        "submit returned having done {reads} source reads of the 32 it queued. It is \
+         doing the IO on the caller's thread, which puts a worker's declaration of its \
+         future reads on the critical path. At most one is the single prefetch worker \
+         having picked up the head of the queue, which is it doing its job."
     );
-    let _ = handle.reads();
 }
 
 /// A cancelled plan stops fetching. Anything already in flight finishes — that
@@ -1210,8 +1307,15 @@ fn a_failing_fetch_surfaces_and_does_not_wedge_the_next_read() {
         let started = Instant::now();
         let err = cache.read_region_bytes(array, &region).unwrap_err();
         assert!(err.to_string().contains("on fire"), "{err}");
+        // **Five seconds, not the 100 ms this used to be.** The failure is a
+        // claim that was never released, and a read waiting on one waits
+        // *forever* — so any bound at all discriminates, and the one to pick is
+        // the one a loaded shared runner cannot reach by being slow. 100 ms is
+        // within reach of a runner running this suite in parallel with itself;
+        // see `a_demand_read_does_not_queue_behind_a_saturated_prefetcher`,
+        // which failed that way.
         assert!(
-            started.elapsed() < Duration::from_millis(100),
+            started.elapsed() < Duration::from_secs(5),
             "the second read waited for a claim the failed fetch should have released"
         );
     }

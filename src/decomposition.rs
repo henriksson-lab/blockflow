@@ -2621,6 +2621,22 @@ pub struct PhaseTraffic {
     /// so no plan holds it and `phase_traffic` answers `1`. A caller with a real
     /// run's `Stats::substages` says so with [`PhaseTraffic::repeating`].
     pub repeats: u64,
+    /// Block buffers the chain holds **inside** this phase, from
+    /// [`Chain::resident_block_buffers`] over the phase's own slots.
+    ///
+    /// **Derived where the price is taken rather than recorded on the plan.**
+    /// The quantity is a function of the chain, and every caller that prices a
+    /// budget holds the chain — `resident_buffers_of` is the helper. A field on
+    /// [`PhaseDecomposition`] was the other option and is worse: it has no safe
+    /// neutral value, so a `check` would have to refuse every plan that did not
+    /// declare it, where `dtype` and `source_images` both have defaults that
+    /// most plans genuinely satisfy.
+    ///
+    /// Zero for the one-op phase [`PhaseCost::working_set_bytes_per_block`]'s
+    /// old `x 2.0` was written for, so adding this moved no such phase's price.
+    /// It is the term that was missing for everything else, and by 46.5x for a
+    /// 91-arm fan-in whose combine cannot fold.
+    pub chain_buffers: usize,
 }
 
 impl PhaseTraffic {
@@ -2631,6 +2647,15 @@ impl PhaseTraffic {
             images_read: 1,
             writes_an_image: true,
             repeats: 1,
+            chain_buffers: 0,
+        }
+    }
+
+    /// The same traffic, holding `buffers` block buffers inside its chain.
+    pub fn holding(self, buffers: usize) -> Self {
+        PhaseTraffic {
+            chain_buffers: buffers,
+            ..self
         }
     }
 
@@ -3019,7 +3044,26 @@ pub fn price_phase(
         // as if it read one, which is not, and is a known gap recorded here
         // rather than half-fixed: correcting it changes which plans are
         // *affordable*, and that is a budget review with its own measurements.
-        working_set_bytes_per_block: resident_voxels * bytes_per_voxel * 2.0,
+        // **Every block-sized buffer alive while one block is in flight**, not
+        // the two the formula assumed. The phase's own input and output are
+        // `images_read + writes_an_image` — which is exactly `2` for the
+        // one-in-one-out phase this was written for, so that case did not move —
+        // and `chain_buffers` is what the chain holds between them: two for a
+        // long sequence, which ping-pongs, and **one per arm** for a fan-in whose
+        // combine cannot fold.
+        //
+        // The old `2.0` was an under-charge for everything else, and
+        // `budget.rs`'s header recorded it as a known gap "rather than
+        // half-fixed". What made it worth fixing was measuring the size: 93
+        // buffers against 2 for the feature stack of
+        // `docs/design/pixel-classification.md`, in the direction that admits a
+        // plan the run cannot afford. See `tests/working_set_residency.rs`,
+        // which holds the shape-derived count to a global allocator as an
+        // equality over fourteen shapes.
+        working_set_bytes_per_block: resident_voxels
+            * bytes_per_voxel
+            * (traffic.images_read + usize::from(traffic.writes_an_image) + traffic.chain_buffers)
+                as f64,
         repeats: traffic.repeats,
         // **`S x (read + compute) + write`, and the split is the point.**
         //
@@ -3275,6 +3319,14 @@ pub(crate) fn phase_traffic(
     Ok(PhaseTraffic {
         images_read: phase.images_read(index).len(),
         writes_an_image,
+        // **Zero, and this is the one path where that is right.** The term is a
+        // fact about the *chain*, which a `PhaseDecomposition` does not hold —
+        // and every caller of this function either owns no chain slots (a
+        // fragment or iterative phase, which holds nothing of its own) or is
+        // reporting rather than pricing a budget. The budget is decided in
+        // `strategy`, where the slots are in scope and
+        // `resident_buffers_of` answers; see `PhaseTraffic::chain_buffers`.
+        chain_buffers: 0,
         // One, always, and a caller who has measured otherwise says so with
         // `PhaseTraffic::repeating`. The plan cannot know: an iteration runs to
         // convergence over data, which is why `IterativeOp` has a `limit` and no
@@ -3468,6 +3520,23 @@ pub fn check_block_constraints(chain: &Chain, decomposition: &Decomposition) -> 
 /// Finally the recorded `source_images` must be exactly what the slots name —
 /// a plan whose record disagrees with its chain would read one image and price
 /// another, and the whole reason the field exists is that it is parity-visible.
+/// How many block buffers a run of chain slots holds inside itself.
+///
+/// **A phase is a `Chain::Sequence` of its slots**, and asking the sequence is
+/// not the same as asking each slot: a run of four maps holds two intermediates
+/// because the walk ping-pongs, where summing the slots would say zero and
+/// counting them would say three. [`Chain::resident_block_buffers`] holds that
+/// rule and every other, measured against a global allocator; this only has to
+/// build the sequence it is a rule about.
+///
+/// Nothing is cloned and no `Chain` is built: a `Chain` owns boxed trait objects
+/// and is not `Clone`, which is why the rule is an associated function taking
+/// references rather than a method on a node this would have had to construct.
+pub(crate) fn resident_buffers_of(slots: &[&Chain], group: &[usize]) -> usize {
+    let children: Vec<&Chain> = group.iter().map(|&slot| slots[slot]).collect();
+    Chain::sequence_resident_buffers(&children)
+}
+
 pub fn check_source_images(chain: &Chain, decomposition: &Decomposition) -> Result<()> {
     let slots = chain.slots();
     for (phase_index, phase) in decomposition.phases.iter().enumerate() {

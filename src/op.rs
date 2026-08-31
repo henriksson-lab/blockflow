@@ -2674,6 +2674,134 @@ impl Chain {
     /// an error message uses and not what a comparison uses; the comparison is
     /// [`Self::shape_id`], and both are written by one walk so they cannot
     /// disagree about what a chain is.
+    /// **How many block-sized buffers this chain holds inside itself**, at its
+    /// worst moment, derived from its shape and without running it.
+    ///
+    /// This is the "shape-derived figure that would stand in for one before a
+    /// first run" that [`crate::budget::FrameworkFigure::Exact`] names, and it
+    /// did not exist until a measurement made its absence expensive. The count
+    /// **excludes** the phase's own input and output — `PhaseCost::
+    /// working_set_bytes_per_block`'s `x 2.0` already covers those — and it
+    /// excludes the buffers the executor fetches for [`Chain::Source`] arms,
+    /// which are one per *image* and are the caller's to add. So a chain of one
+    /// op answers `0` and the formula is right about it, which is the case the
+    /// formula was written for.
+    ///
+    /// # The rules, and the measurement each comes from
+    ///
+    /// Every one is pinned against a global allocator in
+    /// `tests/working_set_residency.rs`, which is the only honest instrument:
+    /// the buffers are allocated by three different parties — the executor, the
+    /// `Sequence` walk, the `Parallel` walk — and no one of them can see the
+    /// others' total.
+    ///
+    /// * **[`Chain::Op`] and [`Chain::Source`] hold nothing of their own.** An
+    ///   op writes the buffer it was handed; a source arm *is* a buffer the
+    ///   executor fetched, counted with the others of its kind.
+    /// * **A [`Chain::Sequence`] ping-pongs**, so it holds at most two
+    ///   intermediates however long it is — one it is reading and one it is
+    ///   writing — and only one when it has exactly two children, because the
+    ///   last write goes to the phase's own output. Measured: two maps hold one
+    ///   intermediate and four maps hold two, not three. A [`Chain::Source`]
+    ///   among the children allocates none of its own — it *is* a fetched
+    ///   buffer, counted with the others of its kind — which is why
+    ///   `[source, map]` holds what `[map, map]` holds rather than one more.
+    /// * **A [`Chain::Parallel`] is the whole reason this method exists**, and
+    ///   it has two behaviours rather than one. A combine that declares a
+    ///   [`Combine::fold_carrier`] is folded branch by branch and holds at most
+    ///   two of its own — the partial and the branch just finished — *whatever
+    ///   its arity*. One that does not must be handed every branch result at
+    ///   once, so it holds one per computed branch and the figure grows without
+    ///   bound. Measured at arities 2, 6, 12 and 24: exactly `1.000` buffers per
+    ///   arm, with the folding control flat across the same range.
+    /// * **[`Chain::Alternative`] takes the maximum**, because one branch runs.
+    ///
+    /// # What it is for
+    ///
+    /// The gap it closes is not small. A 91-arm feature stack under a forest
+    /// predictor — the chain `docs/design/pixel-classification.md` builds, whose
+    /// combine *cannot* fold — holds 93 block buffers where the budget charges
+    /// for 2. At a `64^3` `f64` block that is 186 MiB against 4 MiB charged, and
+    /// the direction is the dangerous one: the plan is admitted and the run
+    /// exhausts memory.
+    /// The sequence rule of [`Self::resident_block_buffers`], over children a
+    /// caller holds by reference.
+    ///
+    /// **It is an associated function because a phase is a sequence of slots
+    /// that is never built as one.** `Decomposition::declare_resident_buffers`
+    /// has a `&[&Chain]` and cannot make a `Chain::Sequence` of it — a `Chain`
+    /// owns boxed trait objects and is not `Clone` — so either the rule lives
+    /// here and both callers use it, or it is written twice and drifts. It is
+    /// the second kind of thing this crate states once on principle: the
+    /// difference between "four maps hold two intermediates" and "four maps hold
+    /// three" is invisible in a plan and shows up as a budget that admits a run
+    /// which then dies.
+    ///
+    /// **A child allocates an intermediate only if it is not the last and is not
+    /// a source.** The last writes into the phase's own output, which the
+    /// working-set formula's own `images_read + writes` already counts; and a
+    /// [`Chain::Source`] *is* a buffer the executor fetched rather than one this
+    /// sequence made, so a sequence beginning with one hands that buffer
+    /// straight on. Measured: `[source, map]` holds what `[map, map]` holds —
+    /// the fetched buffer standing exactly where the other's intermediate does —
+    /// and counting both would have charged it one too many.
+    ///
+    /// The cap of two is the ping-pong: a long sequence reads one intermediate
+    /// and writes another, and reuses them. Measured at two children and four,
+    /// which differ, and at three, which does not differ from four.
+    pub fn sequence_resident_buffers(children: &[&Chain]) -> usize {
+        let allocating = children
+            .iter()
+            .take(children.len().saturating_sub(1))
+            .filter(|child| !matches!(child, Chain::Source { .. }))
+            .count();
+        let within = children
+            .iter()
+            .map(|child| child.resident_block_buffers())
+            .max()
+            .unwrap_or(0);
+        within + allocating.min(2)
+    }
+
+    pub fn resident_block_buffers(&self) -> usize {
+        match self {
+            Chain::Op(_) | Chain::Source { .. } => 0,
+            Chain::Sequence(children) => {
+                let children: Vec<&Chain> = children.iter().collect();
+                Chain::sequence_resident_buffers(&children)
+            }
+            Chain::Alternative { branches, taken } => branches
+                .get(*taken)
+                .map(Chain::resident_block_buffers)
+                .unwrap_or(0),
+            Chain::Parallel { branches, combine } => {
+                let computed = branches
+                    .iter()
+                    .filter(|branch| !matches!(branch, Chain::Source { .. }))
+                    .count();
+                // The element types the combine will be asked about. A fan-in
+                // whose branches disagree is refused elsewhere; here the list
+                // only has to be the right *length*, because that is what a
+                // combine keys its answer on.
+                let inputs: Vec<Dtype> = branches
+                    .iter()
+                    .map(|branch| branch.produces(Dtype::F64).unwrap_or(Dtype::F64))
+                    .collect();
+                let held = if combine.fold_carrier(&inputs).is_some() {
+                    computed.min(2)
+                } else {
+                    computed
+                };
+                let within = branches
+                    .iter()
+                    .map(Chain::resident_block_buffers)
+                    .max()
+                    .unwrap_or(0);
+                held + within
+            }
+        }
+    }
+
     pub fn shape_key(&self) -> String {
         let mut key = String::new();
         self.write_shape(&mut key);

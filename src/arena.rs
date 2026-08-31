@@ -74,7 +74,9 @@
 //! [`Machine::contention`]: crate::simulate::Machine::contention
 //! [`Strategy::decompose`]: crate::strategy::Strategy::decompose
 
-use crate::decomposition::{images_read_by, Constraints, Decomposition, PhaseTraffic};
+use crate::decomposition::{
+    images_read_by, resident_buffers_of, Constraints, Decomposition, PhaseTraffic,
+};
 use crate::error::{Error, Result};
 use crate::fragment::PhaseWork;
 use crate::simulate::{
@@ -527,6 +529,9 @@ fn phase_prices(
             // the image after it.
             writes_an_image: true,
             repeats: 1,
+            // What the run's own slots hold between them; see
+            // `resident_buffers_of`.
+            chain_buffers: resident_buffers_of(&slots, &phase.slots),
         };
         // The distinct traversal orders the run's ops prefer, which is what the
         // search's `GroupFold` accumulates and what `price_phase` charges a

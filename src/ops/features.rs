@@ -347,6 +347,26 @@ impl FeatureStack {
         self.len() == 0
     }
 
+    /// **What one voxel of the stack reads, per axis** — the maximum over the
+    /// arms, because a fan-in folds its branches by a maximum.
+    ///
+    /// Worth having separately from `Chain::reach3` because a caller often wants
+    /// it *before* committing to a chain: it is what decides whether a volume can
+    /// be blocked at all, and at Labkit's five default sigmas it is 193 voxels,
+    /// set by the structure tensor at `gamma = 3` rather than by the
+    /// morphological box a reader would guess. See
+    /// `docs/design/pixel-classification.md`.
+    pub fn reach(&self, volume: [usize; 3]) -> Result<[usize; 3]> {
+        let mut reach = [0usize; 3];
+        for arm in self.branches()? {
+            let arm = arm.reach3(&volume);
+            for axis in 0..3 {
+                reach[axis] = reach[axis].max(arm[axis]);
+            }
+        }
+        Ok(reach)
+    }
+
     /// The channel names, in channel order, without building the chains.
     ///
     /// **The stable identity of a column.** A trained forest stores split

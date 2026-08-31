@@ -199,6 +199,7 @@ pub mod mixing;
 pub mod morphology;
 pub mod normalise;
 pub mod rank;
+pub mod rasterise;
 pub mod reconstruct;
 pub mod regional;
 pub mod resample;

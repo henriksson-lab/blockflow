@@ -1024,3 +1024,223 @@ fn the_predict_workflow_gives_the_same_labels_under_every_decomposition() {
     }
     assert_eq!(cut, 12);
 }
+
+/// **The cropped gather yields the whole volume's rows, bit for bit.**
+///
+/// `gather_samples` computes the feature stack over the bounding box of the
+/// labelled voxels grown by the chain's reach, not over the volume. That is only
+/// legitimate if the rows are *identical* to what the whole volume would have
+/// given, and the argument — that a labelled voxel either sits a full reach
+/// inside the crop or has a crop edge that is the volume edge — is the kind that
+/// is easy to believe and easy to get wrong at a boundary. So it is checked.
+///
+/// Two label placements, because they exercise the two halves of the argument:
+/// one stroke in the middle, where the crop is a true interior box, and one
+/// touching a corner, where the crop clamps and the boundary rule has to be the
+/// volume's own.
+#[test]
+fn the_cropped_gather_gives_the_same_rows_as_the_whole_volume() {
+    let volume = [40usize, 36, 32];
+    let stack = FeatureStack::labkit(&[1.0])
+        .unwrap()
+        .with_truncate(2.0)
+        .unwrap();
+    let reach = stack.reach(volume).unwrap();
+    assert!(
+        reach.iter().all(|&r| r > 0),
+        "a reach of zero proves nothing"
+    );
+
+    let mut state = 8080u64;
+    let input: Voxels = ndarray::Array3::from_shape_fn((volume[0], volume[1], volume[2]), |_| {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (state >> 33) as f64 / (1u64 << 31) as f64
+    })
+    .into();
+
+    for (name, origin) in [("interior", [16usize, 15, 14]), ("at a corner", [0, 0, 0])] {
+        let mut labels = ndarray::Array3::<u32>::zeros((volume[0], volume[1], volume[2]));
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in 0..4 {
+                    labels[[origin[0] + i, origin[1] + j, origin[2] + k]] = 1;
+                    labels[[origin[0] + i + 6, origin[1] + j, origin[2] + k]] = 2;
+                }
+            }
+        }
+        let labels: Voxels = labels.into();
+        let (cropped, classes) =
+            blockflow::ops::gather_samples(&stack, &input, &labels, 0).unwrap();
+        assert_eq!(classes.labels(), &[1, 2]);
+        assert_eq!(cropped.rows(), 128, "{name}");
+
+        // The oracle: the same stack over the whole volume, gathered by hand.
+        let mut columns: Vec<Vec<f64>> = Vec::new();
+        for arm in stack.branches().unwrap() {
+            let mut out = Voxels::zeros(arm.produces(Dtype::F64).unwrap(), volume).unwrap();
+            arm.apply(&input, &mut out, &Anchor::whole(volume)).unwrap();
+            columns.push(out.view::<f64>().unwrap().iter().copied().collect());
+        }
+        let label_view = labels.view::<u32>().unwrap();
+        let mut want: Vec<Vec<f64>> = Vec::new();
+        for (at, &label) in label_view.iter().enumerate() {
+            if label != 0 {
+                want.push(columns.iter().map(|column| column[at]).collect());
+            }
+        }
+
+        assert_eq!(want.len(), cropped.rows(), "{name}");
+        for (row, expected) in want.iter().enumerate() {
+            assert_eq!(
+                cropped.row(row),
+                expected.as_slice(),
+                "{name}: row {row} differs between the cropped gather and the whole volume"
+            );
+        }
+    }
+}
+
+/// And the crop is actually a crop — it is not quietly the whole volume.
+///
+/// Without this the equality above would pass for an implementation that had
+/// stopped cropping, which is the failure mode of an optimisation guarded only
+/// by a correctness test.
+#[test]
+fn the_gather_reads_only_the_labels_neighbourhood() {
+    let volume = [64usize, 64, 64];
+    let stack = FeatureStack::labkit(&[1.0])
+        .unwrap()
+        .with_truncate(2.0)
+        .unwrap();
+    let reach = stack.reach(volume).unwrap();
+
+    // A stroke in one corner. Everything outside its neighbourhood is set to a
+    // value that would make the features enormous if it were read.
+    let mut intensity =
+        ndarray::Array3::<f64>::from_elem((volume[0], volume[1], volume[2]), 1.0e12);
+    let stroke = 8usize;
+    let touched = stroke + reach[0];
+    for i in 0..touched {
+        for j in 0..touched {
+            for k in 0..touched {
+                intensity[[i, j, k]] = 0.25;
+            }
+        }
+    }
+    let input: Voxels = intensity.into();
+
+    let mut labels = ndarray::Array3::<u32>::zeros((volume[0], volume[1], volume[2]));
+    for i in 0..stroke {
+        for j in 0..stroke {
+            for k in 0..stroke {
+                labels[[i, j, k]] = if i < stroke / 2 { 1 } else { 2 };
+            }
+        }
+    }
+    let (samples, _) = blockflow::ops::gather_samples(&stack, &input, &labels.into(), 0).unwrap();
+
+    // Every feature comes from the constant 0.25 region, so nothing is large.
+    // A gather that read the whole volume would have pulled 1e12 into the
+    // windows of the voxels near the edge of the stroke.
+    let largest = (0..samples.rows())
+        .flat_map(|row| samples.row(row).iter().copied())
+        .fold(0.0f64, |worst, value| worst.max(value.abs()));
+    assert!(
+        largest < 1.0e6,
+        "a feature reached {largest:e}, so the gather read past the labels' \
+         neighbourhood into the region that is only there to be noticed"
+    );
+}
+
+/// **Are a forest's splits stable if the feature stack is `f32`?**
+///
+/// `docs/design/pixel-classification.md` lists this as unmeasured and both
+/// reference tools store their stacks at single precision, so it is the obvious
+/// way to halve the 91 live buffers a predictor's fan-in holds. What it risks is
+/// specific: a forest's thresholds are midpoints between observed values, and a
+/// feature that rounds across its threshold sends that voxel down the other
+/// branch.
+///
+/// The measurement is a disagreement rate — how many voxels a forest classifies
+/// differently when its features are put through `f32` and back. It is asserted
+/// as a ceiling rather than reported, because the number is what decides whether
+/// the change is safe and a ceiling is what a regression would break.
+///
+/// **Why it is small, and why that is not luck.** A threshold sits at the
+/// midpoint of two *adjacent* observed values, so the distance from a feature to
+/// the nearest threshold it could cross is on the order of the gap between
+/// neighbouring samples — around `1/n` of the feature's range for `n` rows.
+/// `f32` perturbs by `6e-8` relative. A voxel flips only when it lands within
+/// that of a threshold, which is a vanishing fraction of them, and it flips to a
+/// class the forest was very nearly going to give it anyway.
+#[test]
+fn a_forest_is_stable_when_its_features_are_narrowed_to_f32() {
+    let train = separable_with(600, 8, 3, 1.5);
+    let test = separable_with(2000, 8, 999, 1.5);
+    let forest = Forest::train(&train, &TrainingSpec::default()).unwrap();
+    let mut scratch = vec![0.0f32; forest.classes()];
+
+    let mut narrowed = Vec::with_capacity(test.columns());
+    let mut disagreements = 0usize;
+    for row in 0..test.rows() {
+        let full = forest.predict(test.row(row), &mut scratch);
+        narrowed.clear();
+        narrowed.extend(test.row(row).iter().map(|&value| value as f32 as f64));
+        if forest.predict(&narrowed, &mut scratch) != full {
+            disagreements += 1;
+        }
+    }
+    let rate = disagreements as f64 / test.rows() as f64;
+    println!(
+        "f32 features: {disagreements} of {} classifications change ({:.4}%)",
+        test.rows(),
+        100.0 * rate
+    );
+    assert!(
+        rate < 0.005,
+        "narrowing the features to f32 changed {:.2}% of classifications, which is more \
+         than the rounding argument predicts and would make the memory saving a trade \
+         rather than a free one",
+        100.0 * rate
+    );
+
+    // **The control, and it is what makes a rate of zero mean something.** A test
+    // that only ever compares two precisions cannot distinguish "this forest is
+    // insensitive to precision" from "this harness cannot see a change at all".
+    // So the same forest is fed features quantised coarsely enough that it must
+    // visibly disagree.
+    //
+    // The step is 1/32 and not something finer for a measured reason: at 1/512
+    // it moved only 3 classifications of 2000, which is too few to establish
+    // anything, and the first version of this control asserted against that and
+    // failed. The gap between neighbouring samples on a 600-row fixture is
+    // around 1/600 of the range, so a quantisation has to be coarser than that
+    // before it starts crossing thresholds in quantity — which is the same
+    // arithmetic that explains why `f32`, at 6e-8, crosses none.
+    let mut coarse_disagreements = 0usize;
+    for row in 0..test.rows() {
+        let full = forest.predict(test.row(row), &mut scratch);
+        narrowed.clear();
+        narrowed.extend(
+            test.row(row)
+                .iter()
+                .map(|&value| (value * 32.0).round() / 32.0),
+        );
+        if forest.predict(&narrowed, &mut scratch) != full {
+            coarse_disagreements += 1;
+        }
+    }
+    println!(
+        "control, quantised to 1/32: {coarse_disagreements} of {} change",
+        test.rows()
+    );
+    assert!(
+        coarse_disagreements >= 20,
+        "quantising to 1/32 changed only {coarse_disagreements} classifications, so this \
+         harness cannot see a precision change and the rate above is not evidence"
+    );
+    assert!(
+        coarse_disagreements > 10 * disagreements,
+        "f32 and a 1/32 quantisation are indistinguishable here"
+    );
+}

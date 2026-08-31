@@ -46,6 +46,7 @@ use crate::error::{Error, Result};
 use crate::forest::{Forest, Samples, TrainingSpec};
 use crate::op::{Anchor, Chain, Combine, Slicing};
 use crate::ops::features::FeatureStack;
+use crate::region::Region;
 use crate::voxels::Voxels;
 
 /// What the predictor writes.
@@ -405,23 +406,40 @@ impl ClassMap {
 /// **Gather training rows**: run the feature stack, and take one row at every
 /// voxel whose label is not `unlabelled`.
 ///
-/// # What this does and does not do
+/// # It computes the stack over the labels' neighbourhood, not the volume
 ///
-/// It computes the whole stack over the whole volume handed to it, then keeps
-/// the rows at the labelled voxels. For the workload this is built for — a few
-/// thousand brush-stroke voxels in a volume of `10^9` — that is enormously more
-/// work than the rows require, and it is the right thing anyway *at the size a
-/// caller trains on*: an annotator draws on a crop, and the crop is what is
-/// passed here.
+/// Labels are sparse by construction — a few thousand brush-stroke voxels — and
+/// a feature at a voxel depends only on the voxels within the chain's reach of
+/// it. So the stack is computed over the **bounding box of the labelled voxels,
+/// grown by that reach and clamped to the volume**, and nothing outside it is
+/// touched.
 ///
-/// **What it is not is a whole-volume training path**, and the honest statement
-/// is that this crate does not have one yet. The shape it wants is a sampler as
-/// a phase side output — labels are already a `Chain::source` arm away, and
-/// `BlockOp::apply_side` already emits per-block fragments that
-/// `ops::rows` collects — so a block containing no labelled voxel could be
-/// skipped entirely, which is nearly every block. That is a piece of work with a
-/// clear design and it is not this function; see
-/// `docs/design/pixel-classification.md`.
+/// **The rows are bit-identical to what the whole volume would have given**, and
+/// that is a property rather than an approximation. Two cases and both are
+/// exact: a labelled voxel at least `reach` inside the crop reads only voxels
+/// the crop holds, and one whose neighbourhood runs past the crop has a crop
+/// edge that *is* the volume edge — because the box was grown by the full reach
+/// before clamping — so it meets the same boundary rule it would have met
+/// anyway. `tests/forest_predict.rs` asserts the equality rather than arguing
+/// it.
+///
+/// For a stroke drawn in one corner of a large volume this is the difference
+/// between the work being proportional to the labels and proportional to the
+/// array. For labels scattered to opposite corners the box is the volume again,
+/// and the honest statement is that this is a crop, not a sparse traversal.
+///
+/// # What is still missing, stated accurately
+///
+/// A genuinely sparse path would compute the stack only in the blocks holding
+/// labels, and skip the rest — which for a whole-volume annotation is nearly all
+/// of them. It does **not** fall out of the fragment machinery the way an
+/// earlier note in `docs/design/pixel-classification.md` claimed: a side output
+/// is a [`BlockOp`](crate::op::BlockOp) feature, and the sink of the feature
+/// stack is a [`Combine`], which has no `apply_side` and no `side_outputs`. The
+/// fan-in's sink is the only place where all 91 channels exist at one voxel, so
+/// the sampler has to live there, and giving `Combine` the same side-output pair
+/// `BlockOp` has is the change that would allow it. That is a contained
+/// extension and it is not this function.
 pub fn gather_samples(
     stack: &FeatureStack,
     input: &Voxels,
@@ -434,25 +452,39 @@ pub fn gather_samples(
             got: labels.shape().to_vec(),
         });
     }
-    let shape = input.shape();
+    let volume = input.shape();
     let names = stack.channel_names()?;
     let channels = stack.branches()?;
 
-    // One arm at a time, so the peak is one feature image and not ninety-one.
-    // This is the same fusion argument the block executor makes, taken here
-    // because a training crop is small enough to hold whole but a stack over it
-    // is not.
+    // The box the labels actually occupy, grown by what a feature reads. See
+    // this function's header for why the rows this yields are the whole
+    // volume's rows and not an approximation of them.
+    let label_view = labels.view::<u32>()?;
+    let reach = stack.reach(volume)?;
+    let Some((start, extent)) = labelled_extent(label_view, unlabelled, reach, volume) else {
+        return Err(Error::InvalidArgument(format!(
+            "no voxel of the label volume differs from {unlabelled}, so there is nothing \
+             to fit"
+        )));
+    };
+
+    // `slice_region` and not a copy written here: it is the crate's own sub-box
+    // copy, generic over the element type, and a second one would be a second
+    // chance to get the striding wrong.
+    let cropped_input = input.slice_region(&Region::new(&start, &extent))?;
     let mut columns: Vec<Vec<f64>> = Vec::with_capacity(channels.len());
     for arm in &channels {
-        let mut out = Voxels::zeros(arm.produces(input.dtype())?, shape)?;
-        arm.apply(input, &mut out, &Anchor::whole(shape))?;
+        // One arm at a time, so the peak is one feature image and not
+        // ninety-one. The same fusion argument the block executor makes, taken
+        // here because a training crop is small enough to hold whole but a stack
+        // over it is not.
+        let mut out = Voxels::zeros(arm.produces(cropped_input.dtype())?, extent)?;
+        arm.apply(&cropped_input, &mut out, &Anchor::whole(extent))?;
         let view = out.view::<f64>()?;
         columns.push(view.iter().copied().collect());
     }
 
-    let labels = labels.view::<u32>()?;
-    let flat: Vec<u32> = labels.iter().copied().collect();
-    let mut distinct: Vec<u32> = flat
+    let mut distinct: Vec<u32> = label_view
         .iter()
         .copied()
         .filter(|&label| label != unlabelled)
@@ -470,14 +502,20 @@ pub fn gather_samples(
 
     let mut features = Vec::new();
     let mut rows = Vec::new();
-    for (at, &label) in flat.iter().enumerate() {
-        if label == unlabelled {
-            continue;
+    for i in 0..extent[0] {
+        for j in 0..extent[1] {
+            for k in 0..extent[2] {
+                let label = label_view[[start[0] + i, start[1] + j, start[2] + k]];
+                if label == unlabelled {
+                    continue;
+                }
+                let at = (i * extent[1] + j) * extent[2] + k;
+                for column in &columns {
+                    features.push(column[at]);
+                }
+                rows.push(distinct.iter().position(|&found| found == label).unwrap() as u32);
+            }
         }
-        for column in &columns {
-            features.push(column[at]);
-        }
-        rows.push(distinct.iter().position(|&found| found == label).unwrap() as u32);
     }
     Ok((
         Samples::new(features, rows, names)?,
@@ -501,4 +539,41 @@ pub fn train_workflow(
 ) -> Result<(Forest, ClassMap)> {
     let (samples, classes) = gather_samples(stack, input, labels, unlabelled)?;
     Ok((Forest::train(&samples, spec)?, classes))
+}
+
+/// The bounding box of the voxels whose label is not `unlabelled`, grown by
+/// `reach` on every side and clamped to the volume.
+///
+/// `None` when nothing is labelled. The growth is what makes the crop's rows the
+/// whole volume's rows; see [`gather_samples`].
+fn labelled_extent(
+    labels: ndarray::ArrayView3<'_, u32>,
+    unlabelled: u32,
+    reach: [usize; 3],
+    volume: [usize; 3],
+) -> Option<([usize; 3], [usize; 3])> {
+    let mut low = [usize::MAX; 3];
+    let mut high = [0usize; 3];
+    let mut any = false;
+    for ((i, j, k), &label) in labels.indexed_iter() {
+        if label == unlabelled {
+            continue;
+        }
+        any = true;
+        for (axis, at) in [i, j, k].into_iter().enumerate() {
+            low[axis] = low[axis].min(at);
+            high[axis] = high[axis].max(at);
+        }
+    }
+    if !any {
+        return None;
+    }
+    let mut start = [0usize; 3];
+    let mut extent = [0usize; 3];
+    for axis in 0..3 {
+        start[axis] = low[axis].saturating_sub(reach[axis]);
+        let end = (high[axis] + reach[axis] + 1).min(volume[axis]);
+        extent[axis] = end - start[axis];
+    }
+    Some((start, extent))
 }

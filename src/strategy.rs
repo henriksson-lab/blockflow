@@ -2832,6 +2832,7 @@ pub fn planned_block(
         writes_an_image: true,
         // A run of chain slots is a pixel phase: it reads and computes once.
         repeats: 1,
+        chain_buffers: super::decomposition::resident_buffers_of(&slots, &group),
     };
     let mut candidates = constraints.block_candidates.clone();
     candidates.sort_unstable_by(|a, b| b.cmp(a));
@@ -3894,6 +3895,7 @@ impl PhasePricer<'_> {
             // the image after it — once, having read and computed once.
             writes_an_image: true,
             repeats: 1,
+            chain_buffers: super::decomposition::resident_buffers_of(self.slots, &group),
         };
         // One function with the sweep below and with `crate::arena`, so that
         // "what the search minimises" is one expression in the crate.
@@ -4630,6 +4632,7 @@ fn phase_for_group(
         images_read: super::decomposition::images_read_by(slots, group, volume)?,
         writes_an_image: true,
         repeats: 1,
+        chain_buffers: super::decomposition::resident_buffers_of(slots, group),
     };
     let mut grid = None;
     let mut halo = reach.clone();

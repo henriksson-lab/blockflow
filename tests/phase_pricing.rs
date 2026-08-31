@@ -587,6 +587,9 @@ fn the_pool_is_charged_for_the_workers_that_contend_with_each_other() {
             images_read: 1,
             writes_an_image: true,
             repeats: 1,
+            // A single op holds nothing of its own; see
+            // `Chain::resident_block_buffers`.
+            chain_buffers: 0,
         },
     );
 

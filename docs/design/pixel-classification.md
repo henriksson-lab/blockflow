@@ -307,17 +307,73 @@ but the neighbourhood features can separate them.
 
 ### Still open
 
-* **The sparse training path.** `gather_samples` computes the whole stack over
-  the whole volume it is handed and then keeps the labelled rows. That is right
-  for a crop, which is what an annotator draws on, and wrong for a whole volume.
-  The shape it wants is a sampler as a phase **side output**: labels are a
-  `Chain::source` arm away, `BlockOp::apply_side` already emits per-block
-  fragments and `ops::rows` already collects them, so a block holding no labelled
-  voxel could be skipped — which is nearly every block.
-* **The predictor's residency**, still unmeasured through the allocator. It
-  cannot declare a `fold_carrier`, so its fan-in holds one buffer per arm where
-  `budget.rs` charges for two in total. `tests/working_set_residency.rs` is the
-  harness.
+* **The sparse training path**, half done and with the other half re-scoped
+  after the first plan turned out not to work.
+
+  `gather_samples` now computes the stack over the **bounding box of the labelled
+  voxels grown by the chain's reach**, clamped to the volume, rather than over
+  the whole array. The rows it yields are bit-identical to the whole volume's —
+  a labelled voxel either sits a full reach inside the crop, or has a crop edge
+  that *is* the volume edge and therefore meets the same boundary rule — and
+  `tests/forest_predict.rs` asserts the equality at both placements rather than
+  arguing it, alongside a test that the crop is still a crop. For a stroke drawn
+  in one corner the work is now proportional to the labels; for labels scattered
+  to opposite corners the box is the volume again, and the honest word for this
+  is a crop, not a sparse traversal.
+
+  **The fragment plan this document previously named does not work**, and the
+  correction is worth keeping. It said the sampler wants to be a phase side
+  output, with `BlockOp::apply_side` emitting per-block fragments for `ops::rows`
+  to collect. But a side output is a `BlockOp` feature and the sink of the
+  feature stack is a `Combine`, which has neither `apply_side` nor
+  `side_outputs` — and the sink is the only place where all 91 channels exist at
+  one voxel, so that is where the sampler has to live. The change that would
+  allow it is giving `Combine` the same side-output pair `BlockOp` has;
+  `Chain::side_outputs` already unions over a `Parallel`'s branches and would
+  need to include the combine's. Contained, and a real piece of work rather than
+  a consequence of machinery that already exists.
+* ~~**The predictor's residency**, still unmeasured through the allocator.~~
+  **Measured, and a derivation now exists for it.** Through a global allocator, a
+  fan-in whose combine cannot fold holds **exactly `1.000` block buffers per
+  arm** — least squares over arities 2, 6, 12 and 24, with a folding control flat
+  at 4.1 across the same range. At 91 arms that is 93 buffers where the budget
+  charges 2: a **46.5x** under-charge, in the direction that admits a plan which
+  then exhausts memory.
+
+  `Chain::resident_block_buffers` is the shape-derived figure `budget.rs` had
+  been naming without having, and `tests/working_set_residency.rs` holds it to
+  the allocator as an **equality** over fourteen shapes. Deriving it turned up
+  one rule no argument had produced: a `Chain::Source` at the head of a sequence
+  allocates no intermediate, because it *is* the fetched buffer — `[source, map]`
+  holds what `[map, map]` holds, and counting both would have charged it one too
+  many.
+
+  **And the budget now charges it.** `price_phase`'s working set was a literal
+  `x 2.0`; it is now `images_read + writes_an_image + chain_buffers`, which is
+  exactly 2 for the one-in-one-out phase the formula was written for — so that
+  case did not move — and the truth for everything else. At 91 arms the budget
+  charges 93 units where the allocator measures 93 held.
+
+  **Where the count lives was the design question, and the first answer was
+  wrong.** A field on `PhaseDecomposition` with a `declare`/`check` pair, the
+  arrangement `dtype` and `source_images` have, looked right and is not: those
+  two have meaningful neutral defaults — "unchanged", "no source arms" — and a
+  buffer count has none, so `check` must refuse every plan that did not declare,
+  which invalidated eighteen test files' hand-built plans at a stroke. The
+  quantity is a function of the chain, every caller that prices a budget already
+  holds the chain, and nothing reads `working_set_bytes_per_block` except
+  `Constraints::affords_working_set`. So it is derived at the price sites like
+  `compute_per_voxel`, not recorded like `source_images`, and no plan needs to
+  change.
+
+  **What moved, in the end**: nothing in `costs/` — every committed scenario
+  plans and transfers as before — and two library fixtures whose budgets had been
+  tuned against the old charge. Both hold `Chain::sequence` chains, whose honest
+  charge is exactly twice the old one, so both needed exactly twice the budget.
+  One of them reproduces a consumer's own numbers, and the useful form of that
+  finding is: a caller who had tuned 4 MiB for that work needs 8 MiB to plan it —
+  not because the run got bigger, but because it was always holding four buffers
+  and the budget was told it held two.
 * ~~**`smartcore` as an agreement oracle.**~~ **Done**, as a dev-dependency, and
   the comparison is on held-out accuracy rather than on predictions. Voxel-for-
   voxel agreement was the wrong thing to ask for and it is worth saying why: two
@@ -329,16 +385,25 @@ but the neighbourhood features can separate them.
   column) all show as a systematic gap in accuracy rather than as rounding. The
   fixture is deliberately non-separable, because on a separable one both score
   1.000 and the test would pass for anything.
-* **`f32` for the feature stack**, still unmeasured, and the reason to answer it
-  has changed shape. It was proposed as a memory saving, and as a memory saving
-  it is now the *more* attractive of the two halves: the 91 channels are 91 live
-  buffers in the predictor's fan-in — the residency item above — and halving each
-  is halving that. What it is not is a speed question. The stack declares 17,182
-  against the predictor's 6,298, so it is about **2.7 times** the predictor's
-  cost and the two are within an order of magnitude of each other; narrowing the
-  channels does not change the arithmetic in either op, and the precision
-  question — whether a forest's splits are stable at `f32` — is a separate
-  measurement that has to be taken before the memory saving can be banked.
+* ~~**`f32` for the feature stack**, still unmeasured.~~ **Measured: the splits
+  are stable.** A forest fitted at full precision and then fed the same features
+  put through `f32` and back changes **0 of 2000** classifications. The control
+  in the same test — the same features quantised to 1/32 — changes 46, so the
+  harness can see a precision change and is not merely blind.
+
+  The reason is arithmetic rather than luck, and it is worth keeping because it
+  says when the result would *stop* holding. A threshold sits at the midpoint of
+  two adjacent observed values, so the distance from a feature to the nearest
+  threshold it could cross is about `1/n` of its range for `n` training rows.
+  `f32` perturbs by `6e-8` relative. A voxel flips only if it lands within that
+  of a threshold — and if it does, it flips to a class the forest was on the edge
+  of giving it anyway. A forest fitted to millions of rows rather than thousands
+  would narrow those gaps and is where this would want re-measuring.
+
+  So the change is available and it is worth taking for what it does to the
+  *residency* rather than to speed: the predictor's fan-in holds 91 live block
+  buffers, and at `f32` each is half the size. It does not change either op's
+  arithmetic, which is done in `f64` regardless.
 
 ## Risks, named
 

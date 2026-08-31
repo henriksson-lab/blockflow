@@ -181,9 +181,13 @@ fn map(name: &'static str) -> Chain {
 }
 
 /// What the budget charges for one block of a phase reading `images_read`
-/// images, at zero reach so that the resident extent is exactly the block and
-/// the arithmetic is transparent: `block_voxels x 8 x 2`.
-fn charged(images_read: usize) -> f64 {
+/// images and holding `chain_buffers` of its own, at zero reach so that the
+/// resident extent is exactly the block and the arithmetic is transparent:
+/// `block_voxels x 8 x (images_read + 1 + chain_buffers)`.
+///
+/// The last term is the one this file's measurements put there. It used to be a
+/// literal `2.0` and the table below used to be a record of how wrong that was.
+fn charged(images_read: usize, chain_buffers: usize) -> f64 {
     let grid = BlockGrid::along(VOLUME, &[0], BLOCK[0]).expect("a lattice");
     price_phase(
         &grid,
@@ -199,6 +203,7 @@ fn charged(images_read: usize) -> f64 {
             writes_an_image: true,
             // A pixel phase reads and computes once.
             repeats: 1,
+            chain_buffers,
         },
     )
     .working_set_bytes_per_block
@@ -281,13 +286,34 @@ fn fan_in(computed: usize, sources: &[ImageId]) -> Chain {
     Chain::parallel(branches, Box::new(LogicCombine::new("or", Logic::Or))).expect("a fan-in")
 }
 
-/// **The budget under-charges every phase that reads more than one image, and by
-/// how much is not a constant.**
+/// **What a block holds, and what the budget now charges for it: the same
+/// number.**
 ///
 /// Each row is one `apply` of one `64^3` block, measured through the allocator,
-/// against `working_set_bytes_per_block` for the same block and the same
-/// `images_read`. The unit is one `f64` block buffer — 2 MiB — because that is
-/// what the formula's `x 2.0` counts and it makes the ratio readable.
+/// against `working_set_bytes_per_block` priced for the same block, the same
+/// `images_read` and the same `Chain::resident_block_buffers`. The unit is one
+/// `f64` block buffer — 2 MiB.
+///
+/// **This test used to assert the opposite.** Its title was "the budget
+/// under-charges every phase that reads more than one image, and by how much is
+/// not a constant", and its assertions were that every row held *more* than it
+/// was charged and that the excess varied enough not to be absorbable into a
+/// margin. Both were true and both were the point: the formula was a literal
+/// `x 2.0`, `budget.rs` recorded the gap as known "rather than half-fixed", and
+/// this file was the measurement it was waiting on.
+///
+/// What closed it was measuring a shape nobody had: a fan-in whose combine
+/// cannot declare a `fold_carrier` holds one block buffer **per arm**, so the
+/// 91-arm feature stack of `docs/design/pixel-classification.md` held 93 where
+/// the budget charged 2. A 46.5x under-charge, in the direction that admits a
+/// plan the run cannot afford, is not a gap a margin absorbs.
+/// `Chain::resident_block_buffers` derives the count from the chain's shape,
+/// `Decomposition::declare_resident_buffers` records it on the plan and
+/// `check_resident_buffers` refuses a plan that under-states it, and
+/// `price_phase` now charges it.
+///
+/// So the rows below are an **equality**, and the fractional slack is the small
+/// `Vec` spines and op scratch that are not block buffers and never were.
 #[test]
 fn what_a_block_holds_against_what_the_budget_charges_for_it() {
     let unit = buffer_bytes() as f64;
@@ -355,7 +381,8 @@ fn what_a_block_holds_against_what_the_budget_charges_for_it() {
     let mut rows = Vec::new();
     for (name, chain, sources, images_read) in &cases {
         let held = measure(chain, sources).0 as f64;
-        let charge = charged(*images_read);
+        // The chain's own count, from its shape — the term the formula gained.
+        let charge = charged(*images_read, chain.resident_block_buffers());
         eprintln!(
             "{name:<26} {:>7.2}x {:>7.2}x {:>7.2}x",
             held / unit,
@@ -398,34 +425,31 @@ fn what_a_block_holds_against_what_the_budget_charges_for_it() {
         three.1, seven.1
     );
 
-    // Every other shape holds more than it is charged for, and the excess is not
-    // a constant — which is the property that matters. A fixed factor could be
-    // absorbed into the budget; a factor that varies with the phase's shape
-    // cannot, because the planner compares candidates across shapes.
-    let mut ratios = Vec::new();
-    for (name, held, charge) in &rows[1..] {
+    // And every shape is now charged what it holds. A ratio, not a difference,
+    // so the tolerance is meaningful at every block size.
+    let mut widest = 1.0f64;
+    for (name, held, charge) in &rows {
+        let ratio = held / charge;
         assert!(
-            held > charge,
-            "{name} was expected to hold more than it is charged: {held} against {charge}"
+            (ratio - 1.0).abs() < 0.05,
+            "{name} holds {held} and is charged {charge} — a ratio of {ratio:.3}. The \
+             budget is meant to charge what a block holds; a gap here is either a shape \
+             `Chain::resident_block_buffers` does not know about or a term `price_phase` \
+             has stopped counting."
         );
-        ratios.push(held / charge);
+        widest = widest.max(ratio);
     }
-    let widest = ratios.iter().copied().fold(f64::NEG_INFINITY, |a, b| {
-        if a.total_cmp(&b).is_gt() {
-            a
-        } else {
-            b
-        }
-    });
-    let narrowest =
-        ratios.iter().copied().fold(
-            f64::INFINITY,
-            |a, b| if a.total_cmp(&b).is_lt() { a } else { b },
-        );
     assert!(
-        widest - narrowest > 0.5,
-        "the under-charge is nearly constant across shapes ({narrowest:.2}x to {widest:.2}x), \
-         which would make it absorbable into the budget and this whole review unnecessary"
+        rows.len() >= 8,
+        "only {} shapes measured, which is too few to say the formula is right in general",
+        rows.len()
+    );
+    // The residual is slack in the harness, not in the model: it is small `Vec`
+    // spines and op scratch. If it ever reached a whole buffer it would be a
+    // shape being missed.
+    assert!(
+        widest < 1.05,
+        "the widest over-hold is {widest:.3}, which is approaching a whole buffer"
     );
 }
 
@@ -1230,5 +1254,419 @@ fn a_margin_never_moves_the_admitted_block_by_more_than_eight_times_in_volume() 
         "a margin of 64.0 — two full rungs — moved the admitted block by at most \
          {worst_when_doubled_past:.3}x in volume, so the 8x assertion above cannot distinguish a margin \
          that is within the arithmetic from one that is not"
+    );
+}
+
+// -------------------------------------------- the arity a fold cannot hide --
+
+/// **What a fan-in holds when its combine is not a fold**, which is the shape
+/// `docs/design/pixel-classification.md` puts 91 arms into.
+///
+/// Every fan-in measured above is joined by a `LogicCombine`, which declares a
+/// [`Combine::fold_carrier`] and is therefore folded branch by branch: it holds
+/// three block buffers whatever its arity, and the table says so. That is the
+/// happy case and it is not the case a feature stack is in. A random forest
+/// walks a tree per voxel and needs **every channel at that voxel at once**,
+/// which is the definition of not being a left fold over pairs, so
+/// `ops::classify::ForestPredictor` answers `None` and its fan-in must hold one
+/// buffer per arm.
+///
+/// The budget cannot see any of this: `working_set_bytes_per_block` is
+/// `resident_voxels x bytes_per_voxel x 2.0` for every phase reading one image,
+/// so a 2-arm fan-in and a 91-arm one are charged **identically**. The
+/// `budget.rs` table records the gap at `1.00x` to `3.56x` over the shapes it
+/// has measured; this is the same gap at an arity two orders of magnitude past
+/// any of them.
+///
+/// # What is asserted, and why it is a slope rather than a row at 91
+///
+/// The arities run to 24 and not to 91 deliberately: 91 `64^3` `f64` buffers is
+/// 182 MiB, and `.github/workflows/ci.yml` records this suite's peak RSS as 128
+/// MB and reasons about the runner from it. Raising the whole suite's ceiling by
+/// a third to measure a straight line at its far end is a poor trade, so the
+/// line is measured over four points and its slope is what the claim is made
+/// about — with the 91-arm figure stated as the extrapolation it is.
+#[test]
+fn a_fan_in_that_cannot_fold_holds_one_buffer_per_arm_and_the_budget_charges_for_them() {
+    use std::sync::Arc;
+
+    use blockflow::forest::{Forest, Node};
+    use blockflow::ops::{ForestPredictor, Prediction};
+
+    let unit = buffer_bytes() as f64;
+
+    /// A forest that names `arity` channels and decides on the first one. It is
+    /// the *arity* that matters here — the walk itself allocates two small
+    /// `Vec`s per call and nothing block-sized — so the smallest forest with a
+    /// decision in it is the right fixture.
+    fn stump(arity: usize) -> Arc<Forest> {
+        Arc::new(
+            Forest::new(
+                vec![Node::split(0, 0.5, 1, 2), Node::leaf(0), Node::leaf(2)],
+                vec![0],
+                vec![1.0, 0.0, 0.0, 1.0],
+                2,
+                (0..arity).map(|index| format!("c{index}")).collect(),
+            )
+            .expect("a stump"),
+        )
+    }
+
+    let mut folding = Vec::new();
+    let mut standing = Vec::new();
+    for arity in [2usize, 6, 12, 24] {
+        let arms = || -> Vec<Chain> { (0..arity).map(|_| map("arm")).collect() };
+
+        // The folding control: the same arms, joined by a combine that declares
+        // a carrier. Without this row a growing figure below would be evidence
+        // about `Chain::Parallel` in general rather than about the declaration.
+        let (peak, _, spines) = measure(&fan_in_of(arms(), &[]), &[]);
+        let folded = (peak - spines - preamble_bytes(&fan_in_of(arms(), &[]))) as f64 / unit;
+
+        // `Probability` and not `Label` so the output is `f64` and the harness's
+        // block arithmetic is unchanged; the two differ in one line of the
+        // predictor and in nothing this measures.
+        let build = || {
+            Chain::parallel(
+                arms(),
+                Box::new(
+                    ForestPredictor::new(
+                        "classify",
+                        stump(arity),
+                        Prediction::Probability { class: 0 },
+                    )
+                    .expect("a predictor"),
+                ),
+            )
+            .expect("a fan-in")
+        };
+        let (peak, _, spines) = measure(&build(), &[]);
+        let held = (peak - spines - preamble_bytes(&build())) as f64 / unit;
+
+        println!("{arity:>3} arms: folding {folded:>6.2}x, not folding {held:>6.2}x");
+        folding.push((arity as f64, folded));
+        standing.push((arity as f64, held));
+    }
+
+    // **The fold is flat in the arity** — that is the property it exists for.
+    let folded_spread = folding
+        .iter()
+        .map(|&(_, held)| held)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - folding
+            .iter()
+            .map(|&(_, held)| held)
+            .fold(f64::INFINITY, f64::min);
+    assert!(
+        folded_spread < 0.6,
+        "a folding fan-in moved by {folded_spread:.2} units across a twelve-fold range of \
+         arities, so it is not folding and the comparison below means nothing"
+    );
+
+    // **The non-folding one is a straight line of slope one**: one block buffer
+    // per arm. Least squares over the four points, so a single noisy row cannot
+    // carry the claim.
+    let mean_x = standing.iter().map(|&(x, _)| x).sum::<f64>() / standing.len() as f64;
+    let mean_y = standing.iter().map(|&(_, y)| y).sum::<f64>() / standing.len() as f64;
+    let slope = standing
+        .iter()
+        .map(|&(x, y)| (x - mean_x) * (y - mean_y))
+        .sum::<f64>()
+        / standing
+            .iter()
+            .map(|&(x, _)| (x - mean_x).powi(2))
+            .sum::<f64>();
+    let intercept = mean_y - slope * mean_x;
+    println!("not folding: {slope:.3} buffers per arm + {intercept:.2}");
+    assert!(
+        (slope - 1.0).abs() < 0.15,
+        "a fan-in that cannot fold grew by {slope:.3} block buffers per arm; the claim \
+         `docs/design/pixel-classification.md` rests on is one"
+    );
+
+    // **And the budget now follows it, arm for arm.** This is what the test
+    // exists to hold: the figure the allocator measures and the figure
+    // `price_phase` charges move together, at every arity.
+    //
+    // It used to assert the opposite — that the charge stayed at two units
+    // however many arms there were — because that was true and was the defect.
+    // A 91-arm stack held 93 buffers and was charged 2.
+    for arity in [2usize, 6, 12, 24] {
+        let charge = charged(1, arity) / unit;
+        assert!(
+            (charge - (2 + arity) as f64).abs() < 1e-9,
+            "at {arity} arms the budget charges {charge:.2} units where the chain holds \
+             {} — the phase's own two plus one per arm",
+            2 + arity
+        );
+    }
+
+    // The extrapolation the design document's memory arithmetic rests on, now
+    // that the budget agrees with it: 93 units for the 91-arm stack, against the
+    // 2 it was charged before.
+    let extrapolated = slope * 91.0 + intercept;
+    let charged_now = charged(1, 91) / unit;
+    println!("91 arms: {extrapolated:.0} units held, {charged_now:.0} charged");
+    assert!(
+        (extrapolated - charged_now).abs() < 2.0,
+        "the measured line extrapolates to {extrapolated:.1} units at 91 arms and the \
+         budget charges {charged_now:.1}; these are the same quantity and must agree"
+    );
+    assert!(
+        charged_now > 20.0 * charged(1, 0) / unit,
+        "the corrected charge is not the order of magnitude this test is about"
+    );
+}
+
+/// **The shape-derived figure against the allocator, shape by shape.**
+///
+/// `Chain::resident_block_buffers` claims to predict, from a chain's structure
+/// alone, exactly what the table above measures. This is that claim checked as
+/// an **equality** for every shape in this file — not a bound, because a
+/// derivation that were merely conservative would drift silently until it was
+/// useless, and the whole point of it is to replace a figure that was wrong by
+/// 47x with one that is right.
+///
+/// The accounting, stated so a failure can be read:
+///
+/// ```text
+/// held = 2                          the phase's own input and output
+///      + sources                    one buffer per source image, the executor's
+///      + resident_block_buffers()   what the chain holds inside itself
+/// ```
+///
+/// The first two terms are what `working_set_bytes_per_block` already covers or
+/// could; the third is the one nothing could see.
+#[test]
+fn the_shape_derived_residency_is_what_the_allocator_measures() {
+    use std::sync::Arc;
+
+    use blockflow::forest::{Forest, Node};
+    use blockflow::ops::{ForestPredictor, Prediction};
+
+    let unit = buffer_bytes() as f64;
+    let one = ImageId::from(7usize);
+    let two = ImageId::from(8usize);
+
+    fn predictor(arity: usize) -> Box<dyn blockflow::op::Combine> {
+        Box::new(
+            ForestPredictor::new(
+                "classify",
+                Arc::new(
+                    Forest::new(
+                        vec![Node::split(0, 0.5, 1, 2), Node::leaf(0), Node::leaf(2)],
+                        vec![0],
+                        vec![1.0, 0.0, 0.0, 1.0],
+                        2,
+                        (0..arity).map(|index| format!("c{index}")).collect(),
+                    )
+                    .expect("a stump"),
+                ),
+                Prediction::Probability { class: 0 },
+            )
+            .expect("a predictor"),
+        )
+    }
+
+    let cases: Vec<(&str, Chain, Vec<ImageId>)> = vec![
+        ("one in, one out", map("only"), vec![]),
+        (
+            "sequence of two maps",
+            Chain::sequence(vec![map("a"), map("b")]),
+            vec![],
+        ),
+        (
+            "sequence of three maps",
+            Chain::sequence(vec![map("a"), map("b"), map("c")]),
+            vec![],
+        ),
+        (
+            "sequence of four maps",
+            Chain::sequence(vec![map("a"), map("b"), map("c"), map("d")]),
+            vec![],
+        ),
+        ("fan-in, 2 computed arms", fan_in(2, &[]), vec![]),
+        ("fan-in, 3 computed arms", fan_in(3, &[]), vec![]),
+        ("fan-in, 7 computed arms", fan_in(7, &[]), vec![]),
+        ("fan-in, 1 arm + 1 source", fan_in(1, &[one]), vec![one]),
+        (
+            "fan-in, 1 arm + 2 sources",
+            fan_in(1, &[one, two]),
+            vec![one, two],
+        ),
+        (
+            "fan-in, 2 source arms",
+            fan_in(0, &[one, two]),
+            vec![one, two],
+        ),
+        (
+            "sequence from a source",
+            Chain::sequence(vec![Chain::source(one, Dtype::F64), map("after")]),
+            vec![one],
+        ),
+        // The shapes the fold exists for: a combine that cannot fold.
+        (
+            "unfoldable fan-in, 2 arms",
+            Chain::parallel((0..2).map(|_| map("arm")).collect(), predictor(2)).unwrap(),
+            vec![],
+        ),
+        (
+            "unfoldable fan-in, 9 arms",
+            Chain::parallel((0..9).map(|_| map("arm")).collect(), predictor(9)).unwrap(),
+            vec![],
+        ),
+        // And a nested one, because `max` over branches is a rule no flat shape
+        // can distinguish from `ignore the branches`.
+        (
+            "unfoldable fan-in of sequences",
+            Chain::parallel(
+                (0..3)
+                    .map(|_| Chain::sequence(vec![map("a"), map("b"), map("c")]))
+                    .collect(),
+                predictor(3),
+            )
+            .unwrap(),
+            vec![],
+        ),
+    ];
+
+    println!(
+        "{:<34} {:>8} {:>8} {:>8}",
+        "phase shape", "held", "derived", "agree"
+    );
+    let mut checked = 0;
+    for (name, chain, sources) in &cases {
+        let (peak, _, spines) = measure(chain, sources);
+        let held = (peak - spines - preamble_bytes(chain)) as f64 / unit;
+        let derived = 2 + sources.len() + chain.resident_block_buffers();
+        println!(
+            "{name:<34} {held:>7.2}x {derived:>7}x {:>8}",
+            if (held - derived as f64).abs() < 0.2 {
+                "yes"
+            } else {
+                "NO"
+            }
+        );
+        assert!(
+            (held - derived as f64).abs() < 0.2,
+            "{name}: the allocator says {held:.2} block buffers and the shape-derived \
+             figure says {derived}. The fractional part of the measurement is small \
+             `Vec` spines and scratch, never a block buffer, so a gap of a fifth of a \
+             buffer is already generous — this is a real disagreement."
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, cases.len());
+}
+
+/// **What correcting the figure would cost, for the chain that needs it most.**
+///
+/// `what_a_corrected_figure_would_cost_in_affordable_plans` above sweeps factors
+/// up to `4.00x`, which covered every shape this file had measured. A 91-arm
+/// fan-in under a combine that cannot fold is **46.5x**, an order of magnitude
+/// past the end of that table, so what it does to an admitted block is a
+/// different question and is asked separately here.
+///
+/// **The answer is milder than the ratio suggests, and that is the finding.** A
+/// 46.5x correction does not make the chain unplannable; it moves the admitted
+/// block down two or three rungs of the ladder, because the demand grows as the
+/// cube of the edge and the ladder steps by factors of two. At 4 GiB and
+/// concurrency 8 the planner drops from a 256-voxel block to a 64-voxel one; at
+/// 256 GiB and concurrency 1 it does not move at all.
+///
+/// That matters for whether the correction is worth making, so it is worth
+/// stating plainly. A correction that refused every plan would be one nobody
+/// could adopt. This one costs a smaller block on the chains that were being
+/// under-charged and **nothing at all** on the one-in-one-out phases the formula
+/// was written for, since their factor is exactly the `2.0` already charged. It
+/// only ever charges more, so it can refuse a plan the planner used to admit but
+/// never admits one it used to refuse — and a plan it now refuses is one that
+/// would have exhausted memory at run time.
+///
+/// The prose here first claimed there was no admissible block at all. The table
+/// says otherwise, and the table is what runs.
+#[test]
+fn print_what_an_honest_figure_admits_for_a_ninety_one_arm_stack() {
+    const CANDIDATES: [usize; 6] = [512, 256, 128, 64, 32, 16];
+    const VOLUME_EDGE: usize = 1024;
+
+    // 2 for the phase's own in and out, plus one per arm: the figure
+    // `Chain::resident_block_buffers` derives and the allocator confirms.
+    let buffers = 2.0 + 91.0;
+    let charged = 2.0;
+
+    eprintln!(
+        "\n91-arm unfoldable fan-in, zero reach, 8 B/voxel, volume {VOLUME_EDGE}^3\n\
+         {:>10} {:>6} {:>14} {:>14} {:>10}",
+        "budget", "conc", "charged", "actually held", "admits"
+    );
+    for power in [2u32, 4, 6, 8] {
+        let budget = (1u64 << power) * 1024 * 1024 * 1024;
+        for concurrency in [1u64, 8] {
+            let need = |edge: usize, factor: f64| -> Option<f64> {
+                let grid = BlockGrid::along([VOLUME_EDGE; 3], &[0, 1, 2], edge).ok()?;
+                let cost = price_phase(
+                    &grid,
+                    &Reach::symmetric([0, 0, 0]),
+                    1.0,
+                    1,
+                    false,
+                    8.0,
+                    &CostModel::default(),
+                    1.0,
+                    PhaseTraffic::one_in_one_out(),
+                );
+                // `working_set_bytes_per_block` is the `x 2.0` form, so the
+                // honest demand is that scaled by `buffers / 2`.
+                Some(cost.working_set_bytes_per_block * concurrency as f64 * factor / charged)
+            };
+            let admits = |factor: f64| {
+                CANDIDATES
+                    .iter()
+                    .copied()
+                    .find(|&edge| need(edge, factor).is_some_and(|want| want <= budget as f64))
+            };
+            let today = admits(charged);
+            let honest = admits(buffers);
+            eprintln!(
+                "{:>9} GiB {concurrency:>6} {:>14} {:>14} {:>10}",
+                1u64 << power,
+                match today {
+                    Some(edge) => format!("admits {edge}"),
+                    None => "none".to_string(),
+                },
+                match honest {
+                    Some(edge) => format!("admits {edge}"),
+                    None => "none".to_string(),
+                },
+                match (today, honest) {
+                    (Some(a), Some(b)) if a == b => "same".to_string(),
+                    (Some(_), Some(b)) => format!("{b}"),
+                    (Some(_), None) => "refuses".to_string(),
+                    _ => "-".to_string(),
+                }
+            );
+        }
+    }
+
+    // The claim the table is here to support, asserted so it cannot rot: at the
+    // smallest candidate and the smallest concurrency, an honest figure still
+    // wants more than a 4 GiB budget allows.
+    let grid = BlockGrid::along([VOLUME_EDGE; 3], &[0, 1, 2], 16).expect("a lattice");
+    let cost = price_phase(
+        &grid,
+        &Reach::symmetric([0, 0, 0]),
+        1.0,
+        1,
+        false,
+        8.0,
+        &CostModel::default(),
+        1.0,
+        PhaseTraffic::one_in_one_out(),
+    );
+    let honest = cost.working_set_bytes_per_block * buffers / charged;
+    assert!(
+        honest > cost.working_set_bytes_per_block * 40.0,
+        "the corrected figure is not the order of magnitude this test is about"
     );
 }

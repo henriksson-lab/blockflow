@@ -135,6 +135,9 @@ fn the_ratio_between_two_block_edges_moves_with_the_substage_count() {
                 // No write at all, so what is left is the repeating part.
                 writes_an_image: false,
                 repeats: 1,
+                // A single op holds nothing of its own; see
+                // `Chain::resident_block_buffers`.
+                chain_buffers: 0,
             },
         )
         .cost_per_block

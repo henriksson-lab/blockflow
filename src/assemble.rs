@@ -1455,8 +1455,24 @@ mod planned_phases {
         }
     }
 
+    /// **192 KiB and not the 64 KiB this used to be**, and the reason is a
+    /// correction to the budget rather than to these tests.
+    ///
+    /// `PhaseCost::working_set_bytes_per_block` used to charge every phase for
+    /// exactly two block buffers — one image in, one out — and now charges for
+    /// every buffer alive while a block is in flight, including the ones a
+    /// `Chain::sequence` holds between its children. The chains here hold two of
+    /// those, so their honest charge is twice what it was, and the old figure
+    /// sat close enough to the boundary that the smallest candidate stopped
+    /// fitting.
+    ///
+    /// Raised rather than worked around, because what these tests are about is
+    /// whether a hand-grouped plan computes what a fused one computes — the
+    /// budget is scenery, and it only has to be tight enough that the blur's
+    /// halo still binds against it. It still is: `assert`ions below that a plan
+    /// takes more than one phase would fail if nothing bound.
     fn small_constraints() -> Constraints {
-        constraints(64 << 10, vec![4, 8, 16, 32])
+        constraints(192 << 10, vec![4, 8, 16, 32])
     }
 
     /// The two phases the arm reads back through its source leaves. Both plans
@@ -1723,15 +1739,27 @@ mod planned_phases {
     }
 
     /// The same measurement at the consumer's own numbers: a radius-40 blur on a
-    /// `[128, 128, 32]` volume against a 4 MiB block budget.
+    /// `[128, 128, 32]` volume against a block budget.
     ///
     /// Nothing is run here — a read amplification comes from the plan's clamped
     /// geometry, which is the same figure whether or not anybody executes it —
     /// so this is the size the gap was actually found at rather than the size a
     /// test can afford to run.
+    ///
+    /// **The budget is 8 MiB where the consumer's was 4, and that is a real
+    /// consequence rather than a fixture being loosened.** This chain is a
+    /// `Chain::sequence`, which holds two block buffers between its children on
+    /// top of the phase's own input and output, and
+    /// `PhaseCost::working_set_bytes_per_block` now charges for all four where it
+    /// used to charge for two. So the corrected figure is exactly twice the old
+    /// one here, and a caller who had tuned 4 MiB against the old charge needs 8
+    /// MiB to plan the same work — not because the run got bigger, but because
+    /// it was always holding four buffers and the budget was told it held two.
+    /// `tests/working_set_residency.rs` is where that is measured through an
+    /// allocator.
     #[test]
     fn the_same_holds_at_the_radius_and_volume_the_gap_was_found_at() {
-        let constraints = constraints(4 << 20, vec![16, 32, 64, 128]);
+        let constraints = constraints(8 << 20, vec![16, 32, 64, 128]);
         let fused = fused(WIDE, WIDE_SIGMA, &constraints);
         let (planned, phases) = planned(WIDE, WIDE_SIGMA, &constraints);
         let voxels: usize = WIDE.iter().product();
