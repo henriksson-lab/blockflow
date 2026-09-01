@@ -1375,6 +1375,61 @@ pub trait Combine: Send + Sync {
     fn cost_per_voxel(&self, _branches: usize) -> f64 {
         1.0
     }
+
+    /// Arrays this combine writes **besides** the image it returns, declared the
+    /// way [`BlockOp::side_outputs`] declares an op's.
+    ///
+    /// # Why a combine needs this and could not borrow an op's
+    ///
+    /// A `Chain::Parallel`'s sink is the only place in a chain where **every
+    /// branch's value at one voxel exists at once**. Anything that has to see
+    /// them together and emit something other than an image has nowhere else to
+    /// live: a `BlockOp` downstream reads the combine's single answer, and the
+    /// branches upstream each see only their own.
+    ///
+    /// The case that forced it is `docs/design/pixel-classification.md`'s
+    /// trainer. A feature stack is 91 branches and the rows it must gather are
+    /// one 91-vector per labelled voxel — a fragment, not an image — so the
+    /// sampler is a combine's side output and can be nothing else. Before this
+    /// existed, `ops::classify::gather_samples` had to compute the stack over a
+    /// crop and gather afterwards.
+    ///
+    /// **Empty by default, and that default is safe** for the reason
+    /// [`BlockOp::side_outputs`]'s is: over-declaring allocates an array nobody
+    /// writes and then fails the coverage guard, while declaring nothing is what
+    /// every combine did before this method existed.
+    fn side_outputs(&self, _volume: [usize; 3]) -> Vec<Output> {
+        Vec::new()
+    }
+
+    /// Where this block's slice of side output `which` lands, on exactly
+    /// [`BlockOp::side_region`]'s argument.
+    fn side_region(&self, which: usize, _valid: &Region, _volume: [usize; 3]) -> Result<Region> {
+        Err(Error::InvalidArgument(format!(
+            "side output {which} of combine {:?}, which declares none",
+            self.name()
+        )))
+    }
+
+    /// Produce them, given every branch's result and the combine's own.
+    ///
+    /// `inputs` is what [`Self::apply`] was handed and `primary` is what it
+    /// wrote, so a combine that needs neither pays for neither.
+    ///
+    /// **A combine that declares a side output makes its fan-in recompute every
+    /// branch**, which is the same bargain `RidgeFilterOp::with_scale_map`
+    /// strikes and is stated for the same reason: `Chain::apply_side` is handed
+    /// the combine's answer and not its operands, so the operands are re-derived.
+    /// A fan-in whose combine declares nothing recomputes only the branches that
+    /// declare something themselves, which is what it always did.
+    fn apply_side(
+        &self,
+        _inputs: &[&Voxels],
+        _primary: &Voxels,
+        _block: &SideBlock<'_>,
+    ) -> Result<Vec<ArrayD<f64>>> {
+        Ok(Vec::new())
+    }
 }
 
 /// The stored images a chain's [`Chain::Source`] leaves are handed, keyed by
@@ -3279,9 +3334,13 @@ impl Chain {
                 .flat_map(|child| child.side_outputs(volume))
                 .collect(),
             Chain::Alternative { branches, taken } => branches[*taken].side_outputs(volume),
-            Chain::Parallel { branches, .. } => branches
+            // The branches' in branch order, then **the combine's**, which come
+            // last because that is where the routing below counts them and
+            // because the combine runs last.
+            Chain::Parallel { branches, combine } => branches
                 .iter()
                 .flat_map(|branch| branch.side_outputs(volume))
+                .chain(combine.side_outputs(volume))
                 .collect(),
         }
     }
@@ -3300,9 +3359,29 @@ impl Chain {
             // `Sequence` routes by counting them in child order — because
             // `side_outputs` concatenated them in that order and this is the
             // inverse of that concatenation.
-            Chain::Parallel { branches, .. } | Chain::Sequence(branches) => {
+            Chain::Parallel { branches, combine } => {
                 let mut remaining = which;
                 for child in branches {
+                    let count = child.side_outputs(volume).len();
+                    if remaining < count {
+                        return child.side_region(remaining, valid, volume);
+                    }
+                    remaining -= count;
+                }
+                // Past every branch is the combine's own, in the order
+                // `side_outputs` appended them.
+                if remaining < combine.side_outputs(volume).len() {
+                    return combine.side_region(remaining, valid, volume);
+                }
+                Err(Error::InvalidArgument(format!(
+                    "side output {which} of {:?}, which declares {}",
+                    self.display_name(),
+                    self.side_outputs(volume).len()
+                )))
+            }
+            Chain::Sequence(children) => {
+                let mut remaining = which;
+                for child in children {
                     let count = child.side_outputs(volume).len();
                     if remaining < count {
                         return child.side_region(remaining, valid, volume);
@@ -3355,11 +3434,19 @@ impl Chain {
             // *combine's* answer and no branch produced it. A branch declaring
             // no side output is skipped rather than recomputed — it would have
             // nothing to be asked for.
-            Chain::Parallel { branches, .. } => {
+            Chain::Parallel { branches, combine } => {
+                // **Whether every branch is recomputed turns on the combine.**
+                // If it declares a side output it must be handed every branch's
+                // result — that is what a combine is — so all of them are
+                // derived and kept. If it declares none, only the branches that
+                // declare something are recomputed, which is what this arm
+                // always did and what keeps a plain fan-in free.
+                let wanted = combine.side_outputs(block.at.volume).len();
                 let mut produced = Vec::new();
+                let mut results: Vec<Voxels> = Vec::new();
                 for branch in branches {
                     let taken = branch.side_outputs(block.at.volume).len();
-                    if taken == 0 {
+                    if taken == 0 && wanted == 0 {
                         continue;
                     }
                     let mut result = Voxels::zeros(
@@ -3367,11 +3454,25 @@ impl Chain {
                         branch.output_shape(input.shape())?,
                     )?;
                     branch.apply_with(input, sources, &mut result, block.at)?;
-                    let regions = &block.regions[produced.len()..produced.len() + taken];
-                    produced.extend(branch.apply_side(
-                        input,
-                        sources,
-                        &result,
+                    if taken > 0 {
+                        let regions = &block.regions[produced.len()..produced.len() + taken];
+                        produced.extend(branch.apply_side(
+                            input,
+                            sources,
+                            &result,
+                            &SideBlock { regions, ..*block },
+                        )?);
+                    }
+                    if wanted > 0 {
+                        results.push(result);
+                    }
+                }
+                if wanted > 0 {
+                    let operands: Vec<&Voxels> = results.iter().collect();
+                    let regions = &block.regions[produced.len()..produced.len() + wanted];
+                    produced.extend(combine.apply_side(
+                        &operands,
+                        primary,
                         &SideBlock { regions, ..*block },
                     )?);
                 }

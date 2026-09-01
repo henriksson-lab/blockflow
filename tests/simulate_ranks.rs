@@ -288,6 +288,7 @@ fn a_finer_cut_does_not_lower_the_image_floor() {
     let ceiling = assembly
         .decomposition
         .residency(
+            &assembly.workflow.chain,
             &Constraints {
                 expected_concurrency: 1,
                 ..Constraints::default()
@@ -2200,6 +2201,7 @@ fn the_gather_is_budgeted_and_rises_as_the_cut_gets_finer() {
         let residency = assembly
             .decomposition
             .residency(
+                &assembly.workflow.chain,
                 &Constraints::default(),
                 &assembly.work(),
                 &BTreeSet::new(),
@@ -2249,6 +2251,7 @@ fn the_gather_is_budgeted_and_rises_as_the_cut_gets_finer() {
         pixels_only
             .decomposition
             .residency(
+                &pixels_only.workflow.chain,
                 &Constraints::default(),
                 &pixels_only.work(),
                 &BTreeSet::new(),

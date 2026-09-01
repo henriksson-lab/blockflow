@@ -3,18 +3,20 @@
 // **What one block of a phase actually holds, against what the byte budget
 // charges for it.**
 //
-// `PhaseCost::working_set_bytes_per_block` is `resident_voxels x bytes_per_voxel
-// x 2.0` — "input buffer plus output buffer" — and `strategy` admits the largest
-// candidate block for which `working_set_bytes_per_block x expected_concurrency
-// <= budget_bytes`. The figure is deliberately allowed to over-state, on the
-// stated grounds that it feeds a budget and never a ranking, and over-charging
-// only invents infeasibility.
+// `PhaseCost::working_set_bytes_per_block` **was** `resident_voxels x
+// bytes_per_voxel x 2.0` — "input buffer plus output buffer" — and `strategy`
+// admits the largest candidate block for which `working_set_bytes_per_block x
+// expected_concurrency <= budget_bytes`. The figure was deliberately allowed to
+// over-state, on the stated grounds that it feeds a budget and never a ranking,
+// and over-charging only invents infeasibility.
 //
-// That argument is sound for the direction it was written about and it does not
-// cover the other one. `price_phase` records the gap in its own words: "a phase
+// That argument is sound for the direction it was written about and it did not
+// cover the other one. `price_phase` recorded the gap in its own words: "a phase
 // reading three is charged as if it read one, which is not [the safe direction],
-// and is a known gap recorded here rather than half-fixed". This file is the
-// measurement that gap was waiting on.
+// and is a known gap recorded here rather than half-fixed". **This file is the
+// measurement that gap was waiting on, and it closed it**: the charge now counts
+// every buffer alive, `Chain::resident_block_buffers` derives the chain's own
+// share from its shape, and the rows below are an equality rather than a gap.
 //
 // Why an allocator and not an argument
 // ------------------------------------
@@ -928,7 +930,6 @@ fn the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured() {
     let one = ImageId::from(7usize);
     let two = ImageId::from(8usize);
     let heavy = || Chain::op(RankFilterOp::median("median", element()));
-    let assumed = 2.0 * unit as f64;
 
     let shapes: Vec<(&str, Chain, Vec<ImageId>)> = vec![
         ("one in, one out", map("only"), vec![]),
@@ -984,19 +985,26 @@ fn the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured() {
         ),
     ];
 
-    eprintln!("\n{:<32} {:>9} {:>10}", "shape", "held", "of assumed");
+    eprintln!("\n{:<32} {:>9} {:>10}", "shape", "held", "of charged");
     let mut widest: f64 = 0.0;
     let mut worst = "";
+    let mut worst_charge = 0.0f64;
     for (name, chain, sources) in &shapes {
         let held = measure(chain, sources).0 as f64;
-        let ratio = held / assumed;
+        // **The charge this shape actually gets**, not a flat two buffers. That
+        // was what this fitted against and it is why the constant is 3.6: most
+        // of what it covered was the framework's own buffers, which the charge
+        // now counts. What is left for a margin to cover is the op's scratch.
+        let charge = charged(1 + sources.len(), chain.resident_block_buffers());
+        let ratio = held / charge;
         eprintln!("{name:<32} {:>7.2}x {:>9.4}x", held / unit as f64, ratio);
         if ratio.total_cmp(&widest).is_gt() {
             widest = ratio;
+            worst_charge = charge;
             worst = name;
         }
     }
-    eprintln!("widest: {worst} at {widest:.2}x of the assumed charge");
+    eprintln!("widest: {worst} at {widest:.4}x of its own charge");
 
     // **The smallest tenth that covers it**, which is what the constant is.
     //
@@ -1021,8 +1029,8 @@ fn the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured() {
     );
 
     // and it does cover, in bytes, which is the statement that actually matters
-    let charged = admission_bytes(FrameworkFigure::Assumed(assumed));
-    assert!(charged as f64 >= widest * assumed);
+    let admitted = admission_bytes(FrameworkFigure::Assumed(worst_charge));
+    assert!(admitted as f64 >= widest * worst_charge);
 }
 
 /// The same rule for the op margin, on the figure that remains once the
@@ -1065,11 +1073,26 @@ fn the_op_margin_is_the_smallest_tenth_that_covers_the_ops_measured() {
     );
     assert!(UNOBSERVED_OP_MARGIN - 0.1 < widest);
 
-    // The exact branch is the cheaper of the two on one phase, which is the
-    // whole reason to prefer a known framework figure to an assumed one.
-    assert!(
-        admission_bytes(FrameworkFigure::Exact(2 * unit as u64))
-            < admission_bytes(FrameworkFigure::Assumed(framework))
+    // **The two branches now charge the same, and that is the finding rather
+    // than a defect.**
+    //
+    // This used to assert the exact branch was *cheaper*, which was the whole
+    // reason to prefer a known framework figure to an assumed one: `2.1` against
+    // `3.6`. The difference was never about the op — both branches leave the op
+    // unpriced — it was that an assumed framework figure was missing the
+    // chain's own buffers and needed a margin to cover them. Now that
+    // `working_set_bytes_per_block` counts them, an assumed figure *is* exact
+    // about the framework, the two margins were re-fitted to the same residual,
+    // and they came out equal.
+    //
+    // Asserted as an equality so that the day a shape is found which the
+    // shape-derivation misses, this fails and says so.
+    assert_eq!(
+        admission_bytes(FrameworkFigure::Exact(2 * unit as u64)),
+        admission_bytes(FrameworkFigure::Assumed(2.0 * unit as f64)),
+        "the two branches charge differently again, so the shape-derived framework \
+         figure and an observed one have diverged; `UNOBSERVED_SHAPE_MARGIN` and \
+         `UNOBSERVED_OP_MARGIN` no longer cover the same residual"
     );
 }
 
@@ -1206,11 +1229,13 @@ fn a_margin_never_moves_the_admitted_block_by_more_than_eight_times_in_volume() 
     // quoted in prose beside a test that does not check it is a figure that
     // rots.
     assert_eq!(
-        cold_start_steps, 6,
+        cold_start_steps, 3,
         "the cold-start charge costs a rung at {cold_start_steps} of 9 budgets on this \
-         powers-of-two ladder; `UNOBSERVED_SHAPE_MARGIN`'s documentation says six. The count \
-         is a property of the spacing — see `tests/block_ladder.rs` for the refined one — \
-         where the volume bound above is a property of the margin."
+         powers-of-two ladder; `UNOBSERVED_SHAPE_MARGIN`'s documentation says three. It was \
+         six while that margin was 3.6, and re-fitting it to 2.1 halved the cost — most of \
+         what the old margin covered is now counted exactly rather than guarded against. \
+         The count is a property of the spacing — see `tests/block_ladder.rs` for the \
+         refined one — where the volume bound above is a property of the margin."
     );
 
     // **The control: the volume bound has teeth.** Six of nine budgets move the

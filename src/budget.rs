@@ -36,14 +36,21 @@
 // (`progress.json` records `bytes_per_voxel` per stage), but it is an estimate,
 // and the accounting says so rather than pretending to observe the allocator.
 //
-// What the planner asks this budget for is smaller than what a block holds
+// What the planner asks this budget for, and what it used to leave out
 // --------------------------------------------------------------------------
 // The figure `strategy` checks against a budget is
-// `PhaseCost::working_set_bytes_per_block`, which is `resident_voxels x
-// bytes_per_voxel x 2.0` — one input buffer and one output buffer. That is the
-// whole of what it counts, and `tests/working_set_residency.rs` counts what one
-// block of a phase actually holds, through a global allocator, in units of one
-// `f64` block buffer:
+// `PhaseCost::working_set_bytes_per_block`: `resident_voxels x bytes_per_voxel`
+// times **every block buffer alive while one block is in flight** — the phase's
+// own input and output, one per source image, and one per buffer the chain holds
+// between them (`Chain::resident_block_buffers`).
+//
+// It was a literal `x 2.0` — one input buffer and one output buffer — and the
+// table below is what `tests/working_set_residency.rs` measured against it,
+// through a global allocator, in units of one `f64` block buffer. Those rows are
+// now an equality; they are kept as the record of a gap that ran from `1.00x` to
+// `3.56x` over the shapes listed and to **46.5x** for the one that was not:
+// a fan-in whose combine cannot fold holds one buffer per arm, and the feature
+// stack of `docs/design/pixel-classification.md` has ninety-one of them.
 //
 // ```text
 // one in, one out                2.00x   (the shape the formula is for)
@@ -158,8 +165,8 @@
 // `5^3` rank filter on the *same* chain shape and block — and what a `Combine`
 // allocates inside its own. A residency observation is also scoped to the chain
 // it was taken on and refuses to answer for another, which is why it cannot
-// simply be substituted for the `x 2.0` at plan time without the planner
-// deciding what to do when it has no observation. That decision belongs with
+// simply be substituted for the shape-derived count at plan time without the
+// planner deciding what to do when it has no observation. That decision belongs with
 // the budget review; the sentence that must survive it is the one above — an
 // estimate known to run low, not a ceiling.
 
@@ -572,10 +579,17 @@ pub fn auto_budget_bytes() -> Option<u64> {
 
 /// The margin over an **assumed** framework figure, on a first run.
 ///
-/// `PhaseCost::working_set_bytes_per_block` is `resident_voxels x
-/// bytes_per_voxel x 2.0` — one input buffer and one output buffer — and
-/// `tests/working_set_residency.rs` measures what a block really holds. **As
-/// multiples of that assumed charge**, which is the unit this constant is in:
+/// `PhaseCost::working_set_bytes_per_block` was `resident_voxels x
+/// bytes_per_voxel x 2.0` — one input buffer and one output buffer — when these
+/// were measured, and `tests/working_set_residency.rs` measured what a block
+/// really holds against it. **As multiples of that assumed charge**, which is
+/// the unit this constant is in:
+///
+/// The framework half of that gap is closed — the charge now counts the chain's
+/// own buffers — so what a re-measurement would find is only the **op** half,
+/// the scratch an `apply` allocates inside itself. This constant has not been
+/// re-fitted, and until it is it is larger than its evidence rather than
+/// smaller, which is the safe direction for a margin.
 ///
 /// ```text
 /// one in, one out                 1.00x     fan-in, 1 arm + 1 source    2.00x
@@ -587,8 +601,14 @@ pub fn auto_budget_bytes() -> Option<u64> {
 /// fan-in, 7 computed arms         2.06x     fan-in, rank arm + 2 src  3.5003x <- widest
 /// ```
 ///
-/// `3.6` is the **smallest tenth that covers every shape measured**, which is
-/// what `tests/working_set_residency.rs`'s
+/// **That table is the old one, taken while the charge was a literal `x 2.0`.**
+/// It is kept because it is what the constant was fitted to when it was `3.6`,
+/// and because the difference between it and the table below — where the same
+/// shapes measure `1.00x` — is the whole of what closing that gap bought. The
+/// figure now is **`2.1`**, and the smallest-tenth rule is unchanged; see the
+/// re-fit section below.
+///
+/// The rule is what `tests/working_set_residency.rs`'s
 /// `the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured`
 /// asserts, in both directions — a margin above its evidence is headroom nobody
 /// can point at, and one below it is the failure it exists to prevent.
@@ -631,7 +651,47 @@ pub fn auto_budget_bytes() -> Option<u64> {
 /// allocates more, at a moment when the rest of the chain is also at its
 /// widest, would exceed it, and nothing declares that none does — see
 /// [`crate::op::BlockResidency`].
-pub const UNOBSERVED_SHAPE_MARGIN: f64 = 3.6;
+///
+/// # It was 3.6, and the re-fit is the interesting part
+///
+/// Most of what this used to cover was not the op at all: it was the framework's
+/// own buffers, which `PhaseCost::working_set_bytes_per_block` did not count
+/// while it was a literal `x 2.0`. Now that it counts them, the same fourteen
+/// shapes measure like this against their own charge:
+///
+/// ```text
+/// one in, one out                 1.0000x     fan-in, 2 source arms       1.0000x
+/// sequence of two maps            1.0001x     sequence from a source      1.0001x
+/// sequence of four maps           1.0001x     rank filter alone           2.0002x
+/// fan-in, 2 computed arms         1.0000x     morphological open alone    1.1875x
+/// fan-in, 3 computed arms         1.0312x     fan-in, rank arm + 2 src    1.4001x
+/// fan-in, 7 computed arms         1.0312x     sequence of four ranks      1.5002x
+/// fan-in, 1 arm + 1 source        1.0000x
+/// fan-in, 1 arm + 2 sources       1.0250x
+/// ```
+///
+/// **Every shape whose cost is framework buffers is now `1.00x`** — the charge
+/// is exact for it — and every shape above one has an op in it. So the residual
+/// this margin covers is the op's own scratch and nothing else, and the widest
+/// is the rank filter at `2.0002x`, giving `2.1` by the same smallest-tenth rule.
+///
+/// # And that is the same number [`UNOBSERVED_OP_MARGIN`] carries
+///
+/// Not a coincidence and worth stating rather than leaving for a reader to
+/// notice: the two constants existed to cover different residuals — this one the
+/// framework's *and* the op's, that one the op's alone — and closing the
+/// framework half left them measuring the same thing. They are fitted by
+/// separate tests over separate fixtures, fourteen shapes here and three ops
+/// there, and they agree to the tenth.
+///
+/// **A consequence for [`admission_bytes`]: its two branches now charge
+/// identically.** [`FrameworkFigure`]'s variants still mean different things —
+/// one is derived from a chain's shape, the other observed on a run — and the
+/// arithmetic would separate again the moment a shape is found that the
+/// derivation misses. Keeping both, and keeping them fitted independently, is
+/// what would make that visible; collapsing them into one constant would hide
+/// the very measurement that is currently agreeing.
+pub const UNOBSERVED_SHAPE_MARGIN: f64 = 2.1;
 
 /// The margin over an **exact** framework figure.
 ///
@@ -670,7 +730,8 @@ pub enum FrameworkFigure {
     /// block buffer **per arm**, so the 91-arm feature stack of
     /// `docs/design/pixel-classification.md` held 93 where the budget charged 2.
     /// A 46.5x under-charge, in the direction that admits a plan the run cannot
-    /// afford, is not a gap a margin absorbs — `UNOBSERVED_SHAPE_MARGIN` is 3.6.
+    /// afford, is not a gap a margin absorbs — `UNOBSERVED_SHAPE_MARGIN` was 3.6
+    /// at the time, and is 2.1 now that it no longer has to cover the framework.
     ///
     /// The count is [`Chain::resident_block_buffers`](crate::op::Chain::resident_block_buffers),
     /// derived from the chain's shape and held to a global allocator as an
@@ -753,14 +814,18 @@ pub enum FrameworkFigure {
 ///   It costs read amplification and more tasks. It cannot make a run
 ///   unrunnable and it cannot move a voxel. Counted over a sweep of nine
 ///   budgets **on a ladder of powers of two**: the cold-start charge costs one
-///   rung at **six** of them and nothing at the other three. That count is a
-///   property of that spacing rather than of the margin, which is the
-///   distinction the next paragraph exists to make.
+///   rung at **three** of them and nothing at the other six. It was six of nine
+///   while the margin was `3.6`, and re-fitting it to `2.1` — see
+///   [`UNOBSERVED_SHAPE_MARGIN`] — halved the cost of being careful, because
+///   most of what the old margin covered is now counted exactly rather than
+///   guarded against. That count is a property of that spacing rather than of
+///   the margin, which is the distinction the next paragraph exists to make.
 ///
 /// **And the ceiling on that cost is arithmetic rather than luck — but it is a
-/// ceiling on *volume*, not on rungs.** Every margin here is under eight: `3.6`
-/// on its own, and `3.5626 x 2.1 = 7.48` for the worst measured shape under the
-/// exact figure. A block that fitted without a margin either has a rung at an
+/// ceiling on *volume*, not on rungs.** Every margin here is under eight: `2.1`
+/// on its own, and `2.0002 x 2.1 = 4.20` for the worst measured shape under the
+/// exact figure — both were larger, `3.6` and `7.48`, while the charge was a
+/// literal `x 2.0` and the margin had to cover the framework's own buffers. A block that fitted without a margin either has a rung at an
 /// eighth of its volume, which then fits *with* one, or the ladder has bottomed
 /// out above that point and there is nothing smaller to fall to. Either way:
 /// **neither branch can move the admitted block by more than `8x` in volume, at
@@ -769,7 +834,8 @@ pub enum FrameworkFigure {
 /// **On a ladder of powers of two that is exactly one rung**, which is how this
 /// was first stated and why. It is **not** the same sentence on
 /// [`crate::decomposition::refined_ladder`], where a rung is `2.37x` or `3.375x`
-/// in volume and `3.6` alone already spans two of them. The step count was a
+/// in volume and `2.1` alone can span two of the finer ones — `3.6` spanned two
+/// of either. The step count was a
 /// proxy that happened to equal the volume ratio while the spacing was octaves;
 /// the volume ratio is what survives a change of spacing.
 ///

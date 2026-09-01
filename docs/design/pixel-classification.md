@@ -321,17 +321,25 @@ but the neighbourhood features can separate them.
   to opposite corners the box is the volume again, and the honest word for this
   is a crop, not a sparse traversal.
 
-  **The fragment plan this document previously named does not work**, and the
-  correction is worth keeping. It said the sampler wants to be a phase side
-  output, with `BlockOp::apply_side` emitting per-block fragments for `ops::rows`
-  to collect. But a side output is a `BlockOp` feature and the sink of the
-  feature stack is a `Combine`, which has neither `apply_side` nor
-  `side_outputs` — and the sink is the only place where all 91 channels exist at
-  one voxel, so that is where the sampler has to live. The change that would
-  allow it is giving `Combine` the same side-output pair `BlockOp` has;
-  `Chain::side_outputs` already unions over a `Parallel`'s branches and would
-  need to include the combine's. Contained, and a real piece of work rather than
-  a consequence of machinery that already exists.
+  **The fragment plan this document first named did not work, and the machinery
+  it needed now exists.** It said the sampler wants to be a phase side output,
+  with `BlockOp::apply_side` emitting per-block fragments for `ops::rows` to
+  collect. But a side output was a `BlockOp` feature and the sink of the feature
+  stack is a `Combine`, which had neither `apply_side` nor `side_outputs` — and
+  the sink is the only place where all 91 channels exist at one voxel, so that is
+  where the sampler has to live.
+
+  `Combine` now has the pair, defaulted to declaring nothing.
+  `Chain::side_outputs` appends the combine's after the branches', `side_region`
+  routes past the branches to it, and `apply_side` hands it every branch's
+  result — recomputing them only when it declares something, so a plain fan-in
+  pays nothing. `tests/combine_side_outputs.rs` pins all four, including that
+  last one: a combine declaring nothing must not make its fan-in re-derive a
+  branch, asserted on the branch op's own call count.
+
+  What is left is the sampler itself — a combine that reads a `Chain::source`
+  label arm, emits one row per labelled voxel, and lets a block holding none emit
+  nothing. That is now an op to write rather than a hole in the machinery.
 * ~~**The predictor's residency**, still unmeasured through the allocator.~~
   **Measured, and a derivation now exists for it.** Through a global allocator, a
   fan-in whose combine cannot fold holds **exactly `1.000` block buffers per

@@ -15,13 +15,22 @@
 // `budget::UNOBSERVED_SHAPE_MARGIN`'s header proves that an admission margin
 // costs **at most one ladder step**, and calls it arithmetic rather than luck: a
 // ladder of powers of two steps by `8x` in volume, and every margin is under
-// eight — `3.6` alone, and `3.5626 x 2.1 = 7.48` for the worst measured shape.
+// eight — `2.1` alone, and `2.0002 x 2.1 = 4.20` for the worst measured shape.
 //
 // **That wording does not survive a finer ladder**, and the file that proves the
 // bound would go on passing without noticing: `tests/working_set_residency.rs`
 // hard-codes its own powers-of-two ladder, so it cannot see a ladder a caller
 // supplies. A refined step is `(4/3)^3 = 2.37x` or `(3/2)^3 = 3.375x`,
-// alternating, so `3.6` already spans two of them.
+// alternating, and `4.20` spans two of them.
+//
+// **One of the two margins has since stopped colliding, and the other has not.**
+// Both used to: they were `3.6` and `7.48`, because
+// `PhaseCost::working_set_bytes_per_block` charged every phase for two block
+// buffers and the margins had to cover the ones it was missing. That charge now
+// counts the chain's own buffers, both margins were re-fitted to what is left —
+// the op's scratch — and the cold-start one came down to `2.1`, which fits
+// inside a single refined rung. The exact branch's `4.20` still does not, which
+// is why this file is still here.
 //
 // **The arithmetic survives; the unit it was stated in does not.** Two
 // consecutive refined rungs span exactly `2.37 x 3.375 = 8.0`, because the
@@ -311,11 +320,15 @@ fn a_margin_costs_two_refined_rungs_and_never_more_than_eight_times_in_volume() 
 /// at most two rungs — and `3.6` costs two, which is the specific fact that
 /// breaks the old sentence.
 #[test]
-fn every_margin_is_under_one_coarse_rung_and_over_one_refined_rung() {
+fn every_margin_is_under_one_coarse_rung_and_the_wider_one_spans_two_refined() {
     let fine = refined_ladder(&COARSE);
     let step = |a: usize, b: usize| (a as f64 / b as f64).powi(3);
     let one_refined = step(fine[1], fine[0]).min(step(fine[2], fine[1]));
-    let worst_exact = 3.5626 * UNOBSERVED_OP_MARGIN;
+    // The framework figure the op margin multiplies is now exact, so the worst
+    // measured shape is the worst measured *op* — a rank filter at `2.0002x` its
+    // chain's framework buffers. It was `3.5626x` when the framework figure was
+    // missing the chain's own buffers.
+    let worst_exact = 2.0002 * UNOBSERVED_OP_MARGIN;
 
     for (name, margin) in [
         ("UNOBSERVED_SHAPE_MARGIN", UNOBSERVED_SHAPE_MARGIN),
@@ -329,13 +342,38 @@ fn every_margin_is_under_one_coarse_rung_and_over_one_refined_rung() {
             "{name} is {margin}, which is not under one coarse rung — the bound's arithmetic \
              has stopped holding and `budget.rs`'s header needs rewriting, not this test"
         );
-        assert!(
-            margin > one_refined,
-            "{name} is {margin}, which is under one refined rung of {one_refined:.4}x. If \
-             every margin fitted in one refined rung the collision would not exist and this \
-             file would be unnecessary."
-        );
     }
+
+    // **The collision this file exists for is now one margin's, not both.**
+    //
+    // Both margins used to exceed one refined rung — `3.6` and `7.48` — so the
+    // one-step bound `budget.rs` proves on a powers-of-two ladder failed on a
+    // refined one for either branch. Re-fitting `UNOBSERVED_SHAPE_MARGIN` to
+    // `2.1`, once the charge counted the chain's own buffers, brought the
+    // cold-start branch *inside* a single refined rung.
+    //
+    // That does not make this file unnecessary, and the reason is the second
+    // row: the exact branch still spans two, because a rank filter's own scratch
+    // is `2.0002x` on top of a framework figure that is now right. So the
+    // "at most one step" wording still does not survive a finer ladder, and the
+    // volume bound is still what carries.
+    assert!(
+        UNOBSERVED_SHAPE_MARGIN < one_refined,
+        "UNOBSERVED_SHAPE_MARGIN is {UNOBSERVED_SHAPE_MARGIN}, which no longer fits inside \
+         one refined rung of {one_refined:.4}x. It did once the working-set charge stopped \
+         under-counting; either that charge has regressed or the margin has been re-fitted \
+         upwards."
+    );
+    assert!(
+        worst_exact > one_refined,
+        "the exact branch's worst margin is {worst_exact:.4}, inside one refined rung of \
+         {one_refined:.4}x. If *every* margin fitted in one refined rung the collision \
+         would not exist and this file would be unnecessary."
+    );
+    assert!(
+        worst_exact < one_refined * step(fine[2], fine[1]).max(step(fine[1], fine[0])),
+        "the exact branch's worst margin spans more than two refined rungs"
+    );
     eprintln!(
         "\nmargins {UNOBSERVED_SHAPE_MARGIN} and {worst_exact:.4}; one refined rung is \
          {one_refined:.4}x, one coarse rung is 8x"

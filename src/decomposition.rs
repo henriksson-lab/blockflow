@@ -1072,15 +1072,28 @@ impl Decomposition {
     ///   largest. Not summed here because "how many of each" is a scheduling
     ///   fact and this type is the binding half of a plan; the simulator is
     ///   where that question has an answer.
-    /// * **A phase reading three images is charged as if it read one**, which is
-    ///   [`PhaseCost::working_set_bytes_per_block`]'s own recorded gap and
-    ///   travels with the `x 2.0` this reuses.
     ///
-    /// The image term has neither problem: it is exact, and a consumer suite
-    /// pins it against a measured run to the byte — `56.200 GiB` of images
+    /// The image term does not have that problem: it is exact, and a consumer
+    /// suite pins it against a measured run to the byte — `56.200 GiB` of images
     /// predicted where a process watching `VmHWM` measured `56.200`.
+    ///
+    /// # Why it takes the chain
+    ///
+    /// The working-set term is the same quantity
+    /// [`PhaseCost::working_set_bytes_per_block`] states, and it used to be
+    /// computed here a second time with a hardcoded `x 2.0` — carrying, in that
+    /// method's own words, "that field's known gap verbatim: a phase reading
+    /// three images is charged as if it read one". When the gap was closed there
+    /// the two immediately disagreed, which is the failure mode this crate warns
+    /// about everywhere it states a quantity twice.
+    ///
+    /// So it is stated once. The chain is what the count needs — a phase's
+    /// buffers are its slots' — and it is a parameter rather than something read
+    /// off the plan because a `PhaseDecomposition` does not hold the chain and a
+    /// recorded copy would be a third statement of the same number.
     pub fn residency(
         &self,
+        chain: &Chain,
         constraints: &Constraints,
         work: &[crate::fragment::PhaseWork<'_>],
         released: &BTreeSet<ImageId>,
@@ -1088,14 +1101,17 @@ impl Decomposition {
     ) -> Result<Residency> {
         let workers = constraints.expected_concurrency.max(1);
         // The worst phase's, because residency is a peak and the phases do not
-        // overlap. Two bytes a voxel — one image in, one out — which is
-        // `PhaseCost::working_set_bytes_per_block`'s own factor, and it carries
-        // that field's known gap verbatim: a phase reading three images is
-        // charged as if it read one. Recorded there rather than corrected here.
+        // overlap. The per-block factor is
+        // `PhaseCost::working_set_bytes_per_block`'s own — every block buffer
+        // alive at once, not the two a hardcoded `x 2.0` used to assume — and it
+        // is derived from the same slots by the same helper, so the two cannot
+        // drift.
+        let slots = chain.slots();
         let working_set_bytes = self
             .phases
             .iter()
-            .map(|phase| {
+            .enumerate()
+            .map(|(index, phase)| {
                 let bytes = phase.dtype.unwrap_or(self.dtype).size_of() as f64;
                 // **Clamped to the blocks that exist.** `affords_working_set`
                 // multiplies by the concurrency unclamped, which is the safe
@@ -1105,7 +1121,20 @@ impl Decomposition {
                 // of a block only one worker can hold. A phase runs
                 // `min(workers, n_blocks)` blocks at once and no more.
                 let in_flight = workers.min(phase.grid.n_blocks()).max(1) as f64;
-                resident_voxels_per_block(&phase.grid, &phase.halo) * bytes * 2.0 * in_flight
+                let buffers = if phase.slots.is_empty()
+                    || phase.slots.iter().any(|&slot| slot >= slots.len())
+                {
+                    // A fragment or iterative phase owns no slot of the chain,
+                    // so the chain cannot speak for what it holds; the phase's
+                    // own input and output are all this can claim.
+                    phase.images_read(index).len() + 1
+                } else {
+                    phase.images_read(index).len() + 1 + resident_buffers_of(&slots, &phase.slots)
+                };
+                resident_voxels_per_block(&phase.grid, &phase.halo)
+                    * bytes
+                    * buffers as f64
+                    * in_flight
             })
             .fold(0.0_f64, f64::max)
             .max(0.0) as u64;
