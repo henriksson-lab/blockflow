@@ -1849,14 +1849,50 @@ pub(super) fn cost_for(scales: &ScaleSpace) -> f64 {
 
 /// Measured; see [`cost_report`]. One tap of one separable pass, relative to a
 /// voxelwise map.
-pub(super) const SMOOTH_COST_PER_TAP: f64 = 0.79;
+///
+/// **It was `0.79`, and that was wrong by a factor of eleven.** The re-measured
+/// figure comes from [`smoothing_report`], which times the same separable pass on
+/// its own: `0.407 ns/tap`, against a voxelwise map at `1.19 ns`. At the widest
+/// scale in this file's own table the old constant charged a ridge filter more
+/// for its taps than for its eigen-decomposition, which the measurement says is
+/// 2.4% of the work.
+pub(super) const SMOOTH_COST_PER_TAP: f64 = 0.0718;
 
 /// Measured; see [`cost_report`]. The Hessian, the eigenvalues and the response
 /// at one voxel at one scale, relative to a voxelwise map. Large, and that is
 /// the figure that matters most: a planner pricing this as a neighbourhood
 /// filter would be out by more than an order of magnitude, because the work per
 /// voxel is a cubic root-finder rather than a window.
-pub(super) const DECOMPOSITION_COST: f64 = 41.2;
+///
+/// # It was `41.2`, and the re-fit is a correction of *shape* rather than scale
+///
+/// The old pair said the taps were 29% of a `sigma = 1` filter's cost. The
+/// measurement says **2.4%**: at 21 taps the smoothing is `8.00 ns` of the
+/// filter's `327.13`. So this constant was under-stating the decomposition and
+/// [`SMOOTH_COST_PER_TAP`] was over-stating the smoothing, and the two errors
+/// cancelled at one scale and diverged everywhere else — a `sigma = 4` filter
+/// was priced 39% high, a three-scale space 22%.
+///
+/// **The total was preserved and only the split moved.** The re-fit is anchored
+/// so that `sigmas [1.0]` still prices at `57.79`, which is what it always
+/// priced at. That is deliberate: this module's constants are relative to a
+/// voxelwise map that has since become six times faster, so re-fitting the
+/// *scale* here would put `ops::ridge` in different units from
+/// `ops::morphology`, `ops::rank` and `ops::local`, and `super::COST_MEASUREMENT`
+/// is explicit that a systematic factor is absorbed by
+/// [`crate::statistics::calibrate`] while a relative one between families is not.
+/// The shape is the part no calibration can repair, and it is the part that was
+/// wrong.
+///
+/// # It agrees with `ops::structure_tensor`, which is the corroboration
+///
+/// That module fitted its own per-voxel slab, from a different instrument on a
+/// different day, and got `56.9` where this is `56.28` — 1% apart for what is
+/// the same [`symmetric_eigenvalues`] over the same six numbers. While this
+/// constant was `41.2` the two disagreed by 37%, and
+/// `ops::structure_tensor` had to carry a per-tap constant of its own with a
+/// note explaining that it could not use this one. It uses this one now.
+pub(super) const DECOMPOSITION_COST: f64 = 56.28;
 
 /// The measurement the two constants above came from, kept as text so that a
 /// re-run somewhere else can be compared against it rather than merely replacing
@@ -1872,6 +1908,51 @@ pub(super) const DECOMPOSITION_COST: f64 = 41.2;
 /// ridge, sigmas [1.0, 2.0], truncate 3         776.15       60     128.28
 /// ridge, sigmas [1.0, 2.0, 4.0], truncate 3   1432.04      135     236.69
 /// ```
+///
+/// **That table is the old one, and its constants were right for the code it was
+/// taken on.** Its slope is `0.761` per tap against the `0.79` stored, which is
+/// as good a fit as the instrument supports. Re-taken on 2026-09-01, on the same
+/// fixture:
+///
+/// ```text
+/// case                                       ns/voxel     taps   measured     stored
+/// voxelwise map (the unit)                       1.19        0       1.00       1.00
+/// ridge, sigmas [1.0], truncate 3              327.13       21     273.92      57.79
+/// ridge, sigmas [2.0], truncate 3              337.54       39     282.64      72.01
+/// ridge, sigmas [4.0], truncate 3              316.81       75     265.28     100.45
+/// ridge, sigmas [1.0, 2.0], truncate 3         629.26       60     526.90     129.80
+/// ridge, sigmas [1.0, 2.0, 4.0], truncate 3    931.26      135     779.78     230.25
+/// ```
+///
+/// **The tap term has gone flat**, and a least squares fit over those five rows
+/// returns a *negative* per-tap coefficient — which is not a measurement of
+/// anything except that the term is now below the noise. One scale costs about
+/// the same at 21 taps as at 75.
+///
+/// # What changed was the code, not the machine
+///
+/// [`convolve_axis`] gained a packed walk, and [`smoothing_report`] measures what
+/// it bought: **12 to 25 times**, on every row of that table. So the smoothing
+/// stopped being a third of a ridge filter's cost and became 2.4% of it, and the
+/// constants below were never re-fitted after it. The old per-tap of `0.761` and
+/// the new `0.0718` are 10.6x apart, which is that speed-up seen from the other
+/// side.
+///
+/// This is worth stating carefully because "the constants had drifted" is the
+/// wrong lesson and would point at the wrong fix. Nothing decayed. A measured
+/// constant is a statement about a particular implementation, and this crate
+/// changed the implementation underneath two of them without re-running the
+/// measurement that justified them — which is an argument for the measurements
+/// being one command each, as they are, rather than for distrusting them.
+///
+/// # How the re-fit was anchored
+///
+/// The per-tap figure is taken from [`smoothing_report`], which times the
+/// separable pass on its own — `0.407 ns/tap` — because the ridge rows above
+/// cannot separate a term worth 2.4% of themselves from their own noise. The
+/// slab is then the residual, and the pair is scaled so that `sigmas [1.0]`
+/// still prices at `57.79`, which is what it priced at before. See
+/// [`DECOMPOSITION_COST`] for why only the shape was allowed to move.
 ///
 /// The two constants are the least-squares fit of `relative = tap * taps +
 /// decomposition * scales` over all five rows — two predictors and no intercept,

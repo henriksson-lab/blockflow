@@ -39,7 +39,13 @@
 //! makes forty workers behave like 2.41. A predictor spawning its own threads
 //! would fight the machinery this crate spent its measurements on.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use ndarray::{Array1, Array2, ArrayD, ArrayView1, ArrayView2};
+
+use crate::geometry::BlockGrid;
+use crate::op::{Output, SideBlock};
 
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
@@ -576,4 +582,448 @@ fn labelled_extent(
         extent[axis] = end - start[axis];
     }
     Some((start, extent))
+}
+
+// ------------------------------------------------------- the row sampler --
+
+/// Where every labelled voxel is, and which row of the gathered table it owns.
+///
+/// **Built once, from the label volume and the grid the run will use.** Both are
+/// known before any feature is computed — labels are input data, not something
+/// the run produces — which is what makes a fixed-shape side output possible for
+/// a gather whose length looks data-dependent. It is not: the number of rows is
+/// the number of labelled voxels, and that is countable up front.
+///
+/// # Why the grid is in here
+///
+/// A side output's per-block slice is a **box** — `Output::side_region` returns
+/// one `Region` — so a block's rows have to be contiguous in the table. Labelled
+/// voxels ordered by position in the volume are not contiguous within a block,
+/// because a block is a sub-box and its voxels are interleaved with its
+/// neighbours' in row-major order. So the rows are ordered **by block first**,
+/// and that ordering is a function of the partition.
+///
+/// This makes a chain carrying a sampler valid only for the plan whose grid it
+/// was built against, which is a real constraint and an existing one:
+/// [`Chain::Source`] says the same of the image its
+/// leaf names — "a chain carrying one constrains the plans it is valid for. That
+/// is not a leak: which image is read is parity-visible". Here the grid is
+/// checked rather than trusted: [`SampleCombine::side_region`] refuses a block
+/// it was not built for, by name, rather than returning a plausible wrong range.
+#[derive(Debug, Clone)]
+pub struct LabelIndex {
+    /// One per labelled voxel, ordered by block and then by position within it.
+    positions: Vec<[usize; 3]>,
+    /// The class of each, remapped to `0..n` in ascending order of the label
+    /// the annotator drew.
+    classes: Vec<u32>,
+    /// `start` of each block's core, to the `(row offset, row count)` its
+    /// labelled voxels own.
+    by_block: BTreeMap<[usize; 3], (usize, usize)>,
+    map: ClassMap,
+}
+
+impl LabelIndex {
+    /// Index `labels` against `grid`, treating `unlabelled` as "no class".
+    pub fn build(labels: &Voxels, unlabelled: u32, grid: &BlockGrid) -> Result<Self> {
+        if labels.shape() != grid.volume() {
+            return Err(Error::ShapeMismatch {
+                expected: grid.volume().to_vec(),
+                got: labels.shape().to_vec(),
+            });
+        }
+        let view = labels.view::<u32>()?;
+        let mut distinct: Vec<u32> = view
+            .iter()
+            .copied()
+            .filter(|&label| label != unlabelled)
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() < 2 {
+            return Err(Error::InvalidArgument(format!(
+                "the label volume holds {} class{} besides {unlabelled}. A classifier needs \
+                 two to discriminate between; one is a constant image.",
+                distinct.len(),
+                if distinct.len() == 1 { "" } else { "es" }
+            )));
+        }
+
+        let mut positions = Vec::new();
+        let mut classes = Vec::new();
+        let mut by_block = BTreeMap::new();
+        // **Block by block, in the grid's own order**, so a block's rows are one
+        // contiguous run and `side_region` is a box.
+        for core in grid.cores() {
+            let start = [core.core.start[0], core.core.start[1], core.core.start[2]];
+            let shape = core.core.shape;
+            let offset = positions.len();
+            for i in start[0]..start[0] + shape[0] {
+                for j in start[1]..start[1] + shape[1] {
+                    for k in start[2]..start[2] + shape[2] {
+                        let label = view[[i, j, k]];
+                        if label == unlabelled {
+                            continue;
+                        }
+                        positions.push([i, j, k]);
+                        classes.push(
+                            distinct
+                                .iter()
+                                .position(|&found| found == label)
+                                .expect("collected from the same volume")
+                                as u32,
+                        );
+                    }
+                }
+            }
+            by_block.insert(start, (offset, positions.len() - offset));
+        }
+        Ok(Self {
+            positions,
+            classes,
+            by_block,
+            map: ClassMap { labels: distinct },
+        })
+    }
+
+    pub fn rows(&self) -> usize {
+        self.positions.len()
+    }
+
+    /// The voxel each row is for, in row order — which is block order, not
+    /// volume order. This is what lets a caller join the gathered table back to
+    /// the volume, and it is the only way to: the row index alone means nothing
+    /// without the partition it was built against.
+    pub fn positions(&self) -> &[[usize; 3]] {
+        &self.positions
+    }
+
+    /// The class of each row, as an index into [`Self::classes`].
+    pub fn row_classes(&self) -> &[u32] {
+        &self.classes
+    }
+
+    pub fn classes(&self) -> &ClassMap {
+        &self.map
+    }
+
+    /// The rows belonging to the block whose core begins at `start`.
+    fn range(&self, start: [usize; 3]) -> Option<(usize, usize)> {
+        self.by_block.get(&start).copied()
+    }
+}
+
+/// **Gather one training row per labelled voxel, as a side output of the feature
+/// stack's own fan-in.**
+///
+/// This is what `Combine::side_outputs` was added for, and the reason it had to
+/// be a combine rather than a `BlockOp` is the whole of the design: a fan-in's
+/// sink is the only place where every channel's value at a voxel exists at once.
+/// A `BlockOp` after the stack sees one image; a branch inside it sees one
+/// channel.
+///
+/// # What it buys over [`gather_samples`]
+///
+/// [`gather_samples`] computes the stack over a crop and keeps every channel of
+/// every voxel of that crop in memory — 91 columns times the crop's voxels. At a
+/// `512^3` crop that is 97 GB, so it is a function that works on an annotator's
+/// working crop and falls over on a volume.
+///
+/// This runs inside an ordinary blocked phase. It holds one block's channels,
+/// writes the rows for that block's labelled voxels, and moves on, so its
+/// residency is the block's rather than the crop's and it works at whatever size
+/// the planner can block.
+///
+/// # The primary image
+///
+/// A pixel phase writes an image, so this writes the **class of each voxel**,
+/// `unlabelled` where there is none — the label volume as the run saw it. It
+/// costs one image and it is the thing worth keeping: it is what a reader needs
+/// to check which voxels a training run actually sampled.
+pub struct SampleCombine {
+    name: &'static str,
+    channels: Vec<String>,
+    index: Arc<LabelIndex>,
+    unlabelled: u32,
+}
+
+impl SampleCombine {
+    /// `channels` must be the stack's channel names, in branch order; the
+    /// branches are the stack's arms and nothing else — the labels are not a
+    /// branch, because they are indexed up front rather than read per block.
+    pub fn new(
+        name: &'static str,
+        channels: Vec<String>,
+        index: Arc<LabelIndex>,
+        unlabelled: u32,
+    ) -> Self {
+        Self {
+            name,
+            channels,
+            index,
+            unlabelled,
+        }
+    }
+
+    pub fn index(&self) -> &Arc<LabelIndex> {
+        &self.index
+    }
+
+    /// The gathered table's name as a side output.
+    pub const ROWS: &'static str = "samples.rows";
+
+    /// And the class column's, kept as a second array rather than a column of
+    /// the first: the features are `f64` and a class is not a number to be
+    /// interpolated, so putting them in one array would be inviting exactly the
+    /// arithmetic that must never be done to it.
+    pub const CLASSES: &'static str = "samples.classes";
+}
+
+impl Combine for SampleCombine {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Zero. Every channel is read at the voxel the row is for.
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    /// **Not a stencil, and this is the one place that matters.** The rows a
+    /// block writes are a function of *which* voxels of it are labelled, and
+    /// `side_region` answers for the block's whole valid region. Cutting that
+    /// region into slabs for intra-block threading would give each slab the
+    /// whole block's row range, and they would overwrite one another.
+    fn slicing(&self) -> Slicing {
+        Slicing::UNDECLARED
+    }
+
+    fn accepts(&self, inputs: &[Dtype]) -> bool {
+        inputs.len() == self.channels.len() && inputs.iter().all(|&dtype| dtype == Dtype::F64)
+    }
+
+    fn produces(&self, _inputs: &[Dtype]) -> Dtype {
+        Dtype::U32
+    }
+
+    fn output_shape(&self, inputs: &[[usize; 3]]) -> Result<[usize; 3]> {
+        let first = *inputs.first().ok_or_else(|| {
+            Error::InvalidArgument(format!("{}: no branch results to sample", self.name))
+        })?;
+        if inputs.len() != self.channels.len() {
+            return Err(Error::InvalidArgument(format!(
+                "{}: the sampler names {} channels and was handed {} branches",
+                self.name,
+                self.channels.len(),
+                inputs.len()
+            )));
+        }
+        Ok(first)
+    }
+
+    /// **The label each voxel was drawn with**, `unlabelled` where there is
+    /// none — not the class *index*.
+    ///
+    /// The distinction is not cosmetic and it was a defect here first. Class
+    /// indices run `0..n`, and the commonest sentinel for "no label" is `0`, so
+    /// writing indices makes class 0 and unlabelled the same value in the one
+    /// image whose purpose is to show which voxels were sampled. Writing the
+    /// annotator's own labels is both unambiguous and the thing a reader wants:
+    /// it is the label volume as the run saw it, and it round-trips through
+    /// [`ClassMap`] to the indices the rows carry.
+    fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, at: &Anchor) -> Result<()> {
+        let shapes: Vec<[usize; 3]> = inputs.iter().map(|input| input.shape()).collect();
+        self.output_shape(&shapes)?;
+        let mut out = out.view_mut::<u32>()?;
+        out.fill(self.unlabelled);
+        // `at.within` places the buffer in the volume, which is what the index
+        // is stated in.
+        let origin = at.offset;
+        for (row, position) in self.index.positions.iter().enumerate() {
+            let mut local = [0usize; 3];
+            let mut inside = true;
+            for axis in 0..3 {
+                if position[axis] < origin[axis] {
+                    inside = false;
+                    break;
+                }
+                local[axis] = position[axis] - origin[axis];
+                if local[axis] >= out.shape()[axis] {
+                    inside = false;
+                    break;
+                }
+            }
+            if inside {
+                out[local] = self.index.map.labels[self.index.classes[row] as usize];
+            }
+        }
+        Ok(())
+    }
+
+    /// Two arrays: the features, and the class each row belongs to.
+    fn side_outputs(&self, _volume: [usize; 3]) -> Vec<Output> {
+        vec![
+            Output::new(
+                Self::ROWS,
+                Dtype::F64,
+                &[self.index.rows(), self.channels.len()],
+            ),
+            Output::new(Self::CLASSES, Dtype::F64, &[self.index.rows()]),
+        ]
+    }
+
+    /// **Refuses a block the index was not built for**, rather than answering
+    /// with a plausible wrong range. See [`LabelIndex`] for why the two are
+    /// coupled at all.
+    fn side_region(&self, which: usize, valid: &Region, _volume: [usize; 3]) -> Result<Region> {
+        let start = [valid.start[0], valid.start[1], valid.start[2]];
+        let (offset, count) = self.index.range(start).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "{}: no block of the grid this sampler was built against begins at {start:?}. \
+                 A sampler's row layout is a function of the partition — see `LabelIndex` — \
+                 so it must be built with the grid the plan actually uses.",
+                self.name
+            ))
+        })?;
+        match which {
+            0 => Ok(Region::new(&[offset, 0], &[count, self.channels.len()])),
+            1 => Ok(Region::new(&[offset], &[count])),
+            _ => Err(Error::InvalidArgument(format!(
+                "{}: side output {which}, and it declares two",
+                self.name
+            ))),
+        }
+    }
+
+    fn apply_side(
+        &self,
+        inputs: &[&Voxels],
+        _primary: &Voxels,
+        block: &SideBlock<'_>,
+    ) -> Result<Vec<ArrayD<f64>>> {
+        let views = inputs
+            .iter()
+            .map(|input| input.view::<f64>())
+            .collect::<Result<Vec<_>>>()?;
+        let start = [
+            block.within.start[0],
+            block.within.start[1],
+            block.within.start[2],
+        ];
+        // `within` is relative to the buffer; the index is in volume
+        // coordinates, so the block's origin is the anchor's start plus it.
+        let origin = block.at.offset;
+        let core = [
+            origin[0] + start[0],
+            origin[1] + start[1],
+            origin[2] + start[2],
+        ];
+        let (offset, count) = self.index.range(core).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "{}: no block of this sampler's grid begins at {core:?}",
+                self.name
+            ))
+        })?;
+
+        let mut rows = Array2::<f64>::zeros((count, self.channels.len()));
+        let mut classes = Array1::<f64>::zeros(count);
+        for row in 0..count {
+            let position = self.index.positions[offset + row];
+            let local = [
+                position[0] - origin[0],
+                position[1] - origin[1],
+                position[2] - origin[2],
+            ];
+            for (column, view) in views.iter().enumerate() {
+                rows[[row, column]] = view[local];
+            }
+            classes[row] = self.index.classes[offset + row] as f64;
+        }
+        Ok(vec![rows.into_dyn(), classes.into_dyn()])
+    }
+
+    fn cost_per_voxel(&self, _branches: usize) -> f64 {
+        1.0
+    }
+}
+
+/// **Sample**: a feature stack and a labelled volume, as one chain plus the
+/// index that reads its output back.
+///
+/// The third wrapper beside [`train_workflow`] and [`predict_workflow`], and the
+/// one that makes the blocked path usable without assembling a
+/// [`SampleCombine`] by hand.
+///
+/// **It takes the grid**, which the other two do not, for the reason
+/// [`LabelIndex`] gives: a block's rows have to be contiguous in the gathered
+/// table, so the row order is a function of the partition. A caller therefore
+/// plans first and builds this against the grid the plan chose — the same
+/// sequence `PlanBuilder::regrid` exists for.
+///
+/// The returned index is what turns the run's output back into rows: it holds
+/// the voxel each row is for and the [`ClassMap`] the classes were remapped
+/// through. Hand it and the two arrays to [`samples_from_rows`].
+pub fn sample_workflow(
+    stack: &FeatureStack,
+    labels: &Voxels,
+    grid: &BlockGrid,
+    unlabelled: u32,
+) -> Result<(Chain, Arc<LabelIndex>)> {
+    let channels = stack.channel_names()?;
+    let index = Arc::new(LabelIndex::build(labels, unlabelled, grid)?);
+    let chain = Chain::parallel(
+        stack.branches()?,
+        Box::new(SampleCombine::new(
+            "sample",
+            channels,
+            Arc::clone(&index),
+            unlabelled,
+        )),
+    )?;
+    Ok((chain, index))
+}
+
+/// The two arrays [`SampleCombine`] wrote, as [`Samples`] a forest can be fitted
+/// to.
+///
+/// `classes` is `f64` because a side output is — every one in this crate is an
+/// `ArrayD<f64>` — and it holds class *indices*, which are whole numbers stored
+/// in a float. They are checked on the way back rather than cast: a value that
+/// is not a whole number, or not a class the index knows, means the arrays and
+/// the index have come from different runs, and a silent `as u32` would turn
+/// that into a forest fitted to the wrong labels.
+pub fn samples_from_rows(
+    rows: ArrayView2<'_, f64>,
+    classes: ArrayView1<'_, f64>,
+    index: &LabelIndex,
+    channels: Vec<String>,
+) -> Result<Samples> {
+    if rows.shape()[0] != index.rows() || classes.len() != index.rows() {
+        return Err(Error::InvalidArgument(format!(
+            "the sampler's index holds {} rows and it was handed {} feature rows and {} \
+             classes. The three come from one run or from none.",
+            index.rows(),
+            rows.shape()[0],
+            classes.len()
+        )));
+    }
+    if rows.shape()[1] != channels.len() {
+        return Err(Error::InvalidArgument(format!(
+            "{} columns of features against {} channel names",
+            rows.shape()[1],
+            channels.len()
+        )));
+    }
+    let mut labels = Vec::with_capacity(classes.len());
+    for (row, &value) in classes.iter().enumerate() {
+        if value.fract() != 0.0 || value < 0.0 || value as usize >= index.classes().classes() {
+            return Err(Error::InvalidArgument(format!(
+                "row {row}'s class is {value}, which is not one of the {} the sampler's \
+                 index knows. The arrays and the index are from different runs.",
+                index.classes().classes()
+            )));
+        }
+        labels.push(value as u32);
+    }
+    Samples::new(rows.iter().copied().collect(), labels, channels)
 }

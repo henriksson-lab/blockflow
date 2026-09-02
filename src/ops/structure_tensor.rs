@@ -71,6 +71,7 @@ use crate::voxels::Voxels;
 
 use super::ridge::{
     gaussian_radius, gaussian_smooth_into, gaussian_weights, symmetric_eigenvalues,
+    SMOOTH_COST_PER_TAP,
 };
 use super::shapes_agree;
 
@@ -664,7 +665,7 @@ fn gradient_magnitude_cost_for(tensor: &StructureTensor) -> f64 {
     let taps: usize = (0..3)
         .map(|axis| 2 * gaussian_radius(tensor.sigma[axis], tensor.truncate) + 1)
         .sum();
-    STRUCTURE_TENSOR_COST_PER_TAP * taps as f64 + STRUCTURE_TENSOR_VOXEL_COST * 0.25
+    SMOOTH_COST_PER_TAP * taps as f64 + STRUCTURE_TENSOR_VOXEL_COST * 0.25
 }
 
 /// Measured; see [`COST_MEASUREMENT`] below for the run and the fit.
@@ -688,34 +689,28 @@ pub(super) fn cost_for(tensor: &StructureTensor) -> f64 {
             .map(|axis| 2 * gaussian_radius(scale[axis], tensor.truncate) + 1)
             .sum()
     };
-    STRUCTURE_TENSOR_COST_PER_TAP * (taps(tensor.sigma) + 6 * taps(tensor.rho)) as f64
+    SMOOTH_COST_PER_TAP * (taps(tensor.sigma) + 6 * taps(tensor.rho)) as f64
         + STRUCTURE_TENSOR_VOXEL_COST
 }
-
-/// Measured; see [`COST_MEASUREMENT`]. One tap of one separable pass, relative
-/// to a voxelwise map.
-///
-/// **Not `ridge::SMOOTH_COST_PER_TAP`, although the pass being counted is
-/// literally the same function.** That figure is 0.79 and this one is 0.0567,
-/// and the gap is not a disagreement about the code — it is drift, quantified
-/// in [`COST_MEASUREMENT`]. Sharing the constant would have been tidier and
-/// would have mispriced this op by an order of magnitude.
-pub(super) const STRUCTURE_TENSOR_COST_PER_TAP: f64 = 0.0567;
 
 /// Measured; see [`COST_MEASUREMENT`]. The gradient stencil, the six products
 /// and the eigenvalues at one voxel, relative to a voxelwise map.
 ///
-/// Larger than `ridge`'s stored [`super::ridge::DECOMPOSITION_COST`] of 41.2, and that
-/// comparison is worth stating carefully because it is not the one it looks
-/// like. Against ridge's *stored* slab this is 1.38x; against ridge's slab as
-/// **measured in the same run**, 56.60 in these units, it is 1.004. The two ops
-/// spend nearly the same time per voxel below the smoothing, which is what one
-/// would expect of the same closed form over the same six numbers — this op
-/// forms six products where ridge takes six second differences, and ridge
-/// evaluates three exponentials for its response where this one copies out a
-/// number. The 1.38x is ridge's stored split between its two constants being
-/// stale, not a difference between the ops.
-pub(super) const STRUCTURE_TENSOR_VOXEL_COST: f64 = 56.9;
+/// **Slightly below `ridge`'s [`super::ridge::DECOMPOSITION_COST`] of `56.28`,
+/// and that is the corroboration rather than a discrepancy.** The two are the
+/// same [`symmetric_eigenvalues`] over the same six numbers, fitted from
+/// different instruments on different days, and they land 3% apart. This one is
+/// the lower of the two, which is the direction the ops differ in: it forms six
+/// products where ridge takes six second differences with corner samples, and
+/// ridge evaluates three exponentials for its response where this one copies out
+/// a number.
+///
+/// It read `56.9` and compared itself against ridge's *stored* `41.2` with a
+/// paragraph explaining that the 1.38x between them was ridge's split being
+/// stale rather than a difference between the ops. That turned out to be exactly
+/// right, and ridge has since been re-fitted; the number here moved only because
+/// it is now anchored against a shared per-tap constant rather than its own.
+pub(super) const STRUCTURE_TENSOR_VOXEL_COST: f64 = 54.72;
 
 /// The measurement the two constants above came from, kept as text so a re-run
 /// elsewhere can be compared against it rather than merely replacing it. Taken
@@ -1157,8 +1152,27 @@ mod tests {
     fn the_per_voxel_slab_is_most_of_the_cost_at_a_small_scale() {
         let tensor = StructureTensor::at_gamma([1.0; 3], 1.0, 2.0).unwrap();
         assert!(cost_for(&tensor) < 2.0 * STRUCTURE_TENSOR_VOXEL_COST);
-        // And it exceeds `ridge`'s, which does the same decomposition and fewer
-        // products — a smaller figure here would mean one of the two is wrong.
-        assert!(STRUCTURE_TENSOR_VOXEL_COST > DECOMPOSITION_COST);
+
+        // **And it lands within a tenth of `ridge`'s**, which is the point of
+        // comparing them at all: the two are the same `symmetric_eigenvalues`
+        // over the same six numbers, fitted from different instruments, so a
+        // wide gap would mean one of them is wrong.
+        //
+        // This asserted the *inequality* `structure > ridge` while ridge's
+        // constant was the stale `41.2`, and that reading survived only because
+        // the gap was 38%. Ridge is now `56.28`, this is `54.72`, and the
+        // relationship is agreement rather than order — so agreement is what is
+        // asserted. The 3% is in the direction the ops differ: ridge takes six
+        // second differences with corner samples and evaluates three
+        // exponentials for its response, where this forms six products and
+        // copies out a number.
+        let apart = (STRUCTURE_TENSOR_VOXEL_COST - DECOMPOSITION_COST).abs() / DECOMPOSITION_COST;
+        assert!(
+            apart < 0.1,
+            "the two eigen-decomposition slabs are {:.0}% apart ({STRUCTURE_TENSOR_VOXEL_COST} \
+             against {DECOMPOSITION_COST}); they are the same closed form over the same six \
+             numbers and one of the two fits is wrong",
+            apart * 100.0
+        );
     }
 }

@@ -701,6 +701,36 @@ struct StoredArray {
     compression: Compression,
 }
 
+/// How large a chunk cache a [`ZarrEnvironment`] gets when nobody says.
+///
+/// **A quarter of [`crate::budget::default_budget_bytes`]**, which is itself
+/// half the machine's memory or three quarters of what is available, whichever
+/// is less. So the default asks for an eighth of the machine at most, and leaves
+/// the other three quarters of the budget for the in-flight block buffers that
+/// budget is actually denominated in — `PhaseCost::working_set_bytes_per_block`
+/// times the concurrency.
+///
+/// **A fraction and not the whole budget**, because the two compete for one
+/// pool. The budget exists to bound what blocks in flight hold; a cache sized at
+/// the same figure would double the claim on memory while every plan continued
+/// to be admitted against half of it.
+///
+/// **A caller who knows their plan should say so** with
+/// [`ZarrEnvironment::with_cache`], and the rule to size it by is the one
+/// `docs/design/cache-and-prefetch.md` records: enough to hold a block's read
+/// extent times the blocks in flight, which is what makes a halo re-read a hit
+/// rather than a fetch. This function cannot apply that rule because it has no
+/// plan — `Environment::prepare` is the first point that does, and it takes
+/// `&self`.
+pub fn default_cache_bytes() -> u64 {
+    (crate::budget::default_budget_bytes() / 4).max(1 << 20)
+}
+
+fn default_cache() -> Arc<ChunkCache> {
+    let bytes = default_cache_bytes();
+    Arc::new(ChunkCache::new(MemoryBudget::new(bytes), bytes))
+}
+
 /// A [`StoredArray`] as a [`RegionSource`], so that [`CachingSource::attach`]
 /// has something to attach to.
 ///
@@ -1122,7 +1152,7 @@ impl MultiscaleImage {
             )));
         }
         for (index, factor) in scale.iter().enumerate() {
-            if factor.iter().any(|&axis| axis == 0) {
+            if factor.contains(&0) {
                 return Err(Error::InvalidArgument(format!(
                     "multiscale level {index} has scale {factor:?}; scale factors are positive"
                 )));
@@ -1165,8 +1195,7 @@ impl PyramidSpec {
     pub fn new(factors: Vec<[usize; 3]>) -> Result<Self> {
         if factors
             .iter()
-            .enumerate()
-            .any(|(_, factor)| factor.iter().any(|&axis| axis == 0) || factor == &[1, 1, 1])
+            .any(|factor| factor.contains(&0) || factor == &[1, 1, 1])
         {
             return Err(Error::InvalidArgument(format!(
                 "pyramid decimation factors must be positive and must shrink at least one axis, \
@@ -1263,11 +1292,24 @@ pub struct ZarrEnvironment {
     /// On disk, to match the images. An environment whose volumes are shared
     /// between processes must not offer fragments that are not.
     sidecars: Sidecars,
-    /// The read-through chunk cache, or `None` for the unwired default.
+    /// The read-through chunk cache. `None` only if a caller asked for none.
     ///
-    /// **Off unless asked for**, because turning it on changes what a read
-    /// costs and what the process holds, and neither is a thing to acquire by
-    /// upgrading. [`Self::with_cache`] is the one way in.
+    /// **On by default**, at [`default_cache_bytes`]. It was off, on the
+    /// grounds that "turning it on changes what a read costs and what the
+    /// process holds, and neither is a thing to acquire by upgrading" — a good
+    /// argument for not switching it on silently, and it held for as long as
+    /// nobody had measured what it was worth. `tests/zarr_cache.rs`'s
+    /// `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store` is that
+    /// measurement: on a plan of overlapping halo windows a cache that holds
+    /// the volume reads **3.09x fewer bytes** from the store than one that
+    /// holds a single chunk, and at that capacity it reads every byte exactly
+    /// once.
+    ///
+    /// The other half of the argument is that memory left unused is memory
+    /// wasted: a halo re-read is a read this crate *knows* is coming, and
+    /// declining to hold the bytes for it is choosing to fetch them twice.
+    /// [`Self::without_cache`] is the way out for a caller who wants the old
+    /// behaviour, and it says what it costs.
     cache: Option<Arc<ChunkCache>>,
     /// The [`CachingSource`] registered for each cacheable image, type-erased
     /// because its element type is the image's `Dtype` and that is not known
@@ -1407,6 +1449,25 @@ impl ZarrEnvironment {
             images.push(attached.clone());
         }
         Self::attach(work, &images)
+    }
+
+    /// Read through **no** cache at all.
+    ///
+    /// The default is a cache of [`default_cache_bytes`]; this is the way back
+    /// to the behaviour this environment had before that default, and it costs
+    /// what the measurement says: on a plan of overlapping halo windows, 3.09x
+    /// the bytes off the store.
+    ///
+    /// Two callers legitimately want it. One is measuring the store itself —
+    /// `tests/zarr_cache.rs` uses a single-chunk capacity as its no-cache
+    /// baseline for exactly this reason, and a caller counting bytes wants the
+    /// count to be of their plan rather than of their cache. The other is
+    /// running where the memory is genuinely spoken for by something this
+    /// process cannot see.
+    pub fn without_cache(mut self) -> Self {
+        self.cache = None;
+        self.prefetcher = None;
+        self
     }
 
     /// Read through a chunk cache of at most `capacity_bytes`.
@@ -1664,7 +1725,7 @@ impl ZarrEnvironment {
             unaligned_reads: AtomicU64::new(0),
             counters: EnvCounters::default(),
             sidecars,
-            cache: None,
+            cache: Some(default_cache()),
             cached: RwLock::new(BTreeMap::new()),
             prefetcher: None,
             lookahead: 0,
@@ -1758,7 +1819,7 @@ impl ZarrEnvironment {
             unaligned_reads: AtomicU64::new(0),
             counters: EnvCounters::default(),
             sidecars,
-            cache: None,
+            cache: Some(default_cache()),
             cached: RwLock::new(BTreeMap::new()),
             prefetcher: None,
             lookahead: 0,

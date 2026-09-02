@@ -938,7 +938,27 @@ impl ChunkCache {
         self.emit(std::mem::take(&mut events));
 
         // 2. Claim what nobody else is already fetching.
-        let (claimed, waited) = self.claim(reg.id, &wanted);
+        let (claimed, waited, resident) = self.claim(reg.id, &wanted);
+
+        // 2b. **Chunks that arrived between the caller's miss and the claim.**
+        //     They are nobody's to fetch and still the caller's to be handed;
+        //     see `claim`, which used to drop them and leave the output buffer
+        //     holding zeros here.
+        for chunk in resident {
+            let Some((want, out)) = target.as_mut() else {
+                continue;
+            };
+            if self.serve_from_cache(reg, chunk, want, out, element)? {
+                continue;
+            }
+            // Resident at the claim and gone again now — evicted by another
+            // thread in between. Fetch it rather than leaving the hole this
+            // whole branch exists to close; a direct fetch cannot recurse and
+            // this path is rare by construction.
+            let region = reg.chunk_region(chunk);
+            let decoded = reg.fetcher.fetch(&region)?;
+            copy_overlap(&decoded, &region, out, want, element);
+        }
 
         // 3. Fetch the claimed chunks, coalescing lattice-consecutive runs.
         for run in runs(&claimed, reg.grid[reg.grid.len() - 1], self.max_coalesce) {
@@ -1038,7 +1058,16 @@ impl ChunkCache {
             }
             // The other fetch did not leave anything behind — refused by the
             // budget, evicted immediately, or it died. Do it ourselves.
-            let (mine, _) = self.claim(reg.id, &[chunk]);
+            let (mine, _, already) = self.claim(reg.id, &[chunk]);
+            if !already.is_empty() {
+                // It landed while we were deciding. Serve it, and if it has gone
+                // again fall through to the direct fetch below.
+                if let Some((want, out)) = target.as_mut() {
+                    if self.serve_from_cache(reg, chunk, want, out, element)? {
+                        continue;
+                    }
+                }
+            }
             if mine.is_empty() {
                 // Somebody claimed it again in the meantime; serve it straight
                 // from the source rather than waiting a second time.
@@ -1091,14 +1120,41 @@ impl ChunkCache {
     }
 
     /// Mark chunks pending. Returns `(claimed, already pending elsewhere)`.
-    fn claim(&self, array: ArrayId, chunks: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    /// Split `chunks` into the ones this call will fetch, the ones another call
+    /// is already fetching, and the ones that **became resident** since the
+    /// caller looked.
+    ///
+    /// # The third list, and why it is not a refinement
+    ///
+    /// It used to return two, and the resident ones were `continue`d — correct
+    /// for the question this function's name asks, since a chunk somebody has
+    /// already cached must not be fetched again, and **wrong for the caller**,
+    /// which is filling an output buffer and had counted that chunk as a miss.
+    /// Dropped from both lists, it was copied into the caller's buffer by
+    /// nothing, and the buffer is zeroed at allocation — so the read returned
+    /// **zeros** where that chunk's voxels belonged.
+    ///
+    /// The window is between `read_region_bytes`' `serve_from_cache` reporting a
+    /// miss and this lock being taken, so it needs a second thread to insert the
+    /// same chunk in between, and it never happened while nothing in the crate
+    /// constructed a cache. Turning `ZarrEnvironment`'s cache on by default
+    /// produced it immediately: 23 wrong reads in
+    /// `concurrent_reads_through_the_cache_return_what_uncached_reads_do`, and
+    /// an intermittent failure of
+    /// `zarr_env::concurrent_execution_through_storage_is_still_byte_identical`
+    /// at concurrency 4 — a different voxel each run, which is what a race looks
+    /// like from the outside.
+    fn claim(&self, array: ArrayId, chunks: &[u64]) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let mut claimed = Vec::new();
         let mut waited = Vec::new();
+        let mut resident = Vec::new();
         for &chunk in chunks {
             let key = ChunkKey { array, chunk };
-            // Somebody may have inserted it since the caller looked.
+            // Somebody inserted it since the caller looked. Not ours to fetch,
+            // and still the caller's to be given.
             if state.entries.contains_key(&key) {
+                resident.push(chunk);
                 continue;
             }
             if state.pending.insert(key) {
@@ -1107,7 +1163,7 @@ impl ChunkCache {
                 waited.push(chunk);
             }
         }
-        (claimed, waited)
+        (claimed, waited, resident)
     }
 
     fn release(&self, array: ArrayId, chunks: &[u64]) {

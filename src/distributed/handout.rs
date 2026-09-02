@@ -199,11 +199,14 @@ impl HandoutPolicy {
             //    preference as a *filter* and is therefore wrong in the cheap
             //    direction by construction, nothing bounds this one.
             //  * the LRU is sized by `WorkflowSpec::cache_bytes` and models
-            //    `cache::ChunkCache`, which has **no non-test construction
-            //    site**. What can physically serve a re-read on a node is the
-            //    page cache, sized by free RAM — so the model understates
+            //    `cache::ChunkCache`, which **`ZarrEnvironment` now constructs
+            //    by default** — that half of the objection is gone. What has not
+            //    changed is that the model's size and the real cache's are set
+            //    independently, and that a worker's environment comes from a
+            //    deployment's `WorkflowFactory`, which may not be a
+            //    `ZarrEnvironment` at all. So the model still understates
             //    residency most of the time, which is harmless, and *overstates*
-            //    it exactly under memory pressure, which is not.
+            //    it where the two figures disagree, which is not.
             //
             // And the measurement, which is what turns this from a caution
             // into a refusal: the two are indistinguishable until the model
@@ -222,10 +225,10 @@ impl HandoutPolicy {
             // lift that one: a chunk cache on a read path whose real size is
             // what the policy is given.
             Self::Coalescing => Some(
-                "it scores against a modelled cache, and the model is of `cache::ChunkCache`, which has no non-test construction site — so like `cache-modelled` it is ranking on a residency nothing on the read path produces. It is designed against that policy's two recorded defects: it blends warmth with distance instead of ranking warmth above it, so a miss count that carries no information cannot dominate, and it counts the chunks this worker's own node is already fetching, which is a set the coordinator genuinely knows. Both are arguments rather than measurements. Lifted by the same thing that lifts `cache-modelled`, plus a run on a real coordinator showing it beats `nearest-first` where the simulator says it does",
+                "it scores against a modelled `cache::ChunkCache` whose size is set independently of the cache a worker actually has — `ZarrEnvironment` constructs one by default now, but a worker's environment comes from a deployment's `WorkflowFactory` and `WorkflowSpec::cache_bytes` is not wired to it, so like `cache-modelled` it may be ranking on a residency the read path does not have. It is designed against that policy's two recorded defects: it blends warmth with distance instead of ranking warmth above it, so a miss count that carries no information cannot dominate, and it counts the chunks this worker's own node is already fetching, which is a set the coordinator genuinely knows. Both are arguments rather than measurements. Lifted by the same thing that lifts `cache-modelled`, plus a run on a real coordinator showing it beats `nearest-first` where the simulator says it does",
             ),
             Self::CacheModelled => Some(
-                "it ranks a modelled cache hit above distance while the cache it models does not exist — `cache::ChunkCache` has no non-test construction site, so no `Environment::read` is served from one. Its chunk *set* is real, and while the model holds two tasks' reads or more this policy is `nearest-first` to the digit. Below that it is measurably worse rather than merely uninformative: at a modelled capacity of one chunk it duplicates 22 fetches against `nearest-first`'s 6, a third of the way back to naive pull's 62, because a miss count that varies without carrying information still outranks distance. It is never better at any capacity. Lifted by a chunk cache on a read path whose real size is what the model is given — see `distributed::tests::the_two_policies_are_indistinguishable_until_the_model_evicts`, which is that measurement and which fails if this stops being true",
+                "it ranks a modelled cache hit above distance while nothing ties the model's size to the `cache::ChunkCache` the read path has — `ZarrEnvironment` constructs one by default now, so a cache does exist, but a worker builds its environment from a deployment's `WorkflowFactory`, which need not be one, and `WorkflowSpec::cache_bytes` sizes the model alone. Its chunk *set* is real, and while the model holds two tasks' reads or more this policy is `nearest-first` to the digit. Below that it is measurably worse rather than merely uninformative: at a modelled capacity of one chunk it duplicates 22 fetches against `nearest-first`'s 6, a third of the way back to naive pull's 62, because a miss count that varies without carrying information still outranks distance. It is never better at any capacity. Lifted by a chunk cache on a read path whose real size is what the model is given — see `distributed::tests::the_two_policies_are_indistinguishable_until_the_model_evicts`, which is that measurement and which fails if this stops being true",
             ),
         }
     }

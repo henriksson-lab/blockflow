@@ -95,12 +95,24 @@ fn a_cached_read_is_the_same_read_and_the_cache_serves_it() {
         "the fixture needs a traversal to revisit"
     );
 
+    // **The control is `without_cache`, where it used to be the default.**
+    //
+    // This asserted that a fresh environment has no cache, on the grounds that
+    // "a cache must be asked for; an environment that acquires one by upgrading
+    // changes what a read costs and what the process holds without anyone
+    // saying so". That was a good argument for not switching it on silently and
+    // it held while nobody had measured what a cache was worth.
+    // `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store` below is that
+    // measurement — 3.09x fewer bytes off the store — so the default is now on
+    // and the opt-out is explicit.
     let cold_root = root("cold");
-    let cold = ZarrEnvironment::create(&cold_root, &source(), CHUNK).expect("a store");
+    let cold = ZarrEnvironment::create(&cold_root, &source(), CHUNK)
+        .expect("a store")
+        .without_cache();
     assert!(
         cold.cache_stats().is_none(),
-        "a cache must be asked for; an environment that acquires one by upgrading changes what \
-         a read costs and what the process holds without anyone saying so"
+        "`without_cache` must actually leave the environment without one, or the \
+         comparison below is a cache against a cache"
     );
     let plain = read_all(&cold, &regions);
 
@@ -424,7 +436,8 @@ fn the_prefetch_sweep_has_a_control_at_both_ends() {
 /// * `HandoutPolicy::CacheModelled` and `HandoutPolicy::Coalescing` are both
 ///   **refused at the caller boundary** on the grounds that "`cache::ChunkCache`
 ///   has no non-test construction site, so no `Environment::read` is served from
-///   one";
+///   one" — which was true when written and is not any more, since
+///   `ZarrEnvironment` caches by default;
 /// * `distributed::placement` and `distributed::cache_model` repeat the same
 ///   sentence.
 ///
@@ -570,4 +583,94 @@ fn print_what_the_cache_saves() {
             best * 1e3
         );
     }
+}
+
+/// **Concurrent cached reads must return what concurrent uncached reads do.**
+///
+/// This is the property that was never checked, and the one that fails. Every
+/// other test in this file reads on one thread; the executor does not, and the
+/// moment `ZarrEnvironment` cached by default,
+/// `tests/zarr_env.rs`'s `concurrent_execution_through_storage_is_still_byte_identical`
+/// began failing intermittently at concurrency 4 — a different voxel each run,
+/// which is the signature of a race rather than of a mis-computed answer.
+///
+/// This isolates it from the executor: no plan, no ops, no blocks. Many threads
+/// read overlapping regions of one **immutable** array through one cache, and
+/// every read must equal the same read served without a cache. An immutable
+/// array is the easy case — there is no invalidation to get wrong — so a
+/// disagreement here is the cache's fill protocol and nothing else.
+#[test]
+fn concurrent_reads_through_the_cache_return_what_uncached_reads_do() {
+    use std::sync::Arc;
+
+    let regions = regions();
+    assert!(
+        regions.len() > 8,
+        "the fixture needs a traversal to revisit"
+    );
+
+    // The truth, read once with no cache and no concurrency.
+    let plain_root = root("concurrent-plain");
+    let plain = ZarrEnvironment::create(&plain_root, &source(), CHUNK)
+        .expect("a store")
+        .without_cache();
+    let want = read_all(&plain, &regions);
+
+    // **A capacity that must evict.** Sixteen chunks of the volume's several
+    // hundred, so the fill path is exercised repeatedly rather than warming
+    // once and answering from memory forever — which is the state in which a
+    // race in the claim protocol can be reached at all.
+    let warm_root = root("concurrent-warm");
+    let warm = Arc::new(
+        ZarrEnvironment::create(&warm_root, &source(), CHUNK)
+            .expect("a store")
+            .with_cache(16 * CHUNK.iter().product::<usize>() as u64 * 2),
+    );
+
+    let regions = Arc::new(regions);
+    let want = Arc::new(want);
+    let mut wrong = 0usize;
+    for round in 0..8 {
+        let mut handles = Vec::new();
+        for thread in 0..4 {
+            let warm = Arc::clone(&warm);
+            let regions = Arc::clone(&regions);
+            let want = Arc::clone(&want);
+            handles.push(std::thread::spawn(move || {
+                let mut bad = 0usize;
+                // Each thread walks the same regions from a different offset, so
+                // they contend for the same chunks without marching in step.
+                for step in 0..regions.len() {
+                    let which = (step + thread * 3 + round) % regions.len();
+                    let got = match warm
+                        .read(0, &regions[which])
+                        .expect("a cached read must not fail")
+                    {
+                        blockflow::env::BlockBuf::Array(voxels) => voxels,
+                        other => panic!("expected voxels, got {other:?}"),
+                    };
+                    if got != want[which] {
+                        bad += 1;
+                    }
+                }
+                bad
+            }));
+        }
+        for handle in handles {
+            wrong += handle.join().expect("no thread may panic");
+        }
+    }
+    assert_eq!(
+        wrong, 0,
+        "{wrong} concurrent cached reads disagreed with the uncached read of the same \
+         region. The array is never written, so there is no invalidation to get wrong — \
+         this is the fill protocol serving bytes that are not the chunk's."
+    );
+
+    let stats = warm.cache_stats().expect("a cache");
+    assert!(
+        stats.hits() > 0 && stats.misses > 0,
+        "the capacity did not make the fixture both hit and evict, so the fill path was \
+         not exercised: {stats:?}"
+    );
 }

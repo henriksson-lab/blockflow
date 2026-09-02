@@ -4583,11 +4583,12 @@ impl Strategy for Greedy {
             // of fetches ahead makes the next demand fetch queue behind all of
             // it.
             //
-            // **Not changed here, because `prefetch_depth` currently reaches
-            // nothing** — `cache::ChunkCache` has no non-test construction site,
-            // so no `Environment::read` is served from one and this field is
-            // inert in production. Changing an inert number on a model's word
-            // would be a change nobody could have measured. It is the first
+            // **Not changed here, because `prefetch_depth` still reaches
+            // nothing.** `ZarrEnvironment` caches by default now, so a cache is
+            // no longer the missing piece — but `with_prefetch` is separate, is
+            // off by default, and nothing in the crate calls it, so this field
+            // remains inert in production. Changing an inert number on a model's
+            // word would be a change nobody could have measured. It is the first
             // thing to measure when the prefetcher is wired.
             priority: SchedulePriority::BlockMajor,
             concurrency: self.concurrency,

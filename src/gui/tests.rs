@@ -670,8 +670,10 @@ fn a_public_bind_is_refused_before_a_socket_is_opened() {
         ExportMeta::new("live", [64, 64, 64], 1),
         [1, 1, 1],
     ));
-    let mut options = Options::default();
-    options.bind = "0.0.0.0:0".parse().unwrap();
+    let options = Options {
+        bind: "0.0.0.0:0".parse().unwrap(),
+        ..Default::default()
+    };
     let error = serve(live, options).unwrap_err();
     assert!(
         error.to_string().contains("not a loopback address"),

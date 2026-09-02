@@ -133,13 +133,18 @@ pub struct Machine {
     ///
     /// # Which cache this is, decided
     ///
-    /// It used to be `cache::ChunkCache`'s budget, and that was a model of a
-    /// component nobody constructs: `distributed::cache_model` says so outright
-    /// — "`cache::ChunkCache` … has **no non-test construction site**, so no
-    /// `Environment::read` is served from one. What can physically serve a
-    /// re-read on a node is the page cache, sized by free RAM." So the
+    /// It used to be `cache::ChunkCache`'s budget, and at the time that was a
+    /// model of a component nobody constructed: what could physically serve a
+    /// re-read on a node was the page cache, sized by free RAM, so the
     /// simulator's central mechanism — ordering changes hit rate — was
-    /// parameterised by an axis that does not exist on the machine.
+    /// parameterised by an axis that did not exist on the machine.
+    ///
+    /// **`ZarrEnvironment` caches by default now**, so that axis does exist for
+    /// a run through storage. The decision below is unchanged and the reason is
+    /// worth keeping: the page cache is still what serves a re-read for every
+    /// other environment, it is still sized by free RAM rather than by anything
+    /// this crate sets, and a simulator parameterised by the *smaller* and more
+    /// variable of the two would model the machine less well, not more.
     ///
     /// **The decision taken here is to model what physically serves the
     /// re-read**, which today is the page cache. Two consequences follow and

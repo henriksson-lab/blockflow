@@ -168,7 +168,6 @@ fn go() -> Result<()> {
             bind: args.bind,
             allow_public: args.allow_public,
             advertise: args.advertise.clone(),
-            ..Default::default()
         },
     )?;
     println!(

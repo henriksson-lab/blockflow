@@ -337,9 +337,43 @@ but the neighbourhood features can separate them.
   last one: a combine declaring nothing must not make its fan-in re-derive a
   branch, asserted on the branch op's own call count.
 
-  What is left is the sampler itself — a combine that reads a `Chain::source`
-  label arm, emits one row per labelled voxel, and lets a block holding none emit
-  nothing. That is now an op to write rather than a hole in the machinery.
+  **And the sampler is written.** `ops::classify::SampleCombine` sits at the
+  sink of the feature stack's own fan-in, writes one row per labelled voxel as a
+  side output, and holds one block's channels at a time — so its residency is the
+  block's where `gather_samples`' is the crop's. `tests/forest_predict.rs`
+  compares the two bit for bit on a grid that cuts two ways, keyed by voxel
+  because the orders differ, and exercises a block holding no labels at all.
+
+  **The length is not data-dependent, which is what made a fixed-shape side
+  output possible.** Labels are *input*: the number of rows is the number of
+  labelled voxels and is countable before a single feature is computed. What is
+  data-dependent is only which voxels they are, and `LabelIndex` settles that up
+  front.
+
+  **The row order is a function of the partition, and that is the one real
+  constraint.** A side output's per-block slice is a box, so a block's rows have
+  to be contiguous — which means ordering by block, which means the sampler is
+  built against the grid the plan will use. That is the same coupling
+  `Chain::Source` documents for the image its leaf names, and it is checked
+  rather than trusted: `side_region` refuses a block the index was not built for,
+  by name.
+
+  Writing it turned up one defect worth recording, because the first version of
+  the test asserted the buggy behaviour: the primary image wrote *class indices*
+  filled with the unlabelled sentinel, and class index `0` against a sentinel of
+  `0` makes the first class indistinguishable from no label — in the one image
+  whose purpose is to show which voxels were sampled. It writes the annotator's
+  own labels now.
+
+  **The wrappers are there too**: `sample_workflow` builds the chain and the
+  index against a plan's grid, and `samples_from_rows` turns the two arrays the
+  run wrote back into `Samples`. That last one checks rather than casts — a side
+  output is `f64` and the classes are whole numbers stored in one, so a value
+  that is not a class the index knows means the arrays and the index came from
+  different runs, and an `as u32` would have turned that into a forest fitted to
+  the wrong labels. `sampling_blocked_fits_a_forest_as_good_as_the_cropping_path`
+  runs the whole thing: sample block by block, fit, predict, and recover 95% of a
+  volume whose two classes have the same mean intensity.
 * ~~**The predictor's residency**, still unmeasured through the allocator.~~
   **Measured, and a derivation now exists for it.** Through a global allocator, a
   fan-in whose combine cannot fold holds **exactly `1.000` block buffers per

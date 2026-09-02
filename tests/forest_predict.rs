@@ -1244,3 +1244,319 @@ fn a_forest_is_stable_when_its_features_are_narrowed_to_f32() {
         "f32 and a 1/32 quantisation are indistinguishable here"
     );
 }
+
+// ------------------------------------------------ 8. the blocked sampler --
+
+/// **The blocked sampler gathers exactly the rows the crop-based path does.**
+///
+/// `gather_samples` computes the stack over a crop and holds every channel of
+/// every voxel of it — 91 columns times the crop's voxels, which is 97 GB at a
+/// `512^3` crop. `SampleCombine` runs inside an ordinary fan-in, holds one
+/// block's channels at a time, and writes that block's rows as a side output, so
+/// its residency is the block's.
+///
+/// The two must gather the same features for the same voxels. They do **not**
+/// produce them in the same order and the test does not pretend otherwise:
+/// `gather_samples` orders rows by position in the volume, and the sampler
+/// orders them by block and then by position, because a side output's per-block
+/// slice is a box and a block's rows have to be contiguous. So both are keyed by
+/// voxel — which `LabelIndex::positions` exists to make possible — and compared
+/// as maps.
+#[test]
+fn the_blocked_sampler_gathers_what_the_cropping_gather_does() {
+    use std::collections::BTreeMap;
+
+    use blockflow::geometry::BlockGrid;
+    use blockflow::op::{Chain, SideBlock, SourceInputs};
+    use blockflow::ops::{LabelIndex, SampleCombine};
+    use blockflow::region::Region;
+
+    let volume = [16usize, 12, 8];
+    let stack = FeatureStack::labkit(&[1.0])
+        .unwrap()
+        .with_truncate(2.0)
+        .unwrap()
+        .with_families(&[Family::Gaussian, Family::GradientMagnitude])
+        .unwrap();
+    let names = stack.channel_names().unwrap();
+    assert_eq!(names.len(), 2);
+
+    let mut state = 20260901u64;
+    let input: Voxels = ndarray::Array3::from_shape_fn((volume[0], volume[1], volume[2]), |_| {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (state >> 33) as f64 / (1u64 << 31) as f64
+    })
+    .into();
+
+    // Scattered, so the labels fall in several blocks and at least one block
+    // gets none — the case the sampler must handle by writing an empty slice
+    // rather than by failing.
+    let drawn = [
+        ([1usize, 1usize, 1usize], 3u32),
+        ([2, 3, 4], 3),
+        ([9, 2, 2], 5),
+        ([10, 5, 6], 5),
+        ([14, 9, 7], 5),
+        ([15, 11, 0], 5),
+    ];
+    let mut labels = ndarray::Array3::<u32>::zeros((volume[0], volume[1], volume[2]));
+    for (at, class) in drawn {
+        labels[at] = class;
+    }
+    let labels: Voxels = labels.into();
+
+    // The oracle: the crop-based gather, keyed by voxel. Its rows are in volume
+    // row-major order over the labelled voxels, so that order is rebuilt here
+    // rather than assumed.
+    let (cropped, classes) = blockflow::ops::gather_samples(&stack, &input, &labels, 0).unwrap();
+    assert_eq!(classes.labels(), &[3, 5]);
+    assert_eq!(cropped.rows(), drawn.len());
+    let mut in_volume_order: Vec<[usize; 3]> = drawn.iter().map(|(at, _)| *at).collect();
+    in_volume_order.sort();
+    let want: BTreeMap<[usize; 3], (Vec<f64>, u32)> = in_volume_order
+        .iter()
+        .enumerate()
+        .map(|(row, &at)| (at, (cropped.row(row).to_vec(), cropped.labels()[row])))
+        .collect();
+
+    // The blocked sampler, on a grid that cuts the volume two ways.
+    let grid = BlockGrid::along(volume, &[0, 1], 8).unwrap();
+    assert!(
+        grid.n_blocks() > 1,
+        "one block proves nothing about blocking"
+    );
+    let index = std::sync::Arc::new(LabelIndex::build(&labels, 0, &grid).unwrap());
+    assert_eq!(index.rows(), drawn.len());
+    assert_eq!(index.classes().labels(), &[3, 5]);
+
+    let chain = Chain::parallel(
+        stack.branches().unwrap(),
+        Box::new(SampleCombine::new(
+            "sample",
+            names.clone(),
+            index.clone(),
+            0,
+        )),
+    )
+    .unwrap();
+    let outputs = chain.side_outputs(volume);
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].shape, vec![drawn.len(), names.len()]);
+    assert_eq!(outputs[1].shape, vec![drawn.len()]);
+
+    // Run it block by block, as the executor would. The stack has a halo, so
+    // each block is handed the whole volume and trusts only its core — done by
+    // hand here so the test needs no executor.
+    let mut got: BTreeMap<[usize; 3], (Vec<f64>, u32)> = BTreeMap::new();
+    let at = Anchor::whole(volume);
+    let mut primary = Voxels::zeros(Dtype::U32, volume).unwrap();
+    chain.apply(&input, &mut primary, &at).unwrap();
+    let mut seen_empty = false;
+    for core in grid.cores() {
+        let start = [core.core.start[0], core.core.start[1], core.core.start[2]];
+        let shape = [core.core.shape[0], core.core.shape[1], core.core.shape[2]];
+        let within = Region::new(&start, &shape);
+        let regions = vec![
+            chain.side_region(0, &within, volume).unwrap(),
+            chain.side_region(1, &within, volume).unwrap(),
+        ];
+        seen_empty |= regions[0].shape[0] == 0;
+        let produced = chain
+            .apply_side(
+                &input,
+                SourceInputs::new(&[]),
+                &primary,
+                &SideBlock {
+                    at: &at,
+                    within: &within,
+                    regions: &regions,
+                },
+            )
+            .unwrap();
+        let (rows, row_classes) = (&produced[0], &produced[1]);
+        assert_eq!(rows.shape(), &[regions[0].shape[0], names.len()]);
+        for row in 0..regions[0].shape[0] {
+            // The row's voxel, from the index's own order — the row index means
+            // nothing without it.
+            let position = index.positions()[regions[0].start[0] + row];
+            let features = (0..names.len()).map(|column| rows[[row, column]]).collect();
+            let previous = got.insert(position, (features, row_classes[row] as u32));
+            assert!(previous.is_none(), "voxel {position:?} was written twice");
+        }
+    }
+    assert!(
+        seen_empty,
+        "every block held a labelled voxel, so the empty-slice case is untested"
+    );
+
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "the blocks together wrote every row once"
+    );
+    for (position, (features, class)) in &want {
+        let (mine, my_class) = got.get(position).expect("a row for every labelled voxel");
+        assert_eq!(mine, features, "features differ at {position:?}");
+        assert_eq!(my_class, class, "class differs at {position:?}");
+    }
+
+    // **And the primary image is the labels as the annotator drew them**, not
+    // the class indices they map to. Writing indices was the first version and
+    // was wrong: indices run `0..n` and the sentinel here is `0`, so class 0 and
+    // "unlabelled" would have been the same value in the one image whose job is
+    // to show what was sampled. Both classes appear below, and one of them is
+    // index 0, so this fails for that version.
+    let sampled = primary.view::<u32>().unwrap();
+    for (at, class) in drawn {
+        assert_eq!(sampled[at], class, "at {at:?}");
+    }
+    assert_eq!(
+        sampled.iter().filter(|&&value| value != 0).count(),
+        drawn.len(),
+        "a labelled voxel is missing from the primary, which is what writing class \
+         indices over a zero sentinel would do"
+    );
+}
+
+/// **The blocked path end to end**: sample, fit, predict — and the forest it
+/// produces classifies as well as the one the crop-based path produces.
+///
+/// The two gather the same rows in different orders, so the forests differ: a
+/// bagging draw is a function of the row order. What must agree is what a forest
+/// is *for*, which is the same comparison `the_fit_agrees_with_smartcore_...`
+/// makes and for the same reason.
+#[test]
+fn sampling_blocked_fits_a_forest_as_good_as_the_cropping_path() {
+    use blockflow::geometry::BlockGrid;
+    use blockflow::op::{SideBlock, SourceInputs};
+    use blockflow::ops::{sample_workflow, samples_from_rows};
+    use blockflow::region::Region;
+
+    let volume = [32usize, 24, 16];
+    let stack = FeatureStack::labkit(&[1.0])
+        .unwrap()
+        .with_truncate(2.0)
+        .unwrap();
+    let names = stack.channel_names().unwrap();
+
+    // Two textures split at a plane, same mean, as in the whole-volume test —
+    // so only the neighbourhood features separate them.
+    let mut state = 606u64;
+    let mut draw = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (state >> 33) as f64 / (1u64 << 31) as f64
+    };
+    let input: Voxels =
+        ndarray::Array3::from_shape_fn((volume[0], volume[1], volume[2]), |(i, _, _)| {
+            if i < volume[0] / 2 {
+                0.5
+            } else {
+                draw()
+            }
+        })
+        .into();
+
+    let mut labels = ndarray::Array3::<u32>::zeros((volume[0], volume[1], volume[2]));
+    for i in 2..8 {
+        for j in 2..10 {
+            for k in 2..10 {
+                labels[[i, j, k]] = 1;
+                labels[[i + volume[0] / 2, j, k]] = 2;
+            }
+        }
+    }
+    let labels: Voxels = labels.into();
+
+    let grid = BlockGrid::along(volume, &[0, 1], 16).unwrap();
+    assert!(grid.n_blocks() > 1);
+    let (chain, index) = sample_workflow(&stack, &labels, &grid, 0).unwrap();
+    assert_eq!(index.classes().labels(), &[1, 2]);
+
+    // Run every block, assembling the two arrays the executor would.
+    let at = Anchor::whole(volume);
+    let mut primary = Voxels::zeros(Dtype::U32, volume).unwrap();
+    chain.apply(&input, &mut primary, &at).unwrap();
+    let mut rows = ndarray::Array2::<f64>::zeros((index.rows(), names.len()));
+    let mut classes = ndarray::Array1::<f64>::zeros(index.rows());
+    for core in grid.cores() {
+        let within = Region::new(
+            &[core.core.start[0], core.core.start[1], core.core.start[2]],
+            &[core.core.shape[0], core.core.shape[1], core.core.shape[2]],
+        );
+        let regions = vec![
+            chain.side_region(0, &within, volume).unwrap(),
+            chain.side_region(1, &within, volume).unwrap(),
+        ];
+        let produced = chain
+            .apply_side(
+                &input,
+                SourceInputs::new(&[]),
+                &primary,
+                &SideBlock {
+                    at: &at,
+                    within: &within,
+                    regions: &regions,
+                },
+            )
+            .unwrap();
+        let offset = regions[0].start[0];
+        for row in 0..regions[0].shape[0] {
+            for column in 0..names.len() {
+                rows[[offset + row, column]] = produced[0][[row, column]];
+            }
+            classes[offset + row] = produced[1][[row]];
+        }
+    }
+
+    let sampled = samples_from_rows(rows.view(), classes.view(), &index, names.clone()).unwrap();
+    assert_eq!(sampled.rows(), index.rows());
+    assert_eq!(sampled.channels(), names.as_slice());
+
+    // And a forest fitted to it recovers the volume it was never shown.
+    let spec = TrainingSpec {
+        trees: 20,
+        ..Default::default()
+    };
+    let forest = Forest::train(&sampled, &spec).unwrap();
+    let chain =
+        blockflow::ops::predict_workflow(&stack, Arc::new(forest), Prediction::Label).unwrap();
+    let mut out = Voxels::zeros(Dtype::U32, volume).unwrap();
+    chain
+        .apply(&input, &mut out, &Anchor::whole(volume))
+        .unwrap();
+    let predicted = out.view::<u32>().unwrap();
+
+    let margin = 6usize;
+    let (mut correct, mut total) = (0usize, 0usize);
+    for i in margin..volume[0] - margin {
+        if i.abs_diff(volume[0] / 2) < margin {
+            continue;
+        }
+        for j in margin..volume[1] - margin {
+            for k in margin..volume[2] - margin {
+                let want = u32::from(i >= volume[0] / 2);
+                correct += usize::from(predicted[[i, j, k]] == want);
+                total += 1;
+            }
+        }
+    }
+    assert!(total > 200, "only {total} voxels scored");
+    let accuracy = correct as f64 / total as f64;
+    assert!(
+        accuracy > 0.95,
+        "a forest fitted to the blocked sampler's rows recovered {accuracy:.3} of the \
+         volume; a chain that learned nothing scores about 0.5"
+    );
+
+    // The mismatch guard: the arrays and the index must come from one run.
+    assert!(samples_from_rows(
+        rows.slice(ndarray::s![..2, ..]),
+        classes.slice(ndarray::s![..2]),
+        &index,
+        names.clone()
+    )
+    .is_err());
+    let mut broken = classes.clone();
+    broken[0] = 7.5;
+    assert!(samples_from_rows(rows.view(), broken.view(), &index, names).is_err());
+}

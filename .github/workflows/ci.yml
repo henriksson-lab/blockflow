@@ -159,6 +159,23 @@ jobs:
   # Linux only — a lint is not a platform — and beside `cargo fmt --check`,
   # because the two fail for the same reason and a contributor wants both
   # answers in one job rather than one after the other.
+  #
+  # **And it runs twice, because once had a blind spot.** `cargo clippy
+  # --all-targets` with no features cannot see a `#[cfg(feature = ...)]` module
+  # at all, and `gui`, `zarr`, `distributed` and `model-segment` are all behind
+  # one. Five real lints had accumulated in `src/gui/`, `src/zarr_env.rs` and
+  # `src/bin/blockflow_coordinator.rs` — a manual `find`, two manual
+  # `contains`, a discarded `enumerate` index and a needless struct update —
+  # every one of them under a feature, every one of them invisible here, and
+  # every one of them a `-D warnings` failure the moment anybody built with the
+  # features the job above already tests.
+  #
+  # The second pass is that same wide set. It is not every combination: `fftw`
+  # needs a system library, and `stardist`, `cellpose` and `yolo` are git
+  # dependencies whose compile is most of what this workflow costs. The rule the
+  # two passes encode is that **a feature the matrix builds is a feature the
+  # lints should see**, and those three are built and not tested for reasons the
+  # matrix states.
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -182,6 +199,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-lint-
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features gui,distributed,zarr,model-segment -- -D warnings
 
   # `fftw` links the system `libfftw3`, and when there is none the failure is a
   # link error rather than a fallback to the portable backend — deliberately, and

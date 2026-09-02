@@ -225,7 +225,8 @@ pub use adjacency::{
     walk_adjacent_pairs, AdjacentPairsOp, Pair, HIGHER_COLUMNS,
 };
 pub use classify::{
-    gather_samples, predict_workflow, train_workflow, ClassMap, ForestPredictor, Prediction,
+    gather_samples, predict_workflow, sample_workflow, samples_from_rows, train_workflow, ClassMap,
+    ForestPredictor, LabelIndex, Prediction, SampleCombine,
 };
 /// The only thing in `components` a *caller* chooses rather than a builder of
 /// ops uses. The rest of that module stays behind its own path, because it is

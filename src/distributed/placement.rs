@@ -126,7 +126,7 @@ pub struct Residency<'a> {
     /// **What this claims physically, because an earlier version of this line
     /// claimed something the codebase does not have.** It said the tier modelled
     /// *"this crate's own chunk cache"*. There is no such cache on any read
-    /// path: `cache::ChunkCache` has no non-test construction site, so nothing
+    /// path: `WorkflowSpec::cache_bytes` sizes this model and nothing ties it to the cache a worker's environment actually has, so nothing
     /// anywhere skips a fetch on the strength of an earlier one. What can
     /// physically serve a re-read is whatever the node happens to hold — the
     /// page cache under a filesystem store, and nothing this crate owns —

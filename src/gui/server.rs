@@ -302,12 +302,9 @@ fn control_from(pairs: &[(String, String)]) -> Option<Control> {
 /// environment variable. The same trade `animate::renderer_path` makes, for the
 /// same reason.
 pub fn find_assets() -> Option<PathBuf> {
-    for candidate in asset_candidates() {
-        if candidate.join("index.html").is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    asset_candidates()
+        .into_iter()
+        .find(|candidate| candidate.join("index.html").is_file())
 }
 
 fn asset_candidates() -> Vec<PathBuf> {
