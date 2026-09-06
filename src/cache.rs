@@ -1453,6 +1453,44 @@ impl ChunkCache {
     }
 
     /// Drop everything, returning every lease.
+    /// Drop every cached chunk that `region` of `array` touches.
+    ///
+    /// **What makes an intermediate image cacheable at all.** `ChunkCache` had
+    /// only [`Self::clear`], so `ZarrEnvironment` cached the images a run never
+    /// writes and nothing else — a stale chunk is a wrong answer rather than a
+    /// slow one, and clearing the whole cache at every write would have thrown
+    /// away the source's chunks to protect the intermediate's.
+    ///
+    /// **Chunks, not the region.** A write that covers part of a chunk still
+    /// makes the whole chunk stale, so the unit of invalidation is the unit of
+    /// caching. `covering` is the same function the read path uses to decide
+    /// which chunks answer a region, so the two cannot disagree about what a
+    /// region touches.
+    ///
+    /// Returns how many entries were dropped, which is what lets a test assert
+    /// that a write actually invalidated something rather than that the run
+    /// happened to be correct.
+    pub fn invalidate(&self, array: ArrayId, region: &Region) -> Result<usize> {
+        let reg = self.registered(array)?;
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut dropped = 0;
+        for chunk in reg.covering(region) {
+            let key = ChunkKey { array, chunk };
+            if let Some(entry) = state.entries.remove(&key) {
+                state.bytes = state.bytes.saturating_sub(entry.payload.len() as u64);
+                state.recency.remove(&entry.tick);
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// Whether `array` is one this cache knows, so a caller can skip the work of
+    /// building a region for an image that was never registered.
+    pub fn holds(&self, array: ArrayId) -> bool {
+        self.registered(array).is_ok()
+    }
+
     pub fn clear(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.entries.clear();

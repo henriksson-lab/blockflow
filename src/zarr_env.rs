@@ -1595,9 +1595,43 @@ impl ZarrEnvironment {
         self.cache.as_ref().map(|cache| cache.stats())
     }
 
-    /// Whether `image` may be read through the cache: one this run never writes.
-    fn cacheable(&self, image: usize) -> bool {
-        self.cache.is_some() && (image == 0 || is_supplied_image(image))
+    /// Whether `image` may be read through the cache.
+    ///
+    /// **Every image, now that [`ChunkCache::invalidate`] exists.** It used to be
+    /// image 0 and the supplied inputs alone — the ones a run never writes —
+    /// because the cache could only be cleared wholesale, so protecting an
+    /// intermediate from a stale chunk meant throwing away the source's chunks
+    /// at every phase boundary.
+    ///
+    /// That excluded where much of the remaining value is: the image phase `N`
+    /// writes is read by phase `N + 1` **with a halo**, so it is re-read exactly
+    /// the way the source is, and `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store`
+    /// measures what that is worth on the source at 3.09x.
+    ///
+    /// What makes it safe is that [`Environment::write`] invalidates what it
+    /// writes — see there, which also says why it does so on *both* sides of the
+    /// write rather than relying on phases being ordered.
+    fn cacheable(&self, _image: usize) -> bool {
+        self.cache.is_some()
+    }
+
+    /// Drop the cached chunks `region` of `image` touches, if it is cached.
+    ///
+    /// `Ok(0)` where there is no cache, the image was never registered with one,
+    /// or nothing of it was resident — all three are "nothing to do" and none is
+    /// an error.
+    fn invalidate(&self, image: usize, region: &Region) -> Result<usize> {
+        let Some(cache) = self.cache.as_ref() else {
+            return Ok(0);
+        };
+        let registered = self
+            .cached
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some((id, _)) = registered.get(&image) else {
+            return Ok(0);
+        };
+        cache.invalidate(*id, region)
     }
 
     /// The registered [`CachingSource`] for `image`, registering it on first use.
@@ -2698,12 +2732,29 @@ impl Environment for ZarrEnvironment {
                 got: source.shape().to_vec(),
             });
         }
+        // **Invalidate on both sides of the write.**
+        //
+        // Before, so that a reader arriving while the bytes are going down finds
+        // nothing cached and goes to the store; after, so that anything such a
+        // reader cached from a half-written chunk does not survive the write
+        // that finished it.
+        //
+        // One of the two would do if reads of an image could not overlap writes
+        // of it — phases run in order, so phase `N + 1` reads what phase `N`
+        // finished writing, and within phase `N` nothing reads image `N` at all.
+        // That argument is almost certainly correct and it is exactly the shape
+        // of argument that hid `ChunkCache::claim`'s dropped-chunk race for as
+        // long as it did: a window nobody could reach, until the cache was
+        // switched on and it was reached immediately. Two lock acquisitions per
+        // block write is not a price worth an argument.
+        self.invalidate(image, valid)?;
         let serialised = by_dtype!(array.dtype, |Element| {
             let view = source.view::<Element>()?;
             let standard = view.as_standard_layout();
             let data = standard.as_slice().expect("standard layout is contiguous");
             array.write_as::<Element>(valid, data, Some(&self.locks))
         })?;
+        self.invalidate(image, valid)?;
         if serialised {
             self.serialised_writes.fetch_add(1, Ordering::SeqCst);
         }

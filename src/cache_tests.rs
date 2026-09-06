@@ -1530,3 +1530,111 @@ fn measured_cache_and_prefetch_report() {
         .unwrap();
     println!("cached re-read of the same region: {:?}", hit.elapsed());
 }
+
+/// **Eviction racing a read changes no answer**, which is the mirror of the
+/// insert race `ChunkCache::claim` used to lose.
+///
+/// That bug was a chunk arriving between a reader's miss and its claim, and
+/// being dropped from both of `claim`'s lists — so nothing copied it and the
+/// output buffer kept the zeros it was allocated with. The fix gives `claim` a
+/// third list and serves those chunks; and because a chunk resident at the claim
+/// can be *gone again* by the time it is served, that path falls back to a direct
+/// fetch.
+///
+/// **That fallback is a branch with no other coverage**, and a branch nothing
+/// reaches is a branch nobody has checked. Reaching it needs an eviction between
+/// two instants microseconds apart, which is not a thing to arrange
+/// deterministically — so this arranges it statistically: readers hammer
+/// overlapping regions while another thread clears the cache underneath them, on
+/// a fixture small enough that the two collide constantly.
+///
+/// **And the shape was tuned until it actually reached the branch**, rather than
+/// until it passed. With 40 rounds over single-chunk regions, breaking the
+/// fallback on purpose failed this test only **2 times in 5** — a regression
+/// test that sleeps through the regression three times out of five. Six hundred
+/// rounds over regions spanning *two* chunks, so each read makes two claims and
+/// has two chances to lose one, takes that to **6 of 6**. The passing run is
+/// 0 of 6.
+///
+/// Every read must equal what the source holds, whatever the cache did.
+#[test]
+fn clearing_the_cache_under_concurrent_readers_changes_no_answer() {
+    let volume = ramp_u16([1, 4, 64]);
+    let truth = Probe::new(volume.clone());
+    let (probe, _handle) = probe_pair(Probe::new(volume));
+    let cache = Arc::new(ChunkCache::new(roomy(), 1 << 16));
+    let source = Arc::new(
+        CachingSource::<u16>::attach(
+            Arc::clone(&cache),
+            "churned",
+            &[1, 1, 8],
+            ArrayPolicy::default(),
+            probe,
+        )
+        .expect("attach"),
+    );
+
+    // Overlapping windows, so consecutive reads share chunks and a cleared
+    // entry is one somebody is about to want. Each spans two chunks, so a read
+    // makes two claims and has two chances to find one evicted between the
+    // claim and the serve — which is the window the fallback below exists for.
+    let regions: Vec<Region> = (0..24)
+        .map(|start| Region::new(&[0, start % 4, start * 2], &[1, 1, 12]))
+        .collect();
+    let expected: Vec<_> = regions
+        .iter()
+        .map(|region| truth.read_region(region).expect("the source"))
+        .collect();
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn = {
+        let cache = Arc::clone(&cache);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut cleared = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                cache.clear();
+                cleared += 1;
+            }
+            cleared
+        })
+    };
+
+    let regions = Arc::new(regions);
+    let expected = Arc::new(expected);
+    let readers: Vec<_> = (0..4)
+        .map(|thread| {
+            let source = Arc::clone(&source);
+            let regions = Arc::clone(&regions);
+            let expected = Arc::clone(&expected);
+            std::thread::spawn(move || {
+                let mut bad = 0usize;
+                for round in 0..600 {
+                    let which = (round * 7 + thread) % regions.len();
+                    let got = source.read_region(&regions[which]).expect("a read");
+                    if got != expected[which] {
+                        bad += 1;
+                    }
+                }
+                bad
+            })
+        })
+        .collect();
+
+    let wrong: usize = readers
+        .into_iter()
+        .map(|reader| reader.join().expect("no reader may panic"))
+        .sum();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let cleared = churn.join().expect("the churn thread must not panic");
+
+    assert_eq!(
+        wrong, 0,
+        "{wrong} reads disagreed with the source while the cache was being cleared \
+         underneath them"
+    );
+    assert!(
+        cleared > 0,
+        "the churn thread never ran, so nothing was racing the readers"
+    );
+}

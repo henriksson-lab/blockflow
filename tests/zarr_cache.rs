@@ -169,7 +169,7 @@ fn a_cached_read_is_the_same_read_and_the_cache_serves_it() {
 /// environment, reads it twice, and asserts the cache gained nothing: a hit
 /// there would be a chunk served from before the write.
 #[test]
-fn a_written_image_is_not_cached() {
+fn a_written_image_is_cached_and_a_write_invalidates_it() {
     let path = root("written");
     let env = ZarrEnvironment::create(&path, &source(), CHUNK)
         .expect("a store")
@@ -211,24 +211,65 @@ fn a_written_image_is_not_cached() {
          from an uncached one and the assertion below means nothing"
     );
 
-    let block =
-        blockflow::env::BlockBuf::Array(Voxels::zeros(Dtype::U16, [16, 16, 16]).expect("a block"));
-    env.write(1, &region, &region, &block)
+    // **A written image is cached, and a write to it invalidates.** The
+    // property that matters is not "no hits" — it is that a read after a write
+    // returns what was written, never a chunk cached before it.
+    let ones = Voxels::from(ndarray::Array3::<u16>::from_elem((16, 16, 16), 1));
+    env.write(1, &region, &region, &blockflow::env::BlockBuf::Array(ones))
         .expect("image 1 is writable");
-    let _ = env.read(1, &region).expect("image 1 reads");
-    let _ = env.read(1, &region).expect("image 1 reads again");
-    let after = env.cache_stats().expect("a cache");
+    let first = env.read(1, &region).expect("image 1 reads");
+    let again = env.read(1, &region).expect("image 1 reads again");
     assert_eq!(
-        after.hits(),
-        baseline.hits(),
-        "reading a written image twice added {} hits. `ChunkCache` cannot invalidate one array, \
-         so a chunk cached before a write would be served after it — a wrong answer rather than \
-         a slow one",
-        after.hits() - baseline.hits()
+        first.as_array().unwrap(),
+        again.as_array().unwrap(),
+        "two reads of one written image disagreed"
     );
-    assert_eq!(
-        after.misses, baseline.misses,
-        "a written image should not reach the cache at all, as a miss or otherwise"
+    assert!(
+        first
+            .as_array()
+            .unwrap()
+            .view::<u16>()
+            .unwrap()
+            .iter()
+            .all(|&value| value == 1),
+        "the read did not return what was written"
+    );
+    let after = env.cache_stats().expect("a cache");
+    assert!(
+        after.hits() > baseline.hits(),
+        "reading a written image twice produced no hit, so intermediates are still not \
+         cached and the invalidation below has nothing to protect"
+    );
+
+    // Now overwrite it and read again: the cached chunk from the read above must
+    // not survive. This is the whole of what `ChunkCache::invalidate` buys, and
+    // without it this read returns ones.
+    let twos = Voxels::from(ndarray::Array3::<u16>::from_elem((16, 16, 16), 2));
+    env.write(1, &region, &region, &blockflow::env::BlockBuf::Array(twos))
+        .expect("image 1 is writable again");
+    let overwritten = env
+        .read(1, &region)
+        .expect("image 1 reads after the overwrite");
+    assert!(
+        overwritten
+            .as_array()
+            .unwrap()
+            .view::<u16>()
+            .unwrap()
+            .iter()
+            .all(|&value| value == 2),
+        "a read after an overwrite returned the chunk cached before it — a stale chunk is \
+         a wrong answer rather than a slow one, which is why this image was uncacheable \
+         until `ChunkCache::invalidate` existed"
+    );
+    // And it does reach the cache: the read after the write was a miss, which
+    // is what an invalidated chunk produces and what "not cached at all" would
+    // also produce — which is why the hit above is asserted too. The pair is the
+    // claim: cached, and invalidated.
+    assert!(
+        after.misses > baseline.misses,
+        "the written image produced no miss, so it never reached the cache and the \
+         invalidation above protected nothing"
     );
 }
 
@@ -673,4 +714,216 @@ fn concurrent_reads_through_the_cache_return_what_uncached_reads_do() {
         "the capacity did not make the fixture both hit and evict, so the fill path was \
          not exercised: {stats:?}"
     );
+}
+
+/// **Prefetching must not change what a read returns, under concurrency.**
+///
+/// The sibling of `concurrent_reads_through_the_cache_return_what_uncached_reads_do`,
+/// and written for the reason that one exists: the bug it caught lived in
+/// `ChunkCache::claim`, which the prefetcher drives too — through
+/// `fill(.., None, true)`, on its own threads, against the same shared state.
+///
+/// The existing concurrency coverage of that path is narrower than it looks.
+/// `cache_tests::six_concurrent_readers_of_one_chunk_cause_one_source_read`
+/// spawns six threads at **one region**, which exercises "concurrent demand for
+/// one chunk costs one read" and never reaches varied overlapping regions under
+/// eviction — which is exactly the shape that produced 23 wrong reads before the
+/// fix.
+///
+/// So: demand reads on several threads, a prefetcher filling the same cache
+/// underneath them, and a capacity small enough that it must evict while both
+/// are running. Every read must equal the uncached read of the same region.
+#[test]
+fn prefetching_under_concurrent_demand_reads_changes_no_answer() {
+    use std::sync::Arc;
+
+    let regions = regions();
+    assert!(
+        regions.len() > 8,
+        "the fixture needs a traversal to revisit"
+    );
+
+    let plain_root = root("prefetch-plain");
+    let plain = ZarrEnvironment::create(&plain_root, &source(), CHUNK)
+        .expect("a store")
+        .without_cache();
+    let want = Arc::new(read_all(&plain, &regions));
+
+    // Eight chunks: enough that prefetched chunks land and are used, far too
+    // few to hold the traversal, so the fill path runs throughout.
+    let capacity = 8 * CHUNK.iter().product::<usize>() as u64 * 2;
+    let warm_root = root("prefetch-warm");
+    let warm = Arc::new(
+        ZarrEnvironment::create(&warm_root, &source(), CHUNK)
+            .expect("a store")
+            .with_cache(capacity)
+            .with_prefetch(2, 6)
+            .expect("a prefetcher needs the cache above"),
+    );
+
+    let regions = Arc::new(regions);
+    let mut wrong = 0usize;
+    for round in 0..6 {
+        // Ask for the whole traversal to be warmed while the readers run, so
+        // the prefetch threads and the demand reads contend for one cache.
+        warm.prefetch(0, &regions).expect("a prefetch submission");
+
+        let mut handles = Vec::new();
+        for thread in 0..4 {
+            let warm = Arc::clone(&warm);
+            let regions = Arc::clone(&regions);
+            let want = Arc::clone(&want);
+            handles.push(std::thread::spawn(move || {
+                let mut bad = 0usize;
+                for step in 0..regions.len() {
+                    let which = (step + thread * 3 + round) % regions.len();
+                    let got = match warm
+                        .read(0, &regions[which])
+                        .expect("a cached read must not fail")
+                    {
+                        blockflow::env::BlockBuf::Array(voxels) => voxels,
+                        other => panic!("expected voxels, got {other:?}"),
+                    };
+                    if got != want[which] {
+                        bad += 1;
+                    }
+                }
+                bad
+            }));
+        }
+        for handle in handles {
+            wrong += handle.join().expect("no thread may panic");
+        }
+    }
+    warm.drain_prefetch();
+
+    assert_eq!(
+        wrong, 0,
+        "{wrong} reads disagreed with the uncached read of the same region while a \
+         prefetcher was filling the same cache. The array is never written, so this is \
+         the fill protocol handing out bytes that are not the chunk's."
+    );
+
+    // And the prefetcher was actually doing something — without this the test
+    // passes for a prefetcher that never ran, which is this crate's empty-sink
+    // trap and the exact reason the bug above went unseen for so long.
+    let stats = warm.cache_stats().expect("a cache");
+    assert!(
+        stats.hits() > 0 && stats.misses > 0,
+        "the capacity did not make the fixture both hit and evict: {stats:?}"
+    );
+    let prefetch = warm.prefetch_stats().expect("a prefetcher");
+    assert!(
+        prefetch.started > 0,
+        "the prefetcher started nothing, so this test is a concurrency test with one \
+         fewer thread than it claims: {prefetch:?}"
+    );
+}
+
+/// **What caching the intermediates buys, on a plan that has some.**
+///
+/// `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store` measures the
+/// source at 3.09x, and the source was all the cache held until
+/// `ChunkCache::invalidate` existed. The argument for widening it to written
+/// images is that the image phase `N` writes is read by phase `N + 1` *with a
+/// halo*, so it is re-read the same way — and an argument is not a measurement,
+/// which is what this is.
+///
+/// # Read the hit counts, not `store bytes`
+///
+/// `CacheStats::source_bytes` counts bytes fetched **through the cache**, so it
+/// covers a different set of images in the two configurations and the two
+/// figures are not comparable. Running this against a `cacheable` restricted to
+/// image 0 reports *fewer* store bytes — not because less was read, but because
+/// the intermediate's reads bypassed the cache and were not counted. That
+/// comparison was made, and misread, before this paragraph was written.
+///
+/// The **hits and misses** are comparable, because each is a chunk access the
+/// cache saw. On this fixture, at a roomy capacity:
+///
+/// ```text
+///                       hits   misses   cache-path chunk accesses
+/// image 0 only           936       64   1000
+/// every image           1872      128   2000
+/// the intermediate       936       64   1000   (the difference)
+/// ```
+///
+/// So the intermediate is re-read **exactly as much as the source is**, which is
+/// what the halo argument predicted, and caching it turns 1000 chunk reads into
+/// 64 fetches and 936 hits — the same 15.6x the source gets on this fixture.
+/// Before the widening, all 1000 went to the store.
+///
+/// ```text
+/// cargo test --release --features zarr --test zarr_cache -- --ignored --nocapture what_caching_the_intermediates
+/// ```
+#[test]
+#[ignore = "a measurement, not an assertion"]
+fn print_what_caching_the_intermediates_saves() {
+    use blockflow::ops::smooth::{Gaussian, SmoothOp};
+
+    // Two reaching phases, so both the source and the intermediate are read with
+    // a halo and both have something to reuse.
+    let chain = Chain::sequence(vec![
+        Chain::op(SmoothOp::new(
+            "first",
+            Gaussian::isotropic(1.0, 2.0).expect("a kernel"),
+        )),
+        Chain::op(SmoothOp::new(
+            "second",
+            Gaussian::isotropic(1.0, 2.0).expect("a kernel"),
+        )),
+    ]);
+    let workflow = Workflow::new(chain, VOLUME, Dtype::U16);
+    let slots = workflow.chain.slots();
+    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
+    let grid = BlockGrid::along(VOLUME, &[0, 1, 2], 16).expect("a grid");
+    // One phase per op, so there is a real intermediate image between them.
+    let phases: Vec<PhaseDecomposition> = (0..slots.len())
+        .map(|slot| {
+            let reach = slots[slot].reach3(&VOLUME);
+            PhaseDecomposition::derive(
+                vec![slot],
+                vec![names[slot].clone()],
+                reach,
+                reach,
+                grid.clone(),
+            )
+        })
+        .collect();
+    let mut plan = Decomposition {
+        volume: VOLUME,
+        dtype: workflow.dtype,
+        phases,
+        chain_reach: workflow.chain.reach3(&VOLUME),
+    };
+    // A smoothing widens `u16` to `f64`, and a plan that does not say so is
+    // refused — see `Decomposition::declare_dtypes`, which is the thing to call
+    // rather than a width written here by hand.
+    plan.declare_dtypes(&workflow.chain).expect("the widths");
+    assert_eq!(plan.n_phases(), 2, "the measurement needs an intermediate");
+
+    let chunk_bytes = (CHUNK.iter().product::<usize>() * 2) as u64;
+    println!(
+        "{:>16} {:>14} {:>10} {:>10}",
+        "capacity", "store bytes", "hits", "misses"
+    );
+    for capacity in [0u64, chunk_bytes * 8, chunk_bytes * 64, chunk_bytes * 512] {
+        let path = root(&format!("intermediates-{capacity}"));
+        let mut env = ZarrEnvironment::create(&path, &source(), CHUNK).expect("a store");
+        env = if capacity > 0 {
+            env.with_cache(capacity)
+        } else {
+            env.without_cache()
+        };
+        execute("cached", &workflow, &plan, &Hints::default(), &env).expect("a run");
+        match env.cache_stats() {
+            Some(stats) => println!(
+                "{capacity:>16} {:>14} {:>10} {:>10}",
+                stats.source_bytes,
+                stats.hits(),
+                stats.misses
+            ),
+            None => println!("{:>16} {:>14} {:>10} {:>10}", "none", "-", "-", "-"),
+        }
+    }
 }
