@@ -61,16 +61,19 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-use ndarray::Array3;
+use ndarray::{Array3, ArrayD, IxDyn};
 
+use crate::budget::MemoryBudget;
+use crate::cache::{ArrayId, ArrayPolicy, CacheStats, ChunkCache, RegionSourceFetcher};
 use crate::decomposition::Decomposition;
 use crate::dtype::Dtype;
 use crate::env::{BlockBuf, EnvCounters, Environment};
 use crate::error::{Error, Result};
 use crate::geometry::chunks_touched;
 use crate::op::{Chain, Placement};
-use crate::region::Region;
+use crate::region::{Region, RegionSource};
 use crate::sidecar::{FileSidecars, Sidecars};
 use crate::voxels::Voxels;
 
@@ -121,12 +124,84 @@ fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<()> 
     Ok(())
 }
 
+fn offset_in(volume: [usize; 3], position: [usize; 3]) -> u64 {
+    (((position[0] * volume[1]) + position[1]) * volume[2] + position[2]) as u64 * BYTES as u64
+}
+
+fn read_region_from_file(
+    file: &File,
+    volume: [usize; 3],
+    image: usize,
+    region: &Region,
+) -> Result<Vec<f64>> {
+    let shape = [region.shape[0], region.shape[1], region.shape[2]];
+    let mut values = vec![0.0f64; shape.iter().product()];
+    let run = shape[2];
+    let mut raw = vec![0u8; run * BYTES];
+    let mut at = 0usize;
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            if run > 0 {
+                let offset = offset_in(
+                    volume,
+                    [region.start[0] + i, region.start[1] + j, region.start[2]],
+                );
+                read_exact_at(file, &mut raw, offset).map_err(|err| {
+                    Error::backend(format!("reading image {image} at {offset}: {err}"))
+                })?;
+                for (slot, chunk) in raw.chunks_exact(BYTES).enumerate() {
+                    values[at + slot] = f64::from_le_bytes(chunk.try_into().expect("eight bytes"));
+                }
+            }
+            at += run;
+        }
+    }
+    Ok(values)
+}
+
+struct SharedVolumeSource {
+    file: File,
+    image: usize,
+    volume: [usize; 3],
+    shape: Vec<usize>,
+}
+
+impl SharedVolumeSource {
+    fn new(file: File, image: usize, volume: [usize; 3]) -> Self {
+        Self {
+            file,
+            image,
+            volume,
+            shape: volume.to_vec(),
+        }
+    }
+}
+
+impl RegionSource<f64> for SharedVolumeSource {
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn read_region(&self, region: &Region) -> Result<ArrayD<f64>> {
+        region.check_within(&self.shape, "shared-volume cached read")?;
+        let values = read_region_from_file(&self.file, self.volume, self.image, region)?;
+        ArrayD::from_shape_vec(IxDyn(&region.shape), values)
+            .map_err(|err| Error::invalid(format!("shaping a cached shared-volume block: {err}")))
+    }
+
+    fn describe(&self) -> String {
+        format!("shared-volume image {} {:?}", self.image, self.shape)
+    }
+}
+
 /// One file per storage image, in a directory every worker can see.
 pub struct SharedVolumes {
     dir: PathBuf,
     volume: [usize; 3],
     chunk: [usize; 3],
     images: Vec<File>,
+    cache: Option<Arc<ChunkCache>>,
+    cached: Vec<Option<ArrayId>>,
     counters: EnvCounters,
     /// Fragments beside the images, in the same shared directory and for the
     /// same reason: a task's non-pixel output has to be readable by whichever
@@ -197,6 +272,24 @@ impl SharedVolumes {
         chunk: [usize; 3],
         n_phases: usize,
     ) -> Result<Self> {
+        Self::open_with_cache(dir, volume, chunk, n_phases, None)
+    }
+
+    /// Open image files with the cache budget the coordinator modelled.
+    ///
+    /// `cache_bytes == Some(0)` is a named opt-out. Otherwise the same byte
+    /// figure that sizes the handout model also sizes the cache on the worker's
+    /// real read path for image 0, the immutable input. Produced images are not
+    /// cached here because this is a multi-process store and invalidating a
+    /// chunk written by another worker would require a distributed invalidation
+    /// protocol this environment deliberately does not have.
+    pub fn open_with_cache(
+        dir: &Path,
+        volume: [usize; 3],
+        chunk: [usize; 3],
+        n_phases: usize,
+        cache_bytes: Option<u64>,
+    ) -> Result<Self> {
         let mut images = Vec::with_capacity(n_phases + 1);
         for image in 0..=n_phases {
             let path = Self::image_path(dir, image);
@@ -214,11 +307,35 @@ impl SharedVolumes {
                     })?,
             );
         }
+        let cache = cache_bytes
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| Arc::new(ChunkCache::new(MemoryBudget::new(bytes), bytes)));
+        let mut cached = vec![None; images.len()];
+        if let Some(cache) = &cache {
+            let image = 0;
+            let file = images[image].try_clone().map_err(|err| {
+                Error::backend(format!(
+                    "cloning shared-volume image {image} for cache reads: {err}"
+                ))
+            })?;
+            let source = SharedVolumeSource::new(file, image, volume);
+            let id = cache.register(
+                &format!("shared-volume image {image}"),
+                &volume,
+                &chunk,
+                Dtype::F64,
+                ArrayPolicy::default(),
+                Arc::new(RegionSourceFetcher::<f64, _>::new(source)),
+            )?;
+            cached[image] = Some(id);
+        }
         Ok(Self {
             dir: dir.to_path_buf(),
             volume,
             chunk,
             images,
+            cache,
+            cached,
             counters: EnvCounters::default(),
             sidecars: Sidecars::new(FileSidecars::at(Self::sidecar_root(dir))?),
         })
@@ -228,9 +345,12 @@ impl SharedVolumes {
         &self.dir
     }
 
+    pub fn cache_stats(&self) -> Option<CacheStats> {
+        self.cache.as_ref().map(|cache| cache.stats())
+    }
+
     fn offset(&self, position: [usize; 3]) -> u64 {
-        (((position[0] * self.volume[1]) + position[1]) * self.volume[2] + position[2]) as u64
-            * BYTES as u64
+        offset_in(self.volume, position)
     }
 
     fn image(&self, image: usize) -> Result<&File> {
@@ -326,28 +446,21 @@ impl Environment for SharedVolumes {
 
     fn read(&self, image: usize, region: &Region) -> Result<BlockBuf> {
         region.check_within(&self.volume, "shared-volume read")?;
-        let file = self.image(image)?;
         let shape = [region.shape[0], region.shape[1], region.shape[2]];
-        let mut values = vec![0.0f64; shape.iter().product()];
-        let run = shape[2];
-        let mut raw = vec![0u8; run * BYTES];
-        let mut at = 0usize;
-        for i in 0..shape[0] {
-            for j in 0..shape[1] {
-                if run > 0 {
-                    let offset =
-                        self.offset([region.start[0] + i, region.start[1] + j, region.start[2]]);
-                    read_exact_at(file, &mut raw, offset).map_err(|err| {
-                        Error::backend(format!("reading image {image} at {offset}: {err}"))
-                    })?;
-                    for (slot, chunk) in raw.chunks_exact(BYTES).enumerate() {
-                        values[at + slot] =
-                            f64::from_le_bytes(chunk.try_into().expect("eight bytes"));
-                    }
-                }
-                at += run;
+        let values = match (
+            self.cache.as_ref(),
+            self.cached.get(image).and_then(|entry| *entry),
+        ) {
+            (Some(cache), Some(array)) => {
+                cache
+                    .read_region::<f64>(array, region)?
+                    .into_dimensionality::<ndarray::Ix3>()
+                    .map_err(|err| Error::invalid(format!("shaping a cached block: {err}")))?
+                    .into_raw_vec_and_offset()
+                    .0
             }
-        }
+            _ => read_region_from_file(self.image(image)?, self.volume, image, region)?,
+        };
         let array = Array3::from_shape_vec((shape[0], shape[1], shape[2]), values)
             .map_err(|err| Error::invalid(format!("shaping a block: {err}")))?;
         self.counters.reads.fetch_add(1, Ordering::SeqCst);
@@ -420,6 +533,12 @@ impl Environment for SharedVolumes {
         self.counters
             .write_bytes
             .fetch_add((valid.voxels() * BYTES) as u64, Ordering::SeqCst);
+        if let (Some(cache), Some(array)) = (
+            self.cache.as_ref(),
+            self.cached.get(image).and_then(|entry| *entry),
+        ) {
+            let _ = cache.invalidate(array, valid)?;
+        }
         Ok(())
     }
 
@@ -523,6 +642,60 @@ mod tests {
         writer.finish(1).unwrap();
         let seen = reader.read(1, &region).unwrap();
         assert_eq!(seen, block);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cache_bytes_on_shared_volumes_sizes_a_real_read_cache() {
+        let dir = scratch("cache");
+        let volume = [8, 4, 4];
+        let creator = SharedVolumes::create(&dir, volume, [4, 4, 4], 1).unwrap();
+        let mut input = Array3::<f64>::zeros((volume[0], volume[1], volume[2]));
+        for (flat, value) in input.iter_mut().enumerate() {
+            *value = flat as f64;
+        }
+        creator.write_image(0, &input).unwrap();
+
+        let cached =
+            SharedVolumes::open_with_cache(&dir, volume, [4, 4, 4], 1, Some(1 << 20)).unwrap();
+        let region = Region::new(&[0, 0, 0], &[4, 4, 4]);
+        let first = cached.read(0, &region).unwrap();
+        let after_first = cached.cache_stats().expect("cache enabled");
+        let second = cached.read(0, &region).unwrap();
+        let after_second = cached.cache_stats().expect("cache enabled");
+
+        assert_eq!(first, second);
+        assert!(
+            after_first.misses > 0,
+            "the first read must populate the real cache: {after_first:?}"
+        );
+        assert!(
+            after_second.hits() > after_first.hits(),
+            "the second read must hit the cache sized by cache_bytes: before \
+             {after_first:?}, after {after_second:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cached_shared_volume_writes_invalidate_stale_chunks() {
+        let dir = scratch("invalidate");
+        let volume = [4, 4, 4];
+        let store = SharedVolumes::create(&dir, volume, [4, 4, 4], 1).unwrap();
+        let cached =
+            SharedVolumes::open_with_cache(&dir, volume, [4, 4, 4], 1, Some(1 << 20)).unwrap();
+        let region = Region::whole(&volume);
+        let old = cached.read(0, &region).unwrap();
+        assert!(
+            old.as_array().unwrap().uniform() == Some(0.0),
+            "image 0 starts as the zero input"
+        );
+
+        let block = BlockBuf::Array(Array3::from_elem((4, 4, 4), 9.0).into());
+        cached.write(0, &region, &region, &block).unwrap();
+        let new = cached.read(0, &region).unwrap();
+        assert_eq!(new, block);
+        drop(store);
         std::fs::remove_dir_all(&dir).ok();
     }
 

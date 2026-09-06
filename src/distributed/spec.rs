@@ -568,10 +568,9 @@ pub struct WorkflowSpec {
     /// coordinator's cache model; it is a property of the arrays, so both ends
     /// have to agree on it and it therefore travels.
     pub chunk: [usize; 3],
-    /// The per-worker cache budget the coordinator *models*. Not an instruction
-    /// to the worker — the worker's own budget is its own business — but the
-    /// model is worthless if the two are wildly different, so it is stated once
-    /// in the job rather than guessed per side.
+    /// The per-worker cache budget. It sizes both the coordinator's handout
+    /// model and, for the built-in file-backed worker, the real cache on the
+    /// read path. `0` disables both.
     pub cache_bytes: u64,
     pub ops: Vec<OpSpec>,
     pub store: StoreSpec,
@@ -838,9 +837,13 @@ impl WorkflowFactory for ProbeWorkflows {
 
     fn environment(&self, spec: &WorkflowSpec, n_phases: usize) -> Result<Box<dyn Environment>> {
         Ok(match &spec.store {
-            StoreSpec::Files { dir } => {
-                Box::new(SharedVolumes::open(dir, spec.shape, spec.chunk, n_phases)?)
-            }
+            StoreSpec::Files { dir } => Box::new(SharedVolumes::open_with_cache(
+                dir,
+                spec.shape,
+                spec.chunk,
+                n_phases,
+                Some(spec.cache_bytes),
+            )?),
             StoreSpec::Counting {
                 emptiness,
                 fill_value,

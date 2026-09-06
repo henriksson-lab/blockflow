@@ -123,23 +123,21 @@ pub struct Residency<'a> {
     pub id: &'a str,
     /// Chunks the coordinator models this worker as having **read**.
     ///
-    /// **What this claims physically, because an earlier version of this line
-    /// claimed something the codebase does not have.** It said the tier modelled
-    /// *"this crate's own chunk cache"*. There is no such cache on any read
-    /// path: `WorkflowSpec::cache_bytes` sizes this model and nothing ties it to the cache a worker's environment actually has, so nothing
-    /// anywhere skips a fetch on the strength of an earlier one. What can
-    /// physically serve a re-read is whatever the node happens to hold — the
-    /// page cache under a filesystem store, and nothing this crate owns —
-    /// which is exactly what `produced` already says of its own tier, and the
-    /// two should be read the same way.
+    /// **What this claims physically.** The built-in shared-volume worker now
+    /// uses `WorkflowSpec::cache_bytes` for a real chunk cache on image 0, the
+    /// immutable input. Produced images are not cached there, because peer
+    /// writes would need distributed invalidation. So this tier is partly a
+    /// real cache model and partly the older page-cache/locality claim, and the
+    /// two should be read with that boundary in mind.
     ///
     /// **The set is real and that is why the tier is kept.** A chunk two workers
     /// both read costs two fetches whatever either node caches, so preferring
     /// the worker that already read it is a claim about **duplicated fetches**
     /// and needs no cache to be true. What the model cannot claim is the
-    /// **eviction**: its LRU is sized by `WorkflowSpec::cache_bytes` where the
-    /// page cache is sized by free RAM, so it understates residency most of the
-    /// time and overstates it exactly under memory pressure.
+    /// **eviction** for produced images: its LRU is sized by
+    /// `WorkflowSpec::cache_bytes` where the page cache is sized by free RAM,
+    /// so it understates residency most of the time and overstates it exactly
+    /// under memory pressure.
     ///
     /// That asymmetry is survivable *here* and is why this consumer is unchanged
     /// while `HandoutPolicy::CacheModelled` is refused: `entitled` expresses the

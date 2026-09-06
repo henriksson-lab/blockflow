@@ -26,12 +26,14 @@
 // cache to be true, and it is the whole of what the handout and the placement
 // filter are entitled to lean on.
 //
-// The LRU below is a different claim. It is sized by `WorkflowSpec::cache_bytes`
-// and was written as a model of `cache::ChunkCache` — which has **no non-test
-// construction site**, so no `Environment::read` is served from one. What can
-// physically serve a re-read on a node is the page cache, sized by free RAM.
-// So the eviction understates residency most of the time, which is harmless,
-// and **overstates it exactly under memory pressure**, which is not.
+// The LRU below is a different claim. It is sized by `WorkflowSpec::cache_bytes`.
+// For the built-in shared-volume worker that now matches a real `cache::ChunkCache`
+// on image 0, the immutable input. For produced images, and for deployment
+// factories with their own environments, it is still only a locality model unless
+// that environment gives the same byte budget to the same cache policy. What can
+// physically serve those re-reads may be the page cache, sized by free RAM, so
+// the eviction understates residency most of the time and **overstates it exactly
+// under memory pressure**, which is not harmless for a ranking key.
 //
 // That is why `HandoutPolicy::CacheModelled`, which ranks on the eviction, is
 // refused at `HandoutPolicy::select`, while `placement::entitled`, which uses
