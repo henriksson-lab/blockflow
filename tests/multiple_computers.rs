@@ -276,20 +276,16 @@ fn each_computer_fetches_on_its_own_channel() {
             *wait as f64 / 1e6
         );
     }
-    // **Within 3%, not equal**, and the gap is named rather than tolerated:
-    // `ModelledCache::new(0, ..)` has a capacity of *one* chunk, not zero — a
-    // fact `tests/simulator_against_the_executor.rs` had to learn too — so a
-    // task whose own keys repeat still hits, and how often that happens moves
-    // by a few tenths of a percent with the pool split. What matters is that
-    // the fetch counts are the same work; the wait below differs by 6.6x.
+    // Equal, because `cache_bytes: 0` means no modelled residency: every pool
+    // fetches every chunk it touches. What matters is that the fetch counts are
+    // the same work; the wait below differs by 6.6x.
     let misses = waits[0].2 as f64;
     for (nodes, _, other) in &waits {
         let apart = (*other as f64 - misses).abs() / misses;
         assert!(
-            apart < 0.03,
+            apart == 0.0,
             "{nodes} nodes fetched {other} chunks against {misses}, {:.1}% apart. With a cache \
-             of one chunk every arrangement must fetch the same work, or this comparison is \
-             not about the channel.",
+             this check would mostly be measuring locality, not channel assignment.",
             apart * 100.0
         );
     }
@@ -459,8 +455,7 @@ fn which_computer_gets_a_block_matters_only_when_they_do_not_share_a_cache() {
 
 // ------------------------------ 6. and when spreading them apart pays --
 
-/// **Seeding the computers apart pays where the cache is scarce and the threads
-/// are few — and inverts where it is scarce and they are many.**
+/// **Seeding the computers apart pays across this sweep, but not monotonically.**
 ///
 /// `HandoutPolicy::NearestFirst` — farthest-point seeding, then
 /// nearest-unclaimed — is the coordinator's default and is exactly the right
@@ -471,9 +466,9 @@ fn which_computer_gets_a_block_matters_only_when_they_do_not_share_a_cache() {
 /// ```text
 ///     threads per computer   2 MiB   8 MiB   32 MiB
 ///                        1   1.239   1.034    1.035
-///                        2   1.149   1.016    1.024
-///                        4   1.071   1.017    1.017
-///                       10   0.875   0.998    1.008
+///                        2   1.400   1.212    1.212
+///                        4   1.186   1.197    1.218
+///                       10   1.013   1.157    1.184
 /// ```
 ///
 /// Read it as **cache per thread**, which is the quantity that orders the whole
@@ -483,21 +478,19 @@ fn which_computer_gets_a_block_matters_only_when_they_do_not_share_a_cache() {
 ///   the policy's best case, and it is worth 1.24x and two thirds of the
 ///   traffic. The pool holds what the thread is working on, so keeping the
 ///   machines apart is pure saving;
-/// * **2 MiB and ten threads** — a fifth of a megabyte each — **inverts**, to
-///   0.875x. Each machine's own threads thrash their shared pool, and plan
-///   order, which marches every worker through adjacent blocks together, keeps
-///   a tighter joint working set and wins despite duplicating more *across*
-///   machines;
-/// * **32 MiB** recovers it at ten threads (1.008) and simultaneously flattens
-///   the gain at one (1.035): when a pool holds everything, there is nothing
-///   for a policy to save.
+/// * **2 MiB and two threads** is the peak after the simulator started pricing
+///   the plan's real fetch floor, at 1.40x;
+/// * **2 MiB and ten threads** used to invert. It is now a small win, 1.013x,
+///   so the old "cache per thread" story was partly an artefact of the
+///   one-chunk floor;
+/// * **32 MiB** now pays at ten threads (1.184) but flattens the gain at one
+///   (1.035): when a pool holds the one-thread working set, there is little
+///   left for a policy to save.
 ///
 /// So the rule is not "spread the workers out". It is **spread the computers
-/// apart, provided each computer's cache can hold roughly one read extent per
-/// thread it runs** — and below that, the tighter global order is worth more
-/// than the separation. The knee here is between 2 and 8 MiB for ten threads:
-/// about a quarter of a megabyte each, which is what one block's read extent
-/// spans in `16^3` chunks.
+/// apart, then remeasure when the simulator's floor changes**, because the
+/// ordering depends on whether the floor is one chunk or the plan's whole fetch
+/// set.
 ///
 /// **What this test is not.** It is not a claim that one policy is better. It is
 /// the boundary between them, measured, because "spread the workers out" is the
@@ -563,11 +556,12 @@ fn seeding_the_computers_apart_pays_when_each_can_hold_what_its_threads_touch() 
          cache, where the recorded figure is 1.239",
         table[0][0]
     );
-    // Ten threads on the same cache: it inverts, and that is the finding.
+    // Ten threads on the same cache used to invert under the earlier timing
+    // floor. With the plan-aware fetch floor it still pays, but only barely.
     assert!(
-        table[3][0] < 1.0,
-        "ten threads on a 2 MiB cache gained {:.3}x from seeding; the recorded figure is \
-         0.875, and the inversion is what this test is for",
+        table[3][0] > 1.0,
+        "ten threads on a 2 MiB cache lost to seeding at {:.3}x; the recorded figure is \
+         now 1.013 after the simulator started pricing the plan's real fetch floor",
         table[3][0]
     );
     // The axis is the cache: give those ten threads room and it comes back.
@@ -578,17 +572,14 @@ fn seeding_the_computers_apart_pays_when_each_can_hold_what_its_threads_touch() 
         table[3][2],
         table[3][0]
     );
-    // And the gain falls monotonically with the threads on a tight cache, which
-    // is the shape of the whole finding rather than two endpoints of it.
-    for threads in 1..table.len() {
-        assert!(
-            table[threads][0] < table[threads - 1][0] + 0.02,
-            "the gain from seeding grew with the threads per computer: {:.3} against {:.3} \
-             below it",
-            table[threads][0],
-            table[threads - 1][0]
-        );
-    }
+    assert!(
+        table[1][0] > table[0][0] && table[1][0] > table[2][0],
+        "the tight-cache peak moved away from two threads per computer: one={:.3}, \
+         two={:.3}, four={:.3}",
+        table[0][0],
+        table[1][0],
+        table[2][0]
+    );
 }
 
 // ------------------------------------- 7. a policy that reads the pool --
@@ -624,19 +615,19 @@ fn seeding_the_computers_apart_pays_when_each_can_hold_what_its_threads_touch() 
 ///           1   2 MiB            1.239        1.277
 ///           1   8 MiB            1.034        1.070
 ///           1  32 MiB            1.035        1.070
-///           2   2 MiB            1.149        1.219
-///           4   2 MiB            1.071        1.171
-///          10   2 MiB            0.875        1.093
-///          10   8 MiB            0.998        1.022
-///          10  32 MiB            1.008        1.022
+///           2   2 MiB            1.400        1.324
+///           2   8 MiB            1.212        1.057
+///           4   2 MiB            1.186        1.261
+///           4   8 MiB            1.197        0.987
+///          10   2 MiB            1.013        1.181
+///          10   8 MiB            1.157        0.932
+///          10  32 MiB            1.184        0.932
 /// ```
 ///
-/// **It is better in every cell, and it removes the inversion.** The case where
-/// seeding the computers apart was actively harmful — ten threads sharing two
-/// megabytes, where `NearestFirst` runs at 0.875 of plan order — comes back to
-/// 1.093. Nothing was prescribed to make that happen: the threads of a node
-/// converge because a block their neighbours are already fetching for scores
-/// cheap, which is a fact the policy reads rather than a rule it follows.
+/// **It is conditional, and it still helps the tight ten-thread cell.** The
+/// case that used to invert no longer does, but coalescing still moves ten
+/// threads on two megabytes from 1.013 to 1.181. At larger caches and high
+/// thread counts, the in-flight warmth term over-clusters the run and loses.
 ///
 /// **What it costs.** 122.8 microseconds a handout against `NearestFirst`'s
 /// 8.1 — fifteen times more, and the cause is the chunk-key walk over *every*
@@ -688,34 +679,27 @@ fn scoring_the_candidates_beats_prescribing_a_route() {
                 "{threads:>8} {:>8} {nearest:>14.3} {coalescing:>12.3}",
                 cache >> 20
             );
-            assert!(
-                coalescing > nearest - 0.01,
-                "at {threads} threads on {} MiB, coalescing scored {coalescing:.3} against \
-                 nearest-first's {nearest:.3}. It is recorded as better in every cell; a \
-                 change that makes it worse somewhere is a trade, and trades get written down.",
-                cache >> 20
-            );
             beaten += usize::from(coalescing > nearest + 0.01);
         }
     }
     assert!(
-        beaten >= 10,
-        "coalescing beat nearest-first in only {beaten} of twelve cells, where the record is \
-         twelve"
+        beaten >= 5,
+        "coalescing beat nearest-first in only {beaten} of twelve cells, where the current \
+         record keeps it useful in five cells"
     );
 
-    // The cell the whole policy exists for: separating the computers is
-    // *harmful* there under the old policy, and must not be under this one.
+    // The cell that originally justified the policy no longer inverts, but the
+    // in-flight warmth term should still improve it.
     let inverted = against_plan_order(10, 2 << 20, HandoutPolicy::NearestFirst);
     let fixed = against_plan_order(10, 2 << 20, HandoutPolicy::Coalescing);
     assert!(
-        inverted < 1.0,
-        "ten threads on a 2 MiB pool no longer inverts under nearest-first ({inverted:.3}); \
-         the case this policy was written for has gone, and so has the reason for it"
+        inverted > 1.0,
+        "ten threads on a 2 MiB pool no longer benefits under nearest-first ({inverted:.3}); \
+         the current simulator records it as a small win rather than the old inversion"
     );
     assert!(
-        fixed > 1.05,
-        "coalescing scored {fixed:.3} in the inverted cell, where the record is 1.093. That \
-         cell is the whole point of the imminent-warmth term."
+        fixed > inverted + 0.01,
+        "coalescing scored {fixed:.3} in the tight ten-thread cell against nearest-first's \
+         {inverted:.3}; the imminent-warmth term should still help there."
     );
 }

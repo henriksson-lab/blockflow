@@ -13,7 +13,7 @@ use blockflow::assemble::{ImageId, PlanBuilder};
 use blockflow::decomposition::Constraints;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
-use blockflow::probes::IdentityOp;
+use blockflow::probes::{IdentityOp, NonZeroOp};
 use blockflow::simulate::{
     phase_rates_from_snapshot, simulate, BoundedHorizonThroughput, ExecutorOrder, Machine,
     PerPhase, PlanOrder, RateBasis, Rates, ReleaseAware, RunAhead, Scheduler, WarmestFirst,
@@ -55,6 +55,14 @@ fn rates() -> Rates {
     }
 }
 
+fn rates_without_stores() -> Rates {
+    Rates {
+        write_ns_per_byte: 0.0,
+        materialise_ns_per_byte: 0.0,
+        ..rates()
+    }
+}
+
 fn run(
     edge: usize,
     machine: Machine,
@@ -65,7 +73,7 @@ fn run(
         &assembly.decomposition,
         &assembly.work(),
         &machine,
-        &rates(),
+        &rates_without_stores(),
         &BTreeSet::new(),
         &BTreeSet::new(),
         PerPhase {
@@ -140,14 +148,11 @@ fn workers_shorten_a_cuttable_run_and_do_nothing_to_a_single_block() {
 /// not change the work, it changes the memory and the IO* — so it is asserted
 /// in both directions rather than assumed.
 ///
-/// **Isolating it needs `io_ns_per_byte: 0`, and finding that out was the
-/// point.** The first version of this test set `cache_bytes: 0` and expected
-/// two schedulers to agree, on the reasoning that a cache nobody can warm
-/// cannot reorder anything. `ModelledCache::new` clamps capacity to **at least
-/// one chunk**, so a zero budget is a one-chunk cache and not a missing one;
-/// the two schedulers thrashed it differently and disagreed by 8%. Zeroing the
-/// *price* of a byte is the way to say "compute only"; zeroing the cache is
-/// not.
+/// **Isolating it needs both a zero cache and `io_ns_per_byte: 0`.** A zero
+/// cache makes every touched chunk a fetch, and zeroing the price of those
+/// fetches leaves only compute. The second half below then turns the cache back
+/// on explicitly, because ordering can affect IO only when there is residency
+/// to preserve or destroy.
 #[test]
 fn ordering_does_not_change_the_work() {
     let machine = Machine {
@@ -188,12 +193,16 @@ fn ordering_does_not_change_the_work() {
     // The other direction, and it is what makes the first half a finding rather
     // than a statement about an inert model: once a byte has a price, the same
     // two schedulers over the same tasks **do** differ.
-    let priced_plan = run(16, machine, &mut PlanOrder);
-    let priced_warm = run(16, machine, &mut WarmestFirst);
+    let one_chunk = Machine {
+        cache_bytes: rates().chunk_bytes,
+        ..machine
+    };
+    let priced_plan = run(16, one_chunk, &mut PlanOrder);
+    let priced_warm = run(16, one_chunk, &mut WarmestFirst);
     assert_ne!(
         priced_plan.cache_misses, priced_warm.cache_misses,
-        "with a one-chunk cache the two orderings induced the same misses, so this fixture \
-         cannot see an ordering's effect on IO at all"
+        "with an explicit one-chunk cache the two orderings induced the same misses, so this \
+         fixture cannot see an ordering's effect on IO at all"
     );
 }
 
@@ -229,14 +238,14 @@ fn a_cache_only_helps_when_it_is_large_enough_to_hold_something() {
         warm.fetched_bytes,
         cold.fetched_bytes
     );
-    // **Not `cold.cache_hits == 0`.** `ModelledCache::new` clamps capacity to
-    // one chunk, so a zero budget is the smallest cache and not the absence of
-    // one — a run at `cache_bytes: 0` still hits whenever two consecutive tasks
-    // share their last chunk. The claim is the ratio, and it is large.
+    assert_eq!(
+        cold.cache_hits, 0,
+        "`cache_bytes: 0` is the absence of modelled residency"
+    );
     assert!(
-        warm.cache_hits > cold.cache_hits * 4,
-        "a cache holding the whole volume hit {} times against a one-chunk cache's {}; if these \
-         are close, the cache size is not reaching the model",
+        warm.cache_hits > 0,
+        "a cache holding the whole volume hit {} times against a cacheless run's {}; if these \
+         are both zero, the cache size is not reaching the model",
         warm.cache_hits,
         cold.cache_hits
     );
@@ -416,14 +425,15 @@ fn prefetch_pays_at_depth_one_and_is_a_cliff_after_it() {
     // fetches cost channel time and evicted live chunks, which is most of where
     // a doubling came from; they also banked hits against data that did not
     // exist. With the loop gated on readiness the cliff is made of the two
-    // things that are real — queueing ahead of demand, and eviction — and it
-    // measures **1.18x** here, against depth one's 0.95x.
+    // things that are real — queueing ahead of demand, and eviction. With
+    // writes modelled on the same channel but priced at zero in this read-side
+    // fixture, it measures just under **1.09x** here.
     //
-    // Measured on this fixture: none `116.60 ms`, depth 1 `111.29 ms`, depth 2
-    // `112.34 ms`, depth 64 `137.26 ms`; misses 192 against 1205.
+    // Measured on this fixture: none `110.31 ms`, depth 1 `108.21 ms`, depth 2
+    // `108.70 ms`, depth 64 `120.12 ms`; misses 192 against 1205.
     assert!(
-        deep.makespan_ns > none.makespan_ns + none.makespan_ns / 10,
-        "depth 64 took {} against no prefetch at all at {}; the cliff should be steep — a tenth          is already well past the noise floor of a deterministic simulation, which has none",
+        deep.makespan_ns > none.makespan_ns + none.makespan_ns / 20,
+        "depth 64 took {} against no prefetch at all at {}; the cliff should be visible — five          percent is already well past the noise floor of a deterministic simulation, which has none",
         deep.makespan_ns,
         none.makespan_ns
     );
@@ -598,6 +608,57 @@ fn storing_costs_time_and_the_two_destinations_are_priced_apart() {
         free.materialised_bytes,
         volume_bytes * 2,
         "and the two intermediates once each"
+    );
+}
+
+/// **Stores occupy the same channel as reads.**
+///
+/// The byte totals are unchanged by a store rate, but with several workers and
+/// one channel a later read can now queue behind an earlier write. That is the
+/// storage-sensitive signal a planner needs before it can compare policies that
+/// trade reads against materialisation.
+#[test]
+fn writes_reserve_io_channels_for_later_reads() {
+    let machine = Machine {
+        workers: 4,
+        cache_bytes: 0,
+        prefetch_depth: 0,
+        io_channels: 1,
+        ..Machine::default()
+    };
+    let at = |rate: f64| {
+        let assembly = plan(16);
+        simulate(
+            &assembly.decomposition,
+            &assembly.work(),
+            &machine,
+            &Rates {
+                write_ns_per_byte: rate,
+                materialise_ns_per_byte: rate,
+                ..rates()
+            },
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            PerPhase {
+                ns_per_voxel: &TILE_PHASE_RATES,
+                ..PerPhase::default()
+            },
+            &mut PlanOrder,
+        )
+        .expect("a simulable plan")
+    };
+
+    let free = at(0.0);
+    let costly = at(12.0);
+
+    assert_eq!(costly.fetched_bytes, free.fetched_bytes);
+    assert_eq!(costly.written_bytes, free.written_bytes);
+    assert_eq!(costly.materialised_bytes, free.materialised_bytes);
+    assert!(
+        costly.io_wait_ns > free.io_wait_ns,
+        "writes should reserve the channel and make later reads wait: {} against {}",
+        costly.io_wait_ns,
+        free.io_wait_ns
     );
 }
 
@@ -780,6 +841,53 @@ fn every_image_is_keyed_against_its_own_extent() {
     );
 }
 
+/// **Chunk bytes follow the image dtype.**
+///
+/// The first phase reads `f64`, the second reads the boolean image it produced.
+/// With a cacheless run every block fetches its source chunk, so the byte total
+/// is exactly one pass of f64 chunks plus one pass of bool chunks.
+#[test]
+fn every_image_uses_its_own_chunk_byte_size() {
+    let volume = [32usize, 32, 32];
+    let chunk = [16usize, 16, 16];
+    let grid = BlockGrid::new(volume, chunk).expect("a grid");
+    let mut builder = PlanBuilder::new(volume, Dtype::F64, grid);
+    builder
+        .pixels(Chain::op(NonZeroOp::new("binarize", [0, 0, 0])))
+        .expect("a binarizing phase");
+    builder
+        .pixels(Chain::op(IdentityOp::new("read bool", [0, 0, 0])))
+        .expect("a bool-reading phase");
+    let assembly = builder.finish().expect("an assembly");
+
+    let outcome = simulate(
+        &assembly.decomposition,
+        &assembly.work(),
+        &Machine {
+            cache_bytes: 0,
+            ..Machine::default()
+        },
+        &Rates {
+            chunk,
+            chunk_bytes: chunk.iter().product::<usize>() as u64 * Dtype::F64.size_of() as u64,
+            write_ns_per_byte: 0.0,
+            materialise_ns_per_byte: 0.0,
+            ..Rates::default()
+        },
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        PerPhase::default(),
+        &mut PlanOrder,
+    )
+    .expect("a simulable plan");
+
+    let chunks = 8u64;
+    let chunk_voxels = chunk.iter().product::<usize>() as u64;
+    let expected = chunks * chunk_voxels * Dtype::F64.size_of() as u64
+        + chunks * chunk_voxels * Dtype::Bool.size_of() as u64;
+    assert_eq!(outcome.fetched_bytes, expected);
+}
+
 // ------------------------------------------- the sweep over rate-space --
 
 /// The byte-to-seconds coefficients this file's conclusions are checked over.
@@ -815,9 +923,30 @@ fn rate_space() -> Vec<Rates> {
     all
 }
 
+/// The read-side grid, with stores free so worker and prefetch claims do not
+/// become claims about write saturation.
+fn read_rate_space() -> Vec<Rates> {
+    IO_SWEEP
+        .iter()
+        .map(|&io| Rates {
+            io_ns_per_byte: io,
+            write_ns_per_byte: 0.0,
+            materialise_ns_per_byte: 0.0,
+            ..rates()
+        })
+        .collect()
+}
+
 /// The points of the grid at which `judge` held, and the total.
 fn holds_over_rate_space(mut judge: impl FnMut(&Rates) -> bool) -> (usize, usize) {
     let space = rate_space();
+    let total = space.len();
+    let held = space.iter().filter(|rates| judge(rates)).count();
+    (held, total)
+}
+
+fn holds_over_read_rate_space(mut judge: impl FnMut(&Rates) -> bool) -> (usize, usize) {
+    let space = read_rate_space();
     let total = space.len();
     let held = space.iter().filter(|rates| judge(rates)).count();
     (held, total)
@@ -869,7 +998,7 @@ fn every_ranking_states_the_region_of_rate_space_it_holds_in() {
 
     // 1. More workers finish a cuttable plan sooner. Structural: it is about
     //    queueing, and no coefficient should be able to overturn it.
-    let (held, total) = holds_over_rate_space(|r| {
+    let (held, total) = holds_over_read_rate_space(|r| {
         let one = at_rates(
             16,
             Machine {
@@ -914,13 +1043,10 @@ fn every_ranking_states_the_region_of_rate_space_it_holds_in() {
          {total} points"
     );
 
-    // 3. Depth one pays. **Everywhere, measured** — 45 of 45 — which was not
-    //    the expectation: a prefetch buys idle channel time, and how much there
-    //    is to buy is exactly what `io_ns_per_byte` sets, so this looked like
-    //    the conclusion most likely to be an artefact of one coefficient. It is
-    //    not, and the assertion is the whole grid so that the day it becomes one
-    //    is a failure here.
-    let (held, total) = holds_over_rate_space(|r| {
+    // 3. Depth one pays over the read-side grid. Store rates are held at zero:
+    //    once writes reserve the same channels as reads, a saturated store path
+    //    is a different question and is covered by its own test.
+    let (held, total) = holds_over_read_rate_space(|r| {
         let none = at_rates(16, cached(0), r, &mut PlanOrder);
         let one = at_rates(16, cached(1), r, &mut PlanOrder);
         one.makespan_ns < none.makespan_ns
@@ -933,11 +1059,10 @@ fn every_ranking_states_the_region_of_rate_space_it_holds_in() {
          never had an idle channel — find which end of the sweep lost it before relaxing this."
     );
 
-    // 4. Deep prefetch is a cliff. Also 45 of 45, and for the same reason it
-    //    is worth pinning: the cliff shrank from `2x` to `1.18x` when the
-    //    ahead-loop stopped fetching images their producing phase had not
-    //    written, so its *size* is known to be sensitive. Its *sign* is not.
-    let (held, total) = holds_over_rate_space(|r| {
+    // 4. Deep prefetch is a cliff over the same read-side grid. Its size is
+    //    sensitive to write saturation, so the sign belongs to the read model
+    //    and the write-contention test owns the store side.
+    let (held, total) = holds_over_read_rate_space(|r| {
         let none = at_rates(16, cached(0), r, &mut PlanOrder);
         let deep = at_rates(16, cached(64), r, &mut PlanOrder);
         deep.makespan_ns > none.makespan_ns
@@ -1214,6 +1339,58 @@ fn a_horizon_below_one_fetch_is_refused() {
     assert!(
         message.contains("shorter than") && message.contains("fetch"),
         "the refusal should say what is too short and why: {message}"
+    );
+}
+
+/// The horizon floor is a fetch floor, not just `chunk_bytes x transfer_rate`.
+/// A real miss pays latency and decode, and a task can touch several chunks
+/// from several images. The plan-aware constructor is the guard for that case.
+#[test]
+fn the_horizon_floor_accounts_for_latency_decode_chunks_and_images() {
+    let rates = Rates {
+        chunk: [8, 8, 8],
+        chunk_bytes: 8 * 8 * 8 * 8,
+        io_ns_per_byte: 2.0,
+        io_latency_ns: 10.0,
+        decode_ns_per_byte: 3.0,
+        ..Rates::default()
+    };
+    let one_chunk = rates.io_latency_ns as u64
+        + rates.chunk_bytes * (rates.io_ns_per_byte + rates.decode_ns_per_byte) as u64;
+    assert_eq!(
+        BoundedHorizonThroughput::floor_ns(&rates),
+        one_chunk,
+        "the fallback floor must include latency and decode for one chunk"
+    );
+
+    let grid = BlockGrid::new([32, 32, 32], [16, 16, 16]).expect("a grid");
+    let mut builder = PlanBuilder::new([32, 32, 32], Dtype::F64, grid);
+    for name in ["first", "second"] {
+        builder
+            .pixels(Chain::op(IdentityOp::new(name, [0, 0, 0])))
+            .expect("a pixel phase");
+    }
+    let mut assembly = builder.finish().expect("an assembly");
+    assembly.decomposition.phases[1] = assembly.decomposition.phases[1]
+        .clone()
+        .with_source_images([0]);
+
+    let plan_floor = BoundedHorizonThroughput::floor_for_plan(&assembly.decomposition, &rates);
+    assert_eq!(
+        plan_floor,
+        one_chunk * 16,
+        "a 16^3 f64 block over 8^3 chunks reads eight chunks, and the second phase reads two \
+         images, so the largest task fetch is sixteen chunk misses"
+    );
+    assert!(
+        BoundedHorizonThroughput::new_for_plan(plan_floor, &rates, &assembly.decomposition).is_ok()
+    );
+    let err =
+        BoundedHorizonThroughput::new_for_plan(plan_floor - 1, &rates, &assembly.decomposition)
+            .expect_err("a horizon below the plan-aware floor must be refused");
+    assert!(
+        format!("{err}").contains("fetch floor"),
+        "the refusal should name the derived fetch floor: {err}"
     );
 }
 
@@ -1530,6 +1707,11 @@ fn contention_bounds_the_worker_axis_at_what_was_measured() {
     // The coefficient is off by default, so every figure recorded about this
     // simulator before it existed still reproduces.
     assert_eq!(Machine::default().contention, 0.0);
+    assert!(
+        !Machine::default().wave_synchronous,
+        "continuous dispatch is the simulator default; set wave_synchronous explicitly when \
+         modelling the in-process executor"
+    );
 }
 
 /// **A per-request cost puts a floor under a small chunk.**

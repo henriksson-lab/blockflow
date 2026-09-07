@@ -59,7 +59,7 @@ configuration cannot exercise the one degree of freedom the search has.**
 | | state |
 |---|---|
 | **op reordering / algebraic rewriting** | Forbidden by contract — `execute_phases` refuses a decomposition that reorders. Out of scope by decision, and the report agrees with the decision. |
-| **algorithm selection (`Chain::Alternative`)** | Machinery exists (`choose_branches`, `choose_paths`) and **has no caller in `src/`**. See G6. |
+| **algorithm selection (`Chain::Alternative`)** | Machinery exists (`choose_branches`, `choose_paths`) and the built-in distributed decomposition now calls it before planning owned chains. Borrowed `Workflow` strategy calls still cannot rewrite `taken`. See G6. |
 | **precision / dtype selection** | Ops declare, nothing chooses — and the search prices every phase at `workflow.dtype`, so a chain that binarizes halfway is priced as if the second half still moved 8 bytes a voxel. `Materialising` fixes this for itself and names the defect. |
 | **chunk shape, storage layout** | Derived downstream from the block by a fixed rule, never priced. The *simulator* already has chunk shape as a lever with a measured interior optimum. See G9. |
 | **compression per intermediate** | A fixed table by dtype. The ratios are measured (2.09x raw uint16, 19.7x bool) and never reach the planner: one `materialise_cost_per_voxel` for every intermediate, whose own doc admits it "over-values fusing late stages and under-values fusing early ones". `ChunkCache::encoded_ratio()` measures the real thing at run time and nothing consumes it. |
@@ -123,23 +123,27 @@ New in this report:
   contend — at `contention: 0.0`, where every figure recorded before today was
   taken, they agree to within 1%. The simulator is the pessimistic one, which is
   the direction that matters: a planner tuned against it avoids a plan the
-  executor would run well. So `costs/two-nodes`' 1.467 "regret" is this
-  divergence and not a planner error.
+  executor would run well. So `costs/two-nodes`' elevated regret is this
+  divergence and not a planner error; the direct mixed/uniform control below
+  records the 1.467 ratio.
 
-  **What is still open is which model an arena should judge under.** The sweep
-  runs on the continuous one, because that is what every recorded number used
-  and `Machine::default` still says; flipping it would move all of them. It is
-  no longer an unnoticed difference between two modules, which is what item C
-  was about. `tests/wave_dispatch.rs` carries the measurement.
-* **D. `admission_bytes` has no caller.** `budget.rs` derives a measured 3.6x
-  admission margin over the plan-only working-set figure, with a test asserting
-  it is the smallest tenth covering every measured shape — and
-  `affords_working_set` compares the raw figure.
-* **E. Two concurrency numbers nothing reconciles.** `Strategy::plan` copies
-  `slab_policy` from the constraints into the hints and *not* the concurrency. A
-  caller who sets `Enumerating { concurrency: 40 }` and leaves
-  `expected_concurrency` at its default gets a plan priced for 40, budgeted for
-  1, executed at 40. Both default to 1, so it is silent until someone raises one.
+  **The arena/default decision is continuous dispatch.** The sweep runs on the
+  continuous one because that is what the distributed coordinator does and what
+  every recorded scenario used; flipping `Machine::default` would move the
+  corpus rather than improve its fidelity to the cluster path. The
+  wave-synchronous model remains explicit for the current in-process executor,
+  and `tests/wave_dispatch.rs` carries the measurement.
+* **D. Closed: `admission_bytes` now has a caller.** `budget.rs` derives the
+  measured admission margin over the plan-only working-set figure, with tests
+  asserting it is the smallest tenth covering the measured residuals, and
+  `Constraints::affords_working_set` now compares that charged figure rather
+  than the raw working set.
+* **E. Closed: planned runs now carry one concurrency contract.**
+  `Strategy::plan` copies `Constraints::expected_concurrency` into
+  `Hints::concurrency`, beside the existing slab/cache/prefetch fields, so the
+  executor pool is the same worker count admission used. A caller bypassing
+  `Strategy::plan` is still stating execution advice directly in `Hints`, which
+  is the intended escape hatch.
 * **F. Prefetch depth means three different things** — threads in
   `prefetch::Prefetcher`, blocks-ahead-in-plan-rank in `Machine`, and a boolean
   in the executor, which declares a whole phase at once. The simulator's headline
@@ -182,7 +186,7 @@ each is in the report this file summarises. In short:
   four workers, no contention, a pool that never starves. Pipelining pays where
   a phase *cannot* fill the pool, and no such phase is in the fixture yet. The
   two budget under-charges are untouched and still open.
-- **G3 — per-phase compute rates, plus the dtype prefix fold. DONE, 2026-08-30,
+- **G3 — per-phase compute rates, plus dtype and volume prefix folds. DONE, 2026-08-30,
   and adjudicated by the arena.** `CostModel::compute_of` holds one
   dimensionless correction per op family; `Snapshot::calibrate` fills it from the
   `Term::ComputeOf` coefficients this crate has recorded for years under a doc
@@ -217,23 +221,31 @@ each is in the report this file summarises. In short:
   the narrower type is now refused when the plan is made rather than when a
   block reaches it.
 
-  **The volume half is not done.** `Chain::output_shape` folds the same way, but
-  a per-run volume means each phase's `BlockGrid` is built on its own extent,
-  which is a change to what the search *produces* rather than to how it prices.
-  Left, and named.
+  **The volume half** is folded too: strategy builders walk
+  `Chain::output_shape` into a prefix table, ask each slot's reach, source-input
+  and block-constraint declarations at the image volume that slot reads, and
+  build each phase's `BlockGrid` over the image volume that run writes. The
+  regression is a decimation followed by a whole-axis op: it only becomes a
+  forced barrier if the second slot is judged in the post-decimation volume, and
+  Enumerating, Greedy and Materialising now all produce the smaller per-phase
+  grids.
 - **G4 — greedy dispatch instead of wave-synchronous.** Measure in the simulator
   before touching the executor; `PerPhase::constant_fraction` already exists to
   make the fixture.
 - **G5 — Belady replacement, since the plan is known.** Measure the LRU–OPT gap
   first; the measurement is the deliverable.
-- **G6 — resolve `Chain::Alternative`.** One line to call the shipped machinery;
-  the real work is scoring a branch at its own reach rather than the folded max.
+- **G6 — resolve `Chain::Alternative`.** The built-in distributed path now calls
+  the shipped machinery before planning the owned factory chain. The remaining
+  caveat is architectural rather than accidental: `Strategy::decompose` borrows
+  a `Workflow`, while the chosen branch lives in the owned `Chain`, so generic
+  callers must resolve alternatives before constructing the workflow.
 - **G7 — reconcile the two concurrency numbers; apply the admission margin.**
 - **G8 — price the slab count.** Call `amplification()`.
-- **G9 — storage as a plan decision.** Largest potential payoff, far too large to
-  start before the arena can score it. "Data-blind" and "storage-blind" are
-  different claims and the crate conflates them; a `StorageModel` in
-  `Constraints` would be data-blind, deterministic and hashable.
+- **G9 — storage as a plan decision.** `Constraints::storage` now gives planner
+  and arena code a data-blind, deterministic setting for layout, chunk shape,
+  cache size and prefetch reservation. It is intentionally a contract beside the
+  environment, not a claim that the environment must use that layout; distributed
+  specs populate it from the same `WorkflowSpec` fields the worker opens with.
 
 ## What the arena found first
 
@@ -243,17 +255,17 @@ makespan, each as a ratio to the best in its own column:
 
 | | 1 worker priced | 1 worker simulated | 4 workers priced | 4 workers simulated |
 |---|---|---|---|---|
-| edge 8 (1024 blocks) | 3.068 | 7.506 | 2.530 | 4.663 |
-| edge 16 (128 blocks) | 1.760 | 3.641 | 1.457 | 2.285 |
-| edge 32 (8–16 blocks) | 1.326 | 2.448 | **1.000** | **1.000** |
-| edge 64 (1 block) | **1.000** | **1.000** | 2.660 | 2.479 |
-| Kendall tau | 1.000 | | 0.667 | |
+| edge 8 (1024 blocks) | 3.068 | 7.506 | 2.530 | 2.538 |
+| edge 16 (128 blocks) | 1.760 | 3.641 | 1.457 | 2.123 |
+| edge 32 (8–16 blocks) | 1.326 | 2.448 | **1.000** | 1.469 |
+| edge 64 (1 block) | **1.000** | **1.000** | 2.660 | **1.000** |
+| Kendall tau | 1.000 | | 0.000 | |
 
 **At one worker the two judges order the field identically. At four they do
-not** — the cost model prices the 1024-block plan *below* the single-block one
-and the simulator makes it nearly twice as slow. Both still choose edge 32, so
-the regret (the simulated cost of trusting the model) is 1.000: the model's
-argmin survives and its ordering does not.
+not** — the cost model prices every smaller-edge plan *below* the single-block
+one and the simulator makes the single block fastest. The regret (the simulated
+cost of trusting the model) is now 1.469: the model's argmin no longer survives
+the ordering split.
 
 That is **item C above with a number on it**, reached from the other side: the
 cost model's `rounds()` divides a whole per-block cost by the pool, the
@@ -276,7 +288,13 @@ scenario files — the measured baseline and nine plausible neighbours of it
 (slower disk, slower memory, less memory, two cores, forty cores, fine chunks, a
 compressed store) — and `tests/cost_scenarios.rs` runs the planner against all of
 them. Both judges are told the same coefficients: the planner through
-`Snapshot::calibrate`, the simulator through `Rates::from_snapshot`.
+`Snapshot::calibrate`, the simulator through `Scenario::rates`, which delegates
+to `Rates::from_snapshot` and then overlays the scenario's storage settings.
+For machine-space sweeps that should not become committed records,
+`scenario::MachineSweep` now derives named variants from one baseline and runs
+each through `Arena`. The varied state is the simulator's `Machine` — cache
+bytes, prefetch depth, wave discipline, contention, node count and cache sharing
+— while handout remains a scheduler choice supplied to the sweep's arena call.
 
 **Two findings, and neither is the one that was expected.**
 
@@ -346,38 +364,35 @@ shared. `Constraints` has no `nodes`, `price_phase` has no duplication term, and
 the budget is per node only because `Scenario::constraints` divides the
 concurrency by hand.
 
-**Where spreading the computers apart pays, and where it inverts.** The obvious
-proposal about a cluster — start the machines at different corners rather than
-all at one — is right, and `HandoutPolicy::NearestFirst` (farthest-point
-seeding, then nearest-unclaimed) is already the coordinator's default. What was
-not known is the boundary. Against plan order, four computers over a `96^3`
-volume in `16^3` chunks:
+**Where spreading the computers apart pays.** The obvious proposal about a
+cluster — start the machines at different corners rather than all at one — is
+right in this sweep, and `HandoutPolicy::NearestFirst` (farthest-point seeding,
+then nearest-unclaimed) is already the coordinator's default. The shape changed
+when the simulator started using a plan-aware fetch floor. Against plan order,
+four computers over a `96^3` volume in `16^3` chunks:
 
 | threads per computer | 2 MiB cache | 8 MiB | 32 MiB |
 |---|---|---|---|
 | 1 | **1.239x** | 1.034 | 1.035 |
-| 2 | **1.149x** | 1.016 | 1.024 |
-| 4 | 1.071 | 1.017 | 1.017 |
-| 10 | **0.875x** | 0.998 | 1.008 |
+| 2 | **1.400x** | 1.212 | 1.212 |
+| 4 | 1.186 | 1.197 | 1.218 |
+| 10 | 1.013 | 1.157 | 1.184 |
 
-The ordering quantity is **cache per thread**. With room for a thread's working
-set, separating the machines is pure saving — 1.24x and two thirds of the
-traffic. With a fifth of a megabyte each it **inverts**: a machine's own threads
-thrash their shared pool, and plan order, which marches every worker through
-adjacent blocks together, keeps a tighter joint working set and wins despite
-duplicating more across machines. Give them room and it comes back — and
-simultaneously flattens the gain at one thread, because a pool that holds
-everything leaves a policy nothing to save.
+The old ordering quantity was **cache per thread**. With the plan-aware floor,
+the tight two-thread cell is now the peak and the old ten-thread inversion is a
+small win instead. Give ten threads more room and the policy pays more, while
+one thread remains nearly flat because a pool that holds its working set leaves
+little for a policy to save.
 
-So the rule is **spread the computers apart, provided each computer's cache can
-hold about one read extent per thread it runs** — not "spread the workers out".
+So the rule is **spread the computers apart, then remeasure when the simulator's
+floor changes** — not "spread the workers out".
 
 A prediction that failed, recorded because giving it up was not obvious:
 `Handout` seeded from every *other worker's* anchor, so with ten threads per
 machine it separated threads that share a cache as eagerly as machines that do
 not. Keying the seeds and the view anchor by node instead — `Decision::
-node_anchors`, right on its own terms and kept — changed the inverted case by
-nothing. The axis is the cache, not the seeding target.
+node_anchors`, right on its own terms and kept — changed the old inverted case
+by nothing. The axis was the simulator floor, not the seeding target.
 
 **A policy that reads the pool instead of following a route.**
 `HandoutPolicy::Coalescing` scores candidates by chunks rather than walking a
@@ -392,17 +407,28 @@ count without a constant.
 That second term is the one no existing policy has, and it is what fixes the
 inversion. Against plan order, four computers on `96^3` in `16^3` chunks:
 
+In production coordinator pulls, that in-flight term is now populated from the
+tasks a worker process already holds through its `ahead` pipeline. That is the
+exact state the built-in coordinator owns; it is narrower than a physical-node
+view, but no longer a test-only empty slice. External `coalescing` selection
+remains refused until the real coordinator/read-path measurement beats
+`nearest-first` under a cache model that matches the bytes actually cached.
+
 | threads | cache | `nearest-first` | `coalescing` |
 |---|---|---|---|
 | 1 | 2 MiB | 1.239 | 1.277 |
-| 2 | 2 MiB | 1.149 | 1.219 |
-| 4 | 2 MiB | 1.071 | 1.171 |
-| 10 | 2 MiB | **0.875** | **1.093** |
-| 10 | 32 MiB | 1.008 | 1.022 |
+| 2 | 2 MiB | 1.400 | 1.324 |
+| 2 | 8 MiB | 1.212 | 1.057 |
+| 4 | 2 MiB | 1.186 | 1.261 |
+| 4 | 8 MiB | 1.197 | 0.987 |
+| 10 | 2 MiB | **1.013** | **1.181** |
+| 10 | 8 MiB | 1.157 | 0.932 |
+| 10 | 32 MiB | 1.184 | 0.932 |
 
-Better in every cell, and the harmful case is gone. Nothing was prescribed to
-make a node's threads converge: a block a neighbour is already fetching for
-scores cheap, which is a fact the policy reads rather than a rule it follows.
+Conditional, not universally better. The tight ten-thread cell still improves,
+from 1.013 to 1.181, because a block a neighbour is already fetching for scores
+cheap. At larger caches and higher thread counts that same in-flight warmth term
+over-clusters the run and loses.
 
 **A repulsion term, built twice and rejected both times.** Charging a candidate
 for standing near another computer is the obvious third term. Built once as a
@@ -411,8 +437,7 @@ perpendicular bisector, the chunks fetched twice are those within a halo of it,
 so the expected duplication is the block's chunk count times a risk running 0 to
 1 across a shell of width `2H`. The derivation is sound and dissolves the weight,
 since the result is in chunks like everything else. **Both measured worse than
-no term**, and worst in the cell the policy exists for: 1.093 without it, 1.003
-tuned, 0.986 derived. The reason is double-counting — a block another computer
+no term** in the original tight ten-thread cell. The reason is double-counting — a block another computer
 works near is a block whose chunks are not in my pool and not in my node's
 in-flight set, so it is already expensive by the warmth term, which measures the
 fact directly instead of inferring it from geometry. Repulsion belongs at

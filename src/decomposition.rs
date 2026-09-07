@@ -46,10 +46,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
 use crate::assemble::{describe_image, is_supplied_image, ImageId};
+use crate::budget::{admission_bytes, FrameworkFigure};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::reach::{AxisReach, Frame, Reach};
 use crate::region::Region;
+use crate::slab::SlabCut;
 use crate::tiling::boxes_tile_exactly;
 
 use super::geometry::{region_within, BlockGeometry, BlockGrid};
@@ -1805,6 +1807,52 @@ impl Default for CostModel {
     }
 }
 
+/// Storage shape a planner is allowed to price against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageLayout {
+    /// Chunked array storage: reads, cache entries and prefetches are counted on
+    /// a chunk lattice.
+    #[default]
+    Chunked,
+}
+
+/// Planner-visible storage settings.
+///
+/// The executor/environment still owns the actual store. This value gives the
+/// planner and simulator a deterministic, data-blind place to state the storage
+/// choices they are pricing: layout, chunk lattice and run-level cache/prefetch
+/// reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StorageSettings {
+    pub layout: StorageLayout,
+    /// `None` means "ask the environment", preserving existing defaults.
+    pub chunk: Option<[usize; 3]>,
+    pub cache_bytes: u64,
+    pub prefetch_depth: usize,
+    pub prefetch_chunk_bytes: u64,
+}
+
+impl StorageSettings {
+    pub fn chunked(chunk: [usize; 3]) -> Self {
+        Self {
+            layout: StorageLayout::Chunked,
+            chunk: Some(chunk),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_cache_bytes(mut self, bytes: u64) -> Self {
+        self.cache_bytes = bytes;
+        self
+    }
+
+    pub fn with_prefetch(mut self, depth: usize, chunk_bytes: u64) -> Self {
+        self.prefetch_depth = depth;
+        self.prefetch_chunk_bytes = chunk_bytes;
+        self
+    }
+}
+
 /// What a strategy is allowed to spend.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Constraints {
@@ -1816,8 +1864,24 @@ pub struct Constraints {
     /// `the_default_policy_asks_for_one_slab_under_the_default_constraints`
     /// rather than reasoned.
     pub slab_policy: SlabPolicy,
+    /// Storage settings the planner may price or sweep.
+    pub storage: StorageSettings,
     /// Bytes available for in-flight blocks. `None` means unbounded.
     pub budget_bytes: Option<u64>,
+    /// Bytes reserved for the cache before block working sets are admitted.
+    ///
+    /// A cache is one run-level reservation, not a per-block cost, so it is
+    /// subtracted from [`Self::budget_bytes`] rather than folded into
+    /// [`PhaseCost::working_set_bytes_per_block`].
+    pub cache_bytes: u64,
+    /// Number of chunks the run may prefetch ahead.
+    pub prefetch_depth: usize,
+    /// Bytes reserved per prefetched chunk.
+    ///
+    /// Mirrored into [`Self::storage`] so planner-space sweeps can move the
+    /// chunk lattice and the reservation together. The reservation is
+    /// `prefetch_depth * prefetch_chunk_bytes`.
+    pub prefetch_chunk_bytes: u64,
     /// How many blocks a run is expected to hold at once. Part of the budget
     /// arithmetic, not of the decomposition: a strategy may run with fewer.
     pub expected_concurrency: usize,
@@ -2322,9 +2386,67 @@ impl Constraints {
     /// this to have done it.
     pub fn affords_working_set(&self, cost: &PhaseCost) -> bool {
         self.budget_bytes.is_none_or(|budget| {
-            cost.working_set_bytes_per_block * self.expected_concurrency.max(1) as f64
-                <= budget as f64
+            self.admission_demand_bytes(cost) <= self.admission_budget_bytes(budget)
         })
+    }
+
+    /// Bytes this phase asks admission to reserve for concurrent block work.
+    pub fn admission_demand_bytes(&self, cost: &PhaseCost) -> u64 {
+        let per_block = admission_bytes(FrameworkFigure::Assumed(cost.working_set_bytes_per_block));
+        per_block.saturating_mul(self.expected_concurrency.max(1) as u64)
+    }
+
+    /// Bytes available to block working sets after run-level reservations.
+    pub fn admission_budget_bytes(&self, budget: u64) -> u64 {
+        budget.saturating_sub(self.reserved_bytes())
+    }
+
+    /// Bytes held aside for runtime cache and prefetch state.
+    pub fn reserved_bytes(&self) -> u64 {
+        self.cache_bytes
+            .saturating_add((self.prefetch_depth as u64).saturating_mul(self.prefetch_chunk_bytes))
+    }
+
+    /// Compute/read amplification introduced by the slab policy for one phase.
+    ///
+    /// This is the priced counterpart to the executor's advisory slab offer.
+    /// Unavailable cuts are priced as uncut, matching `slab::apply_at_most`:
+    /// the executor declines the offer and runs the block whole.
+    pub fn slab_amplification(&self, grid: &BlockGrid, halo: &Reach) -> f64 {
+        let slabs = self
+            .slab_policy
+            .slabs_for(self.expected_concurrency, grid.n_blocks());
+        if slabs <= 1 {
+            return 1.0;
+        }
+        SlabCut::plan_longest(grid.block(), slabs, halo, grid.volume())
+            .map(|cut| cut.amplification())
+            .unwrap_or(1.0)
+    }
+
+    /// The same constraints with a cache reservation.
+    pub fn with_cache_bytes(mut self, bytes: u64) -> Self {
+        self.cache_bytes = bytes;
+        self.storage.cache_bytes = bytes;
+        self
+    }
+
+    /// The same constraints with a prefetch reservation.
+    pub fn with_prefetch(mut self, depth: usize, chunk_bytes: u64) -> Self {
+        self.prefetch_depth = depth;
+        self.prefetch_chunk_bytes = chunk_bytes;
+        self.storage.prefetch_depth = depth;
+        self.storage.prefetch_chunk_bytes = chunk_bytes;
+        self
+    }
+
+    /// The same constraints with planner-visible storage settings.
+    pub fn with_storage(mut self, storage: StorageSettings) -> Self {
+        self.cache_bytes = storage.cache_bytes;
+        self.prefetch_depth = storage.prefetch_depth;
+        self.prefetch_chunk_bytes = storage.prefetch_chunk_bytes;
+        self.storage = storage;
+        self
     }
 
     /// The same constraints with `policy`.
@@ -2365,7 +2487,11 @@ impl Default for Constraints {
     fn default() -> Self {
         Self {
             slab_policy: SlabPolicy::default(),
+            storage: StorageSettings::default(),
             budget_bytes: None,
+            cache_bytes: 0,
+            prefetch_depth: 0,
+            prefetch_chunk_bytes: 0,
             expected_concurrency: 1,
             model: CostModel::default(),
             block_candidates: vec![32, 64, 128],
@@ -5105,6 +5231,33 @@ mod tests {
         assert_eq!(SlabPolicy::ALL.len(), 2, "a sweep must cover both");
     }
 
+    #[test]
+    fn slab_policy_amplification_enters_planner_space() {
+        let grid = BlockGrid::along([16, 16, 16], &[0, 1, 2], 16).unwrap();
+        let halo = Reach::from([1, 0, 0]);
+        let fill = Constraints {
+            expected_concurrency: 4,
+            slab_policy: SlabPolicy::FillIdleWorkers,
+            ..Constraints::default()
+        };
+        let off = Constraints {
+            expected_concurrency: 4,
+            slab_policy: SlabPolicy::Off,
+            ..Constraints::default()
+        };
+
+        assert!(
+            fill.slab_amplification(&grid, &halo) > 1.0,
+            "a one-block phase under four workers must price the redundant slab halo"
+        );
+        assert_eq!(off.slab_amplification(&grid, &halo), 1.0);
+        assert_eq!(
+            fill.slab_amplification(&grid, &Reach::from([16, 0, 0])),
+            1.0,
+            "the executor declines an uncuttable whole-axis slab offer"
+        );
+    }
+
     /// **The default changes nothing**, which is what makes it safe to be the
     /// default: `Constraints::default()`'s concurrency is one, so the rule
     /// answers one slab and no recorded figure moves.
@@ -5120,5 +5273,38 @@ mod tests {
         // And it is the filling one rather than the off one, so a caller who
         // raises the concurrency gets the behaviour without asking twice.
         assert_eq!(SlabPolicy::default(), SlabPolicy::FillIdleWorkers);
+    }
+
+    #[test]
+    fn cache_and_prefetch_reservations_reduce_the_admission_budget() {
+        let cost = PhaseCost {
+            redundancy: 1.0,
+            read_voxels_per_block: 1.0,
+            compute_per_voxel: 1.0,
+            working_set_bytes_per_block: 700.0,
+            repeats: 1,
+            cost_per_block: 1.0,
+        };
+        let constraints = Constraints {
+            budget_bytes: Some(1_000),
+            cache_bytes: 200,
+            prefetch_depth: 2,
+            prefetch_chunk_bytes: 50,
+            ..Constraints::default()
+        };
+        assert_eq!(constraints.reserved_bytes(), 300);
+        assert_eq!(constraints.admission_budget_bytes(1_000), 700);
+        assert_eq!(constraints.admission_demand_bytes(&cost), 1_470);
+        assert!(
+            !constraints.affords_working_set(&cost),
+            "admission charges the measured margin over the raw working set"
+        );
+
+        let fitting = PhaseCost {
+            working_set_bytes_per_block: 333.0,
+            ..cost
+        };
+        assert_eq!(constraints.admission_demand_bytes(&fitting), 699);
+        assert!(constraints.affords_working_set(&fitting));
     }
 }

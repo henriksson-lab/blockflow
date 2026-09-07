@@ -124,11 +124,10 @@ pub struct Residency<'a> {
     /// Chunks the coordinator models this worker as having **read**.
     ///
     /// **What this claims physically.** The built-in shared-volume worker now
-    /// uses `WorkflowSpec::cache_bytes` for a real chunk cache on image 0, the
-    /// immutable input. Produced images are not cached there, because peer
-    /// writes would need distributed invalidation. So this tier is partly a
-    /// real cache model and partly the older page-cache/locality claim, and the
-    /// two should be read with that boundary in mind.
+    /// uses `WorkflowSpec::cache_bytes` for a real chunk cache on every
+    /// shared-volume image. Deployment factories can still provide environments
+    /// with different cache behaviour, so this tier remains a model unless the
+    /// selected read path states the same cache contract.
     ///
     /// **The set is real and that is why the tier is kept.** A chunk two workers
     /// both read costs two fetches whatever either node caches, so preferring

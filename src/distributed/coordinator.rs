@@ -439,6 +439,14 @@ impl Job {
             .collect()
     }
 
+    fn in_flight_for(&self, worker: &str) -> Vec<usize> {
+        self.claims
+            .iter()
+            .filter(|(_, claim)| claim.worker == worker)
+            .map(|(&task, _)| task)
+            .collect()
+    }
+
     /// A worker is gone. Stop the job and say what was lost.
     ///
     /// **This is the answer to a node loss, and reissue is not.** The two are
@@ -736,13 +744,16 @@ impl Job {
                 &contenders,
             )
         };
+        let in_flight = self.in_flight_for(worker);
         let view = {
             let model = self.workers.get(worker).expect("admitted above");
             WorkerView {
-                // The coordinator does not track which tasks a *node* has in
-                // flight as a set, and only `Coalescing` reads it — which is not
-                // selectable here. Empty is the honest value: see the field.
-                in_flight: &[],
+                // The coordinator's production state names a worker process,
+                // not a physical node. What it can state exactly is the set of
+                // tasks this worker already holds through its `ahead` pipeline;
+                // those reads are about to land in the same local cache this
+                // worker will use for the next claim.
+                in_flight: &in_flight,
                 anchor: model.anchor,
                 cache: Some(&model.cache),
             }
@@ -1294,6 +1305,26 @@ mod tests {
         assert_eq!(seen, (0..total).collect::<Vec<_>>());
         assert_eq!(job.status().done, total);
         assert!(job.reissued_tasks().is_empty());
+    }
+
+    #[test]
+    fn a_workers_claims_are_visible_as_in_flight_tasks() {
+        let mut job = job(8, 1);
+        let first = match job.pull("w1") {
+            Handout::Task(assignment) => assignment.task,
+            other => panic!("expected first task, got {other:?}"),
+        };
+        let second = match job.pull("w1") {
+            Handout::Task(assignment) => assignment.task,
+            other => panic!("expected second task, got {other:?}"),
+        };
+
+        let mut in_flight = job.in_flight_for("w1");
+        in_flight.sort_unstable();
+        let mut expected = vec![first, second];
+        expected.sort_unstable();
+        assert_eq!(in_flight, expected);
+        assert!(job.in_flight_for("w2").is_empty());
     }
 
     #[test]

@@ -42,14 +42,22 @@
 //! regret of `1.0` says the model picked the simulator's winner. Nothing here
 //! asserts that it does.
 //!
+//! Each [`Verdict`](crate::arena::Verdict) also states whether the entrant was
+//! admissible under its own constraints. Inadmissible entrants keep their
+//! prices and simulated outcomes in the table, but winner selection skips them,
+//! so a faster-looking plan can be shown and rejected in the same report.
+//!
 //! # What this is not
 //!
 //! **Not a runtime prediction.** `simulate`'s own header says it ranks designs
 //! and does not predict runtimes, and every limit listed there is inherited
-//! whole: workers do not contend unless [`Machine::contention`] says so, and the
-//! executor is wave-synchronous where the simulator dispatches continuously
-//! (`planner-gaps.md`, item C). A regret figure is evidence that two rankings
-//! differ, not a measurement of seconds anybody will wait.
+//! whole: workers do not contend unless
+//! [`Machine::contention`](crate::simulate::Machine::contention) says so. The
+//! simulator default dispatches continuously because that is what the
+//! distributed coordinator does;
+//! [`Machine::wave_synchronous`](crate::simulate::Machine::wave_synchronous) is
+//! the explicit model for the current in-process executor. A regret figure is evidence that
+//! two rankings differ, not a measurement of seconds anybody will wait.
 //!
 //! **Not a search.** The arena judges the entrants it is handed. Turning a
 //! disagreement into a better planner is the work `planner-gaps.md` lists after
@@ -105,6 +113,8 @@ pub struct Entrant {
 pub struct Verdict {
     pub name: String,
     pub phases: usize,
+    /// Whether this plan fits the admission contract it was entered with.
+    pub admissible: bool,
     /// Blocks per phase, in phase order.
     pub blocks: Vec<usize>,
     /// The block extent each phase chose.
@@ -139,6 +149,7 @@ impl Judgement {
     pub fn model_pick(&self) -> Option<&Verdict> {
         self.verdicts
             .iter()
+            .filter(|verdict| verdict.admissible)
             .min_by(|a, b| a.priced_ns.total_cmp(&b.priced_ns))
     }
 
@@ -146,6 +157,7 @@ impl Judgement {
     pub fn simulated_pick(&self) -> Option<&Verdict> {
         self.verdicts
             .iter()
+            .filter(|verdict| verdict.admissible)
             .min_by(|a, b| a.simulated_ns().total_cmp(&b.simulated_ns()))
     }
 
@@ -230,15 +242,16 @@ impl Judgement {
             .map(Verdict::simulated_ns)
             .fold(f64::INFINITY, f64::min);
         let mut out = format!(
-            "planner arena, {} workers\n{:<34} {:>7} {:>9} {:>10} {:>10} {:>12}\n",
-            self.workers, "plan", "phases", "blocks", "priced", "simulated", "fetched MiB"
+            "planner arena, {} workers\n{:<34} {:>7} {:>5} {:>9} {:>10} {:>10} {:>12}\n",
+            self.workers, "plan", "phases", "fit", "blocks", "priced", "simulated", "fetched MiB"
         );
         for verdict in &self.verdicts {
             let blocks: usize = verdict.blocks.iter().sum();
             out.push_str(&format!(
-                "{:<34} {:>7} {:>9} {:>10.3} {:>10.3} {:>12.1}\n",
+                "{:<34} {:>7} {:>5} {:>9} {:>10.3} {:>10.3} {:>12.1}\n",
                 verdict.name,
                 verdict.phases,
+                if verdict.admissible { "yes" } else { "no" },
                 blocks,
                 verdict.priced_ns / best_priced.max(f64::MIN_POSITIVE),
                 verdict.simulated_ns() / best_simulated.max(f64::MIN_POSITIVE),
@@ -382,6 +395,7 @@ impl Arena {
                 &entrant.constraints,
                 self.machine.workers,
             )?;
+            let admissible = admissible_plan(workflow, decomposition, &entrant.constraints)?;
             // Every phase a `Strategy` produces is a run of chain slots; see the
             // module header for why the arena holds no other kind.
             let work = vec![PhaseWork::Pixels; decomposition.n_phases()];
@@ -414,6 +428,7 @@ impl Arena {
             verdicts.push(Verdict {
                 name: entrant.name.clone(),
                 phases: decomposition.n_phases(),
+                admissible,
                 blocks: decomposition
                     .phases
                     .iter()
@@ -433,6 +448,22 @@ impl Arena {
             workers: self.machine.workers,
         })
     }
+}
+
+/// Whether a plan fits the admission contract it was entered with.
+pub fn admissible_plan(
+    workflow: &Workflow,
+    decomposition: &Decomposition,
+    constraints: &Constraints,
+) -> Result<bool> {
+    Ok(phase_prices(
+        workflow,
+        decomposition,
+        constraints,
+        constraints.expected_concurrency,
+    )?
+    .iter()
+    .all(|(cost, _)| constraints.affords_working_set(cost)))
 }
 
 /// **The planner's objective, applied to a plan the planner did not have to
@@ -571,6 +602,7 @@ mod tests {
         Verdict {
             name: name.to_string(),
             phases: 1,
+            admissible: true,
             blocks: vec![1],
             edges: vec![[1, 1, 1]],
             priced_ns,
@@ -719,5 +751,26 @@ mod tests {
     fn a_field_that_takes_no_time_has_no_regret() {
         let field = judged(vec![verdict("a", 1.0, 0), verdict("b", 2.0, 5)]);
         assert_eq!(field.regret(), None);
+    }
+
+    #[test]
+    fn inadmissible_verdicts_are_reported_but_not_picked() {
+        let mut impossible = verdict("too-large", 0.1, 1);
+        impossible.admissible = false;
+        let field = judged(vec![impossible, verdict("fits", 1.0, 10)]);
+
+        assert_eq!(field.model_pick().map(|v| v.name.as_str()), Some("fits"));
+        assert_eq!(
+            field.simulated_pick().map(|v| v.name.as_str()),
+            Some("fits")
+        );
+        assert!(
+            field.table().contains("too-large"),
+            "the rejected entrant should still be visible"
+        );
+        assert!(
+            field.table().contains(" no "),
+            "the table should expose why the faster-looking entrant was skipped"
+        );
     }
 }

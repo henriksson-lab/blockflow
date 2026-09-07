@@ -62,10 +62,12 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
+use crate::arena::{Arena, Judgement};
 use crate::decomposition::{Constraints, CostModel};
 use crate::error::{Error, Result};
-use crate::simulate::{Machine, Rates};
+use crate::simulate::{Machine, Rates, Scheduler};
 use crate::statistics::{Coefficient, MachineKey, Snapshot, Term, REPRODUCTIONS};
+use crate::strategy::{Plan, Workflow};
 
 /// The file format tag, and the version of it.
 ///
@@ -127,6 +129,115 @@ pub struct Scenario {
     /// which is `Constraints::default()`'s own answer and is the scenario for a
     /// machine whose memory is not the binding constraint.
     pub budget_bytes: Option<u64>,
+}
+
+/// A named family of scenarios that varies the machine, not the coefficients.
+///
+/// This is the in-memory counterpart to the committed `costs/` directory. The
+/// directory is a record; a `MachineSweep` is a question a test or report asks
+/// of that record: "what if the same measured costs ran with another cache,
+/// another worker count, another phase discipline, another node layout?"
+///
+/// The baseline's [`Snapshot`] is cloned into every variant, through
+/// [`Scenario::with_machine`] and [`Scenario::with_memory`], so both judges keep
+/// deriving their rates from the same evidence while the simulator's
+/// [`Machine`] moves. Scheduler choices such as a distributed handout policy are
+/// deliberately passed to [`Self::judge_with`] instead of stored here: they are
+/// a coordinator policy, not a machine field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MachineSweep {
+    baseline: Scenario,
+    variants: Vec<Scenario>,
+}
+
+/// One row of a [`MachineSweep`] after it has been judged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MachineSweepJudgement {
+    pub scenario: Scenario,
+    pub judgement: Judgement,
+}
+
+impl MachineSweep {
+    /// Start a sweep at the measured point it is derived from.
+    pub fn new(baseline: Scenario) -> Self {
+        Self {
+            variants: vec![baseline.clone()],
+            baseline,
+        }
+    }
+
+    /// The scenarios this sweep will run, including the baseline.
+    pub fn variants(&self) -> &[Scenario] {
+        &self.variants
+    }
+
+    /// Add a pre-built scenario to the sweep.
+    pub fn with_scenario(mut self, scenario: Scenario) -> Self {
+        self.variants.push(scenario);
+        self
+    }
+
+    /// Add a variant by editing the baseline machine.
+    pub fn with_machine(
+        mut self,
+        name: &str,
+        note: impl Into<String>,
+        edit: impl FnOnce(&mut Machine),
+    ) -> Self {
+        let mut machine = self.baseline.machine;
+        edit(&mut machine);
+        self.variants.push(
+            self.baseline
+                .clone()
+                .with_machine(name, machine)
+                .noted(note),
+        );
+        self
+    }
+
+    /// Add a memory/cache variant, keeping the planner budget and the simulated
+    /// cache size tied together.
+    pub fn with_memory(mut self, name: &str, note: impl Into<String>, bytes: u64) -> Self {
+        let scenario = self.baseline.clone().with_memory(name, bytes).noted(note);
+        self.variants.push(scenario);
+        self
+    }
+
+    /// Plan and judge every machine variant through the arena.
+    ///
+    /// `plan` is a closure because worker count is usually part of the strategy
+    /// value, not only of `Constraints`; the cost-scenario tests build
+    /// `Enumerating { concurrency: scenario.machine.workers, .. }` this way.
+    /// `make_scheduler` is likewise per scenario so a caller can run the same
+    /// machine sweep under `ExecutorOrder`, `HandoutPolicy::NearestFirst`, or a
+    /// bounded-horizon scheduler without pretending those are machine fields.
+    pub fn judge_with<P, S>(
+        &self,
+        workflow: &Workflow,
+        base_constraints: &Constraints,
+        seed_rates: &Rates,
+        mut plan: P,
+        mut make_scheduler: S,
+    ) -> Result<Vec<MachineSweepJudgement>>
+    where
+        P: FnMut(&Scenario, &Workflow, &Constraints) -> Result<Plan>,
+        S: FnMut(&Scenario) -> Box<dyn Scheduler>,
+    {
+        let mut rows = Vec::with_capacity(self.variants.len());
+        for scenario in &self.variants {
+            let constraints = scenario.constraints(base_constraints);
+            let chosen = plan(scenario, workflow, &constraints)?;
+            let mut arena = Arena::new(scenario.machine, scenario.rates(seed_rates))
+                .with_snapshot(scenario.snapshot.clone());
+            arena.enter_plan("planner", chosen, constraints)?;
+            let judgement = arena.judge_with(workflow, &mut || make_scheduler(scenario))?;
+            rows.push(MachineSweepJudgement {
+                scenario: scenario.clone(),
+                judgement,
+            });
+        }
+        Ok(rows)
+    }
 }
 
 impl Scenario {
@@ -754,5 +865,114 @@ mod tests {
             constraints.model.compute_scale,
             scenario.model(&base.model).compute_scale
         );
+    }
+
+    /// A machine sweep varies the simulator's machine axes while keeping the
+    /// coefficients derived from the same snapshot. The scheduler is supplied
+    /// separately so distributed handout choices can be swept with the same
+    /// machine variants instead of being smuggled into a `Machine` field.
+    #[test]
+    fn a_machine_sweep_runs_cache_prefetch_waves_contention_and_handout_axes() {
+        use crate::distributed::handout::HandoutPolicy;
+        use crate::op::Chain;
+        use crate::probes::{AffineOp, IdentityOp};
+        use crate::simulate::Handout;
+        use crate::strategy::{Enumerating, Strategy, Workflow};
+        use crate::Dtype;
+
+        let workflow = Workflow::new(
+            Chain::sequence(vec![
+                Chain::op(IdentityOp::new("wide", [2, 2, 2]).with_cost(2.0)),
+                Chain::op(AffineOp::new("scale", 1.25, 0.5, [1, 1, 1]).with_cost(4.0)),
+                Chain::op(IdentityOp::new("narrow", [0, 0, 0]).with_cost(1.0)),
+            ]),
+            [32, 32, 32],
+            Dtype::F64,
+        );
+        let constraints = Constraints {
+            block_candidates: vec![8, 16],
+            split_axes: vec![0, 1, 2],
+            ..Default::default()
+        };
+        let sweep = MachineSweep::new(measured_baseline())
+            .with_memory(
+                "tight-cache",
+                "less cache and less admission budget",
+                1 << 20,
+            )
+            .with_machine("prefetch-two", "two-block prefetch horizon", |machine| {
+                machine.prefetch_depth = 2;
+            })
+            .with_machine("wave-sync", "executor-style phase waves", |machine| {
+                machine.wave_synchronous = true;
+            })
+            .with_machine(
+                "contended",
+                "measured contention at a larger worker count",
+                |machine| {
+                    machine.workers = 16;
+                    machine.contention = crate::simulate::MEASURED_CONTENTION;
+                },
+            )
+            .with_machine(
+                "distributed-handout",
+                "two nodes with per-node caches",
+                |machine| {
+                    machine.nodes = 2;
+                    machine.workers = 8;
+                    machine.cache_shared = false;
+                    machine.cache_bytes = 1 << 22;
+                    machine.candidate_window = 16;
+                },
+            );
+
+        let rows = sweep
+            .judge_with(
+                &workflow,
+                &constraints,
+                &Rates::default(),
+                |scenario, workflow, constraints| {
+                    Enumerating {
+                        concurrency: scenario.machine.workers.max(1),
+                        ..Enumerating::default()
+                    }
+                    .plan(workflow, constraints)
+                },
+                |_| Box::new(Handout::new(HandoutPolicy::NearestFirst)),
+            )
+            .expect("every machine variant should plan and simulate");
+
+        assert_eq!(rows.len(), sweep.variants().len());
+        assert!(
+            rows.iter()
+                .any(|row| row.scenario.machine.prefetch_depth == 2),
+            "the prefetch axis was not represented"
+        );
+        assert!(
+            rows.iter().any(|row| row.scenario.machine.wave_synchronous),
+            "the wave-synchronous axis was not represented"
+        );
+        assert!(
+            rows.iter().any(|row| row.scenario.machine.contention > 0.0),
+            "the contention axis was not represented"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.scenario.machine.nodes > 1 && !row.scenario.machine.cache_shared),
+            "the distributed handout/cache-sharing axis was not represented"
+        );
+        for row in rows {
+            assert_eq!(row.judgement.workers, row.scenario.machine.workers);
+            let verdict = row
+                .judgement
+                .verdicts
+                .first()
+                .expect("the planner entrant is present");
+            assert!(
+                verdict.simulated_ns() > 0.0,
+                "{} produced no simulated work",
+                row.scenario.name
+            );
+        }
     }
 }

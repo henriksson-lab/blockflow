@@ -49,12 +49,12 @@
 //! * noise, jitter, or any distribution at all — one run, one answer;
 //! * rates that change over time, thermal or otherwise;
 //! * crashes, retries, stragglers, or workers leaving;
-//! * storage physics — no seek, no queue depth, no readahead heuristics. What
-//!   *is* modelled is a **single serial IO channel**: a byte fetched costs
-//!   [`Rates::io_ns_per_byte`] of that one channel's time and a byte in cache
-//!   costs nothing. That is the least structure under which prefetch is a
-//!   trade rather than free money — without it, deeper prefetching improves
-//!   every run without bound and a depth sweep is meaningless;
+//! * storage physics — no seek, no request coalescing, no readahead heuristics.
+//!   What *is* modelled is a finite set of per-node IO channels: fetched bytes
+//!   and stored bytes both queue there, while cache hits cost no transfer. That
+//!   is the least structure under which prefetch is a trade rather than free
+//!   money — without it, deeper prefetching improves every run without bound
+//!   and a depth sweep is meaningless;
 //! * NUMA, memory bandwidth contention, or any interaction between concurrent
 //!   workers other than the slot count itself.
 //!
@@ -86,6 +86,7 @@ use crate::distributed::cache_model::{ChunkGrid, ModelledCache};
 use crate::error::Result;
 use crate::fragment::{PhaseWork, SidecarSize};
 use crate::graph::TaskGraph;
+use crate::log::{Event, ExecutionLog, Stats};
 
 /// The machine, as the simulator understands one.
 ///
@@ -500,7 +501,12 @@ pub struct Rates {
     /// unaligned re-fetches well above aligned ones — and a chunk grid is the
     /// smallest model that can express that at all.
     pub chunk: [usize; 3],
-    /// Bytes in one chunk.
+    /// Fallback bytes in one chunk.
+    ///
+    /// The simulator derives per-image transfer bytes from this chunk shape and
+    /// each image's dtype. This scalar remains for callers that need one
+    /// representative chunk size, such as bounded-horizon floors and tests that
+    /// size a cache in chunks.
     pub chunk_bytes: u64,
 }
 
@@ -674,9 +680,9 @@ pub struct Outcome {
     /// Bytes fetched ahead of demand. Part of [`Self::fetched_bytes`], not
     /// additional to it.
     pub prefetched_bytes: u64,
-    /// Nanoseconds a worker spent waiting on the IO channel before its compute
-    /// could start. **The quantity prefetch exists to reduce**, and the one a
-    /// too-deep prefetch increases by queueing ahead of demand.
+    /// Nanoseconds a worker spent waiting on an IO channel before a transfer
+    /// could start. **The read-side quantity prefetch exists to reduce**, and
+    /// the one a too-deep prefetch increases by queueing ahead of demand.
     pub io_wait_ns: u64,
     /// Tasks completed. **The conservation law**: it is a property of the plan
     /// and not of the schedule, so any two schedulers on one plan must agree on
@@ -816,6 +822,61 @@ pub struct PerPhase<'a> {
     pub constant_fraction: &'a [f64],
 }
 
+/// Owned per-phase simulator inputs derived from a real run.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MeasuredPerPhase {
+    pub ns_per_voxel: Vec<f64>,
+    pub substages: Vec<usize>,
+    pub constant_fraction: Vec<f64>,
+}
+
+impl MeasuredPerPhase {
+    /// Derive data-dependent simulator inputs from executor stats.
+    pub fn from_stats(decomposition: &Decomposition, stats: &Stats) -> Self {
+        let mut measured = Self::from_log(decomposition, &stats.log);
+        measured.substages = stats.substages.clone();
+        measured
+    }
+
+    /// Derive per-phase short-circuit fractions from the execution log.
+    pub fn from_log(decomposition: &Decomposition, log: &ExecutionLog) -> Self {
+        let n = decomposition.n_phases();
+        let mut admitted = vec![0usize; n];
+        let mut short = vec![0usize; n];
+        for event in log.events() {
+            match event {
+                Event::TaskAdmitted { phase, .. } if phase < n => admitted[phase] += 1,
+                Event::BlockShortCircuited { phase, .. } if phase < n => short[phase] += 1,
+                _ => {}
+            }
+        }
+        let constant_fraction = admitted
+            .iter()
+            .zip(short)
+            .map(|(&tasks, skipped)| {
+                if tasks == 0 {
+                    0.0
+                } else {
+                    skipped as f64 / tasks as f64
+                }
+            })
+            .collect();
+        Self {
+            ns_per_voxel: Vec::new(),
+            substages: Vec::new(),
+            constant_fraction,
+        }
+    }
+
+    pub fn as_per_phase(&self) -> PerPhase<'_> {
+        PerPhase {
+            ns_per_voxel: &self.ns_per_voxel,
+            substages: &self.substages,
+            constant_fraction: &self.constant_fraction,
+        }
+    }
+}
+
 /// Whether a block short-circuits, from a fraction and its index.
 ///
 /// A hash rather than a stride, so that the skipped set is not a plane or a
@@ -832,6 +893,63 @@ fn short_circuits(index: [usize; 3], fraction: f64) -> bool {
         ^ index[1].wrapping_mul(19_349_663)
         ^ index[2].wrapping_mul(83_492_791)) as u64;
     (mixed % 10_000) < (fraction * 10_000.0) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decomposition::PhaseDecomposition;
+    use crate::dtype::Dtype;
+    use crate::geometry::BlockGrid;
+    use crate::reach::Reach;
+
+    #[test]
+    fn measured_per_phase_derives_short_circuit_fraction_from_the_log() {
+        let volume = [8, 4, 4];
+        let grid = BlockGrid::along(volume, &[0], 4).unwrap();
+        let decomposition = Decomposition {
+            volume,
+            dtype: Dtype::F64,
+            phases: vec![
+                PhaseDecomposition::derive(
+                    vec![0],
+                    vec!["a".to_string()],
+                    Reach::from([0, 0, 0]),
+                    Reach::from([0, 0, 0]),
+                    grid.clone(),
+                ),
+                PhaseDecomposition::derive(
+                    vec![1],
+                    vec!["b".to_string()],
+                    Reach::from([0, 0, 0]),
+                    Reach::from([0, 0, 0]),
+                    grid,
+                ),
+            ],
+            chain_reach: [0, 0, 0],
+        };
+        let log = ExecutionLog::new();
+        for phase in 0..2 {
+            for x in 0..2 {
+                log.push(Event::TaskAdmitted {
+                    phase,
+                    index: [x, 0, 0],
+                });
+            }
+        }
+        log.push(Event::BlockShortCircuited {
+            phase: 1,
+            index: [0, 0, 0],
+            from: 0.0,
+            to: 0.0,
+            slots: vec![1],
+            names: vec!["b".to_string()],
+        });
+
+        let measured = MeasuredPerPhase::from_log(&decomposition, &log);
+        assert_eq!(measured.constant_fraction, vec![0.0, 0.5]);
+        assert_eq!(measured.as_per_phase().constant_fraction, &[0.0, 0.5]);
+    }
 }
 
 /// What a [`Scheduler`] may look at when it chooses.
@@ -1270,7 +1388,60 @@ impl BoundedHorizonThroughput {
     /// everything — the "nonsense strategies that ignore cost of IO" a short
     /// horizon invites.
     pub fn floor_ns(rates: &Rates) -> u64 {
-        ((rates.chunk_bytes as f64 * rates.io_ns_per_byte) as u64).max(1)
+        (rates.io_latency_ns
+            + rates.chunk_bytes as f64 * (rates.io_ns_per_byte + rates.decode_ns_per_byte))
+            .ceil()
+            .max(1.0) as u64
+    }
+
+    /// The shortest horizon that can contain the largest fetch any one task in
+    /// `decomposition` may perform.
+    ///
+    /// This is the plan-aware form of [`Self::floor_ns`]. A task may read
+    /// several chunks, and a source-leaf phase may read several images; the
+    /// fallback one-chunk floor cannot see either. This walks the same
+    /// per-image chunk grids that [`simulate`] and [`Decision::chunks_of`] use,
+    /// then prices the miss path as latency per chunk plus transfer and decode
+    /// per byte.
+    pub fn floor_for_plan(decomposition: &Decomposition, rates: &Rates) -> u64 {
+        let images_read: Vec<Vec<usize>> = decomposition
+            .phases
+            .iter()
+            .enumerate()
+            .map(|(index, phase)| phase.images_read(index))
+            .collect();
+        let mut grids: BTreeMap<usize, ChunkGrid> = BTreeMap::new();
+        for images in &images_read {
+            for &image in images {
+                grids
+                    .entry(image)
+                    .or_insert_with(|| ChunkGrid::new(decomposition.volume_at(image), rates.chunk));
+            }
+        }
+        let graph = TaskGraph::build(decomposition);
+        graph
+            .tasks
+            .iter()
+            .map(|task| {
+                let mut chunks = 0u64;
+                let mut bytes = 0u64;
+                for &image in &images_read[task.phase] {
+                    let Some(grid) = grids.get(&image) else {
+                        continue;
+                    };
+                    let n = grid.keys(image, &task.geometry.source).len() as u64;
+                    chunks += n;
+                    bytes += n
+                        * rates.chunk.iter().product::<usize>() as u64
+                        * decomposition.dtype_at(image).size_of() as u64;
+                }
+                (chunks as f64 * rates.io_latency_ns
+                    + bytes as f64 * (rates.io_ns_per_byte + rates.decode_ns_per_byte))
+                    .ceil()
+                    .max(1.0) as u64
+            })
+            .max()
+            .unwrap_or_else(|| Self::floor_ns(rates))
     }
 
     /// A horizon at or above [`Self::floor_ns`], on [`RateBasis::PerPhaseCost`].
@@ -1278,13 +1449,39 @@ impl BoundedHorizonThroughput {
         Self::with_basis(horizon_ns, rates, RateBasis::PerPhaseCost)
     }
 
+    /// A horizon at or above [`Self::floor_for_plan`], on
+    /// [`RateBasis::PerPhaseCost`].
+    pub fn new_for_plan(
+        horizon_ns: u64,
+        rates: &Rates,
+        decomposition: &Decomposition,
+    ) -> Result<Self> {
+        Self::with_basis_for_plan(horizon_ns, rates, decomposition, RateBasis::PerPhaseCost)
+    }
+
     /// The same, on a stated basis. See [`RateBasis`].
     pub fn with_basis(horizon_ns: u64, rates: &Rates, rate: RateBasis) -> Result<Self> {
         let floor = Self::floor_ns(rates);
+        Self::with_floor(horizon_ns, floor, rate)
+    }
+
+    /// [`Self::with_basis`], but using [`Self::floor_for_plan`] as the lower
+    /// bound.
+    pub fn with_basis_for_plan(
+        horizon_ns: u64,
+        rates: &Rates,
+        decomposition: &Decomposition,
+        rate: RateBasis,
+    ) -> Result<Self> {
+        let floor = Self::floor_for_plan(decomposition, rates);
+        Self::with_floor(horizon_ns, floor, rate)
+    }
+
+    fn with_floor(horizon_ns: u64, floor: u64, rate: RateBasis) -> Result<Self> {
         if horizon_ns < floor {
             return Err(crate::error::Error::InvalidArgument(format!(
-                "a horizon of {horizon_ns} ns is shorter than the {floor} ns one chunk fetch \
-                 takes at these rates. A scheduler that cannot see a fetch finish cannot see it \
+                "a horizon of {horizon_ns} ns is shorter than the {floor} ns fetch floor at \
+                 these rates. A scheduler that cannot see a fetch finish cannot see it \
                  pay for itself, and will order the run as though re-reading were free."
             )));
         }
@@ -1536,6 +1733,14 @@ pub fn simulate(
                 .or_insert_with(|| ChunkGrid::new(decomposition.volume_at(image), rates.chunk));
         }
     }
+    let chunk_bytes: BTreeMap<usize, u64> = grids
+        .keys()
+        .map(|&image| {
+            let bytes = rates.chunk.iter().product::<usize>() as u64
+                * decomposition.dtype_at(image).size_of() as u64;
+            (image, bytes.max(1))
+        })
+        .collect();
     // **Two tiers, because the real cache has two.** The decoded tier is what a
     // hit used to be — free. The encoded tier holds more for the same bytes and
     // charges a decode for every hit, which is what gives a cache-size sweep the
@@ -1940,9 +2145,12 @@ pub fn simulate(
             &images_read[task.phase]
         };
         let mut misses = 0u64;
-        let mut encoded_hits = 0u64;
+        let mut fetched = 0u64;
+        let mut encoded_hit_bytes = 0u64;
         for &image in fetches {
             let keys = grids[&image].keys(image, &task.geometry.source);
+            let size = chunk_bytes[&image];
+            let sized_keys: Vec<(u64, u64)> = keys.iter().map(|&key| (key, size)).collect();
             let missed_decoded = caches[pool].misses(&keys) as u64;
             // A chunk the decoded tier does not hold may still be in the encoded
             // one, where it is a hit that costs a decode rather than a fetch.
@@ -1950,7 +2158,8 @@ pub fn simulate(
                 .iter()
                 .filter(|key| !caches[pool].holds(**key) && !encodeds[pool].holds(**key))
                 .count() as u64;
-            encoded_hits += missed_decoded - not_in_either;
+            encoded_hit_bytes += (missed_decoded - not_in_either) * size;
+            fetched += not_in_either * size;
             // A chunk this pool must fetch that **another** pool has already
             // fetched is a duplicated fetch — the thing a handout policy exists
             // to avoid, and invisible under one shared pool.
@@ -1969,14 +2178,13 @@ pub fn simulate(
                     }
                 }
             }
-            caches[pool].note_assigned(&keys);
-            encodeds[pool].note_assigned(&keys);
+            caches[pool].note_assigned_sized(&sized_keys);
+            encodeds[pool].note_assigned_sized(&sized_keys);
             outcome.cache_hits += keys.len() as u64 - not_in_either;
             outcome.cache_misses += not_in_either;
             outcome.encoded_hits += missed_decoded - not_in_either;
             misses += not_in_either;
         }
-        let fetched = misses * rates.chunk_bytes;
         outcome.fetched_bytes += fetched;
         // A request per chunk, plus the bytes. This is what puts a floor under a
         // small chunk: without it, halving the chunk halves the over-fetch and
@@ -2004,7 +2212,7 @@ pub fn simulate(
         // does not occupy a channel and does not overlap with the fetch that
         // produced its bytes. An **encoded hit** pays the same decode without
         // the fetch, which is the whole of what the second tier trades.
-        let decoded_bytes = fetched + encoded_hits * rates.chunk_bytes;
+        let decoded_bytes = fetched + encoded_hit_bytes;
         let decoded = io_done + (decoded_bytes as f64 * rates.decode_ns_per_byte) as u64;
 
         let read_voxels = task.geometry.read.voxels() as u64;
@@ -2075,7 +2283,7 @@ pub fn simulate(
         // Compute starts when the bytes have landed, not when the slot opened.
         let computed = decoded + compute.max(1);
 
-        // **The write, on the same channel the read came over.**
+        // **The write, on the same IO channels the reads use.**
         //
         // The extent and the element type are the executor's own accounting —
         // `strategy`'s `phase_bytes` is `outcome.valid.voxels() x
@@ -2083,34 +2291,11 @@ pub fn simulate(
         // stores. `writes_an_image` is asked of the work, so a fragment phase
         // that writes no image is charged nothing.
         //
-        // **The write costs the task its own time, and does not touch the
-        // channel.** That is a smaller claim than it looks, and both halves were
-        // arrived at by getting it wrong first.
-        //
-        // The worker really does block on its store — `strategy` writes inside
-        // the task — so the duration belongs to the slot, and a plan that stores
-        // more finishes later. That is the whole of what this item is for, and it
-        // is enough for the ranking: makespan responds to write bytes, and
-        // `written_bytes` and `materialised_bytes` record them exactly.
-        //
-        // Charging the store to the **serial channel** is the part left undone,
-        // and deliberately. A store joins the channel when the compute ends, so
-        // `io_free_at` would have to move past that compute — and then the next
-        // task's *read* queues behind it, and the channel becomes a global lock
-        // through which every task's compute is serialised. Measured on the
-        // suite's own fixture: a plan that took `203.9 ms` on one worker took
-        // `203.9 ms` on eight, to the nanosecond, which is a simulator with no
-        // worker axis at all. Accounting it from dispatch instead avoids that
-        // and breaks the other end — the channel is then never idle, and the
-        // prefetcher, whose whole rule is "only into idle channel time", stops
-        // issuing at every depth.
-        //
-        // Both failures are the same missing thing: a serial channel with an
-        // arrival order needs a **request queue**, not another placement of one
-        // scalar. That is the IO model being replaced rather than patched — see
-        // the `IO latency and IO parallelism` item in
-        // `docs/design/simulator-fidelity.md`, which is where read and write
-        // contention become one question with one answer.
+        // The worker blocks on its store, and the store queues behind whatever
+        // else is using the node's storage. This is the request queue the old
+        // scalar model was missing: the arrival time is `computed`, not dispatch
+        // time, so compute still overlaps compute while reads and writes
+        // contend for the same finite IO channels.
         let written = task.phase + 1;
         let write_bytes = if writes[task.phase] && written < decomposition.n_images() {
             task.geometry.valid.voxels() as u64 * decomposition.dtype_at(written).size_of() as u64
@@ -2146,9 +2331,18 @@ pub fn simulate(
             }
             // A sidecar is an intermediate by nature: nothing outside the run
             // reads one, and `Lifecycle` is how it goes.
-            computed
-                + (write_bytes as f64 * rate) as u64
-                + (sidecar_bytes as f64 * rates.materialise_ns_per_byte) as u64
+            let transfer = (write_bytes as f64 * rate) as u64
+                + (sidecar_bytes as f64 * rates.materialise_ns_per_byte) as u64;
+            if transfer > 0 {
+                let channel = earliest_channel(&io_free_at, node, channels);
+                let start = computed.max(io_free_at[channel]);
+                let done = start + transfer;
+                outcome.io_wait_ns += start - computed;
+                io_free_at[channel] = done;
+                done
+            } else {
+                computed
+            }
         } else {
             computed
         };
@@ -2202,20 +2396,28 @@ pub fn simulate(
                 if indegree[ahead.id] != 0 {
                     continue;
                 }
-                let ahead_keys: Vec<u64> = images_read[ahead.phase]
+                let mut ahead_keys: Vec<(u64, u64)> = Vec::new();
+                for &image in &images_read[ahead.phase] {
+                    let size = chunk_bytes[&image];
+                    ahead_keys.extend(
+                        grids[&image]
+                            .keys(image, &ahead.geometry.source)
+                            .into_iter()
+                            .map(|key| (key, size)),
+                    );
+                }
+                let ahead_missed: Vec<(u64, u64)> = ahead_keys
                     .iter()
-                    .flat_map(|&image| grids[&image].keys(image, &ahead.geometry.source))
+                    .filter(|(key, _)| !caches[pool].holds(*key) && !encodeds[pool].holds(*key))
+                    .copied()
                     .collect();
-                let ahead_misses = ahead_keys
-                    .iter()
-                    .filter(|key| !caches[pool].holds(**key) && !encodeds[pool].holds(**key))
-                    .count() as u64;
+                let ahead_misses = ahead_missed.len() as u64;
                 if ahead_misses == 0 {
                     continue;
                 }
-                caches[pool].note_assigned(&ahead_keys);
-                encodeds[pool].note_assigned(&ahead_keys);
-                let bytes = ahead_misses * rates.chunk_bytes;
+                let bytes = ahead_missed.iter().map(|(_, bytes)| *bytes).sum::<u64>();
+                caches[pool].note_assigned_sized(&ahead_keys);
+                encodeds[pool].note_assigned_sized(&ahead_keys);
                 outcome.fetched_bytes += bytes;
                 outcome.prefetched_bytes += bytes;
                 outcome.cache_misses += ahead_misses;

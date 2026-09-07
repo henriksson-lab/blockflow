@@ -519,10 +519,10 @@ fn an_ops_own_working_buffers_are_not_visible_to_any_declaration() {
 /// under-charge actually bites.**
 ///
 /// The admission rule is `strategy`'s own: the largest candidate edge for which
-/// `working_set_bytes_per_block x expected_concurrency <= budget_bytes`. The
-/// factors are measured above — `1.00` is what the formula charges today,
-/// `2.00` a sequence or a two-arm fan-in, `3.06` the widest framework shape
-/// here, `4.00` a one-in-one-out phase whose op is a rank filter.
+/// `admission_bytes(working_set_bytes_per_block) x expected_concurrency <=
+/// budget_bytes`. The factors are measured above — `1.00` is the raw framework
+/// figure, `2.00` a sequence or a two-arm fan-in, `3.06` the widest framework
+/// shape here, `4.00` a one-in-one-out phase whose op is a rank filter.
 ///
 /// **The affordability cost is bounded at one step of the ladder, and that is
 /// arithmetic rather than luck**: the candidates go up by a factor of two in

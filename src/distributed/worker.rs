@@ -70,7 +70,7 @@
 // onto a queue. Observation must never be able to slow down the thing it
 // observes, and an event sender that blocked would be exactly that.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -85,6 +85,7 @@ use crate::fragment::{check_phase_work, PhaseWork};
 use crate::graph::TaskGraph;
 use crate::listener::EventListener;
 use crate::log::Event;
+use crate::region::Region;
 use crate::strategy::{execute_task_with_reduction, reduce_phase};
 
 use super::client::Client;
@@ -548,8 +549,10 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
     // `slabs_for` rather than clamping inline keeps the cap in the one place
     // that owns it.
     let slabs = SlabPolicy::FillIdleWorkers.slabs_for(options.threads, 1);
+    let mut prefetched = BTreeSet::new();
 
     while let Some(assignment) = next_task(&shared, &mut report) {
+        prefetch_queued(&shared, environment.as_ref(), &mut prefetched);
         check_agreement(&graph, &assignment, &decomposition)?;
         let task = &graph.tasks[assignment.task];
         if decomposition.phases[task.phase].barrier && !reduced.contains_key(&task.phase) {
@@ -774,6 +777,38 @@ fn next_task(shared: &Arc<Shared>, report: &mut WorkerReport) -> Option<Assignme
             .wait_timeout(queue, Duration::from_millis(20))
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         queue = next;
+    }
+}
+
+fn prefetch_queued(
+    shared: &Arc<Shared>,
+    environment: &dyn crate::env::Environment,
+    submitted: &mut BTreeSet<usize>,
+) {
+    let queued: Vec<(usize, usize, Region)> = {
+        let queue = guard(&shared.queue);
+        queue
+            .iter()
+            .filter(|assignment| !submitted.contains(&assignment.task))
+            .map(|assignment| {
+                (
+                    assignment.task,
+                    assignment.phase,
+                    // Distributed assignments carry `read`, which is the fetch
+                    // region for the uniform-volume shared store. Source-mapped
+                    // shape-changing plans are refused by this environment.
+                    assignment.read.clone(),
+                )
+            })
+            .collect()
+    };
+    let mut by_image: BTreeMap<usize, Vec<Region>> = BTreeMap::new();
+    for (task, phase, region) in queued {
+        submitted.insert(task);
+        by_image.entry(phase).or_default().push(region);
+    }
+    for (image, regions) in by_image {
+        let _ = environment.prefetch(image, &regions);
     }
 }
 

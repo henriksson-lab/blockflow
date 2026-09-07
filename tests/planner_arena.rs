@@ -279,22 +279,21 @@ fn every_strategy_produces_a_plan_the_simulator_runs() {
 /// ```text
 ///     1 worker                          4 workers
 ///     plan     priced  simulated        plan     priced  simulated
-///     edge 8    3.068      7.506        edge 8    2.530      4.663
-///     edge 16   1.760      3.641        edge 16   1.457      2.285
-///     edge 32   1.326      2.448        edge 32   1.000      1.000
-///     edge 64   1.000      1.000        edge 64   2.660      2.479
-///     kendall tau 1.0                   kendall tau 0.667
-///     no discordant pair                edge 8 against edge 64
+///     edge 8    3.068      7.506        edge 8    2.530      2.538
+///     edge 16   1.760      3.641        edge 16   1.457      2.123
+///     edge 32   1.326      2.448        edge 32   1.000      1.469
+///     edge 64   1.000      1.000        edge 64   2.660      1.000
+///     kendall tau 1.0                   kendall tau 0.000
+///     no discordant pair                edge 8/16/32 against edge 64
 /// ```
 ///
 /// At one worker the two orderings are **identical**, which is what
 /// `Enumerating::concurrency`'s own doc predicts when it calls `1` the negative
 /// control: the objective collapses to serial work, which is monotone in the
 /// edge, and so is the simulator here. At four they disagree about the two
-/// extremes — the cost model prices the 1024-block plan *below* the
-/// single-block one, and the simulator makes it nearly twice as slow. Both
-/// still pick edge 32, so the regret is `1.000`: **the model's argmin survives
-/// and its ordering does not.**
+/// single-block plan — the cost model prices every smaller edge below it, and
+/// the simulator makes the single block fastest. The model now pays regret
+/// `1.469`: **the model's argmin no longer survives the ordering split.**
 ///
 /// **This is item C of `docs/design/planner-gaps.md` with a number on it** —
 /// "the simulator and the executor have different concurrency models, and
@@ -380,22 +379,26 @@ fn the_two_judges_agree_at_one_worker_and_part_at_four() {
     assert!(
         *tau_four < 1.0,
         "at four workers the two judges now agree on the whole ordering. That is a finding — \
-         the recorded measurement is a tau of 0.667 with edge 8 against edge 64 — and this \
+         the recorded measurement is a tau of 0.000 with edges 8/16/32 against edge 64 — and this \
          test is where to write down what changed."
     );
     assert_eq!(
         four.discordant_pairs(),
-        vec![("edge 8", "edge 64")],
-        "the recorded disagreement is between the extremes of the ladder"
+        vec![
+            ("edge 8", "edge 64"),
+            ("edge 16", "edge 64"),
+            ("edge 32", "edge 64")
+        ],
+        "the recorded disagreement is now every smaller edge against edge 64"
     );
-    assert_eq!(
-        *regret_four, 1.0,
-        "the model's argmin used to survive the disagreement; now it does not, which is a \
-         bigger finding than the disagreement itself"
+    assert!(
+        (1.46..1.48).contains(regret_four),
+        "the model's argmin no longer survives the disagreement; recorded regret is 1.469, \
+         got {regret_four:.3}"
     );
     assert_eq!(
         four.simulated_pick().map(|verdict| verdict.name.as_str()),
-        Some("edge 32")
+        Some("edge 64")
     );
 }
 

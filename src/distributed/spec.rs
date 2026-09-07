@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::decomposition::{Constraints, Decomposition};
+use crate::decomposition::{Constraints, Decomposition, StorageSettings};
 use crate::dtype::Dtype;
 use crate::env::{AccountingEnvironment, Environment};
 use crate::error::{Error, Result};
@@ -51,7 +51,7 @@ use crate::probes::{
     AffineOp, BlockSummaryOp, FragmentReduceOp, IdentityOp, NeighbourFoldOp, OpaqueOp, WindowSumOp,
 };
 use crate::sidecar::{check_stream_name, Lifecycle};
-use crate::strategy::{Enumerating, Strategy, Workflow};
+use crate::strategy::{choose_paths, Enumerating, Strategy, Workflow};
 
 use super::handout::HandoutPolicy;
 use super::shared_volume::SharedVolumes;
@@ -572,6 +572,9 @@ pub struct WorkflowSpec {
     /// model and, for the built-in file-backed worker, the real cache on the
     /// read path. `0` disables both.
     pub cache_bytes: u64,
+    /// How many upcoming file-backed reads the built-in worker may submit to
+    /// the prefetcher. `0` disables prefetch.
+    pub prefetch_depth: usize,
     pub ops: Vec<OpSpec>,
     pub store: StoreSpec,
     /// Per-block output that is not a pixel region. `None` — the usual case —
@@ -593,6 +596,9 @@ impl WorkflowSpec {
             "ops": self.ops.iter().map(OpSpec::to_json).collect::<Vec<_>>(),
             "store": self.store.to_json(),
         });
+        if self.prefetch_depth > 0 {
+            value["prefetch_depth"] = json!(self.prefetch_depth);
+        }
         if let Some(sidecar) = &self.sidecar {
             value["sidecar"] = sidecar.to_json();
         }
@@ -616,6 +622,7 @@ impl WorkflowSpec {
             dtype,
             chunk: triple_or(value, "chunk", [1, 1, 1]),
             cache_bytes: number_or(value, "cache_bytes", 256 << 20),
+            prefetch_depth: number_or(value, "prefetch_depth", 0) as usize,
             ops: array(value, "ops")?
                 .iter()
                 .map(OpSpec::from_json)
@@ -837,13 +844,21 @@ impl WorkflowFactory for ProbeWorkflows {
 
     fn environment(&self, spec: &WorkflowSpec, n_phases: usize) -> Result<Box<dyn Environment>> {
         Ok(match &spec.store {
-            StoreSpec::Files { dir } => Box::new(SharedVolumes::open_with_cache(
-                dir,
-                spec.shape,
-                spec.chunk,
-                n_phases,
-                Some(spec.cache_bytes),
-            )?),
+            StoreSpec::Files { dir } => {
+                let env = SharedVolumes::open_with_cache(
+                    dir,
+                    spec.shape,
+                    spec.chunk,
+                    n_phases,
+                    Some(spec.cache_bytes),
+                )?;
+                let env = if spec.prefetch_depth > 0 {
+                    env.with_prefetch(1, spec.prefetch_depth)?
+                } else {
+                    env
+                };
+                Box::new(env)
+            }
             StoreSpec::Counting {
                 emptiness,
                 fill_value,
@@ -917,6 +932,7 @@ pub fn probe_job_over(
         dtype: Dtype::F64,
         chunk: [4, 8, 8],
         cache_bytes: 1 << 20,
+        prefetch_depth: 0,
         ops,
         store,
         sidecar: None,
@@ -933,13 +949,27 @@ pub fn probe_job_over(
 /// given the answer, because "workers receive certainty".
 pub fn decompose(spec: &JobSpec, min_phases: usize) -> Result<Decomposition> {
     let factory = ProbeWorkflows;
-    let chain = factory.chain(&spec.workflow)?;
-    let workflow = Workflow::new(chain, spec.workflow.shape, spec.workflow.dtype);
+    let chunk_bytes =
+        spec.workflow.chunk.iter().product::<usize>() as u64 * spec.workflow.dtype.size_of() as u64;
+    let storage = StorageSettings::chunked(spec.workflow.chunk)
+        .with_cache_bytes(spec.workflow.cache_bytes)
+        .with_prefetch(spec.workflow.prefetch_depth, chunk_bytes);
     let constraints = Constraints {
         block_candidates: vec![8],
         split_axes: vec![0],
+        cache_bytes: spec.workflow.cache_bytes,
+        prefetch_depth: spec.workflow.prefetch_depth,
+        prefetch_chunk_bytes: chunk_bytes,
+        storage,
         ..Default::default()
     };
+    let chain = choose_paths(
+        factory.chain(&spec.workflow)?,
+        spec.workflow.shape,
+        spec.workflow.dtype,
+        &constraints,
+    )?;
+    let workflow = Workflow::new(chain, spec.workflow.shape, spec.workflow.dtype);
     let mut decomposition = Enumerating::default().decompose(&workflow, &constraints)?;
     if decomposition.n_phases() < min_phases {
         // Force the split the caller asked for. Legitimate: the partition is a

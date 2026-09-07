@@ -1746,20 +1746,16 @@ mod planned_phases {
     /// so this is the size the gap was actually found at rather than the size a
     /// test can afford to run.
     ///
-    /// **The budget is 8 MiB where the consumer's was 4, and that is a real
+    /// **The budget is 18 MiB where the consumer's was 4, and that is a real
     /// consequence rather than a fixture being loosened.** This chain is a
     /// `Chain::sequence`, which holds two block buffers between its children on
-    /// top of the phase's own input and output, and
-    /// `PhaseCost::working_set_bytes_per_block` now charges for all four where it
-    /// used to charge for two. So the corrected figure is exactly twice the old
-    /// one here, and a caller who had tuned 4 MiB against the old charge needs 8
-    /// MiB to plan the same work — not because the run got bigger, but because
-    /// it was always holding four buffers and the budget was told it held two.
-    /// `tests/working_set_residency.rs` is where that is measured through an
-    /// allocator.
+    /// top of the phase's own input and output, and admission now charges the
+    /// measured first-run margin over that framework figure. The run did not get
+    /// bigger; the budget was told what it was already holding, plus the margin
+    /// `budget.rs` measured for unobserved op scratch.
     #[test]
     fn the_same_holds_at_the_radius_and_volume_the_gap_was_found_at() {
-        let constraints = constraints(8 << 20, vec![16, 32, 64, 128]);
+        let constraints = constraints(18 << 20, vec![16, 32, 64, 128]);
         let fused = fused(WIDE, WIDE_SIGMA, &constraints);
         let (planned, phases) = planned(WIDE, WIDE_SIGMA, &constraints);
         let voxels: usize = WIDE.iter().product();

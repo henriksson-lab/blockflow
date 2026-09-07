@@ -25,6 +25,7 @@
 
 use ndarray::Array3;
 
+use crate::budget::{admission_bytes, FrameworkFigure};
 use crate::dtype::Dtype;
 use crate::region::Region;
 
@@ -451,10 +452,11 @@ fn a_memory_budget_forces_cuts_the_cost_model_would_not_choose() {
     assert_eq!(unbounded.n_phases(), 1, "unbounded, the cost model fuses");
 
     // One phase of three ops reaches 24, so a block of 128 reads 176 planes:
-    // 176 x 32 x 32 x 8 bytes x 2 buffers = 2.88 MB. A single op reaches 8 and
-    // reads 144 planes: 2.36 MB. Budget between them.
+    // 176 x 32 x 32 x 8 bytes x 2 buffers = 2.88 MB raw, 6.06 MB after the
+    // measured admission margin. A single op reaches 8 and reads 144 planes:
+    // 2.36 MB raw, 4.95 MB charged. Budget between them.
     let mut tight = constraints(vec![0], vec![128]);
-    tight.budget_bytes = Some(2_500_000);
+    tight.budget_bytes = Some(5_500_000);
     let bounded = Enumerating::default().decompose(&workflow, &tight).unwrap();
     assert!(
         bounded.n_phases() > 1,
@@ -463,7 +465,7 @@ fn a_memory_budget_forces_cuts_the_cost_model_would_not_choose() {
     );
     for phase in &bounded.phases {
         let read: usize = phase.blocks.iter().map(|b| b.read.voxels()).max().unwrap();
-        assert!((read * 8 * 2) as u64 <= 2_500_000);
+        assert!(admission_bytes(FrameworkFigure::Assumed((read * 8 * 2) as f64)) <= 5_500_000);
     }
 }
 

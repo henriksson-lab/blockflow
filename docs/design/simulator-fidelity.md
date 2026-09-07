@@ -413,7 +413,9 @@ properties, and is where such a model belongs.
 
   **Change.** An occupancy model — the fraction of blocks that are constant, as
   a function of block edge — supplied per phase, and the executor's own skip rule
-  applied to it. Not an op model.
+  applied to it. Not an op model. `simulate::MeasuredPerPhase` now derives those
+  fractions from real `ExecutionLog` `TaskAdmitted` and `BlockShortCircuited`
+  events; synthetic fractions remain only for controlled experiments.
 
   **Acceptance.** On a fixture with a known constant fraction, the simulated
   skip count matches a real run's `tasks_short_circuited` at two different block
@@ -560,6 +562,31 @@ or `Machine` (planner levers) — the split those two structs already document.
 ---
 
 ## Still open, and named rather than implied
+
+`tests/simulator_against_the_executor.rs` now has two layers of differential
+coverage. The original single-worker `ArrayEnvironment` cases still compare
+exact admission order, task count, demand chunk touches and stored image bytes.
+The multi-worker sweep drops the order assertion, because cache, prefetch,
+contention, wave discipline and handout scheduling are supposed to move order,
+and keeps the conservation laws instead. It also asserts non-zero prefetch
+bytes and non-zero duplicated cross-pool fetches, so the extra arms are not just
+different names for the same single-worker run.
+
+The handout bridge is now explicit as well. A 3-D probe job is run once through
+the real distributed coordinator path (`Job::pull` plus `execute_task`) and once
+through simulator `Handout`. The counters are not the same unit — real side
+counts distinct duplicated chunks, simulator side counts duplicated fetch events
+— so the assertion is the planning claim: `NearestFirst` reduces duplicated
+cross-cache work relative to `Naive` in both harnesses. The recorded bridge
+point is `192 -> 186` duplicated chunks in the coordinator and `4452 -> 1009`
+duplicated fetches in the simulator over the same 1536-task job.
+
+`BoundedHorizonThroughput`'s lower bound is now a real fetch floor. The fallback
+`floor_ns` includes fixed latency and decode for one chunk, and the plan-aware
+`floor_for_plan` scans the decomposition's task graph to find the largest miss a
+single task can issue across every image the phase reads. Callers that know the
+plan use `new_for_plan` or `with_basis_for_plan`; the one-chunk constructor
+remains the conservative fallback for code that only has rates.
 
 Item 11 built the **machinery** — `SidecarSize`, the bound checked at the write
 site, the simulator's per-block charge and gather peak — and declared a size on

@@ -73,6 +73,7 @@ use crate::env::{BlockBuf, EnvCounters, Environment};
 use crate::error::{Error, Result};
 use crate::geometry::chunks_touched;
 use crate::op::{Chain, Placement};
+use crate::prefetch::{BlockPlan, PrefetchStats, Prefetcher};
 use crate::region::{Region, RegionSource};
 use crate::sidecar::{FileSidecars, Sidecars};
 use crate::voxels::Voxels;
@@ -202,6 +203,8 @@ pub struct SharedVolumes {
     images: Vec<File>,
     cache: Option<Arc<ChunkCache>>,
     cached: Vec<Option<ArrayId>>,
+    prefetcher: Option<Prefetcher>,
+    prefetch_lookahead: usize,
     counters: EnvCounters,
     /// Fragments beside the images, in the same shared directory and for the
     /// same reason: a task's non-pixel output has to be readable by whichever
@@ -279,10 +282,9 @@ impl SharedVolumes {
     ///
     /// `cache_bytes == Some(0)` is a named opt-out. Otherwise the same byte
     /// figure that sizes the handout model also sizes the cache on the worker's
-    /// real read path for image 0, the immutable input. Produced images are not
-    /// cached here because this is a multi-process store and invalidating a
-    /// chunk written by another worker would require a distributed invalidation
-    /// protocol this environment deliberately does not have.
+    /// real read path for every shared-volume image. Produced images are only
+    /// read by later phases after their producing phase has drained, and local
+    /// writes invalidate the writer's own cache entries.
     pub fn open_with_cache(
         dir: &Path,
         volume: [usize; 3],
@@ -312,22 +314,23 @@ impl SharedVolumes {
             .map(|bytes| Arc::new(ChunkCache::new(MemoryBudget::new(bytes), bytes)));
         let mut cached = vec![None; images.len()];
         if let Some(cache) = &cache {
-            let image = 0;
-            let file = images[image].try_clone().map_err(|err| {
-                Error::backend(format!(
-                    "cloning shared-volume image {image} for cache reads: {err}"
-                ))
-            })?;
-            let source = SharedVolumeSource::new(file, image, volume);
-            let id = cache.register(
-                &format!("shared-volume image {image}"),
-                &volume,
-                &chunk,
-                Dtype::F64,
-                ArrayPolicy::default(),
-                Arc::new(RegionSourceFetcher::<f64, _>::new(source)),
-            )?;
-            cached[image] = Some(id);
+            for (image, file) in images.iter().enumerate() {
+                let file = file.try_clone().map_err(|err| {
+                    Error::backend(format!(
+                        "cloning shared-volume image {image} for cache reads: {err}"
+                    ))
+                })?;
+                let source = SharedVolumeSource::new(file, image, volume);
+                let id = cache.register(
+                    &format!("shared-volume image {image}"),
+                    &volume,
+                    &chunk,
+                    Dtype::F64,
+                    ArrayPolicy::default(),
+                    Arc::new(RegionSourceFetcher::<f64, _>::new(source)),
+                )?;
+                cached[image] = Some(id);
+            }
         }
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -336,6 +339,8 @@ impl SharedVolumes {
             images,
             cache,
             cached,
+            prefetcher: None,
+            prefetch_lookahead: 0,
             counters: EnvCounters::default(),
             sidecars: Sidecars::new(FileSidecars::at(Self::sidecar_root(dir))?),
         })
@@ -347,6 +352,30 @@ impl SharedVolumes {
 
     pub fn cache_stats(&self) -> Option<CacheStats> {
         self.cache.as_ref().map(|cache| cache.stats())
+    }
+
+    pub fn with_prefetch(mut self, threads: usize, lookahead: usize) -> Result<Self> {
+        let Some(cache) = self.cache.as_ref() else {
+            return Err(Error::invalid(
+                "shared-volume prefetch needs a cache to fetch into; open with a non-zero \
+                 cache budget first",
+            ));
+        };
+        self.prefetcher = Some(Prefetcher::new(Arc::clone(cache), threads));
+        self.prefetch_lookahead = lookahead;
+        Ok(self)
+    }
+
+    pub fn prefetch_stats(&self) -> Option<PrefetchStats> {
+        self.prefetcher
+            .as_ref()
+            .map(|prefetcher| prefetcher.stats())
+    }
+
+    pub fn drain_prefetch(&self) {
+        if let Some(prefetcher) = &self.prefetcher {
+            prefetcher.drain();
+        }
     }
 
     fn offset(&self, position: [usize; 3]) -> u64 {
@@ -441,6 +470,22 @@ impl Environment for SharedVolumes {
                 )));
             }
         }
+        Ok(())
+    }
+
+    fn prefetch(&self, image: usize, regions: &[Region]) -> Result<()> {
+        let Some(prefetcher) = self.prefetcher.as_ref() else {
+            return Ok(());
+        };
+        if regions.is_empty() {
+            return Ok(());
+        }
+        let Some(array) = self.cached.get(image).and_then(|entry| *entry) else {
+            return Ok(());
+        };
+        let plan =
+            BlockPlan::in_order(array, regions.iter().cloned()).head(self.prefetch_lookahead);
+        prefetcher.submit(&plan);
         Ok(())
     }
 
@@ -678,6 +723,37 @@ mod tests {
     }
 
     #[test]
+    fn prefetch_on_shared_volumes_warms_the_real_cache() {
+        let dir = scratch("prefetch");
+        let volume = [8, 4, 4];
+        let creator = SharedVolumes::create(&dir, volume, [4, 4, 4], 1).unwrap();
+        let cached = SharedVolumes::open_with_cache(&dir, volume, [4, 4, 4], 1, Some(1 << 20))
+            .unwrap()
+            .with_prefetch(1, 1)
+            .unwrap();
+        let region = Region::new(&[0, 0, 0], &[4, 4, 4]);
+
+        cached.prefetch(0, std::slice::from_ref(&region)).unwrap();
+        cached.drain_prefetch();
+        let prefetch = cached.prefetch_stats().expect("prefetch enabled");
+        let after_prefetch = cached.cache_stats().expect("cache enabled");
+        let _ = cached.read(0, &region).unwrap();
+        let after_read = cached.cache_stats().expect("cache enabled");
+
+        assert!(
+            prefetch.submitted > 0 && prefetch.started > 0,
+            "the shared-volume prefetcher did not run: {prefetch:?}"
+        );
+        assert!(
+            after_read.hits() > after_prefetch.hits(),
+            "the demand read did not use the prefetched shared-volume chunk: before \
+             {after_prefetch:?}, after {after_read:?}"
+        );
+        drop(creator);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn cached_shared_volume_writes_invalidate_stale_chunks() {
         let dir = scratch("invalidate");
         let volume = [4, 4, 4];
@@ -696,6 +772,37 @@ mod tests {
         let new = cached.read(0, &region).unwrap();
         assert_eq!(new, block);
         drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn produced_shared_volume_images_use_the_real_cache() {
+        let dir = scratch("produced-cache");
+        let volume = [4, 4, 4];
+        let creator = SharedVolumes::create(&dir, volume, [4, 4, 4], 1).unwrap();
+        let cached =
+            SharedVolumes::open_with_cache(&dir, volume, [4, 4, 4], 1, Some(1 << 20)).unwrap();
+        let region = Region::whole(&volume);
+        let block = BlockBuf::Array(Array3::from_elem((4, 4, 4), 11.0).into());
+        creator.write(1, &region, &region, &block).unwrap();
+
+        let first = cached.read(1, &region).unwrap();
+        let after_first = cached.cache_stats().expect("cache enabled");
+        let second = cached.read(1, &region).unwrap();
+        let after_second = cached.cache_stats().expect("cache enabled");
+
+        assert_eq!(first, block);
+        assert_eq!(second, block);
+        assert!(
+            after_first.misses > 0,
+            "the first produced-image read must populate the cache: {after_first:?}"
+        );
+        assert!(
+            after_second.hits() > after_first.hits(),
+            "the second produced-image read must hit the real cache: before \
+             {after_first:?}, after {after_second:?}"
+        );
+        drop(creator);
         std::fs::remove_dir_all(&dir).ok();
     }
 

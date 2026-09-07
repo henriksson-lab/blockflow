@@ -347,6 +347,13 @@ So the planner-space rule is:
 > the block cut is already paying a halo, and about sixteen when it is not. Give
 > it **one** whenever `n_blocks >= workers`, because in that regime it is a loss.
 
+The planner now prices that rule rather than leaving it as a side choice:
+`Constraints::slab_amplification` asks the policy how many slabs a candidate
+phase would get, uses `SlabCut::amplification()` for the redundant halo work, and
+`phase_price` applies the multiplier before the phase makespan comparison.
+Unavailable cuts are charged as uncut, matching the executor's advisory
+`apply_at_most` path.
+
 ---
 
 ## 8. The halo, priced in time rather than in voxels

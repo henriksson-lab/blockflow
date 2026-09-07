@@ -191,12 +191,12 @@ disagreement is visible rather than silent.
 ### 2.1 `admission_bytes` cannot carry it, and the reason is dimensional
 
 `admission_bytes(figure: FrameworkFigure) -> u64` charges **one block**. Its two
-margins are fitted per-block quantities — `UNOBSERVED_SHAPE_MARGIN = 3.6` over
-the widest measured chain shape, `UNOBSERVED_OP_MARGIN = 2.1` over the widest
-measured op. The comparison that uses it is, at both sites in `strategy.rs`:
+margins are fitted per-block quantities over the measured shape and op
+residuals. The comparison that uses it is:
 
 ```text
-cost.working_set_bytes_per_block * expected_concurrency  <=  budget_bytes
+admission_bytes(Assumed(cost.working_set_bytes_per_block)) * expected_concurrency
+    <= budget_bytes - cache_bytes - prefetch_depth * prefetch_chunk_bytes
 ```
 
 A cache is **one reservation for the whole run**, not a per-block cost. Folding
@@ -262,12 +262,12 @@ into `Hints::slab_policy` — *"the one line that carries `Constraints::slab_pol
 into the run"* — and the executor reads it where it reads every other performance
 decision. **A caller states it once, at the constraint.**
 
-So: `Constraints::cache_bytes` and `Constraints::prefetch_depth`, copied into
-`Hints`. `Hints::prefetch_depth` **already exists** — *"Reserved for
-`MULTISLAB_IO.md` §4's hint-driven prefetcher. Recorded so a strategy can express
-it before there is a prefetcher to consume it."* It is set in seven places and
-**read in none.** Half of §4's plumbing is therefore already built and inert, in
-the same way and for the same reason as everything else in this note.
+So: `Constraints::cache_bytes`, `Constraints::prefetch_depth`, and
+`Constraints::prefetch_chunk_bytes`, copied into `Hints`.
+`Hints::prefetch_depth` already existed; `cache_bytes` and
+`prefetch_chunk_bytes` make the byte contract explicit beside it. The chunk byte
+size also has a planner-space home now: `Constraints::storage` carries layout,
+chunk shape, cache bytes and prefetch reservation as one setting for sweeps.
 
 ### 3.2 The principle: derived, not chosen — and how far that reaches
 
@@ -346,7 +346,7 @@ already builds one from an array and an ordered sequence of regions.
 | an `ArrayId` | whatever `ChunkCache::register` returned for that image (§1.2) |
 | a `Region` per future read | `graph.tasks[t].geometry.source` — **the same field** `placement::read_keys` and `handout::nearest` already use |
 | a `rank` | the block's index in the plan's own visit order |
-| a depth | `Hints::prefetch_depth`, which exists and is read by nothing (§3.1) |
+| a depth | `Hints::prefetch_depth` for in-process runs, and `WorkflowSpec::prefetch_depth` for the built-in distributed worker |
 
 **Nothing has to be predicted.** `src/prefetch.rs`'s header is right that this is
 scheduling rather than prediction — *"the block plan is enumerated up front, so a
@@ -362,14 +362,24 @@ scheduler's myopia, because it is not consulting the throughput criterion at all
 That separation is what makes a greedy compute scheduler safe, and it is already
 built.
 
+The production path is wired on the same boundary. The in-process scheduler
+declares a phase's future reads through `Environment::prefetch` when the phase
+starts. `ZarrEnvironment` registers cacheable images lazily and submits a bounded
+`BlockPlan` to its `Prefetcher`. The built-in distributed worker submits reads
+for assignments already sitting in its local ahead queue, so prefetch runs while
+the current assignment computes; `SharedVolumes` accepts those submissions for
+every registered shared-volume image, so produced-source reads can be warmed once
+their producing phase has drained.
+
 ### 4.2 What `PrefetchWasted` must be non-zero against
 
 *"Waste is the cost of depth and is what tells you the depth is wrong; nothing
 else in the system will."* The counters exist —
 `CacheStats::{prefetch_issued, prefetch_used, prefetch_wasted_evicted,
 prefetch_wasted_refused, prefetch_declined}` and
-`PrefetchStats::{submitted, started, chunks, cancelled, declined, failed}` — and
-have never been non-zero outside `cache_tests.rs`.
+`PrefetchStats::{submitted, started, chunks, cancelled, declined, failed}`. They
+are now production counters: Zarr and the built-in shared-volume worker both
+submit real prefetch work when configured with a non-zero depth.
 
 **"Waste must be non-zero somewhere in the suite" is the right instinct and the
 wrong assertion**, because a run that wastes nothing may simply have a cache
@@ -514,8 +524,10 @@ never prices.
 * **It does not make the plan-time cache and the run-time cache the same
   object.** They will be two numbers that must agree, and §5's third row is the
   only thing that would notice if they stopped.
-* **It says nothing about a write-side cache.** `produced` in the coordinator's
-  model is about written chunks; nothing here proposes retaining them.
+* **It does not make produced writes instantly resident.** `produced` in the
+  coordinator's model is about written chunks. The built-in shared-volume worker
+  can now cache produced-source reads, but a worker that only wrote a chunk has
+  not inserted it into its read cache unless it later reads that chunk.
 
 ---
 

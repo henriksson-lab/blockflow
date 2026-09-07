@@ -60,7 +60,7 @@ const CHUNK: [usize; 3] = [8, 8, 8];
 
 /// A scheduler that records what it picked, delegating the decision itself.
 struct Recording {
-    inner: ExecutorOrder,
+    inner: Box<dyn Scheduler>,
     picked: Rc<RefCell<Vec<usize>>>,
 }
 
@@ -87,21 +87,43 @@ struct Both {
     simulator_chunks_read: u64,
     executor_bytes_written: u64,
     simulator_bytes_written: u64,
+    simulator_prefetched_bytes: u64,
+    simulator_duplicated_fetches: u64,
 }
 
 fn run_both(assembly: Assembly, volume: [usize; 3]) -> Both {
+    run_both_with(
+        assembly,
+        volume,
+        Hints {
+            concurrency: 1,
+            ..Hints::default()
+        },
+        Machine {
+            workers: 1,
+            cache_bytes: 0,
+            prefetch_depth: 0,
+            ..Machine::default()
+        },
+        Rates::default(),
+        || Box::new(ExecutorOrder::phase_major()),
+    )
+}
+
+fn run_both_with(
+    assembly: Assembly,
+    volume: [usize; 3],
+    hints: Hints,
+    machine: Machine,
+    rates: Rates,
+    make_scheduler: impl FnOnce() -> Box<dyn Scheduler>,
+) -> Both {
     let plan = &assembly.decomposition;
 
     // --- the executor ---------------------------------------------------
     let input = Voxels::F64(ndarray::Array3::from_elem(volume, 1.0));
     let env = ArrayEnvironment::for_decomposition(input, plan, CHUNK).expect("an environment");
     let workflow = &assembly.workflow;
-    // One worker, so the admitted order is a sequence rather than an
-    // interleaving that only a clock could reproduce.
-    let hints = Hints {
-        concurrency: 1,
-        ..Hints::default()
-    };
     // **`execute_phases` and not `execute`.** `execute` hands every phase
     // `PhaseWork::Pixels` — so a fragment phase reached through it is never
     // applied, and the block is read and written as if the phase were a chain.
@@ -134,29 +156,22 @@ fn run_both(assembly: Assembly, volume: [usize; 3]) -> Both {
     // --- the simulator --------------------------------------------------
     let picked = Rc::new(RefCell::new(Vec::new()));
     let mut scheduler = Recording {
-        inner: ExecutorOrder::phase_major(),
+        inner: make_scheduler(),
         picked: picked.clone(),
     };
     let outcome = simulate(
         plan,
         &assembly.work(),
-        // The cache is irrelevant to what is compared: the executor's
-        // `RegionRead::chunks` counts the chunks a fetch *touches*, and the
-        // simulator's `cache_misses + cache_hits` is the same count with the
-        // hit/miss split thrown away. Comparing against misses alone was the
-        // first version of this test and it was wrong by 21 of 192 —
-        // `ModelledCache::new(0, ..)` has a capacity of **one**, not zero, so
-        // "no cache" still hits. The sum has no such assumption in it.
-        &Machine {
-            workers: 1,
-            cache_bytes: 0,
-            prefetch_depth: 0,
-            ..Machine::default()
-        },
+        // The cache is irrelevant to the demand count compared here: the
+        // executor's `RegionRead::chunks` counts chunks a demand fetch touches,
+        // and the simulator's hit/miss split is reduced back to that below.
+        // Prefetch fills are a separate simulator counter and deliberately not
+        // part of the executor-facing demand read comparison.
+        &machine,
         &Rates {
             chunk: CHUNK,
             chunk_bytes: (CHUNK.iter().product::<usize>() * 8) as u64,
-            ..Rates::default()
+            ..rates
         },
         &BTreeSet::new(),
         &BTreeSet::new(),
@@ -175,15 +190,20 @@ fn run_both(assembly: Assembly, volume: [usize; 3]) -> Both {
         })
         .collect();
 
+    let simulated_chunks_touched = outcome.cache_misses + outcome.cache_hits;
+    let prefetched_chunks = outcome.prefetched_bytes / (CHUNK.iter().product::<usize>() * 8) as u64;
+
     Both {
         executor_order,
         simulator_order,
         executor_tasks: stats.tasks,
         simulator_tasks: outcome.tasks_run,
         executor_chunks_read,
-        simulator_chunks_read: outcome.cache_misses + outcome.cache_hits,
+        simulator_chunks_read: simulated_chunks_touched.saturating_sub(prefetched_chunks),
         executor_bytes_written,
         simulator_bytes_written: outcome.written_bytes + outcome.materialised_bytes,
+        simulator_prefetched_bytes: outcome.prefetched_bytes,
+        simulator_duplicated_fetches: outcome.duplicated_fetches,
     }
 }
 
@@ -198,17 +218,21 @@ fn assert_stores_agree(what: &str, both: &Both) {
 }
 
 fn assert_agrees(what: &str, both: &Both) {
-    assert_eq!(
-        both.simulator_tasks as usize, both.executor_tasks,
-        "{what}: the simulator ran {} tasks against the executor's {}. This is a property of the \
-         plan, so a disagreement is about which tasks exist rather than about scheduling.",
-        both.simulator_tasks, both.executor_tasks
-    );
+    assert_counts_agree(what, both);
     assert_eq!(
         both.simulator_order, both.executor_order,
         "{what}: the two admitted blocks in different orders. `priority_key` is shared, so the \
          difference is in the loop around it — readiness, a barrier, or which phase a task was \
          thought to belong to."
+    );
+}
+
+fn assert_counts_agree(what: &str, both: &Both) {
+    assert_eq!(
+        both.simulator_tasks as usize, both.executor_tasks,
+        "{what}: the simulator ran {} tasks against the executor's {}. This is a property of the \
+         plan, so a disagreement is about which tasks exist rather than about scheduling.",
+        both.simulator_tasks, both.executor_tasks
     );
     assert_eq!(
         both.simulator_chunks_read, both.executor_chunks_read,
@@ -251,6 +275,120 @@ fn a_reachless_chain_agrees() {
     let both = run_both(builder.finish().expect("an assembly"), volume);
     assert_agrees("a reachless chain", &both);
     assert_stores_agree("a reachless chain", &both);
+}
+
+/// The single-worker differential above checks the exact admission sequence.
+/// With several workers, prefetch, contention or a handout scheduler, the order
+/// is intentionally a scheduling question rather than a conservation law. The
+/// executor and simulator still have to agree on the plan arithmetic: how many
+/// tasks exist, how many chunks demand reads touch, and how many bytes the plan
+/// stores.
+#[test]
+fn machine_terms_and_handout_scheduling_preserve_executor_arithmetic() {
+    use blockflow::distributed::handout::HandoutPolicy;
+    use blockflow::simulate::Handout;
+
+    enum SimScheduler {
+        PhaseMajor,
+        NearestHandout,
+    }
+
+    impl SimScheduler {
+        fn make(&self) -> Box<dyn Scheduler> {
+            match self {
+                Self::PhaseMajor => Box::new(ExecutorOrder::phase_major()),
+                Self::NearestHandout => Box::new(Handout::new(HandoutPolicy::NearestFirst)),
+            }
+        }
+    }
+
+    fn assembly(volume: [usize; 3]) -> Assembly {
+        let grid = BlockGrid::new(volume, [8, 8, 8]).expect("a grid");
+        let mut builder = PlanBuilder::new(volume, Dtype::F64, grid);
+        for name in ["wide", "middle", "narrow"] {
+            builder
+                .pixels(Chain::op(IdentityOp::new(name, [1, 1, 1])))
+                .expect("a pixel phase");
+        }
+        builder.finish().expect("an assembly")
+    }
+
+    let volume = [32, 32, 32];
+    let cases = [
+        (
+            "cache and prefetch",
+            Hints {
+                concurrency: 4,
+                prefetch_depth: 2,
+                ..Hints::default()
+            },
+            Machine {
+                workers: 4,
+                cache_bytes: 1 << 20,
+                prefetch_depth: 2,
+                io_channels: 8,
+                ..Machine::default()
+            },
+            Rates {
+                compute_ns_per_voxel: 1_000.0,
+                ..Rates::default()
+            },
+            SimScheduler::PhaseMajor,
+        ),
+        (
+            "wave dispatch and contention",
+            Hints {
+                concurrency: 4,
+                ..Hints::default()
+            },
+            Machine {
+                workers: 4,
+                wave_synchronous: true,
+                contention: blockflow::simulate::MEASURED_CONTENTION,
+                ..Machine::default()
+            },
+            Rates::default(),
+            SimScheduler::PhaseMajor,
+        ),
+        (
+            "distributed handout",
+            Hints {
+                concurrency: 6,
+                ..Hints::default()
+            },
+            Machine {
+                nodes: 2,
+                workers: 6,
+                cache_bytes: 1 << 18,
+                cache_shared: false,
+                candidate_window: 24,
+                ..Machine::default()
+            },
+            Rates::default(),
+            SimScheduler::NearestHandout,
+        ),
+    ];
+
+    let mut saw_prefetch = false;
+    let mut saw_duplicated_fetch = false;
+    for (name, hints, machine, rates, scheduler) in cases {
+        let both = run_both_with(assembly(volume), volume, hints, machine, rates, || {
+            scheduler.make()
+        });
+        assert_counts_agree(name, &both);
+        assert_stores_agree(name, &both);
+        saw_prefetch |= both.simulator_prefetched_bytes > 0;
+        saw_duplicated_fetch |= both.simulator_duplicated_fetches > 0;
+    }
+    assert!(
+        saw_prefetch,
+        "the prefetch arm never issued a prefetch, so it did not exercise the machine term"
+    );
+    assert!(
+        saw_duplicated_fetch,
+        "the distributed handout arm never duplicated a fetch, so it did not exercise the \
+         multi-cache machine term"
+    );
 }
 
 /// A **dtype change**, so that the images are not all `f64` and the per-image

@@ -28,12 +28,12 @@
 //
 // The LRU below is a different claim. It is sized by `WorkflowSpec::cache_bytes`.
 // For the built-in shared-volume worker that now matches a real `cache::ChunkCache`
-// on image 0, the immutable input. For produced images, and for deployment
-// factories with their own environments, it is still only a locality model unless
-// that environment gives the same byte budget to the same cache policy. What can
-// physically serve those re-reads may be the page cache, sized by free RAM, so
-// the eviction understates residency most of the time and **overstates it exactly
-// under memory pressure**, which is not harmless for a ranking key.
+// on every shared-volume image. For deployment factories with their own
+// environments, it is still only a locality model unless that environment gives
+// the same byte budget to the same cache policy. What can physically serve those
+// re-reads may be the page cache, sized by free RAM, so the eviction understates
+// residency most of the time and **overstates it exactly under memory pressure**,
+// which is not harmless for a ranking key.
 //
 // That is why `HandoutPolicy::CacheModelled`, which ranks on the eviction, is
 // refused at `HandoutPolicy::select`, while `placement::entitled`, which uses
@@ -70,7 +70,7 @@
 // per node, 30 518 across eight. That is a `HashSet` and a `VecDeque`, not a
 // problem.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::region::Region;
 
@@ -156,6 +156,11 @@ fn key(image: usize, chunk: u64) -> u64 {
     ((image as u64) << 40) | (chunk & 0xff_ffff_ffff)
 }
 
+/// The image part of a chunk key.
+pub fn image_of(key: u64) -> usize {
+    (key >> 40) as usize
+}
+
 /// What the coordinator believes one worker's cache holds.
 ///
 /// An LRU over chunk keys with a byte budget, replayed from assignments. It
@@ -166,7 +171,9 @@ pub struct ModelledCache {
     budget_bytes: u64,
     chunk_bytes: u64,
     capacity: usize,
+    resident_bytes: u64,
     resident: HashSet<u64>,
+    sizes: HashMap<u64, u64>,
     /// Front is least recently used. A `VecDeque` plus a set rather than a
     /// linked hash map: a touch is a removal and a push, the sequence is short,
     /// and this is a model of a cache rather than a cache.
@@ -179,16 +186,21 @@ impl ModelledCache {
     /// `chunk_bytes` is a decoded chunk's size — `chunk voxels x dtype width`.
     pub fn new(budget_bytes: u64, chunk_bytes: u64) -> Self {
         let chunk_bytes = chunk_bytes.max(1);
-        // At least one entry, so a budget smaller than a chunk models a cache
-        // that thrashes rather than one that cannot exist. The real cache
-        // degrades to a pass-through in that situation, which costs a fetch —
-        // and a fetch is what a modelled miss predicts anyway.
-        let capacity = (budget_bytes / chunk_bytes).max(1) as usize;
+        // Zero is a named opt-out, matching the real shared-volume cache. A
+        // positive budget smaller than a chunk still models a tiny thrashing
+        // cache rather than silently disabling the cache the caller asked for.
+        let capacity = if budget_bytes == 0 {
+            0
+        } else {
+            (budget_bytes / chunk_bytes).max(1) as usize
+        };
         Self {
             budget_bytes,
             chunk_bytes,
             capacity,
+            resident_bytes: 0,
             resident: HashSet::new(),
+            sizes: HashMap::new(),
             order: VecDeque::new(),
             inserted: 0,
             evicted: 0,
@@ -239,21 +251,38 @@ impl ModelledCache {
     /// The only way state enters this type, and it is called from the handout,
     /// with the coordinator's own lock already held. Nothing waits.
     pub fn note_assigned(&mut self, keys: &[u64]) {
-        for &key in keys {
+        let sized: Vec<(u64, u64)> = keys.iter().map(|&key| (key, self.chunk_bytes)).collect();
+        self.note_assigned_sized(&sized);
+    }
+
+    /// Record an assignment where chunks may have different byte sizes.
+    pub fn note_assigned_sized(&mut self, keys: &[(u64, u64)]) {
+        for &(key, bytes) in keys {
+            let bytes = bytes.max(1);
             if self.resident.contains(&key) {
                 if let Some(position) = self.order.iter().position(|&entry| entry == key) {
                     self.order.remove(position);
                 }
             } else {
                 self.resident.insert(key);
+                self.sizes.insert(key, bytes);
+                self.resident_bytes = self.resident_bytes.saturating_add(bytes);
                 self.inserted += 1;
             }
             self.order.push_back(key);
         }
-        while self.order.len() > self.capacity {
+        while (self.budget_bytes == 0 && !self.order.is_empty())
+            || (self.budget_bytes > 0
+                && self.resident_bytes > self.budget_bytes
+                && self.order.len() > 1)
+        {
             if let Some(oldest) = self.order.pop_front() {
-                self.resident.remove(&oldest);
-                self.evicted += 1;
+                if self.resident.remove(&oldest) {
+                    if let Some(bytes) = self.sizes.remove(&oldest) {
+                        self.resident_bytes = self.resident_bytes.saturating_sub(bytes);
+                    }
+                    self.evicted += 1;
+                }
             }
         }
     }
@@ -321,6 +350,17 @@ mod tests {
             assert!(cache.holds(grid.keys(0, &Region::new(&[block * 16, 0, 0], &[16, 16, 16]))[0]));
         }
         assert_eq!(cache.evicted(), 1);
+    }
+
+    #[test]
+    fn a_zero_budget_holds_nothing() {
+        let mut cache = ModelledCache::new(0, 100);
+        assert_eq!(cache.capacity(), 0);
+        cache.note_assigned(&[1, 2, 3]);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.misses(&[1, 2, 3]), 3);
+        assert!(!cache.holds(1));
     }
 
     #[test]

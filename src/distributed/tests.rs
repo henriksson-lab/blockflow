@@ -20,14 +20,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::assemble::PlanBuilder;
 use crate::env::{AccountingEnvironment, Environment};
+use crate::fragment::PhaseWork;
+use crate::geometry::BlockGrid;
+use crate::op::Chain;
+use crate::probes::IdentityOp;
+use crate::simulate::{simulate, Machine, PerPhase, Rates};
 use crate::strategy::execute_task;
+use crate::Dtype;
 
 use super::cache_model::ChunkGrid;
 use super::coordinator::Job;
 use super::handout::HandoutPolicy;
 use super::protocol::Handout;
-use super::spec::{probe_job, ChainSpec, OpSpec, ProbeWorkflows, WorkflowFactory};
+use super::spec::{
+    probe_job, ChainSpec, JobSpec, OpSpec, ProbeWorkflows, StoreSpec, WorkflowFactory, WorkflowSpec,
+};
 
 // ------------------------------------------------- the protocol is insulated --
 
@@ -161,6 +170,14 @@ fn measure_at(
     if let Some(bytes) = cache_bytes {
         spec.workflow.cache_bytes = bytes;
     }
+    measure_job(spec, decomposition, workers)
+}
+
+fn measure_job(
+    spec: JobSpec,
+    decomposition: crate::decomposition::Decomposition,
+    workers: usize,
+) -> Locality {
     let chunk = spec.workflow.chunk;
     let volume = spec.workflow.shape;
     let chain = ProbeWorkflows.chain(&spec.workflow).expect("a probe chain");
@@ -225,6 +242,81 @@ fn measure_at(
             .sum(),
         tasks,
     }
+}
+
+fn handout_validation_job() -> (JobSpec, crate::decomposition::Decomposition) {
+    let volume = [64, 64, 64];
+    let grid = BlockGrid::new(volume, [8, 8, 8]).expect("a 3-D grid");
+    let mut builder = PlanBuilder::new(volume, Dtype::F64, grid);
+    for name in ["first", "second", "third"] {
+        builder
+            .pixels(Chain::op(IdentityOp::new(name, [1, 1, 1])))
+            .expect("a pixel phase");
+    }
+    let decomposition = builder.finish().expect("an assembly").decomposition;
+    let workflow = WorkflowSpec {
+        kind: "probe".to_string(),
+        shape: volume,
+        dtype: Dtype::F64,
+        chunk: [16, 16, 16],
+        cache_bytes: 16 * 16 * 16 * 8 * 32,
+        prefetch_depth: 0,
+        ops: vec![
+            OpSpec::new("identity", "first", [1, 1, 1]),
+            OpSpec::new("identity", "second", [1, 1, 1]),
+            OpSpec::new("identity", "third", [1, 1, 1]),
+        ],
+        store: StoreSpec::Counting {
+            emptiness: 0.0,
+            fill_value: 0.0,
+        },
+        sidecar: None,
+        fragment_phases: Vec::new(),
+    };
+    (JobSpec::new("handout-validation", workflow), decomposition)
+}
+
+fn simulated_handout(
+    mut spec: JobSpec,
+    decomposition: crate::decomposition::Decomposition,
+    policy: HandoutPolicy,
+    workers: usize,
+) -> u64 {
+    spec.policy = policy;
+    let work = vec![PhaseWork::Pixels; decomposition.n_phases()];
+    let mut scheduler = crate::simulate::Handout::new(policy);
+    let outcome = simulate(
+        &decomposition,
+        &work,
+        &Machine {
+            // One cache pool per virtual coordinator worker, matching
+            // `measure_at`'s one accounting environment per worker. This is
+            // the pessimistic topology `simulate::Handout` documents for
+            // policy validation; `Machine::nodes` is covered separately by the
+            // multi-computer simulator suite.
+            nodes: 1,
+            workers,
+            cache_bytes: spec.workflow.cache_bytes,
+            cache_shared: false,
+            ..Machine::default()
+        },
+        &Rates {
+            chunk: spec.workflow.chunk,
+            chunk_bytes: spec.workflow.chunk.iter().product::<usize>() as u64 * 8,
+            ..Rates::default()
+        },
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        PerPhase::default(),
+        &mut scheduler,
+    )
+    .expect("a simulable distributed probe");
+    assert_eq!(
+        outcome.tasks_run as usize,
+        decomposition.n_tasks(),
+        "the simulator and the coordinator fixture must be running the same task graph"
+    );
+    outcome.duplicated_fetches
 }
 
 /// The design's claim, measured: **naive global pull destroys locality.**
@@ -304,6 +396,61 @@ fn nearest_first_handout_costs_fewer_duplicated_fetches_than_naive_pull() {
         modelled.duplicated,
         modelled.redundancy(),
         modelled.chunk_reads,
+    );
+}
+
+/// The simulator's handout scheduler and the real coordinator agree on the
+/// locality sign over the same probe job.
+///
+/// The two counters are deliberately not asserted equal. The coordinator-side
+/// `Locality::duplicated` counts distinct chunks touched by more than one
+/// worker; the simulator's `Outcome::duplicated_fetches` counts duplicated
+/// fetch events as the schedule runs. What must agree before simulator handout
+/// results are used for planning is the ordering: `NearestFirst` reduces the
+/// duplicated cross-cache work that `Naive` creates.
+#[test]
+fn simulated_handout_matches_the_real_coordinator_locality_ordering() {
+    let workers = 4;
+    let (mut naive_spec, decomposition) = handout_validation_job();
+    naive_spec.policy = HandoutPolicy::Naive;
+    let mut nearest_spec = naive_spec.clone();
+    nearest_spec.policy = HandoutPolicy::NearestFirst;
+
+    let real_naive = measure_job(naive_spec.clone(), decomposition.clone(), workers);
+    let real_nearest = measure_job(nearest_spec.clone(), decomposition.clone(), workers);
+    let simulated_naive = simulated_handout(
+        naive_spec,
+        decomposition.clone(),
+        HandoutPolicy::Naive,
+        workers,
+    );
+    let simulated_nearest = simulated_handout(
+        nearest_spec,
+        decomposition.clone(),
+        HandoutPolicy::NearestFirst,
+        workers,
+    );
+
+    assert!(
+        real_nearest.duplicated < real_naive.duplicated,
+        "real coordinator: nearest-first duplicated {} chunks against naive {}",
+        real_nearest.duplicated,
+        real_naive.duplicated
+    );
+    assert!(
+        simulated_nearest < simulated_naive,
+        "simulator: nearest-first duplicated {simulated_nearest} fetches against naive \
+         {simulated_naive}. The simulator is allowed a different unit, not the opposite \
+         locality ordering."
+    );
+    println!(
+        "same 3-D probe job, {} tasks over {workers} workers: real \
+         duplicated chunks {} -> {}, simulator duplicated fetches {} -> {}",
+        decomposition.n_tasks(),
+        real_naive.duplicated,
+        real_nearest.duplicated,
+        simulated_naive,
+        simulated_nearest
     );
 }
 

@@ -58,8 +58,8 @@ use crate::voxels::Voxels;
 
 use super::decomposition::{
     check_block_constraints, check_dtypes, check_output_shapes, check_source_images,
-    compute_charge_per_voxel, constraint_for, cuttable_axes, groups_for, is_planning_barrier,
-    price_phase, region_to_ranges, Constraints, Decomposition, PhaseDecomposition, SlabPolicy,
+    compute_charge_per_voxel, cuttable_axes, groups_for, is_planning_barrier, price_phase,
+    region_to_ranges, Constraints, Decomposition, PhaseDecomposition, SlabPolicy, StorageSettings,
 };
 use super::env::{block_shape, BlockBuf, Environment};
 use super::fragment::{
@@ -173,9 +173,17 @@ pub struct Hints {
     pub visit_order: Option<[usize; 3]>,
     pub priority: SchedulePriority,
     pub concurrency: usize,
-    /// Reserved for `MULTISLAB_IO.md` §4's hint-driven prefetcher. Recorded so
-    /// a strategy can express it before there is a prefetcher to consume it.
+    /// Bytes reserved for the runtime cache. Advisory for execution, but copied
+    /// from `Constraints` so a planned run carries the same memory contract the
+    /// admission check used.
+    pub cache_bytes: u64,
+    /// Reserved for `MULTISLAB_IO.md` §4's hint-driven prefetcher. Copied from
+    /// `Constraints` by `Strategy::plan` for caller-stated plans.
     pub prefetch_depth: usize,
+    /// Bytes reserved per prefetched chunk.
+    pub prefetch_chunk_bytes: u64,
+    /// Planner-visible storage settings copied from `Constraints`.
+    pub storage: StorageSettings,
     /// Internal images to keep rather than free when their reader finishes.
     ///
     /// **Advisory, and it belongs here rather than in the plan for one reason:
@@ -270,7 +278,10 @@ impl Default for Hints {
             visit_order: None,
             priority: SchedulePriority::PhaseMajor,
             concurrency: 1,
+            cache_bytes: 0,
             prefetch_depth: 0,
+            prefetch_chunk_bytes: 0,
+            storage: StorageSettings::default(),
             keep_images: BTreeSet::new(),
             release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
@@ -336,6 +347,11 @@ pub trait Strategy: Sync {
         let decomposition = self.decompose(workflow, constraints)?;
         let hints = Hints {
             slab_policy: constraints.slab_policy,
+            concurrency: constraints.expected_concurrency.max(1),
+            cache_bytes: constraints.cache_bytes,
+            prefetch_depth: constraints.prefetch_depth,
+            prefetch_chunk_bytes: constraints.prefetch_chunk_bytes,
+            storage: constraints.storage,
             ..self.hints(workflow, &decomposition)
         };
         Ok(Plan {
@@ -3026,7 +3042,10 @@ impl Strategy for Trivial {
             visit_order: None,
             priority: SchedulePriority::PhaseMajor,
             concurrency: 1,
+            cache_bytes: 0,
             prefetch_depth: 0,
+            prefetch_chunk_bytes: 0,
+            storage: StorageSettings::default(),
             keep_images: BTreeSet::new(),
             // **Nothing released, and that is the safe default a strategy can
             // take.** Whether the caller wants its input back afterwards is a
@@ -3115,10 +3134,11 @@ impl Strategy for Trivial {
 ///
 /// **Residency**, in two halves that go opposite ways and are worth separating.
 ///
-/// * *The block half can only improve.* `budget_bytes` binds
-///   `working_set_bytes_per_block x expected_concurrency` per phase and that
-///   test is unchanged; a phase this objective moves to a *smaller* block has a
-///   strictly smaller working set, and one it leaves alone has the same.
+/// * *The block half can only improve.* `budget_bytes` binds the measured
+///   admission charge for `working_set_bytes_per_block x expected_concurrency`
+///   per phase, and that test is monotone in the working set; a phase this
+///   objective moves to a *smaller* block has a strictly smaller working set,
+///   and one it leaves alone has the same.
 ///   `tests/per_phase_block.rs` asserts the priced peak does not rise.
 /// * *The partition half can rise.* More phases means more intermediate images
 ///   alive, and buying a cut in order to give one half its own grid is exactly
@@ -3184,9 +3204,9 @@ impl Default for Enumerating {
 ///   pool width, so it is as local to one group as the price it multiplies. At
 ///   `concurrency == 1` it reduces to `cost_per_block x n_blocks` and this is
 ///   [`crate::decomposition::predicted_cost`] exactly;
-/// * [`crate::decomposition::summarise_slots`] and [`constraint_for`] fold over
-///   the group alone, so the reach, the traversal preferences and the mandate
-///   are the group's own;
+/// * [`crate::decomposition::summarise_slots`] and
+///   [`crate::decomposition::constraint_for`] fold over the group alone, so the
+///   reach, the traversal preferences and the mandate are the group's own;
 /// * [`compute_charge_per_voxel`] is asked at the grid *this* phase chose, and the
 ///   budget is checked against that phase's own working set — so the block edge
 ///   is an inner loop, not a coupling between phases;
@@ -3409,8 +3429,9 @@ impl GroupFold {
     }
 
     /// Take in the next slot, so the fold covers `start..end + 1`.
-    fn extend(&mut self, slots: &[&Chain], volume: [usize; 3]) {
+    fn extend(&mut self, slots: &[&Chain], volumes_at: &[[usize; 3]]) {
         let chain = slots[self.end];
+        let volume = volumes_at[self.end];
         self.end += 1;
         self.names.push(chain.display_name());
         for order in chain.preferred_iterations() {
@@ -3792,7 +3813,7 @@ pub fn phase_price(
     constraints: &Constraints,
     workers: usize,
 ) -> (super::decomposition::PhaseCost, f64) {
-    let cost = price_phase(
+    let mut cost = price_phase(
         grid,
         halo,
         // Re-asked at this grid rather than carried, because an op may declare
@@ -3807,6 +3828,7 @@ pub fn phase_price(
         constraints.model.materialise_cost_per_voxel,
         traffic,
     );
+    cost.cost_per_block *= constraints.slab_amplification(grid, halo);
     // The per-voxel write charge `price_phase` applied, re-derived so that
     // `phase_makespan` puts the same number on the channel bound.
     let write_cost = if is_materialised {
@@ -3821,7 +3843,10 @@ pub fn phase_price(
 /// Everything needed to price one contiguous run of slots.
 struct PhasePricer<'a> {
     slots: &'a [&'a Chain],
-    volume: [usize; 3],
+    /// `volumes_at[i]` is the image volume read by slot `i`; `volumes_at[i + 1]`
+    /// is what that slot writes. A contiguous run `start..end` therefore reads
+    /// `volumes_at[start]` and is cut into a grid over `volumes_at[end]`.
+    volumes_at: &'a [[usize; 3]],
     /// Bytes per voxel of the image the run **starting at this slot** reads,
     /// one entry per slot: the element type folded along the chain with
     /// [`Chain::produces`].
@@ -3866,11 +3891,12 @@ impl PhasePricer<'_> {
             return (GroupPrice::Refused(Some(refusal.clone())), tally);
         }
         let group: Vec<usize> = (fold.start..fold.end).collect();
+        let output_volume = self.volumes_at[fold.end];
         let reach = fold.reach.clone().unwrap_or_default();
         // What the ops in this run will accept. A conflict is a fact about
         // *this partition* — the same two ops in two phases are fine — so it
         // drops the partition and the search goes on.
-        let mandated = match constraint_for(self.slots, &group, self.volume) {
+        let mandated = match constraint_for_at(self.slots, &group, self.volumes_at) {
             Ok(found) => found,
             Err(err) => return (GroupPrice::Refused(Some(err.to_string())), tally),
         };
@@ -3884,11 +3910,10 @@ impl PhasePricer<'_> {
         // One traversal per array the run reads: its own input image plus every
         // distinct image a `Chain::Source` leaf in it names. See
         // `images_read_by`.
-        let images_read =
-            match super::decomposition::images_read_by(self.slots, &group, self.volume) {
-                Ok(count) => count,
-                Err(err) => return (GroupPrice::Refused(Some(err.to_string())), tally),
-            };
+        let images_read = match images_read_by_at(self.slots, &group, self.volumes_at) {
+            Ok(count) => count,
+            Err(err) => return (GroupPrice::Refused(Some(err.to_string())), tally),
+        };
         let traffic = super::decomposition::PhaseTraffic {
             images_read,
             // A run of chain slots is a pixel phase, and a pixel phase writes
@@ -3927,7 +3952,7 @@ impl PhasePricer<'_> {
             // is anisotropic in general, so it is not expressible as a candidate
             // at all. The budget still binds — a block that does not fit does
             // not fit — but there is nothing to choose between.
-            match constraint.lattice(self.volume, &reach) {
+            match constraint.lattice(output_volume, &reach) {
                 Ok(Some((grid, window))) => {
                     let (cost, makespan) = price(&grid, &window);
                     tally.offered += 1;
@@ -3956,8 +3981,8 @@ impl PhasePricer<'_> {
                 // The reach-derived floor, per candidate: an axis is cut only
                 // where the cut narrows what a block reads, which depends on the
                 // edge and so cannot be hoisted out of this loop.
-                let axes = cuttable_axes(&self.constraints.split_axes, &reach, self.volume, edge);
-                let grid = match BlockGrid::along(self.volume, &axes, edge) {
+                let axes = cuttable_axes(&self.constraints.split_axes, &reach, output_volume, edge);
+                let grid = match BlockGrid::along(output_volume, &axes, edge) {
                     Ok(grid) => grid,
                     Err(_) => {
                         tally.no_grid += 1;
@@ -4056,7 +4081,7 @@ impl PriceTable {
                     account.runs_forbidden_by_barrier += n + 1 - end;
                     break;
                 }
-                fold.extend(pricer.slots, pricer.volume);
+                fold.extend(pricer.slots, pricer.volumes_at);
                 let (price, tally) = pricer.price(&fold, end < n);
                 account.candidates.offered += tally.offered;
                 account.candidates.no_grid += tally.no_grid;
@@ -4282,7 +4307,10 @@ impl Strategy for Enumerating {
             visit_order: consensus_order(workflow, decomposition),
             priority: self.priority,
             concurrency: self.concurrency,
+            cache_bytes: 0,
             prefetch_depth: 1,
+            prefetch_chunk_bytes: 0,
+            storage: StorageSettings::default(),
             // Nothing kept: a strategy advising on speed has no reason to want
             // an intermediate afterwards. A caller who does overrides it. And
             // nothing released, for `Hints::release_images`'s reason — the
@@ -4292,6 +4320,85 @@ impl Strategy for Enumerating {
             slab_policy: SlabPolicy::default(),
         }
     }
+}
+
+fn slot_volumes(slots: &[&Chain], input: [usize; 3]) -> Result<Vec<[usize; 3]>> {
+    let mut volumes = Vec::with_capacity(slots.len() + 1);
+    let mut current = input;
+    volumes.push(current);
+    for slot in slots {
+        current = slot.output_shape(current)?;
+        volumes.push(current);
+    }
+    Ok(volumes)
+}
+
+fn summarise_slots_at(
+    slots: &[&Chain],
+    group: &[usize],
+    volumes_at: &[[usize; 3]],
+) -> Result<(Reach, Vec<String>, Vec<[usize; 3]>)> {
+    let mut reach: Option<Reach> = None;
+    let mut names = Vec::with_capacity(group.len());
+    let mut orders: Vec<[usize; 3]> = Vec::new();
+    for &slot in group {
+        let chain = slots[slot];
+        let stated = chain.reach_spec(volumes_at[slot])?;
+        reach = Some(match reach {
+            Some(so_far) => so_far.add(&stated)?,
+            None => stated,
+        });
+        names.push(chain.display_name());
+        for order in chain.preferred_iterations() {
+            if !orders.contains(&order) {
+                orders.push(order);
+            }
+        }
+    }
+    Ok((reach.unwrap_or_default(), names, orders))
+}
+
+fn constraint_for_at(
+    slots: &[&Chain],
+    group: &[usize],
+    volumes_at: &[[usize; 3]],
+) -> Result<Option<super::op::BlockConstraint>> {
+    let mut found: Option<super::op::BlockConstraint> = None;
+    for &slot in group {
+        let Some(constraint) = slots[slot].block_constraint(volumes_at[slot])? else {
+            continue;
+        };
+        match &found {
+            None => found = Some(constraint),
+            Some(existing) if existing == &constraint => {}
+            Some(existing) => {
+                return Err(Error::InvalidArgument(format!(
+                    "slot {slot} ({}) mandates {constraint:?} and an earlier slot of the same \
+                     phase mandates {existing:?}; one phase hands every one of its ops the \
+                     same block, so these two cannot be fused",
+                    slots[slot].display_name()
+                )))
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn images_read_by_at(
+    slots: &[&Chain],
+    group: &[usize],
+    volumes_at: &[[usize; 3]],
+) -> Result<usize> {
+    let mut images: Vec<usize> = Vec::new();
+    for &slot in group {
+        for input in slots[slot].source_inputs(volumes_at[slot])? {
+            let index = input.image.index();
+            if !images.contains(&index) {
+                images.push(index);
+            }
+        }
+    }
+    Ok(1 + images.len())
 }
 
 impl Enumerating {
@@ -4344,10 +4451,11 @@ impl Enumerating {
             ));
         }
         let volume = workflow.shape;
+        let volumes_at = slot_volumes(&slots, volume)?;
         // Cuts neither search is free to skip: a full-reach op is a planning
         // barrier, so it is its own phase whatever the cost model thinks. See
         // `is_planning_barrier`.
-        let forced_cuts = barrier_cuts(&slots, volume);
+        let forced_cuts = barrier_cuts(&slots, &volumes_at);
         // The element type each run reads, folded once along the chain. Fallible
         // where the fold is: `Chain::produces` refuses an op handed a type it
         // does not accept, which is a plan that could not run and is better
@@ -4361,7 +4469,7 @@ impl Enumerating {
         }
         let pricer = PhasePricer {
             slots: &slots,
-            volume,
+            volumes_at: &volumes_at,
             bytes_at,
             constraints,
             workers: self.concurrency.max(1),
@@ -4495,6 +4603,7 @@ impl Strategy for Greedy {
             ));
         }
         let volume = workflow.shape;
+        let volumes_at = slot_volumes(&slots, volume)?;
         let bytes = workflow.dtype.size_of() as f64;
 
         // Cut at every full-reach op, and wherever the traversal preference
@@ -4508,12 +4617,12 @@ impl Strategy for Greedy {
         let mut after_barrier = false;
         for (position, slot) in slots.iter().enumerate() {
             let order = slot.preferred_iterations().first().copied();
-            let barrier = is_planning_barrier(slot, volume);
+            let barrier = is_planning_barrier(slot, volumes_at[position]);
             // A third reason to cut, structural like the barrier rather than
             // heuristic like the order: two ops that mandate different blocks
             // cannot share a phase, and cutting between them is the plan that
             // runs. An op with no mandate joins whichever phase it lands in.
-            let mandate = slot.block_constraint(volume)?;
+            let mandate = slot.block_constraint(volumes_at[position])?;
             let order_changed =
                 order.is_some() && current_order.is_some() && order != current_order;
             let mandate_changed =
@@ -4542,7 +4651,7 @@ impl Strategy for Greedy {
             phases.push(phase_for_group(
                 &slots,
                 group,
-                volume,
+                &volumes_at,
                 bytes,
                 is_materialised,
                 constraints,
@@ -4592,7 +4701,10 @@ impl Strategy for Greedy {
             // thing to measure when the prefetcher is wired.
             priority: SchedulePriority::BlockMajor,
             concurrency: self.concurrency,
+            cache_bytes: 0,
             prefetch_depth: 2,
+            prefetch_chunk_bytes: 0,
+            storage: StorageSettings::default(),
             keep_images: BTreeSet::new(),
             release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
@@ -4616,21 +4728,27 @@ impl Strategy for Greedy {
 fn phase_for_group(
     slots: &[&Chain],
     group: &[usize],
-    volume: [usize; 3],
+    volumes_at: &[[usize; 3]],
     bytes: f64,
     is_materialised: bool,
     constraints: &Constraints,
     who: &str,
     position: usize,
 ) -> Result<PhaseDecomposition> {
+    group.first().copied().ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "{who}: phase {position} has no slots, so it has no volume to price"
+        ))
+    })?;
+    let end = group.last().copied().unwrap() + 1;
+    let output_volume = volumes_at[end];
     // `compute` is dropped here and re-asked per candidate grid; see
     // `decomposition::compute_per_voxel`.
-    let (reach, _compute, names, orders) =
-        super::decomposition::summarise_slots(slots, group, volume)?;
-    let mandated = constraint_for(slots, group, volume)?;
+    let (reach, names, orders) = summarise_slots_at(slots, group, volumes_at)?;
+    let mandated = constraint_for_at(slots, group, volumes_at)?;
     // The same count `PhasePricer::price` takes; see `images_read_by`.
     let traffic = super::decomposition::PhaseTraffic {
-        images_read: super::decomposition::images_read_by(slots, group, volume)?,
+        images_read: images_read_by_at(slots, group, volumes_at)?,
         writes_an_image: true,
         repeats: 1,
         chain_buffers: super::decomposition::resident_buffers_of(slots, group),
@@ -4641,7 +4759,7 @@ fn phase_for_group(
         // Mandated, so there is nothing to choose between; the budget still
         // binds. See `Enumerating` for why the candidate list is replaced
         // rather than filtered.
-        let (candidate, window) = constraint.lattice(volume, &reach)?.ok_or_else(|| {
+        let (candidate, window) = constraint.lattice(output_volume, &reach)?.ok_or_else(|| {
             Error::InvalidArgument(format!(
                 "{who}: phase {position} mandates {constraint:?}, which no block grid produces — \
                  a grid's cores are `index * block`, evenly strided and disjoint. A plan for it \
@@ -4662,10 +4780,7 @@ fn phase_for_group(
             constraints.model.materialise_cost_per_voxel,
             traffic,
         );
-        let fits = constraints.budget_bytes.is_none_or(|budget| {
-            cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
-                <= budget as f64
-        });
+        let fits = constraints.affords_working_set(&cost);
         if fits {
             grid = Some(candidate);
         }
@@ -4676,8 +4791,8 @@ fn phase_for_group(
         for edge in candidates {
             // As in `Enumerating`: the reach-derived floor, asked per candidate
             // because it is a question about this edge.
-            let axes = cuttable_axes(&constraints.split_axes, &reach, volume, edge);
-            let Ok(candidate) = BlockGrid::along(volume, &axes, edge) else {
+            let axes = cuttable_axes(&constraints.split_axes, &reach, output_volume, edge);
+            let Ok(candidate) = BlockGrid::along(output_volume, &axes, edge) else {
                 continue;
             };
             let cost = price_phase(
@@ -4691,10 +4806,7 @@ fn phase_for_group(
                 constraints.model.materialise_cost_per_voxel,
                 traffic,
             );
-            let fits = constraints.budget_bytes.is_none_or(|budget| {
-                cost.working_set_bytes_per_block * constraints.expected_concurrency.max(1) as f64
-                    <= budget as f64
-            });
+            let fits = constraints.affords_working_set(&cost);
             if fits {
                 grid = Some(candidate);
                 break;
@@ -4794,6 +4906,7 @@ impl Strategy for Materialising {
             ));
         }
         let volume = workflow.shape;
+        let volumes_at = slot_volumes(&slots, volume)?;
 
         let mut phases = Vec::with_capacity(slots.len());
         // The element type the phase **reads**, folded slot by slot exactly as
@@ -4820,7 +4933,7 @@ impl Strategy for Materialising {
             phases.push(phase_for_group(
                 &slots,
                 &[position],
-                volume,
+                &volumes_at,
                 reads.size_of() as f64,
                 is_materialised,
                 constraints,
@@ -4847,7 +4960,10 @@ impl Strategy for Materialising {
             visit_order: consensus_order(workflow, decomposition),
             priority: self.priority,
             concurrency: self.concurrency,
+            cache_bytes: 0,
             prefetch_depth: 1,
+            prefetch_chunk_bytes: 0,
+            storage: StorageSettings::default(),
             keep_images: BTreeSet::new(),
             release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
@@ -4902,10 +5018,11 @@ impl Materialising {
 /// constraint costs one `&` per candidate partition and removes those
 /// partitions from the search rather than pricing them out of it. A structural
 /// fact should not depend on a weight.
-fn barrier_cuts(slots: &[&Chain], volume: [usize; 3]) -> u32 {
+fn barrier_cuts(slots: &[&Chain], volumes_at: &[[usize; 3]]) -> u32 {
     let barrier: Vec<bool> = slots
         .iter()
-        .map(|slot| is_planning_barrier(slot, volume))
+        .enumerate()
+        .map(|(index, slot)| is_planning_barrier(slot, volumes_at[index]))
         .collect();
     let mut mask = 0u32;
     for slot in 1..slots.len() {
@@ -4926,7 +5043,8 @@ fn consensus_order(workflow: &Workflow, _decomposition: &Decomposition) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::probes::IdentityOp;
+    use crate::decomposition::CostModel;
+    use crate::probes::{DecimateOp, IdentityOp};
 
     fn workflow(chain: Chain, shape: [usize; 3]) -> Workflow {
         Workflow::new(chain, shape, Dtype::F64)
@@ -4964,6 +5082,76 @@ mod tests {
         let env = super::super::env::AccountingEnvironment::new([8, 4, 4], [4, 4, 4], 8);
         let err = execute("test", &workflow, &decomposition, &Hints::default(), &env).unwrap_err();
         assert!(err.to_string().contains("never reorder or drop an op"));
+    }
+
+    #[test]
+    fn plan_copies_runtime_contract_into_hints() {
+        let workflow = workflow(Chain::op(IdentityOp::new("a", [0, 0, 0])), [8, 4, 4]);
+        let storage = StorageSettings::chunked([2, 4, 4])
+            .with_cache_bytes(256)
+            .with_prefetch(3, 64);
+        let constraints = Constraints {
+            cache_bytes: 256,
+            prefetch_depth: 3,
+            prefetch_chunk_bytes: 64,
+            storage,
+            expected_concurrency: 5,
+            ..Constraints::default()
+        };
+        let plan = Trivial.plan(&workflow, &constraints).unwrap();
+        assert_eq!(plan.hints.concurrency, constraints.expected_concurrency);
+        assert_eq!(plan.hints.cache_bytes, constraints.cache_bytes);
+        assert_eq!(plan.hints.prefetch_depth, constraints.prefetch_depth);
+        assert_eq!(
+            plan.hints.prefetch_chunk_bytes,
+            constraints.prefetch_chunk_bytes
+        );
+        assert_eq!(plan.hints.storage, storage);
+    }
+
+    #[test]
+    fn partitioning_strategies_fold_volume_before_pricing_later_slots() {
+        let input = [16usize, 4, 4];
+        let smaller = [8usize, 4, 4];
+        let chain = || {
+            Chain::sequence(vec![
+                Chain::op(DecimateOp::new("half", 2)),
+                Chain::op(IdentityOp::new("whole-smaller", [smaller[0], 0, 0])),
+            ])
+        };
+        let constraints = Constraints {
+            budget_bytes: None,
+            expected_concurrency: 1,
+            model: CostModel::default(),
+            block_candidates: vec![4],
+            split_axes: vec![0],
+            ..Default::default()
+        };
+        let planners: [(&str, Box<dyn Strategy>); 3] = [
+            ("enumerating", Box::<Enumerating>::default()),
+            ("greedy", Box::<Greedy>::default()),
+            ("materialising", Box::<Materialising>::default()),
+        ];
+
+        for (name, planner) in planners {
+            let plan = planner
+                .decompose(&Workflow::new(chain(), input, Dtype::F64), &constraints)
+                .unwrap();
+
+            assert_eq!(
+                plan.phases
+                    .iter()
+                    .map(|phase| phase.slots.clone())
+                    .collect::<Vec<_>>(),
+                vec![vec![0], vec![1]],
+                "{name}: the second slot is a full-axis barrier only in the post-decimation volume"
+            );
+            assert_eq!(plan.volume_at(0), input, "{name}");
+            assert_eq!(plan.volume_at(1), smaller, "{name}");
+            assert_eq!(plan.volume_at(2), smaller, "{name}");
+            assert_eq!(plan.phases[0].volume(), smaller, "{name}");
+            assert_eq!(plan.phases[1].volume(), smaller, "{name}");
+        }
     }
 }
 
@@ -5451,11 +5639,12 @@ mod fold_tests {
             }),
         ]);
         let slots = chain.slots();
+        let volumes_at = vec![volume; slots.len() + 1];
         let mut refusals = 0;
         for start in 0..slots.len() {
             let mut fold = GroupFold::new(start);
             for end in start + 1..=slots.len() {
-                fold.extend(&slots, volume);
+                fold.extend(&slots, &volumes_at);
                 let group: Vec<usize> = (start..end).collect();
                 match summarise_slots(&slots, &group, volume) {
                     Ok((reach, _compute, names, orders)) => {
