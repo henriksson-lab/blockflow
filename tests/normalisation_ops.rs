@@ -41,18 +41,19 @@
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+use blockflow::decomposition::Decomposition;
 use blockflow::env::ArrayEnvironment;
-use blockflow::geometry::BlockGrid;
-use blockflow::op::{Anchor, BlockOp, Chain};
+use blockflow::op::{BlockOp, Chain};
 use blockflow::ops::{
     AdaptiveThresholdOp, ElementShape, LevelCorrectionOp, LocalContrastOp, LocalStatistic, Rank,
     Removal, SampleLattice, Statistic, StructuringElement,
 };
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
-use blockflow::voxels::Voxels;
-use blockflow::Dtype;
+
+mod support;
+
+use support::single_phase;
 
 const VOLUME: [usize; 3] = [32, 24, 20];
 
@@ -89,14 +90,14 @@ fn intensities() -> Array3<f64> {
 }
 
 fn workflow(chain: Chain) -> Workflow {
-    Workflow::new(chain, VOLUME, Dtype::F64)
+    single_phase::workflow_f64(chain, VOLUME)
 }
 
 /// One phase holding the whole chain, at a given block edge and split axes,
 /// built from the chain's **own** reach — nothing here supplies one, so nothing
 /// here can hide one that is wrong.
 fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {
-    plan_with_reach(workflow, block, split_axes, workflow.chain.reach3(&VOLUME))
+    single_phase::plan(workflow, VOLUME, block, split_axes)
 }
 
 /// The same, with the reach stated rather than derived — for provoking the
@@ -107,26 +108,12 @@ fn plan_with_reach(
     split_axes: &[usize],
     reach: [usize; 3],
 ) -> Decomposition {
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(VOLUME, split_axes, block).unwrap();
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
-    Decomposition {
-        volume: VOLUME,
-        dtype: workflow.dtype,
-        phases: vec![phase],
-        chain_reach: reach,
-    }
+    single_phase::plan_with_reach(workflow, VOLUME, block, split_axes, reach)
 }
 
 /// The oracle: the same kernels, called once, over the whole array.
 fn reference(chain: &Chain, input: &Array3<f64>) -> Array3<f64> {
-    let source: Voxels = input.clone().into();
-    let mut out = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
-    chain
-        .apply(&source, &mut out, &Anchor::whole(VOLUME))
-        .expect("the whole-volume reference must run");
-    out.view::<f64>().unwrap().to_owned()
+    single_phase::reference_f64(chain, input, VOLUME)
 }
 
 fn run(workflow: &Workflow, decomposition: &Decomposition, input: &Array3<f64>) -> Array3<f64> {
@@ -138,20 +125,8 @@ fn run_reporting(
     decomposition: &Decomposition,
     input: &Array3<f64>,
 ) -> (Array3<f64>, usize) {
-    let env =
-        ArrayEnvironment::new(input.clone().into(), decomposition.n_phases(), [4, 4, 4]).unwrap();
-    let stats = execute(
-        "normalise",
-        workflow,
-        decomposition,
-        &Hints::default(),
-        &env,
-    )
-    .unwrap();
-    (
-        env.output().view::<f64>().unwrap().to_owned(),
-        stats.tasks_short_circuited,
-    )
+    let ran = single_phase::run_f64("normalise", workflow, decomposition, input, [4, 4, 4]);
+    (ran.output, ran.tasks_short_circuited)
 }
 
 // ------------------------------------------------------------- the ops --

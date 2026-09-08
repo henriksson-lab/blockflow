@@ -454,6 +454,99 @@ impl Arena {
     }
 }
 
+/// Builds an [`Arena`] candidate field while making duplicate plans
+/// unrepresentable.
+///
+/// Candidate fields are planner evidence: reports, simulator-backed ranking and
+/// transfer tests must all agree on which plans were considered. This helper is
+/// the shared path for entering strategy plans, pinned block-edge variants and
+/// mixed per-phase edge variants.
+pub struct CandidateFieldBuilder {
+    arena: Arena,
+    seen: BTreeSet<PlanSignature>,
+}
+
+impl CandidateFieldBuilder {
+    pub fn new(machine: Machine, rates: Rates) -> Self {
+        Self {
+            arena: Arena::new(machine, rates),
+            seen: BTreeSet::new(),
+        }
+    }
+
+    pub fn with_snapshot(mut self, snapshot: Snapshot) -> Self {
+        self.arena = self.arena.with_snapshot(snapshot);
+        self
+    }
+
+    pub fn enter_strategy(
+        &mut self,
+        name: impl Into<String>,
+        strategy: &dyn Strategy,
+        workflow: &Workflow,
+        constraints: &Constraints,
+    ) -> Result<bool> {
+        let plan = strategy.plan(workflow, constraints)?;
+        self.enter_plan(name, plan, constraints.clone())
+    }
+
+    pub fn enter_plan(
+        &mut self,
+        name: impl Into<String>,
+        plan: Plan,
+        constraints: Constraints,
+    ) -> Result<bool> {
+        if !self.seen.insert(PlanSignature::from(&plan)) {
+            return Ok(false);
+        }
+        self.arena.enter_plan(name, plan, constraints)?;
+        Ok(true)
+    }
+
+    pub fn enter_pinned_edges(
+        &mut self,
+        label: impl Fn(usize) -> String,
+        strategy: &dyn Strategy,
+        workflow: &Workflow,
+        constraints: &Constraints,
+    ) -> Result<()> {
+        for &edge in &constraints.block_candidates {
+            let pinned = Constraints {
+                block_candidates: vec![edge],
+                ..constraints.clone()
+            };
+            if let Ok(plan) = strategy.plan(workflow, &pinned) {
+                self.enter_plan(label(edge), plan, pinned)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn enter_mixed_edges(
+        &mut self,
+        label: impl Fn(usize, &[usize]) -> String,
+        edges: &[usize],
+        constraints: &Constraints,
+    ) -> Result<()> {
+        let seeds: Vec<Plan> = self
+            .arena
+            .entrants()
+            .iter()
+            .map(|entrant| entrant.plan.clone())
+            .collect();
+        for (seed_index, seed) in seeds.iter().enumerate() {
+            for (chosen, plan) in mixed_edge_plans(seed, edges)? {
+                self.enter_plan(label(seed_index, &chosen), plan, constraints.clone())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Arena {
+        self.arena
+    }
+}
+
 /// An opt-in strategy wrapper that lets the simulator choose among candidates.
 ///
 /// The wrapped strategy still builds every candidate. This wrapper only changes
@@ -552,42 +645,25 @@ where
         constraints: &Constraints,
         machine: Machine,
     ) -> Result<Arena> {
-        let mut arena = Arena::new(machine, self.rates);
+        let mut field = CandidateFieldBuilder::new(machine, self.rates);
         if let Some(snapshot) = &self.snapshot {
-            arena = arena.with_snapshot(snapshot.clone());
+            field = field.with_snapshot(snapshot.clone());
         }
-        let mut seen = BTreeSet::new();
-        let first = self.strategy.plan(workflow, constraints)?;
-        seen.insert(plan_signature(&first));
-        arena.enter_plan("strategy", first, constraints.clone())?;
-        for edge in &constraints.block_candidates {
-            let pinned = Constraints {
-                block_candidates: vec![*edge],
-                ..constraints.clone()
-            };
-            if let Ok(plan) = self.strategy.plan(workflow, &pinned) {
-                if seen.insert(plan_signature(&plan)) {
-                    arena.enter_plan(format!("edge-{edge}"), plan, pinned)?;
-                }
-            }
-        }
+        field.enter_strategy("strategy", &self.strategy, workflow, constraints)?;
+        field.enter_pinned_edges(
+            |edge| format!("edge-{edge}"),
+            &self.strategy,
+            workflow,
+            constraints,
+        )?;
         if self.include_mixed_edges {
-            let seeds: Vec<Plan> = arena
-                .entrants()
-                .iter()
-                .map(|entrant| entrant.plan.clone())
-                .collect();
-            for (seed_index, seed) in seeds.iter().enumerate() {
-                for (name, plan) in
-                    mixed_edge_plans(seed_index, seed, &constraints.block_candidates)?
-                {
-                    if seen.insert(plan_signature(&plan)) {
-                        arena.enter_plan(name, plan, constraints.clone())?;
-                    }
-                }
-            }
+            field.enter_mixed_edges(
+                |seed_index, chosen| format!("mixed-{seed_index}-{chosen:?}"),
+                &constraints.block_candidates,
+                constraints,
+            )?;
         }
-        Ok(arena)
+        Ok(field.finish())
     }
 
     /// Build the default-machine candidate arena without choosing a winner.
@@ -668,19 +744,22 @@ where
     }
 }
 
-fn plan_signature(plan: &Plan) -> Vec<(Vec<usize>, usize)> {
-    plan.decomposition
-        .phases
-        .iter()
-        .map(|phase| (phase.slots.clone(), phase.grid.block()[0]))
-        .collect()
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PlanSignature(Vec<(Vec<usize>, usize)>);
+
+impl From<&Plan> for PlanSignature {
+    fn from(plan: &Plan) -> Self {
+        Self(
+            plan.decomposition
+                .phases
+                .iter()
+                .map(|phase| (phase.slots.clone(), phase.grid.block()[0]))
+                .collect(),
+        )
+    }
 }
 
-fn mixed_edge_plans(
-    seed_index: usize,
-    seed: &Plan,
-    edges: &[usize],
-) -> Result<Vec<(String, Plan)>> {
+fn mixed_edge_plans(seed: &Plan, edges: &[usize]) -> Result<Vec<(Vec<usize>, Plan)>> {
     if seed
         .decomposition
         .phases
@@ -693,11 +772,10 @@ fn mixed_edge_plans(
     let mut chosen = vec![0usize; seed.decomposition.n_phases()];
     fn visit(
         at: usize,
-        seed_index: usize,
         seed: &Plan,
         edges: &[usize],
         chosen: &mut [usize],
-        out: &mut Vec<(String, Plan)>,
+        out: &mut Vec<(Vec<usize>, Plan)>,
     ) -> Result<()> {
         if at == chosen.len() {
             let mut phases = Vec::with_capacity(seed.decomposition.phases.len());
@@ -720,7 +798,7 @@ fn mixed_edge_plans(
                 phases.push(rebuilt);
             }
             out.push((
-                format!("mixed-{seed_index}-{:?}", chosen),
+                chosen.to_vec(),
                 Plan {
                     decomposition: Decomposition {
                         volume: seed.decomposition.volume,
@@ -735,11 +813,11 @@ fn mixed_edge_plans(
         }
         for &edge in edges {
             chosen[at] = edge;
-            visit(at + 1, seed_index, seed, edges, chosen, out)?;
+            visit(at + 1, seed, edges, chosen, out)?;
         }
         Ok(())
     }
-    visit(0, seed_index, seed, edges, &mut chosen, &mut out)?;
+    visit(0, seed, edges, &mut chosen, &mut out)?;
     Ok(out)
 }
 

@@ -92,6 +92,7 @@ use crate::voxels::{VoxelElement, Voxels};
 
 use super::element::{select_nth, Rank, StepOrigin, StructuringElement, Total};
 use super::shapes_agree;
+use super::MaskSource;
 
 /// Select `rank` of `element` around every voxel of `input`.
 ///
@@ -1705,7 +1706,7 @@ pub struct MaskedRankFilterOp {
     name: &'static str,
     element: StructuringElement,
     rank: Rank,
-    mask: usize,
+    mask: MaskSource,
     centre: ExcludedCentre<f64>,
     cost: f64,
 }
@@ -1725,7 +1726,7 @@ impl MaskedRankFilterOp {
             name,
             element,
             rank,
-            mask: mask.into().index(),
+            mask: MaskSource::new(mask),
             centre: ExcludedCentre::Select,
             cost,
         }
@@ -1772,7 +1773,7 @@ impl MaskedRankFilterOp {
 
     /// The image this op reads its population from.
     pub fn mask_image(&self) -> usize {
-        self.mask
+        self.mask.image()
     }
 
     pub fn with_cost(mut self, cost: f64) -> Self {
@@ -1801,10 +1802,7 @@ impl BlockOp for MaskedRankFilterOp {
     /// element that states both. That equality is also what keeps this op
     /// inside what a plan can currently fetch — see `check_source_images`.
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<crate::op::SourceInput> {
-        vec![crate::op::SourceInput::new(
-            self.mask,
-            self.element.reach_spec(),
-        )]
+        vec![self.mask.source_input(self.element.reach_spec())]
     }
 
     fn accepts(&self, dtype: Dtype) -> bool {
@@ -1814,11 +1812,7 @@ impl BlockOp for MaskedRankFilterOp {
     /// Refuses, and the refusal is the point: an op whose population comes from
     /// a second array cannot be computed from one. See [`BlockOp::apply_with`].
     fn apply(&self, _input: &Voxels, _out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        Err(Error::InvalidArgument(format!(
-            "{}: the population comes from image {}, so this op has no answer from its input \
-             alone. It is applied through `apply_with`.",
-            self.name, self.mask
-        )))
+        Err(self.mask.input_only_error(self.name))
     }
 
     /// `at` is read, for the reason [`RankFilterOp::apply`] gives.
@@ -1829,18 +1823,7 @@ impl BlockOp for MaskedRankFilterOp {
         out: &mut Voxels,
         at: &Anchor,
     ) -> Result<()> {
-        let mask = sources.get(self.mask)?;
-        if mask.dtype() != Dtype::Bool {
-            return Err(Error::InvalidArgument(format!(
-                "{}: the population is read from image {}, which holds {}. A population is a \
-                 yes-or-no per voxel and is stored as one; a wider type would leave 'which \
-                 non-zero values count' to be decided somewhere this op cannot see.",
-                self.name,
-                self.mask,
-                mask.dtype().numpy_name()
-            )));
-        }
-        let mask = mask.view::<bool>()?;
+        let mask = self.mask.bool_view(self.name, sources)?;
 
         #[allow(clippy::too_many_arguments)]
         fn ordered<T: VoxelElement + Ord>(

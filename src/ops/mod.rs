@@ -170,7 +170,13 @@
 // `ops::voxelwise::cost_report` therefore has its own case list, and new cases
 // anywhere should ask whether they are worth perturbing the old ones.
 
+use ndarray::ArrayView3;
+
+use crate::assemble::ImageId;
+use crate::dtype::Dtype;
 use crate::error::{Error, Result};
+use crate::op::{SourceInput, SourceInputs};
+use crate::reach::Reach;
 
 pub mod adjacency;
 pub mod align;
@@ -456,6 +462,53 @@ pub(crate) fn shapes_agree(input: &[usize], out: &[usize], what: &str) -> Result
         .map_err(|err: Error| Error::InvalidArgument(format!("{what}: {err}")));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaskSource {
+    image: usize,
+}
+
+impl MaskSource {
+    pub(crate) fn new(mask: impl Into<ImageId>) -> Self {
+        Self {
+            image: mask.into().index(),
+        }
+    }
+
+    pub(crate) fn image(self) -> usize {
+        self.image
+    }
+
+    pub(crate) fn source_input(self, reach: Reach) -> SourceInput {
+        SourceInput::new(self.image, reach)
+    }
+
+    pub(crate) fn input_only_error(self, name: &str) -> Error {
+        Error::InvalidArgument(format!(
+            "{name}: the population comes from image {}, so this op has no answer from its input \
+             alone. It is applied through `apply_with`.",
+            self.image
+        ))
+    }
+
+    pub(crate) fn bool_view<'a>(
+        self,
+        name: &str,
+        sources: SourceInputs<'a>,
+    ) -> Result<ArrayView3<'a, bool>> {
+        let mask = sources.get(self.image)?;
+        if mask.dtype() != Dtype::Bool {
+            return Err(Error::InvalidArgument(format!(
+                "{name}: the population is read from image {}, which holds {}. A population is a \
+                 yes-or-no per voxel and is stored as one; a wider type would leave 'which \
+                 non-zero values count' to be decided somewhere this op cannot see.",
+                self.image,
+                mask.dtype().numpy_name()
+            )));
+        }
+        mask.view::<bool>()
+    }
 }
 
 // The **second-moment half of `ops::tabulate`**, appended as its own `pub use`

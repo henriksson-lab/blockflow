@@ -8,49 +8,19 @@
 // planner choice, a richer field of rejected candidates, and the simulator's
 // winner under the scheduling policies that can change the answer.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use blockflow::arena::{Arena, Judgement, SimulationObjective, SimulatorBacked, Verdict};
-use blockflow::decomposition::{Constraints, CostModel, Decomposition, PhaseDecomposition};
+use blockflow::arena::{CandidateFieldBuilder, Judgement, SimulationObjective, Verdict};
+use blockflow::decomposition::Constraints;
 use blockflow::distributed::handout::HandoutPolicy;
-use blockflow::geometry::BlockGrid;
-use blockflow::op::Chain;
-use blockflow::probes::{AffineOp, IdentityOp};
 use blockflow::scenario::Scenario;
 use blockflow::simulate::{ExecutorOrder, Handout, Machine, Rates, Scheduler};
-use blockflow::strategy::{Enumerating, PartitionSearch, Plan, Strategy, Workflow};
-use blockflow::Dtype;
+use blockflow::strategy::{Enumerating, PartitionSearch, Strategy, Workflow};
 
-const COSTS: &str = "costs";
-const VOLUME: [usize; 3] = [96, 96, 96];
-const LADDER: [usize; 4] = [16, 24, 32, 48];
+mod support;
 
-fn chain() -> Chain {
-    Chain::sequence(vec![
-        Chain::op(IdentityOp::new("smooth", [4, 4, 4]).with_cost(2.0)),
-        Chain::op(AffineOp::new("combine", 1.5, 0.5, [1, 1, 1]).with_cost(1.0)),
-        Chain::op(IdentityOp::new("skeletonize", [2, 2, 2]).with_cost(8.0)),
-    ])
-}
-
-fn workflow() -> Workflow {
-    Workflow::new(chain(), VOLUME, Dtype::F64)
-}
-
-fn base_constraints() -> Constraints {
-    Constraints {
-        block_candidates: LADDER.to_vec(),
-        split_axes: vec![0, 1, 2],
-        model: CostModel::default(),
-        ..Default::default()
-    }
-}
-
-fn scenarios() -> BTreeMap<String, Scenario> {
-    Scenario::load_dir(COSTS).unwrap_or_else(|err| {
-        panic!("the committed scenarios must load: {err}");
-    })
-}
+use support::planner_perf::{
+    base_constraints, enumerating_for, scenarios, simulator_backed_for,
+    uniform_simulator_backed_for, workflow, LADDER,
+};
 
 #[derive(Clone, Copy)]
 enum SchedulerCase {
@@ -89,75 +59,6 @@ fn edge_signature(verdict: &Verdict) -> String {
     format!("{}p{:?}", verdict.phases, edges)
 }
 
-fn plan_signature(plan: &Plan) -> Vec<(Vec<usize>, usize)> {
-    plan.decomposition
-        .phases
-        .iter()
-        .map(|phase| (phase.slots.clone(), phase.grid.block()[0]))
-        .collect()
-}
-
-fn mixed_edge_plans(seed: &Plan, edges: &[usize]) -> Vec<(String, Plan)> {
-    assert!(
-        seed.decomposition
-            .phases
-            .iter()
-            .all(|phase| !phase.reads_across_grids()),
-        "the oracle report's mixed-edge expander only preserves default source regions"
-    );
-    let mut out = Vec::new();
-    let mut chosen = vec![0usize; seed.decomposition.n_phases()];
-    fn visit(
-        at: usize,
-        seed: &Plan,
-        edges: &[usize],
-        chosen: &mut [usize],
-        out: &mut Vec<(String, Plan)>,
-    ) {
-        if at == chosen.len() {
-            let mut phases = Vec::with_capacity(seed.decomposition.phases.len());
-            for (phase, edge) in seed.decomposition.phases.iter().zip(chosen.iter().copied()) {
-                let grid = BlockGrid::new(phase.volume(), [edge; 3])
-                    .expect("a candidate edge produces a grid");
-                let mut rebuilt = PhaseDecomposition::derive(
-                    phase.slots.clone(),
-                    phase.names.clone(),
-                    phase.reach.clone(),
-                    phase.halo.clone(),
-                    grid,
-                )
-                .with_source_images(phase.source_images.clone())
-                .with_supplied_dtypes(phase.supplied_dtypes.clone())
-                .reading_input_image(phase.reads_input_image)
-                .with_barrier(phase.barrier);
-                if let Some(dtype) = phase.dtype {
-                    rebuilt = rebuilt.with_dtype(dtype);
-                }
-                phases.push(rebuilt);
-            }
-            out.push((
-                format!("mixed-{:?}", chosen),
-                Plan {
-                    decomposition: Decomposition {
-                        volume: seed.decomposition.volume,
-                        dtype: seed.decomposition.dtype,
-                        phases,
-                        chain_reach: seed.decomposition.chain_reach,
-                    },
-                    hints: seed.hints.clone(),
-                },
-            ));
-            return;
-        }
-        for &edge in edges {
-            chosen[at] = edge;
-            visit(at + 1, seed, edges, chosen, out);
-        }
-    }
-    visit(0, seed, edges, &mut chosen, &mut out);
-    out
-}
-
 fn judge(
     scenario: &Scenario,
     workflow: &Workflow,
@@ -166,24 +67,17 @@ fn judge(
 ) -> Judgement {
     let constraints = scenario.constraints(base);
     let workers = scenario.machine.workers.max(1);
-    let strategy = |constraints: &Constraints| {
-        Enumerating {
-            concurrency: workers,
-            ..Enumerating::default()
-        }
-        .plan(workflow, constraints)
-    };
+    let enumerating = enumerating_for(scenario.machine);
+    let strategy = |constraints: &Constraints| enumerating.plan(workflow, constraints);
     let chosen = strategy(&constraints)
         .unwrap_or_else(|err| panic!("{}: the planner must plan: {err}", scenario.name));
 
-    let mut arena = Arena::new(
+    let mut field = CandidateFieldBuilder::new(
         case.machine(scenario.machine),
         scenario.rates(&Rates::default()),
     )
     .with_snapshot(scenario.snapshot.clone());
-    let mut seen = BTreeSet::new();
-    seen.insert(plan_signature(&chosen));
-    arena
+    field
         .enter_plan("planner", chosen, constraints.clone())
         .expect("a plan the arena can hold");
 
@@ -198,44 +92,30 @@ fn judge(
             ..Enumerating::default()
         };
         if let Ok(plan) = variant.plan(workflow, &constraints) {
-            if seen.insert(plan_signature(&plan)) {
-                arena
-                    .enter_plan(label.to_string(), plan, constraints.clone())
-                    .expect("a plan the arena can hold");
-            }
+            field
+                .enter_plan(label.to_string(), plan, constraints.clone())
+                .expect("a plan the arena can hold");
         }
     }
 
-    for edge in LADDER {
-        let pinned = Constraints {
-            block_candidates: vec![edge],
-            ..constraints.clone()
-        };
-        if let Ok(plan) = strategy(&pinned) {
-            if seen.insert(plan_signature(&plan)) {
-                arena
-                    .enter_plan(format!("edge-{edge}"), plan, pinned)
-                    .expect("a plan the arena can hold");
-            }
-        }
-    }
+    field
+        .enter_pinned_edges(
+            |edge| format!("edge-{edge}"),
+            &enumerating_for(scenario.machine),
+            workflow,
+            &constraints,
+        )
+        .expect("pinned-edge candidates can be entered");
+    field
+        .enter_mixed_edges(
+            |_, chosen| format!("mixed-{chosen:?}"),
+            &LADDER,
+            &constraints,
+        )
+        .expect("mixed-edge candidates can be entered");
 
-    let seeds: Vec<Plan> = arena
-        .entrants()
-        .iter()
-        .map(|entrant| entrant.plan.clone())
-        .collect();
-    for seed in seeds {
-        for (name, plan) in mixed_edge_plans(&seed, &LADDER) {
-            if seen.insert(plan_signature(&plan)) {
-                arena
-                    .enter_plan(name, plan, constraints.clone())
-                    .expect("a mixed-edge candidate the arena can hold");
-            }
-        }
-    }
-
-    arena
+    field
+        .finish()
         .judge_with(workflow, &mut || case.scheduler())
         .unwrap_or_else(|err| panic!("{} under {}: {err}", scenario.name, case.name()))
 }
@@ -356,11 +236,7 @@ fn simulator_backed_ranking_is_an_opt_in_strategy_that_closes_the_two_node_oracl
     let base = base_constraints();
     let scenario = Scenario::load("costs/two-nodes.json").expect("the committed scenario");
     let constraints = scenario.constraints(&base);
-    let workers = scenario.machine.workers.max(1);
-    let current = Enumerating {
-        concurrency: workers,
-        ..Enumerating::default()
-    };
+    let current = enumerating_for(scenario.machine);
     let current_plan = current
         .plan(&workflow, &constraints)
         .expect("the current planner must plan");
@@ -371,16 +247,7 @@ fn simulator_backed_ranking_is_an_opt_in_strategy_that_closes_the_two_node_oracl
         .map(|phase| phase.grid.block()[0])
         .collect();
 
-    let uniform_oracle = SimulatorBacked::new(
-        Enumerating {
-            concurrency: workers,
-            ..Enumerating::default()
-        },
-        scenario.machine,
-        scenario.rates(&Rates::default()),
-        || Box::new(ExecutorOrder::phase_major()),
-    )
-    .with_snapshot(scenario.snapshot.clone());
+    let uniform_oracle = uniform_simulator_backed_for(&scenario);
     let uniform_oracle_plan = uniform_oracle
         .plan(&workflow, &constraints)
         .expect("the simulator-backed wrapper must return the uniform-ladder oracle winner");
@@ -391,14 +258,7 @@ fn simulator_backed_ranking_is_an_opt_in_strategy_that_closes_the_two_node_oracl
         .map(|phase| phase.grid.block()[0])
         .collect();
 
-    let mixed_oracle = SimulatorBacked::new(
-        current,
-        scenario.machine,
-        scenario.rates(&Rates::default()),
-        || Box::new(ExecutorOrder::phase_major()),
-    )
-    .with_snapshot(scenario.snapshot.clone())
-    .with_mixed_edges();
+    let mixed_oracle = simulator_backed_for(&scenario);
     let mixed_oracle_plan = mixed_oracle
         .plan(&workflow, &constraints)
         .expect("the simulator-backed wrapper must return the mixed-edge oracle winner");
@@ -432,22 +292,10 @@ fn simulator_backed_ranking_can_choose_the_wave_synchronous_machine_contract() {
     let base = base_constraints();
     let scenario = Scenario::load("costs/two-nodes.json").expect("the committed scenario");
     let constraints = scenario.constraints(&base);
-    let workers = scenario.machine.workers.max(1);
     let mut waves = scenario.machine;
     waves.wave_synchronous = true;
 
-    let oracle = SimulatorBacked::new(
-        Enumerating {
-            concurrency: workers,
-            ..Enumerating::default()
-        },
-        scenario.machine,
-        scenario.rates(&Rates::default()),
-        || Box::new(ExecutorOrder::phase_major()),
-    )
-    .with_snapshot(scenario.snapshot.clone())
-    .with_mixed_edges()
-    .with_machine_variant("waves", waves);
+    let oracle = simulator_backed_for(&scenario).with_machine_variant("waves", waves);
 
     let fastest = oracle
         .plan_with_machine(&workflow, &constraints)

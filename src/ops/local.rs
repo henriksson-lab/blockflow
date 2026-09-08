@@ -95,6 +95,7 @@ use super::element::{select_nth, Rank, StructuringElement, Total};
 use super::rank::ExcludedCentre;
 use super::shapes_agree;
 use super::voxelwise::combine_into;
+use super::MaskSource;
 
 // ------------------------------------------------------------- lattice --
 
@@ -2580,7 +2581,7 @@ impl LocalStatistic {
 pub struct LocalStatisticOp {
     name: &'static str,
     statistic: LocalStatistic,
-    mask: Option<usize>,
+    mask: Option<MaskSource>,
     population: Population,
     cost: f64,
 }
@@ -2602,7 +2603,7 @@ impl LocalStatisticOp {
     /// A builder rather than an argument to [`Self::new`], so the choice is
     /// additive: a caller who never had it keeps its call and its answer.
     pub fn masked_by(mut self, mask: impl Into<crate::assemble::ImageId>) -> Self {
-        self.mask = Some(mask.into().index());
+        self.mask = Some(MaskSource::new(mask));
         self.cost *= super::rank::MASK_COST_FACTOR;
         self
     }
@@ -2653,7 +2654,7 @@ impl LocalStatisticOp {
 
     /// The image this op reads its population from, where it reads one.
     pub fn mask_image(&self) -> Option<usize> {
-        self.mask
+        self.mask.map(MaskSource::image)
     }
 
     pub fn population(&self) -> Population {
@@ -2705,12 +2706,8 @@ impl BlockOp for LocalStatisticOp {
     /// shell work, so this shell declares what it can actually bridge instead of
     /// promising a conversion it would have to invent.
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
-        if let Some(image) = self.mask {
-            return Err(Error::InvalidArgument(format!(
-                "{}: the population comes from image {image}, so this op has no answer from its \
-                 input alone. It is applied through `apply_with`.",
-                self.name
-            )));
+        if let Some(mask) = self.mask {
+            return Err(mask.input_only_error(self.name));
         }
         self.statistic
             .evaluate_into(input.view::<f64>()?, at, out.view_mut::<f64>()?)
@@ -2728,7 +2725,7 @@ impl BlockOp for LocalStatisticOp {
     /// than its phase.
     fn source_inputs(&self, volume: [usize; 3]) -> Vec<SourceInput> {
         match self.mask {
-            Some(mask) => vec![SourceInput::new(mask, self.statistic.reach_spec(volume))],
+            Some(mask) => vec![mask.source_input(self.statistic.reach_spec(volume))],
             None => Vec::new(),
         }
     }
@@ -2740,10 +2737,10 @@ impl BlockOp for LocalStatisticOp {
         out: &mut Voxels,
         at: &Anchor,
     ) -> Result<()> {
-        let Some(image) = self.mask else {
+        let Some(mask) = self.mask else {
             return self.apply(input, out, at);
         };
-        let mask = population_image(self.name, image, sources)?;
+        let mask = mask.bool_view(self.name, sources)?;
         self.statistic.evaluate_masked_into(
             input.view::<f64>()?,
             mask,
@@ -2774,29 +2771,6 @@ impl BlockOp for LocalStatisticOp {
     }
 }
 
-/// The `Bool` image an op reads a population from, or the refusal that names
-/// what it holds instead.
-///
-/// One function rather than one per shell: the check, the message and the view
-/// are the same three lines, and two copies of them would be two places for the
-/// dtype rule to drift.
-fn population_image<'a>(
-    name: &str,
-    image: usize,
-    sources: SourceInputs<'a>,
-) -> Result<ArrayView3<'a, bool>> {
-    let mask = sources.get(image)?;
-    if mask.dtype() != Dtype::Bool {
-        return Err(Error::InvalidArgument(format!(
-            "{name}: the population is read from image {image}, which holds {}. A population is a \
-             yes-or-no per voxel and is stored as one; a wider type would leave 'which non-zero \
-             values count' to be decided somewhere this op cannot see.",
-            mask.dtype().numpy_name()
-        )));
-    }
-    mask.view::<bool>()
-}
-
 /// Compare each voxel against `scale * statistic + offset` at that voxel.
 ///
 /// The affine adjustment is the parameterisation: `scale` alone gives "a
@@ -2811,7 +2785,7 @@ pub struct AdaptiveThresholdOp {
     offset: f64,
     above: f64,
     below: f64,
-    mask: Option<usize>,
+    mask: Option<MaskSource>,
     population: Population,
     cost: f64,
 }
@@ -2836,7 +2810,7 @@ impl AdaptiveThresholdOp {
     /// image. The comparison itself is still made at every voxel: a mask decides
     /// what the level is computed from, not which voxels get an answer.
     pub fn masked_by(mut self, mask: impl Into<crate::assemble::ImageId>) -> Self {
-        self.mask = Some(mask.into().index());
+        self.mask = Some(MaskSource::new(mask));
         self.cost *= super::rank::MASK_COST_FACTOR;
         self
     }
@@ -2873,7 +2847,7 @@ impl AdaptiveThresholdOp {
 
     /// The image this op reads its population from, where it reads one.
     pub fn mask_image(&self) -> Option<usize> {
-        self.mask
+        self.mask.map(MaskSource::image)
     }
 
     pub fn population(&self) -> Population {
@@ -2959,12 +2933,8 @@ impl BlockOp for AdaptiveThresholdOp {
     /// input would have to be widened to be compared against it, which is a
     /// conversion this shell would be choosing rather than adapting.
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
-        if let Some(image) = self.mask {
-            return Err(Error::InvalidArgument(format!(
-                "{}: the population comes from image {image}, so this op has no answer from its \
-                 input alone. It is applied through `apply_with`.",
-                self.name
-            )));
+        if let Some(mask) = self.mask {
+            return Err(mask.input_only_error(self.name));
         }
         self.compare(input, None, out, at)
     }
@@ -2974,7 +2944,7 @@ impl BlockOp for AdaptiveThresholdOp {
     /// the same reason. The comparison adds nothing on either side.
     fn source_inputs(&self, volume: [usize; 3]) -> Vec<SourceInput> {
         match self.mask {
-            Some(mask) => vec![SourceInput::new(mask, self.statistic.reach_spec(volume))],
+            Some(mask) => vec![mask.source_input(self.statistic.reach_spec(volume))],
             None => Vec::new(),
         }
     }
@@ -2986,10 +2956,10 @@ impl BlockOp for AdaptiveThresholdOp {
         out: &mut Voxels,
         at: &Anchor,
     ) -> Result<()> {
-        let Some(image) = self.mask else {
+        let Some(mask) = self.mask else {
             return self.apply(input, out, at);
         };
-        let mask = population_image(self.name, image, sources)?;
+        let mask = mask.bool_view(self.name, sources)?;
         self.compare(input, Some(mask), out, at)
     }
 

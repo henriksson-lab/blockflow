@@ -42,57 +42,17 @@
 
 use std::collections::BTreeMap;
 
-use blockflow::arena::{Arena, SimulatedPlan, SimulatorBacked};
-use blockflow::decomposition::{Constraints, CostModel};
-use blockflow::op::Chain;
-use blockflow::probes::{AffineOp, IdentityOp};
+use blockflow::arena::{Arena, SimulatedPlan};
+use blockflow::decomposition::Constraints;
 use blockflow::scenario::Scenario;
-use blockflow::simulate::{ExecutorOrder, Rates};
+use blockflow::simulate::Rates;
 use blockflow::strategy::{Enumerating, Plan, Strategy, Workflow};
-use blockflow::Dtype;
 
-/// Where the committed scenario files live, relative to the crate root.
-const COSTS: &str = "costs";
+mod support;
 
-const VOLUME: [usize; 3] = [96, 96, 96];
-
-/// The block edges every scenario's planner may choose between, and the field
-/// its choice is judged against.
-///
-/// **The caller's knob, not the scenario's** — see `Scenario::constraints`. It
-/// is the same ladder for every machine so that what varies across a row of the
-/// table is the machine and not the search space.
-const LADDER: [usize; 4] = [16, 24, 32, 48];
-
-/// A chain with a real decision in it: a wide-reach op that wants coarse blocks
-/// and a cheap narrow one that does not, so where the phase boundary goes and
-/// how big the blocks are both matter.
-fn chain() -> Chain {
-    Chain::sequence(vec![
-        Chain::op(IdentityOp::new("smooth", [4, 4, 4]).with_cost(2.0)),
-        Chain::op(AffineOp::new("combine", 1.5, 0.5, [1, 1, 1]).with_cost(1.0)),
-        Chain::op(IdentityOp::new("skeletonize", [2, 2, 2]).with_cost(8.0)),
-    ])
-}
-
-fn workflow() -> Workflow {
-    Workflow::new(chain(), VOLUME, Dtype::F64)
-}
-
-fn base_constraints() -> Constraints {
-    Constraints {
-        block_candidates: LADDER.to_vec(),
-        split_axes: vec![0, 1, 2],
-        model: CostModel::default(),
-        ..Default::default()
-    }
-}
-
-fn scenarios() -> BTreeMap<String, Scenario> {
-    Scenario::load_dir(COSTS).unwrap_or_else(|err| {
-        panic!("the committed scenarios must load: {err}");
-    })
-}
+use support::planner_perf::{
+    base_constraints, plan_shape, scenarios, simulator_backed_for, workflow, COSTS, LADDER,
+};
 
 /// **Write `costs/` from the baseline and the transforms that derive it.**
 ///
@@ -533,18 +493,7 @@ fn the_simulator_backed_planner_chooses_well_on_every_committed_scenario() {
     let mut worst: Option<(String, f64)> = None;
     for (name, scenario) in &scenarios {
         let constraints = scenario.constraints(&base);
-        let workers = scenario.machine.workers.max(1);
-        let planner = SimulatorBacked::new(
-            Enumerating {
-                concurrency: workers,
-                ..Enumerating::default()
-            },
-            scenario.machine,
-            scenario.rates(&Rates::default()),
-            || Box::new(ExecutorOrder::phase_major()),
-        )
-        .with_snapshot(scenario.snapshot.clone())
-        .with_mixed_edges();
+        let planner = simulator_backed_for(scenario);
         let chosen = planner
             .plan_with_machine(&workflow, &constraints)
             .unwrap_or_else(|err| panic!("{name}: simulator-backed planning failed: {err}"));
@@ -559,17 +508,7 @@ fn the_simulator_backed_planner_chooses_well_on_every_committed_scenario() {
             .simulated_pick()
             .expect("the candidate field has a simulator winner");
         let regret = verdict.simulated_ns() / best.simulated_ns();
-        let plan_shape = format!(
-            "{} phase(s) at {:?}",
-            chosen.plan.decomposition.n_phases(),
-            chosen
-                .plan
-                .decomposition
-                .phases
-                .iter()
-                .map(|phase| phase.grid.block()[0])
-                .collect::<Vec<_>>()
-        );
+        let plan_shape = plan_shape(&chosen.plan);
         println!("{name:<24} {plan_shape:<24} {regret:>8.3}");
         if regret <= 1.10 {
             within_ten_percent += 1;
@@ -604,7 +543,7 @@ fn plan_edges(plan: &Plan) -> Vec<usize> {
         .collect()
 }
 
-fn plan_shape(plan: &Plan) -> (usize, Vec<usize>) {
+fn plan_edges_shape(plan: &Plan) -> (usize, Vec<usize>) {
     (plan.decomposition.n_phases(), plan_edges(plan))
 }
 
@@ -624,7 +563,7 @@ fn storage_axes_only_move_the_planner_when_the_oracle_moves() {
         .expect("the measured scenario is the baseline");
     let (measured_choice, _) = simulator_backed_choice_for(measured, &workflow, &base);
     let measured_plan = measured_choice.plan;
-    let measured_shape = plan_shape(&measured_plan);
+    let measured_shape = plan_edges_shape(&measured_plan);
     let storage_rows = [
         ("slow-disk", false),
         ("slow-disk-high-latency", false),
@@ -641,7 +580,7 @@ fn storage_axes_only_move_the_planner_when_the_oracle_moves() {
             .get(name)
             .unwrap_or_else(|| panic!("{name}: committed storage scenario missing"));
         let (choice, _) = simulator_backed_choice_for(scenario, &workflow, &base);
-        let oracle_shape = plan_shape(&choice.plan);
+        let oracle_shape = plan_edges_shape(&choice.plan);
         let best = choice
             .judgement
             .simulated_pick()
@@ -697,7 +636,7 @@ fn cache_and_prefetch_policy_search_runs_after_scheduler_shape_search() {
         .expect("the measured scenario is the cache/prefetch baseline");
     let (measured_choice, _) = simulator_backed_choice_for(measured, &workflow, &base);
     let measured_plan = measured_choice.plan;
-    let measured_shape = plan_shape(&measured_plan);
+    let measured_shape = plan_edges_shape(&measured_plan);
 
     let variant = |name: &str, note: &str, edit: fn(&mut blockflow::simulate::Machine)| {
         let mut machine = measured.machine;
@@ -772,7 +711,7 @@ fn cache_and_prefetch_policy_search_runs_after_scheduler_shape_search() {
         saw_prefetch |= scenario.machine.prefetch_depth > 0;
         saw_cache_contract |= !scenario.machine.cache_shared || scenario.machine.cache_bytes == 0;
         let (choice, _) = simulator_backed_choice_for(&scenario, &workflow, &base);
-        let oracle_shape = plan_shape(&choice.plan);
+        let oracle_shape = plan_edges_shape(&choice.plan);
         let best = choice
             .judgement
             .simulated_pick()
@@ -883,22 +822,23 @@ fn simulator_backed_choice_for(
     base: &Constraints,
 ) -> (SimulatedPlan, Constraints) {
     let constraints = scenario.constraints(base);
-    let workers = scenario.machine.workers.max(1);
-    let planner = SimulatorBacked::new(
-        Enumerating {
-            concurrency: workers,
-            ..Enumerating::default()
-        },
-        scenario.machine,
-        scenario.rates(&Rates::default()),
-        || Box::new(ExecutorOrder::phase_major()),
-    )
-    .with_snapshot(scenario.snapshot.clone())
-    .with_mixed_edges();
+    let planner = simulator_backed_for(scenario);
     let chosen = planner
         .plan_with_machine(workflow, &constraints)
         .unwrap_or_else(|err| panic!("{}: simulator-backed planning failed: {err}", scenario.name));
     (chosen, constraints)
+}
+
+#[derive(Clone)]
+struct PlanChoice {
+    name: String,
+    plan: Plan,
+    constraints: Constraints,
+}
+
+enum Fit<T> {
+    Fits(T),
+    OverBudget,
 }
 
 fn simulated_ns_on(
@@ -907,6 +847,18 @@ fn simulated_ns_on(
     workflow: &Workflow,
     base: &Constraints,
 ) -> Option<f64> {
+    match judge_plan_on_scenario(plan, scenario, workflow, base) {
+        Fit::Fits(ns) => Some(ns),
+        Fit::OverBudget => None,
+    }
+}
+
+fn judge_plan_on_scenario(
+    plan: &Plan,
+    scenario: &Scenario,
+    workflow: &Workflow,
+    base: &Constraints,
+) -> Fit<f64> {
     use blockflow::arena::working_set_bytes;
 
     let constraints = scenario.constraints(base);
@@ -917,7 +869,7 @@ fn simulated_ns_on(
         .budget_bytes
         .is_some_and(|budget| working_set > budget as f64)
     {
-        return None;
+        return Fit::OverBudget;
     }
     let mut arena = Arena::new(scenario.machine, scenario.rates(&Rates::default()))
         .with_snapshot(scenario.snapshot.clone());
@@ -927,7 +879,142 @@ fn simulated_ns_on(
     let judgement = arena
         .judge(workflow)
         .unwrap_or_else(|err| panic!("{}: candidate did not simulate: {err}", scenario.name));
-    Some(judgement.verdicts[0].simulated_ns())
+    Fit::Fits(judgement.verdicts[0].simulated_ns())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum MatrixCell {
+    Ratio(f64),
+    OverBudget,
+}
+
+impl MatrixCell {
+    fn render(&self) -> String {
+        match self {
+            Self::Ratio(ratio) => format!("{ratio:.3}"),
+            Self::OverBudget => "over".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WorstCell {
+    row: String,
+    column: String,
+    ratio: f64,
+}
+
+struct PlanMatrix {
+    names: Vec<String>,
+    rows: BTreeMap<String, Vec<MatrixCell>>,
+    worst: WorstCell,
+    column_worst: BTreeMap<String, f64>,
+}
+
+impl PlanMatrix {
+    fn from_choices(
+        choices: &[PlanChoice],
+        scenarios: &BTreeMap<String, Scenario>,
+        workflow: &Workflow,
+        base: &Constraints,
+    ) -> Self {
+        let names: Vec<String> = choices.iter().map(|choice| choice.name.clone()).collect();
+        let mut rows = BTreeMap::new();
+        let mut worst = WorstCell {
+            row: String::new(),
+            column: String::new(),
+            ratio: 1.0,
+        };
+        let mut column_worst = BTreeMap::new();
+
+        for row in choices {
+            let mut cells = Vec::with_capacity(choices.len());
+            for column in choices {
+                let scenario = &scenarios[&column.name];
+                match transfer_ratio(&row.plan, &column.plan, scenario, workflow, base) {
+                    Fit::OverBudget => cells.push(MatrixCell::OverBudget),
+                    Fit::Fits(ratio) => {
+                        let entry = column_worst.entry(column.name.clone()).or_insert(1.0);
+                        if ratio > *entry {
+                            *entry = ratio;
+                        }
+                        if ratio > worst.ratio {
+                            worst = WorstCell {
+                                row: row.name.clone(),
+                                column: column.name.clone(),
+                                ratio,
+                            };
+                        }
+                        cells.push(MatrixCell::Ratio(ratio));
+                    }
+                }
+            }
+            rows.insert(row.name.clone(), cells);
+        }
+
+        Self {
+            names,
+            rows,
+            worst,
+            column_worst,
+        }
+    }
+
+    fn print(&self, title: &str) {
+        println!("{title}");
+        print!("{:<24}", "");
+        for name in &self.names {
+            print!("{:>10.10}", name);
+        }
+        println!();
+        for (name, cells) in &self.rows {
+            print!("{name:<24}");
+            for cell in cells {
+                print!("{:>10}", cell.render());
+            }
+            println!();
+        }
+    }
+
+    fn contains_over_budget(&self) -> bool {
+        self.rows
+            .values()
+            .flatten()
+            .any(|cell| matches!(cell, MatrixCell::OverBudget))
+    }
+}
+
+fn transfer_ratio(
+    foreign: &Plan,
+    native: &Plan,
+    scenario: &Scenario,
+    workflow: &Workflow,
+    base: &Constraints,
+) -> Fit<f64> {
+    use blockflow::arena::working_set_bytes;
+
+    let constraints = scenario.constraints(base);
+    let workers = scenario.machine.workers.max(1);
+    let working_set = working_set_bytes(workflow, &foreign.decomposition, &constraints, workers)
+        .unwrap_or_else(|err| panic!("{}: foreign working set failed: {err}", scenario.name));
+    if scenario
+        .budget_bytes
+        .is_some_and(|budget| working_set > budget as f64)
+    {
+        return Fit::OverBudget;
+    }
+
+    let mut arena = Arena::new(scenario.machine, scenario.rates(&Rates::default()))
+        .with_snapshot(scenario.snapshot.clone());
+    for (name, plan) in [("foreign", foreign), ("native", native)] {
+        arena
+            .enter_plan(name.to_string(), plan.clone(), constraints.clone())
+            .expect("a plan the arena can hold");
+    }
+    let judgement = arena
+        .judge(workflow)
+        .unwrap_or_else(|err| panic!("{}: transfer simulation failed: {err}", scenario.name));
+    Fit::Fits(judgement.verdicts[0].simulated_ns() / judgement.verdicts[1].simulated_ns())
 }
 
 fn robust_simulator_backed_plan_for(
@@ -937,18 +1024,7 @@ fn robust_simulator_backed_plan_for(
     base: &Constraints,
 ) -> (Plan, Constraints, f64, f64) {
     let constraints = scenario.constraints(base);
-    let workers = scenario.machine.workers.max(1);
-    let planner = SimulatorBacked::new(
-        Enumerating {
-            concurrency: workers,
-            ..Enumerating::default()
-        },
-        scenario.machine,
-        scenario.rates(&Rates::default()),
-        || Box::new(ExecutorOrder::phase_major()),
-    )
-    .with_snapshot(scenario.snapshot.clone())
-    .with_mixed_edges();
+    let planner = simulator_backed_for(scenario);
     let candidate_arena = planner
         .candidate_arena(workflow, &constraints)
         .unwrap_or_else(|err| panic!("{}: candidate arena failed: {err}", scenario.name));
@@ -1010,82 +1086,34 @@ fn robust_simulator_backed_plan_for(
 /// production planner.
 #[test]
 fn simulator_backed_plans_transfer_to_the_other_committed_scenarios() {
-    use blockflow::arena::working_set_bytes;
-
     let scenarios = scenarios();
     let workflow = workflow();
     let base = base_constraints();
-    let chosen: Vec<(String, Plan, Constraints)> = scenarios
+    let chosen: Vec<PlanChoice> = scenarios
         .iter()
         .map(|(name, scenario)| {
             let (plan, constraints) = simulator_backed_plan_for(scenario, &workflow, &base);
-            (name.clone(), plan, constraints)
+            PlanChoice {
+                name: name.clone(),
+                plan,
+                constraints,
+            }
         })
         .collect();
-    let names: Vec<&str> = chosen.iter().map(|(name, _, _)| name.as_str()).collect();
-    let mut rows: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    let mut worst = ("".to_string(), "".to_string(), 1.0f64);
+    let matrix = PlanMatrix::from_choices(&chosen, &scenarios, &workflow, &base);
 
-    println!("simulator-backed plan chosen for (row), run on (column)");
-    print!("{:>24}", "");
-    for name in &names {
-        print!("{:>10}", &name[..name.len().min(9)]);
-    }
-    println!();
-
-    for (row_name, plan, _) in &chosen {
-        let mut cells = Vec::new();
-        for (column_name, scenario) in &scenarios {
-            let column_constraints = scenario.constraints(&base);
-            let workers = scenario.machine.workers.max(1);
-            let working_set =
-                working_set_bytes(&workflow, &plan.decomposition, &column_constraints, workers)
-                    .unwrap_or_else(|err| panic!("{row_name} on {column_name}: {err}"));
-            if scenario
-                .budget_bytes
-                .is_some_and(|budget| working_set > budget as f64)
-            {
-                cells.push("over".to_string());
-                continue;
-            }
-            let (native, _) = simulator_backed_plan_for(scenario, &workflow, &base);
-            let mut arena = Arena::new(scenario.machine, scenario.rates(&Rates::default()))
-                .with_snapshot(scenario.snapshot.clone());
-            for (name, plan) in [("foreign", plan.clone()), ("native", native)] {
-                arena
-                    .enter_plan(name.to_string(), plan, column_constraints.clone())
-                    .expect("a plan the arena can hold");
-            }
-            let judgement = arena
-                .judge(&workflow)
-                .unwrap_or_else(|err| panic!("{row_name} on {column_name}: {err}"));
-            let ratio = judgement.verdicts[0].simulated_ns() / judgement.verdicts[1].simulated_ns();
-            cells.push(format!("{ratio:.3}"));
-            if ratio > worst.2 {
-                worst = (row_name.clone(), column_name.clone(), ratio);
-            }
-        }
-        rows.insert(row_name.as_str(), cells);
-    }
-
-    for (name, cells) in &rows {
-        print!("{name:<24}");
-        for cell in cells {
-            print!("{cell:>10}");
-        }
-        println!();
-    }
+    matrix.print("simulator-backed plan chosen for (row), run on (column)");
     println!(
         "simulator-backed worst transfer: the plan for {} costs {:.3}x on {}",
-        worst.0, worst.2, worst.1
+        matrix.worst.row, matrix.worst.ratio, matrix.worst.column
     );
     assert!(
-        worst.2 <= 4.8,
+        matrix.worst.ratio <= 4.8,
         "simulator-backed transfer moved beyond the recorded diagnostic ceiling: {} on {} costs \
          {:.3}x. If this is deliberate, update the table and the TODO4 portability item.",
-        worst.0,
-        worst.1,
-        worst.2
+        matrix.worst.row,
+        matrix.worst.column,
+        matrix.worst.ratio
     );
 }
 
@@ -1098,99 +1126,52 @@ fn simulator_backed_plans_transfer_to_the_other_committed_scenarios() {
 /// ranking gives up some local optimality to keep the plan portable.
 #[test]
 fn robust_simulator_backed_plans_transfer_under_the_todo4_ceiling() {
-    use blockflow::arena::working_set_bytes;
-
     let scenarios = scenarios();
     let workflow = workflow();
     let base = base_constraints();
-    let chosen: Vec<(String, Plan, Constraints, f64, f64)> = scenarios
+    let robust: Vec<(PlanChoice, f64, f64)> = scenarios
         .iter()
         .map(|(name, scenario)| {
             let (plan, constraints, oracle_worst, local_regret) =
                 robust_simulator_backed_plan_for(scenario, &scenarios, &workflow, &base);
-            (name.clone(), plan, constraints, oracle_worst, local_regret)
+            (
+                PlanChoice {
+                    name: name.clone(),
+                    plan,
+                    constraints,
+                },
+                oracle_worst,
+                local_regret,
+            )
         })
         .collect();
-    let names: Vec<&str> = chosen
-        .iter()
-        .map(|(name, _, _, _, _)| name.as_str())
-        .collect();
-    let mut rows: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    let mut worst = ("".to_string(), "".to_string(), 1.0f64);
+    let chosen: Vec<PlanChoice> = robust.iter().map(|(choice, _, _)| choice.clone()).collect();
+    let matrix = PlanMatrix::from_choices(&chosen, &scenarios, &workflow, &base);
     let mut local_worst = ("".to_string(), 1.0f64);
 
-    println!("robust simulator-backed plan chosen for (row), run on (column)");
-    print!("{:>24}", "");
-    for name in &names {
-        print!("{:>10}", &name[..name.len().min(9)]);
-    }
-    println!();
-
-    for (row_name, plan, _, oracle_worst, local_regret) in &chosen {
+    for (choice, oracle_worst, local_regret) in &robust {
         if *local_regret > local_worst.1 {
-            local_worst = (row_name.clone(), *local_regret);
-        }
-        let mut cells = Vec::new();
-        for (column_name, scenario) in &scenarios {
-            let column_constraints = scenario.constraints(&base);
-            let workers = scenario.machine.workers.max(1);
-            let working_set =
-                working_set_bytes(&workflow, &plan.decomposition, &column_constraints, workers)
-                    .unwrap_or_else(|err| panic!("{row_name} on {column_name}: {err}"));
-            if scenario
-                .budget_bytes
-                .is_some_and(|budget| working_set > budget as f64)
-            {
-                cells.push("over".to_string());
-                continue;
-            }
-            let native = &chosen
-                .iter()
-                .find(|(name, _, _, _, _)| name == column_name)
-                .expect("every column is a scenario that was planned for")
-                .1;
-            let mut arena = Arena::new(scenario.machine, scenario.rates(&Rates::default()))
-                .with_snapshot(scenario.snapshot.clone());
-            for (name, plan) in [("foreign", plan.clone()), ("native", native.clone())] {
-                arena
-                    .enter_plan(name.to_string(), plan, column_constraints.clone())
-                    .expect("a plan the arena can hold");
-            }
-            let judgement = arena
-                .judge(&workflow)
-                .unwrap_or_else(|err| panic!("{row_name} on {column_name}: {err}"));
-            let ratio = judgement.verdicts[0].simulated_ns() / judgement.verdicts[1].simulated_ns();
-            cells.push(format!("{ratio:.3}"));
-            if ratio > worst.2 {
-                worst = (row_name.clone(), column_name.clone(), ratio);
-            }
+            local_worst = (choice.name.clone(), *local_regret);
         }
         println!(
-            "{row_name}: robust oracle worst against local oracles {oracle_worst:.3}, local regret \
-             {local_regret:.3}"
+            "{}: robust oracle worst against local oracles {oracle_worst:.3}, local regret \
+             {local_regret:.3}",
+            choice.name
         );
-        rows.insert(row_name.as_str(), cells);
     }
-
-    for (name, cells) in &rows {
-        print!("{name:<24}");
-        for cell in cells {
-            print!("{cell:>10}");
-        }
-        println!();
-    }
+    matrix.print("robust simulator-backed plan chosen for (row), run on (column)");
     println!(
         "robust simulator-backed worst transfer: the plan for {} costs {:.3}x on {}; local \
          regret tradeoff worst {:.3} on {}",
-        worst.0, worst.2, worst.1, local_worst.1, local_worst.0
+        matrix.worst.row, matrix.worst.ratio, matrix.worst.column, local_worst.1, local_worst.0
     );
     assert!(
-        worst.2 <= 1.50,
+        matrix.worst.ratio <= 1.50,
         "TODO4 requires the worst admissible transfer cell <=1.50; robust simulator-backed got \
          {:.3} for {} on {}",
-        worst.2,
-        worst.0,
-        worst.1
+        matrix.worst.ratio,
+        matrix.worst.row,
+        matrix.worst.column
     );
 }
 
@@ -1271,7 +1252,7 @@ fn a_plan_chosen_for_one_machine_transfers_to_the_others() {
 
     // One plan per scenario, chosen by the planner under that scenario's own
     // model, budget and worker count.
-    let chosen: Vec<(String, blockflow::strategy::Plan, Constraints)> = scenarios
+    let chosen: Vec<PlanChoice> = scenarios
         .iter()
         .map(|(name, scenario)| {
             let constraints = scenario.constraints(&base);
@@ -1281,80 +1262,21 @@ fn a_plan_chosen_for_one_machine_transfers_to_the_others() {
             }
             .plan(&workflow, &constraints)
             .unwrap_or_else(|err| panic!("{name}: {err}"));
-            (name.clone(), plan, constraints)
+            PlanChoice {
+                name: name.clone(),
+                plan,
+                constraints,
+            }
         })
         .collect();
 
-    let names: Vec<&str> = chosen.iter().map(|(name, _, _)| name.as_str()).collect();
-    println!("plan chosen for (row), run on (column)");
-    print!("{:<24}", "");
-    for name in &names {
-        print!("{:>10.10}", name);
-    }
-    println!();
-
-    let mut worst = (String::new(), String::new(), 1.0f64);
-    let mut column_worst: BTreeMap<&str, f64> = BTreeMap::new();
-    let mut rows: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for (row_name, plan, _) in &chosen {
-        let mut cells = Vec::new();
-        for (column_name, _, _) in &chosen {
-            let scenario = &scenarios[column_name.as_str()];
-            let constraints = scenario.constraints(&base);
-            let workers = scenario.machine.workers.max(1);
-
-            // Does it fit at all on this machine?
-            let bytes = working_set_bytes(&workflow, &plan.decomposition, &constraints, workers)
-                .unwrap_or_else(|err| panic!("{row_name} on {column_name}: {err}"));
-            if scenario
-                .budget_bytes
-                .is_some_and(|budget| bytes > budget as f64)
-            {
-                cells.push("over".to_string());
-                continue;
-            }
-
-            let native = &chosen
-                .iter()
-                .find(|(name, _, _)| name == column_name)
-                .expect("every column is a scenario that was planned for")
-                .1;
-            let mut arena = Arena::new(scenario.machine, scenario.rates(&Rates::default()))
-                .with_snapshot(scenario.snapshot.clone());
-            // Entrant 0 is the foreign plan and entrant 1 the native one, which
-            // is what the ratio below reads. On the diagonal they are the same
-            // plan and the cell is 1.000 by construction.
-            for (name, plan) in [("foreign", plan), ("native", native)] {
-                arena
-                    .enter_plan(name.to_string(), plan.clone(), constraints.clone())
-                    .expect("a plan the arena can hold");
-            }
-            let judgement = arena
-                .judge(&workflow)
-                .unwrap_or_else(|err| panic!("{row_name} on {column_name}: {err}"));
-            let ratio = judgement.verdicts[0].simulated_ns() / judgement.verdicts[1].simulated_ns();
-            cells.push(format!("{ratio:.3}"));
-            let entry = column_worst.entry(column_name.as_str()).or_insert(1.0);
-            *entry = entry.max(ratio);
-            if ratio > worst.2 {
-                worst = (row_name.clone(), column_name.clone(), ratio);
-            }
-        }
-        rows.insert(row_name.as_str(), cells);
-    }
-
-    for (name, cells) in &rows {
-        print!("{name:<24}");
-        for cell in cells {
-            print!("{cell:>10}");
-        }
-        println!();
-    }
+    let matrix = PlanMatrix::from_choices(&chosen, &scenarios, &workflow, &base);
+    matrix.print("plan chosen for (row), run on (column)");
     println!(
         "worst transfer: the plan for {} costs {:.3}x on {}",
-        worst.0, worst.2, worst.1
+        matrix.worst.row, matrix.worst.ratio, matrix.worst.column
     );
-    for (column, ratio) in &column_worst {
+    for (column, ratio) in &matrix.column_worst {
         assert!(
             *ratio <= 2.3,
             "{column}: the worst foreign plan costs {ratio:.3}x the plan chosen for it. The \
@@ -1364,7 +1286,7 @@ fn a_plan_chosen_for_one_machine_transfers_to_the_others() {
         );
     }
     assert!(
-        rows.values().flatten().any(|cell| cell == "over"),
+        matrix.contains_over_budget(),
         "no plan was inadmissible anywhere, so no committed scenario has a budget that binds \
          — and a budget that never binds is the baseline with a smaller number in it. See \
          `less-memory`, which is the scenario tuned to bind."
@@ -1372,16 +1294,22 @@ fn a_plan_chosen_for_one_machine_transfers_to_the_others() {
     // Every scenario's own plan fits its own machine, which is the planner
     // honouring the budget it was given and is what makes an `over` cell
     // meaningful rather than an artefact of how the fit is computed.
-    for (name, plan, constraints) in &chosen {
-        let scenario = &scenarios[name.as_str()];
+    for choice in &chosen {
+        let scenario = &scenarios[choice.name.as_str()];
         let workers = scenario.machine.workers.max(1);
-        let bytes = working_set_bytes(&workflow, &plan.decomposition, constraints, workers)
-            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let bytes = working_set_bytes(
+            &workflow,
+            &choice.plan.decomposition,
+            &choice.constraints,
+            workers,
+        )
+        .unwrap_or_else(|err| panic!("{}: {err}", choice.name));
         if let Some(budget) = scenario.budget_bytes {
             assert!(
                 bytes <= budget as f64,
                 "{name}: the planner returned a plan needing {bytes:.0} bytes against its own \
-                 {budget} byte budget"
+                 {budget} byte budget",
+                name = choice.name
             );
         }
     }
