@@ -276,9 +276,9 @@ pair is discordant at chunk edges 8, 16, 32 and 64, and the tau at one worker is
 1.000 at all four.
 
 The figures are pinned in
-`the_two_judges_agree_at_one_worker_and_part_at_four`, which says in its own
-doc that a change to either judge is expected to move them and that the test is
-where the new ones get written down.
+`the_two_judges_record_the_raw_gap_and_simulator_backed_closes_it`, which says
+in its own doc that a change to either judge is expected to move them and that
+the test is where the new ones get written down.
 
 ## Overfitting: what the planner does on machines this is not
 

@@ -28,7 +28,7 @@
 // argmin over a ladder is the edge the search chose is a check on the
 // composition around that function, which is not shared.
 
-use blockflow::arena::{price_plan, Arena};
+use blockflow::arena::{price_plan, Arena, SimulatorBacked};
 use blockflow::decomposition::{Constraints, CostModel};
 use blockflow::op::Chain;
 use blockflow::probes::{AffineOp, IdentityOp};
@@ -309,7 +309,7 @@ fn every_strategy_produces_a_plan_the_simulator_runs() {
 /// continuously, moves these numbers; the assertions below are here so that it
 /// moves them *visibly*, with a place to write down what the new figures are.
 #[test]
-fn the_two_judges_agree_at_one_worker_and_part_at_four() {
+fn the_two_judges_record_the_raw_gap_and_simulator_backed_closes_it() {
     let workflow = workflow();
     let edges = [8usize, 16, 32, 64];
     let mut taus = Vec::new();
@@ -399,6 +399,38 @@ fn the_two_judges_agree_at_one_worker_and_part_at_four() {
     assert_eq!(
         four.simulated_pick().map(|verdict| verdict.name.as_str()),
         Some("edge 64")
+    );
+
+    let simulator_backed = SimulatorBacked::new(
+        Enumerating {
+            concurrency: 4,
+            ..Enumerating::default()
+        },
+        machine(4),
+        rates(),
+        || Box::new(ExecutorOrder::phase_major()),
+    );
+    let choice = simulator_backed
+        .plan_with_machine(&workflow, &constraints(edges.to_vec()))
+        .expect("the opt-in simulator-backed strategy must rank the same field");
+    let picked = choice
+        .judgement
+        .verdicts
+        .iter()
+        .find(|verdict| verdict.name == choice.name)
+        .expect("the selected plan is in its judgement");
+    let best = choice
+        .judgement
+        .simulated_pick()
+        .expect("the simulator-backed field has a simulator winner");
+    assert_eq!(
+        choice.name, "edge-64",
+        "the simulator-backed planner should select the simulator winner for the four-worker \
+         arena gap"
+    );
+    assert!(
+        picked.simulated_ns() / best.simulated_ns() <= 1.10,
+        "the simulator-backed selected plan should be within the TODO4 arena stop condition"
     );
 }
 

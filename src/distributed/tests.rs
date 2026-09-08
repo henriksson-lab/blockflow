@@ -454,6 +454,86 @@ fn simulated_handout_matches_the_real_coordinator_locality_ordering() {
     );
 }
 
+/// The promotion bridge `Coalescing` is waiting for, and why it is not lifted
+/// yet.
+///
+/// This does not make the policy selectable. It pins both halves of the
+/// missing evidence: if the simulator ever says coalescing beats nearest-first
+/// on duplicated fetches for this shared-cache model, the real coordinator's
+/// locality counters must move in the same direction on the same decomposition
+/// and cache budget; and today's fixture is not that evidence, because the real
+/// coordinator improves while the simulator still predicts a loss.
+#[test]
+fn coalescing_stays_refused_when_real_and_simulated_directions_diverge() {
+    let workers = 10;
+    let (nearest_seed, decomposition) = handout_validation_job();
+    let chunk_bytes = nearest_seed.workflow.chunk.iter().product::<usize>() as u64 * 8;
+    let capacities = [1usize, 2, 4, 8, 16, 32, 512];
+    let mut real_win_cases = 0usize;
+    let mut simulator_win_cases = 0usize;
+
+    for capacity in capacities {
+        let cache_bytes = capacity as u64 * chunk_bytes;
+        let mut nearest_spec = nearest_seed.clone();
+        nearest_spec.policy = HandoutPolicy::NearestFirst;
+        nearest_spec.workflow.cache_bytes = cache_bytes;
+        let mut coalescing_spec = nearest_spec.clone();
+        coalescing_spec.policy = HandoutPolicy::Coalescing;
+
+        let real_nearest = measure_job(nearest_spec.clone(), decomposition.clone(), workers);
+        let real_coalescing = measure_job(coalescing_spec.clone(), decomposition.clone(), workers);
+        let simulated_nearest = simulated_handout(
+            nearest_spec,
+            decomposition.clone(),
+            HandoutPolicy::NearestFirst,
+            workers,
+        );
+        let simulated_coalescing = simulated_handout(
+            coalescing_spec,
+            decomposition.clone(),
+            HandoutPolicy::Coalescing,
+            workers,
+        );
+
+        assert_eq!(real_coalescing.tasks, real_nearest.tasks);
+        assert_eq!(real_coalescing.distinct, real_nearest.distinct);
+        println!(
+            "coalescing bridge cap {capacity:3}: real duplicated {} -> {}, simulator duplicated \
+             {} -> {}",
+            real_nearest.duplicated,
+            real_coalescing.duplicated,
+            simulated_nearest,
+            simulated_coalescing
+        );
+
+        if real_coalescing.duplicated < real_nearest.duplicated {
+            real_win_cases += 1;
+        }
+        if simulated_coalescing < simulated_nearest {
+            simulator_win_cases += 1;
+            assert!(
+                real_coalescing.duplicated < real_nearest.duplicated,
+                "capacity {capacity}: simulator says coalescing wins ({simulated_coalescing} < \
+                 {simulated_nearest}) but the real coordinator duplicated {} chunks against \
+                 nearest-first's {}",
+                real_coalescing.duplicated,
+                real_nearest.duplicated
+            );
+        }
+    }
+
+    assert!(
+        real_win_cases > 0,
+        "the bridge must exercise a real-coordinator coalescing win, or it is not testing the \
+         policy's promotion path"
+    );
+    assert_eq!(
+        simulator_win_cases, 0,
+        "this fixture has become simulator promotion evidence; revisit `HandoutPolicy::refusal` \
+         and replace this diagnostic with a positive bridge"
+    );
+}
+
 /// **The one regime `CacheModelled` can differ in, which had never been run.**
 ///
 /// `nearest_first_handout_costs_fewer_duplicated_fetches_than_naive_pull`

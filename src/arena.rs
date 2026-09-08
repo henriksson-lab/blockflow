@@ -82,11 +82,15 @@
 //! [`Machine::contention`]: crate::simulate::Machine::contention
 //! [`Strategy::decompose`]: crate::strategy::Strategy::decompose
 
+use std::collections::BTreeSet;
+
 use crate::decomposition::{
-    images_read_by, resident_buffers_of, Constraints, Decomposition, PhaseTraffic,
+    images_read_by, resident_buffers_of, Constraints, Decomposition, PhaseDecomposition,
+    PhaseTraffic,
 };
 use crate::error::{Error, Result};
 use crate::fragment::PhaseWork;
+use crate::geometry::BlockGrid;
 use crate::simulate::{
     phase_rates_from_snapshot, simulate, ExecutorOrder, Machine, Outcome, PerPhase, Rates,
     Scheduler,
@@ -447,6 +451,315 @@ impl Arena {
             verdicts,
             workers: self.machine.workers,
         })
+    }
+}
+
+/// An opt-in strategy wrapper that lets the simulator choose among candidates.
+///
+/// The wrapped strategy still builds every candidate. This wrapper only changes
+/// the judge: it enters the wrapped strategy's normal plan plus the same
+/// strategy pinned to each stated block candidate, runs that field through
+/// [`Arena`], and returns the simulator winner.
+///
+/// This is intentionally separate from the default planner. It is a measuring
+/// and experimentation strategy for closing planner regret, not a claim that
+/// simulator-backed ranking should be the production default everywhere.
+pub struct SimulatorBacked<S, F>
+where
+    S: Strategy,
+    F: Fn() -> Box<dyn Scheduler> + Sync,
+{
+    pub strategy: S,
+    pub machine: Machine,
+    pub machine_variants: Vec<(String, Machine)>,
+    pub rates: Rates,
+    pub snapshot: Option<Snapshot>,
+    pub make_scheduler: F,
+    pub include_mixed_edges: bool,
+}
+
+/// The simulator-backed winner with the execution contract it was judged under.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimulatedPlan {
+    pub name: String,
+    pub plan: Plan,
+    pub machine_name: String,
+    pub machine: Machine,
+    pub regret: f64,
+    pub judgement: Judgement,
+}
+
+/// How [`SimulatorBacked`] chooses across named machine contracts.
+///
+/// `FastestOracle` asks "which candidate field produced the shortest simulated
+/// runtime?" `LowestPlannerRegret` asks "which execution contract makes the
+/// planner's model pick closest to the simulator pick?" The second form is for
+/// explicit policy decisions such as wave-synchronous dispatch, where closing a
+/// planner/executor mismatch may be more important than selecting the fastest
+/// sampled continuous-overlap oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulationObjective {
+    FastestOracle,
+    LowestPlannerRegret,
+}
+
+impl<S, F> SimulatorBacked<S, F>
+where
+    S: Strategy,
+    F: Fn() -> Box<dyn Scheduler> + Sync,
+{
+    pub fn new(strategy: S, machine: Machine, rates: Rates, make_scheduler: F) -> Self {
+        Self {
+            strategy,
+            machine,
+            machine_variants: Vec::new(),
+            rates,
+            snapshot: None,
+            make_scheduler,
+            include_mixed_edges: false,
+        }
+    }
+
+    pub fn with_snapshot(mut self, snapshot: Snapshot) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// Add every per-phase combination of the stated scalar block candidates,
+    /// preserving each seed plan's phase partition.
+    ///
+    /// This is explicit because it can grow quickly: a three-phase plan and a
+    /// four-rung ladder adds `4^3` candidates for that partition.
+    pub fn with_mixed_edges(mut self) -> Self {
+        self.include_mixed_edges = true;
+        self
+    }
+
+    /// Add a named machine contract to the simulator-backed choice.
+    ///
+    /// The default `machine` passed to [`Self::new`] is always considered. This
+    /// adds alternatives such as a wave-synchronous dispatch model without
+    /// hiding that the returned plan was chosen under a different execution
+    /// contract.
+    pub fn with_machine_variant(mut self, name: impl Into<String>, machine: Machine) -> Self {
+        self.machine_variants.push((name.into(), machine));
+        self
+    }
+
+    fn candidate_field(
+        &self,
+        workflow: &Workflow,
+        constraints: &Constraints,
+        machine: Machine,
+    ) -> Result<Arena> {
+        let mut arena = Arena::new(machine, self.rates);
+        if let Some(snapshot) = &self.snapshot {
+            arena = arena.with_snapshot(snapshot.clone());
+        }
+        let mut seen = BTreeSet::new();
+        let first = self.strategy.plan(workflow, constraints)?;
+        seen.insert(plan_signature(&first));
+        arena.enter_plan("strategy", first, constraints.clone())?;
+        for edge in &constraints.block_candidates {
+            let pinned = Constraints {
+                block_candidates: vec![*edge],
+                ..constraints.clone()
+            };
+            if let Ok(plan) = self.strategy.plan(workflow, &pinned) {
+                if seen.insert(plan_signature(&plan)) {
+                    arena.enter_plan(format!("edge-{edge}"), plan, pinned)?;
+                }
+            }
+        }
+        if self.include_mixed_edges {
+            let seeds: Vec<Plan> = arena
+                .entrants()
+                .iter()
+                .map(|entrant| entrant.plan.clone())
+                .collect();
+            for (seed_index, seed) in seeds.iter().enumerate() {
+                for (name, plan) in
+                    mixed_edge_plans(seed_index, seed, &constraints.block_candidates)?
+                {
+                    if seen.insert(plan_signature(&plan)) {
+                        arena.enter_plan(name, plan, constraints.clone())?;
+                    }
+                }
+            }
+        }
+        Ok(arena)
+    }
+
+    /// Build the default-machine candidate arena without choosing a winner.
+    ///
+    /// This is for reports and robust-selection experiments that need to judge
+    /// the same candidate field under several machines before committing to a
+    /// plan.
+    pub fn candidate_arena(&self, workflow: &Workflow, constraints: &Constraints) -> Result<Arena> {
+        self.candidate_field(workflow, constraints, self.machine)
+    }
+
+    /// Choose the simulator winner and state the machine contract it was judged
+    /// under.
+    pub fn plan_with_machine(
+        &self,
+        workflow: &Workflow,
+        constraints: &Constraints,
+    ) -> Result<SimulatedPlan> {
+        self.plan_with_machine_by(workflow, constraints, SimulationObjective::FastestOracle)
+    }
+
+    /// Choose a simulator-backed plan under the requested cross-machine
+    /// objective.
+    pub fn plan_with_machine_by(
+        &self,
+        workflow: &Workflow,
+        constraints: &Constraints,
+        objective: SimulationObjective,
+    ) -> Result<SimulatedPlan> {
+        let mut cases = Vec::with_capacity(1 + self.machine_variants.len());
+        cases.push(("default".to_string(), self.machine));
+        cases.extend(self.machine_variants.iter().cloned());
+
+        let mut best: Option<(SimulatedPlan, f64, f64)> = None;
+        for (machine_name, machine) in cases {
+            let arena = self.candidate_field(workflow, constraints, machine)?;
+            let judgement = arena.judge_with(workflow, &mut || (self.make_scheduler)())?;
+            let winner = judgement.simulated_pick().ok_or_else(|| {
+                Error::InvalidArgument("simulator-backed: no candidate fit".into())
+            })?;
+            let simulated_ns = winner.simulated_ns();
+            let name = winner.name.clone();
+            let regret = judgement.regret().unwrap_or(f64::NAN);
+            let plan = arena
+                .entrants()
+                .iter()
+                .find(|entrant| entrant.name == name)
+                .map(|entrant| entrant.plan.clone())
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "simulator-backed: simulator picked unknown entrant {name}"
+                    ))
+                })?;
+            let candidate = SimulatedPlan {
+                name,
+                plan,
+                machine_name,
+                machine,
+                regret,
+                judgement,
+            };
+            let score = match objective {
+                SimulationObjective::FastestOracle => simulated_ns,
+                SimulationObjective::LowestPlannerRegret => regret,
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(_, best_score, best_simulated_ns)| {
+                    score < *best_score
+                        || (score == *best_score && simulated_ns < *best_simulated_ns)
+                })
+            {
+                best = Some((candidate, score, simulated_ns));
+            }
+        }
+        best.map(|(candidate, _, _)| candidate)
+            .ok_or_else(|| Error::InvalidArgument("simulator-backed: no machine cases".into()))
+    }
+}
+
+fn plan_signature(plan: &Plan) -> Vec<(Vec<usize>, usize)> {
+    plan.decomposition
+        .phases
+        .iter()
+        .map(|phase| (phase.slots.clone(), phase.grid.block()[0]))
+        .collect()
+}
+
+fn mixed_edge_plans(
+    seed_index: usize,
+    seed: &Plan,
+    edges: &[usize],
+) -> Result<Vec<(String, Plan)>> {
+    if seed
+        .decomposition
+        .phases
+        .iter()
+        .any(|phase| phase.reads_across_grids())
+    {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut chosen = vec![0usize; seed.decomposition.n_phases()];
+    fn visit(
+        at: usize,
+        seed_index: usize,
+        seed: &Plan,
+        edges: &[usize],
+        chosen: &mut [usize],
+        out: &mut Vec<(String, Plan)>,
+    ) -> Result<()> {
+        if at == chosen.len() {
+            let mut phases = Vec::with_capacity(seed.decomposition.phases.len());
+            for (phase, edge) in seed.decomposition.phases.iter().zip(chosen.iter().copied()) {
+                let grid = BlockGrid::new(phase.volume(), [edge; 3])?;
+                let mut rebuilt = PhaseDecomposition::derive(
+                    phase.slots.clone(),
+                    phase.names.clone(),
+                    phase.reach.clone(),
+                    phase.halo.clone(),
+                    grid,
+                )
+                .with_source_images(phase.source_images.clone())
+                .with_supplied_dtypes(phase.supplied_dtypes.clone())
+                .reading_input_image(phase.reads_input_image)
+                .with_barrier(phase.barrier);
+                if let Some(dtype) = phase.dtype {
+                    rebuilt = rebuilt.with_dtype(dtype);
+                }
+                phases.push(rebuilt);
+            }
+            out.push((
+                format!("mixed-{seed_index}-{:?}", chosen),
+                Plan {
+                    decomposition: Decomposition {
+                        volume: seed.decomposition.volume,
+                        dtype: seed.decomposition.dtype,
+                        phases,
+                        chain_reach: seed.decomposition.chain_reach,
+                    },
+                    hints: seed.hints.clone(),
+                },
+            ));
+            return Ok(());
+        }
+        for &edge in edges {
+            chosen[at] = edge;
+            visit(at + 1, seed_index, seed, edges, chosen, out)?;
+        }
+        Ok(())
+    }
+    visit(0, seed_index, seed, edges, &mut chosen, &mut out)?;
+    Ok(out)
+}
+
+impl<S, F> Strategy for SimulatorBacked<S, F>
+where
+    S: Strategy,
+    F: Fn() -> Box<dyn Scheduler> + Sync,
+{
+    fn name(&self) -> &'static str {
+        "simulator-backed"
+    }
+
+    fn decompose(&self, workflow: &Workflow, constraints: &Constraints) -> Result<Decomposition> {
+        self.plan(workflow, constraints)
+            .map(|plan| plan.decomposition)
+    }
+
+    fn plan(&self, workflow: &Workflow, constraints: &Constraints) -> Result<Plan> {
+        self.plan_with_machine(workflow, constraints)
+            .map(|chosen| chosen.plan)
     }
 }
 
