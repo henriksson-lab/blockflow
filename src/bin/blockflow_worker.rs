@@ -61,6 +61,9 @@ blockflow-worker — pulls block tasks from a coordinator and executes them.
                         spare this is its only parallelism; set it to the node's
                         cores divided by the worker processes sharing them. A
                         chain that has not declared itself sliceable ignores it.
+  --cache-bytes BYTES   Bytes for this worker's real shared-volume read cache.
+                        Omit to use the job model; set 0 to disable caching.
+  --prefetch-threads N  Threads for this worker's real prefetcher. Default 1.
   --report PATH         Write this worker's counters here on exit.
   --verbose
   --help
@@ -124,6 +127,18 @@ fn go() -> Result<()> {
                     .parse()
                     .map_err(|_| Error::invalid("--threads takes a number".to_string()))?
             }
+            "--cache-bytes" => {
+                options.cache_bytes = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| Error::invalid("--cache-bytes takes a number".to_string()))?,
+                )
+            }
+            "--prefetch-threads" => {
+                options.prefetch_threads = value()?
+                    .parse()
+                    .map_err(|_| Error::invalid("--prefetch-threads takes a number".to_string()))?
+            }
             "--report" => report = Some(PathBuf::from(value()?)),
             "--verbose" => options.verbose = true,
             other => return Err(Error::invalid(format!("unknown flag {other:?}\n\n{USAGE}"))),
@@ -169,6 +184,8 @@ fn go() -> Result<()> {
                 "chunks_read": done.chunks_read,
                 "reductions": done.reductions,
                 "reduced_bytes": done.reduced_bytes,
+                "cache_bytes": done.cache_bytes,
+                "prefetch_threads": done.prefetch_threads,
                 "listener_faults": done.listener_faults,
                 "elapsed_ms": done.elapsed.as_millis() as u64,
                 "joined_ms": done.joined.as_millis() as u64,

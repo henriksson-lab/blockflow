@@ -33,22 +33,16 @@ use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::zarr_env::ZarrEnvironment;
 use blockflow::Dtype;
 use blockflow::Voxels;
-use ndarray::Array3;
+
+mod support;
+
+use support::volume::{modular_mask_bool, xorshift_u16, xorshift_unit_f64};
 
 const VOLUME: [usize; 3] = [64, 64, 64];
 const CHUNK: [usize; 3] = [16, 16, 16];
 
 fn source() -> Voxels {
-    let mut state = 0x2545_F491_4F6C_DD1Du64;
-    Voxels::U16(Array3::from_shape_fn(
-        (VOLUME[0], VOLUME[1], VOLUME[2]),
-        |_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 48) as u16
-        },
-    ))
+    Voxels::U16(xorshift_u16(VOLUME, 0x2545_F491_4F6C_DD1D))
 }
 
 /// Overlapping windows: a `24^3` core on a `16` stride, so consecutive reads
@@ -86,12 +80,109 @@ fn root(tag: &str) -> std::path::PathBuf {
     path
 }
 
+struct CacheFixture {
+    regions: Vec<Region>,
+}
+
+impl CacheFixture {
+    fn new() -> Self {
+        Self { regions: regions() }
+    }
+
+    fn regions(&self) -> &[Region] {
+        &self.regions
+    }
+
+    fn uncached(&self, tag: &str) -> ZarrEnvironment {
+        ZarrEnvironment::create(root(tag), &source(), CHUNK)
+            .expect("a store")
+            .without_cache()
+    }
+
+    fn cached_u16(&self, tag: &str, capacity: u64) -> ZarrEnvironment {
+        ZarrEnvironment::create(root(tag), &source(), CHUNK)
+            .expect("a store")
+            .with_cache(capacity)
+    }
+
+    fn single_phase_threshold(dtype: Dtype) -> (Workflow, Decomposition) {
+        let chain: Chain = Chain::op(VoxelwiseMapOp::threshold("threshold", 0.5, 1.0, 0.0));
+        let workflow = Workflow::new(chain, VOLUME, dtype);
+        let reach = workflow.chain.reach3(&VOLUME);
+        let slots = workflow.chain.slots();
+        let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
+        let grid = BlockGrid::along(VOLUME, &[0, 1, 2], CHUNK[0]).expect("a grid");
+        let plan = Decomposition {
+            volume: VOLUME,
+            dtype: workflow.dtype,
+            phases: vec![PhaseDecomposition::derive(
+                (0..slots.len()).collect(),
+                names,
+                reach,
+                reach,
+                grid,
+            )],
+            chain_reach: reach,
+        };
+        (workflow, plan)
+    }
+
+    fn read_all(&self, env: &ZarrEnvironment) -> Vec<Voxels> {
+        read_all(env, &self.regions)
+    }
+
+    fn uncached_truth(&self, tag: &str) -> Vec<Voxels> {
+        self.read_all(&self.uncached(tag))
+    }
+
+    fn run_offset_readers(
+        &self,
+        warm: &std::sync::Arc<ZarrEnvironment>,
+        want: std::sync::Arc<Vec<Voxels>>,
+        rounds: usize,
+        before_round: impl Fn(&std::sync::Arc<ZarrEnvironment>, &std::sync::Arc<Vec<Region>>),
+    ) -> usize {
+        let regions = std::sync::Arc::new(self.regions.clone());
+        let mut wrong = 0usize;
+        for round in 0..rounds {
+            before_round(warm, &regions);
+            let mut handles = Vec::new();
+            for thread in 0..4 {
+                let warm = std::sync::Arc::clone(warm);
+                let regions = std::sync::Arc::clone(&regions);
+                let want = std::sync::Arc::clone(&want);
+                handles.push(std::thread::spawn(move || {
+                    let mut bad = 0usize;
+                    for step in 0..regions.len() {
+                        let which = (step + thread * 3 + round) % regions.len();
+                        let got = match warm
+                            .read(0, &regions[which])
+                            .expect("a cached read must not fail")
+                        {
+                            blockflow::env::BlockBuf::Array(voxels) => voxels,
+                            other => panic!("expected voxels, got {other:?}"),
+                        };
+                        if got != want[which] {
+                            bad += 1;
+                        }
+                    }
+                    bad
+                }));
+            }
+            for handle in handles {
+                wrong += handle.join().expect("no thread may panic");
+            }
+        }
+        wrong
+    }
+}
+
 /// **Same voxels, and the cache really served them.**
 #[test]
 fn a_cached_read_is_the_same_read_and_the_cache_serves_it() {
-    let regions = regions();
+    let fixture = CacheFixture::new();
     assert!(
-        regions.len() > 8,
+        fixture.regions().len() > 8,
         "the fixture needs a traversal to revisit"
     );
 
@@ -105,25 +196,19 @@ fn a_cached_read_is_the_same_read_and_the_cache_serves_it() {
     // `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store` below is that
     // measurement — 3.09x fewer bytes off the store — so the default is now on
     // and the opt-out is explicit.
-    let cold_root = root("cold");
-    let cold = ZarrEnvironment::create(&cold_root, &source(), CHUNK)
-        .expect("a store")
-        .without_cache();
+    let cold = fixture.uncached("cold");
     assert!(
         cold.cache_stats().is_none(),
         "`without_cache` must actually leave the environment without one, or the \
          comparison below is a cache against a cache"
     );
-    let plain = read_all(&cold, &regions);
+    let plain = fixture.read_all(&cold);
 
-    let warm_root = root("warm");
-    let warm = ZarrEnvironment::create(&warm_root, &source(), CHUNK)
-        .expect("a store")
-        // Sixteen chunks of `16^3` `u16` — big enough to hold a neighbourhood
-        // and far too small to hold the volume, so it must evict and the hits
-        // that remain are real reuse rather than "everything fits".
-        .with_cache(16 * 16 * 16 * 16 * 2);
-    let cached = read_all(&warm, &regions);
+    // Sixteen chunks of `16^3` `u16` — big enough to hold a neighbourhood
+    // and far too small to hold the volume, so it must evict and the hits
+    // that remain are real reuse rather than "everything fits".
+    let warm = fixture.cached_u16("warm", 16 * 16 * 16 * 16 * 2);
+    let cached = fixture.read_all(&warm);
 
     assert_eq!(plain.len(), cached.len());
     for (index, (a, b)) in plain.iter().zip(cached.iter()).enumerate() {
@@ -176,24 +261,7 @@ fn a_written_image_is_cached_and_a_write_invalidates_it() {
         .with_cache(1 << 24);
     // A one-phase plan, stated directly rather than searched for: what this
     // test needs from it is only that image 1 exists.
-    let chain: Chain = Chain::op(VoxelwiseMapOp::threshold("threshold", 0.5, 1.0, 0.0));
-    let workflow = Workflow::new(chain, VOLUME, Dtype::U16);
-    let reach = workflow.chain.reach3(&VOLUME);
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(VOLUME, &[0, 1, 2], CHUNK[0]).expect("a grid");
-    let plan = Decomposition {
-        volume: VOLUME,
-        dtype: workflow.dtype,
-        phases: vec![PhaseDecomposition::derive(
-            (0..slots.len()).collect(),
-            names,
-            reach,
-            reach,
-            grid,
-        )],
-        chain_reach: reach,
-    };
+    let (_workflow, plan) = CacheFixture::single_phase_threshold(Dtype::U16);
     env.prepare(&plan).expect("image 1 is created");
 
     let region = Region {
@@ -281,10 +349,7 @@ fn a_written_image_is_cached_and_a_write_invalidates_it() {
 #[test]
 fn a_bool_volume_round_trips_through_the_cache() {
     let path = root("bool");
-    let mask = Voxels::Bool(Array3::from_shape_fn(
-        (VOLUME[0], VOLUME[1], VOLUME[2]),
-        |(z, y, x)| (z + y + x) % 3 == 0,
-    ));
+    let mask = Voxels::Bool(modular_mask_bool(VOLUME, 3, 0));
     let env = ZarrEnvironment::create(&path, &mask, CHUNK)
         .expect("a store")
         .with_cache(1 << 24);
@@ -330,34 +395,8 @@ fn the_prefetch_sweep_has_a_control_at_both_ends() {
     // `f64`, because `threshold` states the element types it accepts and
     // `uint16` is not one — the plan is refused when it is made rather than
     // when a block reaches the op, which is the crate working as intended.
-    let mut state = 0x9E37_79B9_7F4A_7C15u64;
-    let volume = Voxels::F64(Array3::from_shape_fn(
-        (VOLUME[0], VOLUME[1], VOLUME[2]),
-        |_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 11) as f64 / (1u64 << 53) as f64
-        },
-    ));
-    let chain: Chain = Chain::op(VoxelwiseMapOp::threshold("threshold", 0.5, 1.0, 0.0));
-    let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
-    let reach = workflow.chain.reach3(&VOLUME);
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(VOLUME, &[0, 1, 2], CHUNK[0]).expect("a grid");
-    let plan = Decomposition {
-        volume: VOLUME,
-        dtype: workflow.dtype,
-        phases: vec![PhaseDecomposition::derive(
-            (0..slots.len()).collect(),
-            names,
-            reach,
-            reach,
-            grid,
-        )],
-        chain_reach: reach,
-    };
+    let volume = Voxels::F64(xorshift_unit_f64(VOLUME, 0x9E37_79B9_7F4A_7C15));
+    let (workflow, plan) = CacheFixture::single_phase_threshold(Dtype::F64);
 
     // Eight chunks of `16^3 f64`, against a volume of sixty-four of them. **The
     // cache must be well below the plan's footprint** or nothing can be evicted
@@ -558,35 +597,11 @@ fn a_bigger_cache_reads_strictly_fewer_bytes_from_the_store() {
     );
 }
 
-/// The same sweep with a clock on it, for a human deciding whether to turn a
-/// cache on. **Ignored, because it is a measurement**: this crate asserts on
-/// byte counts and never on durations, and the assertion above is the part that
-/// belongs in a suite.
+/// The same capacity sweep with a clock on it.
 ///
-/// Recorded, release, best of three over this file's overlapping windows:
-///
-/// ```text
-///     capacity        wall (ms)   store bytes
-///     none                  7.9      uncached
-///     one chunk            17.9     4 866 048
-///     sixteen chunks        9.6     2 359 296
-///     the whole volume      1.5       524 288
-/// ```
-///
-/// Two things, and the second is the one nobody would guess:
-///
-/// * a cache that holds the working set is **5.3x faster** than none, and reads
-///   each chunk exactly once — 524 288 bytes is the volume, so the halo re-reads
-///   are entirely absorbed;
-/// * a cache that is **too small is worse than none at all**: 17.9 ms against
-///   7.9, because it pays the bookkeeping on every read and never reuses
-///   anything. The same shape as every other locality mechanism this crate has
-///   measured — below a threshold set by the working set, the machinery costs
-///   more than the sharing saves.
-///
-/// So "turn the cache on" is not the whole recommendation. It is "turn it on
-/// with a budget that holds a block's read extent times the blocks in flight",
-/// and below that leave it off.
+/// Ignored because this crate gates on deterministic byte counts, not host
+/// timings. The recorded calibration table lives in
+/// `docs/design/cache-and-prefetch.md` §5.1.
 #[test]
 #[ignore = "a measurement, not an assertion"]
 fn print_what_the_cache_saves() {
@@ -644,63 +659,24 @@ fn print_what_the_cache_saves() {
 fn concurrent_reads_through_the_cache_return_what_uncached_reads_do() {
     use std::sync::Arc;
 
-    let regions = regions();
+    let fixture = CacheFixture::new();
     assert!(
-        regions.len() > 8,
+        fixture.regions().len() > 8,
         "the fixture needs a traversal to revisit"
     );
 
     // The truth, read once with no cache and no concurrency.
-    let plain_root = root("concurrent-plain");
-    let plain = ZarrEnvironment::create(&plain_root, &source(), CHUNK)
-        .expect("a store")
-        .without_cache();
-    let want = read_all(&plain, &regions);
+    let want = fixture.uncached_truth("concurrent-plain");
 
     // **A capacity that must evict.** Sixteen chunks of the volume's several
     // hundred, so the fill path is exercised repeatedly rather than warming
     // once and answering from memory forever — which is the state in which a
     // race in the claim protocol can be reached at all.
-    let warm_root = root("concurrent-warm");
-    let warm = Arc::new(
-        ZarrEnvironment::create(&warm_root, &source(), CHUNK)
-            .expect("a store")
-            .with_cache(16 * CHUNK.iter().product::<usize>() as u64 * 2),
-    );
-
-    let regions = Arc::new(regions);
-    let want = Arc::new(want);
-    let mut wrong = 0usize;
-    for round in 0..8 {
-        let mut handles = Vec::new();
-        for thread in 0..4 {
-            let warm = Arc::clone(&warm);
-            let regions = Arc::clone(&regions);
-            let want = Arc::clone(&want);
-            handles.push(std::thread::spawn(move || {
-                let mut bad = 0usize;
-                // Each thread walks the same regions from a different offset, so
-                // they contend for the same chunks without marching in step.
-                for step in 0..regions.len() {
-                    let which = (step + thread * 3 + round) % regions.len();
-                    let got = match warm
-                        .read(0, &regions[which])
-                        .expect("a cached read must not fail")
-                    {
-                        blockflow::env::BlockBuf::Array(voxels) => voxels,
-                        other => panic!("expected voxels, got {other:?}"),
-                    };
-                    if got != want[which] {
-                        bad += 1;
-                    }
-                }
-                bad
-            }));
-        }
-        for handle in handles {
-            wrong += handle.join().expect("no thread may panic");
-        }
-    }
+    let warm = Arc::new(fixture.cached_u16(
+        "concurrent-warm",
+        16 * CHUNK.iter().product::<usize>() as u64 * 2,
+    ));
+    let wrong = fixture.run_offset_readers(&warm, Arc::new(want), 8, |_, _| {});
     assert_eq!(
         wrong, 0,
         "{wrong} concurrent cached reads disagreed with the uncached read of the same \
@@ -737,64 +713,29 @@ fn concurrent_reads_through_the_cache_return_what_uncached_reads_do() {
 fn prefetching_under_concurrent_demand_reads_changes_no_answer() {
     use std::sync::Arc;
 
-    let regions = regions();
+    let fixture = CacheFixture::new();
     assert!(
-        regions.len() > 8,
+        fixture.regions().len() > 8,
         "the fixture needs a traversal to revisit"
     );
 
-    let plain_root = root("prefetch-plain");
-    let plain = ZarrEnvironment::create(&plain_root, &source(), CHUNK)
-        .expect("a store")
-        .without_cache();
-    let want = Arc::new(read_all(&plain, &regions));
+    let want = Arc::new(fixture.uncached_truth("prefetch-plain"));
 
     // Eight chunks: enough that prefetched chunks land and are used, far too
     // few to hold the traversal, so the fill path runs throughout.
     let capacity = 8 * CHUNK.iter().product::<usize>() as u64 * 2;
-    let warm_root = root("prefetch-warm");
     let warm = Arc::new(
-        ZarrEnvironment::create(&warm_root, &source(), CHUNK)
-            .expect("a store")
-            .with_cache(capacity)
+        fixture
+            .cached_u16("prefetch-warm", capacity)
             .with_prefetch(2, 6)
             .expect("a prefetcher needs the cache above"),
     );
 
-    let regions = Arc::new(regions);
-    let mut wrong = 0usize;
-    for round in 0..6 {
+    let wrong = fixture.run_offset_readers(&warm, want, 6, |warm, regions| {
         // Ask for the whole traversal to be warmed while the readers run, so
         // the prefetch threads and the demand reads contend for one cache.
-        warm.prefetch(0, &regions).expect("a prefetch submission");
-
-        let mut handles = Vec::new();
-        for thread in 0..4 {
-            let warm = Arc::clone(&warm);
-            let regions = Arc::clone(&regions);
-            let want = Arc::clone(&want);
-            handles.push(std::thread::spawn(move || {
-                let mut bad = 0usize;
-                for step in 0..regions.len() {
-                    let which = (step + thread * 3 + round) % regions.len();
-                    let got = match warm
-                        .read(0, &regions[which])
-                        .expect("a cached read must not fail")
-                    {
-                        blockflow::env::BlockBuf::Array(voxels) => voxels,
-                        other => panic!("expected voxels, got {other:?}"),
-                    };
-                    if got != want[which] {
-                        bad += 1;
-                    }
-                }
-                bad
-            }));
-        }
-        for handle in handles {
-            wrong += handle.join().expect("no thread may panic");
-        }
-    }
+        warm.prefetch(0, regions).expect("a prefetch submission");
+    });
     warm.drain_prefetch();
 
     assert_eq!(
@@ -820,38 +761,11 @@ fn prefetching_under_concurrent_demand_reads_changes_no_answer() {
     );
 }
 
-/// **What caching the intermediates buys, on a plan that has some.**
+/// Print what caching written intermediates buys on a two-reaching-phase plan.
 ///
-/// `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store` measures the
-/// source at 3.09x, and the source was all the cache held until
-/// `ChunkCache::invalidate` existed. The argument for widening it to written
-/// images is that the image phase `N` writes is read by phase `N + 1` *with a
-/// halo*, so it is re-read the same way — and an argument is not a measurement,
-/// which is what this is.
-///
-/// # Read the hit counts, not `store bytes`
-///
-/// `CacheStats::source_bytes` counts bytes fetched **through the cache**, so it
-/// covers a different set of images in the two configurations and the two
-/// figures are not comparable. Running this against a `cacheable` restricted to
-/// image 0 reports *fewer* store bytes — not because less was read, but because
-/// the intermediate's reads bypassed the cache and were not counted. That
-/// comparison was made, and misread, before this paragraph was written.
-///
-/// The **hits and misses** are comparable, because each is a chunk access the
-/// cache saw. On this fixture, at a roomy capacity:
-///
-/// ```text
-///                       hits   misses   cache-path chunk accesses
-/// image 0 only           936       64   1000
-/// every image           1872      128   2000
-/// the intermediate       936       64   1000   (the difference)
-/// ```
-///
-/// So the intermediate is re-read **exactly as much as the source is**, which is
-/// what the halo argument predicted, and caching it turns 1000 chunk reads into
-/// 64 fetches and 936 hits — the same 15.6x the source gets on this fixture.
-/// Before the widening, all 1000 went to the store.
+/// Read hit counts, not `store bytes`: source-byte counts cover different image
+/// sets when only image 0 is cacheable. The recorded comparison lives in
+/// `docs/design/cache-and-prefetch.md` §1.5.
 ///
 /// ```text
 /// cargo test --release --features zarr --test zarr_cache -- --ignored --nocapture what_caching_the_intermediates

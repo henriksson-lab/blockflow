@@ -3,66 +3,20 @@
 // Original work for this crate.
 //
 // The verification the distribution design asks for, run the way it asks:
-// **local multi-node mode, as separate processes.**
+// local multi-node mode, as separate processes.
 //
-// Not threads. A thread-based fake shares one address space, one cache, one
-// memory budget, one allocator and one set of file handles, so it would
-// exercise the message shapes and none of the things that actually go wrong
-// here — a worker reading an intermediate before the writer flushed it, two
-// processes writing one file, an event stream that merges correctly only
-// because both ends were the same object, a work list that stays ahead only
-// because the "network" was a function call. Every test in this file starts
-// real processes over real sockets against real shared files.
+// Every test in this file starts real processes over real sockets and shared
+// files because the invariants under test are process-boundary invariants:
+// flushed intermediates, exclusive writes, merged event streams, ahead-of-pull
+// work, and worker death. `docs/design/distributed-locality.md` records the
+// fixture history and the measurements behind the current premise checks.
 //
-// The five claims, one test each
-// ------------------------------
-// 1. **N workers produce byte-identical output to a single-node run**, swept
-//    over worker counts. The headline, and the one that would catch a wrong
-//    seam, a missing flush or a mis-stitched block.
-// 2. **Every block executed exactly once**, asserted by the crate's *existing*
-//    coverage criteria over the merged event stream — no distribution-specific
-//    analysis, because a merged stream is an `ExecutionLog` like any other.
-//    Which criterion depends on the merge and not on the work: a one-worker
-//    stream is a single FIFO and gets `check_coverage_and_order`, a
-//    many-worker stream arrives interleaved and gets
-//    `check_coverage_unordered`. Both are asserted, over the same job.
-// 3. **A worker dies and the job stops, naming what was lost.** The default:
-//    node loss is not recovered from, and what to do about it is decided above
-//    this crate. What must not happen is a silent hang.
-// 4. **A worker dies under an explicit lease and its task is reissued.** The
-//    same death with one field set. Reissue is opt-in now — see the module
-//    header for the decision of 2026-08-17 — and this test is what keeps it
-//    compiled, exercised and honest.
-// 5. **The work list stays at least one task ahead**, so a worker never blocks
-//    except on its own pull. No single-node test would catch this regressing,
-//    and it is asserted from both ends — `starved` at the worker, `withheld` at
-//    the coordinator — because neither end can see the whole question.
-//
-// A note on what a green run in this file does and does not say
-// -------------------------------------------------------------
-// Every test here starts real processes, and a process is a thing that can fail
-// to be given anything to do. Three of the claims above have a **premise** as
-// well as an assertion — several processes wrote these fragments; a worker died
-// while the job was running — and a premise that quietly fails leaves a test
-// that passes while measuring nothing, or fails while measuring nothing, which
-// is worse because it reads as the design breaking. Every such premise here is
-// asserted before the claim it supports and says so in its own words when it
-// does not hold.
-//
-// **Holding the work back until the whole cohort has joined was tried, and it
-// is worse.** A coordinator that refuses every handout until N workers have
-// asked does make the premises hold — and it turns one slow worker into a slow
-// job, which on a loaded machine is the common case rather than the rare one:
-// measured over forty runs, thirty-nine took longer than ten seconds against
-// none without it, and the failures went up rather than down. Pull-based
-// handout tolerates a straggler by construction and a cohort gate gives that
-// up. So the premises are checked, not enforced.
-//
-// A note on 3 and 4 together, because the pair is the load-bearing part. Each
-// is the other's counterexample: 4 alone cannot tell "expiry is off" from
-// "expiry is broken", and 3 alone cannot tell "no lease" from "no claims". Run
-// as a pair over the same fixture and the same death, they pin the default and
-// the opt-in against each other.
+// The five claims, one test each:
+// 1. N workers produce byte-identical output to a single-node run.
+// 2. Every block executed exactly once under the normal coverage criteria.
+// 3. A worker death without a lease stops the job and names what was lost.
+// 4. A worker death with an explicit lease reissues the task.
+// 5. The work list stays at least one task ahead from both sides' counters.
 
 #![cfg(feature = "distributed")]
 
@@ -72,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blockflow::decomposition::Decomposition;
-use blockflow::distributed::local::{self, Binaries, LocalOptions, LocalRun};
+use blockflow::distributed::local::{self, LocalRun};
 use blockflow::distributed::shared_volume::SharedVolumes;
 use blockflow::distributed::spec::{
     probe_job_over, read_task_fragment, ChainSpec, FragmentPhaseSpec, JobSpec, OpSpec,
@@ -87,84 +41,33 @@ use blockflow::log::ExecutionLog;
 use blockflow::probes::NeighbourFoldOp;
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute, Hints, Workflow};
-use ndarray::Array3;
 use serde_json::Value;
+
+mod support;
+
+use support::distributed::{
+    local_options as options, output_bytes, ramp, scratch as support_scratch, write_ramp_input,
+};
 
 const BLOCKS: usize = 16;
 
-/// The block count the two **death** tests decompose over, and the reason it is
-/// not `BLOCKS`.
+/// Block count for worker-death tests.
 ///
-/// A death test's premise is that a worker died *while the job was running*, and
-/// that premise used to be a race. The runner killed a worker once the
-/// coordinator reported two tasks done, which it learned by polling — over the
-/// same HTTP server three workers were posting an event stream to. A sixteen
-/// block probe job is milliseconds of arithmetic behind a few hundred
-/// milliseconds of process startup, so under load the runner walked from "two
-/// done" straight past "all sixteen done" between two samples, killed a worker
-/// that had already gone home, and both death tests read that as the design
-/// failing. Neither a flake nor a defect in the design: the fixture could not
-/// keep its own premise, and raising the block count alone did not fix it — the
-/// extra work is extra traffic on the server being polled, which is the thing
-/// that was slow.
-///
-/// So the death is now the **worker's own**, counted on its side where nothing
-/// is sampled: `LocalOptions::abort_worker_after`. The block count is still
-/// raised, for the one thing it does buy — the survivors have a job left to
-/// finish, so "the job completed after a death" and "the lease reissued a
-/// claim" are statements about a run rather than about its last instant. And
-/// the premise is *asserted* either way: both tests check `run.died` before they
-/// check anything else, because a worker that never got a task cannot die
-/// holding one.
+/// The death premise is sampled by the worker itself through
+/// `LocalOptions::abort_worker_after`; this larger job leaves enough survivor
+/// work that completion/reissue assertions describe a run, not its last instant.
 const DEATH_BLOCKS: usize = 128;
 
 /// The block count for the tests whose premise is that **several worker
-/// processes did the work**, and the same argument as [`DEATH_BLOCKS`] in a
-/// different place.
+/// processes did the work**.
 ///
-/// Neither the coordinator nor the handout promises a spread — the founding
-/// property of this layer is that any assignment of blocks to workers produces
-/// the same output — so a test that needs one has to make it rather than hope
-/// for it. Measured over forty runs at load 50, at the sixteen-block size this
-/// used to run, the handout spreads a three-worker fragment job perfectly well:
-/// `[12, 12, 8]`, `[9, 13, 10]`, `[11, 13, 8]`. What it cannot do is give work
-/// to a worker that has not arrived, and sixteen blocks here is forty-eight
-/// tasks of arithmetic behind a few hundred milliseconds of process startup —
-/// so under load one worker occasionally finished the lot before its peers had
-/// joined, and the run came out `[32, 0, 0]`.
-///
-/// **That is the fixture's fault and not the handout's**, which is why the
-/// answer is a job long enough that a late joiner still has something to do
-/// rather than a change to how work is placed. The premise stays asserted in
-/// both tests — a run where only one process produced fragments demonstrates
-/// nothing about several and says so — because sizing makes it likely and only
-/// the assertion makes it checked.
+/// The coordinator promises correct output for any assignment, not an even
+/// spread. This longer job makes late-joining workers likely to receive work;
+/// the tests still assert the premise before treating the run as evidence.
 const SPREAD_BLOCKS: usize = 64;
 
-fn binaries() -> Binaries {
-    Binaries {
-        coordinator: PathBuf::from(env!("CARGO_BIN_EXE_blockflow-coordinator")),
-        worker: PathBuf::from(env!("CARGO_BIN_EXE_blockflow-worker")),
-    }
-}
-
 fn scratch(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("blockflow-multinode-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
-}
-
-/// A volume whose every voxel is different, so a block written to the wrong
-/// place is *visible* rather than plausible. Plausible-but-wrong is the failure
-/// mode this whole crate is arranged against.
-fn ramp(shape: [usize; 3]) -> Array3<f64> {
-    let mut array = Array3::zeros((shape[0], shape[1], shape[2]));
-    for (flat, value) in array.iter_mut().enumerate() {
-        *value = flat as f64;
-    }
-    array
+    support_scratch("multinode", name)
 }
 
 /// Build the job, lay down its input, and return everything needed to run it.
@@ -190,38 +93,8 @@ fn prepare_over(
     );
     spec.policy = HandoutPolicy::NearestFirst;
     spec.lease = lease;
-    let store = SharedVolumes::create(
-        &volumes,
-        spec.workflow.shape,
-        spec.workflow.chunk,
-        decomposition.n_phases(),
-    )
-    .expect("image files");
-    store
-        .write_image(0, &ramp(spec.workflow.shape))
-        .expect("an input");
+    write_ramp_input(dir, &spec, &decomposition);
     (spec, decomposition)
-}
-
-fn options(dir: &Path, workers: usize) -> LocalOptions {
-    let mut options = LocalOptions::new(dir, workers).expect("local options");
-    options.binaries = binaries();
-    options.timeout = Duration::from_secs(120);
-    options
-}
-
-/// The final image's bytes, exactly as they are on disk.
-fn output_bytes(dir: &Path, spec: &JobSpec, decomposition: &Decomposition) -> Vec<u8> {
-    let store = SharedVolumes::open(
-        &dir.join("volumes"),
-        spec.workflow.shape,
-        spec.workflow.chunk,
-        decomposition.n_phases(),
-    )
-    .expect("the volumes");
-    store
-        .image_bytes(decomposition.n_phases())
-        .expect("the output image")
 }
 
 /// A **single-node** run: one process, the crate's own scheduler, the same
@@ -347,6 +220,48 @@ fn n_workers_produce_byte_identical_output_to_a_single_node_run() {
         std::fs::remove_dir_all(&dir).ok();
     }
     std::fs::remove_dir_all(&reference_dir).ok();
+}
+
+#[test]
+fn worker_reports_the_real_cache_and_prefetch_resources_it_uses() {
+    let dir = scratch("worker-resources");
+    let (mut spec, decomposition) = prepare(&dir, 1, None);
+    spec.workflow.cache_bytes = 4096;
+    spec.workflow.prefetch_depth = 1;
+
+    let mut run_options = options(&dir, 2);
+    run_options.cache_bytes = Some(8192);
+    run_options.prefetch_threads = 2;
+    let run = local::run(&run_options, &spec, &decomposition).expect("a run");
+    assert!(
+        !run.workers.is_empty(),
+        "the run should collect worker reports"
+    );
+
+    let cache_bytes: Vec<u64> = run
+        .workers
+        .iter()
+        .map(|report| {
+            report
+                .get("cache_bytes")
+                .and_then(Value::as_u64)
+                .expect("worker report carries cache bytes")
+        })
+        .collect();
+    let prefetch_threads: Vec<u64> = run
+        .workers
+        .iter()
+        .map(|report| {
+            report
+                .get("prefetch_threads")
+                .and_then(Value::as_u64)
+                .expect("worker report carries prefetch threads")
+        })
+        .collect();
+    assert_eq!(cache_bytes, vec![8192; run.workers.len()]);
+    assert_eq!(prefetch_threads, vec![2; run.workers.len()]);
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// The same, across a **barrier** — a full-reach op, which resolves to a single

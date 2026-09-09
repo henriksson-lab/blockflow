@@ -46,6 +46,10 @@ use blockflow::strategy::{choose_branches, choose_paths, execute, Enumerating, H
 use blockflow::strategy::{Trivial, Workflow};
 use blockflow::voxels::Voxels;
 
+mod support;
+
+use support::volume::modular_ramp_u16;
+
 const DOMAIN: usize = 4096;
 const VOLUME: [usize; 3] = [256, 8, 4];
 
@@ -57,12 +61,6 @@ const VOLUME: [usize; 3] = [256, 8, 4];
 /// `BlockOp::cost_per_voxel` read back.
 const LONG: [usize; 3] = [150, 1, 1];
 const SHORT: [usize; 3] = [9, 1, 1];
-
-fn ramp(shape: [usize; 3]) -> Array3<u16> {
-    Array3::from_shape_fn((shape[0], shape[1], shape[2]), |(i, j, k)| {
-        (((i * 7919 + j * 104729 + k * 1299709) % DOMAIN) as u16).min(DOMAIN as u16 - 1)
-    })
-}
 
 /// The general path and the fast one, over the same element at the same rank.
 ///
@@ -96,7 +94,7 @@ fn dense(input: ArrayView3<'_, u16>, element: &StructuringElement, rank: Rank) -
 /// in this file rather than on a cross-reference.
 #[test]
 fn the_two_branches_are_the_same_function() -> Result<()> {
-    let input = ramp(VOLUME);
+    let input = modular_ramp_u16(VOLUME, DOMAIN);
     for element in [
         StructuringElement::from_size(ElementShape::Box, [9, 1, 1])?,
         StructuringElement::from_size(ElementShape::Box, [5, 5, 3])?,
@@ -250,7 +248,7 @@ fn choosing_a_branch_does_not_move_the_plan() -> Result<()> {
 fn the_resolved_chain_runs_and_gives_the_whole_volume_answer() -> Result<()> {
     let element = StructuringElement::from_size(ElementShape::Box, LONG)?;
     let rank = Rank::ceiling_percentile(0.25).unwrap();
-    let input = ramp(VOLUME);
+    let input = modular_ramp_u16(VOLUME, DOMAIN);
     let want: Voxels = dense(input.view(), &element, rank).into();
 
     let constraints = Constraints {

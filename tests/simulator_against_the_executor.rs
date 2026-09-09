@@ -293,6 +293,14 @@ fn machine_terms_and_handout_scheduling_preserve_executor_arithmetic() {
         NearestHandout,
     }
 
+    struct MachineCase {
+        name: &'static str,
+        hints: Hints,
+        machine: Machine,
+        rates: Rates,
+        scheduler: SimScheduler,
+    }
+
     impl SimScheduler {
         fn make(&self) -> Box<dyn Scheduler> {
             match self {
@@ -315,48 +323,48 @@ fn machine_terms_and_handout_scheduling_preserve_executor_arithmetic() {
 
     let volume = [32, 32, 32];
     let cases = [
-        (
-            "cache and prefetch",
-            Hints {
+        MachineCase {
+            name: "cache and prefetch",
+            hints: Hints {
                 concurrency: 4,
                 prefetch_depth: 2,
                 ..Hints::default()
             },
-            Machine {
+            machine: Machine {
                 workers: 4,
                 cache_bytes: 1 << 20,
                 prefetch_depth: 2,
                 io_channels: 8,
                 ..Machine::default()
             },
-            Rates {
+            rates: Rates {
                 compute_ns_per_voxel: 1_000.0,
                 ..Rates::default()
             },
-            SimScheduler::PhaseMajor,
-        ),
-        (
-            "wave dispatch and contention",
-            Hints {
+            scheduler: SimScheduler::PhaseMajor,
+        },
+        MachineCase {
+            name: "wave dispatch and contention",
+            hints: Hints {
                 concurrency: 4,
                 ..Hints::default()
             },
-            Machine {
+            machine: Machine {
                 workers: 4,
                 wave_synchronous: true,
                 contention: blockflow::simulate::MEASURED_CONTENTION,
                 ..Machine::default()
             },
-            Rates::default(),
-            SimScheduler::PhaseMajor,
-        ),
-        (
-            "distributed handout",
-            Hints {
+            rates: Rates::default(),
+            scheduler: SimScheduler::PhaseMajor,
+        },
+        MachineCase {
+            name: "distributed handout",
+            hints: Hints {
                 concurrency: 6,
                 ..Hints::default()
             },
-            Machine {
+            machine: Machine {
                 nodes: 2,
                 workers: 6,
                 cache_bytes: 1 << 18,
@@ -364,19 +372,24 @@ fn machine_terms_and_handout_scheduling_preserve_executor_arithmetic() {
                 candidate_window: 24,
                 ..Machine::default()
             },
-            Rates::default(),
-            SimScheduler::NearestHandout,
-        ),
+            rates: Rates::default(),
+            scheduler: SimScheduler::NearestHandout,
+        },
     ];
 
     let mut saw_prefetch = false;
     let mut saw_duplicated_fetch = false;
-    for (name, hints, machine, rates, scheduler) in cases {
-        let both = run_both_with(assembly(volume), volume, hints, machine, rates, || {
-            scheduler.make()
-        });
-        assert_counts_agree(name, &both);
-        assert_stores_agree(name, &both);
+    for case in cases {
+        let both = run_both_with(
+            assembly(volume),
+            volume,
+            case.hints,
+            case.machine,
+            case.rates,
+            || case.scheduler.make(),
+        );
+        assert_counts_agree(case.name, &both);
+        assert_stores_agree(case.name, &both);
         saw_prefetch |= both.simulator_prefetched_bytes > 0;
         saw_duplicated_fetch |= both.simulator_duplicated_fetches > 0;
     }

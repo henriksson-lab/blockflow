@@ -59,7 +59,8 @@ use crate::voxels::Voxels;
 use super::decomposition::{
     check_block_constraints, check_dtypes, check_output_shapes, check_source_images,
     compute_charge_per_voxel, cuttable_axes, groups_for, is_planning_barrier, price_phase,
-    region_to_ranges, Constraints, Decomposition, PhaseDecomposition, SlabPolicy, StorageSettings,
+    region_to_ranges, Constraints, DeclaredSourceSet, Decomposition, PhaseDecomposition,
+    SlabPolicy, StorageSettings,
 };
 use super::env::{block_shape, BlockBuf, Environment};
 use super::fragment::{
@@ -1662,27 +1663,12 @@ fn run_task(
         // phase with a source leaf never short circuits — `Chain::Source`
         // declines `constant_maps_to` — so this is a property of the code
         // rather than of the plan, and worth keeping true by construction.)
-        let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_images.len());
-        for &image in &phase.source_images {
-            let started = Instant::now();
-            let stored = env.read(image, fetch)?;
-            let read_ns = started.elapsed().as_nanos() as u64;
-            // Priced exactly like the input read, through the same event, so a
-            // run that reads two arrays per block reports two arrays' worth of
-            // bytes. A second arm that cost nothing in the counters would make
-            // every measurement of this feature a measurement of the wrong plan.
-            events.emit(Event::RegionRead {
-                source: format!("level {image}"),
-                image,
-                index: Some(task.index),
-                region: fetch.clone(),
-                voxels: fetch.voxels(),
-                bytes: fetch.voxels() as u64 * decomposition.dtype_at(image).size_of() as u64,
-                chunks: chunks_touched(fetch, &env.chunk_shape()),
-                duration_ns: read_ns,
-            });
-            sources.push((image, stored));
-        }
+        // Priced exactly like the input read, through the same event, so a run
+        // that reads two arrays per block reports two arrays' worth of bytes. A
+        // second arm that cost nothing in the counters would make every
+        // measurement of this feature a measurement of the wrong plan.
+        let sources =
+            read_declared_source_images(phase, decomposition, env, events, task.index, fetch)?;
         for (&slot, place) in phase.slots.iter().zip(&places) {
             let started = Instant::now();
             // **The offer, not a demand.** `slabs` is what the policy allots
@@ -1774,6 +1760,34 @@ fn run_task(
         side_written,
         listener_faults: 0,
     })
+}
+
+fn read_declared_source_images(
+    phase: &PhaseDecomposition,
+    decomposition: &Decomposition,
+    env: &dyn Environment,
+    events: &Dispatch,
+    index: [usize; 3],
+    fetch: &Region,
+) -> Result<Vec<(usize, BlockBuf)>> {
+    let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_images.len());
+    for &image in &phase.source_images {
+        let started = Instant::now();
+        let stored = env.read(image, fetch)?;
+        let read_ns = started.elapsed().as_nanos() as u64;
+        events.emit(Event::RegionRead {
+            source: format!("level {image}"),
+            image,
+            index: Some(index),
+            region: fetch.clone(),
+            voxels: fetch.voxels(),
+            bytes: fetch.voxels() as u64 * decomposition.dtype_at(image).size_of() as u64,
+            chunks: chunks_touched(fetch, &env.chunk_shape()),
+            duration_ns: read_ns,
+        });
+        sources.push((image, stored));
+    }
+    Ok(sources)
 }
 
 /// What differs between two applications of one block, or `None` if nothing
@@ -1878,23 +1892,8 @@ fn run_fragment_task(
     // image `p` and `source_inputs` is about every other image, so an op that
     // consults a stored array without wanting its own input pays for one array
     // rather than two.
-    let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_images.len());
-    for &image in &phase.source_images {
-        let started = Instant::now();
-        let stored = env.read(image, fetch)?;
-        let read_ns = started.elapsed().as_nanos() as u64;
-        events.emit(Event::RegionRead {
-            source: format!("level {image}"),
-            image,
-            index: Some(task.index),
-            region: fetch.clone(),
-            voxels: fetch.voxels(),
-            bytes: fetch.voxels() as u64 * decomposition.dtype_at(image).size_of() as u64,
-            chunks: chunks_touched(fetch, &env.chunk_shape()),
-            duration_ns: read_ns,
-        });
-        sources.push((image, stored));
-    }
+    let sources =
+        read_declared_source_images(phase, decomposition, env, events, task.index, fetch)?;
     let borrowed: Vec<(usize, &BlockBuf)> =
         sources.iter().map(|(image, buf)| (*image, buf)).collect();
 
@@ -2475,23 +2474,8 @@ fn run_iterative_reduce_phase(
             } else {
                 None
             };
-            let mut sources: Vec<(usize, BlockBuf)> = Vec::with_capacity(phase.source_images.len());
-            for &image in &phase.source_images {
-                let started = Instant::now();
-                let stored = env.read(image, fetch)?;
-                let read_ns = started.elapsed().as_nanos() as u64;
-                events.emit(Event::RegionRead {
-                    source: format!("level {image}"),
-                    image,
-                    index: Some(task.index),
-                    region: fetch.clone(),
-                    voxels: fetch.voxels(),
-                    bytes: fetch.voxels() as u64 * decomposition.dtype_at(image).size_of() as u64,
-                    chunks: chunks_touched(fetch, &env.chunk_shape()),
-                    duration_ns: read_ns,
-                });
-                sources.push((image, stored));
-            }
+            let sources =
+                read_declared_source_images(phase, decomposition, env, events, task.index, fetch)?;
             let borrowed: Vec<(ImageId, &Voxels)> = sources
                 .iter()
                 .map(|(image, buf)| Ok((ImageId::from(*image), buf.as_array()?)))
@@ -4389,16 +4373,10 @@ fn images_read_by_at(
     group: &[usize],
     volumes_at: &[[usize; 3]],
 ) -> Result<usize> {
-    let mut images: Vec<usize> = Vec::new();
-    for &slot in group {
-        for input in slots[slot].source_inputs(volumes_at[slot])? {
-            let index = input.image.index();
-            if !images.contains(&index) {
-                images.push(index);
-            }
-        }
-    }
-    Ok(1 + images.len())
+    Ok(
+        DeclaredSourceSet::from_slots(slots, group, |slot| volumes_at[slot])?
+            .images_read_count(true),
+    )
 }
 
 impl Enumerating {

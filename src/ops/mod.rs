@@ -170,13 +170,133 @@
 // `ops::voxelwise::cost_report` therefore has its own case list, and new cases
 // anywhere should ask whether they are worth perturbing the old ones.
 
-use ndarray::ArrayView3;
+use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::assemble::ImageId;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
+use crate::fragment::SourceBlocks;
 use crate::op::{SourceInput, SourceInputs};
 use crate::reach::Reach;
+use crate::region::Region;
+use crate::voxels::Voxels;
+
+macro_rules! dispatch_f64_input {
+    ($input:expr, $f16_error:expr, |$view:ident| $body:block) => {{
+        let input = $input;
+        match input.dtype() {
+            Dtype::U8 => {
+                let $view = input.view::<u8>()?;
+                $body
+            }
+            Dtype::U16 => {
+                let $view = input.view::<u16>()?;
+                $body
+            }
+            Dtype::U32 => {
+                let $view = input.view::<u32>()?;
+                $body
+            }
+            Dtype::I8 => {
+                let $view = input.view::<i8>()?;
+                $body
+            }
+            Dtype::I16 => {
+                let $view = input.view::<i16>()?;
+                $body
+            }
+            Dtype::I32 => {
+                let $view = input.view::<i32>()?;
+                $body
+            }
+            Dtype::F32 => {
+                let $view = input.view::<f32>()?;
+                $body
+            }
+            Dtype::F64 => {
+                let $view = input.view::<f64>()?;
+                $body
+            }
+            Dtype::Bool | Dtype::U64 | Dtype::I64 => {
+                let widened = input.widened();
+                let $view = widened.view();
+                $body
+            }
+            Dtype::F16 => Err($f16_error),
+        }
+    }};
+}
+
+pub(crate) fn apply_float_detour(
+    input: &Voxels,
+    out: &mut Voxels,
+    run: impl FnOnce(ArrayView3<'_, f64>, ArrayViewMut3<'_, f64>) -> Result<()>,
+) -> Result<()> {
+    match input.dtype() {
+        Dtype::F64 => run(input.view::<f64>()?, out.view_mut::<f64>()?),
+        Dtype::F32 => {
+            let widened = input.view::<f32>()?.mapv(f64::from);
+            let mut result = Array3::zeros(widened.raw_dim());
+            run(widened.view(), result.view_mut())?;
+            let mut out = out.view_mut::<f32>()?;
+            ndarray::Zip::from(&mut out)
+                .and(&result)
+                .for_each(|slot, &value| *slot = value as f32);
+            Ok(())
+        }
+        dtype => Err(Error::InvalidArgument(format!(
+            "expected float32 or float64 input, got {}",
+            dtype.numpy_name()
+        ))),
+    }
+}
+
+pub(crate) fn accepts_mask_carrier(dtype: Dtype) -> bool {
+    matches!(dtype, Dtype::Bool | Dtype::F64)
+}
+
+pub(crate) fn apply_mask_carrier(
+    input: &Voxels,
+    out: &mut Voxels,
+    run: impl FnOnce(ArrayView3<'_, bool>, ArrayViewMut3<'_, bool>) -> Result<()>,
+) -> Result<()> {
+    match input.dtype() {
+        Dtype::Bool => run(input.view::<bool>()?, out.view_mut::<bool>()?),
+        Dtype::F64 => {
+            let mask = input.view::<f64>()?.mapv(voxelwise::is_set);
+            let mut result = Array3::from_elem(mask.raw_dim(), false);
+            run(mask.view(), result.view_mut())?;
+            let mut out = out.view_mut::<f64>()?;
+            ndarray::Zip::from(&mut out)
+                .and(&result)
+                .for_each(|slot, &value| *slot = voxelwise::from_set(value));
+            Ok(())
+        }
+        dtype => Err(Error::InvalidArgument(format!(
+            "expected bool or float64 mask carrier, got {}",
+            dtype.numpy_name()
+        ))),
+    }
+}
+
+pub(crate) fn expect_colocated(
+    what: impl FnOnce() -> String,
+    reference: &Voxels,
+    operand: &Voxels,
+) -> Result<()> {
+    expect_extent(what, reference.shape(), operand.shape())
+}
+
+pub(crate) fn expect_extent(
+    what: impl FnOnce() -> String,
+    expected: [usize; 3],
+    got: [usize; 3],
+) -> Result<()> {
+    if got == expected {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(what()))
+}
 
 pub mod adjacency;
 pub mod align;
@@ -481,7 +601,14 @@ impl MaskSource {
     }
 
     pub(crate) fn source_input(self, reach: Reach) -> SourceInput {
-        SourceInput::new(self.image, reach)
+        SourceInput::new(self.image, reach).holding(Dtype::Bool)
+    }
+
+    pub(crate) fn maybe_source_input(mask: Option<Self>, reach: Reach) -> Vec<SourceInput> {
+        match mask {
+            Some(mask) => vec![mask.source_input(reach)],
+            None => Vec::new(),
+        }
     }
 
     pub(crate) fn input_only_error(self, name: &str) -> Error {
@@ -508,6 +635,121 @@ impl MaskSource {
             )));
         }
         mask.view::<bool>()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LabelSeedSource {
+    image: usize,
+}
+
+impl LabelSeedSource {
+    pub(crate) fn new(seeds: impl Into<ImageId>) -> Self {
+        Self {
+            image: seeds.into().index(),
+        }
+    }
+
+    pub(crate) fn image(self) -> usize {
+        self.image
+    }
+
+    pub(crate) fn source_input(self, reach: Reach) -> SourceInput {
+        SourceInput::new(self.image, reach).holding(Dtype::U32)
+    }
+
+    pub(crate) fn input_only_error(self, name: &str) -> Error {
+        Error::InvalidArgument(format!(
+            "{name}: the seeds come from image {}, so this op has no answer from its input alone \
+             — it would flood nothing and write an empty volume. It is applied through \
+             `apply_with`.",
+            self.image
+        ))
+    }
+
+    pub(crate) fn u32_view<'a>(
+        self,
+        name: &str,
+        sources: SourceInputs<'a>,
+    ) -> Result<ArrayView3<'a, u32>> {
+        let seeds = sources.get(self.image)?;
+        if seeds.dtype() != Dtype::U32 {
+            return Err(Error::InvalidArgument(format!(
+                "{name}: the seeds are read from image {}, which holds {}. A seed is a label and \
+                 is stored as one; a float would leave 'which values are the same seed' to be \
+                 decided somewhere this op cannot see.",
+                self.image,
+                seeds.dtype().numpy_name()
+            )));
+        }
+        seeds.view::<u32>()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TypedSource {
+    image: usize,
+    dtype: Option<Dtype>,
+}
+
+impl TypedSource {
+    pub(crate) fn new(image: impl Into<ImageId>) -> Self {
+        Self {
+            image: image.into().index(),
+            dtype: None,
+        }
+    }
+
+    pub(crate) fn dtype(self) -> Option<Dtype> {
+        self.dtype
+    }
+
+    pub(crate) fn holding(mut self, dtype: Dtype) -> Self {
+        self.dtype = Some(dtype);
+        self
+    }
+
+    pub(crate) fn voxelwise_input(self) -> SourceInput {
+        self.source_input(Reach::none())
+    }
+
+    pub(crate) fn source_input(self, reach: Reach) -> SourceInput {
+        let input = SourceInput::new(self.image, reach);
+        match self.dtype {
+            Some(dtype) => input.holding(dtype),
+            None => input,
+        }
+    }
+
+    pub(crate) fn block<'a>(self, sources: SourceBlocks<'a>) -> Result<&'a crate::env::BlockBuf> {
+        sources.get(self.image)
+    }
+
+    pub(crate) fn block_at_extent<'a>(
+        self,
+        name: &str,
+        role: &str,
+        sources: SourceBlocks<'a>,
+        read: &Region,
+    ) -> Result<&'a crate::env::BlockBuf> {
+        let block = self.block(sources)?;
+        let crate::env::BlockBuf::Array(array) = block else {
+            return Ok(block);
+        };
+        let expected = read.shape3();
+        expect_extent(
+            || {
+                format!(
+                    "{name}: the {role} arrived as {:?} for a block read extent of {expected:?}. \
+                     The source operand is fetched at the block's own fetch region, so a \
+                     disagreement here is the plan handing over two different geometries.",
+                    array.shape()
+                )
+            },
+            expected,
+            array.shape(),
+        )?;
+        Ok(block)
     }
 }
 

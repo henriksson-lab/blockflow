@@ -90,7 +90,7 @@ use crate::strategy::{execute_task_with_reduction, reduce_phase};
 
 use super::client::Client;
 use super::protocol::{path, Assignment, Handout, Joined, PROTOCOL_VERSION};
-use super::spec::{task_fragment, JobSpec, WorkflowFactory};
+use super::spec::{task_fragment, JobSpec, RuntimeResources, WorkflowFactory};
 use super::wire::decomposition_from_json;
 
 #[derive(Debug, Clone)]
@@ -177,6 +177,14 @@ pub struct WorkerOptions {
     /// `strategy::run_task` dispatches one before the offer exists. Raising this
     /// therefore cannot make two workers disagree.
     pub threads: usize,
+    /// Bytes this worker gives to the real shared-volume read cache.
+    ///
+    /// `None` means use `WorkflowSpec::cache_bytes`, so the real worker path
+    /// matches the coordinator model by default. `Some(0)` is the explicit
+    /// opt-out and opens the environment with no cache.
+    pub cache_bytes: Option<u64>,
+    /// Threads owned by the environment prefetcher. Zero is normalized to one.
+    pub prefetch_threads: usize,
 }
 
 impl WorkerOptions {
@@ -192,6 +200,15 @@ impl WorkerOptions {
             // One, so that a worker built today runs exactly as it ran before
             // this field existed. See the field.
             threads: 1,
+            cache_bytes: None,
+            prefetch_threads: 1,
+        }
+    }
+
+    pub fn runtime_resources(&self) -> RuntimeResources {
+        RuntimeResources {
+            cache_bytes: self.cache_bytes,
+            prefetch_threads: self.prefetch_threads.max(1),
         }
     }
 }
@@ -291,6 +308,11 @@ pub struct WorkerReport {
     /// have cost this worker if it were shipped, measured against the fragment
     /// set it was derived from instead.
     pub reduced_bytes: u64,
+    /// Effective bytes used for the real shared-volume read cache. Zero means
+    /// the worker opened the environment without a cache.
+    pub cache_bytes: u64,
+    /// Effective prefetcher thread count after worker-option normalization.
+    pub prefetch_threads: usize,
     pub elapsed: Duration,
     /// How long this worker took to be admitted, from the first line of
     /// `run`.
@@ -458,7 +480,10 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
     // same reason `Decomposition::check` is: a worker that would produce
     // something unreadable should say so before it starts, not per task.
     check_phase_work(&decomposition, &work)?;
-    let environment = factory.environment(&spec.workflow, decomposition.n_phases())?;
+    let runtime = options.runtime_resources();
+    let cache_bytes = runtime.cache_bytes_for(&spec.workflow);
+    let prefetch_threads = runtime.prefetch_threads();
+    let environment = factory.environment(&spec.workflow, decomposition.n_phases(), runtime)?;
     environment.prepare(&decomposition)?;
     // Declared by every worker, idempotently, exactly as the job's own sidecar
     // stream is: a worker that joins late or restarts declares the same thing.
@@ -509,6 +534,8 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
     let mut report = WorkerReport {
         worker: joined.worker.clone(),
         job: joined.job.clone(),
+        cache_bytes,
+        prefetch_threads,
         joined: joined_after,
         ready: ready_after,
         ..Default::default()

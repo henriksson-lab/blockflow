@@ -755,7 +755,12 @@ impl JobSpec {
 /// coordinator, the protocol and the worker loop free of it.
 pub trait WorkflowFactory: Send + Sync {
     fn chain(&self, spec: &WorkflowSpec) -> Result<Chain>;
-    fn environment(&self, spec: &WorkflowSpec, n_phases: usize) -> Result<Box<dyn Environment>>;
+    fn environment(
+        &self,
+        spec: &WorkflowSpec,
+        n_phases: usize,
+        runtime: RuntimeResources,
+    ) -> Result<Box<dyn Environment>>;
 
     /// The fragment phases appended after the chain's, in order.
     ///
@@ -765,6 +770,41 @@ pub trait WorkflowFactory: Send + Sync {
     /// what lets a reader tell which node produced one.
     fn fragment_ops(&self, _spec: &WorkflowSpec, _tag: u64) -> Result<Vec<Box<dyn FragmentOp>>> {
         Ok(Vec::new())
+    }
+}
+
+/// Node-local resources a worker brings to a workflow environment.
+///
+/// The workflow describes what the coordinator modelled. These values describe
+/// what this worker process actually has. Leaving a value unset means "use the
+/// workflow contract"; setting cache bytes to zero is an explicit no-cache
+/// opt-out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeResources {
+    pub cache_bytes: Option<u64>,
+    pub prefetch_threads: usize,
+}
+
+impl RuntimeResources {
+    pub const fn from_workflow() -> Self {
+        Self {
+            cache_bytes: None,
+            prefetch_threads: 1,
+        }
+    }
+
+    pub fn cache_bytes_for(self, spec: &WorkflowSpec) -> u64 {
+        self.cache_bytes.unwrap_or(spec.cache_bytes)
+    }
+
+    pub fn prefetch_threads(self) -> usize {
+        self.prefetch_threads.max(1)
+    }
+}
+
+impl Default for RuntimeResources {
+    fn default() -> Self {
+        Self::from_workflow()
     }
 }
 
@@ -842,7 +882,12 @@ impl WorkflowFactory for ProbeWorkflows {
             .collect()
     }
 
-    fn environment(&self, spec: &WorkflowSpec, n_phases: usize) -> Result<Box<dyn Environment>> {
+    fn environment(
+        &self,
+        spec: &WorkflowSpec,
+        n_phases: usize,
+        runtime: RuntimeResources,
+    ) -> Result<Box<dyn Environment>> {
         Ok(match &spec.store {
             StoreSpec::Files { dir } => {
                 let env = SharedVolumes::open_with_cache(
@@ -850,10 +895,10 @@ impl WorkflowFactory for ProbeWorkflows {
                     spec.shape,
                     spec.chunk,
                     n_phases,
-                    Some(spec.cache_bytes),
+                    Some(runtime.cache_bytes_for(spec)),
                 )?;
                 let env = if spec.prefetch_depth > 0 {
-                    env.with_prefetch(1, spec.prefetch_depth)?
+                    env.with_prefetch(runtime.prefetch_threads(), spec.prefetch_depth)?
                 } else {
                     env
                 };
@@ -1102,5 +1147,29 @@ mod tests {
         assert!(three.n_phases() >= 3, "{}", three.n_phases());
         assert!(three.n_tasks() > one.n_tasks());
         three.check().unwrap();
+    }
+
+    #[test]
+    fn runtime_resources_default_to_the_workflow_contract_until_overridden() {
+        let (mut spec, _) = probe_job(2, 1, ChainSpec::identity());
+        spec.workflow.cache_bytes = 8192;
+
+        let defaulted = RuntimeResources::default();
+        assert_eq!(defaulted.cache_bytes_for(&spec.workflow), 8192);
+        assert_eq!(defaulted.prefetch_threads(), 1);
+
+        let overridden = RuntimeResources {
+            cache_bytes: Some(4096),
+            prefetch_threads: 4,
+        };
+        assert_eq!(overridden.cache_bytes_for(&spec.workflow), 4096);
+        assert_eq!(overridden.prefetch_threads(), 4);
+
+        let no_cache = RuntimeResources {
+            cache_bytes: Some(0),
+            prefetch_threads: 0,
+        };
+        assert_eq!(no_cache.cache_bytes_for(&spec.workflow), 0);
+        assert_eq!(no_cache.prefetch_threads(), 1);
     }
 }

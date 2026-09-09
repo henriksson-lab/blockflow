@@ -77,8 +77,8 @@ use crate::reach::Reach;
 use crate::voxels::Voxels;
 
 use super::element::{StepOrigin, StructuringElement};
-use super::shapes_agree;
 use super::voxelwise::{from_set, is_set};
+use super::{accepts_mask_carrier, apply_mask_carrier, shapes_agree};
 
 /// The conjunction of the element around every voxel.
 ///
@@ -684,7 +684,7 @@ impl BlockOp for MorphologyOp {
     /// this module's `is_set`/`from_set` convention, and dropping it would break
     /// every such chain for no gain.
     fn accepts(&self, dtype: Dtype) -> bool {
-        matches!(dtype, Dtype::Bool | Dtype::F64)
+        accepts_mask_carrier(dtype)
     }
 
     /// **`at` is read rather than ignored**, so that an element whose step counts
@@ -692,27 +692,9 @@ impl BlockOp for MorphologyOp {
     /// seam. Every other element reads the same offsets everywhere and cannot
     /// tell the difference.
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
-        match input.dtype() {
-            // No conversion and no intermediate: the kernel is a `bool` kernel
-            // and the buffer is a `bool` buffer.
-            Dtype::Bool => self.kind.apply_into_at(
-                input.view::<bool>()?,
-                at,
-                &self.element,
-                out.view_mut::<bool>()?,
-            ),
-            _ => {
-                let mask = input.view::<f64>()?.mapv(is_set);
-                let mut result = Array3::from_elem(mask.raw_dim(), false);
-                self.kind
-                    .apply_into_at(mask.view(), at, &self.element, result.view_mut())?;
-                let mut out = out.view_mut::<f64>()?;
-                ndarray::Zip::from(&mut out)
-                    .and(&result)
-                    .for_each(|slot, &value| *slot = from_set(value));
-                Ok(())
-            }
-        }
+        apply_mask_carrier(input, out, |input, out| {
+            self.kind.apply_into_at(input, at, &self.element, out)
+        })
     }
 
     /// Exactly the constant, as a mask, for all four operations.
@@ -818,24 +800,9 @@ impl BlockOp for GreyDilateOp {
     /// counts from the clipped start re-phases at the volume's faces and not at
     /// a block seam — which is the whole reason this op exists.
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
-        match input.dtype() {
-            Dtype::F64 => dilate_placed_grey_into_at(
-                input.view::<f64>()?,
-                at,
-                &self.element,
-                out.view_mut::<f64>()?,
-            ),
-            _ => {
-                let widened = input.view::<f32>()?.mapv(f64::from);
-                let mut result = Array3::zeros(widened.raw_dim());
-                dilate_placed_grey_into_at(widened.view(), at, &self.element, result.view_mut())?;
-                let mut out = out.view_mut::<f32>()?;
-                ndarray::Zip::from(&mut out)
-                    .and(&result)
-                    .for_each(|slot, &value| *slot = value as f32);
-                Ok(())
-            }
-        }
+        super::apply_float_detour(input, out, |source, out| {
+            dilate_placed_grey_into_at(source, at, &self.element, out)
+        })
     }
 
     /// A dilation of a constant field is that constant, and so is the value at

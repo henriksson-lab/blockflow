@@ -8,18 +8,18 @@
 // planner choice, a richer field of rejected candidates, and the simulator's
 // winner under the scheduling policies that can change the answer.
 
-use blockflow::arena::{CandidateFieldBuilder, Judgement, SimulationObjective, Verdict};
+use blockflow::arena::{CandidatePolicy, Judgement, PlanShape, SimulationObjective, Verdict};
 use blockflow::decomposition::Constraints;
 use blockflow::distributed::handout::HandoutPolicy;
 use blockflow::scenario::Scenario;
 use blockflow::simulate::{ExecutorOrder, Handout, Machine, Rates, Scheduler};
-use blockflow::strategy::{Enumerating, PartitionSearch, Strategy, Workflow};
+use blockflow::strategy::{Strategy, Workflow};
 
 mod support;
 
 use support::planner_perf::{
-    base_constraints, enumerating_for, scenarios, simulator_backed_for,
-    uniform_simulator_backed_for, workflow, LADDER,
+    base_constraints, enumerating_for, planner_choice_for, scenarios, simulator_backed_for,
+    uniform_simulator_backed_for, workflow,
 };
 
 #[derive(Clone, Copy)]
@@ -55,8 +55,11 @@ impl SchedulerCase {
 }
 
 fn edge_signature(verdict: &Verdict) -> String {
-    let edges: Vec<usize> = verdict.edges.iter().map(|edge| edge[0]).collect();
-    format!("{}p{:?}", verdict.phases, edges)
+    verdict.shape.to_string()
+}
+
+fn first_axis_edges(plan: &blockflow::strategy::Plan) -> Vec<usize> {
+    PlanShape::from_plan(plan).first_axis_edges()
 }
 
 fn judge(
@@ -66,56 +69,18 @@ fn judge(
     case: SchedulerCase,
 ) -> Judgement {
     let constraints = scenario.constraints(base);
-    let workers = scenario.machine.workers.max(1);
     let enumerating = enumerating_for(scenario.machine);
-    let strategy = |constraints: &Constraints| enumerating.plan(workflow, constraints);
-    let chosen = strategy(&constraints)
-        .unwrap_or_else(|err| panic!("{}: the planner must plan: {err}", scenario.name));
-
-    let mut field = CandidateFieldBuilder::new(
-        case.machine(scenario.machine),
-        scenario.rates(&Rates::default()),
-    )
-    .with_snapshot(scenario.snapshot.clone());
-    field
-        .enter_plan("planner", chosen, constraints.clone())
-        .expect("a plan the arena can hold");
-
-    for (label, search) in [
-        ("search-dp", PartitionSearch::Dp),
-        ("search-exhaustive", PartitionSearch::Exhaustive),
-        ("search-single", PartitionSearch::SingleGroup),
-    ] {
-        let variant = Enumerating {
-            concurrency: workers,
-            search,
-            ..Enumerating::default()
-        };
-        if let Ok(plan) = variant.plan(workflow, &constraints) {
-            field
-                .enter_plan(label.to_string(), plan, constraints.clone())
-                .expect("a plan the arena can hold");
-        }
-    }
-
-    field
-        .enter_pinned_edges(
-            |edge| format!("edge-{edge}"),
-            &enumerating_for(scenario.machine),
+    CandidatePolicy::oracle_report()
+        .build_for_enumerating(
+            "planner",
+            &enumerating,
             workflow,
             &constraints,
+            case.machine(scenario.machine),
+            scenario.rates(&Rates::default()),
+            Some(scenario.snapshot.clone()),
         )
-        .expect("pinned-edge candidates can be entered");
-    field
-        .enter_mixed_edges(
-            |_, chosen| format!("mixed-{chosen:?}"),
-            &LADDER,
-            &constraints,
-        )
-        .expect("mixed-edge candidates can be entered");
-
-    field
-        .finish()
+        .expect("oracle candidate field can be built")
         .judge_with(workflow, &mut || case.scheduler())
         .unwrap_or_else(|err| panic!("{} under {}: {err}", scenario.name, case.name()))
 }
@@ -203,7 +168,7 @@ fn report_planner_choices_against_the_simulator_oracle() {
                 case.name()
             );
             assert!(
-                regret <= 2.5,
+                regret <= 2.25,
                 "{name} {}: planner regret {regret:.3} exceeded the recorded oracle-report \
                  ceiling. If this is deliberate, update TODO4's baseline and this table.",
                 case.name()
@@ -236,38 +201,20 @@ fn simulator_backed_ranking_is_an_opt_in_strategy_that_closes_the_two_node_oracl
     let base = base_constraints();
     let scenario = Scenario::load("costs/two-nodes.json").expect("the committed scenario");
     let constraints = scenario.constraints(&base);
-    let current = enumerating_for(scenario.machine);
-    let current_plan = current
-        .plan(&workflow, &constraints)
-        .expect("the current planner must plan");
-    let current_edges: Vec<usize> = current_plan
-        .decomposition
-        .phases
-        .iter()
-        .map(|phase| phase.grid.block()[0])
-        .collect();
+    let current_plan = planner_choice_for(&scenario, &workflow, &base).plan;
+    let current_edges = first_axis_edges(&current_plan);
 
     let uniform_oracle = uniform_simulator_backed_for(&scenario);
     let uniform_oracle_plan = uniform_oracle
         .plan(&workflow, &constraints)
         .expect("the simulator-backed wrapper must return the uniform-ladder oracle winner");
-    let uniform_oracle_edges: Vec<usize> = uniform_oracle_plan
-        .decomposition
-        .phases
-        .iter()
-        .map(|phase| phase.grid.block()[0])
-        .collect();
+    let uniform_oracle_edges = first_axis_edges(&uniform_oracle_plan);
 
     let mixed_oracle = simulator_backed_for(&scenario);
     let mixed_oracle_plan = mixed_oracle
         .plan(&workflow, &constraints)
         .expect("the simulator-backed wrapper must return the mixed-edge oracle winner");
-    let mixed_oracle_edges: Vec<usize> = mixed_oracle_plan
-        .decomposition
-        .phases
-        .iter()
-        .map(|phase| phase.grid.block()[0])
-        .collect();
+    let mixed_oracle_edges = first_axis_edges(&mixed_oracle_plan);
 
     assert_eq!(
         current_edges,

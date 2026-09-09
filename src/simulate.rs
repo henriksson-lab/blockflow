@@ -85,6 +85,7 @@ use crate::decomposition::Decomposition;
 use crate::distributed::cache_model::{ChunkGrid, ModelledCache};
 use crate::error::Result;
 use crate::fragment::{PhaseWork, SidecarSize};
+use crate::geometry::product3;
 use crate::graph::TaskGraph;
 use crate::log::{Event, ExecutionLog, Stats};
 
@@ -904,6 +905,26 @@ mod tests {
     use crate::reach::Reach;
 
     #[test]
+    fn machine_topology_normalizes_zero_workers_and_nodes() {
+        let machine = Machine {
+            nodes: 0,
+            workers: 0,
+            cache_shared: true,
+            ..Machine::default()
+        };
+
+        let topology = MachineTopology::new(&machine);
+
+        assert_eq!(topology.nodes, 1);
+        assert_eq!(topology.workers, 1);
+        assert_eq!(topology.node_of(0), 0);
+        assert_eq!(topology.pool_of(0), 0);
+        assert_eq!(topology.pools(), 1);
+        assert_eq!(topology.workers_per_node(), 1);
+        assert_eq!(topology.cache_pools_per_node(), 1);
+    }
+
+    #[test]
     fn measured_per_phase_derives_short_circuit_fraction_from_the_log() {
         let volume = [8, 4, 4];
         let grid = BlockGrid::along(volume, &[0], 4).unwrap();
@@ -1014,6 +1035,7 @@ pub struct Decision<'a> {
     pub live_images: &'a [(usize, u64)],
     /// Bytes resident right now: images plus in-flight block buffers.
     pub resident_bytes: u64,
+    read_footprints: &'a ReadFootprints,
     /// The cache, for a scheduler that wants to prefer a warm task.
     pub cache: &'a ModelledCache,
     /// One chunk grid per image the plan reads, keyed by image id.
@@ -1050,15 +1072,7 @@ impl Decision<'_> {
     /// scheduler that assembled the keys itself would be a fourth statement of
     /// what a block fetches, and the first one to go stale.
     pub fn chunks_of(&self, task: &crate::graph::Task) -> Vec<u64> {
-        self.images_read[task.phase]
-            .iter()
-            .flat_map(|&image| {
-                self.grids
-                    .get(&image)
-                    .map(|grid| grid.keys(image, &task.geometry.source))
-                    .unwrap_or_default()
-            })
-            .collect()
+        self.read_footprints.chunks_of(task)
     }
 }
 
@@ -1404,44 +1418,9 @@ impl BoundedHorizonThroughput {
     /// then prices the miss path as latency per chunk plus transfer and decode
     /// per byte.
     pub fn floor_for_plan(decomposition: &Decomposition, rates: &Rates) -> u64 {
-        let images_read: Vec<Vec<usize>> = decomposition
-            .phases
-            .iter()
-            .enumerate()
-            .map(|(index, phase)| phase.images_read(index))
-            .collect();
-        let mut grids: BTreeMap<usize, ChunkGrid> = BTreeMap::new();
-        for images in &images_read {
-            for &image in images {
-                grids
-                    .entry(image)
-                    .or_insert_with(|| ChunkGrid::new(decomposition.volume_at(image), rates.chunk));
-            }
-        }
+        let read_footprints = ReadFootprints::new(decomposition, rates);
         let graph = TaskGraph::build(decomposition);
-        graph
-            .tasks
-            .iter()
-            .map(|task| {
-                let mut chunks = 0u64;
-                let mut bytes = 0u64;
-                for &image in &images_read[task.phase] {
-                    let Some(grid) = grids.get(&image) else {
-                        continue;
-                    };
-                    let n = grid.keys(image, &task.geometry.source).len() as u64;
-                    chunks += n;
-                    bytes += n
-                        * rates.chunk.iter().product::<usize>() as u64
-                        * decomposition.dtype_at(image).size_of() as u64;
-                }
-                (chunks as f64 * rates.io_latency_ns
-                    + bytes as f64 * (rates.io_ns_per_byte + rates.decode_ns_per_byte))
-                    .ceil()
-                    .max(1.0) as u64
-            })
-            .max()
-            .unwrap_or_else(|| Self::floor_ns(rates))
+        read_footprints.max_task_fetch_ns(&graph, rates)
     }
 
     /// A horizon at or above [`Self::floor_ns`], on [`RateBasis::PerPhaseCost`].
@@ -1617,19 +1596,1095 @@ impl Scheduler for Handout {
     }
 }
 
-/// The earliest-free channel **on one node**, as an index into the flat table.
+struct ReadFootprint {
+    keys: Vec<u64>,
+    chunk_bytes: u64,
+    buffer_bytes: u64,
+}
+
+/// Per-task read footprints on each image's own chunk lattice.
 ///
-/// One function rather than the two `min_by_key`s it replaced, because a demand
-/// fetch and a prefetch that disagreed about which channels a node owns would be
-/// a node with a private link for one and a shared one for the other.
-fn earliest_channel(io_free_at: &[u64], node: usize, channels: usize) -> usize {
-    let base = node * channels;
-    io_free_at[base..base + channels]
-        .iter()
-        .enumerate()
-        .min_by_key(|&(_, free)| *free)
-        .map(|(index, _)| base + index)
-        .unwrap_or(base)
+/// Scheduler warmth, bounded-horizon floors, demand reads, prefetch reads and
+/// block-buffer residency all ask this one owner what a task reads. The byte
+/// meanings stay separate: `chunk_bytes` prices storage/cache transfers, while
+/// `buffer_bytes` is the in-memory block slice the worker holds.
+struct ReadFootprints {
+    images_read: Vec<Vec<usize>>,
+    grids: BTreeMap<usize, ChunkGrid>,
+    chunk_bytes: BTreeMap<usize, u64>,
+    element_bytes: BTreeMap<usize, u64>,
+}
+
+impl ReadFootprints {
+    fn new(decomposition: &Decomposition, rates: &Rates) -> Self {
+        // **A grid per image, not one per plan.** `ChunkGrid` is built from a
+        // volume, and the images of a plan do not share one: a resampling phase
+        // writes an image of a different extent, and a pyramid level is a
+        // different extent by construction.
+        //
+        // `BTreeMap` rather than a `Vec` because a supplied input's id is not
+        // an index into `0..n_images()`.
+        let images_read: Vec<Vec<usize>> = decomposition
+            .phases
+            .iter()
+            .enumerate()
+            .map(|(index, phase)| phase.images_read(index))
+            .collect();
+        let mut grids: BTreeMap<usize, ChunkGrid> = BTreeMap::new();
+        for images in &images_read {
+            for &image in images {
+                grids
+                    .entry(image)
+                    .or_insert_with(|| ChunkGrid::new(decomposition.volume_at(image), rates.chunk));
+            }
+        }
+        let element_bytes: BTreeMap<usize, u64> = grids
+            .keys()
+            .map(|&image| (image, decomposition.dtype_at(image).size_of() as u64))
+            .collect();
+        let chunk_bytes: BTreeMap<usize, u64> = element_bytes
+            .iter()
+            .map(|(&image, &bytes)| {
+                let chunk = product3(rates.chunk) as u64 * bytes;
+                (image, chunk.max(1))
+            })
+            .collect();
+        Self {
+            images_read,
+            grids,
+            chunk_bytes,
+            element_bytes,
+        }
+    }
+
+    #[inline]
+    fn images_read(&self) -> &[Vec<usize>] {
+        &self.images_read
+    }
+
+    #[inline]
+    fn grids(&self) -> &BTreeMap<usize, ChunkGrid> {
+        &self.grids
+    }
+
+    #[inline]
+    fn images_of(&self, phase: usize) -> &[usize] {
+        &self.images_read[phase]
+    }
+
+    fn chunks_of(&self, task: &crate::graph::Task) -> Vec<u64> {
+        self.images_of(task.phase)
+            .iter()
+            .flat_map(|&image| self.keys(image, task).unwrap_or_default())
+            .collect()
+    }
+
+    fn demand_reads(&self, task: &crate::graph::Task, skipped: bool) -> Vec<ReadFootprint> {
+        let images = self.images_of(task.phase);
+        let fetches = if skipped {
+            &images[..1.min(images.len())]
+        } else {
+            images
+        };
+        fetches
+            .iter()
+            .filter_map(|&image| self.footprint(image, task))
+            .collect()
+    }
+
+    fn prefetch_reads(&self, task: &crate::graph::Task) -> Vec<(u64, u64)> {
+        self.images_of(task.phase)
+            .iter()
+            .flat_map(|&image| {
+                let size = self.chunk_bytes[&image];
+                self.keys(image, task)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |key| (key, size))
+            })
+            .collect()
+    }
+
+    fn max_task_fetch_ns(&self, graph: &TaskGraph, rates: &Rates) -> u64 {
+        graph
+            .tasks
+            .iter()
+            .map(|task| {
+                let mut chunks = 0u64;
+                let mut bytes = 0u64;
+                for read in self.demand_reads(task, false) {
+                    let n = read.keys.len() as u64;
+                    chunks += n;
+                    bytes += n * read.chunk_bytes;
+                }
+                (chunks as f64 * rates.io_latency_ns
+                    + bytes as f64 * (rates.io_ns_per_byte + rates.decode_ns_per_byte))
+                    .ceil()
+                    .max(1.0) as u64
+            })
+            .max()
+            .unwrap_or_else(|| BoundedHorizonThroughput::floor_ns(rates))
+    }
+
+    fn footprint(&self, image: usize, task: &crate::graph::Task) -> Option<ReadFootprint> {
+        let keys = self.keys(image, task)?;
+        Some(ReadFootprint {
+            keys,
+            chunk_bytes: self.chunk_bytes[&image],
+            buffer_bytes: task.geometry.source.voxels() as u64 * self.element_bytes[&image],
+        })
+    }
+
+    fn keys(&self, image: usize, task: &crate::graph::Task) -> Option<Vec<u64>> {
+        self.grids
+            .get(&image)
+            .map(|grid| grid.keys(image, &task.geometry.source))
+    }
+}
+
+struct WriteFootprint {
+    writes_image: bool,
+    sidecars: Vec<SidecarSize>,
+}
+
+struct BlockStore {
+    image_bytes: u64,
+    image_kind: crate::decomposition::ImageKind,
+    sidecar_bytes: u64,
+}
+
+/// Per-phase write and sidecar footprints.
+///
+/// Residency allocation, in-flight output buffers, store counters, store IO and
+/// sidecar gather peaks all ask this one owner what a phase produces. The facts
+/// still come from `phase_traffic` and `PhaseWork::outputs`; this type only
+/// keeps the event loop from restating them at each accounting site.
+struct WriteFootprints {
+    phases: Vec<WriteFootprint>,
+}
+
+impl WriteFootprints {
+    fn new(decomposition: &Decomposition, work: &[PhaseWork<'_>]) -> Result<Self> {
+        let phases = decomposition
+            .phases
+            .iter()
+            .enumerate()
+            .map(|(index, phase)| {
+                let traffic = crate::decomposition::phase_traffic(index, phase, work.get(index))?;
+                let sidecars = match work.get(index) {
+                    Some(crate::fragment::PhaseWork::Fragments(op)) => {
+                        op.outputs().iter().map(|output| output.size).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(WriteFootprint {
+                    writes_image: traffic.writes_an_image,
+                    sidecars,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { phases })
+    }
+
+    #[inline]
+    fn writes_image(&self, phase: usize) -> bool {
+        self.phases[phase].writes_image
+    }
+
+    #[inline]
+    fn allocation(
+        &self,
+        task: &crate::graph::Task,
+        decomposition: &Decomposition,
+        bytes_of: impl FnOnce(usize) -> u64,
+    ) -> Option<(usize, u64)> {
+        let image = task.phase + 1;
+        (image < decomposition.n_images() && self.writes_image(task.phase))
+            .then(|| (image, bytes_of(image)))
+    }
+
+    #[inline]
+    fn output_buffer_bytes(&self, task: &crate::graph::Task, decomposition: &Decomposition) -> u64 {
+        if self.writes_image(task.phase) {
+            task.geometry.read.voxels() as u64
+                * decomposition.dtype_at(task.phase + 1).size_of() as u64
+        } else {
+            0
+        }
+    }
+
+    fn sidecar_bytes(&self, task: &crate::graph::Task) -> u64 {
+        self.phases[task.phase]
+            .sidecars
+            .iter()
+            .filter_map(|size| {
+                size.bytes_at_most(task.geometry.core.shape3(), task.geometry.read.shape3())
+            })
+            .sum()
+    }
+
+    fn gather_peak(&self, phase: usize, graph: &TaskGraph) -> u64 {
+        if !graph.is_barrier(phase) && self.phases[phase].sidecars.is_empty() {
+            return 0;
+        }
+        graph
+            .tasks_in_phase(phase)
+            .iter()
+            .map(|task| self.sidecar_bytes(task))
+            .sum()
+    }
+
+    fn store(&self, task: &crate::graph::Task, decomposition: &Decomposition) -> BlockStore {
+        let image = task.phase + 1;
+        let image_bytes = if self.writes_image(task.phase) && image < decomposition.n_images() {
+            task.geometry.valid.voxels() as u64 * decomposition.dtype_at(image).size_of() as u64
+        } else {
+            0
+        };
+        BlockStore {
+            image_bytes,
+            image_kind: decomposition.image_kind(image),
+            sidecar_bytes: self.sidecar_bytes(task),
+        }
+    }
+}
+
+/// Normalized machine topology for the simulator event loop.
+///
+/// `Machine` is the external contract; this is the internal view with at least
+/// one worker, at least one node, round-robin worker placement, and one
+/// cache-pool rule. Scheduler decisions, cache pools, node anchors, contention
+/// and IO reservations all depend on these same facts.
+#[derive(Debug, Clone, Copy)]
+struct MachineTopology {
+    nodes: usize,
+    workers: usize,
+    cache_shared: bool,
+}
+
+impl MachineTopology {
+    fn new(machine: &Machine) -> Self {
+        Self {
+            nodes: machine.nodes.max(1),
+            workers: machine.workers.max(1),
+            cache_shared: machine.cache_shared,
+        }
+    }
+
+    #[inline]
+    fn node_of(self, worker: usize) -> usize {
+        worker % self.nodes
+    }
+
+    #[inline]
+    fn pool_of(self, worker: usize) -> usize {
+        if self.cache_shared {
+            self.node_of(worker)
+        } else {
+            worker
+        }
+    }
+
+    #[inline]
+    fn pools(self) -> usize {
+        if self.cache_shared {
+            self.nodes
+        } else {
+            self.workers
+        }
+    }
+
+    #[inline]
+    fn workers_per_node(self) -> usize {
+        self.workers.div_ceil(self.nodes)
+    }
+
+    #[inline]
+    fn cache_pools_per_node(self) -> u64 {
+        if self.cache_shared {
+            1
+        } else {
+            self.workers_per_node().max(1) as u64
+        }
+    }
+}
+
+/// Maintained task readiness, including tasks held behind phase barriers.
+///
+/// Dependency counts, started-task marking, and barrier-held admission live
+/// here together. The visible ready slice is always sorted by task id,
+/// preserving the order the old full scan handed to schedulers.
+struct ReadySet {
+    ready: Vec<usize>,
+    held: Vec<Vec<usize>>,
+    indegree: Vec<usize>,
+}
+
+impl ReadySet {
+    fn new(graph: &TaskGraph, phase_open: impl Fn(usize) -> bool) -> Self {
+        let mut this = Self {
+            ready: Vec::new(),
+            held: vec![Vec::new(); graph.n_phases()],
+            indegree: graph
+                .tasks
+                .iter()
+                .map(|task| task.n_dependencies())
+                .collect(),
+        };
+        for id in 0..graph.tasks.len() {
+            if this.indegree[id] == 0 {
+                this.admit(id, graph.tasks[id].phase, &phase_open);
+            }
+        }
+        this
+    }
+
+    #[inline]
+    fn dependencies_complete(&self, id: usize) -> bool {
+        self.indegree[id] == 0
+    }
+
+    #[inline]
+    fn mark_started(&mut self, id: usize) {
+        // `usize::MAX` cannot be reached by decrementing. It marks a task that
+        // has left the ready set, so neither the debug oracle nor prefetch
+        // treats it as ready again.
+        self.indegree[id] = usize::MAX;
+    }
+
+    fn complete_dependencies(
+        &mut self,
+        completed: usize,
+        graph: &TaskGraph,
+        dependents: &[Vec<usize>],
+        phase_open: impl Fn(usize) -> bool,
+    ) {
+        for &next in &dependents[completed] {
+            self.indegree[next] -= 1;
+            if self.indegree[next] == 0 {
+                self.admit(next, graph.tasks[next].phase, &phase_open);
+            }
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[usize] {
+        &self.ready
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.ready.is_empty()
+    }
+
+    #[inline]
+    fn push(&mut self, id: usize) {
+        let at = self.ready.partition_point(|&other| other < id);
+        self.ready.insert(at, id);
+    }
+
+    #[inline]
+    fn admit(&mut self, id: usize, phase: usize, phase_open: impl Fn(usize) -> bool) {
+        if phase_open(phase) {
+            self.push(id);
+        } else {
+            self.hold(phase, id);
+        }
+    }
+
+    #[inline]
+    fn hold(&mut self, phase: usize, id: usize) {
+        self.held[phase].push(id);
+    }
+
+    #[inline]
+    fn release_through(&mut self, phase_limit: usize) {
+        for phase in 0..phase_limit.min(self.held.len()) {
+            let held = std::mem::take(&mut self.held[phase]);
+            for id in held {
+                self.push(id);
+            }
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, slot: usize) -> usize {
+        self.ready.remove(slot)
+    }
+
+    #[cfg(debug_assertions)]
+    fn scanned(&self, graph: &TaskGraph, phase_open: impl Fn(usize) -> bool) -> Vec<usize> {
+        (0..graph.tasks.len())
+            .filter(|&id| self.indegree[id] == 0)
+            .filter(|&id| phase_open(graph.tasks[id].phase))
+            .collect()
+    }
+}
+
+/// The prefix of the ready set visible to a scheduler at one dispatch.
+///
+/// `0` is the unbounded case. Every non-zero window is clamped to the current
+/// ready length, and scheduler results are clamped back to the same visible
+/// prefix. That keeps "what the scheduler was offered" and "what it can pick"
+/// as one contract.
+struct CandidateWindow<'a> {
+    ready: &'a [usize],
+}
+
+impl<'a> CandidateWindow<'a> {
+    fn new(ready: &'a ReadySet, limit: usize) -> Self {
+        let ready = ready.as_slice();
+        debug_assert!(
+            !ready.is_empty(),
+            "candidate window is only built when a task is ready"
+        );
+        let end = match limit {
+            0 => ready.len(),
+            limit => limit.min(ready.len()),
+        };
+        Self {
+            ready: &ready[..end],
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &'a [usize] {
+        self.ready
+    }
+
+    #[inline]
+    fn clamp_pick(&self, slot: usize) -> usize {
+        slot.min(self.ready.len() - 1)
+    }
+}
+
+struct CacheAccess {
+    fetched_bytes: u64,
+    misses: u64,
+    encoded_hit_bytes: u64,
+    hits: u64,
+    encoded_hits: u64,
+    duplicated_fetches: u64,
+}
+
+struct PrefetchAccess {
+    fetched_bytes: u64,
+    misses: u64,
+}
+
+struct DemandReadTransaction {
+    fetches: Vec<ReadFootprint>,
+    transfer: ChunkTransfer,
+    encoded_hit_bytes: u64,
+}
+
+impl DemandReadTransaction {
+    fn start(
+        task: &crate::graph::Task,
+        skipped: bool,
+        read_footprints: &ReadFootprints,
+        caches: &mut CachePools,
+        pool: usize,
+        outcome: &mut Outcome,
+    ) -> Self {
+        let fetches = read_footprints.demand_reads(task, skipped);
+        let mut transfer = ChunkTransfer::default();
+        let mut encoded_hit_bytes = 0u64;
+        for read in &fetches {
+            let access = caches.demand(pool, &read.keys, read.chunk_bytes);
+            encoded_hit_bytes += access.encoded_hit_bytes;
+            transfer.add(access.misses, access.fetched_bytes);
+            outcome.cache_hits += access.hits;
+            outcome.cache_misses += access.misses;
+            outcome.encoded_hits += access.encoded_hits;
+            outcome.duplicated_fetches += access.duplicated_fetches;
+        }
+        outcome.fetched_bytes += transfer.fetched_bytes;
+        Self {
+            fetches,
+            transfer,
+            encoded_hit_bytes,
+        }
+    }
+
+    #[inline]
+    fn transfer_ns(&self, rates: &Rates) -> u64 {
+        self.transfer.read_ns(rates)
+    }
+
+    #[inline]
+    fn needs_channel(&self) -> bool {
+        !self.transfer.is_empty()
+    }
+
+    #[inline]
+    fn decoded_at(&self, io_done: u64, rates: &Rates) -> u64 {
+        let decoded_bytes = self.transfer.fetched_bytes + self.encoded_hit_bytes;
+        io_done + (decoded_bytes as f64 * rates.decode_ns_per_byte) as u64
+    }
+
+    #[inline]
+    fn input_buffer_bytes(&self) -> u64 {
+        self.fetches.iter().map(|read| read.buffer_bytes).sum()
+    }
+}
+
+struct StoreTransaction {
+    store: BlockStore,
+}
+
+impl StoreTransaction {
+    fn start(
+        task: &crate::graph::Task,
+        write_footprints: &WriteFootprints,
+        decomposition: &Decomposition,
+        outcome: &mut Outcome,
+    ) -> Self {
+        let store = write_footprints.store(task, decomposition);
+        outcome.sidecar_bytes_written += store.sidecar_bytes;
+        Self { store }
+    }
+
+    #[inline]
+    fn finish_after(
+        self,
+        computed: u64,
+        node: usize,
+        io: &mut IoChannels,
+        rates: &Rates,
+        outcome: &mut Outcome,
+    ) -> u64 {
+        if self.store.image_bytes + self.store.sidecar_bytes == 0 {
+            return computed;
+        }
+
+        let intermediate = self.store.image_kind == crate::decomposition::ImageKind::Intermediate;
+        let rate = if intermediate {
+            rates.materialise_ns_per_byte
+        } else {
+            rates.write_ns_per_byte
+        };
+        if intermediate {
+            outcome.materialised_bytes += self.store.image_bytes;
+        } else {
+            outcome.written_bytes += self.store.image_bytes;
+        }
+
+        let transfer = (self.store.image_bytes as f64 * rate) as u64
+            + (self.store.sidecar_bytes as f64 * rates.materialise_ns_per_byte) as u64;
+        if transfer == 0 {
+            return computed;
+        }
+
+        let (start, done) = io.reserve(node, computed, transfer);
+        outcome.io_wait_ns += start - computed;
+        done
+    }
+}
+
+struct PrefetchIssuance;
+
+impl PrefetchIssuance {
+    #[allow(clippy::too_many_arguments)]
+    fn issue_after_dispatch(
+        depth: usize,
+        dispatched_id: usize,
+        now: u64,
+        node: usize,
+        pool: usize,
+        graph: &TaskGraph,
+        ready: &ReadySet,
+        read_footprints: &ReadFootprints,
+        caches: &mut CachePools,
+        io: &mut IoChannels,
+        rates: &Rates,
+        outcome: &mut Outcome,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        let mut issued = 0usize;
+        for ahead in graph.tasks.iter().skip(dispatched_id + 1) {
+            if issued == depth {
+                break;
+            }
+            // Test the idle-channel admission once per dispatch. A depth run
+            // may queue several speculative reads once it has found idle time.
+            if issued == 0 && io.all_busy_at(node, now) {
+                break;
+            }
+            if !ready.dependencies_complete(ahead.id) {
+                continue;
+            }
+            let ahead_keys = read_footprints.prefetch_reads(ahead);
+            let access = caches.prefetch(pool, &ahead_keys);
+            if access.misses == 0 {
+                continue;
+            }
+            outcome.fetched_bytes += access.fetched_bytes;
+            outcome.prefetched_bytes += access.fetched_bytes;
+            outcome.cache_misses += access.misses;
+            io.reserve(
+                node,
+                now,
+                ChunkTransfer {
+                    misses: access.misses,
+                    fetched_bytes: access.fetched_bytes,
+                }
+                .read_ns(rates),
+            );
+            issued += 1;
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ChunkTransfer {
+    misses: u64,
+    fetched_bytes: u64,
+}
+
+impl ChunkTransfer {
+    #[inline]
+    fn add(&mut self, misses: u64, fetched_bytes: u64) {
+        self.misses += misses;
+        self.fetched_bytes += fetched_bytes;
+    }
+
+    #[inline]
+    fn is_empty(self) -> bool {
+        self.misses == 0 && self.fetched_bytes == 0
+    }
+
+    #[inline]
+    fn read_ns(self, rates: &Rates) -> u64 {
+        (self.misses as f64 * rates.io_latency_ns
+            + self.fetched_bytes as f64 * rates.io_ns_per_byte) as u64
+    }
+}
+
+/// Demand and prefetch access to the simulator's decoded/encoded cache pools.
+///
+/// The wrapper keeps tier checks, LRU updates and duplicated-fetch accounting
+/// together, because a prefetch and a demand read must agree on which chunks are
+/// resident even though they charge different outcome fields.
+struct CachePools {
+    decoded: Vec<ModelledCache>,
+    encoded: Vec<ModelledCache>,
+    ever_fetched: BTreeMap<u64, usize>,
+}
+
+impl CachePools {
+    fn new(pools: usize, decoded_bytes: u64, encoded_bytes: u64, chunk_bytes: u64) -> Self {
+        Self {
+            decoded: (0..pools)
+                .map(|_| ModelledCache::new(decoded_bytes, chunk_bytes))
+                .collect(),
+            encoded: (0..pools)
+                .map(|_| ModelledCache::new(encoded_bytes, chunk_bytes))
+                .collect(),
+            ever_fetched: BTreeMap::new(),
+        }
+    }
+
+    #[inline]
+    fn decoded(&self, pool: usize) -> &ModelledCache {
+        &self.decoded[pool]
+    }
+
+    fn demand(&mut self, pool: usize, keys: &[u64], size: u64) -> CacheAccess {
+        let sized_keys: Vec<(u64, u64)> = keys.iter().map(|&key| (key, size)).collect();
+        let missed_decoded = self.decoded[pool].misses(keys) as u64;
+        let not_in_either = keys
+            .iter()
+            .filter(|key| !self.decoded[pool].holds(**key) && !self.encoded[pool].holds(**key))
+            .count() as u64;
+        let mut duplicated_fetches = 0;
+        for key in keys {
+            if self.decoded[pool].holds(*key) || self.encoded[pool].holds(*key) {
+                continue;
+            }
+            match self.ever_fetched.entry(*key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(pool);
+                }
+                std::collections::btree_map::Entry::Occupied(first) => {
+                    if *first.get() != pool {
+                        duplicated_fetches += 1;
+                    }
+                }
+            }
+        }
+        self.decoded[pool].note_assigned_sized(&sized_keys);
+        self.encoded[pool].note_assigned_sized(&sized_keys);
+        CacheAccess {
+            fetched_bytes: not_in_either * size,
+            misses: not_in_either,
+            encoded_hit_bytes: (missed_decoded - not_in_either) * size,
+            hits: keys.len() as u64 - not_in_either,
+            encoded_hits: missed_decoded - not_in_either,
+            duplicated_fetches,
+        }
+    }
+
+    fn prefetch(&mut self, pool: usize, keys: &[(u64, u64)]) -> PrefetchAccess {
+        let missed: Vec<(u64, u64)> = keys
+            .iter()
+            .filter(|(key, _)| !self.decoded[pool].holds(*key) && !self.encoded[pool].holds(*key))
+            .copied()
+            .collect();
+        if missed.is_empty() {
+            return PrefetchAccess {
+                fetched_bytes: 0,
+                misses: 0,
+            };
+        }
+        let fetched_bytes = missed.iter().map(|(_, bytes)| *bytes).sum();
+        self.decoded[pool].note_assigned_sized(keys);
+        self.encoded[pool].note_assigned_sized(keys);
+        PrefetchAccess {
+            fetched_bytes,
+            misses: missed.len() as u64,
+        }
+    }
+}
+
+/// Image residency and per-task in-flight buffers.
+///
+/// The simulator still asks [`Decomposition::images_freed_after`] when a phase
+/// completes. This type owns the resulting bookkeeping: what images are live,
+/// which phase outputs have already been allocated, and how many task-local
+/// bytes are currently in flight.
+struct Residency {
+    live: Vec<(usize, u64)>,
+    allocated: Vec<bool>,
+    block_bytes: Vec<u64>,
+    in_flight_bytes: u64,
+}
+
+impl Residency {
+    fn new(decomposition: &Decomposition, tasks: usize, bytes_of: impl Fn(usize) -> u64) -> Self {
+        let mut live = vec![(0, bytes_of(0))];
+        for image in decomposition.supplied_input_images() {
+            live.push((image, bytes_of(image)));
+        }
+        Self {
+            live,
+            allocated: vec![false; decomposition.n_images() + 1],
+            block_bytes: vec![0; tasks],
+            in_flight_bytes: 0,
+        }
+    }
+
+    #[inline]
+    fn live_images(&self) -> &[(usize, u64)] {
+        &self.live
+    }
+
+    #[inline]
+    fn resident_bytes(&self) -> u64 {
+        self.live.iter().map(|&(_, bytes)| bytes).sum::<u64>() + self.in_flight_bytes
+    }
+
+    #[inline]
+    fn allocate_once(&mut self, image: usize, bytes: u64) {
+        if image < self.allocated.len() && !self.allocated[image] {
+            self.allocated[image] = true;
+            self.live.push((image, bytes));
+        }
+    }
+
+    #[inline]
+    fn release(&mut self, freed: &[usize]) {
+        self.live.retain(|&(image, _)| !freed.contains(&image));
+    }
+
+    #[inline]
+    fn start_task(&mut self, task: usize, bytes: u64) {
+        self.block_bytes[task] = bytes;
+        self.in_flight_bytes += bytes;
+    }
+
+    #[inline]
+    fn finish_task(&mut self, task: usize) {
+        self.in_flight_bytes -= self.block_bytes[task];
+    }
+}
+
+/// Phase completion state and the barrier-open predicate derived from it.
+///
+/// The event loop needs four facts to agree: when a phase first started, when
+/// its latest task finished, how many of its tasks are done, and which barrier
+/// phases are now open. Keeping them together makes "phase p has drained" one
+/// transition instead of repeated vector arithmetic at completion sites.
+struct PhaseProgress {
+    done: Vec<usize>,
+    tasks: Vec<usize>,
+    started: Vec<Option<u64>>,
+    finished: Vec<u64>,
+    finished_phases: usize,
+}
+
+impl PhaseProgress {
+    fn new(graph: &TaskGraph) -> Self {
+        Self {
+            done: vec![0; graph.n_phases()],
+            tasks: (0..graph.n_phases())
+                .map(|phase| graph.tasks_in_phase(phase).len())
+                .collect(),
+            started: vec![None; graph.n_phases()],
+            finished: vec![0; graph.n_phases()],
+            finished_phases: 0,
+        }
+    }
+
+    #[inline]
+    fn phase_open(&self, phase: usize, waits_for_the_phase_below: impl Fn(usize) -> bool) -> bool {
+        !waits_for_the_phase_below(phase) || self.finished_phases >= phase
+    }
+
+    #[inline]
+    fn mark_started(&mut self, phase: usize, now: u64) {
+        self.started[phase].get_or_insert(now);
+    }
+
+    #[inline]
+    fn complete_task(&mut self, phase: usize, now: u64) -> bool {
+        self.finished[phase] = self.finished[phase].max(now);
+        self.done[phase] += 1;
+        if self.done[phase] == self.tasks[phase] {
+            self.finished_phases = self.finished_phases.max(phase + 1);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    fn release_limit(&self) -> usize {
+        self.finished_phases + 1
+    }
+
+    fn phase_span_ns(&self) -> u64 {
+        self.started
+            .iter()
+            .zip(self.finished.iter())
+            .filter_map(|(started, finished)| {
+                started.map(|started| finished.saturating_sub(started))
+            })
+            .sum()
+    }
+}
+
+/// Worker timeline state: current time, running tasks, occupied slots, anchors,
+/// and task conservation.
+///
+/// These values are one state machine. A task in `running` must occupy exactly
+/// one worker slot, a completed task must free that slot before its anchor is
+/// updated, and `remaining` must fall only with a real completion.
+struct ExecutionTimeline {
+    now: u64,
+    running: Vec<(u64, usize)>,
+    busy: Vec<Option<usize>>,
+    anchors: Vec<Option<[f64; 3]>>,
+    node_anchors: Vec<Option<[f64; 3]>>,
+    remaining: usize,
+}
+
+impl ExecutionTimeline {
+    fn new(graph: &TaskGraph, topology: MachineTopology) -> Self {
+        Self {
+            now: 0,
+            running: Vec::new(),
+            busy: vec![None; topology.workers],
+            anchors: vec![None; topology.workers],
+            node_anchors: vec![None; topology.nodes],
+            remaining: graph.tasks.len(),
+        }
+    }
+
+    #[inline]
+    fn now(&self) -> u64 {
+        self.now
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    #[inline]
+    fn at_capacity(&self, topology: MachineTopology) -> bool {
+        self.running.len() >= topology.workers
+    }
+
+    #[inline]
+    fn has_free_worker(&self, topology: MachineTopology) -> bool {
+        self.running.len() < topology.workers
+    }
+
+    fn idle_slots_until_next_finish(&self, ready_empty: bool, topology: MachineTopology) -> u64 {
+        if ready_empty && self.has_free_worker(topology) {
+            self.running
+                .last()
+                .map(|&(finish, _)| {
+                    (finish - self.now) * (topology.workers - self.running.len()) as u64
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn is_idle(&self) -> bool {
+        self.running.is_empty()
+    }
+
+    fn advance_to_next_finish(
+        &mut self,
+        graph: &TaskGraph,
+        topology: MachineTopology,
+    ) -> Vec<usize> {
+        let Some(&(finish, _)) = self.running.last() else {
+            return Vec::new();
+        };
+        self.now = finish;
+        let mut completed = Vec::new();
+        while let Some(&(finish_ns, id)) = self.running.last() {
+            if finish_ns != self.now {
+                break;
+            }
+            self.running.pop();
+            let slot = self
+                .busy
+                .iter()
+                .position(|held| *held == Some(id))
+                .expect("a running task occupies one worker slot");
+            self.busy[slot] = None;
+            let at = crate::distributed::handout::position(graph, id);
+            self.anchors[slot] = Some(at);
+            self.node_anchors[topology.node_of(slot)] = Some(at);
+            self.remaining -= 1;
+            completed.push(id);
+        }
+        self.debug_assert_consistent();
+        completed
+    }
+
+    #[inline]
+    fn free_worker(&self) -> usize {
+        self.busy
+            .iter()
+            .position(|slot| slot.is_none())
+            .expect("a free worker, since the loop only reaches here below the worker count")
+    }
+
+    fn running_ids(&self) -> Vec<usize> {
+        self.running.iter().map(|&(_, id)| id).collect()
+    }
+
+    fn node_running(&self, node: usize, topology: MachineTopology) -> Vec<usize> {
+        self.busy
+            .iter()
+            .enumerate()
+            .filter(|&(slot, _)| topology.node_of(slot) == node)
+            .filter_map(|(_, held)| *held)
+            .collect()
+    }
+
+    #[inline]
+    fn anchors(&self) -> &[Option<[f64; 3]>] {
+        &self.anchors
+    }
+
+    #[inline]
+    fn node_anchors(&self) -> &[Option<[f64; 3]>] {
+        &self.node_anchors
+    }
+
+    fn running_on_node(&self, node: usize, topology: MachineTopology) -> usize {
+        self.busy
+            .iter()
+            .enumerate()
+            .filter(|&(slot, held)| held.is_some() && topology.node_of(slot) == node)
+            .count()
+    }
+
+    fn start(&mut self, worker: usize, id: usize, finish: u64) {
+        debug_assert!(
+            self.busy[worker].is_none(),
+            "worker slot is already occupied"
+        );
+        self.busy[worker] = Some(id);
+        self.running.push((finish, id));
+        // Descending by finish time, so the earliest completion is `last`.
+        self.running
+            .sort_by_key(|&(finish, _)| std::cmp::Reverse(finish));
+        self.debug_assert_consistent();
+    }
+
+    #[inline]
+    fn debug_assert_consistent(&self) {
+        debug_assert_eq!(
+            self.running.len(),
+            self.busy.iter().filter(|slot| slot.is_some()).count(),
+            "running tasks and occupied worker slots disagree"
+        );
+    }
+}
+
+/// Node-local IO channel reservations.
+///
+/// The simulator's IO model is deliberately small: a node owns `channels`
+/// independent serial links, and reads, writes and prefetches all reserve the
+/// earliest-free link on their own node. Keeping the flat table behind this
+/// type makes "which channels belong to a node" one rule instead of arithmetic
+/// repeated at demand, write and prefetch sites.
+struct IoChannels {
+    channels: usize,
+    free_at: Vec<u64>,
+}
+
+impl IoChannels {
+    fn new(nodes: usize, channels: usize) -> Self {
+        let channels = channels.max(1);
+        Self {
+            channels,
+            free_at: vec![0; channels * nodes.max(1)],
+        }
+    }
+
+    #[inline]
+    fn reserve(&mut self, node: usize, earliest: u64, duration: u64) -> (u64, u64) {
+        let channel = self.earliest_channel(node);
+        let start = earliest.max(self.free_at[channel]);
+        let done = start + duration;
+        self.free_at[channel] = done;
+        (start, done)
+    }
+
+    #[inline]
+    fn all_busy_at(&self, node: usize, now: u64) -> bool {
+        self.node_channels(node).iter().all(|&free| free > now)
+    }
+
+    #[inline]
+    fn earliest_channel(&self, node: usize) -> usize {
+        let base = node * self.channels;
+        self.node_channels(node)
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, free)| *free)
+            .map(|(index, _)| base + index)
+            .unwrap_or(base)
+    }
+
+    #[inline]
+    fn node_channels(&self, node: usize) -> &[u64] {
+        let base = node * self.channels;
+        &self.free_at[base..base + self.channels]
+    }
 }
 
 /// Run the plan and report what it did.
@@ -1678,17 +2733,7 @@ pub fn simulate(
     } else {
         per_phase.ns_per_voxel.to_vec()
     };
-    // What one block of each phase writes to its sidecar streams, from the
-    // declaration. `work` carries the op, so this needs nothing the plan does not
-    // already hand over; a phase that is not a fragment phase writes none.
-    let sidecar_per_block: Vec<Vec<SidecarSize>> = (0..n)
-        .map(|phase| match work.get(phase) {
-            Some(crate::fragment::PhaseWork::Fragments(op)) => {
-                op.outputs().iter().map(|output| output.size).collect()
-            }
-            _ => Vec::new(),
-        })
-        .collect();
+    let write_footprints = WriteFootprints::new(decomposition, work)?;
     let constant_fraction: Vec<f64> = if per_phase.constant_fraction.is_empty() {
         vec![0.0; n]
     } else {
@@ -1708,39 +2753,8 @@ pub fn simulate(
     };
     let graph = TaskGraph::build(decomposition);
     let dependents = graph.dependents();
-    let mut indegree: Vec<usize> = graph.tasks.iter().map(|t| t.n_dependencies()).collect();
 
-    // **A grid per image, not one per plan.** `ChunkGrid` is built from a
-    // volume, and the images of a plan do not share one: a resampling phase
-    // writes an image of a different extent, and a pyramid level is a different
-    // extent by construction. One grid over `decomposition.volume` keyed every
-    // image against the full-resolution lattice, so the hit rate reported for
-    // any phase below the top was fiction.
-    //
-    // `BTreeMap` rather than a `Vec` because a supplied input's id is not an
-    // index into `0..n_images()`.
-    let images_read: Vec<Vec<usize>> = decomposition
-        .phases
-        .iter()
-        .enumerate()
-        .map(|(index, phase)| phase.images_read(index))
-        .collect();
-    let mut grids: BTreeMap<usize, ChunkGrid> = BTreeMap::new();
-    for images in &images_read {
-        for &image in images {
-            grids
-                .entry(image)
-                .or_insert_with(|| ChunkGrid::new(decomposition.volume_at(image), rates.chunk));
-        }
-    }
-    let chunk_bytes: BTreeMap<usize, u64> = grids
-        .keys()
-        .map(|&image| {
-            let bytes = rates.chunk.iter().product::<usize>() as u64
-                * decomposition.dtype_at(image).size_of() as u64;
-            (image, bytes.max(1))
-        })
-        .collect();
+    let read_footprints = ReadFootprints::new(decomposition, rates);
     // **Two tiers, because the real cache has two.** The decoded tier is what a
     // hit used to be — free. The encoded tier holds more for the same bytes and
     // charges a decode for every hit, which is what gives a cache-size sweep the
@@ -1760,63 +2774,24 @@ pub fn simulate(
     // arrangements `Machine::cache_shared` names, and the middle one — a
     // computer's page cache, shared by its threads and by nobody else — is the
     // one that only exists once there are nodes.
-    let nodes = machine.nodes.max(1);
-    let workers = machine.workers.max(1);
-    // Round robin; see `Machine::nodes`. Written once, here, because three
-    // separate pieces of accounting below ask it and a second spelling of it
-    // would be a second topology.
-    let node_of = |worker: usize| worker % nodes;
-    // Slots on the busiest node, which is what a node's cache is divided among
-    // when it is not shared. `div_ceil` rather than a division, so a worker
-    // count that does not divide evenly gives every node the smaller share
-    // rather than giving one node an over-large one.
-    let workers_per_node = workers.div_ceil(nodes);
-    let pools = if machine.cache_shared { nodes } else { workers };
-    let pool_of = |worker: usize| {
-        if machine.cache_shared {
-            node_of(worker)
-        } else {
-            worker
-        }
-    };
+    let topology = MachineTopology::new(machine);
     // **`cache_bytes` is per node**, so it is divided among the pools *of a
     // node* and not among all of them: four computers with 16 GiB each have 64,
     // not 16 shared four ways. At one node this is the expression it was.
-    let per_pool = machine.cache_bytes
-        / if machine.cache_shared {
-            1
-        } else {
-            workers_per_node.max(1) as u64
-        };
+    let per_pool = machine.cache_bytes / topology.cache_pools_per_node();
     let encoded_bytes = (per_pool as f64 * machine.encoded_fraction) as u64;
-    let mut caches: Vec<ModelledCache> = (0..pools)
-        .map(|_| ModelledCache::new(per_pool - encoded_bytes, rates.chunk_bytes))
-        .collect();
-    let mut encodeds: Vec<ModelledCache> = (0..pools)
-        .map(|_| ModelledCache::new(encoded_bytes * ENCODED_RESIDENCY, rates.chunk_bytes))
-        .collect();
-    // Which pool first fetched each chunk, for counting the duplicated fetches a
-    // *second* pool causes. A map and not a set, so that a pool going back for
-    // something it evicted is not counted as another machine's copy — see
-    // `Outcome::duplicated_fetches`. Not an eviction model: which chunks a node
-    // has read is something a coordinator genuinely knows, and it is exactly
-    // what a duplicated fetch is made of.
-    let mut ever_fetched: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut anchors: Vec<Option<[f64; 3]>> = vec![None; machine.workers.max(1)];
-    // Where each computer last finished. One entry per node, and identical to
-    // `anchors` when there is one worker per node; see `Decision::node_anchors`.
-    let mut node_anchors: Vec<Option<[f64; 3]>> = vec![None; machine.nodes.max(1)];
-    let mut busy: Vec<Option<usize>> = vec![None; machine.workers.max(1)];
-
+    let mut caches = CachePools::new(
+        topology.pools(),
+        per_pool - encoded_bytes,
+        encoded_bytes * ENCODED_RESIDENCY,
+        rates.chunk_bytes,
+    );
     // --- image residency, on the executor's own rule -------------------------
     let bytes_of = |image: usize| -> u64 {
         let volume = decomposition.volume_at(image);
-        volume.iter().product::<usize>() as u64 * decomposition.dtype_at(image).size_of() as u64
+        product3(volume) as u64 * decomposition.dtype_at(image).size_of() as u64
     };
-    let mut live: Vec<(usize, u64)> = vec![(0, bytes_of(0))];
-    for image in decomposition.supplied_input_images() {
-        live.push((image, bytes_of(image)));
-    }
+    let mut residency = Residency::new(decomposition, graph.tasks.len(), bytes_of);
 
     let mut outcome = Outcome::default();
     // **One serial IO channel.** Not storage physics — there is no seek, no
@@ -1831,36 +2806,9 @@ pub fn simulate(
     // **Channels per node**, flat: node `n`'s channels are
     // `n * channels .. (n + 1) * channels`. A fetch takes the earliest-free one
     // *on its own node*, so two computers never queue behind each other.
-    let channels = machine.io_channels.max(1);
-    let mut io_free_at: Vec<u64> = vec![0; channels * nodes];
-    let mut now: u64 = 0;
-    // (finish_ns, task id), kept sorted so the earliest completion is last.
-    let mut running: Vec<(u64, usize)> = Vec::new();
-    let mut block_bytes: Vec<u64> = vec![0; graph.tasks.len()];
-    let mut in_flight_bytes: u64 = 0;
-    let mut done_in_phase: Vec<usize> = vec![0; graph.n_phases()];
-    // When each phase's first task started and its last one finished, for
-    // `Outcome::phase_span_ns`. `None` for a phase that never started, which is
-    // a phase with no tasks — its span is nothing rather than zero-to-zero.
-    let mut phase_started: Vec<Option<u64>> = vec![None; graph.n_phases()];
-    let mut phase_finished: Vec<u64> = vec![0; graph.n_phases()];
-    let mut finished_phases: usize = 0;
-    let mut remaining = graph.tasks.len();
-    // Phases whose output image has been counted as allocated.
-    let mut allocated: Vec<bool> = vec![false; decomposition.n_images() + 1];
-    // Asked once per phase rather than once per task: it is a property of the
-    // phase, and `phase_traffic` returns an error for a phase whose work is
-    // missing, which is a thing to find out before the run rather than midway.
-    let writes: Vec<bool> = decomposition
-        .phases
-        .iter()
-        .enumerate()
-        .map(|(index, phase)| {
-            crate::decomposition::phase_traffic(index, phase, work.get(index))
-                .map(|traffic| traffic.writes_an_image)
-        })
-        .collect::<Result<Vec<bool>>>()?;
-
+    let mut io = IoChannels::new(topology.nodes, machine.io_channels);
+    let mut timeline = ExecutionTimeline::new(&graph, topology);
+    let mut phases = PhaseProgress::new(&graph);
     // --- the ready set, maintained rather than rebuilt ----------------------
     //
     // **Which tasks may start**: indegree zero, not started, and — for a barrier
@@ -1893,24 +2841,11 @@ pub fn simulate(
     // executors.
     let waits_for_the_phase_below =
         |phase: usize| machine.wave_synchronous || graph.is_barrier(phase);
-    let mut ready: Vec<usize> = Vec::new();
-    // Tasks whose dependencies are all done and whose phase is a barrier that
-    // has not cleared. One list per phase, so a phase's tasks come back in the
-    // order they went in — which is ascending, because that is the order they
-    // are admitted in.
-    let mut barrier_held: Vec<Vec<usize>> = vec![Vec::new(); graph.n_phases()];
-    for id in 0..graph.tasks.len() {
-        if indegree[id] == 0 {
-            let phase = graph.tasks[id].phase;
-            if !waits_for_the_phase_below(phase) || finished_phases >= phase {
-                ready.push(id);
-            } else {
-                barrier_held[phase].push(id);
-            }
-        }
-    }
+    let mut ready = ReadySet::new(&graph, |phase| {
+        phases.phase_open(phase, waits_for_the_phase_below)
+    });
 
-    while remaining > 0 {
+    while timeline.remaining() > 0 {
         // **The scan the maintained set replaced, kept as its oracle.** Every
         // test in this crate that runs a simulation runs this comparison — the
         // suite is built in the dev profile — and a release build pays nothing
@@ -1919,69 +2854,41 @@ pub fn simulate(
         // that quietly changed.
         #[cfg(debug_assertions)]
         {
-            let scanned: Vec<usize> = (0..graph.tasks.len())
-                .filter(|&id| indegree[id] == 0)
-                .filter(|&id| {
-                    let phase = graph.tasks[id].phase;
-                    !waits_for_the_phase_below(phase) || finished_phases >= phase
-                })
-                .collect();
+            let scanned = ready.scanned(&graph, |phase| {
+                phases.phase_open(phase, waits_for_the_phase_below)
+            });
             debug_assert_eq!(
-                ready, scanned,
+                ready.as_slice(),
+                scanned.as_slice(),
                 "the maintained ready set and the full scan disagree"
             );
         }
 
-        if ready.is_empty() || running.len() >= machine.workers {
+        if ready.is_empty() || timeline.at_capacity(topology) {
             // Advance to the next completion. Nothing can start before then.
-            let Some(&(finish, _)) = running.last() else {
+            if timeline.is_idle() {
                 // Nothing ready and nothing running: the graph cannot progress.
                 // Reached only by a malformed decomposition, and returning the
                 // partial outcome would report a run that did not happen.
                 return Err(crate::error::Error::InvalidArgument(format!(
-                    "simulate: {remaining} tasks remain, none is ready and none is running. The \
-                     task graph has a cycle or a barrier that can never clear."
+                    "simulate: {} tasks remain, none is ready and none is running. The \
+                     task graph has a cycle or a barrier that can never clear.",
+                    timeline.remaining()
                 )));
-            };
-            if ready.is_empty() && running.len() < machine.workers {
-                outcome.idle_slot_ns += (finish - now) * (machine.workers - running.len()) as u64;
             }
-            now = finish;
-            while let Some(&(finish_ns, id)) = running.last() {
-                if finish_ns != now {
-                    break;
-                }
-                running.pop();
-                if let Some(slot) = busy.iter().position(|held| *held == Some(id)) {
-                    busy[slot] = None;
-                    let at = crate::distributed::handout::position(&graph, id);
-                    anchors[slot] = Some(at);
-                    node_anchors[slot % machine.nodes.max(1)] = Some(at);
-                }
-                in_flight_bytes -= block_bytes[id];
-                remaining -= 1;
+            outcome.idle_slot_ns +=
+                timeline.idle_slots_until_next_finish(ready.is_empty(), topology);
+            for id in timeline.advance_to_next_finish(&graph, topology) {
+                residency.finish_task(id);
                 outcome.tasks_run += 1;
-                for &next in &dependents[id] {
-                    indegree[next] -= 1;
-                    // Its last dependency: admit it, to the ready set or to the
-                    // barrier its phase is still waiting on.
-                    if indegree[next] == 0 {
-                        let phase = graph.tasks[next].phase;
-                        if !waits_for_the_phase_below(phase) || finished_phases >= phase {
-                            let at = ready.partition_point(|&other| other < next);
-                            ready.insert(at, next);
-                        } else {
-                            barrier_held[phase].push(next);
-                        }
-                    }
-                }
+                ready.complete_dependencies(id, &graph, &dependents, |phase| {
+                    phases.phase_open(phase, waits_for_the_phase_below)
+                });
                 let phase = graph.tasks[id].phase;
-                phase_finished[phase] = phase_finished[phase].max(now);
-                done_in_phase[phase] += 1;
-                if done_in_phase[phase] == graph.tasks_in_phase(phase).len() {
-                    finished_phases = finished_phases.max(phase + 1);
+                if phases.complete_task(phase, timeline.now()) {
                     // The barrier this completion cleared, for every phase it
-                    // cleared it for. `finished_phases` only grows, so a phase
+                    // cleared it for. `finished_phases` only grows inside
+                    // `PhaseProgress`, so a phase
                     // drained here is never held again.
                     //
                     // **`+ 1`, because the test is `finished_phases >= phase`
@@ -1993,13 +2900,7 @@ pub fn simulate(
                     // ever. The debug oracle above catches it, but only on a
                     // fixture that has a barrier phase, which is why
                     // `simulate_ranks` grew one.
-                    let cleared = finished_phases + 1;
-                    for held in barrier_held.iter_mut().take(cleared) {
-                        for id in held.drain(..) {
-                            let at = ready.partition_point(|&other| other < id);
-                            ready.insert(at, id);
-                        }
-                    }
+                    ready.release_through(phases.release_limit());
                     // **The gather.** A barrier reduces over every contributing
                     // block's fragment, which means holding them all at once —
                     // `n_blocks x payload` resident at one instant, with no term
@@ -2007,96 +2908,60 @@ pub fn simulate(
                     // added to `peak_bytes`, because a figure the byte budget
                     // does not yet know about must not silently start moving the
                     // number strategies are compared on.
-                    if graph.is_barrier(phase) || !sidecar_per_block[phase].is_empty() {
-                        let gathered: u64 = graph
-                            .tasks_in_phase(phase)
-                            .iter()
-                            .map(|task| {
-                                let core = task.geometry.core.shape3();
-                                let read = task.geometry.read.shape3();
-                                sidecar_per_block[phase]
-                                    .iter()
-                                    .filter_map(|size| size.bytes_at_most(core, read))
-                                    .sum::<u64>()
-                            })
-                            .sum();
-                        outcome.sidecar_gather_peak = outcome.sidecar_gather_peak.max(gathered);
-                    }
+                    let gathered = write_footprints.gather_peak(phase, &graph);
+                    outcome.sidecar_gather_peak = outcome.sidecar_gather_peak.max(gathered);
                     // Free what the executor frees after this phase — by
                     // calling the executor's rule, not by restating it.
                     let freed = decomposition.images_freed_after(phase, released, kept);
-                    live.retain(|&(image, _)| !freed.contains(&image));
+                    residency.release(&freed);
                 }
             }
             continue;
         }
 
-        let worker = busy
-            .iter()
-            .position(|slot| slot.is_none())
-            .expect("a free worker, since the loop only reaches here below the worker count");
-        let pool = pool_of(worker);
-        let node = node_of(worker);
+        let worker = timeline.free_worker();
+        let pool = topology.pool_of(worker);
+        let node = topology.node_of(worker);
         let slot = {
-            let running_ids: Vec<usize> = running.iter().map(|&(_, id)| id).collect();
+            let running_ids = timeline.running_ids();
             // The tasks held by slots on this worker's own node, from the slot
             // table rather than from `running`, which is task ids and does not
             // say which machine holds one.
-            let node_running: Vec<usize> = busy
-                .iter()
-                .enumerate()
-                .filter(|&(slot, _)| node_of(slot) == node_of(worker))
-                .filter_map(|(_, held)| *held)
-                .collect();
-            // **The candidate window**: the first `candidate_window` ready
-            // tasks, or all of them at `0`. A prefix of a slice that is already
-            // maintained in ascending task id, so it costs a bounds check and
-            // nothing else — no sort, no copy, no second set to keep in step
-            // with this one.
-            //
-            // `ready` is non-empty here and a window of `0` is the unbounded
-            // case, so `candidates` is never empty and the `- 1` below is never
-            // an underflow.
-            let candidates = match machine.candidate_window {
-                0 => &ready[..],
-                window => &ready[..window.min(ready.len())],
-            };
+            let node_running = timeline.node_running(node, topology);
+            let candidates = CandidateWindow::new(&ready, machine.candidate_window);
             let decision = Decision {
-                now_ns: now,
-                nodes,
+                now_ns: timeline.now(),
+                nodes: topology.nodes,
                 graph: &graph,
                 decomposition,
-                ready: candidates,
+                ready: candidates.as_slice(),
                 running: &running_ids,
                 node_running: &node_running,
-                live_images: &live,
-                resident_bytes: live.iter().map(|&(_, b)| b).sum::<u64>() + in_flight_bytes,
-                cache: &caches[pool],
+                live_images: residency.live_images(),
+                resident_bytes: residency.resident_bytes(),
+                read_footprints: &read_footprints,
+                cache: caches.decoded(pool),
                 worker,
-                anchors: &anchors,
-                node_anchors: &node_anchors,
-                grids: &grids,
-                images_read: &images_read,
+                anchors: timeline.anchors(),
+                node_anchors: timeline.node_anchors(),
+                grids: read_footprints.grids(),
+                images_read: read_footprints.images_read(),
                 phase_ns_per_voxel: &phase_rates,
                 phase_substages: &substages,
             };
-            // Clamped to the **window** and not to the ready set, so a
-            // scheduler that returns an index it was not offered still cannot
-            // reach past what it was shown.
-            scheduler.pick(&decision).min(candidates.len() - 1)
+            candidates.clamp_pick(scheduler.pick(&decision))
         };
         // Out of the set as it starts. `slot` indexes the window, and the
         // window is a *prefix* of `ready`, so the two indices are the same
         // number and no translation is needed — which is the reason the window
-        // is a prefix rather than a selection. The scan's equivalent is
-        // `indegree[id] = usize::MAX` below, which is still done — it is what the oracle above
-        // compares against and what keeps a completed task's decrement from
-        // re-admitting a started one.
+        // is a prefix rather than a selection. `ReadySet::mark_started` keeps
+        // the debug oracle and prefetch eligibility from seeing this task as
+        // ready again.
         let id = ready.remove(slot);
         let task = &graph.tasks[id];
         // Time only advances at the head of the loop, so the first dispatch of a
         // phase is its earliest start.
-        phase_started[task.phase].get_or_insert(now);
+        phases.mark_started(task.phase, timeline.now());
 
         // The image this phase writes is allocated when its first block starts.
         //
@@ -2105,10 +2970,8 @@ pub fn simulate(
         // write no image at all, and a walk that allocated one per phase would
         // over-count every plan with a fragment stage in it — which is every
         // plan this project actually runs.
-        let written = task.phase + 1;
-        if !allocated[written] && written < decomposition.n_images() && writes[task.phase] {
-            allocated[written] = true;
-            live.push((written, bytes_of(written)));
+        if let Some((image, bytes)) = write_footprints.allocation(task, decomposition, bytes_of) {
+            residency.allocate_once(image, bytes);
         }
 
         // What this task fetches, and what that costs. A demand fetch queues
@@ -2139,59 +3002,19 @@ pub fn simulate(
         if skipped {
             outcome.tasks_short_circuited += 1;
         }
-        let fetches: &[usize] = if skipped {
-            &images_read[task.phase][..1.min(images_read[task.phase].len())]
-        } else {
-            &images_read[task.phase]
-        };
-        let mut misses = 0u64;
-        let mut fetched = 0u64;
-        let mut encoded_hit_bytes = 0u64;
-        for &image in fetches {
-            let keys = grids[&image].keys(image, &task.geometry.source);
-            let size = chunk_bytes[&image];
-            let sized_keys: Vec<(u64, u64)> = keys.iter().map(|&key| (key, size)).collect();
-            let missed_decoded = caches[pool].misses(&keys) as u64;
-            // A chunk the decoded tier does not hold may still be in the encoded
-            // one, where it is a hit that costs a decode rather than a fetch.
-            let not_in_either = keys
-                .iter()
-                .filter(|key| !caches[pool].holds(**key) && !encodeds[pool].holds(**key))
-                .count() as u64;
-            encoded_hit_bytes += (missed_decoded - not_in_either) * size;
-            fetched += not_in_either * size;
-            // A chunk this pool must fetch that **another** pool has already
-            // fetched is a duplicated fetch — the thing a handout policy exists
-            // to avoid, and invisible under one shared pool.
-            for key in &keys {
-                if caches[pool].holds(*key) || encodeds[pool].holds(*key) {
-                    continue;
-                }
-                match ever_fetched.entry(*key) {
-                    std::collections::btree_map::Entry::Vacant(slot) => {
-                        slot.insert(pool);
-                    }
-                    std::collections::btree_map::Entry::Occupied(first) => {
-                        if *first.get() != pool {
-                            outcome.duplicated_fetches += 1;
-                        }
-                    }
-                }
-            }
-            caches[pool].note_assigned_sized(&sized_keys);
-            encodeds[pool].note_assigned_sized(&sized_keys);
-            outcome.cache_hits += keys.len() as u64 - not_in_either;
-            outcome.cache_misses += not_in_either;
-            outcome.encoded_hits += missed_decoded - not_in_either;
-            misses += not_in_either;
-        }
-        outcome.fetched_bytes += fetched;
+        let demand_read = DemandReadTransaction::start(
+            task,
+            skipped,
+            &read_footprints,
+            &mut caches,
+            pool,
+            &mut outcome,
+        );
         // A request per chunk, plus the bytes. This is what puts a floor under a
         // small chunk: without it, halving the chunk halves the over-fetch and
         // nothing pays for the extra objects, so a chunk-size sweep improves
         // without bound toward zero.
-        let transfer =
-            (misses as f64 * rates.io_latency_ns + fetched as f64 * rates.io_ns_per_byte) as u64;
+        let transfer_ns = demand_read.transfer_ns(rates);
         // **A task that fetches nothing does not touch the channel**, and
         // therefore does not wait for it. This used to be `now.max(io_free_at)`
         // unconditionally, which was invisible while the only thing advancing
@@ -2199,21 +3022,18 @@ pub fn simulate(
         // a bug the moment writes began reserving it, because then every task
         // waited behind every prior task's store and the makespan stopped
         // responding to the worker count at all.
-        let io_done = if transfer > 0 {
-            let channel = earliest_channel(&io_free_at, node, channels);
-            let done = now.max(io_free_at[channel]) + transfer;
-            io_free_at[channel] = done;
+        let io_done = if demand_read.needs_channel() {
+            let (_, done) = io.reserve(node, timeline.now(), transfer_ns);
             done
         } else {
-            now
+            timeline.now()
         };
-        outcome.io_wait_ns += io_done - now;
+        outcome.io_wait_ns += io_done - timeline.now();
         // The decode is CPU work between the transfer and the compute, so it
         // does not occupy a channel and does not overlap with the fetch that
         // produced its bytes. An **encoded hit** pays the same decode without
         // the fetch, which is the whole of what the second tier trades.
-        let decoded_bytes = fetched + encoded_hit_bytes;
-        let decoded = io_done + (decoded_bytes as f64 * rates.decode_ns_per_byte) as u64;
+        let decoded = demand_read.decoded_at(io_done, rates);
 
         let read_voxels = task.geometry.read.voxels() as u64;
         // One input tile per image the block fetches, at the extent it fetches
@@ -2226,18 +3046,9 @@ pub fn simulate(
         // recorded gap: a phase reading three images was charged as if it read
         // one. That gap remains on `PhaseCost`; closing it there is a change to
         // what the planner *chooses* on and wants its own measurement.
-        let fetch_voxels = task.geometry.source.voxels() as u64;
-        let input_bytes: u64 = fetches
-            .iter()
-            .map(|&image| fetch_voxels * decomposition.dtype_at(image).size_of() as u64)
-            .sum();
-        let output_bytes = if writes[task.phase] {
-            read_voxels * decomposition.dtype_at(task.phase + 1).size_of() as u64
-        } else {
-            0
-        };
-        block_bytes[id] = input_bytes + output_bytes;
-        in_flight_bytes += block_bytes[id];
+        let input_bytes = demand_read.input_buffer_bytes();
+        let output_bytes = write_footprints.output_buffer_bytes(task, decomposition);
+        residency.start_task(id, input_bytes + output_bytes);
 
         // **`S x compute`, one fetch and one store.** The shape `iterate`'s own
         // header states is `S x (read + compute) + write`, and its `read` is the
@@ -2264,12 +3075,7 @@ pub fn simulate(
         // this task. At one node it is `running.len() + 1`, the expression this
         // replaced, and `contention_counts_only_the_workers_of_one_node` is what
         // says so.
-        let concurrent = (busy
-            .iter()
-            .enumerate()
-            .filter(|&(slot, held)| held.is_some() && node_of(slot) == node)
-            .count()
-            + 1) as f64;
+        let concurrent = (timeline.running_on_node(node, topology) + 1) as f64;
         let slowdown = 1.0 + machine.contention * (concurrent - 1.0);
         let compute = if skipped {
             0
@@ -2277,9 +3083,7 @@ pub fn simulate(
             (read_voxels as f64 * phase_rates[task.phase] * substages[task.phase] as f64 * slowdown)
                 as u64
         };
-        // Indegree is decremented on completion, so mark the task started by
-        // making it un-ready. `usize::MAX` cannot be reached by decrementing.
-        indegree[id] = usize::MAX;
+        ready.mark_started(id);
         // Compute starts when the bytes have landed, not when the slot opened.
         let computed = decoded + compute.max(1);
 
@@ -2296,60 +3100,12 @@ pub fn simulate(
         // scalar model was missing: the arrival time is `computed`, not dispatch
         // time, so compute still overlaps compute while reads and writes
         // contend for the same finite IO channels.
-        let written = task.phase + 1;
-        let write_bytes = if writes[task.phase] && written < decomposition.n_images() {
-            task.geometry.valid.voxels() as u64 * decomposition.dtype_at(written).size_of() as u64
-        } else {
-            0
-        };
-        // The sidecar a fragment block writes, on the same terms as the image
-        // write: the worker blocks on it, and the bytes are the declared bound.
-        let sidecar_bytes: u64 = sidecar_per_block[task.phase]
-            .iter()
-            .filter_map(|size| {
-                size.bytes_at_most(task.geometry.core.shape3(), task.geometry.read.shape3())
-            })
-            .sum();
-        outcome.sidecar_bytes_written += sidecar_bytes;
-        let finish = if write_bytes + sidecar_bytes > 0 {
-            let intermediate =
-                decomposition.image_kind(written) == crate::decomposition::ImageKind::Intermediate;
-            let rate = if intermediate {
-                rates.materialise_ns_per_byte
-            } else {
-                rates.write_ns_per_byte
-            };
-            // The image bytes are counted as image bytes and the sidecar bytes
-            // as sidecar bytes — they share the *duration*, because the worker
-            // blocks on both, and nothing else. Folding them into one counter
-            // was the first version and it made `written_bytes` disagree with
-            // the executor's `RegionWritten` by exactly the sidecar payload.
-            if intermediate {
-                outcome.materialised_bytes += write_bytes;
-            } else {
-                outcome.written_bytes += write_bytes;
-            }
-            // A sidecar is an intermediate by nature: nothing outside the run
-            // reads one, and `Lifecycle` is how it goes.
-            let transfer = (write_bytes as f64 * rate) as u64
-                + (sidecar_bytes as f64 * rates.materialise_ns_per_byte) as u64;
-            if transfer > 0 {
-                let channel = earliest_channel(&io_free_at, node, channels);
-                let start = computed.max(io_free_at[channel]);
-                let done = start + transfer;
-                outcome.io_wait_ns += start - computed;
-                io_free_at[channel] = done;
-                done
-            } else {
-                computed
-            }
-        } else {
-            computed
-        };
-        busy[worker] = Some(id);
-        running.push((finish, id));
-        // Descending by finish time, so the earliest completion is `last`.
-        running.sort_by_key(|&(finish, _)| std::cmp::Reverse(finish));
+        // The image bytes are counted as image bytes and the sidecar bytes as
+        // sidecar bytes. They share the duration because the worker blocks on
+        // both, but they do not share an outcome counter.
+        let finish = StoreTransaction::start(task, &write_footprints, decomposition, &mut outcome)
+            .finish_after(computed, node, &mut io, rates, &mut outcome);
+        timeline.start(worker, id, finish);
 
         // **Prefetch fills idle channel time and nothing else.**
         //
@@ -2364,79 +3120,22 @@ pub fn simulate(
         // what `prefetch::Prefetcher` ranks on. That is the point made in the
         // bounded-horizon argument: the prefetcher is immune to the compute
         // scheduler's myopia precisely because it does not consult it.
-        if machine.prefetch_depth > 0 {
-            let mut issued = 0usize;
-            for ahead in graph.tasks.iter().skip(id + 1) {
-                if issued == machine.prefetch_depth {
-                    break;
-                }
-                // **Only into idle channel time, and the test is taken once per
-                // dispatch rather than once per fetch.** A prefetcher with a
-                // queue issues a run of fetches when it finds the channel free;
-                // it does not re-ask after each one, or `depth` would mean "at
-                // most one outstanding fetch" and every depth above 1 would be
-                // inert. That was this model's first form, and a sweep of
-                // depths 1 to 64 returned the identical row seven times.
-                if issued == 0
-                    && io_free_at[node * channels..(node + 1) * channels]
-                        .iter()
-                        .all(|&free| free > now)
-                {
-                    break;
-                }
-                // **Only a task whose dependencies are met.** `usize::MAX`
-                // marks a task already started; `0` is the readiness test the
-                // dispatcher itself uses. Anything else names a task whose
-                // input image the producing phase has not written, and a fetch
-                // of bytes that do not exist yet is not a prefetch — it is a
-                // hit banked against data the run has not produced. Tasks are
-                // laid out phase-major (`TaskGraph::build`), so without this
-                // every depth past the end of the current phase was doing
-                // exactly that.
-                if indegree[ahead.id] != 0 {
-                    continue;
-                }
-                let mut ahead_keys: Vec<(u64, u64)> = Vec::new();
-                for &image in &images_read[ahead.phase] {
-                    let size = chunk_bytes[&image];
-                    ahead_keys.extend(
-                        grids[&image]
-                            .keys(image, &ahead.geometry.source)
-                            .into_iter()
-                            .map(|key| (key, size)),
-                    );
-                }
-                let ahead_missed: Vec<(u64, u64)> = ahead_keys
-                    .iter()
-                    .filter(|(key, _)| !caches[pool].holds(*key) && !encodeds[pool].holds(*key))
-                    .copied()
-                    .collect();
-                let ahead_misses = ahead_missed.len() as u64;
-                if ahead_misses == 0 {
-                    continue;
-                }
-                let bytes = ahead_missed.iter().map(|(_, bytes)| *bytes).sum::<u64>();
-                caches[pool].note_assigned_sized(&ahead_keys);
-                encodeds[pool].note_assigned_sized(&ahead_keys);
-                outcome.fetched_bytes += bytes;
-                outcome.prefetched_bytes += bytes;
-                outcome.cache_misses += ahead_misses;
-                // **Queued, not restarted.** Each fetch begins when the one
-                // before it ends, so a deep prefetch pushes the channel's free
-                // moment far into the future — and the next *demand* fetch
-                // queues behind all of it. That delay is the cost of depth, and
-                // without accumulating here there is no cost and deeper would
-                // be better without bound.
-                let channel = earliest_channel(&io_free_at, node, channels);
-                io_free_at[channel] = io_free_at[channel].max(now)
-                    + (ahead_misses as f64 * rates.io_latency_ns
-                        + bytes as f64 * rates.io_ns_per_byte) as u64;
-                issued += 1;
-            }
-        }
+        PrefetchIssuance::issue_after_dispatch(
+            machine.prefetch_depth,
+            id,
+            timeline.now(),
+            node,
+            pool,
+            &graph,
+            &ready,
+            &read_footprints,
+            &mut caches,
+            &mut io,
+            rates,
+            &mut outcome,
+        );
 
-        let resident = live.iter().map(|&(_, b)| b).sum::<u64>() + in_flight_bytes;
-        outcome.peak_bytes = outcome.peak_bytes.max(resident);
+        outcome.peak_bytes = outcome.peak_bytes.max(residency.resident_bytes());
         outcome.makespan_ns = outcome.makespan_ns.max(finish);
     }
 
@@ -2444,11 +3143,7 @@ pub fn simulate(
     // which is a phase with no tasks; `saturating_sub` rather than a subtraction
     // because a phase whose every task was short-circuited can finish in the
     // nanosecond it started.
-    outcome.phase_span_ns = phase_started
-        .iter()
-        .zip(phase_finished.iter())
-        .filter_map(|(started, finished)| started.map(|started| finished.saturating_sub(started)))
-        .sum();
+    outcome.phase_span_ns = phases.phase_span_ns();
 
     Ok(outcome)
 }

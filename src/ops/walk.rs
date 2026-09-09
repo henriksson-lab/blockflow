@@ -138,11 +138,11 @@ use std::sync::Arc;
 use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
-    BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput, SeamFold,
-    SidecarSize, SourceBlocks,
+    BlockOutput, BlockView, FragmentInput, FragmentOp, FragmentOutput, SeamFold, SourceBlocks,
 };
 use crate::op::SourceInput;
 use crate::ops::rows::{value_at, Limit, RowStreams};
+use crate::ops::TypedSource;
 use crate::reach::Reach;
 use crate::region::Region;
 use crate::table::{Column, Row, RowBuilder, Schema, Table, Value};
@@ -657,7 +657,8 @@ pub fn walk_blob(
 pub struct OffsetWalkOp {
     name: &'static str,
     rows: RowStreams,
-    image: usize,
+    schema: Schema,
+    image: TypedSource,
     column: String,
     sequence: OffsetSequence,
     stop: Limit,
@@ -687,9 +688,8 @@ impl OffsetWalkOp {
         stop: Limit,
         not_found: f64,
     ) -> Result<Self> {
-        let image = image.into().index();
         let column = column.into();
-        walk_schema(&rows.schema, &column)?;
+        let schema = walk_schema(&rows.schema, &column)?;
         if !not_found.is_finite() {
             return Err(Error::invalid(format!(
                 "the not-found value is {not_found}, and a table's f64 column refuses anything \
@@ -710,7 +710,8 @@ impl OffsetWalkOp {
         Ok(Self {
             name,
             rows,
-            image,
+            schema,
+            image: TypedSource::new(image),
             column,
             sequence,
             stop,
@@ -721,7 +722,7 @@ impl OffsetWalkOp {
     /// The schema of the rows this op emits: its input's, with the distance
     /// column appended.
     pub fn schema(&self) -> Result<Schema> {
-        walk_schema(&self.rows.schema, &self.column)
+        Ok(self.schema.clone())
     }
 
     pub fn sequence(&self) -> &OffsetSequence {
@@ -751,31 +752,15 @@ impl FragmentOp for OffsetWalkOp {
     }
 
     fn inputs(&self) -> Vec<FragmentInput> {
-        // Reach `[0, 0, 0]`: this block's rows and no neighbour's. A row is read
-        // by exactly one block, and an overlap here would duplicate rows rather
-        // than cost recomputation.
-        vec![FragmentInput::own(self.rows.input.clone(), self.rows.phase)]
+        self.rows.inputs()
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            self.rows.output.clone(),
-            self.rows.lifecycle,
-            // Every block, always. This phase writes no image, so the tiling
-            // check has nothing to bite on and this declaration is the only
-            // guard there is.
-            Coverage::EveryBlock,
-        )
-        // A walk emits at most one row per input row, and the input is keyed by
-        //             // position, so one per core voxel bounds it.
-        .sized(match self.schema() {
-            Ok(schema) => SidecarSize::row_table(&schema, 1),
-            Err(_) => SidecarSize::Unstated,
-        })]
+        self.rows.outputs_for(&self.schema)
     }
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
-        vec![SourceInput::new(self.image, self.sequence.reach())]
+        vec![self.image.source_input(self.sequence.reach())]
     }
 
     fn seam_fold(&self) -> Option<SeamFold> {
@@ -795,38 +780,36 @@ impl FragmentOp for OffsetWalkOp {
     }
 
     fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
-        let schema = self.schema()?;
-        let blob = at.own(&self.rows.input).unwrap_or(&[]);
-        let BlockBuf::Array(pixels) = sources.get(self.image)? else {
+        let blob = self.rows.own(at);
+        let BlockBuf::Array(pixels) =
+            self.image
+                .block_at_extent(self.name, "walk source", sources, at.read)?
+        else {
             // An accounting run holds no data. It still writes a fragment,
             // because what such a run measures is the IO and a phase that
             // silently produced nothing would be a measurement of a different
             // program. What it must not do is invent distances, so the fragment
             // is present and empty rather than present and fabricated.
-            return Ok(BlockOutput::fragment(
-                self.rows.output.clone(),
-                RowBuilder::new(Arc::new(schema)).encode(),
-            ));
+            return Ok(self
+                .rows
+                .fragment(RowBuilder::new(Arc::new(self.schema.clone())).encode()));
         };
         // The operand covers the block's fetch region, whose lowest voxel is
         // where this block's anchor sits. Taken from the anchor rather than from
         // `read` because that is the region the executor read the operand over.
         let origin = at.at.offset;
-        Ok(BlockOutput::fragment(
-            self.rows.output.clone(),
-            walk_blob(
-                at.volume(),
-                &self.rows.schema,
-                blob,
-                &self.column,
-                at.core,
-                &self.sequence,
-                self.stop,
-                self.not_found,
-                pixels,
-                origin,
-            )?,
-        ))
+        Ok(self.rows.fragment(walk_blob(
+            at.volume(),
+            &self.rows.schema,
+            blob,
+            &self.column,
+            at.core,
+            &self.sequence,
+            self.stop,
+            self.not_found,
+            pixels,
+            origin,
+        )?))
     }
 }
 

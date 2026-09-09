@@ -159,6 +159,12 @@ pub struct LocalOptions {
     /// runner asks of the machine, and nothing checks it against the machine's
     /// cores, exactly as `workers` alone was never checked.
     pub threads: usize,
+    /// `--cache-bytes` for every worker. `None` lets the job's workflow cache
+    /// budget drive the real worker cache; `Some(0)` disables it.
+    pub cache_bytes: Option<u64>,
+    /// `--prefetch-threads` for every worker. The worker normalizes zero to
+    /// one.
+    pub prefetch_threads: usize,
 }
 
 impl LocalOptions {
@@ -175,6 +181,8 @@ impl LocalOptions {
             ahead: 2,
             // One, so a runner built today starts the workers it always started.
             threads: 1,
+            cache_bytes: None,
+            prefetch_threads: 1,
         })
     }
 }
@@ -419,8 +427,13 @@ pub fn run(
             .arg(options.ahead.to_string())
             .arg("--threads")
             .arg(options.threads.to_string())
+            .arg("--prefetch-threads")
+            .arg(options.prefetch_threads.to_string())
             .arg("--report")
             .arg(&path);
+        if let Some(cache_bytes) = options.cache_bytes {
+            worker.arg("--cache-bytes").arg(cache_bytes.to_string());
+        }
         if let Some((_, tasks)) = options.stop_after.iter().find(|(which, _)| *which == index) {
             worker.arg("--stop-after").arg(tasks.to_string());
         }

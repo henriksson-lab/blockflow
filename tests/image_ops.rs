@@ -41,38 +41,28 @@ use blockflow::ops::{
     StructuringElement, VoxelwiseMapOp,
 };
 use blockflow::strategy::{execute, Hints, Workflow};
-use blockflow::synthetic::{Scene, SceneSpec};
+use blockflow::synthetic::SceneSpec;
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
 mod support;
 
-use support::single_phase;
+use support::{single_phase, volume};
 
 const VOLUME: [usize; 3] = [32, 24, 20];
+const SUITE: single_phase::Suite = single_phase::Suite::new("ops", VOLUME, [4, 4, 4]);
 
 // ------------------------------------------------------------- fixtures --
 
 /// A generated volume with structure at several scales, so that a filter has
 /// something to do and a seam has something to get wrong.
 fn intensities() -> Array3<f64> {
-    let scene = Scene::new(
+    volume::scene_intensity(
         SceneSpec::new(VOLUME, 20250811)
             .with_objects(40)
             .with_radius(1.5, 4.0)
             .with_noise(0.02),
     )
-    .unwrap();
-    let rendered = scene.render();
-    let mut array = Array3::zeros((VOLUME[0], VOLUME[1], VOLUME[2]));
-    for i in 0..VOLUME[0] {
-        for j in 0..VOLUME[1] {
-            for k in 0..VOLUME[2] {
-                array[[i, j, k]] = rendered.intensity[[i, j, k]];
-            }
-        }
-    }
-    array
 }
 
 /// A mask, for the ops that take one.
@@ -81,7 +71,7 @@ fn mask(input: &Array3<f64>, level: f64) -> Array3<f64> {
 }
 
 fn workflow(chain: Chain) -> Workflow {
-    single_phase::workflow_f64(chain, VOLUME)
+    SUITE.workflow(chain)
 }
 
 /// One phase holding the whole chain, at a given block edge and split axes.
@@ -89,7 +79,7 @@ fn workflow(chain: Chain) -> Workflow {
 /// Built from the chain's **own** reach, which is the only honest way: nothing
 /// here supplies a reach, so nothing here can hide one that is wrong.
 fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {
-    single_phase::plan(workflow, VOLUME, block, split_axes)
+    SUITE.plan(workflow, block, split_axes)
 }
 
 /// The same, with the reach stated rather than derived — for provoking the
@@ -100,12 +90,12 @@ fn plan_with_reach(
     split_axes: &[usize],
     reach: [usize; 3],
 ) -> Decomposition {
-    single_phase::plan_with_reach(workflow, VOLUME, block, split_axes, reach)
+    SUITE.plan_with_reach(workflow, block, split_axes, reach)
 }
 
 /// The oracle: the same kernels, called once, over the whole array.
 fn reference(chain: &Chain, input: &Array3<f64>) -> Array3<f64> {
-    single_phase::reference_f64(chain, input, VOLUME)
+    SUITE.reference_f64(chain, input)
 }
 
 fn run(workflow: &Workflow, decomposition: &Decomposition, input: &Array3<f64>) -> Array3<f64> {
@@ -120,7 +110,7 @@ fn run_reporting(
     decomposition: &Decomposition,
     input: &Array3<f64>,
 ) -> (Array3<f64>, usize) {
-    let ran = single_phase::run_f64("ops", workflow, decomposition, input, [4, 4, 4]);
+    let ran = SUITE.run_f64(workflow, decomposition, input);
     (ran.output, ran.tasks_short_circuited)
 }
 

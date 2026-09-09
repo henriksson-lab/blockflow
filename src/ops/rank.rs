@@ -1639,29 +1639,9 @@ impl BlockOp for RankFilterOp {
             // `Total` detour. `f32` widens to `f64` on the way in and back on
             // the way out, which is exact both ways because the filter selects a
             // value it read rather than combining two.
-            Dtype::F64 => rank_filter_f64_into_at(
-                input.view::<f64>()?,
-                at,
-                &self.element,
-                self.rank,
-                out.view_mut::<f64>()?,
-            ),
-            Dtype::F32 => {
-                let widened = input.view::<f32>()?.mapv(f64::from);
-                let mut selected = Array3::zeros(widened.raw_dim());
-                rank_filter_f64_into_at(
-                    widened.view(),
-                    at,
-                    &self.element,
-                    self.rank,
-                    selected.view_mut(),
-                )?;
-                let mut out = out.view_mut::<f32>()?;
-                ndarray::Zip::from(&mut out)
-                    .and(&selected)
-                    .for_each(|slot, &value| *slot = value as f32);
-                Ok(())
-            }
+            Dtype::F64 | Dtype::F32 => super::apply_float_detour(input, out, |source, out| {
+                rank_filter_f64_into_at(source, at, &self.element, self.rank, out)
+            }),
             Dtype::F16 => Err(Error::InvalidArgument(format!(
                 "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
                 self.name
@@ -1883,33 +1863,18 @@ impl BlockOp for MaskedRankFilterOp {
             Dtype::I16 => ordered::<i16>(input, at, mask, out, &self.element, self.rank, centre),
             Dtype::I32 => ordered::<i32>(input, at, mask, out, &self.element, self.rank, centre),
             Dtype::I64 => ordered::<i64>(input, at, mask, out, &self.element, self.rank, centre),
-            Dtype::F64 => {
+            Dtype::F64 | Dtype::F32 => super::apply_float_detour(input, out, |source, mut out| {
                 let selected = through_total(
-                    input.view::<f64>()?.to_owned(),
+                    source.to_owned(),
                     at,
                     mask,
                     &self.element,
                     self.rank,
                     centre,
                 )?;
-                out.view_mut::<f64>()?.assign(&selected);
+                out.assign(&selected);
                 Ok(())
-            }
-            Dtype::F32 => {
-                let selected = through_total(
-                    input.view::<f32>()?.mapv(f64::from),
-                    at,
-                    mask,
-                    &self.element,
-                    self.rank,
-                    centre,
-                )?;
-                let mut out = out.view_mut::<f32>()?;
-                ndarray::Zip::from(&mut out)
-                    .and(&selected)
-                    .for_each(|slot, &value| *slot = value as f32);
-                Ok(())
-            }
+            }),
             Dtype::F16 => Err(Error::InvalidArgument(format!(
                 "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
                 self.name

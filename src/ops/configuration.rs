@@ -133,8 +133,8 @@ use crate::iterate::{IterativeOp, Substage, SubstageLimit, SubstageOperand};
 use crate::op::{Anchor, BlockOp};
 use crate::voxels::Voxels;
 
-use super::shapes_agree;
 use super::voxelwise::{from_set, is_set};
+use super::{accepts_mask_carrier, apply_mask_carrier, shapes_agree};
 
 /// Voxels in a 3x3x3 neighbourhood, and therefore bits in a configuration.
 pub const CONFIGURATION_BITS: u32 = 27;
@@ -673,33 +673,13 @@ impl BlockOp for ConfigurationPassOp {
     /// kept because a chain may carry a mask as `f64` under this module's
     /// `is_set`/`from_set` convention; the kernel is a `bool` kernel either way.
     fn accepts(&self, dtype: Dtype) -> bool {
-        matches!(dtype, Dtype::Bool | Dtype::F64)
+        accepts_mask_carrier(dtype)
     }
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        match input.dtype() {
-            Dtype::Bool => configuration_passes_into(
-                input.view::<bool>()?,
-                &self.table,
-                self.passes,
-                out.view_mut::<bool>()?,
-            ),
-            _ => {
-                let mask = input.view::<f64>()?.mapv(is_set);
-                let mut result = Array3::from_elem(mask.raw_dim(), false);
-                configuration_passes_into(
-                    mask.view(),
-                    &self.table,
-                    self.passes,
-                    result.view_mut(),
-                )?;
-                let mut out = out.view_mut::<f64>()?;
-                ndarray::Zip::from(&mut out)
-                    .and(&result)
-                    .for_each(|slot, &value| *slot = from_set(value));
-                Ok(())
-            }
-        }
+        apply_mask_carrier(input, out, |input, out| {
+            configuration_passes_into(input, &self.table, self.passes, out)
+        })
     }
 
     /// **Only an all-clear block, and only under a table that leaves the empty
@@ -783,26 +763,14 @@ impl IterativeOp for ConfigurationFixedPointOp {
     }
 
     fn accepts(&self, dtype: Dtype) -> bool {
-        matches!(dtype, Dtype::Bool | Dtype::F64)
+        accepts_mask_carrier(dtype)
     }
 
     fn substage(&self, at: &Substage<'_>, out: &mut Voxels) -> Result<()> {
         let input = at.operand(0)?;
-        match input.dtype() {
-            Dtype::Bool => {
-                configuration_pass_into(input.view::<bool>()?, &self.table, out.view_mut::<bool>()?)
-            }
-            _ => {
-                let mask = input.view::<f64>()?.mapv(is_set);
-                let mut result = Array3::from_elem(mask.raw_dim(), false);
-                configuration_pass_into(mask.view(), &self.table, result.view_mut())?;
-                let mut out = out.view_mut::<f64>()?;
-                ndarray::Zip::from(&mut out)
-                    .and(&result)
-                    .for_each(|slot, &value| *slot = from_set(value));
-                Ok(())
-            }
-        }
+        apply_mask_carrier(input, out, |input, out| {
+            configuration_pass_into(input, &self.table, out)
+        })
     }
 
     fn cost_per_voxel(&self) -> f64 {

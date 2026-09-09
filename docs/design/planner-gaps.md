@@ -316,9 +316,42 @@ And one operational finding: on `less-memory` every plan chosen elsewhere is
 would have ranked an impossible plan against feasible ones, which is why the
 harness checks the working set against the budget before it times anything.
 
-The tables are recorded in the tests' own docs, with per-scenario ceilings, so a
-change that degrades one machine while leaving this one alone fails with that
-machine's name in the message.
+The raw cost-model transfer matrix is now recorded here instead of only in the
+test header. Rows are the machine planned for, columns the machine run on;
+`over` is a plan that does not fit that machine's memory budget. This is the
+trimmed table printed by `tests/cost_scenarios.rs` after the contention term:
+
+```text
+                     forty-c  four-no  less-me  measure  ten-nod  two-nod
+compressed-store       1.433    0.893     over    1.000    1.275    0.460
+forty-cores            1.000    0.935    1.307    0.794    0.819    0.517
+four-nodes             1.412    1.000    1.312    0.990    0.811    0.689
+less-memory            1.945    1.120    1.000    0.890    1.042    0.647
+measured               1.433    0.893     over    1.000    1.275    0.460
+slow-disk              1.441    0.894     over    1.006    1.262    0.462
+ten-nodes              1.792    1.126    0.943    0.838    1.000    0.622
+two-cores              1.433    0.893     over    1.000    1.275    0.460
+two-nodes              2.263    1.325     over    1.230    1.256    1.000
+```
+
+Four things it says:
+
+* the current largest raw transfer cell is **2.263x** on forty cores for the
+  two-node plan. That row's mixed grid was chosen to exploit two nodes and is a
+  poor traveller on one busy machine with forty workers;
+* the `less-memory` column is `over` for every foreign plan. A plan chosen on a
+  machine with memory is inadmissible on one without it, which is why the
+  transfer harness checks fit before timing;
+* the `two-nodes` column is below one for almost every foreign plan, and its own
+  row is the worst traveller in the table. Both are the same contention fact
+  seen from opposite sides;
+* machines that differ only in storage still transfer at `1.000`. Disk speed,
+  chunk shape and compression choose one plan among themselves; slot count, node
+  count and budget move the plan.
+
+The test keeps the executable ceiling per column, so a change that degrades one
+machine while leaving this one alone fails with that machine's name in the
+message.
 
 ## More than one computer
 
@@ -356,13 +389,11 @@ on eight.
 
 **What it costs the planner.** `costs/` now carries `two-nodes`, `four-nodes`
 and `ten-nodes` — the measured machine, two, four and ten times over — and the
-transfer matrix says a plan chosen for **one** machine costs **1.86x** on ten.
-That is the largest cell in the table and it is a term no `CostModel` can
-express: the node count and the slot count are one axis to this planner, and
+raw transfer matrix above says the two-node plan costs **2.263x** on forty
+cores and **1.325x** on four nodes. That is a term no phase-local `CostModel`
+can express cleanly: node count and slot count are one axis to this planner, but
 they differ in precisely the thing that matters, which is whether a fetch can be
-shared. `Constraints` has no `nodes`, `price_phase` has no duplication term, and
-the budget is per node only because `Scenario::constraints` divides the
-concurrency by hand.
+shared and how overlapping phases contend.
 
 **Where spreading the computers apart pays.** The obvious proposal about a
 cluster — start the machines at different corners rather than all at one — is

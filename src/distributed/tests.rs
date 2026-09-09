@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::assemble::PlanBuilder;
 use crate::env::{AccountingEnvironment, Environment};
 use crate::fragment::PhaseWork;
-use crate::geometry::BlockGrid;
+use crate::geometry::{product3, BlockGrid};
 use crate::op::Chain;
 use crate::probes::IdentityOp;
 use crate::simulate::{simulate, Machine, PerPhase, Rates};
@@ -244,7 +244,48 @@ fn measure_job(
     }
 }
 
-fn handout_validation_job() -> (JobSpec, crate::decomposition::Decomposition) {
+#[derive(Clone)]
+struct HandoutProbe {
+    seed: JobSpec,
+    decomposition: crate::decomposition::Decomposition,
+}
+
+impl HandoutProbe {
+    fn spec(&self, policy: HandoutPolicy, cache_bytes: Option<u64>) -> JobSpec {
+        let mut spec = self.seed.clone();
+        spec.policy = policy;
+        if let Some(cache_bytes) = cache_bytes {
+            spec.workflow.cache_bytes = cache_bytes;
+        }
+        spec
+    }
+
+    fn measure(&self, policy: HandoutPolicy, cache_bytes: Option<u64>, workers: usize) -> Locality {
+        measure_job(
+            self.spec(policy, cache_bytes),
+            self.decomposition.clone(),
+            workers,
+        )
+    }
+
+    fn simulated(&self, policy: HandoutPolicy, cache_bytes: Option<u64>, workers: usize) -> u64 {
+        simulated_handout(
+            self.spec(policy, cache_bytes),
+            self.decomposition.clone(),
+            workers,
+        )
+    }
+
+    fn chunk_bytes(&self) -> u64 {
+        product3(self.seed.workflow.chunk) as u64 * 8
+    }
+
+    fn n_tasks(&self) -> usize {
+        self.decomposition.n_tasks()
+    }
+}
+
+fn handout_validation_probe() -> HandoutProbe {
     let volume = [64, 64, 64];
     let grid = BlockGrid::new(volume, [8, 8, 8]).expect("a 3-D grid");
     let mut builder = PlanBuilder::new(volume, Dtype::F64, grid);
@@ -273,18 +314,19 @@ fn handout_validation_job() -> (JobSpec, crate::decomposition::Decomposition) {
         sidecar: None,
         fragment_phases: Vec::new(),
     };
-    (JobSpec::new("handout-validation", workflow), decomposition)
+    HandoutProbe {
+        seed: JobSpec::new("handout-validation", workflow),
+        decomposition,
+    }
 }
 
 fn simulated_handout(
-    mut spec: JobSpec,
+    spec: JobSpec,
     decomposition: crate::decomposition::Decomposition,
-    policy: HandoutPolicy,
     workers: usize,
 ) -> u64 {
-    spec.policy = policy;
     let work = vec![PhaseWork::Pixels; decomposition.n_phases()];
-    let mut scheduler = crate::simulate::Handout::new(policy);
+    let mut scheduler = crate::simulate::Handout::new(spec.policy);
     let outcome = simulate(
         &decomposition,
         &work,
@@ -302,7 +344,7 @@ fn simulated_handout(
         },
         &Rates {
             chunk: spec.workflow.chunk,
-            chunk_bytes: spec.workflow.chunk.iter().product::<usize>() as u64 * 8,
+            chunk_bytes: product3(spec.workflow.chunk) as u64 * 8,
             ..Rates::default()
         },
         &BTreeSet::new(),
@@ -411,25 +453,12 @@ fn nearest_first_handout_costs_fewer_duplicated_fetches_than_naive_pull() {
 #[test]
 fn simulated_handout_matches_the_real_coordinator_locality_ordering() {
     let workers = 4;
-    let (mut naive_spec, decomposition) = handout_validation_job();
-    naive_spec.policy = HandoutPolicy::Naive;
-    let mut nearest_spec = naive_spec.clone();
-    nearest_spec.policy = HandoutPolicy::NearestFirst;
+    let probe = handout_validation_probe();
 
-    let real_naive = measure_job(naive_spec.clone(), decomposition.clone(), workers);
-    let real_nearest = measure_job(nearest_spec.clone(), decomposition.clone(), workers);
-    let simulated_naive = simulated_handout(
-        naive_spec,
-        decomposition.clone(),
-        HandoutPolicy::Naive,
-        workers,
-    );
-    let simulated_nearest = simulated_handout(
-        nearest_spec,
-        decomposition.clone(),
-        HandoutPolicy::NearestFirst,
-        workers,
-    );
+    let real_naive = probe.measure(HandoutPolicy::Naive, None, workers);
+    let real_nearest = probe.measure(HandoutPolicy::NearestFirst, None, workers);
+    let simulated_naive = probe.simulated(HandoutPolicy::Naive, None, workers);
+    let simulated_nearest = probe.simulated(HandoutPolicy::NearestFirst, None, workers);
 
     assert!(
         real_nearest.duplicated < real_naive.duplicated,
@@ -446,7 +475,7 @@ fn simulated_handout_matches_the_real_coordinator_locality_ordering() {
     println!(
         "same 3-D probe job, {} tasks over {workers} workers: real \
          duplicated chunks {} -> {}, simulator duplicated fetches {} -> {}",
-        decomposition.n_tasks(),
+        probe.n_tasks(),
         real_naive.duplicated,
         real_nearest.duplicated,
         simulated_naive,
@@ -466,34 +495,20 @@ fn simulated_handout_matches_the_real_coordinator_locality_ordering() {
 #[test]
 fn coalescing_stays_refused_when_real_and_simulated_directions_diverge() {
     let workers = 10;
-    let (nearest_seed, decomposition) = handout_validation_job();
-    let chunk_bytes = nearest_seed.workflow.chunk.iter().product::<usize>() as u64 * 8;
+    let probe = handout_validation_probe();
+    let chunk_bytes = probe.chunk_bytes();
     let capacities = [1usize, 2, 4, 8, 16, 32, 512];
     let mut real_win_cases = 0usize;
     let mut simulator_win_cases = 0usize;
 
     for capacity in capacities {
         let cache_bytes = capacity as u64 * chunk_bytes;
-        let mut nearest_spec = nearest_seed.clone();
-        nearest_spec.policy = HandoutPolicy::NearestFirst;
-        nearest_spec.workflow.cache_bytes = cache_bytes;
-        let mut coalescing_spec = nearest_spec.clone();
-        coalescing_spec.policy = HandoutPolicy::Coalescing;
-
-        let real_nearest = measure_job(nearest_spec.clone(), decomposition.clone(), workers);
-        let real_coalescing = measure_job(coalescing_spec.clone(), decomposition.clone(), workers);
-        let simulated_nearest = simulated_handout(
-            nearest_spec,
-            decomposition.clone(),
-            HandoutPolicy::NearestFirst,
-            workers,
-        );
-        let simulated_coalescing = simulated_handout(
-            coalescing_spec,
-            decomposition.clone(),
-            HandoutPolicy::Coalescing,
-            workers,
-        );
+        let real_nearest = probe.measure(HandoutPolicy::NearestFirst, Some(cache_bytes), workers);
+        let real_coalescing = probe.measure(HandoutPolicy::Coalescing, Some(cache_bytes), workers);
+        let simulated_nearest =
+            probe.simulated(HandoutPolicy::NearestFirst, Some(cache_bytes), workers);
+        let simulated_coalescing =
+            probe.simulated(HandoutPolicy::Coalescing, Some(cache_bytes), workers);
 
         assert_eq!(real_coalescing.tasks, real_nearest.tasks);
         assert_eq!(real_coalescing.distinct, real_nearest.distinct);

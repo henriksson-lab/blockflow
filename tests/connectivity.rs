@@ -65,6 +65,10 @@ use blockflow::ops::fill::{fill_phases, label_background_into, FillHolesOp, Labe
 use blockflow::ops::regional::{regional_phases, LabelPlateauxOp, RegionalMaximaOp};
 use blockflow::sidecar::Lifecycle;
 
+mod support;
+
+use support::volume::{point_mask_bool, sparse_xorshift_bool};
+
 const EVERY: [Connectivity; 3] = [
     Connectivity::Faces,
     Connectivity::FacesAndEdges,
@@ -196,11 +200,7 @@ fn components(labels: &Array3<u32>) -> u32 {
 }
 
 fn mask_of(shape: [usize; 3], voxels: &[[usize; 3]]) -> Array3<bool> {
-    let mut mask = Array3::from_elem((shape[0], shape[1], shape[2]), false);
-    for &at in voxels {
-        mask[at] = true;
-    }
-    mask
+    point_mask_bool(shape, voxels)
 }
 
 /// The labelling as one digit per voxel in row-major order, which is the form
@@ -621,19 +621,10 @@ fn the_wider_connectivities_are_decomposition_invariant() {
 #[test]
 fn a_sparse_pseudorandom_volume_is_decomposition_invariant_under_every_connectivity() {
     let volume = [17usize, 13, 11];
-    let mut state = 0x2545_f491_4f6c_dd1du64;
-    let mut mask = Array3::from_elem((volume[0], volume[1], volume[2]), false);
-    for cell in mask.iter_mut() {
-        // xorshift64*, written out so the fixture is a function of this file
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        // About 4% set. Higher and 26-connectivity percolates: at 15% this
-        // volume collapses to 26 components and the test stops being able to
-        // see an over-join, which is the thing that was measured rather than
-        // guessed here.
-        *cell = (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 56) < 10;
-    }
+    // About 4% set. Higher and 26-connectivity percolates: at 15% this volume
+    // collapses to 26 components and the test stops being able to see an
+    // over-join, which is the thing that was measured rather than guessed here.
+    let mask = sparse_xorshift_bool(volume, 0x2545_f491_4f6c_dd1d, 10);
 
     for connectivity in EVERY {
         let reference = whole(&mask, connectivity);

@@ -460,29 +460,14 @@ impl BlockOp for StructureTensorOp {
             // and the three that are not — `bool`, and the 64-bit integers,
             // whose `Into<f64>` does not exist because it would be lossy — go
             // through the widening `Voxels` already knows how to do.
-            macro_rules! direct {
-                ($type:ty) => {
-                    self.tensor.eigenvalues_into(input.view::<$type>()?, slots)
-                };
-            }
-            match input.dtype() {
-                Dtype::U8 => direct!(u8),
-                Dtype::U16 => direct!(u16),
-                Dtype::U32 => direct!(u32),
-                Dtype::I8 => direct!(i8),
-                Dtype::I16 => direct!(i16),
-                Dtype::I32 => direct!(i32),
-                Dtype::F32 => direct!(f32),
-                Dtype::F64 => direct!(f64),
-                Dtype::Bool | Dtype::U64 | Dtype::I64 => {
-                    let widened = input.widened();
-                    self.tensor.eigenvalues_into(widened.view(), slots)
-                }
-                Dtype::F16 => Err(Error::InvalidArgument(format!(
+            dispatch_f64_input!(
+                input,
+                Error::InvalidArgument(format!(
                     "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
                     self.name
-                ))),
-            }?;
+                )),
+                |view| { self.tensor.eigenvalues_into(view, slots) }
+            )?;
         }
         let chosen = &values[self.which.index()];
         let mut out = out.view_mut::<f64>()?;
@@ -615,29 +600,14 @@ impl BlockOp for GradientMagnitudeOp {
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
         let out = out.view_mut::<f64>()?;
-        macro_rules! direct {
-            ($type:ty) => {
-                self.magnitude_into(input.view::<$type>()?, out)
-            };
-        }
-        match input.dtype() {
-            Dtype::U8 => direct!(u8),
-            Dtype::U16 => direct!(u16),
-            Dtype::U32 => direct!(u32),
-            Dtype::I8 => direct!(i8),
-            Dtype::I16 => direct!(i16),
-            Dtype::I32 => direct!(i32),
-            Dtype::F32 => direct!(f32),
-            Dtype::F64 => direct!(f64),
-            Dtype::Bool | Dtype::U64 | Dtype::I64 => {
-                let widened = input.widened();
-                self.magnitude_into(widened.view(), out)
-            }
-            Dtype::F16 => Err(Error::InvalidArgument(format!(
+        dispatch_f64_input!(
+            input,
+            Error::InvalidArgument(format!(
                 "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
                 self.name
-            ))),
-        }
+            )),
+            |view| { self.magnitude_into(view, out) }
+        )
     }
 
     /// Zero for every constant, and exactly — a magnitude of a gradient that is

@@ -50,6 +50,10 @@ use blockflow::strategy::{execute, execute_observed, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::{Dtype, Event, EventListener};
 
+mod support;
+
+use support::source_fixture::{self, SourcePhase};
+
 const VOLUME: [usize; 3] = [16, 12, 10];
 /// The image the second arm reads: written by phase 0, read by phase 1 as its
 /// input and by phase 2 through a source leaf. An *intermediate*, deliberately —
@@ -166,28 +170,16 @@ fn arms() -> (Array3<f64>, Array3<f64>) {
 /// One phase per slot, so every stage really does materialise an image and the
 /// stored image is an image rather than a buffer inside a phase.
 fn one_phase_per_slot(chain: &Chain, grid: &BlockGrid) -> Decomposition {
-    let slots = chain.slots();
     let reaches = [[1usize, 1, 1], [1, 1, 1], [0, 0, 0]];
-    let phases = (0..slots.len())
-        .map(|slot| {
-            PhaseDecomposition::derive(
-                vec![slot],
-                vec![slots[slot].display_name()],
-                reaches[slot],
-                reaches[slot],
-                grid.clone(),
-            )
-        })
-        .collect();
-    let mut plan = Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::F64,
-        phases,
-        chain_reach: [2, 2, 2],
-    };
-    plan.declare_dtypes(chain).unwrap();
-    plan.declare_source_images(chain).unwrap();
-    plan
+    source_fixture::declared_plan(
+        chain,
+        VOLUME,
+        Dtype::F64,
+        grid,
+        [2, 2, 2],
+        (0..chain.slots().len())
+            .map(|slot| SourcePhase::with_equal_halo(vec![slot], reaches[slot])),
+    )
 }
 
 fn grids() -> Vec<BlockGrid> {

@@ -51,6 +51,7 @@ use ndarray::ArrayD;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::op::{Anchor, BlockOp, Output, SideBlock, SourceInput, SourceInputs};
+use crate::ops::expect_colocated;
 use crate::region::Region;
 use crate::voxels::Voxels;
 
@@ -249,16 +250,20 @@ impl TupleOp {
         held.push(input);
         for &image in &self.sources {
             let array = sources.get(image)?;
-            if array.shape() != input.shape() {
-                return Err(Error::InvalidArgument(format!(
-                    "{}: the image it was handed is {:?} and image {image} came back {:?}. A \
+            expect_colocated(
+                || {
+                    format!(
+                        "{}: the image it was handed is {:?} and image {image} came back {:?}. A \
                      reach-0 operand is read at the block's own fetch region, so the two are the \
                      same extent or the positions do not correspond.",
-                    self.name,
-                    input.shape(),
-                    array.shape()
-                )));
-            }
+                        self.name,
+                        input.shape(),
+                        array.shape()
+                    )
+                },
+                input,
+                array,
+            )?;
             if array.dtype() != self.dtype {
                 return Err(Error::InvalidArgument(format!(
                     "{}: image {image} holds {} and this op reads {}. Every array a kernel sees \

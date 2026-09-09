@@ -64,6 +64,10 @@ use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+
+use support::source_fixture::{self, SourcePhase};
+
 /// Deliberately not a multiple of the spacing on any axis, so the lattice's
 /// unsampled margins differ from each other and from the block boundaries.
 const VOLUME: [usize; 3] = [17, 13, 11];
@@ -563,33 +567,18 @@ fn chain_over(element: StructuringElement, population: Population) -> Chain {
 }
 
 fn plan(chain: &Chain, grid: &BlockGrid) -> Decomposition {
-    let slots = chain.slots();
     let reach = chain.reach3(&VOLUME);
-    let phases = vec![
-        PhaseDecomposition::derive(
-            vec![0],
-            vec![slots[0].display_name()],
-            [0usize, 0, 0],
-            [0usize, 0, 0],
-            grid.clone(),
-        ),
-        PhaseDecomposition::derive(
-            vec![1, 2],
-            vec![slots[1].display_name(), slots[2].display_name()],
-            reach,
-            reach,
-            grid.clone(),
-        ),
-    ];
-    let mut plan = Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::F64,
-        phases,
-        chain_reach: reach,
-    };
-    plan.declare_dtypes(chain).unwrap();
-    plan.declare_source_images(chain).unwrap();
-    plan
+    source_fixture::declared_plan(
+        chain,
+        VOLUME,
+        Dtype::F64,
+        grid,
+        reach,
+        [
+            SourcePhase::with_equal_halo(vec![0], [0, 0, 0]),
+            SourcePhase::with_equal_halo(vec![1, 2], reach),
+        ],
+    )
 }
 
 /// Block sizes that cut the lattice in every way that is available: not at all,

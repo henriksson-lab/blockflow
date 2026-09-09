@@ -392,6 +392,7 @@ use crate::fragment::{
 };
 use crate::geometry::BlockGrid;
 use crate::op::SourceInput;
+use crate::ops::expect_extent;
 use crate::region::Region;
 use crate::sidecar::{FragmentKey, Lifecycle};
 use crate::table::{Column, ColumnType, Row, RowBuilder, Schema, Table, Value, POSITION_WORDS};
@@ -1065,14 +1066,18 @@ impl RowStreams {
         })
     }
 
-    fn inputs(&self) -> Vec<FragmentInput> {
+    pub(crate) fn inputs(&self) -> Vec<FragmentInput> {
         // Reach `[0, 0, 0]`: this block's fragment and no neighbour's. See the
         // module header — a row op reads one row to write one row, and an
         // overlap here duplicates rows rather than costing recomputation.
         vec![FragmentInput::own(self.input.clone(), self.phase)]
     }
 
-    fn outputs(&self) -> Vec<FragmentOutput> {
+    pub(crate) fn outputs(&self) -> Vec<FragmentOutput> {
+        self.outputs_for(&self.schema)
+    }
+
+    pub(crate) fn outputs_for(&self, schema: &Schema) -> Vec<FragmentOutput> {
         vec![FragmentOutput::new(
             self.output.clone(),
             self.lifecycle,
@@ -1083,7 +1088,11 @@ impl RowStreams {
             Coverage::EveryBlock,
         )
         // A row stream keyed by position: at most one row per voxel read.
-        .sized(SidecarSize::row_table(&self.schema, 1))]
+        .sized(SidecarSize::row_table(schema, 1))]
+    }
+
+    pub(crate) fn fragment(&self, bytes: Vec<u8>) -> BlockOutput {
+        BlockOutput::fragment(self.output.clone(), bytes)
     }
 
     /// This block's blob, or the empty one.
@@ -1093,7 +1102,7 @@ impl RowStreams {
     /// and the coverage guard is what says so — checking it a second time here
     /// would report it as this op's fault, in a message about a stream this op
     /// does not write.
-    fn own<'a>(&self, at: &'a BlockView<'a>) -> &'a [u8] {
+    pub(crate) fn own<'a>(&self, at: &'a BlockView<'a>) -> &'a [u8] {
         at.own(&self.input).unwrap_or(&[])
     }
 }
@@ -1313,15 +1322,12 @@ impl FragmentOp for ScaleRowsOp {
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
-        Ok(BlockOutput::fragment(
-            self.rows.output.clone(),
-            scale_blob(
-                at.volume(),
-                &self.rows.schema,
-                self.rows.own(at),
-                self.factor,
-            )?,
-        ))
+        Ok(self.rows.fragment(scale_blob(
+            at.volume(),
+            &self.rows.schema,
+            self.rows.own(at),
+            self.factor,
+        )?))
     }
 }
 
@@ -1415,15 +1421,19 @@ impl GatherRowsOp {
             return Ok(RowBuilder::new(Arc::new(self.schema.clone())).encode());
         };
         let shape = [read.shape[0], read.shape[1], read.shape[2]];
-        if pixels.shape() != shape {
-            return Err(Error::invalid(format!(
-                "a gather was handed image {} as {:?} for a block read extent of {shape:?}. A \
+        expect_extent(
+            || {
+                format!(
+                    "a gather was handed image {} as {:?} for a block read extent of {shape:?}. A \
                  source image is fetched at the block's own fetch region, so a disagreement here \
                  is the plan handing over two geometries rather than a row in the wrong place.",
-                self.image,
-                pixels.shape()
-            )));
-        }
+                    self.image,
+                    pixels.shape()
+                )
+            },
+            shape,
+            pixels.shape(),
+        )?;
         gather_blob(
             volume,
             &self.rows.schema,
@@ -1488,16 +1498,13 @@ impl FragmentOp for GatherRowsOp {
     }
 
     fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
-        Ok(BlockOutput::fragment(
-            self.rows.output.clone(),
-            self.gather_block(
-                at.volume(),
-                self.rows.own(at),
-                sources.get(self.image)?,
-                at.read,
-                at.core,
-            )?,
-        ))
+        Ok(self.rows.fragment(self.gather_block(
+            at.volume(),
+            self.rows.own(at),
+            sources.get(self.image)?,
+            at.read,
+            at.core,
+        )?))
     }
 }
 
@@ -1554,15 +1561,12 @@ impl FragmentOp for FilterRowsOp {
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
-        Ok(BlockOutput::fragment(
-            self.rows.output.clone(),
-            filter_blob(
-                at.volume(),
-                &self.rows.schema,
-                self.rows.own(at),
-                &self.filter,
-            )?,
-        ))
+        Ok(self.rows.fragment(filter_blob(
+            at.volume(),
+            &self.rows.schema,
+            self.rows.own(at),
+            &self.filter,
+        )?))
     }
 }
 
@@ -2436,10 +2440,7 @@ impl FragmentOp for GroupRowsOp {
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
         let groups = self.grouping.fold_blob(at.volume(), self.rows.own(at))?;
-        Ok(BlockOutput::fragment(
-            self.rows.output.clone(),
-            encode_groups(&self.grouping, &groups)?,
-        ))
+        Ok(self.rows.fragment(encode_groups(&self.grouping, &groups)?))
     }
 }
 

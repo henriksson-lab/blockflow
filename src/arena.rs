@@ -83,10 +83,10 @@
 //! [`Strategy::decompose`]: crate::strategy::Strategy::decompose
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use crate::decomposition::{
-    images_read_by, resident_buffers_of, Constraints, Decomposition, PhaseDecomposition,
-    PhaseTraffic,
+    images_read_by, resident_buffers_of, Constraints, Decomposition, PhaseTraffic,
 };
 use crate::error::{Error, Result};
 use crate::fragment::PhaseWork;
@@ -96,7 +96,7 @@ use crate::simulate::{
     Scheduler,
 };
 use crate::statistics::Snapshot;
-use crate::strategy::{phase_price, Plan, Strategy, Workflow};
+use crate::strategy::{phase_price, Enumerating, PartitionSearch, Plan, Strategy, Workflow};
 
 /// One plan entered into the competition, and what it was planned under.
 ///
@@ -112,17 +112,64 @@ pub struct Entrant {
     pub constraints: Constraints,
 }
 
+/// The structural shape of a plan, independent of cost and scheduling.
+///
+/// This is intentionally more than a printed edge list. The planner arena uses
+/// shape as evidence and as a duplicate key; recording only one block axis can
+/// merge distinct anisotropic plans.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PlanShape {
+    pub phases: Vec<PhaseShape>,
+}
+
+impl PlanShape {
+    pub fn from_plan(plan: &Plan) -> Self {
+        Self::from_decomposition(&plan.decomposition)
+    }
+
+    pub fn from_decomposition(decomposition: &Decomposition) -> Self {
+        Self {
+            phases: decomposition
+                .phases
+                .iter()
+                .map(|phase| PhaseShape {
+                    slots: phase.slots.clone(),
+                    block: phase.grid.block(),
+                    blocks: phase.grid.n_blocks(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Transitional convenience for reports that still print the old shape.
+    pub fn first_axis_edges(&self) -> Vec<usize> {
+        self.phases.iter().map(|phase| phase.block[0]).collect()
+    }
+}
+
+impl fmt::Display for PlanShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let blocks: Vec<[usize; 3]> = self.phases.iter().map(|phase| phase.block).collect();
+        write!(f, "{} phase(s) at {:?}", self.phases.len(), blocks)
+    }
+}
+
+/// One phase's contribution to [`PlanShape`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PhaseShape {
+    pub slots: Vec<usize>,
+    pub block: [usize; 3],
+    pub blocks: usize,
+}
+
 /// What both judges said about one entrant.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Verdict {
     pub name: String,
-    pub phases: usize,
+    /// Full phase/block shape. Use this for equality, deduplication and reports.
+    pub shape: PlanShape,
     /// Whether this plan fits the admission contract it was entered with.
     pub admissible: bool,
-    /// Blocks per phase, in phase order.
-    pub blocks: Vec<usize>,
-    /// The block extent each phase chose.
-    pub edges: Vec<[usize; 3]>,
     /// **The planner's objective**: the sum over phases of [`phase_price`]'s
     /// makespan, at the arena's worker count.
     pub priced_ns: f64,
@@ -250,11 +297,11 @@ impl Judgement {
             self.workers, "plan", "phases", "fit", "blocks", "priced", "simulated", "fetched MiB"
         );
         for verdict in &self.verdicts {
-            let blocks: usize = verdict.blocks.iter().sum();
+            let blocks: usize = verdict.shape.phases.iter().map(|phase| phase.blocks).sum();
             out.push_str(&format!(
                 "{:<34} {:>7} {:>5} {:>9} {:>10.3} {:>10.3} {:>12.1}\n",
                 verdict.name,
-                verdict.phases,
+                verdict.shape.phases.len(),
                 if verdict.admissible { "yes" } else { "no" },
                 blocks,
                 verdict.priced_ns / best_priced.max(f64::MIN_POSITIVE),
@@ -272,6 +319,63 @@ impl Judgement {
         }
         out
     }
+}
+
+/// One execution case in a robust simulator-backed comparison.
+///
+/// `baseline_ns` is the local oracle for this case: candidate makespans are
+/// divided by it to produce regret. The arena does not prescribe how that
+/// baseline was chosen, which keeps the robust selector usable with committed
+/// scenarios, ad hoc machines, or a caller's own acceptance corpus.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RobustCase {
+    pub name: String,
+    pub machine: Machine,
+    pub rates: Rates,
+    pub constraints: Constraints,
+    pub snapshot: Option<Snapshot>,
+    pub baseline_ns: f64,
+    pub local: bool,
+}
+
+impl RobustCase {
+    pub fn new(
+        name: impl Into<String>,
+        machine: Machine,
+        rates: Rates,
+        constraints: Constraints,
+        baseline_ns: f64,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            machine,
+            rates,
+            constraints,
+            snapshot: None,
+            baseline_ns,
+            local: false,
+        }
+    }
+
+    pub fn with_snapshot(mut self, snapshot: Snapshot) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn local(mut self) -> Self {
+        self.local = true;
+        self
+    }
+}
+
+/// The entrant selected by robust simulator-backed scoring.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RobustPick {
+    pub name: String,
+    pub plan: Plan,
+    pub worst_regret: f64,
+    pub local_regret: f64,
+    pub fit_cases: usize,
 }
 
 /// The competition: a machine, a set of rates, and the plans entered so far.
@@ -429,20 +533,11 @@ impl Arena {
                 },
                 scheduler.as_mut(),
             )?;
+            let shape = PlanShape::from_decomposition(decomposition);
             verdicts.push(Verdict {
                 name: entrant.name.clone(),
-                phases: decomposition.n_phases(),
+                shape,
                 admissible,
-                blocks: decomposition
-                    .phases
-                    .iter()
-                    .map(|phase| phase.grid.n_blocks())
-                    .collect(),
-                edges: decomposition
-                    .phases
-                    .iter()
-                    .map(|phase| phase.grid.block())
-                    .collect(),
                 priced_ns,
                 outcome,
             });
@@ -450,6 +545,98 @@ impl Arena {
         Ok(Judgement {
             verdicts,
             workers: self.machine.workers,
+        })
+    }
+
+    /// Pick the entrant with the lowest worst regret across `cases`.
+    ///
+    /// Ties go to the lower regret on the case marked `local`, then to the
+    /// entrant order. Plans that do not fit a case are skipped for that case;
+    /// a candidate must fit the local case and at least one case overall.
+    pub fn robust_pick_with(
+        &self,
+        workflow: &Workflow,
+        cases: &[RobustCase],
+        make_scheduler: &mut dyn FnMut() -> Box<dyn Scheduler>,
+    ) -> Result<RobustPick> {
+        if cases.is_empty() {
+            return Err(Error::InvalidArgument(
+                "robust simulator-backed: no execution cases".into(),
+            ));
+        }
+        if !cases.iter().any(|case| case.local) {
+            return Err(Error::InvalidArgument(
+                "robust simulator-backed: no local execution case".into(),
+            ));
+        }
+        for case in cases {
+            if case.baseline_ns <= 0.0 {
+                return Err(Error::InvalidArgument(format!(
+                    "robust simulator-backed: case {} has non-positive baseline {}",
+                    case.name, case.baseline_ns
+                )));
+            }
+        }
+
+        let mut best: Option<RobustPick> = None;
+        for entrant in &self.entrants {
+            let mut worst_regret = 1.0f64;
+            let mut local_regret = None;
+            let mut fit_cases = 0usize;
+            for case in cases {
+                match plan_fit(
+                    workflow,
+                    &entrant.plan.decomposition,
+                    &case.constraints,
+                    case.machine.workers.max(1),
+                )? {
+                    PlanFit::Fits { .. } => {}
+                    PlanFit::OverBudget { .. } => continue,
+                }
+
+                let mut arena = Arena::new(case.machine, case.rates);
+                if let Some(snapshot) = &case.snapshot {
+                    arena = arena.with_snapshot(snapshot.clone());
+                }
+                arena.enter_plan(
+                    entrant.name.clone(),
+                    entrant.plan.clone(),
+                    case.constraints.clone(),
+                )?;
+                let judgement = arena.judge_with(workflow, make_scheduler)?;
+                let simulated_ns = judgement.verdicts[0].simulated_ns();
+                let regret = simulated_ns / case.baseline_ns;
+                worst_regret = worst_regret.max(regret);
+                fit_cases += 1;
+                if case.local {
+                    local_regret = Some(regret);
+                }
+            }
+
+            let Some(local_regret) = local_regret else {
+                continue;
+            };
+            if fit_cases == 0 {
+                continue;
+            }
+            let pick = RobustPick {
+                name: entrant.name.clone(),
+                plan: entrant.plan.clone(),
+                worst_regret,
+                local_regret,
+                fit_cases,
+            };
+            if best.as_ref().is_none_or(|current| {
+                pick.worst_regret < current.worst_regret
+                    || (pick.worst_regret == current.worst_regret
+                        && pick.local_regret < current.local_regret)
+            }) {
+                best = Some(pick);
+            }
+        }
+
+        best.ok_or_else(|| {
+            Error::InvalidArgument("robust simulator-backed: no candidate fits local case".into())
         })
     }
 }
@@ -496,7 +683,7 @@ impl CandidateFieldBuilder {
         plan: Plan,
         constraints: Constraints,
     ) -> Result<bool> {
-        if !self.seen.insert(PlanSignature::from(&plan)) {
+        if !self.seen.insert(PlanSignature(PlanShape::from_plan(&plan))) {
             return Ok(false);
         }
         self.arena.enter_plan(name, plan, constraints)?;
@@ -547,6 +734,161 @@ impl CandidateFieldBuilder {
     }
 }
 
+/// Which plan variants enter a simulator-backed candidate field.
+///
+/// The policy owns field construction, not the scoring objective. Robust and
+/// minimax selection stay explicit on [`Arena`] so callers can see whether they
+/// are choosing a local simulator winner or a cross-scenario compromise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidatePolicy {
+    pub include_strategy: bool,
+    pub include_partition_variants: bool,
+    pub include_pinned_edges: bool,
+    pub include_mixed_edges: bool,
+}
+
+impl CandidatePolicy {
+    pub const fn simulator_backed() -> Self {
+        Self {
+            include_strategy: true,
+            include_partition_variants: false,
+            include_pinned_edges: true,
+            include_mixed_edges: false,
+        }
+    }
+
+    pub const fn simulator_backed_mixed() -> Self {
+        Self {
+            include_mixed_edges: true,
+            ..Self::simulator_backed()
+        }
+    }
+
+    pub const fn oracle_report() -> Self {
+        Self {
+            include_strategy: true,
+            include_partition_variants: true,
+            include_pinned_edges: true,
+            include_mixed_edges: true,
+        }
+    }
+
+    pub fn build_for_strategy(
+        &self,
+        strategy_label: impl Into<String>,
+        strategy: &dyn Strategy,
+        workflow: &Workflow,
+        constraints: &Constraints,
+        machine: Machine,
+        rates: Rates,
+        snapshot: Option<Snapshot>,
+    ) -> Result<Arena> {
+        if self.include_partition_variants {
+            return Err(Error::InvalidArgument(
+                "candidate policy: partition variants require an Enumerating strategy".into(),
+            ));
+        }
+        let mut field = self.builder(machine, rates, snapshot);
+        self.enter_strategy(&mut field, strategy_label, strategy, workflow, constraints)?;
+        self.enter_pinned_edges(&mut field, strategy, workflow, constraints)?;
+        self.enter_mixed_edges(&mut field, constraints)?;
+        Ok(field.finish())
+    }
+
+    pub fn build_for_enumerating(
+        &self,
+        strategy_label: impl Into<String>,
+        strategy: &Enumerating,
+        workflow: &Workflow,
+        constraints: &Constraints,
+        machine: Machine,
+        rates: Rates,
+        snapshot: Option<Snapshot>,
+    ) -> Result<Arena> {
+        let mut field = self.builder(machine, rates, snapshot);
+        self.enter_strategy(&mut field, strategy_label, strategy, workflow, constraints)?;
+        if self.include_partition_variants {
+            for (label, search) in [
+                ("search-dp", PartitionSearch::Dp),
+                ("search-exhaustive", PartitionSearch::Exhaustive),
+                ("search-single", PartitionSearch::SingleGroup),
+            ] {
+                let variant = Enumerating {
+                    concurrency: strategy.concurrency,
+                    search,
+                    ..Enumerating::default()
+                };
+                if let Ok(plan) = variant.plan(workflow, constraints) {
+                    field.enter_plan(label.to_string(), plan, constraints.clone())?;
+                }
+            }
+        }
+        self.enter_pinned_edges(&mut field, strategy, workflow, constraints)?;
+        self.enter_mixed_edges(&mut field, constraints)?;
+        Ok(field.finish())
+    }
+
+    fn builder(
+        &self,
+        machine: Machine,
+        rates: Rates,
+        snapshot: Option<Snapshot>,
+    ) -> CandidateFieldBuilder {
+        let mut field = CandidateFieldBuilder::new(machine, rates);
+        if let Some(snapshot) = snapshot {
+            field = field.with_snapshot(snapshot);
+        }
+        field
+    }
+
+    fn enter_strategy(
+        &self,
+        field: &mut CandidateFieldBuilder,
+        strategy_label: impl Into<String>,
+        strategy: &dyn Strategy,
+        workflow: &Workflow,
+        constraints: &Constraints,
+    ) -> Result<()> {
+        if self.include_strategy {
+            field.enter_strategy(strategy_label, strategy, workflow, constraints)?;
+        }
+        Ok(())
+    }
+
+    fn enter_pinned_edges(
+        &self,
+        field: &mut CandidateFieldBuilder,
+        strategy: &dyn Strategy,
+        workflow: &Workflow,
+        constraints: &Constraints,
+    ) -> Result<()> {
+        if self.include_pinned_edges {
+            field.enter_pinned_edges(
+                |edge| format!("edge-{edge}"),
+                strategy,
+                workflow,
+                constraints,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn enter_mixed_edges(
+        &self,
+        field: &mut CandidateFieldBuilder,
+        constraints: &Constraints,
+    ) -> Result<()> {
+        if self.include_mixed_edges {
+            field.enter_mixed_edges(
+                |seed_index, chosen| format!("mixed-{seed_index}-{chosen:?}"),
+                &constraints.block_candidates,
+                constraints,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// An opt-in strategy wrapper that lets the simulator choose among candidates.
 ///
 /// The wrapped strategy still builds every candidate. This wrapper only changes
@@ -568,7 +910,7 @@ where
     pub rates: Rates,
     pub snapshot: Option<Snapshot>,
     pub make_scheduler: F,
-    pub include_mixed_edges: bool,
+    pub candidate_policy: CandidatePolicy,
 }
 
 /// The simulator-backed winner with the execution contract it was judged under.
@@ -609,7 +951,7 @@ where
             rates,
             snapshot: None,
             make_scheduler,
-            include_mixed_edges: false,
+            candidate_policy: CandidatePolicy::simulator_backed(),
         }
     }
 
@@ -624,7 +966,7 @@ where
     /// This is explicit because it can grow quickly: a three-phase plan and a
     /// four-rung ladder adds `4^3` candidates for that partition.
     pub fn with_mixed_edges(mut self) -> Self {
-        self.include_mixed_edges = true;
+        self.candidate_policy = CandidatePolicy::simulator_backed_mixed();
         self
     }
 
@@ -645,25 +987,15 @@ where
         constraints: &Constraints,
         machine: Machine,
     ) -> Result<Arena> {
-        let mut field = CandidateFieldBuilder::new(machine, self.rates);
-        if let Some(snapshot) = &self.snapshot {
-            field = field.with_snapshot(snapshot.clone());
-        }
-        field.enter_strategy("strategy", &self.strategy, workflow, constraints)?;
-        field.enter_pinned_edges(
-            |edge| format!("edge-{edge}"),
+        self.candidate_policy.build_for_strategy(
+            "strategy",
             &self.strategy,
             workflow,
             constraints,
-        )?;
-        if self.include_mixed_edges {
-            field.enter_mixed_edges(
-                |seed_index, chosen| format!("mixed-{seed_index}-{chosen:?}"),
-                &constraints.block_candidates,
-                constraints,
-            )?;
-        }
-        Ok(field.finish())
+            machine,
+            self.rates,
+            self.snapshot.clone(),
+        )
     }
 
     /// Build the default-machine candidate arena without choosing a winner.
@@ -745,19 +1077,7 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct PlanSignature(Vec<(Vec<usize>, usize)>);
-
-impl From<&Plan> for PlanSignature {
-    fn from(plan: &Plan) -> Self {
-        Self(
-            plan.decomposition
-                .phases
-                .iter()
-                .map(|phase| (phase.slots.clone(), phase.grid.block()[0]))
-                .collect(),
-        )
-    }
-}
+struct PlanSignature(PlanShape);
 
 fn mixed_edge_plans(seed: &Plan, edges: &[usize]) -> Result<Vec<(Vec<usize>, Plan)>> {
     if seed
@@ -781,21 +1101,7 @@ fn mixed_edge_plans(seed: &Plan, edges: &[usize]) -> Result<Vec<(Vec<usize>, Pla
             let mut phases = Vec::with_capacity(seed.decomposition.phases.len());
             for (phase, edge) in seed.decomposition.phases.iter().zip(chosen.iter().copied()) {
                 let grid = BlockGrid::new(phase.volume(), [edge; 3])?;
-                let mut rebuilt = PhaseDecomposition::derive(
-                    phase.slots.clone(),
-                    phase.names.clone(),
-                    phase.reach.clone(),
-                    phase.halo.clone(),
-                    grid,
-                )
-                .with_source_images(phase.source_images.clone())
-                .with_supplied_dtypes(phase.supplied_dtypes.clone())
-                .reading_input_image(phase.reads_input_image)
-                .with_barrier(phase.barrier);
-                if let Some(dtype) = phase.dtype {
-                    rebuilt = rebuilt.with_dtype(dtype);
-                }
-                phases.push(rebuilt);
+                phases.push(phase.regrid_preserving_metadata(grid));
             }
             out.push((
                 chosen.to_vec(),
@@ -841,20 +1147,111 @@ where
     }
 }
 
+/// Whether a plan fits the arena admission contract, with the first refusal
+/// stated in the same adjusted bytes [`Constraints::affords_working_set`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanFit {
+    Fits { bytes: u64 },
+    OverBudget { bytes: u64, budget: u64 },
+}
+
+impl PlanFit {
+    pub fn fits(self) -> bool {
+        matches!(self, Self::Fits { .. })
+    }
+
+    pub fn with_admitted_value<T>(self, value: impl FnOnce() -> T) -> PlanAdmission<T> {
+        match self {
+            Self::Fits { bytes } => PlanAdmission::Fits {
+                bytes,
+                value: value(),
+            },
+            Self::OverBudget { bytes, budget } => PlanAdmission::OverBudget { bytes, budget },
+        }
+    }
+
+    pub fn refused<T>(self) -> Option<PlanAdmission<T>> {
+        match self {
+            Self::Fits { .. } => None,
+            Self::OverBudget { bytes, budget } => Some(PlanAdmission::OverBudget { bytes, budget }),
+        }
+    }
+}
+
+/// A value produced only if a plan passed the admission contract.
+///
+/// Simulator-backed reports often need to carry a measured value such as
+/// simulated nanoseconds or transfer regret, but an over-budget plan must keep
+/// the adjusted bytes that explain the refusal. This type keeps those two facts
+/// on the same path as [`PlanFit`] instead of erasing the refusal into a bool.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanAdmission<T> {
+    Fits { bytes: u64, value: T },
+    OverBudget { bytes: u64, budget: u64 },
+}
+
+impl<T> PlanAdmission<T> {
+    pub fn fits(&self) -> bool {
+        matches!(self, Self::Fits { .. })
+    }
+
+    pub fn value(&self) -> Option<&T> {
+        match self {
+            Self::Fits { value, .. } => Some(value),
+            Self::OverBudget { .. } => None,
+        }
+    }
+
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> PlanAdmission<U> {
+        match self {
+            Self::Fits { bytes, value } => PlanAdmission::Fits {
+                bytes,
+                value: f(value),
+            },
+            Self::OverBudget { bytes, budget } => PlanAdmission::OverBudget { bytes, budget },
+        }
+    }
+}
+
 /// Whether a plan fits the admission contract it was entered with.
 pub fn admissible_plan(
     workflow: &Workflow,
     decomposition: &Decomposition,
     constraints: &Constraints,
 ) -> Result<bool> {
-    Ok(phase_prices(
+    Ok(plan_fit(
         workflow,
         decomposition,
         constraints,
         constraints.expected_concurrency,
     )?
-    .iter()
-    .all(|(cost, _)| constraints.affords_working_set(cost)))
+    .fits())
+}
+
+/// Whether a plan fits at `workers` concurrent block tasks.
+pub fn plan_fit(
+    workflow: &Workflow,
+    decomposition: &Decomposition,
+    constraints: &Constraints,
+    workers: usize,
+) -> Result<PlanFit> {
+    let admission = Constraints {
+        expected_concurrency: workers.max(1),
+        ..constraints.clone()
+    };
+    let priced = phase_prices(workflow, decomposition, &admission, workers)?;
+    let mut peak = 0;
+    for (cost, _) in &priced {
+        let bytes = admission.admission_demand_bytes(cost);
+        peak = peak.max(bytes);
+        if let Some(budget) = admission.budget_bytes {
+            let budget = admission.admission_budget_bytes(budget);
+            if bytes > budget {
+                return Ok(PlanFit::OverBudget { bytes, budget });
+            }
+        }
+    }
+    Ok(PlanFit::Fits { bytes: peak })
 }
 
 /// **The planner's objective, applied to a plan the planner did not have to
@@ -992,10 +1389,14 @@ mod tests {
     fn verdict(name: &str, priced_ns: f64, makespan_ns: u64) -> Verdict {
         Verdict {
             name: name.to_string(),
-            phases: 1,
+            shape: PlanShape {
+                phases: vec![PhaseShape {
+                    slots: Vec::new(),
+                    block: [1, 1, 1],
+                    blocks: 1,
+                }],
+            },
             admissible: true,
-            blocks: vec![1],
-            edges: vec![[1, 1, 1]],
             priced_ns,
             outcome: Outcome {
                 makespan_ns,
@@ -1009,6 +1410,92 @@ mod tests {
             verdicts,
             workers: 1,
         }
+    }
+
+    fn plan_with_block(block: [usize; 3]) -> Plan {
+        Plan {
+            decomposition: Decomposition {
+                volume: [16, 16, 16],
+                dtype: crate::Dtype::F64,
+                phases: vec![crate::decomposition::PhaseDecomposition::derive(
+                    vec![0],
+                    vec!["only".to_string()],
+                    [0, 0, 0],
+                    [0, 0, 0],
+                    BlockGrid::new([16, 16, 16], block).unwrap(),
+                )],
+                chain_reach: [0, 0, 0],
+            },
+            hints: crate::strategy::Hints::default(),
+        }
+    }
+
+    #[test]
+    fn plan_shape_distinguishes_anisotropic_blocks_with_the_same_first_edge() {
+        let wide_y = PlanShape::from_plan(&plan_with_block([8, 16, 8]));
+        let wide_z = PlanShape::from_plan(&plan_with_block([8, 8, 16]));
+
+        assert_ne!(
+            wide_y, wide_z,
+            "candidate deduplication must not collapse plans that only agree on block()[0]"
+        );
+        assert_eq!(
+            wide_y.first_axis_edges(),
+            wide_z.first_axis_edges(),
+            "this is the collision the old scalar signature could not see"
+        );
+    }
+
+    #[test]
+    fn plan_fit_reports_the_adjusted_admission_budget() {
+        let workflow = Workflow::new(
+            crate::op::Chain::op(crate::probes::IdentityOp::new("only", [0, 0, 0])),
+            [16, 16, 16],
+            crate::Dtype::F64,
+        );
+        let plan = plan_with_block([16, 16, 16]);
+        let constraints = Constraints {
+            budget_bytes: Some(10_000),
+            cache_bytes: 9_000,
+            expected_concurrency: 1,
+            ..Constraints::default()
+        };
+
+        let fit = plan_fit(&workflow, &plan.decomposition, &constraints, 1).unwrap();
+
+        let PlanFit::OverBudget { bytes, budget } = fit else {
+            panic!("expected the cache reservation to make the plan over budget, got {fit:?}");
+        };
+        assert_eq!(budget, 1_000);
+        assert!(bytes > budget);
+    }
+
+    #[test]
+    fn plan_admission_carries_value_only_for_fitting_plans() {
+        let admitted = PlanFit::Fits { bytes: 64 }.with_admitted_value(|| "simulated");
+        assert_eq!(
+            admitted,
+            PlanAdmission::Fits {
+                bytes: 64,
+                value: "simulated"
+            }
+        );
+        assert_eq!(admitted.value(), Some(&"simulated"));
+
+        let refused: PlanAdmission<&'static str> = PlanFit::OverBudget {
+            bytes: 200,
+            budget: 100,
+        }
+        .with_admitted_value(|| panic!("refused plans must not evaluate a simulated value"));
+        assert_eq!(
+            refused,
+            PlanAdmission::OverBudget {
+                bytes: 200,
+                budget: 100
+            }
+        );
+        assert!(!refused.fits());
+        assert_eq!(refused.value(), None);
     }
 
     /// The two rankings agreeing is tau `1.0` and regret `1.0`; the two exactly

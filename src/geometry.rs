@@ -72,6 +72,11 @@ use crate::error::{Error, Result};
 use crate::reach::{AxisReach, Reach};
 use crate::region::Region;
 
+#[inline]
+pub(crate) fn product3(values: [usize; 3]) -> usize {
+    values[0] * values[1] * values[2]
+}
+
 /// A grid of block cores over a 3-D volume.
 ///
 /// Per phase, not per chain: a phase boundary is already a materialisation, so
@@ -160,7 +165,7 @@ impl BlockGrid {
     }
 
     pub fn n_blocks(&self) -> usize {
-        self.blocks_per_axis().iter().product()
+        product3(self.blocks_per_axis())
     }
 
     /// Voxels in an interior block's core — the unit the infinite-grid cost
@@ -172,7 +177,7 @@ impl BlockGrid {
     /// that *compares two grids*, use [`BlockGrid::mean_core_voxels`] and read
     /// its note on why.
     pub fn core_voxels(&self) -> f64 {
-        self.block.iter().map(|&edge| edge as f64).product()
+        product3(self.block) as f64
     }
 
     /// Voxels in the **average** block's core: the volume, over the blocks that
@@ -222,7 +227,7 @@ impl BlockGrid {
     /// same expression, in the read charge. The rule and both measurements are
     /// stated once on [`PhaseCost`](crate::decomposition::PhaseCost).
     pub fn mean_core_voxels(&self) -> f64 {
-        self.volume.iter().map(|&edge| edge as f64).product::<f64>() / self.n_blocks() as f64
+        product3(self.volume) as f64 / self.n_blocks() as f64
     }
 
     /// The mean over this grid's blocks of the voxels one block **reads** at

@@ -192,8 +192,8 @@ use crate::error::{Error, Result};
 use crate::op::{Anchor, BlockOp, Chain};
 use crate::voxels::Voxels;
 
-use super::shapes_agree;
-use super::voxelwise::{from_set, is_set};
+use super::voxelwise::is_set;
+use super::{accepts_mask_carrier, apply_mask_carrier, shapes_agree};
 
 // ------------------------------------------------------ the neighbourhood --
 
@@ -736,28 +736,13 @@ impl BlockOp for ThinningOp {
     /// narrows on the way in and widens on the way out, which is the shell's
     /// work and not the kernel's.
     fn accepts(&self, dtype: Dtype) -> bool {
-        matches!(dtype, Dtype::Bool | Dtype::F64)
+        accepts_mask_carrier(dtype)
     }
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
-        match input.dtype() {
-            Dtype::Bool => thin_subfield_into(
-                input.view::<bool>()?,
-                self.subfield,
-                at.offset,
-                out.view_mut::<bool>()?,
-            ),
-            _ => {
-                let mask = input.view::<f64>()?.mapv(is_set);
-                let mut result = Array3::from_elem(mask.raw_dim(), false);
-                thin_subfield_into(mask.view(), self.subfield, at.offset, result.view_mut())?;
-                let mut out = out.view_mut::<f64>()?;
-                ndarray::Zip::from(&mut out)
-                    .and(&result)
-                    .for_each(|slot, &value| *slot = from_set(value));
-                Ok(())
-            }
-        }
+        apply_mask_carrier(input, out, |input, out| {
+            thin_subfield_into(input, self.subfield, at.offset, out)
+        })
     }
 
     /// **Clear maps to clear, and set maps to nothing at all.**
@@ -1535,6 +1520,7 @@ mod tests {
     use crate::decomposition::{Decomposition, PhaseDecomposition};
     use crate::env::ArrayEnvironment;
     use crate::geometry::BlockGrid;
+    use crate::ops::from_set;
     use crate::strategy::{execute, Hints, Workflow};
 
     // ------------------------------------------------------- fixtures --

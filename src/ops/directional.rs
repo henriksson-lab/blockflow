@@ -180,9 +180,9 @@ use crate::error::{Error, Result};
 use crate::op::{Anchor, BlockOp, Chain};
 use crate::voxels::Voxels;
 
-use super::shapes_agree;
 use super::skeleton::{neighbour_index, neighbour_offset, PassLimit, CENTRE, NEIGHBOURHOOD};
-use super::voxelwise::{from_set, is_set};
+use super::voxelwise::is_set;
+use super::{accepts_mask_carrier, apply_mask_carrier, shapes_agree};
 
 // ------------------------------------------------------------ the templates --
 
@@ -1075,7 +1075,7 @@ impl BlockOp for DirectionalPassOp {
     /// kernel, and the `f64` arm is the shell narrowing on the way in and
     /// widening on the way out.
     fn accepts(&self, dtype: Dtype) -> bool {
-        matches!(dtype, Dtype::Bool | Dtype::F64)
+        accepts_mask_carrier(dtype)
     }
 
     /// **`Anchor` is unused, and that is a property of the algorithm.** Every
@@ -1085,19 +1085,7 @@ impl BlockOp for DirectionalPassOp {
     /// absolute position — and it is the one respect in which this op is the
     /// easier of the two to decompose.
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        match input.dtype() {
-            Dtype::Bool => directional_pass_into(input.view::<bool>()?, out.view_mut::<bool>()?),
-            _ => {
-                let mask = input.view::<f64>()?.mapv(is_set);
-                let mut result = Array3::from_elem(mask.raw_dim(), false);
-                directional_pass_into(mask.view(), result.view_mut())?;
-                let mut out = out.view_mut::<f64>()?;
-                ndarray::Zip::from(&mut out)
-                    .and(&result)
-                    .for_each(|slot, &value| *slot = from_set(value));
-                Ok(())
-            }
-        }
+        apply_mask_carrier(input, out, directional_pass_into)
     }
 
     /// **Clear maps to clear, and set maps to nothing at all**, exactly as in

@@ -65,6 +65,7 @@ mod support;
 use support::single_phase;
 
 const VOLUME: [usize; 3] = [28, 20, 16];
+const SUITE: single_phase::Suite = single_phase::Suite::new("background", VOLUME, [4, 4, 4]);
 const SEED: u64 = 20250812;
 
 /// How far the field swings, and how fast.
@@ -111,14 +112,14 @@ fn element(shape: ElementShape, radius: [usize; 3]) -> StructuringElement {
 }
 
 fn workflow(chain: Chain) -> Workflow {
-    single_phase::workflow_f64(chain, VOLUME)
+    SUITE.workflow(chain)
 }
 
 /// One phase holding the whole chain, at a given block edge and split axes,
 /// built from the chain's **own** reach — nothing here supplies one, so nothing
 /// here can hide one that is wrong.
 fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {
-    single_phase::plan(workflow, VOLUME, block, split_axes)
+    SUITE.plan(workflow, block, split_axes)
 }
 
 /// The same, with the reach stated rather than derived — for provoking the
@@ -129,12 +130,12 @@ fn plan_with_reach(
     split_axes: &[usize],
     reach: [usize; 3],
 ) -> Decomposition {
-    single_phase::plan_with_reach(workflow, VOLUME, block, split_axes, reach)
+    SUITE.plan_with_reach(workflow, block, split_axes, reach)
 }
 
 /// The oracle: the same kernels, called once, over the whole array.
 fn reference(chain: &Chain, input: &Array3<f64>) -> Array3<f64> {
-    single_phase::reference_f64(chain, input, VOLUME)
+    SUITE.reference_f64(chain, input)
 }
 
 fn run(workflow: &Workflow, decomposition: &Decomposition, input: &Array3<f64>) -> Array3<f64> {
@@ -146,7 +147,7 @@ fn run_reporting(
     decomposition: &Decomposition,
     input: &Array3<f64>,
 ) -> (Array3<f64>, usize) {
-    let ran = single_phase::run_f64("background", workflow, decomposition, input, [4, 4, 4]);
+    let ran = SUITE.run_f64(workflow, decomposition, input);
     (ran.output, ran.tasks_short_circuited)
 }
 

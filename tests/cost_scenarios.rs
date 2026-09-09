@@ -40,18 +40,17 @@
 // different suite's job and is unaffected by the coefficients: a decomposition
 // is byte-identical whatever it cost to choose.
 
-use std::collections::BTreeMap;
-
-use blockflow::arena::{Arena, SimulatedPlan};
-use blockflow::decomposition::Constraints;
+use blockflow::arena::{plan_fit, CandidatePolicy, PlanShape};
 use blockflow::scenario::Scenario;
 use blockflow::simulate::Rates;
-use blockflow::strategy::{Enumerating, Plan, Strategy, Workflow};
+use blockflow::strategy::{Plan, Strategy};
 
 mod support;
 
 use support::planner_perf::{
-    base_constraints, plan_shape, scenarios, simulator_backed_for, workflow, COSTS, LADDER,
+    base_constraints, enumerating_for, plan_shape, planner_choice_for, scenarios, simulated_ns_on,
+    simulator_backed_choice_for, simulator_backed_for, simulator_backed_plan_for, workflow,
+    PlanChoice, PlanMatrix, RobustPlanChoice, COSTS,
 };
 
 /// **Write `costs/` from the baseline and the transforms that derive it.**
@@ -311,46 +310,24 @@ fn run(scenario: &Scenario) -> Ran {
     let workflow = workflow();
     let base = base_constraints();
     let constraints = scenario.constraints(&base);
-    let workers = scenario.machine.workers.max(1);
-    let strategy = |constraints: &Constraints| {
-        Enumerating {
-            concurrency: workers,
-            ..Enumerating::default()
-        }
-        .plan(&workflow, constraints)
-    };
+    let strategy = enumerating_for(scenario.machine);
 
-    let chosen = strategy(&constraints)
+    let chosen = strategy
+        .plan(&workflow, &constraints)
         .unwrap_or_else(|err| panic!("{}: the planner must plan: {err}", scenario.name));
-    let plan_shape = format!(
-        "{} phase(s) at {:?}",
-        chosen.decomposition.n_phases(),
-        chosen
-            .decomposition
-            .phases
-            .iter()
-            .map(|phase| phase.grid.block()[0])
-            .collect::<Vec<_>>()
-    );
+    let plan_shape = PlanShape::from_plan(&chosen).to_string();
 
-    let mut arena = Arena::new(scenario.machine, scenario.rates(&Rates::default()))
-        .with_snapshot(scenario.snapshot.clone());
-    arena
-        .enter_plan("planner".to_string(), chosen, constraints.clone())
-        .expect("a plan the arena can hold");
-    for edge in LADDER {
-        let pinned = Constraints {
-            block_candidates: vec![edge],
-            ..constraints.clone()
-        };
-        // A rung the budget refuses is not an entrant; the planner's own
-        // refusal to use it is the point of the budget.
-        if let Ok(plan) = strategy(&pinned) {
-            arena
-                .enter_plan(format!("edge {edge}"), plan, pinned)
-                .expect("a plan the arena can hold");
-        }
-    }
+    let arena = CandidatePolicy::simulator_backed()
+        .build_for_enumerating(
+            "planner",
+            &strategy,
+            &workflow,
+            &constraints,
+            scenario.machine,
+            scenario.rates(&Rates::default()),
+            Some(scenario.snapshot.clone()),
+        )
+        .unwrap_or_else(|err| panic!("{}: candidate field must build: {err}", scenario.name));
     let judgement = arena
         .judge(&workflow)
         .unwrap_or_else(|err| panic!("{}: every plan must simulate: {err}", scenario.name));
@@ -535,16 +512,8 @@ fn the_simulator_backed_planner_chooses_well_on_every_committed_scenario() {
     );
 }
 
-fn plan_edges(plan: &Plan) -> Vec<usize> {
-    plan.decomposition
-        .phases
-        .iter()
-        .map(|phase| phase.grid.block()[0])
-        .collect()
-}
-
-fn plan_edges_shape(plan: &Plan) -> (usize, Vec<usize>) {
-    (plan.decomposition.n_phases(), plan_edges(plan))
+fn plan_shape_key(plan: &Plan) -> PlanShape {
+    PlanShape::from_plan(plan)
 }
 
 /// Storage should enter planner pricing only where it changes the oracle.
@@ -563,57 +532,78 @@ fn storage_axes_only_move_the_planner_when_the_oracle_moves() {
         .expect("the measured scenario is the baseline");
     let (measured_choice, _) = simulator_backed_choice_for(measured, &workflow, &base);
     let measured_plan = measured_choice.plan;
-    let measured_shape = plan_edges_shape(&measured_plan);
+    let measured_shape = plan_shape_key(&measured_plan);
+    struct StorageRow {
+        name: &'static str,
+        should_move: bool,
+    }
     let storage_rows = [
-        ("slow-disk", false),
-        ("slow-disk-high-latency", false),
-        ("compressed-store", false),
-        ("fine-chunks", true),
+        StorageRow {
+            name: "slow-disk",
+            should_move: false,
+        },
+        StorageRow {
+            name: "slow-disk-high-latency",
+            should_move: false,
+        },
+        StorageRow {
+            name: "compressed-store",
+            should_move: false,
+        },
+        StorageRow {
+            name: "fine-chunks",
+            should_move: true,
+        },
     ];
 
     println!(
         "{:<24} {:<18} {:<18} {:>8}",
         "scenario", "baseline", "oracle", "baseline/oracle"
     );
-    for (name, should_move) in storage_rows {
+    for row in storage_rows {
         let scenario = scenarios
-            .get(name)
-            .unwrap_or_else(|| panic!("{name}: committed storage scenario missing"));
+            .get(row.name)
+            .unwrap_or_else(|| panic!("{}: committed storage scenario missing", row.name));
         let (choice, _) = simulator_backed_choice_for(scenario, &workflow, &base);
-        let oracle_shape = plan_edges_shape(&choice.plan);
+        let oracle_shape = plan_shape_key(&choice.plan);
         let best = choice
             .judgement
             .simulated_pick()
             .expect("a simulator-backed storage field has a winner")
             .simulated_ns();
         let baseline_ns = simulated_ns_on(&measured_plan, scenario, &workflow, &base)
-            .unwrap_or_else(|| panic!("{name}: measured baseline plan must fit"));
+            .unwrap_or_else(|| panic!("{}: measured baseline plan must fit", row.name));
         let regret = baseline_ns / best;
         println!(
-            "{name:<24} {:<18} {:<18} {regret:>8.3}",
+            "{:<24} {:<18} {:<18} {regret:>8.3}",
+            row.name,
             format!("{:?}", measured_shape),
             format!("{:?}", oracle_shape)
         );
-        if should_move {
+        if row.should_move {
             assert_ne!(
                 oracle_shape, measured_shape,
-                "{name}: this row is expected to be the storage axis that moves the oracle"
+                "{}: this row is expected to be the storage axis that moves the oracle",
+                row.name
             );
             assert!(
                 regret >= 1.10,
-                "{name}: oracle moved shape but baseline regret was only {regret:.3}; do not add \
-                 a planner storage term below the 10% acceptance bar"
+                "{}: oracle moved shape but baseline regret was only {regret:.3}; do not add a \
+                 planner storage term below the 10% acceptance bar",
+                row.name
             );
         } else {
             assert_eq!(
                 oracle_shape, measured_shape,
-                "{name}: storage changed the oracle shape; this row now justifies a pricing term \
-                 and TODO4's storage notes must be updated"
+                "{}: storage changed the oracle shape; this row now justifies a pricing term and \
+                 TODO4's storage notes must be updated",
+                row.name
             );
             assert!(
                 regret <= 1.10,
-                "{name}: baseline storage plan costs {regret:.3}x the oracle; this now crosses \
-                 TODO4's 10% acceptance bar"
+                "{}: baseline storage plan costs {regret:.3}x the oracle; this now crosses \
+                 TODO4's 10% acceptance bar",
+                row.name
             );
         }
     }
@@ -636,68 +626,80 @@ fn cache_and_prefetch_policy_search_runs_after_scheduler_shape_search() {
         .expect("the measured scenario is the cache/prefetch baseline");
     let (measured_choice, _) = simulator_backed_choice_for(measured, &workflow, &base);
     let measured_plan = measured_choice.plan;
-    let measured_shape = plan_edges_shape(&measured_plan);
+    let measured_shape = plan_shape_key(&measured_plan);
 
-    let variant = |name: &str, note: &str, edit: fn(&mut blockflow::simulate::Machine)| {
-        let mut machine = measured.machine;
-        edit(&mut machine);
-        measured.clone().with_machine(name, machine).noted(note)
-    };
+    struct PolicyRow {
+        name: &'static str,
+        note: &'static str,
+        edit: fn(&mut blockflow::simulate::Machine),
+    }
+
+    impl PolicyRow {
+        fn scenario(&self, measured: &Scenario) -> Scenario {
+            let mut machine = measured.machine;
+            (self.edit)(&mut machine);
+            measured
+                .clone()
+                .with_machine(self.name, machine)
+                .noted(self.note)
+        }
+    }
+
     let rows = [
-        variant(
-            "cache-off",
-            "no modelled residency and no prefetch",
-            |machine| {
+        PolicyRow {
+            name: "cache-off",
+            note: "no modelled residency and no prefetch",
+            edit: |machine| {
                 machine.cache_bytes = 0;
                 machine.prefetch_depth = 0;
             },
-        ),
-        variant(
-            "tiny-shared-cache",
-            "shared cache smaller than the measured page cache",
-            |machine| {
+        },
+        PolicyRow {
+            name: "tiny-shared-cache",
+            note: "shared cache smaller than the measured page cache",
+            edit: |machine| {
                 machine.cache_bytes = 1 << 20;
                 machine.cache_shared = true;
                 machine.prefetch_depth = 0;
             },
-        ),
-        variant(
-            "tiny-private-cache",
-            "per-worker private cache pools under the same byte budget",
-            |machine| {
+        },
+        PolicyRow {
+            name: "tiny-private-cache",
+            note: "per-worker private cache pools under the same byte budget",
+            edit: |machine| {
                 machine.cache_bytes = 1 << 20;
                 machine.cache_shared = false;
                 machine.prefetch_depth = 0;
             },
-        ),
-        variant(
-            "prefetch-off",
-            "baseline cache with prefetch disabled",
-            |machine| {
+        },
+        PolicyRow {
+            name: "prefetch-off",
+            note: "baseline cache with prefetch disabled",
+            edit: |machine| {
                 machine.prefetch_depth = 0;
             },
-        ),
-        variant(
-            "prefetch-one",
-            "baseline cache with one-rank prefetch",
-            |machine| {
+        },
+        PolicyRow {
+            name: "prefetch-one",
+            note: "baseline cache with one-rank prefetch",
+            edit: |machine| {
                 machine.prefetch_depth = 1;
             },
-        ),
-        variant(
-            "prefetch-two",
-            "baseline cache with two-rank prefetch",
-            |machine| {
+        },
+        PolicyRow {
+            name: "prefetch-two",
+            note: "baseline cache with two-rank prefetch",
+            edit: |machine| {
                 machine.prefetch_depth = 2;
             },
-        ),
-        variant(
-            "prefetch-deep",
-            "baseline cache with a deep prefetch horizon",
-            |machine| {
+        },
+        PolicyRow {
+            name: "prefetch-deep",
+            note: "baseline cache with a deep prefetch horizon",
+            edit: |machine| {
                 machine.prefetch_depth = 64;
             },
-        ),
+        },
     ];
 
     println!(
@@ -707,11 +709,12 @@ fn cache_and_prefetch_policy_search_runs_after_scheduler_shape_search() {
     let mut moved_oracle = 0usize;
     let mut saw_prefetch = false;
     let mut saw_cache_contract = false;
-    for scenario in rows {
+    for row in rows {
+        let scenario = row.scenario(measured);
         saw_prefetch |= scenario.machine.prefetch_depth > 0;
         saw_cache_contract |= !scenario.machine.cache_shared || scenario.machine.cache_bytes == 0;
         let (choice, _) = simulator_backed_choice_for(&scenario, &workflow, &base);
-        let oracle_shape = plan_edges_shape(&choice.plan);
+        let oracle_shape = plan_shape_key(&choice.plan);
         let best = choice
             .judgement
             .simulated_pick()
@@ -807,275 +810,6 @@ fn performance_corpus_covers_the_known_planner_failure_modes() {
     );
 }
 
-fn simulator_backed_plan_for(
-    scenario: &Scenario,
-    workflow: &Workflow,
-    base: &Constraints,
-) -> (Plan, Constraints) {
-    let (chosen, constraints) = simulator_backed_choice_for(scenario, workflow, base);
-    (chosen.plan, constraints)
-}
-
-fn simulator_backed_choice_for(
-    scenario: &Scenario,
-    workflow: &Workflow,
-    base: &Constraints,
-) -> (SimulatedPlan, Constraints) {
-    let constraints = scenario.constraints(base);
-    let planner = simulator_backed_for(scenario);
-    let chosen = planner
-        .plan_with_machine(workflow, &constraints)
-        .unwrap_or_else(|err| panic!("{}: simulator-backed planning failed: {err}", scenario.name));
-    (chosen, constraints)
-}
-
-#[derive(Clone)]
-struct PlanChoice {
-    name: String,
-    plan: Plan,
-    constraints: Constraints,
-}
-
-enum Fit<T> {
-    Fits(T),
-    OverBudget,
-}
-
-fn simulated_ns_on(
-    plan: &Plan,
-    scenario: &Scenario,
-    workflow: &Workflow,
-    base: &Constraints,
-) -> Option<f64> {
-    match judge_plan_on_scenario(plan, scenario, workflow, base) {
-        Fit::Fits(ns) => Some(ns),
-        Fit::OverBudget => None,
-    }
-}
-
-fn judge_plan_on_scenario(
-    plan: &Plan,
-    scenario: &Scenario,
-    workflow: &Workflow,
-    base: &Constraints,
-) -> Fit<f64> {
-    use blockflow::arena::working_set_bytes;
-
-    let constraints = scenario.constraints(base);
-    let workers = scenario.machine.workers.max(1);
-    let working_set = working_set_bytes(workflow, &plan.decomposition, &constraints, workers)
-        .unwrap_or_else(|err| panic!("{}: working set failed: {err}", scenario.name));
-    if scenario
-        .budget_bytes
-        .is_some_and(|budget| working_set > budget as f64)
-    {
-        return Fit::OverBudget;
-    }
-    let mut arena = Arena::new(scenario.machine, scenario.rates(&Rates::default()))
-        .with_snapshot(scenario.snapshot.clone());
-    arena
-        .enter_plan("candidate".to_string(), plan.clone(), constraints)
-        .expect("a plan the arena can hold");
-    let judgement = arena
-        .judge(workflow)
-        .unwrap_or_else(|err| panic!("{}: candidate did not simulate: {err}", scenario.name));
-    Fit::Fits(judgement.verdicts[0].simulated_ns())
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum MatrixCell {
-    Ratio(f64),
-    OverBudget,
-}
-
-impl MatrixCell {
-    fn render(&self) -> String {
-        match self {
-            Self::Ratio(ratio) => format!("{ratio:.3}"),
-            Self::OverBudget => "over".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct WorstCell {
-    row: String,
-    column: String,
-    ratio: f64,
-}
-
-struct PlanMatrix {
-    names: Vec<String>,
-    rows: BTreeMap<String, Vec<MatrixCell>>,
-    worst: WorstCell,
-    column_worst: BTreeMap<String, f64>,
-}
-
-impl PlanMatrix {
-    fn from_choices(
-        choices: &[PlanChoice],
-        scenarios: &BTreeMap<String, Scenario>,
-        workflow: &Workflow,
-        base: &Constraints,
-    ) -> Self {
-        let names: Vec<String> = choices.iter().map(|choice| choice.name.clone()).collect();
-        let mut rows = BTreeMap::new();
-        let mut worst = WorstCell {
-            row: String::new(),
-            column: String::new(),
-            ratio: 1.0,
-        };
-        let mut column_worst = BTreeMap::new();
-
-        for row in choices {
-            let mut cells = Vec::with_capacity(choices.len());
-            for column in choices {
-                let scenario = &scenarios[&column.name];
-                match transfer_ratio(&row.plan, &column.plan, scenario, workflow, base) {
-                    Fit::OverBudget => cells.push(MatrixCell::OverBudget),
-                    Fit::Fits(ratio) => {
-                        let entry = column_worst.entry(column.name.clone()).or_insert(1.0);
-                        if ratio > *entry {
-                            *entry = ratio;
-                        }
-                        if ratio > worst.ratio {
-                            worst = WorstCell {
-                                row: row.name.clone(),
-                                column: column.name.clone(),
-                                ratio,
-                            };
-                        }
-                        cells.push(MatrixCell::Ratio(ratio));
-                    }
-                }
-            }
-            rows.insert(row.name.clone(), cells);
-        }
-
-        Self {
-            names,
-            rows,
-            worst,
-            column_worst,
-        }
-    }
-
-    fn print(&self, title: &str) {
-        println!("{title}");
-        print!("{:<24}", "");
-        for name in &self.names {
-            print!("{:>10.10}", name);
-        }
-        println!();
-        for (name, cells) in &self.rows {
-            print!("{name:<24}");
-            for cell in cells {
-                print!("{:>10}", cell.render());
-            }
-            println!();
-        }
-    }
-
-    fn contains_over_budget(&self) -> bool {
-        self.rows
-            .values()
-            .flatten()
-            .any(|cell| matches!(cell, MatrixCell::OverBudget))
-    }
-}
-
-fn transfer_ratio(
-    foreign: &Plan,
-    native: &Plan,
-    scenario: &Scenario,
-    workflow: &Workflow,
-    base: &Constraints,
-) -> Fit<f64> {
-    use blockflow::arena::working_set_bytes;
-
-    let constraints = scenario.constraints(base);
-    let workers = scenario.machine.workers.max(1);
-    let working_set = working_set_bytes(workflow, &foreign.decomposition, &constraints, workers)
-        .unwrap_or_else(|err| panic!("{}: foreign working set failed: {err}", scenario.name));
-    if scenario
-        .budget_bytes
-        .is_some_and(|budget| working_set > budget as f64)
-    {
-        return Fit::OverBudget;
-    }
-
-    let mut arena = Arena::new(scenario.machine, scenario.rates(&Rates::default()))
-        .with_snapshot(scenario.snapshot.clone());
-    for (name, plan) in [("foreign", foreign), ("native", native)] {
-        arena
-            .enter_plan(name.to_string(), plan.clone(), constraints.clone())
-            .expect("a plan the arena can hold");
-    }
-    let judgement = arena
-        .judge(workflow)
-        .unwrap_or_else(|err| panic!("{}: transfer simulation failed: {err}", scenario.name));
-    Fit::Fits(judgement.verdicts[0].simulated_ns() / judgement.verdicts[1].simulated_ns())
-}
-
-fn robust_simulator_backed_plan_for(
-    scenario: &Scenario,
-    scenarios: &BTreeMap<String, Scenario>,
-    workflow: &Workflow,
-    base: &Constraints,
-) -> (Plan, Constraints, f64, f64) {
-    let constraints = scenario.constraints(base);
-    let planner = simulator_backed_for(scenario);
-    let candidate_arena = planner
-        .candidate_arena(workflow, &constraints)
-        .unwrap_or_else(|err| panic!("{}: candidate arena failed: {err}", scenario.name));
-    let baselines: BTreeMap<&str, f64> = scenarios
-        .iter()
-        .map(|(name, column)| {
-            let (choice, _) = simulator_backed_choice_for(column, workflow, base);
-            let best = choice
-                .judgement
-                .simulated_pick()
-                .expect("a simulator-backed candidate field has a winner")
-                .simulated_ns();
-            (name.as_str(), best)
-        })
-        .collect();
-
-    let mut best: Option<(Plan, f64, f64)> = None;
-    for entrant in candidate_arena.entrants() {
-        let mut worst = 1.0f64;
-        let mut local = None;
-        let mut fits_some_column = false;
-        for (name, column) in scenarios {
-            let Some(simulated) = simulated_ns_on(&entrant.plan, column, workflow, base) else {
-                continue;
-            };
-            fits_some_column = true;
-            let regret = simulated / baselines[name.as_str()];
-            if name == &scenario.name {
-                local = Some(regret);
-            }
-            worst = worst.max(regret);
-        }
-        if !fits_some_column || local.is_none() {
-            continue;
-        }
-        let local = local.expect("checked above");
-        if best.as_ref().is_none_or(|(_, best_worst, best_local)| {
-            worst < *best_worst || (worst == *best_worst && local < *best_local)
-        }) {
-            best = Some((entrant.plan.clone(), worst, local));
-        }
-    }
-    let (plan, worst, local) = best.unwrap_or_else(|| {
-        panic!(
-            "{}: no robust simulator-backed candidate fit",
-            scenario.name
-        )
-    });
-    (plan, constraints, worst, local)
-}
-
 /// The portability question for the opt-in simulator-backed planner.
 ///
 /// Its native regret is tautologically low because it chooses the simulator
@@ -1129,34 +863,25 @@ fn robust_simulator_backed_plans_transfer_under_the_todo4_ceiling() {
     let scenarios = scenarios();
     let workflow = workflow();
     let base = base_constraints();
-    let robust: Vec<(PlanChoice, f64, f64)> = scenarios
-        .iter()
-        .map(|(name, scenario)| {
-            let (plan, constraints, oracle_worst, local_regret) =
-                robust_simulator_backed_plan_for(scenario, &scenarios, &workflow, &base);
-            (
-                PlanChoice {
-                    name: name.clone(),
-                    plan,
-                    constraints,
-                },
-                oracle_worst,
-                local_regret,
+    let robust: Vec<RobustPlanChoice> = scenarios
+        .values()
+        .map(|scenario| {
+            support::planner_perf::robust_simulator_backed_plan_for(
+                scenario, &scenarios, &workflow, &base,
             )
         })
         .collect();
-    let chosen: Vec<PlanChoice> = robust.iter().map(|(choice, _, _)| choice.clone()).collect();
+    let chosen: Vec<PlanChoice> = robust.iter().map(|entry| entry.choice.clone()).collect();
     let matrix = PlanMatrix::from_choices(&chosen, &scenarios, &workflow, &base);
     let mut local_worst = ("".to_string(), 1.0f64);
 
-    for (choice, oracle_worst, local_regret) in &robust {
-        if *local_regret > local_worst.1 {
-            local_worst = (choice.name.clone(), *local_regret);
+    for entry in &robust {
+        if entry.local_regret > local_worst.1 {
+            local_worst = (entry.choice.name.clone(), entry.local_regret);
         }
         println!(
-            "{}: robust oracle worst against local oracles {oracle_worst:.3}, local regret \
-             {local_regret:.3}",
-            choice.name
+            "{}: robust oracle worst against local oracles {:.3}, local regret {:.3}",
+            entry.choice.name, entry.oracle_worst, entry.local_regret
         );
     }
     matrix.print("robust simulator-backed plan chosen for (row), run on (column)");
@@ -1189,63 +914,14 @@ fn robust_simulator_backed_plans_transfer_under_the_todo4_ceiling() {
 ///
 /// **This is the overfitting measurement.** Every planner figure in this crate
 /// was taken on one machine; a search tuned to it would show up here as a row
-/// that is `1.000` in its own column and large everywhere else. What the table
-/// actually shows is milder and worth knowing:
-///
-/// * the `measured` row transfers cleanly to every other machine, so the plan
-///   this crate's own evidence produces is not a plan for this host alone;
-/// * the whole matrix is driven by the **worker count**, which is the axis
-///   every other measurement this session landed on: the `forty-cores` row and
-///   column are where the cells depart from one, and the disk, memory and
-///   chunk scenarios transfer to each other almost exactly.
-///
-/// Recorded, 2026-08-30 (after the contention term). Rows are the machine
-/// planned for, columns the machine run on; `over` is a plan that does not fit
-/// that machine's budget. Trimmed to the columns that are not near-constant;
-/// the full table is what the test prints.
-///
-/// ```text
-///                          forty-c  four-no  less-me  measure  ten-nod  two-nod
-///     compressed-store       1.433    0.893     over    1.000    1.275    0.460
-///     forty-cores            1.000    0.935    1.307    0.794    0.819    0.517
-///     four-nodes             1.412    1.000    1.312    0.990    0.811    0.689
-///     less-memory            1.945    1.120    1.000    0.890    1.042    0.647
-///     measured               1.433    0.893     over    1.000    1.275    0.460
-///     slow-disk              1.441    0.894     over    1.006    1.262    0.462
-///     ten-nodes              1.792    1.126    0.943    0.838    1.000    0.622
-///     two-cores              1.433    0.893     over    1.000    1.275    0.460
-///     two-nodes              2.263    1.325     over    1.230    1.256    1.000
-/// ```
-///
-/// Four things it says:
-///
-/// * **the current largest cell is 2.263x on forty cores for the two-node
-///   plan**. That row's mixed grid was chosen to exploit two nodes and becomes
-///   a poor traveller when the run is judged on one busy machine with forty
-///   workers. The old largest cell, a single-machine plan on ten computers,
-///   was the cross-node fetch duplication that `CostModel` still does not
-///   price;
-/// * **the `less-memory` column is `over` for every foreign plan.** A plan
-///   chosen on a machine with memory is not slow on one without it — it is
-///   inadmissible, which is the strongest form the overfitting question has.
-///   That column is the reason the fit is checked rather than only the duration;
-/// * **the `two-nodes` column is below one for almost every foreign plan**, and
-///   its own row is the worst traveller in the table (2.263 on `forty-cores`
-///   and 1.325 on `four-nodes`). Both are the same fact seen twice: that row's plan is
-///   the mixed grid whose penalty is contention between overlapping phases —
-///   see the regret test's doc, and the control that switches contention off and
-///   watches the penalty vanish;
-/// * **the machines that differ only in their storage still transfer at
-///   1.000.** Disk speed, chunk shape and compression choose one plan among
-///   them, exactly as before the contention term. What moves a plan is the slot
-///   count, the node count and the budget.
+/// that is `1.000` in its own column and large everywhere else. The recorded
+/// transfer table and interpretation live in `docs/design/planner-gaps.md`
+/// under "Overfitting: what the planner does on machines this is not".
 ///
 /// The ceiling below is per column, so a change that ruins one machine's
 /// transfer is named by that machine rather than averaged away.
 #[test]
 fn a_plan_chosen_for_one_machine_transfers_to_the_others() {
-    use blockflow::arena::working_set_bytes;
-
     let scenarios = scenarios();
     let workflow = workflow();
     let base = base_constraints();
@@ -1253,21 +929,8 @@ fn a_plan_chosen_for_one_machine_transfers_to_the_others() {
     // One plan per scenario, chosen by the planner under that scenario's own
     // model, budget and worker count.
     let chosen: Vec<PlanChoice> = scenarios
-        .iter()
-        .map(|(name, scenario)| {
-            let constraints = scenario.constraints(&base);
-            let plan = Enumerating {
-                concurrency: scenario.machine.workers.max(1),
-                ..Enumerating::default()
-            }
-            .plan(&workflow, &constraints)
-            .unwrap_or_else(|err| panic!("{name}: {err}"));
-            PlanChoice {
-                name: name.clone(),
-                plan,
-                constraints,
-            }
-        })
+        .values()
+        .map(|scenario| planner_choice_for(scenario, &workflow, &base))
         .collect();
 
     let matrix = PlanMatrix::from_choices(&chosen, &scenarios, &workflow, &base);
@@ -1297,20 +960,17 @@ fn a_plan_chosen_for_one_machine_transfers_to_the_others() {
     for choice in &chosen {
         let scenario = &scenarios[choice.name.as_str()];
         let workers = scenario.machine.workers.max(1);
-        let bytes = working_set_bytes(
+        let fit = plan_fit(
             &workflow,
             &choice.plan.decomposition,
             &choice.constraints,
             workers,
         )
         .unwrap_or_else(|err| panic!("{}: {err}", choice.name));
-        if let Some(budget) = scenario.budget_bytes {
-            assert!(
-                bytes <= budget as f64,
-                "{name}: the planner returned a plan needing {bytes:.0} bytes against its own \
-                 {budget} byte budget",
-                name = choice.name
-            );
-        }
+        assert!(
+            fit.fits(),
+            "{name}: the planner returned a plan that does not fit its own budget: {fit:?}",
+            name = choice.name
+        );
     }
 }

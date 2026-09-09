@@ -4,6 +4,7 @@ use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::ArrayEnvironment;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, Chain};
+use blockflow::reach::Reach;
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
@@ -11,6 +12,82 @@ use blockflow::Dtype;
 pub struct RunF64 {
     pub output: Array3<f64>,
     pub tasks_short_circuited: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Suite {
+    name: &'static str,
+    volume: [usize; 3],
+    chunk: [usize; 3],
+}
+
+impl Suite {
+    pub const fn new(name: &'static str, volume: [usize; 3], chunk: [usize; 3]) -> Self {
+        Self {
+            name,
+            volume,
+            chunk,
+        }
+    }
+
+    pub fn workflow(&self, chain: Chain) -> Workflow {
+        workflow_f64(chain, self.volume)
+    }
+
+    /// One phase holding the whole chain, using the chain's own reach.
+    pub fn plan(&self, workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {
+        plan(workflow, self.volume, block, split_axes)
+    }
+
+    /// One phase with an explicitly supplied reach, for failure fixtures.
+    pub fn plan_with_reach(
+        &self,
+        workflow: &Workflow,
+        block: usize,
+        split_axes: &[usize],
+        reach: [usize; 3],
+    ) -> Decomposition {
+        plan_with_reach(workflow, self.volume, block, split_axes, reach)
+    }
+
+    /// One phase with the chain's own per-side reach.
+    pub fn plan_with_reach_spec(
+        &self,
+        workflow: &Workflow,
+        block: usize,
+        split_axes: &[usize],
+    ) -> Decomposition {
+        let reach = workflow
+            .chain
+            .reach_spec(self.volume)
+            .expect("a foldable reach");
+        self.plan_with_halo_spec(workflow, block, split_axes, reach.clone(), reach)
+    }
+
+    /// One phase with explicit per-side reach and halo, for failure fixtures.
+    pub fn plan_with_halo_spec(
+        &self,
+        workflow: &Workflow,
+        block: usize,
+        split_axes: &[usize],
+        reach: Reach,
+        halo: Reach,
+    ) -> Decomposition {
+        plan_with_halo_spec(workflow, self.volume, block, split_axes, reach, halo)
+    }
+
+    pub fn reference_f64(&self, chain: &Chain, input: &Array3<f64>) -> Array3<f64> {
+        reference_f64(chain, input, self.volume)
+    }
+
+    pub fn run_f64(
+        &self,
+        workflow: &Workflow,
+        decomposition: &Decomposition,
+        input: &Array3<f64>,
+    ) -> RunF64 {
+        run_f64(self.name, workflow, decomposition, input, self.chunk)
+    }
 }
 
 pub fn workflow_f64(chain: Chain, volume: [usize; 3]) -> Workflow {
@@ -48,6 +125,26 @@ pub fn plan_with_reach(
         dtype: workflow.dtype,
         phases: vec![phase],
         chain_reach: reach,
+    }
+}
+
+pub fn plan_with_halo_spec(
+    workflow: &Workflow,
+    volume: [usize; 3],
+    block: usize,
+    split_axes: &[usize],
+    reach: Reach,
+    halo: Reach,
+) -> Decomposition {
+    let slots = workflow.chain.slots();
+    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
+    let grid = BlockGrid::along(volume, split_axes, block).unwrap();
+    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, halo, grid);
+    Decomposition {
+        volume,
+        dtype: workflow.dtype,
+        phases: vec![phase],
+        chain_reach: workflow.chain.reach3(&volume),
     }
 }
 

@@ -34,17 +34,19 @@
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+use blockflow::decomposition::Decomposition;
 use blockflow::env::ArrayEnvironment;
-use blockflow::geometry::BlockGrid;
-use blockflow::op::{Anchor, BlockOp, Chain};
+use blockflow::op::{BlockOp, Chain};
 use blockflow::ops::{Polarity, RidgeFilterOp, RidgeResponse, ScaleSpace};
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
-use blockflow::voxels::Voxels;
-use blockflow::Dtype;
+
+mod support;
+
+use support::single_phase;
 
 const VOLUME: [usize; 3] = [26, 20, 16];
+const SUITE: single_phase::Suite = single_phase::Suite::new("ridge", VOLUME, [4, 4, 4]);
 
 // ------------------------------------------------------------- fixtures --
 
@@ -93,13 +95,13 @@ fn response() -> RidgeResponse {
 }
 
 fn workflow(chain: Chain) -> Workflow {
-    Workflow::new(chain, VOLUME, Dtype::F64)
+    SUITE.workflow(chain)
 }
 
 /// One phase holding the chain, built from the chain's **own** reach — nothing
 /// here supplies one, so nothing here can hide one that is wrong.
 fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {
-    plan_with_reach(workflow, block, split_axes, workflow.chain.reach3(&VOLUME))
+    SUITE.plan(workflow, block, split_axes)
 }
 
 fn plan_with_reach(
@@ -108,30 +110,16 @@ fn plan_with_reach(
     split_axes: &[usize],
     reach: [usize; 3],
 ) -> Decomposition {
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(VOLUME, split_axes, block).unwrap();
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
-    Decomposition {
-        volume: VOLUME,
-        dtype: workflow.dtype,
-        phases: vec![phase],
-        chain_reach: reach,
-    }
+    SUITE.plan_with_reach(workflow, block, split_axes, reach)
 }
 
 /// The oracle: the same kernel, called once, over the whole array.
 fn reference(chain: &Chain, input: &Array3<f64>) -> Array3<f64> {
-    let source: Voxels = input.clone().into();
-    let mut out = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
-    chain
-        .apply(&source, &mut out, &Anchor::whole(VOLUME))
-        .expect("the whole-volume reference must run");
-    out.view::<f64>().unwrap().to_owned()
+    SUITE.reference_f64(chain, input)
 }
 
 fn run(workflow: &Workflow, decomposition: &Decomposition, input: &Array3<f64>) -> Array3<f64> {
-    run_with_env(workflow, decomposition, input).0
+    SUITE.run_f64(workflow, decomposition, input).output
 }
 
 fn run_with_env(

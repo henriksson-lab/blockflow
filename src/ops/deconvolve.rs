@@ -566,29 +566,14 @@ impl DeconvolveOp {
     /// conversion the kernel would have to invent. `f16` is refused before a run
     /// starts, by `accepts`, because no buffer holds one.
     fn evaluate(&self, input: &Voxels, out: ArrayViewMut3<'_, f64>) -> Result<()> {
-        macro_rules! direct {
-            ($type:ty) => {
-                deconvolve_into(input.view::<$type>()?, &self.parameters, out)
-            };
-        }
-        match input.dtype() {
-            Dtype::U8 => direct!(u8),
-            Dtype::U16 => direct!(u16),
-            Dtype::U32 => direct!(u32),
-            Dtype::I8 => direct!(i8),
-            Dtype::I16 => direct!(i16),
-            Dtype::I32 => direct!(i32),
-            Dtype::F32 => direct!(f32),
-            Dtype::F64 => direct!(f64),
-            Dtype::Bool | Dtype::U64 | Dtype::I64 => {
-                let widened = input.widened();
-                deconvolve_into(widened.view(), &self.parameters, out)
-            }
-            Dtype::F16 => Err(Error::InvalidArgument(format!(
+        dispatch_f64_input!(
+            input,
+            Error::InvalidArgument(format!(
                 "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
                 self.name
-            ))),
-        }
+            )),
+            |view| { deconvolve_into(view, &self.parameters, out) }
+        )
     }
 }
 

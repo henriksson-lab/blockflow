@@ -66,7 +66,7 @@ use blockflow::assemble::{ImageId, PlanBuilder};
 use blockflow::decomposition::Decomposition;
 use blockflow::dtype::Dtype;
 use blockflow::env::{ArrayEnvironment, Environment};
-use blockflow::fragment::PhaseWork;
+use blockflow::fragment::{FragmentOp, PhaseWork};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::ops::components::{label_members_into_with, Connectivity, LabelIndex, Union};
@@ -907,4 +907,25 @@ fn a_supplied_label_volume_is_refused_until_its_element_type_is_declared() {
     // an image of the plan, silent: plannable, and that is the correct default
     tabulate_phases(grid, Dtype::F64, &undeclared(ImageId::from(1usize)), &merge)
         .expect("an image the run writes has its width in the fold");
+}
+
+#[test]
+fn a_tabulator_declares_the_element_types_of_both_supplied_operands() {
+    let op = TabulateValuesOp::new(
+        "tabulate",
+        ImageId::supplied(0),
+        ImageId::supplied(1),
+        FixedPoint::default(),
+        "partials",
+        Lifecycle::DeleteOnExit,
+    )
+    .expect("two different images")
+    .holding(Dtype::U32, Dtype::F64);
+
+    let inputs = op.source_inputs(VOLUME);
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs[0].image.index(), ImageId::supplied(0).index());
+    assert_eq!(inputs[0].dtype, Some(Dtype::U32));
+    assert_eq!(inputs[1].image.index(), ImageId::supplied(1).index());
+    assert_eq!(inputs[1].dtype, Some(Dtype::F64));
 }

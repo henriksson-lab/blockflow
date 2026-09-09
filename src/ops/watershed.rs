@@ -135,13 +135,14 @@
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::op::{Anchor, BlockOp, SourceInput, SourceInputs};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
 
 use super::scikitimage_watershed::watershed_raveled_reporting_peak;
 use super::shapes_agree;
+use super::{LabelSeedSource, MaskSource};
 
 /// What happens where two floods meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,8 +286,8 @@ pub fn seeded_watershed(
 /// module documentation for the argument and for what it costs.
 pub struct SeededWatershedOp {
     name: &'static str,
-    seeds: usize,
-    mask: Option<usize>,
+    seeds: LabelSeedSource,
+    mask: Option<MaskSource>,
     separation: Separation,
     cost: f64,
 }
@@ -300,7 +301,7 @@ impl SeededWatershedOp {
     ) -> Self {
         Self {
             name,
-            seeds: seeds.into().into(),
+            seeds: LabelSeedSource::new(seeds),
             mask: None,
             separation,
             cost: match separation {
@@ -313,16 +314,16 @@ impl SeededWatershedOp {
     /// Flood only within `mask`. Without one the whole block is floodable, and
     /// every voxel of it takes a label.
     pub fn within(mut self, mask: impl Into<crate::assemble::ImageId>) -> Self {
-        self.mask = Some(mask.into().into());
+        self.mask = Some(MaskSource::new(mask));
         self
     }
 
     pub fn seed_image(&self) -> usize {
-        self.seeds
+        self.seeds.image()
     }
 
     pub fn mask_image(&self) -> Option<usize> {
-        self.mask
+        self.mask.map(MaskSource::image)
     }
 
     pub fn separation(&self) -> Separation {
@@ -355,9 +356,9 @@ impl BlockOp for SeededWatershedOp {
     /// makes about its own input — a flood consults every voxel of all three or
     /// it is a different flood.
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
-        let mut declared = vec![SourceInput::new(self.seeds, Reach::all())];
+        let mut declared = vec![self.seeds.source_input(Reach::all())];
         if let Some(mask) = self.mask {
-            declared.push(SourceInput::new(mask, Reach::all()));
+            declared.push(mask.source_input(Reach::all()));
         }
         declared
     }
@@ -380,12 +381,7 @@ impl BlockOp for SeededWatershedOp {
     /// Refuses, and the refusal is the point: a flood with no seeds has no
     /// answer, it has an empty one. See [`BlockOp::apply_with`].
     fn apply(&self, _input: &Voxels, _out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        Err(Error::InvalidArgument(format!(
-            "{}: the seeds come from image {}, so this op has no answer from its input alone — \
-             it would flood nothing and write an empty volume. It is applied through \
-             `apply_with`.",
-            self.name, self.seeds
-        )))
+        Err(self.seeds.input_only_error(self.name))
     }
 
     fn apply_with(
@@ -395,33 +391,10 @@ impl BlockOp for SeededWatershedOp {
         out: &mut Voxels,
         _at: &Anchor,
     ) -> Result<()> {
-        let seeds = sources.get(self.seeds)?;
-        if seeds.dtype() != Dtype::U32 {
-            return Err(Error::InvalidArgument(format!(
-                "{}: the seeds are read from image {}, which holds {}. A seed is a label and is \
-                 stored as one; a float would leave 'which values are the same seed' to be \
-                 decided somewhere this op cannot see.",
-                self.name,
-                self.seeds,
-                seeds.dtype().numpy_name()
-            )));
-        }
-        let seeds = seeds.view::<u32>()?;
+        let seeds = self.seeds.u32_view(self.name, sources)?;
 
         let mask = match self.mask {
-            Some(image) => {
-                let mask = sources.get(image)?;
-                if mask.dtype() != Dtype::Bool {
-                    return Err(Error::InvalidArgument(format!(
-                        "{}: the floodable region is read from image {}, which holds {}. It is a \
-                         yes-or-no per voxel and is stored as one.",
-                        self.name,
-                        image,
-                        mask.dtype().numpy_name()
-                    )));
-                }
-                Some(mask.view::<bool>()?)
-            }
+            Some(mask) => Some(mask.bool_view(self.name, sources)?),
             None => None,
         };
 
@@ -690,5 +663,24 @@ mod tests {
         let failed = seeded_watershed(cost.view(), seeds.view(), None, Separation::Line)
             .expect_err("mismatched shapes");
         assert!(failed.to_string().contains("seeds"), "{failed}");
+    }
+
+    #[test]
+    fn the_shell_declares_seed_and_mask_source_dtypes() {
+        let op = SeededWatershedOp::new(
+            "watershed",
+            crate::assemble::ImageId::supplied(0),
+            Separation::Line,
+        )
+        .within(crate::assemble::ImageId::supplied(1));
+        assert_eq!(
+            op.source_inputs([5, 4, 3]),
+            vec![
+                SourceInput::new(crate::assemble::ImageId::supplied(0), Reach::all())
+                    .holding(Dtype::U32),
+                SourceInput::new(crate::assemble::ImageId::supplied(1), Reach::all())
+                    .holding(Dtype::Bool),
+            ]
+        );
     }
 }

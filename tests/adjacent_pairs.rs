@@ -77,6 +77,10 @@ use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::table::encoded_schema;
 use blockflow::voxels::Voxels;
 
+mod support;
+
+use support::volume::point_mask_bool;
+
 const VOLUME: [usize; 3] = [12, 12, 8];
 const STREAM: &str = "adjacency.pairs";
 const CHUNK: [usize; 3] = [4, 4, 4];
@@ -615,9 +619,7 @@ fn each_connectivity_is_decomposition_invariant_and_they_differ() {
 /// corner, which is the case a face-only seam walk would never look at.
 #[test]
 fn a_corner_touch_across_a_lattice_corner_is_owned_correctly() {
-    let mut mask = Array3::from_elem((VOLUME[0], VOLUME[1], VOLUME[2]), false);
-    mask[[3, 3, 3]] = true;
-    mask[[4, 4, 4]] = true;
+    let mask = point_mask_bool(VOLUME, &[[3, 3, 3], [4, 4, 4]]);
     // Under [4, 4, 4] those are blocks [0, 0, 0] and [1, 1, 1]: a lattice corner.
     for cut in CUTS {
         assert_eq!(
@@ -640,8 +642,7 @@ fn a_corner_touch_across_a_lattice_corner_is_owned_correctly() {
 #[test]
 fn a_single_voxel_has_no_pair_wherever_the_seams_fall() {
     for at in [[0, 0, 0], [7, 5, 3], [11, 11, 7]] {
-        let mut mask = Array3::from_elem((VOLUME[0], VOLUME[1], VOLUME[2]), false);
-        mask[at] = true;
+        let mask = point_mask_bool(VOLUME, &[at]);
         assert!(adjacent_pairs(mask.view(), WIDE)
             .expect("reference")
             .is_empty());

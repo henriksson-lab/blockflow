@@ -54,7 +54,7 @@ use crate::region::Region;
 use crate::slab::SlabCut;
 use crate::tiling::boxes_tile_exactly;
 
-use super::geometry::{region_within, BlockGeometry, BlockGrid};
+use super::geometry::{product3, region_within, BlockGeometry, BlockGrid};
 use super::op::{Anchor, BlockConstraint, Chain, Placement};
 
 /// One fused run of slots: read once with a halo sized to **this phase's**
@@ -266,6 +266,30 @@ impl PhaseDecomposition {
         self.grid.volume()
     }
 
+    /// Rebuild this phase on another grid while preserving every binding field
+    /// that is not geometry.
+    ///
+    /// Candidate generation and tests often need to ask "same phase, different
+    /// block lattice". This method keeps that a single operation, so a future
+    /// phase metadata field is not silently lost by one reconstruction site.
+    pub fn regrid_preserving_metadata(&self, grid: BlockGrid) -> Self {
+        let mut rebuilt = Self::derive(
+            self.slots.clone(),
+            self.names.clone(),
+            self.reach.clone(),
+            self.halo.clone(),
+            grid,
+        )
+        .with_source_images(self.source_images.clone())
+        .with_supplied_dtypes(self.supplied_dtypes.clone())
+        .reading_input_image(self.reads_input_image)
+        .with_barrier(self.barrier);
+        if let Some(dtype) = self.dtype {
+            rebuilt = rebuilt.with_dtype(dtype);
+        }
+        rebuilt
+    }
+
     /// Say this phase writes a different element type than it read.
     pub fn with_dtype(mut self, dtype: Dtype) -> Self {
         self.dtype = Some(dtype);
@@ -278,10 +302,7 @@ impl PhaseDecomposition {
     /// fingerprinted and two plans that read the same images must hash the same
     /// whatever order the chain was walked in.
     pub fn with_source_images(mut self, images: impl IntoIterator<Item = usize>) -> Self {
-        let mut images: Vec<usize> = images.into_iter().collect();
-        images.sort_unstable();
-        images.dedup();
-        self.source_images = images;
+        self.source_images = normalise_images(images);
         self
     }
 
@@ -290,10 +311,7 @@ impl PhaseDecomposition {
     /// Normalised on the way in — ascending, no repeats — for the reason
     /// [`Self::with_source_images`] is: the list is fingerprinted.
     pub fn with_supplied_dtypes(mut self, held: impl IntoIterator<Item = (usize, Dtype)>) -> Self {
-        let mut held: Vec<(usize, Dtype)> = held.into_iter().collect();
-        held.sort_by_key(|(image, _)| *image);
-        held.dedup();
-        self.supplied_dtypes = held;
+        self.supplied_dtypes = normalise_supplied_dtypes(held);
         self
     }
 
@@ -378,6 +396,70 @@ impl PhaseDecomposition {
             .filter(|block| !block.valid_covers_core())
             .map(|block| block.index)
             .collect()
+    }
+}
+
+fn normalise_images(images: impl IntoIterator<Item = usize>) -> Vec<usize> {
+    let mut images: Vec<usize> = images.into_iter().collect();
+    images.sort_unstable();
+    images.dedup();
+    images
+}
+
+fn normalise_supplied_dtypes(
+    held: impl IntoIterator<Item = (usize, Dtype)>,
+) -> Vec<(usize, Dtype)> {
+    let mut held: Vec<(usize, Dtype)> = held.into_iter().collect();
+    held.sort_by_key(|(image, _)| *image);
+    held.dedup();
+    held
+}
+
+pub(crate) struct DeclaredSourceSet {
+    inputs: Vec<crate::op::SourceInput>,
+}
+
+impl DeclaredSourceSet {
+    pub(crate) fn from_slots(
+        slots: &[&Chain],
+        group: &[usize],
+        mut volume_of_slot: impl FnMut(usize) -> [usize; 3],
+    ) -> Result<Self> {
+        let mut inputs: Vec<crate::op::SourceInput> = Vec::new();
+        for &slot in group {
+            let Some(node) = slots.get(slot) else {
+                continue;
+            };
+            for input in node.source_inputs(volume_of_slot(slot))? {
+                match inputs.iter_mut().find(|held| held.image == input.image) {
+                    Some(held) => held.reach = held.reach.max(&input.reach)?,
+                    None => inputs.push(input),
+                }
+            }
+        }
+        inputs.sort_by_key(|input| input.image);
+        Ok(Self { inputs })
+    }
+
+    pub(crate) fn inputs(&self) -> &[crate::op::SourceInput] {
+        &self.inputs
+    }
+
+    pub(crate) fn images(&self) -> Vec<usize> {
+        normalise_images(self.inputs.iter().map(|input| input.image.index()))
+    }
+
+    pub(crate) fn supplied_dtypes(&self) -> Vec<(usize, Dtype)> {
+        normalise_supplied_dtypes(
+            self.inputs
+                .iter()
+                .filter(|input| input.image.is_supplied())
+                .filter_map(|input| input.dtype.map(|dtype| (input.image.index(), dtype))),
+        )
+    }
+
+    pub(crate) fn images_read_count(&self, reads_input: bool) -> usize {
+        usize::from(reads_input) + self.images().len()
     }
 }
 
@@ -526,15 +608,12 @@ impl Decomposition {
     /// Derived from `source_images` and not recorded: an array nothing reads is
     /// not an image of this plan, whatever the caller handed the environment.
     pub fn supplied_input_images(&self) -> Vec<usize> {
-        let mut images: Vec<usize> = self
-            .phases
-            .iter()
-            .flat_map(|phase| phase.source_images.iter().copied())
-            .filter(|&image| is_supplied_image(image))
-            .collect();
-        images.sort_unstable();
-        images.dedup();
-        images
+        normalise_images(
+            self.phases
+                .iter()
+                .flat_map(|phase| phase.source_images.iter().copied())
+                .filter(|&image| is_supplied_image(image)),
+        )
     }
 
     /// How many arrays this plan expects to be handed.
@@ -563,7 +642,6 @@ impl Decomposition {
             _ => self.phases[image - 1].volume(),
         }
     }
-
     /// The element type of image `image`, folded from image 0: a phase that
     /// declares no `dtype` hands on the one it read.
     pub fn dtype_at(&self, image: usize) -> Dtype {
@@ -882,32 +960,12 @@ impl Decomposition {
             if phase.slots.is_empty() {
                 continue;
             }
-            let mut declared: Vec<crate::op::SourceInput> = Vec::new();
-            for &slot in &phase.slots {
-                let Some(node) = slots.get(slot) else {
-                    continue;
-                };
-                for input in node.source_inputs(volumes[index])? {
-                    if !declared.iter().any(|held| held.image == input.image) {
-                        declared.push(input);
-                    }
-                }
-            }
-            let mut images: Vec<usize> = declared.iter().map(|input| input.image.index()).collect();
-            images.sort_unstable();
-            images.dedup();
+            let declared = DeclaredSourceSet::from_slots(&slots, &phase.slots, |_| volumes[index])?;
+            phase.source_images = declared.images();
             // Only the supplied ones. An image the run writes has its element
             // type in the fold and recording a second copy of it would be a
             // second number to disagree with the first.
-            let mut held: Vec<(usize, Dtype)> = declared
-                .iter()
-                .filter(|input| input.image.is_supplied())
-                .filter_map(|input| input.dtype.map(|dtype| (input.image.index(), dtype)))
-                .collect();
-            held.sort_by_key(|(image, _)| *image);
-            held.dedup();
-            phase.source_images = images;
-            phase.supplied_dtypes = held;
+            phase.supplied_dtypes = declared.supplied_dtypes();
         }
         Ok(())
     }
@@ -1235,7 +1293,7 @@ impl Decomposition {
     ) -> Result<u64> {
         let bytes_of = |image: usize| -> u64 {
             let volume = self.volume_at(image);
-            volume.iter().product::<usize>() as u64 * self.dtype_at(image).size_of() as u64
+            product3(volume) as u64 * self.dtype_at(image).size_of() as u64
         };
         // Every image the run holds: the ones the plan fills in, and the
         // supplied inputs, which `n_images` deliberately excludes because every
@@ -3342,16 +3400,7 @@ pub fn predicted_cost(
 /// materialising the second array because it adds nothing to the halo, not
 /// because its traversal is free.
 pub fn images_read_by(slots: &[&Chain], group: &[usize], volume: [usize; 3]) -> Result<usize> {
-    let mut images: Vec<usize> = Vec::new();
-    for &slot in group {
-        for input in slots[slot].source_inputs(volume)? {
-            let index = input.image.index();
-            if !images.contains(&index) {
-                images.push(index);
-            }
-        }
-    }
-    Ok(1 + images.len())
+    Ok(DeclaredSourceSet::from_slots(slots, group, |_| volume)?.images_read_count(true))
 }
 
 /// What one phase costs per voxel, whatever kind of work it runs.
@@ -3711,16 +3760,7 @@ pub fn check_source_images(chain: &Chain, decomposition: &Decomposition) -> Resu
             continue;
         }
         let volume = decomposition.volume_at(phase_index);
-        let mut declared: Vec<crate::op::SourceInput> = Vec::new();
-        for &slot in &phase.slots {
-            for input in slots[slot].source_inputs(volume)? {
-                match declared.iter_mut().find(|held| held.image == input.image) {
-                    Some(held) => held.reach = held.reach.max(&input.reach)?,
-                    None => declared.push(input),
-                }
-            }
-        }
-        declared.sort_by_key(|input| input.image);
+        let declared = DeclaredSourceSet::from_slots(&slots, &phase.slots, |_| volume)?;
 
         // **The equal-reach limit, stated where it is checkable.** The executor
         // reads a source image at the block's own fetch region, so an operand
@@ -3732,7 +3772,7 @@ pub fn check_source_images(chain: &Chain, decomposition: &Decomposition) -> Resu
         // name rather than planned and discovered as an out-of-bounds read.
         let block = phase.grid.block();
         let granted = phase.halo.in_voxels(block);
-        for input in &declared {
+        for input in declared.inputs() {
             let wanted = input.reach.in_voxels(block);
             for axis in 0..3 {
                 let (want_lo, want_hi) = wanted.axis(axis).bound(volume[axis]);
@@ -3756,7 +3796,7 @@ pub fn check_source_images(chain: &Chain, decomposition: &Decomposition) -> Resu
         // be folded to say what is in it: the readers are the declaration. One
         // that says nothing would leave `dtype_at` guessing, and every fold the
         // chain makes is built on that answer.
-        for input in &declared {
+        for input in declared.inputs() {
             if input.image.is_supplied() && input.dtype.is_none() {
                 return Err(Error::InvalidArgument(format!(
                     "decomposition phase {phase_index} ({}) reads {}, and nothing says what it \
@@ -3769,13 +3809,7 @@ pub fn check_source_images(chain: &Chain, decomposition: &Decomposition) -> Resu
                 )));
             }
         }
-        let mut held: Vec<(usize, Dtype)> = declared
-            .iter()
-            .filter(|input| input.image.is_supplied())
-            .filter_map(|input| input.dtype.map(|dtype| (input.image.index(), dtype)))
-            .collect();
-        held.sort_by_key(|(image, _)| *image);
-        held.dedup();
+        let held = declared.supplied_dtypes();
         if held != phase.supplied_dtypes {
             return Err(Error::InvalidArgument(format!(
                 "decomposition phase {phase_index} ({}) records that its supplied inputs hold \
@@ -3803,9 +3837,7 @@ pub fn check_source_images(chain: &Chain, decomposition: &Decomposition) -> Resu
             }
         }
 
-        let mut named: Vec<usize> = declared.iter().map(|input| input.image.index()).collect();
-        named.sort_unstable();
-        named.dedup();
+        let named = declared.images();
         if named != phase.source_images {
             return Err(Error::InvalidArgument(format!(
                 "decomposition phase {phase_index} ({}) records that it also reads image(s) \
@@ -5147,6 +5179,39 @@ mod tests {
         // phase 1 declares nothing, so image 2 is what image 1 was
         assert_eq!(plan.dtype_at(2), Dtype::U8);
         assert_eq!(plan.uniform_dtype(), None);
+    }
+
+    #[test]
+    fn regridding_a_phase_preserves_non_geometry_metadata() {
+        let grid = BlockGrid::new([16, 8, 4], [8, 8, 4]).unwrap();
+        let phase = PhaseDecomposition::derive(
+            vec![0, 1],
+            vec!["first".to_string(), "second".to_string()],
+            [1, 2, 0],
+            [3, 2, 0],
+            grid,
+        )
+        .with_dtype(Dtype::U16)
+        .with_source_images([3, 1, 3])
+        .with_supplied_dtypes([(4, Dtype::Bool), (2, Dtype::U8)])
+        .reading_input_image(false)
+        .with_barrier(true);
+
+        let regridded =
+            phase.regrid_preserving_metadata(BlockGrid::new([16, 8, 4], [4, 8, 4]).unwrap());
+
+        assert_eq!(regridded.slots, phase.slots);
+        assert_eq!(regridded.names, phase.names);
+        assert_eq!(regridded.reach, phase.reach);
+        assert_eq!(regridded.halo, phase.halo);
+        assert_eq!(regridded.dtype, phase.dtype);
+        assert_eq!(regridded.source_images, phase.source_images);
+        assert_eq!(regridded.supplied_dtypes, phase.supplied_dtypes);
+        assert_eq!(regridded.reads_input_image, phase.reads_input_image);
+        assert_eq!(regridded.barrier, phase.barrier);
+        assert_eq!(regridded.grid.volume(), phase.grid.volume());
+        assert_eq!(regridded.grid.block(), [4, 8, 4]);
+        assert_ne!(regridded.blocks.len(), phase.blocks.len());
     }
 
     /// The provocation must change the halo and nothing else, or it proves

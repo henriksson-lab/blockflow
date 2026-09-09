@@ -171,6 +171,22 @@ pub fn combine_in_place<A, B>(
     Ok(())
 }
 
+fn apply_unary_f64<B>(
+    input: ArrayView3<'_, f64>,
+    mut out: ArrayViewMut3<'_, B>,
+    fast: impl FnOnce(&[f64], &mut [B]),
+    map: impl Fn(&f64) -> B,
+) -> Result<()> {
+    shapes_agree(input.shape(), out.shape(), "map_into")?;
+    if input.is_standard_layout() && out.is_standard_layout() {
+        let src = input.as_slice().expect("standard layout is contiguous");
+        let dst = out.as_slice_mut().expect("standard layout is contiguous");
+        fast(src, dst);
+        return Ok(());
+    }
+    map_into(input, out, map)
+}
+
 /// The binary connectives, over `bool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Logic {
@@ -946,16 +962,12 @@ impl<M: MapFn> BlockOp for VoxelwiseMapOp<M> {
     /// `map_into` in both so the error text is the one this op has always
     /// produced.
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        let input = input.view::<f64>()?;
-        let mut out = out.view_mut::<f64>()?;
-        shapes_agree(input.shape(), out.shape(), "map_into")?;
-        if input.is_standard_layout() && out.is_standard_layout() {
-            let src = input.as_slice().expect("standard layout is contiguous");
-            let dst = out.as_slice_mut().expect("standard layout is contiguous");
-            self.map.map_slice(src, dst);
-            return Ok(());
-        }
-        map_into(input, out, |&value| self.map.map(value))
+        apply_unary_f64(
+            input.view::<f64>()?,
+            out.view_mut::<f64>()?,
+            |src, dst| self.map.map_slice(src, dst),
+            |&value| self.map.map(value),
+        )
     }
 
     /// **A stencil**, and the argument is one this crate has already made and
@@ -1137,16 +1149,12 @@ impl<M: MaskFn> BlockOp for VoxelwiseMaskOp<M> {
     /// standard layout. The failure label is `map_into` in both, so a shape
     /// mismatch reads the same here as it does for a map.
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        let input = input.view::<f64>()?;
-        let mut out = out.view_mut::<bool>()?;
-        shapes_agree(input.shape(), out.shape(), "map_into")?;
-        if input.is_standard_layout() && out.is_standard_layout() {
-            let src = input.as_slice().expect("standard layout is contiguous");
-            let dst = out.as_slice_mut().expect("standard layout is contiguous");
-            self.mask.holds_slice(src, dst);
-            return Ok(());
-        }
-        map_into(input, out, |&value| self.mask.holds(value))
+        apply_unary_f64(
+            input.view::<f64>()?,
+            out.view_mut::<bool>()?,
+            |src, dst| self.mask.holds_slice(src, dst),
+            |&value| self.mask.holds(value),
+        )
     }
 
     /// **A stencil**, on [`VoxelwiseMapOp::slicing`]'s argument in full: the

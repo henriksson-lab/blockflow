@@ -158,6 +158,6 @@ pub use rendezvous::{
 pub use shared_volume::SharedVolumes;
 pub use spec::{
     decompose, probe_job, probe_job_over, read_job, ChainSpec, FragmentPhaseSpec, JobSpec, OpSpec,
-    ProbeWorkflows, SidecarSpec, StoreSpec, WorkflowFactory, WorkflowSpec,
+    ProbeWorkflows, RuntimeResources, SidecarSpec, StoreSpec, WorkflowFactory, WorkflowSpec,
 };
 pub use worker::{WorkerOptions, WorkerReport};

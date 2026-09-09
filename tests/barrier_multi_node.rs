@@ -41,51 +41,26 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use blockflow::decomposition::Decomposition;
-use blockflow::distributed::local::{self, Binaries, LocalOptions};
-use blockflow::distributed::shared_volume::SharedVolumes;
+use blockflow::distributed::local;
 use blockflow::distributed::spec::{
     probe_job_over, ChainSpec, FragmentPhaseSpec, HoistedReduceOp, JobSpec, StoreSpec,
 };
 use blockflow::distributed::HandoutPolicy;
 use blockflow::sidecar::Lifecycle;
-use ndarray::Array3;
-use serde_json::Value;
+
+mod support;
+
+use support::distributed::{
+    first_difference, local_options as options, output_bytes, scratch as support_scratch,
+    worker_field, write_ramp_input,
+};
 
 const BLOCKS: usize = 16;
 
-fn binaries() -> Binaries {
-    Binaries {
-        coordinator: PathBuf::from(env!("CARGO_BIN_EXE_blockflow-coordinator")),
-        worker: PathBuf::from(env!("CARGO_BIN_EXE_blockflow-worker")),
-    }
-}
-
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "blockflow-barrier-multinode-{}-{name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
-}
-
-fn ramp(shape: [usize; 3]) -> Array3<f64> {
-    let mut array = Array3::zeros((shape[0], shape[1], shape[2]));
-    for (flat, value) in array.iter_mut().enumerate() {
-        *value = flat as f64;
-    }
-    array
-}
-
-fn options(dir: &Path, workers: usize) -> LocalOptions {
-    let mut options = LocalOptions::new(dir, workers).expect("local options");
-    options.binaries = binaries();
-    options.timeout = Duration::from_secs(120);
-    options
+    support_scratch("barrier-multinode", name)
 }
 
 /// A summary phase followed by a **barrier** phase whose op hoists its fold.
@@ -119,70 +94,8 @@ fn barrier_job(dir: &Path, hoisted: bool) -> (JobSpec, Decomposition) {
     ];
     let decomposition =
         blockflow::distributed::spec::decompose(&spec, 1).expect("a barrier job decomposes");
-    let store = SharedVolumes::create(
-        &volumes,
-        spec.workflow.shape,
-        spec.workflow.chunk,
-        decomposition.n_phases(),
-    )
-    .expect("image files");
-    store
-        .write_image(0, &ramp(spec.workflow.shape))
-        .expect("an input");
+    write_ramp_input(dir, &spec, &decomposition);
     (spec, decomposition)
-}
-
-fn output_bytes(dir: &Path, spec: &JobSpec, decomposition: &Decomposition) -> Vec<u8> {
-    SharedVolumes::open(
-        &dir.join("volumes"),
-        spec.workflow.shape,
-        spec.workflow.chunk,
-        decomposition.n_phases(),
-    )
-    .expect("the volumes")
-    .image_bytes(decomposition.n_phases())
-    .expect("the output image")
-}
-
-/// Where two images first differ, and by how much — rather than the two whole
-/// byte vectors.
-///
-/// An `assert_eq!` on the images themselves is correct and unreadable: it prints
-/// megabytes of little-endian `f64` on failure, which is the shape of a message
-/// nobody reads and therefore nearly as bad as no message. This says the same
-/// thing in one line.
-fn first_difference(left: &[u8], right: &[u8]) -> Option<String> {
-    if left.len() != right.len() {
-        return Some(format!(
-            "different sizes: {} byte(s) against {}",
-            left.len(),
-            right.len()
-        ));
-    }
-    let at = left.iter().zip(right).position(|(a, b)| a != b)?;
-    let voxel = at / std::mem::size_of::<f64>();
-    let word = |bytes: &[u8]| {
-        let start = voxel * 8;
-        bytes
-            .get(start..start + 8)
-            .and_then(|slice| slice.try_into().ok())
-            .map(f64::from_le_bytes)
-    };
-    let differing = left.iter().zip(right).filter(|(a, b)| a != b).count();
-    Some(format!(
-        "first differ at byte {at} (voxel {voxel}): {:?} against {:?}; {differing} of {} \
-         byte(s) differ",
-        word(left),
-        word(right),
-        left.len()
-    ))
-}
-
-fn worker_field(reports: &[Value], field: &str) -> Vec<u64> {
-    reports
-        .iter()
-        .map(|report| report.get(field).and_then(Value::as_u64).unwrap_or(0))
-        .collect()
 }
 
 // ------------------------------------------------------------ the headline --
@@ -464,7 +377,7 @@ fn the_cost_of_reducing_on_every_node_is_per_node_not_per_block() {
 #[test]
 fn a_reduction_over_an_incomplete_fragment_set_is_refused() {
     use blockflow::distributed::spec::ProbeWorkflows;
-    use blockflow::distributed::WorkflowFactory;
+    use blockflow::distributed::{RuntimeResources, WorkflowFactory};
     use blockflow::fragment::PhaseWork;
     use blockflow::strategy::reduce_phase;
 
@@ -483,7 +396,7 @@ fn a_reduction_over_an_incomplete_fragment_set_is_refused() {
         })
         .collect();
     let env = factory
-        .environment(&spec.workflow, plan.n_phases())
+        .environment(&spec.workflow, plan.n_phases(), RuntimeResources::default())
         .expect("an environment");
     env.prepare(&plan).expect("prepared");
     for entry in &work {

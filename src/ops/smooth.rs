@@ -288,34 +288,14 @@ impl SmoothOp {
     /// run starts, by `accepts`, because no buffer holds one.
     fn evaluate(&self, input: &Voxels, out: ArrayViewMut3<'_, f64>) -> Result<()> {
         let boundary = self.gaussian.boundary();
-        macro_rules! direct {
-            ($type:ty) => {
-                gaussian_smooth_into_with(
-                    input.view::<$type>()?,
-                    self.gaussian.kernels(),
-                    boundary,
-                    out,
-                )
-            };
-        }
-        match input.dtype() {
-            Dtype::U8 => direct!(u8),
-            Dtype::U16 => direct!(u16),
-            Dtype::U32 => direct!(u32),
-            Dtype::I8 => direct!(i8),
-            Dtype::I16 => direct!(i16),
-            Dtype::I32 => direct!(i32),
-            Dtype::F32 => direct!(f32),
-            Dtype::F64 => direct!(f64),
-            Dtype::Bool | Dtype::U64 | Dtype::I64 => {
-                let widened = input.widened();
-                gaussian_smooth_into_with(widened.view(), self.gaussian.kernels(), boundary, out)
-            }
-            Dtype::F16 => Err(Error::InvalidArgument(format!(
+        dispatch_f64_input!(
+            input,
+            Error::InvalidArgument(format!(
                 "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
                 self.name
-            ))),
-        }
+            )),
+            |view| { gaussian_smooth_into_with(view, self.gaussian.kernels(), boundary, out) }
+        )
     }
 }
 

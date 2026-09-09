@@ -41,7 +41,7 @@
 
 use ndarray::{Array3, ArrayView3};
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+use blockflow::decomposition::Decomposition;
 use blockflow::env::ArrayEnvironment;
 use blockflow::error::Error;
 use blockflow::geometry::BlockGrid;
@@ -53,6 +53,10 @@ use blockflow::ops::{
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
+
+mod support;
+
+use support::source_fixture::{self, SourcePhase};
 
 const VOLUME: [usize; 3] = [16, 12, 10];
 /// Written by phase 0, read by phase 1 as the window's population.
@@ -233,32 +237,17 @@ fn chain() -> Chain {
 }
 
 fn plan(chain: &Chain, grid: &BlockGrid) -> Decomposition {
-    let slots = chain.slots();
-    let phases = vec![
-        PhaseDecomposition::derive(
-            vec![0],
-            vec![slots[0].display_name()],
-            [0usize, 0, 0],
-            [0usize, 0, 0],
-            grid.clone(),
-        ),
-        PhaseDecomposition::derive(
-            vec![1, 2],
-            vec![slots[1].display_name(), slots[2].display_name()],
-            [1usize, 1, 1],
-            [1usize, 1, 1],
-            grid.clone(),
-        ),
-    ];
-    let mut plan = Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::F64,
-        phases,
-        chain_reach: [1, 1, 1],
-    };
-    plan.declare_dtypes(chain).unwrap();
-    plan.declare_source_images(chain).unwrap();
-    plan
+    source_fixture::declared_plan(
+        chain,
+        VOLUME,
+        Dtype::F64,
+        grid,
+        [1, 1, 1],
+        [
+            SourcePhase::with_equal_halo(vec![0], [0, 0, 0]),
+            SourcePhase::with_equal_halo(vec![1, 2], [1, 1, 1]),
+        ],
+    )
 }
 
 fn grids() -> Vec<BlockGrid> {

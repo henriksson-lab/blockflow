@@ -273,27 +273,9 @@ fn every_strategy_produces_a_plan_the_simulator_runs() {
 /// finding, recorded here.
 ///
 /// The field is four plans over one chain, differing only in the block edge the
-/// ladder was pinned to — the one degree of freedom the search's inner sweep
-/// has. Both rankings are taken at one worker and at four:
-///
-/// ```text
-///     1 worker                          4 workers
-///     plan     priced  simulated        plan     priced  simulated
-///     edge 8    3.068      7.506        edge 8    2.530      2.538
-///     edge 16   1.760      3.641        edge 16   1.457      2.123
-///     edge 32   1.326      2.448        edge 32   1.000      1.469
-///     edge 64   1.000      1.000        edge 64   2.660      1.000
-///     kendall tau 1.0                   kendall tau 0.000
-///     no discordant pair                edge 8/16/32 against edge 64
-/// ```
-///
-/// At one worker the two orderings are **identical**, which is what
-/// `Enumerating::concurrency`'s own doc predicts when it calls `1` the negative
-/// control: the objective collapses to serial work, which is monotone in the
-/// edge, and so is the simulator here. At four they disagree about the two
-/// single-block plan — the cost model prices every smaller edge below it, and
-/// the simulator makes the single block fastest. The model now pays regret
-/// `1.469`: **the model's argmin no longer survives the ordering split.**
+/// ladder was pinned to, judged at one worker and at four. The recorded table
+/// and interpretation live in `docs/design/planner-gaps.md` under "What the
+/// arena found first".
 ///
 /// **This is item C of `docs/design/planner-gaps.md` with a number on it** —
 /// "the simulator and the executor have different concurrency models, and
@@ -520,17 +502,19 @@ fn the_phases_overlap_only_under_the_policy_that_fuses() {
     for (one, other) in sequential.verdicts.iter().zip(fused.verdicts.iter()) {
         let sequential = one.outcome.phase_overlap().expect("a run of some length");
         let fused = other.outcome.phase_overlap().expect("a run of some length");
+        let phases = one.shape.phases.len();
+        let blocks: usize = one.shape.phases.iter().map(|phase| phase.blocks).sum();
         println!(
             "{:<12} {:>7} {:>8} {:>13.3} {:>13.3} {:>14.3} {:>9.3}",
             one.name,
-            one.phases,
-            one.blocks.iter().sum::<usize>(),
+            phases,
+            blocks,
             sequential,
             fused,
             other.simulated_ns() / one.simulated_ns(),
             other.outcome.peak_bytes as f64 / one.outcome.peak_bytes.max(1) as f64
         );
-        if one.phases == 1 {
+        if phases == 1 {
             single_phase += 1;
             assert_eq!(
                 (sequential, fused),

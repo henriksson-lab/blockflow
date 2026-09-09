@@ -70,6 +70,10 @@ use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
 
+mod support;
+
+use support::volume::point_mask_bool;
+
 const VOLUME: [usize; 3] = [14, 14, 24];
 const STREAM: &str = "connectivity.faces";
 const POINTS: &str = "connectivity.points";
@@ -109,11 +113,7 @@ fn chains() -> Vec<[usize; 3]> {
 }
 
 fn mask_of(voxels: &[[usize; 3]]) -> Array3<bool> {
-    let mut mask = Array3::from_elem((VOLUME[0], VOLUME[1], VOLUME[2]), false);
-    for &at in voxels {
-        mask[at] = true;
-    }
-    mask
+    point_mask_bool(VOLUME, voxels)
 }
 
 /// The decompositions every sweep below runs, chosen to cut one, two and three

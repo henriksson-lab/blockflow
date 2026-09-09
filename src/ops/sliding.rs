@@ -101,6 +101,7 @@ use crate::voxels::{VoxelElement, Voxels};
 use super::element::{Rank, StepOrigin, StructuringElement};
 use super::rank::ExcludedCentre;
 use super::shapes_agree;
+use super::MaskSource;
 
 /// An element type whose values index histogram bins directly.
 ///
@@ -868,7 +869,7 @@ pub struct SlidingHistogramOp {
     plan: ScanPlan,
     domain: Domain,
     query: Box<dyn HistogramQuery>,
-    mask: Option<usize>,
+    mask: Option<MaskSource>,
     centre: ExcludedCentre<f64>,
     cost: f64,
 }
@@ -907,7 +908,7 @@ impl SlidingHistogramOp {
 
     /// Read the window's population from `mask`, which must be a `Bool` image.
     pub fn masked_by(mut self, mask: impl Into<crate::assemble::ImageId>) -> Self {
-        self.mask = Some(mask.into().index());
+        self.mask = Some(MaskSource::new(mask));
         self.cost *= MASK_COST_FACTOR;
         self
     }
@@ -993,10 +994,7 @@ impl BlockOp for SlidingHistogramOp {
     }
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
-        match self.mask {
-            Some(mask) => vec![SourceInput::new(mask, self.element.reach_spec())],
-            None => Vec::new(),
-        }
+        MaskSource::maybe_source_input(self.mask, self.element.reach_spec())
     }
 
     /// The unsigned integers, and nothing else. See [`BinnedElement`]: the
@@ -1008,12 +1006,8 @@ impl BlockOp for SlidingHistogramOp {
     }
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        if let Some(image) = self.mask {
-            return Err(Error::InvalidArgument(format!(
-                "{}: the population comes from image {image}, so this op has no answer from its \
-                 input alone. It is applied through `apply_with`.",
-                self.name
-            )));
+        if let Some(mask) = self.mask {
+            return Err(mask.input_only_error(self.name));
         }
         self.dispatch(input, None, out)
     }
@@ -1025,19 +1019,10 @@ impl BlockOp for SlidingHistogramOp {
         out: &mut Voxels,
         at: &Anchor,
     ) -> Result<()> {
-        let Some(image) = self.mask else {
+        let Some(mask) = self.mask else {
             return self.apply(input, out, at);
         };
-        let mask = sources.get(image)?;
-        if mask.dtype() != Dtype::Bool {
-            return Err(Error::InvalidArgument(format!(
-                "{}: the population is read from image {image}, which holds {}. A population is a \
-                 yes-or-no per voxel and is stored as one.",
-                self.name,
-                mask.dtype().numpy_name()
-            )));
-        }
-        let mask = mask.view::<bool>()?;
+        let mask = mask.bool_view(self.name, sources)?;
         self.dispatch(input, Some(mask), out)
     }
 
@@ -1154,6 +1139,25 @@ mod tests {
         assert!(!op.accepts(Dtype::F32));
         assert!(!op.accepts(Dtype::I16));
         assert!(op.accepts(Dtype::U16));
+    }
+
+    #[test]
+    fn a_masked_sliding_histogram_declares_a_bool_source() {
+        let element = StructuringElement::from_radius(ElementShape::Box, [2, 1, 0]);
+        let reach = element.reach_spec();
+        let op = SlidingHistogramOp::rank(
+            "sliding",
+            element,
+            Rank::lowest(),
+            Domain::of::<u8>().unwrap(),
+        )
+        .masked_by(crate::assemble::ImageId::supplied(0));
+        assert_eq!(
+            op.source_inputs([9, 8, 7]),
+            vec![
+                SourceInput::new(crate::assemble::ImageId::supplied(0), reach).holding(Dtype::Bool)
+            ]
+        );
     }
 
     /// **The element this traversal cannot express is refused by name**, and the

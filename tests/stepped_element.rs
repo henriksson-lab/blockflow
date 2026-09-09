@@ -61,40 +61,29 @@
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
-use blockflow::env::ArrayEnvironment;
-use blockflow::geometry::BlockGrid;
-use blockflow::op::{Anchor, BlockOp, Chain};
+use blockflow::decomposition::Decomposition;
+use blockflow::op::{BlockOp, Chain};
 use blockflow::ops::{ElementShape, Rank, RankFilterOp, StepOrigin, StructuringElement};
 use blockflow::reach::Reach;
-use blockflow::strategy::{execute, Hints, Workflow};
-use blockflow::synthetic::{Scene, SceneSpec};
-use blockflow::voxels::Voxels;
-use blockflow::Dtype;
+use blockflow::strategy::Workflow;
+use blockflow::synthetic::SceneSpec;
+
+mod support;
+use support::{single_phase, volume};
 
 /// Long on axis 0, where the elements below are widest and where a reach of five
 /// has to leave room for several blocks; short on the other two, because the
 /// sweep's cost is the product of the three and the property is per axis.
 const VOLUME: [usize; 3] = [30, 16, 12];
+const SUITE: single_phase::Suite = single_phase::Suite::new("stepped", VOLUME, [4, 4, 4]);
 
 fn intensities() -> Array3<f64> {
-    let scene = Scene::new(
+    volume::scene_intensity(
         SceneSpec::new(VOLUME, 20260806)
             .with_objects(35)
             .with_radius(1.5, 4.0)
             .with_noise(0.02),
     )
-    .unwrap();
-    let rendered = scene.render();
-    let mut array = Array3::zeros((VOLUME[0], VOLUME[1], VOLUME[2]));
-    for i in 0..VOLUME[0] {
-        for j in 0..VOLUME[1] {
-            for k in 0..VOLUME[2] {
-                array[[i, j, k]] = rendered.intensity[[i, j, k]];
-            }
-        }
-    }
-    array
 }
 
 /// A decimated element whose step counts **from the anchor** — the subject of
@@ -165,14 +154,13 @@ fn cases() -> Vec<(String, Chain)> {
 }
 
 fn workflow(chain: Chain) -> Workflow {
-    Workflow::new(chain, VOLUME, Dtype::F64)
+    SUITE.workflow(chain)
 }
 
 /// A plan built from the chain's **own** per-side reach — nothing here states a
 /// reach, so nothing here can hide one that is wrong.
 fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {
-    let spec = workflow.chain.reach_spec(VOLUME).expect("a foldable reach");
-    plan_with_halo(workflow, block, split_axes, spec.clone(), spec)
+    SUITE.plan_with_reach_spec(workflow, block, split_axes)
 }
 
 fn plan_with_halo(
@@ -182,32 +170,15 @@ fn plan_with_halo(
     reach: Reach,
     halo: Reach,
 ) -> Decomposition {
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(VOLUME, split_axes, block).unwrap();
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, halo, grid);
-    Decomposition {
-        volume: VOLUME,
-        dtype: workflow.dtype,
-        phases: vec![phase],
-        chain_reach: workflow.chain.reach3(&VOLUME),
-    }
+    SUITE.plan_with_halo_spec(workflow, block, split_axes, reach, halo)
 }
 
 fn reference(chain: &Chain, input: &Array3<f64>) -> Array3<f64> {
-    let source: Voxels = input.clone().into();
-    let mut out = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
-    chain
-        .apply(&source, &mut out, &Anchor::whole(VOLUME))
-        .expect("the whole-volume reference must run");
-    out.view::<f64>().unwrap().to_owned()
+    SUITE.reference_f64(chain, input)
 }
 
 fn run(workflow: &Workflow, decomposition: &Decomposition, input: &Array3<f64>) -> Array3<f64> {
-    let env =
-        ArrayEnvironment::new(input.clone().into(), decomposition.n_phases(), [4, 4, 4]).unwrap();
-    execute("stepped", workflow, decomposition, &Hints::default(), &env).unwrap();
-    env.output().view::<f64>().unwrap().to_owned()
+    SUITE.run_f64(workflow, decomposition, input).output
 }
 
 // ------------------------------------------------------ what is derived --

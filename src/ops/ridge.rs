@@ -1570,29 +1570,14 @@ impl BlockOp for HessianEigenvalueOp {
 
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
         let out = out.view_mut::<f64>()?;
-        macro_rules! direct {
-            ($type:ty) => {
-                self.eigenvalue_into(input.view::<$type>()?, out)
-            };
-        }
-        match input.dtype() {
-            Dtype::U8 => direct!(u8),
-            Dtype::U16 => direct!(u16),
-            Dtype::U32 => direct!(u32),
-            Dtype::I8 => direct!(i8),
-            Dtype::I16 => direct!(i16),
-            Dtype::I32 => direct!(i32),
-            Dtype::F32 => direct!(f32),
-            Dtype::F64 => direct!(f64),
-            Dtype::Bool | Dtype::U64 | Dtype::I64 => {
-                let widened = input.widened();
-                self.eigenvalue_into(widened.view(), out)
-            }
-            Dtype::F16 => Err(Error::InvalidArgument(format!(
+        dispatch_f64_input!(
+            input,
+            Error::InvalidArgument(format!(
                 "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
                 self.name
-            ))),
-        }
+            )),
+            |view| { self.eigenvalue_into(view, out) }
+        )
     }
 
     /// A constant field has a zero Hessian, so every eigenvalue of it is zero —
@@ -1681,35 +1666,14 @@ impl RidgeFilterOp {
         out: ArrayViewMut3<'_, f64>,
         chosen: Option<ArrayViewMut3<'_, f64>>,
     ) -> Result<()> {
-        macro_rules! direct {
-            ($type:ty) => {
-                ridge_response_into(
-                    input.view::<$type>()?,
-                    &self.scales,
-                    &self.response,
-                    out,
-                    chosen,
-                )
-            };
-        }
-        match input.dtype() {
-            Dtype::U8 => direct!(u8),
-            Dtype::U16 => direct!(u16),
-            Dtype::U32 => direct!(u32),
-            Dtype::I8 => direct!(i8),
-            Dtype::I16 => direct!(i16),
-            Dtype::I32 => direct!(i32),
-            Dtype::F32 => direct!(f32),
-            Dtype::F64 => direct!(f64),
-            Dtype::Bool | Dtype::U64 | Dtype::I64 => {
-                let widened = input.widened();
-                ridge_response_into(widened.view(), &self.scales, &self.response, out, chosen)
-            }
-            Dtype::F16 => Err(Error::InvalidArgument(format!(
+        dispatch_f64_input!(
+            input,
+            Error::InvalidArgument(format!(
                 "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
                 self.name
-            ))),
-        }
+            )),
+            |view| { ridge_response_into(view, &self.scales, &self.response, out, chosen) }
+        )
     }
 }
 

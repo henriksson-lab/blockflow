@@ -493,6 +493,7 @@ use crate::fragment::{
 };
 use crate::geometry::BlockGrid;
 use crate::op::SourceInput;
+use crate::ops::{expect_extent, TypedSource};
 use crate::region::Region;
 use crate::sidecar::{FragmentKey, Lifecycle};
 use crate::table::{Column, ColumnType, Row, Schema, Table, Value, POSITION_WORDS};
@@ -1422,20 +1423,16 @@ pub fn decode_partial(bytes: &[u8]) -> Result<Vec<Tally>> {
 /// fold across the seam belongs to [`MergeTabulationOp`].
 pub struct TabulateValuesOp {
     name: &'static str,
-    labels: usize,
-    values: usize,
+    /// Label operand identity plus optional supplied-input dtype.
+    ///
+    /// `None` leaves the element type to the plan fold; `holding` states it
+    /// only for supplied arrays that no phase writes.
+    labels: TypedSource,
+    /// Value operand identity plus optional supplied-input dtype.
+    values: TypedSource,
     fixed: FixedPoint,
     stream: String,
     lifecycle: Lifecycle,
-    /// What the two operands hold, stated only when the plan cannot say.
-    ///
-    /// `None` is the honest answer for an image the run writes: its element type
-    /// is in the fold of the chain that wrote it, and a second copy here would
-    /// be a second number to disagree with the first — which is the reason
-    /// `Decomposition::declare_source_images` records the supplied ones and no
-    /// others. See [`TabulateValuesOp::holding`].
-    labels_dtype: Option<Dtype>,
-    values_dtype: Option<Dtype>,
 }
 
 impl TabulateValuesOp {
@@ -1466,13 +1463,11 @@ impl TabulateValuesOp {
         }
         Ok(Self {
             name,
-            labels,
-            values,
+            labels: TypedSource::new(labels),
+            values: TypedSource::new(values),
             fixed,
             stream: stream.into(),
             lifecycle,
-            labels_dtype: None,
-            values_dtype: None,
         })
     }
 
@@ -1502,21 +1497,21 @@ impl TabulateValuesOp {
     /// drift. So this is safe to call for either operand and is only consulted
     /// for the one that needs it.
     pub fn holding(mut self, labels: Dtype, values: Dtype) -> Self {
-        self.labels_dtype = Some(labels);
-        self.values_dtype = Some(values);
+        self.labels = self.labels.holding(labels);
+        self.values = self.values.holding(values);
         self
     }
 
     /// What this op says its label volume holds, or `None` if it left the plan to
     /// say.
     pub fn labels_dtype(&self) -> Option<Dtype> {
-        self.labels_dtype
+        self.labels.dtype()
     }
 
     /// What this op says its value array holds, or `None` if it left the plan to
     /// say.
     pub fn values_dtype(&self) -> Option<Dtype> {
-        self.values_dtype
+        self.values.dtype()
     }
 
     pub fn fixed(&self) -> FixedPoint {
@@ -1552,14 +1547,18 @@ impl TabulateValuesOp {
         };
         let shape = [read.shape[0], read.shape[1], read.shape[2]];
         for (what, array) in [("label volume", labels), ("value array", values)] {
-            if array.shape() != shape {
-                return Err(Error::invalid(format!(
+            expect_extent(
+                || {
+                    format!(
                     "tabulate: the {what} arrived as {:?} for a block read extent of {shape:?}. \
                      Both operands are fetched at the block's own fetch region, so a disagreement \
                      here is the plan handing over two different geometries.",
                     array.shape()
-                )));
-            }
+                    )
+                },
+                shape,
+                array.shape(),
+            )?;
         }
         let labels = labels.widened();
         let values = values.widened();
@@ -1613,18 +1612,6 @@ fn holds(region: &Region, at: [usize; 3]) -> bool {
     })
 }
 
-/// A `SourceInput` with an element type attached, when there is one to attach.
-///
-/// A free function rather than a method on `SourceInput` because the crate's
-/// rule is that only a **supplied** array's reader states its width, so
-/// `holding` is deliberately not an `Option`-taking builder over there.
-fn held(input: SourceInput, dtype: Option<Dtype>) -> SourceInput {
-    match dtype {
-        Some(dtype) => input.holding(dtype),
-        None => input,
-    }
-}
-
 impl FragmentOp for TabulateValuesOp {
     fn name(&self) -> &'static str {
         self.name
@@ -1643,10 +1630,7 @@ impl FragmentOp for TabulateValuesOp {
     }
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
-        vec![
-            held(SourceInput::voxelwise(self.labels), self.labels_dtype),
-            held(SourceInput::voxelwise(self.values), self.values_dtype),
-        ]
+        vec![self.labels.voxelwise_input(), self.values.voxelwise_input()]
     }
 
     fn seam_fold(&self) -> Option<crate::fragment::SeamFold> {
@@ -1670,8 +1654,10 @@ impl FragmentOp for TabulateValuesOp {
 
     fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
         let tallies = self.tally_block(
-            sources.get(self.labels)?,
-            sources.get(self.values)?,
+            self.labels
+                .block_at_extent(self.name, "label volume", sources, at.read)?,
+            self.values
+                .block_at_extent(self.name, "value array", sources, at.read)?,
             at.read,
             at.core,
         )?;

@@ -589,38 +589,16 @@ impl BlockOp for ConvolveOp {
     /// one element that would.
     fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
         let out = out.view_mut::<f64>()?;
-        macro_rules! direct {
-            ($type:ty) => {
-                convolve_into(
-                    input.view::<$type>()?,
-                    &self.kernel,
-                    self.sense,
-                    self.boundary,
-                    out,
-                )
-            };
-        }
-        match input.dtype() {
-            Dtype::U8 => direct!(u8),
-            Dtype::U16 => direct!(u16),
-            Dtype::U32 => direct!(u32),
-            Dtype::I8 => direct!(i8),
-            Dtype::I16 => direct!(i16),
-            Dtype::I32 => direct!(i32),
-            Dtype::F32 => direct!(f32),
-            Dtype::F64 => direct!(f64),
-            // No `Into<f64>`, so the same detour `ops::smooth` takes.
-            Dtype::Bool | Dtype::U64 | Dtype::I64 => {
-                let widened = input.widened();
-                convolve_into(widened.view(), &self.kernel, self.sense, self.boundary, out)
-            }
-            Dtype::F16 => Err(Error::InvalidArgument(format!(
+        dispatch_f64_input!(
+            input,
+            Error::InvalidArgument(format!(
                 "{}: no buffer holds half-precision; `accepts` refuses it before a run starts \
                  ({})",
                 self.name,
                 self.sense.label()
-            ))),
-        }
+            )),
+            |view| { convolve_into(view, &self.kernel, self.sense, self.boundary, out,) }
+        )
     }
 
     /// The weighted sum of the constant, **computed the way the gather computes

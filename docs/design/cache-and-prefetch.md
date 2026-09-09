@@ -184,6 +184,39 @@ assumes; a `WorkerOptions::cache_bytes` states what the node will actually give,
 defaulting to the job's figure**, and the worker reports which it used so a
 disagreement is visible rather than silent.
 
+Implemented: the worker passes `RuntimeResources` into
+`WorkflowFactory::environment`. `WorkerOptions::cache_bytes = None` uses the
+workflow cache budget, `Some(0)` disables the real cache, and
+`WorkerOptions::prefetch_threads` controls the built-in shared-volume
+prefetcher. Worker JSON reports include the effective `cache_bytes` and
+`prefetch_threads`.
+
+### 1.5 Written intermediates are cacheable only with invalidation
+
+The argument for widening the cache from source images to written intermediates
+is that image `N` is often read by phase `N + 1` with a halo, so it is re-read
+the same way as image 0. That argument is now measured by
+`tests/zarr_cache.rs::print_what_caching_the_intermediates_saves`.
+
+The comparison must use hit and miss counts, not `CacheStats::source_bytes`.
+`source_bytes` counts bytes fetched through the cache, so an image-0-only cache
+and an every-image cache cover different access sets. In the image-0-only arm,
+intermediate reads bypass the cache and are absent from the counter.
+
+At a roomy capacity on the two-reaching-phase fixture:
+
+```text
+                  hits   misses   cache-path chunk accesses
+image 0 only       936       64   1000
+every image       1872      128   2000
+intermediate       936       64   1000
+```
+
+The intermediate is re-read exactly as much as the source on this fixture.
+Caching it turns 1000 chunk reads into 64 fetches and 936 hits, the same 15.6x
+chunk-access reduction the source receives. This is only correct because writes
+invalidate local cache entries before later reads can hit stale chunks.
+
 ---
 
 ## 2. What the budget subtracts, and when
@@ -420,7 +453,31 @@ counter after two clocks disagreed in sign.
 | depth is not too shallow | §4.2's sweep | waste rises with depth; `prefetch_used > 0` at the shallow end |
 | the cache never starves compute | `CacheStats::refusals`, `prefetch_declined` | both non-zero under a deliberately tight budget, and the run still completes |
 
-### 5.1 One trap, and it would destroy the crate's best validation
+### 5.1 Cache timing is calibration, not a gate
+
+`tests/zarr_cache.rs::print_what_the_cache_saves` keeps an ignored wall-clock
+sweep for human calibration. The assertable suite gates byte counts instead,
+because duration depends on the host while store bytes and hit counts describe
+the cache contract.
+
+Recorded release timing, best of three over the overlapping-window fixture:
+
+```text
+    capacity        wall (ms)   store bytes
+    none                  7.9      uncached
+    one chunk            17.9     4 866 048
+    sixteen chunks        9.6     2 359 296
+    the whole volume      1.5       524 288
+```
+
+Two results matter. A cache that holds the working set is 5.3x faster than no
+cache and reads each chunk exactly once. A cache that is too small is worse than
+none: it pays bookkeeping on every read without enough reuse to recover the
+cost. The policy implication is not "always turn the cache on"; it is "turn it
+on with a budget large enough for the block read extent times the blocks in
+flight, and leave it off below that."
+
+### 5.2 One trap, and it would destroy the crate's best validation
 
 `EnvCounters::chunks_read` is computed **geometrically** — `chunks_touched(region,
 chunk)` — and is not a measurement of IO at all. Today that is harmless, because

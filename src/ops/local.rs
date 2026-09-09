@@ -2724,10 +2724,7 @@ impl BlockOp for LocalStatisticOp {
     /// fetch; see `check_source_images`, which refuses an operand wanting more
     /// than its phase.
     fn source_inputs(&self, volume: [usize; 3]) -> Vec<SourceInput> {
-        match self.mask {
-            Some(mask) => vec![mask.source_input(self.statistic.reach_spec(volume))],
-            None => Vec::new(),
-        }
+        MaskSource::maybe_source_input(self.mask, self.statistic.reach_spec(volume))
     }
 
     fn apply_with(
@@ -2943,10 +2940,7 @@ impl BlockOp for AdaptiveThresholdOp {
     /// [`LocalStatisticOp::source_inputs`], which declares the same thing for
     /// the same reason. The comparison adds nothing on either side.
     fn source_inputs(&self, volume: [usize; 3]) -> Vec<SourceInput> {
-        match self.mask {
-            Some(mask) => vec![mask.source_input(self.statistic.reach_spec(volume))],
-            None => Vec::new(),
-        }
+        MaskSource::maybe_source_input(self.mask, self.statistic.reach_spec(volume))
     }
 
     fn apply_with(
