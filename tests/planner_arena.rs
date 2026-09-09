@@ -38,6 +38,9 @@ use blockflow::strategy::{
 };
 use blockflow::Dtype;
 
+mod support;
+use support::refuses;
+
 /// Long enough on the split axis for the ladder below to give genuinely
 /// different grids, and small enough that a simulated run is instant.
 const VOLUME: [usize; 3] = [64, 64, 64];
@@ -657,13 +660,10 @@ fn the_search_refuses_a_chain_that_narrows_into_an_op_that_cannot_take_it() {
         VOLUME,
         Dtype::F64,
     );
-    let err = Enumerating::default()
-        .plan(&workflow, &constraints(vec![32]))
-        .expect_err("an op handed a type it does not accept must be refused")
-        .to_string();
-    assert!(
-        err.contains("scale") && err.contains("bool"),
-        "the refusal must name the op and the type: {err}"
+    refuses!(
+        Enumerating::default().plan(&workflow, &constraints(vec![32])),
+        "scale",
+        "bool",
     );
 }
 
@@ -938,8 +938,7 @@ fn print_the_cost_of_the_dispatch_loop() {
     use blockflow::assemble::PlanBuilder;
     use blockflow::geometry::BlockGrid;
     use blockflow::probes::IdentityOp;
-    use blockflow::simulate::{simulate, ExecutorOrder, PerPhase};
-    use std::collections::BTreeSet;
+    use blockflow::simulate::{ExecutorOrder, Run};
     use std::time::Instant;
 
     let volume = [128usize, 128, 128];
@@ -961,17 +960,11 @@ fn print_the_cost_of_the_dispatch_loop() {
             let mut best = f64::INFINITY;
             for _ in 0..repetitions {
                 let started = Instant::now();
-                let outcome = simulate(
-                    &assembly.decomposition,
-                    &assembly.work(),
-                    &machine(4),
-                    &rates(),
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    PerPhase::default(),
-                    scheduler,
-                )
-                .expect("a simulable plan");
+                let outcome = Run::new(&assembly.decomposition, &assembly.work())
+                    .machine(machine(4))
+                    .rates(rates())
+                    .go(scheduler)
+                    .expect("a simulable plan");
                 assert_eq!(outcome.tasks_run as usize, tasks);
                 best = best.min(started.elapsed().as_secs_f64());
             }

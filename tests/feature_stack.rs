@@ -32,6 +32,9 @@ use blockflow::strategy::{
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::refuses;
+
 use ndarray::Array3;
 
 /// Labkit's own default scale list, five sigmas, which is what makes the
@@ -389,13 +392,7 @@ fn the_halo_puts_a_floor_under_the_working_set_that_no_block_size_escapes() {
     assert_eq!(whole.phases[0].grid.block(), VOLUME);
 
     // Below the floor there is no plan, at any block size.
-    let err = plan(Some(floor / 4))
-        .expect_err("a budget below the halo's floor cannot be met")
-        .to_string();
-    assert!(
-        err.contains("no partition") && err.contains("budget"),
-        "the refusal does not explain itself: {err}"
-    );
+    refuses!(plan(Some(floor / 4)), "no partition", "budget");
 }
 
 /// **The separable box is the same filter as the direct box**, which is the

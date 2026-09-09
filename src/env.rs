@@ -2510,19 +2510,7 @@ mod tests {
     fn an_unwritten_image_reads_as_the_sentinel_it_would_have_been_filled_with() {
         let extent = [4, 4, 4];
         let region = Region::new(&[1, 1, 1], &[2, 2, 2]);
-        for dtype in [
-            Dtype::Bool,
-            Dtype::U8,
-            Dtype::U16,
-            Dtype::U32,
-            Dtype::U64,
-            Dtype::I8,
-            Dtype::I16,
-            Dtype::I32,
-            Dtype::I64,
-            Dtype::F32,
-            Dtype::F64,
-        ] {
+        for &dtype in Dtype::voxel_types() {
             let env =
                 ArrayEnvironment::new(Voxels::zeros(dtype, extent).unwrap(), 1, extent).unwrap();
             let whole = Voxels::unwritten(dtype, extent).unwrap();

@@ -61,6 +61,9 @@ use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::volume::clipped_start_grid_sweep;
+
 // ------------------------------------------------------- the hand case --
 
 /// Seven voxels on the axis under test and one on each of the others, so that
@@ -397,16 +400,7 @@ fn blocked(element: StructuringElement, grid: &BlockGrid, input: &Array3<f64>) -
 }
 
 fn grids() -> Vec<BlockGrid> {
-    vec![
-        BlockGrid::new(VOLUME, VOLUME).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 5).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 7).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 8).unwrap(),
-        BlockGrid::along(VOLUME, &[1], 2).unwrap(),
-        BlockGrid::along(VOLUME, &[2], 3).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1, 2], 3).unwrap(),
-    ]
+    clipped_start_grid_sweep(VOLUME)
 }
 
 /// Byte-identical to the whole-volume answer under every decomposition, on an

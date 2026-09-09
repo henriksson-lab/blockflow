@@ -84,6 +84,7 @@ use crate::export::event_json;
 use crate::fragment::{check_phase_work, PhaseWork};
 use crate::graph::TaskGraph;
 use crate::listener::EventListener;
+use crate::lock::MutexExt;
 use crate::log::Event;
 use crate::region::Region;
 use crate::strategy::{execute_task_with_reduction, reduce_phase};
@@ -410,15 +411,10 @@ impl EventListener for Outbox {
         // push. Whatever the coordinator is doing, this returns.
         self.shared
             .events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock_unpoisoned()
             .push_back(event.clone());
         self.shared.events_ready.notify_one();
     }
-}
-
-fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Join, run until the job is finished, report.
@@ -762,7 +758,7 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
 /// a question about the coordinator and is asked there, by `Job::withheld`.
 fn next_task(shared: &Arc<Shared>, report: &mut WorkerReport) -> Option<Assignment> {
     {
-        let mut queue = guard(&shared.queue);
+        let mut queue = shared.queue.lock_unpoisoned();
         if let Some(assignment) = queue.pop_front() {
             report.started_ready += 1;
             shared.taken.notify_one();
@@ -772,9 +768,9 @@ fn next_task(shared: &Arc<Shared>, report: &mut WorkerReport) -> Option<Assignme
     // The first task has nothing to be ahead of, so no wait before one has
     // started is ever a starve.
     let running = report.started_ready + report.started_after_waiting > 0;
-    let believed_available = *guard(&shared.last) == LastReply::Work;
+    let believed_available = *shared.last.lock_unpoisoned() == LastReply::Work;
     let refusals_before = shared.refusals.load(Ordering::Acquire);
-    let mut queue = guard(&shared.queue);
+    let mut queue = shared.queue.lock_unpoisoned();
     loop {
         if let Some(assignment) = queue.pop_front() {
             report.started_after_waiting += 1;
@@ -813,7 +809,7 @@ fn prefetch_queued(
     submitted: &mut BTreeSet<usize>,
 ) {
     let queued: Vec<(usize, usize, Region)> = {
-        let queue = guard(&shared.queue);
+        let queue = shared.queue.lock_unpoisoned();
         queue
             .iter()
             .filter(|assignment| !submitted.contains(&assignment.task))
@@ -901,7 +897,7 @@ fn spawn_puller(
                     // a fixed lag between the list draining and this thread
                     // noticing, so a task shorter than the sleep hands the
                     // executor a list one shallower than `ahead` asked for.
-                    let mut queue = guard(&shared.queue);
+                    let mut queue = shared.queue.lock_unpoisoned();
                     while queue.len() >= ahead && !shared.done.load(Ordering::Acquire) {
                         let (next, _) = shared
                             .taken
@@ -924,12 +920,12 @@ fn spawn_puller(
                 }
                 match answer.map(|value| Handout::from_json(&value)) {
                     Ok(Ok(Handout::Task(assignment))) => {
-                        *guard(&shared.last) = LastReply::Work;
-                        guard(&shared.queue).push_back(*assignment);
+                        *shared.last.lock_unpoisoned() = LastReply::Work;
+                        shared.queue.lock_unpoisoned().push_back(*assignment);
                         shared.arrived.notify_all();
                     }
                     Ok(Ok(Handout::Wait { after_ms, .. })) => {
-                        *guard(&shared.last) = LastReply::Blocked;
+                        *shared.last.lock_unpoisoned() = LastReply::Blocked;
                         // Recorded before the notify, so an executor woken by
                         // it already sees the refusal it is about to be
                         // classified by.
@@ -938,7 +934,7 @@ fn spawn_puller(
                         std::thread::sleep(Duration::from_millis(after_ms.clamp(1, 200)));
                     }
                     Ok(Ok(Handout::Finished)) => {
-                        *guard(&shared.last) = LastReply::Finished;
+                        *shared.last.lock_unpoisoned() = LastReply::Finished;
                         shared.done.store(true, Ordering::Release);
                         shared.arrived.notify_all();
                         break;
@@ -951,7 +947,7 @@ fn spawn_puller(
                         // rather than spinning against a closed port; a
                         // transient failure has already been retried once by
                         // the client.
-                        *guard(&shared.last) = LastReply::Finished;
+                        *shared.last.lock_unpoisoned() = LastReply::Finished;
                         shared.done.store(true, Ordering::Release);
                         shared.arrived.notify_all();
                         break;
@@ -985,7 +981,7 @@ fn spawn_reporter(
             let mut seq: u64 = 0;
             loop {
                 let event = {
-                    let mut queue = guard(&shared.events);
+                    let mut queue = shared.events.lock_unpoisoned();
                     while queue.is_empty() {
                         if shared.quiet.load(Ordering::Acquire) {
                             return;

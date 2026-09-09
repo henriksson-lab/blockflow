@@ -47,6 +47,9 @@ use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [48, 4, 4];
 /// Everything is a parameter: the value above which a voxel seeds the spread is
 /// the caller's, not the op's.
@@ -391,20 +394,20 @@ fn the_limit_fires_by_name_and_returns_no_partial_result() {
     let source = input(44);
     let env =
         ArrayEnvironment::for_decomposition(source, &plan, [8, 4, 4]).expect("an environment");
-    let error = execute_phases(
-        "iterate",
-        &empty_workflow(),
-        &plan,
-        &Hints::default(),
-        &env,
-        &[],
-        &[PhaseWork::Iterate(&op)],
-    )
-    .expect_err("this iteration cannot converge in three substages");
-    let message = error.to_string();
-    assert!(message.contains("spread"), "{message}");
-    assert!(message.contains("3 substage(s)"), "{message}");
-    assert!(message.contains("deliberately not written"), "{message}");
+    refuses!(
+        execute_phases(
+            "iterate",
+            &empty_workflow(),
+            &plan,
+            &Hints::default(),
+            &env,
+            &[],
+            &[PhaseWork::Iterate(&op)],
+        ),
+        "spread",
+        "3 substage(s)",
+        "deliberately not written",
+    );
 
     // A partially converged volume is plausible, well-formed and wrong, so none
     // of it is there: the output image is still the unwritten sentinel.
@@ -429,12 +432,7 @@ fn a_zero_limit_is_refused_where_it_is_stated() {
 fn the_halo_guard_fires_for_an_iterative_phase_with_a_short_halo() {
     let op = op(generous());
     let plan = plan(&op, 12).with_forced_halo([0, 0, 0]);
-    let error = plan
-        .check()
-        .expect_err("a halo of zero under a reach of one leaves a hole");
-    let message = error.to_string();
-    assert!(message.contains("tile"), "{message}");
-    assert!(message.contains("lost part of their core"), "{message}");
+    refuses!(plan.check(), "tile", "lost part of their core",);
 
     // And the executor refuses it too, rather than running a plan its own guard
     // rejects.
@@ -544,18 +542,18 @@ fn an_iterative_phase_that_is_given_a_chain_slot_is_refused() {
     );
     let env =
         ArrayEnvironment::for_decomposition(input(4), &plan, [8, 4, 4]).expect("an environment");
-    let message = execute_phases(
-        "iterate",
-        &workflow,
-        &plan,
-        &Hints::default(),
-        &env,
-        &[],
-        &[PhaseWork::Iterate(&op)],
-    )
-    .expect_err("a phase cannot both iterate and apply a slot")
-    .to_string();
-    assert!(message.contains("owns no slot of the chain"), "{message}");
+    refuses!(
+        execute_phases(
+            "iterate",
+            &workflow,
+            &plan,
+            &Hints::default(),
+            &env,
+            &[],
+            &[PhaseWork::Iterate(&op)],
+        ),
+        "owns no slot of the chain",
+    );
 }
 
 /// **A finding, recorded as a test.** An iteration runs to convergence, and
@@ -572,19 +570,19 @@ fn an_environment_that_holds_no_data_refuses_to_iterate_rather_than_guessing() {
     let op = op(generous());
     let plan = plan(&op, 12);
     let env = AccountingEnvironment::new(VOLUME, [8, 4, 4], 8);
-    let message = execute_phases(
-        "iterate",
-        &empty_workflow(),
-        &plan,
-        &Hints::default(),
-        &env,
-        &[],
-        &[PhaseWork::Iterate(&op)],
-    )
-    .expect_err("convergence is a question about values")
-    .to_string();
-    assert!(message.contains("holds no data"), "{message}");
-    assert!(message.contains("spread"), "{message}");
+    refuses!(
+        execute_phases(
+            "iterate",
+            &empty_workflow(),
+            &plan,
+            &Hints::default(),
+            &env,
+            &[],
+            &[PhaseWork::Iterate(&op)],
+        ),
+        "holds no data",
+        "spread",
+    );
 }
 
 // --------------------------------------- 9. the substage wave, at any width --

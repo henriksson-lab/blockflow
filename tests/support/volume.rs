@@ -1,5 +1,6 @@
 use ndarray::Array3;
 
+use blockflow::geometry::BlockGrid;
 use blockflow::synthetic::{Scene, SceneSpec};
 
 pub fn shape3(shape: [usize; 3]) -> (usize, usize, usize) {
@@ -68,6 +69,109 @@ pub fn point_mask_bool(shape: [usize; 3], points: &[[usize; 3]]) -> Array3<bool>
         mask[point] = true;
     }
     mask
+}
+
+pub fn fill_box(mask: &mut Array3<bool>, low: [usize; 3], high: [usize; 3], value: bool) {
+    for i in low[0]..=high[0] {
+        for j in low[1]..=high[1] {
+            for k in low[2]..=high[2] {
+                mask[[i, j, k]] = value;
+            }
+        }
+    }
+}
+
+pub fn every_block(grid: &BlockGrid) -> Vec<[usize; 3]> {
+    grid.cores().into_iter().map(|core| core.index).collect()
+}
+
+pub fn core_of(grid: &BlockGrid, index: [usize; 3]) -> ([usize; 3], [usize; 3]) {
+    let volume = grid.volume();
+    let edge = grid.block();
+    let mut low = [0usize; 3];
+    let mut extent = [0usize; 3];
+    for axis in 0..3 {
+        low[axis] = index[axis] * edge[axis];
+        extent[axis] = edge[axis].min(volume[axis] - low[axis]);
+    }
+    (low, extent)
+}
+
+pub fn core_cut<T: Copy>(volume: &Array3<T>, low: [usize; 3], extent: [usize; 3]) -> Array3<T> {
+    Array3::from_shape_fn(shape3(extent), |(i, j, k)| {
+        volume[[low[0] + i, low[1] + j, low[2] + k]]
+    })
+}
+
+pub fn block_local_disagreements<S, T>(
+    grid: &BlockGrid,
+    input: &Array3<S>,
+    global: &Array3<T>,
+    locally: impl Fn(&Array3<S>, [usize; 3]) -> Array3<T>,
+) -> Vec<[usize; 3]>
+where
+    S: Copy,
+    T: PartialEq,
+{
+    let mut out = Vec::new();
+    for index in every_block(grid) {
+        let (low, extent) = core_of(grid, index);
+        let cut = core_cut(input, low, extent);
+        let local = locally(&cut, extent);
+        for i in 0..extent[0] {
+            for j in 0..extent[1] {
+                for k in 0..extent[2] {
+                    let at = [low[0] + i, low[1] + j, low[2] + k];
+                    if local[[i, j, k]] != global[at] {
+                        out.push(at);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn grid_sweep(volume: [usize; 3], edges: [usize; 6]) -> Vec<BlockGrid> {
+    vec![
+        BlockGrid::new(volume, volume).expect("the whole volume is one block"),
+        BlockGrid::along(volume, &[0], edges[0]).expect("an axis-0 grid"),
+        BlockGrid::along(volume, &[0], edges[1]).expect("a second axis-0 grid"),
+        BlockGrid::along(volume, &[1], edges[2]).expect("an axis-1 grid"),
+        BlockGrid::along(volume, &[2], edges[3]).expect("an axis-2 grid"),
+        BlockGrid::along(volume, &[0, 1], edges[4]).expect("an axis-0/1 grid"),
+        BlockGrid::along(volume, &[0, 1, 2], edges[5]).expect("a three-axis grid"),
+    ]
+}
+
+pub fn standard_grid_sweep(volume: [usize; 3]) -> Vec<BlockGrid> {
+    grid_sweep(volume, [4, 8, 4, 5, 4, 4])
+}
+
+pub fn sample_offset_grid_sweep(volume: [usize; 3]) -> Vec<BlockGrid> {
+    vec![
+        BlockGrid::new(volume, volume).expect("the whole volume is one block"),
+        BlockGrid::along(volume, &[0], 5).expect("an axis-0 grid before the samples"),
+        BlockGrid::along(volume, &[0], 8).expect("an axis-0 grid on the samples"),
+        BlockGrid::along(volume, &[0], 9).expect("an axis-0 grid after the samples"),
+        BlockGrid::along(volume, &[1], 6).expect("an axis-1 grid"),
+        BlockGrid::along(volume, &[2], 4).expect("an axis-2 grid"),
+        BlockGrid::along(volume, &[0, 2], 6).expect("an axis-0/2 grid"),
+        BlockGrid::along(volume, &[0, 1, 2], 6).expect("a three-axis grid"),
+    ]
+}
+
+pub fn clipped_start_grid_sweep(volume: [usize; 3]) -> Vec<BlockGrid> {
+    vec![
+        BlockGrid::new(volume, volume).expect("the whole volume is one block"),
+        BlockGrid::along(volume, &[0], 5).expect("an axis-0 grid before the clipped start"),
+        BlockGrid::along(volume, &[0], 7).expect("an axis-0 grid on the clipped start"),
+        BlockGrid::along(volume, &[0], 8).expect("an axis-0 grid after the clipped start"),
+        BlockGrid::along(volume, &[1], 2).expect("an axis-1 grid"),
+        BlockGrid::along(volume, &[2], 3).expect("an axis-2 grid"),
+        BlockGrid::along(volume, &[0, 1], 4).expect("an axis-0/1 grid"),
+        BlockGrid::along(volume, &[0, 1, 2], 3).expect("a three-axis grid"),
+    ]
 }
 
 pub fn modular_mask_bool(shape: [usize; 3], modulus: usize, residue: usize) -> Array3<bool> {

@@ -73,6 +73,9 @@ use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::table::{Column, RowBuilder, Schema, Value};
 use blockflow::voxels::Voxels;
 
+mod support;
+use support::fragments::sidecars;
+
 const VOLUME: [usize; 3] = [8, 8, 8];
 const CHUNK: [usize; 3] = [4, 4, 4];
 
@@ -665,27 +668,25 @@ fn every_blocks_gathered_fragment_is_a_function_of_its_own_core() {
 
     let whole = gathered_definition();
     let grid = BlockGrid::new(VOLUME, block).expect("a grid");
+    let cores: std::collections::BTreeMap<_, _> = grid
+        .cores()
+        .into_iter()
+        .map(|core| (core.index, core.core))
+        .collect();
     let mut accounted = 0usize;
-    for core in grid.cores() {
-        let bytes = env
-            .read_sidecar(GATHERED, 1, core.index)
-            .expect("a read")
-            .unwrap_or_else(|| panic!("block {:?} wrote no fragment", core.index));
-        let mine = merge_rows(
-            VOLUME,
-            gather.schema().clone(),
-            [(core.index, bytes.as_slice())],
-        )
-        .expect("the merge");
+    for (index, bytes) in sidecars(&env, GATHERED, 1, &grid) {
+        let core = cores.get(&index).expect("the grid still has this core");
+        let mine = merge_rows(VOLUME, gather.schema().clone(), [(index, bytes.as_slice())])
+            .expect("the merge");
         let want: Vec<RowValues> = whole
             .iter()
-            .filter(|row| holds(&core.core, row.at))
+            .filter(|row| holds(core, row.at))
             .cloned()
             .collect();
         assert_eq!(
             mine, want,
             "block {:?} gathered rows that are not its own core's",
-            core.index
+            index
         );
         accounted += want.len();
     }

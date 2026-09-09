@@ -37,7 +37,7 @@ use ndarray::Array3;
 use blockflow::assemble::{ImageId, PlanBuilder};
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::dtype::Dtype;
-use blockflow::env::{ArrayEnvironment, Environment};
+use blockflow::env::ArrayEnvironment;
 use blockflow::fragment::{fragment_phase, FragmentInput, FragmentOp, PhaseWork};
 use blockflow::geometry::BlockGrid;
 use blockflow::iterate::{iterative_phase, SubstageLimit};
@@ -53,6 +53,10 @@ use blockflow::region::Region;
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
+
+mod support;
+use support::fragments::sidecars;
+use support::refuses;
 
 const VOLUME: [usize; 3] = [16, 16, 8];
 const BLOCK: [usize; 3] = [8, 8, 8];
@@ -374,12 +378,8 @@ fn run_points(
     .expect("a run");
     let last = plan.n_phases() - 1;
     let mut store = PointStore::new(plan.volume).expect("a store");
-    for core in plan.phases[last].grid.cores() {
-        let bytes = env
-            .read_sidecar(POINTS, last, core.index)
-            .expect("a read")
-            .expect("every block writes a blob");
-        store.write(core.index, &bytes).expect("a write");
+    for (index, bytes) in sidecars(&env, POINTS, last, &plan.phases[last].grid) {
+        store.write(index, &bytes).expect("a write");
     }
     store.seal().expect("sealed");
     store
@@ -482,10 +482,7 @@ fn reading_a_freed_image_names_the_image_the_phase_and_the_hint() {
     // completion is what frees it.
     assert!(env.is_discarded(1));
     assert_eq!(env.freed_after(1), Some(1));
-    let message = env.try_image(1).expect_err("a freed image").to_string();
-    assert!(message.contains("image 1"), "{message}");
-    assert!(message.contains("after phase 1"), "{message}");
-    assert!(message.contains("keep_images"), "{message}");
+    refuses!(env.try_image(1), "image 1", "after phase 1", "keep_images",);
 
     // And the hint is the answer: pin it and the same read succeeds.
     let env = ArrayEnvironment::for_decomposition(input_volume(), &built.decomposition, [4, 4, 4])
@@ -532,12 +529,12 @@ fn naming_the_wrong_producing_phase_is_refused_and_names_both() {
     // inside the op moved, which is exactly the mistake that used to be
     // undetectable.
     blockflow::fragment::check_phase_work(&hand.decomposition, &hand.work()).expect("the plan");
-    let message = blockflow::fragment::check_phase_work(&hand.decomposition, &work)
-        .expect_err("a wrong address")
-        .to_string();
-    assert!(message.contains("phase 4"), "{message}");
-    assert!(message.contains("phase 2"), "{message}");
-    assert!(message.contains("[3]"), "{message}");
+    refuses!(
+        blockflow::fragment::check_phase_work(&hand.decomposition, &work),
+        "phase 4",
+        "phase 2",
+        "[3]",
+    );
 }
 
 /// The builder path has no number to get wrong: a [`Phase`] comes from the call

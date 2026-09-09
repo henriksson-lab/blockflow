@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::error::{Error, Result};
+use crate::lock::MutexExt;
 use crate::region::Region;
 
 /// One thing the executor did.
@@ -345,24 +346,15 @@ impl ExecutionLog {
     }
 
     pub fn push(&self, event: Event) {
-        self.events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(event);
+        self.events.lock_unpoisoned().push(event);
     }
 
     pub fn events(&self) -> Vec<Event> {
-        self.events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.events.lock_unpoisoned().clone()
     }
 
     pub fn len(&self) -> usize {
-        self.events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+        self.events.lock_unpoisoned().len()
     }
 
     pub fn is_empty(&self) -> bool {

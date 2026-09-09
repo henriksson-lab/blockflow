@@ -59,6 +59,9 @@ use blockflow::table::{Schema, Value};
 use blockflow::Voxels;
 use ndarray::Array3;
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [16, 16, 16];
 const MAXIMUM: [usize; 3] = [3, 3, 3];
 
@@ -507,19 +510,19 @@ fn a_window_shorter_than_the_maximum_is_refused_rather_than_truncated() {
         .slice(ndarray::s![6..12, 6..12, 6..12])
         .to_owned()
         .into();
-    let failed = walk_from(
-        &sequence,
-        [9, 7, 7],
-        VOLUME,
-        &window,
-        [6, 6, 6],
-        Limit::AtMost(0.0),
-    )
-    .expect_err("a walk that leaves its window must not answer")
-    .to_string();
-    assert!(failed.contains("inside the volume"), "{failed}");
-    assert!(failed.contains("outside the window"), "{failed}");
-    assert!(failed.contains("stated maximum"), "{failed}");
+    refuses!(
+        walk_from(
+            &sequence,
+            [9, 7, 7],
+            VOLUME,
+            &window,
+            [6, 6, 6],
+            Limit::AtMost(0.0),
+        ),
+        "inside the volume",
+        "outside the window",
+        "stated maximum",
+    );
 }
 
 /// The same walk with the operand reach **understated**, to show that the guard
@@ -604,23 +607,23 @@ fn a_short_operand_reach_is_refused_by_the_run_rather_than_answered() {
     // The plan really is the short one, or the test would be asserting nothing.
     assert_eq!(plan.phases[2].halo, [0, 0, 0]);
     let env = ArrayEnvironment::new(fixture(), plan.n_phases(), [4, 4, 4]).expect("an environment");
-    let failed = execute_phases(
-        "short",
-        &identity_workflow(),
-        &plan,
-        &Hints::default(),
-        &env,
-        &[],
-        &[
-            PhaseWork::Pixels,
-            PhaseWork::Fragments(&points),
-            PhaseWork::Fragments(&walk),
-        ],
-    )
-    .expect_err("a walk that leaves its window must not answer")
-    .to_string();
-    assert!(failed.contains("outside the window"), "{failed}");
-    assert!(failed.contains("stated maximum"), "{failed}");
+    refuses!(
+        execute_phases(
+            "short",
+            &identity_workflow(),
+            &plan,
+            &Hints::default(),
+            &env,
+            &[],
+            &[
+                PhaseWork::Pixels,
+                PhaseWork::Fragments(&points),
+                PhaseWork::Fragments(&walk),
+            ],
+        ),
+        "outside the window",
+        "stated maximum",
+    );
 }
 
 /// A row on the volume's face. Offsets that leave the volume name nothing and
@@ -676,11 +679,7 @@ fn a_walk_that_never_stops_says_so_in_a_value_no_distance_can_be() {
         Limit::AtMost(0.0),
         1.0,
     );
-    let message = match collides {
-        Ok(_) => panic!("1.0 is a distance the sequence reports"),
-        Err(error) => error.to_string(),
-    };
-    assert!(message.contains("indistinguishable"), "{message}");
+    refuses!(collides, "indistinguishable");
 }
 
 /// An empty offset set is refused rather than run. Every row's walk would stop
@@ -688,11 +687,10 @@ fn a_walk_that_never_stops_says_so_in_a_value_no_distance_can_be() {
 /// well-formed, and a measurement of nothing.
 #[test]
 fn an_empty_offset_set_is_refused() {
-    let message = match OffsetSequence::from_offsets(Vec::new(), [1.0, 1.0, 1.0]) {
-        Ok(_) => panic!("a walk over no offsets is not a walk"),
-        Err(error) => error.to_string(),
-    };
-    assert!(message.contains("at least one offset"), "{message}");
+    refuses!(
+        OffsetSequence::from_offsets(Vec::new(), [1.0, 1.0, 1.0]),
+        "at least one offset",
+    );
 }
 
 /// **The exactness precondition, in the direction that fails.** A maximum that
@@ -703,12 +701,11 @@ fn an_empty_offset_set_is_refused() {
 /// reproducible on one machine only.
 #[test]
 fn a_sequence_whose_equal_keys_report_different_distances_is_refused() {
-    let message = match OffsetSequence::ellipsoid([3, 3, 1], [1.0, 1.0, 1.0]) {
-        Ok(_) => panic!("this configuration cannot give an exact distance"),
-        Err(error) => error.to_string(),
-    };
-    assert!(message.contains("ordering key"), "{message}");
-    assert!(message.contains("not reproducible"), "{message}");
+    refuses!(
+        OffsetSequence::ellipsoid([3, 3, 1], [1.0, 1.0, 1.0]),
+        "ordering key",
+        "not reproducible",
+    );
     // The check is a rule about the two orders agreeing, not a ban on
     // anisotropy: where `spacing * maximum` is equal on every axis they agree
     // and the sequence is accepted.
@@ -731,17 +728,16 @@ fn the_walk_appends_one_column_and_refuses_a_name_already_used() {
         schema,
     )
     .expect("two different streams");
-    let message = match OffsetWalkOp::new(
-        "walk",
-        streams,
-        0,
-        "distance",
-        sequence(),
-        Limit::AtMost(0.0),
-        NOT_FOUND,
-    ) {
-        Ok(_) => panic!("two columns of one name are ambiguous"),
-        Err(error) => error.to_string(),
-    };
-    assert!(message.contains("already have"), "{message}");
+    refuses!(
+        OffsetWalkOp::new(
+            "walk",
+            streams,
+            0,
+            "distance",
+            sequence(),
+            Limit::AtMost(0.0),
+            NOT_FOUND,
+        ),
+        "already have",
+    );
 }

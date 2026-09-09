@@ -38,6 +38,9 @@ use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
 
+mod support;
+use support::volume::fill_box;
+
 const VOLUME: [usize; 3] = [16, 32, 32];
 const STREAM: &str = "stats.fill.faces";
 
@@ -49,16 +52,6 @@ fn mask_scene() -> Array3<bool> {
     fill_box(&mut mask, [1, 12, 12], [14, 20, 20], true);
     fill_box(&mut mask, [2, 13, 13], [13, 19, 19], false);
     mask
-}
-
-fn fill_box(mask: &mut Array3<bool>, low: [usize; 3], high: [usize; 3], value: bool) {
-    for i in low[0]..=high[0] {
-        for j in low[1]..=high[1] {
-            for k in low[2]..=high[2] {
-                mask[[i, j, k]] = value;
-            }
-        }
-    }
 }
 
 /// `ops::fill`'s two phases at `block`, with the merge placed by `merge`.

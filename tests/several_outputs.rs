@@ -49,6 +49,9 @@ use blockflow::strategy::{execute, execute_observed, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::{AffineOp, Dtype, Event, OrderLog, SideOutputOp};
 
+mod support;
+use support::refuses;
+
 // --------------------------------------------------------------- helpers --
 
 fn one_phase(
@@ -362,10 +365,10 @@ fn the_halo_guard_still_fires_on_a_phase_with_side_outputs() {
 
     let short = good.with_forced_halo([0, 0, 0]);
     assert_eq!(short.phases[0].reach, reach, "the reach is untouched");
-    let message = short.check().unwrap_err().to_string();
-    assert!(
-        message.contains("do not tile the volume exactly") && message.contains("halo [0, 0, 0]"),
-        "{message}"
+    refuses!(
+        short.check(),
+        "do not tile the volume exactly",
+        "halo [0, 0, 0]",
     );
     let env = ArrayEnvironment::new(ramp(), 1, [2, 2, 2]).unwrap();
     assert!(execute("t", &workflow, &short, &Hints::default(), &env).is_err());
@@ -453,8 +456,8 @@ fn a_side_output_may_be_a_different_size_and_a_different_rank_from_the_image() {
         .clone()
         .with_sources(|block| Region::new(&block.read.start.clone(), &[1, 1, 1]));
     let env = ArrayEnvironment::new(input, 1, [2, 2, 2]).unwrap();
-    let message = execute("t", &workflow, &decomposition, &Hints::default(), &env)
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("has nowhere to land"), "{message}");
+    refuses!(
+        execute("t", &workflow, &decomposition, &Hints::default(), &env),
+        "has nowhere to land",
+    );
 }

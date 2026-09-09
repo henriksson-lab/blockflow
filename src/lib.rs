@@ -157,6 +157,7 @@ pub mod http;
 /// be.
 pub mod iterate;
 pub mod listener;
+pub(crate) mod lock;
 pub mod log;
 #[cfg(feature = "model-segment")]
 pub mod model_segment;

@@ -52,15 +52,16 @@ use rayon::prelude::*;
 use crate::assemble::ImageId;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
+use crate::lock::MutexExt;
 use crate::region::Region;
 use crate::tiling::boxes_tile_exactly;
 use crate::voxels::Voxels;
 
 use super::decomposition::{
     check_block_constraints, check_dtypes, check_output_shapes, check_source_images,
-    compute_charge_per_voxel, cuttable_axes, groups_for, is_planning_barrier, price_phase,
-    region_to_ranges, Constraints, DeclaredSourceSet, Decomposition, PhaseDecomposition,
-    SlabPolicy, StorageSettings,
+    compute_charge_per_voxel, constraint_for_with, cuttable_axes, groups_for, images_read_by_with,
+    is_planning_barrier, price_phase, region_to_ranges, summarise_slots_with, write_charge,
+    Constraints, Decomposition, PhaseDecomposition, SlabPolicy, StorageSettings,
 };
 use super::env::{block_shape, BlockBuf, Environment};
 use super::fragment::{
@@ -2334,7 +2335,7 @@ fn run_iterative_phase(
                         }
                     }
                     {
-                        let mut held = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut held = sink.lock_unpoisoned();
                         env.place(&mut held, &whole, valid, &core)?;
                     }
 
@@ -2836,27 +2837,31 @@ pub fn planned_block(
     };
     let mut candidates = constraints.block_candidates.clone();
     candidates.sort_unstable_by(|a, b| b.cmp(a));
+    let mut ignored = CandidateTally::default();
     for edge in candidates {
         // The same floor `Greedy` applies, so that a branch is priced at the
         // block the run will really use rather than at one the planner would
         // have refused to cut.
-        let axes = cuttable_axes(&constraints.split_axes, &reach, volume, edge);
-        let Ok(grid) = BlockGrid::along(volume, &axes, edge) else {
-            continue;
-        };
-        let cost = price_phase(
-            &grid,
+        if let Some((grid, _cost)) = affordable_candidate(
+            constraints,
             &reach,
-            chain.cost_per_voxel_in(grid.block()),
-            1,
-            false,
-            dtype.size_of() as f64,
-            &constraints.model,
-            constraints.model.materialise_cost_per_voxel,
-            traffic,
-        );
-        let fits = constraints.affords_working_set(&cost);
-        if fits {
+            volume,
+            edge,
+            &mut ignored,
+            |grid| {
+                price_phase(
+                    grid,
+                    &reach,
+                    chain.cost_per_voxel_in(grid.block()),
+                    1,
+                    false,
+                    dtype.size_of() as f64,
+                    &constraints.model,
+                    traffic,
+                )
+            },
+            |cost| constraints.affords_working_set(cost),
+        ) {
             return Ok(grid.block());
         }
     }
@@ -2995,23 +3000,19 @@ impl Strategy for Trivial {
         let grid = BlockGrid::whole(workflow.shape)?;
         let slots = workflow.chain.slots();
         let reach = workflow.chain.reach_spec(workflow.shape)?;
-        let chain_reach = reach.bound(workflow.shape);
         let names = slots.iter().map(|slot| slot.display_name()).collect();
-        let mut decomposition = Decomposition {
-            volume: workflow.shape,
-            dtype: workflow.dtype,
-            phases: vec![PhaseDecomposition::derive(
+        let decomposition = Decomposition::finish(
+            &workflow.chain,
+            workflow.shape,
+            workflow.dtype,
+            vec![PhaseDecomposition::derive(
                 (0..slots.len()).collect(),
                 names,
                 reach,
                 [0, 0, 0],
                 grid,
             )],
-            chain_reach,
-        };
-        decomposition.declare_dtypes(&workflow.chain)?;
-        decomposition.declare_source_images(&workflow.chain)?;
-        decomposition.check()?;
+        )?;
         // The oracle has exactly one plan to offer, so it consults the ops'
         // constraint by *checking* rather than by choosing: an op that mandates
         // anything other than the whole volume is told plainly that this
@@ -3556,18 +3557,11 @@ pub fn predicted_makespan(
             is_materialised,
             decomposition.dtype_at(index).size_of() as f64,
             model,
-            model.materialise_cost_per_voxel,
             traffic,
         );
         // Zero for a phase that writes no image, so that the channel bound below
         // counts the same bytes `price_phase` charged for. See `PhaseTraffic`.
-        let write = if !traffic.writes_an_image {
-            0.0
-        } else if is_materialised {
-            model.materialise_cost_per_voxel
-        } else {
-            model.write_cost_per_voxel
-        };
+        let write = write_charge(model, traffic, is_materialised);
         total += phase_makespan(&cost, &phase.grid, workers, model, write);
     }
     Ok(total)
@@ -3762,6 +3756,71 @@ pub struct CandidateTally {
     pub priced: usize,
 }
 
+/// Try one scalar candidate edge under the reach-derived floor and budget.
+///
+/// Selection policy deliberately stays with the caller: `Enumerating` keeps the
+/// argmin of its makespan objective, while `Greedy` and `Materialising` keep the
+/// first descending fit. This helper owns the shared mechanics that must not
+/// drift between them.
+pub fn affordable_candidate<T>(
+    constraints: &Constraints,
+    reach: &Reach,
+    volume: [usize; 3],
+    edge: usize,
+    tally: &mut CandidateTally,
+    price: impl FnOnce(&BlockGrid) -> T,
+    affordable: impl FnOnce(&T) -> bool,
+) -> Option<(BlockGrid, T)> {
+    tally.offered += 1;
+    let axes = cuttable_axes(&constraints.split_axes, reach, volume, edge);
+    let grid = match BlockGrid::along(volume, &axes, edge) {
+        Ok(grid) => grid,
+        Err(_) => {
+            tally.no_grid += 1;
+            return None;
+        }
+    };
+    let priced = price(&grid);
+    if !affordable(&priced) {
+        tally.over_budget += 1;
+        return None;
+    }
+    tally.priced += 1;
+    Some((grid, priced))
+}
+
+/// Fallible form of [`affordable_candidate`].
+///
+/// A construction error is not a budget refusal, so it propagates without
+/// touching `over_budget`. This is the shape used when pricing a candidate must
+/// first derive the phase that would be appended.
+pub fn try_affordable_candidate<T>(
+    constraints: &Constraints,
+    reach: &Reach,
+    volume: [usize; 3],
+    edge: usize,
+    tally: &mut CandidateTally,
+    price: impl FnOnce(&BlockGrid) -> Result<T>,
+    affordable: impl FnOnce(&T) -> bool,
+) -> Result<Option<(BlockGrid, T)>> {
+    tally.offered += 1;
+    let axes = cuttable_axes(&constraints.split_axes, reach, volume, edge);
+    let grid = match BlockGrid::along(volume, &axes, edge) {
+        Ok(grid) => grid,
+        Err(_) => {
+            tally.no_grid += 1;
+            return Ok(None);
+        }
+    };
+    let priced = price(&grid)?;
+    if !affordable(&priced) {
+        tally.over_budget += 1;
+        return Ok(None);
+    }
+    tally.priced += 1;
+    Ok(Some((grid, priced)))
+}
+
 /// **The search's objective, for one phase and one grid** — what a phase of
 /// `slots[group]` on this grid and halo is predicted to cost on `workers`.
 ///
@@ -3809,17 +3868,12 @@ pub fn phase_price(
         is_materialised,
         bytes_per_voxel,
         &constraints.model,
-        constraints.model.materialise_cost_per_voxel,
         traffic,
     );
     cost.cost_per_block *= constraints.slab_amplification(grid, halo);
     // The per-voxel write charge `price_phase` applied, re-derived so that
     // `phase_makespan` puts the same number on the channel bound.
-    let write_cost = if is_materialised {
-        constraints.model.materialise_cost_per_voxel
-    } else {
-        constraints.model.write_cost_per_voxel
-    };
+    let write_cost = write_charge(&constraints.model, traffic, is_materialised);
     let makespan = phase_makespan(&cost, grid, workers, &constraints.model, write_cost);
     (cost, makespan)
 }
@@ -3880,7 +3934,7 @@ impl PhasePricer<'_> {
         // What the ops in this run will accept. A conflict is a fact about
         // *this partition* — the same two ops in two phases are fine — so it
         // drops the partition and the search goes on.
-        let mandated = match constraint_for_at(self.slots, &group, self.volumes_at) {
+        let mandated = match constraint_for_with(self.slots, &group, |slot| self.volumes_at[slot]) {
             Ok(found) => found,
             Err(err) => return (GroupPrice::Refused(Some(err.to_string())), tally),
         };
@@ -3894,10 +3948,11 @@ impl PhasePricer<'_> {
         // One traversal per array the run reads: its own input image plus every
         // distinct image a `Chain::Source` leaf in it names. See
         // `images_read_by`.
-        let images_read = match images_read_by_at(self.slots, &group, self.volumes_at) {
-            Ok(count) => count,
-            Err(err) => return (GroupPrice::Refused(Some(err.to_string())), tally),
-        };
+        let images_read =
+            match images_read_by_with(self.slots, &group, |slot| self.volumes_at[slot]) {
+                Ok(count) => count,
+                Err(err) => return (GroupPrice::Refused(Some(err.to_string())), tally),
+            };
         let traffic = super::decomposition::PhaseTraffic {
             images_read,
             // A run of chain slots is a pixel phase, and a pixel phase writes
@@ -3961,24 +4016,20 @@ impl PhasePricer<'_> {
             }
         } else {
             for &edge in &self.constraints.block_candidates {
-                tally.offered += 1;
                 // The reach-derived floor, per candidate: an axis is cut only
                 // where the cut narrows what a block reads, which depends on the
                 // edge and so cannot be hoisted out of this loop.
-                let axes = cuttable_axes(&self.constraints.split_axes, &reach, output_volume, edge);
-                let grid = match BlockGrid::along(output_volume, &axes, edge) {
-                    Ok(grid) => grid,
-                    Err(_) => {
-                        tally.no_grid += 1;
-                        continue;
-                    }
-                };
-                let (cost, phase_total) = price(&grid, &reach);
-                if !affordable(&cost) {
-                    tally.over_budget += 1;
+                let Some((grid, (_cost, phase_total))) = affordable_candidate(
+                    self.constraints,
+                    &reach,
+                    output_volume,
+                    edge,
+                    &mut tally,
+                    |grid| price(grid, &reach),
+                    |(cost, _)| affordable(cost),
+                ) else {
                     continue;
-                }
-                tally.priced += 1;
+                };
                 // **The objective** is `phase_total`, from `phase_price` above.
                 // Not `cost_per_block * n_blocks`, which is the phase's serial
                 // *work* and falls monotonically as the block grows — under it
@@ -4317,68 +4368,6 @@ fn slot_volumes(slots: &[&Chain], input: [usize; 3]) -> Result<Vec<[usize; 3]>> 
     Ok(volumes)
 }
 
-fn summarise_slots_at(
-    slots: &[&Chain],
-    group: &[usize],
-    volumes_at: &[[usize; 3]],
-) -> Result<(Reach, Vec<String>, Vec<[usize; 3]>)> {
-    let mut reach: Option<Reach> = None;
-    let mut names = Vec::with_capacity(group.len());
-    let mut orders: Vec<[usize; 3]> = Vec::new();
-    for &slot in group {
-        let chain = slots[slot];
-        let stated = chain.reach_spec(volumes_at[slot])?;
-        reach = Some(match reach {
-            Some(so_far) => so_far.add(&stated)?,
-            None => stated,
-        });
-        names.push(chain.display_name());
-        for order in chain.preferred_iterations() {
-            if !orders.contains(&order) {
-                orders.push(order);
-            }
-        }
-    }
-    Ok((reach.unwrap_or_default(), names, orders))
-}
-
-fn constraint_for_at(
-    slots: &[&Chain],
-    group: &[usize],
-    volumes_at: &[[usize; 3]],
-) -> Result<Option<super::op::BlockConstraint>> {
-    let mut found: Option<super::op::BlockConstraint> = None;
-    for &slot in group {
-        let Some(constraint) = slots[slot].block_constraint(volumes_at[slot])? else {
-            continue;
-        };
-        match &found {
-            None => found = Some(constraint),
-            Some(existing) if existing == &constraint => {}
-            Some(existing) => {
-                return Err(Error::InvalidArgument(format!(
-                    "slot {slot} ({}) mandates {constraint:?} and an earlier slot of the same \
-                     phase mandates {existing:?}; one phase hands every one of its ops the \
-                     same block, so these two cannot be fused",
-                    slots[slot].display_name()
-                )))
-            }
-        }
-    }
-    Ok(found)
-}
-
-fn images_read_by_at(
-    slots: &[&Chain],
-    group: &[usize],
-    volumes_at: &[[usize; 3]],
-) -> Result<usize> {
-    Ok(
-        DeclaredSourceSet::from_slots(slots, group, |slot| volumes_at[slot])?
-            .images_read_count(true),
-    )
-}
-
 impl Enumerating {
     /// [`Strategy::decompose`], with the [`SearchAccount`] it built the plan by.
     ///
@@ -4537,15 +4526,7 @@ impl Enumerating {
             })
             .collect();
 
-        let mut decomposition = Decomposition {
-            volume,
-            dtype: workflow.dtype,
-            phases,
-            chain_reach: workflow.chain.reach3(&volume),
-        };
-        decomposition.declare_dtypes(&workflow.chain)?;
-        decomposition.declare_source_images(&workflow.chain)?;
-        decomposition.check()?;
+        let decomposition = Decomposition::finish(&workflow.chain, volume, workflow.dtype, phases)?;
         Ok((decomposition, account))
     }
 }
@@ -4638,15 +4619,7 @@ impl Strategy for Greedy {
             )?);
         }
 
-        let mut decomposition = Decomposition {
-            volume,
-            dtype: workflow.dtype,
-            phases,
-            chain_reach: workflow.chain.reach3(&volume),
-        };
-        decomposition.declare_dtypes(&workflow.chain)?;
-        decomposition.declare_source_images(&workflow.chain)?;
-        decomposition.check()?;
+        let decomposition = Decomposition::finish(&workflow.chain, volume, workflow.dtype, phases)?;
         Ok(decomposition)
     }
 
@@ -4722,11 +4695,11 @@ fn phase_for_group(
     let output_volume = volumes_at[end];
     // `compute` is dropped here and re-asked per candidate grid; see
     // `decomposition::compute_per_voxel`.
-    let (reach, names, orders) = summarise_slots_at(slots, group, volumes_at)?;
-    let mandated = constraint_for_at(slots, group, volumes_at)?;
+    let (reach, _, names, orders) = summarise_slots_with(slots, group, |slot| volumes_at[slot])?;
+    let mandated = constraint_for_with(slots, group, |slot| volumes_at[slot])?;
     // The same count `PhasePricer::price` takes; see `images_read_by`.
     let traffic = super::decomposition::PhaseTraffic {
-        images_read: images_read_by_at(slots, group, volumes_at)?,
+        images_read: images_read_by_with(slots, group, |slot| volumes_at[slot])?,
         writes_an_image: true,
         repeats: 1,
         chain_buffers: super::decomposition::resident_buffers_of(slots, group),
@@ -4755,7 +4728,6 @@ fn phase_for_group(
             is_materialised,
             bytes,
             &constraints.model,
-            constraints.model.materialise_cost_per_voxel,
             traffic,
         );
         let fits = constraints.affords_working_set(&cost);
@@ -4766,26 +4738,35 @@ fn phase_for_group(
         // largest candidate that fits
         let mut candidates = constraints.block_candidates.clone();
         candidates.sort_unstable_by(|a, b| b.cmp(a));
+        let mut ignored = CandidateTally::default();
         for edge in candidates {
             // As in `Enumerating`: the reach-derived floor, asked per candidate
             // because it is a question about this edge.
-            let axes = cuttable_axes(&constraints.split_axes, &reach, output_volume, edge);
-            let Ok(candidate) = BlockGrid::along(output_volume, &axes, edge) else {
-                continue;
-            };
-            let cost = price_phase(
-                &candidate,
+            if let Some((candidate, _cost)) = affordable_candidate(
+                constraints,
                 &reach,
-                compute_charge_per_voxel(slots, group, candidate.block(), &constraints.model),
-                orders.len(),
-                is_materialised,
-                bytes,
-                &constraints.model,
-                constraints.model.materialise_cost_per_voxel,
-                traffic,
-            );
-            let fits = constraints.affords_working_set(&cost);
-            if fits {
+                output_volume,
+                edge,
+                &mut ignored,
+                |candidate| {
+                    price_phase(
+                        candidate,
+                        &reach,
+                        compute_charge_per_voxel(
+                            slots,
+                            group,
+                            candidate.block(),
+                            &constraints.model,
+                        ),
+                        orders.len(),
+                        is_materialised,
+                        bytes,
+                        &constraints.model,
+                        traffic,
+                    )
+                },
+                |cost| constraints.affords_working_set(cost),
+            ) {
                 grid = Some(candidate);
                 break;
             }
@@ -4921,15 +4902,7 @@ impl Strategy for Materialising {
             reads = slots[position].produces(reads)?;
         }
 
-        let mut decomposition = Decomposition {
-            volume,
-            dtype: workflow.dtype,
-            phases,
-            chain_reach: workflow.chain.reach3(&volume),
-        };
-        decomposition.declare_dtypes(&workflow.chain)?;
-        decomposition.declare_source_images(&workflow.chain)?;
-        decomposition.check()?;
+        let decomposition = Decomposition::finish(&workflow.chain, volume, workflow.dtype, phases)?;
         Ok(decomposition)
     }
 
@@ -5310,7 +5283,6 @@ mod block_floor_tests {
                     false,
                     8.0,
                     &CostModel::default(),
-                    1.0,
                     PhaseTraffic::one_in_one_out(),
                 )
                 .working_set_bytes_per_block
@@ -5523,7 +5495,6 @@ mod block_floor_tests {
             false,
             8.0,
             &CostModel::default(),
-            1.0,
             PhaseTraffic::one_in_one_out(),
         )
         .redundancy;

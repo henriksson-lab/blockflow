@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use blockflow::env::{ArrayEnvironment, Environment};
+use blockflow::env::ArrayEnvironment;
 use blockflow::model_segment::stub::ThresholdBackend;
 use blockflow::model_segment::{identify, InstanceSegment};
 use blockflow::op::Chain;
@@ -27,6 +27,9 @@ use blockflow::{
     fragment_phase, BlockGrid, Decomposition, Dtype, Lifecycle, PhaseWork, Region, Voxels,
 };
 use ndarray::Array3;
+
+mod support;
+use support::fragments::sidecars;
 
 const STREAM: &str = "objects";
 
@@ -168,13 +171,9 @@ fn run(scene: &Scene, block: [usize; 3], halo: usize) -> Vec<([usize; 3], Vec<Ow
     .expect("a run");
 
     let schema = op.schema().expect("a schema");
-    every_block(&grid)
+    sidecars(&env, STREAM, 0, &grid)
         .into_iter()
-        .map(|index| {
-            let bytes = env
-                .read_sidecar(STREAM, 0, index)
-                .expect("the store answers")
-                .unwrap_or_else(|| panic!("block {index:?} wrote no blob"));
+        .map(|(index, bytes)| {
             let mut table = Table::new(scene.volume, schema.clone()).expect("a table");
             table.write(index, &bytes).expect("a row blob");
             table.seal().expect("a seal");
@@ -223,10 +222,6 @@ impl OwnedRow {
             self.values[base + 2],
         )
     }
-}
-
-fn every_block(grid: &BlockGrid) -> Vec<[usize; 3]> {
-    grid.cores().into_iter().map(|core| core.index).collect()
 }
 
 fn all_rows(emitted: &[([usize; 3], Vec<OwnedRow>)]) -> Vec<OwnedRow> {

@@ -221,12 +221,11 @@
 // the planner sees `2 * 3.87 * |element|` per voxel and not a flat figure.
 
 use std::ops::Sub;
-use std::time::Instant;
 
 use ndarray::{ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
-use crate::error::{Error, Result};
+use crate::error::{bail, Error, Result};
 use crate::op::{Anchor, BlockOp, Chain, Combine, Slicing};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
@@ -348,13 +347,13 @@ impl Combine for DifferenceCombine {
     fn output_shape(&self, inputs: &[[usize; 3]]) -> Result<[usize; 3]> {
         match inputs {
             [minuend, subtrahend] if minuend == subtrahend => Ok(*minuend),
-            [minuend, subtrahend] => Err(Error::InvalidArgument(format!(
+            [minuend, subtrahend] => Err(Error::invalid(format_args!(
                 "{}: branch 0 produced {minuend:?} and branch 1 produced {subtrahend:?}. A \
                  voxelwise difference subtracts co-located voxels, and buffers of different \
                  extents have no such pairing.",
                 self.name
             ))),
-            other => Err(Error::InvalidArgument(format!(
+            other => Err(Error::invalid(format_args!(
                 "{}: a difference has a minuend and a subtrahend and was handed {} branch \
                  results. Subtraction is not associative, so there is no fold over a longer \
                  list that is not a convention about parentheses.",
@@ -368,11 +367,11 @@ impl Combine for DifferenceCombine {
         let (minuend, subtrahend) = match inputs {
             [minuend, subtrahend] => (minuend, subtrahend),
             other => {
-                return Err(Error::InvalidArgument(format!(
+                bail!(
                     "{}: a difference joins exactly two results and was handed {}",
                     self.name,
                     other.len()
-                )));
+                );
             }
         };
         match minuend.dtype() {
@@ -386,7 +385,7 @@ impl Combine for DifferenceCombine {
                 subtrahend.view::<f32>()?,
                 out.view_mut::<f32>()?,
             ),
-            other => Err(Error::InvalidArgument(format!(
+            other => Err(Error::invalid(format_args!(
                 "{}: a difference is stated over the floating-point element types and was \
                  handed {}. `accepts` refuses it before a run starts.",
                 self.name,
@@ -606,19 +605,8 @@ const DIFFERENCE_COST: f64 = 0.40;
 /// a filter.
 pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
     let voxels = (shape[0] * shape[1] * shape[2]) as f64;
-    let input = ramp(shape);
     let repetitions = repetitions.max(1);
-
-    let best_of = |mut run: Box<dyn FnMut()>| -> f64 {
-        run();
-        let mut best = f64::INFINITY;
-        for _ in 0..repetitions {
-            let started = Instant::now();
-            run();
-            best = best.min(started.elapsed().as_secs_f64() * 1e9 / voxels);
-        }
-        best
-    };
+    let input = super::cost::ramp(shape);
 
     let mut rows: Vec<(String, f64, f64)> = Vec::new();
 
@@ -630,9 +618,9 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
         let anchor = Anchor::whole(shape);
         rows.push((
             "voxelwise map".to_string(),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 op.apply(&input, &mut out, &anchor).unwrap();
-            })),
+            }),
             1.0,
         ));
     }
@@ -640,15 +628,15 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
     // the sink
     {
         let combine = DifferenceCombine::new("difference");
-        let operands = [input.clone(), ramp(shape)];
+        let operands = [input.clone(), super::cost::ramp(shape)];
         let mut out = Voxels::zeros(Dtype::F64, shape).unwrap();
         let anchor = Anchor::whole(shape);
         rows.push((
             "difference combine (two branch results)".to_string(),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 let refs: Vec<&Voxels> = operands.iter().collect();
                 combine.apply(&refs, &mut out, &anchor).unwrap();
-            })),
+            }),
             1.0,
         ));
     }
@@ -667,9 +655,9 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
             let anchor = Anchor::whole(shape);
             rows.push((
                 format!("{label}, {}-voxel element", element.len()),
-                best_of(Box::new(move || {
+                super::cost::best_of_voxels(repetitions, voxels, move || {
                     chain.apply(&input, &mut out, &anchor).unwrap();
-                })),
+                }),
                 passes * element.len() as f64,
             ));
         }
@@ -688,14 +676,6 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
         ));
     }
     out
-}
-
-fn ramp(shape: [usize; 3]) -> Voxels {
-    let mut array = ndarray::Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
-    for (flat, value) in array.iter_mut().enumerate() {
-        *value = ((flat * 7919) % 1013) as f64;
-    }
-    array.into()
 }
 
 #[cfg(test)]

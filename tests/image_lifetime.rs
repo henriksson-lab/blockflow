@@ -42,6 +42,9 @@ use blockflow::strategy::{execute, execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::{refuses, single_phase};
+
 const VOLUME: [usize; 3] = [16, 12, 10];
 const STAGES: usize = 20;
 
@@ -65,32 +68,10 @@ fn long_chain() -> Chain {
     )
 }
 
-/// One phase per slot, so every stage really does materialise an image.
-fn one_phase_per_slot(chain: &Chain) -> Decomposition {
-    let slots = chain.slots();
-    let grid = BlockGrid::along(VOLUME, &[0], 8).unwrap();
-    let phases = (0..slots.len())
-        .map(|slot| {
-            PhaseDecomposition::derive(
-                vec![slot],
-                vec![slots[slot].display_name()],
-                [0, 0, 0],
-                [0, 0, 0],
-                grid.clone(),
-            )
-        })
-        .collect();
-    Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::F64,
-        phases,
-        chain_reach: [0, 0, 0],
-    }
-}
-
 fn run(hints: &Hints) -> (Array3<f64>, ArrayEnvironment) {
     let chain = long_chain();
-    let plan = one_phase_per_slot(&chain);
+    let grid = BlockGrid::along(VOLUME, &[0], 8).unwrap();
+    let plan = single_phase::one_phase_per_slot(&chain, VOLUME, Dtype::F64, &grid, [0, 0, 0]);
     let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
     let env = ArrayEnvironment::for_decomposition(input().into(), &plan, [4, 4, 4]).unwrap();
     execute("images", &workflow, &plan, hints, &env).expect("a run");
@@ -137,7 +118,8 @@ fn freeing_the_intermediates_changes_no_voxel() {
 #[test]
 fn the_input_and_the_output_are_never_freed() {
     let chain = long_chain();
-    let plan = one_phase_per_slot(&chain);
+    let grid = BlockGrid::along(VOLUME, &[0], 8).unwrap();
+    let plan = single_phase::one_phase_per_slot(&chain, VOLUME, Dtype::F64, &grid, [0, 0, 0]);
     assert_eq!(plan.image_visibility(0), Visibility::Published);
     assert_eq!(
         plan.image_visibility(plan.n_images() - 1),
@@ -164,9 +146,7 @@ fn reading_a_freed_image_fails_and_says_why() {
     assert!(env.is_discarded(1));
 
     let region = blockflow::region::Region::new(&[0, 0, 0], &[4, 4, 4]);
-    let message = env.read(1, &region).unwrap_err().to_string();
-    assert!(message.contains("discarded"), "{message}");
-    assert!(message.contains("keep_images"), "{message}");
+    refuses!(env.read(1, &region), "discarded", "keep_images");
 }
 
 /// Pinning one image keeps exactly that one.
@@ -710,8 +690,7 @@ fn releasing_the_input_frees_it_after_its_last_reader_and_moves_no_voxel() {
     // reason: a released image that came back as zeros would be the defect this
     // crate fills unwritten images with NaN to prevent.
     let region = blockflow::region::Region::new(&[0, 0, 0], &[4, 4, 4]);
-    let message = with.read(0, &region).unwrap_err().to_string();
-    assert!(message.contains("discarded"), "{message}");
+    refuses!(with.read(0, &region), "discarded");
 }
 
 /// **`keep_images` wins over `release_images`.**

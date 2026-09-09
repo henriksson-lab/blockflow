@@ -37,6 +37,10 @@ use blockflow::voxels::Voxels;
 use blockflow::{DecimateOp, Dtype, IdentityOp, NonZeroOp};
 use ndarray::Array3;
 
+mod support;
+
+use support::{refuses, single_phase};
+
 const VOLUME: [usize; 3] = [24, 12, 12];
 
 /// A mask with structure at two scales, so an opening has something to remove
@@ -61,24 +65,8 @@ fn chain() -> Chain {
 /// One phase holding the whole chain, at a given block edge and split axes,
 /// with the halo derived from the chain's own reach and from nothing else.
 fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let reach = workflow.chain.reach3(&VOLUME);
     let grid = BlockGrid::along(VOLUME, split_axes, block).unwrap();
-    let mut plan = Decomposition {
-        volume: VOLUME,
-        dtype: workflow.dtype,
-        phases: vec![PhaseDecomposition::derive(
-            (0..slots.len()).collect(),
-            names,
-            reach,
-            reach,
-            grid,
-        )],
-        chain_reach: reach,
-    };
-    plan.declare_dtypes(&workflow.chain).unwrap();
-    plan
+    single_phase::typed_plan_on_grid(workflow, VOLUME, grid)
 }
 
 // -------------------------------------------------------- 1. the measurement --
@@ -199,19 +187,12 @@ fn a_short_halo_is_caught_on_a_bool_phase_too() {
     honest.check().unwrap();
 
     let forced = honest.with_forced_halo([1, 0, 0]);
-    let message = forced.check().unwrap_err().to_string();
-    assert!(
-        message.contains("do not tile the volume exactly"),
-        "{message}"
-    );
+    refuses!(forced.check(), "do not tile the volume exactly");
 
     let env = ArrayEnvironment::new(speckle().into(), 1, [4, 4, 4]).unwrap();
-    let message = execute("short", &workflow, &forced, &Hints::default(), &env)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("do not tile the volume exactly"),
-        "{message}"
+    refuses!(
+        execute("short", &workflow, &forced, &Hints::default(), &env),
+        "do not tile the volume exactly"
     );
 }
 
@@ -229,13 +210,10 @@ fn an_op_that_cannot_take_the_element_type_is_refused_when_the_plan_is_made() {
         VOLUME,
         Dtype::Bool,
     );
-    let message = Trivial
-        .decompose(&workflow, &Default::default())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("threshold") && message.contains("bool"),
-        "{message}"
+    refuses!(
+        Trivial.decompose(&workflow, &Default::default()),
+        "threshold",
+        "bool"
     );
 }
 
@@ -261,12 +239,10 @@ fn a_plan_whose_image_is_the_wrong_width_is_refused_by_the_executor() {
 
     let env =
         ArrayEnvironment::new(Voxels::zeros(Dtype::F64, VOLUME).unwrap(), 1, [4, 4, 4]).unwrap();
-    let message = execute("mistyped", &workflow, &hand_built, &Hints::default(), &env)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("its ops write bool") && message.contains("allocates image 1 as float64"),
-        "{message}"
+    refuses!(
+        execute("mistyped", &workflow, &hand_built, &Hints::default(), &env),
+        "its ops write bool",
+        "allocates image 1 as float64"
     );
 }
 
@@ -310,12 +286,10 @@ fn a_phase_may_narrow_the_element_type_and_the_image_follows_the_plan() {
     // `ArrayEnvironment::new` gives every image the input's type, which cannot
     // host this plan — and says so rather than converting at the write.
     let flat = ArrayEnvironment::new(input.into(), 1, [4, 4, 4]).unwrap();
-    let message = execute("flat", &workflow, &decomposition, &Hints::default(), &flat)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("holds image 1 as float64") && message.contains("as bool"),
-        "{message}"
+    refuses!(
+        execute("flat", &workflow, &decomposition, &Hints::default(), &flat),
+        "holds image 1 as float64",
+        "as bool"
     );
 }
 
@@ -431,19 +405,16 @@ fn a_phase_whose_op_does_not_resize_is_refused_and_names_both_extents() {
         [2, 2, 2],
     )
     .unwrap();
-    let message = execute(
-        "mismatch",
-        &workflow,
-        &decomposition,
-        &Hints::default(),
-        &env,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        message.contains("has nowhere to land")
-            && message.contains("its ops turn that into [8, 12, 12]")
-            && message.contains("read extent of [4, 12, 12]"),
-        "{message}"
+    refuses!(
+        execute(
+            "mismatch",
+            &workflow,
+            &decomposition,
+            &Hints::default(),
+            &env,
+        ),
+        "has nowhere to land",
+        "its ops turn that into [8, 12, 12]",
+        "read extent of [4, 12, 12]"
     );
 }

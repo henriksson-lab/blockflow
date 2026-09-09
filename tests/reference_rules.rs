@@ -57,9 +57,7 @@
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::ArrayEnvironment;
-use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain};
 use blockflow::ops::{
     bounded_gain_value, AdaptiveThresholdOp, ElementShape, Isodata, LocalGainOp, LocalStatistic,
@@ -70,6 +68,9 @@ use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
+
+mod support;
+use support::single_phase;
 
 const VOLUME: [usize; 3] = [32, 24, 20];
 
@@ -124,17 +125,7 @@ fn whole_volume(chain: &Chain, input: &Array3<f64>) -> Array3<f64> {
 /// its ops and is not `Clone`, and every run here needs its own.
 fn run(chain: Chain, input: &Array3<f64>, block: usize, split_axes: &[usize]) -> Array3<f64> {
     let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
-    let reach = workflow.chain.reach3(&VOLUME);
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(VOLUME, split_axes, block).unwrap();
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
-    let decomposition = Decomposition {
-        volume: VOLUME,
-        dtype: workflow.dtype,
-        phases: vec![phase],
-        chain_reach: reach,
-    };
+    let decomposition = single_phase::plan(&workflow, VOLUME, block, split_axes);
     decomposition
         .check()
         .expect("an honestly derived plan must tile");

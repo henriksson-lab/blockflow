@@ -188,7 +188,7 @@
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
-use crate::error::{Error, Result};
+use crate::error::{bail, ensure, Result};
 use crate::op::{Anchor, BlockOp, Chain};
 use crate::voxels::Voxels;
 
@@ -434,13 +434,12 @@ impl Subfield {
 
     /// The class with this index, or an error naming the range.
     pub fn new(index: usize) -> Result<Self> {
-        if index >= Self::COUNT {
-            return Err(Error::InvalidArgument(format!(
-                "subfield {index}: the lattice has {} parity classes, indexed 0..{}",
-                Self::COUNT,
-                Self::COUNT
-            )));
-        }
+        ensure!(
+            index < Self::COUNT,
+            "subfield {index}: the lattice has {} parity classes, indexed 0..{}",
+            Self::COUNT,
+            Self::COUNT
+        );
         Ok(Self(index as u8))
     }
 
@@ -615,11 +614,10 @@ impl PassLimit {
     /// volume's own shortest axis, since nothing thicker fits.
     pub fn of(passes: usize) -> Result<Self> {
         if passes == 0 {
-            return Err(Error::InvalidArgument(
+            bail!(
                 "a pass limit of zero would refuse before doing anything; the limit is a \
                  backstop, and one that fires immediately is a limit that means \"do not run\""
-                    .to_string(),
-            ));
+            );
         }
         Ok(Self(passes))
     }
@@ -668,7 +666,7 @@ pub fn thin_to_fixed_point(
         }
         current = next;
         if passes >= limit.passes() {
-            return Err(Error::InvalidArgument(format!(
+            bail!(
                 "thinning did not reach a fixed point in {} pass(es) over a {:?} volume. \
                  Either the limit is below what this data needs — raise it, or take it from \
                  `PassLimit::for_volume` — or a thinning pass has stopped being monotone, \
@@ -677,7 +675,7 @@ pub fn thin_to_fixed_point(
                  well-formed, wrong skeleton.",
                 limit.passes(),
                 [input.shape()[0], input.shape()[1], input.shape()[2]]
-            )));
+            );
         }
     }
 }
@@ -1062,41 +1060,21 @@ pub const COST_MEASUREMENT: &str = "ops::skeleton::cost_report";
 /// the full test. The unit is the voxelwise map, as in `super::cost` and
 /// `super::ridge::cost_report`.
 pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
-    use std::time::Instant;
-
     let voxels = (shape[0] * shape[1] * shape[2]) as f64;
-    let anchor = Anchor::whole(shape);
     let repetitions = repetitions.max(1);
-
-    let best_of = |mut run: Box<dyn FnMut()>| -> f64 {
-        // One untimed pass first: a freshly allocated output pays a page fault
-        // per page on first touch, and that fault is the measurement for the
-        // cheapest op here.
-        run();
-        let mut best = f64::INFINITY;
-        for _ in 0..repetitions {
-            let started = Instant::now();
-            run();
-            best = best.min(started.elapsed().as_secs_f64() * 1e9 / voxels);
-        }
-        best
-    };
 
     let mut rows: Vec<(String, f64)> = Vec::new();
 
     {
-        let mut ramp = Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
-        for (flat, value) in ramp.iter_mut().enumerate() {
-            *value = ((flat * 7919) % 1013) as f64;
-        }
-        let input: Voxels = ramp.into();
+        let input = super::cost::ramp(shape);
         let op = super::voxelwise::VoxelwiseMapOp::threshold("map", 500.0, 1.0, 0.0);
         let mut out = Voxels::zeros(Dtype::F64, shape).unwrap();
+        let anchor = Anchor::whole(shape);
         rows.push((
             "voxelwise map (the unit)".to_string(),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 op.apply(&input, &mut out, &anchor).unwrap();
-            })),
+            }),
         ));
     }
 
@@ -1120,9 +1098,9 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
         let anchor = Anchor::whole(shape);
         rows.push((
             what.to_string(),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 op.apply(&input, &mut out, &anchor).unwrap();
-            })),
+            }),
         ));
     }
 

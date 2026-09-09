@@ -56,7 +56,9 @@ use blockflow::Dtype;
 
 mod support;
 
+use support::refuses;
 use support::source_fixture::{self, SourcePhase};
+use support::volume::standard_grid_sweep;
 
 const VOLUME: [usize; 3] = [16, 12, 10];
 /// Written by phase 0, read by phase 1 as the window's population.
@@ -251,15 +253,7 @@ fn plan(chain: &Chain, grid: &BlockGrid) -> Decomposition {
 }
 
 fn grids() -> Vec<BlockGrid> {
-    vec![
-        BlockGrid::new(VOLUME, VOLUME).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 8).unwrap(),
-        BlockGrid::along(VOLUME, &[1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[2], 5).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1, 2], 4).unwrap(),
-    ]
+    standard_grid_sweep(VOLUME)
 }
 
 fn run(grid: &BlockGrid) -> Array3<f64> {
@@ -289,18 +283,15 @@ fn a_mask_image_that_is_not_bool_is_refused_by_name() {
     let wrong: Voxels = image().into();
     let mut out = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
     let entries = [(MASK.into(), &wrong)];
-    let failed = op
-        .apply_with(
+    refuses!(
+        op.apply_with(
             &input,
             SourceInputs::new(&entries),
             &mut out,
             &Anchor::whole(VOLUME),
-        )
-        .unwrap_err();
-    let message = failed.to_string();
-    assert!(
-        message.contains("float64") && message.contains(&MASK.to_string()),
-        "the refusal must name the image and what it holds: {message}"
+        ),
+        "float64",
+        &MASK.to_string()
     );
 }
 
@@ -660,16 +651,14 @@ fn a_mask_of_the_wrong_shape_is_refused() {
     let ordered = image.mapv(Total);
     let small = Array3::from_elem((4, 4, 4), true);
     let mut out = Array3::from_elem(ordered.raw_dim(), Total(0.0));
-    let failed = masked_rank_filter_into(
-        ordered.view(),
-        ArrayView3::from(small.view()),
-        &element(),
-        rank(),
-        out.view_mut(),
-    )
-    .unwrap_err();
-    assert!(
-        failed.to_string().contains("mask"),
-        "the refusal must say which array disagreed: {failed}"
+    refuses!(
+        masked_rank_filter_into(
+            ordered.view(),
+            ArrayView3::from(small.view()),
+            &element(),
+            rank(),
+            out.view_mut(),
+        ),
+        "mask"
     );
 }

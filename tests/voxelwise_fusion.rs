@@ -38,6 +38,9 @@ use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::compare::identical;
+
 const VOLUME: [usize; 3] = [32, 24, 20];
 
 fn intensities() -> Array3<f64> {
@@ -104,18 +107,6 @@ fn whole(chain: &Chain, input: &Array3<f64>) -> Array3<f64> {
         .apply(&source, &mut out, &Anchor::whole(VOLUME))
         .expect("the whole-volume reference must run");
     out.view::<f64>().unwrap().to_owned()
-}
-
-#[track_caller]
-fn identical(left: &Array3<f64>, right: &Array3<f64>, what: &str) {
-    assert_eq!(left.shape(), right.shape(), "{what}: shapes");
-    for (index, (a, b)) in left.iter().zip(right.iter()).enumerate() {
-        assert_eq!(
-            a.to_bits(),
-            b.to_bits(),
-            "{what}: voxel {index} is {a} fused and {b} in two phases"
-        );
-    }
 }
 
 /// The two phases, as a chain, and the one fused phase that replaces them.

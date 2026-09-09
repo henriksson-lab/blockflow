@@ -425,7 +425,6 @@ fn the_cost_model_prices_a_full_reach_phase_towards_one_block() {
             false,
             8.0,
             &model,
-            1.0,
             PhaseTraffic::one_in_one_out(),
         );
         costs.push((

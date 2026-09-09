@@ -65,6 +65,10 @@ use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
 
+mod support;
+use support::refuses;
+use support::volume::fill_box;
+
 /// Small enough that the finest lattice below is 256 blocks of 4 voxels an edge
 /// and the whole sweep runs in well under a second; large enough that the merge
 /// has something to join at every one of them.
@@ -97,16 +101,6 @@ fn mask_scene() -> Array3<bool> {
         mask[[7, y, 8]] = false;
     }
     mask
-}
-
-fn fill_box(mask: &mut Array3<bool>, low: [usize; 3], high: [usize; 3], value: bool) {
-    for i in low[0]..=high[0] {
-        for j in low[1]..=high[1] {
-            for k in low[2]..=high[2] {
-                mask[[i, j, k]] = value;
-            }
-        }
-    }
 }
 
 /// A field with plateaus that span the lattice and one corner higher than all of
@@ -810,25 +804,26 @@ fn a_reduction_blob_says_what_it_is_and_what_it_was_reduced_over() {
     );
 
     // another op's magic
-    let wrong = decode_block_flags_for(&blob, counts, [0, 0, 0], 0x8765_4321, "a blob")
-        .expect_err("a blob decoded under the wrong op's magic must be refused");
-    assert!(wrong.to_string().contains("magic"), "{wrong}");
+    refuses!(
+        decode_block_flags_for(&blob, counts, [0, 0, 0], 0x8765_4321, "a blob"),
+        "magic",
+    );
 
     // another lattice, which is the plausible-in-every-block failure
-    let other = decode_block_flags_for(&blob, [2, 1, 1], [0, 0, 0], 0x1234_5678, "a blob")
-        .expect_err("a blob from another cut must be refused");
-    assert!(other.to_string().contains("lattice"), "{other}");
+    refuses!(
+        decode_block_flags_for(&blob, [2, 1, 1], [0, 0, 0], 0x1234_5678, "a blob"),
+        "lattice",
+    );
 
     // an empty blob, which is what a block gets from an entry point that carries
     // none
-    let empty = decode_block_flags_for(&[], counts, [0, 0, 0], 0x1234_5678, "a blob")
-        .expect_err("an empty reduction must be refused");
-    assert!(empty.to_string().contains("empty"), "{empty}");
+    refuses!(
+        decode_block_flags_for(&[], counts, [0, 0, 0], 0x1234_5678, "a blob"),
+        "empty",
+    );
 
     // a lattice the merge did not answer for every block of
-    let short = encode_block_flags(&flags, [1, 1, 3], 0x1234_5678)
-        .expect_err("a merge that skipped a block must be refused");
-    assert!(short.to_string().contains("block"), "{short}");
+    refuses!(encode_block_flags(&flags, [1, 1, 3], 0x1234_5678), "block");
 }
 
 /// A hoisted op run through the entry point that carries no blob is refused
@@ -863,16 +858,16 @@ fn a_shipped_reducing_op_is_refused_by_the_entry_point_that_has_no_blob() {
     .expect("environment");
     let graph = TaskGraph::build(&plan);
     let task = graph.tasks_in_phase(1)[0].clone();
-    let err = blockflow::strategy::execute_task_of(
-        &Chain::sequence(Vec::new()),
-        &plan,
-        &task,
-        &PhaseWork::Fragments(&fill),
-        &env,
-        &[],
-    )
-    .expect_err("a reducing op has no blob here");
-    let message = err.to_string();
-    assert!(message.contains("reduce"), "{message}");
-    assert!(message.contains("execute_task_with_reduction"), "{message}");
+    refuses!(
+        blockflow::strategy::execute_task_of(
+            &Chain::sequence(Vec::new()),
+            &plan,
+            &task,
+            &PhaseWork::Fragments(&fill),
+            &env,
+            &[],
+        ),
+        "reduce",
+        "execute_task_with_reduction",
+    );
 }

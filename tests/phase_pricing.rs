@@ -64,7 +64,6 @@ fn predicted_and_exact(edge: usize, halo: [usize; 3], charged: [usize; 3]) -> (f
         false,
         8.0,
         &CostModel::default(),
-        1.0,
         // One image in, one image out: the case this file is about is the halo,
         // and holding the traffic at the classic assumption keeps it that way.
         PhaseTraffic::one_in_one_out(),
@@ -205,6 +204,9 @@ use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::predicted_makespan;
 use blockflow::voxels::Voxels;
 use blockflow::Result;
+
+mod support;
+use support::refuses;
 
 /// A one-substage spread along axis 0 whose per-voxel cost the test sets.
 ///
@@ -402,21 +404,15 @@ fn a_slotless_phase_the_caller_did_not_describe_is_refused_by_name() {
     let merge = NullFragmentOp::new("merge", "merged", Lifecycle::DeleteOnExit);
     let plan = fragment_only(VOLUME, [16, 16, 16], Dtype::F64, &[&merge])
         .expect("a fragments-only decomposition");
-    let message = blockflow::decomposition::predicted_cost(
-        &Chain::sequence(Vec::new()),
-        &plan,
-        &[],
-        &CostModel::default(),
-    )
-    .expect_err("a slotless phase with no work entry must not price")
-    .to_string();
-    assert!(
-        message.contains("owns no chain slot"),
-        "the refusal should say what is missing: {message}"
-    );
-    assert!(
-        message.contains("PhaseWork"),
-        "the refusal should name the thing to pass: {message}"
+    refuses!(
+        blockflow::decomposition::predicted_cost(
+            &Chain::sequence(Vec::new()),
+            &plan,
+            &[],
+            &CostModel::default(),
+        ),
+        "owns no chain slot",
+        "PhaseWork",
     );
 }
 
@@ -582,7 +578,6 @@ fn the_pool_is_charged_for_the_workers_that_contend_with_each_other() {
         false,
         8.0,
         &CostModel::default(),
-        1.0,
         PhaseTraffic {
             images_read: 1,
             writes_an_image: true,

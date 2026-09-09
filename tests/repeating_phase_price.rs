@@ -52,7 +52,6 @@ fn price(edge: usize, substages: usize) -> f64 {
         false,
         8.0,
         &CostModel::default(),
-        CostModel::default().materialise_cost_per_voxel,
         PhaseTraffic::one_in_one_out().repeating(substages),
     )
     .cost_per_block
@@ -129,7 +128,6 @@ fn the_ratio_between_two_block_edges_moves_with_the_substage_count() {
             false,
             8.0,
             &CostModel::default(),
-            CostModel::default().materialise_cost_per_voxel,
             PhaseTraffic {
                 images_read: 1,
                 // No write at all, so what is left is the repeating part.
@@ -165,7 +163,6 @@ fn the_price_records_how_many_times_it_charged() {
             false,
             8.0,
             &CostModel::default(),
-            CostModel::default().materialise_cost_per_voxel,
             PhaseTraffic::one_in_one_out().repeating(substages),
         )
         .repeats

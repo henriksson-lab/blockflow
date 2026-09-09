@@ -61,7 +61,7 @@ use ndarray::{s, Array3};
 
 use blockflow::decomposition::Decomposition;
 use blockflow::dtype::Dtype;
-use blockflow::env::{ArrayEnvironment, Environment};
+use blockflow::env::ArrayEnvironment;
 use blockflow::fragment::PhaseWork;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
@@ -79,6 +79,7 @@ use blockflow::voxels::Voxels;
 
 mod support;
 
+use support::fragments::sidecars;
 use support::volume::point_mask_bool;
 
 const VOLUME: [usize; 3] = [12, 12, 8];
@@ -222,17 +223,8 @@ fn run(mask: &Array3<bool>, block: [usize; 3]) -> (ArrayEnvironment, Decompositi
 /// what the coverage guard exists to catch and this says so a second time where
 /// the bytes are read.
 fn blobs(env: &ArrayEnvironment, plan: &Decomposition) -> Vec<([usize; 3], Vec<u8>)> {
-    plan.phases[0]
-        .grid
-        .cores()
+    sidecars(env, STREAM, 0, &plan.phases[0].grid)
         .into_iter()
-        .map(|core| {
-            let bytes = env
-                .read_sidecar(STREAM, 0, core.index)
-                .expect("the store answers")
-                .unwrap_or_else(|| panic!("block {:?} wrote no blob", core.index));
-            (core.index, bytes)
-        })
         .collect()
 }
 

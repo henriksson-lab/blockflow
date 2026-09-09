@@ -199,7 +199,6 @@ fn charged(images_read: usize, chain_buffers: usize) -> f64 {
         false,
         8.0,
         &CostModel::default(),
-        1.0,
         PhaseTraffic {
             images_read,
             writes_an_image: true,
@@ -580,7 +579,6 @@ fn what_a_corrected_figure_would_cost_in_affordable_plans() {
             false,
             8.0,
             &CostModel::default(),
-            1.0,
             PhaseTraffic::one_in_one_out(),
         );
         Some(cost.working_set_bytes_per_block * CONCURRENCY as f64)
@@ -1137,7 +1135,6 @@ fn a_margin_never_moves_the_admitted_block_by_more_than_eight_times_in_volume() 
                 false,
                 8.0,
                 &CostModel::default(),
-                1.0,
                 PhaseTraffic::one_in_one_out(),
             )
             .working_set_bytes_per_block,
@@ -1638,7 +1635,6 @@ fn print_what_an_honest_figure_admits_for_a_ninety_one_arm_stack() {
                     false,
                     8.0,
                     &CostModel::default(),
-                    1.0,
                     PhaseTraffic::one_in_one_out(),
                 );
                 // `working_set_bytes_per_block` is the `x 2.0` form, so the
@@ -1686,7 +1682,6 @@ fn print_what_an_honest_figure_admits_for_a_ninety_one_arm_stack() {
         false,
         8.0,
         &CostModel::default(),
-        1.0,
         PhaseTraffic::one_in_one_out(),
     );
     let honest = cost.working_set_bytes_per_block * buffers / charged;

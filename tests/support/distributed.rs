@@ -7,6 +7,7 @@ use blockflow::distributed::shared_volume::SharedVolumes;
 use blockflow::distributed::spec::JobSpec;
 use serde_json::Value;
 
+use super::scratch::ScratchDir;
 pub use super::volume::flat_ramp_f64 as ramp;
 
 pub fn binaries() -> Binaries {
@@ -17,11 +18,9 @@ pub fn binaries() -> Binaries {
 }
 
 pub fn scratch(prefix: &str, name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("blockflow-{prefix}-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+    let dir = ScratchDir::new(prefix, name);
+    std::fs::create_dir_all(dir.path()).expect("a scratch directory");
+    dir.keep()
 }
 
 pub fn local_options(dir: &Path, workers: usize) -> LocalOptions {

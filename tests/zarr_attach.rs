@@ -24,13 +24,11 @@
 #![cfg(feature = "zarr")]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+use blockflow::decomposition::Decomposition;
 use blockflow::env::{ArrayEnvironment, Environment};
-use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::ops::rank::RankFilterOp;
 use blockflow::ops::{ElementShape, StructuringElement};
@@ -40,33 +38,16 @@ use blockflow::voxels::Voxels;
 use blockflow::zarr_env::ZarrEnvironment;
 use blockflow::{AttachedImage, Dtype, Region};
 
+mod support;
+use support::scratch::ScratchDir;
+use support::single_phase;
+
 const VOLUME: [usize; 3] = [16, 20, 24];
 
 // ------------------------------------------------------------- fixtures --
 
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(name: &str) -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let unique = NEXT.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "blockflow-zarr-attach-{}-{name}-{unique}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        Self(path)
-    }
-
-    fn path(&self) -> &PathBuf {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+fn scratch(name: &str) -> ScratchDir {
+    ScratchDir::new("zarr-attach", name)
 }
 
 fn intensities(shape: [usize; 3]) -> Voxels {
@@ -99,17 +80,7 @@ fn median_workflow(volume: [usize; 3]) -> Workflow {
 }
 
 fn plan(workflow: &Workflow, volume: [usize; 3], block: usize) -> Decomposition {
-    let reach = workflow.chain.reach3(&volume);
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(volume, &[0, 1, 2], block).unwrap();
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
-    Decomposition {
-        volume,
-        dtype: workflow.dtype,
-        phases: vec![phase],
-        chain_reach: reach,
-    }
+    single_phase::plan(workflow, volume, block, &[0, 1, 2])
 }
 
 /// The message of a refusal.
@@ -168,10 +139,10 @@ fn a_chain_over_an_attached_array_answers_what_the_same_chain_answers_in_memory(
     .unwrap();
     let expected = memory.output();
 
-    let source = Scratch::new("source");
+    let source = scratch("source");
     let array = stored(source.path(), &input, [5, 5, 5]);
 
-    let work = Scratch::new("work");
+    let work = scratch("work");
     let env = ZarrEnvironment::attach(work.path(), &[AttachedImage::at(&array)]).unwrap();
     execute(
         "attached",
@@ -190,10 +161,10 @@ fn a_chain_over_an_attached_array_answers_what_the_same_chain_answers_in_memory(
 #[test]
 fn an_attached_array_describes_itself() {
     let input = intensities(VOLUME);
-    let source = Scratch::new("describes");
+    let source = scratch("describes");
     let array = stored(source.path(), &input, [4, 5, 6]);
 
-    let work = Scratch::new("describes-work");
+    let work = scratch("describes-work");
     let env = ZarrEnvironment::attach(work.path(), &[AttachedImage::at(&array)]).unwrap();
 
     assert_eq!(env.volume(), VOLUME);
@@ -211,11 +182,11 @@ fn an_attached_array_describes_itself() {
 fn a_window_of_one_plane_reads_that_plane_and_no_other() {
     let stack = [4, 20, 24];
     let input = intensities(stack);
-    let source = Scratch::new("plane");
+    let source = scratch("plane");
     let array = stored(source.path(), &input, [1, 5, 6]);
 
     for channel in 0..stack[0] {
-        let work = Scratch::new("plane-work");
+        let work = scratch("plane-work");
         let env = ZarrEnvironment::attach(
             work.path(),
             &[AttachedImage::at(&array).plane(channel, [stack[1], stack[2]])],
@@ -250,12 +221,12 @@ fn a_window_of_one_plane_reads_that_plane_and_no_other() {
 fn a_window_moves_every_read_and_not_only_the_whole_one() {
     let volume = [8, 20, 24];
     let input = intensities(volume);
-    let source = Scratch::new("region");
+    let source = scratch("region");
     let array = stored(source.path(), &input, [4, 5, 6]);
 
     let start = [3, 7, 9];
     let shape = [2, 6, 5];
-    let work = Scratch::new("region-work");
+    let work = scratch("region-work");
     let env = ZarrEnvironment::attach(
         work.path(),
         &[AttachedImage::at(&array).window(start, shape)],
@@ -327,9 +298,9 @@ fn a_run_over_a_window_is_a_run_over_that_sub_box() {
     )
     .unwrap();
 
-    let source = Scratch::new("window-run");
+    let source = scratch("window-run");
     let array = stored(source.path(), &input, [4, 5, 6]);
-    let work = Scratch::new("window-run-work");
+    let work = scratch("window-run-work");
     let env = ZarrEnvironment::attach(
         work.path(),
         &[AttachedImage::at(&array).window(start, shape)],
@@ -358,15 +329,15 @@ fn a_run_over_a_window_is_a_run_over_that_sub_box() {
 /// the environment is built, naming both extents.
 #[test]
 fn a_supplied_input_of_a_different_extent_is_refused_by_name() {
-    let source = Scratch::new("extent");
-    let first = Scratch::new("extent-a");
-    let second = Scratch::new("extent-b");
+    let source = scratch("extent");
+    let first = scratch("extent-a");
+    let second = scratch("extent-b");
     let _ = &source;
 
     let image0 = stored(first.path(), &intensities(VOLUME), [4, 4, 4]);
     let other = stored(second.path(), &intensities([8, 20, 24]), [4, 4, 4]);
 
-    let work = Scratch::new("extent-work");
+    let work = scratch("extent-work");
     let error = refusal(ZarrEnvironment::attach(
         work.path(),
         &[AttachedImage::at(&image0), AttachedImage::at(&other)],
@@ -380,9 +351,9 @@ fn a_supplied_input_of_a_different_extent_is_refused_by_name() {
 /// rather than at the first read that falls outside.
 #[test]
 fn a_window_that_does_not_fit_is_refused() {
-    let source = Scratch::new("fit");
+    let source = scratch("fit");
     let array = stored(source.path(), &intensities(VOLUME), [4, 4, 4]);
-    let work = Scratch::new("fit-work");
+    let work = scratch("fit-work");
 
     let error = refusal(ZarrEnvironment::attach(
         work.path(),
@@ -401,7 +372,7 @@ fn a_window_that_does_not_fit_is_refused() {
 /// environment with nothing to read.
 #[test]
 fn attaching_nothing_is_refused() {
-    let work = Scratch::new("nothing");
+    let work = scratch("nothing");
     let error = refusal(ZarrEnvironment::attach(work.path(), &[]));
     assert!(error.contains("no images"), "got: {error}");
 }

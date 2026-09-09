@@ -74,6 +74,9 @@ use blockflow::strategy::{execute_phases, Hints};
 use blockflow::table::{Column, ColumnType, RowBuilder, Schema, Table, Value};
 use blockflow::voxels::Voxels;
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [8, 4, 4];
 const ROWS: &str = "rows.in";
 const PARTIALS: &str = "rows.partials";
@@ -446,10 +449,7 @@ fn a_partial_round_trips_and_a_truncated_one_is_refused() {
     assert_eq!(round, folded);
 
     let short = &bytes[..bytes.len() - 8];
-    let message = decode_groups(&grouping, short)
-        .expect_err("a truncated partial is refused")
-        .to_string();
-    assert!(message.contains("whole number of"), "{message}");
+    refuses!(decode_groups(&grouping, short), "whole number of");
 }
 
 // ------------------------------------------------------------- refusals --
@@ -471,12 +471,11 @@ fn two_partials_claiming_one_least_row_are_refused_by_name() {
     let rows = fixture();
     let merge = merge_op(&grouping, [1, 1, 1]);
     let one = partial(&grouping, &rows[0..4]);
-    let message = merge
-        .fold([one.as_slice(), one.as_slice()])
-        .expect_err("the same partial twice is refused")
-        .to_string();
-    assert!(message.contains("least row"), "{message}");
-    assert!(message.contains("disjoint"), "{message}");
+    refuses!(
+        merge.fold([one.as_slice(), one.as_slice()]),
+        "least row",
+        "disjoint",
+    );
 
     // And the control: two partials of *different* rows fold, because their
     // least rows differ. The refusal is about duplication and not about folding.
@@ -541,11 +540,7 @@ fn a_total_past_the_column_is_refused_rather_than_wrapped() {
     let (key, fold) = folded.iter().next().expect("one group");
     assert_eq!(fold.columns[0].total, 1i128 << 63, "the exact total");
 
-    let message = grouping
-        .finish(key, fold)
-        .expect_err("the total does not fit the column")
-        .to_string();
-    assert!(message.contains("range"), "{message}");
+    refuses!(grouping.finish(key, fold), "range");
 
     // What the refusal is instead of. `as i64` on `2^63` wraps to `-2^63`, which
     // `value_of` reads back as `-2.0` — a plausible number, of the wrong sign,
@@ -568,50 +563,70 @@ fn a_total_past_the_column_is_refused_rather_than_wrapped() {
 #[test]
 fn a_grouping_refuses_what_would_make_the_output_meaningless() {
     let fixed = FixedPoint::default();
-    let refusal = |key: Vec<usize>, reductions: Vec<Reduction>| {
-        Grouping::new(schema(), key, reductions, fixed)
-            .expect_err("this grouping must be refused")
-            .to_string()
-    };
+    refuses!(
+        Grouping::new(schema(), vec![], vec![], fixed),
+        "no key columns"
+    );
 
-    let empty = refusal(vec![], vec![]);
-    assert!(empty.contains("no key columns"), "{empty}");
+    refuses!(
+        Grouping::new(schema(), vec![SCORE], vec![], fixed),
+        "holds floats",
+    );
 
-    let float_key = refusal(vec![SCORE], vec![]);
-    assert!(float_key.contains("holds floats"), "{float_key}");
+    refuses!(
+        Grouping::new(schema(), vec![KEY, KEY], vec![], fixed),
+        "twice in the key",
+    );
 
-    let repeated = refusal(vec![KEY, KEY], vec![]);
-    assert!(repeated.contains("twice in the key"), "{repeated}");
+    refuses!(
+        Grouping::new(schema(), vec![9], vec![], fixed),
+        "the rows have",
+    );
 
-    let missing = refusal(vec![9], vec![]);
-    assert!(missing.contains("the rows have"), "{missing}");
-
-    let self_reduced = refusal(vec![KEY], vec![Reduction::new(KEY, Aggregate::FirstRow)]);
-    assert!(self_reduced.contains("the key back"), "{self_reduced}");
+    refuses!(
+        Grouping::new(
+            schema(),
+            vec![KEY],
+            vec![Reduction::new(KEY, Aggregate::FirstRow)],
+            fixed,
+        ),
+        "the key back",
+    );
 
     // A count with no mask is `rows` under another name.
-    let bare_count = refusal(vec![KEY], vec![Reduction::new(SCORE, Aggregate::Count)]);
-    assert!(bare_count.contains(GROUP_ROWS), "{bare_count}");
+    refuses!(
+        Grouping::new(
+            schema(),
+            vec![KEY],
+            vec![Reduction::new(SCORE, Aggregate::Count)],
+            fixed,
+        ),
+        GROUP_ROWS,
+    );
 
     // A mask that is not a `U64` column.
-    let float_mask = refusal(
-        vec![KEY],
-        vec![Reduction::masked(SCORE, Aggregate::Count, MARK)],
+    refuses!(
+        Grouping::new(
+            schema(),
+            vec![KEY],
+            vec![Reduction::masked(SCORE, Aggregate::Count, MARK)],
+            fixed,
+        ),
+        "presence mask",
     );
-    assert!(float_mask.contains("presence mask"), "{float_mask}");
 
     // The three statistics over a column of names.
     let names = Schema::new(vec![Column::u64("key"), Column::u64("name")]).expect("two names");
     for aggregate in [Aggregate::Sum, Aggregate::Min, Aggregate::Max] {
-        let message = Grouping::new(
-            names.clone(),
-            vec![0],
-            vec![Reduction::new(1, aggregate)],
-            fixed,
-        )
-        .expect_err("a name column admits no order statistic and no total")
-        .to_string();
-        assert!(message.contains("category error"), "{message}");
+        refuses!(
+            Grouping::new(
+                names.clone(),
+                vec![0],
+                vec![Reduction::new(1, aggregate)],
+                fixed,
+            ),
+            "category error",
+        );
     }
     // And the three that are defined over it are accepted, with a `First`'s
     // output column keeping the input's type.
@@ -645,10 +660,7 @@ fn a_grouping_refuses_what_would_make_the_output_meaningless() {
     // A key column named after the group size collides with it, and says so
     // rather than producing a schema with two columns of one name.
     let clashing = Schema::new(vec![Column::u64(GROUP_ROWS), Column::f64("v")]).expect("two names");
-    let message = Grouping::new(clashing, vec![0], vec![], fixed)
-        .expect_err("the name is taken")
-        .to_string();
-    assert!(message.contains(GROUP_ROWS), "{message}");
+    refuses!(Grouping::new(clashing, vec![0], vec![], fixed), GROUP_ROWS);
 }
 
 /// A coordinate the packed position cannot hold is refused rather than
@@ -662,11 +674,11 @@ fn a_coordinate_past_the_packed_position_is_refused() {
         .expect("the fold runs");
     let (_, fold) = folded.iter_mut().next().expect("a group");
     fold.columns[0].first_present = Some(([MAX_PACKED_COORDINATE + 1, 0, 0], 0));
-    let message = encode_groups(&grouping, &folded)
-        .expect_err("the coordinate does not fit")
-        .to_string();
-    assert!(message.contains("packed position"), "{message}");
-    assert!(message.contains("silently"), "{message}");
+    refuses!(
+        encode_groups(&grouping, &folded),
+        "packed position",
+        "silently",
+    );
 }
 
 /// The op refuses a stream whose schema is not the one it was built to reduce,
@@ -678,11 +690,10 @@ fn the_op_refuses_a_stream_of_the_wrong_schema() {
     let other = Schema::new(vec![Column::u64("key"), Column::f64("elsewhere")]).expect("two names");
     let streams = RowStreams::new(ROWS, 0, PARTIALS, Lifecycle::DeleteOnExit, other)
         .expect("two distinct streams");
-    let message = match GroupRowsOp::new("group", streams, grouping) {
-        Err(error) => error.to_string(),
-        Ok(_) => panic!("a grouping whose input schema is not the stream's must be refused"),
-    };
-    assert!(message.contains("decodes perfectly"), "{message}");
+    refuses!(
+        GroupRowsOp::new("group", streams, grouping),
+        "decodes perfectly",
+    );
 }
 
 // ------------------------------------------------------------- the plan --
@@ -792,21 +803,17 @@ fn the_phases_can_be_appended_to_an_existing_plan() {
     assert_eq!(rows_phase, 2);
 
     // The merge reads and writes different streams, and says so if asked not to.
-    let message = match MergeGroupsOp::new(
-        "merge",
-        PARTIALS,
-        1,
-        grid.blocks_per_axis(),
-        grouping_again(),
-        PARTIALS,
-        Lifecycle::Persistent,
-    ) {
-        Err(error) => error.to_string(),
-        Ok(_) => panic!("one stream cannot be both the merge's input and its output"),
-    };
-    assert!(
-        message.contains("not even the same wire format"),
-        "{message}"
+    refuses!(
+        MergeGroupsOp::new(
+            "merge",
+            PARTIALS,
+            1,
+            grid.blocks_per_axis(),
+            grouping_again(),
+            PARTIALS,
+            Lifecycle::Persistent,
+        ),
+        "not even the same wire format",
     );
 }
 

@@ -823,6 +823,104 @@ pub struct PerPhase<'a> {
     pub constant_fraction: &'a [f64],
 }
 
+/// A configured simulator run.
+///
+/// This is a named-argument layer over [`simulate`]. The free function remains
+/// the implementation; this type exists so callers can state only the machine,
+/// rates, residency and per-phase measurements they mean to vary.
+#[derive(Clone)]
+pub struct Run<'a, 'work> {
+    decomposition: &'a Decomposition,
+    work: &'a [PhaseWork<'work>],
+    machine: Machine,
+    rates: Rates,
+    released: BTreeSet<ImageId>,
+    kept: BTreeSet<ImageId>,
+    per_phase: PerPhase<'a>,
+}
+
+impl<'a, 'work> Run<'a, 'work> {
+    pub fn new(decomposition: &'a Decomposition, work: &'a [PhaseWork<'work>]) -> Self {
+        Self {
+            decomposition,
+            work,
+            machine: Machine::default(),
+            rates: Rates::default(),
+            released: BTreeSet::new(),
+            kept: BTreeSet::new(),
+            per_phase: PerPhase::default(),
+        }
+    }
+
+    pub fn machine(mut self, machine: Machine) -> Self {
+        self.machine = machine;
+        self
+    }
+
+    pub fn workers(mut self, workers: usize) -> Self {
+        self.machine.workers = workers;
+        self
+    }
+
+    pub fn rates(mut self, rates: Rates) -> Self {
+        self.rates = rates;
+        self
+    }
+
+    pub fn release_images(mut self, images: impl IntoIterator<Item = ImageId>) -> Self {
+        self.released = images.into_iter().collect();
+        self
+    }
+
+    pub fn keep_images(mut self, images: impl IntoIterator<Item = ImageId>) -> Self {
+        self.kept = images.into_iter().collect();
+        self
+    }
+
+    pub fn images(
+        mut self,
+        released: impl IntoIterator<Item = ImageId>,
+        kept: impl IntoIterator<Item = ImageId>,
+    ) -> Self {
+        self.released = released.into_iter().collect();
+        self.kept = kept.into_iter().collect();
+        self
+    }
+
+    pub fn ns_per_voxel(mut self, rates: &'a [f64]) -> Self {
+        self.per_phase.ns_per_voxel = rates;
+        self
+    }
+
+    pub fn substages(mut self, substages: &'a [usize]) -> Self {
+        self.per_phase.substages = substages;
+        self
+    }
+
+    pub fn constant_fraction(mut self, fractions: &'a [f64]) -> Self {
+        self.per_phase.constant_fraction = fractions;
+        self
+    }
+
+    pub fn per_phase(mut self, per_phase: PerPhase<'a>) -> Self {
+        self.per_phase = per_phase;
+        self
+    }
+
+    pub fn go(self, scheduler: &mut dyn Scheduler) -> Result<Outcome> {
+        simulate(
+            self.decomposition,
+            self.work,
+            &self.machine,
+            &self.rates,
+            &self.released,
+            &self.kept,
+            self.per_phase,
+            scheduler,
+        )
+    }
+}
+
 /// Owned per-phase simulator inputs derived from a real run.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MeasuredPerPhase {

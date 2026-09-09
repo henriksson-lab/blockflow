@@ -29,14 +29,12 @@
 // speed-up curve. Adding computers here makes a run finish sooner for the same
 // reason it makes it fetch more, and only the second is a finding.
 
-use std::collections::BTreeSet;
-
 use blockflow::assemble::{Assembly, PlanBuilder};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::probes::IdentityOp;
 use blockflow::simulate::{
-    simulate, ExecutorOrder, Machine, Outcome, PerPhase, Rates, Scheduler, MEASURED_CONTENTION,
+    ExecutorOrder, Machine, Outcome, Rates, Run, Scheduler, MEASURED_CONTENTION,
 };
 use blockflow::Dtype;
 
@@ -70,17 +68,11 @@ fn rates() -> Rates {
 }
 
 fn run(assembly: &Assembly, machine: Machine, scheduler: &mut dyn Scheduler) -> Outcome {
-    simulate(
-        &assembly.decomposition,
-        &assembly.work(),
-        &machine,
-        &rates(),
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        PerPhase::default(),
-        scheduler,
-    )
-    .expect("a simulable plan")
+    Run::new(&assembly.decomposition, &assembly.work())
+        .machine(machine)
+        .rates(rates())
+        .go(scheduler)
+        .expect("a simulable plan")
 }
 
 /// A plan whose neighbouring blocks genuinely **share chunks**, on a volume no

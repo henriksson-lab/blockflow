@@ -61,6 +61,10 @@ use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::compare::identical as assert_identical;
+use support::volume::standard_grid_sweep;
+
 /// Wide enough that a median is not a tie and narrow enough that a window of a
 /// few hundred voxels holds repeats: both halves of a histogram's behaviour.
 const DOMAIN: usize = 4096;
@@ -231,26 +235,6 @@ fn sliding(
         "sliding under test",
     )?;
     Ok(out)
-}
-
-/// Bit-for-bit, naming the first voxel that differs.
-///
-/// `to_le_bytes` rather than `==` so that what is asserted is the *stored bit
-/// pattern* and not some notion of numeric equality that could differ from it.
-/// For `u16` the two coincide; writing it this way is what keeps the claim true
-/// if this file is ever pointed at a type where they do not.
-#[track_caller]
-fn assert_identical(got: &Array3<u16>, want: &Array3<u16>, what: &str) {
-    assert_eq!(got.dim(), want.dim(), "{what}: shape");
-    for ((i, j, k), value) in got.indexed_iter() {
-        let expected = want[[i, j, k]];
-        assert_eq!(
-            value.to_le_bytes(),
-            expected.to_le_bytes(),
-            "{what}: at [{i}, {j}, {k}] the sliding window gave {value} where the dense gather \
-             gave {expected}"
-        );
-    }
 }
 
 /// A sweep that agreed because every answer was the same number asserts nothing.
@@ -671,15 +655,7 @@ fn plan(chain: &Chain, grid: &BlockGrid) -> Decomposition {
 /// all three — so a scan line is cut on the axis the window slides along
 /// whichever axis that turns out to be.
 fn grids() -> Vec<BlockGrid> {
-    vec![
-        BlockGrid::new(VOLUME, VOLUME).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 8).unwrap(),
-        BlockGrid::along(VOLUME, &[1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[2], 5).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1, 2], 4).unwrap(),
-    ]
+    standard_grid_sweep(VOLUME)
 }
 
 fn run(grid: &BlockGrid, centre: ExcludedCentre<f64>) -> Array3<u16> {

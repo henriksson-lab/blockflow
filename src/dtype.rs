@@ -35,6 +35,45 @@ pub enum Dtype {
 }
 
 impl Dtype {
+    pub const ALL: [Self; 12] = [
+        Self::Bool,
+        Self::U8,
+        Self::U16,
+        Self::U32,
+        Self::U64,
+        Self::I8,
+        Self::I16,
+        Self::I32,
+        Self::I64,
+        Self::F16,
+        Self::F32,
+        Self::F64,
+    ];
+
+    pub const VOXEL_TYPES: [Self; 11] = [
+        Self::Bool,
+        Self::U8,
+        Self::U16,
+        Self::U32,
+        Self::U64,
+        Self::I8,
+        Self::I16,
+        Self::I32,
+        Self::I64,
+        Self::F32,
+        Self::F64,
+    ];
+
+    /// Every dtype in the canonical order used by storage dispatch tables.
+    pub fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
+    /// Every dtype that has a concrete [`crate::voxels::Voxels`] variant.
+    pub fn voxel_types() -> &'static [Self] {
+        &Self::VOXEL_TYPES
+    }
+
     /// Bytes one element occupies **in memory**, decoded.
     ///
     /// Not what it occupies on disk: a compressed `bool` volume measures ~19.7x
@@ -91,26 +130,72 @@ impl Dtype {
     }
 }
 
+/// Dispatch from a runtime [`Dtype`] tag to the Rust element type that stores it.
+///
+/// This macro is for boundary code that receives erased storage and then calls
+/// monomorphised implementations. It binds `$element` as a type alias in each
+/// arm, and lets the caller spell the `F16` case because this crate treats
+/// `Dtype::F16` as a storage tag rather than a `Voxels` element.
+#[macro_export]
+macro_rules! dtype_dispatch {
+    ($dtype:expr, |$element:ident| $body:expr, f16 => $f16:expr) => {{
+        match $dtype {
+            $crate::Dtype::Bool => {
+                type $element = bool;
+                $body
+            }
+            $crate::Dtype::U8 => {
+                type $element = u8;
+                $body
+            }
+            $crate::Dtype::U16 => {
+                type $element = u16;
+                $body
+            }
+            $crate::Dtype::U32 => {
+                type $element = u32;
+                $body
+            }
+            $crate::Dtype::U64 => {
+                type $element = u64;
+                $body
+            }
+            $crate::Dtype::I8 => {
+                type $element = i8;
+                $body
+            }
+            $crate::Dtype::I16 => {
+                type $element = i16;
+                $body
+            }
+            $crate::Dtype::I32 => {
+                type $element = i32;
+                $body
+            }
+            $crate::Dtype::I64 => {
+                type $element = i64;
+                $body
+            }
+            $crate::Dtype::F16 => $f16,
+            $crate::Dtype::F32 => {
+                type $element = f32;
+                $body
+            }
+            $crate::Dtype::F64 => {
+                type $element = f64;
+                $body
+            }
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn every_name_reads_back_as_the_variant_that_wrote_it() {
-        for dtype in [
-            Dtype::Bool,
-            Dtype::U8,
-            Dtype::U16,
-            Dtype::U32,
-            Dtype::U64,
-            Dtype::I8,
-            Dtype::I16,
-            Dtype::I32,
-            Dtype::I64,
-            Dtype::F16,
-            Dtype::F32,
-            Dtype::F64,
-        ] {
+        for &dtype in Dtype::all() {
             assert_eq!(Dtype::from_numpy_name(dtype.numpy_name()), Some(dtype));
         }
         // **The absence is deliberate and argued, not pending.** A complex
@@ -128,21 +213,7 @@ mod tests {
 
     #[test]
     fn every_variant_has_a_width_and_a_name() {
-        let all = [
-            Dtype::Bool,
-            Dtype::U8,
-            Dtype::U16,
-            Dtype::U32,
-            Dtype::U64,
-            Dtype::I8,
-            Dtype::I16,
-            Dtype::I32,
-            Dtype::I64,
-            Dtype::F16,
-            Dtype::F32,
-            Dtype::F64,
-        ];
-        for dtype in all {
+        for &dtype in Dtype::all() {
             assert!(matches!(dtype.size_of(), 1 | 2 | 4 | 8));
             assert!(!dtype.numpy_name().is_empty());
         }

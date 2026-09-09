@@ -1264,19 +1264,7 @@ mod tests {
 
     #[test]
     fn the_tag_and_the_width_agree_for_every_variant() {
-        for dtype in [
-            Dtype::Bool,
-            Dtype::U8,
-            Dtype::U16,
-            Dtype::U32,
-            Dtype::U64,
-            Dtype::I8,
-            Dtype::I16,
-            Dtype::I32,
-            Dtype::I64,
-            Dtype::F32,
-            Dtype::F64,
-        ] {
+        for &dtype in Dtype::voxel_types() {
             let block = Voxels::zeros(dtype, [2, 3, 4]).unwrap();
             assert_eq!(block.dtype(), dtype);
             assert_eq!(block.shape(), [2, 3, 4]);

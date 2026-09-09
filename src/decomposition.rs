@@ -561,6 +561,26 @@ pub struct Decomposition {
 }
 
 impl Decomposition {
+    /// A strategy's finished binding plan, with the derived declarations and
+    /// the decomposition guard applied in one place.
+    pub fn finish(
+        chain: &Chain,
+        volume: [usize; 3],
+        dtype: Dtype,
+        phases: Vec<PhaseDecomposition>,
+    ) -> Result<Self> {
+        let mut decomposition = Self {
+            volume,
+            dtype,
+            phases,
+            chain_reach: chain.reach3(&volume),
+        };
+        decomposition.declare_dtypes(chain)?;
+        decomposition.declare_source_images(chain)?;
+        decomposition.check()?;
+        Ok(decomposition)
+    }
+
     /// Slot indices in execution order, phase by phase. This must equal
     /// `(0..n_slots)` — a decomposition may partition the chain but never
     /// reorder or drop an op.
@@ -3160,7 +3180,6 @@ pub fn price_phase(
     is_materialised: bool,
     bytes_per_voxel: f64,
     model: &CostModel,
-    materialise_cost_per_voxel: f64,
     traffic: PhaseTraffic,
 ) -> PhaseCost {
     // The **average** core, not the widest. Every block is still charged the
@@ -3237,13 +3256,7 @@ pub fn price_phase(
     } else {
         0.0
     };
-    let write = if !traffic.writes_an_image {
-        0.0
-    } else if is_materialised {
-        materialise_cost_per_voxel
-    } else {
-        model.write_cost_per_voxel
-    };
+    let write = write_charge(model, traffic, is_materialised);
     PhaseCost {
         redundancy,
         read_voxels_per_block: read_voxels,
@@ -3297,6 +3310,22 @@ pub fn price_phase(
                 + compute_voxels * model.compute_scale * compute_per_voxel)
             + core_voxels * write
             + conflict,
+    }
+}
+
+/// The per-voxel write charge a phase applies to its image output.
+///
+/// This is shared with the makespan roofline so the channel bound counts the
+/// same bytes that [`price_phase`] charged. A phase that writes no image has no
+/// write-side channel term.
+#[inline]
+pub fn write_charge(model: &CostModel, traffic: PhaseTraffic, is_materialised: bool) -> f64 {
+    if !traffic.writes_an_image {
+        0.0
+    } else if is_materialised {
+        model.materialise_cost_per_voxel
+    } else {
+        model.write_cost_per_voxel
     }
 }
 
@@ -3368,7 +3397,6 @@ pub fn predicted_cost(
             is_materialised,
             decomposition.dtype_at(index).size_of() as f64,
             model,
-            model.materialise_cost_per_voxel,
             traffic,
         );
         total += cost.cost_per_block * phase.grid.n_blocks() as f64;
@@ -3399,8 +3427,16 @@ pub fn predicted_cost(
 /// saving a source arm is supposed to *not* have: `Chain::Source` is cheaper than
 /// materialising the second array because it adds nothing to the halo, not
 /// because its traversal is free.
+pub fn images_read_by_with(
+    slots: &[&Chain],
+    group: &[usize],
+    volume_of_slot: impl FnMut(usize) -> [usize; 3],
+) -> Result<usize> {
+    Ok(DeclaredSourceSet::from_slots(slots, group, volume_of_slot)?.images_read_count(true))
+}
+
 pub fn images_read_by(slots: &[&Chain], group: &[usize], volume: [usize; 3]) -> Result<usize> {
-    Ok(DeclaredSourceSet::from_slots(slots, group, |_| volume)?.images_read_count(true))
+    images_read_by_with(slots, group, |_| volume)
 }
 
 /// What one phase costs per voxel, whatever kind of work it runs.
@@ -3585,10 +3621,10 @@ pub fn compute_charge_per_voxel(
 /// conversion, would put a number in the binding half of the plan that nobody
 /// stated.
 #[allow(clippy::type_complexity)]
-pub fn summarise_slots(
+pub fn summarise_slots_with(
     slots: &[&Chain],
     group: &[usize],
-    volume: [usize; 3],
+    mut volume_of_slot: impl FnMut(usize) -> [usize; 3],
 ) -> Result<(Reach, f64, Vec<String>, Vec<[usize; 3]>)> {
     // The first slot's space is the group's; `Reach::none()` would impose the
     // default one on a group that states another, and then adding the first
@@ -3600,7 +3636,7 @@ pub fn summarise_slots(
     let mut orders: Vec<[usize; 3]> = Vec::new();
     for &slot in group {
         let chain = slots[slot];
-        let stated = chain.reach_spec(volume)?;
+        let stated = chain.reach_spec(volume_of_slot(slot))?;
         reach = Some(match reach {
             Some(so_far) => so_far.add(&stated)?,
             None => stated,
@@ -3616,6 +3652,15 @@ pub fn summarise_slots(
     Ok((reach.unwrap_or_default(), compute, names, orders))
 }
 
+#[allow(clippy::type_complexity)]
+pub fn summarise_slots(
+    slots: &[&Chain],
+    group: &[usize],
+    volume: [usize; 3],
+) -> Result<(Reach, f64, Vec<String>, Vec<[usize; 3]>)> {
+    summarise_slots_with(slots, group, |_| volume)
+}
+
 /// What a contiguous run of slots requires of the blocks it is handed.
 ///
 /// The counterpart of [`summarise_slots`] for [`BlockConstraint`], and separate
@@ -3623,14 +3668,14 @@ pub fn summarise_slots(
 /// share a phase, and that is a fact about the partition rather than a summary
 /// of it. A planner turns the error into "this partition is infeasible" and
 /// keeps searching, which is why it is returned rather than raised.
-pub fn constraint_for(
+pub fn constraint_for_with(
     slots: &[&Chain],
     group: &[usize],
-    volume: [usize; 3],
+    mut volume_of_slot: impl FnMut(usize) -> [usize; 3],
 ) -> Result<Option<BlockConstraint>> {
     let mut found: Option<BlockConstraint> = None;
     for &slot in group {
-        let Some(constraint) = slots[slot].block_constraint(volume)? else {
+        let Some(constraint) = slots[slot].block_constraint(volume_of_slot(slot))? else {
             continue;
         };
         match &found {
@@ -3647,6 +3692,14 @@ pub fn constraint_for(
         }
     }
     Ok(found)
+}
+
+pub fn constraint_for(
+    slots: &[&Chain],
+    group: &[usize],
+    volume: [usize; 3],
+) -> Result<Option<BlockConstraint>> {
+    constraint_for_with(slots, group, |_| volume)
 }
 
 /// Every phase of `decomposition` hands its ops blocks they accept.
@@ -4748,7 +4801,6 @@ mod tests {
                 materialised,
                 8.0,
                 &model,
-                1.0,
                 PhaseTraffic::one_in_one_out(),
             )
             .cost_per_block
@@ -4842,7 +4894,6 @@ mod tests {
             false,
             8.0,
             &model,
-            1.0,
             PhaseTraffic::one_in_one_out(),
         );
         assert!(
@@ -4862,7 +4913,6 @@ mod tests {
             false,
             8.0,
             &model,
-            1.0,
             PhaseTraffic::one_in_one_out(),
         );
         assert_eq!(bounded.redundancy, 1.0);
@@ -4897,7 +4947,6 @@ mod tests {
             false,
             8.0,
             &model,
-            1.0,
             PhaseTraffic::one_in_one_out(),
         )
         .redundancy;
@@ -4912,7 +4961,6 @@ mod tests {
             false,
             8.0,
             &model,
-            1.0,
             PhaseTraffic::one_in_one_out(),
         )
         .redundancy;
@@ -4933,7 +4981,6 @@ mod tests {
             false,
             8.0,
             &model,
-            1.0,
             PhaseTraffic::one_in_one_out(),
         )
         .redundancy;
@@ -4997,7 +5044,6 @@ mod tests {
             false,
             8.0,
             &model,
-            1.0,
             PhaseTraffic::one_in_one_out(),
         );
         let whole_volume_bytes = (volume.iter().product::<usize>() * 8 * 2) as f64;

@@ -32,6 +32,9 @@ use blockflow::ops::{Family, FeatureStack, ForestPredictor, Prediction};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::{refuses, single_phase};
+
 // ------------------------------------------------------------- fixtures --
 
 fn channels(count: usize) -> Vec<String> {
@@ -161,16 +164,16 @@ fn every_child_comes_after_its_parent_and_a_forest_that_breaks_that_is_refused()
     );
 
     // A cycle: node 1 points back at node 0.
-    let err = Forest::new(
-        vec![Node::split(0, 0.5, 1, 1), Node::split(0, 0.5, 0, 0)],
-        vec![0],
-        vec![1.0, 0.0],
-        2,
-        channels(1),
-    )
-    .expect_err("a cycle must be refused")
-    .to_string();
-    assert!(err.contains("does not exceed its parent"), "{err}");
+    refuses!(
+        Forest::new(
+            vec![Node::split(0, 0.5, 1, 1), Node::split(0, 0.5, 0, 0)],
+            vec![0],
+            vec![1.0, 0.0],
+            2,
+            channels(1),
+        ),
+        "does not exceed its parent",
+    );
 }
 
 /// Each refusal is of something that would otherwise be an infinite loop, an
@@ -517,11 +520,10 @@ fn a_forest_is_refused_against_a_stack_it_was_not_trained_on() {
     // The same names in a different order does not, and says where.
     let mut swapped = names.clone();
     swapped.swap(0, 1);
-    let err = match blockflow::ops::predict_workflow(&stack, train(swapped), Prediction::Label) {
-        Ok(_) => panic!("a reordered stack must be refused"),
-        Err(err) => err.to_string(),
-    };
-    assert!(err.contains("first differing at 0"), "{err}");
+    refuses!(
+        blockflow::ops::predict_workflow(&stack, train(swapped), Prediction::Label),
+        "first differing at 0",
+    );
 
     // And so does one of the wrong width.
     let mut shorter = names;
@@ -913,9 +915,7 @@ fn the_fit_agrees_with_smartcore_on_held_out_accuracy() {
 /// the only tolerance there is.
 #[test]
 fn the_predict_workflow_gives_the_same_labels_under_every_decomposition() {
-    use blockflow::decomposition::{Decomposition, PhaseDecomposition};
     use blockflow::env::ArrayEnvironment;
-    use blockflow::geometry::BlockGrid;
     use blockflow::strategy::{execute, Hints, Workflow};
 
     let volume = [28usize, 24, 20];
@@ -982,24 +982,20 @@ fn the_predict_workflow_gives_the_same_labels_under_every_decomposition() {
         for split_axes in [&[0usize][..], &[2][..], &[0, 1][..], &[0, 1, 2][..]] {
             let workflow = Workflow::new(build(), volume, Dtype::F64);
             let reach = workflow.chain.reach3(&volume);
-            let slots = workflow.chain.slots();
-            let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-            let grid = BlockGrid::along(volume, split_axes, block).unwrap();
-            let mut phase =
-                PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
             // **The phase changes the element type and has to say so.** The
             // stack reads `f64` and the predictor writes `u32` labels, so the
             // image this phase allocates is a quarter the width of the one it
             // reads. A plan that left this unset is refused by name — which is
             // the check earning its keep on the first chain in the crate whose
             // sink narrows.
-            phase.dtype = Some(Dtype::U32);
-            let decomposition = Decomposition {
+            let decomposition = single_phase::plan_with_reach_and_output_dtype(
+                &workflow,
                 volume,
-                dtype: workflow.dtype,
-                phases: vec![phase],
-                chain_reach: reach,
-            };
+                block,
+                split_axes,
+                reach,
+                Dtype::U32,
+            );
             decomposition.check().unwrap();
             // `for_decomposition` and not `new`: it allocates each image at the
             // element type its phase gives it, which for this chain is a `u32`

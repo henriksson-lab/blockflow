@@ -54,6 +54,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::cache::{ArrayId, ChunkCache};
+use crate::lock::MutexExt;
 use crate::region::Region;
 
 /// A read a worker knows it will make.
@@ -224,7 +225,7 @@ impl Prefetcher {
     /// Register a plan. Returns immediately; the reads happen elsewhere.
     pub fn submit(&self, plan: &dyn AccessPlan) -> PlanHandle {
         let requests = plan.requests();
-        let mut queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+        let mut queue = self.shared.queue.lock_unpoisoned();
         let handle = PlanHandle(queue.next_plan);
         queue.next_plan += 1;
         for request in requests {
@@ -255,7 +256,7 @@ impl Prefetcher {
     /// interrupting a storage read mid-flight is not something this can do, and
     /// pretending otherwise would be worse than letting one read complete.
     pub fn cancel(&self, handle: PlanHandle) {
-        let mut queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+        let mut queue = self.shared.queue.lock_unpoisoned();
         queue.cancelled.insert(handle.0);
         drop(queue);
         self.shared.work.notify_all();
@@ -282,7 +283,7 @@ impl Prefetcher {
     /// waited for the prefetcher would be exactly the coupling this component
     /// is built to avoid.
     pub fn drain(&self) {
-        let mut queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+        let mut queue = self.shared.queue.lock_unpoisoned();
         while !queue.heap.is_empty() || queue.in_flight > 0 {
             let (next, _) = self
                 .shared
@@ -295,12 +296,7 @@ impl Prefetcher {
 
     /// How many requests are queued but not yet started.
     pub fn queued(&self) -> usize {
-        self.shared
-            .queue
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .heap
-            .len()
+        self.shared.queue.lock_unpoisoned().heap.len()
     }
 
     pub fn stats(&self) -> PrefetchStats {
@@ -323,7 +319,7 @@ impl Prefetcher {
 impl Drop for Prefetcher {
     fn drop(&mut self) {
         {
-            let mut queue = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+            let mut queue = self.shared.queue.lock_unpoisoned();
             queue.shutdown = true;
             queue.heap.clear();
         }
@@ -337,7 +333,7 @@ impl Drop for Prefetcher {
 fn worker(shared: Arc<Shared>) {
     loop {
         let item = {
-            let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+            let mut queue = shared.queue.lock_unpoisoned();
             loop {
                 if queue.shutdown {
                     return;
@@ -358,7 +354,7 @@ fn worker(shared: Arc<Shared>) {
         };
 
         let cancelled = {
-            let queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+            let queue = shared.queue.lock_unpoisoned();
             queue.cancelled.contains(&item.plan)
         };
         if cancelled {
@@ -399,7 +395,7 @@ fn worker(shared: Arc<Shared>) {
             }
         }
 
-        let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
+        let mut queue = shared.queue.lock_unpoisoned();
         queue.in_flight -= 1;
         drop(queue);
         shared.quiet.notify_all();

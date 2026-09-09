@@ -887,53 +887,7 @@ pub fn read_header_file(path: &Path) -> Result<Header> {
 /// Every `Voxels` variant, by the tag a header carries.
 macro_rules! voxels_by_dtype {
     ($dtype:expr, $what:expr, |$element:ident| $body:expr) => {
-        match $dtype {
-            Dtype::Bool => {
-                type $element = bool;
-                $body
-            }
-            Dtype::U8 => {
-                type $element = u8;
-                $body
-            }
-            Dtype::U16 => {
-                type $element = u16;
-                $body
-            }
-            Dtype::U32 => {
-                type $element = u32;
-                $body
-            }
-            Dtype::U64 => {
-                type $element = u64;
-                $body
-            }
-            Dtype::I8 => {
-                type $element = i8;
-                $body
-            }
-            Dtype::I16 => {
-                type $element = i16;
-                $body
-            }
-            Dtype::I32 => {
-                type $element = i32;
-                $body
-            }
-            Dtype::I64 => {
-                type $element = i64;
-                $body
-            }
-            Dtype::F32 => {
-                type $element = f32;
-                $body
-            }
-            Dtype::F64 => {
-                type $element = f64;
-                $body
-            }
-            Dtype::F16 => return Err(refuse_float16($what)),
-        }
+        crate::dtype_dispatch!($dtype, |$element| $body, f16 => return Err(refuse_float16($what)))
     };
 }
 
@@ -1072,53 +1026,7 @@ fn refuse_float16(what: &str) -> Error {
 /// Every [`Elements`] variant, by the tag a header carries.
 macro_rules! elements_by_dtype {
     ($dtype:expr, $what:expr, |$element:ident| $body:expr) => {
-        match $dtype {
-            Dtype::Bool => {
-                type $element = bool;
-                $body
-            }
-            Dtype::U8 => {
-                type $element = u8;
-                $body
-            }
-            Dtype::U16 => {
-                type $element = u16;
-                $body
-            }
-            Dtype::U32 => {
-                type $element = u32;
-                $body
-            }
-            Dtype::U64 => {
-                type $element = u64;
-                $body
-            }
-            Dtype::I8 => {
-                type $element = i8;
-                $body
-            }
-            Dtype::I16 => {
-                type $element = i16;
-                $body
-            }
-            Dtype::I32 => {
-                type $element = i32;
-                $body
-            }
-            Dtype::I64 => {
-                type $element = i64;
-                $body
-            }
-            Dtype::F32 => {
-                type $element = f32;
-                $body
-            }
-            Dtype::F64 => {
-                type $element = f64;
-                $body
-            }
-            Dtype::F16 => return Err(refuse_float16($what)),
-        }
+        crate::dtype_dispatch!($dtype, |$element| $body, f16 => return Err(refuse_float16($what)))
     };
 }
 
@@ -2080,19 +1988,7 @@ mod tests {
     /// Every element type this crate holds survives a header round trip.
     #[test]
     fn every_element_type_names_itself_in_a_descr_and_reads_back() {
-        for dtype in [
-            Dtype::Bool,
-            Dtype::U8,
-            Dtype::U16,
-            Dtype::U32,
-            Dtype::U64,
-            Dtype::I8,
-            Dtype::I16,
-            Dtype::I32,
-            Dtype::I64,
-            Dtype::F32,
-            Dtype::F64,
-        ] {
+        for &dtype in Dtype::voxel_types() {
             let descr = descr_of(dtype, "<memory>").unwrap();
             let (back, endian) = dtype_of_descr(descr, "<memory>").unwrap();
             assert_eq!(back, dtype, "{descr}");

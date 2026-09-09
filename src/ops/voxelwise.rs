@@ -2552,15 +2552,8 @@ pub(super) const COMBINE_COST: f64 = 0.49;
 /// **alternating, in one process**: `3.66` against `3.68` ns/voxel, `1.00x`. A
 /// ratio taken that way survives a load the absolute figures do not.
 pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
-    use std::time::Instant;
-
-    let voxels = (shape[0] * shape[1] * shape[2]) as f64;
     let anchor = Anchor::whole(shape);
-    let mut input = ndarray::Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
-    for (flat, value) in input.iter_mut().enumerate() {
-        *value = ((flat * 7919) % 1013) as f64;
-    }
-    let input: Voxels = input.into();
+    let input = super::cost::ramp(shape);
 
     // Four thresholds, so the composed row is far enough from one map to say
     // something: whether the derived cost — the sum of the parts — is the model.
@@ -2636,25 +2629,11 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
 
     let mut rows = Vec::new();
     for (name, op) in cases {
-        let mut out = Voxels::zeros(op.produces(input.dtype()), op.output_shape(shape)).unwrap();
-        // One untimed pass: a freshly allocated output pays a page fault per
-        // page on first touch, and at a nanosecond a voxel that fault *is* the
-        // measurement.
-        op.apply(&input, &mut out, &anchor).unwrap();
-        let mut best = f64::INFINITY;
-        for _ in 0..repetitions.max(1) {
-            let started = Instant::now();
-            op.apply(&input, &mut out, &anchor).unwrap();
-            let elapsed = started.elapsed().as_secs_f64() * 1e9;
-            // One voxel, in whatever the op wrote — `Bool` now that a row
-            // produces one — so that the optimiser cannot drop the call.
-            std::hint::black_box(match out.dtype() {
-                Dtype::Bool => from_set(out.view::<bool>().unwrap()[[0, 0, 0]]),
-                _ => out.view::<f64>().unwrap()[[0, 0, 0]],
-            });
-            best = best.min(elapsed / voxels);
-        }
-        rows.push((name, best, op.cost_per_voxel()));
+        rows.push((
+            name,
+            super::cost::measure_block_op(&*op, &input, &anchor, shape, repetitions),
+            op.cost_per_voxel(),
+        ));
     }
 
     let unit = rows.first().map(|(_, nanos, _)| *nanos).unwrap_or(1.0);
@@ -3630,20 +3609,7 @@ mod arithmetic_tests {
     /// The element-type decision, in one table.
     #[test]
     fn the_selections_admit_every_ordered_type_and_the_arithmetic_admits_the_floats() {
-        let every = [
-            Dtype::Bool,
-            Dtype::U8,
-            Dtype::U16,
-            Dtype::U32,
-            Dtype::U64,
-            Dtype::I8,
-            Dtype::I16,
-            Dtype::I32,
-            Dtype::I64,
-            Dtype::F32,
-            Dtype::F64,
-        ];
-        for dtype in every {
+        for &dtype in Dtype::voxel_types() {
             assert!(Arithmetic::Minimum.admits(dtype), "{dtype:?}");
             assert!(Arithmetic::Maximum.admits(dtype), "{dtype:?}");
         }

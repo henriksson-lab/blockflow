@@ -58,7 +58,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use crate::error::{Error, Result};
+use crate::error::{bail, ensure, Result};
 use crate::reach::Reach;
 
 /// Which voxels of the bounding box belong to the neighbourhood.
@@ -277,21 +277,20 @@ impl StructuringElement {
     pub fn from_offsets(offsets: impl IntoIterator<Item = [isize; 3]>) -> Result<Self> {
         let mut offsets: Vec<[isize; 3]> = offsets.into_iter().collect();
         if offsets.is_empty() {
-            return Err(Error::InvalidArgument(
+            bail!(
                 "a structuring element needs at least one offset; an empty element selects \
                  nothing and every op that reduces over one has no value to write"
-                    .to_string(),
-            ));
+            );
         }
         offsets.sort_unstable();
         if let Some(pair) = offsets.windows(2).find(|pair| pair[0] == pair[1]) {
-            return Err(Error::InvalidArgument(format!(
+            bail!(
                 "the offset {:?} appears more than once. A repeated offset is gathered twice, \
                  so it doubles that voxel's weight in a mean and shifts every rank — which is \
                  a change to the filter rather than to the window, and is refused rather than \
                  quietly folded away.",
                 pair[0]
-            )));
+            );
         }
         let (lo, hi) = spanned_sides(&offsets);
         Ok(Self {
@@ -376,13 +375,12 @@ impl StructuringElement {
         origin: StepOrigin,
     ) -> Result<Self> {
         for axis in 0..3 {
-            if step[axis] == 0 {
-                return Err(Error::InvalidArgument(format!(
-                    "an element's step must be non-zero on every axis; got {step:?}. A step of \
+            ensure!(
+                step[axis] != 0,
+                "an element's step must be non-zero on every axis; got {step:?}. A step of \
                      zero names no offsets at all, which is an empty window rather than a \
                      cheaper one."
-                )));
-            }
+            );
         }
         let element = Self::build(shape, lo, hi, step, origin);
         // A step can strand a shape entirely: a radius-3 ball stepped by nine
@@ -393,13 +391,12 @@ impl StructuringElement {
         // than returned, because an empty element is not a cheaper filter: it is
         // a window with nothing in it, and every consumer downstream would have
         // to invent an answer for a rank over no values.
-        if element.is_empty() {
-            return Err(Error::InvalidArgument(format!(
-                "a step of {step:?} leaves no offset inside a {:?} element of sides {lo:?}/{hi:?}; \
+        ensure!(
+            !element.is_empty(),
+            "a step of {step:?} leaves no offset inside a {:?} element of sides {lo:?}/{hi:?}; \
                  the decimation is coarser than the shape it decimates",
-                shape
-            )));
-        }
+            shape
+        );
         Ok(element)
     }
 
@@ -516,11 +513,10 @@ impl StructuringElement {
         let mut lo = [0usize; 3];
         let mut hi = [0usize; 3];
         for axis in 0..3 {
-            if size[axis] == 0 {
-                return Err(Error::InvalidArgument(format!(
-                    "an element needs a non-zero size on every axis; got {size:?}"
-                )));
-            }
+            ensure!(
+                size[axis] != 0,
+                "an element needs a non-zero size on every axis; got {size:?}"
+            );
             lo[axis] = size[axis] / 2;
             hi[axis] = size[axis] - 1 - lo[axis];
         }
@@ -691,15 +687,14 @@ impl StructuringElement {
     /// operation built out of gathers has to refuse the element instead of
     /// silently gathering a different one.
     pub fn reflected(&self) -> Result<Self> {
-        if self.origin != StepOrigin::Anchor {
-            return Err(Error::InvalidArgument(format!(
-                "this element's step counts from {:?}, so what it reads depends on where it is \
+        ensure!(
+            self.origin == StepOrigin::Anchor,
+            "this element's step counts from {:?}, so what it reads depends on where it is \
                  evaluated and it has no reflection that is itself an element. The dilation \
                  adjoint to an erosion by such an element places the element at the source \
                  voxel, which `ops::morphology::dilate_placed_into` does and a gather cannot.",
-                self.origin
-            )));
-        }
+            self.origin
+        );
         let mut offsets: Vec<[isize; 3]> = self
             .offsets
             .iter()
@@ -1073,11 +1068,10 @@ pub struct Percentile(f64);
 impl Percentile {
     /// A fraction in `[0, 1]`: `0.0` the lowest value, `1.0` the highest.
     pub fn new(fraction: f64) -> Result<Self> {
-        if !(0.0..=1.0).contains(&fraction) {
-            return Err(Error::InvalidArgument(format!(
-                "a percentile is a fraction in [0, 1], got {fraction}"
-            )));
-        }
+        ensure!(
+            (0.0..=1.0).contains(&fraction),
+            "a percentile is a fraction in [0, 1], got {fraction}"
+        );
         // `-0.0` and `+0.0` are the same fraction and different bit patterns;
         // normalising here is cheaper than a `Hash` that has to remember the
         // exception, and keeps `Hash`'s contract with `Eq`.

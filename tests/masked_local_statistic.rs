@@ -66,7 +66,10 @@ use blockflow::Dtype;
 
 mod support;
 
+use support::compare::{differs, identical};
+use support::refuses;
 use support::source_fixture::{self, SourcePhase};
+use support::volume::sample_offset_grid_sweep;
 
 /// Deliberately not a multiple of the spacing on any axis, so the lattice's
 /// unsampled margins differ from each other and from the block boundaries.
@@ -224,33 +227,6 @@ fn selection_of(
     )
     .unwrap();
     out.mapv(|value| value.0)
-}
-
-/// Equality **on the bits**. `==` would let a last-bit difference through, and a
-/// last-bit difference is still a different answer from the one the whole-volume
-/// run would have given.
-#[track_caller]
-fn identical(got: &Array3<f64>, want: &Array3<f64>, what: &str) {
-    assert_eq!(got.shape(), want.shape(), "{what}: shape");
-    let differing = got
-        .iter()
-        .zip(want.iter())
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
-    assert_eq!(
-        differing, 0,
-        "{what}: {differing} voxels differ on the bits"
-    );
-}
-
-#[track_caller]
-fn differs(got: &Array3<f64>, want: &Array3<f64>, what: &str) {
-    let differing = got
-        .iter()
-        .zip(want.iter())
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
-    assert!(differing > 0, "{what}: the two agreed everywhere");
 }
 
 // -------------------------------- 0. the fixtures are what they say --
@@ -585,16 +561,7 @@ fn plan(chain: &Chain, grid: &BlockGrid) -> Decomposition {
 /// on one axis at three different offsets relative to the samples, on two, and
 /// on all three.
 fn grids() -> Vec<BlockGrid> {
-    vec![
-        BlockGrid::new(VOLUME, VOLUME).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 5).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 8).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 9).unwrap(),
-        BlockGrid::along(VOLUME, &[1], 6).unwrap(),
-        BlockGrid::along(VOLUME, &[2], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 2], 6).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1, 2], 6).unwrap(),
-    ]
+    sample_offset_grid_sweep(VOLUME)
 }
 
 fn run(grid: &BlockGrid, population: Population) -> Array3<f64> {
@@ -834,18 +801,15 @@ fn a_population_image_that_is_not_bool_is_refused_by_name() {
     let wrong: Voxels = image().into();
     let mut out = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
     let entries = [(MASK.into(), &wrong)];
-    let failed = op
-        .apply_with(
+    refuses!(
+        op.apply_with(
             &input,
             SourceInputs::new(&entries),
             &mut out,
             &Anchor::whole(VOLUME),
-        )
-        .unwrap_err();
-    let message = failed.to_string();
-    assert!(
-        message.contains("float64") && message.contains(&MASK.to_string()),
-        "the refusal must name the image and what it holds: {message}"
+        ),
+        "float64",
+        &MASK.to_string(),
     );
 }
 

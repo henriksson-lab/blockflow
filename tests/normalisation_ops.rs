@@ -53,7 +53,7 @@ use blockflow::synthetic::SceneSpec;
 
 mod support;
 
-use support::{single_phase, volume};
+use support::{refuses, single_phase, volume};
 
 const VOLUME: [usize; 3] = [32, 24, 20];
 const SUITE: single_phase::Suite = single_phase::Suite::new("normalise", VOLUME, [4, 4, 4]);
@@ -468,22 +468,15 @@ fn a_halo_short_of_the_derived_reach_is_caught_for_every_op() {
         short[axis] = reach[axis] - 1;
         let forced = honest.with_forced_halo(short);
 
-        let err = forced
-            .check()
-            .expect_err(&format!("{name}: a short halo must not check out"))
-            .to_string();
-        assert!(
-            err.contains("do not tile the volume exactly"),
-            "{name}: expected the tiling guard, got: {err}"
+        refuses!(
+            name => forced.check(),
+            "do not tile the volume exactly"
         );
 
         let env = ArrayEnvironment::new(source.clone().into(), 1, [4, 4, 4]).unwrap();
-        let err = execute("short", &workflow, &forced, &Hints::default(), &env)
-            .expect_err(&format!("{name}: the executor must refuse a short halo"))
-            .to_string();
-        assert!(
-            err.contains("do not tile the volume exactly"),
-            "{name}: got {err}"
+        refuses!(
+            name => execute("short", &workflow, &forced, &Hints::default(), &env),
+            "do not tile the volume exactly"
         );
         provoked += 1;
     }

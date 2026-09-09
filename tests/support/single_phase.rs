@@ -128,6 +128,135 @@ pub fn plan_with_reach(
     }
 }
 
+pub fn plan_with_reach_and_output_dtype(
+    workflow: &Workflow,
+    volume: [usize; 3],
+    block: usize,
+    split_axes: &[usize],
+    reach: [usize; 3],
+    output_dtype: Dtype,
+) -> Decomposition {
+    let slots = workflow.chain.slots();
+    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
+    let grid = BlockGrid::along(volume, split_axes, block).unwrap();
+    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid)
+        .with_dtype(output_dtype);
+    Decomposition {
+        volume,
+        dtype: workflow.dtype,
+        phases: vec![phase],
+        chain_reach: reach,
+    }
+}
+
+pub fn plan_on_grid(workflow: &Workflow, volume: [usize; 3], grid: BlockGrid) -> Decomposition {
+    plan_on_grid_for_chain(&workflow.chain, volume, workflow.dtype, grid)
+}
+
+pub fn plan_on_grid_for_chain(
+    chain: &Chain,
+    volume: [usize; 3],
+    dtype: Dtype,
+    grid: BlockGrid,
+) -> Decomposition {
+    let reach = chain.reach3(&volume);
+    let slots = chain.slots();
+    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
+    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
+    Decomposition {
+        volume,
+        dtype,
+        phases: vec![phase],
+        chain_reach: reach,
+    }
+}
+
+pub fn typed_plan_on_grid(
+    workflow: &Workflow,
+    volume: [usize; 3],
+    grid: BlockGrid,
+) -> Decomposition {
+    let mut plan = plan_on_grid(workflow, volume, grid);
+    plan.declare_dtypes(&workflow.chain).expect("element types");
+    plan
+}
+
+pub fn declared_plan_on_grid(
+    workflow: &Workflow,
+    volume: [usize; 3],
+    grid: BlockGrid,
+) -> Decomposition {
+    let mut plan = typed_plan_on_grid(workflow, volume, grid);
+    plan.declare_source_images(&workflow.chain)
+        .expect("source images");
+    plan
+}
+
+pub fn declared_plan_on_grid_for_chain(
+    chain: &Chain,
+    volume: [usize; 3],
+    dtype: Dtype,
+    grid: BlockGrid,
+) -> Decomposition {
+    let mut plan = plan_on_grid_for_chain(chain, volume, dtype, grid);
+    plan.declare_dtypes(chain).expect("element types");
+    plan.declare_source_images(chain).expect("source images");
+    plan
+}
+
+pub fn one_phase_per_slot(
+    chain: &Chain,
+    volume: [usize; 3],
+    dtype: Dtype,
+    grid: &BlockGrid,
+    reach: [usize; 3],
+) -> Decomposition {
+    let slots = chain.slots();
+    let phases = slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            PhaseDecomposition::derive(
+                vec![index],
+                vec![slot.display_name()],
+                reach,
+                reach,
+                grid.clone(),
+            )
+        })
+        .collect();
+    Decomposition {
+        volume,
+        dtype,
+        phases,
+        chain_reach: reach,
+    }
+}
+
+pub fn typed_one_phase_per_slot(
+    chain: &Chain,
+    volume: [usize; 3],
+    dtype: Dtype,
+    grid: &BlockGrid,
+    reach: [usize; 3],
+) -> Decomposition {
+    let mut plan = one_phase_per_slot(chain, volume, dtype, grid, reach);
+    plan.declare_dtypes(chain).expect("element types");
+    plan
+}
+
+pub fn declared_one_phase_per_slot(
+    chain: &Chain,
+    volume: [usize; 3],
+    dtype: Dtype,
+    grid: &BlockGrid,
+    reach: [usize; 3],
+) -> Decomposition {
+    let mut plan = typed_one_phase_per_slot(chain, volume, dtype, grid, reach);
+    plan.declare_source_images(chain).expect("source images");
+    plan
+}
+
 pub fn plan_with_halo_spec(
     workflow: &Workflow,
     volume: [usize; 3],

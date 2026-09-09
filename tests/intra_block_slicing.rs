@@ -41,7 +41,7 @@
 //   is a different code path, so identity there is trivially true and proves
 //   nothing about the cut. Every other assertion is at two threads or more.
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition, SlabPolicy};
+use blockflow::decomposition::{Decomposition, SlabPolicy};
 use blockflow::dtype::Dtype;
 use blockflow::env::ArrayEnvironment;
 use blockflow::error::Result;
@@ -52,6 +52,10 @@ use blockflow::slab::{apply_sliced, SlabCut};
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use ndarray::Array3;
+
+mod support;
+use support::compare::voxels_differing as differing;
+use support::{refuses, single_phase};
 
 // ------------------------------------------------------------------- ops --
 
@@ -372,43 +376,6 @@ impl Perturbation {
     }
 }
 
-/// How many voxels of two answers differ, **by bits**, for the element types this
-/// file's bars are stated over.
-///
-/// **Per element type and refusing the rest by name**, rather than widening
-/// everything to `f64` and comparing that. `Voxels::widened` is infallible and
-/// lossy; a bar that is bit-identity cannot be built on a lossy comparison, and
-/// an integer past `2^53` would then agree with a different integer. Adding an
-/// element type here is a deliberate act, which is what the refusal is for.
-fn differing(left: &Voxels, right: &Voxels) -> usize {
-    assert_eq!(
-        left.dtype(),
-        right.dtype(),
-        "two answers of different element types are not comparable"
-    );
-    match left.dtype() {
-        Dtype::F64 => left
-            .view::<f64>()
-            .expect("f64")
-            .iter()
-            .zip(right.view::<f64>().expect("f64").iter())
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count(),
-        Dtype::Bool => left
-            .view::<bool>()
-            .expect("bool")
-            .iter()
-            .zip(right.view::<bool>().expect("bool").iter())
-            .filter(|(a, b)| a != b)
-            .count(),
-        other => panic!(
-            "this file's bars are stated over float64 and bool; {} needs an arm here rather \
-             than a widening",
-            other.numpy_name()
-        ),
-    }
-}
-
 /// Whether an answer is anything other than one value repeated.
 ///
 /// The vacuity guard: bit-identity between two constant volumes holds for a
@@ -576,12 +543,10 @@ fn an_undeclared_op_is_refused_and_the_refusal_says_so() {
     let chain = Chain::Op(Box::new(Undeclared));
     assert!(!chain.slicing().is_stencil());
     let shape = [16usize, 4, 4];
-    let error = cut(&chain, &structured(shape), &placement(shape), 4)
-        .expect_err("an undeclared op must be refused");
-    let message = format!("{error}");
-    assert!(
-        message.contains("not sliceable") && message.contains("did not declare"),
-        "the refusal must name the cause: {message}"
+    refuses!(
+        cut(&chain, &structured(shape), &placement(shape), 4),
+        "not sliceable",
+        "did not declare",
     );
 }
 
@@ -983,17 +948,7 @@ fn a_declared_sink_is_what_makes_the_fan_in_sliceable() {
 
 /// A one-phase plan over `volume`, cut into blocks of `block` along axis 0.
 fn one_phase(workflow: &Workflow, volume: [usize; 3], block: usize) -> Decomposition {
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let reach = workflow.chain.reach3(&volume);
-    let grid = BlockGrid::along(volume, &[0], block).expect("a block grid");
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
-    Decomposition {
-        volume,
-        dtype: workflow.dtype,
-        phases: vec![phase],
-        chain_reach: reach,
-    }
+    single_phase::plan(workflow, volume, block, &[0])
 }
 
 /// Run a plan under a stated worker count and slab policy, and answer what it

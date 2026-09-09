@@ -387,6 +387,44 @@ fn row_for(rows: &[RegionValues], label: u64) -> RegionValues {
         .unwrap_or_else(|| panic!("no row for label {label}"))
 }
 
+fn partial_contributors(
+    partials: &BTreeMap<[usize; 3], Vec<u8>>,
+) -> BTreeMap<u64, BTreeSet<[usize; 3]>> {
+    let mut contributors: BTreeMap<u64, BTreeSet<[usize; 3]>> = BTreeMap::new();
+    for (index, bytes) in partials {
+        for tally in decode_partial(bytes).expect("a partial") {
+            contributors.entry(tally.label).or_default().insert(*index);
+        }
+    }
+    contributors
+}
+
+fn straddling_labels(partials: &BTreeMap<[usize; 3], Vec<u8>>) -> Vec<u64> {
+    partial_contributors(partials)
+        .iter()
+        .filter(|(_, who)| who.len() > 1)
+        .map(|(label, _)| *label)
+        .collect()
+}
+
+fn partial_count_for_label(partials: &BTreeMap<[usize; 3], Vec<u8>>, label: u64) -> usize {
+    partial_contributors(partials)
+        .get(&label)
+        .map_or(0, BTreeSet::len)
+}
+
+#[track_caller]
+fn all_answers_agree(answers: &[(String, Vec<u64>)], what: &str) {
+    let (first, rest) = answers.split_first().expect("at least one answer");
+    let (first_name, first_words) = first;
+    for (name, words) in rest {
+        assert_eq!(
+            words, first_words,
+            "the {what} differs between block {first_name} and block {name}"
+        );
+    }
+}
+
 // ---------------------------------------- 1. decomposition invariance --
 
 /// The acceptance criterion, and the assertion that the fixture could have
@@ -402,17 +440,7 @@ fn a_per_region_reduction_is_byte_identical_across_block_sizes() {
 
         // Which labels were cut. Without this the byte-identity below could be
         // the identity of five runs that never merged anything.
-        let mut contributors: BTreeMap<u64, BTreeSet<[usize; 3]>> = BTreeMap::new();
-        for (index, bytes) in &run.partials {
-            for tally in decode_partial(bytes).expect("a partial") {
-                contributors.entry(tally.label).or_default().insert(*index);
-            }
-        }
-        let straddled: Vec<u64> = contributors
-            .iter()
-            .filter(|(_, who)| who.len() > 1)
-            .map(|(label, _)| *label)
-            .collect();
+        let straddled = straddling_labels(&run.partials);
         if block == [12, 4, 4] {
             assert!(
                 straddled.is_empty(),
@@ -520,14 +548,10 @@ fn a_per_region_reduction_is_byte_identical_across_block_sizes() {
         answers.push((format!("{block:?}"), run.words));
     }
 
-    let (first_name, first) = &answers[0];
-    for (name, words) in &answers[1..] {
-        assert_eq!(
-            words, first,
-            "the tabulation differs between block {first_name} and block {name}; a per-region \
-             reduction over a second array must not be a function of the plan"
-        );
-    }
+    all_answers_agree(
+        &answers,
+        "tabulation; a per-region reduction over a second array must not be a function of the plan",
+    );
 }
 
 // --------------------------------- 2. the accumulator's claim is checked --
@@ -1228,17 +1252,7 @@ fn the_weighted_centroid_is_byte_identical_across_block_sizes_where_it_differs_f
 
         // Which labels were cut. Without this the byte-identity below could be
         // the identity of five runs that never merged a moment.
-        let mut contributors: BTreeMap<u64, BTreeSet<[usize; 3]>> = BTreeMap::new();
-        for (index, bytes) in &run.partials {
-            for tally in decode_partial(bytes).expect("a partial") {
-                contributors.entry(tally.label).or_default().insert(*index);
-            }
-        }
-        let straddled: Vec<u64> = contributors
-            .iter()
-            .filter(|(_, who)| who.len() > 1)
-            .map(|(label, _)| *label)
-            .collect();
+        let straddled = straddling_labels(&run.partials);
         if block == [12, 4, 4] {
             assert!(
                 straddled.is_empty(),
@@ -1327,14 +1341,10 @@ fn the_weighted_centroid_is_byte_identical_across_block_sizes_where_it_differs_f
         answers.push((format!("{block:?}"), run.words));
     }
 
-    let (first_name, first) = &answers[0];
-    for (name, words) in &answers[1..] {
-        assert_eq!(
-            words, first,
-            "the weighted centroid differs between block {first_name} and block {name}; a cross \
-             moment of value against position must not be a function of the plan"
-        );
-    }
+    all_answers_agree(
+        &answers,
+        "weighted centroid; a cross moment of value against position must not be a function of the plan",
+    );
 }
 
 /// One region of four voxels, through a real run of four blocks, with **the
@@ -1584,16 +1594,7 @@ fn the_selection_is_byte_identical_across_block_sizes() {
         // and the fixture could have failed: one of these cuts has to put the
         // region across a seam, or the byte-identity below is the identity of
         // three runs that merged nothing.
-        let cut = run
-            .partials
-            .values()
-            .filter(|bytes| {
-                decode_partial(bytes)
-                    .expect("a partial")
-                    .iter()
-                    .any(|tally| tally.label == 1)
-            })
-            .count();
+        let cut = partial_count_for_label(&run.partials, 1);
         if cut > 1 {
             straddled += 1;
         }
@@ -1603,13 +1604,7 @@ fn the_selection_is_byte_identical_across_block_sizes() {
         straddled > 0,
         "no cut put the awkward region across a seam, so none of these runs merged a selection"
     );
-    let (first_name, first) = &answers[0];
-    for (name, words) in &answers[1..] {
-        assert_eq!(
-            words, first,
-            "the table differs between block {first_name} and block {name}"
-        );
-    }
+    all_answers_agree(&answers, "table");
 }
 
 /// `-0.0` against `0.0`, **through the executor's reversal check**.
@@ -2057,12 +2052,7 @@ fn the_second_moments_are_byte_identical_across_block_sizes() {
         // Which labels were cut, and the assertion that makes the byte-identity
         // below mean something: five runs that merged nothing would agree
         // perfectly and prove nothing.
-        let mut contributors: BTreeMap<u64, BTreeSet<[usize; 3]>> = BTreeMap::new();
-        for (index, bytes) in &run.partials {
-            for tally in decode_partial(bytes).expect("a partial") {
-                contributors.entry(tally.label).or_default().insert(*index);
-            }
-        }
+        let contributors = partial_contributors(&run.partials);
         if block == SHAPE_BLOCKS[0] {
             assert!(
                 contributors.values().all(|who| who.len() == 1),
@@ -2116,14 +2106,10 @@ fn the_second_moments_are_byte_identical_across_block_sizes() {
         answers.push((format!("{block:?}"), run.words));
     }
 
-    let (first_name, first) = &answers[0];
-    for (name, words) in &answers[1..] {
-        assert_eq!(
-            words, first,
-            "the second moments differ between block {first_name} and block {name}; a region's \
-             shape must not be a function of the plan"
-        );
-    }
+    all_answers_agree(
+        &answers,
+        "second moments; a region's shape must not be a function of the plan",
+    );
 }
 
 /// **The liveness partner.** A cube has no orientation to get wrong and an

@@ -50,7 +50,7 @@ use ndarray::Array3;
 
 use blockflow::decomposition::Decomposition;
 use blockflow::dtype::Dtype;
-use blockflow::env::{ArrayEnvironment, Environment};
+use blockflow::env::ArrayEnvironment;
 use blockflow::fragment::PhaseWork;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
@@ -72,6 +72,8 @@ use blockflow::voxels::Voxels;
 
 mod support;
 
+use support::fragments::decoded_sidecars;
+use support::refuses;
 use support::volume::point_mask_bool;
 
 const VOLUME: [usize; 3] = [14, 14, 24];
@@ -205,19 +207,10 @@ fn detect_run(mask: &Array3<bool>, block: [usize; 3], connectivity: Connectivity
     )
     .expect("a run");
 
-    let counts = plan.phases[1].grid.blocks_per_axis();
-    let mut found: Vec<Point> = Vec::new();
-    for i in 0..counts[0] {
-        for j in 0..counts[1] {
-            for k in 0..counts[2] {
-                let bytes = env
-                    .read_sidecar(POINTS, 1, [i, j, k])
-                    .expect("the store answers")
-                    .unwrap_or_else(|| panic!("block {:?} wrote no blob", [i, j, k]));
-                found.extend(decode_points(&bytes).expect("a point blob"));
-            }
-        }
-    }
+    let found: Vec<Point> = decoded_sidecars(&env, POINTS, 1, &plan.phases[1].grid, decode_points)
+        .into_values()
+        .flatten()
+        .collect();
     canonical(found)
 }
 
@@ -688,10 +681,10 @@ fn a_plan_whose_halves_disagree_about_connectivity_is_refused_by_every_op() {
             let label =
                 LabelBackgroundOp::new("l", STREAM, Lifecycle::DeleteOnExit).connecting(labelling);
             let fill = FillHolesOp::new("f", STREAM, 0, Dtype::Bool, &grid).connecting(merge);
-            let message = fill_phases(grid.clone(), Dtype::Bool, &label, &fill)
-                .unwrap_err()
-                .to_string();
-            assert!(message.contains("same connectivity"), "{message}");
+            refuses!(
+                fill_phases(grid.clone(), Dtype::Bool, &label, &fill),
+                "same connectivity"
+            );
 
             let plateaux =
                 LabelPlateauxOp::new("l", STREAM, Lifecycle::DeleteOnExit).connecting(labelling);

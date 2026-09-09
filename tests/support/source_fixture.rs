@@ -54,3 +54,30 @@ pub fn declared_plan(
     plan.declare_source_images(chain).unwrap();
     plan
 }
+
+pub fn declared_one_phase_per_slot(
+    chain: &Chain,
+    volume: [usize; 3],
+    dtype: Dtype,
+    grid: &BlockGrid,
+    chain_reach: [usize; 3],
+    reaches: &[[usize; 3]],
+) -> Decomposition {
+    let slots = chain.slots();
+    assert_eq!(
+        slots.len(),
+        reaches.len(),
+        "one reach must be supplied for each chain slot"
+    );
+    declared_plan(
+        chain,
+        volume,
+        dtype,
+        grid,
+        chain_reach,
+        reaches
+            .iter()
+            .enumerate()
+            .map(|(slot, &reach)| SourcePhase::with_equal_halo(vec![slot], reach)),
+    )
+}

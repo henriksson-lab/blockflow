@@ -180,7 +180,7 @@ use ndarray::{Array3, ArrayView3, Axis as NdAxis};
 
 use crate::assemble::{Assembly, Phase, PlanBuilder};
 use crate::decomposition::{price_phase, CostModel, PhaseTraffic};
-use crate::error::{Error, Result};
+use crate::error::{bail, ensure, Result};
 use crate::geometry::BlockGrid;
 use crate::op::{Anchor, BlockOp, Chain};
 use crate::reach::{AxisReach, Reach};
@@ -258,13 +258,12 @@ impl DistanceParams {
         let mut squared = [0.0f64; 3];
         for axis in 0..3 {
             let pitch = self.sampling[axis];
-            if !pitch.is_finite() || pitch <= 0.0 {
-                return Err(Error::InvalidArgument(format!(
-                    "distance: the voxel pitch on axis {axis} is {pitch}, and a distance \
+            ensure!(
+                pitch.is_finite() && pitch > 0.0,
+                "distance: the voxel pitch on axis {axis} is {pitch}, and a distance \
                      transform needs a finite positive length on every axis — a zero pitch \
                      divides by zero in the lower envelope and a negative one is not a length."
-                )));
-            }
+            );
             squared[axis] = pitch * pitch;
         }
         Ok(squared)
@@ -504,16 +503,11 @@ impl DistanceSweepOp {
     /// type's business. `seeds` says whether this pass reads the `bool` mask —
     /// exactly one pass of a chain does.
     pub fn along(axis: usize, pitch: f64, seeds: bool) -> Result<Self> {
-        if axis >= 3 {
-            return Err(Error::InvalidArgument(format!(
-                "distance: there is no axis {axis} to sweep"
-            )));
-        }
-        if !pitch.is_finite() || pitch <= 0.0 {
-            return Err(Error::InvalidArgument(format!(
-                "distance: a voxel pitch of {pitch} is not a length"
-            )));
-        }
+        ensure!(axis < 3, "distance: there is no axis {axis} to sweep");
+        ensure!(
+            pitch.is_finite() && pitch > 0.0,
+            "distance: a voxel pitch of {pitch} is not a length"
+        );
         Ok(Self::squared(axis, pitch * pitch, seeds))
     }
 
@@ -609,16 +603,19 @@ impl BlockOp for DistanceSweepOp {
         // and is reachable without building one. A buffer that does not span the
         // swept axis whole would produce a *block-local* distance transform — a
         // complete, well-formed, wrong volume.
-        if at.offset[self.axis] != 0 || shape[self.axis] != at.volume[self.axis] {
-            return Err(Error::InvalidArgument(format!(
-                "{}: this pass sweeps axis {} and its reach on that axis is the whole of it, so \
+        ensure!(
+            at.offset[self.axis] == 0 && shape[self.axis] == at.volume[self.axis],
+            "{}: this pass sweeps axis {} and its reach on that axis is the whole of it, so \
                  the buffer must start at 0 and span all {} voxels of it. It starts at {} and \
                  spans {}. A lattice that cuts the swept axis without granting the full halo \
                  would compute a block-local distance transform, which is a well-formed volume \
                  and the wrong one.",
-                self.name, self.axis, at.volume[self.axis], at.offset[self.axis], shape[self.axis],
-            )));
-        }
+            self.name,
+            self.axis,
+            at.volume[self.axis],
+            at.offset[self.axis],
+            shape[self.axis],
+        );
 
         let mut field = if self.seeds {
             seed(input.view::<bool>()?)
@@ -715,15 +712,9 @@ impl BlockOp for DistanceFinishOp {
 /// produces the right answer, merely by re-reading every lane in every block —
 /// so the one place the choice is made should be the one place a reader looks.
 pub fn sweep_grid(volume: [usize; 3], axis: usize, block: usize) -> Result<BlockGrid> {
-    if axis >= 3 {
-        return Err(Error::InvalidArgument(format!(
-            "distance: there is no axis {axis} to sweep"
-        )));
-    }
+    ensure!(axis < 3, "distance: there is no axis {axis} to sweep");
     if block == 0 {
-        return Err(Error::InvalidArgument(
-            "distance: a block edge of 0 cuts the volume into nothing".to_string(),
-        ));
+        bail!("distance: a block edge of 0 cuts the volume into nothing");
     }
     let free: Vec<usize> = (0..3).filter(|&other| other != axis).collect();
     BlockGrid::along(volume, &free, block)
@@ -802,7 +793,6 @@ pub fn working_set_bytes(
                 true,
                 8.0,
                 &CostModel::default(),
-                1.0,
                 // `working_set_bytes_per_block` is deliberately independent of
                 // the traffic figure — see `PhaseTraffic` — so this argument
                 // does not reach the number read below.

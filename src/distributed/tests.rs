@@ -26,7 +26,7 @@ use crate::fragment::PhaseWork;
 use crate::geometry::{product3, BlockGrid};
 use crate::op::Chain;
 use crate::probes::IdentityOp;
-use crate::simulate::{simulate, Machine, PerPhase, Rates};
+use crate::simulate::{Machine, Rates, Run};
 use crate::strategy::execute_task;
 use crate::Dtype;
 
@@ -327,10 +327,8 @@ fn simulated_handout(
 ) -> u64 {
     let work = vec![PhaseWork::Pixels; decomposition.n_phases()];
     let mut scheduler = crate::simulate::Handout::new(spec.policy);
-    let outcome = simulate(
-        &decomposition,
-        &work,
-        &Machine {
+    let outcome = Run::new(&decomposition, &work)
+        .machine(Machine {
             // One cache pool per virtual coordinator worker, matching
             // `measure_at`'s one accounting environment per worker. This is
             // the pessimistic topology `simulate::Handout` documents for
@@ -341,18 +339,14 @@ fn simulated_handout(
             cache_bytes: spec.workflow.cache_bytes,
             cache_shared: false,
             ..Machine::default()
-        },
-        &Rates {
+        })
+        .rates(Rates {
             chunk: spec.workflow.chunk,
             chunk_bytes: product3(spec.workflow.chunk) as u64 * 8,
             ..Rates::default()
-        },
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        PerPhase::default(),
-        &mut scheduler,
-    )
-    .expect("a simulable distributed probe");
+        })
+        .go(&mut scheduler)
+        .expect("a simulable distributed probe");
     assert_eq!(
         outcome.tasks_run as usize,
         decomposition.n_tasks(),

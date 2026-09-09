@@ -53,6 +53,9 @@ use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, Workflow};
 use ndarray::Array3;
 
+mod support;
+use support::fragments::sidecars_present;
+
 // ------------------------------------------------------------- fixtures --
 
 const VOLUME: [usize; 3] = [12, 4, 4];
@@ -207,24 +210,7 @@ fn run_at(block: [usize; 3]) -> (Vec<u8>, BTreeMap<[usize; 3], Vec<u8>>, Arc<Exe
     .expect("a run");
 
     let mut per_block = BTreeMap::new();
-    for index in plan.phases[1]
-        .grid
-        .cores()
-        .iter()
-        .enumerate()
-        .map(|(n, _)| {
-            let counts = plan.phases[1].grid.blocks_per_axis();
-            [
-                n / (counts[1] * counts[2]),
-                (n / counts[2]) % counts[1],
-                n % counts[2],
-            ]
-        })
-    {
-        if let Some(bytes) = env.read_sidecar("partials", 1, index).expect("a read") {
-            per_block.insert(index, bytes);
-        }
-    }
+    per_block.extend(sidecars_present(&env, "partials", 1, &plan.phases[1].grid));
     let totals = env
         .read_sidecar("totals", 2, [0, 0, 0])
         .expect("a read")

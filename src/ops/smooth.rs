@@ -107,7 +107,7 @@
 use ndarray::ArrayViewMut3;
 
 use crate::dtype::Dtype;
-use crate::error::{Error, Result};
+use crate::error::{ensure, Error, Result};
 use crate::op::{Anchor, BlockOp, Slicing};
 use crate::voxels::Voxels;
 
@@ -151,19 +151,17 @@ impl Gaussian {
     /// kind of inconsistency that costs an entire feature rather than a line.
     pub fn new(sigma: [f64; 3], truncate: f64) -> Result<Self> {
         for axis in 0..3 {
-            if sigma[axis] < 0.0 || !sigma[axis].is_finite() {
-                return Err(Error::InvalidArgument(format!(
-                    "every axis of a smoothing scale must be a non-negative, finite number of \
+            ensure!(
+                sigma[axis] >= 0.0 && sigma[axis].is_finite(),
+                "every axis of a smoothing scale must be a non-negative, finite number of \
                      voxels; got {sigma:?}. Zero is legitimate and means the axis is not \
                      blurred; a negative or non-finite scale has no kernel."
-                )));
-            }
+            );
         }
-        if !(truncate > 0.0) || !truncate.is_finite() {
-            return Err(Error::InvalidArgument(format!(
-                "a truncation must be a positive, finite multiple of the scale; got {truncate}"
-            )));
-        }
+        ensure!(
+            truncate > 0.0 && truncate.is_finite(),
+            "a truncation must be a positive, finite multiple of the scale; got {truncate}"
+        );
         // The same bound `ScaleSpace::new` states, for the same reason: the
         // radius is a `ceil` cast to `usize`, a Rust float-to-integer cast
         // saturates rather than wrapping, and a sigma of `1e30` would therefore
@@ -171,13 +169,12 @@ impl Gaussian {
         // it. Generous rather than tuned — nothing that reads a million voxels
         // either side of the one it writes is a local op.
         for axis in 0..3 {
-            if truncate * sigma[axis] > 1e6 {
-                return Err(Error::InvalidArgument(format!(
-                    "a smoothing scale of {sigma:?} truncated at {truncate} reaches more than \
+            ensure!(
+                truncate * sigma[axis] <= 1e6,
+                "a smoothing scale of {sigma:?} truncated at {truncate} reaches more than \
                      a million voxels on axis {axis}. That is not a local operation, and a \
                      reach that large overflows every number derived from it."
-                )));
-            }
+            );
         }
         let kernels = [
             gaussian_weights(sigma[0], truncate)?,
@@ -290,7 +287,7 @@ impl SmoothOp {
         let boundary = self.gaussian.boundary();
         dispatch_f64_input!(
             input,
-            Error::InvalidArgument(format!(
+            Error::invalid(format_args!(
                 "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
                 self.name
             )),

@@ -91,6 +91,9 @@ use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::volume::clipped_start_grid_sweep;
+
 /// Long enough on axis 0 for several blocks and **narrower there than the
 /// window**, so that every anchor on that axis re-phases and no block holds only
 /// interior voxels.
@@ -264,16 +267,7 @@ fn blocked(case: Case, element: &StructuringElement, grid: &BlockGrid) -> Voxels
 }
 
 fn grids() -> Vec<BlockGrid> {
-    vec![
-        BlockGrid::new(VOLUME, VOLUME).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 5).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 7).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 8).unwrap(),
-        BlockGrid::along(VOLUME, &[1], 2).unwrap(),
-        BlockGrid::along(VOLUME, &[2], 3).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1, 2], 3).unwrap(),
-    ]
+    clipped_start_grid_sweep(VOLUME)
 }
 
 // ---------------------------------------- the ops that honour the origin --

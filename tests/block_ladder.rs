@@ -73,7 +73,6 @@ fn working_set(edge: usize) -> Option<f64> {
             false,
             8.0,
             &CostModel::default(),
-            1.0,
             PhaseTraffic::one_in_one_out(),
         )
         .working_set_bytes_per_block,

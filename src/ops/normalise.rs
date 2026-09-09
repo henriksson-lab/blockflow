@@ -132,7 +132,7 @@
 
 use ndarray::{Array3, ArrayView3, ArrayViewMut3, Zip};
 
-use crate::error::{Error, Result};
+use crate::error::{ensure, Error, Result};
 use crate::op::{Anchor, BlockOp};
 use crate::voxels::Voxels;
 
@@ -351,14 +351,13 @@ impl Removal {
 /// A floor must be usable as a divisor, and the check is here rather than at the
 /// two call sites so that both ops refuse the same set of arguments.
 fn check_floor(floor: f64, what: &str) -> Result<()> {
-    if !floor.is_finite() || floor <= 0.0 {
-        return Err(Error::InvalidArgument(format!(
-            "{what}: a divisor floor must be finite and strictly positive, got {floor}. It \
-             bounds an estimate away from zero; without it a flat region divides to an \
-             infinity or a NaN, and a NaN is not merely a wrong value — it compares unequal \
-             to itself, so every byte-identity check downstream stops meaning anything."
-        )));
-    }
+    ensure!(
+        floor.is_finite() && floor > 0.0,
+        "{what}: a divisor floor must be finite and strictly positive, got {floor}. It \
+         bounds an estimate away from zero; without it a flat region divides to an \
+         infinity or a NaN, and a NaN is not merely a wrong value — it compares unequal \
+         to itself, so every byte-identity check downstream stops meaning anything."
+    );
     Ok(())
 }
 
@@ -641,15 +640,14 @@ impl LocalGainOp {
         ceiling: f64,
     ) -> Result<Self> {
         check_floor(floor, name)?;
-        if !ceiling.is_finite() || ceiling <= 0.0 {
-            return Err(Error::InvalidArgument(format!(
-                "{name}: a gain ceiling must be finite and strictly positive, got {ceiling}. \
-                 It is the largest value the upper estimate may be carried to, so a \
-                 non-positive one does not bound the gain — it negates or annihilates every \
-                 voxel the cap applies to, which is a different operation wearing this one's \
-                 name."
-            )));
-        }
+        ensure!(
+            ceiling.is_finite() && ceiling > 0.0,
+            "{name}: a gain ceiling must be finite and strictly positive, got {ceiling}. \
+             It is the largest value the upper estimate may be carried to, so a \
+             non-positive one does not bound the gain — it negates or annihilates every \
+             voxel the cap applies to, which is a different operation wearing this one's \
+             name."
+        );
         let cost = cost_for(&low) + cost_for(&high) + CONTRAST_COMBINE_COST;
         Ok(Self {
             name,

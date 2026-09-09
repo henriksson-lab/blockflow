@@ -36,6 +36,9 @@ use blockflow::strategy::{execute, Hints, Strategy, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::{Dtype, Region};
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [32, 6, 5];
 
 /// `out[v] = in[v - back] + ... + in[v]` along axis 0.
@@ -265,13 +268,9 @@ fn the_halo_guard_fires_on_every_new_form_of_short_halo() {
     ];
     for (what, halo) in cases {
         let short = good.with_forced_halo(halo);
-        let message = short
-            .check()
-            .expect_err(&format!("{what}: a short halo must not check"))
-            .to_string();
-        assert!(
-            message.contains("do not tile the volume exactly"),
-            "{what}: {message}"
+        refuses!(
+            what => short.check(),
+            "do not tile the volume exactly"
         );
     }
 
@@ -285,14 +284,9 @@ fn the_halo_guard_fires_on_every_new_form_of_short_halo() {
         assert_eq!(block.read.shape[0], VOLUME[0]);
     }
     // Grant it anything less and no interior block has a trustworthy voxel.
-    let message = whole
-        .with_forced_halo([8, 8, 8])
-        .check()
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("do not tile the volume exactly"),
-        "{message}"
+    refuses!(
+        whole.with_forced_halo([8, 8, 8]).check(),
+        "do not tile the volume exactly",
     );
 }
 
@@ -370,10 +364,10 @@ fn a_phase_whose_edges_are_not_the_arrays_edges_is_not_granted_the_clamp() {
     // the silent version of exactly this.
     let workflow = workflow(2);
     let refused = plan(&workflow, 8, &[0], below);
-    let message = refused.check().unwrap_err().to_string();
-    assert!(
-        message.contains("do not tile the volume exactly") && message.contains("source/voxels"),
-        "{message}"
+    refuses!(
+        refused.check(),
+        "do not tile the volume exactly",
+        "source/voxels",
     );
 }
 
@@ -410,11 +404,10 @@ fn a_dependency_in_the_image_belows_lattice_needs_a_fetch_region_to_meet_it() {
     assert_eq!(stated.space().frame, Frame::Source);
 
     let refused = plan(&workflow, 8, &[0], stated.clone());
-    let message = refused.check().unwrap_err().to_string();
-    assert!(
-        message.contains("steps of the image below's own lattice")
-            && message.contains("where each block reads"),
-        "{message}"
+    refuses!(
+        refused.check(),
+        "steps of the image below's own lattice",
+        "where each block reads",
     );
 
     // With the fetch regions stated, it checks — and the dependency is in the

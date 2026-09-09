@@ -85,6 +85,7 @@ use crate::budget::{Lease, MemoryBudget};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::listener::EventListener;
+use crate::lock::{MutexExt, RwLockExt};
 use crate::log::{Event, PrefetchWaste};
 use crate::region::{Region, RegionSource};
 
@@ -704,8 +705,8 @@ impl ChunkCache {
             .map(|(&dim, &extent)| dim.div_ceil(extent))
             .collect();
 
-        let mut arrays = self.arrays.write().unwrap_or_else(|p| p.into_inner());
-        let mut policies = self.policies.write().unwrap_or_else(|p| p.into_inner());
+        let mut arrays = self.arrays.write_unpoisoned();
+        let mut policies = self.policies.write_unpoisoned();
         let id = ArrayId(arrays.len() as u32);
         arrays.push(Arc::new(Registered {
             id,
@@ -723,7 +724,7 @@ impl ChunkCache {
     /// Change an array's policy mid-run. The planner's lever: a stage that has
     /// stopped being read can be demoted without dropping what it already holds.
     pub fn set_policy(&self, array: ArrayId, policy: ArrayPolicy) -> Result<()> {
-        let mut policies = self.policies.write().unwrap_or_else(|p| p.into_inner());
+        let mut policies = self.policies.write_unpoisoned();
         let slot = policies
             .get_mut(array.0 as usize)
             .ok_or_else(|| Error::invalid(format!("no array {}", array.0)))?;
@@ -733,16 +734,14 @@ impl ChunkCache {
 
     pub fn policy(&self, array: ArrayId) -> Option<ArrayPolicy> {
         self.policies
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
+            .read_unpoisoned()
             .get(array.0 as usize)
             .copied()
     }
 
     fn registered(&self, array: ArrayId) -> Result<Arc<Registered>> {
         self.arrays
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
+            .read_unpoisoned()
             .get(array.0 as usize)
             .cloned()
             .ok_or_else(|| Error::invalid(format!("no array {}", array.0)))
@@ -828,7 +827,7 @@ impl ChunkCache {
         // it here rather than after cloning the payload out is what keeps the
         // claim "a hit is one memcpy" true.
         let encoded_payload = {
-            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self.state.lock_unpoisoned();
             let Some(entry) = state.entries.get(&key) else {
                 return Ok(false);
             };
@@ -1023,7 +1022,7 @@ impl ChunkCache {
             };
             let started = Instant::now();
             {
-                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                let mut state = self.state.lock_unpoisoned();
                 while state.pending.contains(&key) {
                     let (next, timeout) = self
                         .resolved
@@ -1040,11 +1039,7 @@ impl ChunkCache {
             let served = if let Some((want, out)) = target.as_mut() {
                 self.serve_from_cache(reg, chunk, want, out, element)?
             } else {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .entries
-                    .contains_key(&key)
+                self.state.lock_unpoisoned().entries.contains_key(&key)
             };
             if served {
                 if waited_ns > 0 {
@@ -1145,7 +1140,7 @@ impl ChunkCache {
     /// at concurrency 4 — a different voxel each run, which is what a race looks
     /// like from the outside.
     fn claim(&self, array: ArrayId, chunks: &[u64]) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         let mut claimed = Vec::new();
         let mut waited = Vec::new();
         let mut resident = Vec::new();
@@ -1167,7 +1162,7 @@ impl ChunkCache {
     }
 
     fn release(&self, array: ArrayId, chunks: &[u64]) {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         for &chunk in chunks {
             state.pending.remove(&ChunkKey { array, chunk });
         }
@@ -1213,7 +1208,7 @@ impl ChunkCache {
 
         let mut events = Vec::new();
         {
-            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self.state.lock_unpoisoned();
             state.pending.remove(&key);
 
             let admissible = policy.retain && cost > 0 && cost <= self.capacity;
@@ -1316,8 +1311,7 @@ impl ChunkCache {
 
     fn name_of(&self, array: ArrayId) -> String {
         self.arrays
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
+            .read_unpoisoned()
             .get(array.0 as usize)
             .map(|reg| reg.name.clone())
             .unwrap_or_default()
@@ -1340,7 +1334,7 @@ impl ChunkCache {
             return Ok(0);
         }
         let missing: Vec<u64> = {
-            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = self.state.lock_unpoisoned();
             reg.covering(region)
                 .into_iter()
                 .filter(|&chunk| {
@@ -1378,7 +1372,7 @@ impl ChunkCache {
         let mut events = Vec::new();
         let mut dropped = 0;
         {
-            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self.state.lock_unpoisoned();
             let doomed: Vec<ChunkKey> = state
                 .entries
                 .iter()
@@ -1408,7 +1402,7 @@ impl ChunkCache {
     // ------------------------------------------------------------- state --
 
     pub fn stats(&self) -> CacheStats {
-        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let state = self.state.lock_unpoisoned();
         let counters = &self.counters;
         CacheStats {
             hits_decoded: counters.hits_decoded.load(Ordering::Relaxed),
@@ -1433,15 +1427,14 @@ impl ChunkCache {
 
     /// Bytes currently held. Equal, always, to the bytes leased.
     pub fn resident_bytes(&self) -> u64 {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).bytes
+        self.state.lock_unpoisoned().bytes
     }
 
     /// How many of `array`'s chunks are resident. The cross-array eviction
     /// evidence is read off this.
     pub fn resident_chunks(&self, array: ArrayId) -> usize {
         self.state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .lock_unpoisoned()
             .entries
             .keys()
             .filter(|key| key.array == array)
@@ -1472,7 +1465,7 @@ impl ChunkCache {
     /// happened to be correct.
     pub fn invalidate(&self, array: ArrayId, region: &Region) -> Result<usize> {
         let reg = self.registered(array)?;
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         let mut dropped = 0;
         for chunk in reg.covering(region) {
             let key = ChunkKey { array, chunk };
@@ -1492,7 +1485,7 @@ impl ChunkCache {
     }
 
     pub fn clear(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         state.entries.clear();
         state.recency.clear();
         state.bytes = 0;

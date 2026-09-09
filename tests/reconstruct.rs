@@ -51,6 +51,9 @@ use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [24, 10, 6];
 
 // ------------------------------------------------------------- the scenes --
@@ -641,20 +644,20 @@ fn the_limit_fires_by_name_on_a_path_longer_than_the_geometry_predicts() {
     let plan = plan_with(&op, [8, 8, 1], SLAB);
     let env = ArrayEnvironment::for_decomposition(maze().into(), &plan, [4, 4, 1])
         .expect("an environment");
-    let error = execute_phases(
-        "reconstruct",
-        &empty_workflow(SLAB),
-        &plan,
-        &Hints::default(),
-        &env,
-        &[],
-        &[PhaseWork::Iterate(&op)],
-    )
-    .expect_err("a corridor four times the slab's diameter cannot converge in its diameter");
-    let message = error.to_string();
-    assert!(message.contains("h-maxima"), "{message}");
-    assert!(message.contains("32 substage(s)"), "{message}");
-    assert!(message.contains("deliberately not written"), "{message}");
+    refuses!(
+        execute_phases(
+            "reconstruct",
+            &empty_workflow(SLAB),
+            &plan,
+            &Hints::default(),
+            &env,
+            &[],
+            &[PhaseWork::Iterate(&op)],
+        ),
+        "h-maxima",
+        "32 substage(s)",
+        "deliberately not written",
+    );
 
     // A partially flooded volume is plausible, well-formed and wrong, so none of
     // it reaches the output: the image is still the unwritten sentinel.
@@ -743,13 +746,12 @@ fn a_mask_holding_a_nan_is_refused_by_name_rather_than_failing_to_converge() {
     values[[5, 5, 2]] = f64::NAN;
     let op = op(1.0, generous());
     let plan = plan(&op, [8, 4, 2]);
-    let message = run_plan(&plan, values.into(), &op)
-        .err()
-        .expect("a NaN cannot converge under an equality test")
-        .to_string();
-    assert!(message.contains("h-maxima"), "{message}");
-    assert!(message.contains("NaN"), "{message}");
-    assert!(message.contains("not equal to itself"), "{message}");
+    refuses!(
+        run_plan(&plan, values.into(), &op),
+        "h-maxima",
+        "NaN",
+        "not equal to itself",
+    );
 }
 
 /// The infinities need no rule and are asserted to need none: `+inf` caps

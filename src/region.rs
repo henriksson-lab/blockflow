@@ -40,6 +40,7 @@ use std::sync::Mutex;
 use ndarray::{ArrayD, Axis, IxDyn, Slice};
 
 use crate::error::{Error, Result};
+use crate::lock::MutexExt;
 
 /// An axis-aligned box, in voxels.
 ///
@@ -298,10 +299,7 @@ where
     fn write_region(&self, start: &[usize], data: &ArrayD<T>) -> Result<()> {
         let region = Region::new(start, data.shape());
         region.check_within(&self.shape, "array region sink")?;
-        let mut volume = self
-            .volume
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut volume = self.volume.lock_unpoisoned();
         let mut target = volume.view_mut();
         for (axis, (&lo, &len)) in start.iter().zip(data.shape().iter()).enumerate() {
             target.slice_axis_inplace(Axis(axis), Slice::from(lo..lo + len));

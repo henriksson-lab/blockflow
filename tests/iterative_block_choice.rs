@@ -91,6 +91,9 @@ use blockflow::strategy::{execute_phases, predicted_makespan, Hints};
 use blockflow::voxels::Voxels;
 use blockflow::Result;
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [256, 256, 256];
 const CANDIDATES: [usize; 5] = [16, 32, 64, 128, 256];
 
@@ -661,8 +664,8 @@ fn pricing_never_loses_to_inheriting_and_usually_beats_it() {
 fn an_empty_candidate_list_is_refused_and_names_the_alternative() {
     let grid = BlockGrid::new(VOLUME, [64, 64, 64]).expect("a lattice");
     let mut plan = PlanBuilder::new(VOLUME, Dtype::F64, grid);
-    let message = plan
-        .iterate_priced(
+    refuses!(
+        plan.iterate_priced(
             Spread {
                 reach: 1,
                 cost: 1.0,
@@ -674,11 +677,10 @@ fn an_empty_candidate_list_is_refused_and_names_the_alternative() {
             40,
             Materialisation::Output,
             Substages::Unknown,
-        )
-        .expect_err("an empty candidate list")
-        .to_string();
-    assert!(message.contains("spread"), "{message}");
-    assert!(message.contains("iterate"), "{message}");
+        ),
+        "spread",
+        "iterate",
+    );
 }
 
 /// A budget no candidate fits is refused with the tally in the message: how many
@@ -691,8 +693,8 @@ fn an_empty_candidate_list_is_refused_and_names_the_alternative() {
 fn a_budget_no_candidate_fits_is_refused_with_the_tally() {
     let grid = BlockGrid::new(VOLUME, [64, 64, 64]).expect("a lattice");
     let mut plan = PlanBuilder::new(VOLUME, Dtype::F64, grid);
-    let message = plan
-        .iterate_priced(
+    refuses!(
+        plan.iterate_priced(
             Spread {
                 reach: 1,
                 cost: 1.0,
@@ -704,12 +706,11 @@ fn a_budget_no_candidate_fits_is_refused_with_the_tally() {
             40,
             Materialisation::Output,
             Substages::Unknown,
-        )
-        .expect_err("a budget nothing fits")
-        .to_string();
-    assert!(message.contains("spread"), "{message}");
-    assert!(message.contains("budget"), "{message}");
-    assert!(message.contains("16"), "{message}");
+        ),
+        "spread",
+        "budget",
+        "16",
+    );
 }
 
 /// The tally is what the sweep actually did, not a restatement of the candidate
@@ -1283,8 +1284,8 @@ fn the_reported_price_is_the_plans_whatever_the_sweep_ranked_on() {
 fn a_measured_count_of_zero_is_refused_and_names_the_alternative() {
     let grid = BlockGrid::new(VOLUME, [64, 64, 64]).expect("a lattice");
     let mut plan = PlanBuilder::new(VOLUME, Dtype::F64, grid);
-    let message = plan
-        .iterate_priced(
+    refuses!(
+        plan.iterate_priced(
             Spread {
                 reach: 1,
                 cost: 1.0,
@@ -1293,11 +1294,10 @@ fn a_measured_count_of_zero_is_refused_and_names_the_alternative() {
             40,
             Materialisation::Output,
             Substages::Measured(0),
-        )
-        .expect_err("a count of zero")
-        .to_string();
-    assert!(message.contains("spread"), "{message}");
-    assert!(message.contains("Unknown"), "{message}");
+        ),
+        "spread",
+        "Unknown",
+    );
 }
 
 /// **The discriminating pair**, and the reason `Substages` scales what it scales.

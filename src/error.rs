@@ -79,6 +79,23 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err($crate::error::Error::invalid(format_args!($($arg)*)))
+    };
+}
+
+macro_rules! ensure {
+    ($condition:expr, $($arg:tt)*) => {
+        if !$condition {
+            $crate::error::bail!($($arg)*);
+        }
+    };
+}
+
+pub(crate) use bail;
+pub(crate) use ensure;
+
 #[cfg(test)]
 mod tests {
     use super::*;

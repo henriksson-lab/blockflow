@@ -51,6 +51,11 @@ use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 use ndarray::Array3;
 
+mod support;
+use support::refuses;
+#[cfg(feature = "zarr")]
+use support::scratch::ScratchDir;
+
 /// Not a round number on any axis, so a factor divides none of them evenly
 /// unless it was chosen to.
 const VOLUME: [usize; 3] = [24, 18, 14];
@@ -415,11 +420,7 @@ fn a_halo_below_the_reach_is_caught_on_a_resampling_phase() {
     );
 
     let forced = honest.with_forced_halo([0, 0, 0]);
-    let message = forced.check().unwrap_err().to_string();
-    assert!(
-        message.contains("do not tile the volume exactly"),
-        "{message}"
-    );
+    refuses!(forced.check(), "do not tile the volume exactly");
 
     let workflow = Workflow::new(
         Chain::op(ResampleOp::new("resample", resample)),
@@ -427,12 +428,9 @@ fn a_halo_below_the_reach_is_caught_on_a_resampling_phase() {
         Dtype::F64,
     );
     let env = ArrayEnvironment::for_decomposition(input, &forced, [4, 4, 4]).unwrap();
-    let message = execute("short", &workflow, &forced, &Hints::default(), &env)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("do not tile the volume exactly"),
-        "{message}"
+    refuses!(
+        execute("short", &workflow, &forced, &Hints::default(), &env),
+        "do not tile the volume exactly",
     );
 }
 
@@ -454,18 +452,16 @@ fn a_plan_built_for_another_factor_is_refused_and_names_both_extents() {
     );
     let input: Voxels = texture(VOLUME).into();
     let env = ArrayEnvironment::for_decomposition(input, &decomposition, [4, 4, 4]).unwrap();
-    let message = execute(
-        "mismatch",
-        &workflow,
-        &decomposition,
-        &Hints::default(),
-        &env,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        message.contains("has nowhere to land") && message.contains("its ops turn that into"),
-        "{message}"
+    refuses!(
+        execute(
+            "mismatch",
+            &workflow,
+            &decomposition,
+            &Hints::default(),
+            &env,
+        ),
+        "has nowhere to land",
+        "its ops turn that into",
     );
 }
 
@@ -636,19 +632,7 @@ fn the_halo_must_be_per_block_and_per_side_and_the_alignment_is_priced() {
 fn a_resizing_phase_runs_through_zarr_and_agrees_with_memory() {
     use blockflow::zarr_env::ZarrEnvironment;
 
-    let root = std::env::temp_dir().join(format!(
-        "blockflow-resample-zarr-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
-    struct Scratch(std::path::PathBuf);
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let scratch = Scratch(root.clone());
+    let scratch = ScratchDir::new("resample-zarr", "resize");
 
     let input: Voxels = texture(VOLUME).into();
     for (specs, interpolation) in [
@@ -660,7 +644,7 @@ fn a_resizing_phase_runs_through_zarr_and_agrees_with_memory() {
         decomposition.check().unwrap();
         let want = run(&resample, &input, &decomposition);
 
-        let path = scratch.0.join(format!("{specs:?}-{interpolation:?}"));
+        let path = scratch.join(&format!("{specs:?}-{interpolation:?}"));
         let workflow = Workflow::new(
             Chain::op(ResampleOp::new("resample", resample)),
             VOLUME,
@@ -794,8 +778,7 @@ fn the_stated_and_the_factored_extent_differ_on_every_axis_here() {
     assert_eq!(factored.ratio(0), Ratio::new(13, 80).unwrap());
     // A stated extent is bound to the volume it was stated against, and being
     // asked about another is refused rather than answered by the factor.
-    let message = stated.output_volume([25, 18, 14]).unwrap_err().to_string();
-    assert!(message.contains("bound to the volume"), "{message}");
+    refuses!(stated.output_volume([25, 18, 14]), "bound to the volume");
 }
 
 /// **The factor-exact default is byte-unchanged**, asserted rather than assumed.
@@ -1018,33 +1001,26 @@ fn a_short_fetch_under_a_stated_extent_is_refused_rather_than_clamped() {
 
     // One voxel short on the far side, which is where a clamp would be silent.
     let mut out = Voxels::zeros(Dtype::F64, [3, 18, 14]).unwrap();
-    let message = op
-        .apply_placed(
+    refuses!(
+        op.apply_placed(
             &slice(fetch.start[0], fetch.shape[0] - 1),
             SourceInputs::new(&[]),
             &mut out,
             &placed(fetch.start[0]),
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("reads source") && message.contains("was handed source"),
-        "{message}"
+        ),
+        "reads source",
+        "was handed source",
     );
     // And one voxel short on the near side, which is the other end of the same
     // interval and would clamp just as quietly.
     let mut out = Voxels::zeros(Dtype::F64, [3, 18, 14]).unwrap();
-    let message = op
-        .apply_placed(
+    refuses!(
+        op.apply_placed(
             &slice(fetch.start[0] + 1, fetch.shape[0] - 1),
             SourceInputs::new(&[]),
             &mut out,
             &placed(fetch.start[0] + 1),
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("bracket between source voxels"),
-        "{message}"
+        ),
+        "bracket between source voxels",
     );
 }

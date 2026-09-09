@@ -38,7 +38,6 @@
 #![cfg(feature = "zarr")]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ndarray::Array3;
 
@@ -60,35 +59,16 @@ use blockflow::zarr_env::{
 };
 use blockflow::{Dtype, Region};
 
+mod support;
+use support::scratch::ScratchDir;
+use support::{refuses, single_phase};
+
 const VOLUME: [usize; 3] = [32, 24, 20];
 
 // ------------------------------------------------------------- fixtures --
 
-/// A directory nobody else is using. Removed by [`Scratch`]'s `Drop`, so a test
-/// that panics still cleans up after itself.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(name: &str) -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let unique = NEXT.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "blockflow-zarr-env-{}-{name}-{unique}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        Self(path)
-    }
-
-    fn path(&self) -> &PathBuf {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+fn zarr_scratch(name: &str) -> ScratchDir {
+    ScratchDir::new("zarr-env", name)
 }
 
 /// A generated volume with structure at several scales, so that a filter has
@@ -133,17 +113,7 @@ fn ball(radius: [usize; 3]) -> StructuringElement {
 /// axis. Built from the chain's **own** reach: nothing here supplies one, so
 /// nothing here can hide one that is wrong.
 fn plan(workflow: &Workflow, block: usize) -> Decomposition {
-    let reach = workflow.chain.reach3(&VOLUME);
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(VOLUME, &[0, 1, 2], block).unwrap();
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
-    Decomposition {
-        volume: VOLUME,
-        dtype: workflow.dtype,
-        phases: vec![phase],
-        chain_reach: reach,
-    }
+    single_phase::plan(workflow, VOLUME, block, &[0, 1, 2])
 }
 
 /// The same run, in memory.
@@ -247,7 +217,7 @@ fn assert_same(left: &Voxels, right: &Voxels, what: &str) {
 
 #[test]
 fn a_multiscale_store_is_built_as_storage_levels_not_workflow_images() {
-    let scratch = Scratch::new("multiscale");
+    let scratch = zarr_scratch("multiscale");
     let input = Array3::from_shape_fn((8, 6, 4), |(x, y, z)| (x + 10 * y + 100 * z) as f64);
     let spec = PyramidSpec::powers_of_two(3).unwrap().with_chunk([2, 2, 2]);
 
@@ -264,7 +234,7 @@ fn a_multiscale_store_is_built_as_storage_levels_not_workflow_images() {
     assert!(metadata.contains("\"multiscales\""));
     assert!(metadata.contains("\"path\": \"2\""));
 
-    let work = Scratch::new("multiscale-level1-work");
+    let work = zarr_scratch("multiscale-level1-work");
     let level1 = ZarrEnvironment::attach(work.path(), &[pyramid.level(1).unwrap().clone()])
         .expect("level attaches");
     let image = level1.image(0).expect("level reads");
@@ -286,9 +256,9 @@ fn a_multiscale_store_is_built_as_storage_levels_not_workflow_images() {
 
 #[test]
 fn a_multiscale_level_can_seed_a_run_with_a_supplied_peer() {
-    let fixed_root = Scratch::new("multiscale-fixed");
-    let moving_root = Scratch::new("multiscale-moving");
-    let work = Scratch::new("multiscale-run");
+    let fixed_root = zarr_scratch("multiscale-fixed");
+    let moving_root = zarr_scratch("multiscale-moving");
+    let work = zarr_scratch("multiscale-run");
     let fixed = Array3::from_shape_fn((8, 6, 4), |(x, y, z)| (x + 10 * y + 100 * z) as f64);
     let moving = fixed.mapv(|value| value + 1.0);
     let spec = PyramidSpec::powers_of_two(2).unwrap().with_chunk([2, 2, 2]);
@@ -404,7 +374,7 @@ fn every_op_through_storage_is_byte_identical_to_the_same_op_in_memory() {
                 let hints = Hints::default();
                 let memory = through_memory(&workflow, &decomposition, &source, &hints);
 
-                let scratch = Scratch::new("identity");
+                let scratch = zarr_scratch("identity");
                 let (storage, env) = through_storage(
                     scratch.path(),
                     &workflow,
@@ -454,7 +424,7 @@ fn compression_is_invisible_to_the_answer_for_every_op_family() {
             ("gzip9", CompressionPolicy::uniform(Compression::Gzip(9))),
         ] {
             let (what, compression) = policy;
-            let scratch = Scratch::new("compressed-identity");
+            let scratch = zarr_scratch("compressed-identity");
             // An input chunk shape that divides neither the volume nor the block
             // grid, so reads decompress chunks they keep a corner of, and the
             // written image's own chunks overhang the volume's far edge — which
@@ -494,7 +464,7 @@ fn a_compressed_store_and_a_raw_one_differ_on_disk_and_agree_in_the_answer() {
     decomposition.declare_dtypes(&workflow.chain).unwrap();
     assert_eq!(decomposition.dtype_at(1), Dtype::Bool);
 
-    let scratch = Scratch::new("raw");
+    let scratch = zarr_scratch("raw");
     let (raw, raw_env) = through_storage_with(
         scratch.path(),
         &workflow,
@@ -504,7 +474,7 @@ fn a_compressed_store_and_a_raw_one_differ_on_disk_and_agree_in_the_answer() {
         &Hints::default(),
         CompressionPolicy::uniform(Compression::None),
     );
-    let scratch = Scratch::new("gzipped");
+    let scratch = zarr_scratch("gzipped");
     let (gzipped, gzip_env) = through_storage_with(
         scratch.path(),
         &workflow,
@@ -647,7 +617,7 @@ fn compression_pays_for_bool_and_not_for_float() {
     ];
     let mut measured = Vec::new();
     for (what, policy) in policies {
-        let scratch = Scratch::new("measure");
+        let scratch = zarr_scratch("measure");
         let (storage, env, elapsed) = through_storage_timed(
             scratch.path(),
             &workflow,
@@ -726,7 +696,7 @@ fn compression_pays_for_bool_and_not_for_float() {
         Compression::Gzip(6),
         Compression::Gzip(9),
     ] {
-        let scratch = Scratch::new("measure-uint16");
+        let scratch = zarr_scratch("measure-uint16");
         let started = std::time::Instant::now();
         let env = ZarrEnvironment::create_with_compression(
             scratch.path(),
@@ -833,7 +803,7 @@ fn a_per_image_override_reaches_the_arrays_it_names() {
         ..Hints::default()
     };
     let memory = through_memory(&workflow, &decomposition, &source, &keep_all);
-    let scratch = Scratch::new("mixed");
+    let scratch = zarr_scratch("mixed");
     let (storage, env) = through_storage_with(
         scratch.path(),
         &workflow,
@@ -879,7 +849,7 @@ fn the_alignment_counters_still_mean_what_they_meant_under_compression() {
     let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
     let everything = CompressionPolicy::uniform(Compression::Gzip(1));
 
-    let scratch = Scratch::new("aligned-gzip");
+    let scratch = zarr_scratch("aligned-gzip");
     let (aligned, aligned_env) = through_storage_with(
         scratch.path(),
         &workflow,
@@ -892,7 +862,7 @@ fn the_alignment_counters_still_mean_what_they_meant_under_compression() {
     assert_eq!(aligned_env.serialised_writes(), 0);
     assert_eq!(aligned_env.unaligned_reads(), 0);
 
-    let scratch = Scratch::new("straddling-gzip");
+    let scratch = zarr_scratch("straddling-gzip");
     let (straddling, straddling_env) = through_storage_with(
         scratch.path(),
         &workflow,
@@ -948,7 +918,7 @@ fn concurrent_execution_through_storage_is_still_byte_identical() {
             concurrency,
             ..Hints::default()
         };
-        let scratch = Scratch::new("concurrent");
+        let scratch = zarr_scratch("concurrent");
         let (storage, env) = through_storage(
             scratch.path(),
             &workflow,
@@ -992,7 +962,7 @@ fn decomposition_invariance_survives_storage() {
         (6, [16, 16, 16]),
     ] {
         let decomposition = plan(&workflow, block);
-        let scratch = Scratch::new("invariance");
+        let scratch = zarr_scratch("invariance");
         let (storage, _) = through_storage(
             scratch.path(),
             &workflow,
@@ -1043,7 +1013,7 @@ fn a_block_grid_that_straddles_a_dictated_chunk_grid_is_refused_and_names_the_ch
     // chunk grid covers every chunk it touches from edge to edge — including the
     // last one on each axis, which is the case that is easy to get wrong.
     let aligned_plan = plan(&workflow, 4);
-    let scratch = Scratch::new("aligned");
+    let scratch = zarr_scratch("aligned");
     let aligned_env = ZarrEnvironment::create(scratch.path(), &source, [4, 4, 4])
         .unwrap()
         .with_output_chunk([4, 4, 4]);
@@ -1071,23 +1041,23 @@ fn a_block_grid_that_straddles_a_dictated_chunk_grid_is_refused_and_names_the_ch
     // [0,0,0] writes 0..6 of axis 0 and block [1,0,0] writes 6..12, so chunk
     // [1,0,0] — voxels 4..8 — has two writers.
     let straddling_plan = plan(&workflow, 6);
-    let scratch = Scratch::new("straddling-dictated");
+    let scratch = zarr_scratch("straddling-dictated");
     let dictated = ZarrEnvironment::create(scratch.path(), &source, [4, 4, 4])
         .unwrap()
         .with_output_chunk([4, 4, 4]);
-    let err = dictated.prepare(&straddling_plan).unwrap_err().to_string();
-    assert!(err.contains("phase 0"), "got: {err}");
-    assert!(err.contains("chunk [1, 0, 0]"), "got: {err}");
-    assert!(err.contains("[4, 0, 0]..[8, 4, 4]"), "got: {err}");
-    assert!(
-        err.contains("block [0, 0, 0]") && err.contains("block [1, 0, 0]"),
-        "got: {err}"
+    refuses!(
+        dictated.prepare(&straddling_plan),
+        "phase 0",
+        "chunk [1, 0, 0]",
+        "[4, 0, 0]..[8, 4, 4]",
+        "block [0, 0, 0]",
+        "block [1, 0, 0]",
+        "exactly one task",
+        "with_output_chunk",
+        "BlockConstraint::Extent"
     );
-    assert!(err.contains("exactly one task"), "got: {err}");
     // And it names the constraint the caller chose, because that is the one
     // they can drop — together with the one they may not be able to.
-    assert!(err.contains("with_output_chunk"), "got: {err}");
-    assert!(err.contains("BlockConstraint::Extent"), "got: {err}");
     // The refusal is not something `execute` can walk past: `prepare` is the
     // first thing it does.
     assert!(execute(
@@ -1101,7 +1071,7 @@ fn a_block_grid_that_straddles_a_dictated_chunk_grid_is_refused_and_names_the_ch
 
     // The same block grid with nothing dictated: legal, chunked from the blocks,
     // and the same answer to the voxel.
-    let scratch = Scratch::new("straddling-derived");
+    let scratch = zarr_scratch("straddling-derived");
     let (derived, derived_env) = through_storage(
         scratch.path(),
         &workflow,
@@ -1143,7 +1113,7 @@ fn a_conforming_plan_serialises_no_write_and_over_reads_no_chunk() {
     // on every axis.
     for block in [2usize, 4] {
         let decomposition = plan(&workflow, block);
-        let scratch = Scratch::new("conforming");
+        let scratch = zarr_scratch("conforming");
         let (_, env) = through_storage(
             scratch.path(),
             &workflow,
@@ -1215,7 +1185,7 @@ fn a_phase_that_changes_element_type_gets_an_image_of_that_type_on_disk() {
         ..Hints::default()
     };
     let memory = through_memory(&workflow, &decomposition, &source, &keep_all);
-    let scratch = Scratch::new("dtype-change");
+    let scratch = zarr_scratch("dtype-change");
     let (storage, env) = through_storage(
         scratch.path(),
         &workflow,
@@ -1257,7 +1227,7 @@ fn side_outputs_through_storage_hold_what_the_in_memory_environment_holds() {
     )
     .unwrap();
 
-    let scratch = Scratch::new("side");
+    let scratch = zarr_scratch("side");
     let storage = ZarrEnvironment::create(scratch.path(), &source, [8, 8, 8]).unwrap();
     execute(
         "storage",
@@ -1310,7 +1280,7 @@ fn a_run_through_storage_agrees_with_the_whole_volume_kernels() {
         .unwrap();
 
     let decomposition = plan(&workflow, 9);
-    let scratch = Scratch::new("oracle");
+    let scratch = zarr_scratch("oracle");
     let (storage, _) = through_storage(
         scratch.path(),
         &workflow,
@@ -1325,14 +1295,10 @@ fn a_run_through_storage_agrees_with_the_whole_volume_kernels() {
 /// A read outside the image is refused rather than clamped, and says which axis.
 #[test]
 fn a_region_outside_an_image_is_refused_by_name() {
-    let scratch = Scratch::new("bounds");
+    let scratch = zarr_scratch("bounds");
     let source = Voxels::zeros(Dtype::U8, [4, 4, 4]).unwrap();
     let env = ZarrEnvironment::create(scratch.path(), &source, [2, 2, 2]).unwrap();
-    let err = env
-        .read(0, &Region::new(&[3, 0, 0], &[2, 4, 4]))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("axis 0"), "got: {err}");
+    refuses!(env.read(0, &Region::new(&[3, 0, 0], &[2, 4, 4])), "axis 0");
 }
 
 /// The fragments an op writes beside its blocks survive on the same store, so a
@@ -1341,7 +1307,7 @@ fn a_region_outside_an_image_is_refused_by_name() {
 fn sidecar_fragments_round_trip_through_the_store() {
     use blockflow::sidecar::Lifecycle;
 
-    let scratch = Scratch::new("sidecars");
+    let scratch = zarr_scratch("sidecars");
     let source = Voxels::zeros(Dtype::U8, [4, 4, 4]).unwrap();
     let env = ZarrEnvironment::create(scratch.path(), &source, [2, 2, 2]).unwrap();
     env.declare_sidecar("counts", Lifecycle::Persistent)
@@ -1360,21 +1326,20 @@ fn sidecar_fragments_round_trip_through_the_store() {
 /// on which op ran last is the class of silent wrongness this crate removes.
 #[test]
 fn two_disagreeing_side_output_declarations_are_refused() {
-    let scratch = Scratch::new("declare-twice");
+    let scratch = zarr_scratch("declare-twice");
     let source = Voxels::zeros(Dtype::F64, [4, 4, 4]).unwrap();
     let env = ZarrEnvironment::create(scratch.path(), &source, [2, 2, 2]).unwrap();
     let first = Output::new("table", Dtype::F64, &[4, 2]);
     env.declare_side_output(&first).unwrap();
     env.declare_side_output(&first).unwrap();
     let second = Output::new("table", Dtype::F64, &[4, 3]);
-    let err = env.declare_side_output(&second).unwrap_err().to_string();
-    assert!(err.contains("table"), "got: {err}");
+    refuses!(env.declare_side_output(&second), "table");
 }
 
 /// An environment given a plan it cannot host says so, naming the image.
 #[test]
 fn a_plan_that_disagrees_with_image_zero_is_refused_by_prepare() {
-    let scratch = Scratch::new("prepare");
+    let scratch = zarr_scratch("prepare");
     let source = Voxels::zeros(Dtype::F64, [4, 4, 4]).unwrap();
     let env = ZarrEnvironment::create(scratch.path(), &source, [2, 2, 2]).unwrap();
     let chain: Chain = Chain::op(VoxelwiseMapOp::threshold("threshold", 0.5, 1.0, 0.0));
@@ -1393,11 +1358,7 @@ fn a_plan_that_disagrees_with_image_zero_is_refused_by_prepare() {
         )],
         chain_reach: [0, 0, 0],
     };
-    let err = env.prepare(&decomposition).unwrap_err().to_string();
-    assert!(
-        err.contains("float64") && err.contains("uint16"),
-        "got: {err}"
-    );
+    refuses!(env.prepare(&decomposition), "float64", "uint16");
 }
 
 /// A side output written before it was declared is refused rather than creating
@@ -1406,16 +1367,15 @@ fn a_plan_that_disagrees_with_image_zero_is_refused_by_prepare() {
 fn a_side_output_written_before_it_was_declared_is_refused() {
     use blockflow::voxels::SideBuf;
 
-    let scratch = Scratch::new("undeclared");
+    let scratch = zarr_scratch("undeclared");
     let source = Voxels::zeros(Dtype::F64, [4, 4, 4]).unwrap();
     let env = ZarrEnvironment::create(scratch.path(), &source, [2, 2, 2]).unwrap();
     let output = Output::new("nowhere", Dtype::F64, &[2, 2]);
     let region = Region::whole(&[2, 2]);
-    let err = env
-        .write_side(&output, 0, &region, &SideBuf::zeros(&region))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("declared"), "got: {err}");
+    refuses!(
+        env.write_side(&output, 0, &region, &SideBuf::zeros(&region)),
+        "declared"
+    );
 }
 
 // ------------------------------------------------------- image lifetime --
@@ -1464,7 +1424,7 @@ fn an_intermediate_image_is_erased_from_the_store_and_the_answer_is_unchanged() 
         chain_reach: workflow.chain.reach3(&VOLUME),
     };
 
-    let kept_root = Scratch::new("image-lifetime-kept");
+    let kept_root = zarr_scratch("image-lifetime-kept");
     let keep_all = Hints {
         keep_images: (0..plan.n_images()).map(ImageId::from).collect(),
         ..Hints::default()
@@ -1478,7 +1438,7 @@ fn an_intermediate_image_is_erased_from_the_store_and_the_answer_is_unchanged() 
         &keep_all,
     );
 
-    let freed_root = Scratch::new("image-lifetime-freed");
+    let freed_root = zarr_scratch("image-lifetime-freed");
     let (freed, freed_env) = through_storage(
         freed_root.path(),
         &workflow,
@@ -1518,10 +1478,9 @@ fn an_intermediate_image_is_erased_from_the_store_and_the_answer_is_unchanged() 
     assert!(!freed_env.is_discarded(plan.n_images() - 1));
 
     // and the freed image is loud rather than empty
-    let message = freed_env
-        .read(1, &blockflow::region::Region::new(&[0, 0, 0], &[4, 4, 4]))
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("discarded"), "{message}");
-    assert!(message.contains("keep_images"), "{message}");
+    refuses!(
+        freed_env.read(1, &blockflow::region::Region::new(&[0, 0, 0], &[4, 4, 4])),
+        "discarded",
+        "keep_images"
+    );
 }

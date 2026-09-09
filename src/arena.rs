@@ -92,8 +92,7 @@ use crate::error::{Error, Result};
 use crate::fragment::PhaseWork;
 use crate::geometry::BlockGrid;
 use crate::simulate::{
-    phase_rates_from_snapshot, simulate, ExecutorOrder, Machine, Outcome, PerPhase, Rates,
-    Scheduler,
+    phase_rates_from_snapshot, ExecutorOrder, Machine, Outcome, Rates, Run, Scheduler,
 };
 use crate::statistics::Snapshot;
 use crate::strategy::{phase_price, Enumerating, PartitionSearch, Plan, Strategy, Workflow};
@@ -520,19 +519,15 @@ impl Arena {
                 None => Vec::new(),
             };
             let mut scheduler = make_scheduler();
-            let outcome = simulate(
-                decomposition,
-                &work,
-                &self.machine,
-                &self.rates,
-                &entrant.plan.hints.release_images,
-                &entrant.plan.hints.keep_images,
-                PerPhase {
-                    ns_per_voxel: &phase_rates,
-                    ..PerPhase::default()
-                },
-                scheduler.as_mut(),
-            )?;
+            let outcome = Run::new(decomposition, &work)
+                .machine(self.machine)
+                .rates(self.rates)
+                .images(
+                    entrant.plan.hints.release_images.iter().copied(),
+                    entrant.plan.hints.keep_images.iter().copied(),
+                )
+                .ns_per_voxel(&phase_rates)
+                .go(scheduler.as_mut())?;
             let shape = PlanShape::from_decomposition(decomposition);
             verdicts.push(Verdict {
                 name: entrant.name.clone(),

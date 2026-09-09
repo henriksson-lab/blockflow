@@ -29,16 +29,17 @@
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::dtype::Dtype;
 use blockflow::env::ArrayEnvironment;
-use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain};
 use blockflow::ops::local::{Narrowing, Rounding};
 use blockflow::ops::{NarrowOp, VoxelwiseMapOp, WidenOp};
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
+
+mod support;
+use support::single_phase;
 
 const VOLUME: [usize; 3] = [24, 18, 12];
 
@@ -64,39 +65,16 @@ fn intensities() -> Array3<f64> {
     array
 }
 
-/// One phase per chain slot, so an intermediate really is materialised at the
-/// element type the slot before it declared.
-fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {
-    let grid = BlockGrid::along(VOLUME, split_axes, block).unwrap();
-    let reach = workflow.chain.reach3(&VOLUME);
-    let phases = workflow
-        .chain
-        .slots()
-        .iter()
-        .enumerate()
-        .map(|(index, slot)| {
-            PhaseDecomposition::derive(
-                vec![index],
-                vec![slot.display_name()],
-                reach,
-                reach,
-                grid.clone(),
-            )
-        })
-        .collect();
-    let mut plan = Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::F64,
-        phases,
-        chain_reach: reach,
-    };
-    plan.declare_dtypes(&workflow.chain).unwrap();
-    plan
-}
-
 fn run(chain: Chain, block: usize, split_axes: &[usize], input: &Array3<f64>) -> Voxels {
     let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
-    let decomposition = plan(&workflow, block, split_axes);
+    let grid = blockflow::geometry::BlockGrid::along(VOLUME, split_axes, block).unwrap();
+    let decomposition = single_phase::typed_one_phase_per_slot(
+        &workflow.chain,
+        VOLUME,
+        Dtype::F64,
+        &grid,
+        workflow.chain.reach3(&VOLUME),
+    );
     let env = ArrayEnvironment::for_decomposition(input.clone().into(), &decomposition, [4, 4, 4])
         .unwrap();
     execute("cast", &workflow, &decomposition, &Hints::default(), &env).unwrap();

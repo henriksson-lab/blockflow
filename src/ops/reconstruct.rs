@@ -219,7 +219,7 @@
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
-use crate::error::{Error, Result};
+use crate::error::{bail, ensure, Result};
 use crate::iterate::{IterativeOp, Substage, SubstageLimit, SubstageOperand};
 use crate::op::Anchor;
 use crate::voxels::Voxels;
@@ -363,11 +363,10 @@ pub fn reconstruct_step_into_at<T: Copy + PartialOrd>(
     shapes_agree(running.shape(), mask.shape(), "reconstruct_step_into")?;
     shapes_agree(running.shape(), out.shape(), "reconstruct_step_into")?;
     if element.is_empty() {
-        return Err(Error::InvalidArgument(
+        bail!(
             "reconstruct_step_into: an empty element has nothing to reduce over, so the flood \
              would never leave the voxel it started on"
-                .to_string(),
-        ));
+        );
     }
     let extent = [
         running.shape()[0] as isize,
@@ -378,16 +377,15 @@ pub fn reconstruct_step_into_at<T: Copy + PartialOrd>(
     // re-phases; the same argument `ops::rank` makes at greater length.
     if element.origin() == StepOrigin::ClippedStart {
         for axis in 0..3 {
-            if at.offset[axis] + extent[axis] as usize > at.volume[axis] {
-                return Err(Error::InvalidArgument(format!(
-                    "reconstruct_step_into: a buffer of {:?} at {:?} does not fit a volume of \
+            ensure!(
+                at.offset[axis] + extent[axis] as usize <= at.volume[axis],
+                "reconstruct_step_into: a buffer of {:?} at {:?} does not fit a volume of \
                      {:?}, and this element's step counts from the clipped start of the window, \
                      so where the buffer sits in the volume is part of the step",
-                    running.shape(),
-                    at.offset,
-                    at.volume
-                )));
-            }
+                running.shape(),
+                at.offset,
+                at.volume
+            );
         }
     }
     // The element's offsets at one voxel, for the one element that has more than
@@ -474,7 +472,7 @@ pub fn reconstruct_to_fixed_point<T: Copy + PartialOrd>(
         for j in 0..seed.shape()[1] {
             for k in 0..seed.shape()[2] {
                 if !method.admits(&seed[[i, j, k]], &mask[[i, j, k]]) {
-                    return Err(Error::InvalidArgument(format!(
+                    bail!(
                         "reconstruct_to_fixed_point: the seed does not satisfy the \
                          precondition at [{i}, {j}, {k}] — a {:?} reconstruction needs the \
                          seed on the mask's own side of it everywhere, and an unordered value \
@@ -482,7 +480,7 @@ pub fn reconstruct_to_fixed_point<T: Copy + PartialOrd>(
                          away at the first substage and hand back a well-formed answer to a \
                          different question, so it is refused here instead.",
                         method
-                    )));
+                    );
                 }
             }
         }
@@ -500,7 +498,7 @@ pub fn reconstruct_to_fixed_point<T: Copy + PartialOrd>(
             return Ok((current, steps));
         }
         if steps >= limit.substages() {
-            return Err(Error::InvalidArgument(format!(
+            bail!(
                 "a {:?} reconstruction did not reach a fixed point in {} step(s) over a {:?} \
                  volume. Either the limit is below what this data needs — raise it, or take it \
                  from `flooding_bound`, and note that a mask forcing a serpentine path needs \
@@ -511,7 +509,7 @@ pub fn reconstruct_to_fixed_point<T: Copy + PartialOrd>(
                 method,
                 limit.substages(),
                 [mask.shape()[0], mask.shape()[1], mask.shape()[2]]
-            )));
+            );
         }
     }
 }
@@ -597,16 +595,15 @@ pub fn flooding_bound(volume: [usize; 3], element: &StructuringElement) -> Subst
 }
 
 fn check_h(h: f64, method: Reconstruction) -> Result<()> {
-    if !h.is_finite() || h < 0.0 {
-        return Err(Error::InvalidArgument(format!(
-            "the {} transform needs a finite, non-negative h and was given {h}. A negative h \
+    ensure!(
+        h.is_finite() && h >= 0.0,
+        "the {} transform needs a finite, non-negative h and was given {h}. A negative h \
              puts the seed on the wrong side of the mask, which is the one precondition a \
              reconstruction has; an infinite one turns a finite mask into an infinite seed and \
              an infinite mask into a NaN, which is the only way this op could manufacture an \
              unordered value out of data that held none.",
-            method.transform()
-        )));
-    }
+        method.transform()
+    );
     Ok(())
 }
 
@@ -646,14 +643,13 @@ impl HExtremaOp {
         limit: SubstageLimit,
     ) -> Result<Self> {
         check_h(h, method)?;
-        if element.is_empty() {
-            return Err(Error::InvalidArgument(format!(
-                "the {} transform was given an empty element, which has nothing to reduce over: \
+        ensure!(
+            !element.is_empty(),
+            "the {} transform was given an empty element, which has nothing to reduce over: \
                  the flood would never leave the voxel it started on and every peak would \
                  survive whatever its prominence.",
-                method.transform()
-            )));
-        }
+            method.transform()
+        );
         let cost = cost_for(&element);
         Ok(Self {
             name,
@@ -782,7 +778,7 @@ impl IterativeOp for HExtremaOp {
                 // end at the limit with a true and useless message. Caught here,
                 // at substage 0, where it costs one pass and can be explained.
                 if value.is_nan() {
-                    return Err(Error::InvalidArgument(format!(
+                    bail!(
                         "iterative op {:?} was handed a mask holding a NaN. The kernel would \
                          treat it as this crate's order says — unordered with everything, so it \
                          neither floods nor holds anything back — but an iterative phase stops \
@@ -792,7 +788,7 @@ impl IterativeOp for HExtremaOp {
                          the run: one voxelwise map, to +inf to treat missing data as a ceiling \
                          or to -inf to treat it as a floor.",
                         self.name
-                    )));
+                    );
                 }
                 *slot = self.method.seed_from(value, self.h);
             }
@@ -892,26 +888,10 @@ pub const COST_MEASUREMENT: &str = "ops::reconstruct::cost_report";
 /// are the precedent, and the unit is the same voxelwise map so the numbers stay
 /// comparable with the module's table.
 pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
-    use std::time::Instant;
-
     use super::element::ElementShape;
 
     let voxels = (shape[0] * shape[1] * shape[2]) as f64;
     let repetitions = repetitions.max(1);
-
-    let best_of = |mut run: Box<dyn FnMut()>| -> f64 {
-        // One untimed pass first: a freshly allocated output pays a page fault
-        // per page on first touch, and that fault is the measurement for the
-        // cheapest case here.
-        run();
-        let mut best = f64::INFINITY;
-        for _ in 0..repetitions {
-            let started = Instant::now();
-            run();
-            best = best.min(started.elapsed().as_secs_f64() * 1e9 / voxels);
-        }
-        best
-    };
 
     let ramp = Array3::from_shape_fn((shape[0], shape[1], shape[2]), |(i, j, k)| {
         ((i * 7919 + j * 104_729 + k * 1013) % 1013) as f64
@@ -926,10 +906,10 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
         let anchor = crate::op::Anchor::whole(shape);
         rows.push((
             "voxelwise map (the unit)".to_string(),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 use crate::op::BlockOp;
                 op.apply(&input, &mut out, &anchor).unwrap();
-            })),
+            }),
             1.0,
         ));
     }
@@ -943,7 +923,7 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
         let named = element.clone();
         rows.push((
             format!("reconstruction step, {size}-voxel element"),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 reconstruct_step_into(
                     seed.view(),
                     mask.view(),
@@ -952,7 +932,7 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
                     out.view_mut(),
                 )
                 .unwrap();
-            })),
+            }),
             size as f64,
         ));
     }
@@ -962,11 +942,11 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
         let mut out = Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
         rows.push((
             "seed derivation (substage 0 only)".to_string(),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 for (slot, &value) in out.iter_mut().zip(mask.iter()) {
                     *slot = value - 100.0;
                 }
-            })),
+            }),
             1.0,
         ));
     }

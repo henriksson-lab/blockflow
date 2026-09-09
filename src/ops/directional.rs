@@ -176,7 +176,7 @@ use std::sync::OnceLock;
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
-use crate::error::{Error, Result};
+use crate::error::{bail, Result};
 use crate::op::{Anchor, BlockOp, Chain};
 use crate::voxels::Voxels;
 
@@ -966,7 +966,7 @@ pub fn directional_to_fixed_point(
         }
         current = next;
         if passes >= limit.passes() {
-            return Err(Error::InvalidArgument(format!(
+            bail!(
                 "directional thinning did not reach a fixed point in {} pass(es) over a {:?} \
                  volume. Either the limit is below what this data needs — raise it, or take it \
                  from `PassLimit::for_volume` — or a pass has stopped being monotone, which \
@@ -975,7 +975,7 @@ pub fn directional_to_fixed_point(
                  wrong skeleton.",
                 limit.passes(),
                 [input.shape()[0], input.shape()[1], input.shape()[2]]
-            )));
+            );
         }
     }
 }
@@ -1162,42 +1162,21 @@ pub const COST_MEASUREMENT: &str = "ops::directional::cost_report";
 /// Run with
 /// `cargo test --release -- --ignored --nocapture ops::directional::cost`.
 pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
-    use std::time::Instant;
-
-    use crate::op::Anchor;
-
     let voxels = (shape[0] * shape[1] * shape[2]) as f64;
     let repetitions = repetitions.max(1);
     let anchor = Anchor::whole(shape);
-    let best_of = |mut run: Box<dyn FnMut()>| -> f64 {
-        // One untimed run first: a freshly allocated output pays a page fault
-        // per page on first touch, which is most of the measurement for the
-        // cheapest case here.
-        run();
-        let mut best = f64::INFINITY;
-        for _ in 0..repetitions {
-            let started = Instant::now();
-            run();
-            best = best.min(started.elapsed().as_secs_f64() * 1e9 / voxels);
-        }
-        best
-    };
 
     let mut rows: Vec<(String, f64)> = Vec::new();
     {
-        let mut ramp = Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
-        for (flat, value) in ramp.iter_mut().enumerate() {
-            *value = ((flat * 7919) % 1013) as f64;
-        }
-        let input: Voxels = ramp.into();
+        let input = super::cost::ramp(shape);
         let op = super::voxelwise::VoxelwiseMapOp::threshold("map", 500.0, 1.0, 0.0);
         let mut out = Voxels::zeros(Dtype::F64, shape).unwrap();
         let anchor = anchor.clone();
         rows.push((
             "voxelwise map (the unit)".to_string(),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 op.apply(&input, &mut out, &anchor).unwrap();
-            })),
+            }),
         ));
     }
 
@@ -1221,9 +1200,9 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
         let anchor = anchor.clone();
         rows.push((
             what.to_string(),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 op.apply(&input, &mut out, &anchor).unwrap();
-            })),
+            }),
         ));
     }
 

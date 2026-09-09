@@ -71,7 +71,7 @@
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
-use crate::error::{Error, Result};
+use crate::error::{bail, ensure, Result};
 use crate::op::{Anchor, BlockOp, Slicing};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
@@ -312,9 +312,7 @@ fn preflight(
 ) -> Result<[isize; 3]> {
     shapes_agree(shape, out_shape, what)?;
     if element.is_empty() {
-        return Err(Error::InvalidArgument(format!(
-            "{what}: an empty element has nothing to reduce over"
-        )));
+        bail!("{what}: an empty element has nothing to reduce over");
     }
     let extent = [shape[0] as isize, shape[1] as isize, shape[2] as isize];
     // Checked only where the anchor decides anything, which is where the element
@@ -324,14 +322,15 @@ fn preflight(
     // always correct.
     if element.origin() == StepOrigin::ClippedStart {
         for axis in 0..3 {
-            if at.offset[axis] + extent[axis] as usize > at.volume[axis] {
-                return Err(Error::InvalidArgument(format!(
-                    "{what}: a buffer of {:?} at {:?} does not fit a volume of {:?}, and this \
+            ensure!(
+                at.offset[axis] + extent[axis] as usize <= at.volume[axis],
+                "{what}: a buffer of {:?} at {:?} does not fit a volume of {:?}, and this \
                      element's step counts from the clipped start of the window, so where the \
                      buffer sits in the volume is part of the operation",
-                    shape, at.offset, at.volume
-                )));
-            }
+                shape,
+                at.offset,
+                at.volume
+            );
         }
     }
     Ok(extent)

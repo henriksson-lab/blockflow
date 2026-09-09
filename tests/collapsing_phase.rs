@@ -75,6 +75,9 @@ use blockflow::Dtype;
 use ndarray::Array3;
 use std::cmp::Ordering;
 
+mod support;
+use support::refuses;
+
 /// Deliberately not a round number on any axis, so a block edge divides none of
 /// them unless it was chosen to.
 const VOLUME: [usize; 3] = [11, 13, 17];
@@ -499,11 +502,13 @@ fn a_projection_that_reads_only_its_own_extent_is_refused_by_name() {
     // Everything except the claim is in order: the block keeps its whole core.
     assert!(plan.phases[0].blocks_missing_valid_core().is_empty());
 
-    let err = plan.check().unwrap_err().to_string();
-    assert!(err.contains("the whole of axis 0 of image 0"), "{err}");
-    assert!(err.contains("fetches 0..1 of that axis"), "{err}");
-    assert!(err.contains("the whole of it is 0..11"), "{err}");
-    assert!(err.contains("PhaseDecomposition::with_sources"), "{err}");
+    refuses!(
+        plan.check(),
+        "the whole of axis 0 of image 0",
+        "fetches 0..1 of that axis",
+        "the whole of it is 0..11",
+        "PhaseDecomposition::with_sources",
+    );
 }
 
 /// A fetch covering **half** the collapsed axis is the same fault with the fetch
@@ -518,10 +523,12 @@ fn a_projection_that_reads_only_its_own_extent_is_refused_by_name() {
 #[test]
 fn a_fetch_covering_half_the_collapsed_axis_is_refused_by_name() {
     let plan = plan_with(truthful_reach(), COLLAPSED, Some(half_axis_fetch));
-    let err = plan.check().unwrap_err().to_string();
-    assert!(err.contains("the whole of axis 0 of image 0"), "{err}");
-    assert!(err.contains("fetches 0..5 of that axis"), "{err}");
-    assert!(err.contains("the whole of it is 0..11"), "{err}");
+    refuses!(
+        plan.check(),
+        "the whole of axis 0 of image 0",
+        "fetches 0..5 of that axis",
+        "the whole of it is 0..11",
+    );
 
     let fine = texture(VOLUME);
     let input: Voxels = fine.clone().into();
@@ -726,10 +733,9 @@ fn cutting_a_consumed_axis_is_refused_unless_the_halo_spans_it() {
                 block.index
             );
         }
-        let err = plan.check().unwrap_err().to_string();
-        assert!(
-            err.contains("valid regions do not tile the volume exactly"),
-            "halo {halo}: {err}"
+        refuses!(
+            format!("halo {halo}") => plan.check(),
+            "valid regions do not tile the volume exactly"
         );
     }
 

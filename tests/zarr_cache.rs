@@ -36,6 +36,8 @@ use blockflow::Voxels;
 
 mod support;
 
+use support::scratch::ScratchDir;
+use support::single_phase;
 use support::volume::{modular_mask_bool, xorshift_u16, xorshift_unit_f64};
 
 const VOLUME: [usize; 3] = [64, 64, 64];
@@ -74,10 +76,7 @@ fn read_all(env: &ZarrEnvironment, regions: &[Region]) -> Vec<Voxels> {
 }
 
 fn root(tag: &str) -> std::path::PathBuf {
-    let path =
-        std::env::temp_dir().join(format!("blockflow-zarr-cache-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    path
+    ScratchDir::new("zarr-cache", tag).keep()
 }
 
 struct CacheFixture {
@@ -108,22 +107,8 @@ impl CacheFixture {
     fn single_phase_threshold(dtype: Dtype) -> (Workflow, Decomposition) {
         let chain: Chain = Chain::op(VoxelwiseMapOp::threshold("threshold", 0.5, 1.0, 0.0));
         let workflow = Workflow::new(chain, VOLUME, dtype);
-        let reach = workflow.chain.reach3(&VOLUME);
-        let slots = workflow.chain.slots();
-        let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
         let grid = BlockGrid::along(VOLUME, &[0, 1, 2], CHUNK[0]).expect("a grid");
-        let plan = Decomposition {
-            volume: VOLUME,
-            dtype: workflow.dtype,
-            phases: vec![PhaseDecomposition::derive(
-                (0..slots.len()).collect(),
-                names,
-                reach,
-                reach,
-                grid,
-            )],
-            chain_reach: reach,
-        };
+        let plan = single_phase::plan_on_grid(&workflow, VOLUME, grid);
         (workflow, plan)
     }
 

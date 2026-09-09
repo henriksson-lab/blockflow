@@ -53,6 +53,9 @@ use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::{refuses, single_phase};
+
 const VOLUME: [usize; 3] = [32, 24, 20];
 
 // ------------------------------------------------------------- fixtures --
@@ -158,16 +161,7 @@ fn plan_with_reach(
     split_axes: &[usize],
     reach: [usize; 3],
 ) -> Decomposition {
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(VOLUME, split_axes, block).unwrap();
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
-    Decomposition {
-        volume: VOLUME,
-        dtype: workflow.dtype,
-        phases: vec![phase],
-        chain_reach: reach,
-    }
+    single_phase::plan_with_reach(workflow, VOLUME, block, split_axes, reach)
 }
 
 /// The oracle: the same kernels, called once, over the whole array.
@@ -484,13 +478,9 @@ fn a_combine_that_cannot_join_its_branches_is_refused_before_anything_runs() {
         )
         .unwrap(),
     ]);
-    let err = chain
-        .produces(Dtype::F64)
-        .expect_err("a combine must refuse a pair of types it cannot join")
-        .to_string();
-    assert!(
-        err.contains("does not accept [float64, bool]"),
-        "got: {err}"
+    refuses!(
+        chain.produces(Dtype::F64),
+        "does not accept [float64, bool]",
     );
 
     // And a fan-in with nothing to fan into.

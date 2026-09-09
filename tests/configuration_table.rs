@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+use blockflow::decomposition::Decomposition;
 use blockflow::env::ArrayEnvironment;
 use blockflow::fragment::PhaseWork;
 use blockflow::geometry::BlockGrid;
@@ -55,6 +55,10 @@ use blockflow::ops::configuration::{
 use blockflow::strategy::{execute, execute_phases, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::Dtype;
+
+mod support;
+use support::compare::differing as moved;
+use support::single_phase;
 
 const VOLUME: [usize; 3] = [32, 24, 20];
 
@@ -201,14 +205,6 @@ fn alternating() -> ConfigurationTable {
     table
 }
 
-fn moved(before: &Array3<bool>, after: &Array3<bool>) -> usize {
-    before
-        .iter()
-        .zip(after.iter())
-        .filter(|(a, b)| a != b)
-        .count()
-}
-
 // ------------------------------------------------------ the pass shell --
 
 fn pass_workflow(table: &Arc<ConfigurationTable>, passes: usize) -> Workflow {
@@ -229,17 +225,14 @@ fn plan_with_reach(
     split_axes: &[usize],
     reach: [usize; 3],
 ) -> Decomposition {
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(VOLUME, split_axes, block).unwrap();
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid)
-        .with_dtype(Dtype::Bool);
-    Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::Bool,
-        phases: vec![phase],
-        chain_reach: reach,
-    }
+    single_phase::plan_with_reach_and_output_dtype(
+        workflow,
+        VOLUME,
+        block,
+        split_axes,
+        reach,
+        Dtype::Bool,
+    )
 }
 
 fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {

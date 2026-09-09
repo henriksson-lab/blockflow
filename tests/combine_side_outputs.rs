@@ -30,6 +30,9 @@ use blockflow::region::Region;
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [4, 3, 2];
 
 /// A combine that writes the mean of its branches as an image, and **every
@@ -194,11 +197,7 @@ fn side_region_routes_past_the_branches_to_the_combine() {
     assert_eq!(region.shape, vec![12, 3]);
 
     // And one past the end is still refused, by name.
-    let err = chain
-        .side_region(1, &valid, VOLUME)
-        .expect_err("there is only one")
-        .to_string();
-    assert!(err.contains("declares 1"), "{err}");
+    refuses!(chain.side_region(1, &valid, VOLUME), "declares 1");
 }
 
 /// **The combine is handed every branch's result**, which is the whole point:

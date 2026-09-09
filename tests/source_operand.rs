@@ -44,7 +44,9 @@ use blockflow::Dtype;
 
 mod support;
 
-use support::source_fixture::{self, SourcePhase};
+use support::refuses;
+use support::source_fixture;
+use support::volume::standard_grid_sweep;
 
 const VOLUME: [usize; 3] = [16, 12, 10];
 /// Written by phase 0, read by phase 1 as its input **and** by phase 2 as a
@@ -217,27 +219,18 @@ fn whole(chain: &Chain) -> Voxels {
 
 fn one_phase_per_slot(chain: &Chain, grid: &BlockGrid) -> Decomposition {
     let reaches = [[1usize, 1, 1], [1, 1, 1], [RADIUS, RADIUS, RADIUS]];
-    source_fixture::declared_plan(
+    source_fixture::declared_one_phase_per_slot(
         chain,
         VOLUME,
         Dtype::F64,
         grid,
         [2, 2, 2],
-        (0..chain.slots().len())
-            .map(|slot| SourcePhase::with_equal_halo(vec![slot], reaches[slot])),
+        &reaches,
     )
 }
 
 fn grids() -> Vec<BlockGrid> {
-    vec![
-        BlockGrid::new(VOLUME, VOLUME).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 8).unwrap(),
-        BlockGrid::along(VOLUME, &[1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[2], 5).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1, 2], 4).unwrap(),
-    ]
+    standard_grid_sweep(VOLUME)
 }
 
 fn run(grid: &BlockGrid) -> Array3<f64> {
@@ -310,22 +303,16 @@ fn an_op_that_declares_an_operand_and_never_consumes_it_is_refused() {
     let mut out = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
     let stored = input.clone();
     let entries = [(STORED.into(), &stored)];
-    let failed = op
-        .apply_with(
+    refuses!(
+        op.apply_with(
             &input,
             SourceInputs::new(&entries),
             &mut out,
             &Anchor::whole(VOLUME),
-        )
-        .unwrap_err();
-    let message = failed.to_string();
-    assert!(
-        message.contains("forgetful-operand") && message.contains("apply_with"),
-        "the refusal must name the op and the method it is missing: {message}"
-    );
-    assert!(
-        message.contains(&STORED.to_string()),
-        "and the image it asked for: {message}"
+        ),
+        "forgetful-operand",
+        "apply_with",
+        &STORED.to_string(),
     );
 }
 
@@ -380,15 +367,10 @@ fn an_operand_reaching_past_the_phase_halo_is_refused_by_name() {
     plan.declare_dtypes(&chain).unwrap();
     plan.declare_source_images(&chain).unwrap();
 
-    let failed = check_source_images(&chain, &plan).unwrap_err();
-    let message = failed.to_string();
-    assert!(
-        message.contains("per-input halo"),
-        "the refusal must name what would lift the limit: {message}"
-    );
-    assert!(
-        message.contains(&format!("image {STORED}")),
-        "and which operand: {message}"
+    refuses!(
+        check_source_images(&chain, &plan),
+        "per-input halo",
+        &format!("image {STORED}"),
     );
 }
 

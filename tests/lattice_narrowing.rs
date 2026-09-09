@@ -39,7 +39,7 @@
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+use blockflow::decomposition::Decomposition;
 use blockflow::env::ArrayEnvironment;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain};
@@ -55,6 +55,11 @@ use blockflow::ops::local::{
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
+
+mod support;
+use support::compare::{differs, identical};
+use support::volume::sample_offset_grid_sweep;
+use support::{refuses, single_phase};
 
 /// Round on no axis, so a spacing divides none of them unless it was chosen to.
 const VOLUME: [usize; 3] = [30, 24, 18];
@@ -384,10 +389,8 @@ fn a_value_outside_the_range_saturates_and_a_nan_goes_to_zero() {
 /// it is **stated**, and the refusal says which one it is.
 #[test]
 fn an_element_type_with_no_rounding_rule_is_refused_by_name() {
-    let two_valued = Narrowing::to(Dtype::Bool).unwrap_err().to_string();
-    assert!(two_valued.contains("two-valued"), "got: {two_valued}");
-    let half = Narrowing::to(Dtype::F16).unwrap_err().to_string();
-    assert!(half.contains("half precision"), "got: {half}");
+    refuses!(Narrowing::to(Dtype::Bool), "two-valued");
+    refuses!(Narrowing::to(Dtype::F16), "half precision");
     assert!(LatticeNarrowing::through(Dtype::Bool).is_err());
     assert!(LatticeNarrowing::through(Dtype::U8).is_ok());
 }
@@ -468,37 +471,11 @@ fn every_decomposition_gives_the_whole_volume_answer_with_narrowing_on() {
 /// Block sizes that cut the lattice in every way available: not at all, on one
 /// axis at three offsets relative to the samples, on two, and on all three.
 fn grids() -> Vec<BlockGrid> {
-    vec![
-        BlockGrid::new(VOLUME, VOLUME).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 5).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 8).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 9).unwrap(),
-        BlockGrid::along(VOLUME, &[1], 6).unwrap(),
-        BlockGrid::along(VOLUME, &[2], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 2], 6).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1, 2], 6).unwrap(),
-    ]
+    sample_offset_grid_sweep(VOLUME)
 }
 
 fn plan(chain: &Chain, grid: &BlockGrid) -> Decomposition {
-    let slots = chain.slots();
-    let reach = chain.reach3(&VOLUME);
-    let phase = PhaseDecomposition::derive(
-        (0..slots.len()).collect(),
-        slots.iter().map(|slot| slot.display_name()).collect(),
-        reach,
-        reach,
-        grid.clone(),
-    );
-    let mut plan = Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::F64,
-        phases: vec![phase],
-        chain_reach: reach,
-    };
-    plan.declare_dtypes(chain).unwrap();
-    plan.declare_source_images(chain).unwrap();
-    plan
+    single_phase::declared_plan_on_grid_for_chain(chain, VOLUME, Dtype::F64, grid.clone())
 }
 
 fn run(chain: Chain, input: &Voxels, decomposition: &Decomposition) -> Voxels {
@@ -815,25 +792,4 @@ fn a_uniform_block_is_declared_at_the_value_the_kernel_writes() {
         "and a whole number survives the second site"
     );
     assert_eq!(interpolate_half.constant_maps_to(7.5), Some(8.0));
-}
-
-// ------------------------------------------------------------- helpers --
-
-fn identical(got: &Array3<f64>, want: &Array3<f64>, what: &str) {
-    assert_eq!(got.shape(), want.shape(), "{what}: different shapes");
-    for ((index, one), other) in got.indexed_iter().zip(want.iter()) {
-        assert!(
-            one.to_bits() == other.to_bits(),
-            "{what}: at {index:?} got {one} and wanted {other}"
-        );
-    }
-}
-
-fn differs(one: &Array3<f64>, other: &Array3<f64>, what: &str) {
-    assert!(
-        one.iter()
-            .zip(other.iter())
-            .any(|(one, other)| one.to_bits() != other.to_bits()),
-        "{what}: the two must differ, or the comparison beside this one is vacuous"
-    );
 }

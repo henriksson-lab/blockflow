@@ -31,16 +31,13 @@
 // test prints the price, and the recommendation lives in
 // `print_what_a_window_costs`'s own doc.
 
-use std::collections::BTreeSet;
-
 use blockflow::assemble::{Assembly, PlanBuilder};
 use blockflow::distributed::handout::HandoutPolicy;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::probes::IdentityOp;
 use blockflow::simulate::{
-    simulate, Decision, ExecutorOrder, Handout, Machine, Outcome, PerPhase, Rates, ReleaseAware,
-    Scheduler,
+    Decision, ExecutorOrder, Handout, Machine, Outcome, Rates, ReleaseAware, Run, Scheduler,
 };
 use blockflow::Dtype;
 
@@ -109,17 +106,11 @@ fn machine(candidate_window: usize) -> Machine {
 }
 
 fn run(assembly: &Assembly, machine: Machine, scheduler: &mut dyn Scheduler) -> Outcome {
-    simulate(
-        &assembly.decomposition,
-        &assembly.work(),
-        &machine,
-        &rates(),
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        PerPhase::default(),
-        scheduler,
-    )
-    .expect("a simulable plan")
+    Run::new(&assembly.decomposition, &assembly.work())
+        .machine(machine)
+        .rates(rates())
+        .go(scheduler)
+        .expect("a simulable plan")
 }
 
 /// The windows every sweep here uses, and the reason for each.

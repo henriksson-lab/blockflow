@@ -57,6 +57,10 @@ use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 use ndarray::Array3;
 
+mod support;
+use support::compare::differing;
+use support::refuses;
+
 // ------------------------------------------------------------- the fixtures --
 
 /// A one-voxel-thick oblique sheet of **background** in a box of foreground.
@@ -628,13 +632,9 @@ fn a_short_halo_against_the_whole_axis_reach_is_refused() {
     // accepted, and rightly, because it fetches everything.
     for halo in [[4usize, 4, 4], [0, 0, 0], [8, 8, 8], [20, 14, 10]] {
         let short = redundant.decomposition.with_forced_halo(halo);
-        let message = short
-            .check()
-            .expect_err(&format!("halo {halo:?} must not check"))
-            .to_string();
-        assert!(
-            message.contains("do not tile the volume exactly"),
-            "halo {halo:?}: {message}"
+        refuses!(
+            format!("halo {halo:?}") => short.check(),
+            "do not tile the volume exactly"
         );
     }
     println!(
@@ -905,14 +905,6 @@ fn the_finishs_constant_declaration_is_true() {
 }
 
 // -------------------------------------------------------------------- helpers --
-
-fn differing(ours: &Array3<f64>, theirs: &Array3<f64>) -> usize {
-    assert_eq!(ours.shape(), theirs.shape());
-    ours.iter()
-        .zip(theirs.iter())
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count()
-}
 
 fn worst_gap(ours: &Array3<f64>, theirs: &Array3<f64>) -> f64 {
     ours.iter()

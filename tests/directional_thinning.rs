@@ -46,9 +46,8 @@
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+use blockflow::decomposition::Decomposition;
 use blockflow::env::ArrayEnvironment;
-use blockflow::geometry::BlockGrid;
 use blockflow::op::BlockOp;
 use blockflow::ops::directional::{
     border_mask, clear_faces, directional_pass, directional_pass_into,
@@ -59,6 +58,9 @@ use blockflow::ops::directional::{
 use blockflow::ops::skeleton::{betti_numbers, connected_components, Adjacency, PassLimit};
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::Dtype;
+
+mod support;
+use support::{refuses, single_phase};
 
 // ------------------------------------------------------------- fixtures --
 
@@ -666,17 +668,14 @@ fn plan_with_reach(
     split_axes: &[usize],
     reach: [usize; 3],
 ) -> Decomposition {
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let grid = BlockGrid::along(VOLUME, split_axes, block).unwrap();
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid)
-        .with_dtype(Dtype::Bool);
-    Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::Bool,
-        phases: vec![phase],
-        chain_reach: reach,
-    }
+    single_phase::plan_with_reach_and_output_dtype(
+        workflow,
+        VOLUME,
+        block,
+        split_axes,
+        reach,
+        Dtype::Bool,
+    )
 }
 
 fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {
@@ -790,20 +789,13 @@ fn a_halo_short_of_the_declared_reach_is_refused() {
     honest.check().expect("the honest plan tiles");
 
     let forced = honest.with_forced_halo([SUB_ITERATIONS - 1, 0, 0]);
-    let err = forced
-        .check()
-        .expect_err("a short halo must not check out")
-        .to_string();
-    assert!(
-        err.contains("do not tile the volume exactly"),
-        "expected the tiling guard, got: {err}"
-    );
+    refuses!(forced.check(), "do not tile the volume exactly");
 
     let env = ArrayEnvironment::new(input.into(), 1, [4, 4, 4]).unwrap();
-    let err = execute("short", &workflow, &forced, &Hints::default(), &env)
-        .expect_err("the executor must refuse a short halo")
-        .to_string();
-    assert!(err.contains("do not tile the volume exactly"), "got {err}");
+    refuses!(
+        execute("short", &workflow, &forced, &Hints::default(), &env),
+        "do not tile the volume exactly"
+    );
 }
 
 /// **Property 4c, and the half a generous halo cannot show.** A phase that

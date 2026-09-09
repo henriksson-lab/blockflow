@@ -24,15 +24,11 @@
 // | with contention on, they disagree by **47%** on a mixed-grid plan | and that is the number item C never had |
 // | the disagreement is *about the plan*: the two models rank two plans oppositely | a divergence that changed no decision would be a curiosity. This one changes which plan a planner should choose |
 
-use std::collections::BTreeSet;
-
 use blockflow::assemble::{Assembly, PlanBuilder};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::probes::IdentityOp;
-use blockflow::simulate::{
-    simulate, ExecutorOrder, Machine, Outcome, PerPhase, Rates, MEASURED_CONTENTION,
-};
+use blockflow::simulate::{ExecutorOrder, Machine, Outcome, Rates, Run, MEASURED_CONTENTION};
 use blockflow::Dtype;
 
 const VOLUME: [usize; 3] = [96, 96, 96];
@@ -85,21 +81,15 @@ fn machine(contention: f64, wave_synchronous: bool) -> Machine {
 }
 
 fn run(assembly: &Assembly, machine: Machine) -> Outcome {
-    simulate(
-        &assembly.decomposition,
-        &assembly.work(),
-        &machine,
-        &Rates {
+    Run::new(&assembly.decomposition, &assembly.work())
+        .machine(machine)
+        .rates(Rates {
             chunk: [64, 64, 64],
             chunk_bytes: 64 * 64 * 64 * 8,
             ..Rates::default()
-        },
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        PerPhase::default(),
-        &mut ExecutorOrder::phase_major(),
-    )
-    .expect("a simulable plan")
+        })
+        .go(&mut ExecutorOrder::phase_major())
+        .expect("a simulable plan")
 }
 
 /// **The field does what it is named for**: phases stop overlapping.
@@ -343,10 +333,8 @@ fn joining_each_wave_costs_more_the_more_unequal_the_tasks_are() {
     let at = |nodes: usize, workers: usize, fraction: f64| {
         let fractions = vec![fraction; phases];
         let makespan = |wave_synchronous: bool| {
-            simulate(
-                &assembly.decomposition,
-                &assembly.work(),
-                &Machine {
+            Run::new(&assembly.decomposition, &assembly.work())
+                .machine(Machine {
                     nodes,
                     workers,
                     cache_bytes: 1 << 24,
@@ -357,22 +345,16 @@ fn joining_each_wave_costs_more_the_more_unequal_the_tasks_are() {
                     contention: MEASURED_CONTENTION,
                     wave_synchronous,
                     candidate_window: 0,
-                },
-                &Rates {
+                })
+                .rates(Rates {
                     chunk: [16, 16, 16],
                     chunk_bytes: 16 * 16 * 16 * 8,
                     ..Rates::default()
-                },
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                PerPhase {
-                    constant_fraction: &fractions,
-                    ..PerPhase::default()
-                },
-                &mut ExecutorOrder::phase_major(),
-            )
-            .expect("a simulable plan")
-            .makespan_ns as f64
+                })
+                .constant_fraction(&fractions)
+                .go(&mut ExecutorOrder::phase_major())
+                .expect("a simulable plan")
+                .makespan_ns as f64
         };
         makespan(true) / makespan(false)
     };

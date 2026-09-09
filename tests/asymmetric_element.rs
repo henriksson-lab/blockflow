@@ -45,7 +45,7 @@ use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::SceneSpec;
 
 mod support;
-use support::{single_phase, volume};
+use support::{refuses, single_phase, volume};
 
 /// Long on axis 0, where the elements below are widest and where the biggest
 /// reach — an opening's `(9, 9)`, which is `lo + hi` on both sides — has to
@@ -280,22 +280,15 @@ fn a_halo_short_on_the_narrow_side_is_refused_and_the_exact_one_is_not() {
         Reach::asymmetric([(5, 4), (2, 2), (2, 0)]),
     ] {
         let forced = exact.with_forced_halo(short.clone());
-        let err = forced
-            .check()
-            .expect_err(&format!("{short} must not check out"))
-            .to_string();
-        assert!(
-            err.contains("do not tile the volume exactly"),
-            "{short}: expected the tiling guard, got: {err}"
+        refuses!(
+            short => forced.check(),
+            "do not tile the volume exactly"
         );
 
         let env = ArrayEnvironment::new(source.clone().into(), 1, [4, 4, 4]).unwrap();
-        let err = execute("short", &workflow, &forced, &Hints::default(), &env)
-            .expect_err(&format!("{short}: the executor must refuse it"))
-            .to_string();
-        assert!(
-            err.contains("do not tile the volume exactly"),
-            "{short}: {err}"
+        refuses!(
+            short => execute("short", &workflow, &forced, &Hints::default(), &env),
+            "do not tile the volume exactly"
         );
     }
 }

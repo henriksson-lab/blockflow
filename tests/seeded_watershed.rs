@@ -59,6 +59,9 @@ use blockflow::strategy::{execute, Enumerating, Hints, Strategy, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
 
+mod support;
+use support::refuses;
+
 /// Image 1 in the chains below: the seeds.
 const SEEDS: usize = 1;
 /// Image 2: the floodable region.
@@ -999,13 +1002,10 @@ fn the_op_refuses_to_run_without_its_seeds() {
     let op = SeededWatershedOp::new("watershed", SEEDS, Separation::Line);
     let input: Voxels = Array3::<f64>::zeros((4, 4, 4)).into();
     let mut out = Voxels::zeros(Dtype::U32, [4, 4, 4]).unwrap();
-    let failed = op
-        .apply(&input, &mut out, &Anchor::whole([4, 4, 4]))
-        .unwrap_err();
-    let message = failed.to_string();
-    assert!(
-        message.contains("apply_with") && message.contains(&SEEDS.to_string()),
-        "the refusal must name the image and the method: {message}"
+    refuses!(
+        op.apply(&input, &mut out, &Anchor::whole([4, 4, 4])),
+        "apply_with",
+        &SEEDS.to_string(),
     );
 }
 
@@ -1016,18 +1016,15 @@ fn a_seed_image_that_is_not_u32_is_refused_by_name() {
     let wrong: Voxels = Array3::<f64>::zeros((4, 4, 4)).into();
     let mut out = Voxels::zeros(Dtype::U32, [4, 4, 4]).unwrap();
     let entries = [(SEEDS.into(), &wrong)];
-    let failed = op
-        .apply_with(
+    refuses!(
+        op.apply_with(
             &input,
             SourceInputs::new(&entries),
             &mut out,
             &Anchor::whole([4, 4, 4]),
-        )
-        .unwrap_err();
-    let message = failed.to_string();
-    assert!(
-        message.contains("float64") && message.contains(&SEEDS.to_string()),
-        "{message}"
+        ),
+        "float64",
+        &SEEDS.to_string(),
     );
 }
 
@@ -1039,18 +1036,15 @@ fn a_mask_image_that_is_not_bool_is_refused_by_name() {
     let wrong: Voxels = Array3::<f64>::zeros((4, 4, 4)).into();
     let mut out = Voxels::zeros(Dtype::U32, [4, 4, 4]).unwrap();
     let entries = [(SEEDS.into(), &seeds), (MASK.into(), &wrong)];
-    let failed = op
-        .apply_with(
+    refuses!(
+        op.apply_with(
             &input,
             SourceInputs::new(&entries),
             &mut out,
             &Anchor::whole([4, 4, 4]),
-        )
-        .unwrap_err();
-    let message = failed.to_string();
-    assert!(
-        message.contains("float64") && message.contains(&MASK.to_string()),
-        "{message}"
+        ),
+        "float64",
+        &MASK.to_string(),
     );
 }
 

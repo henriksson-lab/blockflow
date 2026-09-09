@@ -77,6 +77,9 @@ use blockflow::strategy::{execute_phases, Hints};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [20, 16, 14];
 
 /// The fixture's values are eleven exact tenths, so a band `[a, b)` selects
@@ -507,14 +510,11 @@ fn a_mixed_fan_in_is_still_refused_when_nobody_says_what_to_write() {
             Chain::op(VoxelwiseMapOp::threshold("wide", 0.5, 1.0, 0.0)),
         ]
     };
-    let err = Chain::parallel(mixed(), Box::new(LogicCombine::new("or", Logic::Or)))
-        .unwrap()
-        .produces(Dtype::F64)
-        .expect_err("a combine that was not told what to write must refuse")
-        .to_string();
-    assert!(
-        err.contains("does not accept [bool, float64]"),
-        "got: {err}"
+    refuses!(
+        Chain::parallel(mixed(), Box::new(LogicCombine::new("or", Logic::Or)))
+            .unwrap()
+            .produces(Dtype::F64),
+        "does not accept [bool, float64]",
     );
 
     let produced = Chain::parallel(
@@ -660,11 +660,10 @@ fn the_held_operand_need_not_be_carried_the_way_the_block_is() {
         Arc::new(Voxels::zeros(Dtype::U16, VOL).unwrap()),
     );
     assert!(!strange.accepts(Dtype::Bool) && !strange.accepts(Dtype::F64));
-    let err = Chain::op(strange)
-        .produces(Dtype::F64)
-        .expect_err("an operand of a third type makes the op unusable")
-        .to_string();
-    assert!(err.contains("does not accept float64"), "got: {err}");
+    refuses!(
+        Chain::op(strange).produces(Dtype::F64),
+        "does not accept float64",
+    );
 }
 
 // ---------------------------------------------------- the sink, both ways --

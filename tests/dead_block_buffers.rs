@@ -45,10 +45,12 @@ use blockflow::assemble::ImageId;
 use blockflow::op::{Anchor, Chain, Combine, SourceInputs};
 use blockflow::ops::background::DifferenceCombine;
 use blockflow::ops::{Arithmetic, ArithmeticCombine, Logic, LogicCombine, VoxelwiseMapOp};
-use blockflow::voxels::{differing_bits, differing_elements, Voxels};
+use blockflow::voxels::{differing_bits, Voxels};
 use blockflow::{Dtype, Error, Result};
 
 use ndarray::Array3;
+
+mod support;
 
 const BLOCK: [usize; 3] = [12, 9, 7];
 
@@ -164,27 +166,8 @@ fn collected_with(
     out
 }
 
-/// Zero differing voxels, compared as bit patterns for the floats and as values
-/// for the one type that has no other pattern.
 fn identical(left: &Voxels, right: &Voxels, what: &str) {
-    assert_eq!(left.dtype(), right.dtype(), "{what}: element type");
-    assert_eq!(left.shape(), right.shape(), "{what}: shape");
-    let differing = match left.dtype() {
-        Dtype::F64 => differing_bits(
-            left.view::<f64>().expect("f64"),
-            right.view::<f64>().expect("f64"),
-        ),
-        Dtype::F32 => differing_bits(
-            left.view::<f32>().expect("f32"),
-            right.view::<f32>().expect("f32"),
-        ),
-        Dtype::Bool => differing_elements(
-            left.view::<bool>().expect("bool"),
-            right.view::<bool>().expect("bool"),
-        ),
-        other => panic!("{what}: nothing here produces {}", other.numpy_name()),
-    }
-    .expect("comparable buffers");
+    let differing = support::compare::voxels_differing(left, right);
     assert_eq!(
         differing, 0,
         "{what}: the folded walk and the collected reference differ in {differing} voxels. \

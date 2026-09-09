@@ -32,6 +32,9 @@ use blockflow::ops::{
 };
 use blockflow::reach::Reach;
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [40, 32, 12];
 
 fn ops() -> Vec<(&'static str, Box<dyn BlockOp>)> {
@@ -291,11 +294,10 @@ impl BlockOp for EmptyTable {
 
 #[test]
 fn an_empty_table_map_is_refused_by_name() {
-    let failed = Chain::op(EmptyTable).reach_spec(VOLUME).unwrap_err();
-    let message = failed.to_string();
-    assert!(
-        message.contains("empty-table") && message.contains("one region per block"),
-        "the refusal must name the op and what a table map is: {message}"
+    refuses!(
+        Chain::op(EmptyTable).reach_spec(VOLUME),
+        "empty-table",
+        "one region per block",
     );
 }
 

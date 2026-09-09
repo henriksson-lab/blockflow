@@ -48,6 +48,10 @@ use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::table::{Table, Value};
 use blockflow::voxels::Voxels;
 
+mod support;
+use support::fragments::{decoded_sidecars, sidecars};
+use support::volume::core_cut;
+
 const VOLUME: [usize; 3] = [24, 16, 12];
 const MOMENTS: &str = "detect.moments";
 const POINTS: &str = "detect.points";
@@ -219,15 +223,8 @@ fn run_emitting(
 
 /// Every block's point blob, in block order.
 fn blobs(env: &ArrayEnvironment, plan: &Decomposition) -> Vec<([usize; 3], Vec<u8>)> {
-    every_block(&plan.phases[1].grid)
+    sidecars(env, POINTS, 1, &plan.phases[1].grid)
         .into_iter()
-        .map(|index| {
-            let bytes = env
-                .read_sidecar(POINTS, 1, index)
-                .expect("the store answers")
-                .unwrap_or_else(|| panic!("block {index:?} wrote no point blob"));
-            (index, bytes)
-        })
         .collect()
 }
 
@@ -259,10 +256,6 @@ fn blockings() -> Vec<[usize; 3]> {
         [7, 5, 5],
         [5, 16, 12],
     ]
-}
-
-fn every_block(grid: &BlockGrid) -> Vec<[usize; 3]> {
-    grid.cores().into_iter().map(|core| core.index).collect()
 }
 
 // --------------------------------------------------------- the properties --
@@ -321,13 +314,9 @@ fn the_merge_changes_the_answer_and_the_suite_says_by_how_much() {
 
     let mut local = Vec::new();
     for core in grid.cores() {
-        let (low, extent) = (
-            [core.core.start[0], core.core.start[1], core.core.start[2]],
-            [core.core.shape[0], core.core.shape[1], core.core.shape[2]],
-        );
-        let cut = Array3::from_shape_fn((extent[0], extent[1], extent[2]), |(i, j, k)| {
-            mask[[low[0] + i, low[1] + j, low[2] + k]]
-        });
+        let low = [core.core.start[0], core.core.start[1], core.core.start[2]];
+        let extent = [core.core.shape[0], core.core.shape[1], core.core.shape[2]];
+        let cut = core_cut(&mask, low, extent);
         let mut labels = Array3::<u32>::zeros(cut.raw_dim());
         let count = label_regions_into(cut.view(), labels.view_mut()).unwrap();
         // The same kernel, given the block's own corner, so the local points are
@@ -695,14 +684,7 @@ fn the_merge_reads_every_block_and_the_fragments_are_summaries() {
     let (env, plan) = run(&mask, CUT);
     let grid = &plan.phases[0].grid;
 
-    let mut stored = BTreeMap::new();
-    for index in every_block(grid) {
-        let bytes = env
-            .read_sidecar(MOMENTS, 0, index)
-            .expect("the store answers")
-            .unwrap_or_else(|| panic!("block {index:?} wrote no moments fragment"));
-        stored.insert(index, RegionMoments::decode(&bytes).expect("a fragment"));
-    }
+    let stored = decoded_sidecars(&env, MOMENTS, 0, grid, RegionMoments::decode);
     assert_eq!(stored.len(), grid.n_blocks());
 
     // The accumulators are partial and they add up: every set voxel is counted
@@ -728,14 +710,9 @@ fn the_merge_reads_every_block_and_the_fragments_are_summaries() {
     let fragment_fraction = |block: [usize; 3]| -> f64 {
         let (env, plan) = run(&mask, block);
         let grid = &plan.phases[0].grid;
-        let bytes: usize = every_block(grid)
-            .into_iter()
-            .map(|index| {
-                env.read_sidecar(MOMENTS, 0, index)
-                    .expect("the store answers")
-                    .expect("a fragment")
-                    .len()
-            })
+        let bytes: usize = sidecars(&env, MOMENTS, 0, grid)
+            .values()
+            .map(Vec::len)
             .sum();
         // Against the u32 label volume phase 0 would otherwise have had to write
         // down for phase 1 to read back, which is the thing it does not write.

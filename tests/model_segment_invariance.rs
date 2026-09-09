@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use blockflow::env::{ArrayEnvironment, Environment};
+use blockflow::env::ArrayEnvironment;
 use blockflow::model_segment::stub::ThresholdBackend;
 use blockflow::model_segment::InstanceSegment;
 use blockflow::op::Chain;
@@ -35,6 +35,9 @@ use blockflow::{
     fragment_phase, BlockGrid, Decomposition, Dtype, Lifecycle, PhaseWork, Region, Voxels,
 };
 use ndarray::Array3;
+
+mod support;
+use support::fragments::sidecars;
 
 const STREAM: &str = "objects";
 const VOLUME: [usize; 3] = [1, 48, 56];
@@ -147,12 +150,8 @@ fn run(block: [usize; 3], halo: usize) -> Vec<OwnedRow> {
 
     let schema = op.schema().expect("a schema");
     let mut table = Table::new(VOLUME, schema).expect("a table");
-    for core in grid.cores() {
-        let bytes = env
-            .read_sidecar(STREAM, 0, core.index)
-            .expect("the store answers")
-            .unwrap_or_else(|| panic!("block {:?} wrote no blob", core.index));
-        table.write(core.index, &bytes).expect("a row blob");
+    for (index, bytes) in sidecars(&env, STREAM, 0, &grid) {
+        table.write(index, &bytes).expect("a row blob");
     }
     table.seal().expect("a seal");
 

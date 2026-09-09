@@ -67,6 +67,7 @@ use blockflow::sidecar::Lifecycle;
 
 mod support;
 
+use support::refuses;
 use support::volume::{point_mask_bool, sparse_xorshift_bool};
 
 const EVERY: [Connectivity; 3] = [
@@ -807,9 +808,5 @@ fn fragments_from_two_different_lattices_are_refused() {
         |report| &report.faces,
         |a, b| sets.union(a, b),
     );
-    let message = refused.expect_err("a lattice mismatch").to_string();
-    assert!(
-        message.contains("two different lattices"),
-        "unexpected message: {message}"
-    );
+    refuses!(refused, "two different lattices");
 }

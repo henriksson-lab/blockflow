@@ -105,8 +105,8 @@
 // disagree, which was the failure this is here to remove.
 
 use crate::decomposition::{
-    check_block_constraints, check_dtypes, check_source_images, cuttable_axes, phase_traffic,
-    price_phase, Constraints, Decomposition, PhaseCost, PhaseDecomposition,
+    check_block_constraints, check_dtypes, check_source_images, phase_traffic, price_phase,
+    write_charge, Constraints, Decomposition, PhaseCost, PhaseDecomposition,
 };
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
@@ -115,7 +115,9 @@ use crate::geometry::BlockGrid;
 use crate::iterate::{iterative_phase, substage_reach, IterativeOp};
 use crate::op::Chain;
 use crate::reach::Reach;
-use crate::strategy::{phase_makespan, CandidateTally, Strategy, Workflow};
+use crate::strategy::{
+    phase_makespan, try_affordable_candidate, CandidateTally, Strategy, Workflow,
+};
 
 /// An image of the plan: image 0 is the input, image `p + 1` is what phase `p`
 /// wrote, and an address at or above [`ImageId::SUPPLIED_BASE`] is one of the
@@ -805,7 +807,8 @@ impl PlanBuilder {
     /// # What the sweep is
     ///
     /// Each edge in `constraints.block_candidates` is turned into a grid by the
-    /// same two steps the partition search uses — [`cuttable_axes`] takes the
+    /// same two steps the partition search uses —
+    /// [`cuttable_axes`](crate::decomposition::cuttable_axes) takes the
     /// reach-derived floor off the axes, [`BlockGrid::along`] builds the
     /// lattice — the phase is derived on it, priced by [`price_phase`], dropped
     /// if the working set exceeds `budget_bytes`, and scored by
@@ -991,45 +994,46 @@ impl PlanBuilder {
         let mut tally = CandidateTally::default();
         let mut chosen: Option<(f64, usize, PhaseDecomposition)> = None;
         for &edge in &constraints.block_candidates {
-            tally.offered += 1;
             // Per candidate, not hoisted: an axis is cut only where the cut
             // narrows what a block reads, and that depends on the edge.
-            let axes = cuttable_axes(&constraints.split_axes, &reach, volume, edge);
-            let Ok(grid) = BlockGrid::along(volume, &axes, edge) else {
-                tally.no_grid += 1;
+            let Some((_, (phase, cost, traffic))) = try_affordable_candidate(
+                constraints,
+                &reach,
+                volume,
+                edge,
+                &mut tally,
+                |grid| {
+                    // Derived rather than assembled by hand, so that the thing
+                    // priced is the thing appended. `iterative_phase` also runs
+                    // `check_iterative`, which is why an op that could never be
+                    // a phase is refused here at the candidate that exposed it.
+                    let phase = iterative_phase(&op, grid.clone())?;
+                    let work = PhaseWork::Iterate(&op);
+                    let traffic = phase_traffic(index, &phase, Some(&work))?;
+                    let cost = price_phase(
+                        &phase.grid,
+                        // The halo, not the reach. They are equal for an
+                        // iterative phase — `iterative_phase` sets both to one
+                        // substage's — but the argument that picks between them
+                        // is `price_phase`'s and is not this file's to re-decide.
+                        &phase.halo,
+                        op.cost_per_voxel() * repeats,
+                        // A slotless phase has no `preferred_iteration` to
+                        // conflict with, and this is the number
+                        // `predicted_makespan` passes for it.
+                        0,
+                        is_materialised,
+                        bytes,
+                        ranking_model,
+                        traffic,
+                    );
+                    Ok((phase, cost, traffic))
+                },
+                |(_, cost, _)| affordable(cost, constraints),
+            )?
+            else {
                 continue;
             };
-            // Derived rather than assembled by hand, so that the thing priced is
-            // the thing appended. `iterative_phase` also runs `check_iterative`,
-            // which is why an op that could never be a phase is refused here at
-            // the first candidate rather than after a sweep.
-            let phase = iterative_phase(&op, grid)?;
-            let work = PhaseWork::Iterate(&op);
-            let traffic = phase_traffic(index, &phase, Some(&work))?;
-            let cost = price_phase(
-                &phase.grid,
-                // The halo, not the reach. They are equal for an iterative
-                // phase — `iterative_phase` sets both to one substage's — but
-                // the argument that picks between them is `price_phase`'s and
-                // is not this file's to re-decide.
-                &phase.halo,
-                op.cost_per_voxel() * repeats,
-                // A slotless phase has no `preferred_iteration` to conflict
-                // with, and this is the number `predicted_makespan` passes for
-                // it. Anything else here and the sweep would minimise a
-                // quantity the finished plan does not report.
-                0,
-                is_materialised,
-                bytes,
-                ranking_model,
-                ranking_model.materialise_cost_per_voxel,
-                traffic,
-            );
-            if !affordable(&cost, constraints) {
-                tally.over_budget += 1;
-                continue;
-            }
-            tally.priced += 1;
             // The per-voxel write charge, derived from `traffic` rather than
             // from `materialisation` alone, which is `predicted_makespan`'s own
             // line: the channel bound has to count the bytes `price_phase`
@@ -1038,13 +1042,7 @@ impl PlanBuilder {
             // that never takes its first arm today — and it is written this way
             // so that it goes on agreeing with the plan's own price if that
             // ever stops being true.
-            let write_cost = if !traffic.writes_an_image {
-                0.0
-            } else if is_materialised {
-                constraints.model.materialise_cost_per_voxel
-            } else {
-                constraints.model.write_cost_per_voxel
-            };
+            let write_cost = write_charge(&constraints.model, traffic, is_materialised);
             let makespan = phase_makespan(&cost, &phase.grid, workers, ranking_model, write_cost);
             let better = match &chosen {
                 None => true,
@@ -1089,16 +1087,9 @@ impl PlanBuilder {
             is_materialised,
             bytes,
             &constraints.model,
-            constraints.model.materialise_cost_per_voxel,
             traffic,
         );
-        let plan_write = if !traffic.writes_an_image {
-            0.0
-        } else if is_materialised {
-            constraints.model.materialise_cost_per_voxel
-        } else {
-            constraints.model.write_cost_per_voxel
-        };
+        let plan_write = write_charge(&constraints.model, traffic, is_materialised);
         let makespan = phase_makespan(
             &plan_cost,
             &phase.grid,

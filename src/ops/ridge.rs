@@ -1940,15 +1940,8 @@ pub const COST_MEASUREMENT: &str = "ops::ridge::cost_report";
 /// different radius is the per-tap cost, and the intercept is the per-voxel
 /// decomposition.
 pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
-    use std::time::Instant;
-
-    let voxels = (shape[0] * shape[1] * shape[2]) as f64;
     let anchor = Anchor::whole(shape);
-    let mut input = Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
-    for (flat, value) in input.iter_mut().enumerate() {
-        *value = ((flat * 7919) % 1013) as f64;
-    }
-    let input: Voxels = input.into();
+    let input = super::cost::ramp(shape);
 
     let response = RidgeResponse::new(0.5, 0.5, 30.0, Polarity::Ridge).unwrap();
     let mut cases: Vec<(String, Box<dyn BlockOp>, f64)> = vec![(
@@ -1982,20 +1975,12 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
 
     let mut rows = Vec::new();
     for (name, op, taps) in cases {
-        let mut out = Voxels::zeros(op.produces(input.dtype()), op.output_shape(shape)).unwrap();
-        // One untimed pass: a freshly allocated output pays a page fault per
-        // page on first touch, and that fault is the measurement for the
-        // cheapest op here.
-        op.apply(&input, &mut out, &anchor).unwrap();
-        let mut best = f64::INFINITY;
-        for _ in 0..repetitions.max(1) {
-            let started = Instant::now();
-            op.apply(&input, &mut out, &anchor).unwrap();
-            let elapsed = started.elapsed().as_secs_f64() * 1e9;
-            std::hint::black_box(out.view::<f64>().unwrap().iter().take(1).sum::<f64>());
-            best = best.min(elapsed / voxels);
-        }
-        rows.push((name, best, taps, op.cost_per_voxel()));
+        rows.push((
+            name,
+            super::cost::measure_block_op(&*op, &input, &anchor, shape, repetitions),
+            taps,
+            op.cost_per_voxel(),
+        ));
     }
 
     let unit = rows.first().map(|(_, nanos, _, _)| *nanos).unwrap_or(1.0);

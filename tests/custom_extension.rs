@@ -31,15 +31,17 @@ use std::sync::Arc;
 
 use ndarray::Array3;
 
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+use blockflow::decomposition::Decomposition;
 use blockflow::env::ArrayEnvironment;
-use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain};
 use blockflow::ops::local::Reducer;
 use blockflow::ops::{LocalStatistic, LocalStatisticOp, Statistic, StructuringElement};
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
+
+mod support;
+use support::single_phase;
 
 const VOLUME: [usize; 3] = [24, 18, 14];
 
@@ -115,17 +117,7 @@ fn custom_element() -> StructuringElement {
 }
 
 fn plan(workflow: &Workflow, block: usize, split_axes: &[usize]) -> Decomposition {
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let reach = workflow.chain.reach3(&VOLUME);
-    let grid = BlockGrid::along(VOLUME, split_axes, block).unwrap();
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
-    Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::F64,
-        phases: vec![phase],
-        chain_reach: reach,
-    }
+    single_phase::plan(workflow, VOLUME, block, split_axes)
 }
 
 fn chain() -> Chain {

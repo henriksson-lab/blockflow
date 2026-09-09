@@ -57,6 +57,9 @@ use blockflow::npy::{
 use blockflow::{Dtype, Region, RegionSink, RegionSource, Voxels};
 use ndarray::{Array1, Array2, Array3, ArrayD, IxDyn};
 
+mod support;
+use support::refuses;
+
 // ------------------------------------------------ what numpy actually wrote --
 
 /// `np.arange(24, dtype='<u2').reshape(2, 3, 4)`
@@ -469,9 +472,7 @@ fn an_elements_below_rank_three_still_refuses_to_be_a_volume() {
         (ZERO_RANK_F64, "0-dimensional"),
     ] {
         let held = read_elements(bytes, "t", OrderPolicy::Either).expect("read");
-        let text = held.into_voxels("t.npy").expect_err("refused").to_string();
-        assert!(text.contains("t.npy"), "{text}");
-        assert!(text.contains(rank) && text.contains("rank 3"), "{text}");
+        refuses!(held.into_voxels("t.npy"), "t.npy", rank, "rank 3");
     }
 
     // And a rank-3 file becomes one, so the check is a check and not a wall.

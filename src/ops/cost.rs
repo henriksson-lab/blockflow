@@ -33,6 +33,7 @@ use std::time::Instant;
 use ndarray::Array3;
 
 use crate::op::{Anchor, BlockOp};
+use crate::voxels::Voxels;
 
 use super::element::{ElementShape, Rank, StructuringElement};
 use super::local::{AdaptiveThresholdOp, Isodata, LocalStatistic, LocalStatisticOp, Statistic};
@@ -41,6 +42,63 @@ use super::rank::RankFilterOp;
 use super::smooth::{Gaussian, SmoothOp};
 use super::structure_tensor::{Eigenvalue, StructureTensor, StructureTensorOp};
 use super::voxelwise::{CombineOp, Logic, VoxelwiseMapOp};
+
+/// Deterministic `f64` ramp used by op cost measurements.
+pub(in crate::ops) fn ramp_array(shape: [usize; 3]) -> Array3<f64> {
+    let mut array = Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
+    for (flat, value) in array.iter_mut().enumerate() {
+        *value = ((flat * 7919) % 1013) as f64;
+    }
+    array
+}
+
+/// Deterministic `f64` voxel ramp used by op cost measurements.
+pub(in crate::ops) fn ramp(shape: [usize; 3]) -> crate::voxels::Voxels {
+    ramp_array(shape).into()
+}
+
+fn consume_first_voxel(out: &Voxels) {
+    crate::dtype_dispatch!(
+        out.dtype(),
+        |Element| {
+            std::hint::black_box(out.view::<Element>().unwrap()[[0, 0, 0]]);
+        },
+        f16 => panic!("f16 cost-report outputs are not supported by Voxels")
+    );
+}
+
+/// Run once untimed, then return the best nanoseconds per voxel.
+pub(in crate::ops) fn best_of_voxels(
+    repetitions: usize,
+    voxels: f64,
+    mut run: impl FnMut(),
+) -> f64 {
+    run();
+    let mut best = f64::INFINITY;
+    for _ in 0..repetitions.max(1) {
+        let started = Instant::now();
+        run();
+        best = best.min(started.elapsed().as_secs_f64() * 1e9 / voxels);
+    }
+    best
+}
+
+/// Time one `BlockOp` through the executor-facing `apply` entry point.
+pub(in crate::ops) fn measure_block_op(
+    op: &dyn BlockOp,
+    input: &crate::voxels::Voxels,
+    anchor: &Anchor,
+    shape: [usize; 3],
+    repetitions: usize,
+) -> f64 {
+    let voxels = (shape[0] * shape[1] * shape[2]) as f64;
+    let mut out =
+        crate::voxels::Voxels::zeros(op.produces(input.dtype()), op.output_shape(shape)).unwrap();
+    best_of_voxels(repetitions, voxels, || {
+        op.apply(input, &mut out, anchor).unwrap();
+        consume_first_voxel(&out);
+    })
+}
 
 /// One measured op.
 #[derive(Debug, Clone)]
@@ -59,7 +117,6 @@ pub struct Sample {
 
 /// Time every op in this module over `shape`, taking the best of `repetitions`.
 pub fn measure(shape: [usize; 3], repetitions: usize) -> Vec<Sample> {
-    let voxels = (shape[0] * shape[1] * shape[2]) as f64;
     let input = ramp(shape);
     let anchor = Anchor::whole(shape);
     let operand = std::sync::Arc::new(ramp(shape));
@@ -256,25 +313,11 @@ pub fn measure(shape: [usize; 3], repetitions: usize) -> Vec<Sample> {
 
     let mut raw = Vec::new();
     for (name, op, divisor) in cases {
-        // One buffer for the whole case, and one untimed pass over it before
-        // any measurement: a freshly allocated output pays a page fault per
-        // page on first touch, and at a few nanoseconds per voxel that fault
-        // *is* the measurement for the cheapest ops. What is wanted is the
-        // steady-state compute, which is what a run spends its time in.
-        let mut out =
-            crate::voxels::Voxels::zeros(op.produces(input.dtype()), op.output_shape(shape))
-                .unwrap();
-        op.apply(&input, &mut out, &anchor).unwrap();
-        let mut best = f64::INFINITY;
-        for _ in 0..repetitions.max(1) {
-            let started = Instant::now();
-            op.apply(&input, &mut out, &anchor).unwrap();
-            let elapsed = started.elapsed().as_secs_f64() * 1e9;
-            // consume the result so nothing is elided
-            std::hint::black_box(out.view::<f64>().unwrap().iter().take(1).sum::<f64>());
-            best = best.min(elapsed / voxels);
-        }
-        raw.push((name, best, divisor));
+        raw.push((
+            name,
+            measure_block_op(&*op, &input, &anchor, shape, repetitions),
+            divisor,
+        ));
     }
 
     let unit = raw.first().map(|(_, nanos, _)| *nanos).unwrap_or(1.0);
@@ -332,14 +375,6 @@ fn structure_tensor_case(
         )),
         charged as f64,
     )
-}
-
-fn ramp(shape: [usize; 3]) -> crate::voxels::Voxels {
-    let mut array = Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
-    for (flat, value) in array.iter_mut().enumerate() {
-        *value = ((flat * 7919) % 1013) as f64;
-    }
-    array.into()
 }
 
 #[cfg(test)]

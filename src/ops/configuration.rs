@@ -128,7 +128,7 @@ use std::sync::Arc;
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
-use crate::error::{Error, Result};
+use crate::error::{bail, ensure, Error, Result};
 use crate::iterate::{IterativeOp, Substage, SubstageLimit, SubstageOperand};
 use crate::op::{Anchor, BlockOp};
 use crate::voxels::Voxels;
@@ -156,13 +156,12 @@ pub fn configuration_bit(offset: [isize; 3]) -> Result<u32> {
     let mut bit = 0u32;
     for axis in (0..3).rev() {
         let step = offset[axis];
-        if !(-1..=1).contains(&step) {
-            return Err(Error::InvalidArgument(format!(
-                "a 3x3x3 neighbourhood offset is -1, 0 or 1 on every axis, and this one is \
+        ensure!(
+            (-1..=1).contains(&step),
+            "a 3x3x3 neighbourhood offset is -1, 0 or 1 on every axis, and this one is \
                  {offset:?}. A configuration has {CONFIGURATION_BITS} bits and there is no bit \
                  for a voxel two away."
-            )));
-        }
+        );
         bit = bit * 3 + (step + 1) as u32;
     }
     Ok(bit)
@@ -206,20 +205,18 @@ impl ConfigurationTemplate {
     /// and an offset cannot.
     pub fn from_masks(set: u32, clear: u32) -> Result<Self> {
         let outside = (set | clear) & !(CONFIGURATION_COUNT as u32 - 1);
-        if outside != 0 {
-            return Err(Error::InvalidArgument(format!(
-                "a template's masks address bits {outside:#x} outside the \
+        ensure!(
+            outside == 0,
+            "a template's masks address bits {outside:#x} outside the \
                  {CONFIGURATION_BITS} of a configuration; there is no voxel there."
-            )));
-        }
-        if set & clear != 0 {
-            return Err(Error::InvalidArgument(format!(
-                "a template requires the voxels at bits {:#x} to be both set and clear, so it \
+        );
+        ensure!(
+            set & clear == 0,
+            "a template requires the voxels at bits {:#x} to be both set and clear, so it \
                  matches no configuration at all — a rule that silently covers nothing rather \
                  than a rule that covers something.",
-                set & clear
-            )));
-        }
+            set & clear
+        );
         Ok(Self { set, clear })
     }
 
@@ -242,14 +239,14 @@ impl ConfigurationTemplate {
             (&mut self.clear, self.set)
         };
         if opposite & bit != 0 {
-            return Err(Error::InvalidArgument(format!(
+            bail!(
                 "the voxel at {offset:?} is already required to be {} by this template, and is \
                  now required to be {}. A template demanding both matches no configuration at \
                  all, which is a rule that silently covers nothing rather than a rule that \
                  covers something.",
                 if value { "clear" } else { "set" },
                 if value { "set" } else { "clear" }
-            )));
+            );
         }
         *wanted |= bit;
         Ok(self)
@@ -613,7 +610,7 @@ pub fn configuration_to_fixed_point(
             return Ok((current, pass));
         }
     }
-    Err(Error::InvalidArgument(format!(
+    Err(Error::invalid(format_args!(
         "a configuration table iteration did not settle in {} pass(es). Either the limit is \
          below what this data needs, or this table has no fixed point on this volume — a table \
          mapping every configuration to the complement of its centre has period two everywhere, \
@@ -848,38 +845,20 @@ fn face_erosion_table() -> ConfigurationTable {
 /// above — that this op does not care what the data holds — is a measurement
 /// rather than an assertion.
 pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
-    use std::time::Instant;
-
     let voxels = (shape[0] * shape[1] * shape[2]) as f64;
-    let anchor = Anchor::whole(shape);
     let repetitions = repetitions.max(1);
-
-    let best_of = |mut run: Box<dyn FnMut()>| -> f64 {
-        // One untimed pass first, for the page faults a fresh output pays.
-        run();
-        let mut best = f64::INFINITY;
-        for _ in 0..repetitions {
-            let started = Instant::now();
-            run();
-            best = best.min(started.elapsed().as_secs_f64() * 1e9 / voxels);
-        }
-        best
-    };
 
     let mut rows: Vec<(String, f64)> = Vec::new();
     {
-        let mut ramp = Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
-        for (flat, value) in ramp.iter_mut().enumerate() {
-            *value = ((flat * 7919) % 1013) as f64;
-        }
-        let input: Voxels = ramp.into();
+        let input = super::cost::ramp(shape);
         let op = super::voxelwise::VoxelwiseMapOp::threshold("map", 500.0, 1.0, 0.0);
         let mut out = Voxels::zeros(Dtype::F64, shape).expect("a buffer");
+        let anchor = Anchor::whole(shape);
         rows.push((
             "voxelwise map (the unit)".to_string(),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 op.apply(&input, &mut out, &anchor).unwrap();
-            })),
+            }),
         ));
     }
 
@@ -904,9 +883,9 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
         let anchor = Anchor::whole(shape);
         rows.push((
             what.to_string(),
-            best_of(Box::new(move || {
+            super::cost::best_of_voxels(repetitions, voxels, move || {
                 op.apply(&input, &mut out, &anchor).unwrap();
-            })),
+            }),
         ));
     }
 

@@ -52,7 +52,9 @@ use blockflow::{Dtype, Event, EventListener};
 
 mod support;
 
-use support::source_fixture::{self, SourcePhase};
+use support::refuses;
+use support::source_fixture;
+use support::volume::standard_grid_sweep;
 
 const VOLUME: [usize; 3] = [16, 12, 10];
 /// The image the second arm reads: written by phase 0, read by phase 1 as its
@@ -171,27 +173,18 @@ fn arms() -> (Array3<f64>, Array3<f64>) {
 /// stored image is an image rather than a buffer inside a phase.
 fn one_phase_per_slot(chain: &Chain, grid: &BlockGrid) -> Decomposition {
     let reaches = [[1usize, 1, 1], [1, 1, 1], [0, 0, 0]];
-    source_fixture::declared_plan(
+    source_fixture::declared_one_phase_per_slot(
         chain,
         VOLUME,
         Dtype::F64,
         grid,
         [2, 2, 2],
-        (0..chain.slots().len())
-            .map(|slot| SourcePhase::with_equal_halo(vec![slot], reaches[slot])),
+        &reaches,
     )
 }
 
 fn grids() -> Vec<BlockGrid> {
-    vec![
-        BlockGrid::new(VOLUME, VOLUME).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 8).unwrap(),
-        BlockGrid::along(VOLUME, &[1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[2], 5).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1, 2], 4).unwrap(),
-    ]
+    standard_grid_sweep(VOLUME)
 }
 
 fn run(chain: Chain, grid: &BlockGrid, hints: &Hints) -> (Array3<f64>, ArrayEnvironment) {
@@ -541,16 +534,20 @@ fn a_forward_reference_is_refused_when_the_plan_is_made() {
         erode(),
     ]);
     let plan = one_phase_per_slot(&chain, &BlockGrid::along(VOLUME, &[0], 4).unwrap());
-    let message = check_source_images(&chain, &plan).unwrap_err().to_string();
-    assert!(message.contains("phase 1"), "{message}");
-    assert!(message.contains("image 3"), "{message}");
-    assert!(message.contains("phase 2"), "{message}");
+    refuses!(
+        check_source_images(&chain, &plan),
+        "phase 1",
+        "image 3",
+        "phase 2"
+    );
 
     // and the executor refuses it too, before any block runs
     let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
     let env = ArrayEnvironment::for_decomposition(input().into(), &plan, [4, 4, 4]).unwrap();
-    let failed = execute("source", &workflow, &plan, &Hints::default(), &env).unwrap_err();
-    assert!(failed.to_string().contains("image 3"), "{failed}");
+    refuses!(
+        execute("source", &workflow, &plan, &Hints::default(), &env),
+        "image 3"
+    );
     assert_eq!(
         env.counters().ops_applied.load(Ordering::SeqCst),
         0,
@@ -571,9 +568,7 @@ fn an_image_past_the_end_of_the_plan_is_refused() {
         .unwrap(),
     ]);
     let plan = one_phase_per_slot(&chain, &BlockGrid::along(VOLUME, &[0], 4).unwrap());
-    let message = check_source_images(&chain, &plan).unwrap_err().to_string();
-    assert!(message.contains("image 9"), "{message}");
-    assert!(message.contains("4 image(s)"), "{message}");
+    refuses!(check_source_images(&chain, &plan), "image 9", "4 image(s)");
 }
 
 /// The declared element type is the image's, and a leaf that says otherwise is
@@ -585,9 +580,7 @@ fn a_source_leaf_that_misdeclares_the_element_type_is_refused() {
     // exactly the case the check exists for.
     let chain = Chain::sequence(vec![dilate(), erode(), Chain::source(STORED, Dtype::Bool)]);
     let plan = one_phase_per_slot(&chain, &BlockGrid::along(VOLUME, &[0], 4).unwrap());
-    let message = check_source_images(&chain, &plan).unwrap_err().to_string();
-    assert!(message.contains("bool"), "{message}");
-    assert!(message.contains("float64"), "{message}");
+    refuses!(check_source_images(&chain, &plan), "bool", "float64");
 }
 
 /// A plan whose record disagrees with its chain reads one image and prices
@@ -597,8 +590,7 @@ fn a_plan_whose_recorded_images_disagree_with_its_chain_is_refused() {
     let chain = source_chain();
     let mut plan = one_phase_per_slot(&chain, &BlockGrid::along(VOLUME, &[0], 4).unwrap());
     plan.phases[2].source_images.clear();
-    let message = check_source_images(&chain, &plan).unwrap_err().to_string();
-    assert!(message.contains("[1]"), "{message}");
+    refuses!(check_source_images(&chain, &plan), "[1]");
 }
 
 /// **The halo guard still fires**, on the phase that has the source leaf: a
@@ -644,9 +636,7 @@ fn the_halo_guard_fires_for_a_phase_with_a_source_leaf() {
     };
     plan.declare_source_images(&chain).unwrap();
 
-    let message = plan.check().unwrap_err().to_string();
-    assert!(message.contains("phase 2"), "{message}");
-    assert!(message.contains("tile"), "{message}");
+    refuses!(plan.check(), "phase 2", "tile");
 
     // and the fan-in's reach really is the computed arm's, unchanged by the
     // arm that reads
@@ -693,11 +683,10 @@ fn a_source_leaf_applied_with_no_operand_says_which_image_it_wanted() {
     let leaf = Chain::source(7, Dtype::F64);
     let source: Voxels = input().into();
     let mut out = Voxels::zeros(Dtype::F64, VOLUME).unwrap();
-    let message = leaf
-        .apply(&source, &mut out, &blockflow::op::Anchor::whole(VOLUME))
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("image 7"), "{message}");
+    refuses!(
+        leaf.apply(&source, &mut out, &blockflow::op::Anchor::whole(VOLUME)),
+        "image 7"
+    );
 }
 
 // --------------------------------------------------- 5. the fingerprint --

@@ -26,14 +26,12 @@
 //   if they ever stop disagreeing, this suite has stopped testing the merge and
 //   says so instead of passing quietly.
 
-use std::collections::BTreeMap;
-
 use ndarray::Array3;
 
 use blockflow::assemble::ImageId;
 use blockflow::decomposition::Decomposition;
 use blockflow::dtype::Dtype;
-use blockflow::env::{ArrayEnvironment, Environment};
+use blockflow::env::ArrayEnvironment;
 use blockflow::fragment::{neighbourhood_size, FragmentOp, PhaseWork};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
@@ -45,6 +43,10 @@ use blockflow::ops::fill::{
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
+
+mod support;
+use support::fragments::decoded_sidecars;
+use support::volume::{block_local_disagreements, fill_box};
 
 const VOLUME: [usize; 3] = [24, 16, 12];
 const STREAM: &str = "fill.faces";
@@ -87,16 +89,6 @@ fn scene() -> Array3<bool> {
         mask[[22, y, 8]] = false;
     }
     mask
-}
-
-fn fill_box(mask: &mut Array3<bool>, low: [usize; 3], high: [usize; 3], value: bool) {
-    for i in low[0]..=high[0] {
-        for j in low[1]..=high[1] {
-            for k in low[2]..=high[2] {
-                mask[[i, j, k]] = value;
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------- the oracle --
@@ -240,34 +232,15 @@ fn the_merge_changes_the_answer_and_the_suite_says_by_how_much() {
     let block = [8usize, 8, 6];
     let grid = BlockGrid::new(VOLUME, block).expect("a lattice");
 
-    let mut disagreements = 0usize;
-    for index in every_block(&grid) {
-        let (low, extent) = core_of(&grid, index);
-        let mut cut = Array3::from_elem((extent[0], extent[1], extent[2]), false);
-        for i in 0..extent[0] {
-            for j in 0..extent[1] {
-                for k in 0..extent[2] {
-                    cut[[i, j, k]] = mask[[low[0] + i, low[1] + j, low[2] + k]];
-                }
-            }
-        }
+    let disagreements = block_local_disagreements(&grid, &mask, &global, |cut, extent| {
         // the block deciding on its own, with its own faces as the outside
         let mut labels = Array3::<u32>::zeros(cut.raw_dim());
         let count = label_background_into(cut.view(), labels.view_mut()).unwrap();
         let flags = outside_flags(labels.view(), count, [0, 0, 0], extent, extent);
         let mut local = Array3::from_elem(cut.raw_dim(), false);
         fill_from_labels_into(labels.view(), &flags, local.view_mut()).unwrap();
-
-        for i in 0..extent[0] {
-            for j in 0..extent[1] {
-                for k in 0..extent[2] {
-                    if local[[i, j, k]] != global[[low[0] + i, low[1] + j, low[2] + k]] {
-                        disagreements += 1;
-                    }
-                }
-            }
-        }
-    }
+        local
+    });
     // Exactly the interior of cavity 2 — 9 x 3 x 2 voxels, from [2,2,8] to
     // [10,4,9]. Every one of them fills globally and drains locally, because
     // the cavity touches the faces of every block it is cut into. Asserted as a
@@ -275,7 +248,7 @@ fn the_merge_changes_the_answer_and_the_suite_says_by_how_much() {
     // global answers agree, this scene has stopped testing the merge, and the
     // count says which way it moved.
     assert_eq!(
-        disagreements,
+        disagreements.len(),
         9 * 3 * 2,
         "the block-local answer must differ from the global one over exactly the closed \
          cavity that spans the seam"
@@ -392,14 +365,7 @@ fn the_merge_reads_every_block_of_the_lattice_once_for_the_phase() {
     let counts = plan.phases[0].grid.blocks_per_axis();
     let n_blocks = counts[0] * counts[1] * counts[2];
 
-    let mut stored = BTreeMap::new();
-    for index in every_block(&plan.phases[0].grid) {
-        let bytes = env
-            .read_sidecar(STREAM, 0, index)
-            .expect("the store answers")
-            .unwrap_or_else(|| panic!("block {index:?} wrote no faces fragment"));
-        stored.insert(index, BlockFaces::decode(&bytes).expect("a faces fragment"));
-    }
+    let stored = decoded_sidecars(&env, STREAM, 0, &plan.phases[0].grid, BlockFaces::decode);
     assert_eq!(stored.len(), n_blocks);
 
     // what the hoisted shape asks each *block* for, from the op's own
@@ -469,31 +435,4 @@ fn a_mask_carried_as_f64_gives_the_same_answer_as_one_carried_as_bool() {
     for (flag, value) in narrow.iter().zip(out.iter()) {
         assert_eq!(if *flag { 1.0 } else { 0.0 }, *value);
     }
-}
-
-// ------------------------------------------------------------- helpers --
-
-fn every_block(grid: &BlockGrid) -> Vec<[usize; 3]> {
-    let counts = grid.blocks_per_axis();
-    let mut out = Vec::new();
-    for i in 0..counts[0] {
-        for j in 0..counts[1] {
-            for k in 0..counts[2] {
-                out.push([i, j, k]);
-            }
-        }
-    }
-    out
-}
-
-fn core_of(grid: &BlockGrid, index: [usize; 3]) -> ([usize; 3], [usize; 3]) {
-    let volume = grid.volume();
-    let edge = grid.block();
-    let mut low = [0usize; 3];
-    let mut extent = [0usize; 3];
-    for axis in 0..3 {
-        low[axis] = index[axis] * edge[axis];
-        extent[axis] = edge[axis].min(volume[axis] - low[axis]);
-    }
-    (low, extent)
 }

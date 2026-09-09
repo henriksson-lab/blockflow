@@ -67,6 +67,9 @@ use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
 use ndarray::Array3;
 
+mod support;
+use support::refuses;
+
 // ------------------------------------------------------------- fixtures --
 
 /// The scene the two windows are cut out of.
@@ -726,13 +729,7 @@ fn normalized_correlation_recovers_the_translation_but_not_at_the_shipped_substa
         &Voxels::from(moving.clone()),
         WINDOW[0],
     );
-    let message = refused
-        .expect_err("16 substages are not enough for this metric")
-        .to_string();
-    assert!(
-        message.contains("did not converge in 16 substage"),
-        "the shipped normalized-correlation configuration failed for some other reason: {message}"
-    );
+    refuses!(refused, "did not converge in 16 substage");
 
     let mut roomy = shipped.clone();
     roomy.limit = SubstageLimit::of(64).expect("a positive limit");
@@ -1437,12 +1434,9 @@ fn the_spatial_frame_spacing_is_validated_carried_and_never_applied() {
         )
         .expect("a level with an unscaled frame"),
     ];
-    let message = resident_pyramid_levels(&VolumeFitParams::new(), &mismatched)
-        .expect_err("a level 1 at unit spacing is not a level at scale two")
-        .to_string();
-    assert!(
-        message.contains("spacing[0] is 1, expected 2"),
-        "the unscaled level was refused for some other reason: {message}"
+    refuses!(
+        resident_pyramid_levels(&VolumeFitParams::new(), &mismatched),
+        "spacing[0] is 1, expected 2"
     );
     println!(
         "an anisotropic frame {:?} leaves the fitted parameters bit-identical to a unit one, \

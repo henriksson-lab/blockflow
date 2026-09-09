@@ -49,7 +49,7 @@
 use ndarray::ArrayD;
 
 use crate::dtype::Dtype;
-use crate::error::{Error, Result};
+use crate::error::{bail, ensure, Error, Result};
 use crate::op::{Anchor, BlockOp, Output, SideBlock, SourceInput, SourceInputs};
 use crate::ops::expect_colocated;
 use crate::region::Region;
@@ -198,43 +198,39 @@ impl TupleOp {
         side_names: Vec<String>,
         dtype: Dtype,
     ) -> Result<Self> {
-        if sources.len() + 1 != kernel.n_inputs() {
-            return Err(Error::InvalidArgument(format!(
-                "{name}: kernel {:?} reads {} array(s) and was given {} source image(s). Input 0 \
+        ensure!(
+            sources.len() + 1 == kernel.n_inputs(),
+            "{name}: kernel {:?} reads {} array(s) and was given {} source image(s). Input 0 \
                  is the image the phase is handed, so the list names inputs 1..{}.",
-                kernel.name(),
-                kernel.n_inputs(),
-                sources.len(),
-                kernel.n_inputs()
-            )));
-        }
-        if side_names.len() + 1 != kernel.n_outputs() {
-            return Err(Error::InvalidArgument(format!(
-                "{name}: kernel {:?} writes {} array(s) and was given {} side-output name(s). \
+            kernel.name(),
+            kernel.n_inputs(),
+            sources.len(),
+            kernel.n_inputs()
+        );
+        ensure!(
+            side_names.len() + 1 == kernel.n_outputs(),
+            "{name}: kernel {:?} writes {} array(s) and was given {} side-output name(s). \
                  Output 0 is the image the phase writes, so the list names outputs 1..{}.",
-                kernel.name(),
-                kernel.n_outputs(),
-                side_names.len(),
-                kernel.n_outputs()
-            )));
-        }
-        if !kernel.accepts(dtype) {
-            return Err(Error::InvalidArgument(format!(
-                "{name}: kernel {:?} does not run in {}",
-                kernel.name(),
-                dtype.numpy_name()
-            )));
-        }
+            kernel.name(),
+            kernel.n_outputs(),
+            side_names.len(),
+            kernel.n_outputs()
+        );
+        ensure!(
+            kernel.accepts(dtype),
+            "{name}: kernel {:?} does not run in {}",
+            kernel.name(),
+            dtype.numpy_name()
+        );
         let mut seen = sources.clone();
         seen.sort_unstable();
         seen.dedup();
-        if seen.len() != sources.len() {
-            return Err(Error::InvalidArgument(format!(
-                "{name}: the source images {sources:?} name one image twice. One buffer is \
+        ensure!(
+            seen.len() == sources.len(),
+            "{name}: the source images {sources:?} name one image twice. One buffer is \
                  fetched per image per block, so two inputs reading it would be the same \
                  numbers under two coefficients — say so with a coefficient instead."
-            )));
-        }
+        );
         Ok(Self {
             name,
             kernel,
@@ -264,15 +260,14 @@ impl TupleOp {
                 input,
                 array,
             )?;
-            if array.dtype() != self.dtype {
-                return Err(Error::InvalidArgument(format!(
-                    "{}: image {image} holds {} and this op reads {}. Every array a kernel sees \
+            ensure!(
+                array.dtype() == self.dtype,
+                "{}: image {image} holds {} and this op reads {}. Every array a kernel sees \
                      is one element type.",
-                    self.name,
-                    array.dtype().numpy_name(),
-                    self.dtype.numpy_name()
-                )));
-            }
+                self.name,
+                array.dtype().numpy_name(),
+                self.dtype.numpy_name()
+            );
             held.push(array);
         }
         Ok(held)
@@ -331,11 +326,7 @@ impl TupleOp {
                 }
             }
             other => {
-                return Err(Error::InvalidArgument(format!(
-                    "{}: no kernel lane for {}",
-                    self.name,
-                    other.numpy_name()
-                )))
+                bail!("{}: no kernel lane for {}", self.name, other.numpy_name())
             }
         }
         Ok(())
@@ -353,7 +344,7 @@ fn contiguous<'a, T: crate::voxels::VoxelElement>(
     name: &str,
 ) -> Result<&'a [T]> {
     array.view::<T>()?.to_slice().ok_or_else(|| {
-        Error::InvalidArgument(format!(
+        Error::invalid(format_args!(
             "{name}: a buffer of {:?} is not contiguous, and this kernel walks positions in \
              storage order",
             array.shape()
@@ -367,7 +358,7 @@ fn contiguous_mut<'a, T: crate::voxels::VoxelElement>(
 ) -> Result<&'a mut [T]> {
     let shape = array.shape();
     array.view_mut::<T>()?.into_slice().ok_or_else(|| {
-        Error::InvalidArgument(format!(
+        Error::invalid(format_args!(
             "{name}: an output buffer of {shape:?} is not contiguous"
         ))
     })
@@ -402,7 +393,7 @@ impl BlockOp for TupleOp {
     }
 
     fn apply(&self, _input: &Voxels, _out: &mut Voxels, _at: &Anchor) -> Result<()> {
-        Err(Error::InvalidArgument(format!(
+        Err(Error::invalid(format_args!(
             "{}: this op reads {} array(s) and was applied with none of them. A K-ary op runs \
              through `apply_with`, which is what the executor calls once a phase records the \
              images it reads.",
@@ -420,14 +411,13 @@ impl BlockOp for TupleOp {
     ) -> Result<()> {
         let inputs = self.gather(input, sources)?;
         let shape = input.shape();
-        if out.shape() != shape {
-            return Err(Error::InvalidArgument(format!(
-                "{}: reach 0, so the output is the extent of the input — {shape:?} — and it was \
+        ensure!(
+            out.shape() == shape,
+            "{}: reach 0, so the output is the extent of the input — {shape:?} — and it was \
                  handed {:?}",
-                self.name,
-                out.shape()
-            )));
-        }
+            self.name,
+            out.shape()
+        );
         // Output 0, and none of the rest. `apply_side` is handed these same
         // operands and computes outputs `1..K'` from them, so computing them
         // here would be computing them twice — see the type's own documentation
@@ -521,19 +511,17 @@ pub struct LinearMap {
 impl LinearMap {
     /// `rows` outputs by `cols` inputs, row-major.
     pub fn new(name: &'static str, rows: usize, cols: usize, values: Vec<f64>) -> Result<Self> {
-        if rows == 0 || cols == 0 {
-            return Err(Error::InvalidArgument(format!(
-                "{name}: a {rows}x{cols} map reads or writes nothing"
-            )));
-        }
-        if values.len() != rows * cols {
-            return Err(Error::InvalidArgument(format!(
-                "{name}: a {rows}x{cols} map has {} coefficients and {} were given. A missing \
+        ensure!(
+            rows != 0 && cols != 0,
+            "{name}: a {rows}x{cols} map reads or writes nothing"
+        );
+        ensure!(
+            values.len() == rows * cols,
+            "{name}: a {rows}x{cols} map has {} coefficients and {} were given. A missing \
                  one would be an input silently weighted zero.",
-                rows * cols,
-                values.len()
-            )));
-        }
+            rows * cols,
+            values.len()
+        );
         Ok(Self {
             name,
             rows,

@@ -47,6 +47,10 @@ use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
 
+mod support;
+use support::compare::differing as moved;
+use support::refuses;
+
 /// Prime on two axes, so a cubic block edge divides no axis and every grid below
 /// has ragged blocks at its high faces. Not a multiple of the tile either, which
 /// is the case the alignment slack in the halo exists for.
@@ -194,13 +198,6 @@ fn resident(op: &dyn BlockOp, input: &Array3<f64>) -> Array3<f64> {
     op.apply(&source, &mut out, &Anchor::whole(VOLUME))
         .expect("the whole-volume reference must run");
     out.view::<f64>().unwrap().to_owned()
-}
-
-fn moved(left: &Array3<f64>, right: &Array3<f64>) -> usize {
-    left.iter()
-        .zip(right.iter())
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count()
 }
 
 fn worst(left: &Array3<f64>, right: &Array3<f64>) -> f64 {
@@ -555,18 +552,15 @@ fn a_kernel_reaching_one_voxel_cannot_distinguish_the_two_boundary_conventions()
 #[test]
 fn an_empty_tile_is_refused_by_name() {
     for tile in [[0, 3, 3], [3, 0, 3], [3, 3, 0]] {
-        let message = TransformConvolveOp::new(
-            "transform",
-            lopsided(),
-            Sense::Correlate,
-            Boundary::Clamp,
-            tile,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            message.contains("non-empty"),
-            "an empty tile must be refused by name, got {message}"
+        refuses!(
+            TransformConvolveOp::new(
+                "transform",
+                lopsided(),
+                Sense::Correlate,
+                Boundary::Clamp,
+                tile,
+            ),
+            "non-empty"
         );
     }
     assert!(TransformConvolveOp::new(
@@ -582,19 +576,7 @@ fn an_empty_tile_is_refused_by_name() {
 #[test]
 fn what_it_accepts_is_a_list_and_half_precision_is_not_on_it() {
     let op = transform_op(lopsided(), Sense::Correlate, Boundary::Clamp, TILE);
-    for dtype in [
-        Dtype::Bool,
-        Dtype::U8,
-        Dtype::U16,
-        Dtype::U32,
-        Dtype::U64,
-        Dtype::I8,
-        Dtype::I16,
-        Dtype::I32,
-        Dtype::I64,
-        Dtype::F32,
-        Dtype::F64,
-    ] {
+    for &dtype in Dtype::voxel_types() {
         assert!(
             op.accepts(dtype),
             "{dtype:?} holds a real number and must be accepted"

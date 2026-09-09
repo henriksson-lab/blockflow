@@ -507,54 +507,11 @@ impl CompressionPolicy {
 /// [`Voxels::filled`] before a buffer does.
 macro_rules! by_dtype {
     ($dtype:expr, |$element:ident| $body:expr) => {{
-        let dtype = $dtype;
-        match dtype {
-            Dtype::Bool => {
-                type $element = bool;
-                $body
-            }
-            Dtype::U8 => {
-                type $element = u8;
-                $body
-            }
-            Dtype::U16 => {
-                type $element = u16;
-                $body
-            }
-            Dtype::U32 => {
-                type $element = u32;
-                $body
-            }
-            Dtype::U64 => {
-                type $element = u64;
-                $body
-            }
-            Dtype::I8 => {
-                type $element = i8;
-                $body
-            }
-            Dtype::I16 => {
-                type $element = i16;
-                $body
-            }
-            Dtype::I32 => {
-                type $element = i32;
-                $body
-            }
-            Dtype::I64 => {
-                type $element = i64;
-                $body
-            }
-            Dtype::F32 => {
-                type $element = f32;
-                $body
-            }
-            Dtype::F64 => {
-                type $element = f64;
-                $body
-            }
-            Dtype::F16 => return zarr_data_type(Dtype::F16).map(|_| unreachable!()),
-        }
+        crate::dtype_dispatch!(
+            $dtype,
+            |$element| $body,
+            f16 => return zarr_data_type(Dtype::F16).map(|_| unreachable!())
+        )
     }};
 }
 
@@ -972,19 +929,7 @@ impl StoredArray {
 /// whose element type this crate has no buffer for is refused **by name**, at
 /// the moment it is attached, rather than at the first read of the first block.
 fn dtype_from_zarr(data_type: &DataType, path: &str) -> Result<Dtype> {
-    for candidate in [
-        Dtype::Bool,
-        Dtype::U8,
-        Dtype::U16,
-        Dtype::U32,
-        Dtype::U64,
-        Dtype::I8,
-        Dtype::I16,
-        Dtype::I32,
-        Dtype::I64,
-        Dtype::F32,
-        Dtype::F64,
-    ] {
+    for &candidate in Dtype::voxel_types() {
         if zarr_data_type(candidate)? == *data_type {
             return Ok(candidate);
         }
@@ -3021,20 +2966,6 @@ mod tests {
         path
     }
 
-    const EVERY_TYPE: [Dtype; 11] = [
-        Dtype::Bool,
-        Dtype::U8,
-        Dtype::U16,
-        Dtype::U32,
-        Dtype::U64,
-        Dtype::I8,
-        Dtype::I16,
-        Dtype::I32,
-        Dtype::I64,
-        Dtype::F32,
-        Dtype::F64,
-    ];
-
     /// A block whose values are a function of position, so a misplaced voxel is
     /// visible rather than plausible. Kept inside every type's range.
     fn ramp(dtype: Dtype, shape: [usize; 3]) -> Voxels {
@@ -3056,7 +2987,7 @@ mod tests {
 
     #[test]
     fn every_element_type_a_block_can_hold_has_a_zarr_data_type() {
-        for dtype in EVERY_TYPE {
+        for &dtype in Dtype::voxel_types() {
             assert!(zarr_data_type(dtype).is_ok(), "{dtype:?}");
             assert!(unwritten_fill(dtype).is_ok(), "{dtype:?}");
         }
@@ -3255,7 +3186,7 @@ mod tests {
     #[test]
     fn every_element_type_round_trips_at_several_chunk_shapes_aligned_and_not() {
         let shape = [8, 6, 10];
-        for dtype in EVERY_TYPE {
+        for &dtype in Dtype::voxel_types() {
             for chunk in [[8, 6, 10], [4, 3, 5], [2, 2, 2], [3, 4, 7], [16, 16, 16]] {
                 for compression in [
                     Compression::None,
@@ -3391,7 +3322,7 @@ mod tests {
             [97, 512, 33],
         ];
         for block in blocks {
-            for dtype in EVERY_TYPE {
+            for &dtype in Dtype::voxel_types() {
                 let chunk = chunk_for_block(block, dtype);
                 for axis in 0..3 {
                     assert!(chunk[axis] > 0, "{block:?} {dtype:?} axis {axis}");

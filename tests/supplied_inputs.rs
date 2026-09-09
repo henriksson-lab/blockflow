@@ -40,7 +40,7 @@
 use ndarray::Array3;
 
 use blockflow::assemble::{ImageId, PlanBuilder};
-use blockflow::decomposition::{Decomposition, ImageKind, PhaseDecomposition, Visibility};
+use blockflow::decomposition::{Decomposition, ImageKind, Visibility};
 use blockflow::env::{ArrayEnvironment, Environment};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
@@ -48,7 +48,12 @@ use blockflow::ops::{Logic, LogicCombine, NarrowOp, VoxelwiseMapOp};
 use blockflow::probes::IdentityOp;
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
-use blockflow::Dtype;
+use blockflow::{Dtype, Result};
+
+mod support;
+
+use support::volume::standard_grid_sweep;
+use support::{refuses, single_phase};
 
 const VOLUME: [usize; 3] = [16, 12, 10];
 
@@ -129,39 +134,11 @@ fn chain() -> Chain {
 /// One phase per slot, so the union really reads a materialised image and the
 /// supplied arrays are images rather than buffers inside a phase.
 fn one_phase_per_slot(chain: &Chain, grid: &BlockGrid) -> Decomposition {
-    let slots = chain.slots();
-    let phases = (0..slots.len())
-        .map(|slot| {
-            PhaseDecomposition::derive(
-                vec![slot],
-                vec![slots[slot].display_name()],
-                [0usize, 0, 0],
-                [0usize, 0, 0],
-                grid.clone(),
-            )
-        })
-        .collect();
-    let mut plan = Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::F64,
-        phases,
-        chain_reach: [0, 0, 0],
-    };
-    plan.declare_dtypes(chain).expect("element types");
-    plan.declare_source_images(chain).expect("source images");
-    plan
+    single_phase::declared_one_phase_per_slot(chain, VOLUME, Dtype::F64, grid, [0, 0, 0])
 }
 
 fn grids() -> Vec<BlockGrid> {
-    vec![
-        BlockGrid::new(VOLUME, VOLUME).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0], 8).unwrap(),
-        BlockGrid::along(VOLUME, &[1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[2], 5).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1], 4).unwrap(),
-        BlockGrid::along(VOLUME, &[0, 1, 2], 4).unwrap(),
-    ]
+    standard_grid_sweep(VOLUME)
 }
 
 fn arrays() -> Vec<Voxels> {
@@ -345,50 +322,39 @@ fn a_supplied_input_is_never_freed_and_never_written() {
     assert!(env.is_discarded(1));
 
     let image = supplied_images()[0];
-    let refusal = env
-        .discard_image(image)
-        .expect_err("an input cannot be freed");
-    let message = refusal.to_string();
-    assert!(message.contains("supplied input 0"), "{message}");
-    assert!(message.contains("no phase writes it"), "{message}");
+    refuses!(
+        env.discard_image(image),
+        "supplied input 0",
+        "no phase writes it"
+    );
 }
 
 // -------------------------------------------------------- 6. refusals --
 
-fn refusal_of(inputs: Vec<Voxels>) -> String {
+fn refusal_of(inputs: Vec<Voxels>) -> Result<ArrayEnvironment> {
     let plan = one_phase_per_slot(&chain(), &BlockGrid::along(VOLUME, &[0], 4).unwrap());
-    match ArrayEnvironment::with_inputs(channel(0).into(), inputs, &plan, [4, 4, 4]) {
-        Ok(_) => panic!("a refusal"),
-        Err(refusal) => refusal.to_string(),
-    }
+    ArrayEnvironment::with_inputs(channel(0).into(), inputs, &plan, [4, 4, 4])
 }
 
 #[test]
 fn too_few_supplied_arrays_is_refused_by_name() {
     let mut short = arrays();
     short.pop();
-    let message = refusal_of(short);
-    assert!(message.contains("handed 3 array(s)"), "{message}");
-    assert!(message.contains("supplied input 3"), "{message}");
+    refuses!(refusal_of(short), "handed 3 array(s)", "supplied input 3");
 }
 
 #[test]
 fn a_supplied_array_of_the_wrong_shape_is_refused_by_name() {
     let mut wrong = arrays();
     wrong[1] = Array3::from_elem((VOLUME[0], VOLUME[1], VOLUME[2] - 1), false).into();
-    let message = refusal_of(wrong);
-    assert!(message.contains("supplied input 1"), "{message}");
-    assert!(message.contains("coordinate space"), "{message}");
+    refuses!(refusal_of(wrong), "supplied input 1", "coordinate space");
 }
 
 #[test]
 fn a_supplied_array_of_the_wrong_element_type_is_refused_by_name() {
     let mut wrong = arrays();
     wrong[2] = channel(3).into();
-    let message = refusal_of(wrong);
-    assert!(message.contains("supplied input 2"), "{message}");
-    assert!(message.contains("float64"), "{message}");
-    assert!(message.contains("bool"), "{message}");
+    refuses!(refusal_of(wrong), "supplied input 2", "float64", "bool");
 }
 
 /// A reader that names a supplied array without saying what is in it.
@@ -435,12 +401,11 @@ fn a_supplied_input_nobody_declares_the_type_of_is_refused_by_name() {
     );
     plan.pixels(Chain::op(Silent(ImageId::supplied(0).index())))
         .expect("a phase");
-    let message = match plan.finish() {
-        Ok(_) => panic!("a refusal"),
-        Err(refusal) => refusal.to_string(),
-    };
-    assert!(message.contains("supplied input 0"), "{message}");
-    assert!(message.contains("nothing says what it holds"), "{message}");
+    refuses!(
+        plan.finish(),
+        "supplied input 0",
+        "nothing says what it holds"
+    );
 }
 
 /// Two readers of one supplied array cannot disagree about what is in it.
@@ -455,14 +420,10 @@ fn two_readers_declaring_different_types_are_refused_by_name() {
         Box::new(LogicCombine::new("or", Logic::Or)),
     )
     .expect("a fan-in");
-    let message = chain
-        .source_inputs(VOLUME)
-        .expect_err("a refusal")
-        .to_string();
-    assert!(message.contains("supplied input 0"), "{message}");
-    assert!(
-        message.contains("only one of them can be right"),
-        "{message}"
+    refuses!(
+        chain.source_inputs(VOLUME),
+        "supplied input 0",
+        "only one of them can be right"
     );
 }
 
@@ -510,44 +471,26 @@ fn the_builder_assembles_a_plan_that_reads_a_supplied_array() {
 mod on_disk {
     use super::*;
     use blockflow::zarr_env::ZarrEnvironment;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use support::scratch::ScratchDir;
 
-    /// A directory nobody else is using, removed even if a test panics.
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(name: &str) -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let unique = NEXT.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!(
-                "blockflow-supplied-{}-{name}-{unique}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            Self(path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    fn scratch(name: &str) -> ScratchDir {
+        ScratchDir::new("supplied", name)
     }
 
     #[test]
     fn a_stored_run_seeded_with_several_arrays_gives_the_resident_answer() {
         let wanted = resident_union();
         for grid in grids() {
-            let scratch = Scratch::new("union");
+            let scratch = scratch("union");
             let chain = chain();
             let plan = one_phase_per_slot(&chain, &grid);
             let workflow = Workflow::new(chain, VOLUME, Dtype::F64);
             let input: Voxels = channel(0).into();
             let held = arrays();
             let supplied: Vec<&Voxels> = held.iter().collect();
-            let env = ZarrEnvironment::create_with_inputs(&scratch.0, &input, &supplied, [4, 4, 4])
-                .expect("a store");
+            let env =
+                ZarrEnvironment::create_with_inputs(scratch.path(), &input, &supplied, [4, 4, 4])
+                    .expect("a store");
             execute("union", &workflow, &plan, &Hints::default(), &env).expect("a run");
             let out = env
                 .image(plan.n_images() - 1)
@@ -561,23 +504,22 @@ mod on_disk {
 
     #[test]
     fn a_stored_supplied_input_is_neither_written_nor_freed() {
-        let scratch = Scratch::new("refusals");
+        let scratch = scratch("refusals");
         let chain = chain();
         let plan = one_phase_per_slot(&chain, &BlockGrid::along(VOLUME, &[0], 4).unwrap());
         let input: Voxels = channel(0).into();
         let held = arrays();
         let supplied: Vec<&Voxels> = held.iter().collect();
-        let env = ZarrEnvironment::create_with_inputs(&scratch.0, &input, &supplied, [4, 4, 4])
+        let env = ZarrEnvironment::create_with_inputs(scratch.path(), &input, &supplied, [4, 4, 4])
             .expect("a store");
         env.prepare(&plan).expect("a plan this store can host");
 
         let image = supplied_images()[0];
-        let message = match env.discard_image(image) {
-            Ok(()) => panic!("an input cannot be freed"),
-            Err(refusal) => refusal.to_string(),
-        };
-        assert!(message.contains("supplied input 0"), "{message}");
-        assert!(message.contains("no phase writes it"), "{message}");
+        refuses!(
+            env.discard_image(image),
+            "supplied input 0",
+            "no phase writes it"
+        );
 
         // and it is still readable afterwards, which is what "refused" has to
         // mean rather than "refused after erasing it"
@@ -586,19 +528,17 @@ mod on_disk {
 
     #[test]
     fn a_stored_array_of_the_wrong_shape_is_refused_by_name() {
-        let scratch = Scratch::new("shape");
+        let scratch = scratch("shape");
         let input: Voxels = channel(0).into();
         let short: Voxels = Array3::from_elem((VOLUME[0], VOLUME[1], VOLUME[2] - 1), false).into();
         let held = arrays();
         let mut supplied: Vec<&Voxels> = held.iter().collect();
         supplied[2] = &short;
-        let message =
-            match ZarrEnvironment::create_with_inputs(&scratch.0, &input, &supplied, [4, 4, 4]) {
-                Ok(_) => panic!("a refusal"),
-                Err(refusal) => refusal.to_string(),
-            };
-        assert!(message.contains("supplied input 2"), "{message}");
-        assert!(message.contains("coordinate space"), "{message}");
+        refuses!(
+            ZarrEnvironment::create_with_inputs(scratch.path(), &input, &supplied, [4, 4, 4]),
+            "supplied input 2",
+            "coordinate space"
+        );
     }
 }
 
@@ -714,14 +654,13 @@ mod fragment_phase {
             BlockGrid::along(VOLUME, &[0], 4).unwrap(),
         );
         plan.pixels(threshold()).expect("a phase");
-        let message = match plan.fragments(CountOp {
-            image: ImageId::supplied(0).index(),
-            says_what_it_holds: false,
-        }) {
-            Ok(_) => panic!("a refusal"),
-            Err(refusal) => refusal.to_string(),
-        };
-        assert!(message.contains("supplied input 0"), "{message}");
-        assert!(message.contains("nothing says what it holds"), "{message}");
+        refuses!(
+            plan.fragments(CountOp {
+                image: ImageId::supplied(0).index(),
+                says_what_it_holds: false,
+            }),
+            "supplied input 0",
+            "nothing says what it holds"
+        );
     }
 }

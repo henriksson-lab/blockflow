@@ -39,7 +39,6 @@
 // which is not shared — readiness, barriers, and which phase a task belongs to.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use blockflow::assemble::{Assembly, PlanBuilder};
@@ -48,7 +47,7 @@ use blockflow::geometry::BlockGrid;
 use blockflow::log::Event;
 use blockflow::op::Chain;
 use blockflow::probes::IdentityOp;
-use blockflow::simulate::{simulate, Decision, ExecutorOrder, Machine, PerPhase, Rates, Scheduler};
+use blockflow::simulate::{Decision, ExecutorOrder, Machine, Rates, Run, Scheduler};
 use blockflow::strategy::{execute_phases, Hints};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
@@ -159,26 +158,20 @@ fn run_both_with(
         inner: make_scheduler(),
         picked: picked.clone(),
     };
-    let outcome = simulate(
-        plan,
-        &assembly.work(),
+    let outcome = Run::new(plan, &assembly.work())
         // The cache is irrelevant to the demand count compared here: the
         // executor's `RegionRead::chunks` counts chunks a demand fetch touches,
         // and the simulator's hit/miss split is reduced back to that below.
         // Prefetch fills are a separate simulator counter and deliberately not
         // part of the executor-facing demand read comparison.
-        &machine,
-        &Rates {
+        .machine(machine)
+        .rates(Rates {
             chunk: CHUNK,
             chunk_bytes: (CHUNK.iter().product::<usize>() * 8) as u64,
             ..rates
-        },
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        PerPhase::default(),
-        &mut scheduler,
-    )
-    .expect("a simulable plan");
+        })
+        .go(&mut scheduler)
+        .expect("a simulable plan");
 
     let graph = blockflow::graph::TaskGraph::build(plan);
     let simulator_order = picked

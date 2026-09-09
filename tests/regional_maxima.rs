@@ -26,14 +26,12 @@
 // stop disagreeing, this suite has stopped testing the merge and says so instead
 // of passing quietly.
 
-use std::collections::BTreeMap;
-
 use ndarray::Array3;
 
 use blockflow::assemble::ImageId;
 use blockflow::decomposition::Decomposition;
 use blockflow::dtype::Dtype;
-use blockflow::env::{ArrayEnvironment, Environment};
+use blockflow::env::ArrayEnvironment;
 use blockflow::fragment::{neighbourhood_size, FragmentOp, PhaseWork};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
@@ -45,6 +43,11 @@ use blockflow::ops::regional::{
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
+
+mod support;
+use support::fragments::decoded_sidecars;
+use support::refuses;
+use support::volume::block_local_disagreements;
 
 const VOLUME: [usize; 3] = [24, 16, 12];
 const STREAM: &str = "regional.faces";
@@ -282,34 +285,18 @@ fn the_merge_changes_the_answer_and_the_suite_says_by_how_much() {
     let global = reference(&values);
     let grid = BlockGrid::new(VOLUME, CUT).expect("a lattice");
 
-    let mut disagreements = 0usize;
-    let mut disagreed_off_the_ridge = 0usize;
-    for index in every_block(&grid) {
-        let (low, extent) = core_of(&grid, index);
-        let cut = Array3::from_shape_fn((extent[0], extent[1], extent[2]), |(i, j, k)| {
-            values[[low[0] + i, low[1] + j, low[2] + k]]
-        });
-
+    let disagreements = block_local_disagreements(&grid, &values, &global, |cut, _extent| {
         let mut labels = Array3::<u32>::zeros(cut.raw_dim());
         let (count, _) = label_plateaux_into(cut.view(), labels.view_mut()).unwrap();
         let ascends = ascending_neighbours(cut.view(), labels.view(), count).unwrap();
         let mut local = Array3::from_elem(cut.raw_dim(), false);
         maxima_from_labels_into(labels.view(), &ascends, local.view_mut()).unwrap();
-
-        for i in 0..extent[0] {
-            for j in 0..extent[1] {
-                for k in 0..extent[2] {
-                    let (x, y, z) = (low[0] + i, low[1] + j, low[2] + k);
-                    if local[[i, j, k]] != global[[x, y, z]] {
-                        disagreements += 1;
-                        if !on_the_ridge(x, y, z) {
-                            disagreed_off_the_ridge += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
+        local
+    });
+    let disagreed_off_the_ridge = disagreements
+        .iter()
+        .filter(|&&[x, y, z]| !on_the_ridge(x, y, z))
+        .count();
 
     // Exactly the ridge, which is x from 0 to 7 and x from 8 to 15: sixteen
     // voxels, none of them in the block holding the 7.0. Every one of them is a
@@ -319,7 +306,8 @@ fn the_merge_changes_the_answer_and_the_suite_says_by_how_much() {
     // global answers agree, this scene has stopped testing the merge, and the
     // count says which way it moved.
     assert_eq!(
-        disagreements, 16,
+        disagreements.len(),
+        16,
         "the block-local answer must differ from the global one over exactly the ridge, \
          no block of which can see the higher voxel"
     );
@@ -543,17 +531,7 @@ fn the_merge_reads_every_block_and_the_fragments_carry_the_plateau_values() {
     let (_, env, plan) = run_keeping(&values, CUT, &[]);
     let counts = plan.phases[0].grid.blocks_per_axis();
 
-    let mut stored = BTreeMap::new();
-    for index in every_block(&plan.phases[0].grid) {
-        let bytes = env
-            .read_sidecar(STREAM, 0, index)
-            .expect("the store answers")
-            .unwrap_or_else(|| panic!("block {index:?} wrote no faces fragment"));
-        stored.insert(
-            index,
-            PlateauFaces::decode(&bytes).expect("a faces fragment"),
-        );
-    }
+    let stored = decoded_sidecars(&env, STREAM, 0, &plan.phases[0].grid, PlateauFaces::decode);
     assert_eq!(stored.len(), counts[0] * counts[1] * counts[2]);
 
     // what the hoisted shape asks each *block* for, from the op's own
@@ -665,10 +643,10 @@ fn a_plan_over_an_element_type_the_fragment_cannot_carry_is_refused() {
     let grid = BlockGrid::new(VOLUME, CUT).expect("a lattice");
     let label = LabelPlateauxOp::new("label", STREAM, Lifecycle::DeleteOnExit);
     let maxima = RegionalMaximaOp::new("maxima", STREAM, 0, Dtype::Bool, &grid);
-    let message = regional_phases(grid, Dtype::U64, &label, &maxima)
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("where the seam fell"), "{message}");
+    refuses!(
+        regional_phases(grid, Dtype::U64, &label, &maxima),
+        "where the seam fell",
+    );
 
     // and the widths that do fit are planned without complaint
     for dtype in [Dtype::U8, Dtype::U16, Dtype::U32, Dtype::I32, Dtype::F32] {
@@ -677,31 +655,4 @@ fn a_plan_over_an_element_type_the_fragment_cannot_carry_is_refused() {
         regional_phases(grid, dtype, &label, &maxima)
             .unwrap_or_else(|error| panic!("{dtype:?} was refused: {error}"));
     }
-}
-
-// ------------------------------------------------------------- helpers --
-
-fn every_block(grid: &BlockGrid) -> Vec<[usize; 3]> {
-    let counts = grid.blocks_per_axis();
-    let mut out = Vec::new();
-    for i in 0..counts[0] {
-        for j in 0..counts[1] {
-            for k in 0..counts[2] {
-                out.push([i, j, k]);
-            }
-        }
-    }
-    out
-}
-
-fn core_of(grid: &BlockGrid, index: [usize; 3]) -> ([usize; 3], [usize; 3]) {
-    let volume = grid.volume();
-    let edge = grid.block();
-    let mut low = [0usize; 3];
-    let mut extent = [0usize; 3];
-    for axis in 0..3 {
-        low[axis] = index[axis] * edge[axis];
-        extent[axis] = edge[axis].min(volume[axis] - low[axis]);
-    }
-    (low, extent)
 }

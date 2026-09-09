@@ -66,6 +66,9 @@ use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints, SchedulePriority, Workflow};
 use blockflow::Voxels;
 
+mod support;
+use support::refuses;
+
 const STREAM: &str = "sums";
 const WIDE: &str = "wide";
 
@@ -815,15 +818,16 @@ fn a_plan_that_disagrees_with_its_op_about_the_barrier_is_refused() {
         };
         plan = append_fragment_phase(plan, &offset).expect("phase 1");
         plan.phases[1] = plan.phases[1].clone().with_barrier(recorded);
-        let err = blockflow::fragment::check_phase_work(
-            &plan,
-            &[
-                PhaseWork::Fragments(&summarise),
-                PhaseWork::Fragments(&offset),
-            ],
-        )
-        .expect_err("a plan that waits for one thing and fetches another is not a plan");
-        assert!(err.to_string().contains("declares `barrier() =="), "{err}");
+        refuses!(
+            blockflow::fragment::check_phase_work(
+                &plan,
+                &[
+                    PhaseWork::Fragments(&summarise),
+                    PhaseWork::Fragments(&offset),
+                ],
+            ),
+            "declares `barrier() =="
+        );
     }
 }
 
@@ -857,9 +861,10 @@ fn a_barrier_on_a_phase_no_op_could_have_declared_it_for_is_refused() {
     blockflow::fragment::check_phase_work(&plan, &[PhaseWork::Pixels, PhaseWork::Pixels])
         .expect("two pixel phases are a plan");
     plan.phases[1] = plan.phases[1].clone().with_barrier(true);
-    let err = blockflow::fragment::check_phase_work(&plan, &[PhaseWork::Pixels, PhaseWork::Pixels])
-        .expect_err("a barrier nothing declared is a barrier nothing asked for");
-    assert!(err.to_string().contains("records a barrier"), "{err}");
+    refuses!(
+        blockflow::fragment::check_phase_work(&plan, &[PhaseWork::Pixels, PhaseWork::Pixels]),
+        "records a barrier"
+    );
 }
 
 // -------------------------------------------------------------- the plan --
@@ -928,18 +933,16 @@ fn a_single_task_of_a_reducing_phase_is_refused_rather_than_given_nothing() {
     )
     .expect("environment");
     let chain = Chain::sequence(Vec::new());
-    let err = blockflow::strategy::execute_task_of(
-        &chain,
-        &plan,
-        &task,
-        &PhaseWork::Fragments(&hoisting),
-        &env,
-        &[],
-    )
-    .expect_err("a hoisted reduction cannot travel one task at a time");
-    assert!(
-        err.to_string().contains("computes a phase reduction"),
-        "{err}"
+    refuses!(
+        blockflow::strategy::execute_task_of(
+            &chain,
+            &plan,
+            &task,
+            &PhaseWork::Fragments(&hoisting),
+            &env,
+            &[],
+        ),
+        "computes a phase reduction"
     );
 
     // The liveness control: a barrier *without* a reduction distributes, because
@@ -1696,9 +1699,7 @@ fn a_reduction_that_does_not_associate_is_refused() {
         if associates {
             outcome.expect("an integer fold associates and the two walks agree");
         } else {
-            let err = outcome.expect_err("an f64 fold over three terms does not associate");
-            assert!(err.to_string().contains("SeamFold::Unordered"), "{err}");
-            assert!(err.to_string().contains("walking the lattice"), "{err}");
+            refuses!(outcome, "SeamFold::Unordered", "walking the lattice");
         }
     }
 }

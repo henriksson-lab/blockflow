@@ -40,6 +40,10 @@ use blockflow::strategy::{execute, Enumerating, Greedy, Hints, Strategy, Trivial
 use blockflow::voxels::Voxels;
 use blockflow::{Dtype, IdentityOp, MandatedExtentOp, SpreadLatticeOp, Workflow};
 
+mod support;
+
+use support::refuses;
+
 /// The patch-lattice shape, at a size a test can hold: an array in patch-index
 /// space, one block per patch, and a payload axis the block must span whole.
 const PATCHES: [usize; 3] = [11, 11, 12];
@@ -104,13 +108,10 @@ fn both_planners_produce_the_mandated_block_shape() {
 /// told so, instead of being handed the single grid this strategy has.
 #[test]
 fn the_oracle_refuses_a_mandate_it_cannot_meet() {
-    let message = Trivial
-        .decompose(&patch_workflow(), &Constraints::default())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("accepts exactly [1, 1, 12]") && message.contains("[11, 11, 12]"),
-        "{message}"
+    refuses!(
+        Trivial.decompose(&patch_workflow(), &Constraints::default()),
+        "accepts exactly [1, 1, 12]",
+        "[11, 11, 12]"
     );
 }
 
@@ -178,22 +179,20 @@ fn a_mandate_no_window_can_meet_is_refused_at_planning() {
         PATCHES,
         Dtype::F32,
     );
-    let message = Enumerating::default()
-        .decompose(&too_large, &candidates_without_the_mandate())
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("does not fit in a volume"), "{message}");
+    refuses!(
+        Enumerating::default().decompose(&too_large, &candidates_without_the_mandate()),
+        "does not fit in a volume"
+    );
 
     let all_halo = Workflow::new(
         Chain::op(ReachingMandateOp::new([4, 4, 4], [2, 0, 0])),
         [12, 4, 4],
         Dtype::F64,
     );
-    let message = Greedy::default()
-        .decompose(&all_halo, &Constraints::default())
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("leaves no voxel"), "{message}");
+    refuses!(
+        Greedy::default().decompose(&all_halo, &Constraints::default()),
+        "leaves no voxel"
+    );
 }
 
 /// Two ops that mandate different blocks are cut into two phases rather than
@@ -212,8 +211,7 @@ fn two_ops_that_mandate_different_blocks_are_cut_apart() {
         ])
     };
     // The fold says so directly, before any planner is involved.
-    let message = build().block_constraint(volume).unwrap_err().to_string();
-    assert!(message.contains("cannot be fused"), "{message}");
+    refuses!(build().block_constraint(volume), "cannot be fused");
 
     for strategy in [
         &Enumerating::default() as &dyn Strategy,
@@ -259,27 +257,24 @@ fn a_plan_that_violates_a_mandate_is_refused_at_execution() {
     decomposition.check().unwrap();
 
     let env = AccountingEnvironment::new(PATCHES, ONE_PATCH, 4);
-    let message = execute(
-        "foreign",
-        &workflow,
-        &decomposition,
-        &Hints::default(),
-        &env,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(
-        message.contains("decomposition phase 0") && message.contains("accepts exactly [1, 1, 12]"),
-        "{message}"
+    refuses!(
+        execute(
+            "foreign",
+            &workflow,
+            &decomposition,
+            &Hints::default(),
+            &env,
+        ),
+        "decomposition phase 0",
+        "accepts exactly [1, 1, 12]"
     );
 
     // and a *foreign* run of it is refused identically — this crate lets any
     // strategy run any decomposition, so the guard cannot live in a planner
-    let message = Greedy::default()
-        .run(&workflow, &decomposition, &env)
-        .unwrap_err()
-        .to_string();
-    assert!(message.contains("accepts exactly [1, 1, 12]"), "{message}");
+    refuses!(
+        Greedy::default().run(&workflow, &decomposition, &env),
+        "accepts exactly [1, 1, 12]"
+    );
 }
 
 // ------------------------------------------- the lattice that is not a grid --
@@ -387,12 +382,10 @@ fn the_only_plan_that_satisfies_it_carries_the_lattice_as_a_fetch_region() {
         [4, 4, 4],
     )
     .unwrap();
-    let message = execute("t", &workflow, &decomposition, &Hints::default(), &env)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        message.contains("has nowhere to land") && message.contains("[8, 4, 4]"),
-        "{message}"
+    refuses!(
+        execute("t", &workflow, &decomposition, &Hints::default(), &env),
+        "has nowhere to land",
+        "[8, 4, 4]"
     );
 }
 
@@ -504,6 +497,5 @@ fn the_halo_guard_fires_on_a_windowed_phase_whose_window_is_short() {
         .unwrap();
     plan.check().unwrap();
     let short = plan.with_forced_halo([0, 0, 0]);
-    let message = short.check().unwrap_err().to_string();
-    assert!(message.contains("halo [0, 0, 0]"), "{message}");
+    refuses!(short.check(), "halo [0, 0, 0]");
 }

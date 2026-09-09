@@ -31,6 +31,9 @@ use blockflow::probes::{IdentityOp, NullFragmentOp};
 use blockflow::sidecar::Lifecycle;
 use blockflow::{Dtype, ImageId};
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [32, 16, 8];
 
 /// The walk as three consumer residency suites each carry it.
@@ -212,14 +215,7 @@ fn an_undescribed_slotless_phase_is_refused_rather_than_assumed_to_write() {
     let merge = NullFragmentOp::new("merge", "merged", Lifecycle::DeleteOnExit);
     let plan = fragment_only(VOLUME, [8, 8, 8], Dtype::F64, &[&merge])
         .expect("a fragments-only decomposition");
-    let message = plan
-        .peak_image_bytes(&[])
-        .expect_err("a slotless phase with no work entry must not be guessed at")
-        .to_string();
-    assert!(
-        message.contains("owns no chain slot"),
-        "the refusal should say what is missing: {message}"
-    );
+    refuses!(plan.peak_image_bytes(&[]), "owns no chain slot");
 }
 
 /// **The property that makes this a comparison and not a bound.** The figure is

@@ -54,7 +54,7 @@
 use ndarray::Array3;
 
 use blockflow::assemble::ImageId;
-use blockflow::decomposition::{Decomposition, PhaseDecomposition};
+use blockflow::decomposition::Decomposition;
 use blockflow::env::ArrayEnvironment;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, Chain};
@@ -65,6 +65,10 @@ use blockflow::ops::{
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::Dtype;
+
+mod support;
+use support::compare::differing as moved;
+use support::{refuses, single_phase};
 
 /// Small, and **prime on two axes**, so that a cubic block edge divides no axis
 /// and every grid below has ragged blocks at the high faces.
@@ -232,17 +236,8 @@ fn workflow(chain: Chain) -> Workflow {
 /// an op that under-declared would be short of a halo and the comparison against
 /// the whole-volume reference would say so.
 fn plan(workflow: &Workflow, block: [usize; 3]) -> Decomposition {
-    let slots = workflow.chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let reach = workflow.chain.reach3(&VOLUME);
     let grid = BlockGrid::new(VOLUME, block).expect("a grid");
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
-    Decomposition {
-        volume: VOLUME,
-        dtype: workflow.dtype,
-        phases: vec![phase],
-        chain_reach: reach,
-    }
+    single_phase::plan_on_grid(workflow, VOLUME, grid)
 }
 
 /// Block extents that between them exercise every case the bar names: the whole
@@ -286,13 +281,6 @@ fn resident(chain: &Chain, input: &Array3<f64>) -> Array3<f64> {
         .apply(&source, &mut out, &Anchor::whole(VOLUME))
         .expect("the whole-volume reference must run");
     out.view::<f64>().unwrap().to_owned()
-}
-
-fn moved(left: &Array3<f64>, right: &Array3<f64>) -> usize {
-    left.iter()
-        .zip(right.iter())
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count()
 }
 
 // ------------------------------------- 1 and 2. the filter, and invariance --
@@ -441,20 +429,8 @@ fn against_supplied(op: Arithmetic, reversed: bool) -> Chain {
 }
 
 fn supplied_plan(chain: &Chain, block: [usize; 3]) -> Decomposition {
-    let slots = chain.slots();
-    let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-    let reach = chain.reach3(&VOLUME);
     let grid = BlockGrid::new(VOLUME, block).expect("a grid");
-    let phase = PhaseDecomposition::derive((0..slots.len()).collect(), names, reach, reach, grid);
-    let mut plan = Decomposition {
-        volume: VOLUME,
-        dtype: Dtype::F64,
-        phases: vec![phase],
-        chain_reach: reach,
-    };
-    plan.declare_dtypes(chain).expect("element types");
-    plan.declare_source_images(chain).expect("source images");
-    plan
+    single_phase::declared_plan_on_grid_for_chain(chain, VOLUME, Dtype::F64, grid)
 }
 
 fn run_against_supplied(
@@ -963,10 +939,7 @@ fn arithmetic_over_an_integer_chain_is_refused_by_name() {
         )
         .expect("the chain is built; `produces` is where it is judged")
     };
-    let refusal = integers().produces(Dtype::U16).expect_err("a refusal");
-    let message = refusal.to_string();
-    assert!(message.contains("add"), "{message}");
-    assert!(message.contains("uint16"), "{message}");
+    refuses!(integers().produces(Dtype::U16), "add", "uint16");
 
     // …and the two selections are accepted over exactly the same chain, which is
     // what makes the refusal a statement about the arithmetic rather than about
@@ -993,17 +966,16 @@ fn a_supplied_operand_on_another_lattice_is_refused_by_name() {
     let decomposition = supplied_plan(&chain, [4, 4, 4]);
     // half the extent on one axis: the same field at another binning
     let binned: Array3<f64> = Array3::from_elem((VOLUME[0], VOLUME[1], VOLUME[2] / 2 + 1), 1.0);
-    let message = match ArrayEnvironment::with_inputs(
-        input.clone().into(),
-        vec![binned.into()],
-        &decomposition,
-        [4, 4, 4],
-    ) {
-        Ok(_) => panic!("a supplied array on another lattice must be refused"),
-        Err(refusal) => refusal.to_string(),
-    };
-    assert!(message.contains("supplied input 0"), "{message}");
-    assert!(message.contains("coordinate space"), "{message}");
+    refuses!(
+        ArrayEnvironment::with_inputs(
+            input.clone().into(),
+            vec![binned.into()],
+            &decomposition,
+            [4, 4, 4],
+        ),
+        "supplied input 0",
+        "coordinate space",
+    );
 }
 
 /// The cost the planner is told is the kernel's, per tap, and it really varies

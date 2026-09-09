@@ -35,6 +35,9 @@
 use blockflow::ops::{ElementShape, SampleLattice, Sampling, StructuringElement};
 use blockflow::region::Region;
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [64, 48, 7];
 const SPACING: [usize; 3] = [9, 7, 3];
 
@@ -206,12 +209,7 @@ fn a_region_in_voxels_rather_than_samples_is_refused() {
     // A region the size of the fine volume: legal as voxels, past the end as
     // lattice indices, which is exactly the confusion worth refusing.
     let voxels = Region::new(&[0, 0, 0], &VOLUME);
-    let failed = lattice.source_region(&voxels, window()).unwrap_err();
-    let message = failed.to_string();
-    assert!(
-        message.contains("lattice indices"),
-        "the refusal must say which space the region is in: {message}"
-    );
+    refuses!(lattice.source_region(&voxels, window()), "lattice indices");
 }
 
 /// The whole lattice does **not** read the whole volume, and that is a property

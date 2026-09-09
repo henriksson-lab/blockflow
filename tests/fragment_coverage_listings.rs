@@ -46,6 +46,9 @@ use blockflow::strategy::reduce_phase;
 use blockflow::voxels::Voxels;
 use ndarray::Array3;
 
+mod support;
+use support::refuses;
+
 const VOLUME: [usize; 3] = [16, 4, 4];
 const BLOCK: [usize; 3] = [4, 4, 4];
 const BLOCKS: usize = 4;
@@ -278,20 +281,17 @@ fn a_hole_is_still_refused_after_the_grouping() {
     // check is the one the grouping removed. It is still caught, because the
     // single remaining call lists every stream the producer declares.
     let env = env_with(&plan, &[(RIGHT, [2, 0, 0])]);
-    let err = reduce_phase(&plan, 1, &work, &env).expect_err("an incomplete set is refused");
-    let text = err.to_string();
-    assert!(text.contains("is not complete"), "{text}");
-    assert!(text.contains(RIGHT), "the failing stream is named: {text}");
-    assert!(
-        text.contains("not actually shared between nodes"),
-        "the distributed failure mode is named: {text}"
+    refuses!(
+        reduce_phase(&plan, 1, &work, &env),
+        "is not complete",
+        RIGHT,
+        "not actually shared between nodes"
     );
 
     // A hole in the first input is refused too, so the pass above is not the
     // grouping happening to keep only the stream that was broken.
     let env = env_with(&plan, &[(LEFT, [0, 0, 0])]);
-    let err = reduce_phase(&plan, 1, &work, &env).expect_err("an incomplete set is refused");
-    assert!(err.to_string().contains(LEFT), "{err}");
+    refuses!(reduce_phase(&plan, 1, &work, &env), LEFT);
 
     // And the positive arm, so that "refused" is not simply what this fixture
     // always does.

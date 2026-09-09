@@ -9,18 +9,21 @@
 //! improvement must rank as one, a change known to be neutral must rank as
 //! neutral, and a quantity known to be invariant must come out invariant.** A
 //! simulator that fails those ranks nothing, however plausible its numbers.
-use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::assemble::{Assembly, ImageId, PlanBuilder};
 use blockflow::decomposition::Constraints;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::probes::{IdentityOp, NonZeroOp};
 use blockflow::simulate::{
-    phase_rates_from_snapshot, simulate, BoundedHorizonThroughput, ExecutorOrder, Machine,
-    PerPhase, PlanOrder, RateBasis, Rates, ReleaseAware, RunAhead, Scheduler, WarmestFirst,
+    phase_rates_from_snapshot, BoundedHorizonThroughput, ExecutorOrder, Machine, PerPhase,
+    PlanOrder, RateBasis, Rates, ReleaseAware, Run, RunAhead, Scheduler, WarmestFirst,
     MEASURED_CONTENTION,
 };
 use blockflow::Dtype;
 use std::collections::BTreeSet;
+
+mod support;
+use support::refuses;
 
 const VOLUME: [usize; 3] = [64, 64, 64];
 
@@ -69,20 +72,31 @@ fn run(
     scheduler: &mut dyn Scheduler,
 ) -> blockflow::simulate::Outcome {
     let assembly = plan(edge);
-    simulate(
-        &assembly.decomposition,
-        &assembly.work(),
-        &machine,
-        &rates_without_stores(),
-        &BTreeSet::new(),
-        &BTreeSet::new(),
+    run_with(
+        &assembly,
+        machine,
+        rates_without_stores(),
         PerPhase {
             ns_per_voxel: &TILE_PHASE_RATES,
             ..PerPhase::default()
         },
         scheduler,
     )
-    .expect("a simulable plan")
+}
+
+fn run_with(
+    assembly: &Assembly,
+    machine: Machine,
+    rates: Rates,
+    per_phase: PerPhase<'_>,
+    scheduler: &mut dyn Scheduler,
+) -> blockflow::simulate::Outcome {
+    Run::new(&assembly.decomposition, &assembly.work())
+        .machine(machine)
+        .rates(rates)
+        .per_phase(per_phase)
+        .go(scheduler)
+        .expect("a simulable plan")
 }
 
 /// Three phases at the tile run's own measured spread.
@@ -163,23 +177,19 @@ fn ordering_does_not_change_the_work() {
     };
     let compute_only = |scheduler: &mut dyn Scheduler| {
         let assembly = plan(16);
-        simulate(
-            &assembly.decomposition,
-            &assembly.work(),
-            &machine,
-            &Rates {
+        run_with(
+            &assembly,
+            machine,
+            Rates {
                 io_ns_per_byte: 0.0,
                 ..rates()
             },
-            &BTreeSet::new(),
-            &BTreeSet::new(),
             PerPhase {
                 ns_per_voxel: &TILE_PHASE_RATES,
                 ..PerPhase::default()
             },
             scheduler,
         )
-        .expect("a simulable plan")
     };
     let plan_order = compute_only(&mut PlanOrder);
     let warmest = compute_only(&mut WarmestFirst);
@@ -544,24 +554,20 @@ fn storing_costs_time_and_the_two_destinations_are_priced_apart() {
     };
     let at = |write: f64, materialise: f64| {
         let assembly = plan(16);
-        simulate(
-            &assembly.decomposition,
-            &assembly.work(),
-            &machine,
-            &Rates {
+        run_with(
+            &assembly,
+            machine,
+            Rates {
                 write_ns_per_byte: write,
                 materialise_ns_per_byte: materialise,
                 ..rates()
             },
-            &BTreeSet::new(),
-            &BTreeSet::new(),
             PerPhase {
                 ns_per_voxel: &TILE_PHASE_RATES,
                 ..PerPhase::default()
             },
             &mut PlanOrder,
         )
-        .expect("a simulable plan")
     };
 
     let free = at(0.0, 0.0);
@@ -628,24 +634,20 @@ fn writes_reserve_io_channels_for_later_reads() {
     };
     let at = |rate: f64| {
         let assembly = plan(16);
-        simulate(
-            &assembly.decomposition,
-            &assembly.work(),
-            &machine,
-            &Rates {
+        run_with(
+            &assembly,
+            machine,
+            Rates {
                 write_ns_per_byte: rate,
                 materialise_ns_per_byte: rate,
                 ..rates()
             },
-            &BTreeSet::new(),
-            &BTreeSet::new(),
             PerPhase {
                 ns_per_voxel: &TILE_PHASE_RATES,
                 ..PerPhase::default()
             },
             &mut PlanOrder,
         )
-        .expect("a simulable plan")
     };
 
     let free = at(0.0);
@@ -694,17 +696,13 @@ fn a_phase_that_reads_two_images_is_charged_for_two() {
             .pixels(Chain::op(IdentityOp::new("third", [1, 1, 1])))
             .expect("a pixel phase");
         let assembly = builder.finish().expect("an assembly");
-        simulate(
-            &assembly.decomposition,
-            &assembly.work(),
-            &machine,
-            &rates(),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
+        run_with(
+            &assembly,
+            machine,
+            rates(),
             PerPhase::default(),
             &mut PlanOrder,
         )
-        .expect("a simulable plan")
     };
 
     let kept = || Chain::op(IdentityOp::new("kept", [0, 0, 0]));
@@ -805,19 +803,12 @@ fn every_image_is_keyed_against_its_own_extent() {
     let plan = &assembly.decomposition;
 
     let volumes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    simulate(
-        plan,
-        &assembly.work(),
-        &Machine::default(),
-        &rates(),
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        PerPhase::default(),
-        &mut GridsSeen {
+    Run::new(plan, &assembly.work())
+        .rates(rates())
+        .go(&mut GridsSeen {
             volumes: volumes.clone(),
-        },
-    )
-    .expect("a simulable plan");
+        })
+        .expect("a simulable plan");
 
     let seen = volumes.lock().expect("a lock");
     assert!(
@@ -860,26 +851,20 @@ fn every_image_uses_its_own_chunk_byte_size() {
         .expect("a bool-reading phase");
     let assembly = builder.finish().expect("an assembly");
 
-    let outcome = simulate(
-        &assembly.decomposition,
-        &assembly.work(),
-        &Machine {
+    let outcome = Run::new(&assembly.decomposition, &assembly.work())
+        .machine(Machine {
             cache_bytes: 0,
             ..Machine::default()
-        },
-        &Rates {
+        })
+        .rates(Rates {
             chunk,
             chunk_bytes: chunk.iter().product::<usize>() as u64 * Dtype::F64.size_of() as u64,
             write_ns_per_byte: 0.0,
             materialise_ns_per_byte: 0.0,
             ..Rates::default()
-        },
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        PerPhase::default(),
-        &mut PlanOrder,
-    )
-    .expect("a simulable plan");
+        })
+        .go(&mut PlanOrder)
+        .expect("a simulable plan");
 
     let chunks = 8u64;
     let chunk_voxels = chunk.iter().product::<usize>() as u64;
@@ -960,20 +945,16 @@ fn at_rates(
     scheduler: &mut dyn Scheduler,
 ) -> blockflow::simulate::Outcome {
     let assembly = plan(edge);
-    simulate(
-        &assembly.decomposition,
-        &assembly.work(),
-        &machine,
-        rates,
-        &BTreeSet::new(),
-        &BTreeSet::new(),
+    run_with(
+        &assembly,
+        machine,
+        *rates,
         PerPhase {
             ns_per_voxel: &TILE_PHASE_RATES,
             ..PerPhase::default()
         },
         scheduler,
     )
-    .expect("a simulable plan")
 }
 
 /// **Every ranking in this file states the region of rate-space it holds in.**
@@ -1122,13 +1103,10 @@ fn a_substage_count_multiplies_the_compute_and_nothing_else() {
     };
     let run_with = |ns: [f64; 3], substages: [usize; 3]| {
         let assembly = plan(16);
-        simulate(
-            &assembly.decomposition,
-            &assembly.work(),
-            &machine,
-            &rates(),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
+        run_with(
+            &assembly,
+            machine,
+            rates(),
             PerPhase {
                 ns_per_voxel: &ns,
                 substages: &substages,
@@ -1136,7 +1114,6 @@ fn a_substage_count_multiplies_the_compute_and_nothing_else() {
             },
             &mut PlanOrder,
         )
-        .expect("a simulable plan")
     };
 
     let one = TILE_PHASE_RATES;
@@ -1333,12 +1310,10 @@ fn a_horizon_below_one_fetch_is_refused() {
     let rates = rates();
     let floor = BoundedHorizonThroughput::floor_ns(&rates);
     assert!(BoundedHorizonThroughput::new(floor, &rates).is_ok());
-    let err = BoundedHorizonThroughput::new(floor - 1, &rates)
-        .expect_err("a horizon below the floor must be refused");
-    let message = format!("{err}");
-    assert!(
-        message.contains("shorter than") && message.contains("fetch"),
-        "the refusal should say what is too short and why: {message}"
+    refuses!(
+        BoundedHorizonThroughput::new(floor - 1, &rates),
+        "shorter than",
+        "fetch"
     );
 }
 
@@ -1728,29 +1703,24 @@ fn a_chunk_size_sweep_has_an_interior_optimum_once_a_request_costs_something() {
             .into_iter()
             .map(|edge| {
                 let assembly = plan(16);
-                let outcome = simulate(
-                    &assembly.decomposition,
-                    &assembly.work(),
-                    &Machine {
+                let outcome = Run::new(&assembly.decomposition, &assembly.work())
+                    .machine(Machine {
                         workers: 1,
                         cache_bytes: 0,
                         ..Machine::default()
-                    },
-                    &Rates {
+                    })
+                    .rates(Rates {
                         chunk: [edge, edge, edge],
                         chunk_bytes: (edge * edge * edge * 8) as u64,
                         io_latency_ns: latency,
                         ..rates()
-                    },
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    PerPhase {
+                    })
+                    .per_phase(PerPhase {
                         ns_per_voxel: &TILE_PHASE_RATES,
                         ..PerPhase::default()
-                    },
-                    &mut PlanOrder,
-                )
-                .expect("a simulable plan");
+                    })
+                    .go(&mut PlanOrder)
+                    .expect("a simulable plan");
                 outcome.io_wait_ns
             })
             .collect::<Vec<_>>()
@@ -1856,27 +1826,22 @@ fn channels_overlap_fetches_and_widen_the_prefetch_cliff() {
 fn decoding_costs_what_was_fetched() {
     let at = |decode: f64| {
         let assembly = plan(16);
-        simulate(
-            &assembly.decomposition,
-            &assembly.work(),
-            &Machine {
+        Run::new(&assembly.decomposition, &assembly.work())
+            .machine(Machine {
                 workers: 1,
                 cache_bytes: 0,
                 ..Machine::default()
-            },
-            &Rates {
+            })
+            .rates(Rates {
                 decode_ns_per_byte: decode,
                 ..rates()
-            },
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            PerPhase {
+            })
+            .per_phase(PerPhase {
                 ns_per_voxel: &TILE_PHASE_RATES,
                 ..PerPhase::default()
-            },
-            &mut PlanOrder,
-        )
-        .expect("a simulable plan")
+            })
+            .go(&mut PlanOrder)
+            .expect("a simulable plan")
     };
     let free = at(0.0);
     let costly = at(2.0);
@@ -1909,25 +1874,20 @@ fn decoding_costs_what_was_fetched() {
 fn a_short_circuited_block_skips_the_compute_and_still_moves_its_bytes() {
     let at = |fraction: [f64; 3]| {
         let assembly = plan(16);
-        simulate(
-            &assembly.decomposition,
-            &assembly.work(),
-            &Machine {
+        Run::new(&assembly.decomposition, &assembly.work())
+            .machine(Machine {
                 workers: 1,
                 cache_bytes: 0,
                 ..Machine::default()
-            },
-            &rates(),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            PerPhase {
+            })
+            .rates(rates())
+            .per_phase(PerPhase {
                 ns_per_voxel: &TILE_PHASE_RATES,
                 constant_fraction: &fraction,
                 ..PerPhase::default()
-            },
-            &mut PlanOrder,
-        )
-        .expect("a simulable plan")
+            })
+            .go(&mut PlanOrder)
+            .expect("a simulable plan")
     };
 
     let none = at([0.0, 0.0, 0.0]);
@@ -1972,25 +1932,20 @@ fn a_short_circuited_block_skips_the_compute_and_still_moves_its_bytes() {
     // And it is a property of the plan and the data, not of the schedule.
     let by_warmth = {
         let assembly = plan(16);
-        simulate(
-            &assembly.decomposition,
-            &assembly.work(),
-            &Machine {
+        Run::new(&assembly.decomposition, &assembly.work())
+            .machine(Machine {
                 workers: 1,
                 cache_bytes: 0,
                 ..Machine::default()
-            },
-            &rates(),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            PerPhase {
+            })
+            .rates(rates())
+            .per_phase(PerPhase {
                 ns_per_voxel: &TILE_PHASE_RATES,
                 constant_fraction: &[0.0, 0.5, 0.0],
                 ..PerPhase::default()
-            },
-            &mut WarmestFirst,
-        )
-        .expect("a simulable plan")
+            })
+            .go(&mut WarmestFirst)
+            .expect("a simulable plan")
     };
     assert_eq!(
         by_warmth.tasks_short_circuited, half.tasks_short_circuited,
@@ -2014,30 +1969,27 @@ fn a_short_circuited_block_skips_the_compute_and_still_moves_its_bytes() {
 fn the_encoded_tier_trades_fetches_for_decodes() {
     let at = |encoded_fraction: f64| {
         let assembly = plan(16);
-        simulate(
-            &assembly.decomposition,
-            &assembly.work(),
-            &Machine {
-                workers: 1,
-                // Small enough that the decoded tier alone cannot hold the
-                // working set, or there is nothing for a second tier to buy.
-                cache_bytes: rates().chunk_bytes * 4,
-                ..Machine::default()
-            }
-            .with_encoded_fraction(encoded_fraction),
-            &Rates {
+        Run::new(&assembly.decomposition, &assembly.work())
+            .machine(
+                Machine {
+                    workers: 1,
+                    // Small enough that the decoded tier alone cannot hold the
+                    // working set, or there is nothing for a second tier to buy.
+                    cache_bytes: rates().chunk_bytes * 4,
+                    ..Machine::default()
+                }
+                .with_encoded_fraction(encoded_fraction),
+            )
+            .rates(Rates {
                 decode_ns_per_byte: 0.05,
                 ..rates()
-            },
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            PerPhase {
+            })
+            .per_phase(PerPhase {
                 ns_per_voxel: &TILE_PHASE_RATES,
                 ..PerPhase::default()
-            },
-            &mut PlanOrder,
-        )
-        .expect("a simulable plan")
+            })
+            .go(&mut PlanOrder)
+            .expect("a simulable plan")
     };
 
     let one_tier = at(0.0);
@@ -2066,28 +2018,25 @@ fn the_encoded_tier_trades_fetches_for_decodes() {
     // ruinous — if an encoded hit were free this would not move.
     let ruinous_decode = {
         let assembly = plan(16);
-        simulate(
-            &assembly.decomposition,
-            &assembly.work(),
-            &Machine {
-                workers: 1,
-                cache_bytes: rates().chunk_bytes * 4,
-                ..Machine::default()
-            }
-            .with_encoded_fraction(0.5),
-            &Rates {
+        Run::new(&assembly.decomposition, &assembly.work())
+            .machine(
+                Machine {
+                    workers: 1,
+                    cache_bytes: rates().chunk_bytes * 4,
+                    ..Machine::default()
+                }
+                .with_encoded_fraction(0.5),
+            )
+            .rates(Rates {
                 decode_ns_per_byte: 50.0,
                 ..rates()
-            },
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            PerPhase {
+            })
+            .per_phase(PerPhase {
                 ns_per_voxel: &TILE_PHASE_RATES,
                 ..PerPhase::default()
-            },
-            &mut PlanOrder,
-        )
-        .expect("a simulable plan")
+            })
+            .go(&mut PlanOrder)
+            .expect("a simulable plan")
     };
     assert!(
         ruinous_decode.makespan_ns > two_tiers.makespan_ns,
@@ -2153,20 +2102,14 @@ fn a_fragment_phase_writes_sidecar_bytes_and_a_barrier_holds_them_all() {
     let assembly = builder.finish().expect("an assembly");
     let blocks = assembly.decomposition.phases[1].blocks.len() as u64;
 
-    let outcome = simulate(
-        &assembly.decomposition,
-        &assembly.work(),
-        &Machine {
+    let outcome = Run::new(&assembly.decomposition, &assembly.work())
+        .machine(Machine {
             workers: 1,
             ..Machine::default()
-        },
-        &rates(),
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        PerPhase::default(),
-        &mut PlanOrder,
-    )
-    .expect("a simulable plan");
+        })
+        .rates(rates())
+        .go(&mut PlanOrder)
+        .expect("a simulable plan");
 
     assert_eq!(
         outcome.sidecar_bytes_written,
@@ -2258,24 +2201,19 @@ fn writing_past_the_declared_sidecar_bound_is_refused() {
     // `execute_phases` and not `execute`: `execute` hands every phase
     // `PhaseWork::Pixels`, so a fragment op reached through it is never applied
     // at all — the block is read and written as if the phase were a chain.
-    let error = blockflow::strategy::execute_phases(
-        "bound",
-        &assembly.workflow,
-        &assembly.decomposition,
-        &blockflow::strategy::Hints::default(),
-        &env,
-        &[],
-        &assembly.work(),
-    )
-    .expect_err("nine bytes against a declared eight must be refused");
-    let message = error.to_string();
-    assert!(
-        message.contains("declares at most 8") && message.contains("wrote 9"),
-        "the refusal must name the bound and what was written: {message}"
-    );
-    assert!(
-        message.contains("overrun"),
-        "and the op, so a reader knows whose declaration to fix: {message}"
+    refuses!(
+        blockflow::strategy::execute_phases(
+            "bound",
+            &assembly.workflow,
+            &assembly.decomposition,
+            &blockflow::strategy::Hints::default(),
+            &env,
+            &[],
+            &assembly.work(),
+        ),
+        "declares at most 8",
+        "wrote 9",
+        "overrun"
     );
 }
 
@@ -2525,22 +2463,16 @@ fn a_barrier_phase_is_released_when_the_phase_before_it_completes() {
     }
 
     let picked = Rc::new(RefCell::new(Vec::new()));
-    let outcome = simulate(
-        &decomposition,
-        &[blockflow::fragment::PhaseWork::Pixels; 3],
-        &Machine {
+    let outcome = Run::new(&decomposition, &[blockflow::fragment::PhaseWork::Pixels; 3])
+        .machine(Machine {
             workers: 4,
             ..Machine::default()
-        },
-        &rates(),
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        PerPhase::default(),
-        &mut Recording {
+        })
+        .rates(rates())
+        .go(&mut Recording {
             picked: picked.clone(),
-        },
-    )
-    .expect("a plan whose barrier clears must run to completion");
+        })
+        .expect("a plan whose barrier clears must run to completion");
     assert_eq!(outcome.tasks_run as usize, 3 * blocks);
 
     let picked = picked.borrow();

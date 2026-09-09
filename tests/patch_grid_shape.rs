@@ -19,6 +19,7 @@
 // to go there.
 
 mod patch_grid;
+mod support;
 
 use blockflow::{
     execute, BlockGrid, Chain, Constraints, Decomposition, Dtype, Enumerating, Environment, Greedy,
@@ -27,6 +28,7 @@ use blockflow::{
 use patch_grid::{
     one_phase, CountedOp, ExtraOutput, Inbound, Lattice, PatchGeometry, RegridEnvironment,
 };
+use support::refuses;
 
 /// The 2-D case, spelled as this project spells it: a 3-D volume with a
 /// degenerate z extent, not a second code path.
@@ -548,11 +550,7 @@ fn a_phase_boundary_may_change_the_shape_when_it_says_where_it_reads() {
         phases: vec![gather_phase.clone(), combine_phase.clone()],
         chain_reach: [0, 0, 0],
     };
-    let error = unmapped.check().unwrap_err().to_string();
-    assert!(
-        error.contains("reads from image 1") && error.contains("region axis"),
-        "{error}"
-    );
+    refuses!(unmapped.check(), "reads from image 1", "region axis");
 
     // With it: every block of the combine fetches the patches covering its own
     // core, in patch-index space.
@@ -937,9 +935,11 @@ fn the_existing_halo_guard_still_fires_on_the_spatial_side() {
     good.check().unwrap();
 
     let bad = good.with_forced_halo([0, 16, 16]);
-    let error = bad.check().unwrap_err().to_string();
-    assert!(error.contains("do not tile the volume exactly"), "{error}");
-    assert!(error.contains("lost part of their core"), "{error}");
+    refuses!(
+        bad.check(),
+        "do not tile the volume exactly",
+        "lost part of their core"
+    );
 }
 
 /// The patch-grid array's own region arithmetic is rank-3 because everything in
