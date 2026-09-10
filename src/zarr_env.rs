@@ -3535,6 +3535,21 @@ mod tests {
     /// threshold a flaky test rather than a stronger one. What is not negotiable
     /// is the guarded arm, which must be exactly zero.
     ///
+    /// **The unguarded arm needs a second CPU, and asks for one rather than
+    /// assuming it.** The two writers are made to overlap by a `Barrier`, but a
+    /// barrier only releases them together — it cannot make them *run* together
+    /// on a machine with one core to give, and there the first writer finishes
+    /// its whole decode-patch-encode before the second is scheduled, so the
+    /// second reads the first's result and nothing is lost. Measured here:
+    /// **39/40 and 40/40** trials lose a half-chunk on a 40-core machine,
+    /// **0/40** with the same binary pinned to one CPU with `taskset -c 0`. That
+    /// is not the guard working and not `zarrs` fixed; it is the race not being
+    /// run. So when `available_parallelism` reports one, this arm reports that
+    /// it could not measure and declines to conclude — which is the honest
+    /// reading, and stops a single-core CI container from failing the build with
+    /// a diagnostic pointing at two causes that are both innocent. It counts
+    /// cgroup quota and CPU affinity, which is what a CI container restricts.
+    ///
     /// **Run on both a raw and a compressed array**, and the compressed arm is
     /// not a formality: it is the configuration this environment now writes by
     /// default for an integer image, so a guard that had only ever been measured
@@ -3558,13 +3573,25 @@ mod tests {
                 "partial-chunk race ({what}): {open}/40 trials lost a half-chunk unguarded, \
                  {guarded}/40 guarded"
             );
+            let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+            if cpus < 2 {
+                // Say it on the same stream as the numbers above, so a run that
+                // proved less than it looks like it proved says so where the
+                // numbers are read.
+                eprintln!(
+                    "partial-chunk race ({what}): unguarded arm not measured — \
+                     available_parallelism is {cpus}, and two writers cannot overlap on one CPU"
+                );
+                continue;
+            }
             assert!(
                 open > 0,
-                "40 unguarded trials on a {what} array lost nothing. Either `zarrs` has grown the \
-                 chunk lock its source still has commented out, in which case this test has done \
-                 its job and the guard can be reconsidered on evidence — or the two writers are \
-                 not actually overlapping a chunk any more, in which case this test has stopped \
-                 measuring anything and must be fixed before it is trusted."
+                "40 unguarded trials on a {what} array lost nothing, on a machine reporting \
+                 {cpus} CPUs. Either `zarrs` has grown the chunk lock its source still has \
+                 commented out, in which case this test has done its job and the guard can be \
+                 reconsidered on evidence — or the two writers are not actually overlapping a \
+                 chunk any more, in which case this test has stopped measuring anything and must \
+                 be fixed before it is trusted."
             );
         }
     }
