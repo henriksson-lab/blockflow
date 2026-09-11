@@ -643,6 +643,58 @@ impl PlanBuilder {
         Ok(self.push(phase, Work::Pixels, true))
     }
 
+    /// Append a `Pixels` phase whose decomposition was derived by the op
+    /// family that owns its geometry.
+    ///
+    /// This is for shape-changing or otherwise mapped pixel phases where the
+    /// ordinary `pixels` helper cannot derive a correct fetch region from a
+    /// symmetric halo alone. The supplied phase still uses chain-local slot
+    /// numbers; this method is the only place that moves them to the builder's
+    /// slot cursor and advances the builder's current grid to the phase's
+    /// output lattice.
+    pub(crate) fn pixels_decomposed(
+        &mut self,
+        chain: Chain,
+        mut phase: PhaseDecomposition,
+    ) -> Result<Phase> {
+        let slots = chain.slots();
+        if slots.is_empty() {
+            return Err(Error::InvalidArgument(
+                "a decomposed pixel phase with no chain slots would read an image and write it \
+                 back unchanged. If that copy is wanted, say so with an identity op."
+                    .to_string(),
+            ));
+        }
+        let n = slots.len();
+        let expected = (0..n).collect::<Vec<_>>();
+        if phase.slots != expected {
+            return Err(Error::InvalidArgument(format!(
+                "a caller-derived pixel phase must name its chain-local slots as {expected:?}, \
+                 got {:?}",
+                phase.slots
+            )));
+        }
+        if phase.names.len() != n {
+            return Err(Error::InvalidArgument(format!(
+                "a caller-derived pixel phase with {n} slot(s) carried {} name(s)",
+                phase.names.len()
+            )));
+        }
+        let mut produced = self.reads;
+        for slot in &slots {
+            produced = slot.produces(produced)?;
+        }
+        phase.dtype = (produced != self.reads).then_some(produced);
+        for slot in &mut phase.slots {
+            *slot += self.slots_used;
+        }
+        self.slots_used += n;
+        self.grid = phase.grid.clone();
+        self.fragments.push(chain);
+        self.reads = produced;
+        Ok(self.push(phase, Work::Pixels, true))
+    }
+
     /// Append **as many `Pixels` phases as `strategy` makes** of one chain.
     ///
     /// The counterpart of [`Self::pixels`], and the two are the two answers to

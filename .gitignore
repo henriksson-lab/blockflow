@@ -1,0 +1,7 @@
+# Cargo's build output and generated dependency resolution are local to this
+# library repository. Consumers pin their own dependency graph.
+/target/
+/Cargo.lock
+
+# Local agent/editor state.
+/.claude/

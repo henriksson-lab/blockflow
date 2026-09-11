@@ -344,6 +344,7 @@ pub mod smooth;
 pub mod structure_tensor;
 pub mod tabulate;
 pub mod threshold;
+pub mod transform;
 pub mod voxelize;
 pub mod voxelwise;
 pub mod walk;
@@ -512,6 +513,11 @@ pub use threshold::{
     multi_otsu_thresholds, otsu_threshold, threshold_classes, threshold_mask, triangle_threshold,
     yen_threshold, ApplyGlobalThresholdOp, GlobalThreshold, GlobalThresholdOutput,
     GlobalThresholdSamplesOp, GlobalThresholdSelection,
+};
+pub use transform::{
+    affine_transform_into, append_warp_phase, log_polar_transform_into, polar_transform_into,
+    projective_transform_into, remap_into, rotate_into, warp_into, warp_phase, CoordinateMap,
+    TransformBoundary, TransformInterpolation, WarpOp,
 };
 pub use voxelize::{decode_points, encode_points, Point, VoxelizeOp};
 pub use voxelwise::{

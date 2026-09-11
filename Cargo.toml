@@ -2,6 +2,7 @@
 # it. The dependency direction is one-way and enforced here — `blockflow` has no
 # `clearmap-rs` dependency and must never acquire one.
 [workspace]
+members = [".", "crates/blockflow-progress"]
 
 [package]
 name = "blockflow"
@@ -19,6 +20,7 @@ flate2 = "1"
 ndarray = "0.17"
 rayon = "1"
 serde_json = "1"
+blockflow-progress = { path = "crates/blockflow-progress" }
 # `ops::fft` only, and the one exception to the rule stated at the top of this
 # block: an FFT is not the framework's own machinery, it is what one op needs.
 # It is here rather than in a consumer because the rule that decides *which*

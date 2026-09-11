@@ -42,7 +42,7 @@
 //! # What this deliberately does not do
 //!
 //! It does not join the branches. [`FeatureStack::branches`] hands back a `Vec`
-//! and the caller supplies the [`Combine`](crate::op::Combine) — which for the real workload is
+//! and the caller supplies the [`Combine`] — which for the real workload is
 //! forest predictor, the thing that turns 91 images into one. A builder that
 //! chose the combine would have had to know what the stack was for, and the
 //! stack is also wanted for *training*, where the join is a sampler rather than
