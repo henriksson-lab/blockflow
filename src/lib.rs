@@ -183,6 +183,10 @@ pub mod ops;
 pub mod points;
 pub mod prefetch;
 pub mod probes;
+/// A local JSONL progress listener for a Blockflow run.  It is deliberately a
+/// listener rather than part of the executor: failure to write progress can
+/// never change the result of a computation.
+pub mod progress;
 pub mod pyramid;
 /// What an operation reads beyond what it writes, and in which coordinate
 /// space it is counted. See [`reach::Reach`].
@@ -299,6 +303,7 @@ pub use probes::{
     FragmentReduceOp, IdentityOp, MandatedExtentOp, NeighbourFoldOp, NonZeroOp, OpaqueOp,
     RegionMergeOp, RegionSumOp, SideOutputOp, SpreadLatticeOp, WindowSumOp,
 };
+pub use progress::{ProgressLevel, ProgressMeta, StreamingLog};
 pub use reach::{AxisReach, Frame, Reach, Space, Units};
 pub use region::{ArrayRegionSink, ArrayRegionSource, Region, RegionSink, RegionSource};
 pub use sidecar::{
