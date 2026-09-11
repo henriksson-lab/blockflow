@@ -389,9 +389,8 @@ fn the_merged_list_re_encodes_to_the_single_block_blob() {
                 .collect::<Vec<_>>(),
         )
         .expect("the merge");
-        // Re-encoded through the same kernel that wrote the reference, from a
-        // mask that holds exactly the merged pairs' endpoints: what is being
-        // compared is the bytes, and the only way to make bytes is to walk.
+        // The merged pairs re-encoded against the same schema the walk writes,
+        // so what is compared is the bytes rather than the decoded list.
         let mut rebuilt = blockflow::table::RowBuilder::new(std::sync::Arc::new(pair_schema()));
         for (lower, higher) in &merged {
             rebuilt

@@ -59,8 +59,10 @@
 //   nothing in this module is called by it.
 //
 // The measurement behind that claim is in `gui::tests`: a run with a client
-// polling as hard as it can produces the same statistics and the same wall time
-// as a run with no server at all.
+// polling as hard as it can does the same work — the same schedule, the same op
+// and block counts, the same acceptance criterion — as a run with no server at
+// all. Wall time is printed rather than asserted, by `perturbation_report`,
+// because a threshold on a shared machine would be a flaky test.
 //
 // Layout
 // ------
@@ -74,7 +76,7 @@
 //
 // The browser half is a separate crate, `webui/`, compiled to WebAssembly. It
 // is not a dependency of this one and is not built by `cargo`; see
-// [`server::AssetDir`] for how the built files are found and what happens when
+// [`server::find_assets`] for how the built files are found and what happens when
 // they are not there.
 
 pub mod live;

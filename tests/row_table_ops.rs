@@ -25,15 +25,11 @@
 //
 // All three run through the executor, and the gather runs twice
 // ---------------------------------------------------------------
-// `ops::rows` ships a `FragmentOp` for each of the three. The gather was for a
-// while the one that could not have a shell: while a `FragmentOp` read only the
-// image its phase was handed, no arrangement of phases gave a gather both its
-// rows and the array it must sample, and this file pinned that finding as a test
-// written to stop passing. `FragmentOp::source_inputs` is what resolved it — the
-// array a gather samples was never the image its phase is handed, it is a
-// *second* one — and the test that pinned the two refusals has been deleted,
-// which is exactly what it was written to make happen. Neither refusal was
-// weakened; see `ops::rows`' header.
+// `ops::rows` ships a `FragmentOp` for each of the three. The gather needs both
+// its rows and the array it must sample, and that array is never the image its
+// own phase is handed — it is a *second* one, named through
+// `FragmentOp::source_inputs`. See `ops::rows`' header for the refusals that
+// stand around it.
 //
 // So the gather is driven **twice**, and the two are compared:
 //
@@ -180,21 +176,14 @@ const CUTS: [[usize; 3]; 7] = [
 /// The row source: one row per non-zero voxel of the block's core, carrying
 /// that voxel's value.
 ///
-/// **This file used to write its own, and the sentence it wrote it under was a
-/// gap report.** `ops::rows` transforms rows and something has to make them;
-/// `ops::coordinates::SetVoxelsOp` was the right scale and its rows had **no
-/// payload column**, so a filter over them would have had nothing to test — and
-/// a suite whose filter has no column is a suite with no filter in it. The old
-/// producer's doc ended *"that is what needs the shell that does not exist
-/// yet"*, and the shell now exists: `SetVoxelsOp::with_values` adds the column
-/// and changes nothing else.
+/// The **payload column** is what makes the filter below test anything: a suite
+/// whose filter has no column to test is a suite with no filter in it.
+/// `SetVoxelsOp::with_values` adds it and changes nothing else.
 ///
-/// The other half of that sentence is unchanged and is still the honest
-/// statement of what a row op can be spared: this producer reads the image it
-/// emits values from, so where the value wanted **is** the array the rows came
-/// from, no gather is needed at all. The case the consumers have is the other
-/// one — rows from one array, values from a second — and that is
-/// `GatherRowsOp`, which is a different op and remains one.
+/// This producer reads the image it emits values from, so where the value wanted
+/// **is** the array the rows came from, no gather is needed at all. The case the
+/// consumers have is the other one — rows from one array, values from a second —
+/// and that is `GatherRowsOp`.
 fn seed_rows() -> SetVoxelsOp {
     SetVoxelsOp::new("seed rows", SEEDED, Lifecycle::Persistent).with_values(VALUE)
 }

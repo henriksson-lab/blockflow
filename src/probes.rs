@@ -471,16 +471,14 @@ impl BlockSummaryOp {
     }
 
     /// Whether this phase declares that it reads its block's pixels. `true`
-    /// unless said otherwise, which is what every caller before this knob had.
+    /// unless said otherwise.
     ///
     /// **A knob and not a second probe, because the difference is one
     /// declaration.** `reads_pixels` decides whether the executor fetches a
     /// block at all, so "the same phase, with and without pixel IO" is the
-    /// comparison a residency or a fetch-count measurement is made of — and it
-    /// was being made by writing the op twice and promising the two stayed
-    /// identical. With this it is one op and one flipped bool, so the premise
-    /// *"the same op with one thing changed"* is structural rather than a
-    /// comment. `image_lifetime.rs` is where that pair lived.
+    /// comparison a residency or a fetch-count measurement is made of. One op
+    /// and one flipped bool keeps the premise *"the same op with one thing
+    /// changed"* structural rather than a promise in a comment.
     ///
     /// With pixels off the summary's `sum` field is `0`, which is what it
     /// already was under an accounting environment — and the op **refuses**
@@ -581,8 +579,7 @@ impl crate::fragment::FragmentOp for BlockSummaryOp {
 /// The degenerate member of the fragment family, and it exists because two
 /// different measurements need a phase that *is* one: `peak_image_bytes` needs
 /// a phase that writes no image, and `phase_pricing` needs a phase that reads
-/// no pixels. Both were written as a local `Merge` and the two were
-/// byte-for-byte identical below their doc comments.
+/// no pixels.
 ///
 /// [`Coverage::Sparse`](crate::fragment::Coverage::Sparse) is structural rather
 /// than a default: an op that declared `EveryBlock` and then returned
@@ -629,8 +626,8 @@ impl crate::fragment::FragmentOp for NullFragmentOp {
             self.lifecycle,
             crate::fragment::Coverage::Sparse,
         )
-        // Writes nothing at all — `BlockOutput::nothing`, which is what makes this
-        //             // the `Coverage::Sparse` probe.
+        // Writes nothing at all — `BlockOutput::nothing`, which is what makes
+        // this the `Coverage::Sparse` probe.
         .sized(crate::fragment::SidecarSize::fixed(0))]
     }
 
@@ -1116,7 +1113,7 @@ impl crate::fragment::FragmentOp for RegionMergeOp {
             crate::fragment::Coverage::EveryBlock,
         )
         // Three words per region — the id, its voxels and its sum — and a block
-        //             // holds no more regions than voxels.
+        // holds no more regions than voxels.
         .sized(crate::fragment::SidecarSize::per_read_voxel(0, 24))]
     }
 

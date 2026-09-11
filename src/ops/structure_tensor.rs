@@ -373,6 +373,69 @@ pub fn gradient_at(field: ArrayView3<'_, f64>, at: [usize; 3]) -> [f64; 3] {
     gradient
 }
 
+/// The three components of `grad(G_sigma * input)`, one output image per axis.
+pub fn gaussian_gradient_into<T>(
+    input: ArrayView3<'_, T>,
+    sigma: [f64; 3],
+    truncate: f64,
+    out: [ArrayViewMut3<'_, f64>; 3],
+) -> Result<()>
+where
+    T: Copy + Into<f64>,
+{
+    validate_gradient_scale(sigma, truncate)?;
+    let mut out = out;
+    for slot in &out {
+        shapes_agree(input.shape(), slot.shape(), "gaussian_gradient")?;
+    }
+    let dim = (input.shape()[0], input.shape()[1], input.shape()[2]);
+    let mut smoothed = Array3::<f64>::zeros(dim);
+    let kernels = [
+        gaussian_weights(sigma[0], truncate)?,
+        gaussian_weights(sigma[1], truncate)?,
+        gaussian_weights(sigma[2], truncate)?,
+    ];
+    gaussian_smooth_into(input, &kernels, smoothed.view_mut())?;
+    for i in 0..dim.0 {
+        for j in 0..dim.1 {
+            for k in 0..dim.2 {
+                let gradient = gradient_at(smoothed.view(), [i, j, k]);
+                for axis in 0..3 {
+                    out[axis][[i, j, k]] = gradient[axis];
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_gradient_scale(sigma: [f64; 3], truncate: f64) -> Result<()> {
+    for axis in 0..3 {
+        if !sigma[axis].is_finite() || sigma[axis] < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "gaussian gradient: sigma[{axis}] is {}; a scale is a non-negative finite \
+                 number of voxels",
+                sigma[axis]
+            )));
+        }
+    }
+    if !truncate.is_finite() || truncate <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "gaussian gradient: truncate is {truncate}; it is how many standard deviations \
+             the Gaussian is cut off at and must be positive"
+        )));
+    }
+    for axis in 0..3 {
+        if truncate * sigma[axis] > 1e6 {
+            return Err(Error::InvalidArgument(format!(
+                "gaussian gradient: a smoothing scale of {sigma:?} truncated at {truncate} \
+                 reaches more than a million voxels on axis {axis}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// One eigenvalue of the structure tensor, as an op.
 pub struct StructureTensorOp {
     name: &'static str,
@@ -403,6 +466,195 @@ impl StructureTensorOp {
     pub fn with_cost(mut self, cost: f64) -> Self {
         self.cost = cost;
         self
+    }
+}
+
+/// A scalar corner response derived from the structure tensor eigenvalues.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CornerResponse {
+    /// Harris-Stephens response, generalised to the tensor dimensionality as
+    /// `det(J) - k * trace(J)^d`.
+    Harris { k: f64 },
+    /// Shi-Tomasi / minimum-eigenvalue response.
+    ShiTomasi,
+}
+
+impl CornerResponse {
+    pub fn harris(k: f64) -> Result<Self> {
+        if !k.is_finite() || k < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "harris corner response k is {k}; it must be a non-negative finite number"
+            )));
+        }
+        Ok(Self::Harris { k })
+    }
+
+    pub fn at_eigenvalues(self, eigenvalues: [f64; 3], dimensions: usize) -> Result<f64> {
+        if !(1..=3).contains(&dimensions) {
+            return Err(Error::InvalidArgument(format!(
+                "corner response dimensionality is {dimensions}; expected 1, 2 or 3"
+            )));
+        }
+        let active = &eigenvalues[..dimensions];
+        Ok(match self {
+            CornerResponse::Harris { k } => {
+                let trace = active.iter().sum::<f64>();
+                let determinant = active.iter().product::<f64>();
+                determinant - k * trace.powi(dimensions as i32)
+            }
+            CornerResponse::ShiTomasi => active
+                .iter()
+                .copied()
+                .reduce(f64::min)
+                .expect("dimensions is non-zero"),
+        })
+    }
+}
+
+/// Compute a Harris or Shi-Tomasi response image from the structure tensor.
+pub fn corner_response_into<T>(
+    input: ArrayView3<'_, T>,
+    tensor: &StructureTensor,
+    response: CornerResponse,
+    dimensions: usize,
+    mut out: ArrayViewMut3<'_, f64>,
+) -> Result<()>
+where
+    T: Copy + Into<f64>,
+{
+    shapes_agree(input.shape(), out.shape(), "corner_response")?;
+    let dim = (input.shape()[0], input.shape()[1], input.shape()[2]);
+    let mut values = [
+        Array3::<f64>::zeros(dim),
+        Array3::<f64>::zeros(dim),
+        Array3::<f64>::zeros(dim),
+    ];
+    {
+        let [first, second, third] = &mut values;
+        tensor.eigenvalues_into(
+            input,
+            [first.view_mut(), second.view_mut(), third.view_mut()],
+        )?;
+    }
+    for i in 0..dim.0 {
+        for j in 0..dim.1 {
+            for k in 0..dim.2 {
+                let eigenvalues = [
+                    values[0][[i, j, k]],
+                    values[1][[i, j, k]],
+                    values[2][[i, j, k]],
+                ];
+                out[[i, j, k]] = response.at_eigenvalues(eigenvalues, dimensions)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Harris or Shi-Tomasi response image as a `BlockOp`.
+pub struct CornerResponseOp {
+    name: &'static str,
+    tensor: StructureTensor,
+    response: CornerResponse,
+    dimensions: usize,
+    cost: f64,
+}
+
+impl CornerResponseOp {
+    pub fn new(
+        name: &'static str,
+        tensor: StructureTensor,
+        response: CornerResponse,
+        dimensions: usize,
+    ) -> Result<Self> {
+        response.at_eigenvalues([0.0, 0.0, 0.0], dimensions)?;
+        let cost = cost_for(&tensor);
+        Ok(Self {
+            name,
+            tensor,
+            response,
+            dimensions,
+            cost,
+        })
+    }
+
+    pub fn harris(name: &'static str, tensor: StructureTensor, k: f64) -> Result<Self> {
+        Self::new(name, tensor, CornerResponse::harris(k)?, 3)
+    }
+
+    pub fn shi_tomasi(name: &'static str, tensor: StructureTensor) -> Result<Self> {
+        Self::new(name, tensor, CornerResponse::ShiTomasi, 3)
+    }
+
+    pub fn with_dimensions(mut self, dimensions: usize) -> Result<Self> {
+        self.response.at_eigenvalues([0.0, 0.0, 0.0], dimensions)?;
+        self.dimensions = dimensions;
+        Ok(self)
+    }
+
+    pub fn tensor(&self) -> &StructureTensor {
+        &self.tensor
+    }
+
+    pub fn response(&self) -> CornerResponse {
+        self.response
+    }
+
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+impl BlockOp for CornerResponseOp {
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, axis: usize, _volume_len: usize) -> usize {
+        self.tensor.reach(axis)
+    }
+
+    fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+        Reach::symmetric([
+            self.tensor.reach(0),
+            self.tensor.reach(1),
+            self.tensor.reach(2),
+        ])
+    }
+
+    fn accepts(&self, dtype: Dtype) -> bool {
+        dtype != Dtype::F16
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::F64
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        let out = out.view_mut::<f64>()?;
+        dispatch_f64_input!(
+            input,
+            Error::InvalidArgument(format!(
+                "{}: no buffer holds half-precision; `accepts` refuses it before a run starts",
+                self.name
+            )),
+            |view| {
+                corner_response_into(view, &self.tensor, self.response, self.dimensions, out)
+            }
+        )
+    }
+
+    fn constant_maps_to(&self, _value: f64) -> Option<f64> {
+        Some(0.0)
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
     }
 }
 
@@ -551,21 +803,27 @@ impl GradientMagnitudeOp {
     {
         shapes_agree(input.shape(), out.shape(), "gradient_magnitude")?;
         let dim = (input.shape()[0], input.shape()[1], input.shape()[2]);
-        let mut smoothed = Array3::<f64>::zeros(dim);
-        let kernels = [
-            gaussian_weights(self.sigma[0], self.truncate)?,
-            gaussian_weights(self.sigma[1], self.truncate)?,
-            gaussian_weights(self.sigma[2], self.truncate)?,
+        let mut components = [
+            Array3::<f64>::zeros(dim),
+            Array3::<f64>::zeros(dim),
+            Array3::<f64>::zeros(dim),
         ];
-        gaussian_smooth_into(input, &kernels, smoothed.view_mut())?;
+        {
+            let [first, second, third] = &mut components;
+            gaussian_gradient_into(
+                input,
+                self.sigma,
+                self.truncate,
+                [first.view_mut(), second.view_mut(), third.view_mut()],
+            )?;
+        }
         for i in 0..dim.0 {
             for j in 0..dim.1 {
                 for k in 0..dim.2 {
-                    let gradient = gradient_at(smoothed.view(), [i, j, k]);
-                    out[[i, j, k]] = (gradient[0] * gradient[0]
-                        + gradient[1] * gradient[1]
-                        + gradient[2] * gradient[2])
-                        .sqrt();
+                    out[[i, j, k]] = (components[0][[i, j, k]] * components[0][[i, j, k]]
+                        + components[1][[i, j, k]] * components[1][[i, j, k]]
+                        + components[2][[i, j, k]] * components[2][[i, j, k]])
+                    .sqrt();
                 }
             }
         }
@@ -675,11 +933,12 @@ pub(super) fn cost_for(tensor: &StructureTensor) -> f64 {
 /// ridge evaluates three exponentials for its response where this one copies out
 /// a number.
 ///
-/// It read `56.9` and compared itself against ridge's *stored* `41.2` with a
-/// paragraph explaining that the 1.38x between them was ridge's split being
-/// stale rather than a difference between the ops. That turned out to be exactly
-/// right, and ridge has since been re-fitted; the number here moved only because
-/// it is now anchored against a shared per-tap constant rather than its own.
+/// The own-fit read `56.9` against ridge's then-stored `41.2`, and diagnosed the
+/// 1.38x between them as ridge's split being stale rather than a difference
+/// between the ops. Ridge has since been re-fitted to `56.28`, which is that
+/// diagnosis confirmed; the figure here moved only because it is now anchored
+/// against the shared [`SMOOTH_COST_PER_TAP`] rather than a per-tap constant of
+/// its own.
 pub(super) const STRUCTURE_TENSOR_VOXEL_COST: f64 = 54.72;
 
 /// The measurement the two constants above came from, kept as text so a re-run
@@ -726,20 +985,18 @@ pub(super) const STRUCTURE_TENSOR_VOXEL_COST: f64 = 54.72;
 /// relative one is not. The stored constants elsewhere in this module were taken
 /// when the voxelwise map cost 6.05 ns; it now costs 0.991, and the families
 /// have not all drifted by the same factor. So the ridge row exists: ridge at
-/// sigma 1 is stored as `0.79 * 21 + 41.2 = 57.79` and measured at 244.445 ns,
-/// which fixes the conversion at `0.2364` stored units per nanosecond. Under it
-/// the fitted line becomes `0.0567` per tap and `56.85` for the slab, and
-/// `cost_for` at sigma 1 rho 1 comes to 65.2 against ridge's 57.79 — a ratio of
-/// 1.128, where the two rows were measured 1.130 apart. That agreement is the
-/// point of the exercise.
+/// sigma 1 is stored as `57.79` and measured at 244.445 ns, which fixes the
+/// conversion at `0.2364` stored units per nanosecond. Under it, with the per-tap
+/// figure taken from ridge's shared [`SMOOTH_COST_PER_TAP`] rather than fitted
+/// here, the slab is the residual at `54.72`, and `cost_for` at sigma 1 rho 1
+/// comes to 65.2 against ridge's 57.79 — a ratio of 1.128, where the two rows
+/// were measured 1.130 apart. That agreement is the point of the exercise.
 ///
-/// **What this records but does not fix.** Applying the same conversion to
-/// ridge's own measured row puts its slab at 56.60 stored units against the 41.2
-/// it stores, so ridge's split between its per-tap and per-voxel constants no
-/// longer matches its own timings — its total is right and its shape has drifted.
-/// Correcting it would move every plan the committed `costs/` scenarios were
-/// recorded against, which is a change to make deliberately with those
-/// regressions in view rather than as a side effect of adding an op.
+/// Applying the same conversion to ridge's own measured row put its slab at
+/// 56.60 stored units, against the 41.2 it stored at the time — evidence that
+/// ridge's split between its per-tap and per-voxel constants had drifted while
+/// its total stayed right. Ridge has since been re-fitted to `56.28`, which is
+/// that prediction met.
 pub const COST_MEASUREMENT: &str = "ops::cost::report";
 
 #[cfg(test)]
@@ -946,8 +1203,8 @@ mod tests {
     ///
     /// Held here against the radii it is built from, so that a change to either
     /// Gaussian's truncation shows up as this test rather than as wrong values
-    /// at a seam. `tests/structure_tensor.rs` holds the behavioural half — that
-    /// one voxel less is visibly wrong.
+    /// at a seam. `tests/pixel_classification_features.rs` holds the
+    /// behavioural half — that one voxel less is visibly wrong.
     #[test]
     fn the_reach_adds_the_derivative_scale_the_stencil_and_the_integration_scale() {
         let tensor = StructureTensor::new([1.0, 2.0, 4.0], [3.0, 1.0, 0.5], 3.0).unwrap();
@@ -985,6 +1242,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn corner_response_rules_are_shared_over_tensor_eigenvalues() {
+        let eigenvalues = [5.0, 3.0, 2.0];
+        let harris = CornerResponse::harris(0.04).unwrap();
+        assert_eq!(
+            harris.at_eigenvalues(eigenvalues, 2).unwrap(),
+            15.0 - 0.04 * 8.0_f64.powi(2)
+        );
+        assert_eq!(
+            harris.at_eigenvalues(eigenvalues, 3).unwrap(),
+            30.0 - 0.04 * 10.0_f64.powi(3)
+        );
+        assert_eq!(
+            CornerResponse::ShiTomasi
+                .at_eigenvalues(eigenvalues, 3)
+                .unwrap(),
+            2.0
+        );
+        assert!(CornerResponse::harris(f64::NAN).is_err());
+        assert!(CornerResponse::ShiTomasi
+            .at_eigenvalues(eigenvalues, 0)
+            .is_err());
+    }
+
+    #[test]
+    fn corner_response_op_uses_the_structure_tensor_contract() {
+        let tensor = StructureTensor::new([1.0, 1.0, 0.0], [1.0, 1.0, 0.0], 3.0).unwrap();
+        let op = CornerResponseOp::new(
+            "corner",
+            tensor.clone(),
+            CornerResponse::harris(0.04).unwrap(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            op.reach_spec([32, 32, 1]),
+            Reach::symmetric([tensor.reach(0), tensor.reach(1), tensor.reach(2)])
+        );
+        assert_eq!(op.produces(Dtype::U16), Dtype::F64);
+        assert!(op.accepts(Dtype::F32));
+        assert!(!op.accepts(Dtype::F16));
+        assert_eq!(op.constant_maps_to(17.0), Some(0.0));
+
+        let input = Voxels::zeros(Dtype::F64, [9, 9, 1]).unwrap();
+        let mut out = Voxels::zeros(Dtype::F64, [9, 9, 1]).unwrap();
+        op.apply(&input, &mut out, &Anchor::whole([9, 9, 1]))
+            .unwrap();
+        assert!(out.view::<f64>().unwrap().iter().all(|&value| value == 0.0));
+    }
+
     /// **The gradient magnitude's closed form.** Over `I = a x + b y` the
     /// smoothed gradient is exactly `(a, b, 0)`, so the magnitude is
     /// `sqrt(a^2 + b^2)` — a number that depends on both components, unlike the
@@ -1017,6 +1324,42 @@ mod tests {
                         "{} at {i},{j},{k}, want {want}",
                         got[[i, j, k]]
                     );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn gaussian_gradient_components_match_a_tilted_plane() {
+        let (a, b) = (0.5, -0.25);
+        let dim = (19, 19, 5);
+        let input = Array3::from_shape_fn(dim, |(i, j, _)| a * i as f64 + b * j as f64);
+        let mut components = [
+            Array3::<f64>::zeros(dim),
+            Array3::<f64>::zeros(dim),
+            Array3::<f64>::zeros(dim),
+        ];
+        {
+            let [x, y, z] = &mut components;
+            gaussian_gradient_into(
+                input.view(),
+                [1.0, 1.0, 1.0],
+                3.0,
+                [x.view_mut(), y.view_mut(), z.view_mut()],
+            )
+            .unwrap();
+        }
+
+        let radius = gaussian_radius(1.0, 3.0) + 1;
+        let mut checked = 0;
+        for i in radius..dim.0 - radius {
+            for j in radius..dim.1 - radius {
+                for k in 0..dim.2 {
+                    assert!((components[0][[i, j, k]] - a).abs() < 1e-12);
+                    assert!((components[1][[i, j, k]] - b).abs() < 1e-12);
+                    assert!(components[2][[i, j, k]].abs() < 1e-12);
                     checked += 1;
                 }
             }
@@ -1128,14 +1471,11 @@ mod tests {
         // over the same six numbers, fitted from different instruments, so a
         // wide gap would mean one of them is wrong.
         //
-        // This asserted the *inequality* `structure > ridge` while ridge's
-        // constant was the stale `41.2`, and that reading survived only because
-        // the gap was 38%. Ridge is now `56.28`, this is `54.72`, and the
-        // relationship is agreement rather than order — so agreement is what is
-        // asserted. The 3% is in the direction the ops differ: ridge takes six
-        // second differences with corner samples and evaluates three
-        // exponentials for its response, where this forms six products and
-        // copies out a number.
+        // Agreement rather than order is what is asserted: at `56.28` against
+        // `54.72` the two are 3% apart, and which of them is the larger is a
+        // detail of how the ops differ rather than something to pin. An earlier
+        // form asserted the inequality `structure > ridge`, which survived only
+        // because ridge's constant was then the stale `41.2`.
         let apart = (STRUCTURE_TENSOR_VOXEL_COST - DECOMPOSITION_COST).abs() / DECOMPOSITION_COST;
         assert!(
             apart < 0.1,

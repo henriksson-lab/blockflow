@@ -394,16 +394,7 @@ fn refine(block: &[u32], mut cumulative: u32, target: u32) -> usize {
 
 /// Which axis a window slides along, and what a step of one costs.
 ///
-/// Computed from the element and nothing else. The axis is the one that leaves
-/// the most of the window in place — equivalently the one with the fewest
-/// leavers — because that count *is* the per-voxel cost of the traversal. For a
-/// `200 x 200 x 1` element that is one of the wide axes at 200 leavers; sliding
-/// along the flat one would retire and re-admit all 40 000 every step and be
-/// slower than gathering.
-///
-/// Ties go to the highest axis index, which is the contiguous one: when two axes
-/// cost the same number of updates, the one whose neighbours are adjacent in
-/// memory is the cheaper of the two.
+/// Computed from the element and nothing else.
 #[derive(Debug, Clone)]
 pub struct ScanPlan {
     axis: usize,
@@ -415,6 +406,16 @@ pub struct ScanPlan {
 }
 
 impl ScanPlan {
+    /// The cheapest axis for `element`: the one that leaves the most of the
+    /// window in place — equivalently the one with the fewest leavers — because
+    /// that count *is* the per-voxel cost of the traversal. For a
+    /// `200 x 200 x 1` element that is one of the wide axes at 200 leavers;
+    /// sliding along the flat one would retire and re-admit all 40 000 every
+    /// step and be slower than gathering.
+    ///
+    /// Ties go to the highest axis index: when two axes cost the same number of
+    /// updates, the one whose neighbours are closer together in memory is the
+    /// cheaper of the two.
     pub fn new(element: &StructuringElement) -> Self {
         let members: HashSet<[isize; 3]> = element.offsets().iter().copied().collect();
         let mut best = 0usize;
@@ -857,12 +858,10 @@ fn resolve_offset(
 /// window and not a second traversal.
 ///
 /// **This op refuses an element whose step counts from
-/// [`StepOrigin::ClippedStart`]**, and refuses
-/// it when the kernel runs rather than when the op is built: the constructors
-/// below return a `Self` a caller composes into a `Chain`, so there is nowhere
-/// earlier to say it without changing a signature every consumer writes. The
-/// message names the origin and names the two ops that can take such an element
-/// — see the module header for why this traversal cannot.
+/// [`StepOrigin::ClippedStart`]**, and refuses it when the kernel runs rather
+/// than when the op is built. See the module header for both why this traversal
+/// cannot carry such an element and why the refusal cannot sit on the
+/// constructors.
 pub struct SlidingHistogramOp {
     name: &'static str,
     element: StructuringElement,
@@ -1071,11 +1070,10 @@ impl BlockOp for SlidingHistogramOp {
 ///
 /// Two terms, because the traversal has two: one histogram update per voxel per
 /// offset the step moves — *not* per offset of the element, which is the whole
-/// point — and one evaluation of the query over the domain. What is **not**
-/// modelled is the per-line priming gather, which costs `|element|` per line and
-/// therefore `|element| / line length` per voxel: `cost_per_voxel` is handed no
-/// volume, so a term that depends on the line length cannot be stated here. It
-/// is the reason a short scan line is worse than this number claims.
+/// point — and one evaluation of the query over the domain. The per-line priming
+/// gather is **not** modelled here: it depends on the line length and
+/// `cost_per_voxel` is handed no volume, which is why a short scan line is worse
+/// than this number claims. `BlockOp::cost_per_voxel_in` states that term.
 fn cost_for(plan: &ScanPlan, domain: Domain, query: &dyn HistogramQuery) -> f64 {
     SLIDING_UPDATE_COST * 2.0 * plan.step_size() as f64 + query.cost_per_evaluation(domain.bins())
 }

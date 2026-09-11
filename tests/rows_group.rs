@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
-// **The grouped reduction over rows**: `ops::rows`' fourth op and the first that
-// is not a map.
+// **The grouped reduction over rows**: the `ops::rows` op that folds many rows
+// into one, rather than mapping each row on its own.
 //
 // Why this file exists is a gap a consumer found. A grouped statistic —
 // thousands of scattered rows reduced to one row per distinct value of a
@@ -290,10 +290,11 @@ fn the_two_first_rules_disagree_in_both_groups_and_in_opposite_columns() {
     );
 }
 
-/// `min` and `max` skip a `NaN` rather than returning it, which is what
-/// `f64::total_cmp` buys and what `f64::min`/`max` would have got wrong in the
-/// other direction — those return the *other* operand for a `NaN`, so a fold
-/// over them depends on arrival order.
+/// `min` and `max` respect the presence mask, and land on neither end of the
+/// group — so a selection that quietly took a first or a last would be caught
+/// here. (What makes the selection itself order-independent is `total_cmp`
+/// rather than `f64::min`/`max`, which is `ops::rows`' business and not this
+/// fixture's.)
 #[test]
 fn the_selections_skip_the_absences_and_are_not_the_ends_of_the_group() {
     let grouping = grouping(FixedPoint::default());
@@ -823,7 +824,7 @@ fn grouping_again() -> Grouping {
 
 // ------------------------------------------------------------- the harness --
 
-/// One group folded and finished, as the row it becomes.
+/// Every group folded and finished, as the rows they become.
 fn finished(grouping: &Grouping, folded: &BTreeMap<Vec<u64>, GroupFold>) -> Vec<GroupValues> {
     finished_with(grouping, folded)
 }
@@ -866,15 +867,11 @@ fn merge_op(grouping: &Grouping, lattice: [usize; 3]) -> MergeGroupsOp {
 
 /// The fixture as the producer takes it.
 ///
-/// This file used to carry its own producer — *"the producer the row world has
-/// no general op for, and the smallest honest one"* — and it was the third
-/// writing of the same fifteen lines, after two in a consumer of this crate.
-/// `ops::rows::RowSourceOp` is now that op, and this is what is left of the
-/// copy: a conversion, and no rule of its own. The keying
-/// it used to state — [`owner_of`], so the producer and the merge agree by
-/// construction rather than by two matching expressions — is the library's now,
-/// and `every_group_is_emitted_by_exactly_one_block` below still checks it from
-/// this side.
+/// A conversion, and no rule of its own. The keying this file's own producer
+/// used to state — [`owner_of`], so the producer and the merge agree by
+/// construction rather than by two matching expressions — belongs to
+/// `ops::rows::RowSourceOp` now, and `exactly_one_block_emits_each_group` above
+/// still checks it from this side.
 fn source_rows() -> Vec<RowValues> {
     fixture()
         .into_iter()

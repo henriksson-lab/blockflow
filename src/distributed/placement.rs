@@ -21,9 +21,9 @@
 // **only placement decision in the phase**, so getting it right is worth the
 // whole phase's read cost, and getting it wrong wastes a full-volume read.
 //
-// Today that task goes to whichever worker happens to ask first, which is a
-// race between poll timers. It should go to the worker that already holds the
-// most of what the task will read.
+// Without this module that task goes to whichever worker happens to ask first,
+// which is a race between poll timers. It goes instead to the worker that
+// already holds the most of what the task will read.
 //
 // The rule
 // --------
@@ -505,12 +505,9 @@ mod tests {
     ///
     /// Scoring scarcity on the *ready set* rather than on the phase makes the
     /// last few blocks of every ordinary phase contestable, and refusing a
-    /// worker there empties its work list while the coordinator still has work —
-    /// which is exactly the failure `DISTRIBUTION.md` says must not happen,
-    /// because prefetch would stop working multi-node while every single-node
-    /// test kept passing. It broke
-    /// `the_work_list_stays_at_least_one_task_ahead_of_what_is_being_computed`
-    /// before the phase-shaped test replaced it.
+    /// worker there empties its work list while the coordinator still has work.
+    /// Rule 1 of the module header is what that cost and why scarcity is a
+    /// property of the phase.
     #[test]
     fn the_tail_of_an_ordinary_phase_is_never_contested() {
         let (graph, chunks) = barrier();

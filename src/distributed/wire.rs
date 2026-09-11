@@ -6,13 +6,9 @@
 // because what travels here is small, closed and worth reading in the source
 // rather than inferring from derives.
 //
-// The one rule this file exists to keep: **nothing in the protocol names an
-// element type.** A message carries block indices, phases, regions and counts.
-// A `Decomposition` carries a `Dtype` tag because byte accounting needs one,
-// and that is a *width*, not an element type — no message ever carries a voxel.
-// The pending dtype work rewrites `apply` and the environment; if it ever
-// forced a change here, that would be a sign the protocol had acquired a
-// dependency it should not have.
+// The one rule this file exists to keep: **no message carries a voxel.** A
+// message carries block indices, phases, regions and counts; a `Decomposition`
+// carries a `Dtype` tag only because byte accounting needs one.
 
 use serde_json::{json, Value};
 

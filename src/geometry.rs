@@ -534,9 +534,9 @@ impl BlockGeometry {
 
 /// `region` lies inside `shape`.
 ///
-/// `Region::check_within` in `region_io` says the same thing but is private to
-/// that module; this is a local copy rather than a visibility change there,
-/// because `region_io` is not this task's ground.
+/// The same check as [`Region::check_within`], in free-function form. The two
+/// are duplicates: the method was private to the upstream `region_io` when this
+/// copy was taken, and it is public here now.
 pub fn region_within(region: &Region, shape: &[usize], what: &str) -> Result<()> {
     if region.ndim() != shape.len() {
         return Err(Error::ShapeMismatch {

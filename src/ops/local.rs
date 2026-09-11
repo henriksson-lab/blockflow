@@ -41,16 +41,13 @@
 // sums are therefore identical floating-point sums and the output is identical
 // bit for bit.
 //
-// The fourth row is worth its own sentence, because it is where the defect came
-// from. The established implementations of this technique lay the grid out
-// relative to the array they are handed, so under their own block processing the
-// grid becomes a function of *their* block size. That is a defect and not a
-// specification, and it has been measured downstream rather than argued: a
-// re-anchored run is byte-identical to a single whole-volume run at all 22
-// compared stages, while the block-relative run differs by thousands of voxels
-// and raising the block overlap does not reduce the difference at all. So
-// another tool's block size is never something to reproduce here; the
-// whole-volume lattice is the algorithm, correctly placed.
+// The fourth row is where the defect came from: the established implementations
+// lay the grid out relative to the array they are handed, so under their own
+// block processing the grid becomes a function of *their* block size. Measured
+// downstream rather than argued — a re-anchored run is byte-identical to a
+// single whole-volume run at all 22 compared stages, while the block-relative
+// run differs by thousands of voxels and raising the block overlap does not
+// reduce the difference at all.
 //
 // A tool's *layout convention* is a different matter, and that one is worth
 // matching exactly — so it is a parameter, [`Sampling`], and not a constant.
@@ -74,12 +71,10 @@
 // declared only the element's radius would be short by a spacing everywhere.
 //
 // **Which lattice points bracket a voxel is itself a stated convention** — see
-// [`Alignment`] — and the first term is therefore a function of both the
-// sampling and the mapping back, not of the sampling alone. `Alignment::
-// max_distance` is the one place it is computed, from the positions the
-// interpolation actually uses and by the same bracket the kernel reads by, so
-// there is nothing to configure and nothing to get wrong independently of the
-// mapping it describes.
+// [`Alignment`] — so the first term is a function of both the sampling and the
+// mapping back. `Alignment::max_distance` is the one place it is computed, from
+// the positions the interpolation actually uses and by the same bracket the
+// kernel reads by.
 
 use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
@@ -193,9 +188,8 @@ impl Sampling {
     /// however long the axes are. The other two need the extent, and
     /// `cost_per_voxel` is not given one — so they answer `None` and the cost
     /// model charges the window at full density, which **over**-prices them.
-    /// That is the safe direction (a planner isolates an op it thinks is dear),
-    /// it is stated rather than hidden, and `LocalStatisticOp::with_cost` is the
-    /// override for a caller who knows better.
+    /// That is the safe direction; `LocalStatisticOp::with_cost` is the override
+    /// for a caller who knows better.
     pub fn samples_per_voxel(&self) -> Option<f64> {
         match self {
             Sampling::Centred { spacing } => {
@@ -211,14 +205,10 @@ impl Sampling {
 ///
 /// **Explicit is the point.** The type holds positions rather than a rule for
 /// generating them, so once a lattice exists there is nothing left that could
-/// re-derive it from a smaller array. That is what makes the operation
-/// independent of every decomposition rather than carefully consistent with one:
-/// a block does not compute *its* lattice, it looks up which of these positions
-/// it needs.
-///
-/// It is also what admits an irregular lattice at no extra cost — the reach is
-/// the widest gap rather than a spacing, and every consumer already reads
-/// positions.
+/// re-derive it from a smaller array: a block does not compute *its* lattice, it
+/// looks up which of these positions it needs. It is also what admits an
+/// irregular lattice at no extra cost — the reach is the widest gap rather than
+/// a spacing, and every consumer already reads positions.
 ///
 /// The positions are strictly increasing and inside the volume. Both are checked
 /// at construction, because every consumer below assumes them.
@@ -327,10 +317,8 @@ impl SampleLattice {
     /// coordinate sitting exactly on a sample there is a second sample a gap
     /// away that a naive bracket would hand back with weight zero — and then the
     /// op would *read* a voxel a full gap out while its answer did not depend on
-    /// it. `reach` would have to cover that read or under-declare, and an
-    /// under-declared reach is the failure this crate exists to remove.
-    /// Returning the degenerate bracket instead makes the two agree: the op
-    /// reads what it declares and declares what it reads.
+    /// it. Returning the degenerate bracket instead keeps the op reading what it
+    /// declares and declaring what it reads.
     pub fn bracket(&self, axis: usize, coordinate: usize) -> (usize, usize, f64) {
         span_bracket(&self.positions[axis], coordinate)
     }
@@ -354,21 +342,20 @@ impl SampleLattice {
     //
     // **Why that separation is worth having**, since one fused op already
     // computes both: the fused form's reach is `lattice distance + element
-    // radius` against the *fine* volume, and the two terms belong to different
-    // dependencies. Split, the statistic reaches the element and nothing more,
-    // and the interpolation reaches one *coarse* voxel. At a spacing of 25 the
-    // interpolation term is 25 fine voxels of halo per side per block that the
-    // fused form fetches and the split form does not.
+    // radius` against the *fine* volume. Split, the statistic reaches the
+    // element and nothing more, and the interpolation reaches one *coarse*
+    // voxel. At a spacing of 25 the interpolation term is 25 fine voxels of halo
+    // per side per block that the fused form fetches and the split form does
+    // not.
     //
     // The blocks of such a phase are cut on **this** grid, not on the fine one,
-    // which is the arrangement `ResampleOp` already uses and the reason it is
-    // right: a phase's valid regions must tile its own output, and every chunk
-    // of that output must fall inside exactly one of them
-    // (`check_chunk_exclusive_writes`). Cutting the fine grid and deriving
+    // as `ResampleOp` already does: a phase's valid regions must tile its own
+    // output, and every chunk of that output must fall inside exactly one of
+    // them (`check_chunk_exclusive_writes`). Cutting the fine grid and deriving
     // lattice counts would put block boundaries wherever the arithmetic landed
     // and cut chunks; cutting this grid cannot. What varies instead is how much
-    // of the fine image each block reads, and that is stated per block in
-    // `BlockGeometry::source`, which exists for exactly this.
+    // of the fine image each block reads, stated per block in
+    // `BlockGeometry::source`.
 
     /// The shape of the coarse image this lattice defines: one voxel per sample.
     pub fn lattice_volume(&self) -> [usize; 3] {
@@ -442,8 +429,7 @@ impl SampleLattice {
     /// `Reach::window` already makes for `BlockConstraint::Extent`.
     ///
     /// `None` when the lattice is irregular, because there is then no constant
-    /// width to slide, or when the volume is narrower than one block's span.
-    /// Both are facts about the arguments rather than failures to try, and a
+    /// width to slide, or when the volume is narrower than one block's span. A
     /// caller that gets `None` has the fused `LocalStatisticOp`, which needs no
     /// inversion because it writes at full resolution.
     pub fn source_window(
@@ -494,9 +480,7 @@ impl SampleLattice {
     /// `read` is stated in **lattice indices** — it is a region of
     /// [`Self::lattice_volume`], which is what the phase's blocks are cut from —
     /// and the region returned is in fine voxels. The two coordinate systems are
-    /// the whole reason this function exists, and mixing them up is the mistake
-    /// it is arranged to make impossible: neither argument nor result can be
-    /// passed for the other without the extents disagreeing.
+    /// the whole reason this function exists.
     pub fn source_region(&self, read: &Region, window: [(usize, usize); 3]) -> Result<Region> {
         if read.start.len() != 3 || read.shape.len() != 3 {
             return Err(Error::InvalidArgument(format!(
@@ -540,31 +524,26 @@ impl SampleLattice {
 /// blend reads from*, and the blend itself is always the trilinear one.
 ///
 /// **Two tools that upsample a coarse grid do not agree about this**, and the
-/// disagreement is not a bug in either of them — it is a convention, and the
-/// only honest thing to do with a convention is to name it and let the caller
-/// state which one they meant. This is that parameter, in the one place a fine
-/// coordinate becomes a pair of sample indices and a weight.
-///
-/// The two are **separate questions from [`Sampling`]**, which chooses where the
-/// samples sit. A caller picks a placement and a mapping-back independently, and
-/// the interesting combination is exactly the one where they disagree: samples
-/// laid down at a fixed spacing with an unsampled margin at each end, mapped
-/// back by [`Self::PinnedEnds`], which does not consult those positions at all.
+/// disagreement is a convention rather than a bug in either — so it is a
+/// parameter, read in the one place a fine coordinate becomes a pair of sample
+/// indices and a weight. It is a separate question from [`Sampling`], which
+/// chooses where the samples sit; the interesting combination is the one where
+/// the two disagree: samples laid down at a fixed spacing with an unsampled
+/// margin at each end, mapped back by [`Self::PinnedEnds`], which does not
+/// consult those positions at all.
 ///
 /// **Where the two agree, and why that hid the difference.** A voxel sitting
 /// exactly on a sample gets that sample under both, so a lattice of every voxel
 /// — spacing one on every axis — is a case in which the choice cannot be
-/// observed. That is the degenerate case, not the general one.
+/// observed.
 ///
 /// Both are functions of the **whole volume's** extent and sample count and of a
-/// **global** voxel coordinate, never of a block's own shape or offset. That is
-/// what makes either one decomposition-invariant by construction rather than by
-/// care, and it is why the parameter changes no output volume: it changes only
-/// which samples a given voxel reads.
+/// **global** voxel coordinate, never of a block's own shape or offset, which is
+/// why the parameter changes no output volume: it changes only which samples a
+/// given voxel reads.
 ///
-/// **What that costs depends on which of the two callers is asking**, and the
-/// difference is worth stating because it is easy to carry the wrong half of it
-/// across:
+/// **What that costs depends on which of the two callers is asking**, and it is
+/// easy to carry the wrong half across:
 ///
 /// * the **split** interpolation reads a second image and states its dependency
 ///   per block as a fetch region, in the lattice's own indices. Its declared
@@ -582,10 +561,9 @@ pub enum Alignment {
     /// against the two sample coordinates that bracket it, and the weight is how
     /// far it lies between them in fine voxels.
     ///
-    /// The default, and the convention this module had before there was a
-    /// choice. Outside the sampled span — a voxel before the first sample or
-    /// after the last — there is no pair to sit between and the nearest sample
-    /// is read, which leaves a plateau at each end.
+    /// The default. Outside the sampled span — a voxel before the first sample
+    /// or after the last — there is no pair to sit between and the nearest
+    /// sample is read, which leaves a plateau at each end.
     ///
     /// This is [`SampleLattice::bracket`] and nothing else; the whole variant is
     /// a call to it.
@@ -610,17 +588,15 @@ pub enum Alignment {
     ///
     /// **A degenerate axis is answered, not refused.** With one sample there is
     /// nothing to interpolate between and every voxel reads it; with one voxel
-    /// there is nowhere to stretch to. Both would divide by zero in the
-    /// expression above and both are the same answer — sample coordinate `0` —
-    /// so both are folded into one guard rather than into an error the caller
-    /// could do nothing with.
+    /// there is nowhere to stretch to. Both would divide by zero above and both
+    /// mean sample coordinate `0`, so both take one guard.
     ///
-    /// The ratio is in general **not** a whole number, which is the ordinary
-    /// case rather than the awkward one: `n` comes from a spacing that does not
-    /// divide the axis. The coordinate is therefore fractional and the bracket
-    /// straddles two samples, and it is computed as one multiplication followed
-    /// by one division in `f64` — unrounded and never re-associated — so that
-    /// every block computing a given voxel's coordinate computes the same bits.
+    /// The ratio is in general **not** a whole number — `n` comes from a spacing
+    /// that does not divide the axis — so the coordinate is fractional and the
+    /// bracket straddles two samples. It is computed as one multiplication
+    /// followed by one division in `f64`, unrounded and never re-associated, so
+    /// that every block computing a given voxel's coordinate computes the same
+    /// bits.
     PinnedEnds,
 }
 
@@ -636,13 +612,13 @@ impl Alignment {
     ///
     /// **A sample whose weight would be zero is not returned**, under either
     /// convention: at a coordinate landing exactly on a sample, `low == high`
-    /// and the weight is `0.0`. That is not a tidiness — it is what keeps the
-    /// samples this op *reads* equal to the samples it *declares* it will fetch,
-    /// and a bracket that handed back a second sample with weight zero would
-    /// widen every fetch region below by one sample for a value no answer
-    /// depends on. [`SampleLattice::bracket`] arranges it for
-    /// [`Self::SamplePositions`]; the `floor`/`ceil` pair below arranges it for
-    /// [`Self::PinnedEnds`], where an integral coordinate has `floor == ceil`.
+    /// and the weight is `0.0`. That keeps the samples this op *reads* equal to
+    /// the samples it *declares* it will fetch — a bracket handing back a second
+    /// sample at weight zero would widen every fetch region below by one sample
+    /// for a value no answer depends on. [`SampleLattice::bracket`] arranges it
+    /// for [`Self::SamplePositions`]; the `floor`/`ceil` pair below arranges it
+    /// for [`Self::PinnedEnds`], where an integral coordinate has
+    /// `floor == ceil`.
     ///
     /// **Monotone in `coordinate`**, under both: neither the low nor the high
     /// index ever decreases as the coordinate grows. Every fetch region in this
@@ -660,13 +636,12 @@ impl Alignment {
     /// [`Self::bracket`], stated on **one axis' own numbers** rather than on a
     /// lattice: its sample positions and how many voxels it is laid over.
     ///
-    /// The lattice-shaped form above is this one with the axis picked out, and
-    /// both conventions are written here and nowhere else. That matters because
-    /// the two things that have to agree — which samples are *read* and how far
-    /// away the furthest of them can be, which is what [`Self::max_distance`]
-    /// prices — are asked at different times: one per voxel with a lattice in
-    /// hand, one per axis before any lattice exists. Two spellings of one rule
-    /// is how a reach comes to be declared shorter than the read it covers.
+    /// Both conventions are written here and nowhere else, because the two
+    /// things that have to agree — which samples are *read*, and how far away
+    /// the furthest of them can be ([`Self::max_distance`]) — are asked at
+    /// different times: one per voxel with a lattice in hand, one per axis
+    /// before any lattice exists. Two spellings of one rule is how a reach comes
+    /// to be declared shorter than the read it covers.
     pub fn bracket_along(
         self,
         positions: &[usize],
@@ -702,9 +677,8 @@ impl Alignment {
     /// [`Self::PinnedEnds`] stretches the same samples across the volume's whole
     /// extent, so a voxel near an end is mapped past the margin and reads a
     /// sample that can sit most of a gap plus the margin away. A reach derived
-    /// under one and read under the other is short, which is the failure this
-    /// crate exists to remove — so this is a function of the convention, and
-    /// every caller of it holds one.
+    /// under one and read under the other is short — so this is a function of
+    /// the convention, and every caller of it holds one.
     ///
     /// [`Self::SamplePositions`] answers from the positions directly, which is a
     /// maximum over three closed forms. [`Self::PinnedEnds`] has no such form
@@ -870,27 +844,23 @@ impl Rounding {
 /// A **narrower element type a value passes through**, and the rounding rule
 /// that takes it there.
 ///
-/// The value comes back as an `f64` — this is a narrowing of the *value*, not
-/// of the buffer it is stored in. Nothing about an image's declared type changes:
-/// a narrowed value held in an `f64` buffer is the same number it would be in a
-/// buffer of `element`, and holding it in the wider one costs bytes and no
-/// precision.
+/// The value comes back as an `f64` — this is a narrowing of the *value*, not of
+/// the buffer it is stored in. A narrowed value held in an `f64` buffer is the
+/// same number it would be in a buffer of `element`; holding it in the wider one
+/// costs bytes and no precision.
 ///
 /// **Why that is the useful shape.** The thing being reproduced is a chain that
-/// evaluates a statistic in full precision and then keeps it somewhere narrow —
-/// so the narrowing is a step of the computation, at a stated place inside it,
-/// and not a fact about where the answer is eventually written. An op that
-/// narrowed by declaring a narrower output type would put the quantisation at
-/// the *end* of the op, which is one of the two places it can go and not the one
-/// that matters; see [`LatticeNarrowing`].
+/// evaluates a statistic in full precision and then keeps it somewhere narrow,
+/// so the narrowing is a step of the computation at a stated place inside it.
+/// An op that narrowed by declaring a narrower output type would put the
+/// quantisation at the *end* of the op, which is one of the two places it can go
+/// and not the one that matters; see [`LatticeNarrowing`].
 ///
 /// Out of range saturates and `NaN` goes to zero, which is
 /// `VoxelElement::from_f64`'s rule and therefore the rule every other narrowing
-/// in this crate already uses. It is stated here because the alternative — the
-/// wrapping a C cast performs — is what some of the tools this reproduces do,
-/// and a caller reaching a value that far out of range should know which of the
-/// two they got. Saturation is the safer of the two and it is the one this
-/// crate can be consistent about.
+/// in this crate already uses. Stated because the alternative — the wrapping a C
+/// cast performs — is what some of the tools this reproduces do, and a caller
+/// reaching a value that far out of range should know which of the two they got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Narrowing {
     element: Dtype,
@@ -973,7 +943,7 @@ impl Narrowing {
 /// **Two sites, not one, and that is the whole point of this type.** A statistic
 /// on a lattice is two steps — evaluate at the samples, then blend the samples
 /// back to every voxel — and a value can be narrowed after either. The two are
-/// not interchangeable and they are not even close to interchangeable:
+/// nowhere near interchangeable:
 ///
 /// * narrowing **at the samples** changes the numbers that are *interpolated
 ///   between*, so it moves every voxel in the gap and not only the ones near a
@@ -986,22 +956,18 @@ impl Narrowing {
 /// what a comparison against a wrong reference looks like too.
 ///
 /// **The default is neither.** `LatticeNarrowing::default()` narrows at no site
-/// at all, so every caller who states nothing computes what it computed before
-/// this parameter existed, bit for bit.
+/// at all.
 ///
 /// **Why the two rounding rules differ in [`Self::through`].** A value assigned
 /// into an array of an integer type keeps its whole part and drops the rest; a
 /// blend written *out* into an array of an integer type is rounded to the
-/// nearest. Those are two different operations and there is no derivation that
-/// produces both from one rule — so the pair is stated, once, in the one
-/// constructor that names it, and a caller needing a different pair builds the
-/// two [`Narrowing`]s directly.
+/// nearest. There is no derivation that produces both from one rule, so the pair
+/// is stated once in the one constructor that names it; a caller needing a
+/// different pair builds the two [`Narrowing`]s directly.
 ///
 /// **It is not priced.** One rounding and one cast per sample, and one per
-/// voxel, against an interpolation charged at [`INTERPOLATION_COST`]; the
-/// difference is below what `ops::cost` can measure, and charging a term that
-/// cannot be measured would move every existing plan's predicted cost for a
-/// parameter most of them do not set.
+/// voxel, against an interpolation charged at [`INTERPOLATION_COST`] — below
+/// what `ops::cost` can measure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct LatticeNarrowing {
     /// Applied to every sample of the grid **before anything is interpolated**,
@@ -1017,8 +983,7 @@ pub struct LatticeNarrowing {
 }
 
 impl LatticeNarrowing {
-    /// Neither site. The default, and what every caller had before there was a
-    /// choice.
+    /// Neither site; the default.
     pub fn none() -> Self {
         Self::default()
     }
@@ -1027,10 +992,9 @@ impl LatticeNarrowing {
     /// `element`: **toward zero at the samples, to the nearest afterwards**.
     ///
     /// The asymmetry is not a preference and it is not derivable — see
-    /// [`LatticeNarrowing`], where it is written out. It is here as one
-    /// constructor rather than as two calls a caller has to get right
-    /// separately, because getting one of the two right is exactly the mistake
-    /// that produces an answer close enough to be believed.
+    /// [`LatticeNarrowing`]. It is one constructor rather than two calls a
+    /// caller has to get right separately, because getting only one of the two
+    /// right produces an answer close enough to be believed.
     pub fn through(element: Dtype) -> Result<Self> {
         Ok(Self {
             at_samples: Some(Narrowing::new(element, Rounding::TowardZero)?),
@@ -1087,16 +1051,15 @@ pub enum EmptyPopulation {
     Reduce,
     /// Write the sample centre's own value.
     ///
-    /// This is what the dense masked selection writes, for the reason
+    /// What the dense masked selection writes, for the reason
     /// `masked_rank_filter_into` states: a selection's defining property is that
     /// every value it writes is a value it read, and where the population is
-    /// empty the centre is the only value there is. Stating it here is what
-    /// makes the two paths **the same function** at a spacing of one — see
+    /// empty the centre is the only value there is. Stating it here makes the
+    /// two paths **the same function** at a spacing of one — see
     /// `tests/masked_local_statistic.rs`, which pins that on the bits.
     ///
     /// At a coarser spacing the value carried is the sample centre's, and it is
-    /// interpolated like any other sample's; the centre is a lattice point in
-    /// volume coordinates, so which block it lands in cannot change it.
+    /// interpolated like any other sample's.
     Centre,
 }
 
@@ -1104,10 +1067,9 @@ pub enum EmptyPopulation {
 /// window": the two questions that have answers rather than definitions.
 ///
 /// Bundled because they travel together — an op that reads a population wants
-/// both, an op that does not wants neither — and because a kernel taking them
-/// as two more positional arguments would be a kernel nobody can call correctly
-/// from memory. It is a pair of stated policies and not a mechanism: the mask
-/// itself is a declared input, exactly as `MaskedRankFilterOp` declares it.
+/// both, an op that does not wants neither. A pair of stated policies and not a
+/// mechanism: the mask itself is a declared input, exactly as
+/// `MaskedRankFilterOp` declares it.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Population {
     /// What to write where the population denies the **sample centre** itself.
@@ -1118,7 +1080,7 @@ pub struct Population {
 
 impl Population {
     /// The defaults: filter at an excluded centre anyway, and let the statistic
-    /// answer for an empty window. What an unmasked call has always done.
+    /// answer for an empty window.
     pub fn new() -> Self {
         Self::default()
     }
@@ -1143,15 +1105,13 @@ impl Population {
 /// Generic over the element type, which the algorithm allows because the gather
 /// only copies; what it may do with the copies is the reducer's business.
 ///
-/// `at` is not decoration. It is where the lattice comes from — `at.volume`
-/// gives the extent the lattice is laid out over, `at.offset` says which part of
-/// it this buffer holds — and it is why the same voxel gets the same answer
-/// under every decomposition.
+/// `at` is where the lattice comes from — `at.volume` gives the extent it is
+/// laid out over, `at.offset` says which part of it this buffer holds.
 ///
 /// A window is clamped to the buffer. At a real volume boundary that is the
 /// global clamp and is right; short of a sufficient halo it is a truncation the
-/// whole volume would not have made, and the values differ — which is how the
-/// halo guard is *seen* to matter rather than merely asserted.
+/// whole volume would not have made, and the values differ — which is how a
+/// short halo is *seen* rather than merely asserted.
 pub fn local_statistic_into<T, F>(
     input: ArrayView3<'_, T>,
     at: &Anchor,
@@ -1180,8 +1140,7 @@ where
 }
 
 /// The form with the mapping-back convention stated; [`local_statistic_into`]
-/// is this at [`Alignment::default`], which is the convention this kernel had
-/// before there was a choice.
+/// is this at [`Alignment::default`].
 ///
 /// The convention decides **which** samples a voxel is blended from, and
 /// nothing else: the same lattice points are evaluated, over the same windows,
@@ -1214,15 +1173,13 @@ where
 
 /// The general form: the convention *and* the two narrowings stated.
 ///
-/// [`local_statistic_into_with`] is this at [`LatticeNarrowing::none`], so
-/// nothing moves by adding it and no existing call site has to say anything.
+/// [`local_statistic_into_with`] is this at [`LatticeNarrowing::none`].
 ///
 /// **Where the narrowing sits is the whole of what this adds**, and it is two
 /// places rather than one: `narrowing.at_samples` is applied to the sample grid
 /// after every sample has been evaluated and *before* any voxel is blended, and
 /// `narrowing.after_interpolation` is applied to each blended voxel. See
-/// [`LatticeNarrowing`], which is where the difference between the two is
-/// argued.
+/// [`LatticeNarrowing`], where the difference between the two is argued.
 #[allow(clippy::too_many_arguments)]
 pub fn local_statistic_into_narrowed<T, F>(
     input: ArrayView3<'_, T>,
@@ -1263,16 +1220,15 @@ where
 ///
 /// The mask is consulted at *every offset of the element around every lattice
 /// point*, not at the voxel the answer is written to — the same rule
-/// `masked_rank_filter_into` states, over the same declared second input, and
-/// for the same reason it cannot be done as a voxelwise pre-step: a rank is
-/// resolved against the count that survived, so substituting a sentinel for an
-/// excluded voxel would keep it in the count and answer a different question.
+/// `masked_rank_filter_into` states, and for the same reason it cannot be done
+/// as a voxelwise pre-step: a rank is resolved against the count that survived,
+/// so substituting a sentinel for an excluded voxel would keep it in the count
+/// and answer a different question.
 ///
 /// **Excluded voxels leave the population.** [`Statistic::reduce_with`] is
 /// handed what survived, `full` stays the element's own size, and
-/// `Rank::resolve` applies the truncation rule to the surviving count — which is
-/// what it already expects and what makes a mask and a volume face the same kind
-/// of loss.
+/// `Rank::resolve` applies the truncation rule to the surviving count — which
+/// makes a mask and a volume face the same kind of loss.
 ///
 /// `mask` covers the same buffer as `input`, so it is read at the same region.
 /// An op declares that with `BlockOp::source_inputs` at **this op's own reach**
@@ -1311,9 +1267,8 @@ where
 }
 
 /// The form with the convention stated; the one above is this at
-/// [`Alignment::default`]. See [`local_statistic_into_with`], which states the
-/// same parameter for the unmasked path — a population changes which voxels
-/// join a window and nothing about how a voxel is mapped back to the samples.
+/// [`Alignment::default`]. A population changes which voxels join a window and
+/// nothing about how a voxel is mapped back to the samples.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_local_statistic_into_with<T, F>(
     input: ArrayView3<'_, T>,
@@ -1444,11 +1399,11 @@ where
     for axis in 0..3 {
         let start = at.offset[axis];
         let end = start + shape[axis] - 1;
-        // Asked of `bracket` rather than derived beside it, so that the samples
-        // computed are exactly the samples read — the same agreement `reach`
-        // depends on, made in one place. And asked of the *convention's*
-        // `bracket`, which is the one function both this fused form and the
-        // split pair of ops read the mapping out of.
+        // Asked of `bracket` rather than derived beside it, so the samples
+        // computed are exactly the samples read — the agreement `reach` depends
+        // on, made in one place. And of the *convention's* `bracket`, the one
+        // function both this fused form and the split pair read the mapping out
+        // of.
         low[axis] = alignment.bracket(lattice, axis, start).0;
         high[axis] = alignment.bracket(lattice, axis, end).1;
     }
@@ -1485,24 +1440,19 @@ where
                 // The sample centre, in this buffer's own indices — and `None`
                 // where the buffer does not reach it.
                 //
-                // **That case is real and it is harmless**, which is worth the
-                // sentence because the alternative reading is that the halo is
-                // short. The samples evaluated here are the ones bracketing the
-                // *buffer*, halo included, and the outermost of those can sit up
-                // to a lattice distance beyond the buffer's own edge. No voxel
-                // of the block's **core** reads them: a core voxel brackets to
-                // samples within a lattice distance of itself, and the halo is
-                // that distance plus a non-negative element side, so every
-                // sample the core interpolates from is held. The ones that are
-                // not are read only by halo voxels, whose values are discarded —
-                // their windows are clamped to the buffer and already say
-                // nothing.
+                // **That case is real and it is harmless**, which is worth
+                // saying because the alternative reading is that the halo is
+                // short. The samples evaluated here bracket the *buffer*, halo
+                // included, and the outermost can sit up to a lattice distance
+                // beyond the buffer's own edge. No voxel of the block's **core**
+                // reads them: a core voxel brackets to samples within a lattice
+                // distance of itself, and the halo is that distance plus a
+                // non-negative element side. The ones not held are read only by
+                // halo voxels, whose values are discarded.
                 //
                 // So a policy about the centre is applied where there is a
                 // centre to apply it to, and elsewhere the sample is reduced
-                // like any other. Under a short halo that is one more way the
-                // values differ, which is the signal this crate wants from a
-                // short halo rather than an exception.
+                // like any other.
                 let held = if needs_centre {
                     local_index(&centre, at.offset, shape)
                 } else {
@@ -1565,13 +1515,12 @@ where
         }
     }
 
-    // **The first of the two narrowing sites**, and it is here rather than a
-    // few lines up on purpose: every value that reaches the grid passes through
-    // it — the reduced ones, the fill a denied centre gets, the centre's own
-    // value an empty window carries — because the grid holds one element type
-    // and all three are values of it. Done as one sweep over the grid rather
-    // than at each of the three writes so that there is one place a later
-    // fourth way of filling a sample cannot be added without.
+    // **The first of the two narrowing sites.** Every value that reaches the
+    // grid passes through it — the reduced ones, the fill a denied centre gets,
+    // the centre's own value an empty window carries — because the grid holds
+    // one element type and all three are values of it. One sweep rather than a
+    // narrowing at each of the three writes, so a fourth way of filling a sample
+    // cannot be added without it.
     //
     // It is *before* the interpolation, which is the load-bearing half: these
     // are the numbers the blend below reads, so narrowing them moves every voxel
@@ -1607,9 +1556,8 @@ where
     }
 
     // **The second narrowing site**, after the blend and not instead of it. A
-    // separate pass rather than a branch inside the loop above, so that a caller
-    // who narrows at neither site pays nothing at all for the parameter's
-    // existence — which is what keeps the default byte-identical *and* free.
+    // separate pass rather than a branch inside the loop above, so a caller who
+    // narrows at neither site pays nothing for the parameter's existence.
     if let Some(narrowing) = narrowing.after_interpolation {
         out.map_inplace(|value| *value = narrowing.apply(*value));
     }
@@ -1673,14 +1621,12 @@ where
 /// `ops::voxelwise` is generic to avoid it. A reduction runs once per **lattice
 /// point**, after a gather of the window — 27 to 729 voxels for the elements
 /// this crate is used with — so one virtual call is amortised by that factor and
-/// costs nothing measurable. Paying a generic parameter on a type that is
-/// stored, cloned, compared and hashed everywhere would buy nothing back.
+/// costs nothing measurable.
 ///
 /// **Why `f64` rather than generic.** A trait with a generic method is not
-/// object-safe. Nothing is lost: `LocalStatistic::evaluate_into` is stated in
-/// `f64` on both sides already, so the op path never had another element type to
-/// offer. The genericity of [`Statistic::reduce`] survives for the shipped
-/// variants and for direct callers of the kernel.
+/// object-safe, and nothing is lost: `LocalStatistic::evaluate_into` is stated
+/// in `f64` on both sides already. The genericity of [`Statistic::reduce`]
+/// survives for the shipped variants and for direct callers of the kernel.
 pub trait Reducer: Send + Sync + 'static {
     /// Reduce the gathered window to one value.
     ///
@@ -1726,17 +1672,19 @@ pub enum Statistic {
     /// The population standard deviation, computed in two passes so that it
     /// cannot go negative under the square root.
     Deviation,
+    /// The Niblack local threshold, `mean + k * deviation`.
+    Niblack(Niblack),
+    /// The Sauvola local threshold, `mean * (1 + k * (deviation / r - 1))`.
+    Sauvola(Sauvola),
     /// An order statistic, through the same [`Rank`] the rank filter uses.
     Rank(Rank),
     /// The **isodata** threshold of the window's histogram: the value that is
     /// its own two-class midpoint. See [`Isodata`], which holds the two
     /// parameters and states the rule.
     ///
-    /// This is not an approximation of any of the three above and is not
-    /// approximated by them. A mean answers "what is the level here"; this
-    /// answers "where does this window separate into two classes", and on a
-    /// bimodal window the two are far apart — the mean sits wherever the mass
-    /// is, the isodata threshold sits between the modes.
+    /// Not an approximation of any of the three above: a mean answers "what is
+    /// the level here", this answers "where does this window separate into two
+    /// classes", and on a bimodal window the two are far apart.
     Isodata(Isodata),
     /// A reduction supplied by the caller. See [`Reducer`].
     ///
@@ -1746,13 +1694,15 @@ pub enum Statistic {
 }
 
 /// Compared and hashed **by identity, not by behaviour**, because a trait object
-/// has no derivable equality. The shipped variants compare structurally as they
-/// always did; a custom one compares by the key its [`Reducer`] states.
+/// has no derivable equality. The shipped variants compare structurally; a
+/// custom one compares by the key its [`Reducer`] states.
 impl PartialEq for Statistic {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Statistic::Mean, Statistic::Mean) => true,
             (Statistic::Deviation, Statistic::Deviation) => true,
+            (Statistic::Niblack(left), Statistic::Niblack(right)) => left == right,
+            (Statistic::Sauvola(left), Statistic::Sauvola(right)) => left == right,
             (Statistic::Rank(left), Statistic::Rank(right)) => left == right,
             (Statistic::Isodata(left), Statistic::Isodata(right)) => left == right,
             (Statistic::Custom(left), Statistic::Custom(right)) => left.key() == right.key(),
@@ -1768,6 +1718,8 @@ impl std::hash::Hash for Statistic {
         std::mem::discriminant(self).hash(state);
         match self {
             Statistic::Mean | Statistic::Deviation => {}
+            Statistic::Niblack(niblack) => niblack.hash(state),
+            Statistic::Sauvola(sauvola) => sauvola.hash(state),
             Statistic::Rank(rank) => rank.hash(state),
             Statistic::Isodata(isodata) => isodata.hash(state),
             Statistic::Custom(reducer) => reducer.key().hash(state),
@@ -1783,6 +1735,14 @@ impl std::fmt::Debug for dyn Reducer {
 }
 
 impl Statistic {
+    pub fn niblack(k: f64) -> Result<Self> {
+        Ok(Statistic::Niblack(Niblack::new(k)?))
+    }
+
+    pub fn sauvola(k: f64, r: f64) -> Result<Self> {
+        Ok(Statistic::Sauvola(Sauvola::new(k, r)?))
+    }
+
     /// Reduce a gathered window. The window is in the element's canonical order,
     /// so a summation over it is the same summation everywhere.
     pub fn reduce<T>(&self, window: &mut [T], full: usize) -> f64
@@ -1796,19 +1756,12 @@ impl Statistic {
     /// [`Self::reduce`], over a scratch buffer the caller owns.
     ///
     /// **The buffer is the whole of the difference, and it only matters for a
-    /// custom reducer.** A [`Reducer`] is stated in `f64` — it has to be, since
-    /// a trait object cannot be generic over the element type, and being
-    /// injectable without recompiling this crate is the entire point of it — so
-    /// the gathered window is widened before the call. Done inside
-    /// [`Self::reduce`] that is an allocation per window; with a buffer that
-    /// lives outside the loop it is none, which is the same arrangement
-    /// `rank_filter_into` uses for the window it gathers.
-    ///
-    /// The virtual call itself is not worth avoiding here and the asymmetry with
-    /// `MapFn` is deliberate: a `MapFn` runs per voxel on about one arithmetic
-    /// operation, which is why it is generic and monomorphised, and a `Reducer`
-    /// runs once per *window* on `|element|` of them. Amortised over a window,
-    /// an indirect call is not measurable; the allocation was.
+    /// custom reducer.** A [`Reducer`] is stated in `f64`, so the gathered
+    /// window is widened before the call. Done inside [`Self::reduce`] that is
+    /// an allocation per window; with a buffer that lives outside the loop it is
+    /// none, which is the arrangement `rank_filter_into` uses for the window it
+    /// gathers. The virtual call itself is not worth avoiding — amortised over a
+    /// window it is not measurable, and the allocation was.
     ///
     /// The shipped variants take the generic path and touch `scratch` not at
     /// all, so a caller using them pays nothing for its existence.
@@ -1846,6 +1799,8 @@ impl Statistic {
                     .sum();
                 (total / window.len() as f64).sqrt()
             }
+            Statistic::Niblack(niblack) => niblack.of(window.iter().map(|&value| value.into())),
+            Statistic::Sauvola(sauvola) => sauvola.of(window.iter().map(|&value| value.into())),
             Statistic::Rank(rank) => {
                 let index = rank.resolve(full, window.len());
                 select_nth(window, index).map(Into::into).unwrap_or(0.0)
@@ -1885,7 +1840,10 @@ impl Statistic {
         match self {
             Statistic::Rank(_) => Some(value),
             Statistic::Isodata(_) => value.is_finite().then_some(value),
-            Statistic::Mean | Statistic::Deviation => (value == 0.0).then_some(0.0),
+            Statistic::Mean
+            | Statistic::Deviation
+            | Statistic::Niblack(_)
+            | Statistic::Sauvola(_) => (value == 0.0).then_some(0.0),
             Statistic::Custom(reducer) => reducer.constant_maps_to(value),
         }
     }
@@ -1923,8 +1881,144 @@ impl Statistic {
                     + ISODATA_COST_PER_BIN * isodata.bins() as f64
             }
             Statistic::Custom(reducer) => reducer.cost_per_sample(window),
-            Statistic::Mean | Statistic::Deviation | Statistic::Rank(_) => 0.0,
+            Statistic::Mean
+            | Statistic::Deviation
+            | Statistic::Niblack(_)
+            | Statistic::Sauvola(_)
+            | Statistic::Rank(_) => 0.0,
         }
+    }
+}
+
+/// The Niblack local threshold parameter.
+#[derive(Debug, Clone, Copy)]
+pub struct Niblack {
+    k: f64,
+}
+
+impl Niblack {
+    pub fn new(k: f64) -> Result<Self> {
+        if !k.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "a Niblack k must be finite, got {k}"
+            )));
+        }
+        Ok(Self {
+            k: normalised_bits_value(k),
+        })
+    }
+
+    pub fn k(&self) -> f64 {
+        self.k
+    }
+
+    pub fn of<I>(&self, values: I) -> f64
+    where
+        I: Iterator<Item = f64>,
+    {
+        mean_and_deviation(values)
+            .map(|(mean, deviation)| mean + self.k * deviation)
+            .unwrap_or(0.0)
+    }
+}
+
+impl PartialEq for Niblack {
+    fn eq(&self, other: &Self) -> bool {
+        self.k.to_bits() == other.k.to_bits()
+    }
+}
+
+impl Eq for Niblack {}
+
+impl std::hash::Hash for Niblack {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.k.to_bits().hash(state);
+    }
+}
+
+/// The Sauvola local threshold parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct Sauvola {
+    k: f64,
+    r: f64,
+}
+
+impl Sauvola {
+    pub fn new(k: f64, r: f64) -> Result<Self> {
+        if !k.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "a Sauvola k must be finite, got {k}"
+            )));
+        }
+        if !r.is_finite() || r <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "a Sauvola r must be finite and positive, got {r}"
+            )));
+        }
+        Ok(Self {
+            k: normalised_bits_value(k),
+            r: normalised_bits_value(r),
+        })
+    }
+
+    pub fn k(&self) -> f64 {
+        self.k
+    }
+
+    pub fn r(&self) -> f64 {
+        self.r
+    }
+
+    pub fn of<I>(&self, values: I) -> f64
+    where
+        I: Iterator<Item = f64>,
+    {
+        mean_and_deviation(values)
+            .map(|(mean, deviation)| mean * (1.0 + self.k * (deviation / self.r - 1.0)))
+            .unwrap_or(0.0)
+    }
+}
+
+impl PartialEq for Sauvola {
+    fn eq(&self, other: &Self) -> bool {
+        self.k.to_bits() == other.k.to_bits() && self.r.to_bits() == other.r.to_bits()
+    }
+}
+
+impl Eq for Sauvola {}
+
+impl std::hash::Hash for Sauvola {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.k.to_bits().hash(state);
+        self.r.to_bits().hash(state);
+    }
+}
+
+fn mean_and_deviation<I>(values: I) -> Option<(f64, f64)>
+where
+    I: Iterator<Item = f64>,
+{
+    let mut count = 0usize;
+    let mut mean = 0.0;
+    let mut m2 = 0.0;
+    for value in values {
+        count += 1;
+        let delta = value - mean;
+        mean += delta / count as f64;
+        let shifted = value - mean;
+        m2 += delta * shifted;
+    }
+    if count == 0 {
+        return None;
+    }
+    Some((mean, (m2 / count as f64).sqrt()))
+}
+
+fn normalised_bits_value(value: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else {
+        value
     }
 }
 
@@ -1965,23 +2059,19 @@ impl Statistic {
 ///
 /// The two parameters, and why neither has a default here
 /// ------------------------------------------------------
-/// **`bins`** is the resolution of the histogram, and the answer is a bin
-/// centre — so it is also the quantisation of the answer. It is a parameter
-/// because the implementations this rule is shared with choose it by inspecting
-/// the source array's *element type*: one bin per integer value for an integer
-/// array, a fixed count for a float one. A statistic in this module is handed
-/// `f64` on both sides (see [`LocalStatisticOp::apply`]) and cannot see an
-/// element type to dispatch on, and dispatching on whether the values *look*
-/// integral is a documented way to get this wrong — so the choice is stated by
-/// the caller instead. A caller reproducing the float-array behaviour of those
-/// implementations says `256`.
+/// **`bins`** is the resolution of the histogram, and since the answer is a bin
+/// centre it is also the quantisation of the answer. The implementations this
+/// rule is shared with choose it by inspecting the source array's *element
+/// type* — one bin per integer value for an integer array, a fixed count for a
+/// float one — but a statistic here is handed `f64` on both sides (see
+/// [`LocalStatisticOp::apply`]) and cannot see an element type to dispatch on.
+/// A caller reproducing the float-array behaviour of those implementations says
+/// `256`.
 ///
 /// **`fallback`** is what to answer when the histogram admits no threshold at
 /// all — an empty window, a window with no finite value in it, or a histogram
-/// in which no bin has the property above. There is no value derivable from the
-/// data for that case: the rule genuinely has no answer, and the choice of what
-/// to say instead belongs to whoever will consume the number. It is a parameter
-/// for exactly that reason.
+/// in which no bin has the property above. No value is derivable from the data
+/// for that case, so the choice belongs to whoever will consume the number.
 #[derive(Debug, Clone, Copy)]
 pub struct Isodata {
     bins: usize,
@@ -1992,10 +2082,9 @@ impl Isodata {
     /// `bins` equal-width bins, and the value to answer where the rule has no
     /// answer. Both are described on [`Isodata`].
     ///
-    /// `bins` must be at least one and `fallback` must be finite. The finiteness
-    /// is not fussiness: a `NaN` fallback would make a window that took it
-    /// compare unequal to itself, and every byte-identity check downstream in
-    /// this crate would stop meaning anything.
+    /// `bins` must be at least one and `fallback` must be finite: a `NaN`
+    /// fallback would make a window that took it compare unequal to itself, and
+    /// every byte-identity check downstream would stop meaning anything.
     pub fn new(bins: usize, fallback: f64) -> Result<Self> {
         if bins == 0 {
             return Err(Error::InvalidArgument(
@@ -2126,9 +2215,9 @@ impl Isodata {
 ///
 /// The constructor refuses a non-finite fallback and normalises `-0.0`, so on
 /// every value that can exist here bitwise equality and numeric equality are the
-/// same relation — which is what makes deriving `Eq` legitimate at all for a
-/// type holding an `f64`, and it is worth having: [`Statistic`] is `Eq + Hash`
-/// and a variant that could not be would take that away from every caller.
+/// same relation — which is what makes `Eq` legitimate for a type holding an
+/// `f64`. [`Statistic`] is `Eq + Hash`, and a variant that could not be would
+/// take that away from every caller.
 impl PartialEq for Isodata {
     fn eq(&self, other: &Self) -> bool {
         self.bins == other.bins && self.fallback.to_bits() == other.fallback.to_bits()
@@ -2164,28 +2253,20 @@ impl From<Total> for f64 {
 /// itself is materialised once per call from `Anchor::volume`, which is the
 /// global extent, and never from the buffer.
 ///
-/// **Two independent conventions, and they are held side by side because they
-/// are separate questions.** [`Sampling`] chooses where the samples sit;
-/// [`Alignment`] chooses which of them a voxel is blended from on the way back.
-/// This type is the *fused* form — it evaluates the samples and interpolates
-/// them in one pass — so it is where both belong; the split pair of ops carries
-/// one each, the statistic half having no interpolation to have an opinion
-/// about. The interesting combination is the one where the two disagree:
-/// samples laid down at a fixed spacing with an unsampled margin at each end,
-/// mapped back by [`Alignment::PinnedEnds`], which does not consult those
-/// positions at all.
+/// **Two independent conventions, held side by side because they are separate
+/// questions.** [`Sampling`] chooses where the samples sit; [`Alignment`]
+/// chooses which of them a voxel is blended from on the way back. This type is
+/// the *fused* form — it evaluates the samples and interpolates them in one
+/// pass — so it is where both belong; the split pair of ops carries one each,
+/// the statistic half having no interpolation to have an opinion about.
 ///
-/// **The narrowing is the third convention and it is held here for the same
-/// reason as the other two.** [`LatticeNarrowing`] says what element type the
-/// values pass through at the sample grid and after the interpolation, and both
-/// of those sites are inside this type's own `evaluate_into` — the fused form
-/// evaluates and blends in one pass, so an op holding this could not apply the
-/// first of them at all. It also has to travel with the sampling and the
-/// alignment rather than beside them: all three are read by
-/// `constant_maps_to`, and a narrowing kept one level up would leave that
-/// declaration stating the un-narrowed value while the kernel wrote the
-/// narrowed one, which is a short-circuited block computing a number no run
-/// would produce.
+/// **The narrowing is the third convention**, and it is held here because both
+/// of its sites are inside this type's own `evaluate_into`. It also has to
+/// travel with the sampling and the alignment rather than beside them: all three
+/// are read by `constant_maps_to`, and a narrowing kept one level up would leave
+/// that declaration stating the un-narrowed value while the kernel wrote the
+/// narrowed one — a short-circuited block filled with a number no run would
+/// produce.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalStatistic {
     element: StructuringElement,
@@ -2245,17 +2326,15 @@ impl LocalStatistic {
 
     /// The convention this statistic maps a fine voxel back to the lattice by.
     ///
-    /// A builder rather than an argument to a constructor, so the choice is
-    /// additive: every caller who has not been asked to match something else
-    /// keeps its call and its answer, and [`Alignment::default`] is what it had
-    /// before there was a choice.
+    /// A builder, so the choice is additive: [`Alignment::default`] is what a
+    /// caller had before there was one.
     ///
     /// It is part of what the statistic **is** — two statistics differing only
     /// in it compute different numbers from the same samples, and its
     /// `PartialEq` says so. It changes no output volume and no cost. It does
     /// change the **reach**, and by more than a voxel: see
-    /// [`Alignment::max_distance`], which is the single place the lattice term
-    /// is derived, so [`Self::reach_sides`], [`Self::halo`] and the kernel's own
+    /// [`Alignment::max_distance`], the single place the lattice term is
+    /// derived, so [`Self::reach_sides`], [`Self::halo`] and the kernel's own
     /// brackets cannot come apart.
     pub fn with_alignment(mut self, alignment: Alignment) -> Self {
         self.alignment = alignment;
@@ -2269,18 +2348,11 @@ impl LocalStatistic {
     /// The element type the values pass through at the sample grid and after the
     /// interpolation; see [`LatticeNarrowing`], which is where both sites are.
     ///
-    /// A builder rather than an argument to a constructor, for
-    /// [`Self::with_alignment`]'s reason: the choice is additive, and
-    /// [`LatticeNarrowing::none`] — no narrowing at either site — is what every
-    /// caller had before there was one.
-    ///
-    /// It is part of what the statistic **is**: two statistics differing only in
-    /// it compute different numbers from the same windows, and its `PartialEq`
-    /// says so. It changes no output volume and no cost, and — unlike
-    /// [`Alignment`], which does — it changes **no reach**. Rounding a value is
-    /// not reading a different one: the samples evaluated, the windows gathered
-    /// and the brackets blended are all the same, and every narrowing in this
-    /// type is applied to a value already in hand.
+    /// A builder, for [`Self::with_alignment`]'s reason. It is part of what the
+    /// statistic **is**: two statistics differing only in it compute different
+    /// numbers from the same windows, and its `PartialEq` says so. It changes no
+    /// output volume and no cost, and — unlike [`Alignment`], which does — it
+    /// changes **no reach**: rounding a value is not reading a different one.
     pub fn narrowed(mut self, narrowing: LatticeNarrowing) -> Self {
         self.narrowing = narrowing;
         self
@@ -2302,12 +2374,11 @@ impl LocalStatistic {
     ///
     /// **The worst case over the volume**, which is what a symmetric per-axis
     /// integer can say. A globally anchored lattice does not line up with block
-    /// boundaries — that is the whole point of it — so the samples a *particular*
-    /// block needs sit at a different distance outside its core for every block,
-    /// and most blocks reach less than this. Two things say tighter things:
-    /// [`Self::reach_sides`], which drops the symmetry an even window does not
-    /// have and is what `LocalStatisticOp::reach_spec` declares, and
-    /// [`Self::halo`], which drops the "over the volume" and is a table.
+    /// boundaries, so the samples a *particular* block needs sit at a different
+    /// distance outside its core for every block and most blocks reach less than
+    /// this. Two things say tighter things: [`Self::reach_sides`], which drops
+    /// the symmetry an even window does not have, and [`Self::halo`], which
+    /// drops the "over the volume" and is a table.
     pub fn reach(&self, axis: usize, volume_len: usize) -> usize {
         let (lo, hi) = self.reach_sides(axis, volume_len);
         lo.max(hi)
@@ -2319,8 +2390,7 @@ impl LocalStatistic {
     /// direction — and the window term is not, so an element with an even
     /// extent makes the whole thing asymmetric by exactly the element's own
     /// asymmetry. Stated here so that [`Self::halo`] and both op shells derive
-    /// it from one place; two derivations of one quantity is the arrangement
-    /// this crate keeps out of its geometry.
+    /// it from one place.
     pub fn reach_sides(&self, axis: usize, volume_len: usize) -> (usize, usize) {
         let distance = self.lattice_distance(axis, volume_len);
         let (lo, hi) = self.element.sides(axis);
@@ -2331,16 +2401,14 @@ impl LocalStatistic {
     /// for a sample, under **this statistic's** two conventions together.
     ///
     /// The positions come from the [`Sampling`], the distance from the
-    /// [`Alignment`], and the two are asked in that order in one place — a
-    /// distance measured under one mapping and read under another is a halo
-    /// that is short everywhere the two disagree. At [`Alignment::default`] this
-    /// is `Sampling::max_distance`, which is the same function on the same
-    /// positions.
+    /// [`Alignment`], asked in that order in one place — a distance measured
+    /// under one mapping and read under another is a halo that is short
+    /// everywhere the two disagree.
     ///
     /// A sampling that cannot produce positions for this axis answers zero
-    /// rather than failing, as `Sampling::max_distance` does: the reach is
-    /// consulted where there is no `Result` to return, and the constructor has
-    /// already refused a sampling that cannot produce positions at all.
+    /// rather than failing: the reach is consulted where there is no `Result` to
+    /// return, and the constructor has already refused a sampling that cannot
+    /// produce positions at all.
     fn lattice_distance(&self, axis: usize, volume_len: usize) -> usize {
         self.sampling
             .positions(axis, volume_len)
@@ -2359,13 +2427,11 @@ impl LocalStatistic {
 
     /// The halo each block actually needs, as a table.
     ///
-    /// **This is the consequence of global anchoring, priced.** The lattice is
-    /// fixed in volume coordinates and knows nothing about the decomposition, so
-    /// its points do not line up with block boundaries — a block may hold three
+    /// **This is the consequence of global anchoring, priced.** The lattice's
+    /// points do not line up with block boundaries — a block may hold three
     /// samples or four, and the nearest sample outside its core may be one voxel
     /// away or a whole gap away. `reach` has to be the **worst** case over every
-    /// block, because it is a symmetric per-axis integer; most blocks need less,
-    /// and this says how much less for each.
+    /// block; most blocks need less, and this says how much less for each.
     ///
     /// Derived per block from the brackets its own voxels take: the lowest
     /// sample the first voxel of the core interpolates from, the highest the last
@@ -2428,8 +2494,7 @@ impl LocalStatistic {
     /// Evaluate over a `f64` buffer.
     ///
     /// The lattice is built here, from `at.volume`, and that single line is the
-    /// global anchoring: no caller supplies it, and there is no parameter that
-    /// could make it a function of the buffer.
+    /// global anchoring: no parameter could make it a function of the buffer.
     pub fn evaluate_into(
         &self,
         input: ArrayView3<'_, f64>,
@@ -2458,13 +2523,10 @@ impl LocalStatistic {
 
     /// [`Self::evaluate_into`], with `mask` deciding each window's population.
     ///
-    /// The lattice is built here from `at.volume` for the same reason and by the
-    /// same line: masking changes which voxels join a window and nothing at all
-    /// about where the windows are.
-    ///
-    /// The mask covers the same buffer as the input, so it is read at the same
-    /// region — see [`LocalStatisticOp::source_inputs`], which declares it at
-    /// this statistic's own reach rather than at the element's.
+    /// Masking changes which voxels join a window and nothing at all about where
+    /// the windows are. The mask covers the same buffer as the input, so it is
+    /// read at the same region — see [`LocalStatisticOp::source_inputs`], which
+    /// declares it at this statistic's own reach rather than at the element's.
     pub fn evaluate_masked_into(
         &self,
         input: ArrayView3<'_, f64>,
@@ -2496,15 +2558,13 @@ impl LocalStatistic {
     /// masked, where that is **exactly** what it writes.
     ///
     /// The statistic's own declaration, **taken through both narrowing sites**.
-    /// That composition is exact rather than nearly so, and for a reason that is
-    /// arithmetic: a uniform block gives a uniform grid, the grid's narrowing is
-    /// a function of one value, and the blend between two equal samples returns
-    /// that sample bit for bit — so there is nothing between the two narrowings
-    /// that could differ in the last bit. See [`LatticeNarrowing::applied`].
+    /// The composition is exact rather than nearly so: a uniform block gives a
+    /// uniform grid, the grid's narrowing is a function of one value, and the
+    /// blend between two equal samples returns that sample bit for bit. See
+    /// [`LatticeNarrowing::applied`].
     ///
     /// Stated here rather than at each op shell so that an op cannot declare the
-    /// un-narrowed value while its kernel writes the narrowed one, which is a
-    /// short-circuited block filled with a number no run would have produced.
+    /// un-narrowed value while its kernel writes the narrowed one.
     pub fn constant_maps_to(&self, value: f64) -> Option<f64> {
         Some(
             self.narrowing
@@ -2545,8 +2605,7 @@ impl LocalStatistic {
     /// written into the grid and the grid is narrowed as a whole, so what has to
     /// agree is what is written, not what it narrows to. Two values that differ
     /// before the narrowing and coincide after it withdraw the declaration
-    /// anyway, which is the safe direction and the one this method has always
-    /// taken.
+    /// anyway, which is the safe direction.
     pub fn masked_constant_maps_to(&self, value: f64, population: Population) -> Option<f64> {
         let answer = self.statistic.constant_maps_to(value)?;
         if let ExcludedCentre::Fill(fill) = population.centre {
@@ -2570,9 +2629,8 @@ impl LocalStatistic {
 ///
 /// Optionally masked, in which case each window's population is read from a
 /// stored image over the same window the input is read over — exactly as
-/// `MaskedRankFilterOp` reads it, and one op rather than two for the reason
-/// `SlidingHistogramOp` gives: a mask is one more reason an offset does not join
-/// the window, not a second traversal.
+/// `MaskedRankFilterOp` reads it, and one op rather than two: a mask is one more
+/// reason an offset does not join the window, not a second traversal.
 ///
 /// The one thing the dense masked filter does not have to say is **where** the
 /// window sits. Here it sits around a lattice point, so the mask is declared at
@@ -2601,7 +2659,7 @@ impl LocalStatisticOp {
     /// Read each window's population from `mask`, which must be a `Bool` image.
     ///
     /// A builder rather than an argument to [`Self::new`], so the choice is
-    /// additive: a caller who never had it keeps its call and its answer.
+    /// additive.
     pub fn masked_by(mut self, mask: impl Into<crate::assemble::ImageId>) -> Self {
         self.mask = Some(MaskSource::new(mask));
         self.cost *= super::rank::MASK_COST_FACTOR;
@@ -2624,8 +2682,7 @@ impl LocalStatisticOp {
     /// halves have to be told the same thing. Everything that depends on the
     /// convention — the kernel's brackets, [`LocalStatistic::reach_sides`] and
     /// [`LocalStatistic::halo`] — then reads the one field, so the reach this
-    /// op declares and the samples it reads cannot come apart. The same
-    /// forwarding builder sits on [`AdaptiveThresholdOp`].
+    /// op declares and the samples it reads cannot come apart.
     ///
     /// A caller matching the *split* pair of ops states the same value on
     /// `LatticeInterpolateOp::with_alignment`, and the two paths then compute
@@ -2639,11 +2696,9 @@ impl LocalStatisticOp {
     /// [`LatticeNarrowing`], and [`LocalStatistic::narrowed`], which is where it
     /// is held and why.
     ///
-    /// Forwarded rather than stored beside the statistic, exactly as
-    /// [`Self::with_alignment`] is: this op evaluates the samples and
-    /// interpolates them in **one pass** and both narrowing sites are inside it,
-    /// so a second copy of the parameter would be a second thing to keep in
-    /// step. A caller matching the *split* pair states the two halves on
+    /// Forwarded rather than stored beside the statistic, as
+    /// [`Self::with_alignment`] is: both narrowing sites are inside this op's
+    /// one pass. A caller matching the *split* pair states the two halves on
     /// `LatticeStatisticOp::narrowed_to` and
     /// `LatticeInterpolateOp::narrowed_to`, and the two paths then compute the
     /// same numbers.
@@ -2700,11 +2755,9 @@ impl BlockOp for LocalStatisticOp {
     ///
     /// `local_statistic_into` is generic over `T: Copy` with an **`f64`
     /// accumulator** — a mean and a deviation must be summed in something wider
-    /// than a `u8`, and that is a legitimate place `f64` stays whatever the
-    /// input is. What is *not* generic is `LocalStatistic::evaluate_into`, which
-    /// is stated in `f64` on both sides. Widening it is kernel work rather than
-    /// shell work, so this shell declares what it can actually bridge instead of
-    /// promising a conversion it would have to invent.
+    /// than a `u8`. What is *not* generic is `LocalStatistic::evaluate_into`,
+    /// which is stated in `f64` on both sides; widening it is kernel work rather
+    /// than shell work, so this shell declares what it can actually bridge.
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
         if let Some(mask) = self.mask {
             return Err(mask.input_only_error(self.name));
@@ -2719,10 +2772,9 @@ impl BlockOp for LocalStatisticOp {
     /// the windows here sit around lattice points rather than around the voxel
     /// written, so the mask is needed wherever a sample's window is — the
     /// lattice distance plus the element, which is this op's own
-    /// [`Self::reach_spec`] and equal to it by construction rather than by
-    /// arrangement. That equality is what keeps this op inside what a plan can
-    /// fetch; see `check_source_images`, which refuses an operand wanting more
-    /// than its phase.
+    /// [`Self::reach_spec`]. That equality is what keeps this op inside what a
+    /// plan can fetch; see `check_source_images`, which refuses an operand
+    /// wanting more than its phase.
     fn source_inputs(&self, volume: [usize; 3]) -> Vec<SourceInput> {
         MaskSource::maybe_source_input(self.mask, self.statistic.reach_spec(volume))
     }
@@ -2803,6 +2855,27 @@ impl AdaptiveThresholdOp {
         }
     }
 
+    pub fn niblack(
+        name: &'static str,
+        element: StructuringElement,
+        spacing: [usize; 3],
+        k: f64,
+    ) -> Result<Self> {
+        let statistic = LocalStatistic::new(element, spacing, Statistic::niblack(k)?)?;
+        Ok(Self::new(name, statistic, 1.0, 0.0))
+    }
+
+    pub fn sauvola(
+        name: &'static str,
+        element: StructuringElement,
+        spacing: [usize; 3],
+        k: f64,
+        r: f64,
+    ) -> Result<Self> {
+        let statistic = LocalStatistic::new(element, spacing, Statistic::sauvola(k, r)?)?;
+        Ok(Self::new(name, statistic, 1.0, 0.0))
+    }
+
     /// Read the *statistic's* population from `mask`, which must be a `Bool`
     /// image. The comparison itself is still made at every voxel: a mask decides
     /// what the level is computed from, not which voxels get an answer.
@@ -2832,11 +2905,10 @@ impl AdaptiveThresholdOp {
     /// [`LocalStatisticOp::narrowed`], which states the same thing for the same
     /// reason.
     ///
-    /// The order is worth stating because it is the only one that is a
-    /// composition rather than a rewrite: the narrowing belongs to the
-    /// *statistic*, so it happens where the statistic ends, and `scale` and
-    /// `offset` are then applied to the narrowed level. A caller wanting the
-    /// adjusted level narrowed instead is asking for a different op.
+    /// The narrowing belongs to the *statistic*, so it happens where the
+    /// statistic ends, and `scale` and `offset` are then applied to the narrowed
+    /// level. A caller wanting the adjusted level narrowed instead is asking for
+    /// a different op.
     pub fn narrowed(mut self, narrowing: LatticeNarrowing) -> Self {
         self.statistic = self.statistic.narrowed(narrowing);
         self
@@ -2924,11 +2996,9 @@ impl BlockOp for AdaptiveThresholdOp {
         self.statistic.reach_spec(volume)
     }
 
-    /// `f64`, for [`LocalStatisticOp::apply`]'s reason and one more of its own:
-    /// the comparison is `T: PartialOrd` against a threshold **of the same
-    /// type**, and the threshold is the statistic's `f64` output. A narrower
-    /// input would have to be widened to be compared against it, which is a
-    /// conversion this shell would be choosing rather than adapting.
+    /// `f64`, for [`LocalStatisticOp::apply`]'s reason and one of its own: the
+    /// comparison is `T: PartialOrd` against a threshold **of the same type**,
+    /// and the threshold is the statistic's `f64` output.
     fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
         if let Some(mask) = self.mask {
             return Err(mask.input_only_error(self.name));
@@ -2962,8 +3032,7 @@ impl BlockOp for AdaptiveThresholdOp {
     /// The composition is `value > scale * s + offset`, evaluated with the same
     /// expression the kernel evaluates, so where `s` is exact the comparison and
     /// its answer are too. Where the statistic withholds its mapping — a mean of
-    /// a non-zero constant — this withholds as well, by construction rather than
-    /// by a second judgement.
+    /// a non-zero constant — this withholds as well.
     fn constant_maps_to(&self, value: f64) -> Option<f64> {
         let statistic = match self.mask {
             None => self.statistic.constant_maps_to(value)?,
@@ -2997,9 +3066,7 @@ pub(super) fn cost_for(statistic: &LocalStatistic) -> f64 {
     // Two terms per sample: the gather, which scales with the window, and
     // whatever the reducer does afterwards that does *not*. Only one statistic
     // has the second — a histogram sweep is a function of the bin count and not
-    // of how many values went into it — and it is zero for the other three, so
-    // this is bit-for-bit the expression it replaces wherever it was already
-    // right.
+    // of how many values went into it — and it is zero for the other three.
     let window = statistic.element().len();
     let per_sample = SAMPLE_COST_PER_ELEMENT_VOXEL * window as f64
         + statistic.statistic().cost_per_sample(window);
@@ -3078,9 +3145,8 @@ mod tests {
     ///
     /// One fixed voxel, two decompositions that both contain it with room for
     /// the derived reach. Laid out over the block, the sample it interpolates
-    /// from is a *different voxel* in each — that is the defect, and it is shown
-    /// here rather than described. Laid out over the volume, the value is the
-    /// whole-volume value in both.
+    /// from is a *different voxel* in each. Laid out over the volume, the value
+    /// is the whole-volume value in both.
     #[test]
     fn an_unanchored_lattice_moves_with_the_block_and_an_anchored_one_does_not() {
         let volume = [37usize, 12, 11];
@@ -3155,11 +3221,8 @@ mod tests {
     /// The lattice term is symmetric and the window term is not, so an even
     /// window makes the whole reach asymmetric by exactly the window's own
     /// asymmetry — and the halo table has to carry that through per side.
-    ///
-    /// The halo is what a block is actually handed; granting the wider side in
-    /// both directions would give every block a plane no voxel of its core
-    /// reads, on every block of the lattice, which is the cost this crate keeps
-    /// per-side reaches in order not to pay.
+    /// Granting the wider side in both directions would hand every block a plane
+    /// no voxel of its core reads.
     #[test]
     fn an_even_window_makes_both_the_reach_and_the_halo_asymmetric() {
         let element = StructuringElement::from_size(ElementShape::Box, [6, 5, 5]).unwrap();
@@ -3169,17 +3232,14 @@ mod tests {
         assert_eq!(statistic.reach(0, 64), 10, "the bound is the wider side");
         assert_eq!(statistic.reach_spec([64, 64, 64]).at(0, 0, 64), (10, 9));
 
-        // And the granted halo, which is derived from the brackets rather than
-        // from the reach, is asymmetric on the same axis and by the same voxel.
+        // And the granted halo, derived from the brackets rather than from the
+        // reach, is asymmetric on the same axis and by the same voxel.
         //
-        // Taken on the **no-lattice** sampling and on the **interior** blocks,
-        // for two separate reasons. A spacing wide enough to bracket dominates
-        // the window on both sides — with samples eight apart the nearest one
-        // outside the core is far enough away that three and two below it round
-        // to the same halo — so a lattice term would hide the property rather
-        // than exercise it. And the first and last block have their halo
-        // clamped by the volume's own edge, where there is nothing beyond to
-        // fetch, so the asymmetry is a fact about seams.
+        // Taken on the **no-lattice** sampling and on the **interior** blocks.
+        // A spacing wide enough to bracket dominates the window on both sides —
+        // with samples eight apart, three and two below the nearest sample round
+        // to the same halo — so a lattice term would hide the property. And the
+        // first and last block have their halo clamped by the volume's own edge.
         let element = StructuringElement::from_size(ElementShape::Box, [6, 5, 5]).unwrap();
         let dense = LocalStatistic::new(element, [1, 1, 1], Statistic::Mean).unwrap();
         let grid = BlockGrid::new([64, 8, 8], [16, 8, 8]).unwrap();
@@ -3204,10 +3264,8 @@ mod tests {
     /// **under either convention**, and the declared distance is not the same
     /// number for the two.
     ///
-    /// This is the assertion that keeps `bracket` and `reach` from drifting.
-    /// Tighten one without the other and this fails, which is the point — the
-    /// alternative is a reach that is correct only because it is generous, and a
-    /// generosity nobody records is a generosity somebody later removes.
+    /// This is the assertion that keeps `bracket` and `reach` from drifting;
+    /// tighten one without the other and it fails.
     ///
     /// Swept over both conventions because the drift they would allow is not
     /// symmetric: `PinnedEnds` reads *further* than `SamplePositions` on a
@@ -3217,8 +3275,8 @@ mod tests {
     /// sample exactly that far away — which is the load-bearing half for
     /// `SamplePositions`, whose distance is a closed form and could drift from
     /// the sweep in either direction. For `PinnedEnds` the distance *is* the
-    /// sweep, so what the pair of assertions pins there is that the sweep the
-    /// declaration walks and the bracket the kernel reads by are one function.
+    /// sweep, so the pair of assertions pins that the sweep the declaration
+    /// walks and the bracket the kernel reads by are one function.
     #[test]
     fn no_voxel_reads_a_sample_further_than_the_declared_distance() {
         for volume_len in [1usize, 2, 7, 16, 17, 64, 65] {
@@ -3288,6 +3346,8 @@ mod tests {
             for statistic in [
                 Statistic::Mean,
                 Statistic::Deviation,
+                Statistic::niblack(-0.2).unwrap(),
+                Statistic::sauvola(0.5, 128.0).unwrap(),
                 Statistic::Rank(Rank::median(&element)),
             ] {
                 let local =
@@ -3326,11 +3386,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn niblack_and_sauvola_are_window_statistics() {
+        let mut scratch = Vec::new();
+        let mut window = [0i32, 0, 4, 4];
+        let full = window.len();
+
+        let niblack = Statistic::niblack(0.5).unwrap();
+        let sauvola = Statistic::sauvola(0.5, 4.0).unwrap();
+
+        assert_eq!(niblack.reduce_with(&mut window, full, &mut scratch), 3.0);
+        assert_eq!(sauvola.reduce_with(&mut window, full, &mut scratch), 1.5);
+        assert_eq!(niblack.constant_maps_to(0.0), Some(0.0));
+        assert_eq!(sauvola.constant_maps_to(0.0), Some(0.0));
+        assert_eq!(niblack.constant_maps_to(7.0), None);
+        assert_eq!(sauvola.constant_maps_to(7.0), None);
+    }
+
+    #[test]
+    fn niblack_and_sauvola_validate_their_parameters() {
+        assert!(Statistic::niblack(0.0).is_ok());
+        assert!(Statistic::niblack(f64::NAN).is_err());
+        assert!(Statistic::sauvola(0.5, 128.0).is_ok());
+        assert!(Statistic::sauvola(f64::INFINITY, 128.0).is_err());
+        assert!(Statistic::sauvola(0.5, 0.0).is_err());
+        assert!(Statistic::sauvola(0.5, -1.0).is_err());
+    }
+
+    #[test]
+    fn adaptive_threshold_has_niblack_and_sauvola_constructors() {
+        let element = StructuringElement::from_radius(ElementShape::Box, [1, 0, 0]);
+        let niblack =
+            AdaptiveThresholdOp::niblack("niblack", element.clone(), [1, 1, 1], -0.2).unwrap();
+        let sauvola =
+            AdaptiveThresholdOp::sauvola("sauvola", element.clone(), [1, 1, 1], 0.5, 128.0)
+                .unwrap();
+
+        assert!(matches!(
+            niblack.statistic().statistic(),
+            Statistic::Niblack(_)
+        ));
+        assert!(matches!(
+            sauvola.statistic().statistic(),
+            Statistic::Sauvola(_)
+        ));
+        assert_eq!(niblack.reach_spec([9, 1, 1]), element.reach_spec());
+        assert_eq!(sauvola.reach_spec([9, 1, 1]), element.reach_spec());
+
+        let input: Voxels = Array3::from_shape_vec((5, 1, 1), vec![0.0, 0.0, 4.0, 4.0, 9.0])
+            .unwrap()
+            .into();
+        let mut out = Voxels::zeros(Dtype::F64, [5, 1, 1]).unwrap();
+        niblack
+            .apply(&input, &mut out, &Anchor::whole([5, 1, 1]))
+            .unwrap();
+        assert!(
+            out.view::<f64>().unwrap().iter().any(|&value| value == 1.0),
+            "the constructor must run through the adaptive threshold comparison"
+        );
+    }
+
     /// **The deviation is the population one, `/ n`, and this is the only place
     /// that is asserted rather than documented.**
     ///
-    /// [`Statistic::Deviation`] is documented as the population standard
-    /// deviation. Every other test that reaches it — `tests/image_ops.rs`,
+    /// Every other test that reaches it — `tests/image_ops.rs`,
     /// `ops::normalise`'s suite, the lattice statistic's — is a decomposition,
     /// reach or short-circuit test whose reference is this same reducer, so the
     /// choice of divisor is invisible to all of them and a `/ (n - 1)` would
@@ -3558,7 +3677,7 @@ mod tests {
         let wide = of(Statistic::Isodata(Isodata::new(256, 1.0).unwrap()));
         assert!(narrow > mean, "a histogram sweep is not free");
         assert!(wide > narrow, "four times the bins is more work");
-        // and the three that were already here are unchanged, bit for bit
+        // and the three without a second term are the bare gather, bit for bit
         assert_eq!(
             mean,
             SAMPLE_COST_PER_ELEMENT_VOXEL * window.len() as f64 * 1.0 + INTERPOLATION_COST
@@ -3617,9 +3736,7 @@ mod lattice_tests {
     /// A spacing of 7 cut into blocks of 8 drifts by one voxel per block — local
     /// 4, then 3, then 2, then 1 — and then a block holds **two** samples where
     /// each of its neighbours holds one. Nothing about a block's own geometry
-    /// predicts either. That is what "the lattice is independent of the
-    /// decomposition" costs and buys: the answer is the same under every cut,
-    /// and no block can assume where its samples are.
+    /// predicts either, so no block can assume where its samples are.
     #[test]
     fn a_global_lattice_lands_differently_inside_every_block() {
         let lattice = SampleLattice::centred([64, 64, 64], [7, 7, 7]).unwrap();

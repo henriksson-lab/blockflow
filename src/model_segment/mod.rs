@@ -115,7 +115,7 @@ pub trait SegmentBackend: Send + Sync {
 ///
 /// | column | what it is | merges by |
 /// |---|---|---|
-/// | `id` | the object's identity, derived from its centroid — see the crate header | it is the key |
+/// | `id` | the object's identity, derived from its lowest voxel — see [`identify`] | it is the key |
 /// | `count` | voxels in the object | `+` |
 /// | `sum_0`, `sum_1`, `sum_2` | per-axis sum of the object's voxel coordinates, in **volume** coordinates | `+` |
 /// | `sum_c{i}`, `min_c{i}`, `max_c{i}` | over image `i` of the measured set | `+`, `min`, `max` |
@@ -283,8 +283,7 @@ pub struct InstanceSegment {
     /// is empty therefore owns nothing, whatever is in its halo — so skipping
     /// it drops no object that any block would have kept.
     ///
-    /// `None` runs the backend everywhere, which is what this did before the
-    /// parameter existed.
+    /// `None` runs the backend everywhere.
     empty_below: Option<f64>,
 }
 

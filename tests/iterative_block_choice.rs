@@ -1038,7 +1038,7 @@ fn the_substage_count_does_not_depend_on_the_block_edge() {
             // The plans really were cut, which is the hypothesis the equality
             // above is a statement about. Without this the whole table would
             // pass unchanged against a `spread_on` that ignored its `block`
-            // argument — nineteen runs of the same plan agreeing with itself.
+            // argument — thirteen runs of the same plan agreeing with itself.
             assert!(
                 cut_into.iter().copied().max().expect("lattices") > 1,
                 "no lattice cut the volume into more than one block"
@@ -1055,7 +1055,7 @@ fn the_substage_count_does_not_depend_on_the_block_edge() {
 /// iteration long, so the invariance is being checked over a propagation that
 /// has somewhere to go.
 ///
-/// Without this the table above could be nineteen agreeing counts of three, and
+/// Without this the table above could be thirteen agreeing counts of three, and
 /// three substages is not a distance.
 #[test]
 fn the_serpentine_makes_the_iteration_longer_than_the_open_field() {

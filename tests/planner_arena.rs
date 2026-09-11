@@ -814,7 +814,7 @@ fn the_per_family_corrections_change_the_plan_and_the_simulator_prefers_it() {
     );
 }
 
-// ------------------------------------------------- claim 4: deterministic --
+// ------------------------------------------------- claim 7: deterministic --
 
 /// The same field judged twice is the same table.
 ///
@@ -914,7 +914,7 @@ impl Scheduler for FirstReady {
 ///
 /// At the scale an arena sweep works at, **98% of a simulation is the scheduler
 /// scanning the ready set**, and fixing that is a change to the `Scheduler`
-/// trait rather than to this loop: `CacheAware` and the handout policies want
+/// trait rather than to this loop: `WarmestFirst` and the handout policies want
 /// the whole set by design. Recorded in `docs/design/planner-gaps.md` as the
 /// next thing in the way.
 ///

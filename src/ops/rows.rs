@@ -143,13 +143,10 @@
 // duplication this module's *"an overlap here costs correctness"* paragraph is
 // about. [`GroupFold::merge`] **refuses** it by name rather than picking a side.
 //
-// That refusal is a *check* and not a proof, and the difference is measured
-// rather than glossed: it fires when the duplicated row is the group's least in
-// both partials, and a duplicate above the least slips through and inflates the
-// group's row count. What rules the general case out is the producer keying by
-// [`owner_of`], which every producer in this crate does. So the refusal is the
-// cheap half of the guarantee, costing one comparison at the seam, and the other
-// half is a property of how the rows were written.
+// That refusal is a *check* and not a proof: the general case is ruled out by
+// the producer keying by [`owner_of`], which every producer in this crate does.
+// [`GroupFold::merge`] records exactly which duplicates it catches and which
+// slip past it.
 //
 // Two aggregates for one question, because two references disagree
 // ----------------------------------------------------------------
@@ -181,15 +178,10 @@
 // cannot exist in this crate at all, and an op whose presence rule was "finite"
 // would have been a rule about values no table can hold.
 //
-// **That refusal is right and it is not this op's to relax**, which is worth
-// saying because the alternative was available and was rejected rather than
-// overlooked. Widening it would put the crate's one total row order at the mercy
-// of a bit pattern, in every op, to spare one reduction a column. And the thing
-// the absence was needed *for* survives the change intact: an absence is still a
-// first-class case here, still distinguishes [`Aggregate::FirstPresent`] from
-// [`Aggregate::FirstRow`], and a consumer holding the choice between those two
-// as a parameter still gets both readings out of one plan. What moved is where
-// the absence is written down, not whether it can be.
+// **That refusal is not this op's to relax.** Widening it would put the crate's
+// one total row order at the mercy of a bit pattern, in every op, to spare one
+// reduction a column. What moves is where the absence is written down, not
+// whether it can be.
 //
 // Presence is therefore **a `U64` column the caller nominates**:
 // [`Reduction::present`], non-zero for a row that has a value here. It is
@@ -360,11 +352,8 @@
 // carries it as a column, which is what the schema is for.
 //
 // The predicate is a **conjunction of bounds on named columns**, and each bound
-// says whether it is strict. Both spellings exist because both are in the
-// consumers: a half-open `[min, max)` range test, and a strictly-greater
-// threshold. They are one comparison apart and nothing is gained by making a
-// caller express one as the other on floats, where `>= min` and
-// `> next_after(min)` are not the same predicate.
+// says whether it is strict; [`Limit`] records why the strictness is a parameter
+// rather than something a caller re-expresses.
 //
 // What it costs
 // -------------
@@ -531,9 +520,9 @@ fn values_of(row: &Row<'_>) -> Result<Vec<Value>> {
 
 /// One coordinate scaled and rounded, **ties to even**.
 ///
-/// The whole of the module header's rounding section, as three lines. `f64::
-/// round` here instead of [`f64::round_ties_even`] is the recorded defect and
-/// differs on exactly the ties whose floor is odd.
+/// The whole of the module header's rounding section, as three lines.
+/// [`f64::round`] here instead of [`f64::round_ties_even`] is the recorded
+/// defect, and the two differ on exactly the ties whose floor is odd.
 ///
 /// Refuses a factor that is not finite and non-negative, and a product that does
 /// not land in a `usize`. A negative factor would send rows to coordinates a
@@ -1152,13 +1141,10 @@ fn block_rows(
 /// point blob is headerless where a table blob carries its schema in front*. A
 /// `RowSourceOp` over [`Schema::points`] would write the same words behind a
 /// header `ops::voxelize` does not read. So a `points -> fragments` producer is
-/// a second general shape with a second home — `points`, which owns the type
-/// and the encoding — and it is written three times as this is being read:
-/// `tests/voxelize.rs`, `tests/point_labels.rs`, and once in a consumer.
-///
-/// Nothing in any of those copies depended on anything its caller knew, which
-/// is the definition of something that belongs in a library rather than in its
-/// consumers.
+/// a second general shape with a second home: [`crate::points::PointSourceOp`],
+/// which owns the point type and its encoding, and which absorbed the three
+/// copies — `tests/voxelize.rs`, `tests/point_labels.rs` and one in a consumer
+/// — that stood where this op's copies did.
 ///
 /// **Phase 0, and it can be nothing else usefully.** It declares no
 /// [`FragmentInput`] and reads no image, so there is nothing it can follow; it
@@ -1901,11 +1887,9 @@ impl Grouping {
                 // and `as i64` there would turn a large positive total into a
                 // small negative mean with nothing failing.
                 Aggregate::Sum => Value::U64(self.fixed.to_column(column.total)?),
-                // **Zero for an empty selection**, which is `ops::tabulate`'s
-                // convention and is forced by the same rule: a `Table` refuses
-                // a non-finite `F64`, so the absence has no spelling and a
-                // `Count` over the same column is how a reader tells a group
-                // that selected nothing from one whose least value is zero.
+                // **Zero for an empty selection**, not an absence: a `Table`
+                // refuses a non-finite `F64`, so there is no spelling for one.
+                // See [`GroupValues::values`] for how a reader tells them apart.
                 Aggregate::Min => Value::F64(column.min.unwrap_or(0.0)),
                 Aggregate::Max => Value::F64(column.max.unwrap_or(0.0)),
                 Aggregate::FirstPresent => {

@@ -418,13 +418,16 @@ fn selecting<T: Ord + Copy>(
         }
         _ => None,
     };
-    // **The interior, by running extrema**, where the element is planar and the
-    // rank is an end. This writes the interior outright and hands back what it
-    // wrote, so the loop below owns only the boundary shell — the part whose
-    // truncation rule is `Rank::resolve`'s and must not be reimplemented.
+    // **The interior, by running extrema**, where the rank is an end. This
+    // writes the interior outright and hands back what it wrote, so the loop
+    // below owns only the boundary shell — the part whose truncation rule is
+    // `Rank::resolve`'s and must not be reimplemented.
     //
     // It is tried before the flat path rather than instead of it: an element
-    // with depth, or a row the runs cannot span, still gets the flat interior.
+    // whose runs are too short to pay for the decomposition, or one with a run
+    // wider than the volume, still gets the flat interior. Depth is not a
+    // reason to decline — `row_runs_of` groups by `(d0, d2)`, so a
+    // three-dimensional element simply has more runs.
     let running = match (ends, flat.as_ref()) {
         (Some(take), Some((values, _, _, lo, hi))) => {
             let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
@@ -492,16 +495,6 @@ fn selecting<T: Ord + Copy>(
                     }
                     Some(input[at])
                 };
-                // **A min or a max is folded as the neighbours are read.** The
-                // window exists to be *selected over*; an end needs no selection,
-                // so gathering into it would be building a buffer to throw away.
-                // `Rank::extreme` can answer this before the gather — that is
-                // what it is for — where `Rank::resolve` cannot, since it needs
-                // the count the gather produces.
-                //
-                // An erosion is `Rank::lowest` and a dilation is `Rank::highest`,
-                // so a grey opening takes this path twice, and the cell chain's
-                // background arm is exactly one opening.
                 // The interior, flat. `gathered` is the same offset list the
                 // general path walks, so this is the same set of taps read a
                 // cheaper way.
@@ -535,6 +528,16 @@ fn selecting<T: Ord + Copy>(
                     }
                     Some(best)
                 });
+                // **A min or a max is folded as the neighbours are read.** The
+                // window exists to be *selected over*; an end needs no selection,
+                // so gathering into it would be building a buffer to throw away.
+                // `extreme_of` can answer this before the gather — that is what
+                // it is for — where `Rank::resolve` cannot, since it needs the
+                // count the gather produces.
+                //
+                // An erosion is `Rank::lowest` and a dilation is `Rank::highest`,
+                // so a grey opening takes this path twice, and the cell chain's
+                // background arm is exactly one opening.
                 let selected = match ends {
                     _ if interior.is_some() => interior,
                     Some(Extreme::Lowest) => gathered.iter().filter_map(&value_at).min(),
@@ -2097,11 +2100,6 @@ mod tests {
         }
     }
 
-    /// A **deeper** element still agrees, by declining the running path.
-    ///
-    /// The guard is `run.0 != 0`, and a filter that silently took the planar
-    /// path for a depth-3 element would answer a different question, so this
-    /// asserts the decline rather than trusting it.
     /// The shipped background element's own **orientation**, against the
     /// definition.
     ///
@@ -2136,6 +2134,12 @@ mod tests {
         }
     }
 
+    /// A **deeper** element still agrees.
+    ///
+    /// Depth is not a reason the run decomposition declines — `row_runs_of`
+    /// groups by `(d0, d2)`, so a three-dimensional element simply has more
+    /// runs — and a filter that took that grouping to be planar would answer a
+    /// different question on these radii.
     #[test]
     fn an_element_with_depth_agrees_too() {
         let input = ramp((11, 13, 17));

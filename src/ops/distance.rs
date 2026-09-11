@@ -61,8 +61,7 @@
 // `.in_space(..)` — and the op does not change shape: it reads `n` voxels of the
 // swept axis and writes `n`. A projection declares `All` in
 // `Space::source_voxels()` and writes an axis of extent 1, and it is
-// `Decomposition::check`'s fetch verification that keeps *that* honest. Nothing
-// here fetches across grids, so nothing here needs it.
+// `Decomposition::check`'s fetch verification that keeps *that* honest.
 //
 // **The whole-axis mandate, and what the guard inside `apply` is still for.**
 // Two failures are possible and only one of them is a correctness failure:
@@ -96,11 +95,10 @@
 // shape, which is why `docs/ops-survey`'s ask for a `BlockConstraint` on one
 // axis is answered by a *declaration* rather than by a constraint type.
 // [`DistanceSweepOp::apply`] refuses a buffer that does not span its axis from
-// voxel 0 anyway, and that guard is **not** redundant — nothing above it ever
-// made it so, because nothing above it runs at the same time — it is the only thing
-// standing between a caller who invokes a public `BlockOp` outside any plan and
-// a complete, well-formed, wrong volume. Everything above happens when a
-// `Decomposition` is built; `apply` is reachable without building one. Inside a
+// voxel 0 anyway, and that guard is **not** redundant: everything above happens
+// when a `Decomposition` is built and `apply` is reachable without building one,
+// so it is the only thing standing between a caller who invokes a public
+// `BlockOp` outside any plan and a complete, well-formed, wrong volume. Inside a
 // plan the branch never fires, which is exactly why
 // `a_sweep_handed_a_partial_lane_refuses_rather_than_answering` builds the
 // anchor by hand: an assertion nothing can run is not an assertion.

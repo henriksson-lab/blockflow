@@ -27,17 +27,6 @@
 // `cost_per_voxel` multiplied by the voxel count is a linear model, and a
 // transform is `n log n` with a constant nothing here would have measured.
 //
-// **There used to be a third argument here and it has expired.** It read: there
-// is no FFT in the dependency list, and `Cargo.toml` says every entry is
-// something the *framework* needs, so an op that requires one cannot be added
-// without changing what the crate is. That was true when this file was written
-// and it is not true now — [`crate::ops::fft`] is a two-dimensional real
-// transform over `rustfft` and `realfft`, and `Cargo.toml` now says in as many
-// words that an FFT is what one *op* needs rather than what the framework needs.
-// So the dependency argument is gone, and what remains is the two paragraphs
-// above it: the planning barrier and the cost model. Those were always the real
-// reasons and they are untouched.
-//
 // The spatial form gives all of that up for a stated price: it is iterative
 // rather than closed-form, so it approaches the answer instead of computing it,
 // and its reach grows **linearly with the iteration count**. At `n` iterations of
@@ -45,24 +34,20 @@
 // can make too large — and when they do, the guard says so at planning time
 // instead of a transform silently serialising the run.
 //
-// **What the frequency-domain form would need, and which of it now exists.**
-// Still unbuilt, and still deliberately — but the list is shorter than it was
-// and the honest answer to "is it buildable now?" is **yes**, so the list is
-// written as a specification rather than as an obstacle.
+// **What the frequency-domain form would need.** Unbuilt, and deliberately — but
+// buildable, so the list is a specification rather than an obstacle.
 //
 // | what it needs | state |
 // |---|---|
 // | a transform, with the zero padding and the real-input symmetry a volume of arbitrary extent needs | **done**, in [`crate::ops::fft`], for **two** axes. Its normalisation convention is stated there: forward unnormalised, inverse carries `1/N` |
-// | the **third** axis | ~~**missing.**~~ **built**, and by exactly the route this row predicted: [`crate::ops::fft::RealTransform3`] is a real transform along the last axis and `transform_lanes` along the other two, because a `[d0, d1, w]` row-major buffer *is* a `[d0, d1 * w]` one to a first-axis pass. The row's estimate — "the same twenty lines, over `Array3`" — held |
-// | a place to put the spectrum | **missing, and this is the awkward one.** [`crate::voxels::Voxels`] has eleven element variants and none of them is complex, so a `BlockOp` cannot hand a spectrum to the next op. The frequency-domain form would therefore have to be *one* op that transforms, divides and inverse-transforms internally — which it is anyway, since there is nothing useful to do with a spectrum in this pipeline — and never expose one → **this clause was the useful one and it has since been acted on.** The ops survey's G3 row was a request for the complex element type; it has been **refused** on this clause's own argument, and [`crate::ops::convolve::TransformConvolveOp`] is the demonstration — a frequency-domain `BlockOp` with a bounded reach, decomposition-invariant to the bit, whose spectrum never leaves one `apply`. So this row is not an obstacle to a frequency-domain deconvolution and never was |
-// | `reach_spec` returning [`crate::reach::Reach::all`] | **unchanged.** The barrier declared rather than detected, exactly as [`crate::ops::watershed`] declares its own |
-// | a `cost_per_voxel` honest about `log n` | **unchanged, and still the binding problem.** The trait's per-voxel shape cannot express it, so the cost model has to grow a term before the planner can compare a transform against anything. Until it does, an FFT deconvolution would be priced as though it were linear, and `docs/design/BLOCK_OPS.md` is blunt about what a wrong model costs: the search returns the optimum for whatever model it is given |
+// | the **third** axis | **done.** [`crate::ops::fft::RealTransform3`] is a real transform along the last axis and `transform_lanes` along the other two, because a `[d0, d1, w]` row-major buffer *is* a `[d0, d1 * w]` one to a first-axis pass |
+// | a place to put the spectrum | **not needed, and the reason is the useful part.** [`crate::voxels::Voxels`] has eleven element variants and none of them is complex, so a `BlockOp` cannot hand a spectrum to the next op. A frequency-domain form is therefore *one* op that transforms, divides and inverse-transforms internally — which it is anyway, since there is nothing useful to do with a spectrum in this pipeline — and never exposes one. The ops survey's G3 row asked for a complex element type and was **refused** on that argument; [`crate::ops::convolve::TransformConvolveOp`] is the demonstration — a frequency-domain `BlockOp` with a bounded reach, decomposition-invariant to the bit, whose spectrum never leaves one `apply` |
+// | `reach_spec` returning [`crate::reach::Reach::all`] | the barrier declared rather than detected, exactly as [`crate::ops::watershed`] declares its own |
+// | a `cost_per_voxel` honest about `log n` | **the binding problem.** The trait's per-voxel shape cannot express it, so the cost model has to grow a term before the planner can compare a transform against anything. Until it does, an FFT deconvolution would be priced as though it were linear, and `docs/design/BLOCK_OPS.md` is blunt about what a wrong model costs: the search returns the optimum for whatever model it is given |
 // | the padding rule for a *convolution* rather than a correlation | **available.** [`crate::ops::fft::minimal_wrap_free_length`] is stated for a lag window; a linear convolution with a kernel of radius `r` is the same rule with the window `[-r, r]`, which is where a spatial-domain kernel's own reach already lives |
 //
-// So what stops it is no longer the dependency list; it is the cost model and the
-// planning barrier, which is where the argument at the top of this file put it in
-// the first place. Nothing of it is started here, and this table is what a later
-// worker should read before starting.
+// So what stops it is the cost model and the planning barrier, which is where
+// the argument at the top of this file put it. Nothing of it is started here.
 //
 // The iteration
 // -------------

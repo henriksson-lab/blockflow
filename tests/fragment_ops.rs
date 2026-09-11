@@ -13,12 +13,10 @@
 //
 // What each assertion is for
 // --------------------------
-// * **Coverage twice, independently.** Once from the event stream, which is
-//   what a distributed run merges and therefore the only thing available there;
-//   once from what the store actually holds, which is what a merging reader
-//   would see. Two sources agreeing is worth more than either alone, because
-//   the failure being guarded against is a phase that *reports* covering the
-//   lattice.
+// * **Coverage twice, independently.** Once from the event stream, which is all
+//   a distributed run has; once from what the store actually holds, which is
+//   what a merging reader sees. The failure being guarded against is a phase
+//   that *reports* covering the lattice.
 // * **The fetch count, measured against the analytic one.** A reach is a
 //   declaration; the number of fragments fetched is the behaviour. A zero-reach
 //   phase that quietly read its neighbours would still produce the right answer
@@ -225,9 +223,8 @@ fn a_volume_to_fragments_phase_leaves_one_fragment_per_block_and_they_reduce_to_
 /// The measured fetch count against the analytic one, for every reach.
 fn fetch_counts_for(reach: [usize; 3]) -> (usize, usize) {
     // `with_pixels(false)` is the whole of what this phase is: a fragment from
-    // nothing, with no pixel volume behind it. The probe refuses from the
-    // inside if the executor hands it pixels anyway, which is the assertion
-    // this file used to make in a `SeedOp::apply` of its own.
+    // nothing, with no pixel volume behind it. The probe refuses from the inside
+    // if the executor hands it pixels anyway.
     let seed = BlockSummaryOp::new("seed", "seeds", Lifecycle::DeleteOnExit).with_pixels(false);
     let fold = NeighbourFoldOp::new("fold", "seeds", 0, reach, "folded", Lifecycle::DeleteOnExit);
     let plan = fragment_only(VOLUME, BLOCK, Dtype::F64, &[&seed, &fold]).expect("a plan");
@@ -304,10 +301,8 @@ fn a_declared_reach_reads_exactly_the_neighbours_it_should() {
 
 #[test]
 fn a_fragments_only_run_simulates_with_no_data_at_all() {
-    // `with_pixels(false)` is the whole of what this phase is: a fragment from
-    // nothing, with no pixel volume behind it. The probe refuses from the
-    // inside if the executor hands it pixels anyway, which is the assertion
-    // this file used to make in a `SeedOp::apply` of its own.
+    // `with_pixels(false)`: a fragment from nothing, with no pixel volume
+    // behind it. The probe refuses from the inside if it is handed pixels anyway.
     let seed = BlockSummaryOp::new("seed", "seeds", Lifecycle::DeleteOnExit).with_pixels(false);
     let fold = NeighbourFoldOp::new(
         "fold",
@@ -480,19 +475,18 @@ fn what_the_planner_does_with_a_full_reach_op_in_a_chain() {
             .map(|phase| (phase.names.clone(), phase.grid.block(), phase.reach.clone()))
             .collect::<Vec<_>>()
     );
-    // The planner segments here. It did not when this test was written: it
-    // fused all three ops into one phase, dragging the two cheap local ops into
-    // a single-block phase whose working set was the whole volume, and priced
-    // that at redundancy 1.0 — because `price_phase` charged redundancy only on
+    // The planner segments here, and the defect that made it fuse instead is
+    // worth keeping: `price_phase` charged redundancy only on
     // `grid.split_axes()`, and `BlockGrid::new` drops an axis from `split_axes`
-    // when `block == volume`. The model charged nothing for the most expensive
-    // configuration it could pick.
+    // when `block == volume` — so a single-block phase holding the whole volume
+    // priced at redundancy 1.0, and the model charged nothing for the most
+    // expensive configuration it could pick.
     //
-    // Now a full-reach op is a barrier: `Enumerating` refuses to price a
+    // A full-reach op is now a barrier: `Enumerating` refuses to price a
     // partition that fuses across one, and redundancy is charged on split axes
-    // *union* full-reach axes. The same fused plan prices at 55808 against
-    // 31232 for the three-phase one, so structure and cost agree rather than
-    // the cut resting on price alone.
+    // *union* full-reach axes. The fused plan prices at 55808 against 31232 for
+    // the three-phase one, so structure and cost agree rather than the cut
+    // resting on price alone.
     assert!(
         plan.n_phases() >= 2,
         "the chain fused across a full-reach op into {} phase(s)",

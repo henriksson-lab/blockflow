@@ -115,26 +115,26 @@
 // sequence clones its input" would have suggested — the before figures are the
 // same table run with the clone put back.
 //
-// **The two fan-in rows that measure the same are the point of the fourth and
-// the sixth.** A `Parallel` used to hold **one buffer per branch at once**, so
-// its figure grew with the arity and at one block each of those buffers was a
-// whole volume. It now folds as its branches are computed wherever the combine
-// declares itself a left fold over pairs (`Combine::fold_carrier`), and holds
-// three buffers whatever the arity: the partial, the branch just finished, and
-// the buffer their join goes into. Seven arms therefore measure exactly what
+// **That `fan-in, 3 computed arms` and `fan-in, 7 computed arms` measure the
+// same is the point of both rows.** A `Parallel` used to hold **one buffer per
+// branch at once**, so its figure grew with the arity and at one block each of
+// those buffers was a whole volume. It now folds as its branches are computed
+// wherever the combine declares itself a left fold over pairs
+// (`Combine::fold_carrier`), and holds three buffers whatever the arity: the
+// partial, the branch just finished, and the buffer their join goes into. Seven arms therefore measure exactly what
 // three do. The buffers that went away were **computed and then not read** —
 // from the moment a branch finished until the combine ran they were bytes and
 // nothing else — so this is not a trade against locality, and
 // `tests/dead_block_buffers.rs` is the byte-for-byte identity it is only allowed under.
-// Two combines decline the declaration and say why in their own words:
-// `Arithmetic::Subtract` and `Arithmetic::Divide` are not folds, and neither is
-// a difference.
+// Three combines decline the declaration and say why in their own words:
+// `Arithmetic::Subtract` and `Arithmetic::Divide` are not folds, neither is a
+// difference, and a tree walk needs every channel at a voxel at once.
 //
 // **So a lease granted against that figure is not a bound on what the block
 // holds, and this module must not be read as if it were.** Two consequences,
 // both stated here because this is where the promise is made:
 //
-// * the shortfall is **shape-dependent**, `2.00x` to `2.56x` across ordinary
+// * the shortfall is **shape-dependent**, `1.00x` to `2.56x` across ordinary
 //   chains, so it is not a constant a caller can pre-multiply away and have the
 //   planner still rank candidates on comparable numbers;
 // * even a figure corrected for every buffer above would still not be a bound,
@@ -161,9 +161,8 @@
 //
 // **It does not make a lease a promise, and nothing here should be read as if
 // it had.** Two things stay outside any such figure: what an op allocates inside
-// `BlockOp::apply` — `2.00x`, `2.38x` and `4.00x` for a map, a `5^3` open and a
-// `5^3` rank filter on the *same* chain shape and block — and what a `Combine`
-// allocates inside its own. A residency observation is also scoped to the chain
+// `BlockOp::apply` — the three figures above — and what a `Combine` allocates
+// inside its own. A residency observation is also scoped to the chain
 // it was taken on and refuses to answer for another, which is why it cannot
 // simply be substituted for the shape-derived count at plan time without the
 // planner deciding what to do when it has no observation. That decision belongs with
@@ -834,9 +833,9 @@ pub enum FrameworkFigure {
 /// **On a ladder of powers of two that is exactly one rung**, which is how this
 /// was first stated and why. It is **not** the same sentence on
 /// [`crate::decomposition::refined_ladder`], where a rung is `2.37x` or `3.375x`
-/// in volume and `2.1` alone can span two of the finer ones — `3.6` spanned two
-/// of either. The step count was a
-/// proxy that happened to equal the volume ratio while the spacing was octaves;
+/// in volume: `2.1` fits inside one of the finer rungs, but the exact branch's
+/// `4.20` spans two of them — and `3.6` spanned two of either. The step count was
+/// a proxy that happened to equal the volume ratio while the spacing was octaves;
 /// the volume ratio is what survives a change of spacing.
 ///
 /// It is also the **better** bound and not merely the more durable one: the

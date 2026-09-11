@@ -82,7 +82,6 @@ impl Region {
         self.start.len()
     }
 
-    /// Voxels in the region.
     /// The extent as a fixed array, defaulting a missing axis to `1`.
     ///
     /// For callers that need the *shape* rather than the voxel count — a
@@ -97,6 +96,7 @@ impl Region {
         shape
     }
 
+    /// Voxels in the region.
     pub fn voxels(&self) -> usize {
         self.shape.iter().product()
     }

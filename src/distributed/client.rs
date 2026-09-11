@@ -143,8 +143,9 @@ impl Client {
     /// One, not a loop: a first failure is a connect or a write that did not
     /// take, and reopening is bookkeeping. A *second* failure is the
     /// coordinator being gone, which is a real condition the caller has to see
-    /// rather than have retried under it. See the note on [`Client`] for what
-    /// the retry can still duplicate and where that is dealt with.
+    /// rather than have retried under it. A retry can deliver a POST twice —
+    /// the coordinator is where that is dealt with, behind the `TaskState::Done`
+    /// early return that makes a duplicate completion count once.
     fn request(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         match self.attempt(method, path, body) {
             Ok(value) => Ok(value),

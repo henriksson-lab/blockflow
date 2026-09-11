@@ -20,9 +20,7 @@
 // So this module is the seam, and it holds exactly one idea: *how to invoke the
 // bundled renderer*. The renderer itself ships with this crate, in
 // `tools/animate_block_progress.py`, because the crate should own the whole
-// capability. It previously lived in the repository that consumes this one,
-// which pointed the dependency the wrong way — a crate cannot sensibly ask its
-// own consumer for a script.
+// capability.
 //
 // **manim is not a dependency of this crate.** It is not in `Cargo.toml`, it is
 // not checked at build time, and every test in this file passes on a machine
@@ -415,7 +413,6 @@ mod tests {
 
     #[test]
     fn a_missing_renderer_says_where_it_looked() {
-        // Point the environment override at nothing, so the search runs out.
         let request = RenderRequest::new("run.json");
         let missing = PathBuf::from("/nonexistent/renderer.py");
         let error = render(&RenderRequest {

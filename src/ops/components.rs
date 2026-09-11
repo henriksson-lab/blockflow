@@ -2,7 +2,7 @@
 //
 // Original work for this crate.
 //
-// The machinery two **fragment-and-join** ops share, extracted rather than
+// The machinery the **fragment-and-join** ops share, extracted rather than
 // copied.
 //
 // Why there is a second op with this shape at all
@@ -41,17 +41,13 @@
 // the declaration that selects it are shared for the same reason the seam walk
 // is: they are the program, not the question.
 //
-// The last one is here because two of the three ops built on this differ only in
-// that test — `fill` labels the voxels a mask leaves clear, `detect` labels the
+// The flood fill is here because the ops built on it differ only in that test —
+// `fill` labels the voxels a mask leaves clear, `detect` and `label` label the
 // ones it sets — and a second copy of a flood fill is a second place for a
 // traversal to be subtly different. `regional`'s labelling is deliberately *not*
 // expressed through it: what makes two voxels one plateau there is a comparison
 // between them rather than a fact about each, and a pairwise relation does not
 // fit a per-voxel predicate without carrying the seed's value into it.
-//
-// The extraction made `fill` shorter and changed none of its behaviour: its
-// fragment type, its magic, its public functions and its error messages are
-// where they were, and its tests are unchanged.
 //
 // Connectivity is a parameter, and six is the default
 // ---------------------------------------------------
@@ -102,15 +98,20 @@
 // Which ops take the choice, and how many each has
 // -------------------------------------------------
 // An op built on this states its own connectivity in its own header, because
-// what the relation is *about* is the op's. All three that exist take it from a
-// caller and default to [`Connectivity::Faces`], so nothing that predates the
-// parameter moved — and each has exactly one, for a different reason:
+// what the relation is *about* is the op's. Every one of them takes it from a
+// caller and defaults to [`Connectivity::Faces`] — and each has exactly one, for
+// a different reason:
 //
 // | op | what its one connectivity names | why only one |
 // |---|---|---|
 // | `ops::fill` | the **background**'s | the background is the only thing it labels; the foreground's is `detect`'s and the caller pairs them |
 // | `ops::detect` | the **foreground**'s | likewise, from the other side |
+// | `ops::label` | the labelled component's | there is one relation to label, and the flood and the seam walk generate it between them |
 // | `ops::regional` | the plateau's **and** the ascent's | they are provably one relation; two would let a caller state something the definition does not admit |
+//
+// `ops::adjacency` takes a [`Connectivity`] too, without being built on the rest
+// of this module, and it is the one place in the crate whose default is
+// [`Connectivity::FacesEdgesAndCorners`]; its own header says why.
 //
 // The pairing between the first two is worth naming because it is the one thing
 // a caller has to do by hand: the *complementary pair* convention analyses a
@@ -164,8 +165,8 @@ pub const FACE_NEIGHBOURS: [(usize, isize); 6] =
 /// omitted, and it is the same order the offsets table is grouped in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Connectivity {
-    /// The six voxels sharing a face. **The default**, and what every op in this
-    /// crate asks for; conventionally "6-connected".
+    /// The six voxels sharing a face. **The default** everywhere but
+    /// `ops::adjacency`; conventionally "6-connected".
     #[default]
     Faces,
     /// The six faces and the twelve edges: conventionally "18-connected".
@@ -429,9 +430,9 @@ fn label_into(
 /// 1 high, each as `(shape, labels)` in row-major order over the two axes that
 /// are not this face's.
 ///
-/// A type alias rather than a struct on purpose: both ops hold this inside their
-/// own fragment type as a field named `faces`, and a wrapper would have renamed
-/// that field in `fill`'s public API for no gain.
+/// A type alias rather than a struct on purpose: every op here holds this inside
+/// its own fragment type as a field named `faces`, and a wrapper would have
+/// renamed that field in `fill`'s public API for no gain.
 pub type FacePlanes = [([usize; 2], Vec<u32>); 6];
 
 /// Read a block's six face planes off its label volume.
@@ -530,9 +531,9 @@ pub fn bytes_to_words(bytes: &[u8], noun: &str) -> Result<Vec<u32>> {
 /// The magic is not decoration: a fragment is addressed by `(stream, phase,
 /// block)` and nothing in that address says what the bytes mean, so a stream
 /// name reused by two ops would otherwise be decoded as whatever the reader
-/// expected. Two ops in this crate now write six-plane fragments that differ
-/// only in their per-label payload, which is exactly the confusion this refuses.
-/// It is cheaper to refuse.
+/// expected. Four ops in this crate write six-plane fragments that differ only
+/// in their per-label payload, which is exactly the confusion this refuses. It
+/// is cheaper to refuse.
 pub fn read_header(words: &[u32], magic: u32, version: u32, noun: &str) -> Result<u32> {
     if words.len() < 3 {
         return Err(truncated(noun, "is shorter than its own header"));
@@ -637,11 +638,12 @@ const REDUCTION_VERSION: u32 = 1;
 
 /// A merge's whole answer — one flag per label per block — as bytes.
 ///
-/// The shape both fragment-and-join ops in this file's family reduce to:
-/// `merge_faces_with` and `regional::merge_plateaux_with` return exactly this
-/// map, keyed by block index, one `Vec<bool>` in label order. The blob is what
-/// [`FragmentOp::reduce`] hands the phase and what every block then reads its
-/// own row out of with [`decode_block_flags_for`].
+/// The shape the two ops whose merge answers a yes-or-no question per label
+/// reduce to: `merge_faces_with` and `regional::merge_plateaux_with` return
+/// exactly this map, keyed by block index, one `Vec<bool>` in label order.
+/// `detect` and `label` reduce to a per-label quantity instead and carry their
+/// own codec. The blob is what [`FragmentOp::reduce`] hands the phase and what
+/// every block then reads its own row out of with [`decode_block_flags_for`].
 ///
 /// [`FragmentOp::reduce`]: crate::fragment::FragmentOp::reduce
 ///
@@ -664,9 +666,8 @@ const REDUCTION_VERSION: u32 = 1;
 /// plausibly and wrongly, which is the failure `barriers.md` §7.7 says no guard
 /// could catch afterwards. This is the one place it can be caught, so it is.
 ///
-/// Here rather than in an op for this module's own reason: every
-/// fragment-and-join op in the crate merges to exactly this map, so the encoding
-/// is the family's and not any one op's. It landed in `ops::fill` first, on
+/// Here rather than in an op for this module's own reason: the encoding is not
+/// either op's, so it lives with the family. It landed in `ops::fill` first, on
 /// `agree_on_connectivity`'s precedent, and was moved once the family had four
 /// members.
 pub fn encode_block_flags(
@@ -810,7 +811,7 @@ fn linear_index(block: [usize; 3], counts: [usize; 3]) -> Option<usize> {
 ///
 /// Not generic and not a crate-wide utility: it exists to close block-local
 /// labels into global components, its nodes are `(block, label)` pairs flattened
-/// by [`LabelIndex`], and it is `pub` only so that both ops can drive it.
+/// by [`LabelIndex`], and it is `pub` only so that the ops can drive it.
 pub struct Union {
     parent: Vec<usize>,
     size: Vec<usize>,
@@ -1023,7 +1024,7 @@ impl LabelIndex {
 /// [`UNLABELLED`] is skipped and `meet` never sees it: a voxel in no component
 /// takes part in no join.
 ///
-/// What `meet` does is the whole of the difference between the two ops built on
+/// What `meet` does is the whole of the difference between the ops built on
 /// this. `fill` unions unconditionally, because two background labels that touch
 /// across a seam are one background component. `regional` compares first,
 /// because two plateaux that touch are the same plateau only if their values are

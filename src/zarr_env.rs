@@ -7,14 +7,10 @@
 //
 // Why this exists
 // ---------------
-// The three environments this crate shipped with are `ArrayEnvironment` (real
-// values, whole volumes in memory), `AccountingEnvironment` (no values at all,
-// costs only) and the multi-node `SharedVolumes`. Every correctness claim the
-// crate makes was therefore made about arrays that had already been allocated in
-// full — which is exactly the case out-of-core execution exists to avoid. Until
-// something here could read an image off a disk and write the next one back,
-// "out-of-core block processing" was a description of the scheduling, not of the
-// data.
+// The other environments — `ArrayEnvironment` (real values, whole volumes in
+// memory), `AccountingEnvironment` (costs only) and the multi-node
+// `SharedVolumes` — all work on arrays already allocated in full, which is
+// exactly the case out-of-core execution exists to avoid.
 //
 // This is the missing half, and its acceptance criterion is stated as a
 // negative: **the storage layer must be invisible to the answer.** A chain run
@@ -75,12 +71,6 @@
 // is a total order, so a write that touches several chunks cannot deadlock
 // against another that touches an overlapping set.
 //
-// The alternative was to require block writes to be chunk-disjoint. It was
-// rejected because it looked like this layer imposing the storage's grid on the
-// plan's — and then reconsidered, because the dependency runs the other way:
-// see "Chunk-exclusive writing" below. The locks stay regardless, for the
-// reasons stated there.
-//
 // Chunk-exclusive writing, and why it is a mandate now
 // ----------------------------------------------------
 // **Every chunk of an image is written by exactly one task.** That is a
@@ -109,13 +99,9 @@
 //   what keeps it true for callers the planner never saw.
 //
 // [`ZarrEnvironment::serialised_writes`] therefore stops meaning "your blocks
-// straddle chunks" — under the invariant they cannot — and starts meaning "this
-// write read-modify-wrote a chunk", which for a conforming plan happens only
-// where a chunk **overhangs the volume's far edge**: `zarrs` compares a subset
-// against the *unclipped* chunk extent, so the last chunk on an axis whose
-// extent is not a multiple of the chunk's takes the slow path. That is a cost
-// with no hazard behind it — the overhang holds no voxel anybody else can write
-// — and it is zero for a plan whose volume the chunk shape divides.
+// straddle chunks" — under the invariant they cannot — and means only "this
+// write read-modify-wrote a chunk", which for a conforming plan is the chunk
+// that overhangs the volume's far edge and nothing else. See that accessor.
 //
 // **What the guard does not cover**, stated rather than implied: a read
 // concurrent with a write of the same array. Reads take no locks. The contract
@@ -132,38 +118,19 @@
 // `float64` it was thresholded out of sit in the same run and want opposite
 // answers, and a single switch would have to be wrong for one of them.
 //
-// The default is **derived, not configured**. Images already carry their own
-// element type — `Decomposition::dtype_at` — and the element type is the single
+// The default is **derived, not configured**: the element type is the single
 // best predictor of whether deflate will pay, so [`Compression::for_dtype`]
-// reads the plan rather than asking the caller. What that derivation is, and the
-// evidence for it, is on `Compression::for_dtype`. An explicit override is one
-// call away and does not have to fight the default to be heard.
+// reads the plan's `Decomposition::dtype_at` rather than asking the caller. The
+// derivation and the evidence for it are on `Compression::for_dtype`.
 //
-// What compression does to the guard above is the part worth stating, because it
-// changes a trade rather than only a constant:
-//
-// * A **fully covered** chunk is still a blind overwrite and still takes no
-//   lock. What was a `memcpy` into a buffer is now an *encode* — deflate over
-//   the whole chunk — so the fast path got slower in absolute terms.
-// * A **partly covered** chunk was already decode-patch-encode. Under
-//   compression the decode is a *decompress* and the encode is a *recompress*,
-//   both over the whole chunk, and both happen **inside the lock**. The
-//   serialised section is now the dominant cost of such a write rather than a
-//   rounding error on it.
-//
-// So compression does not weaken the guard — it makes it matter more, and it
-// makes the *alignment* advice matter more still. Before, a straddling write
-// paid a decode and a re-encode of bytes it did not change; now it pays a
-// decompress and a recompress of them, under a lock. The counter that reports
-// this is unchanged and means the same thing: [`Self::serialised_writes`] counts
-// writes that took that path, and it is the number a caller who can align their
-// block grid to the chunk grid should be watching. `unaligned_reads` likewise —
-// a partial *read* now pays a decompress of the whole chunk to keep a corner of
-// it.
-//
-// None of that touches the answer. `tests/zarr_env.rs` asserts the same chains
-// through a compressed store, an uncompressed store and `ArrayEnvironment` agree
-// voxel for voxel, which is the only claim compression is allowed to make.
+// Compression does not weaken the guard above — it makes it matter more. A
+// partly covered chunk was already decode-patch-encode; under compression that
+// becomes decompress-patch-recompress over the whole chunk, **inside the lock**,
+// so the serialised section is now the dominant cost of such a write rather than
+// a rounding error on it. [`Self::serialised_writes`] counts those writes and is
+// the number a caller who can align their block grid should watch;
+// `unaligned_reads` likewise, since a partial read now pays a decompress of the
+// whole chunk to keep a corner of it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -215,12 +182,9 @@ type Stored = ZarrArray<Store>;
 /// `float16`, and a `float16` array could be created here quite happily. What
 /// could not happen is a block being read out of it, because Rust has no native
 /// 16-bit float and this crate's dependency list is deliberately short. Creating
-/// an array nothing can read would be worse than saying so.
-///
-/// Refusing by name rather than widening to `float32` is the whole point. A
-/// silent widening writes a file whose element type is not the one the plan
-/// declared, and every consumer downstream — including a reader in another
-/// language — would be right to believe the file.
+/// an array nothing can read would be worse than saying so; widening it to
+/// `float32` would be worse still, because every consumer downstream would be
+/// right to believe the declared element type.
 pub fn zarr_data_type(dtype: Dtype) -> Result<DataType> {
     Ok(match dtype {
         Dtype::Bool => data_type::bool(),
@@ -370,15 +334,13 @@ impl Compression {
     /// region costs nothing whatever the codec. The test above thresholds before
     /// masking precisely so that this does not flatter the numbers above.
     ///
-    /// The float refusal is the one that surprises people, so: it is not that
-    /// floats never compress — a float volume that is mostly one value
-    /// compresses fine, and a caller who has one should say
-    /// `Compression::Gzip(1)` and get it. It is that deflate over a *byte*
-    /// stream cannot see that the interesting bits of an `f64` are in byte 7 and
-    /// the noise is in byte 0. The codec that fixes that is a byte shuffle, and
-    /// the shuffle codec `zarrs` carries is marked experimental and outside Zarr
-    /// v3 core — which is a defensible thing for a caller to opt into and not a
-    /// defensible thing for a library to write into files by default.
+    /// The float refusal is not that floats never compress — a float volume that
+    /// is mostly one value does, and a caller who has one should say
+    /// `Compression::Gzip(1)`. It is that deflate over a *byte* stream cannot
+    /// see that the interesting bits of an `f64` are in byte 7 and the noise is
+    /// in byte 0. The codec that fixes that is a byte shuffle, and the one
+    /// `zarrs` carries is marked experimental and outside Zarr v3 core — fine
+    /// for a caller to opt into, not for a library to write by default.
     ///
     /// `float16` has no case here at all: it is refused before an array exists
     /// (see [`zarr_data_type`]), and this returns [`Compression::None`] for it
@@ -691,13 +653,10 @@ fn default_cache() -> Arc<ChunkCache> {
 /// A [`StoredArray`] as a [`RegionSource`], so that [`CachingSource::attach`]
 /// has something to attach to.
 ///
-/// **This is the adapter `docs/design/cache-and-prefetch.md` §1.2 says is the
-/// only missing piece.** That note settles the placement question — the cache
-/// sits *below* `Voxels`, at the per-array chunk lattice, because a cache keyed
-/// by the extent a caller asked for gives "different keys over the same data"
-/// and a halo re-read is precisely two overlapping boxes — and then observes
-/// that `CachingSource` "does not meet the executor" only because nothing
-/// converts an environment's storage call into a `RegionSource<T>`. This does.
+/// The cache sits *below* `Voxels`, at the per-array chunk lattice, because a
+/// cache keyed by the extent a caller asked for gives different keys over the
+/// same data — a halo re-read is precisely two overlapping boxes.
+/// `docs/design/cache-and-prefetch.md` §1.2 settles that placement.
 struct StoredArraySource<T> {
     array: Arc<StoredArray>,
     element: std::marker::PhantomData<fn() -> T>,
@@ -1239,22 +1198,15 @@ pub struct ZarrEnvironment {
     sidecars: Sidecars,
     /// The read-through chunk cache. `None` only if a caller asked for none.
     ///
-    /// **On by default**, at [`default_cache_bytes`]. It was off, on the
-    /// grounds that "turning it on changes what a read costs and what the
-    /// process holds, and neither is a thing to acquire by upgrading" — a good
-    /// argument for not switching it on silently, and it held for as long as
-    /// nobody had measured what it was worth. `tests/zarr_cache.rs`'s
-    /// `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store` is that
-    /// measurement: on a plan of overlapping halo windows a cache that holds
-    /// the volume reads **3.09x fewer bytes** from the store than one that
-    /// holds a single chunk, and at that capacity it reads every byte exactly
-    /// once.
-    ///
-    /// The other half of the argument is that memory left unused is memory
-    /// wasted: a halo re-read is a read this crate *knows* is coming, and
-    /// declining to hold the bytes for it is choosing to fetch them twice.
-    /// [`Self::without_cache`] is the way out for a caller who wants the old
-    /// behaviour, and it says what it costs.
+    /// **On by default**, at [`default_cache_bytes`], on the measurement in
+    /// `tests/zarr_cache.rs`:
+    /// `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store` shows that on
+    /// a plan of overlapping halo windows a cache holding the volume reads
+    /// **3.09x fewer bytes** from the store than one holding a single chunk,
+    /// and at that capacity reads every byte exactly once. A halo re-read is a
+    /// read this crate *knows* is coming, so declining to hold the bytes for it
+    /// is choosing to fetch them twice. [`Self::without_cache`] is the way out,
+    /// and it says what it costs.
     cache: Option<Arc<ChunkCache>>,
     /// The [`CachingSource`] registered for each cacheable image, type-erased
     /// because its element type is the image's `Dtype` and that is not known
@@ -1417,23 +1369,8 @@ impl ZarrEnvironment {
 
     /// Read through a chunk cache of at most `capacity_bytes`.
     ///
-    /// # What is cached, and why it is not everything
-    ///
-    /// **Only images this run never writes**: image 0 and the supplied inputs.
-    /// Every other image is written by the phase below it and read by the phase
-    /// above, and [`ChunkCache`] has **no per-array invalidation** — only
-    /// [`ChunkCache::clear`], which throws away the source's chunks too. Caching
-    /// a written image would therefore mean either serving stale chunks, or
-    /// clearing the whole cache at every phase boundary and keeping almost
-    /// nothing.
-    ///
-    /// That is a restriction discovered from the API rather than one
-    /// `docs/design/cache-and-prefetch.md` anticipated, and it is stated here
-    /// rather than worked around. **It is also where most of the value is**: a
-    /// halo re-read of the source volume is the repeated read a block plan
-    /// actually makes, and the source is exactly what this does cache. Adding
-    /// per-array invalidation and extending to intermediates is the next step,
-    /// and it is a change to `cache.rs` rather than to this file.
+    /// Every image is cached, intermediates included; see
+    /// [`Environment::write`] for what keeps a written one from going stale.
     ///
     /// # Why this exists on `ZarrEnvironment` and on no other
     ///
@@ -1542,20 +1479,14 @@ impl ZarrEnvironment {
 
     /// Whether `image` may be read through the cache.
     ///
-    /// **Every image, now that [`ChunkCache::invalidate`] exists.** It used to be
-    /// image 0 and the supplied inputs alone — the ones a run never writes —
-    /// because the cache could only be cleared wholesale, so protecting an
-    /// intermediate from a stale chunk meant throwing away the source's chunks
-    /// at every phase boundary.
-    ///
-    /// That excluded where much of the remaining value is: the image phase `N`
-    /// writes is read by phase `N + 1` **with a halo**, so it is re-read exactly
-    /// the way the source is, and `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store`
-    /// measures what that is worth on the source at 3.09x.
-    ///
-    /// What makes it safe is that [`Environment::write`] invalidates what it
-    /// writes — see there, which also says why it does so on *both* sides of the
-    /// write rather than relying on phases being ordered.
+    /// **Every image**, intermediates included: the image phase `N` writes is
+    /// read by phase `N + 1` **with a halo**, so it is re-read exactly the way
+    /// the source is, and
+    /// `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store` measures what
+    /// that is worth on the source at 3.09x. What makes it safe is that
+    /// [`Environment::write`] invalidates what it writes — see there for why it
+    /// does so on *both* sides of the write rather than relying on phase order,
+    /// and [`ChunkCache::invalidate`] for the per-array invalidation this needs.
     fn cacheable(&self, _image: usize) -> bool {
         self.cache.is_some()
     }
@@ -1581,8 +1512,8 @@ impl ZarrEnvironment {
 
     /// The registered [`CachingSource`] for `image`, registering it on first use.
     ///
-    /// Returns `None` where there is no cache or the image is written, which is
-    /// the caller's signal to read directly.
+    /// `None` where there is no cache, which is the caller's signal to read
+    /// directly.
     fn caching_source<T>(
         &self,
         image: usize,
@@ -1952,12 +1883,6 @@ impl ZarrEnvironment {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// One image, or an error saying how many there are.
-    ///
-    /// The guard is taken **once**. Reading an `RwLock` twice in one expression
-    /// — which is what an `ok_or_else` closure that reaches for the length
-    /// again would do — is a recursive read, and `std` is explicit that a
-    /// recursive read may deadlock against a waiting writer.
     /// Whether `image` has been erased from the store.
     pub fn is_discarded(&self, image: usize) -> bool {
         self.discarded
@@ -1966,6 +1891,12 @@ impl ZarrEnvironment {
             .contains(&image)
     }
 
+    /// One image, or an error saying how many there are.
+    ///
+    /// The guard is taken **once**. Reading an `RwLock` twice in one expression
+    /// — which is what an `ok_or_else` closure that reaches for the length
+    /// again would do — is a recursive read, and `std` is explicit that a
+    /// recursive read may deadlock against a waiting writer.
     fn image_array(&self, image: usize) -> Result<Arc<StoredArray>> {
         if let Some(which) = ImageId::from(image).supplied_index() {
             let supplied = self
@@ -2582,9 +2513,8 @@ impl Environment for ZarrEnvironment {
             self.unaligned_reads.fetch_add(1, Ordering::SeqCst);
         }
         // **The one line the cache changes.** `caching_source` answers `None`
-        // for an image this run writes and for a run with no cache at all, and
-        // then this is exactly the read it always was. See
-        // [`Self::with_cache`] for why the written images are excluded.
+        // for a run with no cache at all, and then this is exactly the read it
+        // always was.
         let block = by_dtype!(array.dtype, |Element| {
             match self.caching_source::<Element>(image, &array) {
                 Some(source) => source
@@ -2832,13 +2762,6 @@ impl Environment for ZarrEnvironment {
         self.counters.drop_resident(buf.bytes());
     }
 
-    /// Everything written to `image` is durable.
-    ///
-    /// A `FilesystemStore` write is a completed `write` to a file by the time
-    /// `store_array_subset` returns, so there is nothing here to flush. It is
-    /// still an override point rather than an omission: a store with a write-back
-    /// cache would need one, and a caller must be able to write the barrier
-    /// without knowing which store it has.
     /// Erase the image's arrays from the store.
     ///
     /// **This is where the saving is measured in disk rather than in memory.**
@@ -2878,15 +2801,21 @@ impl Environment for ZarrEnvironment {
         Ok(())
     }
 
+    /// Everything written to `image` is durable.
+    ///
+    /// A `FilesystemStore` write is a completed `write` to a file by the time
+    /// `store_array_subset` returns, so there is nothing here to flush. It is
+    /// still an override point rather than an omission: a store with a write-back
+    /// cache would need one, and a caller must be able to write the barrier
+    /// without knowing which store it has.
     fn finish(&self, _image: usize) -> Result<()> {
         Ok(())
     }
 
     /// Fetch coming reads of `image` ahead, ranked by their position here.
     ///
-    /// **Only for images the cache holds**, which is the same set
-    /// [`Self::with_cache`] describes: those this run never writes. Prefetching
-    /// into an array the cache refuses would read bytes and drop them.
+    /// **Only where there is a cache to fetch into.** Prefetching into an array
+    /// the cache refuses would read bytes and drop them.
     ///
     /// Registration is lazy — a `CachingSource` is created on first read — so
     /// this registers on the way past, through the same `by_dtype!` dispatch

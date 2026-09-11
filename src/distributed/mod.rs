@@ -23,9 +23,9 @@
 //
 // Nodes do not die (decided 2026-08-17)
 // -------------------------------------
-// That last clause is now **narrower than it reads**, by decision rather than
-// by discovery, and the narrowing is worth stating precisely because the two
-// remaining arguments against MPI are untouched by it.
+// That last clause — fault intolerance — is now **narrower than it reads**, by
+// decision rather than by discovery. The other two arguments against MPI, the C
+// dependency and the static rank model, are untouched by it.
 //
 // The deployment this crate is built for is **10-20 cooperating nodes on AWS
 // and SLURM**. At that size a machine going down is not a routine event to be
@@ -72,12 +72,9 @@
 // Output stayed byte-identical, so it was waste and not corruption — but waste
 // is what this decision is optimising against, and no number makes the contract
 // explicit. Removing the deadline removes the contract with it, which is also
-// what frees `ahead` to be chosen for pipelining alone.
-//
-// What is *not* claimed by any of this: that node loss is impossible, or that
-// MPI would now be fine. The other two objections — the C dependency and the
-// static rank model against a greedy adaptive scheduler — stand on their own,
-// and the mechanism here still exists, still runs and is one field away.
+// what frees `ahead` to be chosen for pipelining alone. None of this claims
+// node loss is impossible; the mechanism still exists, still runs and is one
+// field away.
 //
 // The shape
 // ---------
@@ -108,16 +105,13 @@
 //
 // The feature flag, and what it does and does not gate
 // ----------------------------------------------------
-// `distributed` pulls in the HTTP **routing** and the three binaries. It needs
-// no dependency to do it and neither does anything else here: the transport is
-// `crate::http`, this crate's own, compiled with no feature at all, and
-// `Cargo.toml` names no HTTP package for any feature any more. What is behind
-// the flag here is the nine routes and the binaries, not a socket.
-// Everything else — the protocol, the coordinator's
-// whole state machine, the handout policy, the cache model, the rendezvous
-// backends, the client and the worker loop — compiles and is tested with no
-// feature at all. That split is deliberate: the parts that can be wrong in an
-// interesting way are the parts that need no socket to test.
+// `distributed` pulls in the HTTP **routing** and the three binaries, and no
+// dependency: the transport is `crate::http`, this crate's own, compiled with no
+// feature at all, and `Cargo.toml` names no HTTP package for any feature. What
+// is behind the flag is the routes and the binaries, not a socket — everything
+// else here compiles and is tested with no feature at all. That split is
+// deliberate: the parts that can be wrong in an interesting way are the parts
+// that need no socket to test.
 
 pub mod cache_model;
 pub mod client;

@@ -101,8 +101,8 @@ fn go() -> Result<()> {
             "--ahead" => ahead = number(value()?, "--ahead")?,
             "--policy" => {
                 // `select`, which refuses a policy that is built but not
-                // calibrated and says why. The list used to be spelled out here
-                // and would have gone stale the moment one was refused.
+                // calibrated and says why, rather than a list here that would go
+                // stale the moment one was refused.
                 policy = HandoutPolicy::select(&value()?)?;
             }
             "--kill" => {

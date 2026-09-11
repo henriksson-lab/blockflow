@@ -624,17 +624,13 @@ fn the_points_a_run_writes_go_into_a_store_and_come_back_by_region() {
 /// block count. This op's phase 1 reads no pixels at all, because everything it
 /// needs is in the fragments, so the whole run reads each voxel exactly once.
 ///
-/// **Both phases are halo-free now, and the second assertion is inverted rather
-/// than deleted.** It used to read `block.read.voxels() == the whole volume`,
-/// with a comment saying that the whole-volume halo *was* the dependency edge
-/// and cost nothing here because no pixel was fetched through it. That is the
-/// coupling `docs/design/barriers.md` §1.2 is about, and it is gone: phase 1
-/// declares `barrier() == true`, so the edge is stated directly and the halo
-/// drops to the reach. The claim the assertion was making — that this op is
-/// unusual in paying no read amplification — is now true of the *plan* and not
-/// only of the counters, so it is asserted there.
+/// **Both phases are halo-free**, and phase 1's dependency on phase 0 is stated
+/// as `barrier() == true` rather than as a whole-volume halo — the coupling
+/// `docs/design/barriers.md` §1.2 is about. So "this op pays no read
+/// amplification" is a fact about the *plan* and not only about the counters,
+/// and is asserted there.
 ///
-/// It cost this op nothing to lose, which is the other half of the record: a
+/// The barrier cost this op nothing, which is the other half of the record: a
 /// barrier's whole traffic contribution is relieving pixel re-reads, and this op
 /// never paid any. `tests/barrier_migration.rs` measures that as an equality.
 #[test]

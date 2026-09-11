@@ -9,20 +9,13 @@
 // after the loop. So the shape is `S x (read + compute) + write`.
 //
 // `phase_compute_per_voxel`'s own documentation is where this file comes from.
-// It records that the planner priced such a phase at `S == 1`, that the claim
-// "a missing count cannot move the block edge, because a common factor cannot
-// move an argmin" was **measured false**, and why:
-//
-// > the count is not a common factor of the whole price. A substage reads and
-// > computes; the image is written **once**, after the loop. So `S` substages
-// > are `S x (read + compute) + write`, and pricing at `S == 1` over-weights the
-// > write against the rest by a residual that varies with the block edge.
-//
-// It then says what is wanted, and this file is the acceptance for it:
-//
-// > what is wanted is a statement of **which terms of a phase repeat and which
-// > happen once**, which is a fact about `strategy::run_iterative_phase` rather
-// > than about any builder.
+// The planner priced such a phase at `S == 1` on the claim that "a missing count
+// cannot move the block edge, because a common factor cannot move an argmin".
+// That was **measured false**: the count is not a common factor of the whole
+// price, because the write sits outside it, so pricing at `S == 1` over-weights
+// the write by a residual that varies with the block edge. What is wanted is a
+// statement of which terms of a phase repeat and which happen once — a fact
+// about `strategy::run_iterative_phase` rather than about any builder.
 //
 // That statement is `PhaseTraffic::repeats`. What is asserted here is that the
 // split is real arithmetic and not a scale factor: the price is exactly

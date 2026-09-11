@@ -10,29 +10,14 @@
 //
 // What each test is for
 // ---------------------
-// * **Decomposition invariance, byte for byte.** Five cuts of the same point
-//   set, including one block and lattices with partial edge blocks, against the
-//   single-block answer. A tolerance would be meaningless here — these are
-//   integers — so the failure this catches is a rule that consulted the cut.
-// * **A collision across a seam.** Two points in different blocks whose kernels
-//   overlap, arranged so that "the block that owns the voxel decides" and "the
-//   lowest label decides" are *different answers*. This is the fixture that
-//   discriminates; a collision inside one block would pass under either rule.
-// * **The collision rule itself, on one voxel.** Two points at the same
-//   coordinate with different labels, asserted to give the lower one — and
-//   asserted to give it under every blocking. The pair is asymmetric, so "last
-//   wins" and "first in listing order wins" both fail it, and so does a sum.
-// * **The degenerate cases.** No points at all, every point on one voxel, and a
-//   point outside the volume — the last of which is *refused*, which is a
-//   deliberate agreement with `ops::voxelize` rather than with the tools that
-//   drop such a point quietly.
-// * **The cost of the declaration.** No pixel is read: this phase's input is
-//   the fragment stream and nothing else.
-// * **A kernel whose members re-phase.** `StepOrigin::ClippedStart` makes the
-//   stamped window a function of where the point sits relative to the volume's
-//   low faces, which is a rule a block could get wrong in a way no other fixture
-//   here would see — and a negative control beside it, so the sweep is known to
-//   be telling the two origins apart.
+// * **Decomposition invariance, byte for byte**, over five cuts.
+// * **A collision across a seam**, arranged so that "the owning block decides"
+//   and "the lowest label decides" are different answers.
+// * **The collision rule itself, on one voxel**, on an asymmetric pair.
+// * **The degenerate cases**: no points, every point on one voxel, and a point
+//   outside the volume, which is refused.
+// * **The cost of the declaration**: no pixel is read.
+// * **A kernel whose members re-phase**, with a negative control beside it.
 
 use std::collections::BTreeMap;
 
@@ -60,13 +45,11 @@ const STREAM: &str = "points";
 /// A fixed point set out as one fragment per block, keyed by the block whose
 /// **core** contains the point.
 ///
-/// This file used to carry that producer, and so did `tests/voxelize.rs`,
-/// character for character, and so did a consumer of this crate.
-/// `points::PointSourceOp` is now that op. The rule is unchanged and is the
-/// library's: a point on a seam is written once, into the block the seam
-/// starts, and a block with no points writes a zero-length fragment rather than
-/// nothing, so `Coverage::EveryBlock` is honest — "present and empty" is a
-/// different fact from "absent", and only the first can be checked.
+/// The rule is `points::PointSourceOp`'s: a point on a seam is written once,
+/// into the block the seam starts, and a block with no points writes a
+/// zero-length fragment rather than nothing, so `Coverage::EveryBlock` is honest
+/// — "present and empty" is a different fact from "absent", and only the first
+/// can be checked.
 ///
 /// [`UnkeyedSourceOp`] below is deliberately **not** replaced by it: its whole
 /// purpose is to key *wrongly*, which is a thing no library op should be able

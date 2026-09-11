@@ -36,26 +36,23 @@
 // ----------------------------------------------------------------------------
 // `moment_0..2_q{n}` is `sum_i (q(v_i) * x_i[a])` — the **cross moment** of value
 // against position, per axis. It is here because it is the one per-region
-// quantity a consumer cannot derive from the columns beside it: `sum_q{n}` and
-// `sum_0..2` do not determine it, since two regions with the same voxel count,
-// the same total value and the same coordinate totals can hold their value
-// differently over their voxels and have different first moments. A caller
-// wanting it from the other columns would have to re-walk the volume; here it is
-// three more words folded by `+` in an accumulator that already holds both arrays
-// and already visits every voxel once.
+// quantity a consumer cannot derive from the columns beside it: two regions with
+// the same voxel count, the same total value and the same coordinate totals can
+// hold their value differently over their voxels and have different first
+// moments, so a caller wanting it from the other columns would have to re-walk
+// the volume.
 //
 // The **weighted centroid** is its quotient, `moment_a / sum`, and the scale is
 // not in it: both are integers at the same `2^n`, so the `2^n` cancels exactly
 // and the ratio is a pure number. That is why the moment is quantised on the
 // *value* alone and multiplied by the coordinate as the exact integer it already
 // is — the coordinate needs no scale, and giving it one would only narrow the
-// range. `RegionValues::weighted_centroid` is the quotient, taken once, at the
-// end, on two integers that are each already decomposition-invariant.
+// range.
 //
-// **It is taken over the finite voxels**, exactly as `sum` is, because it is a
-// quotient of two of them and a numerator over one voxel set and a denominator
-// over another would not be a centroid of anything. A region's `nonfinite` count
-// is therefore as much a caveat on its weighted centroid as on its sum.
+// **It is taken over the finite voxels**, exactly as `sum` is, because a
+// numerator over one voxel set and a denominator over another would not be a
+// centroid of anything. A region's `nonfinite` count is therefore as much a
+// caveat on its weighted centroid as on its sum.
 //
 // **It is not where the row sits.** The row's position stays the *geometric*
 // centroid, and that is not an omission: block ownership is decided from the
@@ -78,10 +75,8 @@
 // `measure.regionprops` reports both an unweighted moment family and a weighted
 // one, but every field this column set exists to unlock — `orientation`,
 // `axis_major_length`, `axis_minor_length`, `eccentricity`,
-// `inertia_tensor_eigvals` — is defined on the **unweighted** one; the weighted
-// family stops at the moments themselves and `centroid_weighted`, which this op
-// already has. Three further things settled it, and the third is the one that
-// binds:
+// `inertia_tensor_eigvals` — is defined on the **unweighted** one. Two further
+// things settled it, and the second is the one that binds:
 //
 // * **They are a property of the label volume alone.** No value is read into
 //   them, so they are taken over *every* voxel of the region — including the
@@ -89,55 +84,44 @@
 //   moments must exclude. A region every one of whose values is a `NaN` still
 //   has a shape, and reports it. A weighted second moment would inherit the
 //   non-finite caveat and would be absent exactly where a shape is most wanted.
-// * **They carry no fixed-point scale at all**, because there is nothing in them
-//   to quantise: a coordinate is already an integer. So the six columns are
-//   exact integers, like `sum_0..2`, and — this is the load-bearing part — they
-//   **cannot narrow anybody's `n`**. A weighted second moment would be
-//   `sum(q(v) * x_a * x_b)`, whose bound is the sum's own divided by the product
-//   of *two* coordinates rather than one: `|sum(v * x_a * x_b)| < 2^(63-n) /
-//   ((extent[a]-1) * (extent[b]-1))`. At the default twenty bits over a volume a
-//   thousand voxels on a side, that leaves `8.8e6` for the region's *total
-//   value* rather than the `8.8e12` the sum gets — so a million voxels of
-//   magnitude ten out near the far corner are already refused, and they are an
-//   ordinary region. Worse, every caller who *derives* a scale from a bound
-//   rather than picking one gives up a further `log2(max extent)` bits whether
-//   or not it ever reads the column. A consumer deriving a scale for a
-//   32 x 32 x 24 volume by the recipe below goes from **32 fraction bits to 27**
-//   — five bits of resolution spent on six columns it does not read. Six
-//   columns that nothing named derives anything from, costing every caller five
-//   bits of resolution, is the trade `docs/ops-survey` judged "not worth it
-//   before a consumer asked", and no consumer has asked for the weighted one.
-// * A caller who does want them is not silently short-changed: this header says
-//   what they would cost, and the answer is a scale decision rather than a
-//   missing mechanism.
+// * **They carry no fixed-point scale at all**, because a coordinate is already
+//   an integer — so the six columns are exact, and they **cannot narrow
+//   anybody's `n`**. A weighted second moment would be `sum(q(v) * x_a * x_b)`,
+//   whose bound is the sum's own divided by the product of *two* coordinates
+//   rather than one: `|sum(v * x_a * x_b)| < 2^(63-n) / ((extent[a]-1) *
+//   (extent[b]-1))`. At the default twenty bits over a volume a thousand voxels
+//   on a side, that leaves `8.8e6` for the region's *total value* rather than
+//   the `8.8e12` the sum gets — so a million voxels of magnitude ten out near
+//   the far corner are already refused, and they are an ordinary region. Worse,
+//   every caller who *derives* a scale from a bound rather than picking one
+//   gives up a further `log2(max extent)` bits whether or not it ever reads the
+//   column: a consumer deriving a scale for a 32 x 32 x 24 volume by the recipe
+//   below goes from **32 fraction bits to 27**. Five bits of resolution spent on
+//   six columns that nothing named derives anything from is the trade
+//   `docs/ops-survey` judged "not worth it before a consumer asked", and no
+//   consumer has asked for the weighted one.
 //
 // **The origin is the region's own rounded centroid — the row's own position —
-// and not the volume's.** That is the whole of what makes the range liveable,
-// and it is the survey's prescription with one substitution. The survey named
-// the object's bounding-box minimum, on the ground that it is already a column
-// of `ops::detect`, a function of the region alone, and therefore a
-// decomposition-invariant origin. `tabulate` has no bounding box; it has the
-// rounded centroid, which has all three properties — it is already the row's
-// position, it is a function of the merged region alone, and it is an integer,
-// so the re-centred moment is an integer too — and is strictly the better
-// choice, because `sum (x - c)^2` is *minimised* at the centre. Nothing is lost
-// by centring: the moments about the volume origin are
+// and not the volume's.** That is the whole of what makes the range liveable. It
+// has the three properties the origin needs — it is already the row's position,
+// it is a function of the merged region alone, and it is an integer, so the
+// re-centred moment is an integer too — and `sum (x - c)^2` is *minimised* at
+// the centre. Nothing is lost by centring: the moments about the volume origin
+// are
 //
 //     S_ab = M_ab + c_a * P_b + c_b * P_a - N * c_a * c_b
 //
 // from `central`, `sum_0..2`, `count` and the row's position, exactly, in
 // integers — [`RegionShape::second_moments_about_origin`] is that line — so the
-// centred form is the one that is kept for exactly the reason the survey gives
-// for keeping the derivable ones out.
+// centred form is the one that is kept, for the same reason the derivable forms
+// are left out.
 //
 // **A block cannot know the centre, so the fold is about the volume origin and
 // the re-centring happens once, at the end.** [`Tally::second`] accumulates
 // `sum (x_a * x_b)` about the volume origin in `i128` — associative, commutative
 // and exact, so `SeamFold::Unordered` holds for it on the integers' own terms —
 // and [`Tally::central`] subtracts the centre off at the moment the answer
-// becomes a row, on numbers that are already decomposition-invariant. That is
-// the survey's second option ("a block can accumulate about the volume origin in
-// `i128` and the merge can re-centre once, at the end") and it is the one that
+// becomes a row, on numbers that are already decomposition-invariant. Which
 // needs no second pass.
 //
 // The range, worked out rather than discovered
@@ -154,18 +138,9 @@
 // L^3` and `l = L` — that is `L^5 / 4 < 2^63`, or **`L` of exactly 8 192 voxels
 // on a side**, since `8192^5` is `2^65` and `2^65 / 4` is `2^63` — the bound
 // lands on a power of two, which is a coincidence of the constants and a
-// convenient one to quote.
-//
-// About the *volume* origin the same column would hold `sum x_a x_b <= N *
-// (L-1)^2 ~ L^5`, which is `L` of about 6 200 signed — and, since the question
-// is usually asked of `u64`, about **7 100 unsigned by that crude bound** or
-// **8 900 on the exact `L^5 / 3`**. Those two numbers are the ones
-// worth carrying, because the survey's register quotes `L ~ 1800` for this row
-// and `1800^5` is `2^54`, not `2^64`: the figure is right for an accumulator
-// whose exact integers stop at `2^53` — an `f64` — and is about four times too
-// small for the `u64` the row names. The survey's own next clause, "a tenth of
-// the volume the other ten survive", is consistent with 7 100 against 65 536 and
-// not with 1800.
+// convenient one to quote. About the *volume* origin the same column would hold
+// `sum x_a x_b <= N * (L-1)^2 ~ L^5`, which is `L` of about 6 200 signed, or
+// about **7 100 unsigned** — which is what the centring buys.
 //
 // **In the worst case the centring buys only `4^(1/5)`; in every realistic case
 // it buys `4 (L / l)^2`.** A region of `N` voxels whose own extent is `l`,
@@ -174,18 +149,6 @@
 // For a twenty-voxel object in a volume 65 536 on a side that ratio is `4.3e7`.
 // The worst case is the one that binds the *guarantee*; the ratio is the one that
 // says why the column is usable at all.
-//
-// **Which column binds first, on each of the two axes the range has.** On the
-// *scale* axis — the one `FixedPoint` moves along — nothing has changed: the
-// first moment `moment_a_q{n}` is still the column that binds first, at the
-// sum's bound divided by the largest coordinate on its axis, and the second
-// moments have no scale to be narrowed by. On the *geometric* axis, the one that
-// is a fact about the volume rather than about `n`, **the second moment is now
-// the column that binds first**: it fails at a region of 8 192 voxels on a
-// side where the coordinate sums beside it survive to 65 536 and the count
-// survives past any array. Both refusals name themselves — the first moment
-// names its axis, the second moment names its axis pair — so a caller is never
-// sent to the wrong number.
 //
 // What is a column and what a caller derives
 // ------------------------------------------
@@ -200,14 +163,6 @@
 // was added under, read the other way round: it is a column's *quotient* and not
 // a column, and these are a column's *eigen-decomposition* and not columns.
 //
-// **The decode is [`region_shape`] and not a wider [`region_values`]**, and the
-// split is semantic before it is anything else. `RegionValues` is one region's
-// *values* — every field of it is a reading of the value array, over the finite
-// voxels, at a scale. The shape is a reading of the *label volume*, over every
-// voxel, at no scale. They come off the same row and they are two measurements;
-// a caller wanting both takes both, and a caller wanting neither pays for
-// neither.
-//
 // Degeneracy, which is the part that has no numerical answer
 // ----------------------------------------------------------
 // The eigenvalues of a symmetric 3x3 are continuous in its entries and are
@@ -219,8 +174,7 @@
 // from its neighbour by more than [`AXIS_SEPARATION`] times the largest
 // eigenvalue. **A `None`, never a `NaN` and never an arbitrary pick** — the same
 // vocabulary [`Tally::weighted_centroid`] uses for a quotient that does not
-// exist, and for the same reason: the quantity is absent, not zero, and
-// `Table::write` refuses a non-finite `F64` anyway.
+// exist, and `Table::write` refuses a non-finite `F64` anyway.
 //
 // It is a statement about *determinacy*, not about beauty. A cube of voxels has
 // an exactly isotropic scatter matrix and gets three `None`s. A digitised ball
@@ -279,8 +233,7 @@
 // and never compute a new one. In `f64` they are associative, commutative and
 // idempotent already, so a region cut across blocks selects the same bits
 // whatever order the pieces merged in, and `SeamFold::Unordered` holds for them
-// on their own terms rather than on the accumulator's. See "Why the selection
-// carries no scale" below, which is where that argument is finished.
+// on their own terms rather than on the accumulator's.
 //
 // What the fixed point costs, which is a real limit and not a footnote
 // --------------------------------------------------------------------
@@ -302,13 +255,13 @@
 // are `FixedPoint::resolution` and `FixedPoint::limit`, so they can be asserted
 // rather than believed.
 //
-// **The first moment is the column the range binds on first, and by a known
-// factor.** `moment_a` is a sum of `q(v) * x[a]`, so it is the sum's own bound
-// multiplied by the largest coordinate on that axis — `extent[a] - 1`. Its
-// column is the same signed 64-bit word, so the same `+/- 2^(63-n)` applies to
-// it, and a run whose *sum* clears the range by less than that factor will be
-// refused on a moment rather than on the sum. That is stated rather than
-// discovered: the refusal names the moment and says which axis it was.
+// **Which column binds first, on each of the two axes the range has.** On the
+// *scale* axis it is the first moment `moment_a_q{n}`, at the sum's bound
+// divided by the largest coordinate on its axis, so a run whose *sum* clears the
+// range by less than that factor is refused on a moment rather than on the sum.
+// On the *geometric* axis it is the second moment, at 8 192 voxels a side, and
+// no scale can move it. Both refusals name themselves — the first its axis, the
+// second its axis pair — so a caller is never sent to the wrong number.
 //
 // A caller with no scale in mind can **derive** one rather than pick one: a
 // region holds at most every voxel of the volume, each finite value is at most
@@ -324,49 +277,30 @@
 // arithmetic bound on the answer rather than a measurement of it — which is what
 // makes it a derivation and not a value chosen because it happened to pass.
 //
-// At the default of twenty bits the moment's `+/- 8.8e12` covers, for instance, a
-// region of a million voxels whose values are of magnitude up to 4096 on an axis
-// a thousand voxels long only just — `4.1e12` — so a caller with regions and
-// extents of that size is one of the callers the parameter exists for, and trades
-// bits down. A caller with values of order one on an extent of a few hundred has
-// four orders of magnitude of headroom and need not think about it.
+// At twenty bits the moment's `+/- 8.8e12` covers a region of a million voxels of
+// magnitude up to 4096 on an axis a thousand voxels long only just — `4.1e12` —
+// so a caller with regions and extents of that size trades bits down, and one
+// with values of order one on an extent of a few hundred need not think about it.
 //
 // The scale is not carried in the blob as data — it is carried in the **column
 // names**, `sum_q20` and `moment_0..2_q20`. That is deliberate: two tabulations
 // at different scales are not the same schema, and `Table::write` checks the
 // schema in the blob against its own, so mixing them is refused rather than
-// silently averaged. The moment carries the suffix for the same reason the sum
-// does and not by analogy with it: a moment at four bits and a moment at twenty
-// are different integers standing for the same quantity.
+// silently averaged.
 //
 // Why the selection carries no scale
 // ----------------------------------
 // `min` and `max` are `F64` columns named `min` and `max`, with no suffix,
-// because **there is no scale in them to name**. The whole of the paragraph
-// above is an argument about an *addition*: `f64` `+` does not associate, so a
-// total taken across a seam depends on the cut, and the fixed point is what buys
-// the association back. None of it carries to a selection.
+// because **there is no scale in them to name**. Everything above about the
+// fixed point is an argument about an *addition*, and none of it carries to a
+// selection. Quantising one instead would report `round(v * 2^n) / 2^n` where
+// the question asked for the voxel's own value, and would leave `n` pulled
+// between the range and exact representability at once.
 //
-// A selection returns one of the values it was given. Under a total order it is
-// associative, commutative and idempotent in `f64` itself, so folding the same
-// set of partials in any order picks out the same voxel and therefore the same
-// bits — which is exactly what `SeamFold::Unordered` claims and exactly what the
-// executor's reversal check compares. The order used is [`f64::total_cmp`]
-// rather than [`f64::min`]: the two differ only on values that compare equal
-// without being the same bits — `-0.0` against `0.0` — and there `f64::min` may
-// return either operand, which is an order dependence in the one place this op
-// cannot have one.
-//
-// What quantising a selection cost, before this: the column came back as
-// `round(v * 2^n) / 2^n` where the question asked for *the voxel's own value*.
-// A caller wanting byte identity with a value it can see in the array therefore
-// needed an `n` at which every extremal value happened to be exactly
-// representable, while still needing an `n` small enough that no total left the
-// range — two requirements pulling opposite ways, leaving a window a couple of
-// bits wide that closes as soon as a region is wider or a volume brighter. That
-// is a scale chosen because it passed, which is not a scale. Now there is
-// nothing to choose: the sum has a scale because an addition needs one, and the
-// selection has none because a selection does not.
+// The order used is [`f64::total_cmp`] rather than [`f64::min`]: the two differ
+// only on values that compare equal without being the same bits — `-0.0` against
+// `0.0` — and there `f64::min` may return either operand, which is an order
+// dependence in the one place this op cannot have one.
 //
 // Negatives, `NaN` and infinities
 // -------------------------------
@@ -400,10 +334,9 @@
 //   and *reported*: a row with `nonfinite == count` has no finite value at all —
 //   its `sum` is the fixed-point zero, its `min` and `max` are `0.0`, and the
 //   count is what says why — and a row with `0 < nonfinite < count` is a partial
-//   measurement and says so. A `max` that came back `inf` because one voxel was
-//   broken is the failure this rule exists to prevent, and it is the reason the
-//   selection is filtered rather than merely ordered: `total_cmp` would happily
-//   rank an infinity above every real value.
+//   measurement and says so. It is also why the selection is filtered rather
+//   than merely ordered: `total_cmp` would happily rank an infinity above every
+//   real value.
 // * A **finite** value too large for the fixed point is a different thing from a
 //   non-finite one and is treated differently: it is a real overflow, so it is
 //   refused by name. The selection would have carried it — an `f64` column has
@@ -420,9 +353,6 @@
 //   that is that voxel, `min` and `max` that are that voxel's value **bit for
 //   bit**, and a `sum` that is its quantisation — which is the same number only
 //   when the value was on the fixed point's lattice to begin with.
-// * **A region spanning every block** is the ordinary case, not a special one:
-//   the merge reaches the whole lattice, so a region touching every block is
-//   folded from every block's partial exactly as one touching two is.
 // * **Label `0`** is background and is never a row. A negative, fractional or
 //   non-finite label is refused by name — a label volume's convention has no
 //   negative half, and rounding a fraction would invent a region.
@@ -432,36 +362,19 @@
 //   still written* — `sum(v*x)` is defined whatever `sum(v)` is — and it is only
 //   the quotient that does not exist, so the absence is reported where the
 //   quotient is: [`RegionValues::weighted_centroid`] is an `Option` and is `None`
-//   exactly when `sum_fixed == 0`.
-//
-//   Three things it deliberately is not. Not a `NaN`: `Table::write` refuses a
-//   non-finite `F64` column, and a `NaN` a caller has to test for is a value that
-//   propagates silently through everything that does not. Not the unweighted
-//   centroid: that is a different measurement, and substituting it would make a
-//   region with no weight indistinguishable from one whose weight happened to be
-//   uniform. And not [`super::local::EmptyPopulation`], which was the obvious
-//   vocabulary to reach for and does not fit — its two answers are "ask the
-//   statistic", which here is the `0/0` that has no answer, and "take the sample
-//   centre's own value", which needs a centre voxel that a region does not have.
-//   `Option` is the vocabulary that fits, and it is the one [`Tally::centroid`]
-//   and [`Tally::min`] already use for a quantity that is absent rather than
-//   zero.
+//   exactly when `sum_fixed == 0`. Not [`super::local::EmptyPopulation`], which
+//   was the obvious vocabulary to reach for and does not fit — its two answers
+//   are "ask the statistic", which here is the `0/0` that has no answer, and
+//   "take the sample centre's own value", which needs a centre voxel that a
+//   region does not have.
 //
 // The shape, and why it is two phases
 // -----------------------------------
-// [`TabulateValuesOp`] is `(volume, volume) -> fragments`: it reads **both**
-// arrays as declared source images and emits one partial per block, over that
-// block's core only, so every voxel is counted exactly once whatever halo the
-// plan granted. It declares `SeamFold::PerBlock`, which is true of it: a partial
-// is a function of its own block.
-//
-// [`MergeTabulationOp`] is `fragments -> fragments` over the whole lattice. Every
-// block folds every partial, so every block holds the whole answer; each then
-// emits only the rows **it owns** — the block whose core holds the region's
-// centroid — so the union over the lattice is the table exactly once, with
-// nothing lost and nothing duplicated. That is `ops::detect`'s ownership rule and
-// it is reused rather than restated: the centroid is a function of the merged
-// region, the cores tile the volume, so exactly one block owns each row.
+// [`TabulateValuesOp`] is `(volume, volume) -> fragments`, one partial per block
+// over that block's core only. [`MergeTabulationOp`] is `fragments ->
+// fragments` over the whole lattice: every block folds every partial and then
+// emits only the rows **it owns**, which is `ops::detect`'s ownership rule. See
+// the two types for why each is exact.
 //
 // Neither phase reads the image it is handed. `reads_pixels()` is `false` on
 // both, so a run of this pair moves exactly two arrays and the read counters name
@@ -693,11 +606,9 @@ pub const PAIRS: [[usize; 2]; 6] = [[0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [2, 
 /// Names of the six second-moment columns, in [`PAIRS`] order: `central_00`,
 /// `central_01`, `central_02`, `central_11`, `central_12`, `central_22`.
 ///
-/// **Whole names rather than stems, and that is the point of them.** `sum` and
-/// `moment_0..2` carry [`FixedPoint::suffix`] because they are accumulations of
-/// a *value* and an accumulation of a value needs a scale. A second moment
-/// accumulates coordinates, which are already integers, so there is no scale in
-/// it to name — exactly [`MIN`]'s argument, arrived at from the other end.
+/// **Whole names rather than stems**: a second moment accumulates coordinates,
+/// which are already integers, so there is no scale in it to name — exactly
+/// [`MIN`]'s argument, arrived at from the other end.
 pub const CENTRAL: [&str; 6] = [
     "central_00",
     "central_01",
@@ -715,34 +626,24 @@ pub const ROW_WORDS: usize = POSITION_WORDS + COLUMNS;
 
 /// The schema this op writes, at `fixed`.
 ///
-/// **Sixteen `U64` columns and two `F64` ones, and the split is the whole of
-/// what this op decided.** The entry condition `ops::detect::measurement_schema`
-/// states — that a column here is a merged accumulator, and an `F64` column
-/// merged across a seam is not the same number as the whole fold — is an
-/// argument about an *accumulation*, and it is right about every accumulation
-/// here: the counts, the coordinate sums, `sum_q{n}` and `moment_0..2_q{n}` are
-/// `U64` for exactly that reason, and the four signed ones are offset-binary
-/// fixed point on top of it, see [`FixedPoint::to_column`].
+/// **Sixteen `U64` columns and two `F64` ones.** The entry condition
+/// `ops::detect::measurement_schema` states — that a column here is a merged
+/// accumulator, and an `F64` column merged across a seam is not the same number
+/// as the whole fold — is right about every accumulation here: the counts, the
+/// coordinate sums, `sum_q{n}` and `moment_0..2_q{n}` are `U64` for exactly that
+/// reason, and the four signed ones are offset-binary fixed point on top of it,
+/// see [`FixedPoint::to_column`]. `min` and `max` accumulate nothing, so they
+/// stay `F64`; the module header carries that argument in full.
 ///
-/// `min` and `max` accumulate nothing. They select one of the values they were
-/// handed, which is associative, commutative and idempotent in `f64` under a
-/// total order, so a partial merged across a seam **is** the whole fold, bit for
-/// bit. Making them `U64` would have bought nothing and cost the answer: the
-/// column would report `round(v * 2^n) / 2^n` where the question was which value
-/// a voxel held. The module header carries the argument in full.
+/// The scale is in the four accumulated-value names, so a blob written at one
+/// scale cannot be written into a table built at another: `Table::write`
+/// compares the blob's schema against its own and refuses. The two selection
+/// columns and the three coordinate sums are the same at every scale, because
+/// they have none.
 ///
-/// The scale is in the four accumulated-value names — `sum_q{n}` and
-/// `moment_0..2_q{n}` — so a blob written at one scale cannot be written into a
-/// table built at another: `Table::write` compares the blob's schema against its
-/// own and refuses. The two selection columns and the three coordinate sums are
-/// the same at every scale, because they have none: a selection is a value that
-/// was never scaled and a coordinate is an integer that never needed to be.
-///
-/// **The moments are appended rather than placed beside the sum**, so that every
-/// column that existed before this one keeps the index it had. A consumer reading
-/// by index is reading the same column, and a consumer reading by name was never
-/// affected either way. The six [`CENTRAL`] columns are appended on the same
-/// terms and for the same reason, behind the three first moments.
+/// **New columns are appended**, so every column that existed before keeps the
+/// index it had — the three first moments behind the coordinate sums, the six
+/// [`CENTRAL`] columns behind those.
 pub fn tabulation_schema(fixed: FixedPoint) -> Schema {
     let suffix = fixed.suffix();
     let columns = vec![
@@ -819,9 +720,7 @@ pub struct Tally {
     /// region's centre is — the region reaches blocks this one will never see —
     /// so the accumulation is about the one origin every block already agrees
     /// on, and the centring happens once, in [`Self::central`], at the moment
-    /// the answer becomes a row. `i128` for the same reason [`Self::sum`] is:
-    /// the fold has no range limit of its own, and the one stated limit belongs
-    /// at the boundary where the answer becomes a column.
+    /// the answer becomes a row. `i128` for the same reason [`Self::sum`] is.
     ///
     /// **Over every voxel of the label, not only the finite-valued ones.** No
     /// value is read into it: a coordinate is a coordinate whatever the value
@@ -866,10 +765,9 @@ impl Eq for Tally {}
 /// the same bits — `-0.0` and `0.0` — where `f64::min` may return either one.
 /// That is an order dependence, and an order dependence in the seam combine is
 /// the thing [`crate::fragment::SeamFold::Unordered`] exists to forbid.
-/// `total_cmp` is a total order on the bit patterns, so a tie is only ever
-/// between identical bits and the answer is the same whichever way round the two
-/// arrive — which makes this a genuine semilattice: associative, commutative and
-/// idempotent, in `f64`, with no accumulator underneath it.
+/// `total_cmp` is a total order on the bit patterns, so this is a genuine
+/// semilattice: associative, commutative and idempotent, in `f64`, with no
+/// accumulator underneath it.
 fn least(a: f64, b: f64) -> f64 {
     if b.total_cmp(&a).is_lt() {
         b
@@ -1047,13 +945,9 @@ impl Tally {
     /// `moment[a] / sum` per axis — the **weighted centroid** — or `None` when
     /// the finite values totalled exactly zero and the quotient does not exist.
     ///
-    /// `None` rather than a `NaN` and rather than [`Self::centroid`]. A `NaN`
-    /// propagates silently through everything that does not test for it, and
-    /// `Table::write` will not carry one in an `F64` column anyway; the
-    /// unweighted centroid is a *different measurement*, and substituting it
-    /// would make a region with no weight indistinguishable from one whose
-    /// weight was uniform. `None` is the same vocabulary [`Self::min`] uses for
-    /// the region that held no finite value at all, and for the same reason: the
+    /// `None` rather than a `NaN` and rather than [`Self::centroid`]; see the
+    /// module header. It is the same vocabulary [`Self::min`] uses for the
+    /// region that held no finite value at all, and for the same reason: the
     /// quantity is absent, not zero.
     ///
     /// **The scale is not in this.** Numerator and denominator are integers at
@@ -1094,14 +988,9 @@ impl Tally {
     /// a voxel of it, is already the row's position, and keeps the whole thing
     /// in the integers.
     ///
-    /// The half-voxel is not swept under anything. It costs `N * (m_a - c_a)(m_b
-    /// - c_b)` on each component — at most `N / 4`, which is 17% of a
-    /// four-voxel-wide region's own moment and would be a visible false
-    /// anisotropy on a cube — and it is **removed exactly** where the moment
-    /// becomes a measurement: `RegionShape::covariance` subtracts it, from
-    /// `position` and `count`, both of which are columns. So the integer stored
-    ///   is about the rounded centre, the covariance read off it is about the
-    ///   exact mean, and the two differ by a quantity the row determines.
+    /// The half-voxel is not swept under anything: it is **removed exactly**
+    /// where the moment becomes a measurement, by `RegionShape::covariance`,
+    /// from `position` and `count`, both of which are columns.
     ///
     /// Checked throughout, on this module's rule that a wrapped total is a
     /// plausible number and therefore the expensive kind of wrong.
@@ -1196,10 +1085,8 @@ impl Tally {
         words[POSITION_WORDS + 5] = self.max.unwrap_or(0.0).to_bits();
         for axis in 0..3 {
             words[POSITION_WORDS + 6 + axis] = self.position[axis];
-            // The moment narrows to a column here and nowhere earlier, exactly as
-            // the sum does: the fold has no range limit of its own, so a run
-            // whose merged moment fits reports it even where a partial ordering
-            // of the products would not have. The refusal names the axis.
+            // The moment narrows to a column here and nowhere earlier, exactly
+            // as the sum does. The refusal names the axis.
             words[POSITION_WORDS + 9 + axis] =
                 fixed.to_column(self.moment[axis]).map_err(|failed| {
                     Error::invalid(format!(
@@ -1209,11 +1096,9 @@ impl Tally {
                     ))
                 })?;
         }
-        // The second moments narrow here and nowhere earlier, exactly as the sum
-        // and the first moments do — and here the narrowing is also the
+        // The second moments narrow here too, and here the narrowing is also the
         // *centring*, because the fold's form is about the volume origin and the
-        // column's is about the region's own centre. The refusal names the axis
-        // pair; see [`central_column`].
+        // column's is about the region's own centre. See [`central_column`].
         for (index, (value, pair)) in central.into_iter().zip(PAIRS).enumerate() {
             words[POSITION_WORDS + 12 + index] = central_column(value, pair)?;
         }
@@ -1248,9 +1133,7 @@ fn central_column(value: i128, pair: [usize; 2]) -> Result<u64> {
 /// `value + 2^63`.
 ///
 /// [`FixedPoint::to_column`]'s arithmetic without its scale, and offset binary
-/// for [`FixedPoint::to_column`]'s reason: `crate::table` compares a `U64`
-/// column's bits as they stand, and under two's complement every negative
-/// second moment would sort above every positive one.
+/// for its reason.
 pub fn signed_column(value: i128) -> Result<u64> {
     let low = -(1i128 << 63);
     let high = 1i128 << 63;
@@ -1293,10 +1176,6 @@ fn overflowed(what: &str) -> Error {
 /// be large in one block and cancel in the merge. The selections are one word
 /// because they are already the type they end in: nothing widens an `f64` that is
 /// only ever compared.
-///
-/// The moments are appended rather than placed beside the sum, so the entry's
-/// leading words are the ones they always were, and the second moments are
-/// appended behind them on the same terms.
 ///
 /// **The second moments travel in the fold's form — about the volume origin —
 /// and not the column's.** A partial cannot be centred: the block that wrote it
@@ -1478,11 +1357,9 @@ impl TabulateValuesOp {
     /// **supplied** array — `ImageId::supplied(i)`, an array the caller handed in
     /// beside image 0 — is produced by no phase, so no fold of the plan can say
     /// what is in it and the reading op's declaration is the only statement there
-    /// is. Without one, `fragment_phase` refuses the plan by name. So before this
-    /// existed, the crate's own per-object measurement **could not be pointed at a
-    /// label volume that was not an image of its own plan**, which is the
-    /// commonest arrangement there is: a labelling produced by an earlier run, or
-    /// by an earlier `execute_phases` call over the same arrays.
+    /// is. Without one, `fragment_phase` refuses the plan by name — which rules
+    /// out the commonest arrangement there is, a labelling produced by an earlier
+    /// run or by an earlier `execute_phases` call over the same arrays.
     ///
     /// A builder rather than two more arguments on [`Self::new`], for the reason
     /// `ops::fill::append_connected` gives about its own pair: no existing call
@@ -1619,12 +1496,10 @@ impl FragmentOp for TabulateValuesOp {
 
     /// **Zero, and it is the declaration that makes the core filter exact.**
     /// Both operands are [`SourceInput::voxelwise`], so `fragment_phase` grants
-    /// no halo and the block's read extent is its core; [`Self::tally_block`]
-    /// then visits only the core, so every voxel is counted exactly once
-    /// however wide a halo a plan from elsewhere might have granted. Nothing
-    /// crosses a block boundary in this phase — a region split across blocks
-    /// crosses as a *partial*, one phase later, through the stream
-    /// [`MergeTabulationOp`] gathers in **blocks**.
+    /// no halo and the block's read extent is its core. Nothing crosses a block
+    /// boundary in this phase — a region split across blocks crosses as a
+    /// *partial*, one phase later, through the stream [`MergeTabulationOp`]
+    /// gathers in **blocks**.
     fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
         0
     }
@@ -1677,15 +1552,12 @@ impl FragmentOp for TabulateValuesOp {
 /// streamed one at a time rather than all made resident: the reads are the same
 /// and the residency is one fragment plus the accumulator.
 ///
-/// [`crate::fragment::SeamFold::Unordered`], and it is the honest claim rather
-/// than the convenient one — every combine in [`Tally::merge`] is integer `+`,
-/// or a selection under a total order in `f64`, which is a semilattice and
-/// therefore order-independent on its own account rather than on the integers'.
-/// The executor checks it by applying each block a second time with the
-/// neighbourhood reversed and requiring byte-identical output; an `f64`
-/// *accumulator* would fail that on the first block with three partials, which
-/// is the hazard the variant exists to catch and which is why the sum is the one
-/// column that is quantised.
+/// [`crate::fragment::SeamFold::Unordered`]: every combine in [`Tally::merge`]
+/// is integer `+`, or a selection under a total order in `f64`. The executor
+/// checks it by applying each block a second time with the neighbourhood
+/// reversed and requiring byte-identical output; an `f64` *accumulator* would
+/// fail that on the first block with three partials, which is why the sum is
+/// quantised.
 ///
 /// **Each block emits only the rows it owns** — the block whose core holds the
 /// region's centroid — which is `ops::detect`'s ownership rule and is exact for
@@ -1986,10 +1858,7 @@ pub struct RegionValues {
     ///
     /// Over the finite voxels, so a region with a non-zero `nonfinite` has a
     /// weighted centroid of the voxels that had a value. And not necessarily
-    /// inside the region: with values of both signs the denominator can be small
-    /// where the numerator is not, and the ratio is then outside the bounding box
-    /// or outside the volume. That is what `sum(v*x)/sum(v)` is, and this op
-    /// reports it rather than constraining it.
+    /// inside the region: see the module header on signed values.
     pub weighted_centroid: Option<[f64; 3]>,
 }
 
@@ -2938,7 +2807,6 @@ mod tests {
             shape.principal_axes().expect("a region").axis,
             [None, None, None]
         );
-        // the inertia tensor is the covariance read the other way
         // The inertia tensor is `trace(C) I - C`, so an isotropic covariance of
         // `1.25` gives `3 * 1.25 - 1.25` on each diagonal and nothing off it.
         let inertia = shape.inertia_tensor().expect("a region with voxels");
@@ -3375,10 +3243,8 @@ mod tests {
             ("moment_0_q20", ColumnType::U64),
             ("moment_1_q20", ColumnType::U64),
             ("moment_2_q20", ColumnType::U64),
-            // The six second moments, appended behind the first ones, and
-            // **without a scale in their names** — there is none in them, for
-            // `min`'s reason arrived at from the other end: a coordinate is
-            // already an integer.
+            // The six second moments, appended behind the first ones, without a
+            // scale in their names — there is none in them to name.
             ("central_00", ColumnType::U64),
             ("central_01", ColumnType::U64),
             ("central_02", ColumnType::U64),

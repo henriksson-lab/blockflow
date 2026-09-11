@@ -34,9 +34,7 @@
 // more than once.
 //
 // A second chain with no whole-volume step in it is used for the plan-change
-// sweep, because a barrier phase's block is the whole volume and a ladder has
-// nothing to choose there. Which chain answers which question is stated at each
-// test.
+// sweep. Which chain answers which question is stated at each test.
 //
 // How it is measured, and what that is worth
 // ------------------------------------------
@@ -65,9 +63,7 @@ use blockflow::voxels::Voxels;
 ///
 /// `full` makes it a **planning barrier**: a full-reach slot must be alone in
 /// its phase, so a chain with `n` of them plans into at least `n` phases
-/// whatever the cost model prefers. That is how a four-phase plan is arranged
-/// here rather than hoped for — the pipeline's binarize chain gets its phases
-/// the same way, from arms that reduce over everything.
+/// whatever the cost model prefers.
 struct Slot {
     name: &'static str,
     reach: usize,

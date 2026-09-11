@@ -713,18 +713,18 @@ fn the_walks_own_figure_matches_the_allocator_except_for_what_it_says_it_omits()
     let unit = buffer_bytes() as f64;
     let one = ImageId::from(7usize);
     let two = ImageId::from(8usize);
-    // **The two things the walk cannot see, named and computed.** Both are
-    // allocated inside a callee — the same rule that puts an op's scratch out of
-    // scope — so the walk is right not to count them, and this test is what says
-    // how much they are rather than leaving a window for them to hide in.
+    // **The one thing the walk cannot see, computed rather than measured.** It
+    // is allocated inside a callee — the same rule that puts an op's scratch out
+    // of scope — so the walk is right not to count it, and this test is what
+    // says how much it is rather than leaving a window for it to hide in.
     //
-    // `region`: `Chain::Source` finishes with `Voxels::assign`, which builds a
-    // `Region::whole` — two three-element `Vec<usize>`. Only one is ever live,
+    // The `Region`: `Chain::Source` finishes with `Voxels::assign`, which builds
+    // a `Region::whole` — two three-element `Vec<usize>`. Only one is ever live,
     // because each `assign` frees its own before the next arm runs. **No row
     // carries it any more**: the arms that used to assign now borrow, and the
     // one place a source leaf still copies is when it writes a caller's `out`,
-    // which no row here is. It is left named because the term is real and a
-    // future row may meet it again.
+    // which no row here is. The expression is kept because the term is real and
+    // a future row may meet it again.
     let _ = 2 * 3 * std::mem::size_of::<usize>();
 
     let cases: Vec<(&str, Chain, Vec<ImageId>, usize)> = vec![
@@ -1293,12 +1293,12 @@ fn a_margin_never_moves_the_admitted_block_by_more_than_eight_times_in_volume() 
 /// `ops::classify::ForestPredictor` answers `None` and its fan-in must hold one
 /// buffer per arm.
 ///
-/// The budget cannot see any of this: `working_set_bytes_per_block` is
+/// The budget could not see any of this: `working_set_bytes_per_block` was
 /// `resident_voxels x bytes_per_voxel x 2.0` for every phase reading one image,
-/// so a 2-arm fan-in and a 91-arm one are charged **identically**. The
-/// `budget.rs` table records the gap at `1.00x` to `3.56x` over the shapes it
-/// has measured; this is the same gap at an arity two orders of magnitude past
-/// any of them.
+/// so a 2-arm fan-in and a 91-arm one were charged **identically** — the gap
+/// `budget.rs` records at `1.00x` to `3.56x` over the shapes it had measured,
+/// here at an arity two orders of magnitude past any of them. It now charges one
+/// buffer per arm, which is the second thing asserted below.
 ///
 /// # What is asserted, and why it is a slope rather than a row at 91
 ///
@@ -1637,8 +1637,9 @@ fn print_what_an_honest_figure_admits_for_a_ninety_one_arm_stack() {
                     &CostModel::default(),
                     PhaseTraffic::one_in_one_out(),
                 );
-                // `working_set_bytes_per_block` is the `x 2.0` form, so the
-                // honest demand is that scaled by `buffers / 2`.
+                // Priced at `one_in_one_out`, so `working_set_bytes_per_block`
+                // is exactly the two buffers `charged` names; the honest demand
+                // is that scaled by `buffers / 2`.
                 Some(cost.working_set_bytes_per_block * concurrency as f64 * factor / charged)
             };
             let admits = |factor: f64| {

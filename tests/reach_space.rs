@@ -233,9 +233,9 @@ fn a_dependency_declared_on_the_wrong_side_tiles_and_lies() {
 /// symmetric one it was written against.
 ///
 /// Each case grants less than the phase's reach in a different shape: one side
-/// of an asymmetric halo, one block of a per-block halo, and a whole-axis reach
-/// against a bounded halo. `with_forced_halo` is the provocation, which is what
-/// it exists for.
+/// of an asymmetric halo, one block of a per-block halo, and no halo at all —
+/// then, below them, a whole-axis reach granted a bounded halo.
+/// `with_forced_halo` is the provocation, which is what it exists for.
 #[test]
 fn the_halo_guard_fires_on_every_new_form_of_short_halo() {
     let workflow = workflow(2);

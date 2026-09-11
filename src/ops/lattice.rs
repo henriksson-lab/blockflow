@@ -98,21 +98,16 @@
 // apply the other's, which is the same reason the alignment sits on the
 // interpolation half alone.
 //
-// A caller holding the fused form's pair hands the same value to both halves
-// through `narrowing_of`, and the two paths then compute the same numbers. That
-// is one mechanism serving both forms rather than two that have to agree — the
-// arrangement this module already keeps for `Alignment`.
-//
 // The narrowing changes no geometry at either half: not the reach, not the fetch
 // regions, not the output volumes. Rounding a value in hand is not reading a
 // different one.
 //
-// One check moves with it. Taking the write extent from the plan makes the
-// executor's "declared shape against derived read extent" comparison compare the
-// plan with itself, so the op owes a check of its own: every voxel it writes
-// must bracket between samples the buffer actually holds, refused by name rather
-// than clamped to the buffer's edge. That is a check against data instead of
-// against a declaration, which is the stronger of the two.
+// One check moves with the placement. Taking the write extent from the plan
+// makes the executor's "declared shape against derived read extent" comparison
+// compare the plan with itself, so the op owes a check of its own: every voxel
+// it writes must bracket between samples the buffer holds, refused by name
+// rather than clamped to the buffer's edge. That is a check against data instead
+// of against a declaration, which is the stronger of the two.
 
 use ndarray::{ArrayView3, ArrayViewMut3};
 
@@ -350,8 +345,9 @@ impl LatticeStatisticOp {
     /// refusal names what would lift it: two blocks handed identical buffers at
     /// identical offsets cannot be told apart by an `Anchor`, which carries
     /// where a buffer was *read* from and not which outputs it owns. `Placement`
-    /// is the type that carries both; until the executor passes one, a plan that
-    /// would need it is refused at the block rather than computed wrongly.
+    /// is the type that carries both — [`LatticeInterpolateOp`] takes its extent
+    /// from one — and this op does not, so a plan that would need it is refused
+    /// at the block rather than computed wrongly.
     /// [`lattice_statistic_phase`] checks the same property once, when the plan
     /// is built, so this is the backstop and not the report.
     fn samples_at(&self, at: &Anchor, extent: [usize; 3]) -> Result<[usize; 3]> {
@@ -1087,7 +1083,7 @@ impl BlockOp for LatticeInterpolateOp {
     /// and `at.output.offset` is the first fine voxel this block owns. That pair
     /// is exactly what an `Anchor` could not carry and what
     /// [`lattice_interpolate_into`] has always taken separately — see its own
-    /// docs, which were written against the day this arrived.
+    /// docs.
     ///
     /// The check is the one [`Self::placed_output_shape`] traded away: every
     /// voxel written must bracket between samples this buffer holds. `bracket`
@@ -1213,7 +1209,7 @@ impl BlockOp for LatticeInterpolateOp {
 /// `origin` is the first fine voxel it writes. **Both, and not one derived from
 /// the other**, because the derivation does not exist: see
 /// [`LatticeInterpolateOp`] for why a block's fine origin is not a function of
-/// its coarse fetch, and `op::Placement` for the type that would carry it.
+/// its coarse fetch, and `op::Placement` for the type that carries both.
 ///
 /// **Every tap is clamped to the buffer**, which at the lattice's own ends is
 /// the clamp the whole-volume answer makes too (a voxel outside the sampled

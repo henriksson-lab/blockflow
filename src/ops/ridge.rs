@@ -52,8 +52,7 @@
 // needs the input within the Gaussian radius of `u`. The two compose by
 // addition, exactly the way `local.rs`'s lattice distance and window radius do,
 // and an implementation that declared only the Gaussian radius would be short by
-// one voxel everywhere — the smallest possible understatement and therefore the
-// easiest one to not notice.
+// one voxel everywhere.
 //
 // It is *tight*: the outermost tap of the truncated Gaussian has a non-zero
 // weight and the outer coefficient of the second-difference stencil is 1, so the
@@ -61,51 +60,26 @@
 // integration suite understates it by exactly one voxel and requires the output
 // to change.
 //
-// Nothing configures it. The radius is `ceil(truncate * sigma)` computed from
-// the same two numbers the kernel is built from, so there is no second statement
-// of it that could drift, and no field a caller could set.
-//
 // Why the intermediates are **not** side outputs
 // ----------------------------------------------
-// This is the first op here that builds whole intermediate fields — a smoothed
-// volume, six Hessian components, three eigenvalues, per scale — and
-// `BlockOp::side_outputs` exists for results that need somewhere to go. They are
-// nonetheless internal to `apply`, for three reasons, in order of weight:
+// The smoothed volume, the six Hessian components and the three eigenvalues stay
+// internal to `apply`. A side output is terminal — nothing reads one back inside
+// the chain — while here the primary result is computed *from* the Hessian; and
+// `apply_side` is handed the operands and never an intermediate, so declaring
+// them would not hand the executor a field that already exists, it would make
+// the op compute them a second time. With `S` scales that is `10 * S` arrays the
+// size of the image, written, for fields that are a pure function of the input
+// and the parameters.
 //
-// * **A side output is terminal, and these are not.** The trait's own note says
-//   nothing reads a side output back inside the chain; that is why they are
-//   declared separately rather than returned from `apply`. The Hessian is the
-//   opposite — the primary result is computed *from* it. And `apply_side` is
-//   handed the operands — the input, the images the phase read beside it, and
-//   the primary — and never an intermediate, so declaring the Hessian would not
-//   hand the executor a field that already exists, it would make the op compute
-//   it a second time.
-// * **The arithmetic.** With `S` scales the declaration is `10 * S` arrays the
-//   size of the image. At three scales that is thirty times the primary's bytes,
-//   written, for fields that are a pure function of the input and the
-//   parameters. `docs/design/BLOCK_OPS.md`'s reason for the machinery was an
-//   accounting *shortfall*; declaring these would close no shortfall, because
-//   nothing writes them today.
-// * **They are not a different shape or rank.** The `Output`/`SideBlock`
-//   machinery earns its keep where the second array is a different kind of thing
-//   — one row per object, one score per class. Six arrays of the image's own
-//   shape are an image's worth of data each and are better recomputed than
-//   stored.
-//
-// What *is* offered as a side output, and what it costs
-// -----------------------------------------------------
+// What *is* offered as a side output
+// ----------------------------------
 // One thing, opt-in: **which scale won** ([`RidgeFilterOp::with_scale_map`]).
 // That is a result rather than an intermediate — it is not derivable from the
 // response, and it is the second half of the answer for a caller who wants to
-// know how wide the structure at a voxel is, not only that there is one.
-//
-// It is opt-in because of a real cost, stated rather than hidden: `apply_side`
-// receives the operands and not the intermediates, and the argmax is one of the
-// intermediates, so a block that declares the scale map runs the whole
-// multi-scale pass **twice**. The source inputs `apply_side` is now handed do
-// not change that and could not: they are *stored images*, and the winning scale
-// at a voxel is not stored anywhere — it is made and discarded inside `apply`.
-// A caller who does not want the map pays nothing.
+// know how wide the structure at a voxel is, not only that there is one. It is
+// opt-in because declaring it runs the whole multi-scale pass **twice**; see
+// [`RidgeFilterOp::with_scale_map`] for why the argmax cannot be recovered from
+// what `apply_side` is handed.
 //
 // Costs
 // -----
@@ -164,11 +138,6 @@ pub fn gaussian_radius(sigma: f64, truncate: f64) -> usize {
 /// says *this axis is not blurred*, which is what a blur flat on one axis — a
 /// plane-by-plane smoothing of a volume — consists of.
 ///
-/// It was refused until a caller needed exactly that and found it could not be
-/// **constructed**, while `StructuringElement::from_radius` had always accepted a
-/// zero radius for the same meaning. One concept answered two ways is a cost
-/// that keeps being paid, so the two now agree.
-///
 /// The zero case is returned before the loop rather than falling out of it,
 /// because the loop divides by `sigma`: at zero the single tap would be
 /// `0.0 / 0.0`, and `NaN.exp()` is `NaN`. A special case that produces the
@@ -212,14 +181,10 @@ pub fn gaussian_weights(sigma: f64, truncate: f64) -> Result<Vec<f64>> {
 ///
 /// A convolution of radius `r` asks for the sample at `v - r` even when `v` is
 /// the first voxel of an axis, and no arithmetic answers that question — it is a
-/// **convention**, and the only honest thing to do with a convention is to name
-/// it and let the caller state which one they meant. Every reference
-/// implementation of a separable filter carries such a parameter; this is that
-/// parameter, in the one place a neighbourhood turns an offset into an index.
-///
-/// The two differ **only** where the offset leaves the array. Inside, they are
-/// the same index and therefore the same bits, which is why a mode is free to
-/// add: no interior voxel moves.
+/// **convention**, so it is named here, in the one place a neighbourhood turns
+/// an offset into an index, and the caller states which one they meant. The two
+/// differ **only** where the offset leaves the array; inside, they are the same
+/// index and therefore the same bits.
 ///
 /// **A boundary rule is about the array's own edge**, so what it means depends
 /// entirely on whether that edge is real. This crate hands a block its core
@@ -309,11 +274,8 @@ impl Boundary {
 /// caller's element type with no copy, the second and third read `f64`.
 ///
 /// The neighbourhood is resolved against the array handed in by `boundary`, and
-/// that is the **only** place this file decides what lies outside an array. At a
-/// real volume boundary the convention is the whole story and the whole-volume
-/// reference applies the same one; at a block seam it is a truncation the whole
-/// volume would not have made, which is what the halo is for and what the guard
-/// exists to catch.
+/// that is the **only** place this file decides what lies outside an array — see
+/// [`Boundary`] for what that means at a volume face against a block seam.
 ///
 /// **Two implementations of one sum**, and the choice between them is a property
 /// of the memory and never of the arithmetic. [`convolve_axis_packed`] runs when
@@ -1033,15 +995,13 @@ impl RatioResponse {
     /// eigenvalues` keeps only about `sqrt(eps)` at a repeated root — see its
     /// note, which measures it — and `middle / low` is exactly the ratio that is
     /// near one there. So the cross-section term is accurate to about `1e-8`
-    /// precisely where it is closest to its maximum, and its *derivative* with
-    /// respect to the shape is smallest there too, which is the fortunate
-    /// direction: an error of `1e-8` in a ratio that the response is flat in
+    /// precisely where it is closest to its maximum, and the response's
+    /// derivative with respect to the shape is smallest there too, so the error
     /// moves the answer by less than that. The along-axis term divides by
-    /// `|middle|`, which is the well-conditioned root of the pair unless all
-    /// three coincide — and all three coinciding is a sphere, where the response
-    /// is near zero for any parameters. Neither is a case this crate can improve
-    /// without a different solver; both are stated so that a caller reading
-    /// `1e-8` differences between two runs knows where they came from.
+    /// `|middle|`, the well-conditioned root of the pair unless all three
+    /// coincide — a sphere, where the response is near zero for any parameters.
+    /// Stated so that a caller reading `1e-8` differences between two runs knows
+    /// where they came from.
     pub fn evaluate(&self, eigenvalues: [f64; 3]) -> f64 {
         let [high, middle, low] = match self.polarity {
             Polarity::Ridge => eigenvalues,
@@ -1145,14 +1105,12 @@ impl From<RatioResponse> for Response {
 ///
 /// It exists so that [`ridge_response_into`] is generic over the fold rather
 /// than naming one of them, which is what lets a second response be added
-/// **without touching the first**: `RidgeResponse` gains an impl and loses
-/// nothing, and a caller who was passing one keeps passing one.
+/// without touching the first.
 ///
 /// Deliberately not a hook for arbitrary caller-supplied folds — it is a
 /// vocabulary this file's two implementations share and the [`Response`] enum
-/// closes over. A caller who has a third fold is welcome to implement it and
-/// call the kernel; what they cannot do is put it in a [`RidgeFilterOp`], which
-/// is a limit worth having until there is a third.
+/// closes over. A caller with a third fold may implement it and call the kernel;
+/// what they cannot do is put it in a [`RidgeFilterOp`].
 pub trait EigenResponse {
     /// The eigenvalues arrive in **descending algebraic order**, which is what
     /// [`symmetric_eigenvalues`] produces.
@@ -1607,9 +1565,7 @@ pub struct RidgeFilterOp {
 
 impl RidgeFilterOp {
     /// `response` is either of the two folds — see [`Response`] — and is taken
-    /// as `impl Into<Response>` so that handing it a [`RidgeResponse`] directly,
-    /// which is what every caller of this op did before there was a second
-    /// fold, still says what it always said.
+    /// as `impl Into<Response>`, so either may be handed over directly.
     pub fn new(name: &'static str, scales: ScaleSpace, response: impl Into<Response>) -> Self {
         let cost = cost_for(&scales);
         Self {
@@ -1625,13 +1581,11 @@ impl RidgeFilterOp {
     /// scale whose response won at each voxel.
     ///
     /// **This doubles the op's compute for a block**, and the reason is
-    /// structural rather than an oversight: `apply_side` is handed the operands
-    /// — the input, the images read beside it and the primary result — and the
-    /// argmax is carried by none of them, so the multi-scale pass runs again to
-    /// recover it. Being handed the source inputs does not help and cannot: they
-    /// are stored images, and the winning scale is made and discarded inside
-    /// `apply` rather than read from anywhere. That is why the map is opt-in — a
-    /// caller who does not ask pays nothing at all.
+    /// structural: `apply_side` is handed the operands — the input, the images
+    /// read beside it and the primary result — and the argmax is carried by none
+    /// of them, so the multi-scale pass runs again to recover it. The winning
+    /// scale is made and discarded inside `apply` rather than stored anywhere.
+    /// That is why the map is opt-in — a caller who does not ask pays nothing.
     pub fn with_scale_map(mut self, suffix: &'static str) -> Self {
         self.scale_map = Some(suffix);
         self
@@ -1683,8 +1637,7 @@ impl BlockOp for RidgeFilterOp {
     }
 
     /// The widest Gaussian radius in the scale list, plus the derivative
-    /// stencil's one voxel. Both terms come from the parameters and there is no
-    /// field that could set either.
+    /// stencil's one voxel.
     fn reach(&self, axis: usize, _volume_len: usize) -> usize {
         self.scales.reach(axis)
     }
@@ -1722,11 +1675,9 @@ impl BlockOp for RidgeFilterOp {
     /// [`RidgeResponse::evaluate`] takes before it divides, and it returns
     /// `0.0`. The maximum over scales of zeroes is zero.
     ///
-    /// So the error the mean is protecting against cannot arise: the rounding
-    /// happens *before* a cancellation that is exact regardless of what it
-    /// cancels. The test `a_constant_block_is_exactly_zero_and_not_nearly_zero`
-    /// checks the bits over a range of constants rather than trusting this
-    /// paragraph.
+    /// So the rounding happens *before* a cancellation that is exact regardless
+    /// of what it cancels; `a_constant_block_is_exactly_zero_and_not_nearly_zero`
+    /// checks the bits over a range of constants.
     ///
     /// **The last step is asked rather than assumed.** What is exactly true is
     /// that the eigenvalues are `[0, 0, 0]`; what that *becomes* is the
@@ -1851,7 +1802,7 @@ pub(super) const SMOOTH_COST_PER_TAP: f64 = 0.0718;
 /// # It agrees with `ops::structure_tensor`, which is the corroboration
 ///
 /// That module fitted its own per-voxel slab, from a different instrument on a
-/// different day, and got `56.9` where this is `56.28` — 1% apart for what is
+/// different day, and got `54.72` where this is `56.28` — 3% apart for what is
 /// the same [`symmetric_eigenvalues`] over the same six numbers. While this
 /// constant was `41.2` the two disagreed by 37%, and
 /// `ops::structure_tensor` had to carry a per-tap constant of its own with a
@@ -1901,13 +1852,6 @@ pub(super) const DECOMPOSITION_COST: f64 = 56.28;
 /// constants below were never re-fitted after it. The old per-tap of `0.761` and
 /// the new `0.0718` are 10.6x apart, which is that speed-up seen from the other
 /// side.
-///
-/// This is worth stating carefully because "the constants had drifted" is the
-/// wrong lesson and would point at the wrong fix. Nothing decayed. A measured
-/// constant is a statement about a particular implementation, and this crate
-/// changed the implementation underneath two of them without re-running the
-/// measurement that justified them — which is an argument for the measurements
-/// being one command each, as they are, rather than for distrusting them.
 ///
 /// # How the re-fit was anchored
 ///
@@ -2041,9 +1985,7 @@ pub const SMOOTHING_MEASUREMENT: &str = "ops::ridge::smoothing_report";
 ///
 /// Times the two walks [`convolve_axis`] dispatches between, over the same
 /// input, at each of several kernel widths and under both edge conventions. The
-/// **best** of `repetitions`, for `cost_report`'s reason: contention on a shared
-/// machine is one-sided, so a mean over such samples measures the machine and not
-/// the code.
+/// **best** of `repetitions`, for [`cost_report`]'s reason.
 ///
 /// `flat` is a wide kernel on two axes and the one-tap kernel on the third,
 /// which is a plane-by-plane blur and the shape the widest caller uses;
@@ -2808,21 +2750,19 @@ mod tests {
         }
     }
 
-    /// **Degenerate case 3: a double root, off the axes.** `diag(2, 2, 5)`
-    /// rotated by 45 degrees about z. The rotation makes `det(B) / 2` land on
+    /// **Degenerate case 3: a double root, off the axes.** `diag(5, 2, 2)`
+    /// rotated by 45 degrees about y. The rotation makes `det(B) / 2` land on
     /// `1` up to rounding, which is where an unclamped `acos` returns `NaN` —
     /// the failure this asserts is absent.
     #[test]
     fn a_repeated_eigenvalue_is_stable_and_never_produces_a_nan() {
-        // R diag(2, 2, 5) R^T for a 45-degree rotation about z leaves the block
-        // untouched, so build a less kind one: diag(5, 2, 2) rotated about x.
         let (c, s) = (
             std::f64::consts::FRAC_1_SQRT_2,
             std::f64::consts::FRAC_1_SQRT_2,
         );
-        // A = R diag(5, 2, 2) R^T with R a rotation about the x axis by 45 deg.
-        // The y-z block is 2 * I, so it is invariant; rotate about y instead so
-        // the 5 mixes with a 2.
+        // A = R diag(5, 2, 2) R^T, R a 45-degree rotation about y, so the simple
+        // root 5 mixes with a repeated 2. Rotating about x instead would leave
+        // the `2 * I` y-z block invariant and prove nothing.
         let (a, b) = (5.0f64, 2.0f64);
         let xx = a * c * c + b * s * s;
         let zz = a * s * s + b * c * c;

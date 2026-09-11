@@ -2,24 +2,20 @@
 //
 // Original work for this crate.
 //
-// The coordinator's HTTP surface: nine paths, one JSON body each.
+// The coordinator's HTTP surface: ten paths, one JSON body each.
 //
-// Blocking, on ordinary threads, for the reason the progress view uses
-// `tiny_http`: the executor is synchronous, an async runtime would be a second
-// concurrency model inside a crate that has one, and what an async framework
-// buys (routing, extractors, middleware) is not what eight endpoints and a
-// `match` need.
+// Blocking, on ordinary threads, for the same reason the progress view is: the
+// executor is synchronous, an async runtime would be a second concurrency model
+// inside a crate that has one, and what an async framework buys (routing,
+// extractors, middleware) is not what ten endpoints and a `match` need.
 //
 // Where the accept loop went, and why this file no longer has one
 // ----------------------------------------------------------------
 // It was `tiny_http`'s, then it was this file's, and it is now
 // [`crate::http`]'s. The middle step is the one with the measurement behind it
-// and it is recorded there in full: `tiny_http` dispatches each accepted
-// connection to a thread from a pool, running `for rq in connection { .. }` —
-// **a task that does not return while the connection lives** — and the pool
-// grows a thread only when it observes none waiting, so connections arriving
-// together queue behind tasks that never finish and are read only when some
-// *other* connection closes.
+// and it is recorded there in full: `tiny_http` queues connections that arrive
+// together behind pool tasks that do not return while the connection lives, so
+// a queued connection is read only when some *other* connection closes.
 //
 // Every client here holds a permanent connection — that is the design's
 // no-stall property, three per worker so none waits behind another — so "some

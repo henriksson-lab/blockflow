@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// **Can a phase collapse an axis, and can it say so?** Both, now — and the
-// second is the part that took a change.
+// **Can a phase collapse an axis, and can it say so?** Both.
 //
 // The smallest honest projection: maximum along axis 0 of an `[N, Y, X]` volume
 // into `[1, Y, X]`. That output is a legal 3-D volume — a degenerate axis is how
@@ -24,8 +23,8 @@
 // maximum along axis 0 is attained on a different plane at every position and
 // never on plane 0, so the wrong answer is wrong at every voxel.
 //
-// Why the truthful declaration could not be made, and can now
-// -----------------------------------------------------------
+// Why the clamp exception is granted on a consumed axis
+// ------------------------------------------------------
 // A reach stated in `Frame::Source` is denied the clamp exception in
 // `BlockGeometry::derive_with`, on this argument: a **cropping** phase's edge is
 // an interior position of the array it reads, so a neighbour exists there and a
@@ -57,11 +56,10 @@
 // `Space::source_index()` escape rather than merely as much — the escape records
 // *that* a dependency exists, this records **what would satisfy it**.
 //
-// One thing the change does not alter, recorded here because it is the reason
-// the phase-frame plan is not an answer: `All` stated in the phase's own frame
-// plans, and is **vacuous** on a collapsed axis. `AxisReach::is_whole` requires
-// `extent > 1`, so against an axis of extent 1 the words are accepted without
-// being a statement of anything.
+// Why the phase-frame plan is not an answer: `All` stated in the phase's own
+// frame plans, and is **vacuous** on a collapsed axis. `AxisReach::is_whole`
+// requires `extent > 1`, so against an axis of extent 1 the words are accepted
+// without being a statement of anything.
 
 use blockflow::decomposition::{Decomposition, PhaseDecomposition};
 use blockflow::env::ArrayEnvironment;
@@ -298,10 +296,6 @@ fn chain(space: Space) -> Chain {
 /// **Yes.** `AxisReach::All` in `Space::source_voxels()` is granted the clamp
 /// exception on the axis it consumes, so the one block keeps its whole core and
 /// the plan checks.
-///
-/// The inverse of what this file recorded when it was an experiment, and the
-/// assertion that pins the change: this used to leave every block with an empty
-/// valid region and refuse with the tiling message.
 #[test]
 fn the_truthful_declaration_plans() {
     let plan = plan_with(truthful_reach(), COLLAPSED, Some(whole_axis_fetch));

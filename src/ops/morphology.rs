@@ -3,12 +3,14 @@
 // Original work for this crate.
 //
 // Binary morphology over a parameterised structuring element: erosion,
-// dilation, and the two compositions of them.
+// dilation, and the two compositions of them — plus one grey kernel,
+// `dilate_placed_grey_into`, which is here because it is the grey twin of the
+// scatter below and says at its own definition why it is not `ops::rank`.
 //
-// Two dilations, and which one an opening is built from
-// -----------------------------------------------------
-// There are **two** dilations here and the difference between them is the
-// difference between an opening and a translation of the image.
+// Two binary dilations, and which one an opening is built from
+// ------------------------------------------------------------
+// There are **two** binary dilations here and the difference between them is
+// the difference between an opening and a translation of the image.
 //
 // * `dilate_into` gathers: `out[c] = OR over o of in[c + o]`. That is the
 //   disjunction over the neighbourhood the element names, it is the extreme
@@ -26,11 +28,9 @@
 // * there is no second erosion to drift from the first;
 // * an adjunction makes the compositions an opening and a closing — anti-
 //   extensive and idempotent, extensive and idempotent — for **every** element,
-//   with nothing assumed about its symmetry. Composing the gather with the
-//   gather instead gives `(X ⊖ B) ⊕ B̌`, which for an element without a centre
-//   voxel obeys none of those laws and translates the image once per
-//   application. That is what this file did until `dilate_placed_into` existed;
-//   `tests/morphology_laws.rs` measures the laws now rather than assuming them;
+//   with nothing assumed about its symmetry; `dilate_placed_into`'s own doc
+//   argues that, and what composing the gather with the gather gives instead.
+//   `tests/morphology_laws.rs` measures the laws rather than assuming them;
 // * the reach falls out of the composition rather than being asserted, and
 //   reflecting changes it: `lo + hi` on **both** sides, not twice each side. The
 //   two agree for a centred element, which is why nothing here noticed until an
@@ -55,12 +55,12 @@
 // volume**, through `StructuringElement::offsets_at`, rather than gathering one
 // offset set everywhere; `dilate_placed_into` asks it at each **source**
 // voxel's position, which is the same rule read at the other end of the scatter
-// and is what keeps the adjunction for a re-phasing element. That matters for one element and one only: a step
-// counted from `StepOrigin::ClippedStart` re-phases where the window is clipped
-// at a low face of the volume, so a filter that read `offsets` there would
-// compute the anchored window under a name that says otherwise. For every other
-// element `offsets_at` hands back the element's own slice, so the loop is the
-// loop it was and the answer is byte-identical.
+// and is what keeps the adjunction for a re-phasing element. That matters for
+// one element and one only: a step counted from `StepOrigin::ClippedStart`
+// re-phases where the window is clipped at a low face of the volume, so a filter
+// that read `offsets` there would compute the anchored window under a name that
+// says otherwise. For every other element `offsets_at` hands back the element's
+// own slice, so the loop is the loop it was and the answer is byte-identical.
 //
 // This is not a courtesy to the element type. `ops::rank`'s extreme ranks *are*
 // this file's two primitives over the same element — the test below pins that
@@ -72,12 +72,13 @@ use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 
 use crate::dtype::Dtype;
 use crate::error::{bail, ensure, Result};
-use crate::op::{Anchor, BlockOp, Slicing};
+use crate::op::{Anchor, BlockOp, Chain, Slicing};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
 
 use super::element::{StepOrigin, StructuringElement};
 use super::voxelwise::{from_set, is_set};
+use super::voxelwise::{Arithmetic, ArithmeticCombine, CarryOp, Logic, LogicCombine};
 use super::{accepts_mask_carrier, apply_mask_carrier, shapes_agree};
 
 /// The conjunction of the element around every voxel.
@@ -130,6 +131,40 @@ pub fn dilate_into_at(
     out: ArrayViewMut3<'_, bool>,
 ) -> Result<()> {
     sweep(input, at, element, out, true, "dilate_into")
+}
+
+/// The minimum over the element around every voxel.
+///
+/// This is the grey twin of [`erode_into`]: it gathers the element's offsets at
+/// the voxel being written and selects the minimum with `total_cmp`. It exists
+/// as a direct primitive so callers do not have to route a named grey erosion
+/// through the rank filter, while keeping the same boundary and re-phasing
+/// semantics as the binary sweep.
+pub fn erode_grey_into(
+    input: ArrayView3<'_, f64>,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, f64>,
+) -> Result<()> {
+    let at = whole(input.shape());
+    erode_grey_into_at(input, &at, element, out)
+}
+
+/// [`erode_grey_into`] with the buffer's place in its volume stated; see
+/// [`erode_into_at`].
+pub fn erode_grey_into_at(
+    input: ArrayView3<'_, f64>,
+    at: &Anchor,
+    element: &StructuringElement,
+    out: ArrayViewMut3<'_, f64>,
+) -> Result<()> {
+    grey_gather_extreme(
+        input,
+        at,
+        element,
+        out,
+        GreyExtreme::Minimum,
+        "erode_grey_into",
+    )
 }
 
 /// The dilation **by** the element — `X ⊕ B` — written as the element placed
@@ -290,6 +325,323 @@ pub fn close_into_at(
     erode_into_at(between.view(), at, element, out)
 }
 
+/// A ternary element for a hit-or-miss transform.
+///
+/// Offsets in `foreground` must be set, offsets in `background` must be clear,
+/// and every other position is a don't-care.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitOrMiss {
+    foreground: Vec<[isize; 3]>,
+    background: Vec<[isize; 3]>,
+}
+
+impl HitOrMiss {
+    pub fn new(
+        foreground: impl IntoIterator<Item = [isize; 3]>,
+        background: impl IntoIterator<Item = [isize; 3]>,
+    ) -> Result<Self> {
+        let foreground = unique_offsets(foreground, "hit-or-miss foreground")?;
+        let background = unique_offsets(background, "hit-or-miss background")?;
+        ensure!(
+            !foreground.is_empty() || !background.is_empty(),
+            "a hit-or-miss element needs at least one foreground or background offset"
+        );
+        for offset in &foreground {
+            ensure!(
+                !background.contains(offset),
+                "a hit-or-miss element requires offset {offset:?} to be both foreground and \
+                 background"
+            );
+        }
+        Ok(Self {
+            foreground,
+            background,
+        })
+    }
+
+    pub fn foreground(&self) -> &[[isize; 3]] {
+        &self.foreground
+    }
+
+    pub fn background(&self) -> &[[isize; 3]] {
+        &self.background
+    }
+
+    pub fn len(&self) -> usize {
+        self.foreground.len() + self.background.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn reach_spec(&self) -> Reach {
+        let mut sides = [(0usize, 0usize); 3];
+        for offset in self.foreground.iter().chain(&self.background) {
+            for axis in 0..3 {
+                if offset[axis] < 0 {
+                    sides[axis].0 = sides[axis].0.max((-offset[axis]) as usize);
+                } else {
+                    sides[axis].1 = sides[axis].1.max(offset[axis] as usize);
+                }
+            }
+        }
+        Reach::asymmetric(sides)
+    }
+}
+
+/// The hit-or-miss transform over a ternary element.
+pub fn hit_or_miss_into(
+    input: ArrayView3<'_, bool>,
+    element: &HitOrMiss,
+    out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
+    let at = whole(input.shape());
+    hit_or_miss_into_at(input, &at, element, out)
+}
+
+/// [`hit_or_miss_into`] with the buffer's place in the volume stated.
+pub fn hit_or_miss_into_at(
+    input: ArrayView3<'_, bool>,
+    at: &Anchor,
+    element: &HitOrMiss,
+    mut out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
+    shapes_agree(input.shape(), out.shape(), "hit_or_miss_into")?;
+    ensure!(
+        !element.is_empty(),
+        "hit_or_miss_into: an empty element would match every voxel"
+    );
+    for i in 0..input.shape()[0] {
+        for j in 0..input.shape()[1] {
+            for k in 0..input.shape()[2] {
+                let centre = [i as isize, j as isize, k as isize];
+                let hit = element
+                    .foreground
+                    .iter()
+                    .all(|&offset| reads_mask(input, at, centre, offset))
+                    && element
+                        .background
+                        .iter()
+                        .all(|&offset| !reads_mask(input, at, centre, offset));
+                out[[i, j, k]] = hit;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unique_offsets(
+    offsets: impl IntoIterator<Item = [isize; 3]>,
+    what: &str,
+) -> Result<Vec<[isize; 3]>> {
+    let mut unique = Vec::new();
+    for offset in offsets {
+        ensure!(
+            !unique.contains(&offset),
+            "{what} names offset {offset:?} more than once"
+        );
+        unique.push(offset);
+    }
+    Ok(unique)
+}
+
+fn reads_mask(
+    input: ArrayView3<'_, bool>,
+    at: &Anchor,
+    centre: [isize; 3],
+    offset: [isize; 3],
+) -> bool {
+    let target = [
+        centre[0] + offset[0],
+        centre[1] + offset[1],
+        centre[2] + offset[2],
+    ];
+    for axis in 0..3 {
+        let absolute = target[axis] + at.offset[axis] as isize;
+        if absolute < 0 || absolute >= at.volume[axis] as isize {
+            return false;
+        }
+        if target[axis] < 0 || target[axis] >= input.shape()[axis] as isize {
+            return false;
+        }
+    }
+    input[[target[0] as usize, target[1] as usize, target[2] as usize]]
+}
+
+/// [`hit_or_miss_into`] as an op a chain can hold.
+pub struct HitOrMissOp {
+    name: &'static str,
+    element: HitOrMiss,
+    cost: f64,
+}
+
+impl HitOrMissOp {
+    pub fn new(name: &'static str, element: HitOrMiss) -> Self {
+        let cost = MORPHOLOGY_COST_PER_ELEMENT_VOXEL * element.len() as f64;
+        Self {
+            name,
+            element,
+            cost,
+        }
+    }
+
+    pub fn element(&self) -> &HitOrMiss {
+        &self.element
+    }
+
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+impl BlockOp for HitOrMissOp {
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, axis: usize, _volume_len: usize) -> usize {
+        let (lo, hi) = self.element.reach_spec().at(axis, 0, usize::MAX);
+        lo.max(hi)
+    }
+
+    fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+        self.element.reach_spec()
+    }
+
+    fn accepts(&self, dtype: Dtype) -> bool {
+        accepts_mask_carrier(dtype)
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
+        apply_mask_carrier(input, out, |input, out| {
+            hit_or_miss_into_at(input, at, &self.element, out)
+        })
+    }
+
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        let set = is_set(value);
+        Some(from_set(
+            self.element.foreground.iter().all(|_| set)
+                && self.element.background.iter().all(|_| !set),
+        ))
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+}
+
+/// A binary morphological gradient, `dilate(input) - erode(input)`, as a chain.
+pub fn morphological_gradient(element: &StructuringElement) -> Result<Chain> {
+    Chain::parallel(
+        vec![
+            Chain::op(MorphologyOp::new(
+                "morphology.gradient.dilate",
+                Morphology::Dilate,
+                element.clone(),
+            )),
+            Chain::op(MorphologyOp::new(
+                "morphology.gradient.erode",
+                Morphology::Erode,
+                element.clone(),
+            )),
+        ],
+        Box::new(LogicCombine::new("morphology.gradient", Logic::Xor)),
+    )
+}
+
+/// A binary white top-hat, `input - open(input)`, as a chain.
+pub fn white_top_hat(element: &StructuringElement) -> Result<Chain> {
+    Chain::parallel(
+        vec![
+            Chain::op(CarryOp::new("morphology.white_top_hat.original")),
+            Chain::op(MorphologyOp::new(
+                "morphology.white_top_hat.open",
+                Morphology::Open,
+                element.clone(),
+            )),
+        ],
+        Box::new(LogicCombine::new("morphology.white_top_hat", Logic::Xor)),
+    )
+}
+
+/// A binary black top-hat, `close(input) - input`, as a chain.
+pub fn black_top_hat(element: &StructuringElement) -> Result<Chain> {
+    Chain::parallel(
+        vec![
+            Chain::op(MorphologyOp::new(
+                "morphology.black_top_hat.close",
+                Morphology::Close,
+                element.clone(),
+            )),
+            Chain::op(CarryOp::new("morphology.black_top_hat.original")),
+        ],
+        Box::new(LogicCombine::new("morphology.black_top_hat", Logic::Xor)),
+    )
+}
+
+/// A grey opening, `dilate(erode(input))`, as two explicit extrema.
+pub fn grey_opening(element: &StructuringElement) -> Chain {
+    Chain::sequence(vec![
+        Chain::op(GreyErodeOp::new(
+            "morphology.grey_opening.erode",
+            element.clone(),
+        )),
+        Chain::op(GreyDilateOp::new(
+            "morphology.grey_opening.dilate",
+            element.clone(),
+        )),
+    ])
+}
+
+/// A grey closing, `erode(dilate(input))`, as two explicit extrema.
+pub fn grey_closing(element: &StructuringElement) -> Chain {
+    Chain::sequence(vec![
+        Chain::op(GreyDilateOp::new(
+            "morphology.grey_closing.dilate",
+            element.clone(),
+        )),
+        Chain::op(GreyErodeOp::new(
+            "morphology.grey_closing.erode",
+            element.clone(),
+        )),
+    ])
+}
+
+/// A grey white top-hat, `input - grey_opening(input)`, as a chain.
+pub fn grey_white_top_hat(element: &StructuringElement) -> Result<Chain> {
+    Chain::parallel(
+        vec![
+            Chain::op(CarryOp::new("morphology.grey_white_top_hat.original")),
+            grey_opening(element),
+        ],
+        Box::new(ArithmeticCombine::new(
+            "morphology.grey_white_top_hat",
+            Arithmetic::Subtract,
+        )),
+    )
+}
+
+/// A grey black top-hat, `grey_closing(input) - input`, as a chain.
+pub fn grey_black_top_hat(element: &StructuringElement) -> Result<Chain> {
+    Chain::parallel(
+        vec![
+            grey_closing(element),
+            Chain::op(CarryOp::new("morphology.grey_black_top_hat.original")),
+        ],
+        Box::new(ArithmeticCombine::new(
+            "morphology.grey_black_top_hat",
+            Arithmetic::Subtract,
+        )),
+    )
+}
+
 /// The anchor a caller who handed over a bare array is stating: this array is
 /// the volume. One function rather than four call sites, so that the reading
 /// every anchor-free entry point here takes is one statement.
@@ -398,8 +750,65 @@ fn sweep(
     Ok(())
 }
 
-/// The **grey** dilation by the element: `(f ⊕ B)[c] = max over the sources
-/// whose element covers `c`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GreyExtreme {
+    Minimum,
+}
+
+fn grey_gather_extreme(
+    input: ArrayView3<'_, f64>,
+    at: &Anchor,
+    element: &StructuringElement,
+    mut out: ArrayViewMut3<'_, f64>,
+    extreme: GreyExtreme,
+    what: &str,
+) -> Result<()> {
+    let extent = preflight(input.shape(), at, element, out.shape(), what)?;
+    let mut offsets: Vec<[isize; 3]> = Vec::new();
+    let fixed = (element.origin() == StepOrigin::Anchor).then(|| element.offsets());
+    for i in 0..input.shape()[0] {
+        for j in 0..input.shape()[1] {
+            for k in 0..input.shape()[2] {
+                let centre = [i as isize, j as isize, k as isize];
+                let gathered = match fixed {
+                    Some(offsets) => offsets,
+                    None => {
+                        let placed = [
+                            centre[0] + at.offset[0] as isize,
+                            centre[1] + at.offset[1] as isize,
+                            centre[2] + at.offset[2] as isize,
+                        ];
+                        element.offsets_at(placed, at.volume, &mut offsets)
+                    }
+                };
+                let mut answer = input[[i, j, k]];
+                let mut reached = false;
+                for offset in gathered {
+                    let a = centre[0] + offset[0];
+                    let b = centre[1] + offset[1];
+                    let c = centre[2] + offset[2];
+                    if a < 0 || b < 0 || c < 0 || a >= extent[0] || b >= extent[1] || c >= extent[2]
+                    {
+                        continue;
+                    }
+                    let value = input[[a as usize, b as usize, c as usize]];
+                    let better = match extreme {
+                        GreyExtreme::Minimum => value.total_cmp(&answer).is_lt(),
+                    };
+                    if !reached || better {
+                        answer = value;
+                        reached = true;
+                    }
+                }
+                out[[i, j, k]] = answer;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The **grey** dilation by the element: `(f ⊕ B)[c]` is the maximum over the
+/// sources whose element covers `c`.
 ///
 /// **The one kernel in this file that reads its input as values rather than as
 /// a mask**, and it is here because it is the grey twin of
@@ -712,6 +1121,69 @@ impl BlockOp for MorphologyOp {
     }
 }
 
+/// [`erode_grey_into`] as an op a chain can hold.
+pub struct GreyErodeOp {
+    name: &'static str,
+    element: StructuringElement,
+    cost: f64,
+}
+
+impl GreyErodeOp {
+    pub fn new(name: &'static str, element: StructuringElement) -> Self {
+        let cost = MORPHOLOGY_COST_PER_ELEMENT_VOXEL * element.len() as f64;
+        Self {
+            name,
+            element,
+            cost,
+        }
+    }
+
+    pub fn element(&self) -> &StructuringElement {
+        &self.element
+    }
+
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+impl BlockOp for GreyErodeOp {
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, axis: usize, _volume_len: usize) -> usize {
+        self.element.reach(axis)
+    }
+
+    fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+        self.element.reach_spec()
+    }
+
+    fn accepts(&self, dtype: Dtype) -> bool {
+        matches!(dtype, Dtype::F64 | Dtype::F32)
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, at: &Anchor) -> Result<()> {
+        super::apply_float_detour(input, out, |source, out| {
+            erode_grey_into_at(source, at, &self.element, out)
+        })
+    }
+
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        Some(value)
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+}
+
 /// [`dilate_placed_grey_into`] as an op a chain can hold.
 ///
 /// **The second pass of a grey opening, for the element that cannot have one
@@ -833,6 +1305,14 @@ mod tests {
 
     fn speckle(shape: (usize, usize, usize)) -> Array3<bool> {
         Array3::from_shape_fn(shape, |(i, j, k)| (i * 31 + j * 17 + k * 7) % 5 < 2)
+    }
+
+    fn apply_chain(chain: &Chain, input: &Voxels) -> Voxels {
+        let shape = input.shape();
+        let dtype = chain.produces(input.dtype()).unwrap();
+        let mut out = Voxels::zeros(dtype, shape).unwrap();
+        chain.apply(input, &mut out, &Anchor::whole(shape)).unwrap();
+        out
     }
 
     /// Erosion and dilation *are* the extreme ranks over the same element. The
@@ -1018,6 +1498,138 @@ mod tests {
         let mut closed = Array3::from_elem(hole.raw_dim(), false);
         close_into(hole.view(), &element, closed.view_mut()).unwrap();
         assert!(closed.iter().all(|&value| value));
+    }
+
+    #[test]
+    fn binary_composition_presets_are_the_named_set_differences() {
+        let element = StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]);
+        let mask = speckle((7, 6, 5));
+        let input: Voxels = mask.clone().into();
+
+        let mut eroded = Array3::from_elem(mask.raw_dim(), false);
+        erode_into(mask.view(), &element, eroded.view_mut()).unwrap();
+        let mut dilated = Array3::from_elem(mask.raw_dim(), false);
+        dilate_into(mask.view(), &element, dilated.view_mut()).unwrap();
+        let gradient = apply_chain(&morphological_gradient(&element).unwrap(), &input);
+        let gradient = gradient.view::<bool>().unwrap();
+        for ((&got, &hi), &lo) in gradient.iter().zip(dilated.iter()).zip(eroded.iter()) {
+            assert_eq!(got, hi ^ lo);
+        }
+
+        let mut opened = Array3::from_elem(mask.raw_dim(), false);
+        open_into(mask.view(), &element, opened.view_mut()).unwrap();
+        let white = apply_chain(&white_top_hat(&element).unwrap(), &input);
+        let white = white.view::<bool>().unwrap();
+        for ((&got, &original), &opened) in white.iter().zip(mask.iter()).zip(opened.iter()) {
+            assert_eq!(got, original ^ opened);
+        }
+
+        let mut closed = Array3::from_elem(mask.raw_dim(), false);
+        close_into(mask.view(), &element, closed.view_mut()).unwrap();
+        let black = apply_chain(&black_top_hat(&element).unwrap(), &input);
+        let black = black.view::<bool>().unwrap();
+        for ((&got, &closed), &original) in black.iter().zip(closed.iter()).zip(mask.iter()) {
+            assert_eq!(got, closed ^ original);
+        }
+    }
+
+    #[test]
+    fn hit_or_miss_matches_a_ternary_element_and_states_its_reach() {
+        let element = HitOrMiss::new([[0, 0, 0], [-2, 0, 0]], [[1, 0, 0], [0, 1, 0]]).unwrap();
+        assert_eq!(element.foreground(), &[[0, 0, 0], [-2, 0, 0]]);
+        assert_eq!(element.background(), &[[1, 0, 0], [0, 1, 0]]);
+        assert_eq!(element.reach_spec().at(0, 0, 10), (2, 1));
+        assert_eq!(element.reach_spec().at(1, 0, 10), (0, 1));
+
+        let mut input = Array3::from_elem((5, 4, 1), false);
+        input[[2, 1, 0]] = true;
+        input[[0, 1, 0]] = true;
+        input[[3, 3, 0]] = true;
+        input[[1, 3, 0]] = true;
+        input[[4, 3, 0]] = true;
+
+        let mut out = Array3::from_elem(input.raw_dim(), true);
+        hit_or_miss_into(input.view(), &element, out.view_mut()).unwrap();
+        let hits: Vec<_> = out
+            .indexed_iter()
+            .filter_map(|(at, &hit)| hit.then_some(at))
+            .collect();
+        assert_eq!(hits, vec![(2, 1, 0)]);
+    }
+
+    #[test]
+    fn hit_or_miss_validates_conflicts_and_uses_the_mask_carrier_contract() {
+        assert!(HitOrMiss::new([[0, 0, 0]], [[0, 0, 0]]).is_err());
+        assert!(HitOrMiss::new([[0, 0, 0], [0, 0, 0]], []).is_err());
+        assert!(HitOrMiss::new([], []).is_err());
+
+        let element = HitOrMiss::new([[0, 0, 0]], [[1, 0, 0]]).unwrap();
+        let op = HitOrMissOp::new("hit-or-miss", element.clone());
+        assert!(op.accepts(Dtype::Bool));
+        assert!(op.accepts(Dtype::F64));
+        assert!(!op.accepts(Dtype::U8));
+        assert_eq!(op.reach_spec([10; 3]), element.reach_spec());
+        assert_eq!(op.cost_per_voxel(), MORPHOLOGY_COST_PER_ELEMENT_VOXEL * 2.0);
+        assert_eq!(op.constant_maps_to(0.0), Some(0.0));
+        assert_eq!(op.constant_maps_to(1.0), Some(0.0));
+
+        let input: Voxels =
+            Array3::from_shape_fn((3, 1, 1), |(i, _, _)| if i == 1 { 1.0 } else { 0.0 }).into();
+        let got = apply_chain(&Chain::op(op), &input);
+        assert_eq!(got.dtype(), Dtype::F64);
+        assert_eq!(
+            got.view::<f64>()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.0, 1.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn grey_composition_presets_are_chains_over_the_extrema() {
+        let element = StructuringElement::from_size(ElementShape::Box, [4, 3, 2]).unwrap();
+        let field = Array3::from_shape_fn((8, 7, 6), |(i, j, k)| {
+            ((i * 37 + j * 11 + k * 5) % 29) as f64 + (i as f64 * 0.5) - j as f64
+        });
+        let input: Voxels = field.clone().into();
+
+        let mut eroded = Array3::zeros(field.raw_dim());
+        erode_grey_into(field.view(), &element, eroded.view_mut()).unwrap();
+        let mut opened = Array3::zeros(field.raw_dim());
+        dilate_placed_grey_into(eroded.view(), &element, opened.view_mut()).unwrap();
+        let got = apply_chain(&grey_opening(&element), &input);
+        assert_eq!(&opened, got.view::<f64>().unwrap());
+
+        let mut dilated = Array3::zeros(field.raw_dim());
+        dilate_placed_grey_into(field.view(), &element, dilated.view_mut()).unwrap();
+        let mut closed = Array3::zeros(field.raw_dim());
+        erode_grey_into(dilated.view(), &element, closed.view_mut()).unwrap();
+        let got = apply_chain(&grey_closing(&element), &input);
+        assert_eq!(&closed, got.view::<f64>().unwrap());
+
+        let white = apply_chain(&grey_white_top_hat(&element).unwrap(), &input);
+        for ((&got, &original), &opened) in white
+            .view::<f64>()
+            .unwrap()
+            .iter()
+            .zip(field.iter())
+            .zip(opened.iter())
+        {
+            assert_eq!(got, original - opened);
+        }
+
+        let black = apply_chain(&grey_black_top_hat(&element).unwrap(), &input);
+        for ((&got, &closed), &original) in black
+            .view::<f64>()
+            .unwrap()
+            .iter()
+            .zip(closed.iter())
+            .zip(field.iter())
+        {
+            assert_eq!(got, closed - original);
+        }
     }
 
     /// The composition, and the reach that follows from it.
@@ -1240,6 +1852,110 @@ mod tests {
             line[3], 30.0,
             "and a covered voxel takes its source's value, not its own — or the carry above \
              would be indistinguishable from an identity"
+        );
+    }
+
+    #[test]
+    fn grey_erosion_is_the_lowest_rank_over_the_same_element() {
+        let field = Array3::from_shape_fn((7, 6, 5), |(i, j, k)| {
+            ((i * 37 + j * 11 + k * 5) % 29) as f64 - (j % 3) as f64 * 0.25
+        });
+        for element in [
+            StructuringElement::from_radius(ElementShape::Box, [1, 1, 1]),
+            StructuringElement::from_radius(ElementShape::Ellipsoid, [2, 1, 1]),
+            StructuringElement::from_size(ElementShape::Box, [4, 3, 2]).unwrap(),
+            StructuringElement::from_offsets([[0, 0, 0], [2, 1, 0], [-1, 0, 1]]).unwrap(),
+        ] {
+            let mut eroded = Array3::zeros(field.raw_dim());
+            erode_grey_into(field.view(), &element, eroded.view_mut()).unwrap();
+
+            let mut ranked = Array3::zeros(field.raw_dim());
+            super::super::rank::rank_filter_f64_into(
+                field.view(),
+                &element,
+                Rank::lowest(),
+                ranked.view_mut(),
+            )
+            .unwrap();
+
+            assert_eq!(eroded, ranked);
+        }
+    }
+
+    #[test]
+    fn grey_erosion_honours_a_re_phasing_element() {
+        use super::super::element::StepOrigin;
+        use super::super::rank::rank_filter_f64_into_at;
+
+        let field = Array3::from_shape_fn((7, 6, 1), |(i, j, _)| {
+            if i % 2 == 1 || j == 4 {
+                0.0
+            } else {
+                10.0 + j as f64
+            }
+        });
+        let clipped = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            [9, 3, 1],
+            [2, 1, 1],
+            StepOrigin::ClippedStart,
+        )
+        .unwrap();
+        let anchored = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            [9, 3, 1],
+            [2, 1, 1],
+            StepOrigin::Anchor,
+        )
+        .unwrap();
+        let at = Anchor::new([3, 0, 0], [10, 6, 1]);
+
+        let mut eroded = Array3::zeros(field.raw_dim());
+        erode_grey_into_at(field.view(), &at, &clipped, eroded.view_mut()).unwrap();
+        let mut ranked = Array3::zeros(field.raw_dim());
+        rank_filter_f64_into_at(
+            field.view(),
+            &at,
+            &clipped,
+            Rank::lowest(),
+            ranked.view_mut(),
+        )
+        .unwrap();
+        assert_eq!(eroded, ranked);
+
+        let mut other = Array3::zeros(field.raw_dim());
+        erode_grey_into_at(field.view(), &at, &anchored, other.view_mut()).unwrap();
+        assert_ne!(
+            eroded, other,
+            "the placed anchor must reach the grey erosion, not just the rank comparison"
+        );
+    }
+
+    #[test]
+    fn grey_erosion_op_has_the_shared_morphology_contract() {
+        let element = StructuringElement::from_size(ElementShape::Box, [4, 3, 2]).unwrap();
+        let op = GreyErodeOp::new("grey erode", element.clone());
+
+        assert!(op.accepts(Dtype::F64));
+        assert!(op.accepts(Dtype::F32));
+        assert!(!op.accepts(Dtype::Bool));
+        assert_eq!(op.reach_spec([100; 3]), element.reach_spec());
+        assert_eq!(op.constant_maps_to(-3.5), Some(-3.5));
+        assert_eq!(
+            op.cost_per_voxel(),
+            MORPHOLOGY_COST_PER_ELEMENT_VOXEL * element.len() as f64
+        );
+
+        let input: Voxels = Array3::from_elem((5, 5, 5), 4.25).into();
+        let mut out = Voxels::zeros(Dtype::F64, [5, 5, 5]).unwrap();
+        op.apply(&input, &mut out, &Anchor::whole([5, 5, 5]))
+            .unwrap();
+        assert!(
+            out.view::<f64>()
+                .unwrap()
+                .iter()
+                .all(|&value| value == 4.25),
+            "constant declaration and execution must agree"
         );
     }
 

@@ -659,17 +659,11 @@ fn sweep(
 ///
 /// # The recommendation: leave the default at `0`
 ///
-/// Finding 3 is decisive on its own. A non-zero default is a constant, a
-/// constant is a different fraction of the ready set at every plan size, and the
-/// same constant that improves the 12 288-task run by 4% costs the 98 304-task
-/// run 19%. There is no number that is right at both, so the honest default is
-/// the one that says nothing.
-///
-/// Findings 2 and 5 close it. A default would silently re-rank the arena's whole
-/// table — flattering `block_major` and `ReleaseAware` by 30% of makespan,
-/// penalising `nearest-first` by up to 28%, leaving `phase_major` alone — and
-/// every figure this crate has recorded was taken unbounded, with nothing in the
-/// record saying so because there was nothing else it could have been.
+/// Finding 3 is decisive on its own: there is no constant that is right at both
+/// plan sizes, so the honest default is the one that says nothing. Findings 2
+/// and 5 close it — a default would silently re-rank the arena's whole table,
+/// and every figure this crate has recorded was taken unbounded, with nothing in
+/// the record saying so because there was nothing else it could have been.
 ///
 /// **What to do instead**: an arena sweep that needs the speed sets the window
 /// explicitly, states it beside its figures, and holds it fixed across the arms
@@ -684,9 +678,8 @@ fn print_what_a_window_costs() {
     sweep(VOLUME, 4, &WINDOWS, schedulers());
     // **The scale the 98% was measured at**, and only the two schedulers the
     // question was asked about. `ReleaseAware` unbounded is already 74 s at
-    // 12 288 tasks — it walks the live images *and* the ready set per candidate,
-    // so it grows faster than the others — and at 98 304 it would be the whole
-    // measurement rather than a row of it.
+    // 12 288 tasks, so at 98 304 it would be the whole measurement rather than a
+    // row of it; see finding 6.
     sweep(
         LARGE_VOLUME,
         4,

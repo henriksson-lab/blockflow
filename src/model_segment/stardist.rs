@@ -16,13 +16,12 @@
 //!
 //! # Burn fallback
 //!
-//! `stardist-rs`'s own benchmarks use `burn::backend::Flex`, and copying that
-//! was a mistake worth recording: **`Flex` is burn's pure-Rust CPU backend** —
-//! its own documentation says so, "Flex: Pure-Rust CPU backend (std, no_std,
-//! WebAssembly)" — and not, as this file previously claimed, a thing that picks
-//! an accelerator at run time. StarDist was therefore running on the CPU
-//! however much GPU was present, which is what a 1% utilisation measurement
-//! eventually said out loud.
+//! `stardist-rs`'s own benchmarks use `burn::backend::Flex`, and copying that is
+//! a trap worth recording: **`Flex` is burn's pure-Rust CPU backend** — its own
+//! documentation says so, "Flex: Pure-Rust CPU backend (std, no_std,
+//! WebAssembly)" — not something that picks an accelerator at run time. It puts
+//! StarDist on the CPU however much GPU is present, which is what a 1%
+//! utilisation measurement eventually said out loud.
 //!
 //! If someone explicitly enables `stardist-cuda` without `stardist-candle-cuda`,
 //! the Burn device is CUDA. Otherwise the Burn fallback is Flex, which remains
@@ -32,12 +31,8 @@
 //!
 //! StarDist's `predict_instances` does not own the network — it takes a closure
 //! that runs one forward pass and hands back `prob` and `dist` in *its* layout.
-//! So the layout conversion is here, and it is the part to read twice: the
-//! network emits `NCHW` and the predictor wants `YXC`, on a grid that is the
-//! image downsampled by `config.grid`. Both conversions are lifted from
-//! `stardist-rs`'s own `bench_burn_real_data` example rather than derived, so
-//! that a disagreement with upstream is a disagreement about one copied block
-//! and not about an interpretation.
+//! So the layout conversion is here, and it is the part to read twice — see
+//! `forward`, which carries the details.
 
 use std::path::Path;
 use std::sync::Mutex;

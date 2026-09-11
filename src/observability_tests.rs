@@ -441,10 +441,10 @@ impl BlockOp for HoldingOp {
 
 /// A snapshot completes *while* the executor is inside `apply`.
 ///
-/// This is the property the previous wall-clock bound was standing in for: a
-/// poll must not queue behind the work. Stated structurally it does not depend
-/// on how fast the machine is, which the 250 ms bound did — it failed twice
-/// under nothing worse than a concurrent build.
+/// The structural form of "a poll must not queue behind the work", which is what
+/// the wall-clock bound `a_poll_concurrent_with_a_run_never_blocks_and_never_tears`
+/// used to state — see there for why it was dropped. Stated this way it does not
+/// depend on how fast the machine is.
 #[test]
 fn a_poll_completes_while_the_executor_is_inside_an_op() {
     let in_flight = Arc::new(AtomicUsize::new(0));
@@ -485,8 +485,9 @@ fn a_poll_completes_while_the_executor_is_inside_an_op() {
 
     let listeners: Vec<Arc<dyn EventListener>> = vec![latest.clone()];
     // A real array environment, not the accounting one: `AccountingEnvironment`
-    // is data-free and never calls `BlockOp::apply` (`env.rs:583`), so the op
-    // would never enter the window this test is about.
+    // is data-free and its `Environment::apply` prices the slot without ever
+    // calling `BlockOp::apply`, so the op would never enter the window this
+    // test is about.
     let input = Array3::<f64>::zeros((workflow.shape[0], workflow.shape[1], workflow.shape[2]));
     let env = ArrayEnvironment::new(input.into(), decomposition.n_phases(), [64, 64, 64]).unwrap();
     let stats = Greedy { concurrency: 4 }

@@ -19,18 +19,14 @@
 //    `Decomposition::with_forced_halo`.
 // 4. **The same failure seen behaviourally**: understating the reach by exactly
 //    one voxel tiles perfectly and produces wrong values. That is what makes the
-//    derived reach *tight* rather than merely safe, and the `+ 1` the derivative
-//    stencil contributes is precisely a one-voxel term — so this is the test
-//    that would have caught leaving it out.
+//    derived reach *tight* rather than merely safe.
 // 5. **The filter answers**: the response is higher on the elongated objects
-//    `synthetic::Scene` places than on the background between them. A filter
-//    that is decomposition-invariant and responds to nothing would pass 1-4.
+//    `synthetic::Scene` places than on the background between them.
 // 6. **The scale map is a real choice**: the argmax over scales is not the same
 //    scale everywhere, or the side output carries no information.
 // 7. **`constant_maps_to` is exactly true**, checked through the executor rather
 //    than argued: blocks are seen to be skipped, and the volume is still
-//    byte-identical to the reference. This op declares a mapping the local mean
-//    withholds, so the declaration has to be earned rather than asserted.
+//    byte-identical to the reference.
 
 use ndarray::Array3;
 

@@ -890,32 +890,25 @@ fn prefetch_populates_the_cache_and_the_read_that_follows_is_a_hit() {
 /// worked off. At 24 chunks and depth 2 that is twelve rounds of a slow source,
 /// where an independent read is one.
 ///
-/// # It used to assert on wall-clock time, and that was wrong twice over
+/// # Structural, not timed
 ///
-/// The bound was `elapsed < DELAY * 4` — 160 ms — and it failed on a macOS CI
-/// runner at **177 ms**, which is not the order-of-magnitude failure it was
-/// built to catch but a busy machine. `cargo test` runs tests in parallel, the
-/// slow source is a `thread::sleep`, and a 40 ms sleep on an oversubscribed
-/// three-core runner is comfortably 100 ms of wall clock.
+/// A wall-clock bound of `elapsed < DELAY * 4` — 160 ms — failed on a macOS CI
+/// runner at **177 ms**, which is a busy machine rather than the
+/// order-of-magnitude failure it was built to catch: `cargo test` runs in
+/// parallel, the slow source is a `thread::sleep`, and a 40 ms sleep on an
+/// oversubscribed three-core runner is comfortably 100 ms of wall clock.
+/// `.github/workflows/ci.yml` rests the whole suite's safety on a shared runner
+/// on **"nothing in the crate asserts on a duration"**.
 ///
-/// More to the point, `.github/workflows/ci.yml` states as the reason the whole
-/// suite is safe to run on a shared runner that **"nothing in the crate asserts
-/// on a duration"** — and this test's own first line said "Measured, not
-/// asserted" while asserting. Both claims are now true.
-///
-/// # What is asserted instead, and what that does and does not cover
-///
-/// The structural fact: **the queue had not drained when the demand read
-/// returned.** A read serialised behind the backlog returns only after it, so
-/// this catches the failure exactly, and it catches it on any machine at any
-/// speed.
+/// So what is asserted is the structural fact: **the queue had not drained when
+/// the demand read returned.** A read serialised behind the backlog returns only
+/// after it, so this catches the failure on any machine at any speed.
 ///
 /// What it does not catch is a demand read that waits for only the *in-flight*
 /// prefetch reads rather than the whole queue — two of them, at depth 2. That is
 /// a real failure mode and it is a latency claim, so it belongs with the
 /// measurements: `print_the_demand_read_latency_under_a_saturated_queue` below,
-/// `#[ignore]`d like the crate's other 39, because a shared runner is the wrong
-/// instrument for it.
+/// `#[ignore]`d because a shared runner is the wrong instrument for it.
 #[test]
 fn a_demand_read_does_not_queue_behind_a_saturated_prefetcher() {
     const DELAY: Duration = Duration::from_millis(40);
@@ -1024,13 +1017,12 @@ fn print_the_demand_read_latency_under_a_saturated_queue() {
     );
 }
 
-/// Submission itself must be cheap/// Submission itself must be cheap — a worker declaring its future reads is on
+/// Submission itself must be cheap — a worker declaring its future reads is on
 /// the critical path even though the reads are not.
 ///
-/// **Counted, not timed.** This asserted `elapsed < DELAY` — that submit took
-/// less than one source read — which is the same wall-clock claim that failed on
-/// a macOS runner in `a_demand_read_does_not_queue_behind_a_saturated_prefetcher`
-/// above, and for the same reason a shared machine can break it.
+/// **Counted, not timed**, for the reason
+/// `a_demand_read_does_not_queue_behind_a_saturated_prefetcher` above gives: a
+/// shared machine can break any wall-clock bound.
 ///
 /// The property has an exact structural form and does not need a clock: if
 /// submit did the IO, it did **all** of it, so the probe would record 32 reads

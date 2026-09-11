@@ -29,16 +29,10 @@
 // | **shipped** | what `ops::label` and `ops::detect` declare | — | — | — | — |
 //
 // **The fourth arm exists because the order check is not free, and the design
-// note says it nearly is.** `barriers.md` §8.5 prices the reversed-lattice check
-// at "one extra reduction for an op that opted in, against the one extra `apply`
-// per block the same declaration already costs" — which is the right comparison
-// for an op that *already* declared `SeamFold::Unordered`. Neither of these two
-// did. So for them it is not a saving that got smaller, it is a new cost, and it
-// is not only CPU: the second reduction re-reads the whole fragment set out of
-// the store, so the hoisted arm transmits the set **three** times rather than
-// twice — written once, read twice. `the_order_check_costs_one_more_pass_over_
-// the_fragment_set` measures it, and it is why the two hoisted arms are run
-// separately rather than the shipped declaration being assumed free.
+// note says it nearly is** — see
+// `the_order_check_costs_one_more_pass_over_the_fragment_set`, which measures it
+// and is why the two hoisted arms are run separately rather than the shipped
+// declaration being assumed free.
 //
 // The in-plan arm is character for character what the two ops did before this
 // change, so it is the **liveness control** the migration needs: an op whose
@@ -67,13 +61,10 @@
 //
 // The prediction this file exists to test, for `ops::detect`
 // -----------------------------------------------------------
-// `ops::detect`'s phase 1 declares `reads_pixels() == false`, so it pays no
-// pixel re-reads at all — and a barrier's whole traffic contribution is the
-// relief of the pixel re-reads. So the prediction is that **a barrier alone is
-// worth exactly nothing** to `detect`: not "a little", not "less than for
-// `label`", but zero bytes, with everything it pays sitting in the hoisting.
+// **A barrier alone is worth exactly nothing** to `detect`: not "a little", not
+// "less than for `label`", but zero bytes.
 // [`a_barrier_alone_is_worth_nothing_at_all_to_detect`] asserts it as an
-// equality.
+// equality and carries the argument.
 //
 // What it found, on this fixture
 // -------------------------------

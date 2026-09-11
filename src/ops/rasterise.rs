@@ -252,7 +252,7 @@
 // What this deliberately does not do
 // ----------------------------------
 // **Anti-aliasing.** The output is a label volume, and a label is an identity:
-// there is no value between class 3 and class 4. The 4-of-16 threshold is where
+// there is no value between class 3 and class 4. The 7-of-16 threshold is where
 // that gets resolved and it is resolved once, at the sampling rule, rather than
 // per consumer.
 //

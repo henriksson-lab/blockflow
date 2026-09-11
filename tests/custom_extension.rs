@@ -5,12 +5,11 @@
 // **Two extension points, exercised from outside the crate.**
 //
 // A user of this library must be able to add operations and the functions those
-// operations are parameterised by. Two places prevented that until now, and they
-// needed different fixes because the obstacles were different:
+// operations are parameterised by. Two places needed different fixes, because
+// the obstacles were different:
 //
 // * `ops::local::Statistic` was a closed enum, so a windowed statistic the crate
-//   did not ship could not be written at all. `Isodata` had to be added *inside*
-//   the crate for exactly that reason. It is open now, through `Reducer`.
+//   did not ship could not be written at all. It is open through `Reducer`.
 // * `StructuringElement` had no constructor from an explicit offset list, so a
 //   neighbourhood shape the crate did not name could not be built — not because
 //   the shape rule was closed to extension in any costly way, but because there
@@ -23,9 +22,7 @@
 //
 // The bar is the crate's own: a custom reducer over a custom element must be
 // **decomposition invariant**, byte-identical to a whole-volume run of the same
-// kernels over several block sizes and split patterns. Being able to *write* an
-// extension is worth nothing if the extension is not held to the same standard
-// as the shipped ops.
+// kernels over several block sizes and split patterns.
 
 use std::sync::Arc;
 
@@ -72,9 +69,6 @@ impl Reducer for Midrange {
         if window.is_empty() {
             return 0.0;
         }
-        // Written as a mean of two rather than `(low + high) / 2.0` in one step
-        // for no reason but symmetry with the shipped statistics; both are exact
-        // here because a uniform window makes both operands equal.
         (low + high) / 2.0
     }
 

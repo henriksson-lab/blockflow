@@ -3,12 +3,10 @@
 // Original work for this crate. Written from the definitions of the operations,
 // not adapted from any implementation of them.
 //
-// The first ops in this crate that move real data. Until now `probes` held the
-// only implementations of `BlockOp`, and they exist to prove the *framework* —
-// an identity whose expected output is its input, a window sum that diverges
-// when the halo is short. Those are still the right tools for that job. What
-// they cannot do is be used, and this module is what a caller composes a chain
-// out of.
+// The ops in this crate that move real data. `probes` holds the other
+// implementations of `BlockOp` and they exist to prove the *framework* — an
+// identity whose expected output is its input, a window sum that diverges when
+// the halo is short. This module is what a caller composes a chain out of.
 //
 // The families, and what each contributes beyond its arithmetic
 // -------------------------------------------------------------
@@ -21,10 +19,9 @@
 // absent — but so, for a while, was one that added a great deal: the row world
 // below had no entry at all while `coordinates`, `rows` and `tabulate` were
 // three of the largest modules here, so an op belonging to it had nowhere to be
-// announced and the missing *producer* went unnoticed through three separate
-// writings. If a module here is a first, it needs a row; if it is not, its
-// absence is the statement, and saying which is this list's job rather than a
-// reader's.
+// announced and the missing *producer* went unnoticed. If a module here is a
+// first, it needs a row; if it is not, its absence is the statement, and saying
+// which is this list's job rather than a reader's.
 // | module | ops | what it makes expressible |
 // |---|---|---|
 // | `voxelwise` | a general map, and the connectives over two inputs | the **sink of a diamond**: reach 0, two operands, which nothing here could express |
@@ -301,7 +298,9 @@ pub(crate) fn expect_extent(
 pub mod adjacency;
 pub mod align;
 pub mod background;
+pub mod boundaries;
 pub mod classify;
+pub mod cleanup;
 pub mod components;
 pub mod configuration;
 pub mod coordinates;
@@ -309,15 +308,19 @@ pub mod cost;
 pub mod deconvolve;
 pub mod detect;
 pub mod directional;
+pub mod edges;
 pub mod element;
+pub mod exposure;
+pub mod features;
 /// **Not a `BlockOp`, and deliberately.** A Fourier coefficient is a sum over
 /// every element of its input, so there is no halo that makes one and no
 /// block-local form that approaches one. That module's header says what shape it
 /// took instead and why the three obvious ways of wrapping it in this crate's
 /// lattice do not exist.
-pub mod features;
 pub mod fft;
 pub mod fill;
+pub(crate) mod histogram;
+pub mod interest;
 pub mod label;
 pub mod lattice;
 pub mod local;
@@ -340,6 +343,7 @@ pub mod sliding;
 pub mod smooth;
 pub mod structure_tensor;
 pub mod tabulate;
+pub mod threshold;
 pub mod voxelize;
 pub mod voxelwise;
 pub mod walk;
@@ -350,9 +354,21 @@ pub use adjacency::{
     empty_pairs, encode_adjacent_pairs, forward_offsets, merge_pairs, pair_schema,
     walk_adjacent_pairs, AdjacentPairsOp, Pair, HIGHER_COLUMNS,
 };
+pub use boundaries::{
+    boundary_points, find_boundaries_into, labelled_boundary_points, FindBoundariesOp,
+    LabelBoundaryPoint,
+};
 pub use classify::{
     gather_samples, predict_workflow, sample_workflow, samples_from_rows, train_workflow, ClassMap,
     ForestPredictor, LabelIndex, Prediction, SampleCombine,
+};
+pub use cleanup::{
+    append_clear_border_phases, append_expand_labels_phase, append_object_distance_prune_phases,
+    append_remove_small_holes_phases, append_remove_small_objects_phases, clear_border_into,
+    expand_labels_into, object_distance_prune_set, prune_by_object_distance_into,
+    remove_small_holes_into, remove_small_objects_into, ApplyComponentMaskOp,
+    ApplyObjectDistancePruneOp, ApplyRemoveSmallHolesOp, ExpandLabelsOp, LabelBackgroundRegionsOp,
+    ObjectDistanceSamplesOp,
 };
 /// The only thing in `components` a *caller* chooses rather than a builder of
 /// ops uses. The rest of that module stays behind its own path, because it is
@@ -387,8 +403,18 @@ pub use directional::{
     directional_to_fixed_point, faces_are_clear, sub_iteration_sources, DirectionalPassOp,
     DIRECTIONAL_PASS_COST, SUB_ITERATIONS,
 };
+pub use edges::{
+    append_canny_edges_phases, append_hysteresis_threshold_phases, canny_edges_into,
+    canny_response_into, hysteresis_threshold_into, non_maximum_suppression_into,
+    ApplyHysteresisOp, CannyResponseOp, HysteresisLabelsOp,
+};
 pub use element::{
     select_nth, ElementShape, Percentile, Rank, StepOrigin, StructuringElement, Total,
+};
+pub use exposure::{
+    append_equalize_adapthist_phases, append_equalize_histogram_phases, equalize_adapthist_into,
+    equalize_histogram, is_low_contrast, match_histogram, ClaheTileSamplesOp, EqualizeAdapthistOp,
+    EqualizeHistogramOp,
 };
 pub use features::{Family, FeatureChannel, FeatureStack, Geometry};
 pub use fft::{
@@ -399,6 +425,12 @@ pub use fft::{
 pub use fill::{
     agree_on_connectivity, fill_phases, label_background_into_with, merge_faces_with, FillHolesOp,
     LabelBackgroundOp,
+};
+pub use interest::{
+    append_response_peak_table_phases, difference_of_gaussians_response_into,
+    hessian_determinant_response_into, laplacian_of_gaussian_response_into, response_peak_points,
+    response_peak_schema, BlobDetection, BlobDetector, BlobResponse, BlobResponseOp, BlobScale,
+    ResponsePeakRowsOp, RESPONSE_COLUMN,
 };
 pub use label::{
     label_ceiling, label_of, label_points_into, labelled_points, LabelPointsOp, MAX_EXACT_LABEL,
@@ -413,13 +445,16 @@ pub use local::{
     local_statistic_into_with, masked_local_statistic_into, masked_local_statistic_into_narrowed,
     masked_local_statistic_into_with, threshold_against_into, AdaptiveThresholdOp, Alignment,
     EmptyPopulation, Isodata, LatticeNarrowing, LocalStatistic, LocalStatisticOp, Narrowing,
-    Population, Rounding, SampleLattice, Sampling, Statistic,
+    Niblack, Population, Rounding, SampleLattice, Sampling, Sauvola, Statistic,
 };
 pub use mixing::{LinearMap, TupleKernel, TupleOp};
 pub use morphology::{
-    close_into, close_into_at, dilate_into, dilate_into_at, dilate_placed_grey_into,
-    dilate_placed_grey_into_at, dilate_placed_into, dilate_placed_into_at, erode_into,
-    erode_into_at, open_into, open_into_at, GreyDilateOp, Morphology, MorphologyOp,
+    black_top_hat, close_into, close_into_at, dilate_into, dilate_into_at, dilate_placed_grey_into,
+    dilate_placed_grey_into_at, dilate_placed_into, dilate_placed_into_at, erode_grey_into,
+    erode_grey_into_at, erode_into, erode_into_at, grey_black_top_hat, grey_closing, grey_opening,
+    grey_white_top_hat, hit_or_miss_into, hit_or_miss_into_at, morphological_gradient, open_into,
+    open_into_at, white_top_hat, GreyDilateOp, GreyErodeOp, HitOrMiss, HitOrMissOp, Morphology,
+    MorphologyOp,
 };
 pub use normalise::{
     bounded_gain_into, bounded_gain_value, normalise_against_into, normalise_value,
@@ -464,19 +499,26 @@ pub use sliding::{
 };
 pub use smooth::{Gaussian, SmoothOp};
 pub use structure_tensor::{
-    gradient_at, Eigenvalue, GradientMagnitudeOp, StructureTensor, StructureTensorOp,
+    corner_response_into, gaussian_gradient_into, gradient_at, CornerResponse, CornerResponseOp,
+    Eigenvalue, GradientMagnitudeOp, StructureTensor, StructureTensorOp,
 };
 pub use tabulate::{
     append_tabulate_phases, collect_tabulation, decode_partial, encode_partial, merge_tabulation,
     region_values, tabulate_phases, tabulation_schema, FixedPoint, MergeTabulationOp, RegionValues,
     TabulateValuesOp, Tally,
 };
+pub use threshold::{
+    append_global_threshold_phases, li_threshold, mean_threshold, minimum_threshold,
+    multi_otsu_thresholds, otsu_threshold, threshold_classes, threshold_mask, triangle_threshold,
+    yen_threshold, ApplyGlobalThresholdOp, GlobalThreshold, GlobalThresholdOutput,
+    GlobalThresholdSamplesOp, GlobalThresholdSelection,
+};
 pub use voxelize::{decode_points, encode_points, Point, VoxelizeOp};
 pub use voxelwise::{
     combine_into, from_set, is_set, logic_into, map_into, mask_logic_into, not_into, CarryOp,
-    CombineOp, Compose, Identity, Logic, LogicCombine, MapFn, MaskElement, MaskFn, NarrowOp, Not,
-    Threshold, ThresholdMask, ThresholdTest, VoxelwiseMapOp, VoxelwiseMaskOp, WidenOp,
-    IDENTITY_COST, MAP_COST, MASK_COST,
+    CombineOp, Compose, Gamma, Identity, LogCorrection, Logic, LogicCombine, MapFn, MaskElement,
+    MaskFn, NarrowOp, Not, RescaleIntensity, Sigmoid, Threshold, ThresholdMask, ThresholdTest,
+    VoxelwiseMapOp, VoxelwiseMaskOp, WidenOp, IDENTITY_COST, MAP_COST, MASK_COST,
 };
 pub use walk::{
     walk_blob, walk_from, walk_into, walk_schema, walked_distance, OffsetSequence, OffsetWalkOp,
@@ -487,8 +529,6 @@ pub use watershed::{
     WATERSHED_LINE_COST,
 };
 
-// Appended rather than filed alphabetically, because this list is shared and an
-// append is the edit that does not move anybody else's lines.
 /// **The exact Euclidean distance transform**, as three separable whole-axis
 /// sweeps and a pointwise finish. `ops::watershed`'s "a caller who wants a
 /// distance-transform watershed passes the distance" is what this supplies.
@@ -502,14 +542,12 @@ pub use distance::{
     DISTANCE_SEED_SWEEP_COST, DISTANCE_SWEEP_COST,
 };
 
-// Appended, for the reason the block above it is: this list is shared today and
-// an append is the edit that moves nobody else's lines.
 /// **Convolution with a caller-supplied kernel**, in a caller-supplied sense
 /// (correlation or convolution, named rather than assumed) and a caller-supplied
 /// boundary convention. `ops::smooth` is the Gaussian; this is the general one.
 pub mod convolve;
 pub use convolve::{
-    convolve_into, cost_report as convolve_cost_report, ConvolveOp, Kernel, Sense,
+    convolve_into, cost_report as convolve_cost_report, ConvolveOp, Kernel, RobertsDiagonal, Sense,
     CONVOLVE_COST_PER_TAP,
 };
 /// **The same filter through the Fourier transform**: overlap-save over a tile
@@ -753,12 +791,10 @@ impl TypedSource {
     }
 }
 
-// The **second-moment half of `ops::tabulate`**, appended as its own `pub use`
-// rather than folded into the `tabulate` list above: three workers are landing
-// ops in this file today, and a line nobody else has to touch is a line nobody
-// else can conflict with. `RegionShape`/`region_shape` are the shape reading of
-// a tabulated row — the label volume's own measurement, over every voxel and at
-// no scale — and `PrincipalAxes` is what its six `CENTRAL` columns decompose to.
+// The **second-moment half of `ops::tabulate`**. `RegionShape`/`region_shape`
+// are the shape reading of a tabulated row — the label volume's own
+// measurement, over every voxel and at no scale — and `PrincipalAxes` is what
+// its six `CENTRAL` columns decompose to.
 pub use tabulate::{
     collect_shapes, from_signed_column, region_shape, signed_column, PrincipalAxes, RegionShape,
     AXIS_SEPARATION, CENTRAL, PAIRS,

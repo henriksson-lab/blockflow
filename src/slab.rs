@@ -27,11 +27,9 @@
 //   the copies are the whole cost, and §13.3.1 is the measurement of that.
 // * **No `unsafe`, and none is needed for this shape.** Each slab writes its own
 //   disjoint slice of the output through a [`crate::voxels::VoxelsMut`], and the
-//   compiler is what says the slices do not overlap. This used to be one serial
-//   pass at the end instead; it was the only part of a cut that did not
-//   parallelise, it measured at 0.09 s for an 89.9 MB block, and it is gone. The
-//   only shape that would need a raw pointer is an op that reads and writes one
-//   buffer, and no op in this crate does.
+//   compiler is what says the slices do not overlap. The only shape that would
+//   need a raw pointer is an op that reads and writes one buffer, and no op in
+//   this crate does.
 //
 // What makes a cut exact
 // ----------------------
@@ -223,16 +221,13 @@ fn axis_region(block: [usize; 3], axis: usize, lo: usize, hi: usize) -> Region {
 /// Why this chain cannot be cut into `pieces` slabs here, or the cut itself.
 ///
 /// **Total: every refusal is a sentence rather than an [`Error`], and that is
-/// what lets there be one of these rather than two.** Two callers ask this
-/// question and want opposite things done with the answer. [`apply_sliced`] was
-/// *asked* to cut, so a refusal is an error there. [`apply_at_most`] was
+/// what lets there be one of these rather than two.** [`apply_sliced`] was
+/// *asked* to cut, so a refusal is an error there; [`apply_at_most`] was
 /// *offered* threads by a planner that cannot know what the chain holds, so a
-/// refusal there is simply not cutting. Deriving both from one function is what
-/// keeps them from coming to disagree about what is sliceable — which would show
-/// up as a plan that reports a cut it did not make, or the reverse.
+/// refusal there is simply not cutting.
 ///
-/// Every branch below is one of the four refusals the module header lists, in
-/// the order they become answerable.
+/// Every branch below is a refusal in the module header's sense, in the order
+/// they become answerable.
 fn plan_cut(
     chain: &Chain,
     input: &Voxels,
@@ -301,9 +296,7 @@ fn plan_cut(
 /// itself. In particular it refuses a chain the ops have not **declared**
 /// sliceable, and that declaration is never inferred; see [`crate::op::Slicing`].
 ///
-/// A caller that would rather *fall back* than fail wants [`apply_at_most`];
-/// the two share one private `plan_cut` so that they cannot disagree about which chains
-/// are sliceable.
+/// A caller that would rather *fall back* than fail wants [`apply_at_most`].
 pub fn apply_sliced(
     chain: &Chain,
     input: &Voxels,
@@ -327,13 +320,12 @@ pub fn apply_sliced(
 /// has not declared itself a stencil gets.
 ///
 /// **This is the entry point a planner uses, and the fallback is the whole
-/// difference.** [`apply_sliced`] is a caller *asking* for a cut, where being
-/// unable to give one is a failure. A slab count from
-/// [`crate::decomposition::SlabPolicy`] is an *offer* made by a planner that
-/// has not looked at the chain: it is derived from the worker count and the
-/// block count and from nothing else. An offer that failed the run every time a
-/// phase held an undeclared op would fail every plan this crate has today, so an
-/// offer that cannot be taken is declined.
+/// difference.** A slab count from [`crate::decomposition::SlabPolicy`] is an
+/// *offer* made by a planner that has not looked at the chain: it is derived
+/// from the worker count and the block count and from nothing else. An offer
+/// that failed the run every time a phase held an undeclared op would fail
+/// every plan this crate has today, so an offer that cannot be taken is
+/// declined.
 ///
 /// **Only the decision to cut is swallowed.** Once a cut is planned, everything
 /// the ops do propagates: a slab that errors errors the block, and a slab that

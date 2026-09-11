@@ -27,14 +27,11 @@
 // this suite's job is to make sure the fixtures can tell the difference.
 //
 // They can only tell the difference if the scene is **asymmetric across the
-// seams**. A mask whose set voxels happen to be arranged so that every block's
-// entries really are contiguous in the walk order agrees with block-major order
-// by accident, and a suite built on one would pass with the ordering entirely
-// wrong. So `the_scene_separates_block_major_order_from_the_walk` asserts the
-// two orders **disagree** on this scene under the interleaving cuts — the
-// fixture is pinned as a discriminator rather than assumed to be one, and if a
-// change ever makes them agree this suite says it has stopped testing the thing
-// it is for.
+// seams**: a mask whose set voxels happen to be contiguous in the walk order
+// within every block agrees with block-major order by accident, and a suite
+// built on one would pass with the ordering entirely wrong. So
+// `the_scene_separates_block_major_order_from_the_walk` pins the fixture as a
+// discriminator rather than assuming it is one.
 
 use std::collections::BTreeMap;
 

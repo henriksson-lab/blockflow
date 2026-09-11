@@ -22,20 +22,11 @@
 // Reading the measurement, and the caveat that decides how
 // -------------------------------------------------------
 // `measured_against_declared` is `#[ignore]`d and prints a table. **Every
-// absolute nanosecond figure it prints is unreliable**, and not by a little: it
-// was developed on a machine carrying a load average of 39 on 40 cores, where a
-// per-voxel figure is a measurement of the queue as much as of the code. What
-// survives contention far better is the *ratio between two ops timed in the same
-// run*, because both were queued behind the same thing. So the table's last two
-// columns — each op's cost per unit of its own declared cost relative to the
-// run's mean, and how far the repetitions moved — are the ones to read, and the
-// ns/voxel column beside them is context, not evidence.
-//
-// The one figure that survived every reading of the table is the ratio between
-// the two rank filters, whose elements differ by exactly the factor the constant
-// claims the cost is linear in. It repeats to within a few per cent across
-// separate processes, and it is a ratio of two stable rows in one run. Every
-// other row has a caveat on it, and the caveats are in the tests themselves.
+// absolute nanosecond figure it prints is unreliable**: it was developed on a
+// machine carrying a load average of 39 on 40 cores, where a per-voxel figure is
+// a measurement of the queue as much as of the code. What survives contention is
+// the *ratio between two ops timed in the same run*. That test's own header says
+// how to read the table and which rows to believe.
 //
 // **Nothing in this file asserts on a duration.** The assertions are all
 // relationships that hold at any speed: an accounted fraction is a ratio of two
@@ -842,9 +833,8 @@ fn least(values: impl Iterator<Item = f64>) -> f64 {
     })
 }
 
-/// The largest of a sequence, by `total_cmp`, and `0.0` when it is empty — which
-/// is the identity these callers had before and the one that keeps an empty
-/// spread at zero rather than at negative infinity.
+/// The largest of a sequence, by `total_cmp`, and `0.0` when it is empty, which
+/// keeps an empty spread at zero rather than at negative infinity.
 fn greatest(values: impl Iterator<Item = f64>) -> f64 {
     values.fold(0.0_f64, |high, value| {
         if value.total_cmp(&high) == std::cmp::Ordering::Greater {

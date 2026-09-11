@@ -29,7 +29,9 @@
 //   with the halo below it leaves `valid == core`;
 // * the **block** reach — `FragmentInput::reach`, which is in block units and is
 //   the number the executor builds the gather neighbourhood from — is
-//   `ceil(radius / smallest core on that axis)`, clamped to the lattice.
+//   `ceil(radius / nominal block edge on that axis)`, clamped to the lattice.
+//   The next section is why the divisor is the nominal edge and not the
+//   smallest core.
 //
 // Both come from `StructuringElement::radius`, and there is no field that sets
 // either. This module's header states the rule and `element.rs` states the
@@ -164,9 +166,8 @@
 // slice back and the lift below keeps even that out of the loop.
 //
 // **A re-phased window can hold a count the element does not** — fewer where a
-// face truncates it, and for a shaped kernel occasionally *more*, a ball of
-// radius two stepped by two keeping seven members in the interior and eight at
-// the phase reached from `[1, 1, 1]`. Nothing here is sized from
+// face truncates it, and for a shaped kernel occasionally *more*. Nothing here
+// is sized from
 // [`StructuringElement::len`]: the loop walks the slice it was handed and the
 // accumulation is a sum with no arity. So a surprising count moves the mass this
 // op deposits, which is exactly what a different window should move, and the
@@ -214,11 +215,9 @@ use super::element::{ElementShape, StepOrigin, StructuringElement};
 /// that keeps point sets, and are re-exported here so that this op's callers
 /// read one module rather than two.
 ///
-/// They moved because a point is not a fact about this op: it is what a set of
-/// positions is made of, and `points` is where a set of positions is sorted,
-/// indexed and queried. Leaving a second definition here would have been two
-/// encodings of the same four words, which is the shape of a bug that only
-/// appears once the two have drifted.
+/// One definition rather than two: a point is not a fact about this op but what
+/// a set of positions is made of, and a second encoding of the same four words
+/// is the shape of a bug that only appears once the two have drifted.
 pub use crate::points::{decode_points, encode_points, Point, WORDS_PER_POINT};
 
 // ---------------------------------------------------------------- kernels --
@@ -927,9 +926,6 @@ mod tests {
             }
         }
     }
-
-    // The encoding's own round trip and its three refusals moved to
-    // `crate::points`, with the type they are about.
 
     // ------------------------------------------------------------- reaches --
 

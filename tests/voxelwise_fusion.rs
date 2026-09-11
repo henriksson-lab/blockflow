@@ -124,7 +124,7 @@ fn fused() -> Chain {
     ))
 }
 
-/// The equality that justifies fusing at all, over a real volume and eight
+/// The equality that justifies fusing at all, over a real volume and twelve
 /// decompositions of it.
 #[test]
 fn a_fused_map_equals_the_two_phases_it_replaces_under_every_decomposition() {

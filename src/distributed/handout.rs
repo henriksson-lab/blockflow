@@ -73,13 +73,12 @@ pub enum HandoutPolicy {
     ///
     /// The cache model is an estimate fed only by assignments; see
     /// `cache_model`. Distance is the tiebreak, so with an **empty** model this
-    /// degrades exactly to `NearestFirst`.
+    /// degrades exactly to `NearestFirst`: every candidate misses every key, the
+    /// primary sort term is constant and distance decides.
     ///
-    /// **"or useless" used to be in that sentence and is measured false.** An
-    /// empty model misses every key of every candidate, so the primary sort term
-    /// is constant and distance decides — that half holds. A *thrashing* model
-    /// returns a miss count that **varies without carrying information**, and
-    /// because `misses` outranks distance it dominates rather than defers.
+    /// **An inaccurate model is not thereby a harmless one.** A *thrashing*
+    /// model returns a miss count that **varies without carrying information**,
+    /// and because `misses` outranks distance it dominates rather than defers.
     /// `super::tests::the_two_policies_are_indistinguishable_until_the_model_evicts`
     /// measures the cliff: holding two tasks' reads or more this policy is
     /// `NearestFirst` to the digit, and holding one task's or fewer it duplicates
@@ -93,22 +92,22 @@ pub enum HandoutPolicy {
     /// [`HandoutPolicy::select`], which is the one boundary both the operator
     /// flag and a submitted `JobSpec` cross.
     CacheModelled,
-    /// Warmth **blended** with distance rather than ranked above it, and warmth
-    /// counting what this worker's own **node** is about to fetch as well as
-    /// what it already holds.
+    /// Warmth that counts what this worker's own **node** is about to fetch as
+    /// well as what it already holds, with distance demoted to a tiebreak.
     ///
     /// Two changes to [`Self::CacheModelled`], and each answers one half of why
     /// that one is refused.
     ///
-    /// **1. It blends, and the blend is self-scaling.** `CacheModelled` sorts
-    /// on `(misses, distance, task)`, so a miss count that varies without
-    /// carrying information still outranks distance — which is exactly how it
-    /// loses when the model thrashes. Here both terms are normalised into
-    /// `[0, 1]`: warmth against *its own spread across the candidates*, distance
-    /// against the volume's diagonal. When every candidate misses everything the
-    /// spread collapses, the warmth term is flat, and distance decides on its
-    /// own — the degenerate case degrades to [`Self::NearestFirst`] by
-    /// construction rather than by luck.
+    /// **1. Its primary term stays meaningful when the model does not.**
+    /// `CacheModelled` sorts on `(misses, distance, task)` where `misses` is the
+    /// model's alone, so a miss count that varies without carrying information
+    /// still outranks distance — which is exactly how it loses when the model
+    /// thrashes. Here the primary term is a count of the chunks the *node* would
+    /// actually have to fetch, and its in-flight half varies with position
+    /// whatever the cache is doing. Distance, normalised against the volume's
+    /// diagonal, breaks the ties and only the ties; with nothing held and
+    /// nothing in flight every candidate costs alike and this is
+    /// [`Self::NearestFirst`].
     ///
     /// **2. It counts imminent warmth**, from [`WorkerView::in_flight`]: chunks
     /// that this worker's *node* is already fetching for another task. Those
@@ -185,6 +184,20 @@ impl HandoutPolicy {
     pub fn refusal(self) -> Option<&'static str> {
         match self {
             Self::Naive | Self::NearestFirst => None,
+            // The same boundary, for the same reason and not yet for the same
+            // evidence: this one is *designed* against the two defects the
+            // refusal below records — its primary term is not the model alone,
+            // and its warmth counts what the node is about to hold rather than
+            // what a model of a cache nobody constructs claims it holds. Neither
+            // of those is a measurement. `tests/multiple_computers.rs` is
+            // where the measurement is taken, and it is in the simulator, on a
+            // modelled cache, which is precisely the thing the sentence below
+            // says is not the machine. Lifted by the same evidence that would
+            // lift that one: a chunk cache on a read path whose real size is
+            // what the policy is given.
+            Self::Coalescing => Some(
+                "it scores against a modelled `cache::ChunkCache`. `WorkflowSpec::cache_bytes` now sizes the built-in shared-volume worker's real cache for every shared-volume image, but deployment factories may use another environment. So like `cache-modelled` it may be ranking on residency the read path does not have. It is designed against that policy's two recorded defects: it blends warmth with distance instead of ranking warmth above it, so a miss count that carries no information cannot dominate, and it counts the chunks this worker's own node is already fetching, which is a set the coordinator genuinely knows. Both are arguments rather than measurements. Lifted by a run on a real coordinator showing it beats `nearest-first` where the simulator says it does, under a cache model that matches the read path being measured",
+            ),
             // The argument, in the order the evidence came in. The *set* the
             // model carries is real — chunks this worker was assigned to read is
             // derived from assignments the coordinator genuinely made, and it is
@@ -211,20 +224,6 @@ impl HandoutPolicy {
             // thrashes, and then this one loses — 22 duplicated fetches against
             // 6 — while never winning at any capacity. A policy whose best case
             // is a tie with the thing it replaces has not earned a name.
-            // The same boundary, for the same reason and not yet for the same
-            // evidence: this one is *designed* against the two defects the
-            // refusal below records — it blends rather than ranking, and its
-            // warmth counts what the node is about to hold rather than what a
-            // model of a cache nobody constructs claims it holds. Neither of
-            // those is a measurement. `tests/multiple_computers.rs` is where the
-            // measurement is taken, and it is taken in the simulator, on a
-            // modelled cache, which is precisely the thing the sentence below
-            // says is not the machine. Lifted by the same evidence that would
-            // lift that one: a chunk cache on a read path whose real size is
-            // what the policy is given.
-            Self::Coalescing => Some(
-                "it scores against a modelled `cache::ChunkCache`. `WorkflowSpec::cache_bytes` now sizes the built-in shared-volume worker's real cache for every shared-volume image, but deployment factories may use another environment. So like `cache-modelled` it may be ranking on residency the read path does not have. It is designed against that policy's two recorded defects: it blends warmth with distance instead of ranking warmth above it, so a miss count that carries no information cannot dominate, and it counts the chunks this worker's own node is already fetching, which is a set the coordinator genuinely knows. Both are arguments rather than measurements. Lifted by a run on a real coordinator showing it beats `nearest-first` where the simulator says it does, under a cache model that matches the read path being measured",
-            ),
             Self::CacheModelled => Some(
                 "it ranks a modelled `ChunkCache` hit above distance. The built-in shared-volume worker now has a real cache for every shared-volume image sized by `WorkflowSpec::cache_bytes`, but deployment factories may use another environment. Its chunk *set* is real, and while the model holds two tasks' reads or more this policy is `nearest-first` to the digit. Below that it is measurably worse rather than merely uninformative: at a modelled capacity of one chunk it duplicates 22 fetches against `nearest-first`'s 6, a third of the way back to naive pull's 62, because a miss count that varies without carrying information still outranks distance. It is never better at any capacity. Lifted by a real-coordinator measurement on a read path whose cached image set and byte budget match this model — see `distributed::tests::the_two_policies_are_indistinguishable_until_the_model_evicts`, which is the current simulator measurement and which fails if this stops being true",
             ),
@@ -412,7 +411,7 @@ fn nearest(
     best.expect("ready is non-empty").2
 }
 
-/// [`HandoutPolicy::Coalescing`]: warmth blended with distance, both normalised.
+/// [`HandoutPolicy::Coalescing`]: warmth first, distance to break its ties.
 ///
 /// # The two terms
 ///
@@ -428,20 +427,11 @@ fn nearest(
 /// the other nodes stays short, since that boundary is what a duplicated fetch
 /// is made of.
 ///
-/// # Why both are normalised, and against what
+/// # How the two are ranked
 ///
-/// `CacheModelled` ranks lexicographically and its refusal records exactly what
-/// that costs: "a miss count that varies without carrying information still
-/// outranks distance". Normalising warmth **against its own spread across the
-/// candidates** removes that failure by construction — when every candidate
-/// misses everything, `spread` is zero, the warmth term is zero for all of them,
-/// and distance decides alone. The policy degrades to `NearestFirst` in exactly
-/// the regime where `CacheModelled` degrades to noise.
-///
-/// Distance is normalised against the volume's diagonal so that both terms live
-/// in `[0, 1]` and one weight compares them. `WARMTH_AGAINST_DISTANCE` is that
-/// weight and it is `1.0`: neither term is privileged, which is the claim this
-/// policy is making and the one a measurement can refute.
+/// Lexicographically, warmth first and distance only to break its ties — not
+/// blended, and the body says why, and why `CacheModelled`'s recorded failure
+/// under the same shape does not carry over.
 fn coalescing(
     ready: &[usize],
     graph: &TaskGraph,
@@ -456,8 +446,8 @@ fn coalescing(
         incoming.extend(fetch_keys(graph, chunks, task));
     }
 
-    // **The cost of each candidate, in chunks fetched**, which is the unit both
-    // terms are in and the reason neither needs a weight.
+    // **The cost of each candidate, in chunks fetched** — the primary sort key,
+    // and a real count rather than a score, which is why it needs no weight.
     let cost_in_chunks: Vec<f64> = ready
         .iter()
         .map(|&task| {

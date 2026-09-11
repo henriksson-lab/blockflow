@@ -40,11 +40,11 @@
 // the observation at `2.31e7`. The shipped seed is therefore *accidentally
 // nearly right* here — one voxelwise map happens to cost about 2.3 ns of the
 // work this chain does — and that accident, not the calibration, is what sets
-// how much room the comparison has. It is why the criterion below can resolve a
-// model that is 10x wrong and cannot resolve one that is 2x too cheap: a model
-// 2x too cheap really is closer to the truth than the seed. See
-// `the_comparison_rejects_a_model_that_is_ten_times_wrong` for the measured
-// resolution in both directions.
+// how much room the comparison has. It is why the control below is stated as a
+// multiple of the seed's *own* error rather than as a bare factor — see
+// `Wrongness` — and why the resolution limit is asserted in both directions, by
+// `the_comparison_rejects_a_model_wronger_than_the_seed` and
+// `the_comparison_keeps_a_model_less_wrong_than_the_seed`.
 //
 // Both error measures are kept, because measurement showed they catch different
 // things. The **ratio** is scale-free and is the one that means what it says.

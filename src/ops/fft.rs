@@ -306,13 +306,10 @@
 // finds otherwise; the measurement is one `cargo test` away, and it is the same
 // test either way.
 //
-// Two things that do **not** change with the backend, because they were settled
-// on evidence that has nothing to do with the library. The padding rule is one:
-// `N >= max(A, B, A - lo, B + hi)` rounded up to a 5-smooth length, whichever
-// transform runs. `f64` is the other — the `f32` round trip is `3.0e-7` against
-// `f64`'s `8.9e-16`, five orders above the acceptance bar, and FFTW having a
-// single-precision half is not a reason to revisit a decision that was never
-// about speed.
+// Neither the padding rule nor the choice of `f64` changes with the backend:
+// both were settled on evidence that has nothing to do with the library, above.
+// In particular, FFTW having a single-precision half is not a reason to revisit
+// a decision that was never about speed.
 //
 // The dependency
 // --------------
@@ -407,6 +404,7 @@ const LANE_BLOCK: usize = 8;
 /// rather than an oversight to be tidied away: it lets a test say "run this bar
 /// over every backend this build has" and get exactly the old behaviour when
 /// there is only one.
+///
 /// **The default is the derived one only when there is one backend.** With the
 /// `fftw` feature there are two and the feature's whole job is to swap which is
 /// chosen, so the impl below takes over — and the derive has to be conditional
@@ -851,8 +849,8 @@ pub type Spectrum3 = Array3<Complex<f64>>;
 
 /// A discrete Fourier transform of a real **volume**.
 ///
-/// [`RealTransform2`] with the axis [`crate::ops::deconvolve`]'s table calls
-/// missing — "the same twenty lines, over `Array3`" — and it is the same lines:
+/// [`RealTransform2`] with the third axis added — the one
+/// [`crate::ops::deconvolve`]'s table needed — and it is the same lines:
 /// a real transform along the last axis, then [`transform_lanes`] along axis 1
 /// within each plane, then [`transform_lanes`] along axis 0 over the whole
 /// buffer, because a `[d0, d1, w]` row-major buffer **is** a `[d0, d1 * w]` one
@@ -2049,7 +2047,8 @@ pub struct SquaredDifference {
     /// The two energy landscapes and the two-stage scratch behind them, held by
     /// the plan for the same reason the transform's twiddles are: they are a
     /// function of the geometry, and the geometry does not change between calls.
-    /// `parts_a` is the larger of the two at `shape_a[0] x window cols`.
+    /// Each `parts` buffer is its own plane's row count by the window's column
+    /// count — `shape_a[0]` rows for `parts_a`, `shape_b[0]` for `parts_b`.
     energy_a: Array2<f64>,
     energy_b: Array2<f64>,
     parts_a: Array2<f64>,
@@ -2844,10 +2843,10 @@ mod tests {
 
     #[test]
     fn a_cloned_volume_transform_computes_the_same_answer() {
-        // The property the block op below depends on: `apply` takes `&self` and
-        // a transform needs `&mut`, so the op clones a template per block. A
-        // clone that re-planned, or that shared scratch, would make the answer a
-        // function of which thread ran it.
+        // The property `ops::convolve`'s block op depends on: `apply` takes
+        // `&self` and a transform needs `&mut`, so the op clones a template per
+        // block. A clone that re-planned, or that shared scratch, would make the
+        // answer a function of which thread ran it.
         let shape = [6usize, 6, 8];
         let source = volume(shape, 0x0102_0304_0506_0709);
         let mut original = RealTransform3::new(shape).unwrap();

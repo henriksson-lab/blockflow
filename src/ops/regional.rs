@@ -534,9 +534,10 @@ impl PlateauFaces {
     }
 }
 
-/// `"RMAX"` little-endian. Distinct from `fill`'s, which is the point: the two
-/// fragments differ only in their per-label payload, so a stream name used by
-/// both would otherwise decode one as the other.
+/// `"RMAX"` little-endian. Distinct from `fill`'s, `label`'s and `detect`'s,
+/// which is the point: all four fragments are six planes of labels differing
+/// only in their per-label payload, so a stream name reused by two of them would
+/// otherwise decode one as another.
 const MAGIC: u32 = 0x5841_4d52;
 const VERSION: u32 = 1;
 
@@ -734,8 +735,9 @@ impl FragmentOp for LabelPlateauxOp {
             // nought, and the merge needs to see that rather than infer it from
             // an absence.
             Coverage::EveryBlock,
-            // The six-faces shape **plus** an `ascends` flag per label, which is a
-            // second per-label word on top of the one `block_faces` counts.
+            // The six-faces shape **plus** the plateau's value, which is two
+            // more words per label than the single flag word `block_faces`
+            // counts.
         )
         .sized(SidecarSize::plateau_faces())]
     }
@@ -1508,8 +1510,8 @@ mod tests {
         let bytes = faces.encode();
         assert_eq!(PlateauFaces::decode(&bytes).unwrap(), faces);
 
-        // a stream written by something else — including, specifically, by the
-        // other six-plane op in this crate
+        // a stream written by something else — including, specifically, by
+        // another of the six-plane ops in this crate
         let mut foreign = bytes.clone();
         foreign[0] ^= 0xff;
         assert!(PlateauFaces::decode(&foreign).is_err());

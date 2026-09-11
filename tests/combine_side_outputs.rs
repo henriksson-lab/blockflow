@@ -14,9 +14,8 @@
 // The case that forced it is the trainer of
 // `docs/design/pixel-classification.md`. A feature stack is 91 branches, and the
 // rows it gathers are one 91-vector per labelled voxel — a fragment, not an
-// image. `docs/design/pixel-classification.md` first proposed doing this with
-// `BlockOp::apply_side`, which cannot work: side outputs were a `BlockOp`
-// feature and the sink of a fan-in is a `Combine`.
+// image. That note first proposed `BlockOp::apply_side` for it, which cannot
+// work: the sink of a fan-in is a `Combine`, not a `BlockOp`.
 //
 // What is asserted here is the machinery, on a sampler small enough to check by
 // hand — not the feature stack, which `tests/forest_predict.rs` covers.

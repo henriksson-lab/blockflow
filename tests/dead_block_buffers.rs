@@ -1009,19 +1009,15 @@ fn a_sequence_starting_at_a_source_writes_what_the_stored_buffer_maps_to() {
 
 /// **What a source arm costs the walk, which is now nothing on either path.**
 ///
-/// # The control moved, and why it had to
+/// # Why the control is on computed arms
 ///
-/// This test used to read the collected path as its control: a combine
-/// declaring no fold carrier was handed owned `Voxels`, so it copied every
-/// source arm into a buffer of its own, and that growth was the proof that the
-/// tally can see a branch buffer at all. Without such a control, "the folded
+/// The obvious control would be the collected path's growth per source arm, and
+/// it no longer exists: `Combine::apply` takes `&[&Voxels]`, so the collected
+/// path borrows its source arms too and grows by the vector spine's one slot
+/// rather than by a whole block buffer. Without *some* such control, "the folded
 /// path is flat" is equally consistent with a measurement that sees nothing.
 ///
-/// **`Combine::apply` now takes `&[&Voxels]`, so the collected path borrows
-/// too** — the asymmetry that control depended on was the bug. Its growth per
-/// source arm fell from one whole block buffer to the vector spine's one slot.
-///
-/// So the control moves to the axis that still allocates: a **computed** arm
+/// So the control is the axis that still allocates: a **computed** arm
 /// must be bought and cannot be borrowed, and the collected path must grow by a
 /// full buffer for each one. Both rows are asserted here, and the slot is
 /// **measured from the source-arm row rather than named**, because the spine

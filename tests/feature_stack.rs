@@ -624,7 +624,7 @@ fn the_two_moment_deviation_agrees_except_where_it_says_it_will_not() {
 ///
 /// A small stack on a small volume — the point is the fan-in and the halo, and
 /// both are size-independent. Every arm's own decomposition invariance is
-/// covered by that op's suite; what is new here is 21 of them under one halo.
+/// covered by that op's suite; what is new here is 34 of them under one halo.
 #[test]
 fn a_small_stack_reproduces_its_whole_volume_reference_under_decomposition() {
     let volume = [24usize, 20, 18];
@@ -834,7 +834,7 @@ fn print_the_fan_in_measurement() {
 /// over this chain wrong, and the difference is a measurement.
 ///
 /// ```text
-/// cargo test --release --test feature_stack -- --ignored --nocapture arms_measured
+/// cargo test --release --test feature_stack -- --ignored --nocapture print_what_each_family
 /// ```
 #[test]
 #[ignore = "a measurement, not an assertion"]

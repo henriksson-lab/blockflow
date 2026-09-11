@@ -698,10 +698,9 @@ fn tabulate_over_the_decorated_and_the_materialised_label_volume_agree_with_the_
 ///
 /// **The label volume is a `supplied` array**, which is the arrangement a real
 /// consumer is in: the labelling ran earlier, in its own plan, and this plan is
-/// handed the result beside its own input. That was not expressible until
-/// `TabulateValuesOp::holding` existed — a supplied array is produced by no
-/// phase, so nothing in the plan could say what it held and `fragment_phase`
-/// refused the pair by name.
+/// handed the result beside its own input. Hence `TabulateValuesOp::holding`,
+/// whose refusal is the control
+/// `a_supplied_label_volume_is_refused_until_its_element_type_is_declared`.
 ///
 /// `decorate` is the whole of the difference between the two arms: with a table,
 /// the run happens over a `RelabelledEnvironment` decorating the supplied array

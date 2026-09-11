@@ -58,15 +58,10 @@
 // set are the optimisation and they come later.
 //
 // **The runaway limit is required and is a guard, not a parameter**, on exactly
-// `ops::skeleton::PassLimit`'s argument: exceeding it is an error naming the op
-// and the count, never a truncated answer, because a partially converged volume
-// is plausible, well-formed and wrong. Its *derivation* belongs with the op — an
-// op that peels from the surface inward is bounded by half the shortest axis, one
-// that spreads along paths by the longest path the data permits — so it is
-// returned by the op rather than computed centrally. That is also why this is a
-// separate type from `PassLimit` rather than the same one: `PassLimit::
-// for_volume` carries the peeling derivation, and a framework type offering it
-// would be offering one op's bound to every op.
+// `ops::skeleton::PassLimit`'s argument; `SubstageLimit` carries that reasoning.
+// It is a separate type from `PassLimit` rather than the same one because
+// `PassLimit::for_volume` carries the peeling derivation, and a framework type
+// offering it would be offering one op's bound to every op.
 
 use crate::decomposition::PhaseDecomposition;
 use crate::dtype::Dtype;
@@ -102,10 +97,6 @@ pub enum Operand {
     /// at substage 0 would silently compute a different algorithm — which is
     /// precisely the failure `ops/deconvolve.rs`'s header warns about — so
     /// `tests/iterative_phase.rs` carries a test that fails if it is.
-    ///
-    /// Today every `Fixed` operand is a view of the same array, because a phase
-    /// has one input image. When images become a DAG this variant is where the
-    /// image number goes, and nothing else about the interface moves.
     ///
     /// **A second image is now expressible, and this variant has not moved to
     /// it.** [`Chain::Source`](crate::op::Chain::Source) is a leaf that reads a
@@ -292,11 +283,9 @@ pub trait IterativeOp: Send + Sync {
     /// Relative compute cost per voxel per **substage**. Measured, not guessed;
     /// the default of 1.0 is a placeholder, as it is on `BlockOp`.
     ///
-    /// A phase whose substage count is unknown cannot be priced as a whole. The
-    /// planner prices **one** substage — and the second half of what this doc
-    /// used to say, *that this changes the predicted duration and not the plan's
-    /// shape*, is measured false. It changes the shape too, through the block
-    /// edge.
+    /// A phase whose substage count is unknown cannot be priced as a whole, so
+    /// the planner prices **one** substage. That changes the predicted duration
+    /// *and*, measured, the plan's shape — through the block edge.
     ///
     /// A constant multiplier is neutral only if it multiplies the **whole**
     /// price, and `S` substages do not. A substage reads and computes; the image

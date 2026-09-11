@@ -358,10 +358,6 @@ pub fn event_json(event: &Event) -> Value {
             map.insert("bytes".to_string(), json!(bytes));
         }
 
-        // Cache and prefetch events. Keyed by `(array, chunk)` rather than by
-        // block, so a consumer that only draws blocks skips them on `type` —
-        // which is why the type strings are prefixed, and why the schema
-        // version did not need to change to carry them.
         Event::SideOutputWritten {
             output,
             phase,
@@ -376,6 +372,10 @@ pub fn event_json(event: &Event) -> Value {
             region_fields(&mut map, region);
             map.insert("bytes".to_string(), json!(bytes));
         }
+        // Cache and prefetch events. Keyed by `(array, chunk)` rather than by
+        // block, so a consumer that only draws blocks skips them on `type` —
+        // which is why the type strings are prefixed, and why the schema
+        // version did not need to change to carry them.
         Event::CacheHit {
             array,
             chunk,

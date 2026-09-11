@@ -510,14 +510,9 @@ fn an_excluded_centre_and_an_empty_window_are_asked_separately() {
 
 /// The population producer: `image > 8`, into a `Bool` image.
 ///
-/// **This was hand-written here, and the reason it gave has gone.** It said it
-/// was *"kept here rather than taken from `src/ops` because what is under test
-/// is the consumer"* — and when it was written that was the only option, since
-/// `src/ops` had a threshold that produced `1.0` / `0.0` in an `f64` buffer and
-/// none that produced a `Bool` one. `VoxelwiseMaskOp::threshold` is that op, it
-/// is the register's G15 closed, and it makes the same comparison through the
-/// same `ThresholdMask`. What is under test is still the consumer; the producer
-/// is now the library's.
+/// The library's own, rather than hand-written here: `VoxelwiseMaskOp::threshold`
+/// makes this comparison through `ThresholdMask` and produces the `Bool` buffer
+/// the consumer under test reads.
 fn binarize() -> VoxelwiseMaskOp<blockflow::ops::voxelwise::ThresholdMask> {
     VoxelwiseMaskOp::threshold("binarize", 8.0)
 }

@@ -33,11 +33,10 @@
 //!
 //! # Single-threaded per call, deliberately
 //!
-//! The design document names this as a constraint and it is worth restating
-//! where the loop is. The block executor already parallelises across blocks, and
+//! The block executor already parallelises across blocks, and
 //! `simulate::Machine::contention` exists because nested parallelism is what
 //! makes forty workers behave like 2.41. A predictor spawning its own threads
-//! would fight the machinery this crate spent its measurements on.
+//! would fight it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -64,10 +63,8 @@ pub enum Prediction {
     /// The share of the vote one class received, in `[0, 1]`, as `f64`.
     ///
     /// **This is the output that feeds a watershed.** A boundary class's
-    /// probability map is exactly the cost volume
-    /// `ops::scikitimage_watershed` wants, which is the meeting point the design
-    /// document notes between the random-forest workflow and ilastik's carving
-    /// one.
+    /// probability map is exactly the cost volume `ops::scikitimage_watershed`
+    /// wants.
     Probability { class: usize },
 }
 
@@ -116,11 +113,10 @@ impl ForestPredictor {
     /// trained forest and a feature stack**.
     ///
     /// A forest's splits name columns by index, so a stack with the right number
-    /// of channels in the wrong order is the failure this exists to catch: it
-    /// would run, produce a complete well-formed volume, and be wrong
-    /// everywhere. The count is all a `Combine` can check from a `&[Dtype]`;
-    /// [`predict_workflow`] checks the *names*, which is the real test, and does
-    /// it at build time rather than at the first block.
+    /// of channels in the wrong order would run, produce a complete well-formed
+    /// volume, and be wrong everywhere. The count is all a `Combine` can check
+    /// from a `&[Dtype]`; [`predict_workflow`] checks the *names*, which is the
+    /// real test, at build time rather than at the first block.
     fn arity_agrees(&self, inputs: &[Dtype]) -> bool {
         inputs.len() == self.forest.channels().len()
     }
@@ -143,8 +139,8 @@ impl Combine for ForestPredictor {
     /// slicing however sliceable its arms are.
     ///
     /// The claim is the loop's: each output voxel is written from the co-located
-    /// voxel of each input, through one pass that reads no neighbour and carries
-    /// nothing between voxels but a scratch tally it clears.
+    /// voxel of each input, reading no neighbour and carrying nothing between
+    /// voxels but a scratch tally it clears.
     fn slicing(&self) -> Slicing {
         Slicing::Stencil
     }
@@ -204,14 +200,10 @@ impl Combine for ForestPredictor {
             });
         }
 
-        // The channels as flat slices, once, outside the voxel loop. Every
-        // buffer here is a block the executor allocated contiguously, so this is
-        // a borrow rather than a copy — and it turns the inner loop's
-        // per-channel access from a strided `ndarray` index into an offset.
-        //
-        // The views are bound to a local before the slices are taken because a
-        // slice borrows its view; collecting the two in one expression would
-        // borrow from a temporary.
+        // The channels as flat slices, once, outside the voxel loop: a borrow
+        // rather than a copy, and it turns the inner loop's per-channel access
+        // from a strided `ndarray` index into an offset. The views are bound to
+        // a local first because a slice borrows its view.
         let views = inputs
             .iter()
             .map(|input| input.view::<f64>())
@@ -277,16 +269,14 @@ impl Combine for ForestPredictor {
 /// `tests/forest_predict.rs` for the run.
 ///
 /// **Proportional to `trees x mean path`, which is the number of nodes visited
-/// per voxel** — not to the node count, and not to the depth. A forest's cost is
-/// a walk per tree, and what a walk costs is its length; the maximum depth would
-/// misprice an unbalanced forest by the ratio between its deepest and its
+/// per voxel** — not to the node count, and not to the depth. The maximum depth
+/// would misprice an unbalanced forest by the ratio between its deepest and its
 /// average path, and the total node count would misprice every forest by its
 /// breadth.
 ///
 /// The per-visit constant is a dependent load, a compare and a branch, with the
-/// node array too large for L2 at any interesting forest size — so it is a cache
-/// miss more often than not, and that is why the figure is large beside a
-/// voxelwise map's 1.0.
+/// node array too large for L2 at any interesting forest size — which is why the
+/// figure is large beside a voxelwise map's 1.0.
 pub(super) fn cost_for(forest: &Forest) -> f64 {
     forest.trees() as f64 * forest.mean_path() * FOREST_COST_PER_NODE_VISIT
 }
@@ -315,24 +305,19 @@ pub const FOREST_COST_PER_NODE_VISIT: f64 = 6.56;
 /// constant`, and neither the node count nor the maximum depth would have
 /// served. 6.56 is the mean, and the spread is ±6%.
 ///
-/// **And it is flat despite the node array outgrowing cache**, which is worth
-/// noting because the opposite was expected: 57582 nodes at 24 bytes is 1.4 MB,
-/// past L2, and the walk's loads are dependent and effectively random. That it
-/// does not degrade says the array stays resident in L3 across a block's worth
-/// of voxels — every voxel walks the same trees — so the misses are amortised
-/// over the block rather than paid per voxel. A forest large enough to leave L3
-/// would break this, and the table is where that would show.
+/// **And it is flat despite the node array outgrowing cache**: 57582 nodes at 24
+/// bytes is 1.4 MB, past L2, and the walk's loads are dependent and effectively
+/// random. That it does not degrade says the array stays resident in L3 across a
+/// block's worth of voxels — every voxel walks the same trees. A forest large
+/// enough to leave L3 would break this, and the table is where that would show.
 ///
 /// **What it means for the workload.** At Labkit's own default of 100 trees the
 /// predictor costs **6528 ns per voxel, about 6590 times a voxelwise map**. The
 /// whole 91-channel feature stack under it declares roughly 5000, so the
-/// predictor is not merely the most expensive op in this crate by a wide margin
-/// — it is *the majority of the entire workload*, and `docs/design/pixel-
-/// classification.md`'s expectation that it would dominate is confirmed rather
-/// than assumed. Two consequences: the planner's treatment of this chain follows
-/// from this number rather than from the filters, and the contention term
-/// measured for the multi-node work matters more here than on any fixture it was
-/// taken against.
+/// predictor is *the majority of the entire workload*: the planner's treatment
+/// of this chain follows from this number rather than from the filters, and the
+/// contention term measured for the multi-node work matters more here than on
+/// any fixture it was taken against.
 pub const COST_MEASUREMENT: &str = "tests/forest_predict.rs::print_the_predictor_cost";
 
 // -------------------------------------------------------- the workflows --
@@ -343,11 +328,10 @@ pub const COST_MEASUREMENT: &str = "tests/forest_predict.rs::print_the_predictor
 /// `Chain`, so the planner sees the whole thing and can cut it where it likes.
 ///
 /// **The channel names are checked here, and this is the check that matters.**
-/// A forest's splits name columns by index; a stack with the right *number* of
-/// channels in a different order runs to completion and is wrong at every voxel.
-/// `Combine::accepts` sees only a list of element types and cannot catch that.
-/// So the names are compared, in order, before a chain is built at all — a
-/// refusal at build time rather than a wrong volume at the end of a run.
+/// A stack with the right *number* of channels in a different order runs to
+/// completion and is wrong at every voxel, and `Combine::accepts` sees only a
+/// list of element types. So the names are compared, in order, before a chain is
+/// built at all.
 pub fn predict_workflow(
     stack: &FeatureStack,
     forest: Arc<Forest>,
@@ -421,31 +405,22 @@ impl ClassMap {
 /// touched.
 ///
 /// **The rows are bit-identical to what the whole volume would have given**, and
-/// that is a property rather than an approximation. Two cases and both are
-/// exact: a labelled voxel at least `reach` inside the crop reads only voxels
-/// the crop holds, and one whose neighbourhood runs past the crop has a crop
-/// edge that *is* the volume edge — because the box was grown by the full reach
-/// before clamping — so it meets the same boundary rule it would have met
-/// anyway. `tests/forest_predict.rs` asserts the equality rather than arguing
-/// it.
+/// that is a property rather than an approximation. Two cases, both exact: a
+/// labelled voxel at least `reach` inside the crop reads only voxels the crop
+/// holds, and one whose neighbourhood runs past the crop has a crop edge that
+/// *is* the volume edge — because the box was grown by the full reach before
+/// clamping — so it meets the same boundary rule it would have met anyway.
+/// `tests/forest_predict.rs` asserts the equality rather than arguing it.
 ///
-/// For a stroke drawn in one corner of a large volume this is the difference
-/// between the work being proportional to the labels and proportional to the
-/// array. For labels scattered to opposite corners the box is the volume again,
-/// and the honest statement is that this is a crop, not a sparse traversal.
+/// For labels scattered to opposite corners the box is the volume again: this is
+/// a crop, not a sparse traversal.
 ///
-/// # What is still missing, stated accurately
+/// # The blocked alternative
 ///
-/// A genuinely sparse path would compute the stack only in the blocks holding
-/// labels, and skip the rest — which for a whole-volume annotation is nearly all
-/// of them. It does **not** fall out of the fragment machinery the way an
-/// earlier note in `docs/design/pixel-classification.md` claimed: a side output
-/// is a [`BlockOp`](crate::op::BlockOp) feature, and the sink of the feature
-/// stack is a [`Combine`], which has no `apply_side` and no `side_outputs`. The
-/// fan-in's sink is the only place where all 91 channels exist at one voxel, so
-/// the sampler has to live there, and giving `Combine` the same side-output pair
-/// `BlockOp` has is the change that would allow it. That is a contained
-/// extension and it is not this function.
+/// This holds every channel of every voxel of the crop in memory, so it works on
+/// an annotator's working crop and falls over on a volume. [`sample_workflow`]
+/// is the blocked path: it gathers the same rows as a side output of the fan-in
+/// itself, one block at a time.
 pub fn gather_samples(
     stack: &FeatureStack,
     input: &Voxels,
@@ -604,12 +579,10 @@ fn labelled_extent(
 /// and that ordering is a function of the partition.
 ///
 /// This makes a chain carrying a sampler valid only for the plan whose grid it
-/// was built against, which is a real constraint and an existing one:
-/// [`Chain::Source`] says the same of the image its
-/// leaf names — "a chain carrying one constrains the plans it is valid for. That
-/// is not a leak: which image is read is parity-visible". Here the grid is
-/// checked rather than trusted: [`SampleCombine::side_region`] refuses a block
-/// it was not built for, by name, rather than returning a plausible wrong range.
+/// was built against — a real constraint, and an existing one: [`Chain::Source`]
+/// says the same of the image its leaf names. The grid is checked rather than
+/// trusted: [`SampleCombine::side_region`] refuses a block it was not built for,
+/// by name, rather than returning a plausible wrong range.
 #[derive(Debug, Clone)]
 pub struct LabelIndex {
     /// One per labelled voxel, ordered by block and then by position within it.
@@ -716,30 +689,23 @@ impl LabelIndex {
 /// **Gather one training row per labelled voxel, as a side output of the feature
 /// stack's own fan-in.**
 ///
-/// This is what `Combine::side_outputs` was added for, and the reason it had to
-/// be a combine rather than a `BlockOp` is the whole of the design: a fan-in's
-/// sink is the only place where every channel's value at a voxel exists at once.
-/// A `BlockOp` after the stack sees one image; a branch inside it sees one
-/// channel.
+/// This is what `Combine::side_outputs` was added for, and it had to be a
+/// combine rather than a `BlockOp`: a fan-in's sink is the only place where
+/// every channel's value at a voxel exists at once. A `BlockOp` after the stack
+/// sees one image; a branch inside it sees one channel.
 ///
 /// # What it buys over [`gather_samples`]
 ///
-/// [`gather_samples`] computes the stack over a crop and keeps every channel of
-/// every voxel of that crop in memory — 91 columns times the crop's voxels. At a
-/// `512^3` crop that is 97 GB, so it is a function that works on an annotator's
-/// working crop and falls over on a volume.
-///
-/// This runs inside an ordinary blocked phase. It holds one block's channels,
-/// writes the rows for that block's labelled voxels, and moves on, so its
-/// residency is the block's rather than the crop's and it works at whatever size
-/// the planner can block.
+/// [`gather_samples`] keeps every channel of every voxel of the crop in memory —
+/// 91 columns times the crop's voxels, 97 GB at a `512^3` crop. This runs inside
+/// an ordinary blocked phase, holding one block's channels at a time, so it
+/// works at whatever size the planner can block.
 ///
 /// # The primary image
 ///
 /// A pixel phase writes an image, so this writes the **class of each voxel**,
-/// `unlabelled` where there is none — the label volume as the run saw it. It
-/// costs one image and it is the thing worth keeping: it is what a reader needs
-/// to check which voxels a training run actually sampled.
+/// `unlabelled` where there is none — the label volume as the run saw it, which
+/// is what a reader needs to check which voxels a training run actually sampled.
 pub struct SampleCombine {
     name: &'static str,
     channels: Vec<String>,
@@ -824,12 +790,10 @@ impl Combine for SampleCombine {
     /// **The label each voxel was drawn with**, `unlabelled` where there is
     /// none — not the class *index*.
     ///
-    /// The distinction is not cosmetic and it was a defect here first. Class
-    /// indices run `0..n`, and the commonest sentinel for "no label" is `0`, so
-    /// writing indices makes class 0 and unlabelled the same value in the one
-    /// image whose purpose is to show which voxels were sampled. Writing the
-    /// annotator's own labels is both unambiguous and the thing a reader wants:
-    /// it is the label volume as the run saw it, and it round-trips through
+    /// This was a defect here first. Class indices run `0..n` and the commonest
+    /// sentinel for "no label" is `0`, so writing indices makes class 0 and
+    /// unlabelled the same value in the one image whose purpose is to show which
+    /// voxels were sampled. The annotator's own labels round-trip through
     /// [`ClassMap`] to the indices the rows carry.
     fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, at: &Anchor) -> Result<()> {
         let shapes: Vec<[usize; 3]> = inputs.iter().map(|input| input.shape()).collect();
@@ -950,9 +914,7 @@ impl Combine for SampleCombine {
 /// **Sample**: a feature stack and a labelled volume, as one chain plus the
 /// index that reads its output back.
 ///
-/// The third wrapper beside [`train_workflow`] and [`predict_workflow`], and the
-/// one that makes the blocked path usable without assembling a
-/// [`SampleCombine`] by hand.
+/// The third wrapper beside [`train_workflow`] and [`predict_workflow`].
 ///
 /// **It takes the grid**, which the other two do not, for the reason
 /// [`LabelIndex`] gives: a block's rows have to be contiguous in the gathered

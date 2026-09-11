@@ -136,9 +136,8 @@ pub struct TaskGraph {
     /// wanted. Paying a quadratic to express one bit per phase, at the block
     /// counts the feature is for, is the wrong side of that trade.
     ///
-    /// "Every task of `p` waits for every task of `p-1`" is a statement about two
-    /// *phases*, and this is it, stated once. What it costs is that a scheduler
-    /// has to act on it; see [`Self::is_barrier`] for who does.
+    /// What the phase-level form costs is that a scheduler has to act on it; see
+    /// [`Self::is_barrier`] for who does.
     ///
     /// [`PhaseDecomposition::barrier`]: crate::decomposition::PhaseDecomposition::barrier
     pub barriers: Vec<bool>,
@@ -256,11 +255,9 @@ impl TaskGraph {
     /// need, phase 0's tasks are ready from the start, and the property carries
     /// forward.
     ///
-    /// **And it is the only enforcement**, which is worth saying plainly because
-    /// it briefly was not: while the barrier was `blocks x blocks` edges the
-    /// indegree enforced it too, and a property enforced in one place that reads
-    /// as though it is enforced in two is worse than one honestly enforced once.
-    /// It is enforced once, here, by whoever schedules.
+    /// **And it is the only enforcement.** Nothing in the indegree machinery
+    /// backs it up: a scheduler that does not consult this field does not honour
+    /// the barrier at all.
     pub fn is_barrier(&self, phase: usize) -> bool {
         self.barriers.get(phase).copied().unwrap_or(false)
     }
@@ -282,7 +279,7 @@ impl TaskGraph {
         &self.tasks[from..to]
     }
 
-    /// How many tasks depend on each task.
+    /// The ids of the tasks that depend on each task.
     pub fn dependents(&self) -> Vec<Vec<usize>> {
         let mut out = vec![Vec::new(); self.tasks.len()];
         for task in &self.tasks {
@@ -329,16 +326,12 @@ impl TaskGraph {
         for task in &self.tasks {
             // Every image a source leaf reads, on the same argument and against
             // the same region: a source leaf has reach 0, so what it reads is
-            // what the task fetches. Image 0 is skipped because no phase writes
-            // it — it is there before the run, which is the whole reason a
-            // image with no producer is a case of the rule rather than an
-            // exception to it.
+            // what the task fetches. Image 0 and a supplied input are skipped
+            // because no phase writes them — they are there before the run, so
+            // there is nothing whose valid regions could cover the fetch. That a
+            // supplied input is *there* at all is the environment's check, and
+            // its extent is `check_source_images`'.
             for source in &task.source_deps {
-                // ... and a supplied input for the same reason arrived at from
-                // the other end: it was handed to the run, so no phase produces
-                // it and there is nothing whose valid regions could cover the
-                // fetch. That it is *there* at all is the environment's check,
-                // and its extent is `check_source_images`'.
                 if source.image == 0 || crate::assemble::is_supplied_image(source.image) {
                     continue;
                 }

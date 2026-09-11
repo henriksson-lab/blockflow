@@ -154,8 +154,8 @@ impl Voxels {
         self.len() as u64 * self.dtype().size_of() as u64
     }
 
-    /// A zero-filled block. `Dtype::F16` has no variant; see [`Voxels::zeros`]'s
-    /// error for why.
+    /// A zero-filled block. `Dtype::F16` has no variant; see
+    /// [`Voxels::filled`]'s error for why.
     pub fn zeros(dtype: Dtype, shape: [usize; 3]) -> Result<Self> {
         Self::filled(dtype, shape, 0.0)
     }
@@ -643,10 +643,6 @@ impl<'a> VoxelsMut<'a> {
 }
 
 /// Narrow a mutable view to `region` on every axis.
-///
-/// Split out because two callers narrow the same way — [`Voxels`], which owns
-/// its buffer, and [`VoxelsMut`], which borrows one — and a second copy of three
-/// lines of axis slicing is a second place for an off-by-one to live.
 fn narrow_mut<'v, T>(mut view: ArrayViewMut3<'v, T>, region: &Region) -> ArrayViewMut3<'v, T> {
     for (axis, (&start, &len)) in region.start.iter().zip(region.shape.iter()).enumerate() {
         view.slice_axis_inplace(Axis(axis), Slice::from(start..start + len));
@@ -655,6 +651,10 @@ fn narrow_mut<'v, T>(mut view: ArrayViewMut3<'v, T>, region: &Region) -> ArrayVi
 }
 
 /// [`narrow_mut`], for a shared view.
+///
+/// Split out because two callers narrow the same way — [`Voxels`], which owns
+/// its buffer, and [`VoxelsMut`], which borrows one — and a second copy of three
+/// lines of axis slicing is a second place for an off-by-one to live.
 fn narrow<'v, T>(mut view: ArrayView3<'v, T>, region: &Region) -> ArrayView3<'v, T> {
     for (axis, (&start, &len)) in region.start.iter().zip(region.shape.iter()).enumerate() {
         view.slice_axis_inplace(Axis(axis), Slice::from(start..start + len));

@@ -258,15 +258,9 @@ pub struct WorkerReport {
     /// along — the list ran empty while there was work to have. This is the
     /// regression the design warns about, and it is the number to assert zero.
     ///
-    /// **Decided when the wait ends, not when it starts.** The obvious test —
-    /// "was the puller's last reply `Work`?" — reads a reply that may already
-    /// be stale, and the staleness window is exactly one handout round trip:
-    /// the puller receives the last task of a phase, the executor drains the
-    /// list before the puller's *next* reply lands, and a wait for work that
-    /// does not exist is recorded as a wait for work that was withheld. It
-    /// mattered: that misclassification is what made this counter, and the
-    /// three tests asserting it, fail under load. So the wait is classified by
-    /// what ended it — see [`Self::told_to_wait`] for the other outcome.
+    /// **Decided when the wait ends, not when it starts**, because the evidence
+    /// available on entry is a round trip out of date. `next_task` is where that
+    /// is argued; [`Self::told_to_wait`] is the other outcome.
     ///
     /// # What zero here promises, which is not "never"
     ///
@@ -367,11 +361,8 @@ struct Shared {
     arrived: Condvar,
     /// The executor took one off the list, so there is room for another.
     ///
-    /// The puller waits on this rather than sleeping on a timer. A timer here
-    /// is not a poll interval, it is a **lag**: the list cannot be refilled
-    /// until the sleep ends, so every task shorter than the sleep leaves the
-    /// list one deeper down than it should be, and a job whose tasks are
-    /// shorter than the sleep runs it empty however deep `ahead` is.
+    /// The puller waits on this rather than sleeping on a timer; the module
+    /// header measures what the timer used to cost.
     taken: Condvar,
     last: Mutex<LastReply>,
     /// How many times the coordinator has answered "nothing for you now".
@@ -481,8 +472,10 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
     let prefetch_threads = runtime.prefetch_threads();
     let environment = factory.environment(&spec.workflow, decomposition.n_phases(), runtime)?;
     environment.prepare(&decomposition)?;
-    // Declared by every worker, idempotently, exactly as the job's own sidecar
-    // stream is: a worker that joins late or restarts declares the same thing.
+    // Declared here, by every worker, rather than once by the coordinator.
+    // Declaration is idempotent for the same lifecycle precisely so that it
+    // needs no coordination — a worker that joins late, or is restarted after
+    // a death, declares the same thing and carries on.
     for entry in &work {
         if let PhaseWork::Fragments(op) = entry {
             for output in op.outputs() {
@@ -490,10 +483,7 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
             }
         }
     }
-    // Declared here, by every worker, rather than once by the coordinator.
-    // Declaration is idempotent for the same lifecycle precisely so that it
-    // needs no coordination — a worker that joins late, or is restarted after
-    // a death, declares the same thing and carries on.
+    // The job's own sidecar stream, declared on the same terms.
     if let Some(sidecar) = &spec.workflow.sidecar {
         environment.declare_sidecar(&sidecar.stream, sidecar.lifecycle)?;
     }

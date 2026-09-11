@@ -474,12 +474,10 @@ fn the_two_searches_agree_on_long_chains_too() {
 /// **The one thing that stops the agreement being unconditional**, measured
 /// rather than asserted away.
 ///
-/// With costs that binary cannot hold exactly, two partitions of mathematically
-/// equal price differ in their last bits, and *which* of them each search keeps
-/// is then decided by rounding: the enumeration compares whole totals, the DP
-/// compares prefixes, and the noise reaches the two comparisons differently. The
-/// plans may therefore differ — but only where the cost does not, which is what
-/// is asserted here, at every seed, to within `1e-9` relative.
+/// With costs that binary cannot hold exactly the tie-break is decided by
+/// rounding instead — see [`Arithmetic`]. The plans may therefore differ, but
+/// only where the cost does not, which is what is asserted here, at every seed,
+/// to within `1e-9` relative.
 ///
 /// Nothing about this is peculiar to the DP. The enumeration's answer on a tied
 /// pair was already an artefact of the summation order rather than a decision;

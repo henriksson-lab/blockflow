@@ -546,9 +546,9 @@ fn coalescing_stays_refused_when_real_and_simulated_directions_diverge() {
 /// **The one regime `CacheModelled` can differ in, which had never been run.**
 ///
 /// `nearest_first_handout_costs_fewer_duplicated_fetches_than_naive_pull`
-/// measures all three policies and the cache-modelled column is identical to
-/// nearest-first on every one. That is not the model agreeing with reality; it
-/// is the model never being asked. `probe_job` carries `cache_bytes` of 1 MiB
+/// measures naive, nearest-first and cache-modelled, and the cache-modelled
+/// column is identical to nearest-first on every row. That is not the model
+/// agreeing with reality; it is the model never being asked. `probe_job` carries `cache_bytes` of 1 MiB
 /// against a 2 048-byte chunk, so `ModelledCache::capacity` is 512 entries and
 /// the whole run touches 64 distinct chunks — **the model never evicts.** With
 /// no eviction, "chunks this worker was assigned" is a monotone proxy for "near
@@ -1007,7 +1007,8 @@ fn on_a_balanced_cluster_the_selection_has_nothing_to_choose_between() {
 }
 
 /// Whatever else it does, it must not stall. Every worker count from one to
-/// eight, and every policy, over a job with a barrier in it.
+/// eight, over the naive, nearest-first and cache-modelled handouts, on a job
+/// with a barrier in it.
 #[test]
 fn a_barrier_phase_is_always_claimed_by_somebody() {
     for workers in 1..=8usize {
@@ -1042,9 +1043,12 @@ fn the_modelled_overlap_matches_what_the_worker_really_holds() {
 
 /// Coverage, from a merged stream, with several workers and no network.
 ///
-/// The same `check_coverage_and_order` a single-node run is asserted with. That
-/// it applies unchanged is the point: a distributed run's log is an
-/// `ExecutionLog`, not a distributed-specific artefact.
+/// The same `ExecutionLog` a single-node run is asserted from, through
+/// `Job::check_coverage` — which is `check_coverage_unordered`, because a
+/// merged multi-worker stream has no arrival order to check; see that method for
+/// what it still catches. That the log type applies unchanged is the point: a
+/// distributed run's log is an `ExecutionLog`, not a distributed-specific
+/// artefact.
 #[test]
 fn the_merged_event_stream_satisfies_the_single_node_acceptance_criterion() {
     let (mut spec, decomposition) = probe_job(12, 2, ChainSpec::identity());

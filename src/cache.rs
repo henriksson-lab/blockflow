@@ -19,8 +19,9 @@
 //
 // So: one cache above the sources, keyed by `(array, chunk)`, evicting across
 // all of them from a single recency order. Capacity moves to demand because
-// nothing in the structure ties it down. `cross_array_pressure_moves_capacity`
-// in `cache_tests` is the test a per-array cache cannot pass.
+// nothing in the structure ties it down.
+// `cross_array_pressure_moves_capacity_from_the_cold_array_to_the_hot_one` in
+// `cache_tests` is the test a per-array cache cannot pass.
 //
 // The key is a **canonical lattice index**, never a request shape
 // ---------------------------------------------------------------
@@ -1114,10 +1115,9 @@ impl ChunkCache {
         Ok(())
     }
 
-    /// Mark chunks pending. Returns `(claimed, already pending elsewhere)`.
-    /// Split `chunks` into the ones this call will fetch, the ones another call
-    /// is already fetching, and the ones that **became resident** since the
-    /// caller looked.
+    /// Mark chunks pending: split `chunks` into the ones this call will fetch,
+    /// the ones another call is already fetching, and the ones that **became
+    /// resident** since the caller looked.
     ///
     /// # The third list, and why it is not a refinement
     ///
@@ -1445,7 +1445,6 @@ impl ChunkCache {
         self.capacity
     }
 
-    /// Drop everything, returning every lease.
     /// Drop every cached chunk that `region` of `array` touches.
     ///
     /// **What makes an intermediate image cacheable at all.** `ChunkCache` had
@@ -1484,6 +1483,7 @@ impl ChunkCache {
         self.registered(array).is_ok()
     }
 
+    /// Drop everything, returning every lease.
     pub fn clear(&self) {
         let mut state = self.state.lock_unpoisoned();
         state.entries.clear();

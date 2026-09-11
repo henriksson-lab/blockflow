@@ -4,23 +4,13 @@
 //
 // Why this exists at all
 // ----------------------
-// The framework used to return `clearmap_rs::ClearMapError`, which is a
-// thirty-variant enum covering everything from Elastix invocation to npy header
-// parsing. Depending on it would have inverted the dependency this crate was
-// extracted to establish, and it would have been dishonest besides: the whole
-// framework raises exactly **two** kinds of failure.
-//
-// * `InvalidArgument` — a plan, a region or a chain is inconsistent. Every
-//   guard in `geometry`, `decomposition`, `graph` and `tiling` reports this.
-// * `ShapeMismatch` — an op returned an array of the wrong extent, which is the
-//   one failure a caller can act on programmatically.
-//
-// Plus one that only appears at the boundary:
-//
-// * `Backend` — a `RegionSource`/`RegionSink` implementation outside this crate
-//   failed. We deliberately do not model its error; we carry its message. This
-//   crate has no way to interpret "zarrs chunk grid has no chunk at the origin"
-//   and no business trying.
+// The framework used to return `clearmap_rs::ClearMapError`, a thirty-variant
+// enum covering everything from Elastix invocation to npy header parsing.
+// Depending on it would have inverted the dependency this crate was extracted
+// to establish, and the whole framework raises exactly two kinds of failure
+// anyway — plus `Backend`, which deliberately carries a foreign error's message
+// rather than modelling it: this crate has no way to interpret "zarrs chunk
+// grid has no chunk at the origin" and no business trying.
 //
 // Conversion is the *caller's* job, and is stated once at the boundary rather
 // than at every call site: `clearmap-rs` implements `From<Error> for

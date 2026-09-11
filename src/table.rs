@@ -28,16 +28,6 @@
 // wrong stream is told which column disagrees rather than reading somebody
 // else's numbers as its own.
 //
-// What carried over from `crate::points` unchanged
-// ------------------------------------------------
-// Everything structural, because it was right: the two states, the canonical
-// order with an intrinsic tiebreak, the streaming `scan`, the two
-// interchangeable indexes, and the k-way merge that holds a cross-section rather
-// than the whole span. Each of those is argued for below in its own section, and
-// the arguments are the ones that module made — a point set is a table with one
-// payload column, so a property that had to hold for one holds for the other for
-// the same reason.
-//
 // Two states, and why reading early is an error rather than an emptiness
 // ---------------------------------------------------------------------
 // A table is [`State::Accumulating`] — blocks write, nobody reads — or
@@ -1308,9 +1298,7 @@ impl GriddedScan<'_> {
     /// How many cursors a full cross-section needs, which is the bound the heap
     /// never exceeds.
     ///
-    /// Test-only, like the other measurement hooks on [`Gridded`]: a caller who
-    /// could ask this could tell a gridded table from a flat one without timing
-    /// it.
+    /// Test-only, like the other measurement hooks on [`Gridded`].
     #[cfg(test)]
     pub(crate) fn width(&self) -> usize {
         (self.hi[1] - self.lo[1] + 1) * (self.hi[2] - self.lo[2] + 1)
@@ -1694,10 +1682,9 @@ impl Table {
                 return Err(self.outside(None, self.count, at, axis));
             }
         }
-        // Filled in scratch and copied in one go, so a value refused halfway
-        // through leaves no half a row behind. Reused rather than allocated per
-        // call because this is the path `crate::points` writes one point at a
-        // time down.
+        // Scratch as in [`RowBuilder::push`], and reused rather than allocated
+        // per call because this is the path `crate::points` writes one point at
+        // a time down.
         for axis in 0..3 {
             self.scratch[axis] = at[axis] as u64;
         }

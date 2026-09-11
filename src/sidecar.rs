@@ -7,15 +7,12 @@
 // Why this exists
 // ---------------
 // The executor can write exactly one kind of thing: a valid region of an image.
-// That covers every op whose output is an image, and it covers nothing else —
-// yet several real steps produce, per block, a **fragment** that a later global
+// Yet several real steps produce, per block, a **fragment** that a later global
 // step merges: incident lists, connected-component boundaries, per-block
-// displacement estimates a least-squares solve consumes. Every one of them has
-// the same shape — *a block produces a fragment; a global step merges
-// fragments* — and every one of them has, until now, had nowhere to put its
-// output. Which is why such work either stayed outside the executor entirely or
-// was held in memory, and holding it in memory is precisely what pins a stage to
-// one node.
+// displacement estimates a least-squares solve consumes. Without somewhere to
+// put those, such work either stayed outside the executor entirely or was held
+// in memory — and holding it in memory is precisely what pins a stage to one
+// node.
 //
 // Three decisions, and each is what makes the rest tractable
 // ----------------------------------------------------------
@@ -27,20 +24,17 @@
 // nobody else's, and "did every block produce one?" is answered against the same
 // grid every other coverage question is answered against.
 //
-// **2. The value is `&[u8]`, and no format is imposed.** Not serde, not JSON,
-// not a self-describing container. The op knows what it is writing and the
-// merge knows what it is reading; anything in between would be this crate
-// having an opinion about a type it has never seen. It is the refusal to
-// support *types* that makes supporting *arbitrary* types possible — a
-// framework that took `T: Serialize` would support the types its author
-// imagined, and this supports bytes.
+// **2. The value is `&[u8]`, and no format is imposed.** The op knows what it is
+// writing and the merge knows what it is reading. It is the refusal to support
+// *types* that makes supporting *arbitrary* types possible — a framework taking
+// `T: Serialize` would support the types its author imagined, and this supports
+// bytes.
 //
-// **3. Plain objects, not an array.** One object per `(stream, phase, block)`,
-// on a filesystem or in an object store. A chunked array format can express
-// variable-length data, but awkwardly, and none of the three things it would buy
-// — a chunk grid, codecs, partial reads — applies to a blob whose length is
-// whatever the op decided. A prefix and a name is the whole storage model, which
-// is also why it ports to S3 without a design.
+// **3. Plain objects, not an array.** One object per `(stream, phase, block)`.
+// None of the three things a chunked array format would buy — a chunk grid,
+// codecs, partial reads — applies to a blob whose length is whatever the op
+// decided. A prefix and a name is the whole storage model, which is also why it
+// ports to S3 without a design.
 //
 // Where merging happens: not here
 // -------------------------------
@@ -56,11 +50,9 @@
 // Lifecycle is declared, never defaulted
 // --------------------------------------
 // A stream is created as [`Lifecycle::DeleteOnExit`] or
-// [`Lifecycle::Persistent`], and there is no default — `Lifecycle` deliberately
-// does not implement `Default`. Keeping intermediate output deliberately, for
-// debugging, and cleaning it up automatically are both legitimate, and which one
-// a stream wants is a property of the stream. What is not legitimate is drifting
-// into either by omission.
+// [`Lifecycle::Persistent`], and `Lifecycle` deliberately does not implement
+// `Default`. Both are legitimate and which one a stream wants is a property of
+// the stream; what is not legitimate is drifting into either by omission.
 //
 // The deletion has a bug to learn from
 // ------------------------------------
@@ -288,11 +280,10 @@ struct Registered {
 /// reports what it did.
 pub struct Sidecars {
     backend: Box<dyn SidecarBackend>,
-    /// Held behind a lock and attachable after construction, because an
-    /// environment is built by a factory that has never heard of listeners —
-    /// the distributed worker builds its environment from a job spec and only
-    /// then knows where its events go. The lock is taken once per fragment,
-    /// which is per block, not per voxel.
+    /// Attachable after construction, because an environment is built by a
+    /// factory that has never heard of listeners — the distributed worker builds
+    /// its environment from a job spec and only then knows where its events go.
+    /// The lock is taken once per fragment, which is per block, not per voxel.
     listeners: RwLock<Vec<Registered>>,
     /// Streams this handle has seen declared, so the per-write "is it
     /// declared?" check is a set lookup rather than a storage round trip. It is
@@ -301,8 +292,7 @@ pub struct Sidecars {
     /// merging reader, say — behave correctly.
     ///
     /// Worth having because the check is per block: on a shared filesystem an
-    /// uncached one would be an extra open and read per fragment, which is the
-    /// kind of cost that only shows up on a cluster.
+    /// uncached one would be an extra open and read per fragment.
     known: RwLock<BTreeMap<String, Lifecycle>>,
 }
 
@@ -547,10 +537,9 @@ impl std::fmt::Debug for Sidecars {
 
 /// Fragments in a map. What an in-process environment uses.
 ///
-/// Not a stub: the simulated environment counts sidecar traffic like any other,
-/// and a fragment's bytes are the *caller's* — unlike a voxel, they cannot be
-/// fabricated from a region, so a store that discarded them would break any
-/// caller that read one back.
+/// Not a stub: a fragment's bytes are the *caller's* — unlike a voxel, they
+/// cannot be fabricated from a region, so a store that discarded them would
+/// break any caller that read one back.
 #[derive(Debug, Default)]
 pub struct MemorySidecars {
     declared: RwLock<BTreeMap<String, Lifecycle>>,
@@ -735,11 +724,11 @@ impl FileSidecars {
     /// Remove a path, using the call that fits what is actually there, and
     /// **confirm it is gone**.
     ///
-    /// The two halves are both the lesson from the recorded bug: `remove_file`
-    /// on a directory fails, and a failure that is dropped is a cleanup that
-    /// never happened and never said so. Here the error is returned with the
-    /// path in it, and the absence is checked afterwards so that a backend that
-    /// somehow succeeds without removing anything is caught too.
+    /// Both halves are the lesson from the recorded bug: `remove_file` on a
+    /// directory fails, and a failure that is dropped is a cleanup that never
+    /// happened and never said so. The error is returned with the path in it,
+    /// and the absence is checked afterwards so that a removal that succeeds
+    /// without removing anything is caught too.
     fn remove_confirmed(path: &Path) -> Result<()> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,

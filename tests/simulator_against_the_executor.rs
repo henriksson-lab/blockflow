@@ -419,16 +419,15 @@ fn a_chain_that_changes_element_type_agrees() {
     assert_stores_agree("a chain that changes element type", &both);
 }
 
-/// A **fragment phase**, which writes a sidecar rather than an image and is the
-/// one phase kind whose bytes neither half prices yet.
+/// A **fragment phase**, which writes a sidecar rather than an image.
 ///
-/// It is here for the other three quantities — the task count, the admitted
-/// order and the chunks its blocks read — and because a fragment phase is where
-/// `writes_an_image` is asked of the work rather than assumed, which is a branch
-/// no all-pixel plan exercises. The sidecar bytes it writes are the subject of
-/// the `Sidecar traffic and the barrier gather` item and are deliberately not
-/// asserted here: neither side counts them, so agreeing about them would mean
-/// nothing.
+/// It is here for the four quantities the table above compares, and because a
+/// fragment phase is where `writes_an_image` is asked of the work rather than
+/// assumed — a branch no all-pixel plan exercises. The **sidecar** payload is
+/// deliberately outside the comparison: the simulator keeps it in
+/// `Outcome::sidecar_bytes_written` and the executor's `RegionWritten` events
+/// never carry it, so the two are not counting the same thing and agreeing
+/// about it would mean nothing.
 #[test]
 fn a_plan_with_a_fragment_phase_agrees() {
     let volume = [16, 16, 16];

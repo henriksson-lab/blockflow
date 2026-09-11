@@ -120,7 +120,7 @@ pub fn resolve_one(text: &str, default_port: u16) -> Result<SocketAddr> {
 /// This machine's hostname, or `None` where it cannot be read.
 ///
 /// Read from the environment first — a scheduler that knows which interface it
-/// wants sets it — and from `/etc/hostname` or `uname` otherwise. Deliberately
+/// wants sets it — and from `/proc/sys/kernel/hostname` otherwise. Deliberately
 /// no dependency for this: it is a fallback for a value that should have been
 /// passed in.
 fn hostname() -> Option<String> {

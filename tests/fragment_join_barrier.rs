@@ -5,13 +5,12 @@
 // **What the barrier and the hoisted reduction are worth on two shipped ops**,
 // measured rather than quoted.
 //
-// `docs/design/barriers.md` was written from a measurement of the *cost of not
-// having one* and specified a way out in two steps: a phase may declare that it
-// waits for all of the phase below it, and — only then — it may compute one
-// answer for the whole phase instead of re-deriving it in every block. §8.10
-// recorded that no shipped op declared either. `ops::fill` and `ops::regional`
-// now do, and this file is the evidence for what that bought and the control
-// that says it is still the same answer.
+// `docs/design/barriers.md` specifies the way out in two steps: a phase may
+// declare that it waits for all of the phase below it, and — only then — it may
+// compute one answer for the whole phase instead of re-deriving it in every
+// block. `ops::fill` and `ops::regional` declare both, and this file is the
+// evidence for what that bought and the control that says it is still the same
+// answer.
 //
 // Three things this file is arranged to avoid, each of which has bitten this
 // project:
@@ -27,9 +26,8 @@
 //   reference. The arm with the barrier withheld is the shape the framework
 //   admitted before, and it must agree to the byte — if it does not, the barrier
 //   is doing something other than what it claims.
-// * **The lattices are genuinely distinct and that is asserted.** A sweep that
-//   decayed to two grids, one of them a single block, kept passing here and had
-//   stopped meaning anything.
+// * **The lattices are genuinely distinct and that is asserted** — see
+//   `lattices()` for the decay that makes the assertion worth having.
 //
 // The absolute ratios in this file are **not** the ones `barriers.md` §7.1
 // quotes and are not meant to be. §8.8 records why: a fragment is a block *face*

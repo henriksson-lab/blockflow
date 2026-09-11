@@ -86,11 +86,17 @@
 //
 // **And the page cache buys little of it.** `warm/cold` under gzip is `0.78` to
 // `1.00`: a second pass over data that is entirely in the page cache is barely
-// faster, because the inflate is paid again and there is no in-process chunk
-// cache to skip it — `src/cache.rs`'s `ChunkCache` has **no non-test
-// construction site anywhere in the crate**. Uncompressed, where there is
-// nothing to re-decode, the page cache is worth about `2x` (`0.41`-`0.61`), which
-// is the only place in this table the original hypothesis holds.
+// faster, because the inflate is paid again and nothing skips it. Uncompressed,
+// where there is nothing to re-decode, the page cache is worth about `2x`
+// (`0.41`-`0.61`), which is the only place in this table the original hypothesis
+// holds.
+//
+// **The table was taken with no in-process chunk cache on the read path.**
+// `ZarrEnvironment` now installs `cache::ChunkCache` by default — see its
+// `cache` field and `tests/zarr_cache.rs` — which serves a warm re-read decoded
+// and so removes the inflate the warm rows here pay. The cold rows and the
+// `unaligned` column, which are what this file's finding rests on, are
+// unaffected; the warm/cold ratios are a record of the uncached path.
 
 #![cfg(feature = "zarr")]
 

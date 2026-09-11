@@ -259,7 +259,7 @@ impl FragmentOp for YoloBlockDetector {
             Coverage::EveryBlock,
         )
         // One row per detection, and a block cannot detect more objects than it
-        //             // holds voxels.
+        // holds voxels.
         .sized(match self.schema() {
             Ok(schema) => crate::fragment::SidecarSize::row_table(&schema, 1),
             Err(_) => crate::fragment::SidecarSize::Unstated,

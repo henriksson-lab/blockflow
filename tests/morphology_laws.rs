@@ -7,16 +7,14 @@
 //
 // The gap this file closes
 // ------------------------
-// Everything the tree asserts about this module today is either
-// decomposition invariance — `tests/image_ops.rs`, `tests/asymmetric_element.rs`,
-// whose reference is `chain.apply()` called once — or the transitive chain
+// Decomposition invariance — `tests/image_ops.rs`, `tests/asymmetric_element.rs`,
+// whose reference is `chain.apply()` called once — cannot see a composition that
+// is wrong the same way under every cut. Neither can the transitive chain
 // `erosion_and_dilation_are_the_extreme_ranks_of_the_same_element`
-// (`src/ops/morphology.rs`) into `ops::rank`'s `by_definition`. That chain is a
-// real witness for the *sweep*, but it has a common mode: both sides read
-// `input[centre + offset]` over `element.offsets()`, so it cannot see the
-// composition. And the only law asserted anywhere is
-// `opening_removes_an_isolated_voxel_and_closing_fills_an_isolated_hole`, on a
-// symmetric 3x3x3 box.
+// (`src/ops/morphology.rs`) into `ops::rank`'s `by_definition`: that is a real
+// witness for the *sweep*, but it has a common mode — both sides read
+// `input[centre + offset]` over `element.offsets()`, so neither can see the
+// composition at all.
 //
 // An opening is not "erode then dilate". It is the operation defined by three
 // properties — **anti-extensive**, **increasing**, **idempotent** — and "erode
@@ -36,7 +34,7 @@
 // |---|---|
 // | erosion and dilation are the gathered definition | a triple loop over the element's offsets with the clamp written out, on six elements x three masks — 49 896 voxels, exact |
 // | an opening is an opening | anti-extensive, increasing and idempotent, on six elements — four symmetric, two not — x three masks; the closing dual beside it |
-// | the laws are not vacuous | the same three properties are checked to *fail* for a deliberately wrong composition, so a fixture on which everything is an opening is caught |
+// | the laws are not vacuous | the same properties are checked to *fail* for a deliberately wrong composition, so a fixture on which everything is an opening is caught |
 // | **the composition is the one that reflects** | the minimal counterexample the defect was found on, asserted the right way round, with the unreflected composition computed beside it and measured to move the image |
 //
 // What is deliberately not asserted
@@ -395,10 +393,10 @@ fn an_opening_obeys_the_three_laws_over_every_element() {
 /// properties most easily becomes.
 ///
 /// A deliberately wrong composition — dilate first, then erode, which is the
-/// *closing* wearing the opening's name — is put through the same three checks
-/// and measured to fail two of them. If a fixture ever stopped being able to
-/// tell an opening from its dual, this test says so instead of
-/// `an_opening_by_a_symmetric_element_obeys_the_three_laws` passing for nothing.
+/// *closing* wearing the opening's name — is put through [`laws_of_opening`] and
+/// measured to fail anti-extensivity by a wide margin. If a fixture ever stopped
+/// being able to tell an opening from its dual, this test says so instead of
+/// `an_opening_obeys_the_three_laws_over_every_element` passing for nothing.
 #[test]
 fn the_laws_reject_a_composition_that_is_not_an_opening() {
     let element = StructuringElement::from_radius(ElementShape::Ellipsoid, [2, 2, 2]);

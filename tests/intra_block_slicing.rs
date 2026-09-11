@@ -590,19 +590,6 @@ fn one_undeclared_op_refuses_the_whole_chain() {
     );
 }
 
-/// The default is doing its job, and this test is the record of when that stops
-/// being true: an op declared sliceable will appear here.
-///
-/// **Inverted in part, not deleted.** Four of the ops this test was written
-/// against — `SmoothOp`, `MorphologyOp`, `RankFilterOp` and `ConvolveOp` — now
-/// declare themselves stencils and are held to it by
-/// `the_shipped_stencils_survive_the_cut_bit_for_bit`. What remains here is the
-/// half that is still true and is the more interesting half: the ops that *look*
-/// sliceable from outside and are not. `ops::sliding` computes the same
-/// statistic as `ops::rank` with the same reach and the same output shape, by
-/// carrying a histogram along the scan — so **a reach says what an op reads, it
-/// does not say the answer is a function only of what was read**, and this is
-/// the pair that demonstrates it.
 /// **The four shipped ops that now declare themselves stencils, held to the bar
 /// rather than believed.**
 ///
@@ -680,6 +667,19 @@ fn the_shipped_stencils_survive_the_cut_bit_for_bit() {
     }
 }
 
+/// The default is doing its job, and this test is the record of when that stops
+/// being true: an op declared sliceable will appear here.
+///
+/// **Inverted in part, not deleted.** Four of the ops this test was written
+/// against — `SmoothOp`, `MorphologyOp`, `RankFilterOp` and `ConvolveOp` — now
+/// declare themselves stencils and are held to it by
+/// `the_shipped_stencils_survive_the_cut_bit_for_bit`. What remains here is the
+/// half that is still true and is the more interesting half: the ops that *look*
+/// sliceable from outside and are not. `ops::sliding` computes the same
+/// statistic as `ops::rank` with the same reach and the same output shape, by
+/// carrying a histogram along the scan — so **a reach says what an op reads, it
+/// does not say the answer is a function only of what was read**, and this is
+/// the pair that demonstrates it.
 #[test]
 fn every_shipped_op_refuses_to_be_sliced_today() {
     let element = blockflow::ops::element::StructuringElement::from_radius(
@@ -1416,8 +1416,8 @@ fn the_cut_pays_on_a_one_block_plan() {
 /// arm, a grey opening — two rank filters — on the other, joined by a
 /// difference. **Every one of its parts had to be declared before this chain
 /// could be cut** — the two rank filters, the map, and the sink — and until the
-/// last of them was, the node refused however many of the others were stencils. That is the shape of the blocker: *the declaration sits on the
-/// op, the refusal sits on the chain around it.*
+/// last of them was, the node refused however many of the others were
+/// stencils.
 ///
 /// A composite rather than a fifth single op on purpose. Each part is already
 /// held to bit-identity on its own; what this adds is the fold — a fan-in over a

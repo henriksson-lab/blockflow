@@ -290,24 +290,11 @@ impl Phase {
 ///
 /// # Why it is asked for at all
 ///
-/// `IterativeOp::cost_per_voxel` is per substage and the planner prices one, on
-/// the argument that the count is a positive constant common to every candidate
-/// and so cannot move an argmin. **The first half of that is measured and true;
-/// the second half is false.** The count really is independent of the lattice —
-/// `tests/iterative_block_choice.rs` runs the executor over nineteen grids
-/// including one block per voxel, where every propagation step crosses a seam,
-/// and the count never moves — but it multiplies only *part* of the price. A
-/// phase runs `S` substages of read-and-compute and writes its image **once**,
-/// so the true cost is `S * (read + compute) + write`, and ranking on `S == 1`
-/// weighs the write `S` times too heavily. The error is
-/// `(S - 1) * (read + compute)`, which is a function of the block edge through
-/// the read amplification — the same family of mistake as the two before it.
-///
-/// Swept, the chosen edge departs from the one-substage choice at counts as
-/// ordinary as `2` and `4` rather than only at extreme ones, in a small minority
-/// of configurations, and never below three workers. The regret — the price of
-/// the one-substage choice under the objective the phase really has — reaches
-/// `1.125x` over the sweep `tests/iterative_block_choice.rs` holds.
+/// The count multiplies only *part* of a phase's price — `S` substages of
+/// read-and-compute against one write — so it is not the neutral constant a
+/// per-substage ranking assumes, and it moves the chosen block edge.
+/// [`PlanBuilder::iterate_priced`] has the argument and the sweep that measured
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Substages {
     /// Nobody has run it. One substage is priced, which is what the planner has
@@ -366,12 +353,12 @@ pub enum Materialisation {
 /// Whether one candidate's working set fits the budget, at the concurrency the
 /// caller expects to run at.
 ///
-/// Lifted out of the sweep rather than inlined because it is the partition
-/// search's own rule, word for word (`PhasePricer::affordable`), and a second
-/// copy that drifted would let this builder accept a lattice the search would
-/// have refused. `working_set_bytes_per_block` is computed from the *clamped*
-/// read extent for exactly this reason: a budget checked against an
-/// over-charged read invents infeasibility.
+/// Deferred to [`Constraints::affords_working_set`] rather than open-coded,
+/// because it is the partition search's own rule and a second copy that drifted
+/// would let this builder accept a lattice the search would have refused.
+/// `working_set_bytes_per_block` is computed from the *clamped* read extent for
+/// exactly this reason: a budget checked against an over-charged read invents
+/// infeasibility.
 fn affordable(cost: &PhaseCost, constraints: &Constraints) -> bool {
     constraints.affords_working_set(cost)
 }
@@ -1208,10 +1195,7 @@ impl PlanBuilder {
             work: self.work,
         };
         // The executor's own five, in the executor's own order, called
-        // unchanged. Running them here does not make its copies redundant — a
-        // plan may arrive from any strategy or off a wire — it means a plan
-        // written by hand fails at the line that wrote it rather than at the
-        // first run of it.
+        // unchanged. See this method's doc for why its copies stay.
         {
             let work = assembly.work();
             assembly.decomposition.check()?;

@@ -299,8 +299,9 @@ fn the_assembled_mixed_kind_plan_is_the_hand_built_one() {
         hand.decomposition.op_names_in_order()
     );
 
-    // Item four, as a shape rather than as a length assertion: the kinds come
-    // out of the phase list, so there is no second list to be out of order.
+    // The `PhaseWork` list, as a shape rather than as a length assertion: the
+    // kinds come out of the phase list, so there is no second list to be out of
+    // order.
     let work = built.work();
     let expected = hand.work();
     assert_eq!(work.len(), expected.len());

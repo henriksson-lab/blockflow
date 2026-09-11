@@ -16,12 +16,9 @@
 // decision to unify rather than to keep two stores is recorded, with what it
 // bought and what it risked.
 //
-// What did *not* change when that happened is worth saying plainly, because it
-// is the reason the move was cheap: a point blob is three coordinates and
-// `weight.to_bits()`, which is exactly a row of the point schema, so the
-// canonical order over rows is byte-for-byte the order over points. No answer
-// moved, and this module's suite — including its white-box tests of the index,
-// which now drive `table`'s — passes as it was written.
+// The unification was cheap because a point blob is three coordinates and
+// `weight.to_bits()`, which is exactly a row of the point schema: the canonical
+// order over rows is byte-for-byte the order over points, so no answer moved.
 //
 // The problem this removes
 // ------------------------
@@ -117,10 +114,9 @@ use std::cmp::Ordering;
 
 /// One point of the set: a voxel of the volume, and what it carries there.
 ///
-/// The weight is `f64` because a consumer accumulating in anything narrower
-/// would put its own disagreement at around `1e-7` of the total, and it is per
-/// point rather than per set so that "count the points" and "sum a quantity over
-/// the points" are the same operation with a different column.
+/// The weight is `f64`, and per point rather than per set so that "count the
+/// points" and "sum a quantity over the points" are the same operation with a
+/// different column. The module header has the rest of that argument.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
     /// The voxel, in **volume** coordinates. Not block-local: a point travels,
@@ -379,8 +375,9 @@ impl FragmentOp for PointSourceOp {
     fn outputs(&self) -> Vec<FragmentOutput> {
         vec![
             FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
-                // `encode_points` is headerless: four words a point — three coordinates and
-                //             // a weight — and a block holds at most one point per voxel.
+                // `encode_points` is headerless: four words a point — three
+                // coordinates and a weight — and a block holds at most one
+                // point per voxel.
                 .sized(SidecarSize::per_read_voxel(0, 32)),
         ]
     }
@@ -680,11 +677,8 @@ mod tests {
     ///
     /// This is the whole difference between this producer and
     /// `ops::rows::RowSourceOp`, and it is the reason the two are not one op
-    /// with a parameter. That one keys by `ops::detect::owner_of`, which
-    /// **clamps**, because a table refuses an out-of-volume row later and by
-    /// name. Clamping here would hand `ops::voxelize` a fragment holding a
-    /// point outside the block's core, which is precisely what that op refuses
-    /// — so the honest answer is that this producer has nowhere to put it.
+    /// with a parameter; [`block_points`] records why neither rule is a case of
+    /// the other.
     ///
     /// The cut tiles exactly, so "past the volume" and "past the lattice" are
     /// the same coordinate. Under a cut that does *not* tile exactly they are

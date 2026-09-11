@@ -2,13 +2,10 @@
 //
 // Original work for this crate.
 //
-// The arrangement this replaces is a block-processed chain written as one
-// function, whose halo is a hand-maintained formula sitting in a different
-// place from the code it describes. Two things then drift apart with nobody
-// noticing: the stencil an op actually uses, and the number somebody wrote down
-// for it. The abstraction here puts reach, execution and traversal preference
-// on one type, and derives the chain's reach by folding over the same tree the
-// executor walks — so the formula *is* the code.
+// Reach, execution and traversal preference on one type, with the chain's reach
+// derived by folding over the same tree the executor walks — so the formula *is*
+// the code, rather than a hand-maintained halo sitting somewhere else and
+// drifting from the stencil an op actually uses.
 //
 // The invariant this file exists to make structural
 // -------------------------------------------------
@@ -16,11 +13,6 @@
 // **one** structure, not two. `Chain::reach` and `Chain::apply` recurse over
 // the same `Chain` value; a node that contributes to one necessarily
 // contributes to the other.
-//
-// Nothing here calls a real kernel. `BlockOp::apply` is the seat a thin adapter
-// over a translated kernel will occupy later; the framework is proven first, so
-// that a seam failure can be attributed to the framework or the kernel rather
-// than to "somewhere in the pipeline".
 
 use ndarray::ArrayD;
 
@@ -446,32 +438,19 @@ pub enum InputMap {
 
 /// What an op's output space is, and what each input must supply to fill it.
 ///
-/// The declaration the F sketch argued for, in the shape that migration allows:
-/// [`Geometry::same`] is today's behaviour exactly, so the
-/// defaulted [`BlockOp::geometry`] leaves every shipped op correct with no edit,
-/// and the quantities that are currently declared twice — `reach` beside
-/// `reach_spec`, `output_shape` beside a source mapping — become derivable from
-/// one place rather than checked against each other.
+/// [`Geometry::same`] is today's behaviour exactly, so the defaulted
+/// [`BlockOp::geometry`] leaves every shipped op correct with no edit, and the
+/// quantities that are currently declared twice — `reach` beside `reach_spec`,
+/// `output_shape` beside a source mapping — become derivable from one place
+/// rather than checked against each other.
 ///
-/// **Where the sketch is.** The session log kept **outside this repository**,
-/// under the heading *"F, sketched against every shape that exists"*; the staged
-/// migration the two methods below cite is under *"The output-side index map: a
-/// specification"* in the same file. It is not part of this crate and is pointed
-/// at only so the provenance is followable.
-///
-/// **Cited by heading, and the file deliberately not named.** By heading rather
-/// than by line because it is a live document rewritten under this one, and a
-/// line number rots silently where a heading does not. Not by path because
-/// `tests/no_domain_vocabulary.rs` forbids this crate's sources from naming the
-/// application it was extracted from — so a sweep that finds this citation bare
-/// and "fixes" it by adding the repository will turn that test red. A heading is
-/// the stronger anchor regardless: it survives the file being moved as well as
-/// rewritten.
-///
-/// **Nothing consumes it yet.** It lands with the default so that the step which
-/// changes no behaviour is separate from the step that moves a declaration onto
-/// it, because a step that changes nothing is a step whose failure is
-/// unambiguous.
+/// **Where the design sketch is.** A session log kept **outside this
+/// repository**, under the headings *"F, sketched against every shape that
+/// exists"* and *"The output-side index map: a specification"*. Cited by heading
+/// rather than by line because it is rewritten under this one; not by path
+/// because `tests/no_domain_vocabulary.rs` forbids this crate's sources from
+/// naming the application it was extracted from, so "fixing" this bare citation
+/// by adding the repository will turn that test red.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Geometry {
     output_volume: [usize; 3],
@@ -636,10 +615,7 @@ impl SourceInput {
 /// different trait on a different phase kind, which never reaches
 /// [`BlockOp::slicing`] at all. It is recorded because the reasoning transfers
 /// exactly, and because slab parallelism for fragment phases would need its own
-/// declaration rather than this one widened. *An earlier draft of
-/// `docs/design/intra-block.md` gave this as the reason `BlockOp` needed a
-/// declaration; it was the wrong trait, and the real reason is the paragraph
-/// above.*
+/// declaration rather than this one widened.
 ///
 /// So it is declared, and **nothing may infer it**. That prohibition is the
 /// condition on which [`Slicing::Whole`] being the default is safe at all; see
@@ -745,24 +721,14 @@ pub trait BlockOp: Send + Sync {
 
     /// Whether this op's answer survives a cut **inside** one block.
     ///
-    /// **Defaulted to [`Slicing::UNDECLARED`], and that default is deliberate
-    /// where [`Self::reach`]'s absent one is equally deliberate.** The two look
-    /// like the same question and are not, because the two failures are not the
-    /// same failure.
-    ///
-    /// `reach` has no default because a forgotten zero is a *correctness*
-    /// failure with no diagnostic: the plan believes the halo is zero, allocates
-    /// none, and every block computes its edges from data it never read. The
-    /// comment beside `reach` puts it as "the one place a silent zero would
-    /// produce a complete, well-formed, wrong volume", and `FragmentOp::reach`
-    /// had its own silent zero removed this session for exactly that.
-    ///
-    /// A forgotten `slicing` cannot do that. Its default is **today's
-    /// behaviour, exactly**: one task per block on one thread, which is what
-    /// this framework has always done and what every measurement it has is taken
-    /// against. An op author who says nothing loses a speedup that was never
-    /// there. **Zero costs correctness; `Whole` costs performance**, and a
-    /// default is affordable on the second where it is not on the first.
+    /// **Defaulted to [`Slicing::UNDECLARED`] where [`Self::reach`] has no
+    /// default at all**, because the two failures differ. A forgotten `reach`
+    /// is a correctness failure with no diagnostic — the plan allocates no halo
+    /// and every block computes its edges from data it never read. A forgotten
+    /// `slicing` gives today's behaviour exactly: one task per block on one
+    /// thread, so the author loses a speedup that was never there. **Zero costs
+    /// correctness; `Whole` costs performance**, and a default is affordable on
+    /// the second where it is not on the first.
     ///
     /// **That argument has one condition and it is load-bearing.** The default
     /// is only safe while this declaration is the *sole* source of truth. The
@@ -830,12 +796,9 @@ pub trait BlockOp: Send + Sync {
     ///
     /// **The default refuses rather than falling through.** It hands off to
     /// `apply` when nothing was declared — the case that must stay free — and
-    /// errors when something was, because `Environment::apply` already recorded
-    /// the argument this follows: *"silently ignoring an operand" is the precise
-    /// shape of the wrong answer this whole change exists to remove — a
-    /// complete, well-formed volume combined against nothing.* An op that
-    /// declares an operand and forgets the kernel is a bug, and a bug that
-    /// produces a plausible volume is the expensive kind.
+    /// errors when something was: silently ignoring an operand is the precise
+    /// shape of the wrong answer this crate is arranged against, a complete,
+    /// well-formed volume combined against nothing.
     fn apply_with(
         &self,
         input: &Voxels,
@@ -889,22 +852,14 @@ pub trait BlockOp: Send + Sync {
     ///
     /// An op that overrides this is saying its two extents are *not* a function
     /// of each other, and it takes the extent from [`Placement::writes`]
-    /// instead. That trades one check away and it should be paid for: the
-    /// executor compares the shape a phase declares against the read extent its
-    /// plan derived, and an op answering from the plan makes that comparison
-    /// compare the plan against itself. The op then owes a check of its own, in
-    /// its kernel, against the buffer it was actually handed — which is a
-    /// stronger check than the one it replaced, because it is against data
-    /// rather than against a declaration.
+    /// instead — see [`Self::takes_extent_from_placement`] for what that costs.
     ///
-    /// **What the framework requires rather than hopes for.** "The op owes a
-    /// check" is a sentence in a doc comment, and an op may take the escape, pay
-    /// nothing and say nothing. [`crate::decomposition::check_output_shapes`] is
-    /// what stops it saying nothing: it asks this method twice per block, once
-    /// with the placement the executor will really pass and once with
-    /// [`Placement::writes`] stripped out of it, and an op whose two answers
-    /// differ has demonstrably answered out of the plan. That is allowed, and it
-    /// must be declared — see [`Self::takes_extent_from_placement`].
+    /// **The framework requires the declaration rather than hoping for it.**
+    /// [`crate::decomposition::check_output_shapes`] asks this method twice per
+    /// block, once with the placement the executor will really pass and once
+    /// with [`Placement::writes`] stripped out of it, and an op whose two
+    /// answers differ has demonstrably answered out of the plan. That is
+    /// allowed, and it must be declared.
     fn placed_output_shape(&self, input: [usize; 3], _at: &Placement) -> [usize; 3] {
         self.output_shape(input)
     }
@@ -976,14 +931,10 @@ pub trait BlockOp: Send + Sync {
 
     /// The shape of the block this op produces, from the shape it is handed.
     ///
-    /// **Declared rather than assumed**, which is the point. Before this
-    /// existed, `Environment::apply` allocated the output as the input's own
-    /// shape, so a phase could translate its read but never resize it, and
-    /// `run_task` had to refuse every plan whose fetch extent was not its write
-    /// extent (`strategy.rs`, the "cross-grid read that resizes" refusal). The
-    /// executor now compares what the phase *says* it produces against the read
-    /// extent the plan derived, so a decimating or upsampling phase is a plan
-    /// that checks rather than a plan that is turned away.
+    /// **Declared rather than assumed**, which is the point. The executor
+    /// compares what the phase *says* it produces against the read extent the
+    /// plan derived, so a decimating or upsampling phase is a plan that checks
+    /// rather than one turned away for resizing its read.
     ///
     /// A function of the shape and nothing else — never of the data — for the
     /// reason a `Decomposition` is data-blind: two datasets must not produce two
@@ -1233,13 +1184,6 @@ pub trait Combine: Send + Sync {
     /// and at one block that copy is a whole volume — once per source arm, and
     /// a caller adds source arms freely.
     ///
-    /// It used to be `&[Voxels]`, and the asymmetry that produced was the tell:
-    /// a combine declaring a [`Self::fold_carrier`] went through
-    /// [`Self::fold_pair`], which takes references, and paid nothing for its
-    /// source arms; a combine without one paid for every arm. Nothing about
-    /// what a combine *computes* differs between those two, so nothing about
-    /// what it holds should have.
-    ///
     /// Two arms may name the **same** image, and then this is handed one buffer
     /// twice. That is what those two arms mean — an image is one thing, which is
     /// why `SourceInputs` is keyed by image and not by leaf — and it is what the
@@ -1292,17 +1236,6 @@ pub trait Combine: Send + Sync {
         None
     }
 
-    /// One step of the fold [`Self::fold_carrier`] declared.
-    ///
-    /// `left` is the partial fold — branch 0's own result at the first step and
-    /// a buffer of the declared carrier at every step after it — and `right` is
-    /// the next branch's result. `out` is a fresh carrier buffer, or this
-    /// node's own output at the last step.
-    ///
-    /// Only ever called where [`Self::fold_carrier`] answered. The default
-    /// refuses by name rather than doing something: declaring a fold and not
-    /// implementing it is a combine that would otherwise be joined by whatever
-    /// this default invented.
     /// [`Self::fold_pair`] with the left operand **and the output being one
     /// buffer**, or `None` where the combine cannot do that.
     ///
@@ -1319,21 +1252,16 @@ pub trait Combine: Send + Sync {
     /// **A buffer the run did not allocate for this fold.** A `Chain::Source`
     /// branch's answer is an input image of the run at the block's read extent,
     /// which other phases read; accumulating into one would overwrite data the
-    /// plan still needs. `BranchResult::Stored`'s own doc anticipated exactly
-    /// this — *"a fold step that wrote into one of its operands must never
-    /// accumulate into this variant... if something ever does, this
-    /// discriminant is what it has to consult"*. It does, in
-    /// `Chain::apply_tallied`, which offers this only for a `Computed` partial.
-    /// An implementation of this method cannot check it and must not try: by
-    /// the time it is called the provenance is gone.
+    /// plan still needs. `Chain::apply_tallied` is what checks, by offering this
+    /// only for a `Computed` partial. An implementation of this method cannot
+    /// check it and must not try: by the time it is called the provenance is
+    /// gone.
     ///
     /// # Why `Option` rather than a `bool` beside it
     ///
     /// The same reason [`Self::fold_carrier`] returns one: a combine that can
     /// accumulate says so *by being able to*, and there is no second field to
-    /// fall out of agreement with the implementation. `None` is the default and
-    /// leaves the out-of-place fold exactly as it was, so every combine written
-    /// before this existed keeps its recorded figures.
+    /// fall out of agreement with the implementation.
     fn fold_in_place(
         &self,
         _acc: &mut Voxels,
@@ -1343,6 +1271,17 @@ pub trait Combine: Send + Sync {
         None
     }
 
+    /// One step of the fold [`Self::fold_carrier`] declared.
+    ///
+    /// `left` is the partial fold — branch 0's own result at the first step and
+    /// a buffer of the declared carrier at every step after it — and `right` is
+    /// the next branch's result. `out` is a fresh carrier buffer, or this
+    /// node's own output at the last step.
+    ///
+    /// Only ever called where [`Self::fold_carrier`] answered. The default
+    /// refuses by name rather than doing something: declaring a fold and not
+    /// implementing it is a combine that would otherwise be joined by whatever
+    /// this default invented.
     fn fold_pair(
         &self,
         _left: &Voxels,
@@ -1524,13 +1463,12 @@ impl<'a> SourceInputs<'a> {
 /// the two checks below would have been three places for the operand paths to
 /// drift from the one that copies.
 ///
-/// **Both checks are the ones that were already here**, in the same order and
-/// with the same words: the leaf's declared element type against what the
-/// buffer holds, and the extent the caller expects against the extent that was
-/// read. `expected` is the shape the node would have written — `out.shape()`
-/// for the copying arm, the branch's declared output shape for a fan-in
-/// operand — and they are the same quantity, since a source leaf produces the
-/// shape it is handed.
+/// Two checks: the leaf's declared element type against what the buffer holds,
+/// and the extent the caller expects against the extent that was read.
+/// `expected` is the shape the node would have written — `out.shape()` for the
+/// copying arm, the branch's declared output shape for a fan-in operand — and
+/// they are the same quantity, since a source leaf produces the shape it is
+/// handed.
 fn stored_source<'a>(
     image: ImageId,
     dtype: Dtype,
@@ -1571,13 +1509,11 @@ enum BranchResult<'a> {
     /// and owns for the length of this call.
     ///
     /// **Read-only, and that is load-bearing rather than incidental.** This is
-    /// an input image of the run, which other phases read; a fold step that
-    /// wrote into one of its operands — the in-place accumulation that would
-    /// take a fan-in's floor below its current three buffers — must never
-    /// accumulate into this variant. That check does not exist because nothing
-    /// accumulates in place today; if something ever does, this discriminant is
-    /// what it has to consult, and the two changes are safe together only
-    /// because of it.
+    /// an input image of the run, which other phases read, so a fold step that
+    /// writes into one of its operands must never accumulate into this variant.
+    /// This discriminant is what such a step has to consult:
+    /// `Chain::apply_tallied` offers [`Combine::fold_in_place`] only for a
+    /// `Computed` partial.
     Stored(&'a Voxels),
 }
 
@@ -1664,7 +1600,7 @@ impl Tally {
 /// fold over pairs ([`Combine::fold_carrier`]) the walk folds as the branches
 /// are computed and holds three buffers at its worst moment whatever the arity.
 ///
-/// **And the source rows fell because a source arm is no longer copied.** A
+/// **The source rows are low because a source arm is not copied.** A
 /// [`Chain::Source`] leaf's answer is a buffer the executor fetched and owns for
 /// the whole call; where that answer is an *operand* — a fan-in branch, the head
 /// of a sequence — the walk hands the reference on and allocates nothing, so
@@ -1697,15 +1633,14 @@ impl Tally {
 ///   chain shape and the same block, two framework buffers in every case: a
 ///   voxelwise map holds `2.00x`, a `5^3` morphological open `2.38x`, a `5^3`
 ///   rank filter `4.00x`;
-/// * whatever a [`Combine`] allocates inside its own `apply`. **`LogicCombine`'s
-///   fold intermediate used to be the example here and is not any more**: the
-///   walk drives that fold itself, so the buffer is allocated where it can be
-///   counted. What is left outside is a combine that declares no fold carrier
-///   and allocates scratch of its own;
+/// * whatever a [`Combine`] allocates inside its own `apply` — a combine that
+///   declares no fold carrier and allocates scratch of its own. Where a fold
+///   carrier is declared the walk drives the fold itself, so that buffer is
+///   allocated where it can be counted;
 /// * the `Region` [`Voxels::assign`] builds, which is how a [`Chain::Source`]
 ///   arm finishes when it *copies*: two three-element `Vec<usize>`, 48 bytes.
 ///   A source leaf used as an **operand** is borrowed and never assigns, so
-///   this is now only the arm that writes a caller's `out`;
+///   this is only the arm that writes a caller's `out`;
 /// * what the walk allocates **before the tally exists** — the shape and
 ///   element-type folds at the top of [`Chain::apply_tallied`], which are
 ///   `placed_output_shape` and `produces` and are asked of a plan as readily as
@@ -1852,10 +1787,10 @@ impl BlockResidency {
 /// | `cost_per_voxel` | max | sum, plus the combine's |
 /// | `constant_maps_to` | `taken`'s | every branch's, then the combine's |
 ///
-/// The `side_outputs` row is the one that cannot be got wrong quietly. Step 2
-/// of the combined pass put it exactly: *over-declaring an output is not safe
-/// the way over-declaring reach is — a reach that is too large costs reads, an
-/// output that is not produced is a hole.* `Alternative` therefore declares
+/// The `side_outputs` row is the one that cannot be got wrong quietly:
+/// over-declaring an output is not safe the way over-declaring reach is — a
+/// reach that is too large costs reads, an output that is not produced is a
+/// hole. `Alternative` therefore declares
 /// only what `taken` writes. `Parallel` must declare all of them, because all
 /// of them are written, and an undeclared one has no array to land in.
 /// **Structurally, there is nothing else it could do**: the variant carries no
@@ -1972,14 +1907,6 @@ impl Chain {
         }
     }
 
-    /// Every image named by a source leaf anywhere in the subtree, ascending
-    /// and without repeats.
-    ///
-    /// **Every branch of an `Alternative` counts, not just `taken`.** This is
-    /// the `reach` reading rather than the `side_outputs` reading, and for
-    /// `reach`'s reason: the image has to be *there* whichever branch is live,
-    /// so it must be kept alive and read for all of them. Over-declaring costs
-    /// a read; under-declaring is a branch with no operand.
     /// Every image this subtree reads besides its input, with the **widest**
     /// reach any reader of it declared.
     ///
@@ -1988,6 +1915,11 @@ impl Chain {
     /// Folding by max is the same rule `reach` folds an `Alternative` by, and it
     /// is safe in the same direction — over-declaring costs voxels, and
     /// under-declaring is a kernel reading past its operand.
+    ///
+    /// **Every branch of an `Alternative` counts, not just `taken`.** This is
+    /// the `reach` reading rather than the `side_outputs` reading, and for
+    /// `reach`'s reason: the image has to be *there* whichever branch is live,
+    /// so it must be kept alive and read for all of them.
     pub fn source_inputs(&self, volume: [usize; 3]) -> Result<Vec<SourceInput>> {
         let mut seen: Vec<SourceInput> = Vec::new();
         self.collect_source_inputs(volume, &mut seen)?;
@@ -2361,18 +2293,12 @@ impl Chain {
 
     fn fold_reach_spec(&self, volume: [usize; 3]) -> Result<Reach> {
         match self {
-            // **Through `geometry`, not through `reach_spec`.** Step two of the
-            // migration set out under *"The output-side index map: a
-            // specification"*, in the session log outside this repository —
-            // `Geometry` says why that file is cited by heading and not by
-            // name: the declaration becomes the one an op
-            // makes, and the reach becomes something derived from it. Today
-            // `BlockOp::geometry` defaults to `stencil(volume,
-            // self.reach_spec(volume))`, so for every shipped op this is the
-            // same number by the same route — which is the property that makes
-            // this step's failure unambiguous. What it buys is that an op which
-            // *does* state a map has that map honoured here rather than needing
-            // a second declaration beside it.
+            // **Through `geometry`, not through `reach_spec`**, so that the
+            // reach is derived from the declaration an op makes rather than
+            // stated beside it. `BlockOp::geometry` defaults to
+            // `stencil(volume, self.reach_spec(volume))`, so for every shipped
+            // op this is the same number by the same route; what it buys is
+            // that an op which *does* state a map has that map honoured here.
             Chain::Op(op) => Self::reach_of(&op.geometry(volume), op.name()),
             Chain::Source { .. } => Ok(Reach::none()),
             Chain::Sequence(children) => fold_specs(children, volume, Reach::add),
@@ -2718,67 +2644,6 @@ impl Chain {
         })
     }
 
-    /// The structural identity of this chain, readable: every node and every op
-    /// name, in order.
-    ///
-    /// **The scope a [`BlockResidency`] carries**, in the form meant for people.
-    /// Two chains with the same key allocate the same buffers, because the key
-    /// holds exactly what the walk branches on; two with different keys may not,
-    /// and the measured spread is wide enough that guessing is not an option —
-    /// see [`BlockResidency`]'s last section. This form allocates, so it is what
-    /// an error message uses and not what a comparison uses; the comparison is
-    /// [`Self::shape_id`], and both are written by one walk so they cannot
-    /// disagree about what a chain is.
-    /// **How many block-sized buffers this chain holds inside itself**, at its
-    /// worst moment, derived from its shape and without running it.
-    ///
-    /// This is the "shape-derived figure that would stand in for one before a
-    /// first run" that [`crate::budget::FrameworkFigure::Exact`] names, and it
-    /// did not exist until a measurement made its absence expensive. The count
-    /// **excludes** the phase's own input and output — `PhaseCost::
-    /// working_set_bytes_per_block`'s `x 2.0` already covers those — and it
-    /// excludes the buffers the executor fetches for [`Chain::Source`] arms,
-    /// which are one per *image* and are the caller's to add. So a chain of one
-    /// op answers `0` and the formula is right about it, which is the case the
-    /// formula was written for.
-    ///
-    /// # The rules, and the measurement each comes from
-    ///
-    /// Every one is pinned against a global allocator in
-    /// `tests/working_set_residency.rs`, which is the only honest instrument:
-    /// the buffers are allocated by three different parties — the executor, the
-    /// `Sequence` walk, the `Parallel` walk — and no one of them can see the
-    /// others' total.
-    ///
-    /// * **[`Chain::Op`] and [`Chain::Source`] hold nothing of their own.** An
-    ///   op writes the buffer it was handed; a source arm *is* a buffer the
-    ///   executor fetched, counted with the others of its kind.
-    /// * **A [`Chain::Sequence`] ping-pongs**, so it holds at most two
-    ///   intermediates however long it is — one it is reading and one it is
-    ///   writing — and only one when it has exactly two children, because the
-    ///   last write goes to the phase's own output. Measured: two maps hold one
-    ///   intermediate and four maps hold two, not three. A [`Chain::Source`]
-    ///   among the children allocates none of its own — it *is* a fetched
-    ///   buffer, counted with the others of its kind — which is why
-    ///   `[source, map]` holds what `[map, map]` holds rather than one more.
-    /// * **A [`Chain::Parallel`] is the whole reason this method exists**, and
-    ///   it has two behaviours rather than one. A combine that declares a
-    ///   [`Combine::fold_carrier`] is folded branch by branch and holds at most
-    ///   two of its own — the partial and the branch just finished — *whatever
-    ///   its arity*. One that does not must be handed every branch result at
-    ///   once, so it holds one per computed branch and the figure grows without
-    ///   bound. Measured at arities 2, 6, 12 and 24: exactly `1.000` buffers per
-    ///   arm, with the folding control flat across the same range.
-    /// * **[`Chain::Alternative`] takes the maximum**, because one branch runs.
-    ///
-    /// # What it is for
-    ///
-    /// The gap it closes is not small. A 91-arm feature stack under a forest
-    /// predictor — the chain `docs/design/pixel-classification.md` builds, whose
-    /// combine *cannot* fold — holds 93 block buffers where the budget charges
-    /// for 2. At a `64^3` `f64` block that is 186 MiB against 4 MiB charged, and
-    /// the direction is the dangerous one: the plan is admitted and the run
-    /// exhausts memory.
     /// The sequence rule of [`Self::resident_block_buffers`], over children a
     /// caller holds by reference.
     ///
@@ -2818,6 +2683,54 @@ impl Chain {
         within + allocating.min(2)
     }
 
+    /// **How many block-sized buffers this chain holds inside itself**, at its
+    /// worst moment, derived from its shape and without running it.
+    ///
+    /// This is the "shape-derived figure that would stand in for one before a
+    /// first run" that [`crate::budget::FrameworkFigure::Exact`] names, and it
+    /// did not exist until a measurement made its absence expensive. The count
+    /// **excludes** the phase's own input and output — `PhaseCost::
+    /// working_set_bytes_per_block`'s `x 2.0` already covers those — and it
+    /// excludes the buffers the executor fetches for [`Chain::Source`] arms,
+    /// which are one per *image* and are the caller's to add. So a chain of one
+    /// op answers `0` and the formula is right about it, which is the case the
+    /// formula was written for.
+    ///
+    /// # The rules, and the measurement each comes from
+    ///
+    /// Every one is pinned against a global allocator in
+    /// `tests/working_set_residency.rs`, which is the only honest instrument:
+    /// the buffers are allocated by three different parties — the executor, the
+    /// `Sequence` walk, the `Parallel` walk — and no one of them can see the
+    /// others' total.
+    ///
+    /// * **[`Chain::Op`] and [`Chain::Source`] hold nothing of their own.** An
+    ///   op writes the buffer it was handed; a source arm *is* a buffer the
+    ///   executor fetched, counted with the others of its kind.
+    /// * **A [`Chain::Sequence`] ping-pongs**, so it holds at most two
+    ///   intermediates however long it is — one it is reading and one it is
+    ///   writing — and only one when it has exactly two children, because the
+    ///   last write goes to the phase's own output. Measured: two maps hold one
+    ///   intermediate and four maps hold two, not three. See
+    ///   [`Self::sequence_resident_buffers`] for the rule in full.
+    /// * **A [`Chain::Parallel`] is the whole reason this method exists**, and
+    ///   it has two behaviours rather than one. A combine that declares a
+    ///   [`Combine::fold_carrier`] is folded branch by branch and holds at most
+    ///   two of its own — the partial and the branch just finished — *whatever
+    ///   its arity*. One that does not must be handed every branch result at
+    ///   once, so it holds one per computed branch and the figure grows without
+    ///   bound. Measured at arities 2, 6, 12 and 24: exactly `1.000` buffers per
+    ///   arm, with the folding control flat across the same range.
+    /// * **[`Chain::Alternative`] takes the maximum**, because one branch runs.
+    ///
+    /// # What it is for
+    ///
+    /// The gap it closes is not small. A 91-arm feature stack under a forest
+    /// predictor — the chain `docs/design/pixel-classification.md` builds, whose
+    /// combine *cannot* fold — holds 93 block buffers where the budget charges
+    /// for 2. At a `64^3` `f64` block that is 186 MiB against 4 MiB charged, and
+    /// the direction is the dangerous one: the plan is admitted and the run
+    /// exhausts memory.
     pub fn resident_block_buffers(&self) -> usize {
         match self {
             Chain::Op(_) | Chain::Source { .. } => 0,
@@ -2857,6 +2770,17 @@ impl Chain {
         }
     }
 
+    /// The structural identity of this chain, readable: every node and every op
+    /// name, in order.
+    ///
+    /// **The scope a [`BlockResidency`] carries**, in the form meant for people.
+    /// Two chains with the same key allocate the same buffers, because the key
+    /// holds exactly what the walk branches on; two with different keys may not,
+    /// and the measured spread is wide enough that guessing is not an option —
+    /// see [`BlockResidency`]'s last section. This form allocates, so it is what
+    /// an error message uses and not what a comparison uses; the comparison is
+    /// [`Self::shape_id`], and both are written by one walk so they cannot
+    /// disagree about what a chain is.
     pub fn shape_key(&self) -> String {
         let mut key = String::new();
         self.write_shape(&mut key);
@@ -2941,12 +2865,9 @@ impl Chain {
     /// [`Self::apply_placed`], keeping a running count of the buffers **this
     /// walk** allocates.
     ///
-    /// There is one walk and not two, which is the whole point. A separate
-    /// function predicting what this one allocates would be a second source of
-    /// truth about an allocation pattern that lives here, and the two would
-    /// drift the first time a node learned to allocate something new — silently,
-    /// because nothing would compare them. Counting inside the walk cannot
-    /// drift: a buffer that is not tallied is a buffer that was not allocated.
+    /// There is one walk and not two, and counting inside it cannot drift: a
+    /// buffer that is not tallied is a buffer that was not allocated. See
+    /// [`BlockResidency`]'s "Why observed and not derived".
     ///
     /// The tally is unconditional. It is two integer adds per block buffer,
     /// next to zeroing a block buffer, so there is no fast path to keep separate
@@ -3015,15 +2936,10 @@ impl Chain {
             // and this whole node is one slot of one phase.
             //
             // **How many of them are alive at once is the combine's answer, not
-            // this node's.** A combine that declares itself a left fold over
-            // pairs ([`Combine::fold_carrier`]) is folded as the branches are
-            // computed and never holds more than two results and a partial; one
-            // that must see the whole list at once is handed the whole list.
-            // The first path exists because a collected branch result is
-            // **computed and then not read** — from the moment a branch finishes
-            // until the combine runs it is bytes and nothing else — so folding
-            // it early gives up no locality, and at one block each of those
-            // buffers is a whole volume.
+            // this node's**: one that declares a [`Combine::fold_carrier`] is
+            // folded as the branches are computed, one that must see the whole
+            // list at once is handed the whole list. See `fold_carrier` for why
+            // the first path costs nothing.
             Chain::Parallel { branches, combine } => {
                 // Scoped so it is freed before the first branch buffer is
                 // allocated: it is `branches.len()` bytes and it is deliberately
@@ -3041,14 +2957,12 @@ impl Chain {
                 };
                 if let Some(carrier) = carrier {
                     // **The left fold, in branch order, and the order is the
-                    // answer.** `f64` addition is not associative, so a fold
-                    // that visited the branches in any other order would be a
-                    // different volume for a combine that sums; this one visits
-                    // them exactly as the collected path presents them, which is
-                    // what makes the two paths byte-identical rather than merely
-                    // close. `tests/dead_block_buffers.rs` compares them at
-                    // every arity and keeps a fixture whose answer moves if the
-                    // order does.
+                    // answer.** It visits the branches exactly as the collected
+                    // path presents them, which is what makes the two paths
+                    // byte-identical rather than merely close — `f64` addition
+                    // is not associative. `tests/dead_block_buffers.rs` compares
+                    // them at every arity, over a fixture whose answer moves if
+                    // the order does.
                     //
                     // Three block buffers at the worst moment — the partial, the
                     // branch just computed, and the buffer their join is written
@@ -3067,13 +2981,6 @@ impl Chain {
                             // is a whole volume, once per source arm. The copy
                             // was never read in place of anything: the combine
                             // reads whichever buffer it is handed.
-                            //
-                            // Two arms may name the **same** image, and then
-                            // the combine is handed one buffer twice. That is
-                            // what those two arms mean — an image is one thing,
-                            // which is why `SourceInputs` is keyed by image and
-                            // not by leaf — and it is what the two copies said
-                            // before, at twice the bytes.
                             Chain::Source { image, dtype } => {
                                 BranchResult::Stored(stored_source(*image, *dtype, sources, shape)?)
                             }
@@ -3109,11 +3016,8 @@ impl Chain {
                         // leaf's answer — an input image of the run at the
                         // block's read extent, which other phases read — so
                         // writing into it would overwrite data the plan still
-                        // needs. `BranchResult::Stored`'s doc named this
-                        // discriminant as the thing such a change would have to
-                        // consult; this is that consultation, and it is a match
-                        // arm rather than an assertion because the type already
-                        // carries the fact.
+                        // needs. A match arm rather than an assertion, because
+                        // the type already carries the fact.
                         //
                         // The element type must already be the carrier, because
                         // an in-place fold cannot change the buffer's width. At
@@ -3234,19 +3138,11 @@ impl Chain {
                         + std::mem::size_of_val(&places[..])) as u64;
                     tally.take(book);
                     // **The first child reads the caller's block, borrowed.**
-                    // This used to be `input.clone()`, so a sequence of `n`
-                    // children held its input twice over before it had computed
-                    // anything — at one block, a second whole volume that was
-                    // written once and never read, because every read of it went
-                    // to bytes the caller already owned. The clone bought only
-                    // the type: `current` has to be owned from the first
-                    // intermediate onwards, and an `Option` says "not yet" where
-                    // a copy used to.
-                    //
-                    // `None` therefore means *the input*, and it is the only
-                    // difference between the two. Nothing about what any child is
-                    // handed changes: the same bytes at the same placement in the
-                    // same order.
+                    // Copying it instead would hold the input twice over — at
+                    // one block, a second whole volume written once and never
+                    // read. The copy bought only the type: `current` has to be
+                    // owned from the first intermediate onwards, so `None`
+                    // means *the input* until there is one.
                     let mut current: Option<Voxels> = None;
                     let mut held = 0u64;
                     // **A sequence that *starts* at a source leaf starts at a
@@ -3315,15 +3211,11 @@ impl Chain {
     /// branch writes, so only the live branch declares — the same rule
     /// `constant_maps_to` follows.
     ///
-    /// **`Parallel` folds by union, and that is the whole distinction between
-    /// the two variants.** Read the sentence above in reverse: only the branch
-    /// that *writes* may declare, and in a fan-in every branch writes. Folding
-    /// a `Parallel` by consulting one branch would leave the others' arrays
-    /// undeclared, so the executor would never create them and the block
-    /// results would have nowhere to land — the hole that
-    /// `docs/design/BLOCK_OPS.md` §"Step 2" contrasts with an over-wide reach,
-    /// which merely costs reads. There is also nothing to consult with: the
-    /// variant carries no `taken`.
+    /// **`Parallel` folds by union**, which is the same sentence in reverse:
+    /// only the branch that *writes* may declare, and in a fan-in every branch
+    /// writes. Consulting one branch would leave the others' arrays undeclared
+    /// and their block results with nowhere to land. There is also nothing to
+    /// consult with: the variant carries no `taken`.
     pub fn side_outputs(&self, volume: [usize; 3]) -> Vec<Output> {
         match self {
             Chain::Op(op) => op.side_outputs(volume),
@@ -3734,8 +3626,8 @@ impl Chain {
     /// the branches and before the combine would need an image per branch and a
     /// phase with several inputs, neither of which a `Decomposition` can state.
     /// `docs/design/BLOCK_OPS.md` names cutting inside the diamond as what
-    /// fan-in would eventually *let* the planner do; this change makes the
-    /// diamond expressible and executable, and leaves that cut where it was.
+    /// fan-in would eventually *let* the planner do; that cut is still not
+    /// made here.
     pub fn slots(&self) -> Vec<&Chain> {
         let mut out = Vec::new();
         self.collect_slots(&mut out);
@@ -3776,33 +3668,6 @@ fn fold_specs(
     Ok(folded.unwrap_or_default())
 }
 
-/// Where each part of a run of chains sits, given where the run does.
-///
-/// **This is the fold the executor was missing.** A phase's slots and a
-/// `Sequence`'s children are the same shape of thing — a run of chains, each
-/// handed what the one before produced — and both were given one `Anchor`, the
-/// same one, for every member. That is right exactly as long as no member
-/// changes the grid, and the moment one does the members after it are anchored
-/// in a space they are not in.
-///
-/// The derivation has two known ends and one rule. `at.input` is where the run's
-/// first member reads and `at.output` is where its last member writes; both come
-/// from the plan, which holds the fetch region and the read region in their own
-/// spaces. Between them, a member that [`Chain::keeps_grid`] has its output
-/// placement equal to its input placement, so a placement propagates across it
-/// in either direction. Running that forward from the input and backward from
-/// the output resolves every boundary of a run containing at most one
-/// grid-changing member — including the two orders that matter, where the
-/// cross-grid member is first (its output comes from the backward pass) and
-/// where it is last (its input comes from the forward pass).
-///
-/// **A boundary that neither pass reaches keeps today's answer rather than
-/// failing.** Two grid-changing members in one run leave the boundary between
-/// them underivable, and what it falls back to — the run's own anchor, for both
-/// ends — is exactly what every member was handed before this fold existed. So
-/// this cannot make a chain that worked stop working; an op that genuinely needs
-/// a placement it was not given sees an anchor that is not in its own space and
-/// refuses by name, which is the arrangement `LatticeInterpolateOp` already has.
 /// The extent a run of chains turns `input_shape` into, at `at`.
 ///
 /// The fold [`place_parts`] exists to feed, in one place rather than in each of
@@ -3830,6 +3695,33 @@ pub fn parts_output_shape(
     Ok(current)
 }
 
+/// Where each part of a run of chains sits, given where the run does.
+///
+/// **This is the fold the executor was missing.** A phase's slots and a
+/// `Sequence`'s children are the same shape of thing — a run of chains, each
+/// handed what the one before produced — and both were given one `Anchor`, the
+/// same one, for every member. That is right exactly as long as no member
+/// changes the grid, and the moment one does the members after it are anchored
+/// in a space they are not in.
+///
+/// The derivation has two known ends and one rule. `at.input` is where the run's
+/// first member reads and `at.output` is where its last member writes; both come
+/// from the plan, which holds the fetch region and the read region in their own
+/// spaces. Between them, a member that [`Chain::keeps_grid`] has its output
+/// placement equal to its input placement, so a placement propagates across it
+/// in either direction. Running that forward from the input and backward from
+/// the output resolves every boundary of a run containing at most one
+/// grid-changing member — including the two orders that matter, where the
+/// cross-grid member is first (its output comes from the backward pass) and
+/// where it is last (its input comes from the forward pass).
+///
+/// **A boundary that neither pass reaches keeps today's answer rather than
+/// failing.** Two grid-changing members in one run leave the boundary between
+/// them underivable, and what it falls back to — the run's own anchor, for both
+/// ends — is exactly what every member was handed before this fold existed. So
+/// this cannot make a chain that worked stop working; an op that genuinely needs
+/// a placement it was not given sees an anchor that is not in its own space and
+/// refuses by name, which is the arrangement `LatticeInterpolateOp` already has.
 pub fn place_parts(parts: &[&Chain], at: &Placement, input_shape: [usize; 3]) -> Vec<Placement> {
     let n = parts.len();
     let mut anchors: Vec<Option<Anchor>> = vec![None; n + 1];

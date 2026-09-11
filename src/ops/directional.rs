@@ -57,16 +57,14 @@
 // That staleness is not an accident to be tidied away; it is part of the
 // algorithm's proof. Recomputing the border set per sub-iteration is a one-line
 // "fix" that produces a different, unproved algorithm which still returns a
-// plausible-looking skeleton, so
-// `the_border_set_is_stale_within_a_pass` measures it rather than trusting a
-// comment.
+// plausible-looking skeleton, so `the_border_set_is_stale_within_a_pass`
+// measures it rather than trusting a comment.
 //
 // A `BlockOp` carries one input buffer and one output buffer, so there is
-// nowhere to thread a second array through a `Chain::Sequence`. The honest
-// consequence is that **one pass is one op** ([`DirectionalPassOp`]), running
-// its twelve sub-iterations internally, and declaring the reach that follows
-// from doing so. It is not a data-dependent loop — twelve is twelve — so the
-// declaration is exact rather than hopeful, which is the line this crate draws.
+// nowhere to thread a second array through a `Chain::Sequence`. So **one pass
+// is one op** ([`DirectionalPassOp`]), running its twelve sub-iterations
+// internally. It is not a data-dependent loop — twelve is twelve — so the reach
+// it declares is exact rather than hopeful.
 //
 // The reach, derived
 // ------------------
@@ -123,17 +121,13 @@
 // check against a figure.
 //
 // Nothing was copied from any implementation, and in particular **no lookup
-// table was transcribed**. A `2^26`-entry table over this predicate is a pure
-// speed choice, and where one is wanted it is *generated* from the predicate in
-// this file: [`deletion_table_word`] produces any 64 entries of it and
-// [`is_deletable_index`] is the predicate the generator calls, so the table
-// cannot drift from the rule and there is no third-party artefact in the
-// dependency chain. This module itself does not build one — the predicate
-// compiles to a handful of masked integer comparisons ([`CompiledTemplate`]),
-// which measures at about the same cost per sub-iteration as the flood fill
-// `super::skeleton` runs — so the table is offered rather than used, and a
-// caller for whom this is the bottleneck can build it in eight mebibytes as one
-// bit per index without waiting on anything in here.
+// table was transcribed**. Where a `2^26`-entry table is wanted it is
+// *generated* from the predicate in this file — [`deletion_table_word`] over
+// [`is_deletable_index`] — so it cannot drift from the rule and no third-party
+// artefact enters the dependency chain. This module does not build one: the
+// predicate compiles to a handful of masked integer comparisons
+// ([`CompiledTemplate`]), which measures at about the same cost per
+// sub-iteration as the flood fill `super::skeleton` runs.
 //
 // The twelve orientations, and the order they come in
 // --------------------------------------------------

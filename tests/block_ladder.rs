@@ -343,19 +343,12 @@ fn every_margin_is_under_one_coarse_rung_and_the_wider_one_spans_two_refined() {
         );
     }
 
-    // **The collision this file exists for is now one margin's, not both.**
-    //
-    // Both margins used to exceed one refined rung — `3.6` and `7.48` — so the
-    // one-step bound `budget.rs` proves on a powers-of-two ladder failed on a
-    // refined one for either branch. Re-fitting `UNOBSERVED_SHAPE_MARGIN` to
-    // `2.1`, once the charge counted the chain's own buffers, brought the
-    // cold-start branch *inside* a single refined rung.
-    //
-    // That does not make this file unnecessary, and the reason is the second
-    // row: the exact branch still spans two, because a rank filter's own scratch
-    // is `2.0002x` on top of a framework figure that is now right. So the
-    // "at most one step" wording still does not survive a finer ladder, and the
-    // volume bound is still what carries.
+    // **The collision this file exists for is one margin's, not both** — see
+    // the module header. The cold-start branch fits inside a single refined
+    // rung; the exact branch still spans two, because a rank filter's own
+    // scratch is `2.0002x` on top of a framework figure that is now right. So
+    // the "at most one step" wording still does not survive a finer ladder, and
+    // the volume bound is still what carries.
     assert!(
         UNOBSERVED_SHAPE_MARGIN < one_refined,
         "UNOBSERVED_SHAPE_MARGIN is {UNOBSERVED_SHAPE_MARGIN}, which no longer fits inside \

@@ -181,17 +181,14 @@
 //   finds, for every factor, an output one voxel closer to the seam whose value
 //   differs from the whole-volume answer.
 //
-// Where the two-sided, per-block form is **not** optional is the halo. The
-// alignment snapping is per block and per side by construction — a core starting
-// two voxels into a cell needs two more below it and none above, and the block
-// after it needs the opposite — so a halo that could only say one number, or one
-// number per block, could not put every read boundary on the fetch lattice at
-// all. `tests/resample_ops.rs` shows both refusals, so this is a case where
-// `AxisReach::PerBlock` with unequal `(lo, hi)` is what makes an arbitrary block
-// edge **planable** rather than what makes it cheaper. What the alignment itself
-// costs is measured there too, against the tight dependency: 1.00x for every
-// downsampling and every integer growth, 1.52x to 2.01x for a rational growth at
-// a small block edge, and shrinking with the edge.
+// Where the two-sided, per-block form is **not** optional is the halo: the
+// snapping is per block and per side by construction ([`Resample::halo`] says
+// why), so `AxisReach::PerBlock` with unequal `(lo, hi)` is what makes an
+// arbitrary block edge **planable** rather than what makes it cheaper.
+// `tests/resample_ops.rs` shows both refusals, and measures what the alignment
+// itself costs against the tight dependency: 1.00x for every downsampling and
+// every integer growth, 1.52x to 2.01x for a rational growth at a small block
+// edge, and shrinking with the edge.
 
 use ndarray::{ArrayView3, ArrayViewMut3};
 
@@ -542,6 +539,7 @@ impl Resample {
     /// of 8 is zero output voxels, and an image of zero extent is not an image.
     /// That is a fact about the request, so it is refused by name rather than
     /// rounded up to one.
+    ///
     /// A stated extent is bound to one input volume, and asking it about another
     /// is refused rather than answered by the factor. The factor is only exact
     /// *at* the volume it was derived from — `348/2137` applied to 2000 voxels is
@@ -621,6 +619,7 @@ impl Resample {
     /// output voxel wants beyond it do not exist for the whole-volume reference
     /// either. The claim is checked rather than asserted: the acceptance suite
     /// compares every voxel, edges included, against that reference.
+    ///
     /// **Under a stated extent this is `Units::SourceIndex` instead**, which is
     /// `lattice.rs`'s statement and is made for its reason: the dependency is a
     /// region of the image below, named per block, and there is no factor
@@ -644,6 +643,7 @@ impl Resample {
     /// A fetch region is the image of a read extent under `down/up`, so a read
     /// boundary that is not a multiple of `up` has no image on the source
     /// lattice. This is the number the halo snaps to.
+    ///
     /// **`[1, 1, 1]` under a stated extent**: every output boundary is a legal
     /// fetch boundary there, because a fetch is no longer required to be the
     /// image of a read extent under the factor. That requirement existed to let

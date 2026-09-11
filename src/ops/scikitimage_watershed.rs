@@ -98,14 +98,11 @@ struct HeapItem {
 /// a later push sorts *before* an earlier one, so a seed reaches a basin it
 /// never should.
 ///
-/// **So this refuses instead of widening, and that is the parity argument
-/// rather than a limitation of the port.** Widening to `i64` would produce a
-/// *better* algorithm than skimage's above the limit and a different one, which
-/// is exactly what a file whose whole reason for existing is exact parity must
-/// not do quietly — see this file's header. Above the limit there is no
-/// behaviour to be in parity *with*: the original's is C signed overflow.
-/// (It would even be free in memory: the struct pads to 32 bytes either way.
-/// It is declined on the parity ground, not a cost one.)
+/// **So this refuses instead of widening.** Widening to `i64` would produce a
+/// *better* algorithm than skimage's above the limit, and a different one,
+/// which is exactly what a file whose reason for existing is exact parity must
+/// not do quietly. (It would even be free in memory: the struct pads to 32
+/// bytes either way. It is declined on the parity ground, not a cost one.)
 ///
 /// **When this is reachable.** `age` counts pushes, not voxels, and the two
 /// differ by the mode:
@@ -430,8 +427,7 @@ fn flood(
                 // is pushed: it cannot be reached at lower cost later.
                 output[neighbour] = elem_label;
             }
-            // A neighbour never costs less than the voxel it came from, so a
-            // seed cannot win a basin merely by spilling into it one step early.
+            // A neighbour never costs less than the voxel it came from.
             if value < elem_value {
                 value = elem_value;
             }
@@ -504,9 +500,8 @@ pub mod reference_case {
 mod tests {
     use super::*;
 
-    /// The decisive case, straight against the kernel. Written before anything
-    /// else in this op, because "a priority flood that looks right" is the
-    /// failure mode and it passes every other test here.
+    /// The decisive case, straight against the kernel: "a priority flood that
+    /// looks right" is the failure mode, and it passes every other test here.
     #[test]
     fn matches_skimage_where_a_naive_priority_flood_would_not() {
         use reference_case::*;
@@ -537,15 +532,10 @@ mod tests {
         );
     }
 
-    /// **The push counter runs out, and the flood says so instead of wrapping.**
-    ///
-    /// `age` is the `i32` skimage declares, so past [`AGE_LIMIT`] it goes
-    /// negative and `smaller` inverts on every tie — a later push sorting before
-    /// an earlier one, which is a different partition and not a slightly
-    /// different boundary. Reaching that honestly takes 2.1 billion pushes, so
-    /// `flood` takes the limit as a parameter and this test hands it a small
-    /// one: the refusal is the same branch on the same counter, reached in
-    /// microseconds.
+    /// **The push counter runs out, and the flood says so instead of wrapping**
+    /// — see [`AGE_LIMIT`]. Reaching the real limit takes 2.1 billion pushes,
+    /// so this hands `flood` a small one: the same branch on the same counter,
+    /// reached in microseconds.
     ///
     /// Both halves are asserted. The refusal, and that the *same* volume floods
     /// to the *same* labels under the real limit — otherwise a guard that
@@ -594,13 +584,9 @@ mod tests {
     /// the answer decides whether the refusal above is a formality or a
     /// ceiling this crate's own stated target crosses.
     ///
-    /// `age` counts pushes and the two modes push differently: with no
-    /// separating line a voxel is labelled *at push time* and is never queued
-    /// twice, so the bound is the voxel count; with one, labels settle at pop
-    /// and a voxel can be queued once per neighbour — `2 * ndim`, six in 3-D.
-    ///
-    /// `super::super::watershed`'s header contemplates volumes above both
-    /// figures, which is what makes this worth a guard rather than a comment.
+    /// `super::super::watershed`'s header contemplates volumes above both of
+    /// [`AGE_LIMIT`]'s figures, which is what makes this worth a guard rather
+    /// than a comment.
     #[test]
     fn the_limit_is_reachable_at_the_volumes_this_crate_contemplates() {
         let limit = AGE_LIMIT as f64;

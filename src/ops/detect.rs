@@ -153,10 +153,8 @@
 //
 // * **anything accumulated in `f64`.** A running mean, a running variance, a
 //   normalised moment. Floating-point addition does not associate, so the seam
-//   merge would stop being exact and start being nearly exact, and "nearly" is
-//   the decomposition-dependent answer the integer accumulators exist to rule
-//   out. The derived quantity is the caller's to compute from exact integers,
-//   once, after the merge — which is what the sums are for;
+//   merge would stop being exact. The derived quantity is the caller's to compute
+//   from exact integers, once, after the merge — which is what the sums are for;
 // * **second moments**, which are a closer call and are left out on a different
 //   ground. `sum(x^2)` merges by addition and is exactly as associative as
 //   `sum(x)`, so a radius of gyration or an anisotropy could be carried here
@@ -196,11 +194,8 @@
 // --------------------------------------------------
 // Phase 1 hands every block the same merge — the phase runs it once, in
 // [`RegionPointsOp::reduce`], and every block is handed the same bytes — so
-// every block sees every component's centroid. (It used to *run* the merge in
-// every block, for want of anywhere else to put a per-phase quantity; the
-// ownership rule below is unchanged by that having moved, because it was never
-// about who computed the centroid.) What stops the same point being written N
-// times is the ownership rule:
+// every block sees every component's centroid. What stops the same point being
+// written N times is the ownership rule:
 //
 // > **the block whose core holds the component's centroid emits the point.**
 //
@@ -222,28 +217,24 @@
 // ----------------------------------------
 // A centroid weighted by a per-voxel quantity — an intensity-weighted centre
 // rather than a geometric one — is the obvious extension and it is **not
-// implemented**. It used to be blocked on two things and is now blocked on one,
-// and the one is the one that always mattered:
+// implemented**, and what stops it is arithmetic rather than mechanism. The
+// mechanism is built: a [`FragmentOp`] declares the other images it reads with
+// [`FragmentOp::source_inputs`], is handed them through
+// [`FragmentOp::apply_with`], and states what its fold does across a seam with
+// [`SeamFold`]; `ops::tabulate` uses all three to reduce a second array over the
+// regions of a label volume.
 //
-// * it needs a **second input array** beside the mask. **That capability is
-//   built.** A [`FragmentOp`] declares the other images it reads with
-//   [`FragmentOp::source_inputs`], is handed them through
-//   [`FragmentOp::apply_with`], and states what its fold does across a seam with
-//   [`SeamFold`]; the phase records the images, so the executor fetches them, the
-//   DAG orders them and `exact_read_voxels` counts them. `ops::tabulate` uses all
-//   three to reduce a second array over the regions of a label volume. Nothing is
-//   waiting on a mechanism any more;
-// * the tempting shortcut — take the weight from the mask image itself, since a
-//   mask may arrive as any width and `is_set` only asks whether a voxel is
-//   non-zero — would give up the exactness above. The weights would be arbitrary
-//   reals, `f64` addition does not associate, and the seam merge would stop being
-//   exact and start being *nearly* exact, which is precisely the
-//   decomposition-dependent answer the integer accumulators exist to rule out. A
-//   weighted variant has to say what it does about that, and the honest answers
-//   are a fixed-point accumulator or a stated tolerance. Neither is a hook; both
-//   are a design. `ops::tabulate` took the first answer and its header argues it;
-//   this op has not made the choice, and until it does the accumulators here stay
-//   integer counts and integer coordinate sums.
+// The tempting shortcut — take the weight from the mask image itself, since a
+// mask may arrive as any width and `is_set` only asks whether a voxel is
+// non-zero — would give up the exactness above. The weights would be arbitrary
+// reals, `f64` addition does not associate, and the seam merge would stop being
+// exact and start being *nearly* exact, which is precisely the
+// decomposition-dependent answer the integer accumulators exist to rule out. A
+// weighted variant has to say what it does about that, and the honest answers
+// are a fixed-point accumulator or a stated tolerance. Neither is a hook; both
+// are a design. `ops::tabulate` took the first answer and its header argues it;
+// this op has not made the choice, and until it does the accumulators here stay
+// integer counts and integer coordinate sums.
 //
 // **What `ops::tabulate` covers, and what it does not.** Over the regions of a
 // label volume it emits `count`, `nonfinite`, `sum`, `min` and `max` of a second
@@ -262,7 +253,6 @@
 // its `moment_0..2_q{n}` columns are that accumulator and
 // `RegionValues::weighted_centroid` is their quotient. This op labels a mask; a
 // caller who wants a weighted centre labels with `ops::label` and tabulates.
-// Nothing is added here for it, and this paragraph is the whole of the note.
 //
 // Connectivity: one choice, and it is the **foreground's**
 // ---------------------------------------------------------
@@ -332,11 +322,9 @@
 // fragments happened to exist — `barriers.md` §7.4 is the argument and
 // `check_phase_work` is where the pair is enforced.
 //
-// The old closing sentence said the fragment is six planes of labels plus eight
-// words per label, "against a block of pixels — the same shape, for the same
-// reason". That comparison was per block and it was a false reassurance: against
-// a *block* of pixels a fragment is small, and the phase moved the whole fragment
-// set once per block rather than one fragment once. Past a fine enough cut the
+// A fragment is six planes of labels plus one accumulator per label, which is
+// small against a *block* of pixels — but the phase moved the whole fragment set
+// once per block rather than one fragment once, and past a fine enough cut the
 // fragment set exceeds the whole volume, measured. What the hoisting removes is
 // the multiplier and not the set: `F` itself is the total face area of the cut
 // and is geometry, so cutting more finely still costs more fragment bytes — just
@@ -394,6 +382,10 @@ pub struct Moments {
     /// identity and not a coordinate — read it through [`Moments::bounds`],
     /// which returns `None` instead.
     pub min: [u64; 3],
+    /// The lexicographically first voxel in the component, in volume
+    /// coordinates. This is distinct from the bounding-box low corner: a
+    /// connected object need not contain that corner.
+    pub first: [u64; 3],
     /// Per axis, the **largest** coordinate the component occupies — inclusive,
     /// so the extent along an axis is `max - min + 1`.
     ///
@@ -426,6 +418,7 @@ impl Moments {
         count: 0,
         sums: [0, 0, 0],
         min: [u64::MAX; 3],
+        first: [u64::MAX; 3],
         max: [0, 0, 0],
     };
 
@@ -450,6 +443,10 @@ impl Moments {
             self.min[axis] = self.min[axis].min(coordinate);
             self.max[axis] = self.max[axis].max(coordinate);
         }
+        let coordinate = [at[0] as u64, at[1] as u64, at[2] as u64];
+        if lex_less(coordinate, self.first) {
+            self.first = coordinate;
+        }
         Ok(())
     }
 
@@ -472,6 +469,9 @@ impl Moments {
                 .ok_or_else(|| overflowed("position sum"))?;
             self.min[axis] = self.min[axis].min(other.min[axis]);
             self.max[axis] = self.max[axis].max(other.max[axis]);
+        }
+        if lex_less(other.first, self.first) {
+            self.first = other.first;
         }
         Ok(())
     }
@@ -498,6 +498,19 @@ impl Moments {
             high[axis] = self.max[axis] as usize;
         }
         Some((low, high))
+    }
+
+    /// The component's lexicographically first voxel, or `None` for an empty
+    /// component.
+    pub fn first(&self) -> Option<[usize; 3]> {
+        if self.count == 0 {
+            return None;
+        }
+        Some([
+            self.first[0] as usize,
+            self.first[1] as usize,
+            self.first[2] as usize,
+        ])
     }
 
     /// The centroid, rounded to a voxel, or `None` for a component with no
@@ -545,6 +558,10 @@ fn overflowed(what: &str) -> Error {
          L = 65536; a wrapped sum would be an arbitrary centroid rather than an imprecise one, \
          so it is refused here."
     ))
+}
+
+fn lex_less(a: [u64; 3], b: [u64; 3]) -> bool {
+    a < b
 }
 
 // ------------------------------------------------------------ the kernels --
@@ -660,9 +677,7 @@ pub fn detect_regions_with(
 /// The whole-volume answer as **rows**: [`detect_regions`]'s blob, in the richer
 /// form.
 ///
-/// Same kernels again, and for the same reason — the reference and the blocked
-/// path must differ only in how the volume was cut, or a disagreement stops
-/// being evidence of anything.
+/// Same kernels again, and for [`detect_regions`]'s reason.
 pub fn detect_region_rows(mask: ArrayView3<'_, bool>) -> Result<Vec<u8>> {
     encode_measurements(&region_moments(mask)?)
 }
@@ -689,12 +704,8 @@ pub fn region_moments_with(
 ///
 /// **The default is [`Emission::Point`] and it is byte-identical to what this op
 /// has always written** — same stream, same headerless four-word encoding, same
-/// order. The richer form is opt-in. That choice is argued for in the module
-/// header under "One point per region, or one row"; the short version is that
-/// `ops::voxelize` reads point blobs and holds no schema, so making the rich form
-/// the default would have meant either teaching `voxelize` to find a weight
-/// column by name — a run-time lookup where it now has a fixed layout — or
-/// writing two streams from one op.
+/// order. The richer form is opt-in; the module header, under "One point per
+/// region, or one row", is why that way round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Emission {
     /// A [`Point`]: the rounded centroid, carrying the component's voxel count
@@ -818,9 +829,7 @@ fn measured_row(moments: &Moments) -> Option<[u64; MEASURED_WORDS]> {
 /// A set of components as a table blob, in the canonical order.
 ///
 /// Components with no voxels are dropped rather than turned into a row at the
-/// origin, for [`centroid_points`]'s reason: an empty accumulator is a
-/// `(block, label)` slot that no voxel was found for, which is a thing that
-/// exists in the flat numbering and not in the volume.
+/// origin, for [`centroid_points`]'s reason.
 ///
 /// Sorted here so that a block's blob is a function of the component set and not
 /// of the order the union-find happened to produce its roots in — the same
@@ -986,15 +995,16 @@ impl RegionMoments {
     }
 
     /// A self-describing byte form: little-endian `u32` throughout, with a magic
-    /// and a version in front, and each accumulator as ten `u64`s — the count,
-    /// the three sums and the two corners — low word first.
+    /// and a version in front, and each accumulator as thirteen `u64`s — the
+    /// count, the three sums, the low corner, the lexicographic first voxel, and
+    /// the high corner — low word first.
     ///
     /// The words rather than a float or a decimal, because the merge adds these
     /// and the whole claim of the op is that the addition is exact. A number that
     /// had been through a lossy encoding on the way to the merge would make the
     /// claim false in transit, where nothing would catch it.
     ///
-    /// **The corners travel whether or not the run will emit them.** A fragment
+    /// **The corners and representative travel whether or not the run will emit them.** A fragment
     /// whose payload depended on which [`Emission`] phase 1 was configured for
     /// would be a second format, decoded by the same reader, distinguishable only
     /// by a field the reader does not have — and the saving is six words per
@@ -1008,6 +1018,9 @@ impl RegionMoments {
             }
             for axis in 0..3 {
                 push_u64(&mut words, moments.min[axis]);
+            }
+            for axis in 0..3 {
+                push_u64(&mut words, moments.first[axis]);
             }
             for axis in 0..3 {
                 push_u64(&mut words, moments.max[axis]);
@@ -1048,10 +1061,15 @@ impl RegionMoments {
                     take_u64(record, 10),
                     take_u64(record, 12),
                 ],
-                max: [
+                first: [
                     take_u64(record, 14),
                     take_u64(record, 16),
                     take_u64(record, 18),
+                ],
+                max: [
+                    take_u64(record, 20),
+                    take_u64(record, 22),
+                    take_u64(record, 24),
                 ],
             });
         }
@@ -1072,17 +1090,18 @@ impl RegionMoments {
 /// so a stream name reused by two of them would otherwise decode one as another.
 const MAGIC: u32 = 0x4354_4544;
 
-/// Bumped from 1 when the accumulator grew its bounding box.
+/// Bumped from 1 when the accumulator grew its bounding box, and from 2 when it
+/// grew the lexicographic representative.
 ///
-/// A version 1 blob is one word-count short per label, so a new reader would
+/// An old-version blob is one word-count short per label, so a new reader would
 /// have refused it anyway — somewhere inside the face planes, with a message
 /// about the wrong thing. The bump makes the refusal say what actually happened,
 /// which is the only reason a version number is worth carrying.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
-/// Ten `u64`s — the count, the three sums and the two corners — as twenty `u32`
-/// words.
-const WORDS_PER_LABEL: usize = 20;
+/// Thirteen `u64`s — the count, the three sums, the low corner, the
+/// lexicographic first voxel, and the high corner — as twenty-six `u32` words.
+const WORDS_PER_LABEL: usize = 26;
 
 /// `"DTCM"` little-endian — the **merged** accumulators, which is a different
 /// object from a block's fragment and says so.
@@ -1131,6 +1150,9 @@ pub fn encode_moments(components: &[Moments]) -> Result<Vec<u8>> {
             push_u64(&mut words, moments.min[axis]);
         }
         for axis in 0..3 {
+            push_u64(&mut words, moments.first[axis]);
+        }
+        for axis in 0..3 {
             push_u64(&mut words, moments.max[axis]);
         }
         written = written.checked_add(1).ok_or_else(|| {
@@ -1175,10 +1197,15 @@ pub fn decode_moments(bytes: &[u8]) -> Result<Vec<Moments>> {
                 take_u64(record, 10),
                 take_u64(record, 12),
             ],
-            max: [
+            first: [
                 take_u64(record, 14),
                 take_u64(record, 16),
                 take_u64(record, 18),
+            ],
+            max: [
+                take_u64(record, 20),
+                take_u64(record, 22),
+                take_u64(record, 24),
             ],
         });
     }
@@ -1531,11 +1558,10 @@ impl FragmentOp for RegionPointsOp {
     /// It is still declared, because that is what makes it resolvable in
     /// [`Self::reduce`]: `PhaseView` offers the streams the plan records and no
     /// others, for a block's reason — an undeclared stream is one the plan
-    /// neither orders nor prices. What changed is the reach, and it is the whole
-    /// of what this op had left to save. With the merge in `apply` every block
-    /// needed every fragment and said so, which is `barriers.md` §7.6's
-    /// `(1 + blocks) x F` multiplier; with the merge in [`Self::reduce`] the
-    /// *phase* needs them and no block does.
+    /// neither orders nor prices. The reach is zero because the merge is
+    /// [`Self::reduce`]'s: the *phase* needs every fragment and no block does.
+    /// A block-level reach over them is `barriers.md` §7.6's `(1 + blocks) x F`
+    /// multiplier, which is what the hoisting removed.
     fn inputs(&self) -> Vec<FragmentInput> {
         vec![
             FragmentInput::own(self.moments_stream.clone(), self.moments_phase)
@@ -1553,8 +1579,8 @@ impl FragmentOp for RegionPointsOp {
             // and therefore checkable.
             Coverage::EveryBlock,
         )
-        // Two shapes, because this op emits two — and a bound that covered only one
-        //             // of them would be a bound that is false half the time.
+        // Two shapes, because this op emits two — and a bound that covered only
+        // one of them would be a bound that is false half the time.
         .sized(match self.emission {
             // `Emission::Point` is `encode_points`: headerless, four words a
             // centroid, one centroid per component.
@@ -1566,14 +1592,9 @@ impl FragmentOp for RegionPointsOp {
 
     /// **Nothing per block.** The merge is [`Self::reduce`]'s and the totals
     /// arrive in the blob, so a block that gathered anything would be holding a
-    /// fragment set it has no use for.
-    ///
-    /// This said `true` until the merge moved, and the reason it gave was the
-    /// right reason for where the merge was: the seam walk compares block `b`'s
-    /// high face against block `b + 1`'s low face, so it holds every report at
-    /// once and streaming would have moved the residency into this op's own map
-    /// without removing it. That argument is now [`Self::reduce`]'s and is made
-    /// there; a *block* needs none of it.
+    /// fragment set it has no use for. The argument for gathering rather than
+    /// streaming is [`Self::reduce`]'s and is made there; a *block* needs none
+    /// of it.
     fn gathers(&self) -> bool {
         false
     }
@@ -1798,6 +1819,7 @@ mod tests {
             count: 3,
             sums: [6, 9, 12],
             min: [1, 2, 3],
+            first: [1, 2, 3],
             max: [3, 4, 5],
         };
         let totals = vec![live, Moments::EMPTY, live, Moments::EMPTY];
@@ -1947,6 +1969,7 @@ mod tests {
     fn the_identity_is_a_no_op_on_every_field_including_the_corners() {
         assert_eq!(Moments::default(), Moments::EMPTY);
         assert_eq!(Moments::EMPTY.min, [u64::MAX; 3]);
+        assert_eq!(Moments::EMPTY.first, [u64::MAX; 3]);
         assert_eq!(Moments::EMPTY.max, [0; 3]);
         // and it has no box, rather than the absurd one its identities spell
         assert_eq!(Moments::EMPTY.bounds(), None);
@@ -1956,6 +1979,7 @@ mod tests {
             real.add(at).unwrap();
         }
         assert_eq!(real.bounds(), Some(([4, 9, 2], [6, 9, 3])));
+        assert_eq!(real.first(), Some([4, 9, 2]));
 
         // Merging the identity in, on either side, changes nothing at all.
         let mut left = real;
@@ -2311,6 +2335,7 @@ mod tests {
                 count: u64::MAX,
                 sums: [1, u64::MAX - 1, 1 << 53],
                 min: [0, 1, u64::MAX - 3],
+                first: [0, 1, u64::MAX - 3],
                 max: [u64::MAX, 1 << 53, u64::MAX - 2],
             }],
             faces: empty_planes(),
@@ -2361,6 +2386,7 @@ mod tests {
                     count: 2,
                     sums: [1, 0, 0],
                     min: [0, 0, 0],
+                    first: [0, 0, 0],
                     max: [1, 0, 0],
                 }],
                 faces: empty_planes(),
@@ -2372,6 +2398,7 @@ mod tests {
                     count: 2,
                     sums: [9, 0, 0],
                     min: [4, 0, 0],
+                    first: [4, 0, 0],
                     max: [5, 0, 0],
                 }],
                 faces: empty_planes(),
@@ -2390,6 +2417,7 @@ mod tests {
         // and the box is the union of the two, which is min and max rather than
         // either side's alone
         assert_eq!(joined[0].bounds(), Some(([0, 0, 0], [5, 0, 0])));
+        assert_eq!(joined[0].first(), Some([0, 0, 0]));
 
         // and with nothing labelled on the far face they stay two
         let apart: Vec<Moments> = build(false).into_iter().filter(|m| !m.is_empty()).collect();
@@ -2443,12 +2471,14 @@ mod tests {
                 count: 3,
                 sums: [3, 6, 9],
                 min: [0, 1, 2],
+                first: [0, 1, 2],
                 max: [2, 3, 4],
             },
             Moments {
                 count: 1,
                 sums: [15, 0, 0],
                 min: [15, 0, 0],
+                first: [15, 0, 0],
                 max: [15, 0, 0],
             },
             Moments::EMPTY,

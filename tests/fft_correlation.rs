@@ -66,7 +66,7 @@
 // |---|---|
 // | `the_feature_is_the_only_thing_that_chooses_the_backend` | runs **always**, and in the default build asserts the *absence*: one backend, and it is the portable one. The feature claim is inverted rather than dropped |
 // | `the_two_backends_agree_on_the_fixture` | the agreement *between* backends, which is a sharper question than each agreeing with the direct walk — both could pass a `1e-13` bar against the oracle and still differ by `1e-13` from each other |
-// | `the_two_backends_agree_at_the_consumers_geometry` | the same at `128 x 1350`, four orders more arithmetic for them to drift over |
+// | `the_two_backends_agree_at_the_consumers_geometry` | the same at `108 x 1350`, over two orders more arithmetic for them to drift over |
 //
 // Both comparisons assert on **values**, and their liveness half is that the two
 // landscapes must differ *somewhere* in the last places: two implementations of
@@ -1023,8 +1023,8 @@ fn the_two_backends_agree_on_the_fixture() {
 }
 
 /// The same question at the geometry the consumer actually has, where the
-/// padded transform is `128 x 1350` rather than `128 x 32` and there are four
-/// orders of magnitude more arithmetic for the two to drift apart over.
+/// padded transform is `108 x 1350` rather than the fixture's `18 x 30` — over
+/// two orders of magnitude more arithmetic for the two to drift apart over.
 #[cfg(feature = "fftw")]
 #[test]
 fn the_two_backends_agree_at_the_consumers_geometry() {

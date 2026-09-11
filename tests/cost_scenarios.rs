@@ -70,12 +70,10 @@ use support::planner_perf::{
 /// are the record.
 ///
 /// Which is also why nothing checks that the files still equal what this
-/// function emits. A record that had to agree with today's generator would be
-/// rewritten by every change to the generator, and a bound recorded against a
-/// machine six months ago would quietly become a bound against this month's
-/// idea of it. Running this is a decision to replace the record, not a step in
-/// keeping it valid — see `every_committed_scenario_loads_and_round_trips`,
-/// which checks the things that do have to hold.
+/// function emits. Running this is a decision to replace the record, not a step
+/// in keeping it valid — see `every_committed_scenario_loads_and_round_trips`,
+/// which checks the things that do have to hold and says what happened when
+/// this was coupled.
 ///
 /// **Every derived scenario is a ratio against the measured baseline.** None of
 /// the numbers below is a measurement of a machine nobody has run on — they are

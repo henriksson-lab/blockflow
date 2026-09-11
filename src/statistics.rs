@@ -30,9 +30,8 @@
 // --------------------------------------------------
 // There may be no first run — a cold planner has to plan *something* — so the
 // store bootstraps from the constants in `ops/` and from `CostModel::default`.
-// Those seeds do not have to be good, and they are not: the `MAP_COST` family
-// understates by ~2.7x and the neighbourhood figures swing ~35% on codegen
-// partitioning. **None of that matters for a seed.** What a cold planner needs
+// Those seeds do not have to be good, and by the figures above they are not.
+// **None of that matters for a seed.** What a cold planner needs
 // is the *ordering* — a median costs more than a map, an opening more than the
 // erosion inside it, a separable smooth far less than a dense element of the
 // same reach — and the constants have that right whatever their absolute
@@ -108,21 +107,11 @@
 // per process, which is why JSON is right today and will not be for ever.
 //
 // **What the coordinator path does cost is exactness, and it is inherited.**
-// `distributed::Coordinator`'s header is explicit that events are
-// fire-and-forget and deliberately unacknowledged, because acknowledging them
-// would put the coordinator on a worker's critical path; the price is that the
-// last events of a run are still in flight when the last task completes, and the
-// coordinator waits for the stream to go *quiet* rather than for a fixed delay,
-// which bounds the loss without making it zero. So:
-//
-// * **a coefficient is derived from most of a run, not provably all of it.**
-//   That is fine for what it is — an average over hundreds of thousands of
-//   events does not move because a few of the last ones did not arrive.
-// * **the evidence figures on a `Coefficient` are approximate.** They are a
-//   weight, telling a consumer roughly how much is behind a number. They are not
-//   a ledger, and nothing should reconcile against them.
-//
-// Neither is a defect. Both are obvious today and mysterious in six months.
+// `distributed::Coordinator` makes events fire-and-forget on purpose, so a
+// coefficient is derived from most of a run rather than provably all of it, and
+// the evidence figures on a `Coefficient` are a weight rather than a ledger.
+// See `Coefficient` for the mechanism. Neither is a defect, and both are
+// obvious today and mysterious in six months.
 //
 // What was added to the hot path
 // ------------------------------
@@ -285,13 +274,11 @@ pub enum Term {
     /// and is the term that makes the shipped `MAP_COST` family's absolute
     /// scale irrelevant.
     Compute,
-    /// `Compute`, for one op family in isolation. **Recorded, reported and —
-    /// since `CostModel::compute_of` existed to hold it — used**:
-    /// `Snapshot::calibrate` turns each believable one into a dimensionless
-    /// correction, its rate over the run-wide `Compute`, and the planner
-    /// multiplies the family's declared cost by it. It was kept for a long time
-    /// as the evidence for a gap it now fills; `Snapshot::families` is the raw
-    /// reading and `Snapshot::family_spread` the size of what it corrects.
+    /// `Compute`, for one op family in isolation. `Snapshot::calibrate` turns
+    /// each believable one into a dimensionless correction — its rate over the
+    /// run-wide `Compute` — which the planner multiplies the family's declared
+    /// cost by. `Snapshot::families` is the raw reading and
+    /// `Snapshot::family_spread` the size of what it corrects.
     ComputeOf(String),
     /// Nanoseconds per **byte** read. Diagnostic, for the same reason:
     /// `CostModel` prices reads per voxel, and a run whose images have
@@ -1123,8 +1110,8 @@ impl Snapshot {
     ///
     /// **For a caller whose evidence did not come from a run of this crate** —
     /// a test constructing the case it wants to reason about, or a deployment
-    /// carrying figures measured elsewhere. Everything else here is built by
-    /// `Store::record` from an `ExecutionLog`, which is the route that keeps a
+    /// carrying figures measured elsewhere. Everything else here reaches the
+    /// store through [`Statistics::record`], which is the route that keeps a
     /// coefficient tied to the work that produced it; this one is deliberately
     /// the other kind, and `Coefficient::runs` is what a reader checks to tell
     /// them apart, exactly as [`Self::believable`] does.
@@ -1200,10 +1187,9 @@ impl Snapshot {
 
     /// The per-op-family compute coefficients, by family name.
     ///
-    /// **Recorded, and — since `CostModel::compute_of` existed to hold them —
-    /// used.** [`Self::calibrate`] turns each believable one into a correction,
-    /// as a ratio to the run-wide `Term::Compute`; this is the raw reading, for
-    /// a report. See [`Term::ComputeOf`] and [`Snapshot::family_spread`].
+    /// [`Self::calibrate`] turns each believable one into a correction, as a
+    /// ratio to the run-wide `Term::Compute`; this is the raw reading, for a
+    /// report. See [`Term::ComputeOf`] and [`Snapshot::family_spread`].
     pub fn families(&self) -> BTreeMap<String, Coefficient> {
         self.coefficients
             .iter()
@@ -1217,21 +1203,15 @@ impl Snapshot {
     /// The ratio between the dearest and cheapest op family's coefficient, or
     /// `None` with fewer than two families.
     ///
-    /// **This is the number that said what `CostModel` could not express**, and
-    /// the measurement that motivated giving it somewhere to put them:
-    /// `CostModel::compute_of` now holds one correction per family and
-    /// [`Self::calibrate`] fills it, so a spread above one is a plan the model
-    /// can now price differently rather than a defect it cannot see. The
-    /// paragraph below is why the number is worth reporting either way. Every
+    /// **The size of the correction [`Self::calibrate`] applies.** Every
     /// family's coefficient is nanoseconds per unit of *declared* cost, so a
     /// spread of 1.0 would mean the shipped constants have every family's
     /// relative cost exactly right and one `compute_scale` serves all of them.
-    /// A spread of 3 means the planner is charging one family three times what
-    /// it costs relative to another — and until `CostModel::compute_of` existed
-    /// there was nowhere in the model to say so, `compute_scale` being a scalar
-    /// whose best value is the work-weighted blend that `Term::Compute` already
-    /// is. The spread is now what [`Self::calibrate`] turns into corrections,
-    /// so it is the size of the *correction* rather than the size of a defect.
+    /// A spread of 3 means the planner would be charging one family three times
+    /// what it costs relative to another, `compute_scale` being a scalar whose
+    /// best value is the work-weighted blend that `Term::Compute` already is —
+    /// which is why `CostModel::compute_of` holds one correction per family and
+    /// this is worth reporting.
     pub fn family_spread(&self) -> Option<f64> {
         let families = self.families();
         if families.len() < 2 {
@@ -1318,11 +1298,7 @@ impl Snapshot {
                 model.materialise_cost_per_voxel,
             ),
             compute_scale,
-            // **The per-family corrections, which is the half that was measured
-            // and never used.** `Term::ComputeOf` is keyed by slot name and has
-            // been recorded since it existed under a doc saying it is not
-            // consumed, because `CostModel` had one `compute_scale` and nowhere
-            // to put a per-family figure. It has one now.
+            // **The per-family corrections**, keyed by slot name.
             //
             // A *ratio*: the family's own nanoseconds per unit over the run-wide
             // figure, so the table is dimensionless and its neutral value is
@@ -1836,15 +1812,12 @@ mod tests {
                 total_nanos: 100.0 * RETAINED_RUNS as f64
             }
         );
-        // **One outlying run does not move it at all, and this assertion is
-        // inverted from the one that stood here.** It used to read "moves it,
-        // and is diluted by the evidence beside it" — `> 1.0 && < 9.0` — which
-        // was the truth about the pooled quotient this used to compute. The
-        // estimator is now the weighted median (see `weighted_median` and
-        // `REPRODUCTIONS`), and a median does not dilute an outlier, it outvotes
-        // it. That is the whole point of the change: a run that stalled adds
-        // nanoseconds and no units, so under pooling it moved the coefficient in
-        // proportion to how badly it stalled, without limit.
+        // **One outlying run does not move it at all.** The estimator is the
+        // weighted median (see `weighted_median` and `REPRODUCTIONS`), and a
+        // median does not dilute an outlier, it outvotes it. The pooled
+        // quotient it replaced did dilute: a stalled run adds nanoseconds and
+        // no units, so it moved the coefficient in proportion to how badly it
+        // stalled, without limit.
         store.record(&run(machine(), &[(Term::Read, 100.0, 900.0)]));
         let after = store.snapshot(&machine()).coefficient(&Term::Read).unwrap();
         assert_eq!(after.runs, RETAINED_RUNS);

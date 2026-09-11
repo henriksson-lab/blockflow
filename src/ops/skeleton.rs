@@ -622,9 +622,9 @@ impl PassLimit {
         Ok(Self(passes))
     }
 
-    /// The limit implied by a volume: half its shortest axis, rounded up, plus
-    /// one. Nothing thicker than that fits in the volume, so no correct run can
-    /// need more — which makes it a bound rather than a guess.
+    /// The limit implied by a volume: half its shortest axis, rounded down, plus
+    /// two. Nothing thicker than half the shortest axis fits in the volume, so no
+    /// correct run can need more — which makes it a bound rather than a guess.
     pub fn for_volume(volume: [usize; 3]) -> Self {
         let shortest = volume.iter().copied().min().unwrap_or(1).max(1);
         Self(shortest / 2 + 2)

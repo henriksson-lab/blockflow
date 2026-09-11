@@ -113,8 +113,9 @@ fn eight_workers(nodes: usize) -> Machine {
         // taken under; the wave discipline is `tests/wave_dispatch.rs`.
         wave_synchronous: false,
         workers: 8,
-        // Per node. A quarter of the volume's chunks, so that eviction is real
-        // and a node's own re-reads still hit.
+        // Per node. Half of one image's chunks at this volume — 64 chunks of
+        // 32 KiB is 2 MiB — so that eviction is real and a node's own re-reads
+        // still hit.
         cache_bytes: 1 << 20,
         prefetch_depth: 0,
         io_channels: 1,

@@ -146,6 +146,15 @@ impl Sense {
     }
 }
 
+/// Which diagonal of a two-axis Roberts cross kernel is requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RobertsDiagonal {
+    /// `+1` at the low/low corner and `-1` at the high/high corner.
+    Main,
+    /// `+1` at the high/low corner and `-1` at the low/high corner.
+    Anti,
+}
+
 // -------------------------------------------------------------- the kernel --
 
 /// A weight per member of a [`StructuringElement`]: the caller's filter.
@@ -231,6 +240,97 @@ impl Kernel {
     /// `2 * radius + 1` on each axis.
     pub fn from_radius(radius: [usize; 3], weights: Vec<f64>) -> Result<Self> {
         Self::from_sides(radius, radius, weights)
+    }
+
+    /// The Prewitt directional derivative along `axis`.
+    ///
+    /// This is a predefined kernel over the general convolution machinery, not
+    /// a separate op. The derivative axis uses `[-1, 0, 1]`; the other two axes
+    /// use a flat three-tap smoother.
+    pub fn prewitt(axis: usize) -> Result<Self> {
+        Self::separable_derivative(axis, &[-1.0, 0.0, 1.0], &[1.0, 1.0, 1.0])
+    }
+
+    /// The Sobel directional derivative along `axis`.
+    ///
+    /// The derivative axis uses `[-1, 0, 1]`; the other two axes use
+    /// `[1, 2, 1]`.
+    pub fn sobel(axis: usize) -> Result<Self> {
+        Self::separable_derivative(axis, &[-1.0, 0.0, 1.0], &[1.0, 2.0, 1.0])
+    }
+
+    /// The Scharr directional derivative along `axis`.
+    ///
+    /// The derivative axis uses `[-1, 0, 1]`; the other two axes use
+    /// `[3, 10, 3]`, the 3-D extension of the usual 2-D Scharr stencil.
+    pub fn scharr(axis: usize) -> Result<Self> {
+        Self::separable_derivative(axis, &[-1.0, 0.0, 1.0], &[3.0, 10.0, 3.0])
+    }
+
+    /// The Farid five-tap directional derivative along `axis`.
+    ///
+    /// Coefficients follow the standard Farid/Simoncelli five-tap derivative
+    /// family: one antisymmetric derivative vector on `axis` and the matching
+    /// smoothing vector on the other axes.
+    pub fn farid(axis: usize) -> Result<Self> {
+        const DERIVATIVE: [f64; 5] = [
+            -0.109_603_762_960_254,
+            -0.276_690_988_455_557,
+            0.0,
+            0.276_690_988_455_557,
+            0.109_603_762_960_254,
+        ];
+        const SMOOTH: [f64; 5] = [
+            0.037_659_317_195_812_6,
+            0.249_153_396_177_344,
+            0.426_374_573_253_687,
+            0.249_153_396_177_344,
+            0.037_659_317_195_812_6,
+        ];
+        Self::separable_derivative(axis, &DERIVATIVE, &SMOOTH)
+    }
+
+    /// A six-neighbour 3-D Laplace kernel.
+    ///
+    /// The centre has weight `-6`; its six face neighbours have weight `1`.
+    /// The result annihilates a constant field exactly.
+    pub fn laplace_6() -> Result<Self> {
+        Self::from_weighted_offsets([
+            ([0, 0, 0], -6.0),
+            ([-1, 0, 0], 1.0),
+            ([1, 0, 0], 1.0),
+            ([0, -1, 0], 1.0),
+            ([0, 1, 0], 1.0),
+            ([0, 0, -1], 1.0),
+            ([0, 0, 1], 1.0),
+        ])
+    }
+
+    /// A Roberts cross diagonal over the plane named by two axes.
+    ///
+    /// The classic Roberts operator is 2-D. This constructor embeds one of its
+    /// two 2x2 diagonals in the requested axis pair and leaves the third axis at
+    /// zero. The anchor is the low/low corner, so this kernel reaches one voxel
+    /// forward on the two plane axes and zero on the third.
+    pub fn roberts(axis_a: usize, axis_b: usize, diagonal: RobertsDiagonal) -> Result<Self> {
+        if axis_a >= 3 || axis_b >= 3 || axis_a == axis_b {
+            return Err(Error::InvalidArgument(format!(
+                "a Roberts kernel needs two distinct axes in 0..3; got {axis_a} and {axis_b}"
+            )));
+        }
+        let mut first = [0isize; 3];
+        let mut second = [0isize; 3];
+        match diagonal {
+            RobertsDiagonal::Main => {
+                second[axis_a] = 1;
+                second[axis_b] = 1;
+            }
+            RobertsDiagonal::Anti => {
+                first[axis_a] = 1;
+                second[axis_b] = 1;
+            }
+        }
+        Self::from_weighted_offsets([(first, 1.0), (second, -1.0)])
     }
 
     pub fn element(&self) -> &StructuringElement {
@@ -326,6 +426,72 @@ impl Kernel {
     /// because a swap does not change a maximum.
     pub fn reach(&self, axis: usize) -> usize {
         self.element.reach(axis)
+    }
+
+    fn separable_derivative(axis: usize, derivative: &[f64], smooth: &[f64]) -> Result<Self> {
+        if axis >= 3 {
+            return Err(Error::InvalidArgument(format!(
+                "a derivative kernel needs an axis in 0..3; got {axis}"
+            )));
+        }
+        if derivative.len() % 2 == 0 || smooth.len() % 2 == 0 {
+            return Err(Error::InvalidArgument(
+                "a predefined derivative kernel needs odd-length one-dimensional stencils"
+                    .to_string(),
+            ));
+        }
+        let radius = [
+            if axis == 0 {
+                derivative.len() / 2
+            } else {
+                smooth.len() / 2
+            },
+            if axis == 1 {
+                derivative.len() / 2
+            } else {
+                smooth.len() / 2
+            },
+            if axis == 2 {
+                derivative.len() / 2
+            } else {
+                smooth.len() / 2
+            },
+        ];
+        let element = StructuringElement::from_radius(ElementShape::Box, radius);
+        let weights = element
+            .offsets()
+            .iter()
+            .map(|offset| {
+                let mut weight = 1.0;
+                for which in 0..3 {
+                    let index = (offset[which] + radius[which] as isize) as usize;
+                    weight *= if which == axis {
+                        derivative[index]
+                    } else {
+                        smooth[index]
+                    };
+                }
+                weight
+            })
+            .collect();
+        Self::new(element, weights)
+    }
+
+    fn from_weighted_offsets(offsets: impl IntoIterator<Item = ([isize; 3], f64)>) -> Result<Self> {
+        let pairs: Vec<([isize; 3], f64)> = offsets.into_iter().collect();
+        let element = StructuringElement::from_offsets(pairs.iter().map(|(offset, _)| *offset))?;
+        let weights = element
+            .offsets()
+            .iter()
+            .map(|offset| {
+                pairs
+                    .iter()
+                    .find(|(candidate, _)| candidate == offset)
+                    .map(|(_, weight)| *weight)
+                    .expect("the element was built from exactly these offsets")
+            })
+            .collect();
+        Self::new(element, weights)
     }
 }
 
@@ -869,27 +1035,22 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
 /// cannot know where the tile boundaries fall inside it, so the halo must cover
 /// the worst alignment: `tile - 1 + lo` below and `tile - 1 + hi` above. Against
 /// [`ConvolveOp`]'s halo of `lo` and `hi` that is `tile - 1` more per side per
-/// axis, and it is paid **even when the plan's blocks happen to be a whole
-/// number of tiles**, which is the common case and the one where the true halo
-/// is exactly the kernel's. The framework has nowhere to say "cut me on a
-/// stride": [`crate::op::BlockConstraint::Extent`] mandates all three extents
-/// and gives up the search, and `Constraints` has no per-axis rule at all —
-/// which is the ops survey's G9, reached from a new direction. So the price is
-/// real, it is a *planning* price and not a correctness one, and a caller who
-/// pins the block extent to a multiple of the tile pays a halo it does not need
-/// rather than a wrong answer.
+/// axis, and a rule that stopped there would charge it **even when the plan's
+/// blocks happen to be a whole number of tiles**, which is the common case and
+/// the one where the true halo is exactly the kernel's.
 ///
-/// **Corrected: the paragraph above described this file for one pass, and the
-/// sentence that stopped being true is "the framework has nowhere to say".** It
-/// has one now — [`crate::reach::AxisReach::Aligned`] — and it is a *reach*
-/// rather than a constraint, which is a smaller change and a better fit. The
-/// halo is still `tile - 1 + lo` and `tile - 1 + hi` to everything that cannot
-/// see a lattice; `Reach::in_voxels`, which is handed one and which
-/// `decomposition::price_phase` already calls once per candidate grid, discounts
-/// it to exactly `lo` and `hi` when the block edge is a whole number of tiles.
-/// So the planner *prices* an aligned edge cheaper and prefers it, instead of a
-/// constraint refusing everything else — a cost gap answered with a cost, which
-/// is the shape it should have had.
+/// **The way out is a *reach* rather than a constraint** —
+/// [`crate::reach::AxisReach::Aligned`] — which is the smaller change and the
+/// better fit. The halo is still `tile - 1 + lo` and `tile - 1 + hi` to
+/// everything that cannot see a lattice; `Reach::in_voxels`, which is handed one
+/// and which `decomposition::price_phase` already calls once per candidate grid,
+/// discounts it to exactly `lo` and `hi` when the block edge is a whole number
+/// of tiles. So the planner *prices* an aligned edge cheaper and prefers it,
+/// instead of a constraint refusing everything else — a cost gap answered with a
+/// cost. The constraint route is worse on its own terms:
+/// [`crate::op::BlockConstraint::Extent`] mandates all three extents and gives
+/// up the search, and `Constraints` has no per-axis rule at all — which is the
+/// ops survey's G9, reached from a new direction.
 ///
 /// Measured on `1024^3` with a 32-voxel tile and a radius-4 kernel, at the
 /// coarse ladder's rungs that are whole tiles: **`30.176x`, `8.309x` and
@@ -903,11 +1064,10 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
 /// above overstate the *time* the slack costs by roughly `2.6x` cold. Warm they
 /// are close to right, and on a chunked store they understate it. The half of
 /// this op's case that is not a ratio is unaffected: below, a phase that loses
-/// the discount does not merely fetch more, it stops being cuttable at all. In residency, which
-/// is the currency a tile-scale stage runs out of, at edge 128 that is **62.1 MB
-/// against 20.1 MB per block**, or **2.48 GB against 0.80 GB** at 40-way
-/// concurrency.
-///
+/// the discount does not merely fetch more, it stops being cuttable at all. In
+/// residency, which is the currency a tile-scale stage runs out of, at edge 128
+/// that is **62.1 MB against 20.1 MB per block**, or **2.48 GB against 0.80 GB**
+/// at 40-way concurrency.
 ///
 /// **And the amplification above understates it, which the planner-level test
 /// found and this file did not predict.** `decomposition::cuttable_axes` drops
@@ -922,29 +1082,24 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
 /// against the slack pays, the degeneration is what a volume that is not pays —
 /// and `cuttable_axes` resolves the reach against the candidate edge for exactly
 /// this reason.
-/// **Two things it does not do, and both are stated rather than left to be
-/// discovered.** It cannot *demand* an aligned lattice — a caller whose
-/// `block_candidates` are all odd multiples of nothing still gets a correct
-/// answer at the full halo — and the discount is **lost when this op shares a
-/// phase with another**, because `AxisReach::add` and `::max` flatten to the
-/// worst case rather than invent a lattice that satisfies two strides. Both are
-/// the remaining half of G9 and neither is a correctness question.
 ///
-/// **Corrected: the second of those was measured and it was not a limitation, it
-/// was a defect.** A phase's reach is its ops' reaches *added*, so flattening
-/// meant that adding a reach of **nothing** was not the identity — fusing this
-/// op with a voxelwise map lost the entire discount. Measured on `96^3` at
-/// candidate edge 32: **27 blocks alone against one when fused**, which is not a
-/// lost discount but a phase reading the whole volume per block. `AxisReach`
-/// now carries **both** of its answers and folds each componentwise, so adding
-/// nothing is the identity, adding a bounded reach is exact, and two strides
-/// take their least common multiple. A multiple past every candidate edge
-/// degrades to exactly what flattening gave, so the fold is never dearer than
-/// the rule it replaced. `tests/transform_convolution.rs` pins the fused phase
-/// end to end.
+/// **The discount survives a fold, and it had to be made to.** A phase's reach
+/// is its ops' reaches *added*, so a rule that flattened an [`AxisReach`] to its
+/// worst case meant that adding a reach of **nothing** was not the identity —
+/// fusing this op with a voxelwise map lost the entire discount. Measured on
+/// `96^3` at candidate edge 32: **27 blocks alone against one when fused**,
+/// which is not a lost discount but a phase reading the whole volume per block.
+/// `AxisReach` carries **both** of its answers and folds each componentwise, so
+/// adding nothing is the identity, adding a bounded reach is exact, and two
+/// strides take their least common multiple. A multiple past every candidate
+/// edge degrades to exactly what flattening gave, so the fold is never dearer
+/// than the rule it replaced. `tests/transform_convolution.rs` pins the fused
+/// phase end to end.
 ///
-/// **What is still true of the first**: this op cannot demand an aligned
-/// lattice, and that half of G9 is untouched.
+/// **What it still does not do, stated rather than left to be discovered.** It
+/// cannot *demand* an aligned lattice — a caller whose `block_candidates` are
+/// all odd multiples of nothing still gets a correct answer at the full halo —
+/// and that half of G9 is untouched. It is not a correctness question.
 ///
 /// The arithmetic this trades for it: a direct gather is one multiply-add per
 /// tap per voxel and the tap count is the kernel's product, while this is a
@@ -1625,6 +1780,137 @@ mod tests {
         let op = ConvolveOp::new("gradient", kernel, Sense::Convolve, Boundary::Clamp);
         assert_eq!(op.constant_maps_to(7.25), Some(0.0));
         assert_eq!(op.constant_maps_to(0.0), Some(0.0));
+    }
+
+    #[test]
+    fn predefined_derivative_kernels_are_general_kernels() {
+        let sobel = Kernel::sobel(1).expect("a Sobel kernel");
+        let prewitt = Kernel::prewitt(1).expect("a Prewitt kernel");
+        let scharr = Kernel::scharr(1).expect("a Scharr kernel");
+        let farid = Kernel::farid(1).expect("a Farid kernel");
+
+        assert_eq!(sobel.len(), 27);
+        assert_eq!(prewitt.len(), 27);
+        assert_eq!(scharr.len(), 27);
+        assert_eq!(farid.len(), 125);
+        for kernel in [&sobel, &prewitt, &scharr] {
+            assert_eq!(
+                kernel.reach_spec(Sense::Correlate).at(0, 3, 20),
+                (kernel.reach(0), kernel.reach(0))
+            );
+            assert_eq!(kernel.total(), 0.0);
+            assert_eq!(
+                ConvolveOp::new("preset", kernel.clone(), Sense::Correlate, Boundary::Clamp)
+                    .constant_maps_to(42.0),
+                Some(0.0)
+            );
+        }
+        assert_eq!(
+            farid.reach_spec(Sense::Correlate).at(0, 3, 20),
+            (farid.reach(0), farid.reach(0))
+        );
+        assert!(
+            farid.total().abs() < 1.0e-15,
+            "Farid's decimal taps should cancel mathematically, got {} in stored order",
+            farid.total()
+        );
+
+        let message = Kernel::sobel(3)
+            .expect_err("axis 3 is outside 0..3")
+            .to_string();
+        assert!(message.contains("axis in 0..3"), "{message}");
+    }
+
+    #[test]
+    fn the_sobel_preset_matches_the_written_stencil() {
+        let input = Array3::from_shape_fn((3, 3, 3), |(i, j, k)| (100 * i + 10 * j + k) as f64);
+        let kernel = Kernel::sobel(0).expect("a Sobel kernel");
+        let mut out = Array3::zeros(input.raw_dim());
+        convolve_into(
+            input.view(),
+            &kernel,
+            Sense::Correlate,
+            Boundary::Clamp,
+            out.view_mut(),
+        )
+        .unwrap();
+
+        let mut expected = 0.0;
+        for di in [-1isize, 0, 1] {
+            for dj in [-1isize, 0, 1] {
+                for dk in [-1isize, 0, 1] {
+                    let i = (1isize + di) as usize;
+                    let j = (1isize + dj) as usize;
+                    let k = (1isize + dk) as usize;
+                    let derivative = match di {
+                        -1 => -1.0,
+                        0 => 0.0,
+                        1 => 1.0,
+                        _ => unreachable!(),
+                    };
+                    let smooth_j = match dj {
+                        -1 | 1 => 1.0,
+                        0 => 2.0,
+                        _ => unreachable!(),
+                    };
+                    let smooth_k = match dk {
+                        -1 | 1 => 1.0,
+                        0 => 2.0,
+                        _ => unreachable!(),
+                    };
+                    expected += derivative * smooth_j * smooth_k * input[[i, j, k]];
+                }
+            }
+        }
+        assert_eq!(out[[1, 1, 1]], expected);
+        assert_eq!(expected, 3200.0);
+    }
+
+    #[test]
+    fn the_laplace_preset_is_the_six_neighbour_stencil() {
+        let input = Array3::from_shape_fn((3, 3, 3), |(i, j, k)| (100 * i + 10 * j + k) as f64);
+        let kernel = Kernel::laplace_6().expect("a Laplace kernel");
+        assert_eq!(kernel.len(), 7);
+        assert_eq!(kernel.total(), 0.0);
+
+        let mut out = Array3::zeros(input.raw_dim());
+        convolve_into(
+            input.view(),
+            &kernel,
+            Sense::Correlate,
+            Boundary::Clamp,
+            out.view_mut(),
+        )
+        .unwrap();
+        let centre = input[[1, 1, 1]];
+        let expected = input[[0, 1, 1]]
+            + input[[2, 1, 1]]
+            + input[[1, 0, 1]]
+            + input[[1, 2, 1]]
+            + input[[1, 1, 0]]
+            + input[[1, 1, 2]]
+            - 6.0 * centre;
+        assert_eq!(out[[1, 1, 1]], expected);
+        assert_eq!(expected, 0.0);
+    }
+
+    #[test]
+    fn roberts_presets_are_plane_diagonals() {
+        let main = Kernel::roberts(0, 2, RobertsDiagonal::Main).expect("a Roberts kernel");
+        assert_eq!(main.len(), 2);
+        assert_eq!(main.reach_spec(Sense::Correlate).at(0, 0, 10), (0, 1));
+        assert_eq!(main.reach_spec(Sense::Correlate).at(1, 0, 10), (0, 0));
+        assert_eq!(main.reach_spec(Sense::Correlate).at(2, 0, 10), (0, 1));
+        assert_eq!(main.total(), 0.0);
+
+        let anti = Kernel::roberts(0, 2, RobertsDiagonal::Anti).expect("a Roberts kernel");
+        assert_ne!(main, anti);
+        assert_eq!(anti.total(), 0.0);
+
+        let message = Kernel::roberts(1, 1, RobertsDiagonal::Main)
+            .expect_err("a repeated axis is refused")
+            .to_string();
+        assert!(message.contains("two distinct axes"), "{message}");
     }
 
     /// The strided path and the contiguous one are the same function, to the

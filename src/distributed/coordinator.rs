@@ -211,15 +211,15 @@ struct WorkerModel {
     /// A second tier rather than more entries in `cache`, because it is a claim
     /// about a different thing and the two must not be confused. `cache` holds
     /// what this worker was assigned to **read**; `produced` holds what it was
-    /// assigned to **write**. Neither names a cache this crate owns — see
-    /// `placement::Residency::resident`, where the correction is argued: this
-    /// line used to say `cache` modelled "this crate's own chunk cache", and
-    /// `cache::ChunkCache` is on no read path. What either tier can serve a
-    /// re-read from is whatever the node holds — the page cache under a
-    /// filesystem store, a local scratch tier, a write-back cache if one is ever
-    /// added — none of which this crate owns. It is kept separate
-    /// so that the handout's own scoring, and the numbers already measured for
-    /// it, are untouched; only `placement` reads it.
+    /// assigned to **write**. Neither is a claim about a cache this crate owns:
+    /// the built-in shared-volume worker does size a real `cache::ChunkCache`
+    /// from the same budget, but a deployment factory's environment need not,
+    /// and what serves a re-read may instead be whatever the node happens to
+    /// hold — the page cache under a filesystem store, a local scratch tier, a
+    /// write-back cache if one is ever added. See
+    /// `placement::Residency::resident`, where that is argued. It is kept
+    /// separate so that the handout's own scoring, and the numbers already
+    /// measured for it, are untouched; only `placement` reads it.
     ///
     /// It exists because without it the barrier case is unanswerable. Phase `p`
     /// reads image `p` and writes image `p + 1`, so the image a barrier at phase
@@ -884,12 +884,6 @@ impl Job {
         );
     }
 
-    /// One event, as it happened.
-    ///
-    /// An unfamiliar event type is counted and dropped, not refused: a worker
-    /// from a newer build reporting something this coordinator has never heard
-    /// of must not fail the run, for the same reason a listener that panics is
-    /// isolated rather than propagated.
     /// Append one worker's event to the merged stream, once.
     ///
     /// `seq` is the sender's own count of the events it has posted, starting at
@@ -899,6 +893,11 @@ impl Job {
     ///
     /// Returns whether the event was accepted, so the sender can keep a count
     /// that matches this one. See [`Job::reported`].
+    ///
+    /// An unfamiliar event type is counted and dropped, not refused: a worker
+    /// from a newer build reporting something this coordinator has never heard
+    /// of must not fail the run, for the same reason a listener that panics is
+    /// isolated rather than propagated.
     pub fn report(&mut self, worker: &str, seq: Option<u64>, event: &Value) -> bool {
         self.last_event = Instant::now();
         if let Some(seq) = seq {

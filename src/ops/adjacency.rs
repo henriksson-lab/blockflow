@@ -584,13 +584,8 @@ impl FragmentOp for AdjacentPairsOp {
         self.name
     }
 
-    /// One voxel on every axis.
-    ///
-    /// The honest number is asymmetric — a lexicographically positive offset
-    /// never steps down on axis 0, and under [`Connectivity::Faces`] never steps
-    /// down at all — and this signature holds one number per axis, so the wider
-    /// side is declared. The over-fetch is at most one plane per block face and
-    /// is written down in the module header rather than left to be discovered.
+    /// One voxel on every axis: the wider side of an asymmetric reach the
+    /// signature cannot state. The module header prices the over-fetch.
     ///
     /// Independent of the configured halo, as the trait requires: it is a
     /// property of what a pair reaches and would be `1` whatever the lattice.
@@ -615,9 +610,10 @@ impl FragmentOp for AdjacentPairsOp {
             // only guard there is — and a block that owns no pair is the common
             // case on a sparse mask rather than an oddity.
             Coverage::EveryBlock,
-            // A row table of ordered label pairs. A voxel can contribute at most one pair
-            // per lexicographically-later neighbour, and `Connectivity::offsets`
-            // is exactly that list — the same one `encode_adjacent_pairs` steps over.
+            // A row table of ordered coordinate pairs. A voxel contributes at
+            // most one pair per lexicographically-later neighbour, and
+            // `forward_offsets` is exactly that list — the same one
+            // `encode_adjacent_pairs` steps over.
         )
         .sized(SidecarSize::row_table(
             &pair_schema(),

@@ -29,15 +29,12 @@
 // paid for exactly once, in phase 1, and what crosses between them is six
 // planes of labels per block rather than any volume of pixels.
 //
-// **"Exactly once" is now literally true**, and for most of this file's life it
-// was not. Phase 1 declares `FragmentOp::barrier` — its dependency on phase 0 is
-// completion rather than region coverage — and computes the union-find in
-// `FragmentOp::reduce`, which runs at the one moment a barrier creates. Before
-// that declaration existed the only way to say "after all of phase 0" was to
-// fetch the whole volume in every block, and the merge had nowhere to live but
-// `apply`, which is per block. "What this costs" below is the measurement of
-// the difference, and `ops::components::Merge` is the switch the three arms of it are
-// built from.
+// **"Exactly once" is literal.** Phase 1 declares `FragmentOp::barrier` — its
+// dependency on phase 0 is completion rather than region coverage — and computes
+// the union-find in `FragmentOp::reduce`, which runs at the one moment a barrier
+// creates. "What this costs" below measures that against the per-block merge it
+// replaced, and `ops::components::Merge` is the switch the three arms are built
+// from.
 //
 // The intermediate image is decomposition-dependent, and the output is not
 // -----------------------------------------------------------------------------
@@ -105,15 +102,13 @@
 // nobody produced. The merge is therefore folded into phase 1, which reads the
 // fragments *and* the labels and writes the answer.
 //
-// **What has changed is what the fold costs.** The sentence that stood here said
-// the cost of it is that every block re-runs the same global union-find, and that
-// was right; it is no longer the case, and the wall it names is not the reason.
-// `FragmentOp::reduce` gives the phase somewhere to put an answer that belongs to
-// the phase rather than to a block, so the merge runs once inside a two-phase
-// plan and Rule A is not in the way of anything. `docs/design/barriers.md` §7.5
-// is the argument for why the whole-phase blob is specifically the shape that
-// does not need the third phase — and §7.3 is the record of why the merge was
-// ever per block, which was never a choice anybody made.
+// **The fold no longer costs a merge per block.** `FragmentOp::reduce` gives the
+// phase somewhere to put an answer that belongs to the phase rather than to a
+// block, so the merge runs once inside a two-phase plan and the wall above is
+// not in the way of anything. `docs/design/barriers.md` §7.5 is the argument for
+// why the whole-phase blob is specifically the shape that does not need the
+// third phase — and §7.3 is the record of why the merge was ever per block,
+// which was never a choice anybody made.
 //
 // **A fragment op could not change the element type of the image it writes.**
 // Phase 0 reads a `bool` mask and writes `u32` labels, and `check_dtypes` folds
@@ -657,8 +652,8 @@ impl FragmentOp for LabelBackgroundOp {
             // six faces of zeros and a label count of nought, and the merge
             // needs to see that rather than infer it from an absence.
             Coverage::EveryBlock,
-            // The six-faces shape: a header, a word per label, and the block's six
-            //         // boundary planes.
+            // The size below is the six-faces shape: a header, a word per label,
+            // and the block's six boundary planes.
         )
         .sized(SidecarSize::block_faces())]
     }

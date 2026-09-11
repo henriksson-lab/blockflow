@@ -4,12 +4,10 @@
 //
 // **A diamond whose second arm is a stored image.**
 //
-// A phase used to read exactly one image: `run_task` did `env.read(task.phase,
-// fetch)` and nothing else. An op needing a second array therefore had to hold
-// it — `ops::voxelwise::CombineOp` keeps an `Arc<Voxels>` of the whole volume
-// and slices it at the anchor. That is correct, properly anchored, and one full
-// copy of the array resident for the length of the run, at the sizes an
-// out-of-core framework exists for.
+// The alternative is holding the second array: `ops::voxelwise::CombineOp`
+// keeps an `Arc<Voxels>` of the whole volume and slices it at the anchor. That
+// is correct, properly anchored, and one full copy of the array resident for
+// the length of the run, at the sizes an out-of-core framework exists for.
 //
 // `Chain::Source` is a leaf that *reads* an image instead of computing one, so
 // the second arm of a `Chain::Parallel` can be an array on disk. What this file
@@ -368,8 +366,7 @@ fn the_plan_predicts_the_second_read_and_the_run_performs_it() {
 
 // ------------------------------------------------- 3. two readers --
 
-/// Who reads what, straight off the plan. This is the refcount, and it is what
-/// replaced "an image is read by exactly one phase".
+/// Who reads what, straight off the plan. This is the refcount.
 #[test]
 fn an_image_read_by_a_source_leaf_has_two_readers() {
     let chain = source_chain();
@@ -388,12 +385,10 @@ fn an_image_read_by_a_source_leaf_has_two_readers() {
     // applies the zero-reader rule that `peak_image_bytes` always applied — *an
     // image nothing reads dies as soon as it is written* — so an image with no
     // reader inside the run is named by the phase that **wrote** it rather than
-    // by nobody at all. Before that rule moved into `images_dead_after`, an
-    // unread image was named by no phase and the executor never freed it, which
-    // is strictly worse than naming it here: naming it is harmless, because
-    // `image_visibility` is what decides whether an image may be freed and both
-    // `strategy.rs` and `peak_image_bytes` consult it before acting on this
-    // list. The output is `Published`, so it survives being named.
+    // by nobody at all. Naming it is harmless: `image_visibility` decides
+    // whether an image may be freed, and both `strategy.rs` and
+    // `peak_image_bytes` consult it before acting on this list. The output is
+    // `Published`, so it survives being named.
     assert_eq!(plan.images_dead_after(0), vec![0], "the input, never freed");
     assert_eq!(plan.images_dead_after(1), Vec::<usize>::new());
     assert_eq!(

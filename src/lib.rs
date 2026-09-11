@@ -88,10 +88,9 @@
 // and is checked like one.
 //
 // * **Broken links are denied.** A link that no longer resolves names an item
-//   that was renamed or removed, and the sentence around it is then describing
-//   something that is not there. That is drift, and it is exactly the kind that
-//   accumulates silently — the same argument `tests/no_domain_vocabulary.rs`
-//   makes for a rule a grep can check.
+//   that was renamed or removed, so the sentence around it is describing
+//   something that is not there — drift of exactly the kind that accumulates
+//   silently.
 // * **Links to private items are allowed**, deliberately. `[`ImageStore`]` in a
 //   public item's documentation is an accurate reference to a real type that
 //   the public API does not expose; rustdoc renders it as plain text and the

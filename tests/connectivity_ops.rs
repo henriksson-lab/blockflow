@@ -411,9 +411,9 @@ fn the_same_volume_through_a_plan_fills_differently_at_six_and_twenty_six() {
 /// further voxels are set higher than the chains and placed so that:
 ///
 /// * `(6, 6, 4)` is a **corner** step from the corner chain's `(5, 5, 5)` and
-///   three steps from every other chain voxel — so it disqualifies nothing under
-///   6 or 18, and under 26 it disqualifies the corner chain, which by then is one
-///   plateau twelve voxels long;
+///   two or more steps from every other chain voxel — so it disqualifies nothing
+///   under 6 or 18, and under 26 it disqualifies the corner chain, which by then
+///   is one plateau twelve voxels long;
 /// * `(6, 7, 19)` is an **edge** step from the edge chain's `(6, 6, 20)` — so it
 ///   disqualifies nothing under 6, and under 18 and 26 it disqualifies the edge
 ///   chain, which by then is one plateau.
@@ -764,7 +764,7 @@ fn the_foreground_and_the_background_connectivity_are_chosen_separately() {
     assert_eq!(clear_voxels(&filled), 2);
 
     // and the *complement* of that, detected at `FacesEdgesAndCorners`: two
-    // single voxels that are nine slices apart, so two regions whatever is asked
+    // single voxels twenty slices apart, so two regions whatever is asked
     let complement = filled.mapv(|set| !set);
     let regions = detect_run(&complement, [3, 3, 5], Connectivity::FacesEdgesAndCorners);
     assert_eq!(regions.len(), 2);

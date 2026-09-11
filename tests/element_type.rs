@@ -298,9 +298,9 @@ fn a_phase_may_narrow_the_element_type_and_the_image_follows_the_plan() {
 /// The output volume of a decimating phase, in the decomposition.
 ///
 /// `read` is the phase's own (output) extent; `source` is the extent in the
-/// image below that the op must be handed to produce it. Stating the second is
-/// what change 2 added; declaring that the op turns one into the other is what
-/// change 5 added, and the two together are what make this plan runnable.
+/// image below that the op must be handed to produce it. Stating the second and
+/// declaring that the op turns one into the other are together what make this
+/// plan runnable.
 fn decimating_plan(workflow: &Workflow, factor: usize, block: usize) -> Decomposition {
     let out_volume = [VOLUME[0] / factor, VOLUME[1], VOLUME[2]];
     let phase = PhaseDecomposition::derive(
@@ -326,10 +326,8 @@ fn decimating_plan(workflow: &Workflow, factor: usize, block: usize) -> Decompos
 
 /// An image that is **half the size of the one below it**, checked and run.
 ///
-/// This is the wall `strategy.rs` used to refuse outright: `apply` wrote an
-/// output the shape of its input, so a cross-grid fetch could translate but
-/// never resize, and the refusal named what was missing. What was missing was an
-/// op saying what shape it produces.
+/// A cross-grid fetch can translate but not resize, so what makes this runnable
+/// is the op itself saying what shape it produces.
 #[test]
 fn a_phase_may_resize_the_image_when_its_op_declares_the_shape() {
     for factor in [2usize, 3] {

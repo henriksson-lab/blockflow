@@ -28,18 +28,15 @@
 // the image below, whose shape is `Decomposition::volume_at(p)`. The two are
 // equal for every phase whose output grid is its input grid, which is most of
 // them, and the plan is byte-identical there. Where they differ the plan *says
-// so*, which is the whole point: a phase that changes shape used to be refused
-// by `check`, so the only way to run one was to hide the mapping inside an
-// `Environment`, where nothing prices it and nothing checks it.
+// so*, which is the whole point: the alternative is hiding the mapping inside
+// an `Environment`, where nothing prices it and nothing checks it.
 //
 // The guard
 // ---------
-// `Decomposition::check` runs `block_processing::boxes_tile_exactly` over
-// the derived valid regions. That is the *existing* check, unchanged, pointed
-// at the right quantity — the design is explicit that a new bespoke halo
-// assertion is the wrong answer, because the tiling check already runs, already
-// has a message and cannot be forgotten at a new call site. The only change to
-// `block_processing.rs` is that the function is now `pub(crate)`.
+// `Decomposition::check` runs `tiling::boxes_tile_exactly` over the derived
+// valid regions: the existing tiling check pointed at the right quantity,
+// rather than a bespoke `halo >= reach` assertion that would be a second thing
+// to remember at every new call site.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
@@ -95,11 +92,10 @@ pub struct PhaseDecomposition {
     pub grid: BlockGrid,
     /// The element type this phase **writes**, when it is not the one it read.
     ///
-    /// `None` means "unchanged", which is every phase this crate shipped before
-    /// the field existed, and is why `derive` still takes five arguments — the
-    /// alternative was a default element type, and a default is exactly the kind
-    /// of plausible wrong answer a binding plan must not contain. Resolve it
-    /// with [`Decomposition::dtype_at`], which folds the chain from image 0.
+    /// `None` means "unchanged" rather than some default element type, which
+    /// would be exactly the kind of plausible wrong answer a binding plan must
+    /// not contain. Resolve it with [`Decomposition::dtype_at`], which folds the
+    /// chain from image 0.
     pub dtype: Option<Dtype>,
     /// Images this phase reads **besides** the one it is handed, ascending and
     /// without repeats: one per [`Chain::Source`] leaf in its slots.
@@ -134,10 +130,9 @@ pub struct PhaseDecomposition {
     /// supplied input is produced by no phase, so there is no fold and no
     /// arithmetic that could answer; the only statement of what is in it is the
     /// one its readers make (`Chain::Source`'s `dtype`, `SourceInput::dtype`).
-    /// So it is recorded beside the images it belongs to, derived from the chain
-    /// by [`Decomposition::declare_source_images`] and verified against it by
-    /// [`check_source_images`] — exactly the split `declare_dtypes` and
-    /// `check_dtypes` have, and the same one `source_images` itself has.
+    /// So it is recorded beside the images it belongs to, derived by
+    /// [`Decomposition::declare_source_images`] and verified by
+    /// [`check_source_images`].
     ///
     /// Two phases reading one supplied input must agree, and
     /// [`check_source_images`] says so by name if they do not.
@@ -168,9 +163,8 @@ pub struct PhaseDecomposition {
     /// Whether this phase waits for **all** of the previous phase rather than
     /// for the tasks whose valid regions cover what it fetches.
     ///
-    /// `false` for every phase this crate shipped before the field existed, and
-    /// it is set only by `fragment::fragment_phase`, from
-    /// `FragmentOp::barrier`.
+    /// `false` for every pixel phase; set only by `fragment::fragment_phase`,
+    /// from `FragmentOp::barrier`.
     ///
     /// **A declaration, not a hint.** Everything in `Hints` may be ignored,
     /// overridden or recomputed by a strategy and the run is still correct; this
@@ -490,20 +484,11 @@ impl DeclaredSourceSet {
 /// but I must rebuild it before I finish" unsayable, and that is a real state.
 ///
 /// `docs/design/images-and-phases.md` specifies a rename in which this enum
-/// replaces [`Visibility`] outright. The spelling half of that is done — this is
-/// `ImageKind` and not `LevelKind` — and the removal is **not**, deliberately:
+/// replaces [`Visibility`] outright. That removal is deliberately not done:
 /// `Visibility` answers the narrower question every one of its callers actually
 /// asks — *may this be freed* — and folding it away would make each of them
 /// restate `Input | Output` for itself. The two are kept because they are two
 /// questions, and this one is derived from that one so they cannot disagree.
-///
-/// **The argument deliberately does not turn on a count.** Two attempts to
-/// state one disagreed — nine, then eight-and-none-in-the-consumer — and both
-/// were wrong: `image_visibility` is read at seven sites here and **four in the
-/// consumer**, and one of the eight matches a counter found was this file's own
-/// definition. A number in a doc comment is a fact about the day it was written;
-/// what carries the decision is that the two enums answer different questions,
-/// which is true at any count above zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageKind {
     /// Handed to the run. No phase writes it and nothing can rebuild it.
@@ -530,10 +515,9 @@ pub enum Visibility {
     /// [`Decomposition::readers_of_image`] makes — an image dies after its
     /// **last** reader.
     ///
-    /// The reason this is worth naming: today every image of an `N`-phase plan
-    /// is allocated at full volume for the whole run, so a twenty-stage chain
-    /// holds twenty-one copies of the data at once. Only ever two of them are
-    /// live. Saying which are which is what lets the environment free the rest.
+    /// The reason this is worth naming: an `N`-phase plan names `N + 1`
+    /// full-volume images and only ever two of them are live. Saying which are
+    /// which is what lets the environment free the rest.
     Internal,
 }
 
@@ -695,44 +679,32 @@ impl Decomposition {
     /// `source_images` names `i`.** No special case, and the loop is ascending
     /// by construction so nothing is sorted afterwards.
     ///
-    /// **The refcount.** Before source leaves existed this was always a single
-    /// phase — image `p` is phase `p`'s input and nobody else's — and the whole
-    /// lifetime rule was written to that special case. A source leaf is a
-    /// second reader, so the general statement is the one the design record
-    /// asks for: *an image dies after its last reader*.
+    /// **The refcount.** A source leaf is a second reader, so the lifetime rule
+    /// is *an image dies after its last reader* rather than the single-reader
+    /// special case image `p` / phase `p` would suggest.
     ///
     /// # Why `reads_input_image` and not "phase `p` reads image `p`"
     ///
-    /// It used to be the latter, unconditionally, and that is false for exactly
-    /// one kind of phase: a fragment phase whose op declares
-    /// `reads_pixels() == false` is handed an image and never touches it. The
-    /// plan already records the truth in
-    /// [`PhaseDecomposition::reads_input_image`], which `fragment_phase` put
-    /// there. The over-count was **one image for one phase** — image `p`'s only
-    /// credited reader was phase `p` and its writer is phase `p - 1`, so the
-    /// claim could be wrong but not wrong by two — and what it cost was one
-    /// whole image at the plan's element type, held for one phase: kilobytes at
-    /// a test lattice, gigabytes at a real one.
+    /// The latter is false for exactly one kind of phase: a fragment phase whose
+    /// op declares `reads_pixels() == false` is handed an image and never
+    /// touches it, and [`PhaseDecomposition::reads_input_image`] records that.
+    /// Crediting it anyway holds one whole image at the plan's element type for
+    /// one phase — kilobytes at a test lattice, gigabytes at a real one.
     ///
-    /// # The two things that had to move with it
+    /// # Two things that have to move together with the predicate
     ///
-    /// Narrowing this alone is wrong twice, and both were found by running the
-    /// suite against a candidate rather than by reading the call sites.
-    ///
-    /// * The old `phase != image` guard on the `source_images` loop skipped a
-    ///   phase that reads an image through a source leaf *and* is the phase that
-    ///   image is the input of. That reader existed only by the unconditional
-    ///   push, so narrowing the push without widening the loop drops it, and
-    ///   every run in `tests/region_tabulation.rs` fails with *image 1 was
-    ///   discarded after phase 0*. The guard is gone and the predicate above is
-    ///   what replaces both halves.
-    /// * An image with no reader at all would then be named by **no** phase, so
+    /// * A `phase != image` guard on the `source_images` clause skips a phase
+    ///   that reads an image through a source leaf *and* is the phase that image
+    ///   is the input of. Narrowing the first clause without widening the second
+    ///   drops that reader, and every run in `tests/region_tabulation.rs` fails
+    ///   with *image 1 was discarded after phase 0*.
+    /// * An image with no reader at all is then named by **no** phase, so
     ///   [`Self::images_dead_after`] would never free it — strictly worse than
-    ///   the over-count. That is where the zero-reader rule went.
+    ///   an over-count. That is where the zero-reader rule went.
     ///
-    /// The last image has no reader either, which is why it is `Published`;
-    /// [`Self::images_dead_after`] now names it after its writer, and
-    /// [`Self::image_visibility`] is what keeps it alive.
+    /// The last image has no reader either, which is why it is `Published`:
+    /// [`Self::images_dead_after`] names it after its writer and
+    /// [`Self::image_visibility`] keeps it alive.
     pub fn readers_of_image(&self, image: usize) -> Vec<usize> {
         self.phases
             .iter()
@@ -748,24 +720,22 @@ impl Decomposition {
     /// The images whose **last** reader is `phase`: what dies when this phase
     /// finishes every one of its tasks.
     ///
-    /// This is the quantity the executor wants, and stating it this way is what
-    /// keeps the executor from having to know whether the rule is "one reader"
-    /// or "several". A plan with no source leaf answers `[phase]`, which is the
-    /// image the phase read — the old rule, unchanged, as an instance of the
-    /// new one.
+    /// This is the quantity the executor wants, and stating it this way keeps
+    /// the executor from having to know whether the rule is "one reader" or
+    /// "several". A plan with no source leaf answers `[phase]`, the image the
+    /// phase read.
     ///
-    /// Whether an image may be freed at all is still [`Self::image_visibility`]'s
-    /// question, and pinning is still the caller's; neither is folded in here,
-    /// because this is a fact about the plan and those two are policy.
+    /// Whether an image may be freed at all is [`Self::image_visibility`]'s
+    /// question, and pinning is the caller's; neither is folded in here, because
+    /// this is a fact about the plan and those two are policy.
     ///
     /// # An image nothing reads dies as soon as it is written
     ///
-    /// The same rule — *after its last reader* — at zero readers, and it is the
-    /// half [`Self::peak_image_bytes`] already applied while this one did not.
-    /// Without it an unread image is named by no phase at all and is never
-    /// freed, which is worse than any over-count; and unread images are not
-    /// exotic, because the run's output is one and a fragment phase that reads
-    /// no pixels leaves one behind it.
+    /// The same rule — *after its last reader* — at zero readers. Without it an
+    /// unread image is named by no phase at all and is never freed, which is
+    /// worse than any over-count; and unread images are not exotic, because the
+    /// run's output is one and a fragment phase that reads no pixels leaves one
+    /// behind it.
     ///
     /// The writer of image `i` is phase `i - 1`. Image 0 has no writer, is the
     /// run's input and is `Published`, so it is named by nobody when nothing
@@ -790,13 +760,10 @@ impl Decomposition {
     /// `keep_images` has contradicted itself, and the reading that cannot lose
     /// data is the one taken.
     ///
-    /// **One function because it used to be three.** This predicate was written
-    /// out at `strategy`'s discard loop, inside
-    /// [`Self::peak_image_bytes_with`]'s residency walk, and again in
-    /// `simulate`'s — the middle one describing itself as "word for word the
-    /// executor's rule", which is an accurate confession rather than a
-    /// reassurance. Two of the three then disagreed with the first about an
-    /// image nothing reads; see [`Self::images_freed_after`].
+    /// **One function because it used to be three** — `strategy`'s discard loop,
+    /// [`Self::peak_image_bytes_with`]'s residency walk and `simulate`'s — two of
+    /// which disagreed with the first about an image nothing reads. See
+    /// [`Self::images_freed_after`].
     pub fn image_freeable(
         &self,
         image: usize,
@@ -818,23 +785,19 @@ impl Decomposition {
     /// # The reconciliation, stated rather than left to an invariant
     ///
     /// The three former copies did not agree about **an image nothing reads**.
-    /// [`Self::images_dead_after`] answers `i - 1 == phase` for one — it dies
-    /// after the phase that wrote it — while both residency walks matched on
-    /// `readers_of_image(..).last()` and treated `None` as *drop now*. Those are
-    /// different rules. They agreed in practice only because an image enters the
-    /// live set when its writer starts, which made the difference unreachable —
-    /// agreement resting on an invariant stated in another function, which is
-    /// the failure mode transcription produces.
+    /// [`Self::images_dead_after`] answers `i - 1 == phase` — it dies after the
+    /// phase that wrote it — while both residency walks matched on
+    /// `readers_of_image(..).last()` and treated `None` as *drop now*. They
+    /// agreed in practice only because an image enters the live set when its
+    /// writer starts, an invariant stated in another function.
     ///
-    /// **`images_dead_after`'s answer is the one kept**, because the executor
-    /// is what actually runs and that is the rule it followed. Two edge cases
-    /// move as a result, both in the safe direction: **image 0** and a
-    /// **supplied input**, each unread and named in `release_images`, were
-    /// dropped by the residency walks at the first phase boundary and are not
-    /// freed by the executor at all — `images_dead_after` excludes image 0 by
-    /// construction and never names a supplied input, which `n_images` does not
-    /// count. The walks now report those bytes as resident, which is what the
-    /// run holds.
+    /// **`images_dead_after`'s answer is the one kept**, because the executor is
+    /// what actually runs and that is the rule it followed. Two edge cases move
+    /// as a result, both in the safe direction: **image 0** and a **supplied
+    /// input**, each unread and named in `release_images`, are not freed by the
+    /// executor at all — `images_dead_after` excludes image 0 by construction and
+    /// never names a supplied input, which `n_images` does not count. The walks
+    /// report those bytes as resident, which is what the run holds.
     pub fn images_freed_after(
         &self,
         phase: usize,
@@ -876,14 +839,13 @@ impl Decomposition {
     /// What `image` **is**: handed to the run, made on the way through, or the
     /// answer.
     ///
-    /// **Derived, on the same argument [`Self::image_visibility`] is derived**,
-    /// and now with something to say that the arithmetic it replaced could not:
-    /// image 0 and every supplied input are `Input` because no phase writes
+    /// **Derived, on the same argument [`Self::image_visibility`] is derived.**
+    /// Image 0 and every supplied input are `Input` because no phase writes
     /// them, the last image a phase writes is `Output`, and everything between
-    /// is `Intermediate`. The old rule collapsed the first and the last into one
-    /// answer and had no way to distinguish "must not be freed because nothing
-    /// could rebuild it" from "must not be freed because somebody is waiting for
-    /// it".
+    /// is `Intermediate`. Collapsing the first and the last into one answer —
+    /// which is all `Visibility` can say — loses the distinction between "must
+    /// not be freed because nothing could rebuild it" and "must not be freed
+    /// because somebody is waiting for it".
     pub fn image_kind(&self, image: usize) -> ImageKind {
         if image == 0 || is_supplied_image(image) {
             ImageKind::Input
@@ -1013,19 +975,14 @@ impl Decomposition {
     /// fragment phase whose op declares `reads_pixels() == false` is handed
     /// image `p` and never fetches it — `strategy::run_fragment_task` skips the
     /// read outright — so the multiplier is `source_images.len()` and not one
-    /// more. This used to be `1 + source_images.len()` unconditionally, which
-    /// charged such a phase for a fetch that does not happen. It was invisible
-    /// while the only non-reading fragment phases had no source images either
-    /// and thus no `Environment::read` to be compared against; it stopped being
-    /// invisible when phases appeared that read a second array and not their
-    /// own, and it was over by one whole halo-inflated image each.
+    /// more. Charging `1 + source_images.len()` unconditionally is over by one
+    /// whole halo-inflated image for each such phase.
     ///
     /// A phase that reads neither its input nor any source image scores zero,
     /// and that is the right answer rather than a degenerate one:
     /// `fragments -> fragments` merges move no voxels at all, only sidecar
-    /// bytes, and this function has never counted those — its own header calls
-    /// itself the figure to compare against what a run counted, and a run
-    /// counts a fragment gather through the sidecar, not through `read`.
+    /// bytes, and this function does not count those — a run counts a fragment
+    /// gather through the sidecar, not through `read`.
     pub fn exact_read_voxels(&self) -> Vec<usize> {
         self.phases
             .iter()
@@ -1037,78 +994,6 @@ impl Decomposition {
             .collect()
     }
 
-    /// The whole-array bytes this plan's images occupy at the worst moment of a
-    /// run, from the plan alone.
-    ///
-    /// # What the number is
-    ///
-    /// Exactly one thing: **the images this plan names, sized by the volumes and
-    /// element widths it declares, summed over the phase boundary at which most
-    /// of them are simultaneously alive.** An image is alive from the phase that
-    /// writes it until its last reader finishes; a
-    /// [`Visibility::Published`] image — image 0, the
-    /// output, a supplied input — is never discarded, because
-    /// `ArrayEnvironment` does not discard them. Every input is an integer the
-    /// plan states, so two runs of the same plan give the same answer and two
-    /// plans differ here only where they really do name different arrays.
-    ///
-    /// It is the figure that decides whether a stage is worth *attempting* at a
-    /// given size, and it is the right thing to compare two plans on when the
-    /// question is about arrays the plan names.
-    ///
-    /// # What the number is not, measured rather than hedged
-    ///
-    /// **It is not a bound on a run's resident bytes, in either direction**, and
-    /// the two ways it misses were measured rather than reasoned about — on the
-    /// same plan at two block sizes, against a counting allocator:
-    ///
-    /// * **at one block the run saved more than this figure predicted, by 25%.**
-    ///   A `Chain::Parallel` allocates a buffer per branch at the block's read
-    ///   extent, and narrowing a reach shrinks every one of them. No
-    ///   `Decomposition` can see those buffers: they are not images, they have no
-    ///   entry here, and nothing in this walk moves when they do.
-    /// * **at `32^3` the run saved half what this figure predicted.**
-    ///   `ImageStore::pending` allocates an image lazily at first write and frees
-    ///   an internal one after its last reader, so a five-image plan never holds
-    ///   five and the peak this walk computes is a moment the run does not have.
-    ///
-    /// So a caller comparing two plans gets a figure that is **directionally
-    /// right and quantitatively not** — the plan that names fewer and smaller
-    /// arrays does hold less, and by how much is a question only a run answers.
-    /// A caller sizing a machine wants a measured `VmHWM`, and
-    /// `crate::budget::MemoryBudget` for what a run is *permitted* to hold.
-    ///
-    /// # Why `work`
-    ///
-    /// Phase `p` writes image `p + 1` — **unless it does not**. A fragment phase
-    /// that writes no pixels writes no image, and a plan whose last phase is one
-    /// has an image slot nothing ever fills. Whether a phase writes is the op's
-    /// answer and not the plan's ([`crate::fragment::PhaseWork::writes_an_image`]),
-    /// which is the same reason [`predicted_cost`] takes this argument, and it is
-    /// enforced the same way: `&[]` is fine for an all-pixel plan and a slotless
-    /// phase with no entry is **refused** rather than assumed to write.
-    ///
-    /// The read side needs no argument, because the plan already records it:
-    /// [`PhaseDecomposition::reads_input_image`] is what `fragment_phase` put
-    /// there and what [`Self::exact_read_voxels`] already counts with.
-    ///
-    /// # Why this does not call `images_dead_after`, and why it no longer
-    /// # disagrees with it
-    ///
-    /// It used to say something the other could not: [`Self::readers_of_image`]
-    /// counted phase `p` as a reader of image `p` unconditionally, and a
-    /// fragment phase that reads no pixels is not one, so the walk here was
-    /// exact and [`Self::images_dead_after`] was not. The zero-reader rule this
-    /// walk applied — *an image nothing reads dies as soon as it is written*,
-    /// which is the same rule at zero readers — was likewise only here.
-    ///
-    /// **Both have moved to where they belong.** `readers_of_image` now consults
-    /// [`PhaseDecomposition::reads_input_image`] and `images_dead_after` applies
-    /// the zero-reader rule, so the two agree and the executor frees what this
-    /// predicts. The `retain` below is still written out rather than delegated,
-    /// because it asks the question in the walk's own terms — *is there a reader
-    /// after this phase* — and that is one comparison rather than a vector per
-    /// image per phase.
     /// **The two halves of what a run is resident in, named together.**
     ///
     /// A budget question has two terms and they behave differently, which is
@@ -1136,22 +1021,20 @@ impl Decomposition {
     /// `work` is the fragment work, as [`Self::peak_image_bytes`] takes it;
     /// `&[]` is correct and exact for an all-pixel plan.
     ///
-    /// # Two ways this understates, both stated rather than fixed
+    /// # How the working-set term understates, stated rather than fixed
     ///
     /// **It is a report, and the gate is elsewhere.** Nothing is admitted on
     /// this figure — [`Constraints::affords_working_set`] decides that, and it
     /// charges `working_set x concurrency` *unclamped*, which over-states. So
-    /// the safe direction is preserved where it matters and these two limits
-    /// cost a reader accuracy rather than costing a run its memory.
+    /// the safe direction is preserved where it matters.
     ///
-    /// * **The working-set term is a max over phases, and the executor can have
-    ///   two phases in flight.** `strategy::execute` fills a wave from whatever
-    ///   is ready, and a phase's successor becomes ready long before the phase
-    ///   finishes, so blocks of two phases really do coexist. The true figure is
-    ///   bounded by the sum of the two largest phases rather than by the
-    ///   largest. Not summed here because "how many of each" is a scheduling
-    ///   fact and this type is the binding half of a plan; the simulator is
-    ///   where that question has an answer.
+    /// **The term is a max over phases, and the executor can have two phases in
+    /// flight.** `strategy::execute` fills a wave from whatever is ready, and a
+    /// phase's successor becomes ready long before the phase finishes, so blocks
+    /// of two phases really do coexist. The true figure is bounded by the sum of
+    /// the two largest phases rather than by the largest. Not summed here because
+    /// "how many of each" is a scheduling fact and this type is the binding half
+    /// of a plan; the simulator is where that question has an answer.
     ///
     /// The image term does not have that problem: it is exact, and a consumer
     /// suite pins it against a measured run to the byte — `56.200 GiB` of images
@@ -1160,17 +1043,11 @@ impl Decomposition {
     /// # Why it takes the chain
     ///
     /// The working-set term is the same quantity
-    /// [`PhaseCost::working_set_bytes_per_block`] states, and it used to be
-    /// computed here a second time with a hardcoded `x 2.0` — carrying, in that
-    /// method's own words, "that field's known gap verbatim: a phase reading
-    /// three images is charged as if it read one". When the gap was closed there
-    /// the two immediately disagreed, which is the failure mode this crate warns
-    /// about everywhere it states a quantity twice.
-    ///
-    /// So it is stated once. The chain is what the count needs — a phase's
-    /// buffers are its slots' — and it is a parameter rather than something read
-    /// off the plan because a `PhaseDecomposition` does not hold the chain and a
-    /// recorded copy would be a third statement of the same number.
+    /// [`PhaseCost::working_set_bytes_per_block`] states, so it is stated once
+    /// rather than recomputed here. The chain is what the count needs — a
+    /// phase's buffers are its slots' — and it is a parameter because a
+    /// `PhaseDecomposition` does not hold the chain and a recorded copy would be
+    /// a third statement of the same number.
     pub fn residency(
         &self,
         chain: &Chain,
@@ -1183,9 +1060,8 @@ impl Decomposition {
         // The worst phase's, because residency is a peak and the phases do not
         // overlap. The per-block factor is
         // `PhaseCost::working_set_bytes_per_block`'s own — every block buffer
-        // alive at once, not the two a hardcoded `x 2.0` used to assume — and it
-        // is derived from the same slots by the same helper, so the two cannot
-        // drift.
+        // alive at once — derived from the same slots by the same helper, so the
+        // two cannot drift.
         let slots = chain.slots();
         let working_set_bytes = self
             .phases
@@ -1233,11 +1109,11 @@ impl Decomposition {
     ///
     /// A barrier reduces over the whole phase, so the blob it folds holds one
     /// fragment per block simultaneously. Under `Coverage::EveryBlock` that is
-    /// `n_blocks x payload` at one instant — and until this existed, nothing
-    /// budgeted it: `exact_read_voxels` says outright that it "has never counted
-    /// those", and `Residency` had two terms, both of which **fall** as the cut
-    /// gets finer. A fixed per-block payload totals *more* as it gets finer, so
-    /// a planner shrinking the working set was free to grow an unbudgeted peak.
+    /// `n_blocks x payload` at one instant. Nothing else budgets it —
+    /// `exact_read_voxels` counts voxels and not sidecar bytes — and the other
+    /// two `Residency` terms both **fall** as the cut gets finer. A fixed
+    /// per-block payload totals *more* as it gets finer, so a planner shrinking
+    /// the working set is otherwise free to grow an unbudgeted peak.
     ///
     /// # What an undeclared stream contributes, and why it is zero
     ///
@@ -1280,25 +1156,69 @@ impl Decomposition {
             .unwrap_or(0)
     }
 
+    /// The whole-array bytes this plan's images occupy at the worst moment of a
+    /// run, from the plan alone.
+    ///
+    /// # What the number is
+    ///
+    /// Exactly one thing: **the images this plan names, sized by the volumes and
+    /// element widths it declares, summed over the phase boundary at which most
+    /// of them are simultaneously alive.** An image is alive from the phase that
+    /// writes it until its last reader finishes; a [`Visibility::Published`]
+    /// image — image 0, the output, a supplied input — is never discarded,
+    /// because `ArrayEnvironment` does not discard them. Every input is an
+    /// integer the plan states, so two runs of the same plan give the same answer
+    /// and two plans differ here only where they really do name different arrays.
+    ///
+    /// # What the number is not, measured rather than hedged
+    ///
+    /// **It is not a bound on a run's resident bytes, in either direction**, and
+    /// the two ways it misses were measured rather than reasoned about — on the
+    /// same plan at two block sizes, against a counting allocator:
+    ///
+    /// * **at one block the run saved more than this figure predicted, by 25%.**
+    ///   A `Chain::Parallel` allocates a buffer per branch at the block's read
+    ///   extent, and narrowing a reach shrinks every one of them. No
+    ///   `Decomposition` can see those buffers: they are not images, they have no
+    ///   entry here, and nothing in this walk moves when they do.
+    /// * **at `32^3` the run saved half what this figure predicted.**
+    ///   `ImageStore::pending` allocates an image lazily at first write and frees
+    ///   an internal one after its last reader, so a five-image plan never holds
+    ///   five and the peak this walk computes is a moment the run does not have.
+    ///
+    /// So a caller comparing two plans gets a figure that is **directionally
+    /// right and quantitatively not** — the plan that names fewer and smaller
+    /// arrays does hold less, and by how much is a question only a run answers.
+    /// A caller sizing a machine wants a measured `VmHWM`, and
+    /// `crate::budget::MemoryBudget` for what a run is *permitted* to hold.
+    ///
+    /// # Why `work`
+    ///
+    /// Phase `p` writes image `p + 1` — **unless it does not**. A fragment phase
+    /// that writes no pixels writes no image, and a plan whose last phase is one
+    /// has an image slot nothing ever fills. Whether a phase writes is the op's
+    /// answer and not the plan's ([`crate::fragment::PhaseWork::writes_an_image`]),
+    /// which is the same reason [`predicted_cost`] takes this argument, and it is
+    /// enforced the same way: `&[]` is fine for an all-pixel plan and a slotless
+    /// phase with no entry is **refused** rather than assumed to write.
+    ///
+    /// The read side needs no argument, because the plan already records it in
+    /// [`PhaseDecomposition::reads_input_image`], which is what
+    /// [`Self::exact_read_voxels`] counts with.
     pub fn peak_image_bytes(&self, work: &[crate::fragment::PhaseWork<'_>]) -> Result<u64> {
         self.peak_image_bytes_with(work, &BTreeSet::new(), &BTreeSet::new())
     }
 
     /// [`Self::peak_image_bytes`], told what the caller releases and keeps.
     ///
-    /// **The plain form predicts a run nobody makes.** The executor frees an
-    /// image after its last reader when it is `Internal` **or** named in
-    /// `Hints::release_images`, and never when it is named in
-    /// `Hints::keep_images`; the walk here applied only the first clause, so it
-    /// over-stated any plan whose caller released a `Published` image and
-    /// under-stated any plan that kept one.
-    ///
-    /// The size of that gap on the shipped binarisation at the `404 x 1304 x
-    /// 3369` tile over `float64` is **13.223 GiB** — image 0, the run's own
-    /// input, which is `Published` because of where it sits rather than because
-    /// anything reads it back. Predicting **56.200 GiB** where
-    /// `tests/residency_across_cuts.rs` measures **42.977** is not a margin; it
-    /// is the walk answering about a different run.
+    /// **Without these two the walk predicts a run nobody makes.** The executor
+    /// frees an image after its last reader when it is `Internal` **or** named
+    /// in `Hints::release_images`, and never when it is named in
+    /// `Hints::keep_images`. Applying only the first clause over-states any plan
+    /// whose caller released a `Published` image: on the shipped binarisation at
+    /// the `404 x 1304 x 3369` tile over `float64` that is **13.223 GiB** — image
+    /// 0, the run's own input — predicting **56.200 GiB** where
+    /// `tests/residency_across_cuts.rs` measures **42.977**.
     ///
     /// `released` and `kept` are `Hints::release_images` and
     /// `Hints::keep_images`. They are passed rather than reached for because a
@@ -1351,16 +1271,14 @@ impl Decomposition {
     /// `f64`. Two runs with the same decomposition must produce the same value
     /// or the manifest cannot be used to compare them.
     ///
-    /// **Per-phase volumes and element types were already covered**: the grid's
-    /// volume has always been hashed per phase, so a phase that changes shape
-    /// changes the fingerprint without anything being added here. What is new is
-    /// hashed *only where it is used* — a phase that declares no `dtype` and a
-    /// block that reads its own read extent contribute nothing — so a plan that
-    /// does not use the new expressiveness fingerprints exactly as it did before
-    /// the new expressiveness existed. That is not tidiness: a fingerprint is
-    /// how a parity figure is attached to the plan that produced it, and
-    /// renumbering every historical plan to record that two features are unused
-    /// would throw that away for nothing.
+    /// **Optional fields are hashed only where they are used** — a phase that
+    /// declares no `dtype`, a block that reads its own read extent — so a plan
+    /// that does not use them fingerprints exactly as it did before they
+    /// existed. That is not tidiness: a fingerprint is how a parity figure is
+    /// attached to the plan that produced it, and renumbering every historical
+    /// plan to record that a feature is unused throws that away for nothing.
+    /// Per-phase volumes need no such care; the grid's volume is hashed per
+    /// phase already.
     pub fn fingerprint(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.volume.hash(&mut hasher);
@@ -1377,11 +1295,9 @@ impl Decomposition {
             if let Some(dtype) = phase.dtype {
                 dtype.numpy_name().hash(&mut hasher);
             }
-            // Hashed only where it is used, on exactly `dtype`'s argument: a
-            // phase that reads no second image contributes nothing, so every
-            // plan built before source leaves existed fingerprints as it did.
-            // Which image an arm reads changes voxels, so a plan that uses one
-            // must not collide with a plan that reads another.
+            // Hashed only where it is used, on exactly `dtype`'s argument. Which
+            // image an arm reads changes voxels, so a plan that uses one must
+            // not collide with a plan that reads another.
             if !phase.supplied_dtypes.is_empty() {
                 for (image, dtype) in &phase.supplied_dtypes {
                     image.hash(&mut hasher);
@@ -1438,21 +1354,19 @@ impl Decomposition {
     /// tiling develops a hole, and this fires. There is no separate
     /// `halo >= reach` assertion anywhere, by design.
     ///
-    /// **What used to be here and is not.** A phase whose grid volume differed
-    /// from the decomposition's was refused outright, which made
+    /// **Two checks rather than one refusal.** Refusing a phase whose grid
+    /// volume differs from the decomposition's would make
     /// `input grid != output grid` inexpressible — not hard, not unpriced,
     /// *impossible*, for cross-grid pixel ops and for anything that reshapes.
-    /// The refusal is replaced by two checks that are strictly stronger where
-    /// the old one applied and still say something where it did not:
+    /// Instead:
     ///
     /// * the tiling runs against the phase's own volume, so it is a real check
     ///   for every phase rather than a check of one phase and a shape assertion
     ///   for the rest;
-    /// * a block's `source` must lie inside the image it reads, which is the
-    ///   part that used to be true by construction and now has to be verified.
-    ///   The images chain — image 0 is `self.volume`, image `p+1` is phase `p`'s
-    ///   — so a plan whose phases do not join up is caught here rather than
-    ///   becoming two decompositions with no edge between them.
+    /// * a block's `source` must lie inside the image it reads. The images chain
+    ///   — image 0 is `self.volume`, image `p+1` is phase `p`'s — so a plan whose
+    ///   phases do not join up is caught here rather than becoming two
+    ///   decompositions with no edge between them.
     ///
     /// **And a whole-axis reach on the image below is checked against the
     /// fetch.** `AxisReach::All` in `Frame::Source` says the op consumes the
@@ -1677,9 +1591,9 @@ pub(crate) fn region_to_ranges(region: &Region) -> Vec<(usize, usize)> {
 /// number nobody has measured — the same objection that keeps
 /// `order_conflict_penalty` at zero. Residency is already represented, as a
 /// *feasibility* constraint rather than a price: `Constraints::budget_bytes`
-/// against `PhaseCost::working_set_bytes_per_block`. What was wrong was that
-/// figure, not its absence — it was derived from the infinite-grid read and
-/// could exceed the volume — so it is now the clamped extent. A planner told
+/// against `PhaseCost::working_set_bytes_per_block`, which is the *clamped* read
+/// extent rather than the infinite-grid one and so can never exceed the volume.
+/// A planner told
 /// memory is unbounded (`budget_bytes: None`) choosing one whole-volume block
 /// for a local op is answering the question it was asked; the barrier it must
 /// not fuse across is settled structurally, by `is_planning_barrier`, and needs
@@ -1765,13 +1679,9 @@ pub struct CostModel {
     /// spread: the tile run put `combine` at 3.541, `smooth` at 98.329 and
     /// `skeletonize` at 201.397 nanoseconds per voxel. The declared
     /// `cost_per_voxel` each op carries is meant to capture that ratio, and it
-    /// is a *seed* — nothing had ever compared it against a measurement, and
-    /// `statistics::Term::ComputeOf` has recorded the per-family evidence all
-    /// along under a doc that says outright it is "recorded and reported, **not
-    /// used**", because there was nowhere in this struct to put it.
-    ///
-    /// This is that somewhere. `docs/design/planner-gaps.md` carries it as
-    /// **G3** and the reason it matters is the shape of the objective:
+    /// is a *seed*; `statistics::Term::ComputeOf` records the per-family evidence
+    /// and this table is where it lands. `docs/design/planner-gaps.md` carries it
+    /// as **G3**, and the reason it matters is the shape of the objective:
     /// `strategy::phase_makespan` is a **roofline**, a max of a pool term and a
     /// channel term, so an error on one phase's compute does not scale the
     /// answer — it flips which side of the max binds, and with it which
@@ -1992,29 +1902,17 @@ pub struct Constraints {
     ///   volume's own box before it is priced, and the reachable shapes are
     ///   already anisotropic.
     /// * **Where a general per-axis family does win, a finer scalar ladder wins
-    ///   by more, and costs nothing but entries here.** Adding a rung at `3/4` of
-    ///   each power of two — 24, 48, 96, 192, 384 — takes the working-set step
-    ///   between neighbours from 8x to about 2.4x. Swept over two volumes, three
-    ///   reaches, three worker counts and five budgets: the finer ladder beat the
-    ///   coarse one by up to **2.7x** (a tight budget where the coarse ladder
-    ///   drops from a 32-cube to a 16-cube and lands far under the budget, while
-    ///   a 24-cube uses it), against at most **1.4x** for full per-axis freedom
-    ///   over the same coarse rungs. The general family won a minority of cells
-    ///   and never by as much.
+    ///   by more, and costs nothing but entries here.** Swept over two volumes,
+    ///   three reaches, three worker counts and five budgets, a ladder with a
+    ///   rung at `3/4` of each power of two beat the coarse one by up to **2.7x**
+    ///   against at most **1.4x** for full per-axis freedom over the same coarse
+    ///   rungs. The general family won a minority of cells and never by as much.
     ///
     /// So the gap is real and it is **granularity, not anisotropy** — and it is
     /// reachable today. The same result holds on an isotropic `1024^3`, which is
-    /// what says it is not about the volume's aspect ratio.
-    ///
-    /// **That finer ladder is [`BlockLadder::Refined`]**, computed by
-    /// [`refined_ladder`] and selected by [`Constraints::with_ladder`]. It is a
-    /// named setting rather than the default, and the reason is not the search
-    /// cost the sentence above would suggest — that was measured at `1.06x` and
-    /// retired. It is that this project intends to pick planners by running them
-    /// against each other, and a context-dependent gain belongs in that
-    /// competition rather than in a default. `refined_ladder`'s header carries
-    /// the measurement, the decision, and the one guarantee elsewhere that this
-    /// ladder changes the wording of.
+    /// what says it is not about the volume's aspect ratio. That finer ladder is
+    /// [`BlockLadder::Refined`]; see [`refined_ladder`] for the measurement and
+    /// for why it is a named setting rather than the default.
     ///
     /// # What this does not price, and what that is worth
     ///
@@ -2067,20 +1965,24 @@ pub struct Constraints {
 /// rungs, which is the comparison that says the gap is granularity rather than
 /// anisotropy.
 ///
-/// # What it costs: entries, and one restated guarantee
+/// # What it costs
 ///
-/// **Entries.** The search is `partitions x candidates^phases`, so refining a
-/// three-rung ladder to six squares the per-phase factor. That is the reason
-/// this is a function a caller applies rather than the default: the default
-/// stays where every recorded parity figure was measured, and a caller who wants
-/// the finer grid says so and pays the search for it.
+/// **Search time, and less than the algebra suggests.** The framing
+/// `partitions x candidates^phases` makes refining a three-rung ladder to five
+/// look like `81 -> 625` at four phases, and the exponent is not real:
+/// [`crate::strategy::PartitionSearch`] is a dynamic program over prefixes, so
+/// the candidate loop runs once per (run, candidate) rather than once per
+/// combination. Measured end to end by `tests/ladder_planning_cost.rs`:
+/// **`1.06x` to `1.13x` of the coarse ladder's planning time, sub-millisecond
+/// throughout, at phase counts where the nominal combination count reaches seven
+/// figures.**
 ///
 /// **And a guarantee elsewhere that this changes the wording of.**
 /// `budget::UNOBSERVED_SHAPE_MARGIN`'s header argues that an admission margin
-/// can cost *at most one ladder step*, and calls that arithmetic rather than
-/// luck: a ladder of powers of two steps by `8x` in volume, and every margin is
-/// under eight — `3.6` alone, and `3.5626 x 2.1 = 7.48` for the worst measured
-/// shape. **That wording does not survive this ladder.** A step here is
+/// can cost *at most one ladder step*: a ladder of powers of two steps by `8x`
+/// in volume, and every margin is under eight — `3.6` alone, and
+/// `3.5626 x 2.1 = 7.48` for the worst measured shape. **That wording does not
+/// survive this ladder.** A step here is
 /// `(4/3)^3 = 2.37x` or `(3/2)^3 = 3.375x`, alternating, so a margin of `3.6`
 /// already spans two of them.
 ///
@@ -2090,84 +1992,32 @@ pub struct Constraints {
 /// every margin under eight costs **at most two rungs here, which is at most the
 /// same `8x` in block volume the one-step bound guaranteed.** The bound that
 /// survives any spacing is therefore the volume ratio, and the step count was a
-/// proxy that happened to equal it while the ladder was powers of two.
+/// proxy that happened to equal it while the ladder was powers of two. It is
+/// also the *better* bound to state: the planner stops at the largest rung that
+/// fits, so on a finer ladder the correction lands **closer**, never further.
+/// `a_finer_ladder_never_admits_a_smaller_block_than_a_coarse_one` measures both
+/// halves.
 ///
-/// It is also the *better* bound to state, and not only the more durable one:
-/// the planner stops at the largest rung that fits, so on a finer ladder the
-/// correction lands **closer**, never further. That is the same fact the `2.7x`
-/// win is, seen from the margin's side.
-/// [`a_finer_ladder_never_admits_a_smaller_block_than_a_coarse_one`] measures
-/// both halves.
+/// # Why it is not the default
 ///
-/// [`a_finer_ladder_never_admits_a_smaller_block_than_a_coarse_one`]: https://docs.rs/blockflow
-/// # Should this be the default? The two reasons it is not, measured
+/// Neither the search cost above nor the recorded parity figures. A survey
+/// across both crates found no *answer* exposed to this choice — the oracle
+/// comparisons plan with `Trivial` or an explicit list, the sibling crate builds
+/// its own ladder from the caller's block, and the one frozen fingerprint
+/// literal is built under an explicit four-rung list — so what would move is a
+/// handful of ladder-shape literals and one paragraph in the ops survey.
 ///
-/// It was made opt-in for two stated reasons. Both have now been tested rather
-/// than inherited, and **neither survives as originally stated**. The decision
-/// is recorded here rather than acted on, because flipping a default changes
-/// every consumer's plan and that is not a change to make from inside the
-/// function that would benefit from it.
-///
-/// **Reason one — the search cost — is retired.** The framing was
-/// `partitions x candidates^phases`, which makes refining a three-rung ladder to
-/// five look like `81 -> 625` at four phases. Two things are wrong with it.
-/// `boxes_tile_exactly` became a linear separating pass, taking
-/// `PlanBuilder::finish` from 445 ms to 4.2 ms at 8192 blocks, so one candidate
-/// costs a fraction of what it did when that multiplier last looked expensive.
-/// And the exponent is not real: [`crate::strategy::PartitionSearch`] is a
-/// dynamic program over prefixes, so the objective is additive over phases and
-/// the candidate loop runs once per (run, candidate) rather than once per
-/// combination. Measured end to end by `tests/ladder_planning_cost.rs`:
-/// **`1.06x` to `1.13x` of the coarse ladder's planning time, sub-millisecond
-/// throughout, at phase counts where the nominal combination count reaches seven
-/// figures.** The measured ratio stays under the bare `5/3` candidate ratio,
-/// which is the observable form of "it scales with the count, not the power".
-///
-/// **Reason two — the recorded parity figures — is narrower than it sounded, and
-/// it is the one that still decides.** Surveyed across both crates, splitting
-/// what a plan change would move into *answers* (voxel values, digests,
-/// component and row counts, reference comparisons) and *plan-shape
-/// measurements* (phase counts, chosen edges, fingerprints, read counters):
-///
-/// * **No answer is exposed.** Nothing that guarantees decomposition invariance
-///   reaches the planner through this default. The oracle comparisons build
-///   their plans with `Trivial`, which discards the candidate list, or with an
-///   explicit list of their own.
-/// * **The sibling crate is entirely immune** — it generates its own ladder from
-///   the caller's block and never consumes this default.
-/// * **The one frozen fingerprint literal is immune**, being built under an
-///   explicit four-rung list. Every other fingerprint assertion is relational.
-/// * What would move is a handful of **ladder-shape literals** and one recorded
-///   paragraph in the ops survey.
-///
-/// # It was recommended as a default, and the project decided otherwise
-///
-/// **The recommendation is kept rather than deleted, because a recommendation
-/// reversed by a decision should keep its reasoning visible.** On the two
-/// reasons above it was: *flip the default, once the volume-bound restatement
-/// lands in `budget.rs` and once the opt-in method goes with it.* Both
-/// prerequisites were real; the first has since landed.
-///
-/// **The decision was not to flip it, and the reason is better than the
-/// question.** This project intends to run several planners against simulated
-/// data and pick between them by what wins in a given context. A `1.06x`
-/// planning cost buying a larger block in 15 of 27 cells is exactly the kind of
-/// finding that should become a **competitor** rather than a default: the gain
-/// is real, it is context-dependent, and it is not large enough to justify
-/// moving the ground under every consumer of this crate on an average that
-/// nobody can defend in every context.
-///
-/// So what the measurement above is *for* changed. It is no longer the case for
-/// a default; it is the evidence a competition starts from, and the thing that
-/// had to change was how a caller **says which ladder** — see [`BlockLadder`],
-/// which replaced the opt-in method for three reasons that all bite when
-/// planners are compared rather than argued about.
+/// The reason is that this project intends to run several planners against
+/// simulated data and pick between them by context. A `1.06x` planning cost
+/// buying a larger block in 15 of 27 cells is a **competitor** rather than a
+/// default: the gain is real, context-dependent, and not large enough to move
+/// the ground under every consumer of this crate on an average nobody can defend
+/// in every context. [`BlockLadder`] is how a caller says which ladder.
 ///
 /// **What [`BlockLadder::Refined`] buys, and it is modest and real**: a larger
 /// admitted block in 15 of 27 (budget, charge) cells at up to `3.38x` in volume,
 /// never a smaller one; and over a (chain, budget) sweep, a different plan in 6
-/// of 16 cells, two of which planned *fewer phases* — one less materialisation,
-/// which is a second-order win nobody was claiming.
+/// of 16 cells, two of which planned *fewer phases* — one less materialisation.
 ///
 /// **What it does not buy, and should not be sold as:** feasibility.
 /// `the_refined_ladder_never_plans_where_the_coarse_one_cannot` measures it —
@@ -2188,12 +2038,6 @@ pub fn refined_ladder(coarse: &[usize]) -> Vec<usize> {
             // point**: `3k/4` for a power of two `k` is `3 * 2^(k-2)`, never
             // itself a power of two, so a second application finds nothing new
             // to insert.
-            //
-            // That idempotence is not tidiness. A setting whose value cannot be
-            // read back — where "which ladder is this" is unanswerable because
-            // applying it twice gives a third thing — is a bad thing for a
-            // planner competition to sweep, and [`BlockLadder`] is that
-            // competition's first entry.
             [
                 edge,
                 if edge.is_power_of_two() {
@@ -2218,52 +2062,37 @@ pub fn refined_ladder(coarse: &[usize]) -> Vec<usize> {
 /// The precedent is [`crate::strategy::PartitionSearch`], and this is
 /// deliberately its twin: a small enumerable choice carried in the constraints,
 /// with a default, and with the alternative kept as a **named value** rather
-/// than as the absence of a call. That matters for one reason —
-/// `docs/design/barriers.md` is full of settings that are choices, and this
-/// crate now intends to pick planners by running them against each other rather
-/// than by arguing. **A competition needs settings it can put in a list**, and
-/// [`Self::ALL`] is that list.
-///
-/// It replaced a method — `with_refined_ladder()` — which was wrong for three
-/// reasons that all bite exactly when planners compete. It named a
-/// *transformation*, so there was no domain to enumerate. It could not be swept.
-/// And it was not idempotent, so "which ladder is this plan using" was not
-/// answerable from the value: applying it twice gave a third ladder. The first
-/// two are fixed by being an enum; the third is fixed in [`refined_ladder`],
-/// which is now a fixed point.
+/// than as the absence of a call. This crate intends to pick planners by running
+/// them against each other rather than by arguing, and **a competition needs
+/// settings it can put in a list** — [`Self::ALL`] is that list. A method
+/// (`with_refined_ladder()`) would name a *transformation* instead: no domain to
+/// enumerate, nothing to sweep, and — before [`refined_ladder`] became a fixed
+/// point — no way to answer "which ladder is this plan using" from the value.
 ///
 /// # The parameter space this belongs to, which is a second one
 ///
 /// The consumer of this crate keeps a disciplined parameter space for anything
 /// that can change **the answer**: an arbitrary choice is an *axis*, a *synonym*
-/// cannot change the answer and is not one, and a *transcription decision*
-/// changes the answer but no reference parameter reaches it. The block ladder is
-/// placed there already, and placed correctly — a consumer's `LADDER_FLOOR`
-/// calls it *"arbitrary, and therefore a synonym rather than an axis — it cannot
-/// change an answer, only which decomposition computes it."*
+/// cannot change the answer and is not one. The block ladder is placed there as
+/// a synonym, and placed correctly — it *"cannot change an answer, only which
+/// decomposition computes it."*
 ///
-/// **That is true and it is not the whole placement.** A synonym in the answer's
-/// space can be a genuine axis in a second space that has had no name: the
-/// **planner's**. Its parameters are the ones that change which decomposition is
-/// chosen and cannot change what the decomposition computes —
-/// [`crate::strategy::PartitionSearch`] and this are its first two entries.
+/// **That is not the whole placement.** A synonym in the answer's space can be a
+/// genuine axis in a second space that has had no name: the **planner's**. Its
+/// parameters change which decomposition is chosen and cannot change what the
+/// decomposition computes — [`crate::strategy::PartitionSearch`] and this are
+/// its first two entries.
 ///
 /// **Its acceptance bar is different, and that is the point of naming it.** For
-/// the answer's space the bar is "the answer does not move", and here that bar
-/// is met *by construction* — the survey behind [`refined_ladder`]'s header
-/// found no voxel, digest, component count or reference comparison exposed to
-/// this choice at all, because decomposition invariance is what the whole crate
-/// guarantees. A bar that is satisfied before the experiment starts is not a
-/// bar. The bar in the planner's space is **"which is faster, and in what
-/// context"** — a question only measurement answers, and the one a competition
-/// between planners over simulated data exists to ask.
+/// the answer's space the bar is "the answer does not move", and here that is
+/// met *by construction*, because decomposition invariance is what the whole
+/// crate guarantees; a bar satisfied before the experiment starts is not a bar.
+/// The bar in the planner's space is **"which is faster, and in what context"**.
 ///
 /// The discipline that space needs is already visible in `PartitionSearch`:
-/// `Exhaustive` is kept although `Dp` supersedes it, because *"the DP's licence
-/// is the additivity above, and a cost model that breaks it needs a search that
-/// never assumed it. It is also the oracle the DP is tested against."* A
-/// planner's-space parameter keeps a variant when it is somebody's oracle or
-/// somebody's context, not when it wins on average.
+/// `Exhaustive` is kept although `Dp` supersedes it, because it is the oracle
+/// the DP is tested against. A planner's-space parameter keeps a variant when it
+/// is somebody's oracle or somebody's context, not when it wins on average.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlockLadder {
     /// The rungs as the caller stated them, which for every ladder this crate
@@ -2334,28 +2163,15 @@ impl BlockLadder {
 /// how to search, enumerable so a competition covers every variant, with a
 /// default, and **it must be possible to turn off**.
 ///
-/// **It is a field of [`Constraints`], and getting it there answered a design
-/// question rather than just costing an edit.** Adding one breaks every struct
-/// literal of that type — seven in the library and six in the integration tests
-/// — and a struct constructed by literal in thirteen places is a struct whose
-/// every future field is a tree-wide edit. The case *for* the literal is
-/// exhaustiveness: a new field is a compile error at each site, so somebody has
-/// to decide rather than inherit a default. That is worth paying **where the
-/// struct is built for a real run**, and worth nothing where it is a test
-/// fixture stating three knobs it cares about.
-///
-/// So the sites were read rather than rewritten, and **all thirteen turned out
-/// to be test fixtures**: every one sits inside a `#[cfg(test)]` module or a
-/// `tests/` file. No production path in this crate constructs `Constraints` by
-/// literal — real callers take [`Constraints::default`] and a `with_*`. The
-/// exhaustiveness was therefore being paid entirely by fixtures, where a new
-/// planner knob is noise and not a decision, so they now end
-/// `..Default::default()` and the next field costs them nothing. **The compiler
-/// named every site**; no pattern was matched against `Constraints {`, which
-/// matches things that are not literals and corrupted four files the first time
-/// it was tried. Deliberately not an
-/// operator — see [`BlockLadder`]'s own note on why a setting a caller states
-/// once beats a method that compounds.
+/// **A field of [`Constraints`], whose literals all end
+/// `..Default::default()`.** The exhaustiveness a struct literal buys — a new
+/// field is a compile error at each site, so somebody has to decide rather than
+/// inherit — is worth paying where the struct is built for a real run and worth
+/// nothing in a fixture. Every literal of that type in this tree is a fixture:
+/// no production path constructs `Constraints` by literal, real callers take
+/// [`Constraints::default`] and a `with_*`. Deliberately not an operator — see
+/// [`BlockLadder`]'s note on why a setting a caller states once beats a method
+/// that compounds.
 ///
 /// **What it is for, and the measurement is the whole argument.** Cutting a
 /// block into slabs was measured at **`5.39x` at one block and nothing once
@@ -2429,12 +2245,9 @@ impl Constraints {
     /// the concurrency the caller expects.
     ///
     /// **The one copy.** This predicate existed three times — `assemble::
-    /// affordable`, the block-candidate loop in `strategy.rs` and the
-    /// partition search's own closure — and the first of them carried a comment
-    /// explaining that it had been lifted out of the sweep so that "a second
-    /// copy that drifted would let this builder accept a lattice the search
-    /// would have refused". There were three. They agreed, which is luck rather
-    /// than structure.
+    /// affordable`, the block-candidate loop in `strategy.rs` and the partition
+    /// search's own closure — agreeing by luck rather than by structure. A copy
+    /// that drifted would let one builder accept a lattice the search refuses.
     ///
     /// # What it bounds, and what it does not
     ///
@@ -2583,12 +2396,13 @@ impl Default for Constraints {
 /// Does a reach of `reach` cover the whole of an axis of extent `extent`?
 ///
 /// This is the **barrier predicate**, and it is deliberately an exact
-/// comparison rather than a threshold. `docs/design/BLOCK_OPS.md` measures why:
-/// of seven merge steps in one real chain two reach a single voxel and four are
-/// cheap full-reach reductions over streams of 17 kB to 45 MB, so any rule of
-/// the form "large means full" would segment the chain in four places that do
-/// not want it. "Full" is a property of the reach *relative to the volume*, not
-/// a size and not a flag someone sets.
+/// comparison rather than a threshold. `GRAPH_MIGRATION.md` §6.5.1 measures why:
+/// of seven merge steps in one real chain, two reach a single voxel and four are
+/// cheap full-reach reductions over streams of 17 kB to 45 MB. An exact
+/// predicate segments at every whole-volume step; a "large means full" rule
+/// would additionally catch the two 1-voxel steps and price the cheap ones as
+/// expensive. "Full" is a property of the reach *relative to the volume*, not a
+/// size and not a flag someone sets.
 ///
 /// **Declared where it can be, detected where it cannot.** An op that means
 /// "everything" now says so — `AxisReach::All` — and [`Reach::is_whole_axis`]
@@ -2610,13 +2424,6 @@ impl Default for Constraints {
 /// full" caution does not transfer to them unexamined. See [`cuttable_axes`],
 /// which does examine it — including the measurement above, which turns out to
 /// leave the cutting rule untouched on the very chain it was taken from.
-///
-/// The paraphrase above is also a little stronger than its source. `§6.5.1` of
-/// `GRAPH_MIGRATION.md` has four of the seven steps *cheap* rather than four
-/// wrongly segmented: an exact predicate segments at every whole-volume step, and
-/// what a threshold rule would break is the two steps that reach a single voxel,
-/// plus the pricing of the cheap ones. The conclusion is unchanged — exact, not a
-/// threshold — but the "four" counts cheapness, not segments.
 pub fn reaches_whole_axis(reach: usize, extent: usize) -> bool {
     extent > 1 && reach >= extent
 }
@@ -2720,47 +2527,30 @@ pub fn splittable_axes(split_axes: &[usize], reach: &Reach, volume: [usize; 3]) 
 /// single block. What moves is which plan a planner offers, and the one it stops
 /// offering is one that computes the same volume by reading it `n` times.
 ///
-/// # Wired, and what had to be settled first
+/// # How it sits with the barrier rule, and with the price
 ///
-/// This was landed unwired because it contradicted a stated and tested position
-/// of the crate. Both planners call it now, and the contradiction was resolved by
-/// **moving the position**, not by weakening its test:
-///
-/// * `tests::a_large_but_bounded_reach_is_not_a_barrier_and_still_fuses` asserted
-///   that a reach of `volume - 1` left its phase *cuttable* — "priced out of
-///   fusing, but not **forbidden** from it, which is the whole difference from a
-///   barrier". At that reach `lo + hi` is nearly twice the volume, so this rule
-///   forbids the cut, and the two could not both hold. The test now asserts the
-///   narrower claim that survives, and it is the claim that was doing the work:
-///   a bounded reach is not a **barrier** — it forces no phase boundary, its
-///   neighbours may still fuse into it, and every other axis stays cuttable —
-///   while whether *this* axis is worth cutting is a question about the grid,
-///   which the arithmetic here answers and a barrier never asked.
-/// * [`reaches_whole_axis`] argues from the other side that the barrier predicate
-///   is exact *because* a "large means full" rule would segment a real chain
-///   where nothing wants a segment. That argument survives and does not reach
-///   here, for two reasons that were checked rather than assumed. It is an
+/// * **A bounded reach is still not a barrier.** It forces no phase boundary,
+///   its neighbours may fuse into it, and every other axis stays cuttable.
+///   Whether *this* axis is worth cutting is a question about the grid, which
+///   the arithmetic here answers and a barrier never asked.
+/// * [`reaches_whole_axis`]'s argument that the barrier predicate is exact
+///   *because* a "large means full" rule would segment a real chain does not
+///   reach here, for two reasons that were checked rather than assumed. It is an
 ///   argument about **segmentation**, and this rule adds no forced cut and
 ///   removes no fusion; and on the chain it is measured on it makes no difference
 ///   at all — the five whole-volume merge steps have already lost those axes to
 ///   [`splittable_axes`], and the two that reach a single voxel keep every axis
 ///   here at every candidate edge, since `edge + 1 + 1 < extent` for any edge
-///   that cuts anything. (Worth recording while passing: the "four places that do
-///   not want it" in [`reaches_whole_axis`]'s own note overstates its source.
-///   `GRAPH_MIGRATION.md` §6.5.1 has four of the seven *cheap*, not four wrongly
-///   segmented — an exact predicate segments at all five whole-volume steps too,
-///   and the objection to a threshold rule is that it would catch the two
-///   1-voxel ones and price the cheap ones as expensive.) See
+///   that cuts anything. See
 ///   `strategy::block_floor_tests::the_floor_changes_nothing_on_the_chain_the_barrier_rule_was_measured_on`.
 ///   What does *not* transfer is any claim that the grid is therefore untouched
 ///   by fusion: the grid a phase is given changes its price, and price chooses
 ///   the partition — which is the next point.
-/// * the second-order effect that had to move with it: [`price_phase`] charged an
-///   axis on the infinite grid when the grid cut it *or* the reach was whole.
-///   Dropping an axis here without extending that condition hands the phase the
-///   clamp discount and prices it at redundancy `1.0` — the exact hole
-///   `price_phase`'s own doc records having closed for full reaches — and the
-///   partition collapses. The condition is now stated over
+/// * [`price_phase`] charges an axis on the infinite grid when the grid cut it
+///   *or* the reach was whole. Dropping an axis here without extending that
+///   condition hands the phase the clamp discount and prices it at redundancy
+///   `1.0` — the exact hole `price_phase`'s own doc records having closed for
+///   full reaches — and the partition collapses. The condition is stated over
 ///   [`halo_spans_axis`] as well, which is this rule's own edge-independent form.
 ///
 /// The number the decision rests on is in
@@ -2865,10 +2655,10 @@ pub struct PhaseTraffic {
     /// declare it, where `dtype` and `source_images` both have defaults that
     /// most plans genuinely satisfy.
     ///
-    /// Zero for the one-op phase [`PhaseCost::working_set_bytes_per_block`]'s
-    /// old `x 2.0` was written for, so adding this moved no such phase's price.
-    /// It is the term that was missing for everything else, and by 46.5x for a
-    /// 91-arm fan-in whose combine cannot fold.
+    /// Zero for a one-op phase, where the phase's own input and output are the
+    /// whole of what is resident. It is the term that separates that case from
+    /// everything else, and by 46.5x for a 91-arm fan-in whose combine cannot
+    /// fold.
     pub chain_buffers: usize,
 }
 
@@ -2912,7 +2702,7 @@ impl PhaseTraffic {
 /// clamped, so an edge block reads less and costs less than an interior one.
 /// Assuming every block is interior therefore overestimates, which can only
 /// make the planner cautious — the same direction of error as a generous halo.
-/// # The rule this type has now been wrong under twice
+/// # The rule this type has been wrong under five times
 ///
 /// **A term that is wrong by an amount which varies with the candidate is not a
 /// conservative approximation. It is a bias.**
@@ -2923,8 +2713,8 @@ impl PhaseTraffic {
 /// of the work. An error whose size is a property of the **candidate being
 /// priced** does not make the planner cautious — it reorders the candidates, and
 /// it reorders them for a reason that has nothing to do with what any plan would
-/// do. Two instances have been found in this one expression, and they were found
-/// separately because nothing named the pattern:
+/// do. Five instances have been found, the first two in this one expression and
+/// separately, because nothing named the pattern:
 ///
 /// * the **core** was charged at `BlockGrid::core_voxels`, the widest block, so
 ///   each candidate paid for its own grid's padding: `1.253 / 1.588 / 1.404 /
@@ -2964,13 +2754,12 @@ impl PhaseTraffic {
 /// reassurance about a *per-item* cost must name the item count, and the defect
 /// is when that count is the thing the caller is free to increase. Every one of
 /// the five above reads as a bounded per-block statement and is unbounded in the
-/// block count, the array count, the substage count or the worker count.
-///
-/// And the corollary, because all five looked constant right up until somebody
-/// swept them: **"constant across candidates" is a claim to be tested
-/// adversarially, not asserted from the algebra.** Two of the five were argued
-/// correctly from the algebra of one term while a second term, in the same
-/// expression, did the opposite.
+/// block count, the array count, the substage count or the worker count. And the
+/// corollary, since all five looked constant right up until somebody swept them:
+/// **"constant across candidates" is a claim to be tested adversarially, not
+/// asserted from the algebra** — two of the five were argued correctly from the
+/// algebra of one term while a second term in the same expression did the
+/// opposite.
 ///
 /// [`BlockGrid::mean_core_voxels`]: crate::geometry::BlockGrid::mean_core_voxels
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2985,8 +2774,9 @@ pub struct PhaseCost {
     pub read_voxels_per_block: f64,
     pub compute_per_voxel: f64,
     /// Bytes resident while one block is in flight, from the **clamped** read
-    /// extent: input plus output. This is what the byte budget is checked
-    /// against, so it must be physical — a read can never exceed the volume.
+    /// extent: every block-sized buffer alive at once. This is what the byte
+    /// budget is checked against, so it must be physical — a read can never
+    /// exceed the volume.
     pub working_set_bytes_per_block: f64,
     /// How many times the read-and-compute terms of [`Self::cost_per_block`]
     /// were charged. `1` for everything but a measured iteration; see
@@ -3077,10 +2867,9 @@ fn resident_voxels_per_block(grid: &BlockGrid, halo: &Reach) -> f64 {
 ///
 /// It is not exact either **on a single-block phase whose halo spans the axis**
 /// ([`halo_spans_axis`]) — which is what [`cuttable_axes`] leaves behind when the
-/// reach denies every cut. The same sentence applies word for word: no block is
-/// interior, because every output voxel's window covers the extent before the
-/// clamp touches it; the clamp is the whole behaviour rather than a boundary
-/// effect; and the phase cannot be blocked or streamed at all. Without this the
+/// reach denies every cut. The paragraph above applies word for word: no block
+/// is interior, the clamp is the whole behaviour rather than a boundary effect,
+/// and the phase cannot be blocked or streamed at all. Without this the
 /// floor is self-defeating — it turns the phase into one block and the discount
 /// then prices that block at redundancy **1.0**, cheaper than any phase that is
 /// still cut, so the search fuses the chain into it. Measured on a seven-slot
@@ -3108,12 +2897,12 @@ fn resident_voxels_per_block(grid: &BlockGrid, halo: &Reach) -> f64 {
 /// `crate::strategy::chain_floor_measurement` over a `24 x 20 x 16` volume at a
 /// candidate edge of 32: two phases reading `2.0x` become four reading `4.0x`.
 /// Nothing is unrunnable and no voxel moves; the model simply buys a
-/// materialisation it did not need. It is the same over-charge the full-reach
-/// clause has always made in the same situation, in the direction the model is
-/// declared safe in, and separating it out needs `price_phase` to know which axes
-/// the planner *offered* to cut — which it cannot be told without making the
-/// price a function of the search rather than of the plan, and
-/// [`predicted_cost`] reads plans back with no search in hand.
+/// materialisation it did not need — the same over-charge the full-reach clause
+/// makes in the same situation, in the direction the model is declared safe in.
+/// Separating it out needs `price_phase` to know which axes the planner
+/// *offered* to cut, which would make the price a function of the search rather
+/// than of the plan, and [`predicted_cost`] reads plans back with no search in
+/// hand.
 ///
 /// **A bounded reach is still not a barrier, in the price as well as the
 /// structure.** The charge on a dropped axis is `(extent + lo + hi) / extent`; a
@@ -3154,10 +2943,10 @@ fn resident_voxels_per_block(grid: &BlockGrid, halo: &Reach) -> f64 {
 ///
 /// The halo column is zero rather than merely small because the charge is
 /// [`BlockGrid::mean_read_voxels`] — the exact clamped mean, not the
-/// infinite-grid one. That was a second fix of the same shape and its history is
-/// on [`PhaseCost`]. `tests/phase_pricing.rs` holds both columns and asserts the
-/// first as an **equality**, which is what leaves no width for a
-/// candidate-dependent error to hide in.
+/// infinite-grid one; see [`PhaseCost`] for the same defect in the core charge.
+/// `tests/phase_pricing.rs` holds both columns and asserts the first as an
+/// **equality**, which leaves no width for a candidate-dependent error to hide
+/// in.
 ///
 /// [`BlockGrid::mean_read_voxels`]: crate::geometry::BlockGrid::mean_read_voxels
 ///
@@ -3206,12 +2995,11 @@ pub fn price_phase(
         // four edges, against the core's 1.253 / 1.588 / 1.404 / 1.151.
         let (lo, hi) = halo.axis(axis).bound(volume[axis]);
         let grown = block[axis] as f64 + lo as f64 + hi as f64;
-        // The two axes that are charged on the **infinite grid** on purpose. Not
-        // a boundary approximation — a statement that the infinite-grid model
-        // has broken and the clamp *is* the whole behaviour, so pricing the
-        // clamped truth would say the phase is free to fuse across when it
-        // cannot be blocked at all. Everything else takes the exact clamped
-        // mean, which is what the two paragraphs below used to be arguing about.
+        // The two cases charged on the **infinite grid** on purpose. Not a
+        // boundary approximation — a statement that the infinite-grid model has
+        // broken and the clamp *is* the whole behaviour, so pricing the clamped
+        // truth would say the phase is free to fuse across when it cannot be
+        // blocked at all. Every other axis takes the exact clamped mean.
         let on_the_infinite_grid = halo.is_whole_axis(axis, volume[axis])
             || (grid.n_blocks() == 1 && halo_spans_axis(&halo, axis, volume[axis]));
         read_per_block *= if on_the_infinite_grid {
@@ -3220,12 +3008,12 @@ pub fn price_phase(
             grid.mean_read_extent(axis, lo, hi)
         };
     }
-    // One traversal of the read extent per stored image the phase reads. Zero
-    // for a phase that reads none — the `fragments -> fragments` case — and the
-    // zero is the point: see `PhaseTraffic::images_read`.
-    // Reported rather than computed: the ratio the model used to build the read
-    // from, kept because callers and tests read it as "how many times over does
-    // this grid traverse the volume".
+    // Reported rather than computed from: the ratio callers and tests read as
+    // "how many times over does this grid traverse the volume". `read_voxels`
+    // below is one traversal of the read extent per stored image the phase
+    // reads, which is zero for a phase that reads none — the
+    // `fragments -> fragments` case, and the zero is the point. See
+    // `PhaseTraffic::images_read`.
     let redundancy = read_per_block / core_voxels;
     let read_voxels = read_per_block * traffic.images_read as f64;
     // **The voxels the op computes over, which is one traversal and not one per
@@ -3237,11 +3025,9 @@ pub fn price_phase(
     // in it while cutting spread them. That is a pressure to cut that grows with
     // the arms and exists nowhere in any run.
     //
-    // It reached a consumer of this crate's planner before it reached a test
-    // here: a partition suite over a real chain cut a **single-block, zero-halo**
-    // plan into three phases, where there is by construction nothing for a cut
-    // to spread. The control that should have caught it lives here now —
-    // `tests/phase_pricing.rs`'s
+    // It showed up as a real chain's **single-block, zero-halo** plan being cut
+    // into three phases, where there is by construction nothing for a cut to
+    // spread. The control is `tests/phase_pricing.rs`'s
     // `nothing_makes_the_search_cut_a_single_block_plan_with_no_halo`.
     //
     // Zero when the phase reads no array at all: a `fragments -> fragments` op
@@ -3261,31 +3047,20 @@ pub fn price_phase(
         redundancy,
         read_voxels_per_block: read_voxels,
         compute_per_voxel,
-        // Input buffer plus output buffer, both over the clamped read extent —
-        // and deliberately **not** scaled by `traffic`. This figure feeds the
-        // byte budget, where over-charging invents infeasibility but is at least
-        // a statement about one grid, while under-charging admits a plan that
-        // will not run. A phase reading nothing is charged as if it read one
-        // image, which is the safe direction; a phase reading three is charged
-        // as if it read one, which is not, and is a known gap recorded here
-        // rather than half-fixed: correcting it changes which plans are
-        // *affordable*, and that is a budget review with its own measurements.
-        // **Every block-sized buffer alive while one block is in flight**, not
-        // the two the formula assumed. The phase's own input and output are
-        // `images_read + writes_an_image` — which is exactly `2` for the
-        // one-in-one-out phase this was written for, so that case did not move —
-        // and `chain_buffers` is what the chain holds between them: two for a
-        // long sequence, which ping-pongs, and **one per arm** for a fan-in whose
-        // combine cannot fold.
+        // **Every block-sized buffer alive while one block is in flight**, over
+        // the clamped read extent. This figure feeds the byte budget, where
+        // over-charging invents infeasibility but is at least a statement about
+        // one grid, while under-charging admits a plan that will not run. The
+        // phase's own input and output are `images_read + writes_an_image` —
+        // exactly `2` for a one-in-one-out phase — and `chain_buffers` is what
+        // the chain holds between them: two for a long sequence, which
+        // ping-pongs, and **one per arm** for a fan-in whose combine cannot fold.
         //
-        // The old `2.0` was an under-charge for everything else, and
-        // `budget.rs`'s header recorded it as a known gap "rather than
-        // half-fixed". What made it worth fixing was measuring the size: 93
-        // buffers against 2 for the feature stack of
-        // `docs/design/pixel-classification.md`, in the direction that admits a
-        // plan the run cannot afford. See `tests/working_set_residency.rs`,
-        // which holds the shape-derived count to a global allocator as an
-        // equality over fourteen shapes.
+        // A flat `2.0` here is an under-charge for everything else, in the
+        // direction that admits a plan the run cannot afford: 93 buffers against
+        // 2 for the feature stack of `docs/design/pixel-classification.md`. See
+        // `tests/working_set_residency.rs`, which holds the shape-derived count
+        // to a global allocator as an equality over fourteen shapes.
         working_set_bytes_per_block: resident_voxels
             * bytes_per_voxel
             * (traffic.images_read + usize::from(traffic.writes_an_image) + traffic.chain_buffers)
@@ -3404,16 +3179,6 @@ pub fn predicted_cost(
     Ok(total)
 }
 
-/// The compute figure [`price_phase`] wants, at one candidate block shape.
-///
-/// [`summarise_slots`] answers the same question with no block in hand, because
-/// it is asked *before* a grid exists — its result is what the reach and the
-/// traversal preferences are folded from, and those choose the grid. The compute
-/// term is the one quantity in that tuple that a block can move
-/// ([`crate::op::BlockOp::cost_per_voxel_in`]), so a planner comparing candidates
-/// re-asks it per candidate rather than pricing every grid with the figure from
-/// no grid. For every op that takes the default this is the same number by the
-/// same route, so no plan built before it existed moves.
 /// How many stored arrays a block of a run of pixel slots traverses.
 ///
 /// One for the phase's own input image, plus one for each distinct image a
@@ -3452,10 +3217,9 @@ pub fn images_read_by(slots: &[&Chain], group: &[usize], volume: [usize; 3]) -> 
 /// only figure available — the substage count is a fixed point over data, so no
 /// plan holds it.
 ///
-/// **What that costs was got wrong here once and is worth stating carefully.**
-/// This doc claimed the missing count could not move the block edge, because a
-/// common factor across the candidates cannot move an argmin. The claim was
-/// measured and is false, twice over:
+/// **The missing count does move the block edge**, contrary to the tempting
+/// argument that a common factor across the candidates cannot move an argmin.
+/// That argument was measured and is false, twice over:
 ///
 /// * the count is not a common factor of the whole price. A substage reads and
 ///   computes; the image is written **once**, after the loop. So `S` substages
@@ -3508,17 +3272,6 @@ pub(crate) fn phase_compute_per_voxel(
     }
 }
 
-/// How many arrays a block of `phase` reads and whether it writes one.
-///
-/// Both are facts the price needs and the grid cannot supply; see
-/// [`PhaseTraffic`]. The read count comes from the plan — it is the same count
-/// [`Decomposition::exact_read_voxels`] adds up — and the write comes from the
-/// op, because a fragment phase writes an image only if its op says so.
-///
-/// **A slotless phase with no `work` entry is refused**, on the argument
-/// [`phase_compute_per_voxel`] makes: `reads_input_image` defaults true and
-/// `writes_an_image` would default true, so such a phase would be priced for a
-/// read and a write it may do neither of, silently.
 /// [`PhaseTraffic`] for one phase of a plan — what it reads, whether it writes,
 /// and how many times its read-and-compute happen.
 ///
@@ -3540,6 +3293,17 @@ pub fn phase_traffic_of(
     phase_traffic(index, phase, work.get(index))
 }
 
+/// How many arrays a block of `phase` reads and whether it writes one.
+///
+/// Both are facts the price needs and the grid cannot supply; see
+/// [`PhaseTraffic`]. The read count comes from the plan — it is the same count
+/// [`Decomposition::exact_read_voxels`] adds up — and the write comes from the
+/// op, because a fragment phase writes an image only if its op says so.
+///
+/// **A slotless phase with no `work` entry is refused**, on the argument
+/// [`phase_compute_per_voxel`] makes: `reads_input_image` defaults true and
+/// `writes_an_image` would default true, so such a phase would be priced for a
+/// read and a write it may do neither of, silently.
 pub(crate) fn phase_traffic(
     index: usize,
     phase: &PhaseDecomposition,
@@ -3575,6 +3339,16 @@ pub(crate) fn phase_traffic(
     })
 }
 
+/// The compute figure [`price_phase`] wants, at one candidate block shape.
+///
+/// [`summarise_slots`] answers the same question with no block in hand, because
+/// it is asked *before* a grid exists — its result is what the reach and the
+/// traversal preferences are folded from, and those choose the grid. The compute
+/// term is the one quantity in that tuple that a block can move
+/// ([`crate::op::BlockOp::cost_per_voxel_in`]), so a planner comparing candidates
+/// re-asks it per candidate rather than pricing every grid with the figure from
+/// no grid. For every op that takes the default this is the same number by the
+/// same route.
 pub fn compute_per_voxel(slots: &[&Chain], group: &[usize], block: [usize; 3]) -> f64 {
     group
         .iter()
@@ -3736,18 +3510,34 @@ pub fn check_block_constraints(chain: &Chain, decomposition: &Decomposition) -> 
     Ok(())
 }
 
+/// How many block buffers a run of chain slots holds inside itself.
+///
+/// **A phase is a `Chain::Sequence` of its slots**, and asking the sequence is
+/// not the same as asking each slot: a run of four maps holds two intermediates
+/// because the walk ping-pongs, where summing the slots would say zero and
+/// counting them would say three. [`Chain::resident_block_buffers`] holds that
+/// rule and every other, measured against a global allocator; this only has to
+/// build the sequence it is a rule about.
+///
+/// Nothing is cloned and no `Chain` is built: a `Chain` owns boxed trait objects
+/// and is not `Clone`, which is why the rule is an associated function taking
+/// references rather than a method on a node this would have had to construct.
+pub(crate) fn resident_buffers_of(slots: &[&Chain], group: &[usize]) -> usize {
+    let children: Vec<&Chain> = group.iter().map(|&slot| slots[slot]).collect();
+    Chain::sequence_resident_buffers(&children)
+}
+
 /// Every source leaf in `chain` names an image its phase can actually read, and
 /// the plan records which ones.
 ///
 /// **The guard that cannot live in [`Decomposition::check`]**, on exactly
 /// [`check_block_constraints`]' argument: a plan records op names, not
-/// implementations, so the plan alone cannot see the leaves. The executor is
-/// the first place holding both halves, and it runs this before the first
-/// block — a forward reference is a fact about the plan, and a plan that is not
-/// a plan should be refused as one rather than survive until some block asks
-/// for an image nothing has written.
+/// implementations, so the plan alone cannot see the leaves. The executor is the
+/// first place holding both halves, and it runs this before the first block — a
+/// plan that is not a plan should be refused as one rather than survive until
+/// some block asks for an image nothing has written.
 ///
-/// Four things are checked, and each of them is a way for a well-formed,
+/// Five things are checked, and each of them is a way for a well-formed,
 /// complete, wrong volume to come out otherwise:
 ///
 /// * **the image exists.** An index past the end is not a reference to
@@ -3777,23 +3567,6 @@ pub fn check_block_constraints(chain: &Chain, decomposition: &Decomposition) -> 
 /// Finally the recorded `source_images` must be exactly what the slots name —
 /// a plan whose record disagrees with its chain would read one image and price
 /// another, and the whole reason the field exists is that it is parity-visible.
-/// How many block buffers a run of chain slots holds inside itself.
-///
-/// **A phase is a `Chain::Sequence` of its slots**, and asking the sequence is
-/// not the same as asking each slot: a run of four maps holds two intermediates
-/// because the walk ping-pongs, where summing the slots would say zero and
-/// counting them would say three. [`Chain::resident_block_buffers`] holds that
-/// rule and every other, measured against a global allocator; this only has to
-/// build the sequence it is a rule about.
-///
-/// Nothing is cloned and no `Chain` is built: a `Chain` owns boxed trait objects
-/// and is not `Clone`, which is why the rule is an associated function taking
-/// references rather than a method on a node this would have had to construct.
-pub(crate) fn resident_buffers_of(slots: &[&Chain], group: &[usize]) -> usize {
-    let children: Vec<&Chain> = group.iter().map(|&slot| slots[slot]).collect();
-    Chain::sequence_resident_buffers(&children)
-}
-
 pub fn check_source_images(chain: &Chain, decomposition: &Decomposition) -> Result<()> {
     let slots = chain.slots();
     for (phase_index, phase) in decomposition.phases.iter().enumerate() {
@@ -4098,19 +3871,17 @@ pub fn check_dtypes(
 /// [`check_block_constraints`] and [`check_dtypes`] cannot: a plan records op
 /// *names*, not implementations, so the plan alone cannot ask an op anything.
 ///
-/// **What went missing.** The executor compares what a phase's ops declare they
-/// produce against the read extent the plan derived (`strategy::run_task`). That
-/// is a real check only while the two sides are derived independently, and
-/// [`BlockOp::placed_output_shape`] opened a door out of it: an op whose write
-/// extent is not a function of its read extent may take the extent from
+/// **What this is protecting.** The executor compares what a phase's ops declare
+/// they produce against the read extent the plan derived (`strategy::run_task`),
+/// which is a real check only while the two sides are derived independently.
+/// [`BlockOp::placed_output_shape`] is a door out of it: an op whose write extent
+/// is not a function of its read extent may take the extent from
 /// [`Placement::writes`], which *is* the read extent, and the comparison then
-/// compares the plan with itself. One op does that legitimately and pays for it
-/// with a check of its own against the buffer it was handed. Nothing required
-/// the payment, so any op could take the door and say nothing — which is the
-/// hazard `env.rs`' argument for `apply_with` is about, in its second instance.
+/// compares the plan with itself. One op does that legitimately and pays with a
+/// check of its own against the buffer it was handed; without this guard any op
+/// could take the door and say nothing.
 ///
-/// **Exact tiling is not the replacement**, and it is worth saying why here
-/// rather than leaving the next reader to re-derive it:
+/// **Exact tiling is not the replacement:**
 ///
 /// * it already holds, twice. [`Decomposition::check`] runs
 ///   [`boxes_tile_exactly`] over each phase's valid regions, and `execute_phases`
@@ -4242,8 +4013,7 @@ fn block_extent(region: &Region) -> [usize; 3] {
 /// cut by a valid-region boundary", which is what this checks, per axis, per
 /// block, in linear time.
 ///
-/// **Why the invariant is a mandate rather than an aspiration**, since a reader
-/// meeting this function will want to know what it buys:
+/// **Why the invariant is a mandate rather than an aspiration:**
 ///
 /// * a chunk with two writers is a lost-update hazard in any store whose partial
 ///   writes are read-modify-write, which is most of them, and is why the Zarr
@@ -4828,9 +4598,7 @@ mod tests {
         );
     }
 
-    /// Exact, not a threshold. The design measures why: of seven merge steps in
-    /// one real chain two reach a single voxel, and a rule that treated "large"
-    /// as "full" would segment where nothing wants a segment.
+    /// Exact, not a threshold; see [`reaches_whole_axis`] for the measurement.
     #[test]
     fn the_barrier_predicate_is_an_exact_comparison_and_ignores_a_flat_axis() {
         assert!(!reaches_whole_axis(4095, 4096));

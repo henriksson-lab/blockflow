@@ -33,7 +33,7 @@
 //
 // And the other direction: for every case where a little-endian C or Fortran
 // file is what numpy produced, this asserts the bytes written **here** are
-// byte-identical to it. numpy's header spelling, key order, `(5,)` shape
+// byte-identical to it. numpy's header spelling, key order, `(2,)` shape
 // literal and 64-byte padding rule are all reproduced rather than approximated,
 // so that is a check and not an aspiration.
 //

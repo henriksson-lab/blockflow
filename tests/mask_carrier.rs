@@ -392,10 +392,10 @@ fn joined(logic: Logic, carriers: &[Dtype], output: Dtype, operands: &[Vec<bool>
 /// carrying it in.**
 ///
 /// Every assignment of carriers to two and to three branches, against every
-/// carrier of the output, over every connective — and all sixteen answers are
-/// one answer. The negative control is at the end: change the connective and
-/// nothing else, and the answer must move, so this is not sixteen ways of
-/// computing a constant.
+/// carrier of the output, over every connective — twenty-four assignments per
+/// connective, and all of them one answer. The negative control is at the end:
+/// change the connective and nothing else, and the answer must move, so this is
+/// not twenty-four ways of computing a constant.
 #[test]
 fn a_connective_joins_any_carriers_and_the_answer_does_not_depend_on_them() {
     let a: Vec<bool> = (0..8).map(|n| n & 1 == 1).collect();
@@ -818,8 +818,9 @@ fn the_sinks_two_carriers_agree_and_neither_depends_on_the_block_size() {
     }
 }
 
-/// The `Bool` sink is a quarter of the plan's bytes and the `f64` one is more
-/// than half — the same voxels, priced.
+/// The four images the chain writes cost eight bytes a voxel in `f64` and one in
+/// `Bool`, so the whole plan is 40 bytes a voxel against 12 — a **70%** saving
+/// on the same voxels.
 ///
 /// This is the plan-side figure only: `Decomposition::dtype_at` times the
 /// volume, image by image. What a run *holds* is measured under an allocator in

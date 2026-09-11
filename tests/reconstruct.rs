@@ -13,12 +13,11 @@
 //    decompositions — including one block, and including cuts that leave a
 //    partial block on every axis — against a whole-volume reference that runs the
 //    same kernel in a loop.
-// 2. **The bar an iteration adds.** Propagation is the point: a ridge at
-//    constant height crossing several blocks, seeded at one end, must arrive at
-//    the far end, and the **substage count must grow with the ridge's length**.
-//    The second half is what distinguishes propagation from a local computation
-//    that happened to be right; without it a bounded-reach implementation could
-//    pass the whole suite on data whose ridges all fit inside one block.
+// 2. **The bar an iteration adds.** A ridge at constant height crossing several
+//    blocks, seeded at one end, must arrive at the far end, and the **substage
+//    count must grow with the ridge's length**. Without that second half a
+//    bounded-reach implementation could pass the whole suite on data whose
+//    ridges all fit inside one block.
 // 3. **The bar this operation adds.** `h` is a *prominence threshold*, and
 //    nothing in parts 1 and 2 would notice if it were off by a factor or applied
 //    to the wrong quantity. So there is a scene of peaks of **known** prominence
@@ -173,8 +172,7 @@ fn run(op: &HExtremaOp, values: &Array3<f64>, block: [usize; 3]) -> (Array3<f64>
 /// The loop is the executor's own written out — the running operand starts as the
 /// input, the fixed operand is the input at every substage, and it stops when a
 /// substage changes nothing. Not a second implementation of the transform: a
-/// disagreement between this and a decomposed run is a decomposition bug, which
-/// is the only thing the comparison is for.
+/// disagreement between this and a decomposed run is a decomposition bug.
 fn reference(op: &HExtremaOp, values: &Array3<f64>) -> (Array3<f64>, usize) {
     let volume = [values.shape()[0], values.shape()[1], values.shape()[2]];
     let at = Anchor::whole(volume);
@@ -327,9 +325,7 @@ fn the_whole_volume_transform_agrees_with_the_phase_it_models() {
 
 // ------------------------------------------------------- 2. what h means --
 
-/// **The defining property**, and the one test without which this op is
-/// unverified however green the rest of the suite is: `h` is a prominence
-/// threshold in intensity units.
+/// **The defining property**: `h` is a prominence threshold in intensity units.
 ///
 /// Peaks of prominence 1 to 8 over a flat background. At each `h`, exactly the
 /// peaks whose prominence is at most `h` are gone — flattened to the level of the
@@ -469,12 +465,10 @@ const LINE: [usize; 3] = [40, 4, 4];
 /// higher voxel at its near end and stopped by one deep voxel at its far end.
 ///
 /// **The element used with this scene is flat on axes 1 and 2**, and that is the
-/// point of the scene rather than a saving. A flood spreads through everything
-/// its element connects, so with a solid element the background around the ridge
-/// floods too and the substage count becomes the maximum of two distances. Flat
-/// on the other two axes, nothing but this one line can move, so the count is a
-/// function of the ridge's length and of nothing else — which is the quantity the
-/// test is about.
+/// point of the scene rather than a saving. With a solid element the background
+/// around the ridge floods too and the substage count becomes the maximum of two
+/// distances. Flat on the other two axes, nothing but this one line can move, so
+/// the count is a function of the ridge's length alone.
 ///
 /// The deep voxel is what stops the flood: the seed arrives, is capped at the
 /// deep voxel's own value, and the ordinary background beyond it is above that,
@@ -692,10 +686,8 @@ fn the_limit_fires_by_name_on_a_path_longer_than_the_geometry_predicts() {
 /// **The peeling bound would refuse a correct run**, which is why this op derives
 /// its own rather than taking `PassLimit::for_volume`.
 ///
-/// The two numbers are put beside each other because the mistake is not obvious
-/// from either one alone: half the shortest axis is a bound on how far a *surface*
-/// can eat inward, and it says nothing whatever about how far a value can travel
-/// along a path.
+/// Half the shortest axis bounds how far a *surface* can eat inward, and says
+/// nothing about how far a value can travel along a path.
 #[test]
 fn the_peeling_bound_would_refuse_a_run_this_op_needs() {
     let peeling = PassLimit::for_volume(VOLUME).passes();
@@ -736,10 +728,9 @@ fn the_peeling_bound_would_refuse_a_run_this_op_needs() {
 /// A mask holding a NaN is refused **by name**, rather than iterating to the
 /// limit and reporting a failure to converge.
 ///
-/// The reason is in the module header and is a property of the framework rather
-/// than of the operation: the convergence test is `==` on what a substage wrote
-/// against what it read, and a NaN is not equal to itself. The refusal is what
-/// turns that into a message a caller can act on.
+/// The convergence test is `==` on what a substage wrote against what it read,
+/// and a NaN is not equal to itself. The refusal turns that into a message a
+/// caller can act on.
 #[test]
 fn a_mask_holding_a_nan_is_refused_by_name_rather_than_failing_to_converge() {
     let mut values = scene();
@@ -816,13 +807,11 @@ fn extended_maxima_plan(
 ///
 /// The scene holds eight peaks of prominence 1 to 8, each a single voxel, so the
 /// number of flagged voxels at each `h` is a *known number* — the count of peaks
-/// whose prominence is above `h` — rather than merely a smaller one. That is the
-/// difference between testing the transform and testing that something decreases.
+/// whose prominence is above `h` — rather than merely a smaller one.
 ///
 /// At `h = 8` no peak survives, the volume is one flat plateau with nothing above
-/// it, and **all of it** is maximal: 1440 voxels rather than none. That step is
-/// asserted too, because it is the one a reader would get wrong, and because it
-/// is the honest answer rather than an edge case to be suppressed.
+/// it, and **all of it** is maximal: 1440 voxels rather than none. Asserted too,
+/// because it is the step a reader would get wrong.
 #[test]
 fn extended_maxima_are_the_maxima_of_the_h_maxima_and_the_count_is_known_at_each_h() {
     let values = graded_spikes();

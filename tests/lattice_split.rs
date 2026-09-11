@@ -313,8 +313,9 @@ fn the_two_phases_reproduce_the_fused_op_exactly() {
 /// The two-phase plan is the shape a caller actually writes, and it exercises
 /// what one phase alone cannot: the coarse image is *materialised* between the
 /// two, so the interpolation reads an image whose shape is neither the volume's
-/// nor its own output's. The fine phase is one block, which is all it can be —
-/// see `a_multi_block_interpolation_is_refused_and_says_what_is_missing`.
+/// nor its own output's. The fine phase is one block here;
+/// `a_multi_block_interpolation_is_the_whole_volume_answer` is where the blocked
+/// ones are.
 #[test]
 fn the_statistic_half_stays_exact_when_the_lattice_is_blocked() {
     let input: Voxels = texture(VOLUME).into();
@@ -375,14 +376,12 @@ fn the_statistic_half_stays_exact_when_the_lattice_is_blocked() {
 /// The thing this split could not do, now that it can: a **multi-block**
 /// interpolation, byte-identical to the whole-volume answer at every blocking.
 ///
-/// This test replaces the one that pinned the refusal, and the replacement is
-/// the same assertion read the other way round. A block of the fine phase writes
-/// a span that depends on where it sits — the first sample is half a gap into
-/// the volume and the volume's extent is not a whole number of gaps — while
-/// `BlockOp::output_shape` sees only the shape of the buffer handed in. What
-/// changed is not the lattice but where the extent comes from: `op::Placement`
-/// carries the block's position in *both* spaces and the extent the plan cut,
-/// and `BlockOp::placed_output_shape` takes it from there.
+/// A block of the fine phase writes a span that depends on where it sits — the
+/// first sample is half a gap into the volume and the volume's extent is not a
+/// whole number of gaps — while `BlockOp::output_shape` sees only the shape of
+/// the buffer handed in. `op::Placement` carries the block's position in *both*
+/// spaces and the extent the plan cut, and `BlockOp::placed_output_shape` takes
+/// it from there.
 ///
 /// **The block edges are chosen to make the end blocks genuinely different.**
 /// `VOLUME` is `[30, 24, 18]` and none of the edges below divides its axis, so

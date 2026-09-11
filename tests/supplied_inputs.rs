@@ -4,13 +4,11 @@
 //
 // **A run seeded with more than one array.**
 //
-// Before this, a run had exactly one input. `ArrayEnvironment::new` and
-// `ArrayEnvironment::for_decomposition` took a single `Voxels` as image 0 and
-// created every other image `pending`, to be written by a phase;
-// `ZarrEnvironment::create` did the same on disk. `BlockOp::source_inputs` and
-// `Chain::Source` read *additional images of the same plan* — by definition
-// something a phase wrote — so there was no way to hand the framework a second
-// array that already existed.
+// The gap this closes: `BlockOp::source_inputs` and `Chain::Source` read
+// *additional images of the same plan* — by definition something a phase wrote
+// — so a run seeded through `ArrayEnvironment::new` or `ZarrEnvironment::create`
+// had exactly one input and no way to be handed a second array that already
+// existed.
 //
 // What this file pins, in the order the claims depend on each other:
 //

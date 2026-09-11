@@ -51,7 +51,8 @@
 // ---------------------------------------------------
 // Reducing a whole stream to one answer looks like it needs a node the task DAG
 // does not have. It does not. It is an op that reads everything, and the
-// existing geometry already says what that means (`geometry.rs:185-244`):
+// existing geometry already says what that means
+// (`geometry.rs`, `BlockGeometry::derive_with`):
 //
 // * `trust_lo = read_lo + reach` unless the read starts at 0, and
 //   `trust_hi = read_hi - reach` unless it ends at the volume;
@@ -70,14 +71,8 @@
 //
 // The guard, on the side the output is actually on
 // ------------------------------------------------
-// `Decomposition::check` and the executor's post-run check assert that a
-// phase's *valid regions* tile the volume. For a phase whose output is
-// fragments that assertion is about an image nobody wrote: `valid == core` by
-// construction, cores tile by construction, and the check passes without
-// constraining the fragments at all. A guard that cannot fail is worse than no
-// guard, because it is trusted.
-//
-// So a fragment stream declares its [`Coverage`], with no default, and
+// The tiling check says nothing about a phase whose output is fragments, and
+// [`Coverage`] is where that is written out. So a stream declares its own, and
 // [`check_fragment_coverage`] runs after the phase's last task — against the
 // *store*, so that what is checked is what landed. A phase that writes no pixel
 // image and declares no every-block stream is refused at plan time, because
@@ -116,13 +111,9 @@
 //
 // The seam, which is the part that is not plumbing
 // ------------------------------------------------
-// A per-region reduction over a second array *straddles seams*: a region cut by
-// a block boundary is summed in pieces and the pieces are added in the merge.
-// If the accumulator is `f64`, that addition does not associate, so the answer
-// depends on the order the blocks merged in — and a plan cut differently gives a
-// different number. `ops/detect.rs` deferred a weighted centroid on exactly
-// this, and named the honest answers: a fixed-point accumulator, or a stated
-// tolerance.
+// A per-region reduction over a second array *straddles seams*, and an `f64`
+// accumulator makes the answer a function of the merge order — see
+// [`SeamFold`], which states the hazard and the honest answers.
 //
 // This file does not pick one. What it removes is the *silence*: [`SeamFold`]
 // has no default, an op that reads a second array (or that folds fragments
@@ -415,7 +406,7 @@ impl SidecarSize {
     /// `regional`'s plateau report: the six faces, one word per label for the
     /// plateau **value**, and a second per label for the `ascends` flag.
     ///
-    /// A word wider per label than [`SidecarSize::block_faces`], which is what
+    /// Two words wider per label than [`SidecarSize::block_faces`], which is what
     /// the write-site guard reported as `declares at most 236 ... wrote 256`.
     pub fn plateau_faces() -> Self {
         SidecarSize::Terms {
@@ -1066,24 +1057,21 @@ pub trait FragmentOp: Send + Sync {
     ///
     /// # There is no default, and the reason is not that a default was wrong
     ///
-    /// There was one, at `0`, and it was **correct for every implementor that
-    /// took it** — structurally rather than luckily: a fragment op resolves what
+    /// A default of `0` would be correct for every implementor this crate
+    /// ships, structurally rather than luckily: a fragment op resolves what
     /// crosses a block boundary through the fragment *stream*, whose reach is
     /// declared separately, and the pixel-reading ones — a plateau labeller, a
     /// regional-maxima mask, a connected-component labeller, a hole filler — all
     /// read their own block's pixels and reach across seams through that stream.
-    /// Nothing was found wrong at `0` when every implementor was migrated to
-    /// declare it, and each was checked against its own `apply` rather than
-    /// waved through.
     ///
-    /// It is gone because [`BlockOp::reach`] is the same quantity under the same
-    /// contract and has never had one, for a reason written out beside it: *it
-    /// is the one place a silent zero would produce a complete, well-formed,
-    /// wrong volume.* Every word of that applies here. **The value is that a
-    /// future op author is forced to think**, not that anything is being fixed.
-    /// An op that reads a neighbourhood and forgets to say so gets valid regions
-    /// wider than its answers support, the seam voxels are wrong, and nothing
-    /// anywhere reports it.
+    /// There is none anyway, because [`BlockOp::reach`] is the same quantity
+    /// under the same contract and has never had one, for a reason written out
+    /// beside it: *it is the one place a silent zero would produce a complete,
+    /// well-formed, wrong volume.* **The value is that a future op author is
+    /// forced to think**, not that anything is being fixed. An op that reads a
+    /// neighbourhood and forgets to say so gets valid regions wider than its
+    /// answers support, the seam voxels are wrong, and nothing anywhere reports
+    /// it.
     ///
     /// # The guard cannot substitute for the type system here
     ///
@@ -1365,13 +1353,13 @@ pub trait FragmentOp: Send + Sync {
     /// records and the executor reads.
     ///
     /// **The default refuses rather than falling through**, exactly as
-    /// [`BlockOp::apply_with`] does, and for the reason `env.rs:279` gives for
-    /// it: *silently ignoring an operand is the precise shape of the wrong
-    /// answer this whole change exists to remove — a complete, well-formed
-    /// volume combined against nothing.* An op that declares an operand and
-    /// forgets to override this would emit a fragment summarising one array
-    /// while claiming to summarise two, which is a plausible number and
-    /// therefore the expensive kind of wrong.
+    /// [`BlockOp::apply_with`] does, and for the reason `Environment::apply`'s
+    /// `sources` parameter gives for it: *silently ignoring an operand is the
+    /// precise shape of the wrong answer this whole change exists to remove — a
+    /// complete, well-formed volume combined against nothing.* An op that
+    /// declares an operand and forgets to override this would emit a fragment
+    /// summarising one array while claiming to summarise two, which is a
+    /// plausible number and therefore the expensive kind of wrong.
     ///
     /// It hands off to [`Self::apply`] when nothing was declared, which is the
     /// case that must stay free.

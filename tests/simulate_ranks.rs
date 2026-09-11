@@ -281,8 +281,9 @@ fn a_finer_cut_does_not_lower_the_image_floor() {
         coarse.peak_bytes
     );
     // And what remains is the images, which are the same at both cuts. The
-    // reference is `peak_image_bytes` — the walk that `residency_bar.rs`
-    // calibrates against a ruler — rather than a count of images written here,
+    // reference is `peak_image_bytes` — the walk `tests/peak_image_bytes.rs`
+    // pins against a transcribed copy — rather than a count of images written
+    // here,
     // because intermediates are freed after their last reader and a plan does
     // **not** hold one image per phase.
     let assembly = plan(16);
@@ -425,7 +426,8 @@ fn prefetch_pays_at_depth_one_and_is_a_cliff_after_it() {
         two.makespan_ns,
         one.makespan_ns
     );
-    // **The cliff, and why the threshold is a tenth rather than a doubling.**
+    // **The cliff, and why the threshold is a twentieth rather than a
+    // doubling.**
     //
     // It was `> 2x` and that figure was measuring a defect. The ahead-loop used
     // to skip only tasks already *started*, never asking whether a task's
@@ -457,11 +459,6 @@ fn prefetch_pays_at_depth_one_and_is_a_cliff_after_it() {
     );
 }
 
-/// **What the three schedulers actually do, side by side.**
-///
-/// The comparison the simulator exists for. Printed as well as asserted,
-/// because the numbers are the finding and the assertion is only the part that
-/// must not regress.
 /// **A prefetch never fetches an image whose producing phase has not written
 /// it.** The acceptance for the readiness gate in the ahead-loop.
 ///
@@ -1155,6 +1152,11 @@ fn a_substage_count_multiplies_the_compute_and_nothing_else() {
     );
 }
 
+/// **What the schedulers actually do, side by side.**
+///
+/// The comparison the simulator exists for. Printed as well as asserted,
+/// because the numbers are the finding and the assertion is only the part that
+/// must not regress.
 #[test]
 fn the_schedulers_compared() {
     // **Sixteen chunks, and the size is the whole experiment.**
@@ -1285,11 +1287,8 @@ fn the_schedulers_compared() {
     );
 
     // **The control.** All of the above is a finding only if the fixture could
-    // have shown a difference. The first version of this test used an 8 MiB
-    // cache — 256 chunks against the 192 distinct ones these three phases touch
-    // — so the cache held everything, every chunk missed exactly once whatever
-    // the order, and all schedulers reported precisely 192 misses. It looked
-    // clean and measured nothing.
+    // have shown a difference — see the cache size at the top of this test for
+    // the version of it that could not.
     let touches = plan_order.cache_hits + plan_order.cache_misses;
     assert!(
         per_phase.cache_misses > 192,

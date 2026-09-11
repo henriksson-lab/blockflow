@@ -24,9 +24,9 @@
 // `BlockOp::source_inputs` names stored images a phase reads besides the one it
 // is handed, each read at the block's own fetch region — which is exactly reach
 // zero. `BlockOp::side_outputs` declares arrays the op writes beside its primary
-// result, each with its own name, element type and rank. Neither is new here.
-// What *was* missing until images could be supplied is anything for the extra
-// inputs to point at that the run did not compute itself.
+// result, each with its own name, element type and rank. Neither is new here;
+// what supplied images add is something for the extra inputs to point at that
+// the run did not compute itself.
 //
 // It is a `BlockOp` and not a `Combine` for a checkable reason: the `Combine`
 // trait has no side outputs, so a fan-in cannot write more than one array.
@@ -147,10 +147,9 @@ pub trait TupleKernel: Send + Sync {
 ///
 /// [`BlockOp::apply_side`] is handed the operands [`BlockOp::apply_with`] is
 /// handed: the buffer the op read, the [`SourceInputs`] the phase read beside
-/// it, and the primary result. That is what a K-ary op needs and what it did not
-/// have when this module was written — output `o` is a function of all `K`
-/// inputs, and a call holding one of them could not compute a single one of
-/// them.
+/// it, and the primary result. That is what a K-ary op needs — output `o` is a
+/// function of all `K` inputs, so a call holding only one of them could not
+/// compute a single one.
 ///
 /// So each call computes its own and nothing is carried between them:
 /// `apply_with` asks the kernel for **output 0 alone**, `apply_side` asks it for
@@ -166,13 +165,12 @@ pub trait TupleKernel: Send + Sync {
 /// worth. The tiling is the part the split keeps — both passes are tiled, and it
 /// is a pass *per output* that gives the 2.5–2.8x back, not a second pass.
 ///
-/// It is the shape that is worth the 8–10%, not tidiness. What it replaced was a
-/// per-block map from an output buffer's offset to the arrays computed for it,
-/// filled by `apply_with` and drained by `apply_side`: two calls agreeing out of
-/// band about which block they were on, arrays resident between them that no
-/// counter knew about — in a crate whose side outputs exist because 95.2 MB was
-/// counted against 158.6 MB written — and a refusal by name whenever the pair
-/// came apart.
+/// The 8–10% buys the shape. The alternative is a per-block map from an output
+/// buffer's offset to the arrays computed for it, filled by `apply_with` and
+/// drained by `apply_side`: two calls agreeing out of band about which block
+/// they were on, arrays resident between them that no counter knew about — in a
+/// crate whose side outputs exist because 95.2 MB was counted against 158.6 MB
+/// written — and a refusal by name whenever the pair came apart.
 pub struct TupleOp {
     name: &'static str,
     kernel: Box<dyn TupleKernel>,

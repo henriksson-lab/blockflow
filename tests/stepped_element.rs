@@ -43,21 +43,10 @@
 // and its own invariance to establish, and it has its own file:
 // `tests/stepped_element_clipped_start.rs`.
 //
-// Every element below was written before that parameter existed and is
-// unchanged by it: the constructors here name the origin these assertions were
-// always about, and every number in this file is byte-for-byte the one it was.
-// That is the point of naming it — a file whose subject moved because a default
-// moved is a file that stops testing what it says it does.
-//
-// The one thing this file gains is
+// Naming the origin at every constructor is what keeps this file's subject from
+// moving when a default does. The one test that leaves it is
 // `the_rank_filter_gathers_the_window_the_origin_names` at the end, which
-// measures what the rank filter does with the *other* origin. It used to be the
-// opposite measurement — the filter read `StructuringElement::offsets` and
-// therefore computed the anchored window whatever the element said, and that gap
-// was pinned here rather than left to be discovered by someone comparing two arms
-// of a chain. The gap is closed: the filter asks `offsets_at` per voxel, so the
-// assertion is inverted rather than deleted, and it now says which window is
-// gathered instead of which one is not.
+// measures what the rank filter does with the *other* origin.
 
 use ndarray::Array3;
 
@@ -402,14 +391,11 @@ fn a_halo_short_of_the_derived_reach_is_refused_and_the_derived_one_is_not() {
 /// **What the rank filter does with `StepOrigin::ClippedStart`**, measured
 /// rather than assumed: it gathers the window the origin names.
 ///
-/// This assertion used to run the other way. The filter read
-/// `StructuringElement::offsets` — one set, the same set at every voxel — so an
-/// element whose step counts from the clipped start got the *anchored* filter at
-/// the re-phasing element's own (slightly wider) reach, and the measurement
-/// pinned that gap so it could not become an unexamined assumption in either
-/// direction. The filter now asks `offsets_at` at each voxel's position in the
-/// volume, so the measurement is inverted: it says which window is gathered, and
-/// it fails if the filter ever goes back to gathering the other one.
+/// The filter asks `offsets_at` at each voxel's position in the volume. This
+/// fails if it ever goes back to reading `StructuringElement::offsets` — one
+/// set, the same set at every voxel — which would give an element stepped from
+/// the clipped start the *anchored* filter at the re-phasing element's own,
+/// slightly wider, reach.
 ///
 /// Two halves, and the second is what keeps the first from being a statement
 /// about the element rather than about the op. The filter's answer *is* the

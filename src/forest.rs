@@ -266,10 +266,10 @@ impl Forest {
 
     /// The deepest path in any tree, in nodes visited.
     ///
-    /// Not used by the walk — see the module header for why it is not — but it is
-    /// what `cost_per_voxel` is proportional to, so the predictor asks for it
-    /// once when it is built rather than declaring a constant that a differently
-    /// shaped forest would make wrong.
+    /// Not used by the walk — see the module header for why it is not — and not
+    /// what the predictor prices with either: `cost_per_voxel` is proportional
+    /// to [`Self::mean_path`], for the reason stated there. This is the shape
+    /// figure the forest benchmarks report beside it.
     pub fn depth(&self) -> usize {
         let mut depth = vec![0usize; self.nodes.len()];
         // One reverse pass suffices *because* children exceed parents: by the
@@ -524,7 +524,7 @@ impl Default for TrainingSpec {
 /// which columns `mtry` offers. `splitmix64` is eight lines, is the standard
 /// seeder for the xoshiro family, and passes BigCrush; a linear congruential
 /// generator would have failed the third — its low bits cycle with a short
-/// period, and `next_below` reads exactly those.
+/// period.
 struct SplitMix(u64);
 
 impl SplitMix {

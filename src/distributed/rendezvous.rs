@@ -30,11 +30,12 @@
 // Staleness, because a coordinator can move
 // -----------------------------------------
 // A requeued or preempted job restarts its coordinator somewhere else, and the
-// old rendezvous is still sitting there pointing at a dead address. So every
-// published record carries an epoch, and `resolve` will wait for a record newer
-// than one it has been told is stale rather than returning the same corpse
-// forever. Keying on the job id is the other half of that: a stale record from
-// *another* job is never even looked at.
+// old rendezvous is still sitting there pointing at a dead address. So a
+// coordinator republishes over the same key, atomically, and the new record
+// replaces the old one rather than sitting beside it; the epoch each record
+// carries is what lets a reader tell which coordinator it found. Keying on the
+// job id is the other half of that: a record from *another* job is never even
+// looked at.
 //
 // What is deliberately not here
 // -----------------------------
@@ -58,8 +59,9 @@ use crate::net::{addr_to_string, resolve_one};
 pub struct Record {
     pub job: String,
     pub addr: SocketAddr,
-    /// Seconds since the epoch, so a later coordinator's record wins over an
-    /// earlier one's without either knowing about the other.
+    /// Seconds since the epoch: when this coordinator published, so a reader
+    /// can tell a later record from an earlier one without either coordinator
+    /// knowing about the other.
     pub epoch: u64,
     pub pid: u32,
 }
@@ -319,8 +321,7 @@ impl Rendezvous for DirectRendezvous {
 /// lines and defended in a comment. A deployment supplies the eight lines that
 /// wrap its own client — or gets one behind a feature flag when somebody has a
 /// bucket to test it against. What *is* here is the part that is ours and that
-/// a bucket would not test any better: the polling, the staleness rule, and the
-/// record format.
+/// a bucket would not test any better: the polling and the record format.
 pub trait ObjectStore: Send + Sync {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
     /// `None` for "not there yet", which is the normal state while a worker
@@ -333,10 +334,9 @@ pub trait ObjectStore: Send + Sync {
 /// An object store backed by a directory.
 ///
 /// Not a stand-in for the real thing on a cluster — that is what
-/// [`FileRendezvous`] is, and it is simpler. This exists so the polling and
-/// staleness logic above has something to run against, because those are the
-/// parts that can be wrong, and a bucket would not exercise them any harder
-/// than a directory does.
+/// [`FileRendezvous`] is, and it is simpler. This exists so the polling has
+/// something to run against, because that is the part that can be wrong, and a
+/// bucket would not exercise it any harder than a directory does.
 pub struct DirectoryObjects {
     root: PathBuf,
 }
@@ -416,10 +416,12 @@ impl Rendezvous for ObjectRendezvous {
 
 /// Wait for a record to appear, backing off.
 ///
-/// Shared by every backend that has to wait, which is all of them except the
-/// two where the answer is already known. Starting at 20 ms and doubling to a
-/// quarter of a second means the common case — the coordinator was already up —
-/// costs one attempt, and the slow case does not spin.
+/// Shared by every backend that has to wait: the file, the object and the
+/// environment variable, which a scheduler may not have set the instant a
+/// worker starts. [`DirectRendezvous`] is the one that never waits. Starting at
+/// 20 ms and doubling to a quarter of a second means the common case — the
+/// coordinator was already up — costs one attempt, and the slow case does not
+/// spin.
 fn poll(
     timeout: Duration,
     what: String,

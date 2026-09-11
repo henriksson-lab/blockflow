@@ -17,9 +17,9 @@
 //!    and not sufficient* — it is also exactly what a cache that never serves
 //!    anything produces, which is this crate's own empty-sink trap. `hits` is
 //!    what separates the two, and it is asserted non-zero.
-//! 3. **A written image is not cached**, because `ChunkCache` has no per-array
-//!    invalidation and serving a stale chunk would be a wrong answer rather
-//!    than a slow one.
+//! 3. **A written image is cached and a write invalidates it**, because serving
+//!    a stale chunk would be a wrong answer rather than a slow one — which is
+//!    what `ChunkCache::invalidate` is for.
 #![cfg(feature = "zarr")]
 
 use blockflow::cache::CacheStats;
@@ -171,15 +171,11 @@ fn a_cached_read_is_the_same_read_and_the_cache_serves_it() {
         "the fixture needs a traversal to revisit"
     );
 
-    // **The control is `without_cache`, where it used to be the default.**
-    //
-    // This asserted that a fresh environment has no cache, on the grounds that
-    // "a cache must be asked for; an environment that acquires one by upgrading
-    // changes what a read costs and what the process holds without anyone
-    // saying so". That was a good argument for not switching it on silently and
-    // it held while nobody had measured what a cache was worth.
-    // `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store` below is that
-    // measurement — 3.09x fewer bytes off the store — so the default is now on
+    // **The control is `without_cache`, where it used to be the default.** The
+    // argument for opt-in was that a cache changes what a read costs and what
+    // the process holds without anyone saying so; it held until
+    // `a_bigger_cache_reads_strictly_fewer_bytes_from_the_store` below measured
+    // what one is worth — 3.09x fewer bytes off the store — so the default is on
     // and the opt-out is explicit.
     let cold = fixture.uncached("cold");
     assert!(
@@ -231,13 +227,13 @@ fn a_cached_read_is_the_same_read_and_the_cache_serves_it() {
     );
 }
 
-/// **A written image is never cached**, because a stale chunk is a wrong answer.
+/// **A written image is cached, and a write invalidates the chunks it covers.**
 ///
-/// `ChunkCache` has no per-array invalidation — only `clear`, which throws the
-/// source's chunks away too — so an image that a phase writes and the phase
-/// above reads must be read directly. This writes image 1 through the
-/// environment, reads it twice, and asserts the cache gained nothing: a hit
-/// there would be a chunk served from before the write.
+/// Both halves are asserted, because either alone passes for the wrong reason: a
+/// read after a write returning what was written is also what an image nobody
+/// caches produces, and a hit on a written image is only safe if the write threw
+/// away what the cache held. This writes image 1, reads it twice for the hit,
+/// then overwrites and reads again for the invalidation.
 #[test]
 fn a_written_image_is_cached_and_a_write_invalidates_it() {
     let path = root("written");
@@ -491,31 +487,18 @@ fn the_prefetch_sweep_has_a_control_at_both_ends() {
 /// measured.
 ///
 /// The tests above establish that the cache is *correct* — a cached read is the
-/// same read, it really serves hits, a written image is excluded, a `bool`
-/// volume round-trips. None of them says what it is **for**, and that gap is
-/// load-bearing well outside this file:
+/// same read, it really serves hits, a written image is invalidated on write, a
+/// `bool` volume round-trips. None of them says what it is **for**, and that gap
+/// is load-bearing well outside this file:
 ///
 /// * `simulate::Machine::cache_bytes` is the simulator's central lever, and
 ///   ordering-changes-hit-rate is the mechanism the whole module exists to
 ///   rank;
-/// * `HandoutPolicy::CacheModelled` and `HandoutPolicy::Coalescing` are both
-///   **refused at the caller boundary** on the grounds that "`cache::ChunkCache`
-///   has no non-test construction site, so no `Environment::read` is served from
-///   one" — which was true when written and is not any more, since
-///   `ZarrEnvironment` caches by default;
-/// * `distributed::placement` and `distributed::cache_model` repeat the same
-///   sentence.
+/// * `distributed::placement` and `distributed::cache_model` both model a
+///   worker's cache, and neither had a measured figure for what one saves.
 ///
-/// That sentence is exactly true and narrower than it sounds. `ChunkCache` *is*
-/// constructed on the read path — `ZarrEnvironment::with_cache` does it, and
-/// `read` is served through it for image 0 and supplied images. What is missing
-/// is a **caller**: the only four call sites of `with_cache` in the repository
-/// are in this file. So a cache exists, is reachable, is opt-in, and nobody opts
-/// in.
-///
-/// The reason nobody opts in is that its value was never measured, and this is
-/// that measurement: the same plan through the same environment, at a range of
-/// budgets, reporting the bytes that actually left the store.
+/// So this is that measurement: the same plan through the same environment, at a
+/// range of budgets, reporting the bytes that actually left the store.
 ///
 /// **The claim asserted here is byte counts, not time.** The store reads are
 /// deterministic; a wall clock on a shared machine is not, and this crate does

@@ -57,14 +57,11 @@
 // | **materialise** | `LabelComponentsOp` then `RelabelComponentsOp` — a `u32` local-label image and a `u32` global-label image | nothing | the consumer over the global-label image |
 // | **decorate** | `LabelComponentsOp` — a `u32` local-label image | `GlobalLabels::merge`, **once** | the consumer over the local-label image, through `RelabelledEnvironment` |
 //
-// The consumer plan is character for character the same in both arms: a
-// `CarryOp` phase making the values image, then the two tabulation phases. The
-// copy is there because `TabulateValuesOp` needs two *different* images and
-// declares no element type on its operands, so a **supplied** array cannot be
-// its label volume — a small gap, recorded here because it shaped the harness.
-// It is paid identically by both arms, and it has a second use: it makes the
-// decorated label image be read by **two** readers, which is the cost the
-// decorator has and the materialiser does not.
+// The consumer plan is character for character the same in both arms: the two
+// tabulation phases over a **supplied** label volume, with the mask as the value
+// array, through `TabulateValuesOp::holding`. It is paid identically by both
+// arms, and it gives the label image **exactly one reader** — the arrangement
+// least favourable to the decorator, which pays its remap once per reader.
 //
 // What is *not* claimed
 // ----------------------
@@ -1066,7 +1063,7 @@ fn report(block: [usize; 3], blocks: usize, arm: &str, cost: &Arm) {
 ///
 /// The decorated design pays the remap **per reader** and the materialised one
 /// pays a rewrite **once**, so "which is cheaper" is a question about how many
-/// readers a label volume has. The sweep above fixes the consumer at two readers
+/// readers a label volume has. The sweep above fixes the consumer at one reader
 /// of the label image; this measures the slope, so that the break-even reader
 /// count can be computed rather than guessed:
 ///

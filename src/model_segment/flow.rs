@@ -179,8 +179,7 @@ impl WindowGrid {
 /// Running the network over an absolutely-anchored window grid.
 ///
 /// Separated from [`WindowGrid`] so the geometry — the half that can be proved
-/// and is tested above without a GPU — does not need a model to be reasoned
-/// about.
+/// and tested without a GPU — does not need a model to be reasoned about.
 #[cfg(feature = "cellpose")]
 pub mod net {
     use super::WindowGrid;
@@ -282,7 +281,8 @@ pub mod net {
         for group in origins.chunks(batch.max(1)) {
             // The network takes 3 channels; a grayscale image goes in channel 0
             // with the others left at zero, which is what `convert_image` does.
-            // cellpose's `ndarray`, which is 0.16 against this crate's 0.17.
+            // The tile array is cellpose's `ndarray`, which is 0.16 against
+            // this crate's 0.17.
             let mut tiles = ndarray16::Array4::<f32>::zeros((group.len(), 3, window, window));
             for (slot, at) in group.iter().enumerate() {
                 for y in 0..window {
@@ -453,7 +453,7 @@ pub mod net {
 /// dx)`, and the corner reads unchecked behind a single explicit bound.
 ///
 /// It is here rather than in `cellpose-rs` because it is a measurement first:
-/// [`interleave`] and this function together answer "how much is on the table"
+/// [`interleave`] and `follow` together answer "how much is on the table"
 /// without committing anyone to a refactor of somebody else's inner loop. If
 /// the number is worth it, this is the shape the change would take.
 ///

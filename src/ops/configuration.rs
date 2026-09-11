@@ -448,7 +448,7 @@ impl ConfigurationTable {
 /// The definition of the index, in code, and the only place the traversal has to
 /// agree with. [`configuration_pass_into`] computes the same integers by a route
 /// that reads each voxel once instead of 27 times, and
-/// `a_pass_agrees_with_the_index_definition_voxel_by_voxel` is what holds the two
+/// `a_pass_agrees_with_the_index_definition_bit_by_bit` is what holds the two
 /// together.
 pub fn configuration_index_at(input: ArrayView3<'_, bool>, at: [usize; 3]) -> u32 {
     let extent = input.shape();
@@ -782,11 +782,10 @@ impl IterativeOp for ConfigurationFixedPointOp {
 /// pass**; [`ConfigurationPassOp`] multiplies by its own count, as
 /// `MorphologyOp` multiplies by its composition factor.
 ///
-/// **The number is stable across inputs in a way the thinning constant is not**,
-/// and that was the prediction and is now the measurement: 19.71 and 19.65
-/// ns/voxel over the two inputs in [`cost_report`], one built of solid blocks and
-/// one a speckle, agreeing to three parts in a thousand where a thinning
-/// sub-iteration differs by a factor of two. The reason is structural — a pass
+/// **The number is stable across inputs in a way the thinning constant is not**:
+/// 19.71 and 19.65 ns/voxel over the two inputs in [`cost_report`], one built of
+/// solid blocks and one a speckle, agreeing to three parts in a thousand where a
+/// thinning sub-iteration differs by a factor of two. The reason is structural — a pass
 /// does the same nine loads, two shifts and one table probe at every voxel
 /// whatever the data holds, so there is no data-dependent branch for the two
 /// inputs to disagree about — and it is worth having a measurement of, because it

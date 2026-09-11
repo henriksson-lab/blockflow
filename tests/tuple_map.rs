@@ -296,15 +296,10 @@ fn each_input_reaches_exactly_the_outputs_whose_row_weights_it() {
 /// A side output lands in the environment's named map and not in `images`, so
 /// nothing can name one where an image goes.
 ///
-/// **Unchanged by a run being able to be handed images.** A supplied input is an
-/// array that existed before the run; a side output is written during it. The
-/// two are addressed differently — an image by number, a side output by name —
-/// and `Chain::source` and `SourceInput::image` take a number. So the answer to
-/// "can a side output be read back as an input now" is no, and it is no for a
-/// reason that has nothing to do with what changed: there is no name for it in
-/// the image address space, and giving it one would be a *third* thing, an image
-/// written by a phase that a later phase reads — which is what an ordinary image
-/// already is.
+/// **Unchanged by a run being able to be handed images.** The two are addressed
+/// differently — an image by number, a side output by name — and
+/// `Chain::source` and `SourceInput::image` take a number, so there is no
+/// address in the image space a side output could answer to.
 #[test]
 fn a_side_output_is_not_an_image_and_cannot_be_named_as_one() {
     let grid = BlockGrid::along(VOLUME, &[0], 4).unwrap();
@@ -410,11 +405,7 @@ fn apply_side_computes_the_outputs_from_the_operands_it_is_handed() {
 ///
 /// The negative control the test above needs: `apply_side` is a function of its
 /// operands, so an operand that is not there has to stop the block rather than
-/// produce something from the one array it does have. It is also what the
-/// refusal this shape used to carry has become — that one named a block offset
-/// whose entry an earlier call had not left behind, which was a statement about
-/// two calls agreeing rather than about the data, and there are no two calls to
-/// agree any more.
+/// produce something from the one array it does have.
 #[test]
 fn apply_side_without_the_source_inputs_is_refused_by_image() {
     let op = op();
@@ -513,9 +504,7 @@ fn the_cost_of_a_sixteen_by_sixteen_map_over_one_block() {
             // `total_cmp`, not `f64::min`, by the convention this crate holds
             // everywhere a selection is made: `f64::min(-0.0, 0.0)` may return
             // either operand, so a best-of-N written with it is a statement
-            // about `f64::min` rather than about the run. Elapsed times cannot
-            // be NaN or signed zero, so the two agree here — which is the
-            // reason to write the honest one rather than to make an exception.
+            // about `f64::min` rather than about the run.
             let elapsed = started.elapsed().as_secs_f64();
             if elapsed.total_cmp(&best).is_lt() {
                 best = elapsed;

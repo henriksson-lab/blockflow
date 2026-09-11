@@ -443,9 +443,6 @@ fn a_symmetric_kernel_cannot_tell_the_two_apart() {
         );
     }
 
-    // So the mis-adjointed step — the one that back-projects through the kernel
-    // rather than through its reflection — is not merely close to what the op
-    // does under a Gaussian. It is what the op does, on every bit.
     let observed = positive_volume((11, 9, 7));
     let mis_adjointed = richardson_lucy(&observed, &observed, &spread, &spread, 3);
     let theirs = deconvolved(&observed, &spread, 3);

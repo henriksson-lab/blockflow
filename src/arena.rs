@@ -7,13 +7,11 @@
 //! # The gap this closes
 //!
 //! `docs/design/planner-gaps.md` opens on it: *"Nothing has ever fed a
-//! `Strategy`-produced `Decomposition` into `simulate`."* Before this file,
-//! nothing in `src/` called [`simulate`](crate::simulate::simulate) at all, and
-//! the two test suites that did built every plan by hand with `PlanBuilder`.
-//! The [`Scheduler`] trait picks among *ready tasks*, so the simulator ranked
-//! **schedulers over one plan**; nothing ranked **plans**. That is the wrong way
-//! round for a crate whose planner has a search in it and whose cost model is
-//! the only thing that has ever adjudicated the search.
+//! `Strategy`-produced `Decomposition` into `simulate`."* The [`Scheduler`]
+//! trait picks among *ready tasks*, so [`simulate`](crate::simulate::simulate)
+//! ranked **schedulers over one plan**; nothing ranked **plans**. That is the
+//! wrong way round for a crate whose planner has a search in it and whose cost
+//! model is the only thing that has ever adjudicated the search.
 //!
 //! So the arena is the mirror image of the suite that already exists:
 //!
@@ -1266,9 +1264,7 @@ pub fn plan_fit(
 ///   does since G3 and what `Decomposition::predicted_cost` always did. It is
 ///   read off the plan with `dtype_at` rather than folded again here: the plan
 ///   is where the fold's answer was recorded, and a second fold would be a
-///   second opinion about it. Before G3 the search priced every phase at
-///   `workflow.dtype` and this reproduced that, defect and all, because the
-///   arena's job is to price what the planner prices;
+///   second opinion about it;
 /// * **materialised except the last**, which is what a phase boundary *is*;
 /// * **`workers`** is the arena's, not the strategy's. A plan is chosen under
 ///   the concurrency its strategy was configured with and judged at the machine

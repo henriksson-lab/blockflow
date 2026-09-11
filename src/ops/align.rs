@@ -1756,12 +1756,11 @@ pub fn run_with_seed_diagnostics(
     })
 }
 
-/// Run volume fitting and return the transform parameter file text it
-/// emits.
+/// Run one optimization level over resident volumes, optionally seeded.
 ///
-/// This is the compatibility surface for downstream tooling: callers that need
-/// a `TransformParameters.0.txt` can write this string verbatim, and the normal
-/// point-transform reader must be able to consume it again.
+/// Returns the fitted transform together with the final [`OptimizerState`], so
+/// that a pyramid level can hand its whole parameter vector — not merely the
+/// translation it reduces to — to the level below it.
 fn run_with_initial(
     params: &VolumeFitParams,
     fixed: &Voxels,

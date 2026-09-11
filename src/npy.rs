@@ -7,10 +7,10 @@
 //
 // Why it belongs in this crate
 // ----------------------------
-// `region.rs`'s header used to record that the npy backend stayed in the
-// sibling application. That decision was counted: **nineteen private readers in
-// one sibling's test directory alone**, and a twentieth written by the worker
-// who counted them. Every one of them is the same two hundred lines — a magic
+// `region.rs`'s header records that the npy backend was one of the ones that
+// stayed in the sibling application. That decision was counted: **nineteen
+// private readers in one sibling's test directory alone**, and a twentieth
+// written by the worker who counted them. Every one of them is the same two hundred lines — a magic
 // check, a dict literal, a `descr`, a shape, a memcpy — and every one of them is
 // a place the format can be got wrong privately.
 //
@@ -48,15 +48,10 @@
 // | [`read_elements`] and friends | whatever the file says, as an [`Elements`] | any |
 // | [`read_voxels`] and friends | whatever the file says, as a [`Voxels`] | 3, checked |
 //
-// The middle row was added after the fact and is worth explaining, because it
-// looks at first like the third with a check removed. It is not. A caller
-// reading a *volume* whose dtype it does not know has [`read_voxels`]; a caller
-// reading a *table* whose dtype it does not know had nothing, and had to write
-// `match header.dtype { .. }` with one arm per type it might meet — which one
-// consumer, migrating its private readers onto this module, duly wrote in most
-// of the files it touched. [`Elements`] is what those collapse to, and it keeps
-// the rank check where the rank check belongs — on [`Elements::into_voxels`],
-// which is the only place a rank is a claim.
+// The middle row looks at first like the third with a check removed, and is
+// not: [`Elements`]'s own header says what a caller had to write without it.
+// It keeps the rank check where the rank check belongs — on
+// [`Elements::into_voxels`], which is the only place a rank is a claim.
 //
 // Widening is a request, never a default
 // --------------------------------------
@@ -68,11 +63,10 @@
 // types outright, and [`read_array_mapped_from`] to convert inside the decode
 // loop so the narrow array is never held beside the wide one.
 //
-// The two integer widenings are not a redundancy. `f64` has no exact
-// representation past 2^53, so a `int64` identifier widened through it becomes
-// an identifier that compares equal to its neighbours — silently, and only for
-// large values. Which of "identifier" and "measurement" a file holds is the
-// caller's knowledge, so both exist and neither is the default.
+// The two integer widenings are not a redundancy. Which of "identifier" and
+// "measurement" a file holds is the caller's knowledge, so both exist and
+// neither is the default; [`Elements::widened`] states what the `f64` path
+// loses and where.
 //
 // Streaming, and why the writer never holds a second copy
 // ------------------------------------------------------
@@ -2417,8 +2411,9 @@ mod tests {
             }
         }
 
-        // An arbitrary map, not only a widening: this is the `int64 -> u32`
-        // narrowing a caller has to spell out because it is not `From`.
+        // An arbitrary map, not only a widening: the elements are doubled on the
+        // way in, which is what `read_array_file_as` — restricted to `From` —
+        // cannot express and a caller has to spell out here.
         let counted: ArrayD<u32> =
             read_array_mapped::<u16, u32>(&bytes, "<memory>", OrderPolicy::Either, |value| {
                 u32::from(value) * 2

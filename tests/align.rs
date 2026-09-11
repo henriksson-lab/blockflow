@@ -10,12 +10,9 @@
 // ------------------------
 // What stood here was thirty-seven lines: two Gaussian blobs one voxel apart,
 // `run`, and `assert!((params[0] - 1.0).abs() <= 0.25)`. The first test below
-// measures what that assertion was worth. The dense moment initialiser — the
-// difference of the two positive-mass centroids, computed at substage 0 before
-// any Gauss-Newton step is taken — puts the parameters at
-// `[0.9933, -0.9441, -8.9e-16]` on that fixture, whose worst axis error is
-// **0.056 against a bound of 0.25**. The whole optimisation loop could have been
-// deleted and the file would have passed. Nothing in the tree executed
+// measures what that assertion was worth: the moment initialiser alone already
+// satisfies it, so the whole optimisation loop could have been deleted and the
+// file would have passed. Nothing in the tree executed
 // `TransformModel::Affine`, `TransformModel::BSpline`, `Metric::NCC`,
 // `Metric::MutualInformation`, `solve_linear`, the trilinear gradient,
 // `ControlGrid`, `PyramidSchedule`, or `SpatialFrame` at all.

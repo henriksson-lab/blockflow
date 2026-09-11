@@ -265,12 +265,11 @@ pub fn read_task_fragment(bytes: &[u8]) -> Result<([usize; 3], usize)> {
 /// declares [`FragmentOp::barrier`] and hoists its fold into
 /// [`FragmentOp::reduce`].
 ///
-/// It is [`FragmentReduceOp`] with the fold
-/// moved, so the two are directly comparable and the only thing that differs is
-/// where the work happens: that one re-derives the total in every block over a
-/// whole-lattice fragment reach, this one derives it once for the phase and
-/// reaches zero blocks. The answer is the same number and the test suite asserts
-/// so.
+/// It is [`FragmentReduceOp`] with the fold moved, so the two are directly
+/// comparable and the only thing that differs is where the work happens: that
+/// one re-derives the total in every block over a whole-lattice fragment reach,
+/// this one derives it once for the phase and reaches zero blocks. The answer is
+/// the same number and the test suite asserts so.
 ///
 /// **Why it lives here and not with the other probes.** It exists to exercise
 /// the *distributed* half of a barrier — that every worker computes the same
@@ -402,7 +401,7 @@ impl FragmentOp for HoistedReduceOp {
 /// fragments produces no image for a later pixel phase to read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FragmentPhaseSpec {
-    /// Which fragment probe. `"summary"`, `"fold"` or `"reduce"`.
+    /// Which fragment probe. `"summary"`, `"fold"`, `"reduce"` or `"hoisted"`.
     pub kind: String,
     pub name: String,
     /// The stream written. Empty for a phase that writes pixels instead.
@@ -658,13 +657,11 @@ pub struct JobSpec {
     /// takes the task back and gives it to somebody else — **or `None`, which
     /// is the default and means never.**
     ///
-    /// `None` rather than a very large number of milliseconds, and the
-    /// difference is the point. A big number is still a deadline: it can be
-    /// compared, added to, overflowed, and — worst — it can be *met*, so the
-    /// reissue path stays live and the question becomes whether the number was
-    /// chosen large enough. `None` is not a deadline at all; there is no
-    /// arithmetic to get wrong because there is no operand. A claim handed out
-    /// is a claim held until it completes.
+    /// `None` rather than a very large number of milliseconds: a big number is
+    /// still a deadline, and above all a *meetable* one, so the reissue path
+    /// stays live and the question becomes whether the number was chosen large
+    /// enough. The module header records the decision and the measurement
+    /// behind it.
     ///
     /// Set it only to opt in to reissue, which the module header explains is
     /// no longer the default deployment's answer to a lost node. When it is

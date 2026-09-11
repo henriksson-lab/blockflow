@@ -25,23 +25,8 @@
 // why the seam is where it is. With no Python on the machine this binary still
 // writes a usable log and says so.
 //
-// Options
-// -------
-// ```text
-//   --out PATH          log to write            (default ./block_flight.json)
-//   --grid NX,NY,NZ     blocks per axis         (default 4,4,4)
-//   --block N           block edge, voxels      (default 64)
-//   --schedule S        block-major|phase-major (default block-major)
-//   --concurrency N     tasks in flight         (default 4)
-//   --render            draw the movie after exporting
-//   --view 3d|2d        which picture           (default 3d)
-//   --output NAME       movie base name         (default block_flight)
-//   --quality l|m|h     frame size              (default l)
-//   --max-steps N       ceiling on rendered steps (default 40)
-//   --seconds-per-step  pace                    (default 0.15)
-//   --media-dir DIR     where manim writes      (default ./media)
-//   --allow-large       render past the practical block ceiling
-// ```
+// The options are listed once, in `HELP` below, so that `--help` and this
+// preamble cannot drift apart. `parse_options` carries the defaults.
 
 use blockflow::animate::{
     render, within_volume3d_ceiling, Quality, RenderRequest, View, VOLUME3D_BLOCK_CEILING,

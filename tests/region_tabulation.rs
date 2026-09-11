@@ -23,9 +23,9 @@
 // choose one of the values they are handed rather than computing a new one, and
 // under a total order that is associative, commutative and idempotent in `f64`
 // itself — so they are `F64` columns holding the voxel's own bits, and
-// `SeamFold::Unordered` holds for them on their own account. Sections 5 and 6
-// are that split: 5 is the selection being exact where a quantised one could
-// not have been, 6 is the sum not having moved while it happened.
+// `SeamFold::Unordered` holds for them on their own account. Sections 6 and 7
+// are that split: 6 is the selection being exact where a quantised one could
+// not have been, 7 is the sum not having moved while it happened.
 //
 // What each fixture is arranged so that it *can* fail
 // ---------------------------------------------------
@@ -1940,7 +1940,7 @@ fn the_ops_are_shareable_across_workers() {
     assert!(!tabulate.reads_pixels() && !merge.reads_pixels());
 }
 
-// ------------------------------------------------ 7. the second moments, --
+// ------------------------------------------------ 8. the second moments, --
 // ------------------------- which are the shape and are about its own centre --
 
 /// **The shape fixture**, and every region in it is there to fail a different
@@ -2388,7 +2388,7 @@ fn the_shape_is_a_reading_of_the_label_volume_alone() {
     );
 }
 
-// ------------------------------ 8. the fold, and the two directions it has --
+// ------------------------------ 9. the fold, and the two directions it has --
 
 /// The corner of an imaginary volume the fold fixture's partials come from:
 /// `2^26`, where one voxel's `z^2` is `2^52`.

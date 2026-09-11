@@ -256,11 +256,9 @@ fn the_merge_changes_the_answer_and_the_suite_says_by_how_much() {
 }
 
 /// **The inverted assertion.** This test used to require that every block of the
-/// merge read the entire label image, and said in as many words that if a future
-/// change let a phase state "after all of phase 0" without a halo, it should
-/// fail and the reason it failed would be the improvement. That change landed —
-/// `docs/design/barriers.md` — so the requirement is turned round rather than
-/// deleted, and the shape it replaced is kept beside it as the control.
+/// merge read the entire label image; `docs/design/barriers.md` let a phase state
+/// "after all of phase 0" without a halo instead, so the requirement is turned
+/// round rather than deleted and the shape it replaced is kept as the control.
 ///
 /// Phase 0 is halo-free: a block-local labelling reads exactly its own core.
 /// Phase 1 now is too, because the dependency it needs — *after all of phase 0*

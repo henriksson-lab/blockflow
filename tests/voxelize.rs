@@ -23,10 +23,12 @@
 // * **A kernel that straddles a seam.** The contribution has to appear on both
 //   sides, which is what the block reach buys, and the two sides together have
 //   to equal the whole-volume answer.
-// * **A short reach, both kinds.** The pixel-side one fires: a forced halo
+// * **A short halo, both kinds.** The pixel-side guard fires: a forced halo
 //   under this op's voxel reach loses the interior cores and the tiling check
-//   says so. The fragment-side one does *not* fire, and that is recorded here
-//   as a test rather than as a comment — see
+//   says so. The fragment-side guard fires too, on a halo short of the
+//   *declared* block reach. What nothing catches is a block reach that is
+//   **under-declared**, and that is recorded here as a test rather than as a
+//   comment — see
 //   `under_declaring_the_block_reach_is_wrong_and_no_framework_guard_sees_it`.
 // * **The cost of the declaration, measured.** No pixel is read, and the number
 //   of fragments fetched is the analytic neighbourhood size and not one more.
@@ -63,14 +65,11 @@ const STREAM: &str = "points";
 
 /// The producer half of the pair, and the thing a real detector would be.
 ///
-/// This file used to carry it — fifteen lines, keyed by the block whose core
-/// contains each point — and so did `tests/point_labels.rs`, character for
-/// character, and so did a consumer of this crate. `points::PointSourceOp` is
-/// now that op, and what is left here is the name and the stream. The rule it
-/// used to state is the library's: a point on a seam is written once, into the
-/// block the seam starts, and a block with no points writes a zero-length
-/// fragment rather than nothing, which is what `Coverage::EveryBlock` means and
-/// why declaring it is not free of meaning.
+/// `points::PointSourceOp` is that op — this is the name and the stream and
+/// nothing else. The rule it states is the library's: a point on a seam is
+/// written once, into the block the seam starts, and a block with no points
+/// writes a zero-length fragment rather than nothing, which is what
+/// `Coverage::EveryBlock` means and why declaring it is not free of meaning.
 fn source(points: Vec<Point>) -> PointSourceOp {
     PointSourceOp::new("points", STREAM, Lifecycle::DeleteOnExit, points)
 }

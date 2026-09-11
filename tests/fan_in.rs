@@ -265,7 +265,7 @@ fn a_diamond_is_decomposition_invariant_in_memory() {
     }
 }
 
-/// The same claim through the storage backend that landed today.
+/// The same claim through the storage backend.
 ///
 /// A fan-in exercises it in a way a linear chain does not: the branch results
 /// never touch the environment, so what reaches storage is the combine's answer

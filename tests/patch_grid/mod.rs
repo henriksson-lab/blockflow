@@ -251,10 +251,10 @@ impl PatchGeometry {
 
 /// A noop op with a declared reach, cost and traversal preference.
 ///
-/// `blockflow::IdentityOp` would do everything this does except that its
-/// `apply` refuses an array that is not rank 3, and the harness never allocates
-/// one at all. It is repeated here so the harness owns its own probes and the
-/// crate's are left alone.
+/// `blockflow::IdentityOp` is the same kernel, but states its dependency only
+/// as the symmetric triple its `reach` gives. This one can also carry an exact
+/// [`Reach`], which is half of what the harness is here to measure — and
+/// repeating it leaves the crate's own probes alone.
 pub struct CountedOp {
     name: &'static str,
     reach: [usize; 3],

@@ -21,8 +21,7 @@
 //
 // New: the combination itself, and the fact that the second operation runs the
 // estimator **twice** — a centre and a spread, on two independent lattices —
-// which no existing op does and which makes the reach a maximum over two
-// two-term reaches rather than one.
+// which no existing op does.
 //
 // | | estimate | combination |
 // |---|---|---|
@@ -31,8 +30,8 @@
 // | [`LocalContrastOp`] | **two** statistics | `(value - c) / max(s, floor)` |
 // | [`LocalGainOp`] | **two** statistics | `value * g`, `g = 1 / max(l, floor)` capped so `h * g <= ceiling` |
 //
-// Why they are two ops and not one, and where they touch
-// ------------------------------------------------------
+// Why they are separate ops and not one, and where they touch
+// -----------------------------------------------------------
 // [`LevelCorrectionOp`] removes an estimate of the *level*: the slowly varying
 // component a voxel sits on top of, taken out either additively or
 // multiplicatively because which of the two a signal carries is a property of
@@ -688,11 +687,9 @@ impl BlockOp for LocalGainOp {
     }
 
     /// The **larger** of the two statistics' reaches, per axis, for
-    /// [`LocalContrastOp::reach`]'s reason: the two estimates are taken from the
-    /// same buffer rather than one from the other, so the dependency cone is a
-    /// union of two centred neighbourhoods and its half-width is the larger of
-    /// the two. Both terms of each come from the statistics' own parameters and
-    /// there is no field on this op that could widen or narrow either.
+    /// [`LocalContrastOp::reach`]'s reason and by the same derivation. Both
+    /// terms of each come from the statistics' own parameters and there is no
+    /// field on this op that could widen or narrow either.
     fn reach(&self, axis: usize, volume_len: usize) -> usize {
         self.low
             .reach(axis, volume_len)

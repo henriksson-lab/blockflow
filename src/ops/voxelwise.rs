@@ -9,46 +9,35 @@
 // two arms which are then combined. Every part of that except the combine
 // existed. This is the combine.
 //
-// The second operand, and why it is held rather than fetched
-// ----------------------------------------------------------
+// The second operand, and the two ways it arrives
+// -----------------------------------------------
 // `BlockOp::apply` takes one input buffer, so a two-input op has to get its
 // second operand from somewhere else. [`CombineOp`] holds it as a whole-volume
-// array and slices it at the [`Anchor`] the executor supplies. That is honest
-// about what today's signature can do and it makes the anchor load-bearing:
-// slice at the wrong offset and the op combines the wrong voxels, everywhere,
-// which the decomposition-invariance tests would see immediately.
+// array and slices it at the [`Anchor`] the executor supplies, which makes the
+// anchor load-bearing: slice at the wrong offset and the op combines the wrong
+// voxels, everywhere, which the decomposition-invariance tests would see
+// immediately.
 //
-// It is *not* a claim that this is how fan-in should eventually work. When
-// `Chain` grows a fan-in node the second arm becomes a sibling subtree and the
-// operand arrives as a buffer like the first; the kernel below — a voxelwise map
-// of two views into a third — is what that node would call either way, which is
-// the reason the kernel is a free function and the op is a shell around it.
-//
-// That node now exists, and the sentence above was taken literally
-// ---------------------------------------------------------------
-// [`Chain::Parallel`] holds a `Box<dyn Combine>`; [`LogicCombine`] is the
-// implementation of it that this module owes. It calls this module's own
+// [`LogicCombine`] is the other arrangement: [`Chain::Parallel`] holds a
+// `Box<dyn Combine>`, and the second operand is a sibling branch's result,
+// produced by the same block from the same input. It calls this module's own
 // kernels and nothing else — [`mask_logic_into`], of which `logic_into` is the
-// all-`bool` case — and the **arrangement** is what changed: the second operand
-// is a sibling branch's result, produced by the same block from the same input,
-// instead of a whole-volume array held by the op and sliced at the anchor.
+// all-`bool` case — which is why the kernels are free functions and the ops are
+// shells around them.
 //
-// `CombineOp` stays. It is not a worse `LogicCombine`; it is a different shape
-// — one arm computed, one arm supplied from outside the chain — and it is the
-// only way to combine against an array a chain did not produce. What it can no
-// longer claim is to be the diamond.
+// `CombineOp` is not a worse `LogicCombine`; it is a different shape — one arm
+// computed, one arm supplied from outside the chain — and it is the only way to
+// combine against an array a chain did not produce.
 //
 // The map is a type parameter, and what that buys
 // ------------------------------------------------
-// [`VoxelwiseMapOp`] used to hold `Box<dyn Fn(f64) -> f64>` and call it once per
-// voxel. That is an optimisation barrier in the innermost loop of the cheapest
-// op in the crate: nothing inlines through an indirect call, nothing vectorises
-// across it, nothing reorders past it. The kernel [`map_into`] was already
-// generic over `impl Fn` and vectorised fine when handed a real closure, so the
-// entire loss was the shell. It now holds an `M: MapFn` type parameter instead,
-// and the `dyn` boundary moves out to `Box<dyn BlockOp>` in
-// [`Chain`](crate::op::Chain) — one virtual call per *block*, which is free at
-// that rate.
+// [`VoxelwiseMapOp`] holds an `M: MapFn` type parameter rather than a
+// `Box<dyn Fn(f64) -> f64>` called once per voxel, which would be an
+// optimisation barrier in the innermost loop of the cheapest op in the crate:
+// nothing inlines through an indirect call, nothing vectorises across it,
+// nothing reorders past it. The `dyn` boundary moves out to `Box<dyn BlockOp>`
+// in [`Chain`](crate::op::Chain) — one virtual call per *block*, which is free
+// at that rate. [`MAP_COST`] records what the boxed form cost.
 //
 // [`MapFn`] is a trait rather than an enum of the maps this crate happens to
 // need, because the set is not this crate's to close: a third party writes
@@ -62,11 +51,8 @@
 // A mask is one bit, and two things carry it
 // -------------------------------------------
 // The other half of this module is not the arithmetic, it is the **width**. A
-// mask has always had two carriers here — `bool`, and `f64` under [`is_set`] /
-// [`from_set`] — and for a long time a chain could only *arrive* at the narrow
-// one by computing the answer in the wide one first, because [`VoxelwiseMapOp`]
-// holds an `f64 -> f64` map by construction and [`NarrowOp::to_mask`] can only
-// narrow a buffer that has already been allocated and filled.
+// mask has two carriers here — `bool`, and `f64` under [`is_set`] /
+// [`from_set`].
 //
 // [`MaskFn`] and [`VoxelwiseMaskOp`] are [`MapFn`] and [`VoxelwiseMapOp`] with
 // the codomain changed, and they exist because the intermediate buffer is the
@@ -267,11 +253,8 @@ pub fn from_set(value: bool) -> f64 {
 /// There are two, and they are two *carriers of one bit* rather than two kinds
 /// of value: `bool` carries it as itself, and `f64` carries it under the
 /// convention immediately above — [`is_set`] to read, [`from_set`] to write.
-/// The trait exists so that the conversion is named once per carrier here and
-/// is not re-chosen at each op that has to move a mask between the two; an op
-/// that picked its own predicate is exactly how two ops in one chain come to
-/// disagree about what a mask is, which is what [`is_set`]'s own header warns
-/// about.
+/// The trait exists so that the conversion is named once per carrier here and is
+/// not re-chosen at each op that has to move a mask between the two.
 ///
 /// **Nothing else is a carrier.** `u8` would be an obvious third and is
 /// deliberately absent: `is_set` is stated over `f64` and there is no reading of
@@ -399,11 +382,9 @@ pub trait MapFn: Send + Sync + 'static {
 
 /// Any pure `f64 -> f64` closure is a [`MapFn`].
 ///
-/// This is the escape hatch, and it is not speculative: a closure is how most of
-/// this workspace's voxelwise maps are written today, and they will not all be
-/// one of the named types below however many of those are added. Removing it
-/// would mean either a variant per caller — which is the closed set this design
-/// exists to avoid — or rewriting every call site to say the same thing longer.
+/// The escape hatch, and not a speculative one: a closure is how most of this
+/// workspace's voxelwise maps are written, and they will not all be one of the
+/// named types below however many of those are added.
 ///
 /// **It costs nothing the named types do not also cost.** `F` is a type
 /// parameter here too, so a closure passed to `new` is monomorphised into the
@@ -422,22 +403,18 @@ where
 
 /// The map that is not a map.
 ///
-/// Call sites all over this workspace ask for `|value| value`, and at least one
-/// of them cannot simply be deleted: a downstream pipeline uses an identity
-/// phase to hold an image index still when an optional stage is switched off, so
-/// that the plan's wiring does not change with a parameter. The identity
-/// therefore has to exist, and has to be as cheap as the shape allows.
+/// It cannot be deleted: a downstream pipeline uses an identity phase to hold an
+/// image index still when an optional stage is switched off, so that the plan's
+/// wiring does not change with a parameter.
 ///
 /// **What it costs, and why it is not elided further.** `map_slice` is a
-/// `copy_from_slice`, so an identity phase is one `memcpy` from the input block
-/// into the output block — not a `map` call per voxel and not a vectorised loop,
-/// but the widest copy the platform has. It cannot be less than that *here*:
-/// [`BlockOp::apply`] is handed an input buffer and a separate output buffer the
-/// executor has already allocated, and there is no way through this signature to
-/// say "the output *is* the input". Removing the copy altogether is a planner
-/// decision — drop the phase, or alias its image to its input — and neither is
-/// expressible from inside an op. What is expressible is that the copy is a
-/// copy, and that is what this does.
+/// `copy_from_slice`, so an identity phase is one `memcpy` rather than a `map`
+/// call per voxel. It cannot be less than that *here*: [`BlockOp::apply`] is
+/// handed an input buffer and a separate output buffer the executor has already
+/// allocated, and there is no way through this signature to say "the output *is*
+/// the input". Removing the copy altogether is a planner decision — drop the
+/// phase, or alias its image to its input — and neither is expressible from
+/// inside an op.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Identity;
 
@@ -491,13 +468,10 @@ pub enum ThresholdTest {
 /// [`VoxelwiseMaskOp`] is the shell that spends one byte instead, and this is
 /// what it holds.
 ///
-/// Everything else is [`MapFn`]'s arrangement for [`MapFn`]'s reasons. Purity is
-/// a precondition of implementing this and not something checked, and it is what
-/// licenses [`constant_holds`](Self::constant_holds); [`holds`](Self::holds) is
-/// the one method with no default; `Self` is concrete at every call site, so the
-/// predicate inlines and the loop vectorises; and a third party writes
-/// `impl MaskFn for MyTest` outside this crate and gets a fully monomorphised
-/// op, with no variant added here.
+/// Everything else is [`MapFn`]'s arrangement for [`MapFn`]'s reasons: purity is
+/// a precondition of implementing this, which is what licenses
+/// [`constant_holds`](Self::constant_holds), and `Self` is concrete at every call
+/// site, so the predicate inlines and the loop vectorises.
 pub trait MaskFn: Send + Sync + 'static {
     /// The predicate, on one value.
     fn holds(&self, value: f64) -> bool;
@@ -508,10 +482,8 @@ pub trait MaskFn: Send + Sync + 'static {
     /// is overridden only where the type knows something the general case cannot
     /// — [`ThresholdMask`] hoists its comparison out of the loop.
     ///
-    /// `src` and `dst` are the same length; [`VoxelwiseMaskOp::apply`] checks the
-    /// two buffers agree before it gets here. The default zips, which would
-    /// silently stop at the shorter of the two, so the check is the caller's job
-    /// rather than this method's.
+    /// `src` and `dst` are the same length; [`VoxelwiseMaskOp::apply`] checks
+    /// that, not this method, which would otherwise zip to the shorter.
     fn holds_slice(&self, src: &[f64], dst: &mut [bool]) {
         for (slot, &value) in dst.iter_mut().zip(src.iter()) {
             *slot = self.holds(value);
@@ -539,12 +511,10 @@ pub trait MaskFn: Send + Sync + 'static {
 
 /// Any pure `f64 -> bool` closure is a [`MaskFn`].
 ///
-/// [`MapFn`]'s escape hatch, for [`MapFn`]'s reason and at the same price. `F`
-/// is a type parameter here too, so a closure is monomorphised into the loop and
-/// there is no indirect call on this path either; what a closure gives up is
-/// only what a closure cannot *say* — `constant_holds` falls back to calling it
-/// and `cost` falls back to the flat [`MASK_COST`]. A predicate that wants either
-/// derived becomes a named type.
+/// [`MapFn`]'s escape hatch, for [`MapFn`]'s reason and at the same price: `F` is
+/// a type parameter here too, so there is no indirect call on this path either.
+/// What a closure gives up is only what a closure cannot *say* — `constant_holds`
+/// falls back to calling it and `cost` falls back to the flat [`MASK_COST`].
 impl<F> MaskFn for F
 where
     F: Fn(f64) -> bool + Send + Sync + 'static,
@@ -557,16 +527,13 @@ where
 /// [`Threshold`]'s comparison, without its two values: `value > level`, or
 /// `value >= level`, and nothing else.
 ///
-/// **The predicate, written in exactly one place.** Before this existed the
-/// comparison appeared twice inside [`Threshold`] — once branchlessly in `map`
-/// and once hoisted in `map_slice` — and a threshold that also produced `bool`
-/// would have made it four. Two spellings of one boundary is how `>` and `>=`
-/// come to disagree about the voxels sitting exactly *on* the level, which are
-/// the only voxels a threshold is ever asked a hard question about, and this
-/// crate's own header for [`ThresholdTest`] records that the difference "lands
-/// exactly where data piles up". [`Self::holds_with`] is therefore the only
-/// function here that names either operator, and every other threshold path in
-/// this module calls it.
+/// **The predicate, written in exactly one place.** Two spellings of one
+/// boundary is how `>` and `>=` come to disagree about the voxels sitting
+/// exactly *on* the level, which are the only voxels a threshold is ever asked a
+/// hard question about — and [`Threshold`]'s own header records that the
+/// difference "lands exactly where data piles up". [`Self::holds_with`] is the
+/// only function here that names either operator, and every other threshold path
+/// in this module calls it.
 ///
 /// [`Threshold`] holds one of these and asks it the question; so does
 /// [`VoxelwiseMaskOp::threshold`]. That is what makes "the same threshold as a
@@ -731,14 +698,10 @@ impl MapFn for Threshold {
     /// three field loads a closure bakes in as immediates, which is the price of
     /// the parameters being data.
     ///
-    /// **The expression itself is now [`ThresholdMask::holds`]**, which is the
-    /// same three operations reached through the type that owns the comparison —
-    /// `mask()` is a `Copy` of two fields and inlines away. The measurement
-    /// above is the measurement of this line; what moved is where the `>` and
-    /// the `>=` are written, and there is now one place rather than two.
+    /// The expression itself is [`ThresholdMask::holds`]; `mask()` is a `Copy` of
+    /// two fields and inlines away.
     ///
-    /// `NaN` compares false both ways and lands on `below`, which is what the
-    /// `match` form did too.
+    /// `NaN` compares false both ways and lands on `below`.
     fn map(&self, value: f64) -> f64 {
         if self.mask().holds(value) {
             self.above
@@ -779,6 +742,123 @@ impl MapFn for Threshold {
     }
 }
 
+/// Gamma correction: `gain * value.powf(gamma)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gamma {
+    pub gamma: f64,
+    pub gain: f64,
+}
+
+impl Gamma {
+    pub fn new(gamma: f64, gain: f64) -> Result<Self> {
+        if !gamma.is_finite() || !gain.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "gamma correction needs finite gamma and gain; got gamma={gamma}, gain={gain}"
+            )));
+        }
+        Ok(Self { gamma, gain })
+    }
+}
+
+impl MapFn for Gamma {
+    fn map(&self, value: f64) -> f64 {
+        self.gain * value.powf(self.gamma)
+    }
+
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        let mapped = self.map(value);
+        mapped.is_finite().then_some(mapped)
+    }
+}
+
+/// Logarithmic correction: `gain * ln(1 + value)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogCorrection {
+    pub gain: f64,
+}
+
+impl LogCorrection {
+    pub fn new(gain: f64) -> Result<Self> {
+        if !gain.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "log correction needs a finite gain; got {gain}"
+            )));
+        }
+        Ok(Self { gain })
+    }
+}
+
+impl MapFn for LogCorrection {
+    fn map(&self, value: f64) -> f64 {
+        self.gain * (1.0 + value).ln()
+    }
+
+    fn constant_maps_to(&self, value: f64) -> Option<f64> {
+        let mapped = self.map(value);
+        mapped.is_finite().then_some(mapped)
+    }
+}
+
+/// Sigmoid correction: `1 / (1 + exp(gain * (cutoff - value)))`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sigmoid {
+    pub cutoff: f64,
+    pub gain: f64,
+}
+
+impl Sigmoid {
+    pub fn new(cutoff: f64, gain: f64) -> Result<Self> {
+        if !cutoff.is_finite() || !gain.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "sigmoid correction needs finite cutoff and gain; got cutoff={cutoff}, gain={gain}"
+            )));
+        }
+        Ok(Self { cutoff, gain })
+    }
+}
+
+impl MapFn for Sigmoid {
+    fn map(&self, value: f64) -> f64 {
+        1.0 / (1.0 + (self.gain * (self.cutoff - value)).exp())
+    }
+}
+
+/// Linear intensity rescaling with clipping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RescaleIntensity {
+    pub input: [f64; 2],
+    pub output: [f64; 2],
+}
+
+impl RescaleIntensity {
+    pub fn new(input: [f64; 2], output: [f64; 2]) -> Result<Self> {
+        if !input
+            .iter()
+            .chain(output.iter())
+            .all(|value| value.is_finite())
+        {
+            return Err(Error::InvalidArgument(format!(
+                "rescale intensity needs finite input and output ranges; got {input:?} -> \
+                 {output:?}"
+            )));
+        }
+        if input[0] >= input[1] {
+            return Err(Error::InvalidArgument(format!(
+                "rescale intensity needs an increasing input range; got {input:?}"
+            )));
+        }
+        Ok(Self { input, output })
+    }
+}
+
+impl MapFn for RescaleIntensity {
+    fn map(&self, value: f64) -> f64 {
+        let clamped = value.clamp(self.input[0], self.input[1]);
+        let t = (clamped - self.input[0]) / (self.input[1] - self.input[0]);
+        self.output[0] + t * (self.output[1] - self.output[0])
+    }
+}
+
 /// `then` after `first`: two maps as one map.
 ///
 /// This is what makes voxelwise fusion **data** rather than a rewrite. Two ops
@@ -787,12 +867,11 @@ impl MapFn for Threshold {
 /// and because both operands are type parameters, the fused body is one
 /// monomorphised loop with both maps inlined into it, not two calls.
 ///
-/// It is also the worked example for a *user's* fusion op. Nothing about it is
-/// privileged: it is a public generic struct implementing a public trait, and a
-/// third party writes the equivalent for their own combination — three maps, a
-/// map and a reduction, whatever the arrangement is — with no access to anything
-/// private here. What such an op cannot get is planner support; see the module
-/// header for why fusion is a construction-time decision.
+/// It is also the worked example for a *user's* fusion op: a public generic
+/// struct implementing a public trait, which a third party writes the equivalent
+/// of for their own combination with no access to anything private here. What
+/// such an op cannot get is planner support; see the module header for why
+/// fusion is a construction-time decision.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Compose<A: MapFn, B: MapFn> {
     pub first: A,
@@ -893,9 +972,8 @@ impl<M: MapFn> VoxelwiseMapOp<M> {
 /// from, so `VoxelwiseMapOp::from_map("floor", |value| value.max(0.0))` fails to
 /// compile with "type annotations needed" — the blanket `impl MapFn for F where
 /// F: Fn(f64) -> f64` is found only *after* the signature is known, not used to
-/// derive it. Stating the `Fn` bound on the impl instead puts the signature back
-/// where the closure can see it, and every call site that passed a closure to
-/// the old boxed constructor keeps compiling with no annotation.
+/// derive it. Stating the `Fn` bound on the impl puts the signature back where
+/// the closure can see it.
 ///
 /// So this is one constructor per kind of argument, not one constructor and a
 /// convenience. Both produce the same monomorphised op.
@@ -937,6 +1015,34 @@ impl VoxelwiseMapOp<Threshold> {
     }
 }
 
+impl VoxelwiseMapOp<Gamma> {
+    pub fn gamma(name: &'static str, gamma: f64, gain: f64) -> Result<Self> {
+        Ok(Self::from_map(name, Gamma::new(gamma, gain)?))
+    }
+}
+
+impl VoxelwiseMapOp<LogCorrection> {
+    pub fn log_correction(name: &'static str, gain: f64) -> Result<Self> {
+        Ok(Self::from_map(name, LogCorrection::new(gain)?))
+    }
+}
+
+impl VoxelwiseMapOp<Sigmoid> {
+    pub fn sigmoid(name: &'static str, cutoff: f64, gain: f64) -> Result<Self> {
+        Ok(Self::from_map(name, Sigmoid::new(cutoff, gain)?))
+    }
+}
+
+impl VoxelwiseMapOp<RescaleIntensity> {
+    pub fn rescale_intensity(
+        name: &'static str,
+        input: [f64; 2],
+        output: [f64; 2],
+    ) -> Result<Self> {
+        Ok(Self::from_map(name, RescaleIntensity::new(input, output)?))
+    }
+}
+
 impl<M: MapFn> BlockOp for VoxelwiseMapOp<M> {
     fn name(&self) -> &'static str {
         self.name
@@ -970,33 +1076,21 @@ impl<M: MapFn> BlockOp for VoxelwiseMapOp<M> {
         )
     }
 
-    /// **A stencil**, and the argument is one this crate has already made and
-    /// already depends on.
+    /// **A stencil**, on an argument this crate already depends on: *a block
+    /// boundary is already a cut*. [`MapFn`] states purity as a precondition of
+    /// implementing it, this op reaches zero, so every block grid a planner may
+    /// choose already partitions the volume into pieces the map is applied to
+    /// separately — and the conformance suite asserts the answer does not move
+    /// across those grids. A slab cut is one more partition of exactly that kind,
+    /// resting on no assumption the block cut was not already resting on.
     ///
-    /// [`MapFn`] states purity as a *precondition of implementing it* — "if a map
-    /// consulted anything but its argument, the answer for a short-circuited
-    /// block and for a computed one would differ" — and that precondition is what
-    /// licenses [`Self::constant_maps_to`] immediately below.
-    ///
-    /// It licenses this too, and for a **stronger** reason than the short circuit
-    /// has: *a block boundary is already a cut*. This op reaches zero, so every
-    /// block grid a planner may choose already partitions the volume into pieces
-    /// the map is applied to separately, and this crate's conformance suite
-    /// asserts that the answer does not move across those grids. A slab cut is
-    /// one more partition of exactly that kind. It rests on no assumption the
-    /// block cut was not already resting on, which is why declaring it here does
-    /// not widen the bet an out-of-crate `MapFn` is trusted on.
-    ///
-    /// **Why it matters that this one is declared and not only the filters.** A
-    /// `Parallel` node is only as sliceable as its narrowest part, and the
-    /// diamond this crate ships for background removal —
-    /// [`super::background::remove_background`] — is an *identity map* on one arm
-    /// against a grey opening on the other. With the rank filters and the sink
-    /// declared and this left undeclared, the whole node still refused, and the
-    /// declarations on the other three would have been assertions about a chain
-    /// nothing could cut. `tests/intra_block_slicing.rs` runs that composite
-    /// diamond uncut and then cut at every thread count and requires the same
-    /// bits.
+    /// **This one matters as much as the filters.** A `Parallel` node is only as
+    /// sliceable as its narrowest part, and the diamond this crate ships for
+    /// background removal — [`super::background::remove_background`] — is an
+    /// *identity map* on one arm against a grey opening on the other, so leaving
+    /// this undeclared refuses the whole node however the other three are
+    /// declared. `tests/intra_block_slicing.rs` runs that composite diamond uncut
+    /// and then cut at every thread count and requires the same bits.
     ///
     /// **What it costs, and it is the one declared op that made a cut lose.** A
     /// reach-0 cut creates no redundant arithmetic — the amplification is
@@ -1040,17 +1134,14 @@ impl<M: MapFn> BlockOp for VoxelwiseMapOp<M> {
 /// what it writes: one byte a voxel rather than eight, because the answer is one
 /// bit and the buffer says so.
 ///
-/// Why this is an op and not a composition that already existed
-/// ------------------------------------------------------------
+/// Why this is an op and not the composition that already existed
+/// --------------------------------------------------------------
 /// `VoxelwiseMapOp::threshold` followed by [`NarrowOp::to_mask`] computes the
-/// same voxels, and it is what a chain had to write before this. It is two ops,
-/// and the cost is not the second pass: it is the buffer **between** them, which
-/// is the `f64` image the narrowing exists to avoid and which a fan-in allocates
-/// per branch (`Chain::apply_placed`'s `Parallel` arm allocates each branch's
-/// buffer at the branch's own declared width, however many of them it holds at
-/// once). A threshold whose branch result
-/// is `f64` therefore costs the eight bytes a voxel whatever is done to it
-/// afterwards, and inserting the narrowing after it does not take them back.
+/// same voxels. The cost of that pair is not the second pass: it is the buffer
+/// **between** them, which a fan-in allocates per branch at the branch's own
+/// declared width (`Chain::apply_placed`'s `Parallel` arm). A threshold whose
+/// branch result is `f64` costs its eight bytes a voxel whatever is done to it
+/// afterwards, and narrowing afterwards does not take them back.
 ///
 /// So this is not a convenience over the pair. It is the only arrangement in
 /// which the comparison's answer is never materialised eight bytes wide.
@@ -1159,19 +1250,11 @@ impl<M: MaskFn> BlockOp for VoxelwiseMaskOp<M> {
 
     /// **A stencil**, on [`VoxelwiseMapOp::slicing`]'s argument in full: the
     /// predicate is required to be pure, it reads the voxel it writes and
-    /// nothing else, and *a block boundary is already a cut* — this op reaches
-    /// zero, so every block grid a planner may choose already partitions the
-    /// volume into pieces it is applied to separately, and the conformance suite
-    /// asserts the answer does not move across those grids.
+    /// nothing else, and a block boundary is already a cut.
     ///
-    /// **It was declared later than its sibling, and the reason is the bar
-    /// rather than the argument.** It writes `Bool` where the map writes `f64`,
-    /// and `tests/intra_block_slicing.rs`'s two bar helpers read `f64` — so
-    /// declaring it would have meant either a case with no bit-identity check
-    /// behind it or a relaxed bar. The helpers were generalised instead, per
-    /// element type and refusing the rest by name rather than widening
-    /// everything to `f64`, because a bar that is bit-identity cannot rest on a
-    /// lossy comparison.
+    /// `tests/intra_block_slicing.rs`'s bar helpers are generalised per element
+    /// type, refusing the rest by name rather than widening everything to `f64`,
+    /// because a bar that is bit-identity cannot rest on a lossy comparison.
     ///
     /// Nothing here costs what the map's declaration does: a masking op writes
     /// **one byte a voxel**, so a slab's placement moves an eighth of the bytes
@@ -1204,17 +1287,13 @@ impl<M: MaskFn> BlockOp for VoxelwiseMaskOp<M> {
 /// right for a map and wrong for a *carry*: the case this serves is a fan-in
 /// branch whose job is to hand the phase's own input to the combine — the sink
 /// of a chain of `OR`s, most of all — and such a branch has no arithmetic to be
-/// `f64` about. Before this, a chain whose sink was `Bool` could not carry it
-/// forward on a branch at all, and had to reach the image by name through a
-/// [`Chain::Source`](crate::op::Chain::Source) instead, which is a read where a
-/// copy would do.
+/// `f64` about. Without it a chain whose sink is `Bool` has to reach the image by
+/// name through a [`Chain::Source`](crate::op::Chain::Source), which is a read
+/// where a copy would do.
 ///
-/// **The copy is a copy, and is not elidable from inside an op**, which is
-/// exactly what [`Identity`]'s own header says about the `f64` case:
-/// [`BlockOp::apply`] is handed an input buffer and a separate output buffer,
-/// and there is no way through this signature to say "the output *is* the
-/// input". [`Voxels::assign`] is the widest copy available for the width in
-/// hand, and it refuses a width mismatch rather than converting — which is the
+/// **The copy is a copy, and is not elidable from inside an op** — see
+/// [`Identity`]. [`Voxels::assign`] is the widest copy available for the width in
+/// hand, and it refuses a width mismatch rather than converting, which is the
 /// behaviour that makes a mis-declared chain fail rather than silently cast.
 pub struct CarryOp {
     name: &'static str,
@@ -1335,34 +1414,23 @@ impl BlockOp for CombineOp {
 
     /// Either mask carrier, and **not** required to be the operand's.
     ///
-    /// This used to read `dtype == self.operand.dtype()`, and the sentence
-    /// justifying it — "a block of any other type has nothing to be combined
-    /// with" — is the thing [`MaskElement`] falsifies. A `bool` block has a
-    /// great deal to be combined with in an `f64` mask: the connective is a
-    /// function of two *bits*, this crate fixes the conversion between the two
-    /// carriers in one place, and the answer is not in doubt. The rule was an
-    /// artefact of [`Self::apply`] reading one tag and using it for all three
-    /// buffers, which is exactly the artefact [`LogicCombine::accepts`] had.
+    /// A `bool` block combines perfectly well with an `f64` mask: the connective
+    /// is a function of two *bits*, and [`MaskElement`] fixes the conversion
+    /// between the two carriers in one place, so the answer is not in doubt.
     ///
-    /// **What is still checked is that both are carriers at all.** The equality
-    /// used to get that for free; without it the operand needs saying, because
-    /// `accepts` is the only place a plan can learn anything about an array the
-    /// op holds and the plan has never seen. An operand of some third type makes
-    /// this op unusable at *every* input, and it says so when the plan is made
-    /// rather than when a block reaches it.
+    /// **What is checked is that both are carriers at all**, the operand
+    /// included, because `accepts` is the only place a plan can learn anything
+    /// about an array the op holds and the plan has never seen. An operand of
+    /// some third type makes this op unusable at *every* input, and it says so
+    /// when the plan is made rather than when a block reaches it.
     ///
-    /// **This op does not gain `LogicCombine::producing`, and the reason is the
-    /// same reason read from the other side.** That combine needed the carrier
-    /// of its answer stated because it has *n* branches and no canonical one, so
-    /// taking the output from a branch would have made an image's width a
-    /// consequence of an arm's. This one has exactly one input, and
+    /// **This op does not gain `LogicCombine::producing`.** That combine needs
+    /// the carrier of its answer stated because it has *n* branches and no
+    /// canonical one, so taking the output from a branch would make an image's
+    /// width a consequence of an arm's. This one has exactly one input, and
     /// `BlockOp::produces` hands it straight back — the identity, not an
     /// inference, and a function of something the plan already holds. A stated
-    /// output here would be a parameter with no question behind it, which is the
-    /// mistake [`NarrowOp`]'s header declines for a unified cast. Relaxing the
-    /// input rule moves this op *towards* `Chain::produces`'s invariant rather
-    /// than away from it: the width of what it writes now depends on the plan's
-    /// own stream and no longer on an array nothing in the plan can see.
+    /// output here would be a parameter with no question behind it.
     fn accepts(&self, dtype: Dtype) -> bool {
         matches!(dtype, Dtype::Bool | Dtype::F64)
             && matches!(self.operand.dtype(), Dtype::Bool | Dtype::F64)
@@ -1389,12 +1457,10 @@ impl BlockOp for CombineOp {
         let logic = self.logic;
         let operand = self.operand.slice_region(&window)?;
         // **Two carriers to resolve and not three**, which is this op's whole
-        // difference from [`LogicCombine::pair`] written as code: `produces` is
+        // difference from `LogicCombine::pair` written as code: `produces` is
         // the default, so the output carries what the input carried and there is
         // no third thing to choose. Each arm is one monomorphisation of
-        // [`mask_logic_into`]; the two that were reachable before are the two on
-        // the diagonal, and they are the same kernel over the same conversions
-        // they were reaching through `logic_into` and `combine_into`.
+        // `mask_logic_into`.
         match (input.dtype(), operand.dtype()) {
             (Dtype::Bool, Dtype::Bool) => mask_logic_into(
                 input.view::<bool>()?,
@@ -1456,16 +1522,13 @@ impl BlockOp for CombineOp {
 /// for the two pairs it actually does.
 ///
 /// **The branches carry masks, and they need not carry them in the same
-/// thing.** This combine never reads a number: both of its paths have always
-/// gone through [`is_set`] and written through [`from_set`], and its answer is
-/// one bit per voxel in every case. `Bool` and `F64` are therefore two
-/// *carriers* of one bit — [`MaskElement`] is where that is said — and the rule
-/// this used to enforce, that every branch agree, was not a statement about the
-/// connective at all. It was an artefact of [`Self::pair`] reading one branch's
-/// tag and using it for all three buffers. A connective over a `bool` branch and
-/// an `f64` branch is perfectly well defined, and refusing it cost the case this
-/// relaxation exists for: a mask sink narrowed to `Bool` beside arms whose own
-/// arithmetic is `f64` and whose verdicts are therefore `f64`.
+/// thing.** This combine never reads a number: both of its paths go through
+/// [`is_set`] and write through [`from_set`], and its answer is one bit per
+/// voxel in every case. `Bool` and `F64` are two *carriers* of one bit —
+/// [`MaskElement`] is where that is said — so a connective over a `bool` branch
+/// and an `f64` branch is well defined. Refusing it would cost the case this
+/// serves: a mask sink narrowed to `Bool` beside arms whose own arithmetic is
+/// `f64` and whose verdicts are therefore `f64`.
 ///
 /// **What is not relaxed is the output.** An image is allocated at one width and
 /// a decomposition is binding — `Chain::produces`'s own words — so inferring the
@@ -1473,12 +1536,10 @@ impl BlockOp for CombineOp {
 /// or the converse) would make an image's width a consequence of a branch's,
 /// and flipping one arm would silently re-width an image other phases read. So:
 ///
-/// * branches that **agree** produce that carrier, which is exactly the rule
-///   this had before and means every plan already written still means what it
-///   meant;
+/// * branches that **agree** produce that carrier;
 /// * branches that **differ** are joined only when the caller has said what to
 ///   write, with [`Self::producing`]. Without it they are refused when the plan
-///   is made, which is where they were refused before.
+///   is made.
 ///
 /// [`Self::producing`] also applies where the branches agree — an `OR` of two
 /// `f64` masks writing a `Bool` image is how a chain's sink is narrowed at the
@@ -1536,9 +1597,8 @@ impl LogicCombine {
     ///
     /// What a partial fold holds is a bit, and it is the one buffer in the node
     /// whose width nothing outside the node can observe. Under the mask
-    /// convention it carries the same information an `f64` one did — `from_set`
-    /// writes what `is_set` reads — at an eighth of the bytes, at the block
-    /// sizes where a fan-in's own buffers are what a run is holding.
+    /// convention it carries what an `f64` one would — `from_set` writes what
+    /// `is_set` reads — at an eighth of the bytes.
     ///
     /// One function rather than a literal in each place, because
     /// [`Combine::fold_carrier`] and [`Combine::apply`] must agree about it: the
@@ -1604,10 +1664,9 @@ impl Combine for LogicCombine {
     }
 
     /// **A stencil**, and this is the declaration a fan-in cannot get from its
-    /// branches. A `Parallel` node is only as sliceable as its narrowest part,
+    /// branches: a `Parallel` node is only as sliceable as its narrowest part,
     /// so a diamond whose arms are declared stencils is still refused while its
-    /// sink says nothing — which is the position every fan-in in this crate was
-    /// in until this line existed.
+    /// sink says nothing.
     ///
     /// The claim itself is [`mask_logic_into`]'s: it writes each output voxel from the
     /// co-located voxel of each operand and the carrier conversion `MaskElement::set`, through one
@@ -1848,18 +1907,15 @@ arithmetical!(f32);
 /// The binary arithmetic over two co-located voxels, and the two selections
 /// between them.
 ///
-/// **One enum and one shell rather than six ops, on [`Logic`]'s precedent** —
-/// and the argument is worth making because the two are not shaped identically.
-/// `Logic`'s three connectives share an arity rule, an element-type rule and a
-/// fold; these six share the *shape* (reach 0, two co-located operands, one
-/// result of the operands' own type) and differ in exactly two stated ways,
-/// each of which is one method here rather than a separate type: which element
-/// types they admit ([`Self::admits`]) and whether more than two branches has an
-/// unambiguous reading ([`Self::folds_over_many`]). Six types would repeat the
-/// `Combine` implementation six times to vary two predicates, and a caller
-/// choosing between `Add` and `Multiply` would be choosing between two `use`
-/// lines rather than between two values of a parameter — which is the thing this
-/// crate says a caller should be able to do.
+/// **One enum and one shell rather than six ops**, on [`Logic`]'s precedent.
+/// The six share the *shape* — reach 0, two co-located operands, one result of
+/// the operands' own type — and differ in exactly two stated ways, each one
+/// method here rather than a separate type: which element types they admit
+/// ([`Self::admits`]) and whether more than two branches has an unambiguous
+/// reading ([`Self::folds_over_many`]). Six types would repeat the `Combine`
+/// implementation six times to vary two predicates, and a caller choosing
+/// between `Add` and `Multiply` would be choosing between two `use` lines rather
+/// than between two values of a parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Arithmetic {
     Add,
@@ -2012,12 +2068,6 @@ pub fn arithmetic_in_place<T: Arithmetical>(
     combine_in_place(acc, right, |&acc, &right| op.apply(acc, right))
 }
 
-/// `out = op(left, right)` where `op` is a **selection** and the element type
-/// has an order of its own.
-///
-/// Refuses the four arithmetic operations by name rather than silently doing
-/// something: an integer sum is what [`Arithmetic::admits`] declines and this is
-/// the kernel that would have had to invent a rule for it.
 /// [`selection_into`], accumulating over the left operand. See
 /// [`combine_in_place`].
 pub fn selection_in_place<T: Ord + Copy>(
@@ -2037,6 +2087,12 @@ pub fn selection_in_place<T: Ord + Copy>(
     })
 }
 
+/// `out = op(left, right)` where `op` is a **selection** and the element type
+/// has an order of its own.
+///
+/// Refuses the four arithmetic operations by name rather than silently doing
+/// something: an integer sum is what [`Arithmetic::admits`] declines and this is
+/// the kernel that would have had to invent a rule for it.
 pub fn selection_into<T: Ord + Copy>(
     left: ArrayView3<'_, T>,
     right: ArrayView3<'_, T>,
@@ -2072,10 +2128,9 @@ pub fn selection_into<T: Ord + Copy>(
 /// a **supplied** image — `ImageId::supplied(i)`, handed to the run by
 /// `ArrayEnvironment::with_inputs` — read at the block's own fetch region. So
 /// this one combine covers both halves of the two-volume arithmetic: between two
-/// branches of one plan, and against an array the caller brought. The residue is
-/// G2's and is refused elsewhere by name — a supplied array is in image 0's
-/// coordinate space, so one at a different extent or a different binning is
-/// refused at plan time rather than mis-fetched.
+/// branches of one plan, and against an array the caller brought. A supplied
+/// array is required to be in image 0's coordinate space, so one at a different
+/// extent or a different binning is refused at plan time rather than mis-fetched.
 ///
 /// **The arity rule is per-operation**, which is the one place this differs in
 /// shape from `LogicCombine`: see [`Arithmetic::folds_over_many`].
@@ -2164,18 +2219,10 @@ impl Combine for ArithmeticCombine {
         0
     }
 
-    /// **A stencil**, and this is the declaration a fan-in cannot get from its
-    /// branches. A `Parallel` node is only as sliceable as its narrowest part,
-    /// so a diamond whose arms are declared stencils is still refused while its
-    /// sink says nothing — which is the position every fan-in in this crate was
-    /// in until this line existed.
-    ///
-    /// The claim itself is [`arithmetic_into`]'s: it writes each output voxel from the
-    /// co-located voxel of each operand, or selects one of them, through one
-    /// `Zip` that reads no neighbour and carries no accumulator between voxels.
-    /// So the output at `v` is a function of the inputs at `v`, the reach is
-    /// zero on every axis, and the output lattice is the input lattice — the
-    /// three conditions [`Slicing::Stencil`] states.
+    /// **A stencil**, on [`LogicCombine::slicing`]'s argument: the claim is
+    /// [`arithmetic_into`]'s, which writes each output voxel from the co-located
+    /// voxel of each operand — or selects one of them — through one `Zip` that
+    /// reads no neighbour and carries no accumulator between voxels.
     ///
     /// Held to it rather than believed: `tests/intra_block_slicing.rs` runs a
     /// fan-in whose sink is this one uncut and then cut at every thread count
@@ -2752,14 +2799,11 @@ mod tests {
     /// The same connective over two `bool` operands, at an eighth of the bytes
     /// and with no mask conversion on either arm.
     ///
-    /// **The second assertion used to be `!op.accepts(Dtype::F64)`**, and it is
-    /// inverted here rather than deleted, because the thing it recorded the
-    /// absence of has landed: a `bool` operand and an `f64` block are two
-    /// carriers of one bit and the connective over them is not in doubt. See
-    /// [`CombineOp::accepts`] for why the equality it enforced was an artefact,
-    /// and `the_held_operand_need_not_be_carried_the_way_the_block_is` in
-    /// `tests/mask_carrier.rs` for the evidence that the crossed pairs answer
-    /// what the diagonal ones do.
+    /// A `bool` operand and an `f64` block are two carriers of one bit, so the
+    /// connective over them is not in doubt; see [`CombineOp::accepts`]. The
+    /// evidence that the crossed pairs answer what the diagonal ones do is
+    /// `the_held_operand_need_not_be_carried_the_way_the_block_is` in
+    /// `tests/mask_carrier.rs`.
     #[test]
     fn the_combine_op_takes_two_bool_operands_directly() {
         let volume = [4usize, 2, 2];
@@ -2939,9 +2983,8 @@ mod tests {
     /// *declares* a constant block maps to, and what computing that block
     /// actually produces, must agree.
     ///
-    /// This is the property the boxed closure got for free by calling itself.
-    /// Deriving the answer from the expression is what puts it at risk, so it is
-    /// pinned per variant rather than once.
+    /// Deriving the answer from the expression rather than calling the map is
+    /// what puts this at risk, so it is pinned per variant rather than once.
     #[test]
     fn what_a_map_declares_for_a_constant_is_what_computing_it_gives() {
         let probes = [-1.0, -0.0, 0.0, 0.5, 1.0, 7.0, 500.0];
@@ -3013,9 +3056,66 @@ mod tests {
         }
     }
 
-    /// Cost is derived from the expression, which is the whole reason it moved
-    /// off the op and onto the map. No timing here — only the orderings the
-    /// derivation must produce, which are assertions and not measurements.
+    #[test]
+    fn exposure_maps_are_pointwise_maps_with_shared_cost() {
+        let gamma = VoxelwiseMapOp::gamma("gamma", 2.0, 3.0).expect("a gamma map");
+        let log = VoxelwiseMapOp::log_correction("log", 2.0).expect("a log map");
+        let sigmoid = VoxelwiseMapOp::sigmoid("sigmoid", 0.5, 4.0).expect("a sigmoid map");
+        let rescale = VoxelwiseMapOp::rescale_intensity("rescale", [10.0, 20.0], [-1.0, 1.0])
+            .expect("a rescale map");
+
+        assert_eq!(gamma.constant_maps_to(4.0), Some(48.0));
+        assert_eq!(gamma.constant_maps_to(-1.0), Some(3.0));
+        assert_eq!(gamma.cost_per_voxel(), MAP_COST);
+
+        assert_eq!(log.constant_maps_to(0.0), Some(0.0));
+        assert_eq!(log.constant_maps_to(-1.0), None);
+        assert_eq!(log.constant_maps_to(-2.0), None);
+        assert_eq!(log.cost_per_voxel(), MAP_COST);
+
+        let at_cutoff = sigmoid.constant_maps_to(0.5).expect("finite");
+        assert_eq!(at_cutoff, 0.5);
+        assert!(sigmoid.constant_maps_to(2.0).expect("finite") > at_cutoff);
+        assert!(sigmoid.constant_maps_to(-2.0).expect("finite") < at_cutoff);
+        assert_eq!(sigmoid.cost_per_voxel(), MAP_COST);
+
+        assert_eq!(rescale.constant_maps_to(10.0), Some(-1.0));
+        assert_eq!(rescale.constant_maps_to(15.0), Some(0.0));
+        assert_eq!(rescale.constant_maps_to(20.0), Some(1.0));
+        assert_eq!(rescale.constant_maps_to(5.0), Some(-1.0));
+        assert_eq!(rescale.constant_maps_to(25.0), Some(1.0));
+        assert_eq!(rescale.cost_per_voxel(), MAP_COST);
+    }
+
+    #[test]
+    fn exposure_map_constructors_refuse_unstated_parameters() {
+        fn error_message<T>(result: Result<T>) -> String {
+            match result {
+                Ok(_) => panic!("constructor accepted invalid parameters"),
+                Err(error) => error.to_string(),
+            }
+        }
+
+        let gamma = error_message(VoxelwiseMapOp::gamma("gamma", f64::NAN, 1.0));
+        assert!(gamma.contains("finite gamma and gain"), "{gamma}");
+
+        let log = error_message(VoxelwiseMapOp::log_correction("log", f64::INFINITY));
+        assert!(log.contains("finite gain"), "{log}");
+
+        let sigmoid = error_message(VoxelwiseMapOp::sigmoid("sigmoid", 0.0, f64::NEG_INFINITY));
+        assert!(sigmoid.contains("finite cutoff and gain"), "{sigmoid}");
+
+        let range = error_message(VoxelwiseMapOp::rescale_intensity(
+            "rescale",
+            [2.0, 2.0],
+            [0.0, 1.0],
+        ));
+        assert!(range.contains("increasing input range"), "{range}");
+    }
+
+    /// Cost is derived from the expression, which is why it lives on the map
+    /// rather than the op. No timing here — only the orderings the derivation
+    /// must produce, which are assertions and not measurements.
     #[test]
     fn a_maps_cost_follows_its_expression() {
         let identity = VoxelwiseMapOp::identity("identity");
@@ -3067,7 +3167,7 @@ mod tests {
         out
     }
 
-    /// The gap, closed: a comparison computed in `f64` reaching a `bool` image.
+    /// A comparison computed in `f64` reaching a `bool` image.
     ///
     /// The fixture is a ramp with `-0.0` and two denormals in it, because the
     /// mask convention is "non-zero", and `-0.0 != 0.0` is **false** while
@@ -3196,13 +3296,11 @@ mod tests {
         identical(&back, &input, "u8 round trip");
     }
 
-    /// **`VoxelwiseMapOp` is byte-unchanged by the arrival of a width cast.**
-    ///
-    /// The whole risk of gap 2 was that stating an output element type would be
-    /// done by teaching the existing map op to narrow, which would have moved
-    /// every existing chain's answer. Nothing was taught: the map op is still
-    /// `f64 -> f64`, still accepts and produces `f64`, and still gives the same
-    /// bits over a ramp with the awkward values in it.
+    /// **`VoxelwiseMapOp` is byte-unchanged by the width cast.** The tempting
+    /// way to state an output element type would have been to teach the existing
+    /// map op to narrow, which would have moved every existing chain's answer.
+    /// It is still `f64 -> f64`, still accepts and produces `f64`, and still
+    /// gives the same bits over a ramp with the awkward values in it.
     #[test]
     fn the_existing_voxelwise_map_still_produces_f64_and_the_same_bits() {
         let input: Voxels = ramp((7, 5, 3)).into();
@@ -3247,11 +3345,9 @@ mod tests {
 
 /// Widen any element type to `f64`, value for value.
 ///
-/// **The op that was missing between an image and a kernel stated in `f64`.**
-/// `Voxels::widened` has always existed; nothing exposed it as a step of a
-/// chain, so a phase writing `u16` — a median run at the reference's own width,
-/// say — could not be read by an op whose kernel is `f64`, and the chain simply
-/// could not be assembled.
+/// The step that lets a phase writing `u16` — a median run at the reference's
+/// own width, say — be read by an op whose kernel is `f64`. `Voxels::widened`
+/// exposed as a chain step.
 ///
 /// **Widening only, and the name says so.** Narrowing is not the inverse of
 /// this: it has to decide rounding, saturation and what a negative value means
@@ -3318,37 +3414,28 @@ impl BlockOp for WidenOp {
 
 /// Take an `f64` buffer to a **stated** element type.
 ///
-/// **The op that was missing in the other direction from [`WidenOp`].**
-/// `VoxelwiseMapOp` passes its input width straight through — it is an
-/// `f64 -> f64` map in an `f64` buffer — so a chain could compute
-/// `value > level` and had nowhere narrower to put the answer. An image of
-/// `bool` was therefore unreachable from inside a plan, whatever the plan
-/// computed, and so was every image of an integer type.
+/// [`WidenOp`]'s other direction. `VoxelwiseMapOp` passes its input width
+/// straight through — it is an `f64 -> f64` map in an `f64` buffer — so without
+/// this a plan can reach neither a `bool` image nor an image of any integer type.
 ///
-/// **For a comparison specifically there is now a one-pass form**, and it is the
-/// one to reach for: [`VoxelwiseMaskOp`] holds a `f64 -> bool` predicate and
-/// writes `Bool` directly, so the eight-byte buffer this narrows is never
-/// allocated at all. This op keeps the cases that one cannot serve — every
-/// numeric target, and narrowing an `f64` image somebody else computed — which
-/// is most of what it is for.
+/// **For a comparison specifically prefer the one-pass form**:
+/// [`VoxelwiseMaskOp`] holds a `f64 -> bool` predicate and writes `Bool`
+/// directly, so the eight-byte buffer this narrows is never allocated at all.
+/// This op keeps the cases that one cannot serve — every numeric target, and
+/// narrowing an `f64` image somebody else computed.
 ///
-/// Two ops rather than one parameterised on a target type, and the asymmetry is
-/// real
-/// ------------------------------------------------------------------------
+/// Two ops rather than one parameterised on a target type
+/// ------------------------------------------------------
 /// The obvious unification is one `CastOp` with a target `Dtype`, of which
-/// widening is the `F64` case. It is not built, for the reason [`WidenOp`]'s own
-/// documentation already gives: **widening needs no policy and narrowing needs
-/// three.** Widening is total, exact for every type a buffer holds, and has one
-/// possible answer — there is nothing for a caller to state and nothing for the
-/// op to get wrong. Narrowing has to say what happens to a fractional part, what
-/// happens outside the target's range, and what happens to a `NaN`; a single op
-/// covering both would carry parameters that are meaningless on one of its two
-/// directions, and a caller writing `CastOp::new("to f64", Dtype::F64, rounding)`
-/// would be stating a rounding rule that cannot fire. Two names, each with
-/// exactly the parameters its direction has, is the honest shape.
+/// widening is the `F64` case. It is not built because **widening needs no
+/// policy and narrowing needs three**: widening is total and has one possible
+/// answer, where narrowing has to say what happens to a fractional part, what
+/// happens outside the target's range, and what happens to a `NaN`. A caller
+/// writing `CastOp::new("to f64", Dtype::F64, rounding)` would be stating a
+/// rounding rule that cannot fire.
 ///
-/// Where the rules come from, and why none of them is new here
-/// ----------------------------------------------------------
+/// Where the rules come from
+/// -------------------------
 /// Both are rules this crate already states somewhere else, and this op
 /// **reaches for them rather than restating them**, which is what keeps the
 /// answer the same whether a value is narrowed on the way through a statistic or

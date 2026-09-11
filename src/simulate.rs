@@ -135,18 +135,12 @@ pub struct Machine {
     ///
     /// # Which cache this is, decided
     ///
-    /// It used to be `cache::ChunkCache`'s budget, and at the time that was a
-    /// model of a component nobody constructed: what could physically serve a
-    /// re-read on a node was the page cache, sized by free RAM, so the
-    /// simulator's central mechanism — ordering changes hit rate — was
-    /// parameterised by an axis that did not exist on the machine.
-    ///
-    /// **`ZarrEnvironment` caches by default now**, so that axis does exist for
-    /// a run through storage. The decision below is unchanged and the reason is
-    /// worth keeping: the page cache is still what serves a re-read for every
-    /// other environment, it is still sized by free RAM rather than by anything
-    /// this crate sets, and a simulator parameterised by the *smaller* and more
-    /// variable of the two would model the machine less well, not more.
+    /// `ZarrEnvironment` caches by default, so `cache::ChunkCache`'s budget is
+    /// a real axis for a run through storage. It is still not the one modelled
+    /// here: the page cache is what serves a re-read for every other
+    /// environment, it is sized by free RAM rather than by anything this crate
+    /// sets, and a simulator parameterised by the *smaller* and more variable of
+    /// the two would model the machine less well, not more.
     ///
     /// **The decision taken here is to model what physically serves the
     /// re-read**, which today is the page cache. Two consequences follow and
@@ -185,8 +179,7 @@ pub struct Machine {
     /// **Per node**, because each computer has its own link to storage: `n`
     /// nodes fetch on `n` sets of these rather than contending for one.
     ///
-    /// **The channel used to be singular and that was a statement about a
-    /// device that does not exist.** One serial channel is the least structure
+    /// **Why more than one.** A single serial channel is the least structure
     /// that makes prefetch a trade rather than free money — that argument
     /// stands — but it also says concurrency never helps, which is false of
     /// every filesystem and emphatically false of object storage, where
@@ -368,10 +361,11 @@ pub struct Machine {
     ///   Two policies may therefore be compared only at the **same** window.
     ///
     /// `scenario::Scenario` deliberately does not carry this field through its
-    /// JSON: the committed `costs/` files are compared byte for byte against
-    /// what `Scenario::to_json` writes, every one of them was recorded
-    /// unbounded, and a serialiser change would rewrite all of them to state the
-    /// default.
+    /// JSON: a scenario is a machine and a set of costs, and how much of the
+    /// ready set a *scheduler* is shown is a property of the coordinator rather
+    /// than of the machine it runs on. Every committed `costs/` file was
+    /// recorded unbounded, so a scenario that stated nothing reads back as the
+    /// machine it was measured on.
     pub candidate_window: usize,
 }
 
@@ -785,10 +779,8 @@ impl Outcome {
 pub struct PerPhase<'a> {
     /// Compute nanoseconds per voxel of a task's read extent, per phase.
     ///
-    /// Empty falls back to [`Rates::compute_ns_per_voxel`] for every phase.
-    /// Supplying one matters more than any other rate: the tile run measured
-    /// phases spanning **`3.541` to `201.397` ns per voxel, a factor of 57**,
-    /// and under one uniform rate a throughput term can discriminate nothing.
+    /// Empty falls back to [`Rates::compute_ns_per_voxel`] for every phase,
+    /// whose doc records why supplying one matters more than any other rate.
     pub ns_per_voxel: &'a [f64],
     /// Substages each phase ran, as [`crate::log::Stats::substages`] reports
     /// them. Empty, or a zero, means one.
@@ -2864,10 +2856,6 @@ pub fn simulate(
     // capacity is its share of the budget times that ratio.
     const ENCODED_RESIDENCY: u64 = 20;
     //
-    // **One pool, or one per worker.** Shared is the optimistic reading and the
-    // old behaviour; per-worker is what `distributed` actually has, and is the
-    // only arrangement in which a chunk two workers both read costs two fetches
-    // — which is the quantity a handout policy is ranked on.
     // **A pool per node, and within a node one or one per slot.** The three
     // arrangements `Machine::cache_shared` names, and the middle one — a
     // computer's page cache, shared by its threads and by nobody else — is the
@@ -2892,15 +2880,10 @@ pub fn simulate(
     let mut residency = Residency::new(decomposition, graph.tasks.len(), bytes_of);
 
     let mut outcome = Outcome::default();
-    // **One serial IO channel.** Not storage physics — there is no seek, no
-    // queue depth and no readahead — but a single shared resource with a
-    // finite rate, which is the least that makes prefetch a *trade* rather
-    // than free money. Without it, deeper prefetch would improve every run
-    // without bound, and a scheduler tuned against that would be tuned against
-    // a machine with infinite bandwidth.
     // **One free-at time per channel.** A fetch takes the earliest-free one, so
-    // `channels == 1` is exactly the serial model this had and anything above it
-    // lets concurrent fetches overlap the way real storage does.
+    // `channels == 1` is the serial model — the least structure that makes
+    // prefetch a trade rather than free money — and anything above it lets
+    // concurrent fetches overlap the way real storage does.
     // **Channels per node**, flat: node `n`'s channels are
     // `n * channels .. (n + 1) * channels`. A fetch takes the earliest-free one
     // *on its own node*, so two computers never queue behind each other.
@@ -2914,22 +2897,17 @@ pub fn simulate(
     // than encoded as edges because that is where the real graph puts it; see
     // `TaskGraph::barriers`.
     //
-    // This used to be a `(0..graph.tasks.len()).filter(..)` **per dispatch**,
-    // which is `O(T)` predicate evaluations at every one of the `2T` events a
-    // run has: fine at the `4^3` fixtures the simulator shipped with, and
-    // `docs/design/planner-gaps.md` names it as the one thing G1 needed before
-    // an arena could sweep. It is now maintained incrementally — a task is
-    // admitted when its last dependency completes, or when the barrier its
-    // phase waits on clears — so the per-event cost is the *ready* set rather
-    // than the whole graph.
+    // Maintained incrementally — a task is admitted when its last dependency
+    // completes, or when the barrier its phase waits on clears — so the
+    // per-event cost is the *ready* set rather than the whole graph.
     //
-    // **Ascending task id, exactly as the scan produced.** A `Scheduler` is
-    // handed `Decision::ready` as a slice and several of them break a tie by the
-    // first entry they see, so the order is part of the interface and not an
-    // implementation detail: `PlanOrder` is documented as "the lowest ready task
-    // id", and `CacheAware` returns the first of an equal-hit set. Every
-    // insertion is therefore a `partition_point` and every removal takes the
-    // element out in place. That the two agree is checked rather than argued —
+    // **Ascending task id.** A `Scheduler` is handed `Decision::ready` as a
+    // slice and several of them break a tie by the first entry they see, so the
+    // order is part of the interface and not an implementation detail:
+    // `PlanOrder` is documented as "the lowest ready task id", and
+    // `WarmestFirst` returns the first of an equal-miss set. Every insertion is
+    // therefore a `partition_point` and every removal takes the element out in
+    // place. That this agrees with the full scan is checked rather than argued —
     // see the debug assertion at the head of the loop.
     // **Whether a phase waits for the whole of the one before it.** A barrier
     // phase always does; under `Machine::wave_synchronous` every phase does,
@@ -3078,8 +3056,8 @@ pub fn simulate(
         // a too-deep prefetch hurts.
         //
         // **Every image the phase reads, at the region the executor reads it
-        // at.** Two corrections in one, and both were charging the wrong thing
-        // rather than charging too little of the right one:
+        // at.** Two parts, and getting either wrong charges the wrong thing
+        // rather than too little of the right one:
         //
         // * `PhaseDecomposition::images_read` instead of the phase's own image
         //   alone. A phase with a `Chain::Source` arm really does traverse two
@@ -3139,11 +3117,11 @@ pub fn simulate(
         // *read* extent, because `BlockOutput::pixels` is over the read extent
         // and the executor slices the valid sub-box out of it.
         //
-        // This used to be `read_voxels x dtype x 2` — the same two-buffer figure
-        // `PhaseCost::working_set_bytes_per_block` carries, and with the same
-        // recorded gap: a phase reading three images was charged as if it read
-        // one. That gap remains on `PhaseCost`; closing it there is a change to
-        // what the planner *chooses* on and wants its own measurement.
+        // `PhaseCost::working_set_bytes_per_block` still carries the two-buffer
+        // figure `read_voxels x dtype x 2`, with the recorded gap that a phase
+        // reading three images is charged as if it read one. That gap remains on
+        // `PhaseCost`; closing it there is a change to what the planner
+        // *chooses* on and wants its own measurement.
         let input_bytes = demand_read.input_buffer_bytes();
         let output_bytes = write_footprints.output_buffer_bytes(task, decomposition);
         residency.start_task(id, input_bytes + output_bytes);

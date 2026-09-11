@@ -113,11 +113,10 @@ impl Workflow {
     /// Every array this workflow writes: the primary output first, then the
     /// side outputs its ops declare.
     ///
-    /// **Derived, not stored**, and for the reason `op` states about reach: one
-    /// structure, not two. A list on the `Workflow` beside a declaration on the
-    /// op is two places to say the same thing, and the one that is not walked by
-    /// the executor is the one that goes stale. Folding it off the chain means
-    /// an op cannot be added to execution and forgotten in the accounting.
+    /// **Derived, not stored**, and for the reason `op` states about reach: a
+    /// list on the `Workflow` beside a declaration on the op is two places to
+    /// say the same thing, and the one the executor does not walk is the one
+    /// that goes stale.
     ///
     /// The primary's shape is **image 0's**, which is the output's too unless a
     /// phase changes it; `Decomposition::output_volume` is the authority there,
@@ -239,13 +238,10 @@ pub struct Hints {
     /// caller that has said both things has contradicted itself and the
     /// conservative reading is the one that cannot lose data.
     ///
-    /// # It is worth having only because ownership was fixed first
-    ///
     /// Freeing image 0 gives bytes back only if the environment's copy is the
-    /// *only* copy. While a stage cloned its input into the environment, the
-    /// caller's own array was still live and freeing image 0 bought nothing.
-    /// A stage that takes its volume by value has given it away, and this is
-    /// then the only way those bytes ever come back.
+    /// *only* copy, so this is worth having only for a stage that takes its
+    /// volume by value: a stage that clones its input leaves the caller's array
+    /// live and frees nothing.
     pub release_images: BTreeSet<ImageId>,
     /// Whether a block may be cut into slabs and run on several threads, and by
     /// what rule. See [`SlabPolicy`].
@@ -265,12 +261,10 @@ pub struct Hints {
     /// common case and the case this feature must not touch. See
     /// [`SlabPolicy::slabs_for`].
     ///
-    /// **How a caller's [`Constraints::slab_policy`] reaches it.**
-    /// [`Strategy::plan`] copies it, because that is the one method that holds
-    /// the constraints and the hints at once. [`Strategy::run`] is handed a
-    /// decomposition and no constraints, so it gets whatever the strategy's own
-    /// [`Strategy::hints`] advises — the default. A caller who wants a run
-    /// switched off takes the plan, or overrides the field.
+    /// [`Strategy::plan`] is what copies a caller's
+    /// [`Constraints::slab_policy`] here; [`Strategy::run`] holds no
+    /// constraints and gets whatever the strategy's own [`Strategy::hints`]
+    /// advises.
     pub slab_policy: SlabPolicy,
 }
 
@@ -573,46 +567,28 @@ pub fn execute_phases(
     let iterative: Vec<bool> = work.iter().map(|entry| entry.is_iterative()).collect();
     let mut iterative_ready: Vec<usize> = vec![0; n_phases];
     let mut iterative_run: Vec<bool> = vec![false; n_phases];
-    // A **barrier** phase is held back by the same mechanism, and here it is
-    // holding the property up rather than merely tidying it away.
-    //
-    // **This is the only thing enforcing a barrier in this executor**, and that
-    // is said plainly because it briefly was not: while a barrier was
-    // `blocks x blocks` edges in the graph, the indegree above enforced it too,
-    // and a correctness property enforced in one place that reads as though it
-    // is enforced in two is worse than one honestly enforced once. The edges are
-    // gone (`TaskGraph::barriers` has the measurement that removed them) and the
-    // gate is here.
+    // A **barrier** phase is held back by the same mechanism, and this gate is
+    // **the only thing enforcing a barrier in this executor** — the
+    // `blocks x blocks` edges that once enforced it too are gone, and
+    // `TaskGraph::barriers` has the measurement that removed them.
     //
     // A barrier phase's own `deps` are the ordinary region-derived ones — its
     // blocks fetch their own cores — so they go to zero long before the phase
     // below has finished. The condition below is therefore **stated rather than
-    // derived**: every earlier phase's remaining count is zero. An earlier
-    // version released when every task of the phase had become ready, which is
-    // the same moment in any plan whose valid regions tile, but it arrived there
-    // through an invariant proved elsewhere instead of through the sentence the
-    // barrier is.
+    // derived**: every earlier phase's remaining count is zero.
     //
     // **Earlier phases and not only `p-1`, and the difference is unobservable.**
-    // A `FragmentInput` may name a stream written further back, so the sentence
-    // has to be true of that stream too — but in any plan that passed
-    // `Decomposition::check` the two conditions are the same moment, because
-    // every task has a non-empty valid region and those regions tile, so every
-    // task of phase `q` is a dependency of some task of `q+1` and all of `p-1`
-    // done implies all of `p-2` done. Mutating this to `p-1` alone was tried
-    // against a three-phase plan whose barrier reduces over phase 0's stream and
-    // **nothing failed**, which is the induction working rather than a hole in
-    // the test.
+    // A `FragmentInput` may name a stream written further back. In any plan that
+    // passed `Decomposition::check` the two conditions are the same moment,
+    // because every task has a non-empty valid region and those regions tile, so
+    // all of `p-1` done implies all of `p-2` done — mutating this to `p-1` alone
+    // was tried against a three-phase plan whose barrier reduces over phase 0's
+    // stream and **nothing failed**. It is written broadly anyway, at one
+    // comparison per phase per wave, so that the line says the property rather
+    // than depending on a proof in another file.
     //
-    // It is written broadly anyway, because the cost is one comparison per phase
-    // per wave and what it buys is that this line *says* the property instead of
-    // depending on a proof that lives in another file. If the tiling invariant
-    // is ever relaxed, this does not quietly become wrong.
-    //
-    // **This cannot deadlock**, on the argument already written above for an
-    // iterative phase and unchanged by this: a task of phase `p` waits only on
-    // earlier phases, so holding phase `p`'s tasks back blocks nothing that
-    // phase `p`'s tasks need.
+    // It cannot deadlock, on the argument written above for an iterative phase:
+    // a task of phase `p` waits only on earlier phases.
     let barrier: Vec<bool> = decomposition
         .phases
         .iter()
@@ -779,16 +755,13 @@ pub fn execute_phases(
                         // demand read serves every one of these anyway. So it
                         // is not allowed to fail the run.
                         //
-                        // **Image `phase` only, which is a stated limitation
-                        // rather than the whole story.** A phase reads its own
-                        // input image and, through a source leaf, whichever
-                        // images `PhaseDecomposition::source_images` lists. The
-                        // second set is not declared here. It is not an
-                        // oversight to fix silently: a source arm's regions are
-                        // that leaf's, not this phase's, so declaring them means
-                        // asking each leaf what it will read — worth doing, and
-                        // worth doing with a measurement rather than by
-                        // extending this loop with a guess.
+                        // **Image `phase` only, which is a stated limitation.**
+                        // The images a source leaf reads
+                        // (`PhaseDecomposition::source_images`) are not declared
+                        // here: a source arm's regions are that leaf's, not this
+                        // phase's, so declaring them means asking each leaf what
+                        // it will read — worth doing, with a measurement rather
+                        // than a guess.
                         if hints.prefetch_depth > 0 {
                             let regions: Vec<Region> = graph
                                 .tasks_in_phase(phase)
@@ -872,14 +845,11 @@ pub fn execute_phases(
             if phase_remaining[phase] == 0 {
                 // Every image whose **last** reader is this phase is now dead.
                 //
-                // This used to be the single image `phase` reads, on the
-                // argument that exactly one phase reads an image. A source leaf
-                // makes that a special case: an image read by a later phase has a
-                // second reader, and freeing it here would free something still
-                // wanted. `images_dead_after` is the general statement — an image
-                // dies after its last reader — and it answers `[phase]` for
-                // every plan with no source leaf, so this is the same behaviour
-                // stated in a way that stays true when there are two.
+                // The last reader rather than "the image `phase` reads": a
+                // source leaf gives an image a second reader further on, and
+                // freeing it here would free something still wanted.
+                // `images_dead_after` answers `[phase]` for every plan without
+                // one, so nothing else changes.
                 //
                 // The saving is the whole point of `Visibility`: without this an
                 // `N`-phase chain holds `N + 1` full images for the length of
@@ -1080,32 +1050,22 @@ pub fn execute_phases(
 /// shared between nodes, where each worker would otherwise reduce over its own
 /// fragments and answer plausibly and differently on every machine.
 ///
-/// In a single-node run that check is the *second* one on the same stream:
-/// `execute_phases` runs the same `check_fragment_coverage` on a fragment
-/// phase's outputs the moment that phase's last task completes, and every
-/// producer named here is an earlier phase, so it has already completed and
-/// already been checked. **That duplication is kept deliberately**, and what it
-/// costs is one extra listing per producing phase, returning one key per block.
+/// In a single-node run that check is the *second* one on the same stream —
+/// `execute_phases` already ran it when the producing phase's last task
+/// completed — and **the duplication is kept deliberately**, at one extra
+/// listing per producing phase returning one key per block. The check cannot
+/// simply move here: `execute_phases` checks *every* fragment phase, including
+/// those no barrier reduces over, and it checks at the phase that made the hole
+/// rather than at whatever runs next. Nor can it be conditionally skipped on a
+/// caller-supplied "already verified" set, which would turn a guard against a
+/// plausible wrong answer into something a caller switches off by getting one
+/// argument wrong, on the path where nothing else runs it at all.
 ///
-/// It is kept because the alternative is worse in the direction that matters.
-/// The check cannot simply move to `reduce_phase`: `execute_phases` checks
-/// *every* fragment phase, including those no barrier ever reduces over, and it
-/// checks at the phase that made the hole rather than at whatever runs next, so
-/// dropping it would let a doomed run keep going through the phases in between.
-/// And it cannot be *conditionally* skipped by handing this function a
-/// caller-supplied "already verified" set: that turns a guard against a
-/// plausible-wrong-answer into something a caller can switch off by getting one
-/// argument wrong, on the path — the distributed one — where nothing else runs
-/// it at all.
-///
-/// The cost is bounded by the thing the standing rule asks about. `blocks` is
-/// the multiplier a caller raises to make a stage fit in memory, and the extra
-/// listing is `O(blocks)` keys against a phase that irreducibly writes `blocks`
-/// fragments and reads at least `blocks` more — so the ratio is fixed and does
-/// not move when they cut more finely. `Stats::sidecar_listings` and
+/// The extra listing is `O(blocks)` keys against a phase that irreducibly
+/// writes `blocks` fragments and reads at least `blocks` more, so the ratio is
+/// fixed as a caller cuts more finely. `Stats::sidecar_listings` and
 /// `sidecar_keys_listed` report both figures, and `tests/fragment_stats.rs`
-/// pins the listing count against the block count so a change that made it grow
-/// would be caught rather than argued about.
+/// pins the listing count against the block count.
 ///
 /// Refuses a phase the plan does not mark as a barrier: without one there is no
 /// moment at which the fragment set is complete, so there is nothing well
@@ -1191,12 +1151,9 @@ pub fn reduce_phase(
         super::fragment::PhaseView::new(phase, &decomposition.phases[phase].grid, env, streams);
     let answer = op.reduce(&view)?;
     // **`SeamFold::Unordered` is checked here too, and for the same reason it is
-    // checked per block.** The claim is that the fold is a function of the *set*
-    // of fragments rather than of their order; the lattice is walked row-major,
-    // which is one order out of many, and two different lattices walk two
-    // different ones. An `f64` accumulation over three or more fragments answers
-    // differently and would make the phase's answer a property of how the volume
-    // was cut. Skipped for a one-block lattice, which has no order.
+    // checked per block** — see `run_fragment_task`. The lattice is walked
+    // row-major, which is one order out of many, and two different lattices walk
+    // two different ones. Skipped for a one-block lattice, which has no order.
     //
     // It is *not* what makes two nodes agree — they walk the same lattice, so
     // they see the same order and agree for any deterministic op, associative or
@@ -1435,15 +1392,11 @@ pub fn execute_task_of(
 /// measured that row at 4.6-5.4x, and §13.7 is the note that this was the last
 /// place it had not reached.
 ///
-/// **What the parameter costs, since this is a public entry point.** One call
-/// site in this crate — `distributed::worker` — and a compile error naming the
-/// line for anybody outside it, where `1` is the answer that keeps their
-/// behaviour identical. It is a parameter rather than a fourth entry point
-/// because this function is called *for a real run* and never as a convenience,
-/// which is this crate's own test for when exhaustiveness is worth paying:
-/// somebody has to decide how many threads a node spends on one block, and that
-/// is exactly the decision that should not be inheritable from a default. The
-/// two wrappers above are the convenience layer and keep their arity.
+/// **A parameter rather than a fourth entry point**, because this function is
+/// called for a real run and never as a convenience: somebody has to decide how
+/// many threads a node spends on one block, and that decision should not be
+/// inheritable from a default. The two wrappers above are the convenience layer
+/// and keep their arity, where `1` is the answer that changes nothing.
 ///
 /// **It cannot disturb a hoisted reduction, and that is structural rather than
 /// careful.** [`reduce_phase`] is computed by the caller before this is entered
@@ -1523,8 +1476,7 @@ fn run_task(
         )));
     }
     let phase = &decomposition.phases[task.phase];
-    // Two regions, in two coordinate spaces, and which is which is the whole
-    // content of the change that introduced `source`: `fetch` is asked of image
+    // Two regions, in two coordinate spaces: `fetch` is asked of image
     // `task.phase` and is in that image's space; `read` is this phase's own read
     // extent, is what `valid` was derived from, and is the space the output goes
     // back in. They are the same region for every phase whose output grid is its
@@ -1535,19 +1487,9 @@ fn run_task(
     // read extent the plan derived. Those two must agree, because
     // `valid_within_read` slices the result at offsets measured in `read`.
     //
-    // This used to be a flat refusal of any plan where `fetch.shape !=
-    // read.shape`: `BlockOp::apply` wrote an output the shape of its input, so a
-    // cross-grid fetch could translate but never resize. `output_shape` is what
-    // closed it — an op *declares* what it produces, so a decimating or
-    // upsampling phase is now a plan that either checks or is told exactly which
-    // two extents disagree. For every phase whose ops keep their extent this
-    // reduces to the old comparison, unchanged.
-    // Where this block sits in **every** space the phase touches, which is two
-    // regions the executor has had all along and passed one of: `fetch` is in
-    // the image that was read, `read` is in the image being written. They are
-    // the same region in the same volume for every phase whose output grid is
-    // its input grid, which is why one anchor sufficed until a lattice phase
-    // needed both. See `op::Placement`.
+    // Where this block sits in **every** space the phase touches: `fetch` is in
+    // the image that was read, `read` is in the image being written. One anchor
+    // sufficed until a lattice phase needed both. See `op::Placement`.
     //
     // The buffer holds `fetch`, so that is where the ops read from, and the
     // volume is the one `fetch` is a region of — the image that was read. An op
@@ -2556,10 +2498,9 @@ fn run_iterative_reduce_phase(
 /// three incompatible shapes; it took the executor's `BlockBuf`, which is not
 /// what a consumer holds; and it answered `None` for mismatched extents, which
 /// the one call site turned into **zero** with `unwrap_or(0)`. Ten of the
-/// thirteen copies used a bare `zip`, which truncates — so two volumes of
-/// *different* extents were reported as differing in a small number of voxels,
-/// and in a parity suite that is the failure reading as a pass. A count that
-/// cannot fail is a check that cannot fail.
+/// thirteen copies used a bare `zip`, which truncates, so two volumes of
+/// *different* extents were reported as differing in a few voxels — in a parity
+/// suite, the failure reading as a pass.
 ///
 /// So the extent and element-type mismatches are **refused by name** rather than
 /// folded into an absence. The one thing that is legitimately absent — a
@@ -3078,40 +3019,16 @@ impl Strategy for Trivial {
 ///   faster for it. Read volume alone cannot see that: it is the same number at
 ///   every edge, and the tie-break then takes the largest.
 ///
-/// So the objective is the phase's predicted **wall clock**, and it is
-/// [`phase_makespan`] — the larger of the two lower bounds a phase has:
-///
-/// ```text
-/// makespan(phase) = max( cost_per_block x ceil(n / workers) ,  read x read_cost + core x write )
-///                        \------------ the pool -----------/    \--------- the channel -------/
-/// ```
-///
-/// summed over phases, which are sequential because a phase boundary is a
-/// materialisation.
-///
-/// The **pool** bound's `ceil` is not a fudge: the blocks of one phase depend
-/// only on the phase before, so they are independent and identically priced, and
-/// `ceil(n / P)` is the exact makespan of `n` identical independent tasks on `P`
-/// processors. It is honest about the quantisation too — 41 blocks on 40 workers
-/// costs two rounds, and a search told so will not propose it.
-///
-/// The **channel** bound is there because the pool bound divides *everything* by
-/// the pool, reads included, and workers do not multiply bandwidth. Without it
-/// the search buys parallelism with read amplification — see [`phase_makespan`],
-/// which records what that cost when it was measured. It is what makes the
-/// search take the cut where it is free and refuse it where it is paid for in
-/// traffic.
-///
-/// `workers` is [`Enumerating::concurrency`], the same number
-/// [`Strategy::hints`] hands the executor. Nothing new is configured, and no
-/// coefficient is invented: both bounds are built from
+/// So the objective is the phase's predicted **wall clock** — [`phase_makespan`],
+/// the larger of a pool bound and a channel bound — summed over phases, which
+/// are sequential because a phase boundary is a materialisation. `workers` is
+/// [`Enumerating::concurrency`], the same number [`Strategy::hints`] hands the
+/// executor; no coefficient is invented, and both bounds are built from
 /// [`CostModel`](crate::decomposition::CostModel) as it already is.
 ///
-/// **At `concurrency == 1` this is the old objective exactly** — `ceil(n / 1)`
-/// is `n`, the pool bound is then the channel bound plus the compute and the
-/// conflict so the `max` returns it, the expression is the one that was there,
-/// and the `f64` is bit-identical. That is deliberate twice over: no plan built
-/// before this moves, and the old objective stays reachable as the **negative
+/// **At `concurrency == 1` this is the old objective exactly**, bit for bit —
+/// see [`phase_makespan`]. That is deliberate twice over: no plan built before
+/// this moves, and the old objective stays reachable as the **negative
 /// control**, a search that cannot see task count, takes one block everywhere,
 /// and looks optimal on read volume while running on one thread.
 ///
@@ -3295,13 +3212,11 @@ impl Default for Enumerating {
 /// infeasibility is absorbing in this direction, because the working set only
 /// grows and a mandate or space conflict cannot be undone by adding a member.
 /// A budget that forces a *smaller* edge raises the *work* total too, since the
-/// read is `volume x prod((B + lo + hi) / B)` and that falls with `B` — though
-/// under the makespan objective a smaller edge may still be cheaper, because it
-/// buys rounds; that is a statement about which grid is chosen and not about the
-/// monotonicity of the price at a fixed grid, which is what this paragraph is
-/// establishing. And the concern
-/// that a wider group swallows a phase boundary and its write does **not**
-/// apply: `is_materialised` is `i < n`, so for a fixed `i` it is the same for
+/// read is `volume x prod((B + lo + hi) / B)` and that falls with `B`. (Under
+/// the makespan objective a smaller edge may still be cheaper because it buys
+/// rounds — that is about which grid is chosen, not about the price at a fixed
+/// one.) And the concern that a wider group swallows a phase boundary and its
+/// write does **not** apply: `is_materialised` is `i < n`, so for a fixed `i` it is the same for
 /// every `j`, and the saved boundary is priced in `best[j]`, outside this term.
 ///
 /// An exact prune is therefore still available — it has to restart its bound
@@ -3895,9 +3810,7 @@ struct PhasePricer<'a> {
     /// eight bytes a voxel, so every term built on the byte count — the working
     /// set the budget tests, the traffic the roofline's channel bound is made of
     /// — was wrong by the ratio of the two types, which for `f64` to `bool` is
-    /// **eight**. `Materialising` already folded it and its own comment names
-    /// the defect; `Decomposition::predicted_cost` already reads it back with
-    /// `dtype_at`. The search was the last place still holding one number.
+    /// **eight**.
     ///
     /// Indexed by the run's **first** slot, because that is the image the phase
     /// reads and therefore the traversal every term here is stated over. What it
@@ -3938,13 +3851,6 @@ impl PhasePricer<'_> {
             Ok(found) => found,
             Err(err) => return (GroupPrice::Refused(Some(err.to_string())), tally),
         };
-        // The compute figure is re-asked per candidate rather than taken from
-        // the fold, because an op may declare a term whose denominator is a
-        // block extent — see `decomposition::compute_per_voxel`. For every op
-        // that does not, this is the same number by the same route.
-        // Priced at the halo the grid would be *granted*, which is the reach
-        // everywhere except under a mandate — see `price_phase` for why the
-        // difference is not a rounding one.
         // One traversal per array the run reads: its own input image plus every
         // distinct image a `Chain::Source` leaf in it names. See
         // `images_read_by`.
@@ -4030,14 +3936,10 @@ impl PhasePricer<'_> {
                 ) else {
                     continue;
                 };
-                // **The objective** is `phase_total`, from `phase_price` above.
-                // Not `cost_per_block * n_blocks`, which is the phase's serial
-                // *work* and falls monotonically as the block grows — under it
-                // this loop always answers "the largest candidate" and the
-                // per-phase freedom is freedom on paper. It is the phase's
-                // predicted *wall clock*: the same per-block cost over
-                // `ceil(n_blocks / workers)` rounds. At `workers == 1` the two
-                // are the same expression and the same bits.
+                // **The objective** is `phase_total`, from `phase_price` above:
+                // the phase's predicted wall clock rather than its serial work.
+                // See `Enumerating` for why the difference is what makes this
+                // loop a choice at all.
                 // deterministic: lower cost, then the larger block edge
                 let better = match &chosen {
                     None => true,
@@ -4872,14 +4774,13 @@ impl Strategy for Materialising {
         // `Decomposition::declare_dtypes` folds it and as
         // `decomposition::predicted_cost` reads it back with `dtype_at`.
         //
-        // `Greedy` and `Enumerating` both hand `workflow.dtype` to every phase,
-        // which prices a chain that binarizes halfway through as if the second
-        // half still moved 8 bytes a voxel. That is one of the mispricings this
-        // strategy exists to expose, and it is fixed *here* rather than in
-        // `price_phase` because it is an argument a planner chooses, not
-        // arithmetic the pricer does. One phase per slot is also where it bites
-        // hardest: every dtype change is a phase boundary, so there is no fusion
-        // hiding the discrepancy.
+        // `Greedy` still hands `workflow.dtype` to every phase, which prices a
+        // chain that binarizes halfway through as if the second half still moved
+        // 8 bytes a voxel. That is one of the mispricings this strategy exists to
+        // expose, and it is fixed *here* rather than in `price_phase` because it
+        // is an argument a planner chooses, not arithmetic the pricer does. One
+        // phase per slot is where it bites hardest: every dtype change is a phase
+        // boundary, so there is no fusion hiding the discrepancy.
         //
         // It moves no voxel — `bytes` reaches only `working_set_bytes_per_block`,
         // which is a budget test.

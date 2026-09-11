@@ -59,9 +59,10 @@
 // `by_rule` below is the whole of the imported knowledge, and it is a dozen
 // lines.
 //
-// What that comparison found, on a `9 x 7 x 6` volume, over box elements of
-// 27, 25, 64, 24 and 125 voxels and the nine fractions swept below, with the
-// values all distinct so that no agreement could come from a tie:
+// What that comparison found, on a `9 x 7 x 6` volume, over the five elements
+// and nine fractions swept below — boxes of 27, 25, 64 and 24 voxels and an
+// inscribed `5x5x5` ellipsoid of 81 — with the values all distinct so that no
+// agreement could come from a tie:
 //
 // * `Rank::CeilingPercentile` matched the reference's **percentile** filter at
 //   every voxel of all 45 combinations — 0 disagreements out of 378 each.
@@ -243,9 +244,11 @@ fn the_ceiling_percentile_is_the_reference_histogram_walk() {
 
 // ---------------------------------- 2. the two conventions, side by side --
 
-/// **They agree at `p = 0.5` over an odd surviving population and nowhere
-/// else** — asserted as both halves, so the equivalence is pinned and so is the
-/// divergence.
+/// **At `p = 0.5` they agree exactly when the surviving population is odd, and
+/// differ by one when it is even** — asserted as both halves, so the
+/// equivalence is pinned and so is the divergence. At other fractions the two
+/// can still coincide by arithmetic accident;
+/// `the_frozen_indices_of_both_conventions` records where.
 ///
 /// Stated on the resolved indices rather than on filtered volumes, because that
 /// is where the difference lives: two indices that differ can still select the

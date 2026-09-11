@@ -903,7 +903,8 @@ impl Reach {
         self.axes.iter().all(AxisReach::is_none)
     }
 
-    /// Whether any axis says something the old triple could not.
+    /// Whether this reach is exactly the symmetric triple this crate used to
+    /// carry, saying nothing the old form could not.
     pub fn is_degenerate(&self) -> bool {
         self.as_symmetric().is_some()
     }
@@ -1327,9 +1328,8 @@ mod tests {
                 AxisReach::All,
                 AxisReach::none(),
             ]),
-            // Added when the variant was: a hand-enumerated case list is
-            // exactly the assertion a new variant slips past, and this one
-            // would have — see the dedicated test below for what it slips into.
+            // A hand-enumerated case list is exactly what a new variant slips
+            // past; see the dedicated test below for what this one slips into.
             Reach::per_axis([
                 AxisReach::aligned(32, 4, 4),
                 AxisReach::aligned(3, 0, 2),
@@ -1346,13 +1346,9 @@ mod tests {
         }
     }
 
-    /// **An aligned reach must not come back off the wire as a bounded one**,
-    /// and the shape of `from_json` is why this needs saying: its last arm
-    /// accepts *any* object and reads `lo`/`hi` out of it, so an aligned reach
-    /// whose `stride` key were not handled first would round-trip into a
-    /// `Bounded` carrying the **aligned** sides with the stride dropped — a halo
-    /// narrower than the op needs, on a lattice nothing would then check, in
-    /// another process.
+    /// **An aligned reach must not come back off the wire as a bounded one** —
+    /// see the note on the `stride` arm of `AxisReach::from_json` for the
+    /// narrower halo that would otherwise decode.
     #[test]
     fn an_aligned_reach_does_not_come_back_as_the_halo_it_would_have_on_a_good_lattice() {
         let aligned = AxisReach::aligned(32, 4, 4);
@@ -1397,15 +1393,10 @@ mod tests {
         assert_eq!(aligned.bound(1024), (35, 35));
         assert_eq!(aligned.at(7, 1024), (35, 35));
         assert_eq!(aligned.widest(1024), 35);
-        // **Inverted, not deleted.** This block used to assert that a fold
-        // flattens — `aligned.add(&Bounded { lo: 1, hi: 1 })` was
-        // `Bounded { lo: 36, hi: 36 }` and `aligned.add(&aligned)` was
-        // `Bounded { lo: 70, hi: 70 }` — on the argument that two ops may state
-        // two strides. That was true of the second case and wrong about the
-        // first, and the first is the common one: fusing a transform
-        // convolution with a voxelwise map that reaches nothing lost the whole
-        // discount, **27 blocks against one on `96^3`**. A fold now carries
-        // both answers.
+        // A fold carries both answers rather than flattening: flattening lost
+        // the whole discount to the most ordinary fusion there is — a transform
+        // convolution with a voxelwise map that reaches nothing, **27 blocks
+        // against one on `96^3`**.
         let other = AxisReach::Bounded { lo: 1, hi: 1 };
         assert_eq!(aligned.add(&other), AxisReach::aligned(32, 5, 5));
         assert_eq!(aligned.max(&other), AxisReach::aligned(32, 4, 4));

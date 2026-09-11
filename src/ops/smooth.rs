@@ -13,15 +13,9 @@
 // and they are what this file calls — there is no second convolution here and
 // no second kernel builder. What was missing was the ability for a *caller* to
 // ask for a smoothing, because the only shell over that kernel computed a ridge
-// response with it and threw the smoothed field away.
-//
-// So this file is almost entirely a shell, and that is the point rather than an
-// apology for it. `mod.rs` describes the shape every op here has — a free
-// function generic over the element type, and a thin `BlockOp` that adapts a
-// tagged buffer to it — and the claim that shape makes is that a second caller
-// of the same kernel costs a shell. This is the first time that claim has been
-// tested by an op that wanted a kernel someone else had already written, and it
-// came to about eighty lines with no change to the kernel at all.
+// response with it and threw the smoothed field away. So this file is almost
+// entirely a shell, in the shape `mod.rs` describes: a free function generic
+// over the element type, and a thin `BlockOp` that adapts a tagged buffer to it.
 //
 // The reach, and the one voxel that is *not* here
 // -----------------------------------------------
@@ -32,11 +26,9 @@
 // `gaussian_radius + 1`, and the `+ 1` is its second-difference stencil: the
 // answer at `v` needs the smoothed field at `v ± 1`, and the smoothed field at
 // `u` needs the input within a radius of `u`, so the two compose by addition.
-// A smoothing has no stencil on top of the convolution, so it has no `+ 1`. The
-// temptation to copy the neighbour's formula is exactly the kind of thing that
-// makes a reach a number someone wrote down rather than a number that follows,
-// and the difference between the two ops is one voxel — the smallest possible
-// overstatement, and one that would cost real fetches at every block.
+// A smoothing has no stencil on top of the convolution, so it has no `+ 1`, and
+// copying the neighbour's formula would overstate the reach by one voxel on
+// every axis — real fetches at every block.
 //
 // It is *tight*. The outermost tap of the truncated Gaussian has a non-zero
 // weight, so the answer at `v` genuinely depends on the input at `v ± radius`,
@@ -51,11 +43,10 @@
 // choice existed, so a caller who does not care is untouched down to the last
 // bit.
 //
-// Two things about it are worth having in the preamble rather than only at the
-// method. It **changes no reach**: whichever convention resolves a tap, the
-// position it lands on is inside `[v - r, v + r]`, because a reflection folds an
-// offset that left the array back towards the edge it left by. And it is a rule
-// about the **array's own edge**, which under decomposition is the volume's face
+// It **changes no reach**: whichever convention resolves a tap, the position it
+// lands on is inside `[v - r, v + r]`, because a reflection folds an offset that
+// left the array back towards the edge it left by. And it is a rule about the
+// **array's own edge**, which under decomposition is the volume's face
 // where the volume has one and is otherwise an interior position the halo keeps
 // every core voxel's taps away from — so a decomposed run reflects about the
 // volume and not about the block, which is the property the acceptance suite
@@ -75,8 +66,8 @@
 // which is one op, is visible in the chain, and puts the rounding rule where a
 // reader can see which one was chosen.
 //
-// The constant it declares, and the three it does not
-// ---------------------------------------------------
+// The one constant it declares
+// -----------------------------
 // Only zero. The weights are normalised to sum to one, but that normalisation is
 // a division in binary floating point and their sum is not exactly `1.0`; even
 // where it were, `sum(w_i * c)` accumulated in some order is not `c`. So a block
@@ -145,10 +136,7 @@ impl Gaussian {
     /// tap `[1.0]`, the reach is zero, and the cost falls accordingly, so
     /// nothing downstream needs to know it is a special case.
     ///
-    /// This is deliberately the same meaning `StructuringElement::from_radius`
-    /// has always given a zero radius. The two disagreed until a caller wanted a
-    /// blur flat on one axis and found it could not be constructed, which is the
-    /// kind of inconsistency that costs an entire feature rather than a line.
+    /// The same meaning `StructuringElement::from_radius` gives a zero radius.
     pub fn new(sigma: [f64; 3], truncate: f64) -> Result<Self> {
         for axis in 0..3 {
             ensure!(
@@ -196,16 +184,13 @@ impl Gaussian {
 
     /// State how the convolution resolves the array's own edge.
     ///
-    /// **A builder rather than a third argument to [`Self::new`]**, and that is
-    /// the whole of why this is additive: the convention has a default that was
-    /// the only behaviour before it was a choice, so every caller that does not
-    /// care keeps its call, its answer and its last bit, and the one that does
-    /// care says one thing more.
+    /// **A builder rather than a third argument to [`Self::new`]**: the default
+    /// is the only behaviour there was before this was a choice, so a caller
+    /// that does not care keeps its call, its answer and its last bit.
     ///
     /// It changes no kernel, no radius and no [`Self::reach`] — see
-    /// [`Boundary`], and the test that checks the claim rather than repeating
-    /// it. The taps are the same taps; what changes is which sample a tap that
-    /// left the array reads.
+    /// [`Boundary`]. The taps are the same taps; what changes is which sample a
+    /// tap that left the array reads.
     pub fn with_boundary(mut self, boundary: Boundary) -> Self {
         self.boundary = boundary;
         self
@@ -235,9 +220,8 @@ impl Gaussian {
     }
 
     /// How many multiply-adds one voxel costs: the **sum** of the three kernel
-    /// lengths, because the convolution is separable. Not their product, which
-    /// is what a cost model that had not noticed the separability would charge —
-    /// at radius 4 the two differ by a factor of 27.
+    /// lengths, because the convolution is separable — not their product. See
+    /// this file's preamble for what the difference is worth.
     pub fn taps(&self) -> usize {
         self.kernels[0].len() + self.kernels[1].len() + self.kernels[2].len()
     }
@@ -349,7 +333,7 @@ impl BlockOp for SmoothOp {
 ///
 /// Per **tap**, and a tap is one multiply-add of the separable convolution. The
 /// op charges `taps()`, which is the sum of the three kernel lengths.
-pub(super) fn cost_for(gaussian: &Gaussian) -> f64 {
+pub(crate) fn cost_for(gaussian: &Gaussian) -> f64 {
     SMOOTH_COST_PER_TAP * gaussian.taps() as f64
 }
 
@@ -854,12 +838,9 @@ mod tests {
     /// A sigma of zero on an axis is the identity **on that axis**: the kernel is
     /// one tap, the reach is zero, and the volume is blurred plane by plane.
     ///
-    /// This is the case that could not be constructed at all until a caller
-    /// needed it, while a zero *radius* had always been accepted for a
-    /// structuring element. The test asserts the three things that make it a
-    /// real feature rather than a relaxed check: the reach really is zero on
-    /// that axis, planes really do not mix, and within a plane the answer is
-    /// exactly the two-dimensional blur.
+    /// The three things asserted are what make it a feature rather than a
+    /// relaxed check: the reach really is zero on that axis, planes really do
+    /// not mix, and within a plane the answer is exactly the 2-D blur.
     #[test]
     fn a_zero_sigma_is_the_identity_on_that_axis_and_blurs_the_others() {
         let flat = Gaussian::new([1.0, 1.0, 0.0], 3.0).unwrap();

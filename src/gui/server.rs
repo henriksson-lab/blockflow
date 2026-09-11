@@ -15,18 +15,14 @@
 // which four JSON endpoints and a static directory need. That argument is
 // unchanged and it is why this is a blocking server on ordinary threads.
 //
-// What *has* changed is which blocking server. This module used to be
-// `tiny_http`'s, and it is [`crate::http`]'s because of a measurement rather
-// than a preference: that crate's pool grows a thread only when it observes
-// none waiting, and its connection task never returns while the connection
-// lives, so connections arriving together queue behind tasks that never finish
-// and are read only when some *other* connection closes.
-//
-// **The progress view was believed too small for that to matter and it is
-// not.** The pool's floor is four threads, and a browser holding a page of
-// three files and two poll intervals goes past four without trying. Measured
-// here, bursts of simultaneous keep-alive connections held open, 20 bursts per
-// row:
+// It is [`crate::http`]'s rather than `tiny_http`'s because of a measurement:
+// that crate's pool grows a thread only when it observes none waiting, and its
+// connection task never returns while the connection lives, so connections
+// arriving together queue behind tasks that never finish and are read only when
+// some *other* connection closes. The pool's floor is four threads, and a
+// browser holding a page of three files and two poll intervals goes past four
+// without trying. Measured here, bursts of simultaneous keep-alive connections
+// held open, 20 bursts per row:
 //
 // | connections | bursts leaving someone never answered |
 // |---|---|
@@ -44,11 +40,9 @@
 //
 // [`crate::http`] takes a thread per connection **at accept**, which is the
 // simplest dispatch that cannot queue a connection behind a task that never
-// finishes, and its header records the two repairs that failed before it.
-//
-// There is therefore no thread count to set here any more: there was one, it
-// defaulted to two, and two threads answering polls is exactly the shape that
-// could not be made safe.
+// finishes, and its header records the two repairs that failed before it. There
+// is therefore no thread count to set here: a fixed pool answering polls is
+// exactly the shape that could not be made safe.
 //
 // The bind default, which is the one thing here with consequences
 // ---------------------------------------------------------------

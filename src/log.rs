@@ -26,9 +26,8 @@
 //
 // So: **log for scheduling at scale, arrays for geometry at small scale.**
 //
-// The cost accumulation here is what feeds back into validating the cost model.
-// A plan predicting N reads against an execution performing 3N is a planner bug
-// the log shows and output equality never would.
+// The cost accumulation here is what feeds back into validating the cost model;
+// see [`Stats::reads`] for what that buys.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -39,8 +38,8 @@ use crate::region::Region;
 
 /// One thing the executor did.
 ///
-/// Three layers, deliberately kept as one enum
-/// -------------------------------------------
+/// Layers, deliberately kept as one enum
+/// -------------------------------------
 /// * **scheduling** — `PhaseStarted`, `TaskAdmitted`. What the scheduler chose,
 ///   before any work happened.
 /// * **op** — `BlockRead`, `OpApplied`, `BlockShortCircuited`, `BlockWritten`.
@@ -48,9 +47,13 @@ use crate::region::Region;
 /// * **IO** — `RegionRead`, `RegionWritten`, `Materialised`. Bytes moved, and
 ///   how long moving them took.
 ///
-/// One enum rather than three streams because the statistics store wants all of
-/// it and merging three ingestion paths after the fact is worse than one enum
-/// with a `match`. See `EventListener` for what a consumer may and may not do.
+/// The sidecar, cache and prefetch layers follow further down the enum, each
+/// with its own note on why it belongs here and what its granularity is.
+///
+/// One enum rather than one stream per layer because the statistics store wants
+/// all of it and merging several ingestion paths after the fact is worse than
+/// one enum with a `match`. See `EventListener` for what a consumer may and may
+/// not do.
 ///
 /// **Granularity of the IO variants.** One event per *caller-level* call — one
 /// `RegionRead` per `Environment::read`, not one per chunk. A block spans many

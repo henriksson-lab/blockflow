@@ -8,41 +8,34 @@
 // What is asserted, and why each one is here
 // ------------------------------------------
 // 1. **The rule is the published one, on bits.** Two structured fixtures are
-//    pinned voxel by voxel and eleven more by count and digest, against outputs
-//    obtained from an independent implementation of the same published
-//    algorithm. This is the only property in the file that cannot be checked
-//    from inside the crate — every other one is a property of *this* code, and
-//    a wrong rule would satisfy all of them.
-// 2. **The order of the twelve orientations is part of the answer.** Swapping a
-//    quarter turn for a three-quarter turn about one axis leaves the *set* of
-//    twelve rotations unchanged and reorders it, and the result is still a
-//    connected, topology-preserving, one-voxel-wide curve skeleton — just a
-//    different one, displaced by about a voxel. Nothing but a direct comparison
-//    catches it, so there is a direct comparison.
+//    pinned voxel by voxel and eleven more by count and digest, against an
+//    independent implementation of the same published algorithm. This is the
+//    only property in the file that cannot be checked from inside the crate —
+//    a wrong rule would satisfy every other one.
+// 2. **The order of the twelve orientations is part of the answer.** Reordering
+//    them leaves the *set* of rotations unchanged and still yields a connected,
+//    topology-preserving, one-voxel-wide skeleton — just a different one.
+//    Nothing but a direct comparison catches it.
 // 3. **The border set is stale within a pass, deliberately.** Recomputing it
 //    between sub-iterations is a one-line "fix" that produces a different
-//    algorithm and a plausible answer; the test builds the fixed version and
-//    measures how far it drifts.
-// 4. **Decomposition invariance at the declared halo, and failure below it.** A
-//    generous halo that works proves less than a pair: byte-identity at the
-//    declared reach across block sizes and split axes, *and* a short halo that
-//    is caught by the guard, *and* an understated reach that tiles perfectly and
-//    is wrong. The last is what makes the declaration a claim.
+//    algorithm and a plausible answer.
+// 4. **Decomposition invariance at the declared halo, and failure below it.**
+//    Byte-identity at the declared reach across block sizes and split axes, a
+//    short halo caught by the guard, and an understated reach that tiles
+//    perfectly and is wrong. The last is what makes the declaration a claim.
 // 5. **Topology is preserved and the result is one voxel wide.** Measured by a
-//    route that knows nothing about the templates: all three Betti numbers
-//    before and against after, and a thickness test that looks for a full 2x2
-//    square or 2x2x2 cube anywhere in the answer.
+//    route that knows nothing about the templates.
 //
 // What is *not* asserted, and why
 // -------------------------------
-// Thickness is asserted on the fixtures whose topology permits it. A volume of
-// dense random noise has thousands of tunnels and hundreds of cavities that this
-// rule may not destroy, and preserving them **forces** thick residue: a cavity
+// Thickness is asserted only on the fixtures whose topology permits it. Dense
+// random noise has thousands of tunnels and hundreds of cavities that this rule
+// may not destroy, and preserving them **forces** thick residue: a cavity
 // bounded by a one-voxel sheet cannot be thinned to a curve without opening it.
-// Those fixtures are still compared on bits and still checked for topology; they
-// are excluded from the thickness assertion, and the exclusion is measured
-// rather than assumed — `dense_noise_is_topologically_stuck_and_says_so` shows
-// the residue and shows the reason for it.
+// Those fixtures are still compared on bits and still checked for topology, and
+// the exclusion is measured rather than assumed —
+// `dense_noise_is_topologically_stuck_and_says_so` shows the residue and the
+// reason for it.
 
 use ndarray::Array3;
 

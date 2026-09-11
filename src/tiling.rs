@@ -12,10 +12,6 @@
 // computed from an untrustworthy neighbourhood and no voxel was left unwritten.
 // If they do not, the run is wrong — and this is the one place that says so.
 //
-// So this predicate is load-bearing in a way most of the crate is not. It is
-// worth more than its twenty lines suggest, and it is worth stating precisely
-// what it decides.
-//
 // What it decides, and why that is enough
 // ---------------------------------------
 // > For axis-aligned boxes that all lie **inside** `shape`: pairwise disjoint,
@@ -39,16 +35,11 @@
 // counter, which is `O(voxels)` in both time *and* space and would need a
 // second copy of the volume to run at all. So this stays geometric.
 //
-// The first geometric implementation compared every pair, `O(n² · ndim)` in the
-// block count, with a header claiming "still milliseconds" at full scale. That
-// claim was wrong by three orders of magnitude and it was this predicate, not
-// the planner, that made `PlanBuilder::finish` the whole cost of closing a
-// plan: `finish` over a two-phase plan measured `445 ms` at `8192` blocks and
-// `31.7 ms` at `2048`, a clean `4x` per doubling; the same scan over one
-// phase's blocks at `56160` — the density a fine candidate grid asks for —
-// takes `13.3 s`, so a two-phase plan closed in half a minute. A block-size
-// search that pays that to price a candidate it will reject is a search nobody
-// leaves on.
+// A pairwise scan is `O(n² · ndim)` in the block count, and at the densities a
+// fine candidate grid asks for it was this predicate, not the planner, that made
+// `PlanBuilder::finish` the whole cost of closing a plan — half a minute for a
+// two-phase plan; see the table below. A block-size search that pays that to
+// price a candidate it will reject is a search nobody leaves on.
 //
 // So disjointness is now decided by **separation** rather than by comparison,
 // and the pairwise scan survives only as the thing that *names* the offending

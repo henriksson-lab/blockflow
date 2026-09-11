@@ -15,8 +15,8 @@
 //    substitute written here assigns 6/26/12 and an earlier port of this op
 //    assigned 25/9/13. Written first, because "a priority flood that looks
 //    right" is the failure mode of this op and it passes every other test in
-//    this file; the substitute is implemented rather than described, so the
-//    fixture is *shown* to be decisive rather than claimed to be.
+//    this file. The substitute is implemented rather than described, so the
+//    fixture is *shown* to be decisive.
 // 2. **Tie-breaking is the whole difficulty, and it is reproduced.** Priority is
 //    `(cost, age)`; `age` is one global counter; ties on both keys fall to the
 //    queue array's layout. Asserted three ways — a flat cost volume where
@@ -110,8 +110,7 @@ fn tie_heavy(shape: [usize; 3], modulus: usize) -> Array3<f64> {
 /// and the separating line carved by clearing an already-labelled neighbour.
 ///
 /// Every one of those four is a defensible reading of "seeded watershed" and the
-/// result is a different partition. This exists so that the fixture below is
-/// *shown* to separate the two rather than asserted to.
+/// result is a different partition.
 fn a_plausible_priority_flood(
     cost: &Array3<f64>,
     seeds: &Array3<u32>,
@@ -618,10 +617,9 @@ fn blocked_by_hand(
 }
 
 /// **The proof, not the argument.** The planner will not offer a blocked plan
-/// for this op, so one is run by hand and the voxels that move are counted.
-/// Reported at several block sizes and several halos, because "it differs" is
-/// worth much less than "it differs by this much and a wider halo does not fix
-/// it".
+/// for this op, so one is run by hand and the voxels that move are counted, at
+/// several block sizes and several halos — "it differs by this much and a wider
+/// halo does not fix it" is worth far more than "it differs".
 #[test]
 fn a_blocked_run_is_not_the_whole_volume_answer() {
     let shape = [32usize, 32, 24];
@@ -735,14 +733,14 @@ fn objects_that_touch_nothing(labels: &Array3<u32>) -> BTreeSet<u32> {
 ///
 /// A clean scene has a hard edge and a zero background, so `intensity > 0` is
 /// exactly the ground-truth label support and the cost *inside* an object is
-/// flat — which means the flood within an object is decided by tie-breaking
-/// alone, and any drift in the queue would show up here as a size that is off by
-/// a few voxels rather than as a plausible-looking blob.
+/// flat — so the flood within an object is decided by tie-breaking alone, and
+/// any drift in the queue shows up here as a size off by a few voxels rather
+/// than as a plausible-looking blob.
 ///
-/// For an object that touches no other, the answer is not approximately right,
-/// it is exactly `ObjectRecord::voxels`. Objects are placed at random and some
-/// of them do touch; those are the subject of the next test, and mixing the two
-/// would turn an exact claim into a tolerance.
+/// For an object that touches no other the answer is exactly
+/// `ObjectRecord::voxels`. Objects are placed at random and some do touch; those
+/// are the subject of the next test, and mixing the two would turn an exact
+/// claim into a tolerance.
 #[test]
 fn every_basin_is_exactly_its_object_when_objects_do_not_touch() {
     let scene = Scene::new(
@@ -938,12 +936,10 @@ fn on_touching_objects_the_partition_is_measured_against_ground_truth() {
 
 /// The module states 17 B/voxel of dense arrays plus 32 B per queued item, and
 /// bounds the queue at six pushes per masked voxel. The bound is arithmetic; the
-/// *peak* is not knowable without running, so it is measured — and the measured
-/// figure is the interesting one, because on a densely masked volume the queue
-/// is **larger than every dense array put together** and on a sparse one it
-/// rounds to nothing. That is the whole of why the mask matters to a memory
-/// budget, and the numbers this prints are the ones the module's table is built
-/// from.
+/// *peak* is not knowable without running, so it is measured — and on a densely
+/// masked volume the queue is **larger than every dense array put together**
+/// while on a sparse one it rounds to nothing. That is why the mask matters to a
+/// memory budget, and these are the numbers the module's table is built from.
 #[test]
 fn the_queue_is_a_front_not_a_history() {
     let shape = [48usize, 48, 32];

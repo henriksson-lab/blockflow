@@ -774,10 +774,6 @@ fn separable_mean(radius: [usize; 3]) -> Result<Chain> {
 /// [`FeatureStack::with_exact_deviation`] turns it off, in one call, for a
 /// caller who knows their data is in that corner — which is a choice on record
 /// rather than a precision quietly given up.
-///
-/// The result is clamped at zero before the square root: cancellation can make
-/// the difference of two nearly equal moments *negative*, and `sqrt` of that is
-/// a `NaN` in the output volume, which is neither a diagnosis nor a value.
 fn separable_deviation(radius: [usize; 3]) -> Result<Chain> {
     Chain::parallel(
         vec![

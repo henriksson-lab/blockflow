@@ -501,7 +501,7 @@ fn a_fixed_point_is_what_a_stated_pass_count_settles_on() {
     let (settled, depth) = configuration_to_fixed_point(input.view(), &table, generous())
         .expect("a monotone table settles");
 
-    // One pass short is not there yet, and every count past it is.
+    // Two passes short is not there yet; one short, and everything past it, is.
     let short = reference(&table, &input, depth - 2);
     assert_ne!(
         short, settled,

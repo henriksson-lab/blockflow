@@ -9,9 +9,9 @@
 // The executor is synchronous and parallel over rayon. An async framework would
 // bring a runtime, and with it a second concurrency model living inside a crate
 // that has exactly one, plus tens of transitive crates behind a feature flag on
-// a library whose `[dependencies]` section is four lines and is defended in a
-// comment. What that buys is routing, extractors and middleware, none of which
-// a handful of JSON endpoints and a static directory need.
+// a library whose unconditional dependencies are a handful of crates and are
+// defended in a comment. What that buys is routing, extractors and middleware,
+// none of which a handful of JSON endpoints and a static directory need.
 //
 // What it does not buy either is correctness, which is the reason this file
 // exists rather than a small third-party server. `tiny_http` 0.12 was what both

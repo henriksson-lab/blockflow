@@ -14,10 +14,8 @@
 //! slower, when the page cache is a sixteenth of the size, when there are two
 //! cores instead of forty?
 //!
-//! Nothing could ask that before this file. There was one store, keyed by the
-//! host it ran on, and a planner change was accepted on the evidence of the
-//! machine that happened to be under it — which is the definition of overfitting
-//! and is not visible from inside.
+//! Judging a planner change on the evidence of whichever machine happened to be
+//! under it is overfitting, and it is not visible from inside.
 //!
 //! A [`Scenario`](crate::scenario::Scenario) is therefore a **machine that need not exist**: a snapshot of
 //! coefficients, the machine the simulator models, and what the planner is
@@ -552,9 +550,12 @@ impl Scenario {
             // a machine and a set of costs; `Machine::candidate_window` is how
             // much of the ready set a *scheduler* is shown, which is a property
             // of the coordinator being simulated rather than of the machine it
-            // runs on. Every committed scenario was recorded unbounded, and
-            // `to_json` is compared byte for byte against `costs/`, so carrying
-            // it would rewrite all of them to state the default.
+            // runs on. Every committed scenario was recorded unbounded, so
+            // carrying it would add a field to all of them that only ever
+            // states the default. (This once also cited a byte-for-byte
+            // comparison against `costs/`; that check is gone —
+            // `tests/cost_scenarios.rs` records why it had to go — and the
+            // reason above is the one that still holds.)
             candidate_window: 0,
         };
         let chunk = value
@@ -654,11 +655,10 @@ fn scenario_machine(name: &str) -> MachineKey {
 /// The baseline: **what this crate has actually measured**, with every term's
 /// provenance in the note it carries.
 ///
-/// This is the "keep the benchmarked costs" half. Every figure below appears in
-/// the crate already and is cited where it does; nothing here is a new
-/// measurement and nothing is invented. Where the crate has no measurement, the
+/// Every figure below appears in the crate already and is cited where it does;
+/// nothing here is a new measurement. Where the crate has no measurement, the
 /// seed is carried and *said to be* a seed, because a plausible-looking number
-/// with no provenance is the thing this file exists to keep out of a robustness
+/// with no provenance is what this file exists to keep out of a robustness
 /// claim.
 pub fn measured_baseline() -> Scenario {
     let mut snapshot = Snapshot::empty(scenario_machine("measured"));

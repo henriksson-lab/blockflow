@@ -31,6 +31,10 @@
 //    what lets a block's output shape stay a function of its input shape — the
 //    reason for cutting the output grid rather than the input one.
 // 6. A region handed in as voxels rather than as lattice indices is refused.
+// 7. **The handed window inverts**: a block handed the voxels for `n` samples
+//    derives back to exactly `n`, is the same width wherever it sits, and still
+//    contains everything those samples read — the round trip `output_shape`
+//    rests on, and the one an irregular lattice declines rather than invents.
 
 use blockflow::ops::{ElementShape, SampleLattice, Sampling, StructuringElement};
 use blockflow::region::Region;

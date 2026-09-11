@@ -156,12 +156,9 @@ fn sequence() -> OffsetSequence {
 /// be written out. Every block writes a fragment, empty or not, so the coverage
 /// guard has something to check.
 ///
-/// **This file wrote it by hand until `ops::rows::RowSourceOp` landed** — see
-/// `docs/ops-survey/README.md`, G17 — and the keying is the same answer by a
-/// different route: the copy tested core containment directly, the library op
-/// keys by `ops::detect::owner_of`, and for a coordinate inside the volume
-/// those agree by construction, because `owner_of` names the block whose core
-/// holds it. Every point in `POINTS` is inside `VOLUME`.
+/// `RowSourceOp` keys a row by `ops::detect::owner_of`, which for a coordinate
+/// inside the volume names the block whose core holds it — so core containment
+/// is what this is testing. Every point in `POINTS` is inside `VOLUME`.
 fn points_source(stream: &str) -> RowSourceOp {
     RowSourceOp::new(
         "points",

@@ -194,7 +194,7 @@ fn run_keeping(
 }
 
 /// The decompositions the suite sweeps. One block — no seams at all — several
-/// shapes, and three that leave a partial block on an axis.
+/// shapes, and two that leave a partial block on an axis.
 fn blockings() -> Vec<[usize; 3]> {
     vec![
         VOLUME,

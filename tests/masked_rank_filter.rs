@@ -113,7 +113,6 @@ fn reference() -> Array3<f64> {
     out.mapv(|value| value.0)
 }
 
-// ------------------------------------------------------------- the op --
 // ------------------------------------- 1. the sentinel workaround fails --
 
 /// Replacing excluded voxels with a sentinel and running the ordinary filter is

@@ -741,8 +741,9 @@ fn a_short_circuited_block_produces_what_computing_it_would_have() {
     }
 }
 
-/// The other half of the asymmetry: an op that has not stated a mapping is never
-/// skipped, and a chain containing one is not either.
+/// The other half of the asymmetry: a mapping is declared only where it is
+/// exactly true, and withheld — `None`, so the block is computed — everywhere
+/// else.
 #[test]
 fn what_is_not_exactly_true_is_not_declared() {
     let window = box_element([1, 1, 1]);
@@ -821,14 +822,14 @@ fn a_diamond_combines_two_arms_and_stays_decomposition_invariant() {
 
 // --------------------------------------------------- global anchoring --
 
-/// The defect class this batch's last two ops are exposed to, asserted at the
+/// The defect class the sampled-lattice ops are exposed to, asserted at the
 /// image a user would notice it.
 ///
 /// An unanchored sample lattice gives the same voxel a different value depending
 /// on which block it landed in — **throughout** the block, not at its seams — so
 /// the symptom is not a thin band of disagreement but a large fraction of the
 /// volume differing. That is what this test would see if the lattice were ever
-/// re-derived from a buffer, and it is checked at three spacings because the
+/// re-derived from a buffer, and it is checked at four spacings because the
 /// defect scales with the spacing and would be invisible at one.
 #[test]
 fn a_sampled_op_is_invariant_at_every_spacing_and_not_merely_at_one() {
@@ -847,8 +848,9 @@ fn a_sampled_op_is_invariant_at_every_spacing_and_not_merely_at_one() {
             let reach = chain.reach3(&VOLUME);
             if (0..3).any(|axis| reach[axis] >= VOLUME[axis]) {
                 // A reach that spans an axis is a planning barrier, not a local
-                // op; skipping it here is a statement about the fixture, and the
-                // spacings above are chosen so that it does not happen.
+                // op, and the spacings above are chosen so that it does not
+                // happen — so reaching here is a broken fixture rather than a
+                // case to skip.
                 panic!("spacing {spacing:?} makes this a barrier on this volume");
             }
             let want = reference(&chain, &input);

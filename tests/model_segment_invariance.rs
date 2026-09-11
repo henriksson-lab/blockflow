@@ -10,8 +10,9 @@
 //! asserted in a doc comment:
 //!
 //! * **the id is a function of the data.** It is derived from the object's
-//!   centroid in the volume, so nothing is shared between blocks to make two
-//!   runs agree, and there is no counter whose value depends on visit order;
+//!   lowest voxel in raster order, so nothing is shared between blocks to make
+//!   two runs agree, and there is no counter whose value depends on visit
+//!   order;
 //! * **every accumulator is an integer.** Count, coordinate sums, and the
 //!   per-image sum, min and max are all `u64` folded by `+`, `min` and `max`.
 //!   A running mean in `f64` would agree to about fifteen digits and disagree
@@ -209,8 +210,9 @@ fn the_objects_are_the_same_at_every_block_size() {
 }
 
 /// The ids are what make the comparison above possible, and they are a function
-/// of the data: an object's id is derived from its centroid, so it is the same
-/// number in a run that never cut the volume and in one that cut it five ways.
+/// of the data: an object's id is derived from its lowest voxel, so it is the
+/// same number in a run that never cut the volume and in one that cut it five
+/// ways.
 ///
 /// Stated separately from the row comparison because it is the sharper claim —
 /// a scheme that numbered objects in visit order would pass nothing above but

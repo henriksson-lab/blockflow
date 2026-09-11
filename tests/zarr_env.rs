@@ -16,7 +16,7 @@
 // implementation is the thing that says what "correct" means. If a chunk grid,
 // a partial-chunk write or a fill value were wrong, this is where it shows.
 //
-// Four properties, in order of what they would catch:
+// Five properties, in order of what they would catch:
 //
 // 1. **Byte identity.** Every op family, through storage, equals the same op
 //    through memory.
@@ -821,7 +821,7 @@ fn a_per_image_override_reaches_the_arrays_it_names() {
     assert_eq!(env.compression_at(1).unwrap(), Compression::None);
     assert_eq!(env.image_dtype(2).unwrap(), Dtype::Bool);
     assert_eq!(env.compression_at(2).unwrap(), Compression::None);
-    // And the image that was told to compress really did.
+    // And the image that was told to stay raw was still written.
     assert!(
         env.stored_bytes(2).unwrap() > 0,
         "the bool image was written and stored nothing"
@@ -1058,6 +1058,7 @@ fn a_block_grid_that_straddles_a_dictated_chunk_grid_is_refused_and_names_the_ch
     );
     // And it names the constraint the caller chose, because that is the one
     // they can drop — together with the one they may not be able to.
+
     // The refusal is not something `execute` can walk past: `prepare` is the
     // first thing it does.
     assert!(execute(

@@ -386,7 +386,6 @@ fn the_halo_decides_whether_an_object_is_measured_whole() {
         pieces.len(),
         scene.boxes.len()
     );
-    // And every voxel is still accounted for exactly once.
     assert_eq!(
         pieces.iter().map(OwnedRow::count).sum::<u64>(),
         total,

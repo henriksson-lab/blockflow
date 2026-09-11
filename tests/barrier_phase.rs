@@ -14,22 +14,24 @@
 // `FragmentOp::reduce` the merge had nowhere to live but `apply`, which is per
 // block, so it ran once per block.
 //
-// Four arms, and what separates them
-// ----------------------------------
-// One op, `GlobalOffsetOp`, with two booleans. Every other line of the four arms
-// is the same line, so a difference in the counters is attributable to the
-// declaration and to nothing else:
+// Three arms, and what separates them
+// -----------------------------------
+// One op, `GlobalOffsetOp`, with two booleans. Every other line of the three
+// arms is the same line, so a difference in the counters is attributable to the
+// declaration and to nothing else. The fourth row is the baseline they are
+// against — the merge a caller does between two `execute_phases` calls — which
+// is described here rather than run:
 //
 // | arm | `barrier()` | reduction | halo | the merge runs |
 // |---|---|---|---|---|
 // | **in-plan** — what the framework admitted before this | `false` | in `apply` | the whole volume | once per block |
 // | **barrier alone** | `true` | in `apply` | zero | once per block |
 // | **barrier, reduction hoisted** | `true` | in `reduce` | zero | once |
-// | **out of plan** — the merge between two `execute_phases` calls | n/a | in the caller | zero | once |
+// | **out of plan** — the baseline, not exercised below | n/a | in the caller | zero | once |
 //
 // What is asserted, and why each part of it
 // -----------------------------------------
-// * **The same answer, at every lattice, byte for byte.** The four arms and a
+// * **The same answer, at every lattice, byte for byte.** The three arms and a
 //   whole-volume reference agree exactly. That is the acceptance bar and the
 //   grids are asserted to be genuinely distinct — a sweep that had quietly
 //   decayed to one grid, or to a grid of one block, would pass while meaning
@@ -709,13 +711,13 @@ fn the_four_arms_are_measured_against_each_other() {
     }
 }
 
-/// **What a barrier costs the graph, which is now nothing.**
+/// **What a barrier costs the graph, which is nothing.**
 ///
-/// Inverted. It asserted a product; it asserts a sum. Kept rather than deleted
-/// because the product is what the first implementation shipped and the reason
-/// it did not survive is the number this test holds: the graph is the same size
-/// whether or not a phase declares a barrier, and the declaration costs one bool
-/// per phase.
+/// The graph is the same size whether or not a phase declares a barrier, and
+/// the declaration costs one bool per phase. See
+/// [`a_barrier_is_a_phase_level_fact_and_the_edges_stay_a_sum`] for the product
+/// this replaced and [`a_barrier_at_a_large_block_count_is_priced`] for what it
+/// cost.
 #[test]
 fn a_barrier_costs_the_graph_nothing() {
     for block in [[8, 8, 16], [4, 4, 8], [2, 2, 2]] {
@@ -1319,11 +1321,11 @@ fn a_barrier_at_a_large_block_count_is_priced() {
 /// **The coordinator gates it too, and this is what makes the phase-level fact
 /// safe.**
 ///
-/// The barrier used to be `blocks x blocks` edges, which both schedulers
-/// enforced for free through indegree machinery they already had. Removing the
-/// edges removes that, so the distributed coordinator has to gate explicitly —
-/// and if it did not, a worker would compute a barrier phase's block from an
-/// incomplete fragment set and report a plausible wrong answer.
+/// With the barrier carried as one bool per phase rather than as edges, no
+/// scheduler gets the ordering for free from its indegree machinery, so the
+/// distributed coordinator has to gate explicitly — and if it did not, a worker
+/// would compute a barrier phase's block from an incomplete fragment set and
+/// report a plausible wrong answer.
 ///
 /// Driven through the coordinator's own public surface — `pull` and `completed`
 /// — rather than through its internals, because that is what a worker does. It

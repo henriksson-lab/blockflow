@@ -279,9 +279,9 @@ fn live_storage_is_constant_in_the_substage_count() {
         "peak residency moved with the substage count; the ping-pong is not a ping-pong"
     );
 
-    // Not merely equal but small: one whole volume is 6144 voxels at eight bytes,
-    // and the phase holds two of them plus a handful of blocks. One buffer per
-    // substage would be forty-six.
+    // Not merely equal but small: one whole volume is 768 voxels at eight bytes
+    // — 6144 — and the phase holds two of them plus a handful of blocks. One
+    // buffer per substage would be forty-six.
     let volume_bytes = (VOLUME[0] * VOLUME[1] * VOLUME[2] * std::mem::size_of::<f64>()) as u64;
     assert!(
         deep.peak_resident_bytes < 4 * volume_bytes,

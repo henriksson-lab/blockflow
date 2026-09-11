@@ -1143,7 +1143,7 @@ mod tests {
                 ),
             }
         }
-        // The fixture must contain all four kinds or it certifies less than it
+        // The fixture must contain all three kinds or it certifies less than it
         // claims: an immediate stop, a stop at the stated maximum, and a walk
         // that never stops.
         assert_eq!(EXPECTED[0], Some(0.0));

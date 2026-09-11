@@ -292,11 +292,10 @@ impl FragmentOp for RenderOp {
 /// One per phase, because two phases may not write the same stream name; they
 /// read nothing from each other, which is what makes each of them a phase that
 /// performs no pixel IO for its own reasons rather than by inheritance.
-/// The tally and its negative control are now **one probe with one bool
-/// flipped**, which is what the paragraph above claims and what two
-/// hand-written structs could only promise: `probes::BlockSummaryOp` reads its
-/// block's pixels unless `with_pixels(false)` says otherwise, and that
-/// declaration is the entire difference between the two plans below.
+/// The tally and its negative control are **one probe with one bool flipped**:
+/// `probes::BlockSummaryOp` reads its block's pixels unless `with_pixels(false)`
+/// says otherwise, and that declaration is the entire difference between the two
+/// plans below.
 ///
 /// `LazyLock` because the probe owns its stream name and a `String` cannot be
 /// built in a `static` initialiser. The plans want `&'static dyn FragmentOp`,
@@ -335,9 +334,8 @@ fn pixel_head() -> (Decomposition, Chain) {
 /// Image 1 is written by phase 0 and — when phase 1 is a tally with
 /// `with_pixels(false)` — read by **nobody**: it does no pixel IO and no later
 /// phase names image 1 in `source_images`. With the same probe left reading in
-/// that slot it is genuinely read by phase 1, and that is the only difference
-/// between the two plans — one bool, now, rather than two structs that had to
-/// be kept identical by hand.
+/// that slot it is genuinely read by phase 1, and that bool is the only
+/// difference between the two plans.
 fn tally_plan(reads: bool, tallies: usize) -> (Decomposition, Chain, Vec<PhaseWork<'static>>) {
     let (mut plan, chain) = pixel_head();
     let mut work: Vec<PhaseWork<'static>> = vec![PhaseWork::Pixels];
@@ -479,14 +477,12 @@ fn the_same_plan_with_a_reading_phase_holds_the_image_for_a_reason() {
 /// wrote it. Images 2, 3 and 4 are slots those phases never fill, since a
 /// fragment phase that writes no pixels writes no image.
 ///
-/// **Inverted, not deleted.** This test measured the over-hold: each of those
-/// phases was credited with `vec![phase]`, image 1's `first_free` was `2`
-/// rather than `1`, and the arithmetic on the line below came out `1` phase
-/// rather than `0`. One phase was the ceiling as well as the measurement,
-/// because image `p`'s only credited reader was phase `p` and its writer is
-/// phase `p - 1` — the claim could be wrong, but not wrong by two. The bytes
-/// that one phase cost are kept at the bottom, because they are what made the
-/// fix worth making and they do not stop being true for having been fixed.
+/// **Inverted, not deleted.** This test measured the over-hold, and the old
+/// values are quoted in the assertion messages so that what moved stays
+/// readable. The over-hold was exactly one phase — image `p`'s only credited
+/// reader was phase `p` and its writer is phase `p - 1` — and the bytes that
+/// phase cost are kept at the bottom, because they are what made the fix worth
+/// making and they do not stop being true for having been fixed.
 #[test]
 fn no_image_outlives_the_phase_that_wrote_it_when_nothing_reads_it() {
     let (plan, _, _) = tally_plan(false, 3);
@@ -533,9 +529,8 @@ fn no_image_outlives_the_phase_that_wrote_it_when_nothing_reads_it() {
     assert_eq!(bytes([1024, 1024, 1024]), 8 << 30, "8 GiB");
 }
 
-/// **This was the specification of the fix, and the fix has landed.** Kept
-/// live and kept whole, because the argument is what makes the three
-/// assertions above reviewable rather than arbitrary.
+/// **The predicate `readers_of_image` had to grow, and why it has the shape it
+/// does.**
 ///
 /// The defect was in [`Decomposition::readers_of_image`]
 /// (`src/decomposition.rs`): it counted phase `p` as a reader of image `p`
@@ -544,14 +539,12 @@ fn no_image_outlives_the_phase_that_wrote_it_when_nothing_reads_it() {
 /// the truth, and `fragment_phase` is what put it there.
 ///
 /// **Three things had to move together**, which is why this was not done
-/// inline, and all three did.
-/// Correcting `readers_of_image` alone leaves image 1 with *no* reader, and
-/// `images_dead_after` answered `readers.last() == Some(&phase)` — so an image
-/// with no reader would be named by no phase and the executor would never free
-/// it, which is worse than the over-count. The zero-reader rule
+/// inline. Correcting `readers_of_image` alone leaves image 1 with *no* reader,
+/// and `images_dead_after` answered `readers.last() == Some(&phase)` — so an
+/// image with no reader would be named by no phase and the executor would never
+/// free it, which is worse than the over-count. The zero-reader rule
 /// `peak_image_bytes` already applies — *an image nothing reads dies as soon as
-/// it is written* — had to move into `images_dead_after` in the same change,
-/// and did.
+/// it is written* — had to move into `images_dead_after` in the same change.
 ///
 /// **And the `phase != image` guard had to go with them.** A phase that reads
 /// an image through `source_images` rather than as its input image was skipped
@@ -563,40 +556,12 @@ fn no_image_outlives_the_phase_that_wrote_it_when_nothing_reads_it() {
 /// `source_images` names `i`* — one loop, no special case, and it is what
 /// `readers_of_image` now is.
 ///
-/// # The blast radius, predicted from a patched copy and then observed
-///
-/// Measured before the change by applying it in an isolated copy of the crate
-/// and running the whole suite: exactly two files move and no other, and no
-/// output voxel anywhere moves. When the change landed, exactly those
-/// assertions moved and no others — the prediction is left here in full
-/// because a blast radius that turned out right is the evidence that the
-/// method was sound.
-///
-/// In `tests/source_leaf.rs`, two assertions, both because the **output** image
-/// has no reader inside the run and is now named by the phase that wrote it —
-/// harmlessly, since `image_visibility` is what keeps it alive and both
-/// `strategy.rs` and `peak_image_bytes` already consult it:
-///
-/// * `images_dead_after(2)`: `[1, 2]` becomes `[1, 2, 3]`
-/// * the plain-chain loop's `images_dead_after(phase) == [phase]`: at the last
-///   phase, `[2]` becomes `[2, 3]`
-///
-/// In this file, the three tests above, which is what they were for. Each has
-/// since been inverted in place, so the old value is on the left:
-///
-/// * `readers_of_image(1)`: `[1]` becomes `[]`
-/// * `images_dead_after(0)`: `[0]` becomes `[0, 1]`; `(1)`: `[1]` becomes
-///   `[2]`; `(2)`: `[2]` becomes `[3]`
-/// * the sampled residency of image 1: still live at the start of phase 1
-///   becomes already freed, so `first_free` is `1` rather than `2` and the
-///   over-hold is `0` phases rather than `1`
-/// * the two runs of `the_same_plan_with_a_reading_phase_holds_the_image_for_a_reason`
-///   stop being equal, which is that test's whole point
-///
-/// **Nothing in the seven tests this file opened with moves**, and the reason
-/// is structural rather than lucky: every plan in them is pixel phases only, so
-/// `reads_input_image` is true everywhere and the corrected predicate returns
-/// exactly what the unconditional push returned.
+/// The output image is now named by the phase that wrote it, since nothing
+/// inside a run reads it — harmlessly, because `image_visibility` is what keeps
+/// it alive and both `strategy.rs` and `peak_image_bytes` already consult it.
+/// Every plan in the pixel-only tests above is unaffected: `reads_input_image`
+/// is true throughout them, so the corrected predicate returns exactly what the
+/// unconditional push returned.
 #[test]
 fn a_phase_that_reads_no_pixels_is_not_a_reader_of_its_input_image() {
     let (plan, _, _) = tally_plan(false, 1);

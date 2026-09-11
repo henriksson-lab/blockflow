@@ -11,12 +11,16 @@
 // work, and worker death. `docs/design/distributed-locality.md` records the
 // fixture history and the measurements behind the current premise checks.
 //
-// The five claims, one test each:
+// The claims, in the order the sections below take them:
 // 1. N workers produce byte-identical output to a single-node run.
 // 2. Every block executed exactly once under the normal coverage criteria.
 // 3. A worker death without a lease stops the job and names what was lost.
 // 4. A worker death with an explicit lease reissues the task.
 // 5. The work list stays at least one task ahead from both sides' counters.
+// 6. Fragments written by N worker processes are all readable by one merging
+//    reader.
+// 7. A fragment written by one worker process is read by another, because the
+//    plan's declared reach in blocks said so.
 
 #![cfg(feature = "distributed")]
 
@@ -53,9 +57,10 @@ const BLOCKS: usize = 16;
 
 /// Block count for worker-death tests.
 ///
-/// The death premise is sampled by the worker itself through
-/// `LocalOptions::abort_worker_after`; this larger job leaves enough survivor
-/// work that completion/reissue assertions describe a run, not its last instant.
+/// The death is counted by the worker itself through
+/// `LocalOptions::abort_worker_after` — nothing is sampled or polled — and this
+/// larger job leaves enough survivor work that the completion and reissue
+/// assertions describe a run rather than its last instant.
 const DEATH_BLOCKS: usize = 128;
 
 /// The block count for the tests whose premise is that **several worker
@@ -539,9 +544,9 @@ fn every_block_was_executed_exactly_once_across_the_merged_event_stream() {
 /// seconds after the kill, not at the harness timeout, and a hang that is
 /// merely slow would otherwise pass.
 ///
-/// **Over [`DEATH_BLOCKS`], with the death timed by the dying worker.** See that
-/// constant for why the runner is no longer the one holding the knife, and for
-/// what a run that contains no death is worth.
+/// **Over [`DEATH_BLOCKS`], with the death timed by the dying worker.** A run
+/// in which nobody died is evidence of nothing, so the panic below separates
+/// that from a death the job wrongly survived, and says which it saw.
 #[test]
 fn a_worker_that_is_killed_mid_run_aborts_the_job_by_default_and_names_what_was_lost() {
     let dir = scratch("loss");
@@ -600,11 +605,12 @@ fn a_worker_that_is_killed_mid_run_aborts_the_job_by_default_and_names_what_was_
 
 /// Kill a worker mid-run and show the job completes with correct output.
 ///
-/// `SIGKILL`, once the coordinator reports progress — not a timer, which would
-/// race the job, and not a clean exit, which the worker would get to choose the
-/// moment of. The process is taken wherever it is: possibly inside a task, with
-/// a block part-written and nothing reported, and certainly holding the tasks
-/// its work list was keeping ahead.
+/// The worker aborts by unhandled signal having computed two tasks, with the
+/// last one's completion never sent — see `WorkerOptions::abort_after` for why
+/// the worker counts rather than the runner sampling. Not a clean exit, which
+/// the worker would get to choose the moment of: it goes **between** tasks,
+/// holding the completion of a block it had already computed and the tasks its
+/// work list was keeping ahead.
 ///
 /// **What the lease is for, restated because a failure here reads as the lease's
 /// fault and never once was.** It is not a failure detector: node loss is
@@ -656,9 +662,7 @@ fn a_worker_that_is_killed_mid_run_has_its_tasks_reissued_and_the_output_is_stil
 
     // The premise first: a job that finished with everybody alive has nothing
     // to reissue, and "no death" is indistinguishable from "the lease did not
-    // fire" if it is not checked. It is exactly what this pair looked like when
-    // the death was a sampled kill that could arrive after the last task —
-    // see DEATH_BLOCKS.
+    // fire" if it is not checked.
     let died = run.died.first().unwrap_or_else(|| {
         panic!(
             "no worker was seen to die, so there was nothing for the lease to reissue. \
@@ -1385,8 +1389,9 @@ fn a_persistent_sidecar_stream_survives_the_discard_that_removes_a_delete_on_exi
 // fragment written by one worker process is read by another, because the plan
 // said so.**
 //
-// Test 5 above showed the *storage* half — many producers, one merging reader —
-// with the fragments produced as a job-level side effect rather than by an op.
+// Section 6 above showed the *storage* half — many producers, one merging
+// reader — with the fragments produced as a job-level side effect rather than
+// by an op.
 // This is the half that needed `fragment::FragmentOp`: a phase whose input is
 // another phase's fragments, with a declared reach in blocks, so that a worker
 // running block `b` must read blocks `b-1 .. b+1` and those blocks were run by
@@ -1395,9 +1400,9 @@ fn a_persistent_sidecar_stream_survives_the_discard_that_removes_a_delete_on_exi
 //
 // How "it crossed a process boundary" is *measured* rather than assumed: the
 // summary op stamps the producing process's id on every fragment it writes, and
-// the fold records how many distinct stamps it saw. A block reporting two or
-// more folded fragments from more than one process, and there is no way for
-// that to happen inside one address space.
+// the fold records how many distinct stamps it saw. The evidence is a block
+// reporting folded fragments from more than one process, and there is no way
+// for that to happen inside one address space.
 
 /// The chain's phases, plus a `volume -> fragments` phase and a
 /// `fragments -> fragments` phase that reaches one block either way.

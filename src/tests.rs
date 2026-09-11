@@ -249,14 +249,12 @@ fn the_planner_segments_at_a_full_reach_op_rather_than_fusing_across_it() {
 /// cheaper in the model, and the phase is still cut into blocks rather than
 /// forced to span the volume.
 ///
-/// **Narrowed, and the reason is at the bottom of this test.** It also used to
-/// assert that a reach of `volume - 1` left its phase cuttable.
-/// `decomposition::cuttable_axes` is wired now and that cut is gone; what is
-/// asserted in its place is the claim cuttability was standing in for — a
-/// bounded reach forces no phase boundary — plus the price ordering that keeps
-/// it distinguishable from a barrier once neither is cut. The two arms below at
-/// reaches 1 and 512 are untouched: the floor admits their cuts at every
-/// candidate edge, because `1024 + 512 + 512 < 4096`.
+/// The arms at reaches 1 and 512 have their cuts admitted by
+/// `decomposition::cuttable_axes` at every candidate edge, because
+/// `1024 + 512 + 512 < 4096`. At `volume - 1` the floor forbids the cut, so what
+/// is asserted there is that a bounded reach forces no phase *boundary*, plus
+/// the price ordering that keeps it distinguishable from a barrier once neither
+/// is cut.
 #[test]
 fn a_large_but_bounded_reach_is_not_a_barrier_and_still_fuses() {
     let volume = [4096usize, 4, 4];
@@ -308,22 +306,13 @@ fn a_large_but_bounded_reach_is_not_a_barrier_and_still_fuses() {
     let nearly = Enumerating::default()
         .decompose(&workflow(nearly, volume), &constraints(vec![0], vec![1024]))
         .unwrap();
-    // **The claim that used to be made here, and the narrower one that survives.**
-    //
-    // This asserted that the phase carrying a `volume - 1` reach *may still be
-    // cut* — "priced out of fusing, but not forbidden from it, which is the whole
-    // difference from a barrier". `decomposition::cuttable_axes` is wired now and
-    // forbids that cut: at this reach `lo + hi` is nearly twice the volume, so a
-    // block of any edge reads the whole axis and cutting it multiplies the read
-    // by the block count for nothing. The claim as stated cannot hold.
-    //
-    // What it was really defending does hold, and holds more strongly. A barrier
-    // is a **forced cut**: `barrier_cuts` removes the partitions that fuse across
-    // one, so nothing may join it whatever the price says. A large bounded reach
-    // is still not that — no partition is removed, and here the search chooses to
-    // fuse the whole chain into it. Cuttability was a proxy for that freedom and
-    // it was a poor one: it is a fact about the *grid*, and a grid is chosen on
-    // price for one phase, where fusing is chosen on price across phases.
+    // At `volume - 1` the grid itself is uncut — `cuttable_axes` forbids it,
+    // since `lo + hi` is nearly twice the volume so a block of any edge reads
+    // the whole axis — and the claim is about *fusing*, not about the grid. A
+    // barrier is a **forced cut**: `barrier_cuts` removes the partitions that
+    // fuse across one, whatever the price says. A large bounded reach is not
+    // that; no partition is removed, and here the search chooses to fuse the
+    // whole chain into one phase.
     assert_eq!(
         nearly.n_phases(),
         1,
@@ -682,10 +671,8 @@ fn an_affine_chain_lands_at_the_right_offsets_under_every_schedule() {
 /// A two-phase plan whose second phase is cut from a **smaller** volume and
 /// reads a window of the image below.
 ///
-/// This is the plan that could not exist: `Decomposition::check` refused any
-/// phase whose grid was over a different volume, so `input grid != output grid`
-/// was not expensive or unpriced but inexpressible, and the only way to run one
-/// was to hide the mapping inside an `Environment` where nothing prices it.
+/// `input grid != output grid` is what this exercises; the alternative is to
+/// hide the mapping inside an `Environment`, where nothing prices it.
 ///
 /// Two limits are asserted here rather than left to be discovered:
 ///
@@ -696,9 +683,7 @@ fn an_affine_chain_lands_at_the_right_offsets_under_every_schedule() {
 ///   edge as trustworthy, which is exactly right when that edge is a real edge
 ///   of the array — and a cropping phase's edges are *not* edges of the image
 ///   below. So the reach is zero here. A non-zero reach across a crop seam needs
-///   the reach to be stated in the source space, which is the pending reach
-///   work; nothing in this change makes it wrong, and nothing in it makes it
-///   right either.
+///   the reach to be stated in the source space, which is not done yet.
 fn crop_plan(input: [usize; 3], keep: usize, first: usize, second: usize) -> Decomposition {
     let output = [keep, input[1], input[2]];
     let offset = input[0] - keep;

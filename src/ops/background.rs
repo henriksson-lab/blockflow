@@ -91,10 +91,8 @@
 // by `B̌` — `ops::morphology` states the same fact for the binary case, where
 // `dilate_into` gathers and `dilate_placed_into` places — so two gathers over
 // one element compose to `(f ⊖ B) ⊕ B̌`, which is an opening only when `B = B̌`.
-// Every centred element is; no even extent is. This file gathered twice over one
-// element until that was measured: on a `[14, 11, 9]` ramp an even `4x3x1` box
-// gave an "estimate" that stood *above* the image at 136 voxels and moved under
-// a second application at 440, which is not a background and not an opening.
+// Every centred element is; no even extent is. Gathering twice over one element
+// is measurably not an opening — [`background_estimate`] carries the figures.
 //
 // What this file does about the element's step origin: it changes kernel
 // ----------------------------------------------------------------------
@@ -106,9 +104,7 @@
 // a **reflection**: a position-dependent window has none that is itself a
 // window, and the dilation adjoint to a min-filter by it must place the element
 // at the source voxel, which no gather can do. So two gathers cannot compose to
-// an opening, and they did not — 52 anti-extensivity violations on that same
-// ramp for a `9x5x1` box stepped by two, an element whose two sides are
-// *equal*, so it is the re-phasing and not the asymmetry doing it.
+// an opening, and measurably did not; again see [`background_estimate`].
 //
 // So `background_estimate` **branches**: the maximum is a `RankFilterOp` over
 // `B̌` where the element reflects, and `morphology::GreyDilateOp` — the scatter
@@ -313,12 +309,11 @@ impl Combine for DifferenceCombine {
     /// **A stencil**, and this is the declaration a fan-in cannot get from its
     /// branches. A `Parallel` node is only as sliceable as its narrowest part,
     /// so a diamond whose arms are declared stencils is still refused while its
-    /// sink says nothing — which is the position every fan-in in this crate was
-    /// in until this line existed.
+    /// sink says nothing.
     ///
-    /// The claim itself is [`difference_into`]'s: it writes each output voxel from the
-    /// co-located voxel of each operand, through one
-    /// `Zip` that reads no neighbour and carries no accumulator between voxels.
+    /// The claim itself is [`difference_into`]'s: it writes each output voxel
+    /// from the co-located voxel of each operand, through one `Zip` that reads
+    /// no neighbour and carries no accumulator between voxels.
     /// So the output at `v` is a function of the inputs at `v`, the reach is
     /// zero on every axis, and the output lattice is the input lattice — the
     /// three conditions [`Slicing::Stencil`] states.
@@ -480,19 +475,11 @@ const DIFFERENCE: &str = "background.difference";
 /// element once produced a composition that was not an opening at all: on the
 /// same ramp, 52 anti-extensivity violations for a `9x5x1` box stepped by two,
 /// whose two sides are equal.
-///
-/// **Infallible again.** It was briefly `Result<Chain>`, for the window between
-/// the reflection being needed and the scatter existing to supply it; there is
-/// now an arm for every element, so there is nothing to report.
 pub fn background_estimate(element: &StructuringElement) -> Chain {
     let highest = match element.reflected() {
         // The element has a reflection, so the dilation is a **gather** over it
-        // and the kernel is the one this module already has. Worth the branch on
-        // its own: at an extreme rank over a box, `RankFilterOp` is separable
-        // and costs about a dozen operations a voxel whatever the element's
-        // size, where the scatter below costs one per member. A background
-        // element is large by definition — large enough that no object survives
-        // it — so that difference is the whole running time of the estimate.
+        // and the kernel is the one this module already has — which is also the
+        // cheap one; see the header on why the branch is worth its two lines.
         Ok(reflected) => Chain::op(RankFilterOp::new(
             HIGHEST,
             reflected.clone(),
@@ -540,13 +527,12 @@ pub fn remove_background(element: &StructuringElement) -> Result<Chain> {
 /// two agree for a range of elements. A caller sizing a halo before building a
 /// chain can use it; a caller holding a chain should ask the chain.
 ///
-/// **Not `2 * radius`**, which is what this said while the second filter did not
-/// reflect. The two agree for every centred element and part for an element with
-/// an even extent: an element reading `(5, 4)` makes an estimate reading `9` per
-/// side, where the unreflected composition read `(10, 8)`. Both are one number
-/// per axis here because the reflected pair is symmetric however asymmetric the
-/// element is — the erosion reads far below and the dilation reads exactly as
-/// far above.
+/// **Not `2 * radius`.** The two agree for every centred element and part ways
+/// for an element with an even extent: an element reading `(5, 4)` makes an
+/// estimate reading `9` per side, where an unreflected composition would read
+/// `(10, 8)`. Both are one number per axis here because the reflected pair is
+/// symmetric however asymmetric the element is — the erosion reads far below
+/// and the dilation reads exactly as far above.
 pub fn background_reach(element: &StructuringElement) -> [usize; 3] {
     [
         element.reach_reflected_pair(0),
@@ -555,8 +541,7 @@ pub fn background_reach(element: &StructuringElement) -> [usize; 3] {
     ]
 }
 
-/// The same, per side — and here the two say the same thing for **every**
-/// element, which they did not before the second filter reflected.
+/// The same, per side, where the two say the same thing for **every** element.
 ///
 /// The first filter reads `(lo, hi)` and the second, over the reflected
 /// element, reads `(hi, lo)`; a sequence adds side by side, so the pair is

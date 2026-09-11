@@ -2,16 +2,14 @@
 //
 // Original work for this crate.
 //
-// **Step one of the output-side index map: the step that changes nothing.**
+// **The output-side index map, and what its default must reproduce.**
 //
 // `forme.md` specifies `Geometry` — one declaration of an op's output space and
-// what each input must supply to fill it — replacing quantities that are
-// currently stated twice and checked against each other. The migration's first
-// step lands the type with a default that reproduces today's behaviour exactly,
-// *before* anything consumes it, because a step that changes nothing is a step
-// whose failure is unambiguous.
+// what each input must supply to fill it — replacing quantities that were
+// stated twice and checked against each other.
 //
-// So this file asserts that nothing changed:
+// The section below asserts that the default geometry changes nothing, which is
+// what makes a failure in the later sections unambiguous:
 //
 // 1. Every shipped op's default geometry is its own `reach_spec`, on ops chosen
 //    to cover the shapes that differ — symmetric, asymmetric from an even

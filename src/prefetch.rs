@@ -39,9 +39,10 @@
 // 2. Retention takes an `Opportunistic` lease, which is refused outright while
 //    any `Reserved` request is queueing. A prefetch that cannot be retained is
 //    dropped, not waited on.
-// 3. Before doing the work at all, a worker checks whether compute is waiting
-//    (`MemoryBudget::revoking`) and declines if it is — so under pressure the
-//    prefetcher stops spending IO and CPU too, not only memory.
+// 3. Before any chunk is fetched, `ChunkCache::prefetch_region` checks whether
+//    compute is waiting (`MemoryBudget::revoking`) and declines if it is — so
+//    under pressure the prefetcher stops spending IO and CPU too, not only
+//    memory.
 //
 // The first is what the test measures; the second and third are what make the
 // measurement hold under load rather than only when the machine is idle.
@@ -127,6 +128,11 @@ pub struct PrefetchStats {
     /// Requests dropped because their plan was cancelled before they ran.
     pub cancelled: u64,
     /// Requests skipped because compute was queueing for the budget.
+    ///
+    /// **Nothing here raises it today.** The decline happens one level down, in
+    /// `ChunkCache::prefetch_region`, which counts it as the cache's own
+    /// `prefetch_declined` and returns zero chunks — see the `Ok(Ok(0))` arm of
+    /// `worker`, which cannot tell that case from "everything was resident".
     pub declined: u64,
     /// Requests whose fetch returned an error. A prefetch failure is never
     /// propagated — the demand read will hit the same error and report it with

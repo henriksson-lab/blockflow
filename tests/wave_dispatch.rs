@@ -11,9 +11,9 @@
 // and nothing could tell them apart, which is what that item records.
 //
 // `Machine::wave_synchronous` is the field that makes both simulable, and it
-// costs nothing to model: the ready set already knew how to hold a task back
-// until an earlier phase finished, because a barrier phase does exactly that.
-// Turning it on for *every* phase is the executor's discipline.
+// costs nothing to model: the ready set already held a task back until an
+// earlier phase finished, because a barrier phase does exactly that. Turning it
+// on for *every* phase is the executor's discipline.
 //
 // What this file establishes, in order:
 //
@@ -130,12 +130,12 @@ fn wave_synchronous_dispatch_stops_the_phases_overlapping() {
 /// the plan and the machine it was found on rather than a fixture built to
 /// show it.
 ///
-/// The measurement item C never had. `costs/two-nodes` is the machine, the chain
-/// is `tests/cost_scenarios.rs`'s, and the two plans are the ones that file
-/// records: the mixed grid the planner chooses there, and the uniform grid the
-/// simulator prefers. Both judged through the arena, so the per-phase compute
-/// rates come from the scenario's own snapshot — which is what makes the phases
-/// unequal enough for the overlap to cost anything.
+/// `costs/two-nodes` is the machine, the chain is `tests/cost_scenarios.rs`'s,
+/// and the two plans are the ones that file records: the mixed grid the planner
+/// chooses there, and the uniform grid the simulator prefers. Both judged
+/// through the arena, so the per-phase compute rates come from the scenario's
+/// own snapshot — which is what makes the phases unequal enough for the overlap
+/// to cost anything.
 ///
 /// Recorded:
 ///
@@ -156,8 +156,7 @@ fn wave_synchronous_dispatch_stops_the_phases_overlapping() {
 ///
 /// **The simulator is the pessimistic one, and that is the direction that
 /// matters**: a planner tuned against it avoids a plan the executor would run
-/// well. Which of the two to believe is now a stated question with a number on
-/// it rather than an unnoticed difference between two modules.
+/// well.
 #[test]
 fn the_two_models_rank_a_mixed_grid_oppositely_once_workers_contend() {
     use blockflow::arena::Arena;
@@ -267,15 +266,13 @@ fn the_two_models_rank_a_mixed_grid_oppositely_once_workers_contend() {
 ///
 /// `execute_phases` joins a wave before starting the next, so a wave costs its
 /// **slowest** task; the coordinator in `distributed` does not, and neither does
-/// `simulate` by default. Nothing had put a number on the difference, because
-/// with identical tasks there is nothing to measure — a wave of equal blocks
-/// costs exactly what a continuous dispatch of them does.
+/// `simulate` by default. With identical tasks there is nothing to measure — a
+/// wave of equal blocks costs exactly what a continuous dispatch of them does.
 ///
 /// Tasks stop being equal as soon as blocks **short-circuit**, which is not
 /// exotic: `BlockOp::constant_maps_to` exists precisely because a constant
 /// region can be answered without reading it, and a real volume is mostly
-/// background. `PerPhase::constant_fraction` is the crate's own knob for that,
-/// and it is the straggler generator here.
+/// background. `PerPhase::constant_fraction` is the straggler generator here.
 ///
 /// Recorded, as wave-synchronous over continuous, so above one is what the join
 /// costs:
@@ -307,9 +304,7 @@ fn the_two_models_rank_a_mixed_grid_oppositely_once_workers_contend() {
 ///   any model of it.
 ///
 /// The arena judges under continuous because that is what the cluster path does,
-/// which is the deployment the plans being ranked are for. This test is the
-/// evidence for the other half: that the single-process path's discipline is
-/// worth removing.
+/// which is the deployment the plans being ranked are for.
 #[test]
 fn joining_each_wave_costs_more_the_more_unequal_the_tasks_are() {
     // **Its own fixture, not this file's.** `plan` above is built for the

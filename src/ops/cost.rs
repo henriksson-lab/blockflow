@@ -274,6 +274,23 @@ pub fn measure(shape: [usize; 3], repetitions: usize) -> Vec<Sample> {
             Box::new(SmoothOp::new("smooth", wide.clone())),
             wide.taps() as f64,
         ),
+        // **The anchor for the three rows below.** `ops::ridge` decomposes the
+        // same six numbers with the same closed form, so the ratio between this
+        // row and those is what decides whether the structure tensor's per-voxel
+        // slab is priced consistently with its only sibling. Without it that
+        // constant would be in the units of whatever day it was taken, and
+        // `mod.rs` is explicit that the *relative* weighting between op families
+        // is the part a re-measurement cannot repair.
+        (
+            "ridge, sigmas [1.0], truncate 3 (21 taps)".to_string(),
+            Box::new(super::ridge::RidgeFilterOp::new(
+                "ridge",
+                super::ridge::ScaleSpace::isotropic(&[1.0], 3.0, 1.0).unwrap(),
+                super::ridge::RidgeResponse::new(0.5, 0.5, 0.05, super::ridge::Polarity::Ridge)
+                    .unwrap(),
+            )),
+            21.0,
+        ),
         // **Three rows, because the structure tensor's cost has two terms and a
         // shape.** One separable smoothing of the intensity, then *six* of the
         // tensor's components, then a fixed per-voxel slab — the gradient
@@ -289,23 +306,6 @@ pub fn measure(shape: [usize; 3], repetitions: usize) -> Vec<Sample> {
         // comparable with the smoothing rows above it: if it does not land near
         // their per-tap figure, the model is the wrong shape rather than the
         // constant being off.
-        // **The anchor.** `ops::ridge` decomposes the same six numbers with the
-        // same closed form, so the ratio between these two rows is what decides
-        // whether the structure tensor's per-voxel slab is priced consistently
-        // with its only sibling. Without it the constant below would be in the
-        // units of whatever day it was taken, and `mod.rs` is explicit that the
-        // *relative* weighting between op families is the part a re-measurement
-        // cannot repair.
-        (
-            "ridge, sigmas [1.0], truncate 3 (21 taps)".to_string(),
-            Box::new(super::ridge::RidgeFilterOp::new(
-                "ridge",
-                super::ridge::ScaleSpace::isotropic(&[1.0], 3.0, 1.0).unwrap(),
-                super::ridge::RidgeResponse::new(0.5, 0.5, 0.05, super::ridge::Polarity::Ridge)
-                    .unwrap(),
-            )),
-            21.0,
-        ),
         structure_tensor_case("sigma 1, rho 1", [1.0; 3], [1.0; 3]),
         structure_tensor_case("sigma 3, rho 1", [3.0; 3], [1.0; 3]),
         structure_tensor_case("sigma 1, rho 3", [1.0; 3], [3.0; 3]),

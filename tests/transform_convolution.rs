@@ -32,6 +32,8 @@
 //     apart, a constant field cannot tell any of them apart, and a kernel that
 //     reaches one voxel cannot tell `Clamp` from `Reflect`.
 //  6. **The refusals**, by name and before a block runs.
+//  7. **What the tile's alignment slack costs**, and that `AxisReach::Aligned`
+//     recovers it exactly where the block edge is a whole number of tiles.
 //
 // No assertion here is on wall-clock time.
 
@@ -720,14 +722,16 @@ fn a_plan_with_only_the_kernels_halo_does_not_quietly_produce_the_right_answer()
 
 /// **The price of the missing stride constraint, in read amplification.**
 ///
-/// The op's halo is the kernel's two sides **plus `tile - 1` per side**, because
-/// a block cannot know where its tiles begin. That slack is *pure waste* on any
-/// lattice whose block edge is a whole number of tiles — and `BlockGrid::cores`
-/// builds `start = index * block`, so a block edge that is a multiple of the
-/// tile makes **every** block start tile-aligned and the true halo exactly the
-/// kernel's. The planner's own candidate ladder is powers of two; a
-/// power-of-two tile therefore lands on most of it. The waste is not a corner
-/// case, it is the ordinary case, and it is not expressible away today.
+/// Asked without a lattice, the op's halo is the kernel's two sides **plus
+/// `tile - 1` per side**, because a block cannot know where its tiles begin.
+/// That slack is *pure waste* on any lattice whose block edge is a whole number
+/// of tiles — and `BlockGrid::cores` builds `start = index * block`, so a block
+/// edge that is a multiple of the tile makes **every** block start tile-aligned
+/// and the true halo exactly the kernel's. The planner's own candidate ladder is
+/// powers of two; a power-of-two tile therefore lands on most of it, so the
+/// waste is the ordinary case rather than a corner one. This is the size of what
+/// `AxisReach::Aligned` recovers where the lattice earns it — see
+/// `a_tile_aligned_lattice_is_planned_with_the_smaller_halo` below.
 ///
 /// This prints the two amplifications side by side over the crate's own ladders.
 ///

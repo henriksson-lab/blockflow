@@ -336,8 +336,7 @@ impl EnvCounters {
 
     /// `(bytes read, bytes written)` for image data, decoded.
     ///
-    /// Its own accessor rather than two more slots in `snapshot`, whose tuple
-    /// several callers destructure positionally.
+    /// Its own accessor, for [`Self::sidecar_snapshot`]'s reason.
     pub fn byte_snapshot(&self) -> (u64, u64) {
         (
             self.read_bytes.load(Ordering::SeqCst),
@@ -347,8 +346,7 @@ impl EnvCounters {
 
     /// `(writes, elements, bytes written)` for the side outputs.
     ///
-    /// Its own accessor rather than three more slots in `snapshot`, whose tuple
-    /// several callers destructure positionally.
+    /// Its own accessor, for [`Self::sidecar_snapshot`]'s reason.
     pub fn side_snapshot(&self) -> (u64, u64, u64) {
         (
             self.side_writes.load(Ordering::SeqCst),
@@ -1504,14 +1502,13 @@ impl ArrayEnvironment {
 
     /// One image's data, or the refusal that names why it is not there.
     ///
-    /// **The checked form, and the one to use.** A discarded image holds a
-    /// one-voxel placeholder — see [`Self::discard_image`] — so reading one
-    /// through [`Self::image`] used to hand back a `1 x 1 x 1` array that then
-    /// failed, somewhere else, as a shape mismatch against the volume. That is
-    /// the same class of defect as a freed image reading as zeros: the error
-    /// names a symptom, and the fact worth reporting — this image was freed, by
-    /// this phase, and `Hints::keep_images` is how to keep it — is nowhere in
-    /// it.
+    /// **The checked form, and the one to use.** A discarded image used to hold
+    /// a one-voxel placeholder, so reading one through [`Self::image`] handed
+    /// back a `1 x 1 x 1` array that then failed, somewhere else, as a shape
+    /// mismatch against the volume. That is the same class of defect as a freed
+    /// image reading as zeros: the error names a symptom, and the fact worth
+    /// reporting — this image was freed, by this phase, and
+    /// `Hints::keep_images` is how to keep it — is nowhere in it.
     pub fn try_image(&self, image: usize) -> Result<Voxels> {
         self.refuse_if_discarded(image, "image")?;
         self.image_guard(image).whole()
@@ -1803,7 +1800,7 @@ impl Environment for ArrayEnvironment {
 
     /// Free the array and remember that it was freed.
     ///
-    /// There is no placeholder any more, and there does not need to be one: a
+    /// There is no placeholder any more, and there does not need to be one: an
     /// image knows its own element type and shape whether or not it holds a
     /// buffer ([`ImageStore`]), so freeing is dropping the buffer, and the flag
     /// carries the meaning as it always did. What that changes for a reader is

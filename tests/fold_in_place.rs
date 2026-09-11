@@ -179,10 +179,9 @@ fn accumulating_in_place_is_the_same_answer() {
 /// non-commutative operation, and an in-place kernel is exactly where that could
 /// be got backwards with nothing else noticing.
 ///
-/// It is unreachable, but **not for the reason I first wrote down**. My first
-/// version of this test asserted that `Chain::parallel` refuses a subtraction
-/// over four branches. It does not — the chain builds, and the refusal comes
-/// later, from `produces`. The actual guard is one level down:
+/// It is unreachable, but **not by the obvious route**: `Chain::parallel` does
+/// not refuse a subtraction over four branches — the chain builds, and the
+/// refusal comes later, from `produces`. The actual guard is one level down:
 /// `ArithmeticCombine::fold_carrier` is `self.op.folds_over_many().then(...)`,
 /// so a non-associative operation declares **no carrier at all**, takes the
 /// collected path, and never reaches `fold_pair` or `fold_in_place`.

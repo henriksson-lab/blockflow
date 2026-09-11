@@ -204,8 +204,9 @@ impl<T, S: RegionSink<T>> ObservedSink<T, S> {
     }
 
     /// Which phase writes here, and whether the result is an intermediate
-    /// rather than the workflow's output. Both only affect the `Materialised`
-    /// event's fields.
+    /// rather than the workflow's output. `intermediate` reaches only the
+    /// `Materialised` event; `phase` also fixes the image index every
+    /// `RegionWritten` from this sink carries.
     pub fn at_phase(mut self, phase: usize, intermediate: bool) -> Self {
         self.phase = phase;
         self.image = phase + 1;

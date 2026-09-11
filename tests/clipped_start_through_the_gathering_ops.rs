@@ -56,14 +56,10 @@
 // The two that **stamp** rather than gather
 // -----------------------------------------
 // `ops::label` and `ops::voxelize` place an element around a *point* and write,
-// where every op above reads a neighbourhood around a voxel. That is the same
-// question only if a stamp is a gather's transpose, and it is: the transpose of
-// `out[c] = f({in[c + o] : o in K(c)})` scatters `p + o` for `o` in `K(p)`, the
-// kernel read at the **source**, which for those two ops is the point. Underneath
-// it, `ClippedStart` is a property of a *(position, volume)* pair rather than of
-// a direction of data flow, and both ops write into the volume their points live
-// in, so the clip is one clip. The last test of this file is where that is
-// measured; each op's module header carries the argument.
+// where every op above reads a neighbourhood around a voxel. Those are the same
+// question because a stamp is a gather's transpose, so the element is evaluated
+// at the point. The last test of this file states the argument in full and
+// measures it; each op's module header carries it too.
 //
 // What the sweep in the middle establishes
 // -----------------------------------------
@@ -384,19 +380,10 @@ fn an_unstepped_element_is_the_same_element_under_either_origin() {
 
 /// **`ops::lattice`'s windowed statistic gathers the window its element names.**
 ///
-/// This assertion used to read the other way. It pinned the gap — the op read
-/// `StructuringElement::offsets`, one set at every sample, so a lattice
-/// statistic over a re-phasing element computed the *anchored* filter — and it
-/// said in as many words that closing the gap would fail it and that it should
-/// then be **inverted rather than deleted**. The close was
-/// `offsets_at(centre, lattice.volume(), &mut scratch)` in the op's own loop,
-/// which already had the sample centre in volume coordinates and already held
-/// the volume on the lattice. So this is that inversion.
-///
-/// It now states the rule twice over: the statistic **is** the `offsets_at`
-/// gather, written out here rather than called through the op, and it **is not**
-/// the anchored gather on this lattice. The second half is what keeps the first
-/// from passing vacuously — an element whose two origins happen to agree would
+/// The rule is stated twice over: the statistic **is** the `offsets_at` gather,
+/// written out here rather than called through the op, and it **is not** the
+/// anchored gather on this lattice. The second half is what keeps the first from
+/// passing vacuously — an element whose two origins happen to agree would
 /// satisfy any implementation.
 #[test]
 fn the_lattice_statistic_gathers_the_window_the_origin_names() {
@@ -490,12 +477,6 @@ fn the_lattice_statistic_gathers_the_window_the_origin_names() {
 /// **`ops::voxelize` and `ops::label` place the window the origin names**, at the
 /// point's own position in the volume.
 ///
-/// This assertion used to read the other way. It pinned the gap — both ops read
-/// `StructuringElement::offsets`, one set wherever the element was placed, so a
-/// re-phasing element stamped the *interior* window at a point near a low face —
-/// and it said in as many words that closing the gap would fail it and that it
-/// should then be **inverted rather than deleted**. So this is that inversion.
-///
 /// **Why a stamp asks a gather's question.** Neither op gathers: they place the
 /// element around a *point* and write, where a filter reads a neighbourhood
 /// around a voxel. Those are the same question only if the stamp is the gather's
@@ -510,9 +491,9 @@ fn the_lattice_statistic_gathers_the_window_the_origin_names() {
 /// and the two questions cannot come apart. Each op's module header carries the
 /// argument in full.
 ///
-/// Stated here through **runs of both ops** rather than about the element alone,
-/// which is what the old form could not do, with the rule written out from the
-/// definition beside them and a negative control under it.
+/// Stated through **runs of both ops** rather than about the element alone, with
+/// the rule written out from the definition beside them and a negative control
+/// under it.
 #[test]
 fn the_stamping_ops_place_the_window_the_origin_names() {
     let element = StructuringElement::from_size_stepped_at(
@@ -534,9 +515,9 @@ fn the_stamping_ops_place_the_window_the_origin_names() {
     let window = Region::whole(&volume);
     let mut scratch = Vec::new();
 
-    // The two facts the old pin recorded, kept: deep inside the volume the two
-    // sets are one set, and within `lo` of the low face they are not — without
-    // which there would be nothing for either op to be right or wrong about.
+    // Deep inside the volume the two sets are one set, and within `lo` of the
+    // low face they are not — without which there would be nothing for either
+    // op to be right or wrong about.
     assert_eq!(
         element.offsets_at([12, 0, 0], volume, &mut scratch),
         element.offsets()

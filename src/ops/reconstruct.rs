@@ -81,9 +81,9 @@
 //
 // **This works only because a reconstruction's seed and its mask are the same
 // array.** A phase has one input image, so every `Fixed` operand is a view of
-// the array substage 0 seeds from; `crate::iterate::Operand::Fixed` is where a
-// image id will go when images are a DAG, and until they are, *reconstruct A
-// under a mask B computed elsewhere* cannot be a phase. It is not lost — it is
+// the array substage 0 seeds from; `crate::iterate::Operand::Fixed` records what
+// naming a second image would take, and until that exists, *reconstruct A under
+// a mask B computed elsewhere* cannot be a phase. It is not lost — it is
 // [`reconstruct_to_fixed_point`], for a caller holding the whole volume — and
 // when the image DAG exists the op for it is a shell over this same kernel and
 // not a second implementation. That is what the split is for.
@@ -149,16 +149,8 @@
 // crossing. The two are the substage that derives the seed and the substage that
 // observes that nothing moved.
 //
-// An axis the element cannot move along at all — `r_a == 0`, a flat element —
-// contributes **zero** rather than its length, because the flood provably never
-// changes that coordinate.
-//
-// Where the element has no centre voxel its two sides differ, and `r_a` above is
-// the **narrower** of the two travelling sides: the flood crosses the axis at the
-// speed of its slower direction, and dividing by the faster one would put the
-// limit below what a correct run needs. A side of zero is not slow — it is a
-// direction the flood never travels — so it is skipped rather than minimised
-// over. See [`flooding_bound`].
+// Which `r_a` that is, for a flat axis and for an element with no centre voxel,
+// is on the loop in [`flooding_bound`].
 //
 // **What this bound assumes, stated because it is an assumption.** It is the
 // length of a *shortest* path, and a mask can force a detour: a serpentine
