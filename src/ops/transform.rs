@@ -476,21 +476,40 @@ impl WarpOp {
         self.cost = cost;
         self
     }
+
+    fn source_region(&self, output: &Region, input_volume: [usize; 3]) -> Region {
+        source_region_for(
+            &self.map,
+            output,
+            input_volume,
+            self.interpolation,
+            self.boundary,
+        )
+    }
 }
 
 /// The phase shape an analytic warp needs: blocks are cut over the output
-/// volume, while every block fetches the whole input image.
+/// volume, while every block fetches the input region its transformed output
+/// footprint can sample.
 ///
-/// Whole-source fetches are conservative, but they make arbitrary affine,
-/// projective, polar, and log-polar maps correct before the planner grows
-/// tighter transformed bounding boxes.
+/// The bound is still axis-aligned in input space, which is intentionally the
+/// same rectangular contract the rest of the executor moves, but it is derived
+/// from the actual inverse-map samples rather than conservatively fetching the
+/// whole source.
 pub fn warp_phase(
     slots: Vec<usize>,
     names: Vec<String>,
+    op: &WarpOp,
     input_volume: [usize; 3],
     output_grid: BlockGrid,
 ) -> Result<PhaseDecomposition> {
     let output_volume = output_grid.volume();
+    if output_volume != op.output_shape {
+        return Err(Error::InvalidArgument(format!(
+            "{} writes {:?}, but the supplied warp grid is over {output_volume:?}",
+            op.name, op.output_shape
+        )));
+    }
     if input_volume.contains(&0) || output_volume.contains(&0) {
         return Err(Error::InvalidArgument(format!(
             "warp phase needs non-empty input and output volumes, got input {input_volume:?}, \
@@ -499,15 +518,15 @@ pub fn warp_phase(
     }
     Ok(
         PhaseDecomposition::derive(slots, names, Reach::all(), Reach::all(), output_grid)
-            .with_sources(|_| Region::new(&[0, 0, 0], &input_volume)),
+            .with_sources(|block| op.source_region(&block.valid, input_volume)),
     )
 }
 
 /// Append a planner-visible analytic warp phase.
 ///
 /// This is the shape-changing counterpart to `PlanBuilder::pixels`: the caller
-/// supplies a grid over `op`'s output volume, and the phase records that each
-/// output block reads the whole input volume.
+/// supplies a grid over `op`'s output volume, and the phase records each block's
+/// source fetch region in the input volume.
 pub fn append_warp_phase(
     builder: &mut PlanBuilder,
     op: WarpOp,
@@ -525,6 +544,7 @@ pub fn append_warp_phase(
     let phase = warp_phase(
         vec![0],
         vec![op.name().to_string()],
+        &op,
         input_volume,
         output_grid,
     )?;
@@ -584,17 +604,31 @@ impl BlockOp for WarpOp {
         out: &mut Voxels,
         at: &Placement,
     ) -> Result<()> {
-        if at.input.offset != [0, 0, 0] || at.input.volume != input.shape() {
+        let held_shape = input.shape();
+        for axis in 0..3 {
+            if at.input.offset[axis] + held_shape[axis] > at.input.volume[axis] {
+                return Err(Error::InvalidArgument(format!(
+                    "{} source buffer spans axis {axis} {}..{} of {:?}",
+                    self.name,
+                    at.input.offset[axis],
+                    at.input.offset[axis] + held_shape[axis],
+                    at.input.volume
+                )));
+            }
+        }
+        if at.input.volume.contains(&0) {
             return Err(Error::InvalidArgument(format!(
-                "{} needs the whole source image; got source offset {:?}, source volume {:?}, \
-                 held shape {:?}",
-                self.name,
-                at.input.offset,
-                at.input.volume,
-                input.shape()
+                "{} needs a non-empty source volume",
+                self.name
             )));
         }
-        self.apply_typed_dispatch(input, out, at.output.offset)
+        self.apply_typed_dispatch(
+            input,
+            out,
+            at.output.offset,
+            at.input.offset,
+            at.input.volume,
+        )
     }
 
     fn cost_per_voxel(&self) -> f64 {
@@ -608,6 +642,8 @@ impl WarpOp {
         input: &Voxels,
         out: &mut Voxels,
         output_offset: [usize; 3],
+        source_offset: [usize; 3],
+        full_shape: [usize; 3],
     ) -> Result<()>
     where
         T: VoxelElement,
@@ -623,11 +659,13 @@ impl WarpOp {
                         output_offset[1] + j,
                         output_offset[2] + k,
                     ];
-                    out[[i, j, k]] = sample(
+                    out[[i, j, k]] = sample_from_region(
                         input,
                         self.map.at(global),
                         self.interpolation,
                         self.boundary,
+                        source_offset,
+                        full_shape,
                     );
                 }
             }
@@ -640,6 +678,8 @@ impl WarpOp {
         input: &Voxels,
         out: &mut Voxels,
         output_offset: [usize; 3],
+        source_offset: [usize; 3],
+        full_shape: [usize; 3],
     ) -> Result<()> {
         if !self.accepts(input.dtype()) {
             return Err(Error::InvalidArgument(format!(
@@ -650,17 +690,39 @@ impl WarpOp {
             )));
         }
         match input.dtype() {
-            Dtype::Bool => self.apply_typed::<bool>(input, out, output_offset),
-            Dtype::U8 => self.apply_typed::<u8>(input, out, output_offset),
-            Dtype::U16 => self.apply_typed::<u16>(input, out, output_offset),
-            Dtype::U32 => self.apply_typed::<u32>(input, out, output_offset),
-            Dtype::U64 => self.apply_typed::<u64>(input, out, output_offset),
-            Dtype::I8 => self.apply_typed::<i8>(input, out, output_offset),
-            Dtype::I16 => self.apply_typed::<i16>(input, out, output_offset),
-            Dtype::I32 => self.apply_typed::<i32>(input, out, output_offset),
-            Dtype::I64 => self.apply_typed::<i64>(input, out, output_offset),
-            Dtype::F32 => self.apply_typed::<f32>(input, out, output_offset),
-            Dtype::F64 => self.apply_typed::<f64>(input, out, output_offset),
+            Dtype::Bool => {
+                self.apply_typed::<bool>(input, out, output_offset, source_offset, full_shape)
+            }
+            Dtype::U8 => {
+                self.apply_typed::<u8>(input, out, output_offset, source_offset, full_shape)
+            }
+            Dtype::U16 => {
+                self.apply_typed::<u16>(input, out, output_offset, source_offset, full_shape)
+            }
+            Dtype::U32 => {
+                self.apply_typed::<u32>(input, out, output_offset, source_offset, full_shape)
+            }
+            Dtype::U64 => {
+                self.apply_typed::<u64>(input, out, output_offset, source_offset, full_shape)
+            }
+            Dtype::I8 => {
+                self.apply_typed::<i8>(input, out, output_offset, source_offset, full_shape)
+            }
+            Dtype::I16 => {
+                self.apply_typed::<i16>(input, out, output_offset, source_offset, full_shape)
+            }
+            Dtype::I32 => {
+                self.apply_typed::<i32>(input, out, output_offset, source_offset, full_shape)
+            }
+            Dtype::I64 => {
+                self.apply_typed::<i64>(input, out, output_offset, source_offset, full_shape)
+            }
+            Dtype::F32 => {
+                self.apply_typed::<f32>(input, out, output_offset, source_offset, full_shape)
+            }
+            Dtype::F64 => {
+                self.apply_typed::<f64>(input, out, output_offset, source_offset, full_shape)
+            }
             Dtype::F16 => Err(Error::InvalidArgument(
                 "no buffer holds half-precision".to_string(),
             )),
@@ -677,9 +739,28 @@ fn sample<T>(
 where
     T: VoxelElement,
 {
+    let full_shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+    sample_from_region(input, point, interpolation, boundary, [0, 0, 0], full_shape)
+}
+
+fn sample_from_region<T>(
+    input: ArrayView3<'_, T>,
+    point: Option<[f64; 3]>,
+    interpolation: TransformInterpolation,
+    boundary: TransformBoundary,
+    source_offset: [usize; 3],
+    full_shape: [usize; 3],
+) -> T
+where
+    T: VoxelElement,
+{
     match interpolation {
-        TransformInterpolation::Nearest => sample_nearest(input, point, boundary),
-        TransformInterpolation::Linear => sample_linear(input, point, boundary),
+        TransformInterpolation::Nearest => {
+            sample_nearest(input, point, boundary, source_offset, full_shape)
+        }
+        TransformInterpolation::Linear => {
+            sample_linear(input, point, boundary, source_offset, full_shape)
+        }
     }
 }
 
@@ -687,6 +768,8 @@ fn sample_nearest<T>(
     input: ArrayView3<'_, T>,
     point: Option<[f64; 3]>,
     boundary: TransformBoundary,
+    source_offset: [usize; 3],
+    full_shape: [usize; 3],
 ) -> T
 where
     T: VoxelElement,
@@ -694,15 +777,18 @@ where
     let Some(point) = point else {
         return T::from_f64(boundary_value(boundary));
     };
-    let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+    let held_shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
     let mut at = [0usize; 3];
     for axis in 0..3 {
         let rounded = point[axis].round();
         if !rounded.is_finite() {
             return T::from_f64(boundary_value(boundary));
         }
-        match resolve_axis(rounded, shape[axis], boundary) {
-            Some(value) => at[axis] = value,
+        match resolve_axis(rounded, full_shape[axis], boundary) {
+            Some(value) => match local_axis(value, source_offset[axis], held_shape[axis]) {
+                Some(local) => at[axis] = local,
+                None => return T::from_f64(boundary_value(boundary)),
+            },
             None => return T::from_f64(boundary_value(boundary)),
         }
     }
@@ -713,6 +799,8 @@ fn sample_linear<T>(
     input: ArrayView3<'_, T>,
     point: Option<[f64; 3]>,
     boundary: TransformBoundary,
+    source_offset: [usize; 3],
+    full_shape: [usize; 3],
 ) -> T
 where
     T: VoxelElement,
@@ -720,7 +808,7 @@ where
     let Some(point) = point else {
         return T::from_f64(boundary_value(boundary));
     };
-    let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+    let held_shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
     let mut low = [0isize; 3];
     let mut fraction = [0.0f64; 3];
     for axis in 0..3 {
@@ -745,8 +833,16 @@ where
                     } else {
                         fraction[axis]
                     };
-                    match resolve_axis(source as f64, shape[axis], boundary) {
-                        Some(value) => at[axis] = value,
+                    match resolve_axis(source as f64, full_shape[axis], boundary) {
+                        Some(value) => {
+                            match local_axis(value, source_offset[axis], held_shape[axis]) {
+                                Some(local) => at[axis] = local,
+                                None => {
+                                    outside = true;
+                                    break;
+                                }
+                            }
+                        }
                         None => {
                             outside = true;
                             break;
@@ -763,6 +859,156 @@ where
         }
     }
     T::from_f64(out)
+}
+
+fn local_axis(global: usize, source_offset: usize, held_len: usize) -> Option<usize> {
+    let local = global.checked_sub(source_offset)?;
+    (local < held_len).then_some(local)
+}
+
+#[derive(Debug, Clone)]
+struct SourceBounds {
+    low: [usize; 3],
+    high: [usize; 3],
+    any: bool,
+}
+
+impl SourceBounds {
+    fn empty() -> Self {
+        Self {
+            low: [usize::MAX; 3],
+            high: [0; 3],
+            any: false,
+        }
+    }
+
+    fn include(&mut self, point: [usize; 3]) {
+        self.any = true;
+        for (axis, &value) in point.iter().enumerate() {
+            self.low[axis] = self.low[axis].min(value);
+            self.high[axis] = self.high[axis].max(value + 1);
+        }
+    }
+
+    fn region(self) -> Region {
+        if !self.any {
+            return Region::new(&[0, 0, 0], &[1, 1, 1]);
+        }
+        Region::from_ranges(&[
+            (self.low[0], self.high[0]),
+            (self.low[1], self.high[1]),
+            (self.low[2], self.high[2]),
+        ])
+    }
+}
+
+fn source_region_for(
+    map: &CoordinateMap,
+    output: &Region,
+    input_volume: [usize; 3],
+    interpolation: TransformInterpolation,
+    boundary: TransformBoundary,
+) -> Region {
+    let start = [output.start[0], output.start[1], output.start[2]];
+    let shape = [output.shape[0], output.shape[1], output.shape[2]];
+    let mut bounds = SourceBounds::empty();
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                include_sample_footprint(
+                    map.at([start[0] + i, start[1] + j, start[2] + k]),
+                    input_volume,
+                    interpolation,
+                    boundary,
+                    &mut bounds,
+                );
+            }
+        }
+    }
+    bounds.region()
+}
+
+fn include_sample_footprint(
+    point: Option<[f64; 3]>,
+    input_volume: [usize; 3],
+    interpolation: TransformInterpolation,
+    boundary: TransformBoundary,
+    bounds: &mut SourceBounds,
+) {
+    let Some(point) = point else {
+        return;
+    };
+    match interpolation {
+        TransformInterpolation::Nearest => {
+            include_nearest_footprint(point, input_volume, boundary, bounds)
+        }
+        TransformInterpolation::Linear => {
+            include_linear_footprint(point, input_volume, boundary, bounds)
+        }
+    }
+}
+
+fn include_nearest_footprint(
+    point: [f64; 3],
+    input_volume: [usize; 3],
+    boundary: TransformBoundary,
+    bounds: &mut SourceBounds,
+) {
+    let mut at = [0usize; 3];
+    for axis in 0..3 {
+        let rounded = point[axis].round();
+        if !rounded.is_finite() {
+            return;
+        }
+        let Some(value) = resolve_axis(rounded, input_volume[axis], boundary) else {
+            return;
+        };
+        at[axis] = value;
+    }
+    bounds.include(at);
+}
+
+fn include_linear_footprint(
+    point: [f64; 3],
+    input_volume: [usize; 3],
+    boundary: TransformBoundary,
+    bounds: &mut SourceBounds,
+) {
+    let mut low = [0isize; 3];
+    let mut fraction = [0.0f64; 3];
+    for axis in 0..3 {
+        if !point[axis].is_finite() {
+            return;
+        }
+        low[axis] = point[axis].floor() as isize;
+        fraction[axis] = point[axis] - low[axis] as f64;
+    }
+    for da in 0..=1 {
+        for db in 0..=1 {
+            for dc in 0..=1 {
+                let choice = [da, db, dc];
+                let mut at = [0usize; 3];
+                let mut weight = 1.0;
+                for axis in 0..3 {
+                    weight *= if choice[axis] == 0 {
+                        1.0 - fraction[axis]
+                    } else {
+                        fraction[axis]
+                    };
+                    let source = low[axis] + choice[axis] as isize;
+                    let Some(value) = resolve_axis(source as f64, input_volume[axis], boundary)
+                    else {
+                        weight = 0.0;
+                        break;
+                    };
+                    at[axis] = value;
+                }
+                if weight != 0.0 {
+                    bounds.include(at);
+                }
+            }
+        }
+    }
 }
 
 fn resolve_axis(value: f64, len: usize, boundary: TransformBoundary) -> Option<usize> {

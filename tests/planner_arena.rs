@@ -39,6 +39,7 @@ use blockflow::strategy::{
 use blockflow::Dtype;
 
 mod support;
+use support::planner_perf::{OracleComparison, OracleTarget, RegretBudget};
 use support::refuses;
 
 /// Long enough on the split axis for the ladder below to give genuinely
@@ -338,11 +339,13 @@ fn the_two_judges_record_the_raw_gap_and_simulator_backed_closes_it() {
         );
 
         let tau = judgement.kendall_tau().expect("an ordered field");
-        let regret = judgement.regret().expect("a field with a winner");
-        assert!(
-            regret >= 1.0,
-            "a regret below one is arithmetically impossible: {regret}"
-        );
+        let model = judgement.model_pick().expect("a field with a model winner");
+        let context = format!("{workers} workers arena");
+        let oracle = OracleTarget::best_simulated_candidate(&context, &judgement)
+            .expect("a field with a simulator winner");
+        let comparison = OracleComparison::against(&context, model.simulated_ns(), oracle);
+        let assessment = RegretBudget::ORACLE_REPORT_CEILING.assess(comparison);
+        let regret = assessment.regret();
         println!(
             "{workers} workers: kendall tau {tau:.3}, regret {regret:.3}, discordant {:?}",
             judgement.discordant_pairs()
@@ -404,17 +407,19 @@ fn the_two_judges_record_the_raw_gap_and_simulator_backed_closes_it() {
         .iter()
         .find(|verdict| verdict.name == choice.name)
         .expect("the selected plan is in its judgement");
-    let best = choice
-        .judgement
-        .simulated_pick()
-        .expect("the simulator-backed field has a simulator winner");
     assert_eq!(
         choice.name, "edge-64",
         "the simulator-backed planner should select the simulator winner for the four-worker \
          arena gap"
     );
+    let oracle =
+        OracleTarget::best_simulated_candidate("simulator-backed arena pick", &choice.judgement)
+            .expect("the simulator-backed field has a simulator winner");
+    let comparison =
+        OracleComparison::against("simulator-backed arena pick", picked.simulated_ns(), oracle);
+    let assessment = RegretBudget::NEAR_ORACLE.assess(comparison);
     assert!(
-        picked.simulated_ns() / best.simulated_ns() <= 1.10,
+        assessment.accepts(),
         "the simulator-backed selected plan should be within the TODO4 arena stop condition"
     );
 }

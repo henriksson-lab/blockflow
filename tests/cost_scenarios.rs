@@ -50,7 +50,7 @@ mod support;
 use support::planner_perf::{
     base_constraints, enumerating_for, plan_shape, planner_choice_for, scenarios, simulated_ns_on,
     simulator_backed_choice_for, simulator_backed_for, simulator_backed_plan_for, workflow,
-    PlanChoice, PlanMatrix, RobustPlanChoice, COSTS,
+    OracleComparison, OracleTarget, PlanChoice, PlanMatrix, RegretBudget, RobustPlanChoice, COSTS,
 };
 
 /// **Write `costs/` from the baseline and the transforms that derive it.**
@@ -330,15 +330,15 @@ fn run(scenario: &Scenario) -> Ran {
         .judge(&workflow)
         .unwrap_or_else(|err| panic!("{}: every plan must simulate: {err}", scenario.name));
     let makespan_ns = judgement.verdicts[0].simulated_ns();
-    let best_ns = judgement
-        .simulated_pick()
-        .expect("a field with a winner")
-        .simulated_ns();
+    let oracle = OracleTarget::best_simulated_candidate(&scenario.name, &judgement)
+        .expect("a field with a winner");
+    let best_ns = oracle.ns();
+    let comparison = OracleComparison::against(&scenario.name, makespan_ns, oracle);
     Ran {
         plan_shape,
         makespan_ns,
         best_ns,
-        regret: makespan_ns / best_ns,
+        regret: comparison.regret(),
     }
 }
 
@@ -426,17 +426,14 @@ fn run(scenario: &Scenario) -> Ran {
 #[test]
 fn the_planner_chooses_well_on_every_committed_scenario() {
     let scenarios = scenarios();
+    let ceiling = RegretBudget::ORACLE_REPORT_CEILING;
     println!("{:<24} {:<24} {:>8}", "scenario", "plan", "regret");
     let mut worst: Option<(String, f64)> = None;
     for (name, scenario) in &scenarios {
         let ran = run(scenario);
         println!("{name:<24} {:<24} {:>8.3}", ran.plan_shape, ran.regret);
         assert!(
-            ran.regret >= 1.0,
-            "{name}: a regret below one is arithmetically impossible"
-        );
-        assert!(
-            ran.regret <= 2.25,
+            ceiling.accepts(ran.regret),
             "{name}: the planner's own plan is {:.3}x the best block edge on this machine. \
              The recorded worst figure is `two-nodes` at 2.172; see this test's doc: that \
              one is contention between overlapping phases, which the wave-synchronous executor \
@@ -463,6 +460,8 @@ fn the_simulator_backed_planner_chooses_well_on_every_committed_scenario() {
     let workflow = workflow();
     let base = base_constraints();
     let scenarios = scenarios();
+    let near_oracle = RegretBudget::NEAR_ORACLE;
+    let ceiling = RegretBudget::LOCAL_ORACLE_CEILING;
     println!("{:<24} {:<24} {:>8}", "scenario", "plan", "regret");
     let mut within_ten_percent = 0usize;
     let mut worst: Option<(String, f64)> = None;
@@ -478,35 +477,39 @@ fn the_simulator_backed_planner_chooses_well_on_every_committed_scenario() {
             .iter()
             .find(|verdict| verdict.name == chosen.name)
             .expect("the selected plan is in its judgement");
-        let best = chosen
-            .judgement
-            .simulated_pick()
+        let oracle = OracleTarget::best_simulated_candidate(name, &chosen.judgement)
             .expect("the candidate field has a simulator winner");
-        let regret = verdict.simulated_ns() / best.simulated_ns();
+        let comparison = OracleComparison::against(name, verdict.simulated_ns(), oracle);
+        let near_oracle_assessment = near_oracle.assess(comparison);
+        let ceiling_assessment = ceiling.assess(comparison);
+        let regret = ceiling_assessment.regret();
         let plan_shape = plan_shape(&chosen.plan);
         println!("{name:<24} {plan_shape:<24} {regret:>8.3}");
-        if regret <= 1.10 {
+        if near_oracle_assessment.accepts() {
             within_ten_percent += 1;
         }
         if worst.as_ref().is_none_or(|(_, seen)| regret > *seen) {
             worst = Some((name.clone(), regret));
         }
         assert!(
-            regret <= 1.30,
+            ceiling_assessment.accepts(),
             "{name}: simulator-backed continuous regret {regret:.3} exceeds TODO4's per-scenario \
              continuous ceiling"
         );
     }
     let (name, regret) = worst.expect("a scenario");
     println!(
-        "simulator-backed summary: {within_ten_percent}/{} at <=1.10; worst {regret:.3}, on {name}",
-        scenarios.len()
+        "simulator-backed summary: {within_ten_percent}/{} at <={:.2}; worst {regret:.3}, on {name}",
+        scenarios.len(),
+        near_oracle.ratio()
     );
     assert!(
         within_ten_percent >= 10,
-        "TODO4 requires at least 10 of {} committed scenarios at regret <=1.10; got \
+        "TODO4 requires at least 10 of {} committed scenarios at regret <= {:.2} ({}); got \
          {within_ten_percent}",
-        scenarios.len()
+        scenarios.len(),
+        near_oracle.ratio(),
+        near_oracle.label()
     );
 }
 
@@ -525,6 +528,7 @@ fn storage_axes_only_move_the_planner_when_the_oracle_moves() {
     let workflow = workflow();
     let base = base_constraints();
     let scenarios = scenarios();
+    let movement_bar = RegretBudget::NEAR_ORACLE;
     let measured = scenarios
         .get("measured")
         .expect("the measured scenario is the baseline");
@@ -564,14 +568,13 @@ fn storage_axes_only_move_the_planner_when_the_oracle_moves() {
             .unwrap_or_else(|| panic!("{}: committed storage scenario missing", row.name));
         let (choice, _) = simulator_backed_choice_for(scenario, &workflow, &base);
         let oracle_shape = plan_shape_key(&choice.plan);
-        let best = choice
-            .judgement
-            .simulated_pick()
-            .expect("a simulator-backed storage field has a winner")
-            .simulated_ns();
+        let oracle = OracleTarget::best_simulated_candidate(row.name, &choice.judgement)
+            .expect("a simulator-backed storage field has a winner");
         let baseline_ns = simulated_ns_on(&measured_plan, scenario, &workflow, &base)
             .unwrap_or_else(|| panic!("{}: measured baseline plan must fit", row.name));
-        let regret = baseline_ns / best;
+        let comparison = OracleComparison::against(row.name, baseline_ns, oracle);
+        let assessment = movement_bar.assess(comparison);
+        let regret = assessment.regret();
         println!(
             "{:<24} {:<18} {:<18} {regret:>8.3}",
             row.name,
@@ -585,10 +588,11 @@ fn storage_axes_only_move_the_planner_when_the_oracle_moves() {
                 row.name
             );
             assert!(
-                regret >= 1.10,
+                assessment.crossed_by(),
                 "{}: oracle moved shape but baseline regret was only {regret:.3}; do not add a \
-                 planner storage term below the 10% acceptance bar",
-                row.name
+                 planner storage term below the {} acceptance bar",
+                row.name,
+                movement_bar.label()
             );
         } else {
             assert_eq!(
@@ -598,10 +602,11 @@ fn storage_axes_only_move_the_planner_when_the_oracle_moves() {
                 row.name
             );
             assert!(
-                regret <= 1.10,
+                assessment.accepts(),
                 "{}: baseline storage plan costs {regret:.3}x the oracle; this now crosses \
-                 TODO4's 10% acceptance bar",
-                row.name
+                 TODO4's {} acceptance bar",
+                row.name,
+                movement_bar.label()
             );
         }
     }
@@ -619,6 +624,8 @@ fn cache_and_prefetch_policy_search_runs_after_scheduler_shape_search() {
     let workflow = workflow();
     let base = base_constraints();
     let scenarios = scenarios();
+    let movement_bar = RegretBudget::NEAR_ORACLE;
+    let picked_plan_ceiling = RegretBudget::LOCAL_ORACLE_CEILING;
     let measured = scenarios
         .get("measured")
         .expect("the measured scenario is the cache/prefetch baseline");
@@ -713,11 +720,14 @@ fn cache_and_prefetch_policy_search_runs_after_scheduler_shape_search() {
         saw_cache_contract |= !scenario.machine.cache_shared || scenario.machine.cache_bytes == 0;
         let (choice, _) = simulator_backed_choice_for(&scenario, &workflow, &base);
         let oracle_shape = plan_shape_key(&choice.plan);
-        let best = choice
-            .judgement
-            .simulated_pick()
-            .expect("a cache/prefetch candidate field has a winner")
-            .simulated_ns();
+        let baseline_context = format!("{} baseline", scenario.name);
+        let picked_context = format!("{} picked", scenario.name);
+        let baseline_oracle =
+            OracleTarget::best_simulated_candidate(&baseline_context, &choice.judgement)
+                .expect("a cache/prefetch candidate field has a winner");
+        let picked_oracle =
+            OracleTarget::best_simulated_candidate(&picked_context, &choice.judgement)
+                .expect("a cache/prefetch candidate field has a winner");
         let picked = choice
             .judgement
             .verdicts
@@ -727,8 +737,18 @@ fn cache_and_prefetch_policy_search_runs_after_scheduler_shape_search() {
             .simulated_ns();
         let baseline_ns = simulated_ns_on(&measured_plan, &scenario, &workflow, &base)
             .unwrap_or_else(|| panic!("{}: measured baseline plan must fit", scenario.name));
-        let baseline_regret = baseline_ns / best;
-        let picked_regret = picked / best;
+        let baseline_assessment = movement_bar.assess(OracleComparison::against(
+            &baseline_context,
+            baseline_ns,
+            baseline_oracle,
+        ));
+        let picked_assessment = picked_plan_ceiling.assess(OracleComparison::against(
+            &picked_context,
+            picked,
+            picked_oracle,
+        ));
+        let baseline_regret = baseline_assessment.regret();
+        let picked_regret = picked_assessment.regret();
         println!(
             "{:<20} {:<18} {:<18} {:>8.3} {:>8.3}",
             scenario.name,
@@ -737,11 +757,11 @@ fn cache_and_prefetch_policy_search_runs_after_scheduler_shape_search() {
             baseline_regret,
             picked_regret
         );
-        if oracle_shape != measured_shape || baseline_regret >= 1.10 {
+        if oracle_shape != measured_shape || baseline_assessment.crossed_by() {
             moved_oracle += 1;
         }
         assert!(
-            picked_regret <= 1.30,
+            picked_assessment.accepts(),
             "{}: cache/prefetch search selected a plan at {picked_regret:.3}x the local oracle",
             scenario.name
         );
@@ -753,8 +773,9 @@ fn cache_and_prefetch_policy_search_runs_after_scheduler_shape_search() {
     );
     assert!(
         moved_oracle > 0,
-        "the cache/prefetch sweep never moved an oracle shape or cost by 10%; it would not justify \
-         any policy search"
+        "the cache/prefetch sweep never moved an oracle shape or cost by {}; it would not justify \
+         any policy search",
+        movement_bar.label()
     );
 }
 

@@ -15,9 +15,9 @@ use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::probes::{IdentityOp, NonZeroOp};
 use blockflow::simulate::{
-    phase_rates_from_snapshot, BoundedHorizonThroughput, ExecutorOrder, Machine, PerPhase,
-    PlanOrder, RateBasis, Rates, ReleaseAware, Run, RunAhead, Scheduler, WarmestFirst,
-    MEASURED_CONTENTION,
+    phase_rates_from_snapshot, BoundedHorizonThroughput, ExecutorOrder, FetchHorizonFloor,
+    HorizonFloorKind, Machine, PerPhase, PlanOrder, RateBasis, Rates, ReleaseAware, Run, RunAhead,
+    Scheduler, WarmestFirst, MEASURED_CONTENTION,
 };
 use blockflow::Dtype;
 use std::collections::BTreeSet;
@@ -1331,6 +1331,9 @@ fn the_horizon_floor_accounts_for_latency_decode_chunks_and_images() {
     };
     let one_chunk = rates.io_latency_ns as u64
         + rates.chunk_bytes * (rates.io_ns_per_byte + rates.decode_ns_per_byte) as u64;
+    let fallback_floor = FetchHorizonFloor::one_chunk(&rates);
+    assert_eq!(fallback_floor.kind(), HorizonFloorKind::OneChunk);
+    assert_eq!(fallback_floor.ns(), one_chunk);
     assert_eq!(
         BoundedHorizonThroughput::floor_ns(&rates),
         one_chunk,
@@ -1350,6 +1353,9 @@ fn the_horizon_floor_accounts_for_latency_decode_chunks_and_images() {
         .with_source_images([0]);
 
     let plan_floor = BoundedHorizonThroughput::floor_for_plan(&assembly.decomposition, &rates);
+    let plan_floor_witness = FetchHorizonFloor::for_plan(&assembly.decomposition, &rates);
+    assert_eq!(plan_floor_witness.kind(), HorizonFloorKind::PlanTaskFetch);
+    assert_eq!(plan_floor_witness.ns(), plan_floor);
     assert_eq!(
         plan_floor,
         one_chunk * 16,

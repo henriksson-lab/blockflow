@@ -53,6 +53,8 @@
 // | `configuration` | a mask rewritten by a table indexed on the 3x3x3 neighbourhood | the first op whose rule is **data rather than code** — 2^27 entries the caller supplies — and the first written as *both* shells over one kernel, so what a stated pass count and a fixed point cost differently is a comparison rather than an argument |
 // | `mixing` | a K-ary reach-0 shell (`TupleOp`), its kernel trait and the per-voxel matrix | the first op parameterised by **arity** rather than by a window — K co-located arrays in, K' out, every value read at the voxel it is written to. A window is what `Reach` describes and needs an axis to be stated over; arity needs only somewhere for the operands to come from, which is why this became reachable when a run could be handed images it did not compute. This is the register's G10 closed |
 // | `watershed` | a cost volume partitioned into one basin per seed | the first op that **declares itself a planning barrier** rather than being one by arithmetic: its answer is a function of one global queue's pop order, so `AxisReach::All` is the honest reach and the cost of saying so is written down as memory per voxel rather than as an adjective |
+// | `random_walker` | seeded random-walker probabilities from an intensity volume and seed image | the first volume op whose answer is a **sparse linear solve** assembled from block fragments: row IDs are a planner-visible image, sparse rows are emitted per block, and the barrier solve writes a dense probability image back through those row IDs |
+// | `level_set` | signed-distance initialisation and geodesic active-contour evolution | the first op whose natural shape is an explicit PDE step over a running scalar field and a separate fixed image. The resident kernel is the reference; the one-step shell is a `BlockOp` with two-voxel reach, while the multi-step phase waits for `IterativeOp` to name fixed source images rather than only the phase input |
 // | `fft` | a real plane's Fourier transform, and a squared-difference landscape over integer lags through the correlation theorem | the first thing here that is **not an op at all**, and could not be: two inputs of different extents, an output indexed by *lag* rather than by position, and a complex intermediate `Voxels` cannot hold. `watershed` declares the barrier and still fits the shape; this one does not fit the shape, so it is free functions and a plan, and the absent `BlockOp` is the statement |
 // | `align` | block-reduced fitting of a 3-D coordinate map between two scalar volumes | the first op whose output is a small global state rather than a volume or row set. Each iteration maps blocks to local evidence, reduces it, and performs one global update before the next iteration. |
 //
@@ -323,10 +325,13 @@ pub(crate) mod histogram;
 pub mod interest;
 pub mod label;
 pub mod lattice;
+pub mod level_set;
 pub mod local;
+pub mod measure;
 pub mod mixing;
 pub mod morphology;
 pub mod normalise;
+pub mod random_walker;
 pub mod rank;
 pub mod rasterise;
 pub mod reconstruct;
@@ -441,12 +446,183 @@ pub use lattice::{
     lattice_interpolate_phase, lattice_statistic_into, lattice_statistic_phase,
     statistic_block_edge, LatticeInterpolateOp, LatticeStatisticOp,
 };
+pub use level_set::{
+    append_geodesic_level_set_phases, chan_vese_level_set_into, chan_vese_level_set_reporting_into,
+    chan_vese_level_set_step_into, geodesic_level_set_into, geodesic_level_set_reporting_into,
+    geodesic_level_set_step_into, level_set_mask_into, signed_distance_level_set,
+    ChanVeseLevelSetConfig, GeodesicLevelSetConfig, GeodesicLevelSetStepOp, LevelSetReport,
+    GEODESIC_LEVEL_SET_STEP_COST, MAX_EXPLICIT_LEVEL_SET_DT,
+};
 pub use local::{
     axis_max_distance, local_statistic_into, local_statistic_into_narrowed,
     local_statistic_into_with, masked_local_statistic_into, masked_local_statistic_into_narrowed,
     masked_local_statistic_into_with, threshold_against_into, AdaptiveThresholdOp, Alignment,
     EmptyPopulation, Isodata, LatticeNarrowing, LocalStatistic, LocalStatisticOp, Narrowing,
     Niblack, Population, Rounding, SampleLattice, Sampling, Sauvola, Statistic,
+};
+pub use measure::{
+    assert_boundary_measurement_decomposition_invariant, assert_boundary_measurement_invariant,
+    assert_custom_boundary_builder_invariant, assert_custom_region_builder_invariant,
+    assert_object_measurement_invariant, assert_region_measurement_decomposition_invariant,
+    assert_region_measurement_invariant, auto_distribution_measurement_schema,
+    auto_distribution_measurement_schema_set, auto_distribution_measurements,
+    boundary_distance_relationship_measurement_schema, boundary_measurement_schema,
+    centroid_neighbor_measurement_schema, centroid_relationship_measurement_schema,
+    collect_auto_distribution_measurements, collect_auto_distribution_measurements_set,
+    collect_auto_distribution_rows_set, collect_auto_distribution_rows_with_set,
+    collect_boundary_distance_relationship_measurements,
+    collect_boundary_distance_relationship_rows,
+    collect_boundary_distance_relationship_rows_with_contract, collect_boundary_measurements,
+    collect_boundary_rows, collect_centroid_neighbor_measurements, collect_centroid_neighbor_rows,
+    collect_centroid_neighbor_rows_with_contract, collect_centroid_relationship_measurements,
+    collect_centroid_relationship_rows, collect_centroid_relationship_rows_with_contract,
+    collect_class_a_shapes, collect_class_a_values, collect_colocalization_measurements,
+    collect_colocalization_rows, collect_colocalization_rows_with_contract,
+    collect_component_measurements, collect_component_rows, collect_contact_measurements,
+    collect_contact_rows, collect_costes_colocalization_measurements,
+    collect_costes_colocalization_rows, collect_costes_colocalization_rows_with_contract,
+    collect_custom_boundary_rows, collect_custom_object_rows, collect_custom_region_rows,
+    collect_distribution_measurements, collect_distribution_rows,
+    collect_enclosing_sphere_measurements, collect_enclosing_sphere_rows,
+    collect_enclosing_sphere_rows_with_contract, collect_exact_distribution_measurements,
+    collect_exact_distribution_measurements_set, collect_exact_distribution_rows_set,
+    collect_exact_distribution_rows_with_set, collect_exact_label_radius_measurements,
+    collect_exact_label_radius_rows, collect_expansion_relationship_measurements,
+    collect_expansion_relationship_rows, collect_expansion_relationship_rows_with_contract,
+    collect_glcm_texture_measurements, collect_glcm_texture_rows,
+    collect_glcm_texture_rows_with_contract, collect_granularity_measurements,
+    collect_granularity_rows, collect_granularity_rows_with_set,
+    collect_object_3d_moment_measurements, collect_object_3d_moment_measurements_set,
+    collect_object_3d_moment_rows_set, collect_object_3d_moment_rows_with_set,
+    collect_object_convex_hull_measurements, collect_object_convex_hull_rows,
+    collect_object_convex_hull_rows_with_contract, collect_object_geometry_measurements,
+    collect_object_geometry_rows, collect_object_geometry_rows_with_contract,
+    collect_object_hu_moment_measurements, collect_object_hu_moment_rows,
+    collect_object_hu_moment_rows_with_contract, collect_object_projected_convex_measurements,
+    collect_object_projected_convex_measurements_set, collect_object_projected_convex_rows_set,
+    collect_object_projected_convex_rows_with_contract,
+    collect_object_projected_convex_rows_with_set,
+    collect_object_voxel_face_convex_hull_measurements, collect_object_voxel_face_convex_hull_rows,
+    collect_object_voxel_face_convex_hull_rows_with_contract,
+    collect_object_weighted_hu_moment_measurements, collect_object_weighted_hu_moment_rows,
+    collect_object_weighted_hu_moment_rows_with_contract, collect_object_zernike3d_measurements,
+    collect_object_zernike3d_measurements_set, collect_object_zernike3d_rows_set,
+    collect_object_zernike3d_rows_with_contract, collect_object_zernike_moment_measurements,
+    collect_object_zernike_moment_measurements_set, collect_object_zernike_moment_rows_set,
+    collect_object_zernike_moment_rows_with_contract, collect_object_zernike_moment_rows_with_set,
+    collect_rank_weighted_colocalization_measurements, collect_rank_weighted_colocalization_rows,
+    collect_rank_weighted_colocalization_rows_with_contract,
+    collect_shared_boundary_radius_measurements, collect_shared_boundary_radius_rows,
+    collect_topology_measurements, collect_topology_rows, collect_touching_neighbor_measurements,
+    collect_touching_neighbor_rows, collect_touching_neighbor_rows_with_contract,
+    colocalization_measurement_schema, colocalization_measurements, component_measurement_schema,
+    contact_fraction_of_boundary, contact_measurement_schema,
+    costes_colocalization_measurement_schema, costes_colocalization_measurements,
+    decode_custom_measurement_rows, distribution_measurement_schema,
+    enclosing_sphere_measurement_schema, encode_auto_distribution_measurements,
+    encode_auto_distribution_measurements_set, encode_boundary_distance_relationship_measurements,
+    encode_centroid_neighbor_measurements, encode_centroid_relationship_measurements,
+    encode_colocalization_measurements, encode_component_measurements,
+    encode_costes_colocalization_measurements, encode_enclosing_sphere_measurements,
+    encode_exact_distribution_measurements, encode_exact_distribution_measurements_set,
+    encode_exact_label_radius_measurements, encode_expansion_relationship_measurements,
+    encode_granularity_measurements, encode_object_3d_moment_measurements,
+    encode_object_3d_moment_measurements_set, encode_object_convex_hull_measurements,
+    encode_object_geometry_measurements, encode_object_hu_moment_measurements,
+    encode_object_projected_convex_measurements, encode_object_projected_convex_measurements_set,
+    encode_object_voxel_face_convex_hull_measurements,
+    encode_object_weighted_hu_moment_measurements, encode_object_zernike3d_measurements,
+    encode_object_zernike3d_measurements_set, encode_object_zernike_moment_measurements,
+    encode_object_zernike_moment_measurements_set,
+    encode_rank_weighted_colocalization_measurements, encode_shared_boundary_radius_measurements,
+    encode_topology_measurements, encode_touching_neighbor_measurements,
+    equivalent_sphere_diameter, equivalent_sphere_diameter_for_voxels, equivalent_sphere_radius,
+    equivalent_sphere_radius_for_voxels, exact_distribution_measurement_schema,
+    exact_distribution_measurement_schema_set, exact_distribution_measurements,
+    exact_label_radius_measurements, expansion_relationship_measurement_schema,
+    expansion_until_adjacent_relationships_from_boundary_distances, fuse_glcm_texture_measurements,
+    glcm_texture_measurement_schema, glcm_texture_measurements, granularity_measurement_schema,
+    granularity_spectrum_measurements, object_3d_moment_measurement_schema,
+    object_3d_moment_measurement_schema_set, object_3d_moment_measurements,
+    object_3d_moment_measurements_set, object_boundary_distance_relationships,
+    object_centroid_relationships, object_centroid_relationships_from_shapes,
+    object_component_measurements, object_convex_hull_measurement_schema,
+    object_convex_hull_measurements, object_enclosing_sphere_measurements,
+    object_expansion_until_adjacent_relationships, object_geometry_measurement_schema,
+    object_geometry_measurements, object_hu_moment_measurement_schema,
+    object_hu_moments_measurements, object_projected_convex_measurement_schema,
+    object_projected_convex_measurement_schema_set, object_projected_convex_measurements,
+    object_projected_convex_measurements_set, object_topology_measurements,
+    object_topology_measurements_with, object_voxel_face_convex_hull_measurement_schema,
+    object_voxel_face_convex_hull_measurements, object_weighted_hu_moment_measurement_schema,
+    object_weighted_hu_moments_measurements, object_zernike3d_measurement_schema,
+    object_zernike3d_measurement_schema_set, object_zernike3d_measurements,
+    object_zernike3d_measurements_set, object_zernike_moment_measurement_schema,
+    object_zernike_moment_measurement_schema_set, object_zernike_moments_measurements,
+    object_zernike_moments_measurements_set, orientation_yx, principal_axes,
+    principal_axis_lengths, radius_measurement_schema,
+    rank_weighted_colocalization_measurement_schema, rank_weighted_colocalization_measurements,
+    run_boundary_measure, run_object_measure, run_region_measure, shape_boundary_measurements,
+    shared_boundary_distance_field, shared_boundary_radius_measurements,
+    summarize_centroid_neighbors, summarize_centroid_neighbors_within,
+    summarize_touching_neighbors, topology_measurement_schema,
+    touching_neighbor_measurement_schema, ApproxDistributionSet, ApproxMode, ApproxTolerance,
+    AutoDistributionOp, AutoDistributionRows, AutoDistributionSet,
+    BoundaryDistanceRelationshipRows, BoundaryDistanceRelationshipsOp, BoundaryFeature,
+    BoundaryLabelsOp, BoundaryMeasure, BoundaryMeasureOp, BoundaryMeasurements,
+    BoundaryPointTallyOp, BoundaryRows, CentroidNeighborRows, CentroidNeighborSummaryOp,
+    CentroidRelationshipRows, CentroidRelationshipsOp, ClassARows, ColocalizationContract,
+    ColocalizationFeature, ColocalizationMeasurements, ColocalizationPairsOp, ColocalizationRows,
+    ColocalizationSumsOp, ContactFeature, ContactMeasurements, ContactRows,
+    CostesColocalizationFeature, CostesColocalizationMeasurements, CostesColocalizationOp,
+    CostesColocalizationRows, CustomBoundaryRows, CustomObjectRows, CustomRegionRows,
+    DistributionFeature, DistributionMeasurements, DistributionPercentile, DistributionRows,
+    DistributionSet, EnclosingSphereOp, ExactDistributionMeasurements, ExactDistributionOp,
+    ExactDistributionRows, ExactDistributionSet, ExactDistributionTallyOp,
+    ExactLabelRadiusMeasurements, ExactLabelRadiusOp, ExactLabelRadiusRows,
+    ExpansionRelationshipRows, ExpansionUntilAdjacentRelationshipsOp, FeatureScalar, FoldLaw,
+    FusedGlcmTextureMeasurements, GlcmOffset, GlcmQuantization, GlcmTextureContract,
+    GlcmTextureFeature, GlcmTextureMeasurements, GlcmTextureOp, GranularityFeature,
+    GranularityMeasurements, GranularityOp, GranularityRadius, GranularityRows, GranularitySet,
+    HuMomentIndex, IntensityFeature, IntensityHistogramOp, IntensityImage, IntensityMeasurements,
+    IntensitySet, LabelImage, MeasureSource, MeasureValues, MeasurementFrame, MeasurementFrameId,
+    MeasurementKey, MeasurementPlan, MeasurementRows, MeasurementRowsWithContract,
+    MeasurementSourceFact, MeasurementSourceFacts, Measurements,
+    MergeBoundaryDistanceRelationshipsOp, MergeBoundaryLabelsOp, MergeColocalizationSumsOp,
+    MergeCostesColocalizationOp, MergeEnclosingSphereOp, MergeExactDistributionOp,
+    MergeExpansionUntilAdjacentRelationshipsOp, MergeGlcmTextureOp, MergeIntensityHistogramOp,
+    MergeObjectConvexHullOp, MergeObjectGeometryOp, MergeObjectHuMomentsOp, MergeObjectMoment3dOp,
+    MergeObjectProjectedConvexOp, MergeObjectVoxelFaceConvexHullOp, MergeObjectWeightedHuMomentsOp,
+    MergeObjectZernike3dOp, MergeObjectZernikeMomentsOp, MergeRankWeightedColocalizationOp,
+    Moment3d, Moment3dKey, MultiGlcmTextureOp, NeighborSummary, ObjectBoundaryDistanceFeature,
+    ObjectBoundaryDistanceMeasurements, ObjectComponentFeature, ObjectComponentMeasurements,
+    ObjectComponentOp, ObjectConvexHullFeature, ObjectConvexHullMeasurements, ObjectConvexHullOp,
+    ObjectConvexHullRows, ObjectConvexHullView, ObjectEnclosingSphereFeature,
+    ObjectEnclosingSphereMeasurements, ObjectEnclosingSphereRows, ObjectExpansionFeature,
+    ObjectExpansionMeasurements, ObjectGeometryFeature, ObjectGeometryMeasurements,
+    ObjectGeometryOp, ObjectGeometryRows, ObjectHuMomentFeature, ObjectHuMomentRows,
+    ObjectHuMomentsMeasurements, ObjectHuMomentsOp, ObjectInputs, ObjectMeasure,
+    ObjectMeasureMergeOp, ObjectMoment3dFeature, ObjectMoment3dMeasurements, ObjectMoment3dOp,
+    ObjectMoment3dRows, ObjectMoment3dSet, ObjectNeighborFeature, ObjectNeighborMeasurements,
+    ObjectPointTallyOp, ObjectProjectedConvexContract, ObjectProjectedConvexFeature,
+    ObjectProjectedConvexMeasurements, ObjectProjectedConvexOp, ObjectProjectedConvexRows,
+    ObjectProjectionContract, ObjectRelationshipFeature, ObjectRelationshipMeasurements,
+    ObjectTopologyConvention, ObjectTopologyFeature, ObjectTopologyMeasurements, ObjectTopologyOp,
+    ObjectView, ObjectVoxelFaceConvexHullFeature, ObjectVoxelFaceConvexHullMeasurements,
+    ObjectVoxelFaceConvexHullRows, ObjectWeightedHuMomentFeature, ObjectWeightedHuMomentRows,
+    ObjectWeightedHuMomentsMeasurements, ObjectWeightedHuMomentsOp, ObjectZernike3dContract,
+    ObjectZernike3dDescriptor, ObjectZernike3dFeature, ObjectZernike3dMeasurements,
+    ObjectZernike3dRows, ObjectZernike3dSet, ObjectZernikeMoment, ObjectZernikeMomentContract,
+    ObjectZernikeMomentFeature, ObjectZernikeMomentRows, ObjectZernikeMomentSet,
+    ObjectZernikeMomentsMeasurements, ObjectZernikeMomentsOp, PhysicalSpacing, ProjectedConvexSet,
+    ProjectionAxis, RadiusFeature, RankWeightedColocalizationFeature,
+    RankWeightedColocalizationMeasurements, RankWeightedColocalizationOp,
+    RankWeightedColocalizationRows, RegionMeasure, RegionMeasureOp, ShapeBoundaryFeature,
+    ShapeBoundaryMeasurements, ShapeFeature, ShapeMeasurements, ShapeSet,
+    SharedBoundaryRadiusMeasurements, SharedBoundaryRadiusOp, SharedBoundaryRadiusRows,
+    TextureRows, TopologyRows, TouchingNeighborFeature, TouchingNeighborRows,
+    TouchingNeighborSummaryOp, VoxelCount, WeightedHuPointTallyOp, WithinDistanceThreshold,
+    Zernike3dKey, ZernikeMomentKey,
 };
 pub use mixing::{LinearMap, TupleKernel, TupleOp};
 pub use morphology::{
@@ -460,6 +636,22 @@ pub use morphology::{
 pub use normalise::{
     bounded_gain_into, bounded_gain_value, normalise_against_into, normalise_value,
     LevelCorrectionOp, LocalContrastOp, LocalGainOp, Removal,
+};
+pub use random_walker::{
+    append_grady_weight_phase, append_random_walker_binary_seed_image_phases,
+    append_random_walker_row_id_phase, assemble_random_walker_system,
+    assemble_random_walker_system_from_packed,
+    assemble_random_walker_system_from_packed_seed_image,
+    assemble_random_walker_system_from_seed_image, assemble_random_walker_system_from_sparse_table,
+    collect_random_walker_rows, encode_random_walker_rows, grady_weight_phase,
+    grady_weights_packed_into, packed_weight_shape, random_walker_binary_into,
+    random_walker_binary_seed_image_into, random_walker_row_id_phase, random_walker_row_ids_into,
+    random_walker_sparse_columns, random_walker_sparse_schema,
+    solve_random_walker_seed_image_system_into, solve_random_walker_sparse_table_seed_image_into,
+    solve_random_walker_system_into, GradyWeightOp, GradyWeights, RandomWalkerConfig,
+    RandomWalkerImages, RandomWalkerRowIdOp, RandomWalkerRowsOp, RandomWalkerSolve,
+    RandomWalkerSolveImages, RandomWalkerSolveOp, RandomWalkerSparseColumns, RandomWalkerSystem,
+    RandomWalkerWeights,
 };
 pub use rank::{
     masked_rank_filter_into, masked_rank_filter_into_at, masked_rank_filter_into_with,
@@ -506,7 +698,7 @@ pub use structure_tensor::{
 pub use tabulate::{
     append_tabulate_phases, collect_tabulation, decode_partial, encode_partial, merge_tabulation,
     region_values, tabulate_phases, tabulation_schema, FixedPoint, MergeTabulationOp, RegionValues,
-    TabulateValuesOp, Tally,
+    TabulateLabelsOp, TabulateValuesOp, Tally,
 };
 pub use threshold::{
     append_global_threshold_phases, li_threshold, mean_threshold, minimum_threshold,
@@ -746,6 +938,10 @@ impl TypedSource {
 
     pub(crate) fn dtype(self) -> Option<Dtype> {
         self.dtype
+    }
+
+    pub(crate) fn image_index(self) -> usize {
+        self.image
     }
 
     pub(crate) fn holding(mut self, dtype: Dtype) -> Self {

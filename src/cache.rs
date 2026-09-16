@@ -552,6 +552,18 @@ struct State {
     pending: HashSet<ChunkKey>,
 }
 
+#[derive(Debug, Default)]
+struct CacheClaim {
+    /// Chunks this caller became responsible for fetching.
+    fetch: Vec<u64>,
+    /// Chunks another caller already owns, so this caller must wait or fall
+    /// back if the owner does not retain them.
+    wait: Vec<u64>,
+    /// Chunks that became resident after the caller's miss check but before
+    /// the claim lock. These still need to be served to the caller.
+    resident_after_miss: Vec<u64>,
+}
+
 #[derive(Default)]
 struct Counters {
     hits_decoded: AtomicU64,
@@ -938,13 +950,13 @@ impl ChunkCache {
         self.emit(std::mem::take(&mut events));
 
         // 2. Claim what nobody else is already fetching.
-        let (claimed, waited, resident) = self.claim(reg.id, &wanted);
+        let claim = self.claim(reg.id, &wanted);
 
         // 2b. **Chunks that arrived between the caller's miss and the claim.**
         //     They are nobody's to fetch and still the caller's to be handed;
         //     see `claim`, which used to drop them and leave the output buffer
         //     holding zeros here.
-        for chunk in resident {
+        for chunk in claim.resident_after_miss {
             let Some((want, out)) = target.as_mut() else {
                 continue;
             };
@@ -961,7 +973,11 @@ impl ChunkCache {
         }
 
         // 3. Fetch the claimed chunks, coalescing lattice-consecutive runs.
-        for run in runs(&claimed, reg.grid[reg.grid.len() - 1], self.max_coalesce) {
+        for run in runs(
+            &claim.fetch,
+            reg.grid[reg.grid.len() - 1],
+            self.max_coalesce,
+        ) {
             let region = reg.run_region(&run);
             let started = Instant::now();
             let fetched = match reg.fetcher.fetch(&region) {
@@ -1016,7 +1032,7 @@ impl ChunkCache {
         //    it is how concurrent demand for one chunk costs one read — but it
         //    is bounded, so a fetcher that dies mid-flight costs a duplicated
         //    read rather than a hang.
-        for chunk in waited {
+        for chunk in claim.wait {
             let key = ChunkKey {
                 array: reg.id,
                 chunk,
@@ -1054,8 +1070,8 @@ impl ChunkCache {
             }
             // The other fetch did not leave anything behind — refused by the
             // budget, evicted immediately, or it died. Do it ourselves.
-            let (mine, _, already) = self.claim(reg.id, &[chunk]);
-            if !already.is_empty() {
+            let retry = self.claim(reg.id, &[chunk]);
+            if !retry.resident_after_miss.is_empty() {
                 // It landed while we were deciding. Serve it, and if it has gone
                 // again fall through to the direct fetch below.
                 if let Some((want, out)) = target.as_mut() {
@@ -1064,7 +1080,7 @@ impl ChunkCache {
                     }
                 }
             }
-            if mine.is_empty() {
+            if retry.fetch.is_empty() {
                 // Somebody claimed it again in the meantime; serve it straight
                 // from the source rather than waiting a second time.
                 let region = reg.chunk_region(chunk);
@@ -1139,26 +1155,24 @@ impl ChunkCache {
     /// `zarr_env::concurrent_execution_through_storage_is_still_byte_identical`
     /// at concurrency 4 — a different voxel each run, which is what a race looks
     /// like from the outside.
-    fn claim(&self, array: ArrayId, chunks: &[u64]) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+    fn claim(&self, array: ArrayId, chunks: &[u64]) -> CacheClaim {
         let mut state = self.state.lock_unpoisoned();
-        let mut claimed = Vec::new();
-        let mut waited = Vec::new();
-        let mut resident = Vec::new();
+        let mut claim = CacheClaim::default();
         for &chunk in chunks {
             let key = ChunkKey { array, chunk };
             // Somebody inserted it since the caller looked. Not ours to fetch,
             // and still the caller's to be given.
             if state.entries.contains_key(&key) {
-                resident.push(chunk);
+                claim.resident_after_miss.push(chunk);
                 continue;
             }
             if state.pending.insert(key) {
-                claimed.push(chunk);
+                claim.fetch.push(chunk);
             } else {
-                waited.push(chunk);
+                claim.wait.push(chunk);
             }
         }
-        (claimed, waited, resident)
+        claim
     }
 
     fn release(&self, array: ArrayId, chunks: &[u64]) {

@@ -19,7 +19,8 @@ mod support;
 
 use support::planner_perf::{
     base_constraints, enumerating_for, planner_choice_for, scenarios, simulator_backed_for,
-    uniform_simulator_backed_for, workflow,
+    uniform_simulator_backed_for, workflow, OracleComparison, OracleTarget, OracleTargetKind,
+    RegretBudget,
 };
 
 #[derive(Clone, Copy)]
@@ -102,6 +103,8 @@ fn report_planner_choices_against_the_simulator_oracle() {
     let workflow = workflow();
     let base = base_constraints();
     let scenarios = scenarios();
+    let exact_continuous_budget = RegretBudget::EXACT_CONTINUOUS;
+    let report_ceiling = RegretBudget::ORACLE_REPORT_CEILING;
     let cases = [
         SchedulerCase::Continuous,
         SchedulerCase::Waves,
@@ -136,9 +139,38 @@ fn report_planner_choices_against_the_simulator_oracle() {
             let simulated = judgement
                 .simulated_pick()
                 .unwrap_or_else(|| panic!("{name} {}: no simulator pick", case.name()));
-            let regret = judgement
-                .regret()
-                .unwrap_or_else(|| panic!("{name} {}: no regret", case.name()));
+            let context = format!("{name} {}", case.name());
+            let oracle = OracleTarget::exhaustive_simulator_candidate_field(&context, &judgement)
+                .unwrap_or_else(|| panic!("{name} {}: no simulator pick", case.name()));
+            assert_eq!(
+                oracle.kind(),
+                OracleTargetKind::ExhaustiveSimulatorCandidateField,
+                "{context}: oracle report should use the fully judged candidate field target"
+            );
+            assert_eq!(
+                oracle.winner_name(),
+                Some(simulated.name.as_str()),
+                "{context}: oracle target must retain the simulator winner identity"
+            );
+            assert_eq!(
+                oracle.winner_shape(),
+                Some(&simulated.shape),
+                "{context}: oracle target must retain the simulator winner shape"
+            );
+            assert_eq!(
+                oracle.admissible_candidates(),
+                Some(
+                    judgement
+                        .verdicts
+                        .iter()
+                        .filter(|verdict| verdict.admissible)
+                        .count()
+                ),
+                "{context}: oracle target must retain the admissible candidate-field size"
+            );
+            let comparison = OracleComparison::against(&context, model.simulated_ns(), oracle);
+            let report_assessment = report_ceiling.assess(comparison);
+            let regret = report_assessment.regret();
             let tau = judgement
                 .kendall_tau()
                 .unwrap_or_else(|| panic!("{name} {}: no rank correlation", case.name()));
@@ -163,12 +195,7 @@ fn report_planner_choices_against_the_simulator_oracle() {
             );
 
             assert!(
-                regret >= 1.0,
-                "{name} {}: regret below one is impossible",
-                case.name()
-            );
-            assert!(
-                regret <= 2.25,
+                report_assessment.accepts(),
                 "{name} {}: planner regret {regret:.3} exceeded the recorded oracle-report \
                  ceiling. If this is deliberate, update TODO4's baseline and this table.",
                 case.name()
@@ -176,7 +203,8 @@ fn report_planner_choices_against_the_simulator_oracle() {
             worst_any = worst_any.max(regret);
             if matches!(case, SchedulerCase::Continuous) {
                 worst_continuous = worst_continuous.max(regret);
-                exact_continuous += usize::from(regret <= 1.01);
+                exact_continuous +=
+                    usize::from(exact_continuous_budget.assess(comparison).accepts());
             }
         }
     }
@@ -190,8 +218,9 @@ fn report_planner_choices_against_the_simulator_oracle() {
         "the continuous baseline no longer has the four exact scenarios TODO4 records"
     );
     assert!(
-        worst_continuous <= 2.25,
-        "continuous worst regret {worst_continuous:.3} exceeded the recorded cost-scenario bound"
+        report_ceiling.accepts(worst_continuous),
+        "continuous worst regret {worst_continuous:.3} exceeded the recorded cost-scenario bound {:.2}",
+        report_ceiling.ratio()
     );
 }
 
@@ -238,6 +267,7 @@ fn simulator_backed_ranking_can_choose_the_wave_synchronous_machine_contract() {
     let workflow = workflow();
     let base = base_constraints();
     let scenario = Scenario::load("costs/two-nodes.json").expect("the committed scenario");
+    let low_regret = RegretBudget::LOW_REGRET_MACHINE;
     let constraints = scenario.constraints(&base);
     let mut waves = scenario.machine;
     waves.wave_synchronous = true;
@@ -270,7 +300,7 @@ fn simulator_backed_ranking_can_choose_the_wave_synchronous_machine_contract() {
         "the chosen machine contract must state the dispatch model"
     );
     assert!(
-        chosen.regret <= 1.05,
+        low_regret.accepts(chosen.regret),
         "under the chosen dispatch contract the planner field should have little regret, got {:.3}",
         chosen.regret
     );

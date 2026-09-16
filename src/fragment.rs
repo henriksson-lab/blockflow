@@ -1727,12 +1727,26 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
                     phase.slots
                 )));
             }
+            let read_volume = plan.volume_at(index);
+            let declared_sources = op.source_inputs(read_volume);
+            if !declared_sources.is_empty()
+                && (phase.volume() != read_volume || phase.reads_across_grids())
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "phase {index}: iterative op {:?} reads a source image and the phase reads \
+                     a {read_volume:?} image to work in {:?}. A source image is fetched at the \
+                     block's own fetch region, so an op that reads one must be on one lattice in \
+                     one coordinate space.",
+                    op.name(),
+                    phase.volume()
+                )));
+            }
             // The private ping-pong buffers are the phase's own volume, and the
             // running operand of substage 0 is the image below read through the
             // same block geometry. A phase that resized or re-gridded between the
             // two would be handing substage 1 an operand of a different shape
             // than substage 0 produced, so the iteration would not close.
-            let below = plan.volume_at(index);
+            let below = read_volume;
             if phase.volume() != below || phase.reads_across_grids() {
                 return Err(Error::InvalidArgument(format!(
                     "phase {index} runs iterative op {:?} and reads a {below:?} image to write a \
@@ -1773,16 +1787,22 @@ pub fn check_phase_work(plan: &Decomposition, work: &[PhaseWork<'_>]) -> Result<
         // **The half of `check_source_images` a chain cannot make.** That guard
         // folds the *slots* of a phase, so it can only speak for a phase that
         // owns some, and it skips the ones that do not. The two kinds that own
-        // none are the two here: a `Pixels` phase with an empty slot list reads
-        // nothing besides its input, and an iterative phase's second operand is
-        // `Operand::Fixed`, which is its own input image and not a second one.
-        // Either recording a source image is a plan that would fetch an array
-        // nothing consumes, and be priced for it.
-        if phase.slots.is_empty()
-            && !entry.is_fragments()
-            && !matches!(entry, PhaseWork::IterateReduce(_))
-            && !phase.source_images.is_empty()
-        {
+        // none are checked against their own work item instead.
+        let slotless_sources_allowed = match entry {
+            PhaseWork::Fragments(_) | PhaseWork::IterateReduce(_) => true,
+            PhaseWork::Iterate(op) => {
+                let mut declared = op
+                    .source_inputs(plan.volume_at(index))
+                    .into_iter()
+                    .map(|input| input.image.index())
+                    .collect::<Vec<_>>();
+                declared.sort_unstable();
+                declared.dedup();
+                declared == phase.source_images
+            }
+            PhaseWork::Pixels => false,
+        };
+        if phase.slots.is_empty() && !slotless_sources_allowed && !phase.source_images.is_empty() {
             return Err(Error::InvalidArgument(format!(
                 "decomposition phase {index} ({}) owns no chain slot and records that it also \
                  reads image(s) {:?}. Only a fragment op can read a second image without a \

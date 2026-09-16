@@ -189,6 +189,13 @@ fn warp_op_matches_direct_transform_when_decomposed() {
     )
     .unwrap();
     let assembly = builder.finish().unwrap();
+    assert!(
+        assembly.decomposition.phases[0]
+            .blocks
+            .iter()
+            .any(|block| block.source.shape != volume.to_vec()),
+        "the warp phase should derive per-block source regions, not fetch the whole input"
+    );
     let env = ArrayEnvironment::for_decomposition(
         Voxels::from(input),
         &assembly.decomposition,

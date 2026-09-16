@@ -47,15 +47,15 @@ use blockflow::env::{ArrayEnvironment, Environment};
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, Chain, Output};
 use blockflow::ops::{
-    AdaptiveThresholdOp, ElementShape, LocalStatistic, LocalStatisticOp, Morphology, MorphologyOp,
-    Rank, RankFilterOp, Statistic, StructuringElement, VoxelwiseMapOp,
+    AdaptiveThresholdOp, ElementShape, LocalStatistic, LocalStatisticOp, MeasurementSourceFacts,
+    Morphology, MorphologyOp, Rank, RankFilterOp, Statistic, StructuringElement, VoxelwiseMapOp,
 };
 use blockflow::probes::{NonZeroOp, SideOutputOp};
 use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::{
-    chunk_for_block, Compression, CompressionPolicy, PyramidSpec, ZarrEnvironment,
+    chunk_for_block, AttachedImage, Compression, CompressionPolicy, PyramidSpec, ZarrEnvironment,
 };
 use blockflow::{Dtype, Region};
 
@@ -279,6 +279,27 @@ fn a_multiscale_level_can_seed_a_run_with_a_supplied_peer() {
         env.image_shape(ImageId::supplied(0).index()).unwrap(),
         [4, 3, 2]
     );
+}
+
+#[test]
+fn measurement_source_facts_can_come_from_attached_zarr_metadata() {
+    let root = zarr_scratch("measurement-source-facts-root");
+    let input: Voxels = Array3::<f64>::from_elem((8, 6, 4), 1.0).into();
+    let supplied: Voxels = Array3::<u16>::from_elem((8, 6, 4), 7).into();
+    ZarrEnvironment::create_with_inputs(root.path(), &input, &[&supplied], [2, 2, 2])
+        .expect("zarr arrays are created");
+
+    let attached = vec![
+        AttachedImage::at(root.path().join("level0")),
+        AttachedImage::at(root.path().join("input0")),
+    ];
+    let facts = MeasurementSourceFacts::from_attached_images(&attached)
+        .expect("attached zarr metadata seeds measurement facts");
+
+    assert_eq!(facts.get(0usize).unwrap().dtype(), Dtype::F64);
+    assert_eq!(facts.get(0usize).unwrap().extent(), [8, 6, 4]);
+    assert_eq!(facts.get(ImageId::supplied(0)).unwrap().dtype(), Dtype::U16);
+    assert_eq!(facts.get(ImageId::supplied(0)).unwrap().extent(), [8, 6, 4]);
 }
 
 /// One chain per op family, with the element type its `accepts` requires.

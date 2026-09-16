@@ -618,15 +618,20 @@ pub const CENTRAL: [&str; 6] = [
     "central_22",
 ];
 
+/// Per-axis inclusive minimum coordinate of the region's bounding box.
+pub const BBOX_MIN: [&str; 3] = ["bbox_min_0", "bbox_min_1", "bbox_min_2"];
+/// Per-axis exclusive maximum coordinate of the region's bounding box.
+pub const BBOX_MAX: [&str; 3] = ["bbox_max_0", "bbox_max_1", "bbox_max_2"];
+
 /// Payload columns a tabulated row has.
-pub const COLUMNS: usize = 18;
+pub const COLUMNS: usize = 24;
 
 /// Words a tabulated row occupies: the three positions and the payload columns.
 pub const ROW_WORDS: usize = POSITION_WORDS + COLUMNS;
 
 /// The schema this op writes, at `fixed`.
 ///
-/// **Sixteen `U64` columns and two `F64` ones.** The entry condition
+/// **Twenty-two `U64` columns and two `F64` ones.** The entry condition
 /// `ops::detect::measurement_schema` states — that a column here is a merged
 /// accumulator, and an `F64` column merged across a seam is not the same number
 /// as the whole fold — is right about every accumulation here: the counts, the
@@ -665,11 +670,17 @@ pub fn tabulation_schema(fixed: FixedPoint) -> Schema {
         Column::u64(CENTRAL[3]),
         Column::u64(CENTRAL[4]),
         Column::u64(CENTRAL[5]),
+        Column::u64(BBOX_MIN[0]),
+        Column::u64(BBOX_MIN[1]),
+        Column::u64(BBOX_MIN[2]),
+        Column::u64(BBOX_MAX[0]),
+        Column::u64(BBOX_MAX[1]),
+        Column::u64(BBOX_MAX[2]),
     ];
-    // Eighteen distinct, non-empty names, so this cannot fail; expressed as a
+    // The names are distinct and non-empty, so this cannot fail; expressed as a
     // `Result` internally and unwrapped here rather than making every caller
     // handle an impossibility.
-    Schema::new(columns).expect("the tabulation schema names eighteen distinct columns")
+    Schema::new(columns).expect("the tabulation schema names distinct columns")
 }
 
 // ------------------------------------------------------------------ tally --
@@ -728,6 +739,10 @@ pub struct Tally {
     /// [`Self::position`] rather than with [`Self::sum`], and a region whose
     /// every value was a `NaN` still has a shape.
     pub second: [i128; 6],
+    /// Inclusive lower corner of the label's bounding box.
+    pub bbox_min: [u64; 3],
+    /// Exclusive upper corner of the label's bounding box.
+    pub bbox_max: [u64; 3],
 }
 
 /// A selection's bits, which is what two tallies are compared on.
@@ -748,6 +763,8 @@ impl PartialEq for Tally {
             && self.position == other.position
             && self.moment == other.moment
             && self.second == other.second
+            && self.bbox_min == other.bbox_min
+            && self.bbox_max == other.bbox_max
             && selection_bits(self.min) == selection_bits(other.min)
             && selection_bits(self.max) == selection_bits(other.max)
     }
@@ -797,6 +814,8 @@ impl Tally {
             position: [0; 3],
             moment: [0; 3],
             second: [0; 6],
+            bbox_min: [u64::MAX; 3],
+            bbox_max: [0; 3],
         }
     }
 
@@ -823,6 +842,8 @@ impl Tally {
             *sum = sum
                 .checked_add(at[axis] as u64)
                 .ok_or_else(|| overflowed("a coordinate sum"))?;
+            self.bbox_min[axis] = self.bbox_min[axis].min(at[axis] as u64);
+            self.bbox_max[axis] = self.bbox_max[axis].max(at[axis] as u64 + 1);
         }
         // The raw second moments, about the volume origin. Before the quantise
         // and outside its `match` on purpose: no value is read into them, so
@@ -910,6 +931,8 @@ impl Tally {
             self.position[axis] = self.position[axis]
                 .checked_add(other.position[axis])
                 .ok_or_else(|| overflowed("a coordinate sum"))?;
+            self.bbox_min[axis] = self.bbox_min[axis].min(other.bbox_min[axis]);
+            self.bbox_max[axis] = self.bbox_max[axis].max(other.bbox_max[axis]);
             self.moment[axis] = self.moment[axis]
                 .checked_add(other.moment[axis])
                 .ok_or_else(|| overflowed("a fixed-point first moment"))?;
@@ -1050,10 +1073,12 @@ impl Tally {
             count: self.count,
             position: self.position,
             central: narrowed,
+            bbox_min: self.bbox_min,
+            bbox_max: self.bbox_max,
         }))
     }
 
-    /// The row's twenty-one words: the position, then the payload in schema
+    /// The row's words: the position, then the payload in schema
     /// order.
     ///
     /// The words rather than a struct, because **this array is the canonical
@@ -1101,6 +1126,10 @@ impl Tally {
         // column's is about the region's own centre. See [`central_column`].
         for (index, (value, pair)) in central.into_iter().zip(PAIRS).enumerate() {
             words[POSITION_WORDS + 12 + index] = central_column(value, pair)?;
+        }
+        for axis in 0..3 {
+            words[POSITION_WORDS + 18 + axis] = self.bbox_min[axis];
+            words[POSITION_WORDS + 21 + axis] = self.bbox_max[axis];
         }
         Ok(Some(words))
     }
@@ -1165,8 +1194,9 @@ fn overflowed(what: &str) -> Error {
 
 /// Words one label occupies in a **partial**: the label, the two counts, the
 /// `i128` sum as a word pair, the two selections as one word each, the three
-/// coordinate sums, the three `i128` first moments as a word pair each, and the
-/// six `i128` raw second moments as a word pair each.
+/// coordinate sums, the three `i128` first moments as a word pair each, the
+/// six `i128` raw second moments as a word pair each, and the six bounding-box
+/// coordinates.
 ///
 /// The sum and the moments are wider here than in a row on purpose. A partial is
 /// folded, not read, so it carries the accumulator's own type — `i128`, which has
@@ -1184,7 +1214,28 @@ fn overflowed(what: &str) -> Error {
 /// merge a plain `+`; centring per partial would make it a formula that has to
 /// undo one origin before applying another, which is the same arithmetic done
 /// `N` times and rounded `N` times more.
-const PARTIAL_WORDS: usize = 28;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabulationPartialLayout;
+
+impl TabulationPartialLayout {
+    const TALLY_WORDS: usize = 34;
+
+    fn capacity(rows: usize) -> usize {
+        rows.saturating_mul(Self::TALLY_WORDS)
+    }
+
+    fn validate_len(words: &[u64]) -> Result<usize> {
+        if words.len() % Self::TALLY_WORDS != 0 {
+            return Err(Error::invalid(format!(
+                "tabulate: a partial is a whole number of {}-word entries; this one is \
+                 {} word(s)",
+                Self::TALLY_WORDS,
+                words.len()
+            )));
+        }
+        Ok(words.len() / Self::TALLY_WORDS)
+    }
+}
 
 fn put_i128(words: &mut Vec<u64>, value: i128) {
     let bits = value as u128;
@@ -1220,7 +1271,7 @@ fn get_selection(word: u64) -> Option<f64> {
 
 /// Tallies as a fragment, ascending by label.
 pub fn encode_partial(tallies: &BTreeMap<u64, Tally>) -> Vec<u8> {
-    let mut words = Vec::with_capacity(tallies.len() * PARTIAL_WORDS);
+    let mut words = Vec::with_capacity(TabulationPartialLayout::capacity(tallies.len()));
     for tally in tallies.values() {
         words.push(tally.label);
         words.push(tally.count);
@@ -1237,6 +1288,8 @@ pub fn encode_partial(tallies: &BTreeMap<u64, Tally>) -> Vec<u8> {
         for component in tally.second {
             put_i128(&mut words, component);
         }
+        words.extend_from_slice(&tally.bbox_min);
+        words.extend_from_slice(&tally.bbox_max);
     }
     pack_u64(&words)
 }
@@ -1245,15 +1298,9 @@ pub fn encode_partial(tallies: &BTreeMap<u64, Tally>) -> Vec<u8> {
 /// entries is a truncated fragment and says so.
 pub fn decode_partial(bytes: &[u8]) -> Result<Vec<Tally>> {
     let words = unpack_u64(bytes)?;
-    if words.len() % PARTIAL_WORDS != 0 {
-        return Err(Error::invalid(format!(
-            "tabulate: a partial is a whole number of {PARTIAL_WORDS}-word entries; this one is \
-             {} word(s)",
-            words.len()
-        )));
-    }
-    let mut found = Vec::with_capacity(words.len() / PARTIAL_WORDS);
-    for entry in words.chunks_exact(PARTIAL_WORDS) {
+    let entries = TabulationPartialLayout::validate_len(&words)?;
+    let mut found = Vec::with_capacity(entries);
+    for entry in words.chunks_exact(TabulationPartialLayout::TALLY_WORDS) {
         found.push(Tally {
             label: entry[0],
             count: entry[1],
@@ -1275,6 +1322,8 @@ pub fn decode_partial(bytes: &[u8]) -> Result<Vec<Tally>> {
                 get_i128(entry[24], entry[25]),
                 get_i128(entry[26], entry[27]),
             ],
+            bbox_min: [entry[28], entry[29], entry[30]],
+            bbox_max: [entry[31], entry[32], entry[33]],
         });
     }
     Ok(found)
@@ -1337,13 +1386,39 @@ impl TabulateValuesOp {
             return Err(Error::invalid(format!(
                 "tabulate: the label volume and the value array are both image {labels}. \
                  Reducing an array over the regions of itself gives `label * count` and nothing \
-                 else; the second array is the point of this op."
+                else; the second array is the point of this op."
+            )));
+        }
+        Self::from_typed_sources(
+            name,
+            TypedSource::new(labels),
+            TypedSource::new(values),
+            fixed,
+            stream,
+            lifecycle,
+        )
+    }
+
+    pub(crate) fn from_typed_sources(
+        name: &'static str,
+        labels: TypedSource,
+        values: TypedSource,
+        fixed: FixedPoint,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        if labels.image_index() == values.image_index() {
+            return Err(Error::invalid(format!(
+                "tabulate: the label volume and the value array are both image {}. \
+                 Reducing an array over the regions of itself gives `label * count` and nothing \
+                 else; the second array is the point of this op.",
+                labels.image_index()
             )));
         }
         Ok(Self {
             name,
-            labels: TypedSource::new(labels),
-            values: TypedSource::new(values),
+            labels,
+            values,
             fixed,
             stream: stream.into(),
             lifecycle,
@@ -1463,6 +1538,97 @@ impl TabulateValuesOp {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct MultiTabulateValueSource {
+    values: TypedSource,
+    stream: String,
+}
+
+impl MultiTabulateValueSource {
+    pub(crate) fn new(values: TypedSource, stream: impl Into<String>) -> Self {
+        Self {
+            values,
+            stream: stream.into(),
+        }
+    }
+}
+
+/// One label scan that emits one standard tabulation partial stream per value source.
+#[derive(Clone)]
+pub(crate) struct MultiTabulateValuesOp {
+    name: &'static str,
+    labels: TypedSource,
+    values: Vec<MultiTabulateValueSource>,
+    fixed: FixedPoint,
+    lifecycle: Lifecycle,
+}
+
+impl MultiTabulateValuesOp {
+    pub(crate) fn from_typed_sources(
+        name: &'static str,
+        labels: TypedSource,
+        values: Vec<MultiTabulateValueSource>,
+        fixed: FixedPoint,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        if values.is_empty() {
+            return Err(Error::invalid(
+                "tabulate: multi-value tabulation needs at least one value source",
+            ));
+        }
+        let mut seen_images = std::collections::BTreeSet::new();
+        let mut seen_streams = std::collections::BTreeSet::new();
+        for source in &values {
+            if labels.image_index() == source.values.image_index() {
+                return Err(Error::invalid(format!(
+                    "tabulate: the label volume and value array are both image {}. Reducing an \
+                     array over the regions of itself gives `label * count` and nothing else; \
+                     the second array is the point of this op.",
+                    labels.image_index()
+                )));
+            }
+            if !seen_images.insert(source.values.image_index()) {
+                return Err(Error::invalid(format!(
+                    "tabulate: multi-value tabulation was given value image {} more than once",
+                    source.values.image_index()
+                )));
+            }
+            if !seen_streams.insert(source.stream.clone()) {
+                return Err(Error::invalid(format!(
+                    "tabulate: multi-value tabulation emits duplicate partial stream {:?}",
+                    source.stream
+                )));
+            }
+        }
+        Ok(Self {
+            name,
+            labels,
+            values,
+            fixed,
+            lifecycle,
+        })
+    }
+
+    fn value_blocks<'a>(
+        &self,
+        sources: SourceBlocks<'a>,
+        read: &Region,
+    ) -> Result<Vec<&'a BlockBuf>> {
+        self.values
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                source.values.block_at_extent(
+                    self.name,
+                    &format!("value array {index}"),
+                    sources,
+                    read,
+                )
+            })
+            .collect()
+    }
+}
+
 /// The label a voxel carries, refusing everything that is not one.
 ///
 /// Four refusals, and each is a value that would otherwise become a region the
@@ -1487,6 +1653,163 @@ fn holds(region: &Region, at: [usize; 3]) -> bool {
     (0..3).all(|axis| {
         at[axis] >= region.start[axis] && at[axis] < region.start[axis] + region.shape[axis]
     })
+}
+
+/// `volume -> fragments`: one partial shape tally per label in each block,
+/// reading only the label image.
+///
+/// This is the shape-only twin of [`TabulateValuesOp`]. It deliberately emits
+/// the same partial encoding as value tabulation, with every voxel carrying a
+/// zero finite value, so the existing [`MergeTabulationOp`], `collect_shapes`
+/// and row schema remain the only merge/read path.
+pub struct TabulateLabelsOp {
+    name: &'static str,
+    labels: TypedSource,
+    fixed: FixedPoint,
+    stream: String,
+    lifecycle: Lifecycle,
+}
+
+impl TabulateLabelsOp {
+    pub fn new(
+        name: &'static str,
+        labels: impl Into<crate::assemble::ImageId>,
+        fixed: FixedPoint,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Self {
+        Self::from_typed_source(
+            name,
+            TypedSource::new(labels.into().index()),
+            fixed,
+            stream,
+            lifecycle,
+        )
+    }
+
+    pub(crate) fn from_typed_source(
+        name: &'static str,
+        labels: TypedSource,
+        fixed: FixedPoint,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Self {
+        Self {
+            name,
+            labels,
+            fixed,
+            stream: stream.into(),
+            lifecycle,
+        }
+    }
+
+    pub fn holding(mut self, labels: Dtype) -> Self {
+        self.labels = self.labels.holding(labels);
+        self
+    }
+
+    pub fn labels_dtype(&self) -> Option<Dtype> {
+        self.labels.dtype()
+    }
+
+    pub fn fixed(&self) -> FixedPoint {
+        self.fixed
+    }
+
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+
+    pub fn tally_block(
+        &self,
+        labels: &BlockBuf,
+        read: &Region,
+        core: &Region,
+    ) -> Result<BTreeMap<u64, Tally>> {
+        let mut tallies: BTreeMap<u64, Tally> = BTreeMap::new();
+        let BlockBuf::Array(labels) = labels else {
+            return Ok(tallies);
+        };
+        let shape = [read.shape[0], read.shape[1], read.shape[2]];
+        expect_extent(
+            || {
+                format!(
+                    "tabulate: the label volume arrived as {:?} for a block read extent of \
+                     {shape:?}. The operand is fetched at the block's own fetch region, so a \
+                     disagreement here is the plan handing over a different geometry.",
+                    labels.shape()
+                )
+            },
+            shape,
+            labels.shape(),
+        )?;
+        let labels = labels.widened();
+        let offset = [read.start[0], read.start[1], read.start[2]];
+        for (index, raw) in labels.indexed_iter() {
+            let at = [
+                offset[0] + index.0,
+                offset[1] + index.1,
+                offset[2] + index.2,
+            ];
+            if !holds(core, at) {
+                continue;
+            }
+            let label = label_at(*raw, at)?;
+            if label == 0 {
+                continue;
+            }
+            tallies
+                .entry(label)
+                .or_insert_with(|| Tally::new(label))
+                .add(at, 0.0, self.fixed)?;
+        }
+        Ok(tallies)
+    }
+}
+
+impl FragmentOp for TabulateLabelsOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        vec![self.labels.voxelwise_input()]
+    }
+
+    fn seam_fold(&self) -> Option<crate::fragment::SeamFold> {
+        Some(crate::fragment::SeamFold::PerBlock)
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                .sized(SidecarSize::row_table(&tabulation_schema(self.fixed), 1)),
+        ]
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "tabulate: a per-label shape reduction reads a label volume and cannot be computed \
+             without it. It is applied through `apply_with`.",
+        ))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let tallies = self.tally_block(
+            self.labels
+                .block_at_extent(self.name, "label volume", sources, at.read)?,
+            at.read,
+            at.core,
+        )?;
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            encode_partial(&tallies),
+        ))
+    }
 }
 
 impl FragmentOp for TabulateValuesOp {
@@ -1540,6 +1863,132 @@ impl FragmentOp for TabulateValuesOp {
             self.stream.clone(),
             encode_partial(&tallies),
         ))
+    }
+}
+
+impl FragmentOp for MultiTabulateValuesOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        std::iter::once(self.labels.voxelwise_input())
+            .chain(
+                self.values
+                    .iter()
+                    .map(|source| source.values.voxelwise_input()),
+            )
+            .collect()
+    }
+
+    fn seam_fold(&self) -> Option<crate::fragment::SeamFold> {
+        Some(crate::fragment::SeamFold::PerBlock)
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        self.values
+            .iter()
+            .map(|source| {
+                FragmentOutput::new(source.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                    .sized(SidecarSize::row_table(&tabulation_schema(self.fixed), 1))
+            })
+            .collect()
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "tabulate: a multi-value per-region reduction reads source volumes and is applied \
+             through `apply_with`",
+        ))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let labels = self
+            .labels
+            .block_at_extent(self.name, "label volume", sources, at.read)?;
+        let value_blocks = self.value_blocks(sources, at.read)?;
+        let mut outputs = Vec::with_capacity(self.values.len());
+        let BlockBuf::Array(labels) = labels else {
+            for source in &self.values {
+                outputs.push((source.stream.clone(), encode_partial(&BTreeMap::new())));
+            }
+            return Ok(BlockOutput {
+                fragments: outputs,
+                pixels: None,
+            });
+        };
+        let shape = [at.read.shape[0], at.read.shape[1], at.read.shape[2]];
+        expect_extent(
+            || {
+                format!(
+                    "tabulate: the label volume arrived as {:?} for a block read extent of \
+                     {shape:?}",
+                    labels.shape()
+                )
+            },
+            shape,
+            labels.shape(),
+        )?;
+        let widened_values = value_blocks
+            .iter()
+            .map(|block| match block {
+                BlockBuf::Array(values) => {
+                    expect_extent(
+                        || {
+                            format!(
+                                "tabulate: a value array arrived as {:?} for a block read extent \
+                                 of {shape:?}",
+                                values.shape()
+                            )
+                        },
+                        shape,
+                        values.shape(),
+                    )?;
+                    Ok(Some(values.widened()))
+                }
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut tallies = (0..self.values.len())
+            .map(|_| BTreeMap::<u64, Tally>::new())
+            .collect::<Vec<_>>();
+        let labels = labels.widened();
+        let offset = [at.read.start[0], at.read.start[1], at.read.start[2]];
+        for (index, raw) in labels.indexed_iter() {
+            let global = [
+                offset[0] + index.0,
+                offset[1] + index.1,
+                offset[2] + index.2,
+            ];
+            if !holds(at.core, global) {
+                continue;
+            }
+            let label = label_at(*raw, global)?;
+            if label == 0 {
+                continue;
+            }
+            for (channel, values) in widened_values.iter().enumerate() {
+                let Some(values) = values else {
+                    continue;
+                };
+                let value = values[[index.0, index.1, index.2]];
+                tallies[channel]
+                    .entry(label)
+                    .or_insert_with(|| Tally::new(label))
+                    .add(global, value, self.fixed)?;
+            }
+        }
+        for (source, channel_tallies) in self.values.iter().zip(tallies) {
+            outputs.push((source.stream.clone(), encode_partial(&channel_tallies)));
+        }
+        Ok(BlockOutput {
+            fragments: outputs,
+            pixels: None,
+        })
     }
 }
 
@@ -1780,8 +2229,8 @@ pub fn append_tabulate_phases(
         .grid
         .clone();
     plan.phases.push(fragment_phase(tabulate, grid.clone())?);
+    let rows_phase = plan.phases.len();
     plan.phases.push(fragment_phase(merge, grid)?);
-    let rows_phase = plan.phases.len() - 1;
     plan.check()?;
     Ok((plan, rows_phase))
 }
@@ -2251,6 +2700,10 @@ pub struct RegionShape {
     /// integer arithmetic, and the column is the answer rather than a
     /// quantisation of it.
     pub central: [i64; 6],
+    /// Inclusive lower corner of the region's bounding box.
+    pub bbox_min: [u64; 3],
+    /// Exclusive upper corner of the region's bounding box.
+    pub bbox_max: [u64; 3],
 }
 
 impl RegionShape {
@@ -2376,6 +2829,23 @@ impl RegionShape {
     pub fn eccentricity(&self) -> Option<f64> {
         self.principal_axes()?.eccentricity()
     }
+
+    pub fn bbox_extent(&self) -> [u64; 3] {
+        [
+            self.bbox_max[0] - self.bbox_min[0],
+            self.bbox_max[1] - self.bbox_min[1],
+            self.bbox_max[2] - self.bbox_min[2],
+        ]
+    }
+
+    pub fn bbox_volume(&self) -> u64 {
+        self.bbox_extent().into_iter().product()
+    }
+
+    pub fn bbox_fill_fraction(&self) -> Option<f64> {
+        let volume = self.bbox_volume();
+        (volume != 0).then_some(self.count as f64 / volume as f64)
+    }
 }
 
 /// Decode the shape half of one row of [`tabulation_schema`].
@@ -2394,6 +2864,8 @@ pub fn region_shape(row: &Row<'_>) -> Result<RegionShape> {
         count: row.u64(1)?,
         position,
         central,
+        bbox_min: [row.u64(18)?, row.u64(19)?, row.u64(20)?],
+        bbox_max: [row.u64(21)?, row.u64(22)?, row.u64(23)?],
     })
 }
 
@@ -2413,10 +2885,7 @@ pub fn merge_tabulation<'a>(
     fixed: FixedPoint,
     blobs: impl IntoIterator<Item = ([usize; 3], &'a [u8])>,
 ) -> Result<Vec<RegionValues>> {
-    let mut table = Table::new(volume, tabulation_schema(fixed))?;
-    for (block, bytes) in blobs {
-        table.write(block, bytes)?;
-    }
+    let mut table = tabulation_table_from_blobs(volume, fixed, blobs)?;
     ordered_rows(&mut table, volume, fixed)
 }
 
@@ -2434,13 +2903,7 @@ pub fn collect_tabulation(
     volume: [usize; 3],
     fixed: FixedPoint,
 ) -> Result<Vec<RegionValues>> {
-    let mut table = Table::new(volume, tabulation_schema(fixed))?;
-    crate::fragment::fold_fragments(env, stream, &mut |key, bytes| {
-        if key.phase != phase {
-            return Ok(());
-        }
-        table.write(key.block, bytes)
-    })?;
+    let mut table = tabulation_table_from_env(env, stream, phase, volume, fixed)?;
     ordered_rows(&mut table, volume, fixed)
 }
 
@@ -2458,6 +2921,29 @@ pub fn collect_shapes(
     volume: [usize; 3],
     fixed: FixedPoint,
 ) -> Result<Vec<RegionShape>> {
+    let table = tabulation_table_from_env(env, stream, phase, volume, fixed)?;
+    collect_shapes_from_table(table, volume)
+}
+
+fn tabulation_table_from_blobs<'a>(
+    volume: [usize; 3],
+    fixed: FixedPoint,
+    blobs: impl IntoIterator<Item = ([usize; 3], &'a [u8])>,
+) -> Result<Table> {
+    let mut table = Table::new(volume, tabulation_schema(fixed))?;
+    for (block, bytes) in blobs {
+        table.write(block, bytes)?;
+    }
+    Ok(table)
+}
+
+fn tabulation_table_from_env(
+    env: &dyn crate::env::Environment,
+    stream: &str,
+    phase: usize,
+    volume: [usize; 3],
+    fixed: FixedPoint,
+) -> Result<Table> {
     let mut table = Table::new(volume, tabulation_schema(fixed))?;
     crate::fragment::fold_fragments(env, stream, &mut |key, bytes| {
         if key.phase != phase {
@@ -2465,6 +2951,10 @@ pub fn collect_shapes(
         }
         table.write(key.block, bytes)
     })?;
+    Ok(table)
+}
+
+fn collect_shapes_from_table(mut table: Table, volume: [usize; 3]) -> Result<Vec<RegionShape>> {
     table.seal()?;
     let mut found = Vec::with_capacity(table.len());
     for row in table.scan(&Region::whole(&volume))? {
@@ -3052,6 +3542,15 @@ mod tests {
         tallies.insert(3, one);
         tallies.insert(9, Tally::new(9));
         let bytes = encode_partial(&tallies);
+        let words = unpack_u64(&bytes).unwrap();
+        assert_eq!(
+            words.len(),
+            TabulationPartialLayout::capacity(tallies.len())
+        );
+        assert_eq!(
+            TabulationPartialLayout::validate_len(&words).unwrap(),
+            tallies.len()
+        );
         let back = decode_partial(&bytes).expect("a partial");
         assert_eq!(back.len(), 2);
         assert_eq!(back[0], one);
@@ -3226,7 +3725,7 @@ mod tests {
     // ------------------------------------------------------------ the schema --
 
     #[test]
-    fn the_schema_is_eighteen_columns_and_the_accumulated_values_carry_the_scale() {
+    fn the_schema_columns_keep_their_indices_and_bbox_is_appended() {
         let schema = tabulation_schema(FixedPoint::default());
         assert_eq!(schema.len(), COLUMNS);
         assert_eq!(schema.width(), ROW_WORDS);
@@ -3251,6 +3750,12 @@ mod tests {
             ("central_11", ColumnType::U64),
             ("central_12", ColumnType::U64),
             ("central_22", ColumnType::U64),
+            ("bbox_min_0", ColumnType::U64),
+            ("bbox_min_1", ColumnType::U64),
+            ("bbox_min_2", ColumnType::U64),
+            ("bbox_max_0", ColumnType::U64),
+            ("bbox_max_1", ColumnType::U64),
+            ("bbox_max_2", ColumnType::U64),
         ];
         for (index, column) in schema.columns().iter().enumerate() {
             assert_eq!(column.name(), expected[index].0);
@@ -3292,6 +3797,12 @@ mod tests {
                 tabulation_schema(FixedPoint::bits(8).unwrap()).index_of(name),
                 Some(12 + index)
             );
+        }
+        for (axis, name) in BBOX_MIN.into_iter().enumerate() {
+            assert_eq!(schema.index_of(name), Some(18 + axis));
+        }
+        for (axis, name) in BBOX_MAX.into_iter().enumerate() {
+            assert_eq!(schema.index_of(name), Some(21 + axis));
         }
 
         // a different scale is a different schema, which is what stops two

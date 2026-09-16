@@ -1015,6 +1015,16 @@ impl AttachedImage {
         self.window([index, 0, 0], [1, shape[0], shape[1]])
     }
 
+    /// Read the image extent and element type from the array metadata.
+    ///
+    /// This opens only metadata and applies this image's optional window; it
+    /// does not read chunk contents.
+    pub fn metadata(&self) -> Result<(Dtype, [usize; 3])> {
+        let array = self.open(0)?;
+        let shape = block_shape(&Region::whole(&array.shape))?;
+        Ok((array.dtype, shape))
+    }
+
     fn open(&self, id: u64) -> Result<StoredArray> {
         let store = Arc::new(FilesystemStore::new(&self.dir).map_err(Error::backend)?);
         StoredArray::open(&store, "/", id, self.window)

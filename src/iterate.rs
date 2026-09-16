@@ -63,12 +63,14 @@
 // `PassLimit::for_volume` carries the peeling derivation, and a framework type
 // offering it would be offering one op's bound to every op.
 
+use crate::assemble::ImageId;
 use crate::decomposition::PhaseDecomposition;
 use crate::dtype::Dtype;
 use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::geometry::BlockGrid;
 use crate::op::{Anchor, SourceInput, SourceInputs};
+use crate::reach::Reach;
 use crate::region::Region;
 use crate::sidecar::Lifecycle;
 use crate::voxels::Voxels;
@@ -98,18 +100,17 @@ pub enum Operand {
     /// precisely the failure `ops/deconvolve.rs`'s header warns about — so
     /// `tests/iterative_phase.rs` carries a test that fails if it is.
     ///
-    /// **A second image is now expressible, and this variant has not moved to
-    /// it.** [`Chain::Source`](crate::op::Chain::Source) is a leaf that reads a
-    /// stored image at the block's read extent, and a phase records which images
-    /// it reads in `PhaseDecomposition::source_images`. That is the general
-    /// form of what this variant does narrowly — but an iterative phase owns no
-    /// chain slot, so it has no leaf to carry the number and would need the
-    /// image on `SubstageOperand` instead. Adding it is a change to this enum
-    /// and to `run_iterative_phase`'s operand gathering, and nothing else; it is
-    /// left undone rather than guessed at, because no op has asked for it yet
-    /// and an untested variant of a two-array iteration is exactly the kind of
-    /// plausible thing that would be wrong.
+    /// A second image is [`Source`](Self::Source); this variant deliberately
+    /// remains the phase input so reconstruction and other self-capped
+    /// iterations do not have to name their own predecessor.
     Fixed,
+    /// A stored image distinct from the phase input, re-read at every substage.
+    ///
+    /// This is the general form of [`Fixed`](Self::Fixed): a running estimate may
+    /// evolve against an image that was produced earlier in the workflow or
+    /// supplied externally. It is still fixed for the iteration, but the image
+    /// number is part of the declaration instead of being implied by the phase.
+    Source(ImageId),
 }
 
 /// One operand of a substage, and what the substage reads of it.
@@ -138,6 +139,13 @@ impl SubstageOperand {
     pub fn fixed(reach: [usize; 3]) -> Self {
         Self {
             operand: Operand::Fixed,
+            reach,
+        }
+    }
+
+    pub fn source(image: impl Into<ImageId>, reach: [usize; 3]) -> Self {
+        Self {
+            operand: Operand::Source(image.into()),
             reach,
         }
     }
@@ -261,6 +269,22 @@ pub trait IterativeOp: Send + Sync {
     /// empty list would be the same class of defect as a silent zero reach.
     fn operands(&self) -> Vec<SubstageOperand>;
 
+    /// Stored images read by [`Operand::Source`] operands.
+    ///
+    /// Defaulted from [`Self::operands`] so an iterative op has one declaration:
+    /// a source operand names both the image and its per-substage reach.
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        self.operands()
+            .into_iter()
+            .filter_map(|operand| match operand.operand {
+                Operand::Source(image) => {
+                    Some(SourceInput::new(image, Reach::symmetric(operand.reach)))
+                }
+                Operand::Running | Operand::Fixed => None,
+            })
+            .collect()
+    }
+
     /// The runaway guard. See [`SubstageLimit`] for why it is required and why
     /// its derivation is the op's.
     fn limit(&self) -> SubstageLimit;
@@ -370,14 +394,38 @@ pub fn check_iterative(op: &dyn IterativeOp) -> Result<()> {
 /// `OpApplied` event to match it breaks the check for every mixed decomposition.
 pub fn iterative_phase(op: &dyn IterativeOp, grid: BlockGrid) -> Result<PhaseDecomposition> {
     check_iterative(op)?;
+    let volume = grid.volume();
+    let edge = grid.block();
     let reach = substage_reach(op);
-    Ok(PhaseDecomposition::derive(
-        Vec::new(),
-        Vec::new(),
-        reach,
-        reach,
-        grid,
-    ))
+    let mut halo = reach;
+    let mut images = Vec::new();
+    let mut supplied = Vec::new();
+    for input in op.source_inputs(volume) {
+        let wanted = input.reach.in_voxels(edge);
+        for (axis, value) in halo.iter_mut().enumerate() {
+            let (lo, hi) = wanted.axis(axis).bound(volume[axis]);
+            *value = (*value).max(lo).max(hi);
+        }
+        if input.image.is_supplied() {
+            let dtype = input.dtype.ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "iterative op {:?} reads {}, and nothing says what it holds. An image the \
+                     run writes has its element type in the fold of the chain that wrote it; a \
+                     supplied input is produced by no phase, so the reader is the only statement \
+                     there is.",
+                    op.name(),
+                    crate::assemble::describe_image(input.image.index())
+                ))
+            })?;
+            supplied.push((input.image.index(), dtype));
+        }
+        images.push(input.image.index());
+    }
+    Ok(
+        PhaseDecomposition::derive(Vec::new(), Vec::new(), reach, halo, grid)
+            .with_source_images(images)
+            .with_supplied_dtypes(supplied),
+    )
 }
 
 /// One block's view of an iterative map-reduce substage.
@@ -608,6 +656,20 @@ mod tests {
             SubstageOperand::fixed([0, 3, 0]),
         ]);
         assert_eq!(substage_reach(&op), [2, 3, 0]);
+    }
+
+    #[test]
+    fn source_operands_are_recorded_as_phase_sources() {
+        let op = Declaring(vec![
+            SubstageOperand::running([1, 0, 0]),
+            SubstageOperand::source(3usize, [2, 0, 0]),
+        ]);
+        let grid = BlockGrid::new([8, 8, 8], [4, 4, 4]).expect("a grid");
+
+        let phase = iterative_phase(&op, grid).expect("an iterative phase");
+
+        assert_eq!(phase.source_images, vec![3]);
+        assert_eq!(substage_reach(&op), [2, 0, 0]);
     }
 
     #[test]

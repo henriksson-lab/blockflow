@@ -2211,35 +2211,63 @@ fn run_iterative_phase(
                         // the neighbours' *cores* of that which make the reach stay at
                         // one substage's worth. A fixed operand comes off the image
                         // every time, which is the whole point of declaring it.
-                        let from_image = operand.operand == Operand::Fixed || ran == 0;
-                        if from_image {
-                            let started = Instant::now();
-                            let buf = env.read(phase_index, fetch)?;
-                            let read_ns = started.elapsed().as_nanos() as u64;
-                            let chunks = chunks_touched(fetch, &env.chunk_shape());
-                            events.emit(Event::RegionRead {
-                                source: format!("level {phase_index}"),
-                                image: phase_index,
-                                index: Some(task.index),
-                                region: fetch.clone(),
-                                voxels: fetch.voxels(),
-                                bytes: fetch.voxels() as u64 * bytes_per_voxel,
-                                chunks,
-                                duration_ns: read_ns,
-                            });
-                            events.emit(Event::BlockRead {
-                                phase: phase_index,
-                                index: task.index,
-                                region: fetch.clone(),
-                                voxels: fetch.voxels(),
-                                chunks,
-                            });
-                            buffers.push(buf);
-                        } else {
-                            // A private buffer is not an image: no `RegionRead`, because
-                            // nothing was fetched from storage. The residency is still
-                            // booked, because the block is still resident.
-                            buffers.push(env.slice(&current, &whole, fetch)?);
+                        match operand.operand {
+                            Operand::Running if ran > 0 => {
+                                // A private buffer is not an image: no `RegionRead`, because
+                                // nothing was fetched from storage. The residency is still
+                                // booked, because the block is still resident.
+                                buffers.push(env.slice(&current, &whole, fetch)?);
+                            }
+                            Operand::Running | Operand::Fixed => {
+                                let started = Instant::now();
+                                let buf = env.read(phase_index, fetch)?;
+                                let read_ns = started.elapsed().as_nanos() as u64;
+                                let chunks = chunks_touched(fetch, &env.chunk_shape());
+                                events.emit(Event::RegionRead {
+                                    source: format!("level {phase_index}"),
+                                    image: phase_index,
+                                    index: Some(task.index),
+                                    region: fetch.clone(),
+                                    voxels: fetch.voxels(),
+                                    bytes: fetch.voxels() as u64 * bytes_per_voxel,
+                                    chunks,
+                                    duration_ns: read_ns,
+                                });
+                                events.emit(Event::BlockRead {
+                                    phase: phase_index,
+                                    index: task.index,
+                                    region: fetch.clone(),
+                                    voxels: fetch.voxels(),
+                                    chunks,
+                                });
+                                buffers.push(buf);
+                            }
+                            Operand::Source(image) => {
+                                let image = image.index();
+                                let started = Instant::now();
+                                let buf = env.read(image, fetch)?;
+                                let read_ns = started.elapsed().as_nanos() as u64;
+                                let chunks = chunks_touched(fetch, &env.chunk_shape());
+                                events.emit(Event::RegionRead {
+                                    source: format!("level {image}"),
+                                    image,
+                                    index: Some(task.index),
+                                    region: fetch.clone(),
+                                    voxels: fetch.voxels(),
+                                    bytes: fetch.voxels() as u64
+                                        * decomposition.dtype_at(image).size_of() as u64,
+                                    chunks,
+                                    duration_ns: read_ns,
+                                });
+                                events.emit(Event::BlockRead {
+                                    phase: image,
+                                    index: task.index,
+                                    region: fetch.clone(),
+                                    voxels: fetch.voxels(),
+                                    chunks,
+                                });
+                                buffers.push(buf);
+                            }
                         }
                     }
 

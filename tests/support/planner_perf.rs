@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use blockflow::arena::{
-    plan_fit, Arena, PlanAdmission, PlanShape, RobustCase, SimulatedPlan, SimulatorBacked,
+    plan_fit, Arena, Judgement, PlanAdmission, PlanShape, RobustCase, SimulatedPlan,
+    SimulatorBacked,
 };
 use blockflow::decomposition::{Constraints, CostModel};
 use blockflow::op::Chain;
@@ -16,6 +17,86 @@ pub const VOLUME: [usize; 3] = [96, 96, 96];
 pub const LADDER: [usize; 4] = [16, 24, 32, 48];
 
 pub type PlannerSimulator = SimulatorBacked<Enumerating, fn() -> Box<dyn Scheduler>>;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RegretBudget {
+    ratio: f64,
+    label: &'static str,
+}
+
+impl RegretBudget {
+    pub const EXACT_CONTINUOUS: Self = Self {
+        ratio: 1.01,
+        label: "1%",
+    };
+    pub const LOW_REGRET_MACHINE: Self = Self {
+        ratio: 1.05,
+        label: "5%",
+    };
+    pub const NEAR_ORACLE: Self = Self {
+        ratio: 1.10,
+        label: "10%",
+    };
+    pub const LOCAL_ORACLE_CEILING: Self = Self {
+        ratio: 1.30,
+        label: "30%",
+    };
+    pub const ORACLE_REPORT_CEILING: Self = Self {
+        ratio: 2.25,
+        label: "125%",
+    };
+
+    pub fn accepts(self, regret: f64) -> bool {
+        regret <= self.ratio
+    }
+
+    pub fn crossed_by(self, regret: f64) -> bool {
+        regret >= self.ratio
+    }
+
+    pub fn assess(self, comparison: OracleComparison) -> RegretAssessment {
+        RegretAssessment {
+            budget: self,
+            comparison,
+        }
+    }
+
+    pub fn ratio(self) -> f64 {
+        self.ratio
+    }
+
+    pub fn label(self) -> &'static str {
+        self.label
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RegretAssessment {
+    budget: RegretBudget,
+    comparison: OracleComparison,
+}
+
+impl RegretAssessment {
+    pub fn accepts(self) -> bool {
+        self.budget.accepts(self.comparison.regret())
+    }
+
+    pub fn crossed_by(self) -> bool {
+        self.budget.crossed_by(self.comparison.regret())
+    }
+
+    pub fn regret(self) -> f64 {
+        self.comparison.regret()
+    }
+
+    pub fn budget(self) -> RegretBudget {
+        self.budget
+    }
+
+    pub fn comparison(self) -> OracleComparison {
+        self.comparison
+    }
+}
 
 pub fn chain() -> Chain {
     Chain::sequence(vec![
@@ -118,6 +199,134 @@ pub struct RobustPlanChoice {
     pub choice: PlanChoice,
     pub oracle_worst: f64,
     pub local_regret: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleTargetKind {
+    SimulatorCandidateField,
+    ExhaustiveSimulatorCandidateField,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OracleTarget {
+    kind: OracleTargetKind,
+    ns: f64,
+    winner_name: Option<String>,
+    winner_shape: Option<PlanShape>,
+    admissible_candidates: Option<usize>,
+}
+
+impl OracleTarget {
+    pub fn simulator_candidate_field(context: &str, ns: f64) -> Self {
+        assert!(
+            ns.is_finite() && ns > 0.0,
+            "{context}: simulator candidate-field oracle must be finite and positive, got {ns}"
+        );
+        Self {
+            kind: OracleTargetKind::SimulatorCandidateField,
+            ns,
+            winner_name: None,
+            winner_shape: None,
+            admissible_candidates: None,
+        }
+    }
+
+    pub fn best_simulated_candidate(context: &str, judgement: &Judgement) -> Option<Self> {
+        judgement.simulated_pick().map(|verdict| {
+            let mut target = Self::simulator_candidate_field(context, verdict.simulated_ns());
+            target.winner_name = Some(verdict.name.clone());
+            target.winner_shape = Some(verdict.shape.clone());
+            target
+        })
+    }
+
+    pub fn exhaustive_simulator_candidate_field(
+        context: &str,
+        judgement: &Judgement,
+    ) -> Option<Self> {
+        let admissible_candidates = judgement
+            .verdicts
+            .iter()
+            .filter(|verdict| verdict.admissible)
+            .count();
+        judgement.simulated_pick().map(|verdict| {
+            let mut target = Self::simulator_candidate_field(context, verdict.simulated_ns());
+            target.kind = OracleTargetKind::ExhaustiveSimulatorCandidateField;
+            target.winner_name = Some(verdict.name.clone());
+            target.winner_shape = Some(verdict.shape.clone());
+            target.admissible_candidates = Some(admissible_candidates);
+            target
+        })
+    }
+
+    pub fn kind(&self) -> OracleTargetKind {
+        self.kind
+    }
+
+    pub fn ns(&self) -> f64 {
+        self.ns
+    }
+
+    pub fn winner_name(&self) -> Option<&str> {
+        self.winner_name.as_deref()
+    }
+
+    pub fn winner_shape(&self) -> Option<&PlanShape> {
+        self.winner_shape.as_ref()
+    }
+
+    pub fn admissible_candidates(&self) -> Option<usize> {
+        self.admissible_candidates
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OracleComparison {
+    candidate_ns: f64,
+    oracle_ns: f64,
+    regret: f64,
+    target_kind: OracleTargetKind,
+}
+
+impl OracleComparison {
+    pub fn against(context: &str, candidate_ns: f64, target: OracleTarget) -> Self {
+        let oracle_ns = target.ns();
+        assert!(
+            candidate_ns.is_finite() && candidate_ns > 0.0,
+            "{context}: candidate time must be finite and positive, got {candidate_ns}"
+        );
+        assert!(
+            oracle_ns.is_finite() && oracle_ns > 0.0,
+            "{context}: oracle time must be finite and positive, got {oracle_ns}"
+        );
+        let regret = candidate_ns / oracle_ns;
+        assert!(
+            regret >= 1.0,
+            "{context}: regret below one is impossible ({candidate_ns} / {oracle_ns} = {regret})"
+        );
+        Self {
+            candidate_ns,
+            oracle_ns,
+            regret,
+            target_kind: target.kind(),
+        }
+    }
+
+    pub fn regret(self) -> f64 {
+        self.regret
+    }
+
+    pub fn candidate_ns(self) -> f64 {
+        self.candidate_ns
+    }
+
+    pub fn oracle_ns(self) -> f64 {
+        self.oracle_ns
+    }
+
+    pub fn target_kind(self) -> OracleTargetKind {
+        self.target_kind
+    }
 }
 
 pub fn simulated_ns_on(

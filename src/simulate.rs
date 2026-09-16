@@ -1446,6 +1446,60 @@ pub struct BoundedHorizonThroughput {
     rate: RateBasis,
 }
 
+/// The basis used to derive a bounded-horizon fetch floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HorizonFloorKind {
+    /// One representative chunk miss under the current rates.
+    OneChunk,
+    /// The largest miss path any task in a concrete decomposition can induce.
+    PlanTaskFetch,
+}
+
+/// A validated lower bound for a scheduler horizon.
+///
+/// This is a witness, not a tuning knob: once constructed, it carries both the
+/// floor and the reason that floor is admissible, so constructors and tests do
+/// not need to pass around a naked `u64` whose origin can be forgotten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchHorizonFloor {
+    ns: u64,
+    kind: HorizonFloorKind,
+}
+
+impl FetchHorizonFloor {
+    /// Build the fallback one-chunk fetch floor from rates.
+    pub fn one_chunk(rates: &Rates) -> Self {
+        Self {
+            ns: (rates.io_latency_ns
+                + rates.chunk_bytes as f64 * (rates.io_ns_per_byte + rates.decode_ns_per_byte))
+                .ceil()
+                .max(1.0) as u64,
+            kind: HorizonFloorKind::OneChunk,
+        }
+    }
+
+    /// Build the plan-aware floor from the largest fetch path in a
+    /// decomposition.
+    pub fn for_plan(decomposition: &Decomposition, rates: &Rates) -> Self {
+        let read_footprints = ReadFootprints::new(decomposition, rates);
+        let graph = TaskGraph::build(decomposition);
+        Self {
+            ns: read_footprints.max_task_fetch_ns(&graph, rates),
+            kind: HorizonFloorKind::PlanTaskFetch,
+        }
+    }
+
+    /// The lower-bound horizon in nanoseconds.
+    pub fn ns(self) -> u64 {
+        self.ns
+    }
+
+    /// The proof basis for this lower bound.
+    pub fn kind(self) -> HorizonFloorKind {
+        self.kind
+    }
+}
+
 /// What the throughput term is computed over.
 ///
 /// **The distinction is a measured finding, not a knob.** See
@@ -1492,10 +1546,7 @@ impl BoundedHorizonThroughput {
     /// everything — the "nonsense strategies that ignore cost of IO" a short
     /// horizon invites.
     pub fn floor_ns(rates: &Rates) -> u64 {
-        (rates.io_latency_ns
-            + rates.chunk_bytes as f64 * (rates.io_ns_per_byte + rates.decode_ns_per_byte))
-            .ceil()
-            .max(1.0) as u64
+        FetchHorizonFloor::one_chunk(rates).ns()
     }
 
     /// The shortest horizon that can contain the largest fetch any one task in
@@ -1508,9 +1559,7 @@ impl BoundedHorizonThroughput {
     /// then prices the miss path as latency per chunk plus transfer and decode
     /// per byte.
     pub fn floor_for_plan(decomposition: &Decomposition, rates: &Rates) -> u64 {
-        let read_footprints = ReadFootprints::new(decomposition, rates);
-        let graph = TaskGraph::build(decomposition);
-        read_footprints.max_task_fetch_ns(&graph, rates)
+        FetchHorizonFloor::for_plan(decomposition, rates).ns()
     }
 
     /// A horizon at or above [`Self::floor_ns`], on [`RateBasis::PerPhaseCost`].
@@ -1542,16 +1591,33 @@ impl BoundedHorizonThroughput {
         decomposition: &Decomposition,
         rate: RateBasis,
     ) -> Result<Self> {
-        let floor = Self::floor_for_plan(decomposition, rates);
-        Self::with_floor(horizon_ns, floor, rate)
+        let floor = FetchHorizonFloor::for_plan(decomposition, rates);
+        Self::with_fetch_floor(horizon_ns, floor, rate)
     }
 
     fn with_floor(horizon_ns: u64, floor: u64, rate: RateBasis) -> Result<Self> {
-        if horizon_ns < floor {
+        Self::with_fetch_floor(
+            horizon_ns,
+            FetchHorizonFloor {
+                ns: floor,
+                kind: HorizonFloorKind::OneChunk,
+            },
+            rate,
+        )
+    }
+
+    fn with_fetch_floor(
+        horizon_ns: u64,
+        floor: FetchHorizonFloor,
+        rate: RateBasis,
+    ) -> Result<Self> {
+        if horizon_ns < floor.ns() {
             return Err(crate::error::Error::InvalidArgument(format!(
-                "a horizon of {horizon_ns} ns is shorter than the {floor} ns fetch floor at \
+                "a horizon of {horizon_ns} ns is shorter than the {} ns {:?} fetch floor at \
                  these rates. A scheduler that cannot see a fetch finish cannot see it \
-                 pay for itself, and will order the run as though re-reading were free."
+                 pay for itself, and will order the run as though re-reading were free.",
+                floor.ns(),
+                floor.kind()
             )));
         }
         Ok(Self { horizon_ns, rate })

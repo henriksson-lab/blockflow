@@ -98,20 +98,41 @@ impl AccessPlan for [RegionRequest] {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+struct PlanId(u64);
+
+impl PlanId {
+    fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+
+    fn raw(self) -> u64 {
+        self.0
+    }
+
+    fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
 /// A submitted plan, for cancelling it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PlanHandle(u64);
+pub struct PlanHandle {
+    id: PlanId,
+}
 
 impl PlanHandle {
     /// A handle from a raw identifier, for a caller that stores one across a
     /// process boundary. Cancelling a handle this prefetcher never issued is
     /// harmless, which is what makes that safe.
     pub fn from_raw(id: u64) -> Self {
-        Self(id)
+        Self {
+            id: PlanId::from_raw(id),
+        }
     }
 
     pub fn raw(self) -> u64 {
-        self.0
+        self.id.raw()
     }
 }
 
@@ -144,7 +165,7 @@ pub struct PrefetchStats {
 struct Item {
     rank: u32,
     seq: u64,
-    plan: u64,
+    plan: PlanId,
     array: ArrayId,
     region: Region,
 }
@@ -167,11 +188,35 @@ impl PartialOrd for Item {
 #[derive(Default)]
 struct Queue {
     heap: BinaryHeap<Reverse<Item>>,
-    cancelled: HashSet<u64>,
-    next_plan: u64,
+    cancelled: HashSet<PlanId>,
+    next_plan: PlanId,
     next_seq: u64,
     in_flight: usize,
     shutdown: bool,
+}
+
+enum WorkerQueueState {
+    Shutdown,
+    Idle,
+    Work(Item),
+}
+
+impl Queue {
+    fn worker_state(&mut self) -> WorkerQueueState {
+        if self.shutdown {
+            return WorkerQueueState::Shutdown;
+        }
+        if let Some(Reverse(item)) = self.heap.pop() {
+            self.in_flight += 1;
+            return WorkerQueueState::Work(item);
+        }
+        WorkerQueueState::Idle
+    }
+
+    fn finish_worker_item(&mut self) {
+        debug_assert!(self.in_flight > 0);
+        self.in_flight -= 1;
+    }
 }
 
 #[derive(Default)]
@@ -232,15 +277,17 @@ impl Prefetcher {
     pub fn submit(&self, plan: &dyn AccessPlan) -> PlanHandle {
         let requests = plan.requests();
         let mut queue = self.shared.queue.lock_unpoisoned();
-        let handle = PlanHandle(queue.next_plan);
-        queue.next_plan += 1;
+        let handle = PlanHandle {
+            id: queue.next_plan,
+        };
+        queue.next_plan = queue.next_plan.next();
         for request in requests {
             let seq = queue.next_seq;
             queue.next_seq += 1;
             queue.heap.push(Reverse(Item {
                 rank: request.rank,
                 seq,
-                plan: handle.0,
+                plan: handle.id,
                 array: request.array,
                 region: request.region,
             }));
@@ -263,7 +310,7 @@ impl Prefetcher {
     /// pretending otherwise would be worse than letting one read complete.
     pub fn cancel(&self, handle: PlanHandle) {
         let mut queue = self.shared.queue.lock_unpoisoned();
-        queue.cancelled.insert(handle.0);
+        queue.cancelled.insert(handle.id);
         drop(queue);
         self.shared.work.notify_all();
     }
@@ -341,12 +388,10 @@ fn worker(shared: Arc<Shared>) {
         let item = {
             let mut queue = shared.queue.lock_unpoisoned();
             loop {
-                if queue.shutdown {
-                    return;
-                }
-                if let Some(Reverse(item)) = queue.heap.pop() {
-                    queue.in_flight += 1;
-                    break item;
+                match queue.worker_state() {
+                    WorkerQueueState::Shutdown => return,
+                    WorkerQueueState::Work(item) => break item,
+                    WorkerQueueState::Idle => {}
                 }
                 let (next, _) = shared
                     .work
@@ -402,7 +447,7 @@ fn worker(shared: Arc<Shared>) {
         }
 
         let mut queue = shared.queue.lock_unpoisoned();
-        queue.in_flight -= 1;
+        queue.finish_worker_item();
         drop(queue);
         shared.quiet.notify_all();
     }
@@ -463,7 +508,7 @@ mod tests {
             heap.push(Reverse(Item {
                 rank,
                 seq,
-                plan: 0,
+                plan: PlanId::from_raw(0),
                 array: ArrayId(0),
                 region: Region::new(&[0], &[1]),
             }));

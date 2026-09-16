@@ -18,6 +18,7 @@
 // starts the actual binaries.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use crate::assemble::PlanBuilder;
@@ -140,6 +141,35 @@ impl Locality {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheCapacity {
+    chunks: NonZeroUsize,
+    chunk_bytes: NonZeroU64,
+}
+
+impl CacheCapacity {
+    fn new(chunks: usize, chunk_bytes: u64) -> Self {
+        Self {
+            chunks: NonZeroUsize::new(chunks).expect("a positive cache capacity"),
+            chunk_bytes: NonZeroU64::new(chunk_bytes).expect("a non-empty chunk"),
+        }
+    }
+
+    fn chunks(self) -> usize {
+        self.chunks.get()
+    }
+
+    fn budget_bytes(self) -> u64 {
+        (self.chunks.get() as u64)
+            .checked_mul(self.chunk_bytes.get())
+            .expect("cache capacity fits in bytes")
+    }
+
+    fn evicts_before(self, touched_chunks: usize) -> bool {
+        self.chunks() < touched_chunks
+    }
+}
+
 /// Run a whole job over `workers` virtual workers under one policy, and count.
 ///
 /// The workers are virtual in one sense only: they are round-robin rather than
@@ -163,12 +193,12 @@ fn measure_at(
     workers: usize,
     blocks: usize,
     phases: usize,
-    cache_bytes: Option<u64>,
+    cache_capacity: Option<CacheCapacity>,
 ) -> Locality {
     let (mut spec, decomposition) = probe_job(blocks, phases, ChainSpec::identity());
     spec.policy = policy;
-    if let Some(bytes) = cache_bytes {
-        spec.workflow.cache_bytes = bytes;
+    if let Some(capacity) = cache_capacity {
+        spec.workflow.cache_bytes = capacity.budget_bytes();
     }
     measure_job(spec, decomposition, workers)
 }
@@ -251,26 +281,36 @@ struct HandoutProbe {
 }
 
 impl HandoutProbe {
-    fn spec(&self, policy: HandoutPolicy, cache_bytes: Option<u64>) -> JobSpec {
+    fn spec(&self, policy: HandoutPolicy, cache_capacity: Option<CacheCapacity>) -> JobSpec {
         let mut spec = self.seed.clone();
         spec.policy = policy;
-        if let Some(cache_bytes) = cache_bytes {
-            spec.workflow.cache_bytes = cache_bytes;
+        if let Some(cache_capacity) = cache_capacity {
+            spec.workflow.cache_bytes = cache_capacity.budget_bytes();
         }
         spec
     }
 
-    fn measure(&self, policy: HandoutPolicy, cache_bytes: Option<u64>, workers: usize) -> Locality {
+    fn measure(
+        &self,
+        policy: HandoutPolicy,
+        cache_capacity: Option<CacheCapacity>,
+        workers: usize,
+    ) -> Locality {
         measure_job(
-            self.spec(policy, cache_bytes),
+            self.spec(policy, cache_capacity),
             self.decomposition.clone(),
             workers,
         )
     }
 
-    fn simulated(&self, policy: HandoutPolicy, cache_bytes: Option<u64>, workers: usize) -> u64 {
+    fn simulated(
+        &self,
+        policy: HandoutPolicy,
+        cache_capacity: Option<CacheCapacity>,
+        workers: usize,
+    ) -> u64 {
         simulated_handout(
-            self.spec(policy, cache_bytes),
+            self.spec(policy, cache_capacity),
             self.decomposition.clone(),
             workers,
         )
@@ -496,19 +536,20 @@ fn coalescing_stays_refused_when_real_and_simulated_directions_diverge() {
     let mut simulator_win_cases = 0usize;
 
     for capacity in capacities {
-        let cache_bytes = capacity as u64 * chunk_bytes;
-        let real_nearest = probe.measure(HandoutPolicy::NearestFirst, Some(cache_bytes), workers);
-        let real_coalescing = probe.measure(HandoutPolicy::Coalescing, Some(cache_bytes), workers);
+        let capacity = CacheCapacity::new(capacity, chunk_bytes);
+        let real_nearest = probe.measure(HandoutPolicy::NearestFirst, Some(capacity), workers);
+        let real_coalescing = probe.measure(HandoutPolicy::Coalescing, Some(capacity), workers);
         let simulated_nearest =
-            probe.simulated(HandoutPolicy::NearestFirst, Some(cache_bytes), workers);
+            probe.simulated(HandoutPolicy::NearestFirst, Some(capacity), workers);
         let simulated_coalescing =
-            probe.simulated(HandoutPolicy::Coalescing, Some(cache_bytes), workers);
+            probe.simulated(HandoutPolicy::Coalescing, Some(capacity), workers);
 
         assert_eq!(real_coalescing.tasks, real_nearest.tasks);
         assert_eq!(real_coalescing.distinct, real_nearest.distinct);
         println!(
-            "coalescing bridge cap {capacity:3}: real duplicated {} -> {}, simulator duplicated \
+            "coalescing bridge cap {:3}: real duplicated {} -> {}, simulator duplicated \
              {} -> {}",
+            capacity.chunks(),
             real_nearest.duplicated,
             real_coalescing.duplicated,
             simulated_nearest,
@@ -522,9 +563,10 @@ fn coalescing_stays_refused_when_real_and_simulated_directions_diverge() {
             simulator_win_cases += 1;
             assert!(
                 real_coalescing.duplicated < real_nearest.duplicated,
-                "capacity {capacity}: simulator says coalescing wins ({simulated_coalescing} < \
+                "capacity {}: simulator says coalescing wins ({simulated_coalescing} < \
                  {simulated_nearest}) but the real coordinator duplicated {} chunks against \
                  nearest-first's {}",
+                capacity.chunks(),
                 real_coalescing.duplicated,
                 real_nearest.duplicated
             );
@@ -587,16 +629,16 @@ fn the_two_policies_are_indistinguishable_until_the_model_evicts() {
     // The whole sweep is collected before anything is asserted. A sweep that
     // aborts on its first bad row hides its own shape, and the shape is the
     // finding here.
-    let sweep: Vec<(usize, Locality)> = [1usize, 2, 4, 8, 16, 512]
+    let sweep: Vec<(CacheCapacity, Locality)> = [1usize, 2, 4, 8, 16, 512]
         .into_iter()
         .map(|capacity| {
-            let budget = capacity as u64 * chunk_bytes;
+            let capacity = CacheCapacity::new(capacity, chunk_bytes);
             let arm = measure_at(
                 HandoutPolicy::CacheModelled,
                 workers,
                 blocks,
                 1,
-                Some(budget),
+                Some(capacity),
             );
             (capacity, arm)
         })
@@ -616,8 +658,9 @@ fn the_two_policies_are_indistinguishable_until_the_model_evicts() {
     );
     for (capacity, arm) in &sweep {
         println!(
-            "  cache-modelled, cap {capacity:3}{}  duplicated {:4}  redundancy {:.3}",
-            if *capacity < touched_per_worker {
+            "  cache-modelled, cap {:3}{}  duplicated {:4}  redundancy {:.3}",
+            capacity.chunks(),
+            if capacity.evicts_before(touched_per_worker) {
                 " EVICTS"
             } else {
                 "       "
@@ -630,8 +673,13 @@ fn the_two_policies_are_indistinguishable_until_the_model_evicts() {
     // The job is the same job at every budget. Without this a policy that
     // dropped tasks would read as a locality win.
     for (capacity, arm) in &sweep {
-        assert_eq!(arm.tasks, nearest.tasks, "capacity {capacity}");
-        assert_eq!(arm.distinct, nearest.distinct, "capacity {capacity}");
+        assert_eq!(arm.tasks, nearest.tasks, "capacity {}", capacity.chunks());
+        assert_eq!(
+            arm.distinct,
+            nearest.distinct,
+            "capacity {}",
+            capacity.chunks()
+        );
     }
 
     // **The liveness control.** Without it the sweep could pass by never
@@ -640,7 +688,7 @@ fn the_two_policies_are_indistinguishable_until_the_model_evicts() {
     // naive_pull` came to say nothing about this policy.
     let evicting = sweep
         .iter()
-        .filter(|(capacity, _)| *capacity < touched_per_worker)
+        .filter(|(capacity, _)| capacity.evicts_before(touched_per_worker))
         .count();
     assert!(
         evicting >= 3,
@@ -651,7 +699,7 @@ fn the_two_policies_are_indistinguishable_until_the_model_evicts() {
     // documented degradation, pinned. With the model holding everything,
     // `misses` is a monotone proxy for distance and the tiebreak never fires.
     let (roomy_capacity, roomy) = sweep.last().expect("a sweep");
-    assert!(*roomy_capacity > touched_per_worker);
+    assert!(!roomy_capacity.evicts_before(touched_per_worker));
     assert_eq!(
         (roomy.duplicated, roomy.fetched),
         (nearest.duplicated, nearest.fetched),
@@ -674,13 +722,14 @@ fn the_two_policies_are_indistinguishable_until_the_model_evicts() {
     // than as the figures themselves: the magnitude is a property of this
     // decomposition, the *direction* is the property of the policy.
     let (tight_capacity, tight) = sweep.first().expect("a sweep");
-    assert!(*tight_capacity < touched_per_worker);
+    assert!(tight_capacity.evicts_before(touched_per_worker));
     assert!(
         tight.duplicated > nearest.duplicated,
         "the tight arm is the reason `HandoutPolicy::CacheModelled` is refused; if it has \
          stopped being worse than nearest-first, the refusal in `HandoutPolicy::refusal` \
-         should be revisited. cache-modelled at capacity {tight_capacity} duplicated {} \
+         should be revisited. cache-modelled at capacity {} duplicated {} \
          against nearest-first's {}",
+        tight_capacity.chunks(),
         tight.duplicated,
         nearest.duplicated,
     );
@@ -689,7 +738,8 @@ fn the_two_policies_are_indistinguishable_until_the_model_evicts() {
     // rather than merely holding.
     assert!(
         tight.duplicated >= nearest.duplicated * 2,
-        "cache-modelled at capacity {tight_capacity} duplicated {}, nearest-first {}, naive {}",
+        "cache-modelled at capacity {} duplicated {}, nearest-first {}, naive {}",
+        tight_capacity.chunks(),
         tight.duplicated,
         nearest.duplicated,
         naive.duplicated,
