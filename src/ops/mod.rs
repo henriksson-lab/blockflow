@@ -447,11 +447,12 @@ pub use lattice::{
     statistic_block_edge, LatticeInterpolateOp, LatticeStatisticOp,
 };
 pub use level_set::{
-    append_geodesic_level_set_phases, chan_vese_level_set_into, chan_vese_level_set_reporting_into,
-    chan_vese_level_set_step_into, geodesic_level_set_into, geodesic_level_set_reporting_into,
-    geodesic_level_set_step_into, level_set_mask_into, signed_distance_level_set,
-    ChanVeseLevelSetConfig, GeodesicLevelSetConfig, GeodesicLevelSetStepOp, LevelSetReport,
-    GEODESIC_LEVEL_SET_STEP_COST, MAX_EXPLICIT_LEVEL_SET_DT,
+    append_geodesic_level_set_phases, chan_vese_level_set_into, chan_vese_level_set_means,
+    chan_vese_level_set_reporting_into, chan_vese_level_set_step_into, geodesic_level_set_into,
+    geodesic_level_set_reporting_into, geodesic_level_set_step_into, level_set_mask_into,
+    signed_distance_level_set, ChanVeseLevelSetConfig, ChanVeseMeans, GeodesicLevelSetConfig,
+    GeodesicLevelSetStepOp, LevelSetReport, GEODESIC_LEVEL_SET_STEP_COST,
+    MAX_EXPLICIT_LEVEL_SET_DT,
 };
 pub use local::{
     axis_max_distance, local_statistic_into, local_statistic_into_narrowed,
@@ -645,11 +646,12 @@ pub use random_walker::{
     assemble_random_walker_system_from_seed_image, assemble_random_walker_system_from_sparse_table,
     collect_random_walker_rows, encode_random_walker_rows, grady_weight_phase,
     grady_weights_packed_into, packed_weight_shape, random_walker_binary_into,
-    random_walker_binary_seed_image_into, random_walker_row_id_phase, random_walker_row_ids_into,
-    random_walker_sparse_columns, random_walker_sparse_schema,
-    solve_random_walker_seed_image_system_into, solve_random_walker_sparse_table_seed_image_into,
-    solve_random_walker_system_into, GradyWeightOp, GradyWeights, RandomWalkerConfig,
-    RandomWalkerImages, RandomWalkerRowIdOp, RandomWalkerRowsOp, RandomWalkerSolve,
+    random_walker_binary_seed_image_into, random_walker_multilabel_seed_image_into,
+    random_walker_row_id_phase, random_walker_row_ids_into, random_walker_sparse_columns,
+    random_walker_sparse_schema, solve_random_walker_seed_image_system_into,
+    solve_random_walker_sparse_table_seed_image_into, solve_random_walker_system_into,
+    GradyWeightOp, GradyWeights, RandomWalkerConfig, RandomWalkerImages,
+    RandomWalkerMultilabelSolve, RandomWalkerRowIdOp, RandomWalkerRowsOp, RandomWalkerSolve,
     RandomWalkerSolveImages, RandomWalkerSolveOp, RandomWalkerSparseColumns, RandomWalkerSystem,
     RandomWalkerWeights,
 };

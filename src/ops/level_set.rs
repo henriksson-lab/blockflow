@@ -473,7 +473,7 @@ where
     validate_finite(image, "Chan-Vese image")?;
     validate_finite(phi, "Chan-Vese field")?;
 
-    let means = chan_vese_means(image, phi)?;
+    let means = chan_vese_level_set_means(image, phi)?;
     let shape = shape_of(phi);
     for i in 0..shape[0] {
         for j in 0..shape[1] {
@@ -608,15 +608,25 @@ impl BlockOp for GeodesicLevelSetStepOp {
 pub const GEODESIC_LEVEL_SET_STEP_COST: f64 = 90.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct ChanVeseMeans {
-    inside: f64,
-    outside: f64,
+pub struct ChanVeseMeans {
+    pub inside: f64,
+    pub outside: f64,
 }
 
-fn chan_vese_means<T>(image: ArrayView3<'_, T>, phi: ArrayView3<'_, f64>) -> Result<ChanVeseMeans>
+/// Reduce the current Chan-Vese inside/outside means for `phi <= 0`.
+///
+/// Planner-visible Chan-Vese needs this reduction as an explicit barrier before
+/// a later update phase can broadcast the scalars into the stencil step.
+pub fn chan_vese_level_set_means<T>(
+    image: ArrayView3<'_, T>,
+    phi: ArrayView3<'_, f64>,
+) -> Result<ChanVeseMeans>
 where
     T: Copy + Into<f64>,
 {
+    shapes_agree(image.shape(), phi.shape(), "Chan-Vese means")?;
+    validate_finite(image, "Chan-Vese image")?;
+    validate_finite(phi, "Chan-Vese field")?;
     let mut inside_sum = 0.0;
     let mut inside_count = 0usize;
     let mut outside_sum = 0.0;

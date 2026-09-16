@@ -14,7 +14,7 @@
 //! Seeds are fixed Dirichlet values. Only unseeded voxels become unknown rows,
 //! and seeded neighbours contribute to the right-hand side.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use ndarray::{Array3, Array4, ArrayView3, ArrayViewMut3};
@@ -193,6 +193,12 @@ impl RandomWalkerWeights {
 pub struct RandomWalkerSolve {
     pub iterations: usize,
     pub residual_norm: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RandomWalkerMultilabelSolve {
+    pub labels: Vec<u64>,
+    pub solves: Vec<RandomWalkerSolve>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -608,6 +614,79 @@ where
 {
     let seeds = seed_probabilities_from_image(seed_image)?;
     random_walker_binary_into(input, seeds.view(), weights, config, out)
+}
+
+pub fn random_walker_multilabel_seed_image_into<T>(
+    input: ArrayView3<'_, T>,
+    seed_labels: ArrayView3<'_, u64>,
+    params: GradyWeights,
+    config: RandomWalkerConfig,
+    mut out: ArrayViewMut3<'_, u64>,
+) -> Result<RandomWalkerMultilabelSolve>
+where
+    T: VoxelElement,
+{
+    let shape = shape_of(input);
+    shapes_match(shape, seed_labels.shape(), "random-walker multilabel seeds")?;
+    shapes_match(shape, out.shape(), "random-walker multilabel output")?;
+    let labels: Vec<u64> = seed_labels
+        .iter()
+        .copied()
+        .filter(|label| *label != 0)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if labels.is_empty() {
+        return Err(Error::InvalidArgument(
+            "random-walker multilabel needs at least one non-zero seed label".to_string(),
+        ));
+    }
+
+    let weights = RandomWalkerWeights::grady(input, params)?;
+    let mut best_probability =
+        Array3::<f64>::from_elem((shape[0], shape[1], shape[2]), f64::NEG_INFINITY);
+    let mut best_label = Array3::<u64>::zeros((shape[0], shape[1], shape[2]));
+    let mut solves = Vec::with_capacity(labels.len());
+
+    for &label in &labels {
+        let seeds = seed_labels.mapv(|seed| {
+            if seed == 0 {
+                None
+            } else if seed == label {
+                Some(1.0)
+            } else {
+                Some(0.0)
+            }
+        });
+        let system = assemble_random_walker_system(&weights, seeds.view())?;
+        let mut probability = Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
+        let report =
+            solve_random_walker_system_into(&system, seeds.view(), config, probability.view_mut())?;
+        solves.push(report);
+        for ((i, j, k), &value) in probability.indexed_iter() {
+            if value > best_probability[[i, j, k]] {
+                best_probability[[i, j, k]] = value;
+                best_label[[i, j, k]] = label;
+            }
+        }
+    }
+
+    for ((i, j, k), slot) in out.indexed_iter_mut() {
+        let seed = seed_labels[[i, j, k]];
+        *slot = if seed == 0 {
+            let label = best_label[[i, j, k]];
+            if label == 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "random-walker multilabel could not assign unknown voxel [{i}, {j}, {k}]"
+                )));
+            }
+            label
+        } else {
+            seed
+        };
+    }
+
+    Ok(RandomWalkerMultilabelSolve { labels, solves })
 }
 
 pub fn random_walker_row_ids_into(
@@ -1930,6 +2009,29 @@ mod tests {
         for (i, want) in [0.0, 0.25, 0.5, 0.75, 1.0].into_iter().enumerate() {
             assert!((out[[i, 0, 0]] - want).abs() < 1.0e-9, "{i}");
         }
+    }
+
+    #[test]
+    fn multilabel_random_walker_assigns_unknowns_by_largest_label_probability() {
+        let input = Array3::from_elem((5, 1, 1), 0.0);
+        let labels = Array3::from_shape_vec((5, 1, 1), vec![1, 0, 0, 0, 2]).unwrap();
+        let mut out = Array3::<u64>::zeros((5, 1, 1));
+
+        let report = random_walker_multilabel_seed_image_into(
+            input.view(),
+            labels.view(),
+            GradyWeights::new(0.0, 0.0).unwrap(),
+            RandomWalkerConfig::default(),
+            out.view_mut(),
+        )
+        .unwrap();
+
+        assert_eq!(report.labels, vec![1, 2]);
+        assert_eq!(report.solves.len(), 2);
+        assert_eq!(
+            out,
+            Array3::from_shape_vec((5, 1, 1), vec![1, 1, 1, 2, 2]).unwrap()
+        );
     }
 
     #[test]

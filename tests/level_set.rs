@@ -1,10 +1,10 @@
 use blockflow::env::ArrayEnvironment;
 use blockflow::op::{Anchor, BlockOp, SourceInputs};
 use blockflow::ops::{
-    append_geodesic_level_set_phases, chan_vese_level_set_into, chan_vese_level_set_step_into,
-    geodesic_level_set_into, geodesic_level_set_reporting_into, geodesic_level_set_step_into,
-    level_set_mask_into, signed_distance_level_set, ChanVeseLevelSetConfig, DistanceParams,
-    GeodesicLevelSetConfig, GeodesicLevelSetStepOp,
+    append_geodesic_level_set_phases, chan_vese_level_set_into, chan_vese_level_set_means,
+    chan_vese_level_set_step_into, geodesic_level_set_into, geodesic_level_set_reporting_into,
+    geodesic_level_set_step_into, level_set_mask_into, signed_distance_level_set,
+    ChanVeseLevelSetConfig, DistanceParams, GeodesicLevelSetConfig, GeodesicLevelSetStepOp,
 };
 use blockflow::strategy::{execute, Hints};
 use blockflow::ImageId;
@@ -240,6 +240,17 @@ fn chan_vese_step_uses_current_inside_and_outside_means() {
     let delta = 1.0 / (std::f64::consts::PI * 2.0);
     let expected = -1.0 + 0.5 * delta * (-(2.0f64 - 2.0).powi(2) + (2.0f64 - 6.5).powi(2));
     assert!((out[[0, 0, 0]] - expected).abs() <= 1.0e-12);
+}
+
+#[test]
+fn chan_vese_means_are_a_named_reduction_for_planner_broadcast() {
+    let image = Array3::from_shape_vec((1, 1, 4), vec![2.0, 4.0, 10.0, 14.0]).unwrap();
+    let phi = Array3::from_shape_vec((1, 1, 4), vec![-1.0, 0.0, 1.0, 2.0]).unwrap();
+
+    let means = chan_vese_level_set_means(image.view(), phi.view()).unwrap();
+
+    assert_eq!(means.inside, 3.0);
+    assert_eq!(means.outside, 12.0);
 }
 
 #[test]
