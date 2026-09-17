@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/run_cellprofiler_benchmark.sh IMAGE OUTPUT_DIR [REFERENCE_OBJECT_CSV]
+
+Runs the Blockflow CellProfiler-style benchmark binary and, when a reference
+object CSV is supplied, runs semantic table comparison against it.
+
+Environment variables:
+  CARGO_BIN_FLAGS   Extra cargo flags before "--", for example "--release".
+  BF_MIN_SIZE       Minimum object size, default 50.
+  BF_MAX_SIZE       Maximum object size, default 5027. Set empty with BF_NO_MAX_SIZE=1.
+  BF_SIGMA          XY Gaussian sigma, default 1.0.
+  BF_DECLUMP_SIGMA  XY Gaussian sigma for intensity declumping, default 1.3488.
+  BF_THRESHOLD_METHOD Global threshold method, default li.
+  BF_THRESHOLD_BINS Otsu bin count when used, default 256.
+  BF_SEED_MIN_DISTANCE Watershed seed suppression distance, default 6.
+  BF_MAXIMA_DOWNSAMPLE Lower-resolution XY seed-maxima block factor, default 3.
+  BF_DECLUMP_METHOD Declump watershed source, intensity or distance, default intensity.
+  BF_ADJACENT_BASINS Set to 1 to let watershed basins touch instead of carving lines.
+  BF_NO_FILL_HOLES_AFTER_DECLUMPING Set to 1 to skip post-declump hole filling.
+  BF_MERGE_LINE_BASIN_PIXELS Merge resident labels separated by at least this many watershed-line pixels, default 0.
+  BF_MERGE_LINE_MAX_SADDLE_DROP Optional maximum weak-boundary-minus-line mean for line merges.
+  BF_WORKERS       Requested worker count metadata for sweep reports.
+  BF_CHUNK_SHAPE   Requested chunk shape metadata, for example 1x256x256.
+  BF_CACHE_BYTES   Requested cache budget metadata in bytes.
+  BF_DISTANCE_BLOCK Distance-transform block edge for the planned simulator probe, default 256.
+  BF_ENABLE_PLAN_PROBE Set to 0 to skip planned simulator probing.
+  BF_ENABLE_PLAN_MATERIALIZATION Set to 0 to skip planned object CSV materialization.
+  BF_PLAN_MATERIALIZATION_REPEATS Repeat planned materialization timing, default 1.
+  BF_REFERENCE_SUMMARY Optional CellProfiler reference-summary.json.
+  BF_REFERENCE_LABELS Optional grayscale/integer reference label image.
+  BF_COMPARE_ARGS   Extra arguments passed to cellprofiler-compare.
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  usage >&2
+  exit 2
+fi
+
+image="$1"
+output_dir="$2"
+reference_csv="${3:-}"
+
+if [[ ! -f "$image" ]]; then
+  echo "Input image not found: $image" >&2
+  exit 1
+fi
+
+if [[ -n "$reference_csv" && ! -f "$reference_csv" ]]; then
+  echo "Reference CSV not found: $reference_csv" >&2
+  exit 1
+fi
+
+mkdir -p "$output_dir"
+
+min_size="${BF_MIN_SIZE:-50}"
+max_size="${BF_MAX_SIZE:-5027}"
+sigma="${BF_SIGMA:-1.0}"
+declump_sigma="${BF_DECLUMP_SIGMA:-1.3488}"
+threshold_method="${BF_THRESHOLD_METHOD:-li}"
+threshold_bins="${BF_THRESHOLD_BINS:-256}"
+seed_min_distance="${BF_SEED_MIN_DISTANCE:-6}"
+maxima_downsample="${BF_MAXIMA_DOWNSAMPLE:-3}"
+declump_method="${BF_DECLUMP_METHOD:-intensity}"
+basin_args=()
+if [[ "${BF_ADJACENT_BASINS:-}" == "1" ]]; then
+  basin_args+=(--adjacent-basins)
+fi
+hole_args=()
+if [[ "${BF_NO_FILL_HOLES_AFTER_DECLUMPING:-}" == "1" ]]; then
+  hole_args+=(--no-fill-holes-after-declumping)
+fi
+merge_line_basin_pixels="${BF_MERGE_LINE_BASIN_PIXELS:-0}"
+merge_line_max_saddle_drop="${BF_MERGE_LINE_MAX_SADDLE_DROP:-}"
+merge_args=()
+if [[ "$merge_line_basin_pixels" != "0" ]]; then
+  merge_args+=(--merge-line-basin-pixels "$merge_line_basin_pixels")
+fi
+if [[ -n "$merge_line_max_saddle_drop" ]]; then
+  merge_args+=(--merge-line-max-saddle-drop "$merge_line_max_saddle_drop")
+fi
+workers="${BF_WORKERS:-1}"
+chunk_shape="${BF_CHUNK_SHAPE:-1x256x256}"
+cache_bytes="${BF_CACHE_BYTES:-0}"
+distance_block="${BF_DISTANCE_BLOCK:-256}"
+enable_plan_probe="${BF_ENABLE_PLAN_PROBE:-1}"
+enable_plan_materialization="${BF_ENABLE_PLAN_MATERIALIZATION:-1}"
+plan_materialization_repeats="${BF_PLAN_MATERIALIZATION_REPEATS:-1}"
+reference_summary="${BF_REFERENCE_SUMMARY:-}"
+reference_labels="${BF_REFERENCE_LABELS:-}"
+planned_objects_csv="$output_dir/planned/planned_objects.csv"
+
+size_args=(--min-size "$min_size")
+if [[ "${BF_NO_MAX_SIZE:-}" == "1" ]]; then
+  size_args+=(--no-max-size)
+else
+  size_args+=(--max-size "$max_size")
+fi
+plan_size_args=(--min-size "$min_size")
+if [[ "${BF_NO_MAX_SIZE:-}" == "1" ]]; then
+  plan_size_args+=(--no-max-size)
+else
+  plan_size_args+=(--max-size "$max_size")
+fi
+
+read -r -a cargo_bin_flags <<< "${CARGO_BIN_FLAGS:-}"
+read -r -a compare_args <<< "${BF_COMPARE_ARGS:-}"
+label_args=()
+if [[ -n "$reference_labels" ]]; then
+  if [[ ! -f "$reference_labels" ]]; then
+    echo "Reference label image not found: $reference_labels" >&2
+    exit 1
+  fi
+  label_args=(
+    --blockflow-labels "$output_dir/blockflow/labels.png"
+    --reference-labels "$reference_labels"
+  )
+fi
+
+if [[ -n "$reference_summary" && ! -f "$reference_summary" ]]; then
+  echo "Reference summary JSON not found: $reference_summary" >&2
+  exit 1
+fi
+
+{
+  printf 'blockflow_command='
+  printf '%q ' cargo run --features cellprofiler-benchmark --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
+    --input "$image" --out "$output_dir/blockflow" "${size_args[@]}" --sigma "$sigma" \
+    --declump-sigma "$declump_sigma" --threshold-method "$threshold_method" --threshold-bins "$threshold_bins" \
+    --seed-min-distance "$seed_min_distance" --maxima-downsample "$maxima_downsample" \
+    --declump-method "$declump_method" \
+    "${basin_args[@]}" "${hole_args[@]}" "${merge_args[@]}"
+  printf '\n'
+} > "$output_dir/benchmark-command.txt"
+
+cargo run --features cellprofiler-benchmark --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
+  --input "$image" \
+  --out "$output_dir/blockflow" \
+  "${size_args[@]}" \
+  --sigma "$sigma" \
+  --declump-sigma "$declump_sigma" \
+  --threshold-method "$threshold_method" \
+  --threshold-bins "$threshold_bins" \
+  --seed-min-distance "$seed_min_distance" \
+  --maxima-downsample "$maxima_downsample" \
+  --declump-method "$declump_method" \
+  "${basin_args[@]}" \
+  "${hole_args[@]}" \
+  "${merge_args[@]}"
+
+if [[ "$enable_plan_probe" != "0" ]]; then
+  plan_materialize_args=()
+  if [[ "$enable_plan_materialization" != "0" ]]; then
+    plan_materialize_args=(--materialize-objects "$output_dir/planned")
+  fi
+  {
+    printf 'plan_probe_command='
+    printf '%q ' cargo run --features cellprofiler-benchmark --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
+      --input "$image" --out "$output_dir/plan-probe.json" --chunk "$chunk_shape" \
+      --workers "$workers" --cache-bytes "$cache_bytes" --sigma "$sigma" \
+      --threshold-method "$threshold_method" --threshold-bins "$threshold_bins" \
+      "${plan_size_args[@]}" --seed-min-distance "$seed_min_distance" \
+      --maxima-downsample "$maxima_downsample" \
+      --declump-method "$declump_method" \
+      "${merge_args[@]}" \
+      --distance-block "$distance_block" \
+      --materialize-repeats "$plan_materialization_repeats" \
+      "${plan_materialize_args[@]}"
+    printf '\n'
+  } >> "$output_dir/benchmark-command.txt"
+
+  cargo run --features cellprofiler-benchmark --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
+    --input "$image" \
+    --out "$output_dir/plan-probe.json" \
+    --chunk "$chunk_shape" \
+    --workers "$workers" \
+    --cache-bytes "$cache_bytes" \
+    --sigma "$sigma" \
+    --threshold-method "$threshold_method" \
+    --threshold-bins "$threshold_bins" \
+    "${plan_size_args[@]}" \
+    --seed-min-distance "$seed_min_distance" \
+    --maxima-downsample "$maxima_downsample" \
+    --declump-method "$declump_method" \
+    "${merge_args[@]}" \
+    --distance-block "$distance_block" \
+    --materialize-repeats "$plan_materialization_repeats" \
+    "${plan_materialize_args[@]}"
+fi
+
+if [[ -n "$reference_csv" ]]; then
+  {
+    printf 'compare_command='
+    printf '%q ' cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+      --blockflow "$output_dir/blockflow/objects.csv" --reference "$reference_csv" \
+      --out "$output_dir/comparison.json" "${label_args[@]}" "${compare_args[@]}"
+    printf '\n'
+  } >> "$output_dir/benchmark-command.txt"
+
+  cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+    --blockflow "$output_dir/blockflow/objects.csv" \
+    --reference "$reference_csv" \
+    --out "$output_dir/comparison.json" \
+    "${label_args[@]}" \
+    "${compare_args[@]}"
+
+  if [[ "$enable_plan_probe" != "0" && "$enable_plan_materialization" != "0" && -f "$planned_objects_csv" ]]; then
+    {
+      printf 'planned_compare_command='
+      printf '%q ' cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+        --blockflow "$planned_objects_csv" --reference "$reference_csv" \
+        --out "$output_dir/planned-comparison.json" "${compare_args[@]}"
+      printf '\n'
+    } >> "$output_dir/benchmark-command.txt"
+
+    cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+      --blockflow "$planned_objects_csv" \
+      --reference "$reference_csv" \
+      --out "$output_dir/planned-comparison.json" \
+      "${compare_args[@]}"
+  fi
+fi
+
+if [[ "$enable_plan_probe" != "0" && "$enable_plan_materialization" != "0" && -f "$planned_objects_csv" && -f "$output_dir/blockflow/objects.csv" ]]; then
+  {
+    printf 'planned_resident_compare_command='
+    printf '%q ' cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+      --blockflow "$planned_objects_csv" --reference "$output_dir/blockflow/objects.csv" \
+      --out "$output_dir/planned-resident-comparison.json" \
+      --reference-area count --reference-centroid-z centroid_z --reference-centroid-y centroid_y \
+      --reference-centroid-x centroid_x --reference-mean-intensity intensity_mean \
+      --reference-integrated-intensity intensity_sum --reference-bbox-min-z bbox_min_z \
+      --reference-bbox-min-y bbox_min_y --reference-bbox-min-x bbox_min_x \
+      --reference-bbox-max-z bbox_max_z --reference-bbox-max-y bbox_max_y \
+      --reference-bbox-max-x bbox_max_x
+    printf '\n'
+  } >> "$output_dir/benchmark-command.txt"
+
+  cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+    --blockflow "$planned_objects_csv" \
+    --reference "$output_dir/blockflow/objects.csv" \
+    --out "$output_dir/planned-resident-comparison.json" \
+    --reference-area count \
+    --reference-centroid-z centroid_z \
+    --reference-centroid-y centroid_y \
+    --reference-centroid-x centroid_x \
+    --reference-mean-intensity intensity_mean \
+    --reference-integrated-intensity intensity_sum \
+    --reference-bbox-min-z bbox_min_z \
+    --reference-bbox-min-y bbox_min_y \
+    --reference-bbox-min-x bbox_min_x \
+    --reference-bbox-max-z bbox_max_z \
+    --reference-bbox-max-y bbox_max_y \
+    --reference-bbox-max-x bbox_max_x
+fi
+
+python3 - "$output_dir" "$reference_summary" "$workers" "$chunk_shape" "$cache_bytes" "$maxima_downsample" "$merge_line_basin_pixels" "$merge_line_max_saddle_drop" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out_dir = Path(sys.argv[1])
+reference_summary_path = Path(sys.argv[2]) if sys.argv[2] else None
+requested_workers = sys.argv[3]
+requested_chunk_shape = sys.argv[4]
+requested_cache_bytes = sys.argv[5]
+maxima_downsample = int(sys.argv[6])
+merge_line_basin_pixels = int(sys.argv[7])
+merge_line_max_saddle_drop = None if not sys.argv[8] else float(sys.argv[8])
+
+def read_json(path):
+    if path and path.exists():
+        with path.open() as handle:
+            return json.load(handle)
+    return None
+
+blockflow = read_json(out_dir / "blockflow" / "summary.json")
+comparison = read_json(out_dir / "comparison.json")
+plan_probe = read_json(out_dir / "plan-probe.json")
+planned_comparison = read_json(out_dir / "planned-comparison.json")
+planned_resident_comparison = read_json(out_dir / "planned-resident-comparison.json")
+reference = read_json(reference_summary_path) if reference_summary_path else None
+hole_filling = None if blockflow is None else blockflow.get("fill_holes_after_declumping")
+declump_method = None if blockflow is None else blockflow.get("declump_method")
+plan_materialized = None if plan_probe is None else plan_probe.get("materialized_outputs")
+planner_missing = []
+if plan_probe is not None and not plan_materialized:
+    planner_missing.append("planned object CSV/table materialization")
+elif (
+    plan_materialized is not None
+    and (plan_materialized.get("objects") or 0) == 0
+):
+    planner_missing.append("validated non-empty planned object CSV/table materialization")
+requested_execution = {
+    "workers": requested_workers,
+    "chunk_shape": requested_chunk_shape,
+    "cache_bytes": requested_cache_bytes,
+}
+
+report = {
+    "blockflow": blockflow,
+    "cellprofiler_reference": reference,
+    "comparison": comparison,
+    "planned_comparison": planned_comparison,
+    "planned_resident_comparison": planned_resident_comparison,
+    "execution_config": {
+        "requested": requested_execution,
+        "resident_maxima_downsample": maxima_downsample,
+        "resident_merge_line_basin_pixels": merge_line_basin_pixels,
+        "resident_merge_line_max_saddle_drop": merge_line_max_saddle_drop,
+        "applied": {
+            "workers": "resident",
+            "chunk_shape": "whole_image",
+            "cache_bytes": "none",
+        },
+        "applies_requested_execution_config": False,
+        "planned_probe_applies_requested_execution_config": plan_probe is not None,
+        "planned_prefix_applies_requested_execution_config": plan_probe is not None,
+        "reason": "cellprofiler-human currently runs resident kernels directly; worker, chunk and cache settings are recorded for sweeps but not applied to execution yet",
+    },
+    "wall_time": {
+        "blockflow_pipeline_seconds": None if blockflow is None else blockflow.get("pipeline_seconds"),
+        "cellprofiler_wall_seconds": None if reference is None else reference.get("wall_seconds"),
+    },
+    "planner_simulator": {
+        "status": None if plan_probe is None else plan_probe.get("status", "planned_segmentation_with_measurements_simulated"),
+        "observed_pipeline_seconds": None if blockflow is None else blockflow.get("pipeline_seconds"),
+        "estimated_pipeline_seconds": None if plan_probe is None else plan_probe.get("simulator", {}).get("estimated_pipeline_seconds"),
+        "estimate_error_ratio": None,
+        "scope": None if plan_probe is None else plan_probe.get("scope"),
+        "not_included": planner_missing if plan_probe is not None else None,
+        "materialized_outputs": plan_materialized,
+        "planned_vs_reference": planned_comparison,
+        "planned_vs_resident": planned_resident_comparison,
+        "plan_probe": plan_probe,
+        "reason": "the simulator covers the planned segmentation skeleton, min-distance seed suppression, optional watershed-line basin merging, final object-size filtering and shape/intensity measurement phases; when enabled, the same planned path also materializes a diagnostic object table for comparison against resident and reference outputs",
+    },
+}
+
+bf = report["wall_time"]["blockflow_pipeline_seconds"]
+cp = report["wall_time"]["cellprofiler_wall_seconds"]
+if bf is not None and cp is not None and cp != 0:
+    report["wall_time"]["blockflow_over_cellprofiler"] = bf / cp
+estimate = report["planner_simulator"]["estimated_pipeline_seconds"]
+if bf is not None and estimate is not None and bf != 0:
+    report["planner_simulator"]["estimate_error_ratio"] = estimate / bf
+
+with (out_dir / "benchmark-report.json").open("w") as handle:
+    json.dump(report, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY

@@ -1974,6 +1974,21 @@ struct TouchingNeighborRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+struct OverlapRelationshipRequest {
+    other: LabelImage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OverlapAssignmentRequest {
+    threshold: OverlapAssignmentThreshold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OverlapChildCountRequest {
+    threshold: OverlapAssignmentThreshold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct BoundaryDistanceRelationshipRequest {
     spacing: PhysicalSpacing,
 }
@@ -2520,6 +2535,29 @@ fn validate_label_source_fact(
     })
 }
 
+fn validate_same_grid_label_source_fact(
+    source: LabelImage,
+    labels: ValidatedLabelSource,
+    role: &'static str,
+    base: &Decomposition,
+    registry: &MeasurementSourceFacts,
+) -> Result<ValidatedLabelSource> {
+    let checked = validate_label_source_fact(source, base, registry)?;
+    checked.source().grid().ensure_matches(
+        role,
+        checked.id(),
+        labels.source().grid(),
+        "label image",
+    )?;
+    checked.source().ensure_frame_compatible_with(
+        role,
+        checked.id(),
+        labels.source(),
+        "label image",
+    )?;
+    Ok(checked)
+}
+
 /// Builder-validated intensity source for measurement execution.
 ///
 /// This witness means the source exists in the base plan, has a supported value
@@ -2820,6 +2858,9 @@ struct ActiveMeasurementInputs<'a> {
     centroid_relationships: Option<CentroidRelationshipRequest>,
     centroid_neighbors: Option<CentroidNeighborRequest>,
     touching_neighbors: Option<TouchingNeighborRequest>,
+    overlap_relationships: Option<OverlapRelationshipRequest>,
+    overlap_assignments: Option<OverlapAssignmentRequest>,
+    overlap_child_counts: Option<OverlapChildCountRequest>,
     boundary_distance_relationships: Option<BoundaryDistanceRelationshipRequest>,
     expansion_relationships: Option<ExpansionRelationshipRequest>,
     moment3d: Option<ObjectMoment3dRequest>,
@@ -2857,6 +2898,9 @@ impl ActiveMeasurementInputs<'_> {
             || self.centroid_relationships.is_some()
             || self.centroid_neighbors.is_some()
             || self.touching_neighbors.is_some()
+            || self.overlap_relationships.is_some()
+            || self.overlap_assignments.is_some()
+            || self.overlap_child_counts.is_some()
             || self.boundary_distance_relationships.is_some()
             || self.expansion_relationships.is_some()
             || self.moment3d.is_some()
@@ -2899,6 +2943,9 @@ impl ActiveMeasurementRequests {
             centroid_relationships,
             centroid_neighbors,
             touching_neighbors,
+            overlap_relationships: _,
+            overlap_assignments: _,
+            overlap_child_counts: _,
             zernike_moments,
             zernike3d,
             weighted_hu_moments,
@@ -3053,6 +3100,9 @@ pub struct Measurements {
     centroid_relationships: Option<CentroidRelationshipRequest>,
     centroid_neighbors: Option<CentroidNeighborRequest>,
     touching_neighbors: Option<TouchingNeighborRequest>,
+    overlap_relationships: Option<OverlapRelationshipRequest>,
+    overlap_assignments: Option<OverlapAssignmentRequest>,
+    overlap_child_counts: Option<OverlapChildCountRequest>,
     boundary_distance_relationships: Option<BoundaryDistanceRelationshipRequest>,
     expansion_relationships: Option<ExpansionRelationshipRequest>,
     moment3d: Option<ObjectMoment3dRequest>,
@@ -3169,6 +3219,9 @@ impl Measurements {
             centroid_relationships: None,
             centroid_neighbors: None,
             touching_neighbors: None,
+            overlap_relationships: None,
+            overlap_assignments: None,
+            overlap_child_counts: None,
             boundary_distance_relationships: None,
             expansion_relationships: None,
             moment3d: None,
@@ -3364,6 +3417,51 @@ impl Measurements {
 
     pub fn touching_neighbor_summary(mut self, spacing: PhysicalSpacing) -> Self {
         self.touching_neighbors = Some(TouchingNeighborRequest { spacing });
+        self
+    }
+
+    pub fn overlap_relationships(mut self, other: LabelImage) -> Self {
+        self.overlap_relationships = Some(OverlapRelationshipRequest { other });
+        self
+    }
+
+    pub fn maximum_overlap_assignment_summary(mut self, other: LabelImage) -> Self {
+        self.overlap_relationships = Some(OverlapRelationshipRequest { other });
+        self.overlap_assignments = Some(OverlapAssignmentRequest {
+            threshold: OverlapAssignmentThreshold::none(),
+        });
+        self
+    }
+
+    pub fn maximum_overlap_assignment_summary_with_threshold(
+        mut self,
+        other: LabelImage,
+        threshold: OverlapAssignmentThreshold,
+    ) -> Self {
+        self.overlap_relationships = Some(OverlapRelationshipRequest { other });
+        self.overlap_assignments = Some(OverlapAssignmentRequest { threshold });
+        self
+    }
+
+    pub fn overlap_child_count_summary(mut self, other: LabelImage) -> Self {
+        self.overlap_relationships = Some(OverlapRelationshipRequest { other });
+        self.overlap_assignments = Some(OverlapAssignmentRequest {
+            threshold: OverlapAssignmentThreshold::none(),
+        });
+        self.overlap_child_counts = Some(OverlapChildCountRequest {
+            threshold: OverlapAssignmentThreshold::none(),
+        });
+        self
+    }
+
+    pub fn overlap_child_count_summary_with_threshold(
+        mut self,
+        other: LabelImage,
+        threshold: OverlapAssignmentThreshold,
+    ) -> Self {
+        self.overlap_relationships = Some(OverlapRelationshipRequest { other });
+        self.overlap_assignments = Some(OverlapAssignmentRequest { threshold });
+        self.overlap_child_counts = Some(OverlapChildCountRequest { threshold });
         self
     }
 
@@ -3633,6 +3731,16 @@ impl Measurements {
                 registry,
             )?;
         }
+        if let Some(request) = &mut self.overlap_relationships {
+            let checked = validate_same_grid_label_source_fact(
+                request.other,
+                labels,
+                "overlap label image",
+                base,
+                registry,
+            )?;
+            request.other = request.other.holding(checked.dtype());
+        }
         for request in &mut self.custom_region {
             for source in &mut request.sources {
                 let checked = validate_label_separated_same_grid_value_source(
@@ -3678,6 +3786,9 @@ impl Measurements {
         let centroid_relationship_request = self.centroid_relationships;
         let centroid_neighbor_request = self.centroid_neighbors;
         let touching_neighbor_request = self.touching_neighbors;
+        let overlap_relationship_request = self.overlap_relationships;
+        let overlap_assignment_request = self.overlap_assignments;
+        let overlap_child_count_request = self.overlap_child_counts;
         let boundary_distance_relationship_request = self.boundary_distance_relationships;
         let expansion_relationship_request = self.expansion_relationships;
         let moment3d_request = self.moment3d;
@@ -3708,6 +3819,9 @@ impl Measurements {
             centroid_relationships: centroid_relationship_request,
             centroid_neighbors: centroid_neighbor_request,
             touching_neighbors: touching_neighbor_request,
+            overlap_relationships: overlap_relationship_request,
+            overlap_assignments: overlap_assignment_request,
+            overlap_child_counts: overlap_child_count_request,
             boundary_distance_relationships: boundary_distance_relationship_request,
             expansion_relationships: expansion_relationship_request,
             moment3d: moment3d_request,
@@ -4267,6 +4381,9 @@ impl Measurements {
         let mut colocalization = Vec::new();
         let mut costes_colocalization = Vec::new();
         let mut rank_weighted_colocalization = Vec::new();
+        let mut overlap_relationships = None;
+        let mut overlap_assignments = None;
+        let mut overlap_child_counts = None;
         let mut boundary_distance_relationships = None;
         let mut expansion_relationships = None;
         let mut centroid_neighbors = None;
@@ -4480,6 +4597,121 @@ impl Measurements {
                 &grid,
                 stream,
                 request.threshold,
+                derive,
+            )?);
+        }
+        if let Some(request) = overlap_relationship_request {
+            let other = if registry.get(request.other.id()).is_some()
+                || !request.other.id().is_supplied()
+            {
+                validate_same_grid_label_source_fact(
+                    request.other,
+                    labels,
+                    "overlap label image",
+                    &decomposition,
+                    &registry,
+                )?
+            } else {
+                let dtype = request.other.dtype().unwrap_or_else(|| labels.dtype());
+                MeasurementLabelDtype::new(dtype)?;
+                ValidatedLabelSource {
+                    id: request.other.id(),
+                    source: MeasurementSourceFact {
+                        dtype,
+                        grid: labels.source().grid(),
+                        frame: labels.source().physical_frame(),
+                    },
+                }
+            };
+            let partials = OverlapRelationshipPartialStream::new(format!(
+                "{rows}.relationships.overlap.partials"
+            ))?;
+            let stream =
+                OverlapRelationshipOutputStream::new(format!("{rows}.relationships.overlap"))?;
+            let stream_name = stream.as_str().to_string();
+            let mut tally = OverlapRelationshipTallyOp::new(
+                "measure overlap relationships",
+                labels.id(),
+                other.id(),
+                partial_stream_name(&partials),
+                Lifecycle::DeleteOnExit,
+            )?;
+            tally.labels_a = labels.typed_source();
+            tally.labels_b = other.typed_source();
+            overlap_relationships = Some(append_two_phase_measurement(
+                &mut decomposition,
+                &grid,
+                stream,
+                tally,
+                |partial_phase| {
+                    MergeOverlapRelationshipsOp::new(
+                        "merge overlap relationships",
+                        partial_stream_name(&partials),
+                        partial_phase,
+                        grid.blocks_per_axis(),
+                        stream_name,
+                        self.lifecycle,
+                    )
+                },
+            )?);
+        }
+        if let Some(request) = overlap_assignment_request {
+            let relationships = overlap_relationships.as_ref().ok_or_else(|| {
+                Error::invalid(
+                    "measure overlap assignments: maximum-overlap assignment summaries need \
+                     overlap relationship rows",
+                )
+            })?;
+            let stream = OverlapAssignmentOutputStream::new(format!(
+                "{rows}.relationships.overlap.assignments"
+            ))?;
+            let relationship_rows: MeasurementRows<OverlapRelationshipRows> =
+                relationships.rows_handle();
+            let derive = OverlapAssignmentSummaryOp::from_overlap_relationship_rows(
+                "measure maximum-overlap assignments",
+                &relationship_rows,
+                grid.blocks_per_axis(),
+                &stream,
+                request.threshold,
+                self.lifecycle,
+            )?;
+            overlap_assignments = Some(append_one_phase_measurement(
+                &mut decomposition,
+                &grid,
+                stream,
+                derive,
+            )?);
+        }
+        if let Some(request) = overlap_child_count_request {
+            if let Some(assignments_request) = overlap_assignment_request {
+                if request.threshold != assignments_request.threshold {
+                    return Err(Error::invalid(
+                        "measure overlap child counts: child-count threshold must match overlap \
+                         assignment threshold",
+                    ));
+                }
+            }
+            let assignments = overlap_assignments.as_ref().ok_or_else(|| {
+                Error::invalid(
+                    "measure overlap child counts: child-count summaries need overlap assignment \
+                     rows",
+                )
+            })?;
+            let stream = OverlapChildCountOutputStream::new(format!(
+                "{rows}.relationships.overlap.child_counts"
+            ))?;
+            let assignment_rows: MeasurementRows<OverlapAssignmentRows> = assignments.rows_handle();
+            let derive = OverlapChildCountSummaryOp::from_overlap_assignment_rows(
+                "measure overlap child counts",
+                &assignment_rows,
+                grid.blocks_per_axis(),
+                &stream,
+                self.lifecycle,
+            )?;
+            overlap_child_counts = Some(append_one_phase_measurement(
+                &mut decomposition,
+                &grid,
+                stream,
                 derive,
             )?);
         }
@@ -5000,6 +5232,9 @@ impl Measurements {
             rank_weighted_colocalization,
             centroid_relationships,
             centroid_neighbors,
+            overlap_relationships,
+            overlap_assignments,
+            overlap_child_counts,
             boundary_distance_relationships,
             expansion_relationships,
             moment3d,
@@ -5266,6 +5501,18 @@ pub struct CentroidRelationshipRows;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CentroidNeighborRows;
 
+/// Marker for directed overlap relationship measurement rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlapRelationshipRows;
+
+/// Marker for maximum-overlap assignment summary rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlapAssignmentRows;
+
+/// Marker for overlap assignment child-count summary rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlapChildCountRows;
+
 /// Marker for boundary-distance relationship measurement rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundaryDistanceRelationshipRows;
@@ -5348,6 +5595,9 @@ pub struct MeasurementPlan {
     rank_weighted_colocalization: Vec<RankWeightedColocalizationPlan>,
     centroid_relationships: Option<CentroidRelationshipPlan>,
     centroid_neighbors: Option<CentroidNeighborPlan>,
+    overlap_relationships: Option<OverlapRelationshipPlan>,
+    overlap_assignments: Option<OverlapAssignmentPlan>,
+    overlap_child_counts: Option<OverlapChildCountPlan>,
     boundary_distance_relationships: Option<BoundaryDistanceRelationshipPlan>,
     expansion_relationships: Option<ExpansionRelationshipPlan>,
     moment3d: Option<ObjectMoment3dPlan>,
@@ -5433,6 +5683,15 @@ impl MeasurementPlan {
         }
         if let Some(neighbors) = &self.centroid_neighbors {
             work.push(neighbors.phase_work());
+        }
+        if let Some(relationships) = &self.overlap_relationships {
+            work.extend(relationships.phase_work());
+        }
+        if let Some(assignments) = &self.overlap_assignments {
+            work.push(assignments.phase_work());
+        }
+        if let Some(counts) = &self.overlap_child_counts {
+            work.push(counts.phase_work());
         }
         if let Some(relationships) = &self.boundary_distance_relationships {
             work.extend(relationships.phase_work());
@@ -6049,6 +6308,60 @@ impl MeasurementPlan {
         self.centroid_neighbors
             .as_ref()
             .map(|neighbors| neighbors.meta)
+    }
+
+    pub fn overlap_relationship_stream(&self) -> Option<&str> {
+        self.overlap_relationships
+            .as_ref()
+            .map(|relationships| relationships.output.as_str())
+    }
+
+    pub fn overlap_relationship_rows_phase(&self) -> Option<usize> {
+        self.overlap_relationships
+            .as_ref()
+            .map(|relationships| relationships.rows_phase())
+    }
+
+    pub fn overlap_relationship_rows(&self) -> Option<MeasurementRows<OverlapRelationshipRows>> {
+        self.overlap_relationships
+            .as_ref()
+            .map(|relationships| relationships.rows_handle())
+    }
+
+    pub fn overlap_assignment_stream(&self) -> Option<&str> {
+        self.overlap_assignments
+            .as_ref()
+            .map(|assignments| assignments.output.as_str())
+    }
+
+    pub fn overlap_assignment_rows_phase(&self) -> Option<usize> {
+        self.overlap_assignments
+            .as_ref()
+            .map(|assignments| assignments.rows_phase())
+    }
+
+    pub fn overlap_assignment_rows(&self) -> Option<MeasurementRows<OverlapAssignmentRows>> {
+        self.overlap_assignments
+            .as_ref()
+            .map(|assignments| assignments.rows_handle())
+    }
+
+    pub fn overlap_child_count_stream(&self) -> Option<&str> {
+        self.overlap_child_counts
+            .as_ref()
+            .map(|counts| counts.output.as_str())
+    }
+
+    pub fn overlap_child_count_rows_phase(&self) -> Option<usize> {
+        self.overlap_child_counts
+            .as_ref()
+            .map(|counts| counts.rows_phase())
+    }
+
+    pub fn overlap_child_count_rows(&self) -> Option<MeasurementRows<OverlapChildCountRows>> {
+        self.overlap_child_counts
+            .as_ref()
+            .map(|counts| counts.rows_handle())
     }
 
     pub fn boundary_distance_relationship_stream(&self) -> Option<&str> {
@@ -7106,6 +7419,16 @@ type TouchingNeighborPlan = OnePhaseMeasurementPlan<
     TouchingNeighborSummaryOp,
     PhysicalSpacing,
 >;
+type OverlapRelationshipPlan = TwoPhaseMeasurementPlan<
+    OverlapRelationshipOutputStream,
+    OverlapRelationshipTallyOp,
+    MergeOverlapRelationshipsOp,
+    OverlapRelationshipPartialLayout,
+>;
+type OverlapAssignmentPlan =
+    OnePhaseMeasurementPlan<OverlapAssignmentOutputStream, OverlapAssignmentSummaryOp>;
+type OverlapChildCountPlan =
+    OnePhaseMeasurementPlan<OverlapChildCountOutputStream, OverlapChildCountSummaryOp>;
 type BoundaryDistanceRelationshipPlan = TwoPhaseMeasurementPlan<
     BoundaryDistanceRelationshipOutputStream,
     BoundaryPointTallyOp,
@@ -7313,6 +7636,30 @@ row_stream_type!(
 row_stream_type!(
     BoundaryDistanceRelationshipOutputStream,
     "measure relationships: output stream must not be empty"
+);
+partial_stream_type!(
+    OverlapRelationshipPartialStream,
+    "measure overlap relationships: partial stream must not be empty"
+);
+row_stream_type!(
+    OverlapRelationshipOutputStream,
+    "measure overlap relationships: output stream must not be empty"
+);
+row_stream_type!(
+    OverlapRelationshipInputStream,
+    "measure overlap assignments: overlap relationship input stream must not be empty"
+);
+row_stream_type!(
+    OverlapAssignmentOutputStream,
+    "measure overlap assignments: output stream must not be empty"
+);
+row_stream_type!(
+    OverlapAssignmentInputStream,
+    "measure overlap child counts: overlap assignment input stream must not be empty"
+);
+row_stream_type!(
+    OverlapChildCountOutputStream,
+    "measure overlap child counts: output stream must not be empty"
 );
 row_stream_type!(
     ExpansionRelationshipOutputStream,
@@ -10526,6 +10873,19 @@ fn checked_variable_partial_section(
         return Err(Error::invalid(format!("{what} is truncated")));
     }
     Ok(offset..offset + section_words)
+}
+
+fn checked_add_to_map_count<K: Ord>(
+    counts: &mut BTreeMap<K, u64>,
+    key: K,
+    add: u64,
+    what: &str,
+) -> Result<()> {
+    let total = counts.entry(key).or_insert(0);
+    *total = total
+        .checked_add(add)
+        .ok_or_else(|| Error::invalid(format!("{what} overflowed")))?;
+    Ok(())
 }
 
 fn checked_partial_merged_len(left: usize, right: usize, what: &str) -> Result<usize> {
@@ -18944,6 +19304,555 @@ impl ObjectRelationshipMeasurements {
     }
 }
 
+/// Directed overlap row between two explicit label sources.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectOverlapMeasurements {
+    pub labels: [u64; 2],
+    pub overlap_voxels: u64,
+    pub label_a_voxels: u64,
+    pub label_b_voxels: u64,
+    pub fraction_of_a: f64,
+    pub fraction_of_b: f64,
+    pub jaccard: f64,
+}
+
+/// Deterministic many-to-one assignment summary derived from directed overlaps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectOverlapAssignmentMeasurements {
+    pub label: u64,
+    pub assigned_label: u64,
+    pub overlap_voxels: u64,
+    pub label_voxels: u64,
+    pub assigned_label_voxels: u64,
+    pub fraction_of_label: f64,
+    pub fraction_of_assigned: f64,
+    pub jaccard: f64,
+}
+
+/// Per-target summary derived from maximum-overlap assignments.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectOverlapChildCountMeasurements {
+    pub label: u64,
+    pub child_count: u64,
+    pub overlap_voxels: u64,
+    pub child_voxels: u64,
+    pub label_voxels: u64,
+    pub fraction_of_label: f64,
+}
+
+/// Minimum evidence required before an overlap row can become an assignment.
+///
+/// Empty thresholds accept any positive-overlap relationship row. Thresholds are
+/// checked before best-overlap selection, so rejected rows do not compete for a
+/// source label assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct OverlapAssignmentThreshold {
+    min_overlap_voxels: Option<NonZeroU64>,
+    min_fraction_of_label: Option<f64>,
+    min_fraction_of_assigned: Option<f64>,
+    min_jaccard: Option<f64>,
+}
+
+impl OverlapAssignmentThreshold {
+    pub const fn none() -> Self {
+        Self {
+            min_overlap_voxels: None,
+            min_fraction_of_label: None,
+            min_fraction_of_assigned: None,
+            min_jaccard: None,
+        }
+    }
+
+    pub fn min_overlap_voxels(mut self, voxels: NonZeroU64) -> Self {
+        self.min_overlap_voxels = Some(voxels);
+        self
+    }
+
+    pub fn min_fraction_of_label(mut self, fraction: f64) -> Result<Self> {
+        self.min_fraction_of_label = Some(valid_overlap_threshold_fraction(
+            fraction,
+            "fraction of source label",
+        )?);
+        Ok(self)
+    }
+
+    pub fn min_fraction_of_assigned(mut self, fraction: f64) -> Result<Self> {
+        self.min_fraction_of_assigned = Some(valid_overlap_threshold_fraction(
+            fraction,
+            "fraction of assigned label",
+        )?);
+        Ok(self)
+    }
+
+    pub fn min_jaccard(mut self, fraction: f64) -> Result<Self> {
+        self.min_jaccard = Some(valid_overlap_threshold_fraction(fraction, "Jaccard")?);
+        Ok(self)
+    }
+
+    pub fn accepts(self, row: &ObjectOverlapMeasurements) -> bool {
+        self.min_overlap_voxels
+            .map(|min| row.overlap_voxels >= min.get())
+            .unwrap_or(true)
+            && self
+                .min_fraction_of_label
+                .map(|min| row.fraction_of_a >= min)
+                .unwrap_or(true)
+            && self
+                .min_fraction_of_assigned
+                .map(|min| row.fraction_of_b >= min)
+                .unwrap_or(true)
+            && self
+                .min_jaccard
+                .map(|min| row.jaccard >= min)
+                .unwrap_or(true)
+    }
+}
+
+fn valid_overlap_threshold_fraction(value: f64, name: &str) -> Result<f64> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(Error::invalid(format!(
+            "measure overlap assignments: invalid minimum {name} threshold {value}"
+        )));
+    }
+    Ok(value)
+}
+
+/// Derived scalar that can be read from an overlap relationship row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObjectOverlapFeature {
+    OverlapVoxels,
+    LabelAVoxels,
+    LabelBVoxels,
+    FractionOfA,
+    FractionOfB,
+    Jaccard,
+}
+
+impl ObjectOverlapFeature {
+    pub const ALL: [Self; 6] = [
+        Self::OverlapVoxels,
+        Self::LabelAVoxels,
+        Self::LabelBVoxels,
+        Self::FractionOfA,
+        Self::FractionOfB,
+        Self::Jaccard,
+    ];
+
+    pub fn column_name(self) -> &'static str {
+        match self {
+            Self::OverlapVoxels => "overlap_voxels",
+            Self::LabelAVoxels => "label_a_voxels",
+            Self::LabelBVoxels => "label_b_voxels",
+            Self::FractionOfA => "fraction_of_a",
+            Self::FractionOfB => "fraction_of_b",
+            Self::Jaccard => "jaccard",
+        }
+    }
+}
+
+/// Derived scalar that can be read from a maximum-overlap assignment row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObjectOverlapAssignmentFeature {
+    AssignedLabel,
+    OverlapVoxels,
+    LabelVoxels,
+    AssignedLabelVoxels,
+    FractionOfLabel,
+    FractionOfAssigned,
+    Jaccard,
+}
+
+/// Derived scalar that can be read from an overlap child-count summary row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObjectOverlapChildCountFeature {
+    ChildCount,
+    OverlapVoxels,
+    ChildVoxels,
+    LabelVoxels,
+    FractionOfLabel,
+}
+
+impl ObjectOverlapChildCountFeature {
+    pub const ALL: [Self; 5] = [
+        Self::ChildCount,
+        Self::OverlapVoxels,
+        Self::ChildVoxels,
+        Self::LabelVoxels,
+        Self::FractionOfLabel,
+    ];
+
+    pub fn column_name(self) -> &'static str {
+        match self {
+            Self::ChildCount => "child_count",
+            Self::OverlapVoxels => "overlap_voxels",
+            Self::ChildVoxels => "child_voxels",
+            Self::LabelVoxels => "label_voxels",
+            Self::FractionOfLabel => "fraction_of_label",
+        }
+    }
+}
+
+impl ObjectOverlapAssignmentFeature {
+    pub const ALL: [Self; 7] = [
+        Self::AssignedLabel,
+        Self::OverlapVoxels,
+        Self::LabelVoxels,
+        Self::AssignedLabelVoxels,
+        Self::FractionOfLabel,
+        Self::FractionOfAssigned,
+        Self::Jaccard,
+    ];
+
+    pub fn column_name(self) -> &'static str {
+        match self {
+            Self::AssignedLabel => "assigned_label",
+            Self::OverlapVoxels => "overlap_voxels",
+            Self::LabelVoxels => "label_voxels",
+            Self::AssignedLabelVoxels => "assigned_label_voxels",
+            Self::FractionOfLabel => "fraction_of_label",
+            Self::FractionOfAssigned => "fraction_of_assigned",
+            Self::Jaccard => "jaccard",
+        }
+    }
+}
+
+impl ObjectOverlapMeasurements {
+    pub fn feature(&self, feature: ObjectOverlapFeature) -> Option<f64> {
+        match feature {
+            ObjectOverlapFeature::OverlapVoxels => exact_u64_feature(self.overlap_voxels),
+            ObjectOverlapFeature::LabelAVoxels => exact_u64_feature(self.label_a_voxels),
+            ObjectOverlapFeature::LabelBVoxels => exact_u64_feature(self.label_b_voxels),
+            ObjectOverlapFeature::FractionOfA => Some(self.fraction_of_a),
+            ObjectOverlapFeature::FractionOfB => Some(self.fraction_of_b),
+            ObjectOverlapFeature::Jaccard => Some(self.jaccard),
+        }
+    }
+}
+
+impl ObjectOverlapAssignmentMeasurements {
+    pub fn feature(&self, feature: ObjectOverlapAssignmentFeature) -> Option<f64> {
+        match feature {
+            ObjectOverlapAssignmentFeature::AssignedLabel => exact_u64_feature(self.assigned_label),
+            ObjectOverlapAssignmentFeature::OverlapVoxels => exact_u64_feature(self.overlap_voxels),
+            ObjectOverlapAssignmentFeature::LabelVoxels => exact_u64_feature(self.label_voxels),
+            ObjectOverlapAssignmentFeature::AssignedLabelVoxels => {
+                exact_u64_feature(self.assigned_label_voxels)
+            }
+            ObjectOverlapAssignmentFeature::FractionOfLabel => Some(self.fraction_of_label),
+            ObjectOverlapAssignmentFeature::FractionOfAssigned => Some(self.fraction_of_assigned),
+            ObjectOverlapAssignmentFeature::Jaccard => Some(self.jaccard),
+        }
+    }
+}
+
+impl ObjectOverlapChildCountMeasurements {
+    pub fn feature(&self, feature: ObjectOverlapChildCountFeature) -> Option<f64> {
+        match feature {
+            ObjectOverlapChildCountFeature::ChildCount => exact_u64_feature(self.child_count),
+            ObjectOverlapChildCountFeature::OverlapVoxels => exact_u64_feature(self.overlap_voxels),
+            ObjectOverlapChildCountFeature::ChildVoxels => exact_u64_feature(self.child_voxels),
+            ObjectOverlapChildCountFeature::LabelVoxels => exact_u64_feature(self.label_voxels),
+            ObjectOverlapChildCountFeature::FractionOfLabel => Some(self.fraction_of_label),
+        }
+    }
+}
+
+fn overlap_union_voxels(row: &ObjectOverlapMeasurements) -> Result<u64> {
+    row.label_a_voxels
+        .checked_add(row.label_b_voxels)
+        .and_then(|sum| sum.checked_sub(row.overlap_voxels))
+        .ok_or_else(|| {
+            Error::invalid("measure overlap relationships: union voxel count overflowed")
+        })
+}
+
+fn validate_overlap_relationship_row(row: &ObjectOverlapMeasurements) -> Result<()> {
+    if row.labels[0] == 0 || row.labels[1] == 0 {
+        return Err(Error::invalid(
+            "measure overlap relationships: row contains background label 0",
+        ));
+    }
+    if row.overlap_voxels == 0 {
+        return Err(Error::invalid(
+            "measure overlap relationships: row has zero overlap voxels",
+        ));
+    }
+    if row.overlap_voxels > row.label_a_voxels || row.overlap_voxels > row.label_b_voxels {
+        return Err(Error::invalid(
+            "measure overlap relationships: overlap exceeds source label voxel count",
+        ));
+    }
+    let union = overlap_union_voxels(row)?;
+    let expected_a = row.overlap_voxels as f64 / row.label_a_voxels as f64;
+    let expected_b = row.overlap_voxels as f64 / row.label_b_voxels as f64;
+    let expected_jaccard = row.overlap_voxels as f64 / union as f64;
+    if !row.fraction_of_a.is_finite()
+        || !row.fraction_of_b.is_finite()
+        || !row.jaccard.is_finite()
+        || (row.fraction_of_a - expected_a).abs() > 1.0e-12
+        || (row.fraction_of_b - expected_b).abs() > 1.0e-12
+        || (row.jaccard - expected_jaccard).abs() > 1.0e-12
+    {
+        return Err(Error::invalid(
+            "measure overlap relationships: row fractions do not match row counts",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_overlap_assignment_row(row: &ObjectOverlapAssignmentMeasurements) -> Result<()> {
+    if row.label == 0 || row.assigned_label == 0 {
+        return Err(Error::invalid(
+            "measure overlap assignments: row contains background label 0",
+        ));
+    }
+    if row.overlap_voxels == 0 {
+        return Err(Error::invalid(
+            "measure overlap assignments: row has zero overlap voxels",
+        ));
+    }
+    if row.overlap_voxels > row.label_voxels || row.overlap_voxels > row.assigned_label_voxels {
+        return Err(Error::invalid(
+            "measure overlap assignments: overlap exceeds source label voxel count",
+        ));
+    }
+    let union = row
+        .label_voxels
+        .checked_add(row.assigned_label_voxels)
+        .and_then(|sum| sum.checked_sub(row.overlap_voxels))
+        .ok_or_else(|| {
+            Error::invalid("measure overlap assignments: union voxel count overflowed")
+        })?;
+    let expected_label = row.overlap_voxels as f64 / row.label_voxels as f64;
+    let expected_assigned = row.overlap_voxels as f64 / row.assigned_label_voxels as f64;
+    let expected_jaccard = row.overlap_voxels as f64 / union as f64;
+    if !row.fraction_of_label.is_finite()
+        || !row.fraction_of_assigned.is_finite()
+        || !row.jaccard.is_finite()
+        || (row.fraction_of_label - expected_label).abs() > 1.0e-12
+        || (row.fraction_of_assigned - expected_assigned).abs() > 1.0e-12
+        || (row.jaccard - expected_jaccard).abs() > 1.0e-12
+    {
+        return Err(Error::invalid(
+            "measure overlap assignments: row fractions do not match row counts",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_overlap_child_count_row(row: &ObjectOverlapChildCountMeasurements) -> Result<()> {
+    if row.label == 0 {
+        return Err(Error::invalid(
+            "measure overlap child counts: row contains background label 0",
+        ));
+    }
+    if row.child_count == 0 {
+        return Err(Error::invalid(
+            "measure overlap child counts: row has zero children",
+        ));
+    }
+    if row.overlap_voxels == 0 || row.child_voxels == 0 || row.label_voxels == 0 {
+        return Err(Error::invalid(
+            "measure overlap child counts: row has zero voxel evidence",
+        ));
+    }
+    if row.overlap_voxels > row.child_voxels || row.overlap_voxels > row.label_voxels {
+        return Err(Error::invalid(
+            "measure overlap child counts: overlap exceeds source voxel count",
+        ));
+    }
+    let expected = row.overlap_voxels as f64 / row.label_voxels as f64;
+    if !row.fraction_of_label.is_finite() || (row.fraction_of_label - expected).abs() > 1.0e-12 {
+        return Err(Error::invalid(
+            "measure overlap child counts: row fraction does not match row counts",
+        ));
+    }
+    Ok(())
+}
+
+fn overlap_assignment_from_row(
+    row: &ObjectOverlapMeasurements,
+) -> ObjectOverlapAssignmentMeasurements {
+    ObjectOverlapAssignmentMeasurements {
+        label: row.labels[0],
+        assigned_label: row.labels[1],
+        overlap_voxels: row.overlap_voxels,
+        label_voxels: row.label_a_voxels,
+        assigned_label_voxels: row.label_b_voxels,
+        fraction_of_label: row.fraction_of_a,
+        fraction_of_assigned: row.fraction_of_b,
+        jaccard: row.jaccard,
+    }
+}
+
+fn overlap_assignment_key(
+    row: &ObjectOverlapMeasurements,
+) -> (u64, u64, u64, u64, std::cmp::Reverse<u64>) {
+    (
+        row.overlap_voxels,
+        ordered_f64_key(row.fraction_of_a),
+        ordered_f64_key(row.fraction_of_b),
+        ordered_f64_key(row.jaccard),
+        std::cmp::Reverse(row.labels[1]),
+    )
+}
+
+fn ordered_f64_key(value: f64) -> u64 {
+    value.to_bits()
+}
+
+/// Assign each source-A label to the source-B label with strongest overlap.
+///
+/// The rule is many-to-one by construction: at most one output row is emitted
+/// for each `label_a`. Ties are deterministic: higher overlap voxel count,
+/// then higher fraction of source label, higher fraction of target label,
+/// higher Jaccard, then lower target label id.
+pub fn summarize_maximum_overlap_assignments(
+    relationships: &[ObjectOverlapMeasurements],
+) -> Result<Vec<ObjectOverlapAssignmentMeasurements>> {
+    summarize_maximum_overlap_assignments_with_threshold(
+        relationships,
+        OverlapAssignmentThreshold::none(),
+    )
+}
+
+/// Assign each source-A label to the strongest source-B overlap that satisfies
+/// the supplied evidence threshold.
+pub fn summarize_maximum_overlap_assignments_with_threshold(
+    relationships: &[ObjectOverlapMeasurements],
+    threshold: OverlapAssignmentThreshold,
+) -> Result<Vec<ObjectOverlapAssignmentMeasurements>> {
+    let mut best = BTreeMap::<u64, ObjectOverlapMeasurements>::new();
+    for relationship in relationships {
+        validate_overlap_relationship_row(relationship)?;
+        if !threshold.accepts(relationship) {
+            continue;
+        }
+        match best.get_mut(&relationship.labels[0]) {
+            Some(current) => {
+                if overlap_assignment_key(relationship) > overlap_assignment_key(current) {
+                    *current = *relationship;
+                }
+            }
+            None => {
+                best.insert(relationship.labels[0], *relationship);
+            }
+        }
+    }
+    let mut rows = Vec::with_capacity(best.len());
+    for relationship in best.values() {
+        let row = overlap_assignment_from_row(relationship);
+        validate_overlap_assignment_row(&row)?;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OverlapChildCountAccumulator {
+    child_count: u64,
+    overlap_voxels: u64,
+    child_voxels: u64,
+    label_voxels: u64,
+}
+
+impl OverlapChildCountAccumulator {
+    fn add(&mut self, assignment: &ObjectOverlapAssignmentMeasurements) -> Result<()> {
+        if self.label_voxels != assignment.assigned_label_voxels {
+            return Err(Error::invalid(
+                "measure overlap child counts: assigned label voxel count changed across rows",
+            ));
+        }
+        self.child_count = self.child_count.checked_add(1).ok_or_else(|| {
+            Error::invalid("measure overlap child counts: child count overflowed")
+        })?;
+        self.overlap_voxels = self
+            .overlap_voxels
+            .checked_add(assignment.overlap_voxels)
+            .ok_or_else(|| {
+                Error::invalid("measure overlap child counts: overlap voxel count overflowed")
+            })?;
+        self.child_voxels = self
+            .child_voxels
+            .checked_add(assignment.label_voxels)
+            .ok_or_else(|| {
+                Error::invalid("measure overlap child counts: child voxel count overflowed")
+            })?;
+        Ok(())
+    }
+
+    fn finish(self, label: u64) -> Result<ObjectOverlapChildCountMeasurements> {
+        let row = ObjectOverlapChildCountMeasurements {
+            label,
+            child_count: self.child_count,
+            overlap_voxels: self.overlap_voxels,
+            child_voxels: self.child_voxels,
+            label_voxels: self.label_voxels,
+            fraction_of_label: self.overlap_voxels as f64 / self.label_voxels as f64,
+        };
+        validate_overlap_child_count_row(&row)?;
+        Ok(row)
+    }
+}
+
+/// Count source labels assigned to each target label.
+///
+/// This is the native child-count summary. Export layers may call the target a
+/// parent object, but the row itself only states the assignment evidence.
+pub fn summarize_overlap_assignment_child_counts(
+    assignments: &[ObjectOverlapAssignmentMeasurements],
+) -> Result<Vec<ObjectOverlapChildCountMeasurements>> {
+    let mut counts = BTreeMap::<u64, OverlapChildCountAccumulator>::new();
+    for assignment in assignments {
+        validate_overlap_assignment_row(assignment)?;
+        match counts.get_mut(&assignment.assigned_label) {
+            Some(count) => count.add(assignment)?,
+            None => {
+                counts.insert(
+                    assignment.assigned_label,
+                    OverlapChildCountAccumulator {
+                        child_count: 1,
+                        overlap_voxels: assignment.overlap_voxels,
+                        child_voxels: assignment.label_voxels,
+                        label_voxels: assignment.assigned_label_voxels,
+                    },
+                );
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(label, count)| count.finish(label))
+        .collect()
+}
+
+fn overlap_relationships_from_tallies(
+    tallies: &OverlapRelationshipTallies,
+) -> Result<Vec<ObjectOverlapMeasurements>> {
+    let mut rows = Vec::with_capacity(tallies.pairs.len());
+    for (&labels, &overlap_voxels) in &tallies.pairs {
+        let label_a_voxels = *tallies.label_a.get(&labels[0]).ok_or_else(|| {
+            Error::invalid("measure overlap relationships: missing source A label count")
+        })?;
+        let label_b_voxels = *tallies.label_b.get(&labels[1]).ok_or_else(|| {
+            Error::invalid("measure overlap relationships: missing source B label count")
+        })?;
+        let mut row = ObjectOverlapMeasurements {
+            labels,
+            overlap_voxels,
+            label_a_voxels,
+            label_b_voxels,
+            fraction_of_a: overlap_voxels as f64 / label_a_voxels as f64,
+            fraction_of_b: overlap_voxels as f64 / label_b_voxels as f64,
+            jaccard: 0.0,
+        };
+        row.jaccard = overlap_voxels as f64 / overlap_union_voxels(&row)? as f64;
+        validate_overlap_relationship_row(&row)?;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 /// Canonical object-pair row derived from closest boundary voxel centres.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ObjectBoundaryDistanceMeasurements {
@@ -19490,6 +20399,451 @@ impl PartialLayoutContract for LabelPointPartialLayout {
     const SHORT_ERROR: &'static str = "header is truncated";
     const MAGIC_ERROR: &'static str = "wrong format magic";
     const VERSION_ERROR: &'static str = "unsupported version";
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OverlapRelationshipTallies {
+    pairs: BTreeMap<[u64; 2], u64>,
+    label_a: BTreeMap<u64, u64>,
+    label_b: BTreeMap<u64, u64>,
+}
+
+impl OverlapRelationshipTallies {
+    fn add_pair(&mut self, labels: [u64; 2], count: u64) -> Result<()> {
+        if labels[0] == 0 || labels[1] == 0 {
+            return Err(Error::invalid(
+                "measure overlap relationships: overlap pair contains background label 0",
+            ));
+        }
+        checked_add_to_map_count(
+            &mut self.pairs,
+            labels,
+            count,
+            "measure overlap relationships: pair count",
+        )
+    }
+
+    fn add_label_a(&mut self, label: u64, count: u64) -> Result<()> {
+        if label == 0 {
+            return Err(Error::invalid(
+                "measure overlap relationships: source A count contains background label 0",
+            ));
+        }
+        checked_add_to_map_count(
+            &mut self.label_a,
+            label,
+            count,
+            "measure overlap relationships: source A count",
+        )
+    }
+
+    fn add_label_b(&mut self, label: u64, count: u64) -> Result<()> {
+        if label == 0 {
+            return Err(Error::invalid(
+                "measure overlap relationships: source B count contains background label 0",
+            ));
+        }
+        checked_add_to_map_count(
+            &mut self.label_b,
+            label,
+            count,
+            "measure overlap relationships: source B count",
+        )
+    }
+
+    fn merge(&mut self, other: Self) -> Result<()> {
+        for (labels, count) in other.pairs {
+            self.add_pair(labels, count)?;
+        }
+        for (label, count) in other.label_a {
+            self.add_label_a(label, count)?;
+        }
+        for (label, count) in other.label_b {
+            self.add_label_b(label, count)?;
+        }
+        Ok(())
+    }
+}
+
+struct OverlapRelationshipPartialLayout;
+
+impl OverlapRelationshipPartialLayout {
+    const MAGIC: u64 = 0x4f56_4c50_5245_4c31;
+    const VERSION: u64 = 1;
+    const HEADER_WORDS: usize = 5;
+    const PAIR_WORDS: usize = 3;
+    const LABEL_WORDS: usize = 2;
+
+    fn encode(tallies: &OverlapRelationshipTallies) -> Result<Vec<u8>> {
+        let mut words = Vec::with_capacity(variable_partial_capacity(
+            Self::HEADER_WORDS,
+            tallies.pairs.len(),
+            Self::PAIR_WORDS,
+            tallies.label_a.len() + tallies.label_b.len(),
+            Self::LABEL_WORDS,
+            "measure overlap relationships partial",
+        )?);
+        words.push(Self::MAGIC);
+        words.push(Self::VERSION);
+        words.push(partial_usize_word(
+            tallies.pairs.len(),
+            "measure overlap relationships partial: pair count",
+        )?);
+        words.push(partial_usize_word(
+            tallies.label_a.len(),
+            "measure overlap relationships partial: source A label count",
+        )?);
+        words.push(partial_usize_word(
+            tallies.label_b.len(),
+            "measure overlap relationships partial: source B label count",
+        )?);
+        for (&labels, &count) in &tallies.pairs {
+            if labels[0] == 0 || labels[1] == 0 {
+                return Err(Error::invalid(
+                    "measure overlap relationships partial: pair contains background label 0",
+                ));
+            }
+            words.push(labels[0]);
+            words.push(labels[1]);
+            words.push(count);
+        }
+        for (&label, &count) in &tallies.label_a {
+            if label == 0 {
+                return Err(Error::invalid(
+                    "measure overlap relationships partial: source A contains background label 0",
+                ));
+            }
+            words.push(label);
+            words.push(count);
+        }
+        for (&label, &count) in &tallies.label_b {
+            if label == 0 {
+                return Err(Error::invalid(
+                    "measure overlap relationships partial: source B contains background label 0",
+                ));
+            }
+            words.push(label);
+            words.push(count);
+        }
+        Ok(pack_u64(&words))
+    }
+
+    fn decode(bytes: &[u8]) -> Result<OverlapRelationshipTallies> {
+        let words = unpack_u64(bytes)?;
+        Self::validate_prefix(&words)?;
+        let pair_count = partial_word_usize(
+            words[2],
+            "measure overlap relationships partial: pair count",
+        )?;
+        let label_a_count = partial_word_usize(
+            words[3],
+            "measure overlap relationships partial: source A label count",
+        )?;
+        let label_b_count = partial_word_usize(
+            words[4],
+            "measure overlap relationships partial: source B label count",
+        )?;
+        let mut offset = Self::HEADER_WORDS;
+        let pair_range = checked_variable_partial_section(
+            &words,
+            offset,
+            pair_count,
+            Self::PAIR_WORDS,
+            "measure overlap relationships partial: pair section",
+        )?;
+        offset = pair_range.end;
+        let label_a_range = checked_variable_partial_section(
+            &words,
+            offset,
+            label_a_count,
+            Self::LABEL_WORDS,
+            "measure overlap relationships partial: source A section",
+        )?;
+        offset = label_a_range.end;
+        let label_b_range = checked_variable_partial_section(
+            &words,
+            offset,
+            label_b_count,
+            Self::LABEL_WORDS,
+            "measure overlap relationships partial: source B section",
+        )?;
+        if label_b_range.end != words.len() {
+            return Err(Error::invalid(
+                "measure overlap relationships partial: trailing words",
+            ));
+        }
+        let mut tallies = OverlapRelationshipTallies::default();
+        for row in words[pair_range].chunks_exact(Self::PAIR_WORDS) {
+            tallies.add_pair([row[0], row[1]], row[2])?;
+        }
+        for row in words[label_a_range].chunks_exact(Self::LABEL_WORDS) {
+            tallies.add_label_a(row[0], row[1])?;
+        }
+        for row in words[label_b_range].chunks_exact(Self::LABEL_WORDS) {
+            tallies.add_label_b(row[0], row[1])?;
+        }
+        Ok(tallies)
+    }
+}
+
+impl PartialLayoutContract for OverlapRelationshipPartialLayout {
+    const MAGIC: u64 = OverlapRelationshipPartialLayout::MAGIC;
+    const VERSION: u64 = OverlapRelationshipPartialLayout::VERSION;
+    const HEADER_WORDS: usize = OverlapRelationshipPartialLayout::HEADER_WORDS;
+    const FORMAT: &'static str = "measure overlap relationships partial";
+}
+
+/// Block-local directed overlap partials between two label sources.
+#[derive(Debug, Clone)]
+pub struct OverlapRelationshipTallyOp {
+    name: &'static str,
+    labels_a: TypedSource,
+    labels_b: TypedSource,
+    stream: String,
+    lifecycle: Lifecycle,
+}
+
+impl OverlapRelationshipTallyOp {
+    pub fn new(
+        name: &'static str,
+        labels_a: impl Into<ImageId>,
+        labels_b: impl Into<ImageId>,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        let stream = OverlapRelationshipPartialStream::new(stream)?;
+        Ok(Self {
+            name,
+            labels_a: TypedSource::new(labels_a),
+            labels_b: TypedSource::new(labels_b),
+            stream: stream.as_str().to_string(),
+            lifecycle,
+        })
+    }
+
+    fn tally_block(
+        &self,
+        labels_a: &BlockBuf,
+        labels_b: &BlockBuf,
+        read: &Region,
+        core: &Region,
+    ) -> Result<OverlapRelationshipTallies> {
+        let mut tallies = OverlapRelationshipTallies::default();
+        let BlockBuf::Array(labels_a) = labels_a else {
+            return Ok(tallies);
+        };
+        let BlockBuf::Array(labels_b) = labels_b else {
+            return Ok(tallies);
+        };
+        expect_extent(
+            || {
+                format!(
+                    "measure overlap relationships: source A labels arrived as {:?} for a block \
+                     read extent of {:?}",
+                    labels_a.shape(),
+                    read.shape3()
+                )
+            },
+            read.shape3(),
+            labels_a.shape(),
+        )?;
+        expect_extent(
+            || {
+                format!(
+                    "measure overlap relationships: source B labels arrived as {:?} for a block \
+                     read extent of {:?}",
+                    labels_b.shape(),
+                    read.shape3()
+                )
+            },
+            read.shape3(),
+            labels_b.shape(),
+        )?;
+        let labels_a = labels_a.widened();
+        let labels_b = labels_b.widened();
+        for (index, raw_a) in labels_a.indexed_iter() {
+            let at = [
+                read.start[0] + index.0,
+                read.start[1] + index.1,
+                read.start[2] + index.2,
+            ];
+            if !in_region(core, at) {
+                continue;
+            }
+            let label_a = label_value(*raw_a, at)?;
+            let label_b = label_value(labels_b[index], at)?;
+            if label_a != 0 {
+                tallies.add_label_a(label_a, 1)?;
+            }
+            if label_b != 0 {
+                tallies.add_label_b(label_b, 1)?;
+            }
+            if label_a != 0 && label_b != 0 {
+                tallies.add_pair([label_a, label_b], 1)?;
+            }
+        }
+        Ok(tallies)
+    }
+}
+
+impl FragmentOp for OverlapRelationshipTallyOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        vec![
+            CoreBlockSourceRead::new(self.labels_a).source_input(),
+            CoreBlockSourceRead::new(self.labels_b).source_input(),
+        ]
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            Coverage::EveryBlock,
+        )]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        MeasurementSeamLaw::per_block().seam_fold()
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "measure overlap relationships: overlap partials read label sources and are applied \
+             through `apply_with`",
+        ))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let tallies = self.tally_block(
+            self.labels_a
+                .block_at_extent(self.name, "source A label volume", sources, at.read)?,
+            self.labels_b
+                .block_at_extent(self.name, "source B label volume", sources, at.read)?,
+            at.read,
+            at.core,
+        )?;
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            OverlapRelationshipPartialLayout::encode(&tallies)?,
+        ))
+    }
+}
+
+/// Merge directed overlap partials into relationship rows.
+#[derive(Debug, Clone)]
+pub struct MergeOverlapRelationshipsOp {
+    name: &'static str,
+    input: PartialPhaseInput,
+    schema: Arc<Schema>,
+    stream: String,
+    lifecycle: Lifecycle,
+}
+
+impl MergeOverlapRelationshipsOp {
+    pub fn new(
+        name: &'static str,
+        input: impl Into<String>,
+        input_phase: usize,
+        lattice: [usize; 3],
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        let input = OverlapRelationshipPartialStream::new(input)?;
+        let stream = OverlapRelationshipOutputStream::new(stream)?;
+        Ok(Self {
+            name,
+            input: PartialPhaseInput::try_new(&input, input_phase, lattice)?,
+            schema: Arc::new(overlap_relationship_measurement_schema()),
+            stream: stream.as_str().to_string(),
+            lifecycle,
+        })
+    }
+
+    fn merge_partials(&self, partials: &[Vec<u8>]) -> Result<OverlapRelationshipTallies> {
+        let mut merged = OverlapRelationshipTallies::default();
+        for bytes in partials {
+            merged.merge(OverlapRelationshipPartialLayout::decode(bytes)?)?;
+        }
+        Ok(merged)
+    }
+
+    fn relationships(
+        &self,
+        tallies: &OverlapRelationshipTallies,
+    ) -> Result<Vec<ObjectOverlapMeasurements>> {
+        overlap_relationships_from_tallies(tallies)
+    }
+
+    fn encode_owned(
+        &self,
+        relationships: &[ObjectOverlapMeasurements],
+        blocks: BlockLattice,
+        block: [usize; 3],
+    ) -> Result<Vec<u8>> {
+        let mut rows = RowBuilder::new(Arc::clone(&self.schema));
+        for relationship in relationships {
+            let owner = directed_relationship_pair_owner(blocks, relationship.labels)?;
+            if owner != block {
+                continue;
+            }
+            rows.push(
+                [0, 0, 0],
+                &OverlapRelationshipColumns::values(relationship)?,
+            )?;
+        }
+        Ok(rows.encode())
+    }
+}
+
+impl FragmentOp for MergeOverlapRelationshipsOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![self.input.fragment_input()]
+    }
+
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                .sized(SidecarSize::row_table(self.schema.as_ref(), 1)),
+        ]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        MeasurementSeamLaw::unordered_exact().seam_fold()
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let partials = self.input.stream_fragments(at)?;
+        let tallies = self.merge_partials(&partials)?;
+        let relationships = self.relationships(&tallies)?;
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            self.encode_owned(
+                &relationships,
+                BlockLattice::new(at.grid.blocks_per_axis())?,
+                at.index,
+            )?,
+        ))
+    }
 }
 
 /// Block-local object boundary point partials for relationship measurements.
@@ -20423,6 +21777,259 @@ impl FragmentOp for CentroidNeighborSummaryOp {
     }
 }
 
+/// Planned maximum-overlap assignment summary derivation from overlap rows.
+#[derive(Debug, Clone)]
+pub struct OverlapAssignmentSummaryOp {
+    name: &'static str,
+    input: PartialPhaseInput,
+    threshold: OverlapAssignmentThreshold,
+    schema: Arc<Schema>,
+    stream: String,
+    lifecycle: Lifecycle,
+}
+
+impl OverlapAssignmentSummaryOp {
+    pub fn new(
+        name: &'static str,
+        input: impl Into<String>,
+        input_phase: usize,
+        lattice: [usize; 3],
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        Self::with_threshold(
+            name,
+            input,
+            input_phase,
+            lattice,
+            stream,
+            OverlapAssignmentThreshold::none(),
+            lifecycle,
+        )
+    }
+
+    pub fn with_threshold(
+        name: &'static str,
+        input: impl Into<String>,
+        input_phase: usize,
+        lattice: [usize; 3],
+        stream: impl Into<String>,
+        threshold: OverlapAssignmentThreshold,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        let input = OverlapRelationshipInputStream::new(input)?;
+        let stream = OverlapAssignmentOutputStream::new(stream)?;
+        Self::from_overlap_relationship_rows(
+            name,
+            &MeasurementRows::<OverlapRelationshipRows>::from_legacy_collector(
+                input.as_str(),
+                input_phase,
+            )?,
+            lattice,
+            &stream,
+            threshold,
+            lifecycle,
+        )
+    }
+
+    fn from_overlap_relationship_rows(
+        name: &'static str,
+        rows: &MeasurementRows<OverlapRelationshipRows>,
+        lattice: [usize; 3],
+        stream: &OverlapAssignmentOutputStream,
+        threshold: OverlapAssignmentThreshold,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        let input = OverlapRelationshipInputStream::new(rows.stream())?;
+        Ok(Self {
+            name,
+            input: PartialPhaseInput::try_new(&input, rows.phase(), lattice)?,
+            threshold,
+            schema: Arc::new(overlap_assignment_measurement_schema()),
+            stream: stream.as_str().to_string(),
+            lifecycle,
+        })
+    }
+
+    fn assignments_from_table(
+        &self,
+        table: Table,
+        volume: [usize; 3],
+    ) -> Result<Vec<ObjectOverlapAssignmentMeasurements>> {
+        let relationships =
+            scan_measurement_table(table, volume, overlap_relationship_measurement)?;
+        summarize_maximum_overlap_assignments_with_threshold(&relationships, self.threshold)
+    }
+
+    fn encode_owned(
+        &self,
+        assignments: &[ObjectOverlapAssignmentMeasurements],
+        block: [usize; 3],
+    ) -> Result<Vec<u8>> {
+        let mut rows = RowBuilder::new(Arc::clone(&self.schema));
+        if block != [0, 0, 0] {
+            return Ok(rows.encode());
+        }
+        for assignment in assignments {
+            rows.push([0, 0, 0], &OverlapAssignmentColumns::values(assignment)?)?;
+        }
+        Ok(rows.encode())
+    }
+}
+
+impl FragmentOp for OverlapAssignmentSummaryOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![self.input.fragment_input()]
+    }
+
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                .sized(SidecarSize::row_table(self.schema.as_ref(), 1)),
+        ]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        MeasurementSeamLaw::unordered_exact().seam_fold()
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let volume = at.grid.volume();
+        let table = overlap_relationship_row_table_from_block_input(at, &self.input)?;
+        let assignments = self.assignments_from_table(table, volume)?;
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            self.encode_owned(&assignments, at.index)?,
+        ))
+    }
+}
+
+/// Planned child-count summary derivation from maximum-overlap assignment rows.
+#[derive(Debug, Clone)]
+pub struct OverlapChildCountSummaryOp {
+    name: &'static str,
+    input: PartialPhaseInput,
+    schema: Arc<Schema>,
+    stream: String,
+    lifecycle: Lifecycle,
+}
+
+impl OverlapChildCountSummaryOp {
+    pub fn new(
+        name: &'static str,
+        input: impl Into<String>,
+        input_phase: usize,
+        lattice: [usize; 3],
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        let input = OverlapAssignmentInputStream::new(input)?;
+        let stream = OverlapChildCountOutputStream::new(stream)?;
+        Self::from_overlap_assignment_rows(
+            name,
+            &MeasurementRows::<OverlapAssignmentRows>::from_legacy_collector(
+                input.as_str(),
+                input_phase,
+            )?,
+            lattice,
+            &stream,
+            lifecycle,
+        )
+    }
+
+    fn from_overlap_assignment_rows(
+        name: &'static str,
+        rows: &MeasurementRows<OverlapAssignmentRows>,
+        lattice: [usize; 3],
+        stream: &OverlapChildCountOutputStream,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        let input = OverlapAssignmentInputStream::new(rows.stream())?;
+        Ok(Self {
+            name,
+            input: PartialPhaseInput::try_new(&input, rows.phase(), lattice)?,
+            schema: Arc::new(overlap_child_count_measurement_schema()),
+            stream: stream.as_str().to_string(),
+            lifecycle,
+        })
+    }
+
+    fn counts_from_table(
+        &self,
+        table: Table,
+        volume: [usize; 3],
+    ) -> Result<Vec<ObjectOverlapChildCountMeasurements>> {
+        let assignments = scan_measurement_table(table, volume, overlap_assignment_measurement)?;
+        summarize_overlap_assignment_child_counts(&assignments)
+    }
+
+    fn encode_owned(
+        &self,
+        counts: &[ObjectOverlapChildCountMeasurements],
+        block: [usize; 3],
+    ) -> Result<Vec<u8>> {
+        let mut rows = RowBuilder::new(Arc::clone(&self.schema));
+        if block != [0, 0, 0] {
+            return Ok(rows.encode());
+        }
+        for count in counts {
+            rows.push([0, 0, 0], &OverlapChildCountColumns::values(count)?)?;
+        }
+        Ok(rows.encode())
+    }
+}
+
+impl FragmentOp for OverlapChildCountSummaryOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![self.input.fragment_input()]
+    }
+
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                .sized(SidecarSize::row_table(self.schema.as_ref(), 1)),
+        ]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        MeasurementSeamLaw::unordered_exact().seam_fold()
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let volume = at.grid.volume();
+        let table = overlap_assignment_row_table_from_block_input(at, &self.input)?;
+        let counts = self.counts_from_table(table, volume)?;
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            self.encode_owned(&counts, at.index)?,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct CanonicalRelationshipPair([u64; 2]);
 
@@ -20468,6 +22075,34 @@ fn relationship_pair_owner(
         let owner = hash % modulus;
         out[axis] = usize::try_from(owner).map_err(|_| {
             Error::invalid("measure relationships: owner block index does not fit usize")
+        })?;
+    }
+    Ok(out)
+}
+
+fn directed_relationship_pair_owner(blocks: BlockLattice, labels: [u64; 2]) -> Result<[usize; 3]> {
+    if labels[0] == 0 || labels[1] == 0 {
+        return Err(Error::invalid(format!(
+            "measure overlap relationships: directed pair has background label {labels:?}"
+        )));
+    }
+    let blocks = blocks.axes();
+    let mut hash = labels[0]
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .rotate_left(17)
+        ^ labels[1]
+            .wrapping_mul(0x94d0_49bb_1331_11eb)
+            .rotate_left(41);
+    let mut out = [0usize; 3];
+    for axis in 0..3 {
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        let modulus = u64::try_from(blocks[axis]).map_err(|_| {
+            Error::invalid("measure overlap relationships: block count does not fit in u64")
+        })?;
+        let owner = hash % modulus;
+        out[axis] = usize::try_from(owner).map_err(|_| {
+            Error::invalid("measure overlap relationships: owner block index does not fit usize")
         })?;
     }
     Ok(out)
@@ -27271,6 +28906,200 @@ impl CentroidNeighborColumns {
     }
 }
 
+struct OverlapRelationshipColumns;
+
+impl OverlapRelationshipColumns {
+    const WIDTH: usize = 9;
+    const LABEL_A: usize = 0;
+    const LABEL_B: usize = 1;
+    const OVERLAP_VOXELS: usize = 2;
+    const LABEL_A_VOXELS: usize = 3;
+    const LABEL_B_VOXELS: usize = 4;
+    const FRACTION_OF_A: usize = 5;
+    const FRACTION_OF_B: usize = 6;
+    const JACCARD: usize = 7;
+    const UNION_VOXELS: usize = 8;
+
+    fn schema() -> Schema {
+        let columns: [Column; Self::WIDTH] = [
+            Column::u64("label_a"),
+            Column::u64("label_b"),
+            Column::u64("overlap_voxels"),
+            Column::u64("label_a_voxels"),
+            Column::u64("label_b_voxels"),
+            Column::f64("fraction_of_a"),
+            Column::f64("fraction_of_b"),
+            Column::f64("jaccard"),
+            Column::u64("union_voxels"),
+        ];
+        fixed_measurement_schema(columns, "overlap relationship")
+    }
+
+    fn values(row: &ObjectOverlapMeasurements) -> Result<[Value; Self::WIDTH]> {
+        validate_overlap_relationship_row(row)?;
+        Ok([
+            Value::U64(row.labels[0]),
+            Value::U64(row.labels[1]),
+            Value::U64(row.overlap_voxels),
+            Value::U64(row.label_a_voxels),
+            Value::U64(row.label_b_voxels),
+            Value::F64(row.fraction_of_a),
+            Value::F64(row.fraction_of_b),
+            Value::F64(row.jaccard),
+            Value::U64(overlap_union_voxels(row)?),
+        ])
+    }
+
+    fn decode(row: &Row<'_>) -> Result<ObjectOverlapMeasurements> {
+        let measurements = ObjectOverlapMeasurements {
+            labels: [row.u64(Self::LABEL_A)?, row.u64(Self::LABEL_B)?],
+            overlap_voxels: row.u64(Self::OVERLAP_VOXELS)?,
+            label_a_voxels: row.u64(Self::LABEL_A_VOXELS)?,
+            label_b_voxels: row.u64(Self::LABEL_B_VOXELS)?,
+            fraction_of_a: row.f64(Self::FRACTION_OF_A)?,
+            fraction_of_b: row.f64(Self::FRACTION_OF_B)?,
+            jaccard: row.f64(Self::JACCARD)?,
+        };
+        let union = row.u64(Self::UNION_VOXELS)?;
+        if union != overlap_union_voxels(&measurements)? {
+            return Err(Error::invalid(
+                "measure overlap relationships: union_voxels does not match row counts",
+            ));
+        }
+        validate_overlap_relationship_row(&measurements)?;
+        Ok(measurements)
+    }
+}
+
+struct OverlapAssignmentColumns;
+
+impl OverlapAssignmentColumns {
+    const WIDTH: usize = 9;
+    const LABEL: usize = 0;
+    const ASSIGNED_LABEL: usize = 1;
+    const OVERLAP_VOXELS: usize = 2;
+    const LABEL_VOXELS: usize = 3;
+    const ASSIGNED_LABEL_VOXELS: usize = 4;
+    const FRACTION_OF_LABEL: usize = 5;
+    const FRACTION_OF_ASSIGNED: usize = 6;
+    const JACCARD: usize = 7;
+    const UNION_VOXELS: usize = 8;
+
+    fn schema() -> Schema {
+        let columns: [Column; Self::WIDTH] = [
+            Column::u64("label"),
+            Column::u64("assigned_label"),
+            Column::u64("overlap_voxels"),
+            Column::u64("label_voxels"),
+            Column::u64("assigned_label_voxels"),
+            Column::f64("fraction_of_label"),
+            Column::f64("fraction_of_assigned"),
+            Column::f64("jaccard"),
+            Column::u64("union_voxels"),
+        ];
+        fixed_measurement_schema(columns, "overlap assignment")
+    }
+
+    fn values(row: &ObjectOverlapAssignmentMeasurements) -> Result<[Value; Self::WIDTH]> {
+        validate_overlap_assignment_row(row)?;
+        Ok([
+            Value::U64(row.label),
+            Value::U64(row.assigned_label),
+            Value::U64(row.overlap_voxels),
+            Value::U64(row.label_voxels),
+            Value::U64(row.assigned_label_voxels),
+            Value::F64(row.fraction_of_label),
+            Value::F64(row.fraction_of_assigned),
+            Value::F64(row.jaccard),
+            Value::U64(
+                row.label_voxels
+                    .checked_add(row.assigned_label_voxels)
+                    .and_then(|sum| sum.checked_sub(row.overlap_voxels))
+                    .ok_or_else(|| {
+                        Error::invalid("measure overlap assignments: union voxel count overflowed")
+                    })?,
+            ),
+        ])
+    }
+
+    fn decode(row: &Row<'_>) -> Result<ObjectOverlapAssignmentMeasurements> {
+        let measurements = ObjectOverlapAssignmentMeasurements {
+            label: row.u64(Self::LABEL)?,
+            assigned_label: row.u64(Self::ASSIGNED_LABEL)?,
+            overlap_voxels: row.u64(Self::OVERLAP_VOXELS)?,
+            label_voxels: row.u64(Self::LABEL_VOXELS)?,
+            assigned_label_voxels: row.u64(Self::ASSIGNED_LABEL_VOXELS)?,
+            fraction_of_label: row.f64(Self::FRACTION_OF_LABEL)?,
+            fraction_of_assigned: row.f64(Self::FRACTION_OF_ASSIGNED)?,
+            jaccard: row.f64(Self::JACCARD)?,
+        };
+        let union = row.u64(Self::UNION_VOXELS)?;
+        let expected = measurements
+            .label_voxels
+            .checked_add(measurements.assigned_label_voxels)
+            .and_then(|sum| sum.checked_sub(measurements.overlap_voxels))
+            .ok_or_else(|| {
+                Error::invalid("measure overlap assignments: union voxel count overflowed")
+            })?;
+        if union != expected {
+            return Err(Error::invalid(
+                "measure overlap assignments: union_voxels does not match row counts",
+            ));
+        }
+        validate_overlap_assignment_row(&measurements)?;
+        Ok(measurements)
+    }
+}
+
+struct OverlapChildCountColumns;
+
+impl OverlapChildCountColumns {
+    const WIDTH: usize = 6;
+    const LABEL: usize = 0;
+    const CHILD_COUNT: usize = 1;
+    const OVERLAP_VOXELS: usize = 2;
+    const CHILD_VOXELS: usize = 3;
+    const LABEL_VOXELS: usize = 4;
+    const FRACTION_OF_LABEL: usize = 5;
+
+    fn schema() -> Schema {
+        let columns: [Column; Self::WIDTH] = [
+            Column::u64("label"),
+            Column::u64("child_count"),
+            Column::u64("overlap_voxels"),
+            Column::u64("child_voxels"),
+            Column::u64("label_voxels"),
+            Column::f64("fraction_of_label"),
+        ];
+        fixed_measurement_schema(columns, "overlap child count")
+    }
+
+    fn values(row: &ObjectOverlapChildCountMeasurements) -> Result<[Value; Self::WIDTH]> {
+        validate_overlap_child_count_row(row)?;
+        Ok([
+            Value::U64(row.label),
+            Value::U64(row.child_count),
+            Value::U64(row.overlap_voxels),
+            Value::U64(row.child_voxels),
+            Value::U64(row.label_voxels),
+            Value::F64(row.fraction_of_label),
+        ])
+    }
+
+    fn decode(row: &Row<'_>) -> Result<ObjectOverlapChildCountMeasurements> {
+        let measurements = ObjectOverlapChildCountMeasurements {
+            label: row.u64(Self::LABEL)?,
+            child_count: row.u64(Self::CHILD_COUNT)?,
+            overlap_voxels: row.u64(Self::OVERLAP_VOXELS)?,
+            child_voxels: row.u64(Self::CHILD_VOXELS)?,
+            label_voxels: row.u64(Self::LABEL_VOXELS)?,
+            fraction_of_label: row.f64(Self::FRACTION_OF_LABEL)?,
+        };
+        validate_overlap_child_count_row(&measurements)?;
+        Ok(measurements)
+    }
+}
+
 struct BoundaryDistanceRelationshipColumns;
 
 impl BoundaryDistanceRelationshipColumns {
@@ -27462,6 +29291,21 @@ pub fn centroid_neighbor_measurement_schema() -> Schema {
     CentroidNeighborColumns::schema()
 }
 
+/// Table schema for [`ObjectOverlapMeasurements`] rows.
+pub fn overlap_relationship_measurement_schema() -> Schema {
+    OverlapRelationshipColumns::schema()
+}
+
+/// Table schema for [`ObjectOverlapAssignmentMeasurements`] rows.
+pub fn overlap_assignment_measurement_schema() -> Schema {
+    OverlapAssignmentColumns::schema()
+}
+
+/// Table schema for [`ObjectOverlapChildCountMeasurements`] rows.
+pub fn overlap_child_count_measurement_schema() -> Schema {
+    OverlapChildCountColumns::schema()
+}
+
 /// Table schema for [`ObjectBoundaryDistanceMeasurements`] rows.
 pub fn boundary_distance_relationship_measurement_schema() -> Schema {
     BoundaryDistanceRelationshipColumns::schema()
@@ -27497,6 +29341,42 @@ pub fn encode_centroid_neighbor_measurements(
 
 fn centroid_neighbor_measurement(row: &Row<'_>) -> Result<ObjectNeighborMeasurements> {
     CentroidNeighborColumns::decode(row)
+}
+
+/// Encode directed overlap relationship rows as a row-table fragment.
+pub fn encode_overlap_relationship_measurements(
+    relationships: &[ObjectOverlapMeasurements],
+) -> Result<Vec<u8>> {
+    let schema = Arc::new(overlap_relationship_measurement_schema());
+    encode_measurement_rows_at_origin(schema, relationships, OverlapRelationshipColumns::values)
+}
+
+fn overlap_relationship_measurement(row: &Row<'_>) -> Result<ObjectOverlapMeasurements> {
+    OverlapRelationshipColumns::decode(row)
+}
+
+/// Encode maximum-overlap assignment rows as a row-table fragment.
+pub fn encode_overlap_assignment_measurements(
+    assignments: &[ObjectOverlapAssignmentMeasurements],
+) -> Result<Vec<u8>> {
+    let schema = Arc::new(overlap_assignment_measurement_schema());
+    encode_measurement_rows_at_origin(schema, assignments, OverlapAssignmentColumns::values)
+}
+
+fn overlap_assignment_measurement(row: &Row<'_>) -> Result<ObjectOverlapAssignmentMeasurements> {
+    OverlapAssignmentColumns::decode(row)
+}
+
+/// Encode overlap assignment child-count rows as a row-table fragment.
+pub fn encode_overlap_child_count_measurements(
+    counts: &[ObjectOverlapChildCountMeasurements],
+) -> Result<Vec<u8>> {
+    let schema = Arc::new(overlap_child_count_measurement_schema());
+    encode_measurement_rows_at_origin(schema, counts, OverlapChildCountColumns::values)
+}
+
+fn overlap_child_count_measurement(row: &Row<'_>) -> Result<ObjectOverlapChildCountMeasurements> {
+    OverlapChildCountColumns::decode(row)
 }
 
 /// Encode canonical boundary-distance relationship rows as a row-table fragment.
@@ -27551,6 +29431,9 @@ mod tests {
             centroid_relationships: None,
             centroid_neighbors: None,
             touching_neighbors: None,
+            overlap_relationships: None,
+            overlap_assignments: None,
+            overlap_child_counts: None,
             boundary_distance_relationships: None,
             expansion_relationships: None,
             moment3d: None,
@@ -29704,6 +31587,367 @@ mod tests {
     }
 
     #[test]
+    fn overlap_relationship_partials_merge_to_fraction_rows() {
+        let mut left = OverlapRelationshipTallies::default();
+        left.add_label_a(1, 2).unwrap();
+        left.add_label_b(5, 2).unwrap();
+        left.add_pair([1, 5], 2).unwrap();
+
+        let mut right = OverlapRelationshipTallies::default();
+        right.add_label_a(1, 1).unwrap();
+        right.add_label_a(2, 4).unwrap();
+        right.add_label_b(5, 2).unwrap();
+        right.add_label_b(6, 2).unwrap();
+        right.add_pair([1, 5], 1).unwrap();
+        right.add_pair([2, 5], 1).unwrap();
+        right.add_pair([2, 6], 2).unwrap();
+
+        let encoded = [
+            OverlapRelationshipPartialLayout::encode(&left).unwrap(),
+            OverlapRelationshipPartialLayout::encode(&right).unwrap(),
+        ];
+        let mut merged = OverlapRelationshipTallies::default();
+        for bytes in encoded {
+            merged
+                .merge(OverlapRelationshipPartialLayout::decode(&bytes).unwrap())
+                .unwrap();
+        }
+        let rows = overlap_relationships_from_tallies(&merged).unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].labels, [1, 5]);
+        assert_eq!(rows[0].overlap_voxels, 3);
+        assert_eq!(rows[0].label_a_voxels, 3);
+        assert_eq!(rows[0].label_b_voxels, 4);
+        assert_eq!(rows[0].fraction_of_a, 1.0);
+        assert_eq!(rows[0].fraction_of_b, 0.75);
+        assert_eq!(rows[0].jaccard, 0.75);
+        assert_eq!(rows[1].labels, [2, 5]);
+        assert_eq!(rows[1].overlap_voxels, 1);
+        assert_eq!(rows[2].labels, [2, 6]);
+        assert_eq!(rows[2].overlap_voxels, 2);
+    }
+
+    #[test]
+    fn overlap_relationship_builder_merges_counts_across_blocks() {
+        let labels_a =
+            Array3::from_shape_vec((1, 2, 4), vec![1.0, 1.0, 2.0, 2.0, 1.0, 0.0, 2.0, 2.0])
+                .unwrap();
+        let labels_b =
+            Array3::from_shape_vec((1, 2, 4), vec![5.0, 5.0, 5.0, 0.0, 5.0, 0.0, 6.0, 6.0])
+                .unwrap();
+        let volume = label_volume(labels_a.shape()).unwrap();
+        let plan = Measurements::for_labels(0usize)
+            .overlap_relationships(LabelImage::new(ImageId::supplied(0)).holding(Dtype::F64))
+            .stream("overlap-test")
+            .build(measurement_harness_base(volume, [1, 2, 2]).unwrap())
+            .unwrap();
+        let rows = plan
+            .overlap_relationship_rows()
+            .expect("overlap rows are planned");
+        let env = ArrayEnvironment::with_inputs(
+            labels_a.into(),
+            vec![labels_b.into()],
+            &plan.decomposition,
+            [1, 2, 2],
+        )
+        .unwrap();
+        let mut work = vec![PhaseWork::Pixels];
+        work.extend(plan.phase_work());
+        execute_phases(
+            "overlap relationship builder test",
+            &measurement_harness_workflow(volume),
+            &plan.decomposition,
+            &Hints::default(),
+            &env,
+            &[],
+            &work,
+        )
+        .unwrap();
+
+        let got = collect_overlap_relationship_rows(&env, &rows, volume).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].labels, [1, 5]);
+        assert_eq!(got[0].overlap_voxels, 3);
+        assert_eq!(got[1].labels, [2, 5]);
+        assert_eq!(got[1].overlap_voxels, 1);
+        assert_eq!(got[2].labels, [2, 6]);
+        assert_eq!(got[2].overlap_voxels, 2);
+    }
+
+    #[test]
+    fn overlap_child_count_builder_materializes_derived_summary_rows() {
+        let labels_a =
+            Array3::from_shape_vec((1, 2, 4), vec![1.0, 1.0, 2.0, 2.0, 1.0, 0.0, 2.0, 2.0])
+                .unwrap();
+        let labels_b =
+            Array3::from_shape_vec((1, 2, 4), vec![5.0, 5.0, 5.0, 0.0, 5.0, 0.0, 6.0, 6.0])
+                .unwrap();
+        let volume = label_volume(labels_a.shape()).unwrap();
+        let plan = Measurements::for_labels(0usize)
+            .overlap_child_count_summary(LabelImage::new(ImageId::supplied(0)).holding(Dtype::F64))
+            .stream("overlap-summary-test")
+            .build(measurement_harness_base(volume, [1, 2, 2]).unwrap())
+            .unwrap();
+        let relationship_rows = plan
+            .overlap_relationship_rows()
+            .expect("overlap rows are planned");
+        let assignment_rows = plan
+            .overlap_assignment_rows()
+            .expect("assignment rows are planned");
+        let child_count_rows = plan
+            .overlap_child_count_rows()
+            .expect("child-count rows are planned");
+        let env = ArrayEnvironment::with_inputs(
+            labels_a.into(),
+            vec![labels_b.into()],
+            &plan.decomposition,
+            [1, 2, 2],
+        )
+        .unwrap();
+        let mut work = vec![PhaseWork::Pixels];
+        work.extend(plan.phase_work());
+        execute_phases(
+            "overlap child count builder test",
+            &measurement_harness_workflow(volume),
+            &plan.decomposition,
+            &Hints::default(),
+            &env,
+            &[],
+            &work,
+        )
+        .unwrap();
+
+        let relationships =
+            collect_overlap_relationship_rows(&env, &relationship_rows, volume).unwrap();
+        assert_eq!(relationships.len(), 3);
+        let assignments = collect_overlap_assignment_rows(&env, &assignment_rows, volume).unwrap();
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].label, 1);
+        assert_eq!(assignments[0].assigned_label, 5);
+        assert_eq!(assignments[1].label, 2);
+        assert_eq!(assignments[1].assigned_label, 6);
+        let child_counts =
+            collect_overlap_child_count_rows(&env, &child_count_rows, volume).unwrap();
+        assert_eq!(child_counts.len(), 2);
+        assert_eq!(child_counts[0].label, 5);
+        assert_eq!(child_counts[0].child_count, 1);
+        assert_eq!(child_counts[1].label, 6);
+        assert_eq!(child_counts[1].child_count, 1);
+    }
+
+    #[test]
+    fn overlap_child_count_builder_applies_assignment_threshold() {
+        let labels_a =
+            Array3::from_shape_vec((1, 2, 4), vec![1.0, 1.0, 2.0, 2.0, 1.0, 0.0, 2.0, 2.0])
+                .unwrap();
+        let labels_b =
+            Array3::from_shape_vec((1, 2, 4), vec![5.0, 5.0, 5.0, 0.0, 5.0, 0.0, 6.0, 6.0])
+                .unwrap();
+        let threshold = OverlapAssignmentThreshold::none()
+            .min_fraction_of_label(0.75)
+            .unwrap();
+        let volume = label_volume(labels_a.shape()).unwrap();
+        let plan = Measurements::for_labels(0usize)
+            .overlap_child_count_summary_with_threshold(
+                LabelImage::new(ImageId::supplied(0)).holding(Dtype::F64),
+                threshold,
+            )
+            .stream("overlap-threshold-summary-test")
+            .build(measurement_harness_base(volume, [1, 2, 2]).unwrap())
+            .unwrap();
+        let assignment_rows = plan
+            .overlap_assignment_rows()
+            .expect("assignment rows are planned");
+        let child_count_rows = plan
+            .overlap_child_count_rows()
+            .expect("child-count rows are planned");
+        let env = ArrayEnvironment::with_inputs(
+            labels_a.into(),
+            vec![labels_b.into()],
+            &plan.decomposition,
+            [1, 2, 2],
+        )
+        .unwrap();
+        let mut work = vec![PhaseWork::Pixels];
+        work.extend(plan.phase_work());
+        execute_phases(
+            "overlap threshold child count builder test",
+            &measurement_harness_workflow(volume),
+            &plan.decomposition,
+            &Hints::default(),
+            &env,
+            &[],
+            &work,
+        )
+        .unwrap();
+
+        let assignments = collect_overlap_assignment_rows(&env, &assignment_rows, volume).unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].label, 1);
+        assert_eq!(assignments[0].assigned_label, 5);
+        let child_counts =
+            collect_overlap_child_count_rows(&env, &child_count_rows, volume).unwrap();
+        assert_eq!(child_counts.len(), 1);
+        assert_eq!(child_counts[0].label, 5);
+        assert_eq!(child_counts[0].child_count, 1);
+    }
+
+    #[test]
+    fn maximum_overlap_assignment_selects_one_target_per_source_label() {
+        let rows = [
+            ObjectOverlapMeasurements {
+                labels: [1, 5],
+                overlap_voxels: 4,
+                label_a_voxels: 8,
+                label_b_voxels: 10,
+                fraction_of_a: 0.5,
+                fraction_of_b: 0.4,
+                jaccard: 4.0 / 14.0,
+            },
+            ObjectOverlapMeasurements {
+                labels: [1, 6],
+                overlap_voxels: 4,
+                label_a_voxels: 8,
+                label_b_voxels: 8,
+                fraction_of_a: 0.5,
+                fraction_of_b: 0.5,
+                jaccard: 4.0 / 12.0,
+            },
+            ObjectOverlapMeasurements {
+                labels: [2, 9],
+                overlap_voxels: 3,
+                label_a_voxels: 5,
+                label_b_voxels: 7,
+                fraction_of_a: 0.6,
+                fraction_of_b: 3.0 / 7.0,
+                jaccard: 3.0 / 9.0,
+            },
+        ];
+
+        let assignments = summarize_maximum_overlap_assignments(&rows).unwrap();
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].label, 1);
+        assert_eq!(assignments[0].assigned_label, 6);
+        assert_eq!(assignments[0].overlap_voxels, 4);
+        assert_eq!(assignments[0].fraction_of_label, 0.5);
+        assert_eq!(assignments[1].label, 2);
+        assert_eq!(assignments[1].assigned_label, 9);
+
+        let encoded = encode_overlap_assignment_measurements(&assignments).unwrap();
+        let table = row_table_from_single_fragment(
+            [1, 1, 1],
+            overlap_assignment_measurement_schema(),
+            &encoded,
+        )
+        .unwrap();
+        let decoded =
+            scan_measurement_table(table, [1, 1, 1], overlap_assignment_measurement).unwrap();
+        assert_eq!(decoded, assignments);
+    }
+
+    #[test]
+    fn maximum_overlap_assignment_threshold_rejects_weak_matches() {
+        let rows = [
+            ObjectOverlapMeasurements {
+                labels: [1, 5],
+                overlap_voxels: 2,
+                label_a_voxels: 10,
+                label_b_voxels: 8,
+                fraction_of_a: 0.2,
+                fraction_of_b: 0.25,
+                jaccard: 2.0 / 16.0,
+            },
+            ObjectOverlapMeasurements {
+                labels: [1, 6],
+                overlap_voxels: 4,
+                label_a_voxels: 10,
+                label_b_voxels: 10,
+                fraction_of_a: 0.4,
+                fraction_of_b: 0.4,
+                jaccard: 4.0 / 16.0,
+            },
+            ObjectOverlapMeasurements {
+                labels: [2, 9],
+                overlap_voxels: 8,
+                label_a_voxels: 10,
+                label_b_voxels: 12,
+                fraction_of_a: 0.8,
+                fraction_of_b: 8.0 / 12.0,
+                jaccard: 8.0 / 14.0,
+            },
+        ];
+        let threshold = OverlapAssignmentThreshold::none()
+            .min_overlap_voxels(NonZeroU64::new(4).unwrap())
+            .min_fraction_of_label(0.5)
+            .unwrap();
+
+        let assignments =
+            summarize_maximum_overlap_assignments_with_threshold(&rows, threshold).unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].label, 2);
+        assert_eq!(assignments[0].assigned_label, 9);
+    }
+
+    #[test]
+    fn overlap_assignment_child_counts_group_by_assigned_label() {
+        let assignments = [
+            ObjectOverlapAssignmentMeasurements {
+                label: 1,
+                assigned_label: 9,
+                overlap_voxels: 3,
+                label_voxels: 5,
+                assigned_label_voxels: 10,
+                fraction_of_label: 0.6,
+                fraction_of_assigned: 0.3,
+                jaccard: 3.0 / 12.0,
+            },
+            ObjectOverlapAssignmentMeasurements {
+                label: 2,
+                assigned_label: 9,
+                overlap_voxels: 4,
+                label_voxels: 8,
+                assigned_label_voxels: 10,
+                fraction_of_label: 0.5,
+                fraction_of_assigned: 0.4,
+                jaccard: 4.0 / 14.0,
+            },
+            ObjectOverlapAssignmentMeasurements {
+                label: 3,
+                assigned_label: 10,
+                overlap_voxels: 2,
+                label_voxels: 3,
+                assigned_label_voxels: 6,
+                fraction_of_label: 2.0 / 3.0,
+                fraction_of_assigned: 1.0 / 3.0,
+                jaccard: 2.0 / 7.0,
+            },
+        ];
+
+        let counts = summarize_overlap_assignment_child_counts(&assignments).unwrap();
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[0].label, 9);
+        assert_eq!(counts[0].child_count, 2);
+        assert_eq!(counts[0].overlap_voxels, 7);
+        assert_eq!(counts[0].child_voxels, 13);
+        assert_eq!(counts[0].label_voxels, 10);
+        assert_eq!(counts[0].fraction_of_label, 0.7);
+        assert_eq!(counts[1].label, 10);
+        assert_eq!(counts[1].child_count, 1);
+
+        let encoded = encode_overlap_child_count_measurements(&counts).unwrap();
+        let table = row_table_from_single_fragment(
+            [1, 1, 1],
+            overlap_child_count_measurement_schema(),
+            &encoded,
+        )
+        .unwrap();
+        let decoded =
+            scan_measurement_table(table, [1, 1, 1], overlap_child_count_measurement).unwrap();
+        assert_eq!(decoded, counts);
+    }
+
+    #[test]
     fn measurement_row_layouts_match_their_schemas() {
         let distribution = DistributionSet::new(3, 0.0, 1.0).unwrap();
         let distribution_schema = distribution_measurement_schema(distribution);
@@ -29986,6 +32230,25 @@ mod tests {
         assert_eq!(
             centroid_schema.columns()[CentroidRelationshipColumns::DISTANCE].name(),
             "centroid_distance"
+        );
+
+        let overlap_schema = overlap_relationship_measurement_schema();
+        assert_eq!(overlap_schema.len(), OverlapRelationshipColumns::WIDTH);
+        assert_eq!(
+            overlap_schema.columns()[OverlapRelationshipColumns::FRACTION_OF_A].name(),
+            "fraction_of_a"
+        );
+        let assignment_schema = overlap_assignment_measurement_schema();
+        assert_eq!(assignment_schema.len(), OverlapAssignmentColumns::WIDTH);
+        assert_eq!(
+            assignment_schema.columns()[OverlapAssignmentColumns::ASSIGNED_LABEL].name(),
+            "assigned_label"
+        );
+        let child_count_schema = overlap_child_count_measurement_schema();
+        assert_eq!(child_count_schema.len(), OverlapChildCountColumns::WIDTH);
+        assert_eq!(
+            child_count_schema.columns()[OverlapChildCountColumns::CHILD_COUNT].name(),
+            "child_count"
         );
 
         let boundary_distance_schema = boundary_distance_relationship_measurement_schema();
@@ -30365,6 +32628,28 @@ fn centroid_relationship_row_table_from_block_input(
         at,
         input.stream(),
         centroid_relationship_measurement_schema(),
+    )
+}
+
+fn overlap_relationship_row_table_from_block_input(
+    at: &BlockView<'_>,
+    input: &PartialPhaseInput,
+) -> Result<Table> {
+    row_table_from_block_stream_fragments(
+        at,
+        input.stream(),
+        overlap_relationship_measurement_schema(),
+    )
+}
+
+fn overlap_assignment_row_table_from_block_input(
+    at: &BlockView<'_>,
+    input: &PartialPhaseInput,
+) -> Result<Table> {
+    row_table_from_block_stream_fragments(
+        at,
+        input.stream(),
+        overlap_assignment_measurement_schema(),
     )
 }
 
@@ -33612,6 +35897,78 @@ pub fn collect_centroid_neighbor_rows_with_contract(
     volume: [usize; 3],
 ) -> Result<Vec<ObjectNeighborMeasurements>> {
     collect_centroid_neighbor_rows(env, rows.rows(), volume)
+}
+
+pub fn collect_overlap_relationship_measurements(
+    env: &dyn Environment,
+    stream: &str,
+    phase: usize,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectOverlapMeasurements>> {
+    let rows = MeasurementRows::<OverlapRelationshipRows>::from_legacy_collector(stream, phase)?;
+    collect_overlap_relationship_rows(env, &rows, volume)
+}
+
+pub fn collect_overlap_relationship_rows(
+    env: &dyn Environment,
+    rows: &MeasurementRows<OverlapRelationshipRows>,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectOverlapMeasurements>> {
+    collect_fixed_measurement_rows_table(
+        env,
+        rows,
+        volume,
+        overlap_relationship_measurement_schema,
+        overlap_relationship_measurement,
+    )
+}
+
+pub fn collect_overlap_assignment_measurements(
+    env: &dyn Environment,
+    stream: &str,
+    phase: usize,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectOverlapAssignmentMeasurements>> {
+    let rows = MeasurementRows::<OverlapAssignmentRows>::from_legacy_collector(stream, phase)?;
+    collect_overlap_assignment_rows(env, &rows, volume)
+}
+
+pub fn collect_overlap_assignment_rows(
+    env: &dyn Environment,
+    rows: &MeasurementRows<OverlapAssignmentRows>,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectOverlapAssignmentMeasurements>> {
+    collect_fixed_measurement_rows_table(
+        env,
+        rows,
+        volume,
+        overlap_assignment_measurement_schema,
+        overlap_assignment_measurement,
+    )
+}
+
+pub fn collect_overlap_child_count_measurements(
+    env: &dyn Environment,
+    stream: &str,
+    phase: usize,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectOverlapChildCountMeasurements>> {
+    let rows = MeasurementRows::<OverlapChildCountRows>::from_legacy_collector(stream, phase)?;
+    collect_overlap_child_count_rows(env, &rows, volume)
+}
+
+pub fn collect_overlap_child_count_rows(
+    env: &dyn Environment,
+    rows: &MeasurementRows<OverlapChildCountRows>,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectOverlapChildCountMeasurements>> {
+    collect_fixed_measurement_rows_table(
+        env,
+        rows,
+        volume,
+        overlap_child_count_measurement_schema,
+        overlap_child_count_measurement,
+    )
 }
 
 pub fn collect_boundary_distance_relationship_measurements(

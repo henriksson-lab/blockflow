@@ -17,7 +17,8 @@ use crate::dtype::Dtype;
 use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
-    BlockOutput, BlockView, FragmentInput, FragmentOp, PhaseView, SeamFold, SourceBlocks,
+    BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput, PhaseView,
+    SeamFold, SourceBlocks,
 };
 use crate::op::{Anchor, BlockOp, Chain, Slicing, SourceInput};
 use crate::reach::Reach;
@@ -37,10 +38,24 @@ pub fn clear_border_into(
     connectivity: Connectivity,
     out: ArrayViewMut3<'_, bool>,
 ) -> Result<()> {
+    clear_border_on_axes_into(mask, connectivity, [true, true, true], out)
+}
+
+/// Remove foreground components that touch a selected set of volume faces.
+///
+/// This is useful for 2-D images carried in a `z=1` volume: callers can clear
+/// the image-plane border with `[false, true, true]` without treating the
+/// singleton z faces as border contact.
+pub fn clear_border_on_axes_into(
+    mask: ArrayView3<'_, bool>,
+    connectivity: Connectivity,
+    axes: [bool; 3],
+    out: ArrayViewMut3<'_, bool>,
+) -> Result<()> {
     shapes_agree(mask.shape(), out.shape(), "clear_border_into")?;
     let mut labels = Array3::<u32>::zeros(mask.raw_dim());
     let count = label_regions_into_with(mask, connectivity, labels.view_mut())?;
-    let touching = labels_touching_border(labels.view(), count)?;
+    let touching = labels_touching_border_on_axes(labels.view(), count, axes)?;
     let keep: Vec<bool> = touching.into_iter().map(|touches| !touches).collect();
     rewrite_labels_by_keep(labels.view(), &keep, out)
 }
@@ -63,24 +78,161 @@ pub fn remove_small_objects_into(
     rewrite_labels_by_keep(labels.view(), &keep, out)
 }
 
+/// Remove non-zero labels that touch any selected volume face.
+///
+/// Unlike [`clear_border_on_axes_into`], this operates on an already-labelled
+/// image. That distinction matters for watershed-style object identification:
+/// a foreground component can touch the image border before declumping, while
+/// the final split objects inside it do not.
+pub fn filter_labels_touching_border_on_axes_into(
+    labels: ArrayView3<'_, u32>,
+    axes: [bool; 3],
+    mut out: ArrayViewMut3<'_, u32>,
+) -> Result<()> {
+    shapes_agree(
+        labels.shape(),
+        out.shape(),
+        "filter_labels_touching_border_on_axes_into",
+    )?;
+    let border = label_set_touching_border_on_axes(labels, axes);
+    for (slot, &label) in out.iter_mut().zip(labels.iter()) {
+        *slot = if label == 0 || border.contains(&label) {
+            0
+        } else {
+            label
+        };
+    }
+    Ok(())
+}
+
+/// Fill zero-valued holes enclosed by each label inside that label's 2-D box.
+///
+/// This is a label-preserving rule for post-watershed cleanup. It is different
+/// from binary hole filling: every label is considered independently, and only
+/// background that cannot reach the label's own bounding-box edge without
+/// crossing that label is assigned to the label.
+pub fn fill_label_holes_2d_by_label_into(
+    labels: ArrayView3<'_, u32>,
+    mut out: ArrayViewMut3<'_, u32>,
+) -> Result<()> {
+    shapes_agree(
+        labels.shape(),
+        out.shape(),
+        "fill_label_holes_2d_by_label_into",
+    )?;
+    if labels.shape()[0] != 1 {
+        return Err(Error::invalid(
+            "fill_label_holes_2d_by_label_into currently supports 2-D label images",
+        ));
+    }
+    out.assign(&labels);
+    let mut boxes = BTreeMap::<u32, ([usize; 2], [usize; 2])>::new();
+    for ((_, y, x), &label) in labels.indexed_iter() {
+        if label == 0 {
+            continue;
+        }
+        boxes
+            .entry(label)
+            .and_modify(|(min, max)| {
+                min[0] = min[0].min(y);
+                min[1] = min[1].min(x);
+                max[0] = max[0].max(y + 1);
+                max[1] = max[1].max(x + 1);
+            })
+            .or_insert(([y, x], [y + 1, x + 1]));
+    }
+    for (label, (min, max)) in boxes {
+        fill_label_holes_in_box(label, min, max, labels, out.view_mut());
+    }
+    Ok(())
+}
+
+fn fill_label_holes_in_box(
+    label: u32,
+    min: [usize; 2],
+    max: [usize; 2],
+    labels: ArrayView3<'_, u32>,
+    mut out: ArrayViewMut3<'_, u32>,
+) {
+    let height = max[0] - min[0];
+    let width = max[1] - min[1];
+    if height < 3 || width < 3 {
+        return;
+    }
+    let mut outside = vec![false; height * width];
+    let mut queue = std::collections::VecDeque::<(usize, usize)>::new();
+    for y in 0..height {
+        for x in [0, width - 1] {
+            enqueue_label_background(label, min, labels, &mut outside, &mut queue, width, y, x);
+        }
+    }
+    for x in 0..width {
+        for y in [0, height - 1] {
+            enqueue_label_background(label, min, labels, &mut outside, &mut queue, width, y, x);
+        }
+    }
+    while let Some((y, x)) = queue.pop_front() {
+        for (ny, nx) in [
+            y.checked_sub(1).map(|ny| (ny, x)),
+            (y + 1 < height).then_some((y + 1, x)),
+            x.checked_sub(1).map(|nx| (y, nx)),
+            (x + 1 < width).then_some((y, x + 1)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            enqueue_label_background(label, min, labels, &mut outside, &mut queue, width, ny, nx);
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let global = [0, min[0] + y, min[1] + x];
+            if labels[global] == 0 && !outside[y * width + x] {
+                out[global] = label;
+            }
+        }
+    }
+}
+
+fn enqueue_label_background(
+    label: u32,
+    min: [usize; 2],
+    labels: ArrayView3<'_, u32>,
+    outside: &mut [bool],
+    queue: &mut std::collections::VecDeque<(usize, usize)>,
+    width: usize,
+    y: usize,
+    x: usize,
+) {
+    let index = y * width + x;
+    if outside[index] || labels[[0, min[0] + y, min[1] + x]] == label {
+        return;
+    }
+    outside[index] = true;
+    queue.push_back((y, x));
+}
+
 const COMPONENT_MASK_MAGIC: u32 = 0x4d43_4d52;
 const COMPONENT_MASK_NOUN: &str = "a component-mask reduction";
+const LABEL_SIZE_COUNTS_MAGIC: u64 = 0x4c53_434e_5453_0001;
+const LABEL_SIZE_KEEP_MAGIC: u64 = 0x4c53_4b45_4550_0001;
 
 #[derive(Debug, Clone, Copy)]
 enum ComponentMaskRule {
     MinimumSize { minimum_size: u64 },
-    ClearBorder { volume: [usize; 3] },
+    ClearBorder { volume: [usize; 3], axes: [bool; 3] },
 }
 
 impl ComponentMaskRule {
     fn keep(&self, moments: &super::detect::Moments) -> Result<bool> {
         match *self {
             Self::MinimumSize { minimum_size } => Ok(moments.count >= minimum_size),
-            Self::ClearBorder { volume } => {
+            Self::ClearBorder { volume, axes } => {
                 let Some((low, high)) = moments.bounds() else {
                     return Ok(false);
                 };
-                Ok((0..3).all(|axis| low[axis] != 0 && high[axis] + 1 != volume[axis]))
+                Ok((0..3)
+                    .all(|axis| !axes[axis] || (low[axis] != 0 && high[axis] + 1 != volume[axis])))
             }
         }
     }
@@ -269,6 +421,16 @@ pub fn append_clear_border_phases(
     lifecycle: Lifecycle,
     connectivity: Connectivity,
 ) -> Result<Phase> {
+    append_clear_border_on_axes_phases(plan, stream, lifecycle, connectivity, [true, true, true])
+}
+
+pub fn append_clear_border_on_axes_phases(
+    plan: &mut PlanBuilder,
+    stream: impl Into<String>,
+    lifecycle: Lifecycle,
+    connectivity: Connectivity,
+    axes: [bool; 3],
+) -> Result<Phase> {
     let stream = stream.into();
     let mask = ImageId::from(plan.n_phases());
     let mask_dtype = plan.reads();
@@ -287,13 +449,520 @@ pub fn append_clear_border_phases(
             "clear-border rewrite",
             stream,
             labels,
-            ComponentMaskRule::ClearBorder { volume },
+            ComponentMaskRule::ClearBorder { volume, axes },
             lattice,
             mask,
             mask_dtype,
         )
         .connecting(connectivity),
     )
+}
+
+/// Count non-zero labels in every block and emit one sorted label/count table.
+pub struct LabelSizeCountsOp {
+    name: &'static str,
+    stream: String,
+    lifecycle: Lifecycle,
+}
+
+impl LabelSizeCountsOp {
+    pub fn new(name: &'static str, stream: impl Into<String>, lifecycle: Lifecycle) -> Self {
+        Self {
+            name,
+            stream: stream.into(),
+            lifecycle,
+        }
+    }
+}
+
+impl FragmentOp for LabelSizeCountsOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn reads_pixels(&self) -> bool {
+        true
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            Coverage::EveryBlock,
+        )]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::PerBlock)
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let BlockBuf::Array(pixels) = at.pixels()? else {
+            return Ok(BlockOutput::fragment(
+                self.stream.clone(),
+                encode_label_counts(&BTreeMap::new()),
+            ));
+        };
+        let labels = pixels.view::<u32>()?;
+        let mut counts = BTreeMap::<u32, u64>::new();
+        for &label in labels.iter() {
+            if label == 0 {
+                continue;
+            }
+            let count = counts.entry(label).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                Error::invalid("label-size filter: per-block label count overflowed")
+            })?;
+        }
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            encode_label_counts(&counts),
+        ))
+    }
+}
+
+/// Rewrite labels by a global size rule derived from block-local label counts.
+pub struct ApplyLabelSizeFilterOp {
+    name: &'static str,
+    stream: String,
+    phase: usize,
+    min_size: u64,
+    max_size: Option<u64>,
+    labels: ImageId,
+}
+
+impl ApplyLabelSizeFilterOp {
+    pub fn new(
+        name: &'static str,
+        stream: impl Into<String>,
+        phase: impl Into<Phase>,
+        labels: impl Into<ImageId>,
+        min_size: u64,
+        max_size: Option<u64>,
+    ) -> Self {
+        Self {
+            name,
+            stream: stream.into(),
+            phase: phase.into().index(),
+            min_size,
+            max_size,
+            labels: labels.into(),
+        }
+    }
+
+    fn keep_label(&self, count: u64) -> bool {
+        count >= self.min_size && self.max_size.is_none_or(|limit| count <= limit)
+    }
+}
+
+impl FragmentOp for ApplyLabelSizeFilterOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn writes_pixels(&self) -> bool {
+        true
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::U32
+    }
+
+    fn barrier(&self) -> bool {
+        true
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![FragmentInput::own(self.stream.clone(), self.phase).with_reach([0, 0, 0])]
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        vec![SourceInput::voxelwise(self.labels).holding(Dtype::U32)]
+    }
+
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::Unordered)
+    }
+
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        let mut totals = BTreeMap::<u32, u64>::new();
+        for (_key, bytes) in at.fragments(&self.stream)? {
+            for (label, count) in decode_label_counts(&bytes)? {
+                let total = totals.entry(label).or_default();
+                *total = total.checked_add(count).ok_or_else(|| {
+                    Error::invalid("label-size filter: global label count overflowed")
+                })?;
+            }
+        }
+        let keep = totals
+            .into_iter()
+            .filter_map(|(label, count)| self.keep_label(count).then_some(label))
+            .collect::<Vec<_>>();
+        Ok(encode_label_keep_set(&keep))
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "label-size filter rewrites a declared label source and is applied through \
+             `apply_with`."
+                .to_string(),
+        ))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let BlockBuf::Array(pixels) = sources.get(self.labels.index())? else {
+            return Ok(BlockOutput::nothing());
+        };
+        let labels = pixels.view::<u32>()?;
+        let keep = decode_label_keep_set(at.reduced)?;
+        let mut out = Voxels::zeros(
+            Dtype::U32,
+            [labels.shape()[0], labels.shape()[1], labels.shape()[2]],
+        )?;
+        {
+            let mut out = out.view_mut::<u32>()?;
+            for ((z, y, x), slot) in out.indexed_iter_mut() {
+                let label = labels[[z, y, x]];
+                if label != 0 && keep.contains(&label) {
+                    *slot = label;
+                }
+            }
+        }
+        Ok(BlockOutput::nothing().with_pixels(BlockBuf::Array(out)))
+    }
+}
+
+pub fn append_filter_labels_by_size_phases(
+    plan: &mut PlanBuilder,
+    stream: impl Into<String>,
+    lifecycle: Lifecycle,
+    min_size: u64,
+    max_size: Option<u64>,
+) -> Result<Phase> {
+    let stream = stream.into();
+    let labels = ImageId::from(plan.n_phases());
+    let counts = plan.fragments(LabelSizeCountsOp::new(
+        "label-size-filter count labels",
+        stream.clone(),
+        lifecycle,
+    ))?;
+    plan.fragments(ApplyLabelSizeFilterOp::new(
+        "label-size-filter rewrite",
+        stream,
+        counts,
+        labels,
+        min_size,
+        max_size,
+    ))
+}
+
+/// Planned label-image border cleanup after object splitting.
+pub struct FilterLabelsTouchingBorderOnAxesOp {
+    name: &'static str,
+    labels: ImageId,
+    axes: [bool; 3],
+}
+
+impl FilterLabelsTouchingBorderOnAxesOp {
+    pub fn new(name: &'static str, labels: impl Into<ImageId>, axes: [bool; 3]) -> Self {
+        Self {
+            name,
+            labels: labels.into(),
+            axes,
+        }
+    }
+}
+
+impl FragmentOp for FilterLabelsTouchingBorderOnAxesOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        2.0
+    }
+
+    fn writes_pixels(&self) -> bool {
+        true
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::U32
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        vec![SourceInput::new(self.labels, Reach::all()).holding(Dtype::U32)]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::Unordered)
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "label-border filtering rewrites a declared label source and is applied through \
+             `apply_with`."
+                .to_string(),
+        ))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let BlockBuf::Array(pixels) = sources.get(self.labels.index())? else {
+            return Ok(BlockOutput::nothing());
+        };
+        let labels = pixels.view::<u32>()?;
+        if labels.shape() != at.volume() {
+            return Err(Error::invalid(format!(
+                "{} needs a whole-volume label source shaped {:?}, got {:?}",
+                self.name,
+                at.volume(),
+                labels.shape()
+            )));
+        }
+        let border = label_set_touching_border_on_axes(labels, self.axes);
+        let mut out = Voxels::zeros(Dtype::U32, at.read.shape3())?;
+        {
+            let mut out = out.view_mut::<u32>()?;
+            for ((z, y, x), slot) in out.indexed_iter_mut() {
+                let global = [
+                    at.read.start[0] + z,
+                    at.read.start[1] + y,
+                    at.read.start[2] + x,
+                ];
+                let label = labels[global];
+                *slot = if label == 0 || border.contains(&label) {
+                    0
+                } else {
+                    label
+                };
+            }
+        }
+        Ok(BlockOutput::nothing().with_pixels(BlockBuf::Array(out)))
+    }
+}
+
+pub fn append_filter_labels_touching_border_on_axes_phase(
+    plan: &mut PlanBuilder,
+    axes: [bool; 3],
+) -> Result<Phase> {
+    let labels = ImageId::from(plan.n_phases());
+    plan.fragments(FilterLabelsTouchingBorderOnAxesOp::new(
+        "filter-labels-touching-border",
+        labels,
+        axes,
+    ))
+}
+
+/// Planned 2-D per-label hole filling over a label image.
+pub struct FillLabelHoles2dByLabelOp {
+    name: &'static str,
+    labels: ImageId,
+}
+
+impl FillLabelHoles2dByLabelOp {
+    pub fn new(name: &'static str, labels: impl Into<ImageId>) -> Self {
+        Self {
+            name,
+            labels: labels.into(),
+        }
+    }
+}
+
+impl FragmentOp for FillLabelHoles2dByLabelOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        4.0
+    }
+
+    fn writes_pixels(&self) -> bool {
+        true
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::U32
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        vec![SourceInput::new(self.labels, Reach::all()).holding(Dtype::U32)]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::Unordered)
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "label-hole filling rewrites a declared label source and is applied through \
+             `apply_with`."
+                .to_string(),
+        ))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let BlockBuf::Array(pixels) = sources.get(self.labels.index())? else {
+            return Ok(BlockOutput::nothing());
+        };
+        let labels = pixels.view::<u32>()?;
+        if labels.shape() != at.volume() {
+            return Err(Error::invalid(format!(
+                "{} needs a whole-volume label source shaped {:?}, got {:?}",
+                self.name,
+                at.volume(),
+                labels.shape()
+            )));
+        }
+        let mut filled = Array3::<u32>::zeros(labels.raw_dim());
+        fill_label_holes_2d_by_label_into(labels, filled.view_mut())?;
+        let mut out = Voxels::zeros(Dtype::U32, at.read.shape3())?;
+        {
+            let mut out = out.view_mut::<u32>()?;
+            for ((z, y, x), slot) in out.indexed_iter_mut() {
+                let global = [
+                    at.read.start[0] + z,
+                    at.read.start[1] + y,
+                    at.read.start[2] + x,
+                ];
+                *slot = filled[global];
+            }
+        }
+        Ok(BlockOutput::nothing().with_pixels(BlockBuf::Array(out)))
+    }
+}
+
+pub fn append_fill_label_holes_2d_by_label_phase(plan: &mut PlanBuilder) -> Result<Phase> {
+    let labels = ImageId::from(plan.n_phases());
+    plan.fragments(FillLabelHoles2dByLabelOp::new(
+        "fill-label-holes-2d-by-label",
+        labels,
+    ))
+}
+
+fn encode_words(words: &[u64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(words));
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_words(bytes: &[u8], noun: &'static str) -> Result<Vec<u64>> {
+    if !bytes.len().is_multiple_of(std::mem::size_of::<u64>()) {
+        return Err(Error::invalid(format!(
+            "label-size filter: {noun} byte length {} is not a whole number of words",
+            bytes.len()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<u64>())
+        .map(|chunk| {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(chunk);
+            u64::from_le_bytes(word)
+        })
+        .collect())
+}
+
+fn encode_label_counts(counts: &BTreeMap<u32, u64>) -> Vec<u8> {
+    let mut words = Vec::with_capacity(2 + counts.len() * 2);
+    words.push(LABEL_SIZE_COUNTS_MAGIC);
+    words.push(counts.len() as u64);
+    for (&label, &count) in counts {
+        words.push(u64::from(label));
+        words.push(count);
+    }
+    encode_words(&words)
+}
+
+fn decode_label_counts(bytes: &[u8]) -> Result<Vec<(u32, u64)>> {
+    let words = decode_words(bytes, "count fragment")?;
+    if words.len() < 2 || words[0] != LABEL_SIZE_COUNTS_MAGIC {
+        return Err(Error::invalid(
+            "label-size filter: count fragment has the wrong magic",
+        ));
+    }
+    let rows = usize::try_from(words[1]).map_err(|_| {
+        Error::invalid("label-size filter: count fragment row count does not fit usize")
+    })?;
+    if words.len() != 2 + rows * 2 {
+        return Err(Error::invalid(format!(
+            "label-size filter: count fragment declares {rows} rows but has {} words",
+            words.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(rows);
+    for pair in words[2..].chunks_exact(2) {
+        let label = u32::try_from(pair[0])
+            .map_err(|_| Error::invalid("label-size filter: label id does not fit uint32"))?;
+        if label == 0 {
+            return Err(Error::invalid(
+                "label-size filter: count fragment contains background label 0",
+            ));
+        }
+        out.push((label, pair[1]));
+    }
+    Ok(out)
+}
+
+fn encode_label_keep_set(labels: &[u32]) -> Vec<u8> {
+    let mut words = Vec::with_capacity(2 + labels.len());
+    words.push(LABEL_SIZE_KEEP_MAGIC);
+    words.push(labels.len() as u64);
+    words.extend(labels.iter().map(|&label| u64::from(label)));
+    encode_words(&words)
+}
+
+fn decode_label_keep_set(bytes: &[u8]) -> Result<HashSet<u32>> {
+    let words = decode_words(bytes, "keep-set reduction")?;
+    if words.len() < 2 || words[0] != LABEL_SIZE_KEEP_MAGIC {
+        return Err(Error::invalid(
+            "label-size filter: keep-set reduction has the wrong magic",
+        ));
+    }
+    let labels = usize::try_from(words[1]).map_err(|_| {
+        Error::invalid("label-size filter: keep-set label count does not fit usize")
+    })?;
+    if words.len() != 2 + labels {
+        return Err(Error::invalid(format!(
+            "label-size filter: keep-set declares {labels} labels but has {} words",
+            words.len()
+        )));
+    }
+    let mut keep = HashSet::with_capacity(labels);
+    for &word in &words[2..] {
+        let label = u32::try_from(word).map_err(|_| {
+            Error::invalid("label-size filter: keep-set label id does not fit uint32")
+        })?;
+        if label == 0 {
+            return Err(Error::invalid(
+                "label-size filter: keep-set contains background label 0",
+            ));
+        }
+        keep.insert(label);
+    }
+    Ok(keep)
 }
 
 pub struct LabelBackgroundRegionsOp {
@@ -1178,19 +1847,20 @@ impl<'a> ObjectDistanceCursor<'a> {
     }
 }
 
-fn labels_touching_border(labels: ArrayView3<'_, u32>, count: u32) -> Result<Vec<bool>> {
+fn labels_touching_border_on_axes(
+    labels: ArrayView3<'_, u32>,
+    count: u32,
+    axes: [bool; 3],
+) -> Result<Vec<bool>> {
     let mut touching = vec![false; count as usize];
     let shape = labels.shape();
     for i in 0..shape[0] {
         for j in 0..shape[1] {
             for k in 0..shape[2] {
-                if i != 0
-                    && j != 0
-                    && k != 0
-                    && i + 1 != shape[0]
-                    && j + 1 != shape[1]
-                    && k + 1 != shape[2]
-                {
+                let touches_selected_axis = (axes[0] && (i == 0 || i + 1 == shape[0]))
+                    || (axes[1] && (j == 0 || j + 1 == shape[1]))
+                    || (axes[2] && (k == 0 || k + 1 == shape[2]));
+                if !touches_selected_axis {
                     continue;
                 }
                 let label = labels[[i, j, k]];
@@ -1206,6 +1876,28 @@ fn labels_touching_border(labels: ArrayView3<'_, u32>, count: u32) -> Result<Vec
         }
     }
     Ok(touching)
+}
+
+fn label_set_touching_border_on_axes(labels: ArrayView3<'_, u32>, axes: [bool; 3]) -> HashSet<u32> {
+    let mut touching = HashSet::<u32>::new();
+    let shape = labels.shape();
+    for z in 0..shape[0] {
+        for y in 0..shape[1] {
+            for x in 0..shape[2] {
+                let touches_selected_axis = (axes[0] && (z == 0 || z + 1 == shape[0]))
+                    || (axes[1] && (y == 0 || y + 1 == shape[1]))
+                    || (axes[2] && (x == 0 || x + 1 == shape[2]));
+                if !touches_selected_axis {
+                    continue;
+                }
+                let label = labels[[z, y, x]];
+                if label != 0 {
+                    touching.insert(label);
+                }
+            }
+        }
+    }
+    touching
 }
 
 fn label_sizes(labels: ArrayView3<'_, u32>, count: u32) -> Result<Vec<u64>> {

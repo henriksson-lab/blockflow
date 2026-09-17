@@ -33,6 +33,86 @@ This crate aims to resolve the problem using the following ingredients:
 
 This crate is not yet ready for general consumption.
 
+## CellProfiler-Style Benchmark
+
+One current benchmark is the CellProfiler ExampleHuman HT29 image set. To keep
+startup overhead from dominating, this benchmark duplicates the small
+three-channel example into 10-image and 50-image batches. The Blockflow rows
+below are the release `cellprofiler-human` binary running the current DAPI
+nuclei path over the DAPI images. The CellProfiler rows are
+`cellprofiler/cellprofiler:4.2.8` running the downloaded `ExampleHuman.cppipe`
+pipeline in Docker over the same three-channel image sets.
+
+Measured on 2026-09-17 on an Intel Xeon Gold 6138 machine. Compile time is not
+included. The CellProfiler run uses a warm local Docker image and reports peak
+container memory sampled with `docker stats`; Blockflow RSS is Linux
+`/usr/bin/time -v` max RSS.
+
+| runner | scope | wall time | max RSS / peak memory | output |
+|---|---:|---:|---:|---:|
+| Blockflow `target/release/cellprofiler-human` | 10 DAPI nuclei runs | 1.09 s | 23,708 KiB / 23.2 MiB | 2,880 nuclei |
+| CellProfiler 4.2.8 Docker | 10 full ExampleHuman image sets | 54.93 s | 504.4 MiB | 2,890 nuclei |
+| Blockflow `target/release/cellprofiler-human` | 50 DAPI nuclei runs | 5.17 s | 23,928 KiB / 23.4 MiB | 14,400 nuclei |
+| CellProfiler 4.2.8 Docker | 50 full ExampleHuman image sets | 238.13 s | 671.2 MiB | 14,450 nuclei |
+
+That is about a 50x wall-time difference on 10 image sets and 46x on 50 image
+sets, with about 22x lower peak memory on 10 image sets and 29x lower peak
+memory on 50 image sets for the current Blockflow path. This is a
+pipeline-reference benchmark, not a claim of exact operation-for-operation
+parity: the CellProfiler pipeline also
+identifies secondary/tertiary objects and exports more measurements. The
+current semantic comparison is documented in `CELLPROFILER.md`; the remaining
+one-object difference is treated as expected reference drift for this milestone.
+
+Reproduction commands:
+
+```sh
+cargo build --release --features cellprofiler-benchmark --bin cellprofiler-human
+
+N=50
+bench=target/cellprofiler-readme-bench-${N}
+mkdir -p "$bench/images"
+for n in $(seq 0 $((N - 1))); do
+  id=$(printf "%02d" "$n")
+  cp .tmp/cellprofiler-human/examples-master/ExampleHuman/images/AS_09125_050116030001_D03f00d0.tif \
+    "$bench/images/AS_09125_050116${id}_D03f00d0.tif"
+  cp .tmp/cellprofiler-human/examples-master/ExampleHuman/images/AS_09125_050116030001_D03f00d1.tif \
+    "$bench/images/AS_09125_050116${id}_D03f00d1.tif"
+  cp .tmp/cellprofiler-human/examples-master/ExampleHuman/images/AS_09125_050116030001_D03f00d2.tif \
+    "$bench/images/AS_09125_050116${id}_D03f00d2.tif"
+done
+
+/usr/bin/time -v bash -lc 'set -euo pipefail
+  bench=target/cellprofiler-readme-bench-50
+  i=0
+  for img in "$bench"/images/*d0.tif; do
+    target/release/cellprofiler-human \
+      --input "$img" \
+      --out "$bench/blockflow-output/run-${i}" \
+      --min-size 50 --max-size 5027 \
+      --sigma 1.0 --declump-sigma 1.3488 \
+      --threshold-method li --threshold-bins 256 \
+      --seed-min-distance 6 --maxima-downsample 3 \
+      --declump-method intensity \
+      --merge-line-basin-pixels 16 --merge-line-max-saddle-drop 0 >/dev/null
+    i=$((i + 1))
+  done'
+```
+
+The CellProfiler measurement used a non-hidden fixture directory because the
+pipeline excludes hidden directories during image discovery:
+
+```sh
+cp .tmp/cellprofiler-human/examples-master/ExampleHuman/ExampleHuman.cppipe \
+  target/cellprofiler-readme-bench-50/ExampleHuman.cppipe
+
+docker run --rm \
+  -v "$PWD/target/cellprofiler-readme-bench-50:/bench" \
+  -w /bench \
+  cellprofiler/cellprofiler:4.2.8 \
+  -c -r -p ExampleHuman.cppipe -i images -o cellprofiler-output
+```
+
 
 ## Design notes
 
