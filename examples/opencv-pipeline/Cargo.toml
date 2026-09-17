@@ -1,0 +1,20 @@
+[package]
+name = "blockflow-opencv-pipeline"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+blockflow = { path = "../.." }
+image = "0.25"
+ndarray = "0.17"
+serde_json = "1"
+
+[[bin]]
+name = "opencv-pipeline"
+path = "src/bin/opencv_pipeline.rs"
+
+[[bin]]
+name = "opencv-compare"
+path = "src/bin/opencv_compare.rs"

@@ -1,0 +1,25 @@
+[package]
+name = "blockflow-cellprofiler-human"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+blockflow = { path = "../.." }
+csv = "1"
+image = "0.25"
+ndarray = "0.17"
+serde_json = "1"
+
+[[bin]]
+name = "cellprofiler-human"
+path = "src/bin/cellprofiler_human.rs"
+
+[[bin]]
+name = "cellprofiler-compare"
+path = "src/bin/cellprofiler_compare.rs"
+
+[[bin]]
+name = "cellprofiler-plan-probe"
+path = "src/bin/cellprofiler_plan_probe.rs"

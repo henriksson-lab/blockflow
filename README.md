@@ -67,7 +67,7 @@ one-object difference is treated as expected reference drift for this milestone.
 Reproduction commands:
 
 ```sh
-cargo build --release --features cellprofiler-benchmark --bin cellprofiler-human
+cargo build -p blockflow-cellprofiler-human --release --bin cellprofiler-human
 
 N=50
 bench=target/cellprofiler-readme-bench-${N}
@@ -111,6 +111,74 @@ docker run --rm \
   -w /bench \
   cellprofiler/cellprofiler:4.2.8 \
   -c -r -p ExampleHuman.cppipe -i images -o cellprofiler-output
+```
+
+## ImgLib2-Style Benchmark
+
+The ImgLib2 comparison lives in `examples/imglib2-pipeline/`. It uses
+deterministic 8-bit BMP fixtures and runs a generic image-processing pipeline:
+Gaussian smoothing, Otsu thresholding, connected components, size filtering and
+area/centroid export. The Java reference uses ImgLib2 core containers and
+accessors plus Java ImageIO; it is intentionally not an ImageJ/CellProfiler
+workflow clone.
+
+Measured on 2026-09-17 on the same Intel Xeon Gold 6138 machine. The table
+reports script wall time and summed in-process pipeline time from the per-image
+JSON summaries. The comparison requires exact object count and foreground area
+agreement.
+
+| runner | batch | wall time | pipeline time sum | output |
+|---|---:|---:|---:|---:|
+| Blockflow `imglib2-pipeline` | 10 images | 0.155 s | 0.065 s | 49 objects / 23,232 px |
+| ImgLib2 Java reference | 10 images | 2.924 s | 0.889 s | 49 objects / 23,232 px |
+| Blockflow `imglib2-pipeline` | 50 images | 0.766 s | 0.343 s | 248 objects / 115,888 px |
+| ImgLib2 Java reference | 50 images | 14.966 s | 4.616 s | 248 objects / 115,888 px |
+
+Reproduction commands:
+
+```sh
+cargo build -p blockflow-imglib2-pipeline --release
+examples/imglib2-pipeline/reference-imglib2/build.sh
+
+examples/imglib2-pipeline/scripts/run_benchmark.sh 10 .tmp/imglib2-pipeline/bench-10
+examples/imglib2-pipeline/scripts/run_benchmark.sh 50 .tmp/imglib2-pipeline/bench-50
+```
+
+## OpenCV-Style Benchmark
+
+The OpenCV comparison lives in `examples/opencv-pipeline/`. It uses the same
+deterministic BMP fixture family and runs a classical OpenCV-style workflow:
+optional affine warp, Gaussian smoothing, Otsu thresholding, 3x3 open/close,
+connected components, size filtering and area/centroid export. The OpenCV
+reference is a C++ program built with CMake against OpenCV 4.5.4.
+
+Measured on 2026-09-18 on the same Intel Xeon Gold 6138 machine. The table
+reports script wall time and summed in-process pipeline time from per-image JSON
+summaries. The comparison requires exact object count and allows up to 2%
+foreground-area drift because the Gaussian and morphology implementations are
+not bit-identical.
+
+| mode | runner | batch | wall time | pipeline time sum | output |
+|---|---|---:|---:|---:|---:|
+| segment | Blockflow `opencv-pipeline` | 10 images | 0.216 s | 0.112 s | 49 objects / 23,203 px |
+| segment | OpenCV C++ reference | 10 images | 1.806 s | 0.115 s | 49 objects / 22,959 px |
+| segment | Blockflow `opencv-pipeline` | 50 images | 0.979 s | 0.570 s | 248 objects / 115,752 px |
+| segment | OpenCV C++ reference | 50 images | 7.383 s | 0.482 s | 248 objects / 114,482 px |
+| transform | Blockflow `opencv-pipeline` | 10 images | 0.193 s | 0.113 s | 49 objects / 24,112 px |
+| transform | OpenCV C++ reference | 10 images | 1.525 s | 0.092 s | 49 objects / 23,885 px |
+| transform | Blockflow `opencv-pipeline` | 50 images | 0.931 s | 0.551 s | 248 objects / 120,351 px |
+| transform | OpenCV C++ reference | 50 images | 7.678 s | 0.505 s | 248 objects / 119,202 px |
+
+Reproduction commands:
+
+```sh
+cargo build -p blockflow-opencv-pipeline --release
+examples/opencv-pipeline/reference-opencv/build.sh
+
+examples/opencv-pipeline/scripts/run_benchmark.sh 10 .tmp/opencv-pipeline/bench-10 segment
+examples/opencv-pipeline/scripts/run_benchmark.sh 50 .tmp/opencv-pipeline/bench-50 segment
+examples/opencv-pipeline/scripts/run_benchmark.sh 10 .tmp/opencv-pipeline/bench-10-transform transform
+examples/opencv-pipeline/scripts/run_benchmark.sh 50 .tmp/opencv-pipeline/bench-50-transform transform
 ```
 
 

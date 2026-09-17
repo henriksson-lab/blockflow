@@ -2,7 +2,13 @@
 # it. The dependency direction is one-way and enforced here — `blockflow` has no
 # `clearmap-rs` dependency and must never acquire one.
 [workspace]
-members = [".", "crates/blockflow-progress"]
+members = [
+    ".",
+    "crates/blockflow-progress",
+    "examples/cellprofiler-human",
+    "examples/imglib2-pipeline",
+    "examples/opencv-pipeline",
+]
 
 [package]
 name = "blockflow"
@@ -293,7 +299,6 @@ zarr = ["dep:zarrs"]
 # transitive obligation. The dependency block above has the measurements, why the
 # faster library still loses, and the failure mode when `libfftw3` is missing.
 fftw = ["dep:fftw-sys"]
-cellprofiler-benchmark = ["dep:csv", "dep:image"]
 model-segment = []
 cellpose = ["model-segment", "dep:cellpose", "dep:ndarray16"]
 stardist = ["model-segment", "dep:stardist-rs", "dep:burn", "dep:ndarray16"]
@@ -483,21 +488,6 @@ required-features = ["distributed"]
 name = "blockflow-local"
 path = "src/bin/blockflow_local.rs"
 required-features = ["distributed"]
-
-[[bin]]
-name = "cellprofiler-human"
-path = "src/bin/cellprofiler_human.rs"
-required-features = ["cellprofiler-benchmark"]
-
-[[bin]]
-name = "cellprofiler-compare"
-path = "src/bin/cellprofiler_compare.rs"
-required-features = ["cellprofiler-benchmark"]
-
-[[bin]]
-name = "cellprofiler-plan-probe"
-path = "src/bin/cellprofiler_plan_probe.rs"
-required-features = ["cellprofiler-benchmark"]
 
 [[test]]
 name = "model_segment_invariance"

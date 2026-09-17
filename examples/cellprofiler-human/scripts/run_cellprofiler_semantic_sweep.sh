@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/run_cellprofiler_semantic_sweep.sh IMAGE REFERENCE_OBJECT_CSV OUTPUT_DIR
+  examples/cellprofiler-human/scripts/run_cellprofiler_semantic_sweep.sh IMAGE REFERENCE_OBJECT_CSV OUTPUT_DIR
 
 Runs a small semantic parameter sweep for the CellProfiler-style benchmark.
 Each run executes cellprofiler-human, compares the object table against a
@@ -69,7 +69,7 @@ max_size="${BF_MAX_SIZE:-5027}"
 threshold_method="${BF_THRESHOLD_METHOD:-li}"
 threshold_bins="${BF_THRESHOLD_BINS:-256}"
 
-cargo build --features cellprofiler-benchmark \
+cargo build -p blockflow-cellprofiler-human \
   --bin cellprofiler-human \
   --bin cellprofiler-compare \
   "${cargo_profile_flags[@]}"

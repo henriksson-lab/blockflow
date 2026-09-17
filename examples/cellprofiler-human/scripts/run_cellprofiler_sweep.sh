@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/run_cellprofiler_sweep.sh IMAGE OUTPUT_DIR [REFERENCE_OBJECT_CSV]
+  examples/cellprofiler-human/scripts/run_cellprofiler_sweep.sh IMAGE OUTPUT_DIR [REFERENCE_OBJECT_CSV]
 
 Runs a small worker/chunk/cache sweep around the CellProfiler-style benchmark.
 The current output-generating benchmark path is resident-only, so
@@ -40,6 +40,7 @@ fi
 image="$1"
 output_dir="$2"
 reference_csv="${3:-}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 workers="${BF_SWEEP_WORKERS:-1 4}"
 chunks="${BF_SWEEP_CHUNKS:-1x256x256 1x512x512}"
@@ -55,7 +56,7 @@ for worker in $workers; do
       BF_WORKERS="$worker" \
       BF_CHUNK_SHAPE="$chunk" \
       BF_CACHE_BYTES="$cache" \
-      scripts/run_cellprofiler_benchmark.sh "$image" "$run_dir" "$reference_csv"
+      "$script_dir/run_cellprofiler_benchmark.sh" "$image" "$run_dir" "$reference_csv"
       run_index=$((run_index + 1))
     done
   done

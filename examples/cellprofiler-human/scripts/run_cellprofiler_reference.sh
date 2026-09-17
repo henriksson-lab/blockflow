@@ -4,14 +4,14 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/run_cellprofiler_reference.sh PIPELINE INPUT_DIR OUTPUT_DIR [CELLPROFILER_BIN]
+  examples/cellprofiler-human/scripts/run_cellprofiler_reference.sh PIPELINE INPUT_DIR OUTPUT_DIR [CELLPROFILER_BIN]
 
 Runs CellProfiler headlessly to generate the reference CSVs for the
 CellProfiler-style benchmark. The pipeline must contain its own export module;
 the command line only chooses the input and output directories.
 
 Example:
-  scripts/run_cellprofiler_reference.sh \
+  examples/cellprofiler-human/scripts/run_cellprofiler_reference.sh \
     .tmp/cellprofiler-human/examples-master/ExampleHuman/ExampleHuman.cppipe \
     .tmp/cellprofiler-human/examples-master/ExampleHuman/images \
     .tmp/cellprofiler-human/reference

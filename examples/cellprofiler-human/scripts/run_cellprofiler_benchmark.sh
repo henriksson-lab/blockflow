@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/run_cellprofiler_benchmark.sh IMAGE OUTPUT_DIR [REFERENCE_OBJECT_CSV]
+  examples/cellprofiler-human/scripts/run_cellprofiler_benchmark.sh IMAGE OUTPUT_DIR [REFERENCE_OBJECT_CSV]
 
 Runs the Blockflow CellProfiler-style benchmark binary and, when a reference
 object CSV is supplied, runs semantic table comparison against it.
@@ -134,7 +134,7 @@ fi
 
 {
   printf 'blockflow_command='
-  printf '%q ' cargo run --features cellprofiler-benchmark --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
+  printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
     --input "$image" --out "$output_dir/blockflow" "${size_args[@]}" --sigma "$sigma" \
     --declump-sigma "$declump_sigma" --threshold-method "$threshold_method" --threshold-bins "$threshold_bins" \
     --seed-min-distance "$seed_min_distance" --maxima-downsample "$maxima_downsample" \
@@ -143,7 +143,7 @@ fi
   printf '\n'
 } > "$output_dir/benchmark-command.txt"
 
-cargo run --features cellprofiler-benchmark --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
+cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
   --input "$image" \
   --out "$output_dir/blockflow" \
   "${size_args[@]}" \
@@ -165,7 +165,7 @@ if [[ "$enable_plan_probe" != "0" ]]; then
   fi
   {
     printf 'plan_probe_command='
-    printf '%q ' cargo run --features cellprofiler-benchmark --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
+    printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
       --input "$image" --out "$output_dir/plan-probe.json" --chunk "$chunk_shape" \
       --workers "$workers" --cache-bytes "$cache_bytes" --sigma "$sigma" \
       --threshold-method "$threshold_method" --threshold-bins "$threshold_bins" \
@@ -179,7 +179,7 @@ if [[ "$enable_plan_probe" != "0" ]]; then
     printf '\n'
   } >> "$output_dir/benchmark-command.txt"
 
-  cargo run --features cellprofiler-benchmark --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
+  cargo run -p blockflow-cellprofiler-human --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
     --input "$image" \
     --out "$output_dir/plan-probe.json" \
     --chunk "$chunk_shape" \
@@ -201,13 +201,13 @@ fi
 if [[ -n "$reference_csv" ]]; then
   {
     printf 'compare_command='
-    printf '%q ' cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+    printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
       --blockflow "$output_dir/blockflow/objects.csv" --reference "$reference_csv" \
       --out "$output_dir/comparison.json" "${label_args[@]}" "${compare_args[@]}"
     printf '\n'
   } >> "$output_dir/benchmark-command.txt"
 
-  cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+  cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
     --blockflow "$output_dir/blockflow/objects.csv" \
     --reference "$reference_csv" \
     --out "$output_dir/comparison.json" \
@@ -217,13 +217,13 @@ if [[ -n "$reference_csv" ]]; then
   if [[ "$enable_plan_probe" != "0" && "$enable_plan_materialization" != "0" && -f "$planned_objects_csv" ]]; then
     {
       printf 'planned_compare_command='
-      printf '%q ' cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+      printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
         --blockflow "$planned_objects_csv" --reference "$reference_csv" \
         --out "$output_dir/planned-comparison.json" "${compare_args[@]}"
       printf '\n'
     } >> "$output_dir/benchmark-command.txt"
 
-    cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+    cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
       --blockflow "$planned_objects_csv" \
       --reference "$reference_csv" \
       --out "$output_dir/planned-comparison.json" \
@@ -234,7 +234,7 @@ fi
 if [[ "$enable_plan_probe" != "0" && "$enable_plan_materialization" != "0" && -f "$planned_objects_csv" && -f "$output_dir/blockflow/objects.csv" ]]; then
   {
     printf 'planned_resident_compare_command='
-    printf '%q ' cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+    printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
       --blockflow "$planned_objects_csv" --reference "$output_dir/blockflow/objects.csv" \
       --out "$output_dir/planned-resident-comparison.json" \
       --reference-area count --reference-centroid-z centroid_z --reference-centroid-y centroid_y \
@@ -246,7 +246,7 @@ if [[ "$enable_plan_probe" != "0" && "$enable_plan_materialization" != "0" && -f
     printf '\n'
   } >> "$output_dir/benchmark-command.txt"
 
-  cargo run --features cellprofiler-benchmark --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
+  cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
     --blockflow "$planned_objects_csv" \
     --reference "$output_dir/blockflow/objects.csv" \
     --out "$output_dir/planned-resident-comparison.json" \
