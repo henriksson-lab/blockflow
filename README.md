@@ -38,6 +38,16 @@ This crate is not yet ready for general consumption.
 Benchmark results and reproduction commands live in
 [`BENCHMARKS.md`](BENCHMARKS.md).
 
+In short, this crate is designed for high performance and for some sets of workloads it is
+
+* 50x faster than CellProfiler
+* 25x faster than scikit-image/SciPy
+* 20x faster than ImgLib (FIJI/ImageJ)
+* 8x faster than OpenCV
+* a bit faster than DASK-Image, which is the only other framework also designed to process large images
+
+These numbers are workload dependent but gives an idea
+
 ## Design notes
 
 The longer design material that used to sit below this line is now in
