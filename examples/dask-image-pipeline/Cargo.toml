@@ -1,0 +1,20 @@
+[package]
+name = "blockflow-dask-image-pipeline"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+blockflow = { path = "../.." }
+image = "0.25"
+ndarray = "0.17"
+serde_json = "1"
+
+[[bin]]
+name = "dask-image-pipeline"
+path = "src/bin/dask_image_pipeline.rs"
+
+[[bin]]
+name = "dask-image-compare"
+path = "src/bin/dask_image_compare.rs"

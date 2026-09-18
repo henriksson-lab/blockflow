@@ -8,6 +8,8 @@ members = [
     "examples/cellprofiler-human",
     "examples/imglib2-pipeline",
     "examples/opencv-pipeline",
+    "examples/skimage-pipeline",
+    "examples/dask-image-pipeline",
 ]
 
 [package]
