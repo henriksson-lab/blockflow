@@ -71,6 +71,14 @@ fn scratch(name: &str) -> PathBuf {
 /// reach, the fold re-derived in every block. Keeping both here is what makes
 /// the comparison one program with one thing changed.
 fn barrier_job(dir: &Path, hoisted: bool) -> (JobSpec, Decomposition) {
+    barrier_job_with_policy(dir, hoisted, HandoutPolicy::NearestFirst)
+}
+
+fn barrier_job_with_policy(
+    dir: &Path,
+    hoisted: bool,
+    policy: HandoutPolicy,
+) -> (JobSpec, Decomposition) {
     let volumes = dir.join("volumes");
     let (mut spec, pixels_only) = probe_job_over(
         BLOCKS,
@@ -80,7 +88,7 @@ fn barrier_job(dir: &Path, hoisted: bool) -> (JobSpec, Decomposition) {
             dir: volumes.clone(),
         },
     );
-    spec.policy = HandoutPolicy::NearestFirst;
+    spec.policy = policy;
     spec.lease = None;
     let summary_phase = pixels_only.n_phases();
     let lattice = pixels_only.phases[summary_phase - 1].grid.blocks_per_axis();
@@ -124,17 +132,14 @@ fn a_hoisted_reduction_is_byte_identical_however_many_workers_run_it() {
     let reference = output_bytes(&reference_dir, &reference_spec, &reference_plan);
     assert!(!reference.is_empty(), "the reference wrote nothing");
 
-    // **How many workers actually reduced, across the sweep.** The agreement
-    // claim is only exercised by a run where more than one worker reduced, and
-    // whether that happens is the handout policy's business, not this test's —
-    // a locality-aware coordinator may hand every block of a phase to one
-    // worker. So it is measured and asserted at the end rather than assumed per
-    // configuration, and without that assertion this test could pass while never
-    // once comparing two processes' bytes.
+    // **How many workers actually reduced, across the sweep.** This test uses
+    // the naive baseline policy so the ready barrier blocks are not deliberately
+    // kept near one worker. Locality is covered by the cost test below; here the
+    // premise is that more than one process computes the same hoisted blob.
     let mut most_reducers = 0usize;
     for workers in [2usize, 3, 5] {
         let dir = scratch(&format!("hoisted-{workers}"));
-        let (spec, plan) = barrier_job(&dir, true);
+        let (spec, plan) = barrier_job_with_policy(&dir, true, HandoutPolicy::Naive);
         let run = local::run(&options(&dir, workers), &spec, &plan)
             .unwrap_or_else(|error| panic!("{workers} workers: {error}"));
         assert_eq!(run.status.done, run.status.tasks);
