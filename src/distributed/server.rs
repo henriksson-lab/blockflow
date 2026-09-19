@@ -261,10 +261,24 @@ fn handle(request: &Incoming, coordinator: &Coordinator) -> (u16, Value) {
         path::COMPLETED => {
             let worker = text_or(&body, "worker", "");
             let task = body.get("task").and_then(Value::as_u64).unwrap_or(0) as usize;
-            coordinator
-                .status(job.as_deref())
-                .and_then(|status| coordinator.completed(&status.job, &worker, task))
-                .map(|status| status.to_json())
+            // `pull` makes the completion a pull as well, answered under the
+            // same lock: see `path::COMPLETED` and the worker's executor loop.
+            let pull = body.get("pull").and_then(Value::as_bool).unwrap_or(false);
+            coordinator.status(job.as_deref()).and_then(|status| {
+                if pull {
+                    coordinator
+                        .completed_and_pull(&status.job, &worker, task)
+                        .map(|(status, next)| {
+                            let mut reply = status.to_json();
+                            reply["next"] = next.to_json();
+                            reply
+                        })
+                } else {
+                    coordinator
+                        .completed(&status.job, &worker, task)
+                        .map(|status| status.to_json())
+                }
+            })
         }
         path::FAILED => {
             let worker = text_or(&body, "worker", "");

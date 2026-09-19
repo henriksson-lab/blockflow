@@ -1187,6 +1187,27 @@ impl Coordinator {
         })
     }
 
+    /// A completion and a pull in one step, under one lock.
+    ///
+    /// The completion first, so the handout sees its consequences: the anchor
+    /// this worker's next task is chosen near is the block it just finished,
+    /// and any dependent that completion released is ready to be handed out.
+    /// Both halves are the same methods a separate `/completed` and `/pull`
+    /// would run, so every count they keep — pulls, withheld, claims — is kept
+    /// the same way whichever shape the worker used.
+    pub fn completed_and_pull(
+        &self,
+        job: &str,
+        worker: &str,
+        task: usize,
+    ) -> Result<(JobStatus, Handout)> {
+        self.with_job(job, |job| {
+            job.completed(worker, task)?;
+            let next = job.pull(worker);
+            Ok((job.status(), next))
+        })
+    }
+
     pub fn failed(&self, job: &str, worker: &str, task: usize, why: &str) -> Result<()> {
         self.with_job(job, |job| {
             job.failed(worker, task, why);

@@ -41,6 +41,24 @@
 // signalled by the executor on every pop. Measured: nine starved runs in forty
 // became none, and putting the sleep back brought them straight back.
 //
+// **And a consumed task is replaced in the round trip that reports it, not in
+// a race with it.** The condvar removed the lag but left a contest: on every
+// pop the puller started a pull, and the executor started a task followed by a
+// completion post — two round trips to the same coordinator, and the list ran
+// empty whenever the pull lost by more than the task took. The completion is a
+// request the executor cannot avoid, so the puller's whole margin was the
+// compute time, and at the probe fixtures' block size that is a few
+// milliseconds against a scheduling quantum. On a four-core runner with the
+// rest of the test binary for company it lost about one run in seven. So the
+// completion *is* the pull: `/completed` with `"pull": true` is answered, under
+// the coordinator's one lock, with the next task, and the executor pushes it
+// before it pops. The list is then one ahead by construction whenever the
+// coordinator has work, and the puller is left with the two moments that
+// cannot be pipelined — the first fill, and refilling after the coordinator
+// has said "nothing now". `WorkerReport::starved` is what a regression here
+// would raise, and it is asserted at zero because nothing in the steady state
+// depends on timing any more.
+//
 // Three threads, so that none of them can wait behind another
 // -----------------------------------------------------------
 // Three *long-lived* ones. `WorkerOptions::threads` above one adds transient
@@ -105,6 +123,14 @@ pub struct WorkerOptions {
     /// How many tasks to keep in hand. Two — one being computed, one ready —
     /// is the design's "at least one ahead"; more only deepens the pipeline and
     /// makes a reissue after a death more expensive.
+    ///
+    /// "In hand" counts the task being computed, which is what the sentence
+    /// above always said and what the puller now does: it fills the list while
+    /// `queued + executing < ahead`, so `ahead = 2` is one task in the list
+    /// during a task and two between tasks, never three claims. The list used
+    /// to be `ahead` *queued* tasks, one deeper than documented, and the extra
+    /// depth was masking the race the module header describes rather than
+    /// fixing it.
     pub ahead: usize,
     /// Stop after this many tasks, whatever the job says. Only for making a
     /// worker die on cue in a test; a real worker runs until the job is done.
@@ -262,20 +288,18 @@ pub struct WorkerReport {
     /// available on entry is a round trip out of date. `next_task` is where that
     /// is argued; [`Self::told_to_wait`] is the other outcome.
     ///
-    /// # What zero here promises, which is not "never"
+    /// # What zero here promises
     ///
-    /// The list is one task deep at `ahead = 2` — one being computed, one in
-    /// hand — so it survives a handout round trip only while that round trip is
-    /// shorter than a task. That is a **contract**, in the same shape as the
-    /// documented `lease > (ahead + 1) x task duration`, and it is stated here
-    /// because the depth was not chosen against it: the sweep that settled on 2
-    /// ran ~180 ms tasks on an unloaded machine, where `starved` was zero with
-    /// room to spare, and the probe fixtures here run ~7 ms tasks on a machine
-    /// with forty other things on it. Deeper is not free — the same sweep
-    /// measured it monotonically worse for makespan, because depth is claim
-    /// hoarding — so this is a trade-off recorded rather than tuned. A residual
-    /// of about one run in forty remains at that task size, and it is the
-    /// scheduler rather than the handout.
+    /// That the steady state does not depend on timing. The task consumed by a
+    /// pop is replaced by the reply to its own completion (`/completed` with
+    /// `"pull": true`, pushed before the next pop), so while the coordinator
+    /// has work the list is never empty at a pop, whatever a round trip costs.
+    /// This used to be a contract — "the list survives a handout round trip
+    /// only while that round trip is shorter than a task" — with a residual of
+    /// about one run in forty at the probe fixtures' task size, and one in
+    /// seven on a loaded four-core runner. It is now a construction, and a
+    /// non-zero here is a fault: a completion answered without the task it
+    /// asked for, or a handout that says "work" and hands out nothing.
     pub starved: usize,
     /// Waits the coordinator answered, at least once, with "nothing for you
     /// now" before the next task arrived.
@@ -364,6 +388,13 @@ struct Shared {
     /// The puller waits on this rather than sleeping on a timer; the module
     /// header measures what the timer used to cost.
     taken: Condvar,
+    /// A task has been popped and its completion has not yet answered. It
+    /// counts as "in hand" — [`WorkerOptions::ahead`] — because the completion
+    /// that ends it will bring the next task with it, and a puller that filled
+    /// the gap meanwhile would claim one more than asked for. Written and read
+    /// under `queue`'s lock, so the puller never sees the gap between a pop and
+    /// the flag, or between the replacement's push and the flag's clearing.
+    executing: AtomicBool,
     last: Mutex<LastReply>,
     /// How many times the coordinator has answered "nothing for you now".
     ///
@@ -492,6 +523,7 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
         queue: Mutex::new(VecDeque::new()),
         arrived: Condvar::new(),
         taken: Condvar::new(),
+        executing: AtomicBool::new(false),
         last: Mutex::new(LastReply::Nothing),
         refusals: AtomicUsize::new(0),
         first_pull_us: AtomicU64::new(0),
@@ -632,14 +664,29 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
                     // node that stopped existing. See `WorkerOptions::abort_after`.
                     std::process::abort();
                 }
-                completions.post(
+                // The completion is also the pull for the task that replaces
+                // this one — the module header says why the two must be one
+                // request — unless this worker is about to stop on cue, in
+                // which case claiming another task would only leave it to the
+                // lease.
+                let stopping = options
+                    .stop_after
+                    .is_some_and(|limit| report.tasks >= limit);
+                if stopping {
+                    shared.done.store(true, Ordering::Release);
+                }
+                let reply = completions.post(
                     path::COMPLETED,
                     &json!({
                         "job": joined.job,
                         "worker": joined.worker,
                         "task": assignment.task,
+                        "pull": !stopping,
                     }),
                 )?;
+                if !stopping {
+                    replace_consumed(&shared, &reply)?;
+                }
             }
             Err(error) => {
                 // Say so rather than dying quietly. A reported failure returns
@@ -746,11 +793,17 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
 /// no refusal, so it still counts, and the case it stops counting is one where
 /// the coordinator itself said it had nothing. Whether *that* was legitimate is
 /// a question about the coordinator and is asked there, by `Job::withheld`.
+///
+/// Since a completion brings its own replacement (`replace_consumed`), the
+/// waiting branch below is reached only at the first task, after a refusal, and
+/// at the end — never in the steady state — and a starve counted here is a
+/// fault rather than a lost race.
 fn next_task(shared: &Arc<Shared>, report: &mut WorkerReport) -> Option<Assignment> {
     {
         let mut queue = shared.queue.lock_unpoisoned();
         if let Some(assignment) = queue.pop_front() {
             report.started_ready += 1;
+            shared.executing.store(true, Ordering::Release);
             shared.taken.notify_one();
             return Some(assignment);
         }
@@ -779,6 +832,7 @@ fn next_task(shared: &Arc<Shared>, report: &mut WorkerReport) -> Option<Assignme
                     report.told_to_wait += 1;
                 }
             }
+            shared.executing.store(true, Ordering::Release);
             shared.taken.notify_one();
             return Some(assignment);
         }
@@ -791,6 +845,45 @@ fn next_task(shared: &Arc<Shared>, report: &mut WorkerReport) -> Option<Assignme
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         queue = next;
     }
+}
+
+/// Take the coordinator's answer to a completion that was also a pull, and put
+/// it where the executor will find it before its next pop.
+///
+/// The push and the clearing of `executing` happen under one lock acquisition,
+/// so the puller — which counts both — never observes the list one short and
+/// pulls a task this reply is already carrying. A refusal is recorded exactly
+/// as the puller records one, so `next_task` classifies the wait that follows
+/// as "told to wait" and not as a starve; and the puller is woken either way,
+/// because after a refusal it is the one that retries.
+fn replace_consumed(shared: &Arc<Shared>, reply: &serde_json::Value) -> Result<()> {
+    let next = reply.get("next").ok_or_else(|| {
+        Error::invalid(format!(
+            "the completion asked for the next task and the reply carries none: the \
+             coordinator is not speaking protocol {PROTOCOL_VERSION}"
+        ))
+    })?;
+    let handout = Handout::from_json(next)?;
+    // `last` is never held together with `queue`, here or anywhere.
+    *shared.last.lock_unpoisoned() = match &handout {
+        Handout::Task(_) => LastReply::Work,
+        Handout::Wait { .. } => LastReply::Blocked,
+        Handout::Finished => LastReply::Finished,
+    };
+    {
+        let mut queue = shared.queue.lock_unpoisoned();
+        match handout {
+            Handout::Task(assignment) => queue.push_back(*assignment),
+            Handout::Wait { .. } => {
+                shared.refusals.fetch_add(1, Ordering::AcqRel);
+            }
+            Handout::Finished => shared.done.store(true, Ordering::Release),
+        }
+        shared.executing.store(false, Ordering::Release);
+    }
+    shared.arrived.notify_all();
+    shared.taken.notify_all();
+    Ok(())
 }
 
 fn prefetch_queued(
@@ -887,8 +980,17 @@ fn spawn_puller(
                     // a fixed lag between the list draining and this thread
                     // noticing, so a task shorter than the sleep hands the
                     // executor a list one shallower than `ahead` asked for.
+                    //
+                    // The task being computed is in hand too: its completion
+                    // brings the next task with it (`replace_consumed`), so in
+                    // the steady state there is no room here and this thread
+                    // sleeps. It fills the list at the start, and again after
+                    // the coordinator has answered "nothing now".
+                    let in_hand = |queue: &VecDeque<Assignment>| {
+                        queue.len() + usize::from(shared.executing.load(Ordering::Acquire))
+                    };
                     let mut queue = shared.queue.lock_unpoisoned();
-                    while queue.len() >= ahead && !shared.done.load(Ordering::Acquire) {
+                    while in_hand(&queue) >= ahead && !shared.done.load(Ordering::Acquire) {
                         let (next, _) = shared
                             .taken
                             .wait_timeout(queue, Duration::from_millis(20))

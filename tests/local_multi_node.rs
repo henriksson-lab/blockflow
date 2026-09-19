@@ -902,6 +902,15 @@ fn the_work_list_stays_at_least_one_task_ahead_of_what_is_being_computed() {
 /// was leaving pipelining on the table because a lease was watching — and it
 /// says the lever is elsewhere.
 ///
+/// **The table predates 2026-09-19**, when `ahead` started counting the task
+/// being computed — as its documentation always said — and a completion
+/// started bringing the next task back with it. Each depth in the table held
+/// one more queued task than the same number does now, and the steady state
+/// no longer has a pull racing a task at all, which is what kept `starved` at
+/// zero then and what makes it zero by construction now. The shape of the
+/// argument is unchanged; the numbers would want re-measuring before being
+/// quoted against a new depth.
+///
 /// Run it:
 ///
 ///     cargo test --release --features distributed --test local_multi_node -- \
@@ -1140,9 +1149,9 @@ fn a_persistent_coordinator_accepts_a_job_over_http_and_outlives_it() {
     assert_eq!(report.tasks, decomposition.n_tasks());
     assert_eq!(
         report.starved, 0,
-        "one worker, one phase, every task ready from the start: the only way this list \
-         runs empty is the worker outrunning its own puller. {} of its waits were answered \
-         'nothing now'",
+        "one worker, one phase, every task ready from the start: every completion brings \
+         the next task with it, so the only way this list runs empty is a completion \
+         answered without one. {} of its waits were answered 'nothing now'",
         report.told_to_wait
     );
 

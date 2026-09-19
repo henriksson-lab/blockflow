@@ -62,13 +62,25 @@ use super::wire::{
 /// Bumped only when a message changes shape. A worker and a coordinator that
 /// disagree refuse each other at `Join` rather than at some later message whose
 /// absence looks like a hang.
-pub const PROTOCOL_VERSION: u64 = 1;
+///
+/// **2**: a completion may ask for the next task in the same request (`"pull":
+/// true` on `/completed`), and the reply then carries it as `"next"`, a
+/// [`Handout`]. A version-1 coordinator would accept the completion and answer
+/// without the handout, and the worker would wait for a task that never comes —
+/// exactly the silent failure this constant exists to turn into a refusal at
+/// join.
+pub const PROTOCOL_VERSION: u64 = 2;
 
 /// Endpoint paths, named once so the client and the server cannot drift.
 pub mod path {
     pub const JOIN: &str = "/join";
     pub const PULL: &str = "/pull";
     pub const REPORT: &str = "/report";
+    /// A task is done. With `"pull": true` in the body it is also a pull, and
+    /// the reply carries the next [`super::Handout`] under `"next"`: the
+    /// coordinator records the completion and chooses the next task under one
+    /// lock, so a worker replaces the task it consumed in the same round trip
+    /// that reports it. `worker.rs` explains why that has to be one request.
     pub const COMPLETED: &str = "/completed";
     pub const FAILED: &str = "/failed";
     pub const STATUS: &str = "/status";
