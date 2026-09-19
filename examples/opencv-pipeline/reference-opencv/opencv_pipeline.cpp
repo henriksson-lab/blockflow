@@ -20,6 +20,16 @@ struct Config {
     std::string mode = "segment";
 };
 
+struct StageTimings {
+    double transform_seconds = 0.0;
+    double smooth_seconds = 0.0;
+    double threshold_seconds = 0.0;
+    double morphology_seconds = 0.0;
+    double filter_seconds = 0.0;
+    double label_seconds = 0.0;
+    double measure_seconds = 0.0;
+};
+
 std::string value(int argc, char** argv, int& i, const char* name) {
     ++i;
     if (i >= argc) {
@@ -96,7 +106,8 @@ void write_objects(const cv::Mat& stats, const cv::Mat& centroids, const std::fi
 }
 
 void write_summary(const Config& config, int objects, long long total_area, double threshold,
-                   double load_seconds, double pipeline_seconds, const std::filesystem::path& path) {
+                   double load_seconds, double pipeline_seconds, const StageTimings& timings,
+                   const std::filesystem::path& path) {
     std::ofstream out(path);
     if (!out) {
         throw std::runtime_error("create summary failed: " + path.string());
@@ -110,7 +121,16 @@ void write_summary(const Config& config, int objects, long long total_area, doub
     out << "  \"sigma\": " << config.sigma << ",\n";
     out << "  \"min_size\": " << config.min_size << ",\n";
     out << "  \"load_seconds\": " << load_seconds << ",\n";
-    out << "  \"pipeline_seconds\": " << pipeline_seconds << "\n";
+    out << "  \"pipeline_seconds\": " << pipeline_seconds << ",\n";
+    out << "  \"stage_seconds\": {\n";
+    out << "    \"transform\": " << timings.transform_seconds << ",\n";
+    out << "    \"smooth\": " << timings.smooth_seconds << ",\n";
+    out << "    \"threshold\": " << timings.threshold_seconds << ",\n";
+    out << "    \"morphology\": " << timings.morphology_seconds << ",\n";
+    out << "    \"filter\": " << timings.filter_seconds << ",\n";
+    out << "    \"label\": " << timings.label_seconds << ",\n";
+    out << "    \"measure\": " << timings.measure_seconds << "\n";
+    out << "  }\n";
     out << "}\n";
 }
 
@@ -129,21 +149,31 @@ int main(int argc, char** argv) {
         double load_seconds = seconds_since(started);
 
         auto pipeline_started = std::chrono::steady_clock::now();
+        StageTimings timings;
+        auto stage_started = std::chrono::steady_clock::now();
         cv::Mat prepared = transform_if_requested(input, config.mode);
+        timings.transform_seconds = seconds_since(stage_started);
+        stage_started = std::chrono::steady_clock::now();
         cv::Mat smoothed;
         if (config.sigma == 0.0) {
             smoothed = prepared;
         } else {
             cv::GaussianBlur(prepared, smoothed, cv::Size(), config.sigma, config.sigma, cv::BORDER_REFLECT);
         }
+        timings.smooth_seconds = seconds_since(stage_started);
 
+        stage_started = std::chrono::steady_clock::now();
         cv::Mat raw_mask;
         double threshold = cv::threshold(smoothed, raw_mask, 0.0, 255.0, cv::THRESH_BINARY | cv::THRESH_OTSU);
+        timings.threshold_seconds = seconds_since(stage_started);
+        stage_started = std::chrono::steady_clock::now();
         cv::Mat morphed;
         cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
         cv::morphologyEx(raw_mask, morphed, cv::MORPH_OPEN, kernel, cv::Point(-1, -1), 1, cv::BORDER_CONSTANT, cv::Scalar(0));
         cv::morphologyEx(morphed, morphed, cv::MORPH_CLOSE, kernel, cv::Point(-1, -1), 1, cv::BORDER_CONSTANT, cv::Scalar(0));
+        timings.morphology_seconds = seconds_since(stage_started);
 
+        stage_started = std::chrono::steady_clock::now();
         cv::Mat labels;
         cv::Mat stats;
         cv::Mat centroids;
@@ -155,17 +185,22 @@ int main(int argc, char** argv) {
                 kept.setTo(255, labels == label);
             }
         }
+        timings.filter_seconds = seconds_since(stage_started);
 
+        stage_started = std::chrono::steady_clock::now();
         components = cv::connectedComponentsWithStats(kept, labels, stats, centroids, 4);
+        timings.label_seconds = seconds_since(stage_started);
+        stage_started = std::chrono::steady_clock::now();
         int objects = components - 1;
         long long total_area = 0;
         for (int label = 1; label < components; ++label) {
             total_area += stats.at<int>(label, cv::CC_STAT_AREA);
         }
+        timings.measure_seconds = seconds_since(stage_started);
         double pipeline_seconds = seconds_since(pipeline_started);
 
         write_objects(stats, centroids, config.out / "objects.csv");
-        write_summary(config, objects, total_area, threshold, load_seconds, pipeline_seconds, config.out / "summary.json");
+        write_summary(config, objects, total_area, threshold, load_seconds, pipeline_seconds, timings, config.out / "summary.json");
         std::cout << "objects=" << objects << " threshold=" << threshold << " output=" << config.out << "\n";
         return 0;
     } catch (const std::exception& err) {

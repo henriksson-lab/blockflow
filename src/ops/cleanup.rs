@@ -18,7 +18,7 @@ use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
     BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput, PhaseView,
-    SeamFold, SourceBlocks,
+    SeamFold, SidecarSize, SourceBlocks,
 };
 use crate::op::{Anchor, BlockOp, Chain, Slicing, SourceInput};
 use crate::reach::Reach;
@@ -489,11 +489,10 @@ impl FragmentOp for LabelSizeCountsOp {
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
-        vec![FragmentOutput::new(
-            self.stream.clone(),
-            self.lifecycle,
-            Coverage::EveryBlock,
-        )]
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                .sized(SidecarSize::per_read_voxel(16, 16)),
+        ]
     }
 
     fn seam_fold(&self) -> Option<SeamFold> {

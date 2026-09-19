@@ -219,3 +219,86 @@ cargo build -p blockflow-dask-image-pipeline --release
 examples/dask-image-pipeline/scripts/run_benchmark.sh 2 .tmp/dask-image-pipeline/bench-2-c256 segment 256x256
 examples/dask-image-pipeline/scripts/run_benchmark.sh 2 .tmp/dask-image-pipeline/bench-2-c512 segment 512x512
 ```
+
+## 3-D Object Measurement Benchmark
+
+The 3-D object measurement comparison lives in
+`examples/object-3d-measurement/`. It uses deterministic labelled 3-D box
+fixtures stored as CSV box specifications. Blockflow measures the label volumes
+with `object_geometry_basic_measurements_u32`; the scikit-image reference
+reconstructs the same label volumes and uses `regionprops`. This benchmark is
+now intentionally a cheap-geometry benchmark: object count, bbox, physical bbox
+extent, and voxel count. Feret-like measurements should be benchmarked as
+separate rows because exact voxel-pair Feret is quadratic and directional Feret
+has different estimate semantics.
+
+Measured on 2026-09-18 on the same Intel Xeon Gold 6138 machine. Compile time is
+not included in the timed rows. Wall time and RSS are from `/usr/bin/time -v`.
+The compute column is Blockflow `measurement_seconds` and scikit-image
+`pipeline_seconds` from each summary JSON. The comparison requires exact
+agreement for shared CSV columns.
+
+| runner | batch | wall time | compute time | max RSS | output |
+|---|---:|---:|---:|---:|---:|
+| Blockflow `object-3d-measurement` u32 basic geometry | 10 images | 0.04 s | 0.0119 s | 2,880 KiB | 40 objects / 29,802 voxels |
+| scikit-image/SciPy `regionprops` basic geometry | 10 images | 0.94 s | 0.4408 s | 70,580 KiB | 40 objects / 29,802 voxels |
+| Blockflow `object-3d-measurement` u32 basic geometry | 50 images | 0.04 s | 0.0309 s | 2,880 KiB | 200 objects / 149,502 voxels |
+| scikit-image/SciPy `regionprops` basic geometry | 50 images | 0.60 s | 0.3141 s | 70,720 KiB | 200 objects / 149,502 voxels |
+
+Reproduction commands:
+
+```sh
+examples/object-3d-measurement/scripts/run_benchmark.sh 10 .tmp/object-3d-measurement/u32-streaming-10
+examples/object-3d-measurement/scripts/run_benchmark.sh 50 .tmp/object-3d-measurement/final-object-geometry-perf-50
+```
+
+## Colocalization Benchmark
+
+The colocalization comparison lives in `examples/colocalization/`. It uses
+deterministic labelled two-channel fixture specifications. Blockflow computes
+the rows with `colocalization_measurements`; the Python reference computes the
+same labelled reductions with NumPy-style loops.
+
+Measured on 2026-09-18 on the same Intel Xeon Gold 6138 machine. Compile time is
+not included in the timed rows. Wall time and RSS are from `/usr/bin/time -v`.
+The comparison requires exact CSV agreement after fixed decimal formatting.
+
+| runner | batch | wall time | max RSS | output |
+|---|---:|---:|---:|---:|
+| Blockflow `colocalization` | 10 images | 0.03 s | 2,880 KiB | 40 objects / 20,508 pixel pairs |
+| NumPy/scikit-image-style reference | 10 images | 0.09 s | 13,440 KiB | 40 objects / 20,508 pixel pairs |
+| Blockflow `colocalization` | 50 images | 0.10 s | 2,880 KiB | 200 objects / 102,906 pixel pairs |
+| NumPy/scikit-image-style reference | 50 images | 0.17 s | 13,760 KiB | 200 objects / 102,906 pixel pairs |
+
+Reproduction commands:
+
+```sh
+examples/colocalization/scripts/run_benchmark.sh 10 .tmp/colocalization/p102-final-10
+examples/colocalization/scripts/run_benchmark.sh 50 .tmp/colocalization/p102-final-50
+```
+
+## Wound Assay Benchmark
+
+The wound assay comparison lives in `examples/wound-assay/`. It uses
+deterministic 8-bit PGM scratch-assay fixtures. Blockflow, scikit-image/imageio
+and OpenCV all apply the same threshold-only open-area/profile measurement.
+
+Measured on 2026-09-18 on the same Intel Xeon Gold 6138 machine. Compile time is
+not included in the timed rows. Wall time and RSS are from `/usr/bin/time -v`.
+The comparison requires exact image-summary and profile CSV agreement.
+
+| runner | batch | wall time | max RSS | output |
+|---|---:|---:|---:|---:|
+| Blockflow `wound-assay` | 10 images | 0.01 s | 2,880 KiB | 29,370 open pixels |
+| scikit-image/imageio reference | 10 images | 0.26 s | 38,080 KiB | 29,370 open pixels |
+| OpenCV reference | 10 images | 0.27 s | 60,160 KiB | 29,370 open pixels |
+| Blockflow `wound-assay` | 50 images | 0.02 s | 2,880 KiB | 148,421 open pixels |
+| scikit-image/imageio reference | 50 images | 0.28 s | 37,760 KiB | 148,421 open pixels |
+| OpenCV reference | 50 images | 0.32 s | 59,440 KiB | 148,421 open pixels |
+
+Reproduction commands:
+
+```sh
+examples/wound-assay/scripts/run_benchmark.sh 10 .tmp/wound-assay/p102-final-10
+examples/wound-assay/scripts/run_benchmark.sh 50 .tmp/wound-assay/p102-final-50
+```

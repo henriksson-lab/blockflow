@@ -1,0 +1,15 @@
+[package]
+name = "blockflow-wound-assay"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+blockflow = { path = "../.." }
+ndarray = "0.17"
+serde_json = "1"
+
+[[bin]]
+name = "wound-assay"
+path = "src/bin/wound_assay.rs"

@@ -10,6 +10,11 @@ members = [
     "examples/opencv-pipeline",
     "examples/skimage-pipeline",
     "examples/dask-image-pipeline",
+    "examples/percent-positive",
+    "examples/foci-per-nucleus",
+    "examples/wound-assay",
+    "examples/colocalization",
+    "examples/object-3d-measurement",
 ]
 
 [package]
@@ -241,6 +246,11 @@ burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"],
 burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["std", "safetensors"], optional = true }
 candle-core = { version = "0.11", optional = true }
 yolov11 = { git = "https://github.com/henriksson-lab/YOLOv11-rs.git", rev = "f22e9fd33189830e723141078087e9f1f34d774c", optional = true }
+# Resolver guard for `burn/{wgpu,cuda}` through `cubecl -> pliron 0.17`.
+# `pliron 0.17.0` declares `pliron-derive = "0"`, so a lock-free CI resolve can
+# pair it with `pliron-derive 0.18`, whose macro expansion targets newer pliron
+# paths. Keep the pair on 0.17 until the Burn/CubeCL stack moves together.
+pliron-derive = { version = "=0.17.0", optional = true }
 
 [features]
 # The progress view: an HTTP surface and the browser page's asset directory.
@@ -306,8 +316,8 @@ cellpose = ["model-segment", "dep:cellpose", "dep:ndarray16"]
 stardist = ["model-segment", "dep:stardist-rs", "dep:burn", "dep:ndarray16"]
 cellpose-cuda = ["cellpose", "cellpose/cuda"]
 stardist-candle-cuda = ["stardist", "dep:candle-core", "stardist-rs/candle-cuda"]
-stardist-cuda = ["stardist", "burn/cuda"]
-yolo = ["zarr", "dep:anyhow", "dep:csv", "dep:image", "dep:burn", "burn/wgpu", "dep:burn-store", "dep:yolov11"]
+stardist-cuda = ["stardist", "burn/cuda", "dep:pliron-derive"]
+yolo = ["zarr", "dep:anyhow", "dep:csv", "dep:image", "dep:burn", "burn/wgpu", "dep:burn-store", "dep:yolov11", "dep:pliron-derive"]
 yolo-cuda = ["yolo", "burn/cuda", "yolov11/cuda"]
 # The distribution **server** and the three binaries. Deliberately narrow: the
 # protocol, the coordinator's whole state machine, the handout policy, the cache

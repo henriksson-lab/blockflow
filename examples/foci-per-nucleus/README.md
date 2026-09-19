@@ -1,0 +1,40 @@
+# Foci Per Nucleus Example
+
+This example counts bright puncta/foci inside segmented nuclei. It is a
+benchmark-oriented workflow example, not a new library API: the point is to see
+whether containment and child-count glue remains readable at the example layer.
+
+## Build
+
+From the workspace root:
+
+```sh
+cargo build -p blockflow-foci-per-nucleus --release
+```
+
+## Run
+
+Run the Blockflow side:
+
+```sh
+examples/foci-per-nucleus/scripts/run_blockflow.sh \
+  .tmp/foci-per-nucleus/blockflow \
+  10
+```
+
+Run the Python reference:
+
+```sh
+examples/foci-per-nucleus/scripts/run_reference.sh \
+  .tmp/foci-per-nucleus/reference \
+  10
+```
+
+Run both and compare:
+
+```sh
+examples/foci-per-nucleus/scripts/run_benchmark.sh 10
+examples/foci-per-nucleus/scripts/run_benchmark.sh 50
+```
+
+Generated outputs live under `.tmp/foci-per-nucleus/`.

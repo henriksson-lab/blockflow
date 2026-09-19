@@ -225,6 +225,9 @@ pub fn dilate_placed_into_at(
 ) -> Result<()> {
     let what = "dilate_placed_into";
     let extent = preflight(input.shape(), at, element, out.shape(), what)?;
+    if try_binary_box3x3_fast(input, element, out.view_mut(), BinaryBox3x3::DilatePlaced)? {
+        return Ok(());
+    }
     // A scatter accumulates, so the destination starts empty. A gather writes
     // every voxel it visits and needs no such statement — the one asymmetry
     // between the two loops, and it is here rather than left to the caller.
@@ -704,6 +707,14 @@ fn sweep(
     what: &str,
 ) -> Result<()> {
     let extent = preflight(input.shape(), at, element, out.shape(), what)?;
+    let kind = if hit {
+        BinaryBox3x3::DilateGather
+    } else {
+        BinaryBox3x3::ErodeGather
+    };
+    if try_binary_box3x3_fast(input, element, out.view_mut(), kind)? {
+        return Ok(());
+    }
     // The element's offsets at one voxel, for the one element that has more than
     // one set of them. Owned out here so that a voxel pays no allocation, and
     // untouched by every other element.
@@ -748,6 +759,187 @@ fn sweep(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryBox3x3 {
+    ErodeGather,
+    DilateGather,
+    DilatePlaced,
+}
+
+fn try_binary_box3x3_fast(
+    input: ArrayView3<'_, bool>,
+    element: &StructuringElement,
+    mut out: ArrayViewMut3<'_, bool>,
+    kind: BinaryBox3x3,
+) -> Result<bool> {
+    if !is_centered_2d_box3x3(element) {
+        return Ok(false);
+    }
+    let Some(input) = input.as_slice_memory_order() else {
+        return Ok(false);
+    };
+    let shape = out.shape();
+    let [depth, height, width] = [shape[0], shape[1], shape[2]];
+    let Some(out) = out.as_slice_memory_order_mut() else {
+        return Ok(false);
+    };
+    match kind {
+        BinaryBox3x3::ErodeGather => erode_box3x3_slice(input, out, depth, height, width),
+        BinaryBox3x3::DilateGather | BinaryBox3x3::DilatePlaced => {
+            // For a centred symmetric 3x3 box, gather and placed dilation are
+            // the same operation. Other elements stay on the generic paths.
+            dilate_box3x3_slice(input, out, depth, height, width)
+        }
+    }
+    Ok(true)
+}
+
+fn is_centered_2d_box3x3(element: &StructuringElement) -> bool {
+    element.shape() == Some(super::element::ElementShape::Box)
+        && element.origin() == StepOrigin::Anchor
+        && element.step() == [1, 1, 1]
+        && element.sides(0) == (0, 0)
+        && element.sides(1) == (1, 1)
+        && element.sides(2) == (1, 1)
+}
+
+fn erode_box3x3_slice(input: &[bool], out: &mut [bool], depth: usize, height: usize, width: usize) {
+    if height == 0 || width == 0 {
+        return;
+    }
+    let plane = height * width;
+    for z in 0..depth {
+        let z0 = z * plane;
+        if height >= 3 && width >= 3 {
+            for y in 1..height - 1 {
+                let row = z0 + y * width;
+                let above = row - width;
+                let below = row + width;
+                for x in 1..width - 1 {
+                    let at = row + x;
+                    out[at] = input[above + x - 1]
+                        && input[above + x]
+                        && input[above + x + 1]
+                        && input[at - 1]
+                        && input[at]
+                        && input[at + 1]
+                        && input[below + x - 1]
+                        && input[below + x]
+                        && input[below + x + 1];
+                }
+            }
+        }
+        for y in 0..height {
+            out[z0 + y * width] = erode_box3x3_at(input, z0, height, width, y, 0);
+            if width > 1 {
+                out[z0 + y * width + width - 1] =
+                    erode_box3x3_at(input, z0, height, width, y, width - 1);
+            }
+        }
+        if width > 2 && height > 1 {
+            for x in 1..width - 1 {
+                out[z0 + x] = erode_box3x3_at(input, z0, height, width, 0, x);
+                out[z0 + (height - 1) * width + x] =
+                    erode_box3x3_at(input, z0, height, width, height - 1, x);
+            }
+        }
+    }
+}
+
+fn erode_box3x3_at(
+    input: &[bool],
+    z0: usize,
+    height: usize,
+    width: usize,
+    y: usize,
+    x: usize,
+) -> bool {
+    let y0 = y.saturating_sub(1);
+    let y1 = (y + 1).min(height - 1);
+    let x0 = x.saturating_sub(1);
+    let x1 = (x + 1).min(width - 1);
+    for yy in y0..=y1 {
+        for xx in x0..=x1 {
+            if !input[z0 + yy * width + xx] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn dilate_box3x3_slice(
+    input: &[bool],
+    out: &mut [bool],
+    depth: usize,
+    height: usize,
+    width: usize,
+) {
+    if height == 0 || width == 0 {
+        return;
+    }
+    out.fill(false);
+    let plane = height * width;
+    for z in 0..depth {
+        let z0 = z * plane;
+        if height >= 3 && width >= 3 {
+            for y in 1..height - 1 {
+                let row = z0 + y * width;
+                let above = row - width;
+                let below = row + width;
+                for x in 1..width - 1 {
+                    let at = row + x;
+                    out[at] = input[above + x - 1]
+                        || input[above + x]
+                        || input[above + x + 1]
+                        || input[at - 1]
+                        || input[at]
+                        || input[at + 1]
+                        || input[below + x - 1]
+                        || input[below + x]
+                        || input[below + x + 1];
+                }
+            }
+        }
+        for y in 0..height {
+            out[z0 + y * width] = dilate_box3x3_at(input, z0, height, width, y, 0);
+            if width > 1 {
+                out[z0 + y * width + width - 1] =
+                    dilate_box3x3_at(input, z0, height, width, y, width - 1);
+            }
+        }
+        if width > 2 && height > 1 {
+            for x in 1..width - 1 {
+                out[z0 + x] = dilate_box3x3_at(input, z0, height, width, 0, x);
+                out[z0 + (height - 1) * width + x] =
+                    dilate_box3x3_at(input, z0, height, width, height - 1, x);
+            }
+        }
+    }
+}
+
+fn dilate_box3x3_at(
+    input: &[bool],
+    z0: usize,
+    height: usize,
+    width: usize,
+    y: usize,
+    x: usize,
+) -> bool {
+    let y0 = y.saturating_sub(1);
+    let y1 = (y + 1).min(height - 1);
+    let x0 = x.saturating_sub(1);
+    let x1 = (x + 1).min(width - 1);
+    for yy in y0..=y1 {
+        for xx in x0..=x1 {
+            if input[z0 + yy * width + xx] {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1481,6 +1673,35 @@ mod tests {
         let mut dilated = Array3::from_elem(input.raw_dim(), true);
         dilate_into(input.view(), &element, dilated.view_mut()).unwrap();
         assert!(dilated.iter().all(|&value| !value));
+    }
+
+    #[test]
+    fn centered_2d_box3_fast_path_matches_generic_offsets() {
+        let box3 = StructuringElement::from_radius(ElementShape::Box, [0, 1, 1]);
+        let offsets: Vec<[isize; 3]> = (-1..=1)
+            .flat_map(|y| (-1..=1).map(move |x| [0, y, x]))
+            .collect();
+        let generic = StructuringElement::from_offsets(offsets).unwrap();
+
+        for shape in [(1, 1, 1), (1, 2, 2), (2, 4, 5)] {
+            let input = Array3::from_shape_fn(shape, |(z, y, x)| {
+                (z * 19 + y * 11 + x * 5) % 7 < 3 || (y == 0 && x + z > 0)
+            });
+            for kind in [
+                Morphology::Erode,
+                Morphology::Dilate,
+                Morphology::Open,
+                Morphology::Close,
+            ] {
+                let mut fast = Array3::from_elem(input.raw_dim(), false);
+                kind.apply_into(input.view(), &box3, fast.view_mut())
+                    .unwrap();
+                let mut plain = Array3::from_elem(input.raw_dim(), false);
+                kind.apply_into(input.view(), &generic, plain.view_mut())
+                    .unwrap();
+                assert_eq!(fast, plain, "{kind:?} {shape:?}");
+            }
+        }
     }
 
     #[test]

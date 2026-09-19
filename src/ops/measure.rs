@@ -2010,6 +2010,17 @@ struct ObjectGeometryRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+struct ObjectGeometryBasicRequest {
+    spacing: PhysicalSpacing,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ObjectDirectionalFeretRequest {
+    spacing: PhysicalSpacing,
+    directions: DirectionSet3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ObjectConvexHullRequest {
     spacing: PhysicalSpacing,
 }
@@ -2865,6 +2876,8 @@ struct ActiveMeasurementInputs<'a> {
     expansion_relationships: Option<ExpansionRelationshipRequest>,
     moment3d: Option<ObjectMoment3dRequest>,
     geometry: Option<ObjectGeometryRequest>,
+    geometry_basic: Option<ObjectGeometryBasicRequest>,
+    directional_feret: Option<ObjectDirectionalFeretRequest>,
     convex_hull: Option<ObjectConvexHullRequest>,
     voxel_face_convex_hull: Option<ObjectVoxelFaceConvexHullRequest>,
     enclosing_sphere: Option<EnclosingSphereRequest>,
@@ -2905,6 +2918,8 @@ impl ActiveMeasurementInputs<'_> {
             || self.expansion_relationships.is_some()
             || self.moment3d.is_some()
             || self.geometry.is_some()
+            || self.geometry_basic.is_some()
+            || self.directional_feret.is_some()
             || self.convex_hull.is_some()
             || self.voxel_face_convex_hull.is_some()
             || self.enclosing_sphere.is_some()
@@ -3107,6 +3122,8 @@ pub struct Measurements {
     expansion_relationships: Option<ExpansionRelationshipRequest>,
     moment3d: Option<ObjectMoment3dRequest>,
     geometry: Option<ObjectGeometryRequest>,
+    geometry_basic: Option<ObjectGeometryBasicRequest>,
+    directional_feret: Option<ObjectDirectionalFeretRequest>,
     convex_hull: Option<ObjectConvexHullRequest>,
     voxel_face_convex_hull: Option<ObjectVoxelFaceConvexHullRequest>,
     enclosing_sphere: Option<EnclosingSphereRequest>,
@@ -3226,6 +3243,8 @@ impl Measurements {
             expansion_relationships: None,
             moment3d: None,
             geometry: None,
+            geometry_basic: None,
+            directional_feret: None,
             convex_hull: None,
             voxel_face_convex_hull: None,
             enclosing_sphere: None,
@@ -3527,6 +3546,23 @@ impl Measurements {
         self
     }
 
+    pub fn object_geometry_basic(mut self, spacing: PhysicalSpacing) -> Self {
+        self.geometry_basic = Some(ObjectGeometryBasicRequest { spacing });
+        self
+    }
+
+    pub fn object_directional_feret(
+        mut self,
+        spacing: PhysicalSpacing,
+        directions: DirectionSet3,
+    ) -> Self {
+        self.directional_feret = Some(ObjectDirectionalFeretRequest {
+            spacing,
+            directions,
+        });
+        self
+    }
+
     pub fn object_convex_hull(mut self, spacing: PhysicalSpacing) -> Self {
         self.convex_hull = Some(ObjectConvexHullRequest { spacing });
         self
@@ -3793,6 +3829,10 @@ impl Measurements {
         let expansion_relationship_request = self.expansion_relationships;
         let moment3d_request = self.moment3d;
         let geometry_request = self.geometry;
+        let geometry_basic_request = self.geometry_basic;
+        let directional_feret_request = self.directional_feret;
+        let fuse_basic_with_directional =
+            geometry_basic_request.is_some() && directional_feret_request.is_some();
         let convex_hull_request = self.convex_hull;
         let voxel_face_convex_hull_request = self.voxel_face_convex_hull;
         let enclosing_sphere_request = self.enclosing_sphere;
@@ -3826,6 +3866,8 @@ impl Measurements {
             expansion_relationships: expansion_relationship_request,
             moment3d: moment3d_request,
             geometry: geometry_request,
+            geometry_basic: geometry_basic_request,
+            directional_feret: directional_feret_request.clone(),
             convex_hull: convex_hull_request,
             voxel_face_convex_hull: voxel_face_convex_hull_request,
             enclosing_sphere: enclosing_sphere_request,
@@ -4389,6 +4431,8 @@ impl Measurements {
         let mut centroid_neighbors = None;
         let mut moment3d = None;
         let mut geometry = None;
+        let mut geometry_basic = None;
+        let mut directional_feret = None;
         let mut convex_hull = None;
         let mut voxel_face_convex_hull = None;
         let mut enclosing_sphere = None;
@@ -4842,6 +4886,110 @@ impl Measurements {
                 },
             )?);
         }
+        if !fuse_basic_with_directional {
+            if let Some(request) = geometry_basic_request {
+                let partials = ObjectGeometryBasicPartialStream::new(format!(
+                    "{rows}.object.geometry_basic.tallies"
+                ))?;
+                let stream =
+                    ObjectGeometryBasicOutputStream::new(format!("{rows}.object.geometry_basic"))?;
+                let stream_name = stream.as_str().to_string();
+                let mut tally = ObjectGeometryBasicTallyOp::new(
+                    "measure basic object geometry tallies",
+                    labels.id(),
+                    partial_stream_name(&partials),
+                    Lifecycle::DeleteOnExit,
+                )?;
+                tally.labels = labels.typed_source();
+                geometry_basic = Some(ObjectGeometryBasicExecutionPlan::Standalone(
+                    append_two_phase_measurement_with_meta(
+                        &mut decomposition,
+                        &grid,
+                        stream,
+                        request.spacing,
+                        tally,
+                        |partial_phase| {
+                            MergeObjectGeometryBasicOp::new(
+                                "merge basic object geometry",
+                                partial_stream_name(&partials),
+                                partial_phase,
+                                grid.blocks_per_axis(),
+                                request.spacing,
+                                stream_name,
+                                self.lifecycle,
+                            )
+                        },
+                    )?,
+                ));
+            }
+        }
+        if let Some(request) = directional_feret_request {
+            let partials = ObjectDirectionalFeretPartialStream::new(format!(
+                "{rows}.object.directional_feret.tallies"
+            ))?;
+            let stream = ObjectDirectionalFeretOutputStream::new(format!(
+                "{rows}.object.directional_feret"
+            ))?;
+            let stream_name = stream.as_str().to_string();
+            let mut tally = ObjectDirectionalFeretTallyOp::new(
+                "measure directional object Feret tallies",
+                labels.id(),
+                request.spacing,
+                request.directions.clone(),
+                partial_stream_name(&partials),
+                Lifecycle::DeleteOnExit,
+            )?;
+            tally.labels = labels.typed_source();
+            let directions = request.directions.clone();
+            directional_feret = Some(append_two_phase_measurement_with_meta(
+                &mut decomposition,
+                &grid,
+                stream,
+                directions,
+                tally,
+                |partial_phase| {
+                    MergeObjectDirectionalFeretOp::new(
+                        "merge directional object Feret",
+                        partial_stream_name(&partials),
+                        partial_phase,
+                        grid.blocks_per_axis(),
+                        request.spacing,
+                        request.directions.clone(),
+                        stream_name,
+                        self.lifecycle,
+                    )
+                },
+            )?);
+            if let Some(basic_request) = geometry_basic_request {
+                let basic_stream =
+                    ObjectGeometryBasicOutputStream::new(format!("{rows}.object.geometry_basic"))?;
+                let basic_stream_name = basic_stream.as_str().to_string();
+                let partial_phase = directional_feret
+                    .as_ref()
+                    .expect("directional Feret plan was just created")
+                    .pair
+                    .phases
+                    .tally();
+                let basic_merge = MergeObjectGeometryBasicOp::new_from_directional_feret(
+                    "merge basic object geometry from directional Feret tallies",
+                    partial_stream_name(&partials),
+                    partial_phase,
+                    grid.blocks_per_axis(),
+                    basic_request.spacing,
+                    request.directions.len(),
+                    basic_stream_name,
+                    self.lifecycle,
+                )?;
+                let basic_merge_phase =
+                    push_measurement_fragment_phase(&mut decomposition, &grid, &basic_merge)?;
+                geometry_basic = Some(ObjectGeometryBasicExecutionPlan::FromDirectionalFeret {
+                    output: basic_stream,
+                    meta: basic_request.spacing,
+                    merge_phase: basic_merge_phase,
+                    merge: basic_merge,
+                });
+            }
+        }
         if let Some(request) = convex_hull_request {
             let partials =
                 ObjectPointPartialStream::new(format!("{rows}.object.convex_hull.points"))?;
@@ -5239,6 +5387,8 @@ impl Measurements {
             expansion_relationships,
             moment3d,
             geometry,
+            geometry_basic,
+            directional_feret,
             convex_hull,
             voxel_face_convex_hull,
             enclosing_sphere,
@@ -5529,6 +5679,14 @@ pub struct ObjectMoment3dRows;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectGeometryRows;
 
+/// Marker for cheap object geometry measurement rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectGeometryBasicRows;
+
+/// Marker for directional Feret estimate measurement rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectDirectionalFeretRows;
+
 /// Marker for object convex-hull measurement rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectConvexHullRows;
@@ -5602,6 +5760,8 @@ pub struct MeasurementPlan {
     expansion_relationships: Option<ExpansionRelationshipPlan>,
     moment3d: Option<ObjectMoment3dPlan>,
     geometry: Option<ObjectGeometryPlan>,
+    geometry_basic: Option<ObjectGeometryBasicExecutionPlan>,
+    directional_feret: Option<ObjectDirectionalFeretPlan>,
     convex_hull: Option<ConvexHullPlan>,
     voxel_face_convex_hull: Option<VoxelFaceConvexHullPlan>,
     enclosing_sphere: Option<EnclosingSpherePlan>,
@@ -5704,6 +5864,22 @@ impl MeasurementPlan {
         }
         if let Some(geometry) = &self.geometry {
             work.extend(geometry.phase_work());
+        }
+        match (&self.geometry_basic, &self.directional_feret) {
+            (
+                Some(geometry @ ObjectGeometryBasicExecutionPlan::FromDirectionalFeret { .. }),
+                Some(feret),
+            ) => {
+                work.extend(feret.phase_work());
+                work.extend(geometry.phase_work());
+            }
+            (Some(geometry), Some(feret)) => {
+                work.extend(geometry.phase_work());
+                work.extend(feret.phase_work());
+            }
+            (Some(geometry), None) => work.extend(geometry.phase_work()),
+            (None, Some(feret)) => work.extend(feret.phase_work()),
+            (None, None) => {}
         }
         if let Some(convex_hull) = &self.convex_hull {
             work.extend(convex_hull.phase_work());
@@ -6495,6 +6671,70 @@ impl MeasurementPlan {
         self.geometry.as_ref().map(|geometry| geometry.meta)
     }
 
+    pub fn object_geometry_basic_stream(&self) -> Option<&str> {
+        self.geometry_basic
+            .as_ref()
+            .map(|geometry| geometry.output_stream())
+    }
+
+    pub fn object_geometry_basic_rows_phase(&self) -> Option<usize> {
+        self.geometry_basic
+            .as_ref()
+            .map(|geometry| geometry.rows_phase())
+    }
+
+    pub fn object_geometry_basic_rows(&self) -> Option<MeasurementRows<ObjectGeometryBasicRows>> {
+        self.geometry_basic
+            .as_ref()
+            .map(|geometry| geometry.rows_handle())
+    }
+
+    pub fn object_geometry_basic_rows_with_contract(
+        &self,
+    ) -> Option<MeasurementRowsWithContract<ObjectGeometryBasicRows, PhysicalSpacing>> {
+        self.geometry_basic
+            .as_ref()
+            .map(|geometry| geometry.rows_with_contract())
+    }
+
+    pub fn object_geometry_basic_spacing(&self) -> Option<PhysicalSpacing> {
+        self.geometry_basic.as_ref().map(|geometry| geometry.meta())
+    }
+
+    pub fn object_directional_feret_stream(&self) -> Option<&str> {
+        self.directional_feret
+            .as_ref()
+            .map(|feret| feret.output.as_str())
+    }
+
+    pub fn object_directional_feret_rows_phase(&self) -> Option<usize> {
+        self.directional_feret
+            .as_ref()
+            .map(|feret| feret.rows_phase())
+    }
+
+    pub fn object_directional_feret_rows(
+        &self,
+    ) -> Option<MeasurementRows<ObjectDirectionalFeretRows>> {
+        self.directional_feret
+            .as_ref()
+            .map(|feret| feret.rows_handle())
+    }
+
+    pub fn object_directional_feret_rows_with_contract(
+        &self,
+    ) -> Option<MeasurementRowsWithContract<ObjectDirectionalFeretRows, DirectionSet3>> {
+        self.directional_feret
+            .as_ref()
+            .map(|feret| feret.rows_with_contract())
+    }
+
+    pub fn object_directional_feret_directions(&self) -> Option<DirectionSet3> {
+        self.directional_feret
+            .as_ref()
+            .map(|feret| feret.meta.clone())
+    }
+
     pub fn object_convex_hull_stream(&self) -> Option<&str> {
         self.convex_hull
             .as_ref()
@@ -6920,6 +7160,10 @@ impl OrderedPhasePair {
 
     fn merge(self) -> usize {
         self.merge
+    }
+
+    fn tally(self) -> usize {
+        self.tally
     }
 }
 
@@ -7458,6 +7702,76 @@ type ObjectGeometryPlan = TwoPhaseMeasurementPlan<
     LabelPointPartialLayout,
     PhysicalSpacing,
 >;
+type ObjectGeometryBasicPlan = TwoPhaseMeasurementPlan<
+    ObjectGeometryBasicOutputStream,
+    ObjectGeometryBasicTallyOp,
+    MergeObjectGeometryBasicOp,
+    ObjectGeometryBasicPartialLayout,
+    PhysicalSpacing,
+>;
+enum ObjectGeometryBasicExecutionPlan {
+    Standalone(ObjectGeometryBasicPlan),
+    FromDirectionalFeret {
+        output: ObjectGeometryBasicOutputStream,
+        meta: PhysicalSpacing,
+        merge_phase: usize,
+        merge: MergeObjectGeometryBasicOp,
+    },
+}
+
+impl ObjectGeometryBasicExecutionPlan {
+    fn rows_phase(&self) -> usize {
+        match self {
+            Self::Standalone(plan) => plan.rows_phase(),
+            Self::FromDirectionalFeret { merge_phase, .. } => *merge_phase,
+        }
+    }
+
+    fn output_stream(&self) -> &str {
+        match self {
+            Self::Standalone(plan) => plan.output.as_str(),
+            Self::FromDirectionalFeret { output, .. } => output.as_str(),
+        }
+    }
+
+    fn phase_work(&self) -> Vec<PhaseWork<'_>> {
+        match self {
+            Self::Standalone(plan) => plan.phase_work().into_iter().collect(),
+            Self::FromDirectionalFeret { merge, .. } => vec![PhaseWork::Fragments(merge)],
+        }
+    }
+
+    fn rows_with_contract<K>(&self) -> MeasurementRowsWithContract<K, PhysicalSpacing> {
+        MeasurementRowsWithContract::new(self.rows_handle(), self.meta())
+    }
+
+    fn meta(&self) -> PhysicalSpacing {
+        match self {
+            Self::Standalone(plan) => plan.meta,
+            Self::FromDirectionalFeret { meta, .. } => *meta,
+        }
+    }
+}
+
+impl<K> RowPlan<K> for ObjectGeometryBasicExecutionPlan {
+    fn rows_handle(&self) -> MeasurementRows<K> {
+        match self {
+            Self::Standalone(plan) => plan.rows_handle(),
+            Self::FromDirectionalFeret {
+                output,
+                merge_phase,
+                ..
+            } => measurement_rows(output, *merge_phase),
+        }
+    }
+}
+type ObjectDirectionalFeretPlan = TwoPhaseMeasurementPlan<
+    ObjectDirectionalFeretOutputStream,
+    ObjectDirectionalFeretTallyOp,
+    MergeObjectDirectionalFeretOp,
+    ObjectDirectionalFeretPartialLayout,
+    DirectionSet3,
+>;
 type ConvexHullPlan = TwoPhaseMeasurementPlan<
     ConvexHullOutputStream,
     ObjectPointTallyOp,
@@ -7581,6 +7895,14 @@ partial_stream_type!(
     "measure objects: point partial stream must not be empty"
 );
 partial_stream_type!(
+    ObjectGeometryBasicPartialStream,
+    "measure geometry basic: partial stream must not be empty"
+);
+partial_stream_type!(
+    ObjectDirectionalFeretPartialStream,
+    "measure directional Feret: partial stream must not be empty"
+);
+partial_stream_type!(
     WeightedHuSamplePartialStream,
     "measure weighted Hu moments: sample partial stream must not be empty"
 );
@@ -7672,6 +7994,14 @@ row_stream_type!(
 row_stream_type!(
     ObjectGeometryOutputStream,
     "measure geometry: output stream must not be empty"
+);
+row_stream_type!(
+    ObjectGeometryBasicOutputStream,
+    "measure geometry basic: output stream must not be empty"
+);
+row_stream_type!(
+    ObjectDirectionalFeretOutputStream,
+    "measure directional Feret: output stream must not be empty"
 );
 row_stream_type!(
     ConvexHullOutputStream,
@@ -10133,6 +10463,350 @@ pub struct ObjectGeometryMeasurements {
     pub max_voxel_feret_diameter: f64,
 }
 
+/// Cheap object geometry rows that do not compute any Feret-like diameter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectGeometryBasicMeasurements {
+    pub label: u64,
+    pub count: u64,
+    pub bbox_min: [usize; 3],
+    pub bbox_max: [usize; 3],
+    pub physical_bbox_extent: [f64; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObjectGeometryBasicTally {
+    label: u64,
+    count: u64,
+    bbox_min: [usize; 3],
+    bbox_max: [usize; 3],
+}
+
+impl ObjectGeometryBasicTally {
+    fn new(label: u64, at: [usize; 3]) -> Result<Self> {
+        Ok(Self {
+            label,
+            count: 1,
+            bbox_min: at,
+            bbox_max: exclusive_bbox_max(at, "measure geometry basic: bbox_max")?,
+        })
+    }
+
+    fn add(&mut self, at: [usize; 3]) -> Result<()> {
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid("measure geometry basic: count overflowed"))?;
+        let max = exclusive_bbox_max(at, "measure geometry basic: bbox_max")?;
+        for axis in 0..3 {
+            self.bbox_min[axis] = self.bbox_min[axis].min(at[axis]);
+            self.bbox_max[axis] = self.bbox_max[axis].max(max[axis]);
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: Self) -> Result<()> {
+        if self.label != other.label {
+            return Err(Error::invalid(format!(
+                "measure geometry basic: cannot merge label {} into label {}",
+                other.label, self.label
+            )));
+        }
+        self.count = self
+            .count
+            .checked_add(other.count)
+            .ok_or_else(|| Error::invalid("measure geometry basic: count overflowed"))?;
+        for axis in 0..3 {
+            self.bbox_min[axis] = self.bbox_min[axis].min(other.bbox_min[axis]);
+            self.bbox_max[axis] = self.bbox_max[axis].max(other.bbox_max[axis]);
+        }
+        Ok(())
+    }
+
+    fn is_owned_by(&self, grid: &BlockGrid, block: [usize; 3]) -> bool {
+        self.count != 0 && owner_of(grid, self.bbox_min) == block
+    }
+
+    fn into_measurements(self, spacing: PhysicalSpacing) -> ObjectGeometryBasicMeasurements {
+        ObjectGeometryBasicMeasurements {
+            label: self.label,
+            count: self.count,
+            bbox_min: self.bbox_min,
+            bbox_max: self.bbox_max,
+            physical_bbox_extent: physical_bbox_extent(self.bbox_min, self.bbox_max, spacing),
+        }
+    }
+}
+
+trait BasicGeometryLabel: Copy {
+    fn to_basic_geometry_label(self, at: [usize; 3]) -> Result<u64>;
+}
+
+impl BasicGeometryLabel for f64 {
+    fn to_basic_geometry_label(self, at: [usize; 3]) -> Result<u64> {
+        label_value(self, at)
+    }
+}
+
+impl BasicGeometryLabel for u32 {
+    fn to_basic_geometry_label(self, _at: [usize; 3]) -> Result<u64> {
+        Ok(u64::from(self))
+    }
+}
+
+/// Direction set used by [`object_directional_feret_measurements`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectionSet3 {
+    directions: Vec<[f64; 3]>,
+}
+
+impl DirectionSet3 {
+    /// The three coordinate axes.
+    pub fn axes() -> Self {
+        Self {
+            directions: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        }
+    }
+
+    /// A deterministic low-cost spherical direction set.
+    pub fn icosahedral() -> Self {
+        let phi = (1.0 + 5.0_f64.sqrt()) * 0.5;
+        let raw = [
+            [0.0, 1.0, phi],
+            [0.0, -1.0, phi],
+            [0.0, 1.0, -phi],
+            [0.0, -1.0, -phi],
+            [1.0, phi, 0.0],
+            [-1.0, phi, 0.0],
+            [1.0, -phi, 0.0],
+            [-1.0, -phi, 0.0],
+            [phi, 0.0, 1.0],
+            [phi, 0.0, -1.0],
+            [-phi, 0.0, 1.0],
+            [-phi, 0.0, -1.0],
+        ];
+        Self {
+            directions: raw.into_iter().map(normalize_direction3).collect(),
+        }
+    }
+
+    /// A tunable deterministic Fibonacci-sphere direction set.
+    pub fn fibonacci(count: usize) -> Result<Self> {
+        if count == 0 {
+            return Err(Error::invalid(
+                "measure directional Feret: direction count must be greater than zero",
+            ));
+        }
+        let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+        let mut directions = Vec::with_capacity(count);
+        for index in 0..count {
+            let z = 1.0 - (2.0 * (index as f64 + 0.5) / count as f64);
+            let radius = (1.0 - z * z).max(0.0).sqrt();
+            let theta = index as f64 * golden_angle;
+            directions.push([z, radius * theta.sin(), radius * theta.cos()]);
+        }
+        Ok(Self { directions })
+    }
+
+    pub fn new(directions: impl Into<Vec<[f64; 3]>>) -> Result<Self> {
+        let directions = directions.into();
+        if directions.is_empty() {
+            return Err(Error::invalid(
+                "measure directional Feret: direction set must not be empty",
+            ));
+        }
+        let mut normalized = Vec::with_capacity(directions.len());
+        for direction in directions {
+            let norm = direction
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+            if !norm.is_finite() || norm <= 0.0 {
+                return Err(Error::invalid(format!(
+                    "measure directional Feret: direction {direction:?} must be finite and non-zero"
+                )));
+            }
+            normalized.push([
+                direction[0] / norm,
+                direction[1] / norm,
+                direction[2] / norm,
+            ]);
+        }
+        Ok(Self {
+            directions: normalized,
+        })
+    }
+
+    pub fn directions(&self) -> &[[f64; 3]] {
+        &self.directions
+    }
+
+    pub fn len(&self) -> usize {
+        self.directions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.directions.is_empty()
+    }
+}
+
+/// Directional support-width Feret estimate for one object.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectDirectionalFeretMeasurements {
+    pub label: u64,
+    pub count: u64,
+    pub directions: usize,
+    pub max_directional_feret_diameter: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ObjectDirectionalFeretTally {
+    label: u64,
+    count: u64,
+    bbox_min: [usize; 3],
+    bbox_max: [usize; 3],
+    min_dot: Vec<f64>,
+    max_dot: Vec<f64>,
+}
+
+impl ObjectDirectionalFeretTally {
+    fn new(
+        label: u64,
+        at: [usize; 3],
+        point: [f64; 3],
+        directions: &DirectionSet3,
+    ) -> Result<Self> {
+        let dots = directional_dots(point, directions);
+        Ok(Self {
+            label,
+            count: 1,
+            bbox_min: at,
+            bbox_max: exclusive_bbox_max(at, "measure directional Feret: bbox_max")?,
+            min_dot: dots.clone(),
+            max_dot: dots,
+        })
+    }
+
+    fn add(&mut self, at: [usize; 3], point: [f64; 3], directions: &DirectionSet3) -> Result<()> {
+        if self.min_dot.len() != directions.len() || self.max_dot.len() != directions.len() {
+            return Err(Error::invalid(format!(
+                "measure directional Feret: tally for label {} has wrong direction count",
+                self.label
+            )));
+        }
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid("measure directional Feret: count overflowed"))?;
+        let max = exclusive_bbox_max(at, "measure directional Feret: bbox_max")?;
+        for axis in 0..3 {
+            self.bbox_min[axis] = self.bbox_min[axis].min(at[axis]);
+            self.bbox_max[axis] = self.bbox_max[axis].max(max[axis]);
+        }
+        for (index, dot) in directional_dots(point, directions).into_iter().enumerate() {
+            self.min_dot[index] = self.min_dot[index].min(dot);
+            self.max_dot[index] = self.max_dot[index].max(dot);
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: Self) -> Result<()> {
+        if self.label != other.label {
+            return Err(Error::invalid(format!(
+                "measure directional Feret: cannot merge label {} into label {}",
+                other.label, self.label
+            )));
+        }
+        if self.min_dot.len() != other.min_dot.len() || self.max_dot.len() != other.max_dot.len() {
+            return Err(Error::invalid(format!(
+                "measure directional Feret: incompatible direction count for label {}",
+                self.label
+            )));
+        }
+        self.count = self
+            .count
+            .checked_add(other.count)
+            .ok_or_else(|| Error::invalid("measure directional Feret: count overflowed"))?;
+        for axis in 0..3 {
+            self.bbox_min[axis] = self.bbox_min[axis].min(other.bbox_min[axis]);
+            self.bbox_max[axis] = self.bbox_max[axis].max(other.bbox_max[axis]);
+        }
+        for index in 0..self.min_dot.len() {
+            self.min_dot[index] = self.min_dot[index].min(other.min_dot[index]);
+            self.max_dot[index] = self.max_dot[index].max(other.max_dot[index]);
+        }
+        Ok(())
+    }
+
+    fn is_owned_by(&self, grid: &BlockGrid, block: [usize; 3]) -> bool {
+        self.count != 0 && owner_of(grid, self.bbox_min) == block
+    }
+
+    fn max_directional_feret_diameter(&self) -> f64 {
+        self.min_dot
+            .iter()
+            .zip(&self.max_dot)
+            .map(|(&min, &max)| max - min)
+            .fold(0.0, f64::max)
+    }
+
+    fn into_measurements(&self) -> ObjectDirectionalFeretMeasurements {
+        ObjectDirectionalFeretMeasurements {
+            label: self.label,
+            count: self.count,
+            directions: self.min_dot.len(),
+            max_directional_feret_diameter: self.max_directional_feret_diameter(),
+        }
+    }
+}
+
+fn normalize_direction3(direction: [f64; 3]) -> [f64; 3] {
+    let norm = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    [
+        direction[0] / norm,
+        direction[1] / norm,
+        direction[2] / norm,
+    ]
+}
+
+fn directional_dots(point: [f64; 3], directions: &DirectionSet3) -> Vec<f64> {
+    directions
+        .directions()
+        .iter()
+        .map(|direction| {
+            point[0] * direction[0] + point[1] * direction[1] + point[2] * direction[2]
+        })
+        .collect()
+}
+
+fn exclusive_bbox_max(at: [usize; 3], what: &str) -> Result<[usize; 3]> {
+    Ok([
+        at[0]
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid(format!("{what}: z coordinate overflowed")))?,
+        at[1]
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid(format!("{what}: y coordinate overflowed")))?,
+        at[2]
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid(format!("{what}: x coordinate overflowed")))?,
+    ])
+}
+
+fn physical_bbox_extent(
+    bbox_min: [usize; 3],
+    bbox_max: [usize; 3],
+    spacing: PhysicalSpacing,
+) -> [f64; 3] {
+    PhysicalVoxelFrame3::new(spacing)
+        .bbox_extent(VoxelIndex3::new(bbox_min), VoxelIndex3::new(bbox_max))
+        .axes()
+}
+
 /// Derived scalar that can be read from an object-geometry row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObjectGeometryFeature {
@@ -10371,6 +11045,366 @@ pub fn object_geometry_measurements(
     Ok(out)
 }
 
+/// Compute cheap object geometry without any Feret-like diameter.
+pub fn object_geometry_basic_measurements(
+    labels: ArrayView3<'_, f64>,
+    spacing: PhysicalSpacing,
+) -> Result<Vec<ObjectGeometryBasicMeasurements>> {
+    object_geometry_basic_measurements_streaming(labels, spacing)
+}
+
+/// Compute cheap object geometry from integer segmentation labels.
+pub fn object_geometry_basic_measurements_u32(
+    labels: ArrayView3<'_, u32>,
+    spacing: PhysicalSpacing,
+) -> Result<Vec<ObjectGeometryBasicMeasurements>> {
+    object_geometry_basic_measurements_streaming(labels, spacing)
+}
+
+fn object_geometry_basic_measurements_streaming<T>(
+    labels: ArrayView3<'_, T>,
+    spacing: PhysicalSpacing,
+) -> Result<Vec<ObjectGeometryBasicMeasurements>>
+where
+    T: BasicGeometryLabel,
+{
+    let mut objects = BTreeMap::<u64, ObjectGeometryBasicTally>::new();
+    for ((z, y, x), &raw) in labels.indexed_iter() {
+        let at = [z, y, x];
+        let label = raw.to_basic_geometry_label(at)?;
+        if label == 0 {
+            continue;
+        }
+        match objects.entry(label) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(ObjectGeometryBasicTally::new(label, at)?);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().add(at)?;
+            }
+        }
+    }
+    objects
+        .into_values()
+        .map(|tally| {
+            let row = tally.into_measurements(spacing);
+            validate_object_geometry_basic_row(&row)?;
+            Ok(row)
+        })
+        .collect()
+}
+
+/// Estimate maximum Feret diameter by directional support widths.
+///
+/// This is a lower-bound estimate over the supplied directions, not an exact
+/// all-pairs or convex-hull Feret. It costs `objects x voxels x directions` and
+/// avoids the quadratic pairwise distance in `max_voxel_feret_diameter`.
+pub fn object_directional_feret_measurements(
+    labels: ArrayView3<'_, f64>,
+    spacing: PhysicalSpacing,
+    directions: &DirectionSet3,
+) -> Result<Vec<ObjectDirectionalFeretMeasurements>> {
+    if directions.is_empty() {
+        return Err(Error::invalid(
+            "measure directional Feret: direction set must not be empty",
+        ));
+    }
+    let frame = PhysicalVoxelFrame3::new(spacing);
+    let mut objects = BTreeMap::<u64, ObjectDirectionalFeretTally>::new();
+    for ((z, y, x), raw) in labels.indexed_iter() {
+        let at = [z, y, x];
+        let label = label_value(*raw, at)?;
+        if label == 0 {
+            continue;
+        }
+        let point = frame.voxel_center(VoxelIndex3::new(at)).coords();
+        match objects.entry(label) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(ObjectDirectionalFeretTally::new(
+                    label, at, point, directions,
+                )?);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().add(at, point, directions)?;
+            }
+        }
+    }
+    objects
+        .into_values()
+        .map(|tally| {
+            let row = tally.into_measurements();
+            validate_object_directional_feret_row(&row)?;
+            Ok(row)
+        })
+        .collect()
+}
+
+/// Block-local cheap object-geometry tally partials.
+#[derive(Debug, Clone)]
+pub struct ObjectGeometryBasicTallyOp {
+    name: &'static str,
+    labels: TypedSource,
+    stream: String,
+    lifecycle: Lifecycle,
+}
+
+impl ObjectGeometryBasicTallyOp {
+    pub fn new(
+        name: &'static str,
+        labels: impl Into<ImageId>,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        let stream = ObjectGeometryBasicPartialStream::new(stream)?;
+        Ok(Self {
+            name,
+            labels: TypedSource::new(labels),
+            stream: stream.as_str().to_string(),
+            lifecycle,
+        })
+    }
+
+    pub fn holding(mut self, labels: Dtype) -> Self {
+        self.labels = self.labels.holding(labels);
+        self
+    }
+
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+
+    fn tally_block(
+        &self,
+        labels: &BlockBuf,
+        read: &Region,
+    ) -> Result<BTreeMap<u64, ObjectGeometryBasicTally>> {
+        let mut tallies = BTreeMap::<u64, ObjectGeometryBasicTally>::new();
+        let BlockBuf::Array(labels) = labels else {
+            return Ok(tallies);
+        };
+        expect_extent(
+            || {
+                format!(
+                    "measure geometry basic: the label volume arrived as {:?} for a block read \
+                     extent of {:?}",
+                    labels.shape(),
+                    read.shape3()
+                )
+            },
+            read.shape3(),
+            labels.shape(),
+        )?;
+        let labels = labels.widened();
+        for (index, raw) in labels.indexed_iter() {
+            let at = [
+                read.start[0] + index.0,
+                read.start[1] + index.1,
+                read.start[2] + index.2,
+            ];
+            let label = label_value(*raw, at)?;
+            if label == 0 {
+                continue;
+            }
+            match tallies.entry(label) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(ObjectGeometryBasicTally::new(label, at)?);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().add(at)?;
+                }
+            }
+        }
+        Ok(tallies)
+    }
+}
+
+impl FragmentOp for ObjectGeometryBasicTallyOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        vec![CoreBlockSourceRead::new(self.labels).source_input()]
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            Coverage::EveryBlock,
+        )]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        MeasurementSeamLaw::per_block().seam_fold()
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "measure geometry basic: tally partials read the label source and are applied through \
+             `apply_with`",
+        ))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let tallies = self.tally_block(
+            self.labels
+                .block_at_extent(self.name, "label volume", sources, at.read)?,
+            at.read,
+        )?;
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            ObjectGeometryBasicPartialLayout::encode(&tallies)?,
+        ))
+    }
+}
+
+/// Block-local directional Feret tally partials.
+#[derive(Debug, Clone)]
+pub struct ObjectDirectionalFeretTallyOp {
+    name: &'static str,
+    labels: TypedSource,
+    spacing: PhysicalSpacing,
+    directions: DirectionSet3,
+    stream: String,
+    lifecycle: Lifecycle,
+}
+
+impl ObjectDirectionalFeretTallyOp {
+    pub fn new(
+        name: &'static str,
+        labels: impl Into<ImageId>,
+        spacing: PhysicalSpacing,
+        directions: DirectionSet3,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        if directions.is_empty() {
+            return Err(Error::invalid(
+                "measure directional Feret: direction set must not be empty",
+            ));
+        }
+        let stream = ObjectDirectionalFeretPartialStream::new(stream)?;
+        Ok(Self {
+            name,
+            labels: TypedSource::new(labels),
+            spacing,
+            directions,
+            stream: stream.as_str().to_string(),
+            lifecycle,
+        })
+    }
+
+    pub fn holding(mut self, labels: Dtype) -> Self {
+        self.labels = self.labels.holding(labels);
+        self
+    }
+
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+
+    fn tally_block(
+        &self,
+        labels: &BlockBuf,
+        read: &Region,
+    ) -> Result<BTreeMap<u64, ObjectDirectionalFeretTally>> {
+        let mut tallies = BTreeMap::<u64, ObjectDirectionalFeretTally>::new();
+        let BlockBuf::Array(labels) = labels else {
+            return Ok(tallies);
+        };
+        expect_extent(
+            || {
+                format!(
+                    "measure directional Feret: the label volume arrived as {:?} for a block read \
+                     extent of {:?}",
+                    labels.shape(),
+                    read.shape3()
+                )
+            },
+            read.shape3(),
+            labels.shape(),
+        )?;
+        let labels = labels.widened();
+        let frame = PhysicalVoxelFrame3::new(self.spacing);
+        for (index, raw) in labels.indexed_iter() {
+            let at = [
+                read.start[0] + index.0,
+                read.start[1] + index.1,
+                read.start[2] + index.2,
+            ];
+            let label = label_value(*raw, at)?;
+            if label == 0 {
+                continue;
+            }
+            let point = frame.voxel_center(VoxelIndex3::new(at)).coords();
+            match tallies.entry(label) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(ObjectDirectionalFeretTally::new(
+                        label,
+                        at,
+                        point,
+                        &self.directions,
+                    )?);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().add(at, point, &self.directions)?;
+                }
+            }
+        }
+        Ok(tallies)
+    }
+}
+
+impl FragmentOp for ObjectDirectionalFeretTallyOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        vec![CoreBlockSourceRead::new(self.labels).source_input()]
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![FragmentOutput::new(
+            self.stream.clone(),
+            self.lifecycle,
+            Coverage::EveryBlock,
+        )]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        MeasurementSeamLaw::per_block().seam_fold()
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "measure directional Feret: tally partials read the label source and are applied \
+             through `apply_with`",
+        ))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let tallies = self.tally_block(
+            self.labels
+                .block_at_extent(self.name, "label volume", sources, at.read)?,
+            at.read,
+        )?;
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            ObjectDirectionalFeretPartialLayout::encode(&tallies)?,
+        ))
+    }
+}
+
 /// Block-local labelled point partials for object-local measurements.
 #[derive(Debug, Clone)]
 pub struct ObjectPointTallyOp {
@@ -10514,6 +11548,58 @@ fn fold_object_point_stream_partials(
 ) -> Result<BTreeMap<u64, ObjectPointSet>> {
     let partials = stream_fragment_bytes(at, input)?;
     fold_object_point_partials(partials.iter().map(Vec::as_slice))
+}
+
+fn fold_object_geometry_basic_partials<'a>(
+    partials: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<BTreeMap<u64, ObjectGeometryBasicTally>> {
+    let mut objects = BTreeMap::<u64, ObjectGeometryBasicTally>::new();
+    for bytes in partials {
+        for tally in ObjectGeometryBasicPartialLayout::decode(bytes)? {
+            match objects.get_mut(&tally.label) {
+                Some(object) => object.merge(tally)?,
+                None => {
+                    objects.insert(tally.label, tally);
+                }
+            }
+        }
+    }
+    Ok(objects)
+}
+
+fn fold_object_geometry_basic_stream_partials(
+    at: &BlockView<'_>,
+    input: &str,
+) -> Result<BTreeMap<u64, ObjectGeometryBasicTally>> {
+    let partials = stream_fragment_bytes(at, input)?;
+    fold_object_geometry_basic_partials(partials.iter().map(Vec::as_slice))
+}
+
+fn fold_object_directional_feret_partials<'a>(
+    partials: impl IntoIterator<Item = &'a [u8]>,
+    directions: usize,
+) -> Result<BTreeMap<u64, ObjectDirectionalFeretTally>> {
+    let mut objects = BTreeMap::<u64, ObjectDirectionalFeretTally>::new();
+    for bytes in partials {
+        for tally in ObjectDirectionalFeretPartialLayout::decode(bytes, directions)? {
+            match objects.get_mut(&tally.label) {
+                Some(object) => object.merge(tally)?,
+                None => {
+                    objects.insert(tally.label, tally);
+                }
+            }
+        }
+    }
+    Ok(objects)
+}
+
+fn fold_object_directional_feret_stream_partials(
+    at: &BlockView<'_>,
+    input: &str,
+    directions: usize,
+) -> Result<BTreeMap<u64, ObjectDirectionalFeretTally>> {
+    let partials = stream_fragment_bytes(at, input)?;
+    fold_object_directional_feret_partials(partials.iter().map(Vec::as_slice), directions)
 }
 
 fn fold_boundary_point_partials<'a>(
@@ -11000,6 +12086,253 @@ impl FragmentOp for MergeObjectGeometryOp {
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
         let objects = fold_object_point_stream_partials(at, self.input.stream())?;
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            self.encode_owned(&objects, at.grid, at.index)?,
+        ))
+    }
+}
+
+/// Merge basic object-geometry tally partials into cheap object geometry rows.
+#[derive(Debug, Clone)]
+pub struct MergeObjectGeometryBasicOp {
+    name: &'static str,
+    input: PartialPhaseInput,
+    input_kind: ObjectGeometryBasicMergeInput,
+    spacing: PhysicalSpacing,
+    schema: Arc<Schema>,
+    stream: String,
+    lifecycle: Lifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectGeometryBasicMergeInput {
+    Basic,
+    DirectionalFeret { directions: usize },
+}
+
+impl MergeObjectGeometryBasicOp {
+    pub fn new(
+        name: &'static str,
+        input: impl Into<String>,
+        input_phase: usize,
+        lattice: [usize; 3],
+        spacing: PhysicalSpacing,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        let input = ObjectGeometryBasicPartialStream::new(input)?;
+        let stream = ObjectGeometryBasicOutputStream::new(stream)?;
+        Ok(Self {
+            name,
+            input: PartialPhaseInput::try_new(&input, input_phase, lattice)?,
+            input_kind: ObjectGeometryBasicMergeInput::Basic,
+            spacing,
+            schema: Arc::new(object_geometry_basic_measurement_schema()),
+            stream: stream.as_str().to_string(),
+            lifecycle,
+        })
+    }
+
+    pub fn new_from_directional_feret(
+        name: &'static str,
+        input: impl Into<String>,
+        input_phase: usize,
+        lattice: [usize; 3],
+        spacing: PhysicalSpacing,
+        directions: usize,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        if directions == 0 {
+            return Err(Error::invalid(
+                "measure geometry basic: directional Feret partials must have at least one direction",
+            ));
+        }
+        let input = ObjectDirectionalFeretPartialStream::new(input)?;
+        let stream = ObjectGeometryBasicOutputStream::new(stream)?;
+        Ok(Self {
+            name,
+            input: PartialPhaseInput::try_new(&input, input_phase, lattice)?,
+            input_kind: ObjectGeometryBasicMergeInput::DirectionalFeret { directions },
+            spacing,
+            schema: Arc::new(object_geometry_basic_measurement_schema()),
+            stream: stream.as_str().to_string(),
+            lifecycle,
+        })
+    }
+
+    fn encode_owned(
+        &self,
+        objects: &BTreeMap<u64, ObjectGeometryBasicTally>,
+        grid: &BlockGrid,
+        block: [usize; 3],
+    ) -> Result<Vec<u8>> {
+        let mut rows = RowBuilder::new(Arc::clone(&self.schema));
+        for tally in objects.values() {
+            if !tally.is_owned_by(grid, block) {
+                continue;
+            }
+            let row = tally.into_measurements(self.spacing);
+            validate_object_geometry_basic_row(&row)?;
+            rows.push(tally.bbox_min, &ObjectGeometryBasicColumns::values(&row)?)?;
+        }
+        Ok(rows.encode())
+    }
+}
+
+impl FragmentOp for MergeObjectGeometryBasicOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![self.input.fragment_input()]
+    }
+
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                .sized(SidecarSize::row_table(self.schema.as_ref(), 1)),
+        ]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        MeasurementSeamLaw::unordered_exact().seam_fold()
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let objects = match self.input_kind {
+            ObjectGeometryBasicMergeInput::Basic => {
+                fold_object_geometry_basic_stream_partials(at, self.input.stream())?
+            }
+            ObjectGeometryBasicMergeInput::DirectionalFeret { directions } => {
+                fold_object_directional_feret_stream_partials(at, self.input.stream(), directions)?
+                    .into_iter()
+                    .map(|(label, tally)| {
+                        (
+                            label,
+                            ObjectGeometryBasicTally {
+                                label: tally.label,
+                                count: tally.count,
+                                bbox_min: tally.bbox_min,
+                                bbox_max: tally.bbox_max,
+                            },
+                        )
+                    })
+                    .collect()
+            }
+        };
+        Ok(BlockOutput::fragment(
+            self.stream.clone(),
+            self.encode_owned(&objects, at.grid, at.index)?,
+        ))
+    }
+}
+
+/// Merge directional Feret tally partials into support-width Feret rows.
+#[derive(Debug, Clone)]
+pub struct MergeObjectDirectionalFeretOp {
+    name: &'static str,
+    input: PartialPhaseInput,
+    directions: DirectionSet3,
+    schema: Arc<Schema>,
+    stream: String,
+    lifecycle: Lifecycle,
+}
+
+impl MergeObjectDirectionalFeretOp {
+    pub fn new(
+        name: &'static str,
+        input: impl Into<String>,
+        input_phase: usize,
+        lattice: [usize; 3],
+        _spacing: PhysicalSpacing,
+        directions: DirectionSet3,
+        stream: impl Into<String>,
+        lifecycle: Lifecycle,
+    ) -> Result<Self> {
+        if directions.is_empty() {
+            return Err(Error::invalid(
+                "measure directional Feret: direction set must not be empty",
+            ));
+        }
+        let input = ObjectDirectionalFeretPartialStream::new(input)?;
+        let stream = ObjectDirectionalFeretOutputStream::new(stream)?;
+        Ok(Self {
+            name,
+            input: PartialPhaseInput::try_new(&input, input_phase, lattice)?,
+            directions,
+            schema: Arc::new(object_directional_feret_measurement_schema()),
+            stream: stream.as_str().to_string(),
+            lifecycle,
+        })
+    }
+
+    fn encode_owned(
+        &self,
+        objects: &BTreeMap<u64, ObjectDirectionalFeretTally>,
+        grid: &BlockGrid,
+        block: [usize; 3],
+    ) -> Result<Vec<u8>> {
+        let mut rows = RowBuilder::new(Arc::clone(&self.schema));
+        for tally in objects.values() {
+            if !tally.is_owned_by(grid, block) {
+                continue;
+            }
+            let row = tally.into_measurements();
+            validate_object_directional_feret_row(&row)?;
+            rows.push(
+                tally.bbox_min,
+                &ObjectDirectionalFeretColumns::values(&row)?,
+            )?;
+        }
+        Ok(rows.encode())
+    }
+}
+
+impl FragmentOp for MergeObjectDirectionalFeretOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![self.input.fragment_input()]
+    }
+
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![
+            FragmentOutput::new(self.stream.clone(), self.lifecycle, Coverage::EveryBlock)
+                .sized(SidecarSize::row_table(self.schema.as_ref(), 1)),
+        ]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        MeasurementSeamLaw::unordered_exact().seam_fold()
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let objects = fold_object_directional_feret_stream_partials(
+            at,
+            self.input.stream(),
+            self.directions.len(),
+        )?;
         Ok(BlockOutput::fragment(
             self.stream.clone(),
             self.encode_owned(&objects, at.grid, at.index)?,
@@ -12780,6 +14113,63 @@ fn validate_object_geometry_row(row: &ObjectGeometryMeasurements) -> Result<()> 
         return Err(Error::invalid(format!(
             "measure geometry: row for label {} has invalid Feret diameter {}",
             row.label, row.max_voxel_feret_diameter
+        )));
+    }
+    Ok(())
+}
+
+fn validate_object_geometry_basic_row(row: &ObjectGeometryBasicMeasurements) -> Result<()> {
+    if row.label == 0 {
+        return Err(Error::invalid(
+            "measure geometry basic: row has background label 0",
+        ));
+    }
+    if row.count == 0 {
+        return Err(Error::invalid(format!(
+            "measure geometry basic: row for label {} has zero count",
+            row.label
+        )));
+    }
+    for axis in 0..3 {
+        if row.bbox_min[axis] >= row.bbox_max[axis] {
+            return Err(Error::invalid(format!(
+                "measure geometry basic: row for label {} has invalid bbox on axis {axis}: {:?}..{:?}",
+                row.label, row.bbox_min, row.bbox_max
+            )));
+        }
+        let extent = row.physical_bbox_extent[axis];
+        if !extent.is_finite() || extent <= 0.0 {
+            return Err(Error::invalid(format!(
+                "measure geometry basic: row for label {} has invalid physical extent {extent} on axis {axis}",
+                row.label
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_object_directional_feret_row(row: &ObjectDirectionalFeretMeasurements) -> Result<()> {
+    if row.label == 0 {
+        return Err(Error::invalid(
+            "measure directional Feret: row has background label 0",
+        ));
+    }
+    if row.count == 0 {
+        return Err(Error::invalid(format!(
+            "measure directional Feret: row for label {} has zero count",
+            row.label
+        )));
+    }
+    if row.directions == 0 {
+        return Err(Error::invalid(format!(
+            "measure directional Feret: row for label {} has no directions",
+            row.label
+        )));
+    }
+    if !row.max_directional_feret_diameter.is_finite() || row.max_directional_feret_diameter < 0.0 {
+        return Err(Error::invalid(format!(
+            "measure directional Feret: row for label {} has invalid diameter {}",
+            row.label, row.max_directional_feret_diameter
         )));
     }
     Ok(())
@@ -20401,6 +21791,300 @@ impl PartialLayoutContract for LabelPointPartialLayout {
     const VERSION_ERROR: &'static str = "unsupported version";
 }
 
+struct ObjectGeometryBasicPartialLayout;
+
+impl ObjectGeometryBasicPartialLayout {
+    const MAGIC: u64 = 0x4246_4d45_4742_5431;
+    const VERSION: u64 = 1;
+    const HEADER_WORDS: usize = 3;
+    const ROW_WORDS: usize = 8;
+
+    fn encode(tallies: &BTreeMap<u64, ObjectGeometryBasicTally>) -> Result<Vec<u8>> {
+        let mut words = Vec::with_capacity(
+            Self::HEADER_WORDS
+                .checked_add(tallies.len().checked_mul(Self::ROW_WORDS).ok_or_else(|| {
+                    Error::invalid("measure geometry basic partial: row section is too large")
+                })?)
+                .ok_or_else(|| {
+                    Error::invalid("measure geometry basic partial: capacity overflowed")
+                })?,
+        );
+        words.push(Self::MAGIC);
+        words.push(Self::VERSION);
+        words.push(partial_usize_word(
+            tallies.len(),
+            "measure geometry basic partial: row count",
+        )?);
+        for tally in tallies.values() {
+            if tally.label == 0 {
+                return Err(Error::invalid(
+                    "measure geometry basic partial: contains background label 0",
+                ));
+            }
+            if tally.count == 0 {
+                return Err(Error::invalid(format!(
+                    "measure geometry basic partial: row for label {} has zero count",
+                    tally.label
+                )));
+            }
+            words.push(tally.label);
+            words.push(tally.count);
+            push_partial_point3(
+                &mut words,
+                tally.bbox_min,
+                "measure geometry basic partial: bbox_min",
+            )?;
+            push_partial_point3(
+                &mut words,
+                tally.bbox_max,
+                "measure geometry basic partial: bbox_max",
+            )?;
+        }
+        Ok(pack_u64(&words))
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Vec<ObjectGeometryBasicTally>> {
+        let words = unpack_u64(bytes)?;
+        Self::validate_prefix(&words)?;
+        let row_count = partial_word_usize(words[2], "measure geometry basic partial: row count")?;
+        let expected_words = Self::HEADER_WORDS
+            .checked_add(row_count.checked_mul(Self::ROW_WORDS).ok_or_else(|| {
+                Error::invalid("measure geometry basic partial: row section is too large")
+            })?)
+            .ok_or_else(|| Error::invalid("measure geometry basic partial: length overflowed"))?;
+        if words.len() != expected_words {
+            return Err(Error::invalid(format!(
+                "measure geometry basic partial: expected {expected_words} words, got {}",
+                words.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(row_count);
+        let mut offset = Self::HEADER_WORDS;
+        for _ in 0..row_count {
+            let label = words[offset];
+            let count = words[offset + 1];
+            let bbox_min = partial_point3(
+                &words[offset + 2..offset + 5],
+                "measure geometry basic partial: bbox_min",
+            )?;
+            let bbox_max = partial_point3(
+                &words[offset + 5..offset + 8],
+                "measure geometry basic partial: bbox_max",
+            )?;
+            offset += Self::ROW_WORDS;
+            if label == 0 {
+                return Err(Error::invalid(
+                    "measure geometry basic partial: contains background label 0",
+                ));
+            }
+            if count == 0 {
+                return Err(Error::invalid(format!(
+                    "measure geometry basic partial: row for label {label} has zero count"
+                )));
+            }
+            let tally = ObjectGeometryBasicTally {
+                label,
+                count,
+                bbox_min,
+                bbox_max,
+            };
+            validate_object_geometry_basic_row(&tally.into_measurements(PhysicalSpacing::unit()))?;
+            out.push(tally);
+        }
+        Ok(out)
+    }
+}
+
+impl PartialLayoutContract for ObjectGeometryBasicPartialLayout {
+    const MAGIC: u64 = ObjectGeometryBasicPartialLayout::MAGIC;
+    const VERSION: u64 = ObjectGeometryBasicPartialLayout::VERSION;
+    const HEADER_WORDS: usize = ObjectGeometryBasicPartialLayout::HEADER_WORDS;
+    const FORMAT: &'static str = "measure geometry basic partial";
+    const SHORT_ERROR: &'static str = "header is truncated";
+    const MAGIC_ERROR: &'static str = "wrong format magic";
+    const VERSION_ERROR: &'static str = "unsupported version";
+}
+
+struct ObjectDirectionalFeretPartialLayout;
+
+impl ObjectDirectionalFeretPartialLayout {
+    const MAGIC: u64 = 0x4246_4d45_4446_5431;
+    const VERSION: u64 = 1;
+    const HEADER_WORDS: usize = 4;
+    const ROW_FIXED_WORDS: usize = 8;
+
+    fn row_words(directions: usize) -> Result<usize> {
+        Self::ROW_FIXED_WORDS
+            .checked_add(directions.checked_mul(2).ok_or_else(|| {
+                Error::invalid("measure directional Feret partial: direction section is too large")
+            })?)
+            .ok_or_else(|| Error::invalid("measure directional Feret partial: row is too large"))
+    }
+
+    fn encode(tallies: &BTreeMap<u64, ObjectDirectionalFeretTally>) -> Result<Vec<u8>> {
+        let directions = tallies
+            .values()
+            .next()
+            .map(|tally| tally.min_dot.len())
+            .unwrap_or(0);
+        let row_words = Self::row_words(directions)?;
+        let mut words = Vec::with_capacity(
+            Self::HEADER_WORDS
+                .checked_add(tallies.len().checked_mul(row_words).ok_or_else(|| {
+                    Error::invalid("measure directional Feret partial: row section is too large")
+                })?)
+                .ok_or_else(|| {
+                    Error::invalid("measure directional Feret partial: capacity overflowed")
+                })?,
+        );
+        words.push(Self::MAGIC);
+        words.push(Self::VERSION);
+        words.push(partial_usize_word(
+            tallies.len(),
+            "measure directional Feret partial: row count",
+        )?);
+        words.push(partial_usize_word(
+            directions,
+            "measure directional Feret partial: direction count",
+        )?);
+        for tally in tallies.values() {
+            if tally.label == 0 {
+                return Err(Error::invalid(
+                    "measure directional Feret partial: contains background label 0",
+                ));
+            }
+            if tally.count == 0 {
+                return Err(Error::invalid(format!(
+                    "measure directional Feret partial: row for label {} has zero count",
+                    tally.label
+                )));
+            }
+            if tally.min_dot.len() != directions || tally.max_dot.len() != directions {
+                return Err(Error::invalid(format!(
+                    "measure directional Feret partial: row for label {} has wrong direction count",
+                    tally.label
+                )));
+            }
+            words.push(tally.label);
+            words.push(tally.count);
+            push_partial_point3(
+                &mut words,
+                tally.bbox_min,
+                "measure directional Feret partial: bbox_min",
+            )?;
+            push_partial_point3(
+                &mut words,
+                tally.bbox_max,
+                "measure directional Feret partial: bbox_max",
+            )?;
+            for index in 0..directions {
+                let min = tally.min_dot[index];
+                let max = tally.max_dot[index];
+                if !min.is_finite() || !max.is_finite() || min > max {
+                    return Err(Error::invalid(format!(
+                        "measure directional Feret partial: row for label {} has invalid dot range",
+                        tally.label
+                    )));
+                }
+                words.push(min.to_bits());
+                words.push(max.to_bits());
+            }
+        }
+        Ok(pack_u64(&words))
+    }
+
+    fn decode(
+        bytes: &[u8],
+        expected_directions: usize,
+    ) -> Result<Vec<ObjectDirectionalFeretTally>> {
+        let words = unpack_u64(bytes)?;
+        Self::validate_prefix(&words)?;
+        let row_count =
+            partial_word_usize(words[2], "measure directional Feret partial: row count")?;
+        let directions = partial_word_usize(
+            words[3],
+            "measure directional Feret partial: direction count",
+        )?;
+        if directions != expected_directions {
+            return Err(Error::invalid(format!(
+                "measure directional Feret partial: direction count {directions} does not match expected {expected_directions}"
+            )));
+        }
+        let row_words = Self::row_words(directions)?;
+        let expected_words = Self::HEADER_WORDS
+            .checked_add(row_count.checked_mul(row_words).ok_or_else(|| {
+                Error::invalid("measure directional Feret partial: row section is too large")
+            })?)
+            .ok_or_else(|| {
+                Error::invalid("measure directional Feret partial: length overflowed")
+            })?;
+        if words.len() != expected_words {
+            return Err(Error::invalid(format!(
+                "measure directional Feret partial: expected {expected_words} words, got {}",
+                words.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(row_count);
+        let mut offset = Self::HEADER_WORDS;
+        for _ in 0..row_count {
+            let label = words[offset];
+            let count = words[offset + 1];
+            let bbox_min = partial_point3(
+                &words[offset + 2..offset + 5],
+                "measure directional Feret partial: bbox_min",
+            )?;
+            let bbox_max = partial_point3(
+                &words[offset + 5..offset + 8],
+                "measure directional Feret partial: bbox_max",
+            )?;
+            offset += Self::ROW_FIXED_WORDS;
+            if label == 0 {
+                return Err(Error::invalid(
+                    "measure directional Feret partial: contains background label 0",
+                ));
+            }
+            if count == 0 {
+                return Err(Error::invalid(format!(
+                    "measure directional Feret partial: row for label {label} has zero count"
+                )));
+            }
+            let mut min_dot = Vec::with_capacity(directions);
+            let mut max_dot = Vec::with_capacity(directions);
+            for _ in 0..directions {
+                let min = f64::from_bits(words[offset]);
+                let max = f64::from_bits(words[offset + 1]);
+                offset += 2;
+                if !min.is_finite() || !max.is_finite() || min > max {
+                    return Err(Error::invalid(format!(
+                        "measure directional Feret partial: row for label {label} has invalid dot range"
+                    )));
+                }
+                min_dot.push(min);
+                max_dot.push(max);
+            }
+            out.push(ObjectDirectionalFeretTally {
+                label,
+                count,
+                bbox_min,
+                bbox_max,
+                min_dot,
+                max_dot,
+            });
+        }
+        Ok(out)
+    }
+}
+
+impl PartialLayoutContract for ObjectDirectionalFeretPartialLayout {
+    const MAGIC: u64 = ObjectDirectionalFeretPartialLayout::MAGIC;
+    const VERSION: u64 = ObjectDirectionalFeretPartialLayout::VERSION;
+    const HEADER_WORDS: usize = ObjectDirectionalFeretPartialLayout::HEADER_WORDS;
+    const FORMAT: &'static str = "measure directional Feret partial";
+    const SHORT_ERROR: &'static str = "header is truncated";
+    const MAGIC_ERROR: &'static str = "wrong format magic";
+    const VERSION_ERROR: &'static str = "unsupported version";
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct OverlapRelationshipTallies {
     pairs: BTreeMap<[u64; 2], u64>,
@@ -27574,6 +29258,118 @@ impl ObjectGeometryColumns {
     }
 }
 
+struct ObjectGeometryBasicColumns;
+
+impl ObjectGeometryBasicColumns {
+    const WIDTH: usize = 11;
+    const LABEL: usize = 0;
+    const COUNT: usize = 1;
+    const BBOX_MIN: [usize; 3] = [2, 3, 4];
+    const BBOX_MAX: [usize; 3] = [5, 6, 7];
+    const PHYSICAL_EXTENT: [usize; 3] = [8, 9, 10];
+
+    fn schema() -> Schema {
+        let columns: [Column; Self::WIDTH] = [
+            Column::u64("label"),
+            Column::u64("count"),
+            Column::u64("bbox_min_0"),
+            Column::u64("bbox_min_1"),
+            Column::u64("bbox_min_2"),
+            Column::u64("bbox_max_0"),
+            Column::u64("bbox_max_1"),
+            Column::u64("bbox_max_2"),
+            Column::f64("physical_bbox_extent_0"),
+            Column::f64("physical_bbox_extent_1"),
+            Column::f64("physical_bbox_extent_2"),
+        ];
+        fixed_measurement_schema(columns, "object geometry basic")
+    }
+
+    fn values(row: &ObjectGeometryBasicMeasurements) -> Result<[Value; Self::WIDTH]> {
+        Ok([
+            Value::U64(row.label),
+            Value::U64(row.count),
+            usize_column(row.bbox_min[0], "measure geometry basic: bbox_min_0")?,
+            usize_column(row.bbox_min[1], "measure geometry basic: bbox_min_1")?,
+            usize_column(row.bbox_min[2], "measure geometry basic: bbox_min_2")?,
+            usize_column(row.bbox_max[0], "measure geometry basic: bbox_max_0")?,
+            usize_column(row.bbox_max[1], "measure geometry basic: bbox_max_1")?,
+            usize_column(row.bbox_max[2], "measure geometry basic: bbox_max_2")?,
+            Value::F64(row.physical_bbox_extent[0]),
+            Value::F64(row.physical_bbox_extent[1]),
+            Value::F64(row.physical_bbox_extent[2]),
+        ])
+    }
+
+    fn decode(row: &Row<'_>) -> Result<ObjectGeometryBasicMeasurements> {
+        let measurements = ObjectGeometryBasicMeasurements {
+            label: row.u64(Self::LABEL)?,
+            count: row.u64(Self::COUNT)?,
+            bbox_min: [
+                row_usize(row, Self::BBOX_MIN[0], "measure geometry basic: bbox_min_0")?,
+                row_usize(row, Self::BBOX_MIN[1], "measure geometry basic: bbox_min_1")?,
+                row_usize(row, Self::BBOX_MIN[2], "measure geometry basic: bbox_min_2")?,
+            ],
+            bbox_max: [
+                row_usize(row, Self::BBOX_MAX[0], "measure geometry basic: bbox_max_0")?,
+                row_usize(row, Self::BBOX_MAX[1], "measure geometry basic: bbox_max_1")?,
+                row_usize(row, Self::BBOX_MAX[2], "measure geometry basic: bbox_max_2")?,
+            ],
+            physical_bbox_extent: [
+                row.f64(Self::PHYSICAL_EXTENT[0])?,
+                row.f64(Self::PHYSICAL_EXTENT[1])?,
+                row.f64(Self::PHYSICAL_EXTENT[2])?,
+            ],
+        };
+        validate_object_geometry_basic_row(&measurements)?;
+        Ok(measurements)
+    }
+}
+
+struct ObjectDirectionalFeretColumns;
+
+impl ObjectDirectionalFeretColumns {
+    const WIDTH: usize = 4;
+    const LABEL: usize = 0;
+    const COUNT: usize = 1;
+    const DIRECTIONS: usize = 2;
+    const MAX_DIRECTIONAL_FERET: usize = 3;
+
+    fn schema() -> Schema {
+        let columns: [Column; Self::WIDTH] = [
+            Column::u64("label"),
+            Column::u64("count"),
+            Column::u64("directions"),
+            Column::f64("max_directional_feret_diameter"),
+        ];
+        fixed_measurement_schema(columns, "object directional Feret")
+    }
+
+    fn values(row: &ObjectDirectionalFeretMeasurements) -> Result<[Value; Self::WIDTH]> {
+        Ok([
+            Value::U64(row.label),
+            Value::U64(row.count),
+            usize_column(row.directions, "measure directional Feret: directions")?,
+            Value::F64(row.max_directional_feret_diameter),
+        ])
+    }
+
+    fn decode(row: &Row<'_>) -> Result<ObjectDirectionalFeretMeasurements> {
+        let measurements = ObjectDirectionalFeretMeasurements {
+            label: row.u64(Self::LABEL)?,
+            count: row.u64(Self::COUNT)?,
+            directions: row_usize(
+                row,
+                Self::DIRECTIONS,
+                "measure directional Feret: directions",
+            )?,
+            max_directional_feret_diameter: row.f64(Self::MAX_DIRECTIONAL_FERET)?,
+        };
+        validate_object_directional_feret_row(&measurements)?;
+        Ok(measurements)
+    }
+}
+
 struct EnclosingSphereColumns;
 
 impl EnclosingSphereColumns {
@@ -27631,6 +29427,16 @@ pub fn object_geometry_measurement_schema() -> Schema {
     ObjectGeometryColumns::schema()
 }
 
+/// Table schema for [`ObjectGeometryBasicMeasurements`].
+pub fn object_geometry_basic_measurement_schema() -> Schema {
+    ObjectGeometryBasicColumns::schema()
+}
+
+/// Table schema for [`ObjectDirectionalFeretMeasurements`].
+pub fn object_directional_feret_measurement_schema() -> Schema {
+    ObjectDirectionalFeretColumns::schema()
+}
+
 /// Table schema for [`ObjectEnclosingSphereMeasurements`].
 pub fn enclosing_sphere_measurement_schema() -> Schema {
     EnclosingSphereColumns::schema()
@@ -27656,6 +29462,46 @@ fn encode_object_geometry_measurements_with_schema(
     })
 }
 
+/// Encode basic object geometry rows as a row-table fragment.
+pub fn encode_object_geometry_basic_measurements(
+    measurements: &[ObjectGeometryBasicMeasurements],
+) -> Result<Vec<u8>> {
+    encode_object_geometry_basic_measurements_with_schema(
+        measurements,
+        Arc::new(object_geometry_basic_measurement_schema()),
+    )
+}
+
+fn encode_object_geometry_basic_measurements_with_schema(
+    measurements: &[ObjectGeometryBasicMeasurements],
+    schema: Arc<Schema>,
+) -> Result<Vec<u8>> {
+    encode_measurement_rows_at_origin(schema, measurements, |row| {
+        validate_object_geometry_basic_row(row)?;
+        ObjectGeometryBasicColumns::values(row)
+    })
+}
+
+/// Encode directional Feret rows as a row-table fragment.
+pub fn encode_object_directional_feret_measurements(
+    measurements: &[ObjectDirectionalFeretMeasurements],
+) -> Result<Vec<u8>> {
+    encode_object_directional_feret_measurements_with_schema(
+        measurements,
+        Arc::new(object_directional_feret_measurement_schema()),
+    )
+}
+
+fn encode_object_directional_feret_measurements_with_schema(
+    measurements: &[ObjectDirectionalFeretMeasurements],
+    schema: Arc<Schema>,
+) -> Result<Vec<u8>> {
+    encode_measurement_rows_at_origin(schema, measurements, |row| {
+        validate_object_directional_feret_row(row)?;
+        ObjectDirectionalFeretColumns::values(row)
+    })
+}
+
 /// Encode enclosing-sphere rows as a row-table fragment.
 pub fn encode_enclosing_sphere_measurements(
     measurements: &[ObjectEnclosingSphereMeasurements],
@@ -27678,6 +29524,16 @@ fn encode_enclosing_sphere_measurements_with_schema(
 
 fn object_geometry_measurement(row: &Row<'_>) -> Result<ObjectGeometryMeasurements> {
     ObjectGeometryColumns::decode(row)
+}
+
+fn object_geometry_basic_measurement(row: &Row<'_>) -> Result<ObjectGeometryBasicMeasurements> {
+    ObjectGeometryBasicColumns::decode(row)
+}
+
+fn object_directional_feret_measurement(
+    row: &Row<'_>,
+) -> Result<ObjectDirectionalFeretMeasurements> {
+    ObjectDirectionalFeretColumns::decode(row)
 }
 
 fn enclosing_sphere_measurement(row: &Row<'_>) -> Result<ObjectEnclosingSphereMeasurements> {
@@ -29438,6 +31294,8 @@ mod tests {
             expansion_relationships: None,
             moment3d: None,
             geometry: None,
+            geometry_basic: None,
+            directional_feret: None,
             convex_hull: None,
             voxel_face_convex_hull: None,
             enclosing_sphere: None,
@@ -32985,6 +34843,70 @@ pub fn collect_object_geometry_rows_with_contract(
     volume: [usize; 3],
 ) -> Result<Vec<ObjectGeometryMeasurements>> {
     collect_object_geometry_rows(env, rows.rows(), volume)
+}
+
+pub fn collect_object_geometry_basic_measurements(
+    env: &dyn Environment,
+    stream: &str,
+    phase: usize,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectGeometryBasicMeasurements>> {
+    let rows = MeasurementRows::<ObjectGeometryBasicRows>::from_legacy_collector(stream, phase)?;
+    collect_object_geometry_basic_rows(env, &rows, volume)
+}
+
+pub fn collect_object_geometry_basic_rows(
+    env: &dyn Environment,
+    rows: &MeasurementRows<ObjectGeometryBasicRows>,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectGeometryBasicMeasurements>> {
+    collect_measurement_rows_table(
+        env,
+        rows,
+        volume,
+        object_geometry_basic_measurement_schema(),
+        object_geometry_basic_measurement,
+    )
+}
+
+pub fn collect_object_geometry_basic_rows_with_contract(
+    env: &dyn Environment,
+    rows: &MeasurementRowsWithContract<ObjectGeometryBasicRows, PhysicalSpacing>,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectGeometryBasicMeasurements>> {
+    collect_object_geometry_basic_rows(env, rows.rows(), volume)
+}
+
+pub fn collect_object_directional_feret_measurements(
+    env: &dyn Environment,
+    stream: &str,
+    phase: usize,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectDirectionalFeretMeasurements>> {
+    let rows = MeasurementRows::<ObjectDirectionalFeretRows>::from_legacy_collector(stream, phase)?;
+    collect_object_directional_feret_rows(env, &rows, volume)
+}
+
+pub fn collect_object_directional_feret_rows(
+    env: &dyn Environment,
+    rows: &MeasurementRows<ObjectDirectionalFeretRows>,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectDirectionalFeretMeasurements>> {
+    collect_measurement_rows_table(
+        env,
+        rows,
+        volume,
+        object_directional_feret_measurement_schema(),
+        object_directional_feret_measurement,
+    )
+}
+
+pub fn collect_object_directional_feret_rows_with_contract(
+    env: &dyn Environment,
+    rows: &MeasurementRowsWithContract<ObjectDirectionalFeretRows, DirectionSet3>,
+    volume: [usize; 3],
+) -> Result<Vec<ObjectDirectionalFeretMeasurements>> {
+    collect_object_directional_feret_rows(env, rows.rows(), volume)
 }
 
 pub fn collect_enclosing_sphere_measurements(

@@ -56,6 +56,17 @@ struct ObjectRow {
     centroid_x: f64,
 }
 
+#[derive(Debug, Default)]
+struct StageTimings {
+    transform_seconds: f64,
+    smooth_seconds: f64,
+    threshold_seconds: f64,
+    morphology_seconds: f64,
+    filter_seconds: f64,
+    label_seconds: f64,
+    measure_seconds: f64,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -73,11 +84,21 @@ fn run() -> Result<()> {
     let load_seconds = started.elapsed().as_secs_f64();
 
     let pipeline_started = Instant::now();
+    let mut timings = StageTimings::default();
+    let stage_started = Instant::now();
     let prepared = transform_if_requested(input.view(), config.mode);
+    timings.transform_seconds = stage_started.elapsed().as_secs_f64();
+    let stage_started = Instant::now();
     let smoothed = smooth(prepared.view(), config.sigma)?;
+    timings.smooth_seconds = stage_started.elapsed().as_secs_f64();
+    let stage_started = Instant::now();
     let threshold = otsu_threshold(smoothed.iter().copied());
     let raw_mask = smoothed.mapv(|value| value > threshold);
+    timings.threshold_seconds = stage_started.elapsed().as_secs_f64();
+    let stage_started = Instant::now();
     let raw_mask = close3x3(&open3x3(&raw_mask));
+    timings.morphology_seconds = stage_started.elapsed().as_secs_f64();
+    let stage_started = Instant::now();
     let mut mask = Array3::<bool>::from_elem(raw_mask.raw_dim(), false);
     remove_small_objects_into(
         raw_mask.view(),
@@ -85,6 +106,8 @@ fn run() -> Result<()> {
         config.min_size,
         mask.view_mut(),
     )?;
+    timings.filter_seconds = stage_started.elapsed().as_secs_f64();
+    let stage_started = Instant::now();
     let mut labels = Array3::<u32>::zeros(mask.raw_dim());
     components::label_members_into_with(
         [mask.shape()[0], mask.shape()[1], mask.shape()[2]],
@@ -92,7 +115,10 @@ fn run() -> Result<()> {
         |at| mask[[at[0], at[1], at[2]]],
         labels.view_mut(),
     )?;
+    timings.label_seconds = stage_started.elapsed().as_secs_f64();
+    let stage_started = Instant::now();
     let rows = measure(labels.view());
+    timings.measure_seconds = stage_started.elapsed().as_secs_f64();
     let pipeline_seconds = pipeline_started.elapsed().as_secs_f64();
 
     write_objects(&rows, &config.out.join("objects.csv"))?;
@@ -103,6 +129,7 @@ fn run() -> Result<()> {
         threshold,
         load_seconds,
         pipeline_seconds,
+        &timings,
         &config.out.join("summary.json"),
     )?;
 
@@ -250,6 +277,13 @@ fn close3x3(input: &Array3<bool>) -> Array3<bool> {
 fn erode3x3(input: &Array3<bool>) -> Array3<bool> {
     let shape = input.shape();
     let mut out = Array3::<bool>::from_elem(input.raw_dim(), false);
+    if let (Some(input), Some(out_slice)) = (
+        input.as_slice_memory_order(),
+        out.as_slice_memory_order_mut(),
+    ) {
+        erode3x3_slice(input, out_slice, shape[0], shape[1], shape[2]);
+        return out;
+    }
     for z in 0..shape[0] {
         for y in 0..shape[1] {
             for x in 0..shape[2] {
@@ -276,6 +310,13 @@ fn erode3x3(input: &Array3<bool>) -> Array3<bool> {
 fn dilate3x3(input: &Array3<bool>) -> Array3<bool> {
     let shape = input.shape();
     let mut out = Array3::<bool>::from_elem(input.raw_dim(), false);
+    if let (Some(input), Some(out_slice)) = (
+        input.as_slice_memory_order(),
+        out.as_slice_memory_order_mut(),
+    ) {
+        dilate3x3_slice(input, out_slice, shape[0], shape[1], shape[2]);
+        return out;
+    }
     for z in 0..shape[0] {
         for y in 0..shape[1] {
             for x in 0..shape[2] {
@@ -298,6 +339,98 @@ fn dilate3x3(input: &Array3<bool>) -> Array3<bool> {
         }
     }
     out
+}
+
+fn erode3x3_slice(input: &[bool], out: &mut [bool], depth: usize, height: usize, width: usize) {
+    if height < 3 || width < 3 {
+        return;
+    }
+    let plane = height * width;
+    for z in 0..depth {
+        let z0 = z * plane;
+        for y in 1..height - 1 {
+            let row = z0 + y * width;
+            let above = row - width;
+            let below = row + width;
+            for x in 1..width - 1 {
+                let at = row + x;
+                out[at] = input[above + x - 1]
+                    && input[above + x]
+                    && input[above + x + 1]
+                    && input[at - 1]
+                    && input[at]
+                    && input[at + 1]
+                    && input[below + x - 1]
+                    && input[below + x]
+                    && input[below + x + 1];
+            }
+        }
+    }
+}
+
+fn dilate3x3_slice(input: &[bool], out: &mut [bool], depth: usize, height: usize, width: usize) {
+    if height == 0 || width == 0 {
+        return;
+    }
+    let plane = height * width;
+    for z in 0..depth {
+        let z0 = z * plane;
+        if height >= 3 && width >= 3 {
+            for y in 1..height - 1 {
+                let row = z0 + y * width;
+                let above = row - width;
+                let below = row + width;
+                for x in 1..width - 1 {
+                    let at = row + x;
+                    out[at] = input[above + x - 1]
+                        || input[above + x]
+                        || input[above + x + 1]
+                        || input[at - 1]
+                        || input[at]
+                        || input[at + 1]
+                        || input[below + x - 1]
+                        || input[below + x]
+                        || input[below + x + 1];
+                }
+            }
+        }
+        for y in 0..height {
+            for x in [0, width.saturating_sub(1)] {
+                let at = z0 + y * width + x;
+                out[at] = dilate3x3_at(input, z0, height, width, y, x);
+            }
+        }
+        if width > 2 {
+            for y in [0, height.saturating_sub(1)] {
+                for x in 1..width - 1 {
+                    let at = z0 + y * width + x;
+                    out[at] = dilate3x3_at(input, z0, height, width, y, x);
+                }
+            }
+        }
+    }
+}
+
+fn dilate3x3_at(
+    input: &[bool],
+    z0: usize,
+    height: usize,
+    width: usize,
+    y: usize,
+    x: usize,
+) -> bool {
+    let y0 = y.saturating_sub(1);
+    let y1 = (y + 1).min(height - 1);
+    let x0 = x.saturating_sub(1);
+    let x1 = (x + 1).min(width - 1);
+    for yy in y0..=y1 {
+        for xx in x0..=x1 {
+            if input[z0 + yy * width + xx] {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn otsu_threshold(values: impl Iterator<Item = f64>) -> f64 {
@@ -390,6 +523,7 @@ fn write_summary(
     threshold: f64,
     load_seconds: f64,
     pipeline_seconds: f64,
+    timings: &StageTimings,
     path: &Path,
 ) -> Result<()> {
     let summary = serde_json::json!({
@@ -402,6 +536,15 @@ fn write_summary(
         "min_size": config.min_size,
         "load_seconds": load_seconds,
         "pipeline_seconds": pipeline_seconds,
+        "stage_seconds": {
+            "transform": timings.transform_seconds,
+            "smooth": timings.smooth_seconds,
+            "threshold": timings.threshold_seconds,
+            "morphology": timings.morphology_seconds,
+            "filter": timings.filter_seconds,
+            "label": timings.label_seconds,
+            "measure": timings.measure_seconds,
+        },
     });
     let text = serde_json::to_string_pretty(&summary)
         .map_err(|err| Error::invalid(format!("opencv-pipeline: encode summary: {err}")))?;

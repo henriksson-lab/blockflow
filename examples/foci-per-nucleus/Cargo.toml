@@ -1,0 +1,15 @@
+[package]
+name = "blockflow-foci-per-nucleus"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+blockflow = { path = "../.." }
+ndarray = "0.17"
+serde_json = "1"
+
+[[bin]]
+name = "foci-per-nucleus"
+path = "src/bin/foci_per_nucleus.rs"

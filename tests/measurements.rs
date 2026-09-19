@@ -29,6 +29,9 @@ use blockflow::ops::{
     collect_granularity_rows_with_set, collect_object_3d_moment_measurements,
     collect_object_3d_moment_measurements_set, collect_object_3d_moment_rows_with_set,
     collect_object_convex_hull_measurements, collect_object_convex_hull_rows_with_contract,
+    collect_object_directional_feret_measurements,
+    collect_object_directional_feret_rows_with_contract,
+    collect_object_geometry_basic_measurements, collect_object_geometry_basic_rows_with_contract,
     collect_object_geometry_measurements, collect_object_geometry_rows_with_contract,
     collect_object_hu_moment_measurements, collect_object_hu_moment_rows_with_contract,
     collect_object_projected_convex_measurements, collect_object_projected_convex_measurements_set,
@@ -56,7 +59,8 @@ use blockflow::ops::{
     encode_exact_distribution_measurements_set, encode_exact_label_radius_measurements,
     encode_expansion_relationship_measurements, encode_granularity_measurements,
     encode_object_3d_moment_measurements, encode_object_3d_moment_measurements_set,
-    encode_object_convex_hull_measurements, encode_object_geometry_measurements,
+    encode_object_convex_hull_measurements, encode_object_directional_feret_measurements,
+    encode_object_geometry_basic_measurements, encode_object_geometry_measurements,
     encode_object_hu_moment_measurements, encode_object_projected_convex_measurements,
     encode_object_projected_convex_measurements_set,
     encode_object_voxel_face_convex_hull_measurements,
@@ -75,29 +79,31 @@ use blockflow::ops::{
     object_boundary_distance_relationships, object_centroid_relationships,
     object_centroid_relationships_from_shapes, object_component_measurements,
     object_convex_hull_measurement_schema, object_convex_hull_measurements,
+    object_directional_feret_measurement_schema, object_directional_feret_measurements,
     object_enclosing_sphere_measurements, object_expansion_until_adjacent_relationships,
-    object_geometry_measurement_schema, object_geometry_measurements,
-    object_hu_moment_measurement_schema, object_hu_moments_measurements,
-    object_projected_convex_measurement_schema, object_projected_convex_measurement_schema_set,
-    object_projected_convex_measurements, object_projected_convex_measurements_set,
-    object_topology_measurements, object_topology_measurements_with,
-    object_voxel_face_convex_hull_measurement_schema, object_voxel_face_convex_hull_measurements,
-    object_weighted_hu_moment_measurement_schema, object_weighted_hu_moments_measurements,
-    object_zernike3d_measurement_schema_set, object_zernike3d_measurements,
-    object_zernike3d_measurements_set, object_zernike_moment_measurement_schema,
-    object_zernike_moment_measurement_schema_set, object_zernike_moments_measurements,
-    object_zernike_moments_measurements_set, orientation_yx, radius_measurement_schema,
-    rank_weighted_colocalization_measurement_schema, rank_weighted_colocalization_measurements,
-    run_boundary_measure, run_object_measure, run_region_measure, shape_boundary_measurements,
-    shared_boundary_distance_field, shared_boundary_radius_measurements,
-    summarize_centroid_neighbors, summarize_centroid_neighbors_within,
-    summarize_touching_neighbors, topology_measurement_schema,
+    object_geometry_basic_measurement_schema, object_geometry_basic_measurements,
+    object_geometry_basic_measurements_u32, object_geometry_measurement_schema,
+    object_geometry_measurements, object_hu_moment_measurement_schema,
+    object_hu_moments_measurements, object_projected_convex_measurement_schema,
+    object_projected_convex_measurement_schema_set, object_projected_convex_measurements,
+    object_projected_convex_measurements_set, object_topology_measurements,
+    object_topology_measurements_with, object_voxel_face_convex_hull_measurement_schema,
+    object_voxel_face_convex_hull_measurements, object_weighted_hu_moment_measurement_schema,
+    object_weighted_hu_moments_measurements, object_zernike3d_measurement_schema_set,
+    object_zernike3d_measurements, object_zernike3d_measurements_set,
+    object_zernike_moment_measurement_schema, object_zernike_moment_measurement_schema_set,
+    object_zernike_moments_measurements, object_zernike_moments_measurements_set, orientation_yx,
+    radius_measurement_schema, rank_weighted_colocalization_measurement_schema,
+    rank_weighted_colocalization_measurements, run_boundary_measure, run_object_measure,
+    run_region_measure, shape_boundary_measurements, shared_boundary_distance_field,
+    shared_boundary_radius_measurements, summarize_centroid_neighbors,
+    summarize_centroid_neighbors_within, summarize_touching_neighbors, topology_measurement_schema,
     touching_neighbor_measurement_schema, ApproxDistributionSet, ApproxMode, ApproxTolerance,
     AutoDistributionOp, AutoDistributionSet, BoundaryFeature, BoundaryMeasure, BoundaryMeasureOp,
     BoundaryMeasurements, ColocalizationContract, ColocalizationFeature,
     ColocalizationMeasurements, ColocalizationPairsOp, ColocalizationSumsOp, Connectivity,
     ContactFeature, ContactMeasurements, CostesColocalizationFeature,
-    CostesColocalizationMeasurements, DistanceParams, DistributionFeature,
+    CostesColocalizationMeasurements, DirectionSet3, DistanceParams, DistributionFeature,
     DistributionMeasurements, DistributionPercentile, DistributionSet, ElementShape,
     EnclosingSphereOp, ExactDistributionMeasurements, ExactDistributionOp, ExactDistributionSet,
     ExactDistributionTallyOp, ExactLabelRadiusMeasurements, ExactLabelRadiusOp, FeatureScalar,
@@ -108,29 +114,30 @@ use blockflow::ops::{
     MeasureSource, MeasureValues, MeasurementFrame, MeasurementFrameId, MeasurementKey,
     MeasurementSourceFact, MeasurementSourceFacts, Measurements, MergeColocalizationSumsOp,
     MergeCostesColocalizationOp, MergeExactDistributionOp, MergeGlcmTextureOp,
-    MergeObjectMoment3dOp, MergeObjectProjectedConvexOp, MergeObjectZernikeMomentsOp,
-    MergeRankWeightedColocalizationOp, Moment3d, Moment3dKey, MultiGlcmTextureOp, NeighborSummary,
-    ObjectBoundaryDistanceFeature, ObjectBoundaryDistanceMeasurements, ObjectComponentFeature,
-    ObjectComponentMeasurements, ObjectComponentOp, ObjectConvexHullFeature,
-    ObjectConvexHullMeasurements, ObjectConvexHullOp, ObjectConvexHullView,
+    MergeObjectDirectionalFeretOp, MergeObjectGeometryBasicOp, MergeObjectMoment3dOp,
+    MergeObjectProjectedConvexOp, MergeObjectZernikeMomentsOp, MergeRankWeightedColocalizationOp,
+    Moment3d, Moment3dKey, MultiGlcmTextureOp, NeighborSummary, ObjectBoundaryDistanceFeature,
+    ObjectBoundaryDistanceMeasurements, ObjectComponentFeature, ObjectComponentMeasurements,
+    ObjectComponentOp, ObjectConvexHullFeature, ObjectConvexHullMeasurements, ObjectConvexHullOp,
+    ObjectConvexHullView, ObjectDirectionalFeretMeasurements, ObjectDirectionalFeretTallyOp,
     ObjectEnclosingSphereFeature, ObjectEnclosingSphereMeasurements, ObjectExpansionFeature,
-    ObjectExpansionMeasurements, ObjectGeometryFeature, ObjectGeometryMeasurements,
-    ObjectGeometryOp, ObjectHuMomentFeature, ObjectHuMomentsMeasurements, ObjectHuMomentsOp,
-    ObjectInputs, ObjectMeasure, ObjectMeasureMergeOp, ObjectMoment3dFeature,
-    ObjectMoment3dMeasurements, ObjectMoment3dOp, ObjectMoment3dSet, ObjectNeighborFeature,
-    ObjectNeighborMeasurements, ObjectProjectedConvexContract, ObjectProjectedConvexFeature,
-    ObjectProjectedConvexMeasurements, ObjectProjectedConvexOp, ObjectProjectionContract,
-    ObjectRelationshipFeature, ObjectRelationshipMeasurements, ObjectTopologyConvention,
-    ObjectTopologyFeature, ObjectTopologyMeasurements, ObjectTopologyOp, ObjectView,
-    ObjectVoxelFaceConvexHullFeature, ObjectVoxelFaceConvexHullMeasurements,
-    ObjectWeightedHuMomentFeature, ObjectWeightedHuMomentsMeasurements, ObjectWeightedHuMomentsOp,
-    ObjectZernike3dContract, ObjectZernike3dDescriptor, ObjectZernike3dFeature,
-    ObjectZernike3dMeasurements, ObjectZernike3dSet, ObjectZernikeMoment,
-    ObjectZernikeMomentContract, ObjectZernikeMomentFeature, ObjectZernikeMomentSet,
-    ObjectZernikeMomentsMeasurements, ObjectZernikeMomentsOp, PhysicalSpacing, ProjectedConvexSet,
-    ProjectionAxis, RadiusFeature, RankWeightedColocalizationFeature,
-    RankWeightedColocalizationMeasurements, RegionMeasure, RegionMeasureOp, RegionShape,
-    ShapeBoundaryFeature, ShapeFeature, ShapeMeasurements, ShapeSet,
+    ObjectExpansionMeasurements, ObjectGeometryBasicMeasurements, ObjectGeometryBasicTallyOp,
+    ObjectGeometryFeature, ObjectGeometryMeasurements, ObjectGeometryOp, ObjectHuMomentFeature,
+    ObjectHuMomentsMeasurements, ObjectHuMomentsOp, ObjectInputs, ObjectMeasure,
+    ObjectMeasureMergeOp, ObjectMoment3dFeature, ObjectMoment3dMeasurements, ObjectMoment3dOp,
+    ObjectMoment3dSet, ObjectNeighborFeature, ObjectNeighborMeasurements,
+    ObjectProjectedConvexContract, ObjectProjectedConvexFeature, ObjectProjectedConvexMeasurements,
+    ObjectProjectedConvexOp, ObjectProjectionContract, ObjectRelationshipFeature,
+    ObjectRelationshipMeasurements, ObjectTopologyConvention, ObjectTopologyFeature,
+    ObjectTopologyMeasurements, ObjectTopologyOp, ObjectView, ObjectVoxelFaceConvexHullFeature,
+    ObjectVoxelFaceConvexHullMeasurements, ObjectWeightedHuMomentFeature,
+    ObjectWeightedHuMomentsMeasurements, ObjectWeightedHuMomentsOp, ObjectZernike3dContract,
+    ObjectZernike3dDescriptor, ObjectZernike3dFeature, ObjectZernike3dMeasurements,
+    ObjectZernike3dSet, ObjectZernikeMoment, ObjectZernikeMomentContract,
+    ObjectZernikeMomentFeature, ObjectZernikeMomentSet, ObjectZernikeMomentsMeasurements,
+    ObjectZernikeMomentsOp, PhysicalSpacing, ProjectedConvexSet, ProjectionAxis, RadiusFeature,
+    RankWeightedColocalizationFeature, RankWeightedColocalizationMeasurements, RegionMeasure,
+    RegionMeasureOp, RegionShape, ShapeBoundaryFeature, ShapeFeature, ShapeMeasurements, ShapeSet,
     SharedBoundaryRadiusMeasurements, SharedBoundaryRadiusOp, TouchingNeighborFeature, VoxelCount,
     WithinDistanceThreshold, Zernike3dKey, ZernikeMomentKey,
 };
@@ -4427,6 +4434,58 @@ fn object_geometry_reports_voxel_centre_feret_with_physical_spacing() {
 }
 
 #[test]
+fn object_geometry_basic_omits_quadratic_feret_and_directional_feret_is_explicit() {
+    let mut labels = Array3::<f64>::zeros((4, 4, 4));
+    labels[[0, 0, 0]] = 2.0;
+    labels[[2, 1, 3]] = 2.0;
+    labels[[3, 3, 3]] = 5.0;
+    let mut labels_u32 = Array3::<u32>::zeros((4, 4, 4));
+    labels_u32[[0, 0, 0]] = 2;
+    labels_u32[[2, 1, 3]] = 2;
+    labels_u32[[3, 3, 3]] = 5;
+
+    let spacing = PhysicalSpacing::new([2.0, 3.0, 5.0]).unwrap();
+    let basic = object_geometry_basic_measurements(labels.view(), spacing).unwrap();
+    assert_eq!(
+        object_geometry_basic_measurements_u32(labels_u32.view(), spacing).unwrap(),
+        basic
+    );
+    assert_eq!(basic.len(), 2);
+
+    let first = &basic[0];
+    assert_eq!(first.label, 2);
+    assert_eq!(first.count, 2);
+    assert_eq!(first.bbox_min, [0, 0, 0]);
+    assert_eq!(first.bbox_max, [3, 2, 4]);
+    assert_eq!(first.physical_bbox_extent, [6.0, 6.0, 20.0]);
+
+    let directions = DirectionSet3::axes();
+    let feret = object_directional_feret_measurements(labels.view(), spacing, &directions).unwrap();
+    assert_eq!(feret.len(), 2);
+    let first_feret = &feret[0];
+    assert_eq!(first_feret.label, 2);
+    assert_eq!(first_feret.count, 2);
+    assert_eq!(first_feret.directions, 3);
+    assert_eq!(first_feret.max_directional_feret_diameter, 15.0);
+    assert_eq!(
+        feret
+            .iter()
+            .find(|row| row.label == 5)
+            .unwrap()
+            .max_directional_feret_diameter,
+        0.0
+    );
+
+    assert!(DirectionSet3::new([[0.0, 0.0, 0.0]]).is_err());
+    assert!(DirectionSet3::fibonacci(0).is_err());
+    assert_eq!(DirectionSet3::fibonacci(8).unwrap().len(), 8);
+
+    labels[[0, 0, 1]] = -1.0;
+    assert!(object_geometry_basic_measurements(labels.view(), spacing).is_err());
+    assert!(object_directional_feret_measurements(labels.view(), spacing, &directions).is_err());
+}
+
+#[test]
 fn object_3d_moments_report_physical_central_moments() {
     let mut labels = Array3::<f64>::zeros((2, 2, 4));
     labels[[0, 0, 0]] = 2.0;
@@ -5066,6 +5125,72 @@ fn object_geometry_and_sphere_rows_have_canonical_schemas_and_collectors() {
         collect_object_geometry_measurements(&env, "object-geometry.rows", 0, VOLUME).unwrap();
     assert_eq!(got_geometry, geometry);
 
+    let geometry_basic = vec![ObjectGeometryBasicMeasurements {
+        label: 2,
+        count: 2,
+        bbox_min: [0, 0, 0],
+        bbox_max: [3, 2, 4],
+        physical_bbox_extent: [6.0, 6.0, 20.0],
+    }];
+    let encoded_geometry_basic =
+        encode_object_geometry_basic_measurements(&geometry_basic).unwrap();
+    assert_eq!(
+        encoded_schema(&encoded_geometry_basic).unwrap(),
+        object_geometry_basic_measurement_schema()
+    );
+    assert_eq!(
+        encoded_schema(&encoded_geometry_basic)
+            .unwrap()
+            .columns()
+            .last()
+            .unwrap()
+            .name(),
+        "physical_bbox_extent_2"
+    );
+    env.declare_sidecar("object-geometry-basic.rows", Lifecycle::Persistent)
+        .unwrap();
+    env.write_sidecar(
+        "object-geometry-basic.rows",
+        0,
+        [0, 0, 0],
+        &encoded_geometry_basic,
+    )
+    .unwrap();
+    let got_geometry_basic =
+        collect_object_geometry_basic_measurements(&env, "object-geometry-basic.rows", 0, VOLUME)
+            .unwrap();
+    assert_eq!(got_geometry_basic, geometry_basic);
+
+    let directional_feret = vec![ObjectDirectionalFeretMeasurements {
+        label: 2,
+        count: 2,
+        directions: 3,
+        max_directional_feret_diameter: 15.0,
+    }];
+    let encoded_directional_feret =
+        encode_object_directional_feret_measurements(&directional_feret).unwrap();
+    assert_eq!(
+        encoded_schema(&encoded_directional_feret).unwrap(),
+        object_directional_feret_measurement_schema()
+    );
+    env.declare_sidecar("object-directional-feret.rows", Lifecycle::Persistent)
+        .unwrap();
+    env.write_sidecar(
+        "object-directional-feret.rows",
+        0,
+        [0, 0, 0],
+        &encoded_directional_feret,
+    )
+    .unwrap();
+    let got_directional_feret = collect_object_directional_feret_measurements(
+        &env,
+        "object-directional-feret.rows",
+        0,
+        VOLUME,
+    )
+    .unwrap();
+    assert_eq!(got_directional_feret, directional_feret);
+
     let spheres = vec![ObjectEnclosingSphereMeasurements {
         label: 2,
         count: 2,
@@ -5105,6 +5230,25 @@ fn object_geometry_and_sphere_rows_have_canonical_schemas_and_collectors() {
             bbox_max: [0, 1, 1],
             physical_bbox_extent: [1.0, 1.0, 1.0],
             max_voxel_feret_diameter: 0.0,
+        }])
+        .is_err()
+    );
+    assert!(
+        encode_object_geometry_basic_measurements(&[ObjectGeometryBasicMeasurements {
+            label: 0,
+            count: 1,
+            bbox_min: [0, 0, 0],
+            bbox_max: [1, 1, 1],
+            physical_bbox_extent: [1.0, 1.0, 1.0],
+        }])
+        .is_err()
+    );
+    assert!(
+        encode_object_directional_feret_measurements(&[ObjectDirectionalFeretMeasurements {
+            label: 3,
+            count: 1,
+            directions: 0,
+            max_directional_feret_diameter: 0.0,
         }])
         .is_err()
     );
@@ -5164,6 +5308,122 @@ fn planned_object_geometry(
     collect_object_geometry_measurements(&env, "object-geometry.planned.rows", 1, VOLUME).unwrap()
 }
 
+fn planned_object_geometry_basic(
+    block: [usize; 3],
+    spacing: PhysicalSpacing,
+) -> Vec<ObjectGeometryBasicMeasurements> {
+    let mut decomposition = base(block);
+    let grid = decomposition.phases[0].grid.clone();
+    let op = ObjectGeometryBasicTallyOp::new(
+        "measure basic object geometry tallies",
+        0usize,
+        "object-geometry-basic.planned.tallies",
+        Lifecycle::DeleteOnExit,
+    )
+    .unwrap()
+    .holding(Dtype::F64);
+    decomposition
+        .phases
+        .push(fragment_phase(&op, grid.clone()).unwrap());
+    let merge = MergeObjectGeometryBasicOp::new(
+        "merge basic object geometry",
+        "object-geometry-basic.planned.tallies",
+        1,
+        grid.blocks_per_axis(),
+        spacing,
+        "object-geometry-basic.planned.rows",
+        Lifecycle::DeleteOnExit,
+    )
+    .unwrap();
+    decomposition
+        .phases
+        .push(fragment_phase(&merge, grid.clone()).unwrap());
+    decomposition.check().unwrap();
+
+    let env = ArrayEnvironment::new(labels(), decomposition.n_phases(), [2, 2, 2]).unwrap();
+    execute_phases(
+        "planned object geometry basic",
+        &workflow(),
+        &decomposition,
+        &Hints::default(),
+        &env,
+        &[],
+        &[
+            PhaseWork::Pixels,
+            PhaseWork::Fragments(&op),
+            PhaseWork::Fragments(&merge),
+        ],
+    )
+    .unwrap();
+    collect_object_geometry_basic_measurements(
+        &env,
+        "object-geometry-basic.planned.rows",
+        2,
+        VOLUME,
+    )
+    .unwrap()
+}
+
+fn planned_object_directional_feret(
+    block: [usize; 3],
+    spacing: PhysicalSpacing,
+    directions: DirectionSet3,
+) -> Vec<ObjectDirectionalFeretMeasurements> {
+    let mut decomposition = base(block);
+    let grid = decomposition.phases[0].grid.clone();
+    let op = ObjectDirectionalFeretTallyOp::new(
+        "measure directional object Feret tallies",
+        0usize,
+        spacing,
+        directions.clone(),
+        "object-directional-feret.planned.tallies",
+        Lifecycle::DeleteOnExit,
+    )
+    .unwrap()
+    .holding(Dtype::F64);
+    decomposition
+        .phases
+        .push(fragment_phase(&op, grid.clone()).unwrap());
+    let merge = MergeObjectDirectionalFeretOp::new(
+        "merge directional object Feret",
+        "object-directional-feret.planned.tallies",
+        1,
+        grid.blocks_per_axis(),
+        spacing,
+        directions,
+        "object-directional-feret.planned.rows",
+        Lifecycle::DeleteOnExit,
+    )
+    .unwrap();
+    decomposition
+        .phases
+        .push(fragment_phase(&merge, grid.clone()).unwrap());
+    decomposition.check().unwrap();
+
+    let env = ArrayEnvironment::new(labels(), decomposition.n_phases(), [2, 2, 2]).unwrap();
+    execute_phases(
+        "planned object directional Feret",
+        &workflow(),
+        &decomposition,
+        &Hints::default(),
+        &env,
+        &[],
+        &[
+            PhaseWork::Pixels,
+            PhaseWork::Fragments(&op),
+            PhaseWork::Fragments(&merge),
+        ],
+    )
+    .unwrap();
+    collect_object_directional_feret_measurements(
+        &env,
+        "object-directional-feret.planned.rows",
+        2,
+        VOLUME,
+    )
+    .unwrap()
+}
+
 fn planned_enclosing_sphere(
     block: [usize; 3],
     spacing: PhysicalSpacing,
@@ -5207,6 +5467,55 @@ fn planned_object_geometry_is_decomposition_invariant_and_matches_resident_refer
 
     let reference = object_geometry_measurements(labels().view::<f64>().unwrap(), spacing).unwrap();
     assert_eq!(split, reference);
+}
+
+#[test]
+fn planned_basic_geometry_and_directional_feret_match_resident_reference() {
+    let spacing = PhysicalSpacing::new([2.0, 3.0, 5.0]).unwrap();
+    let directions = DirectionSet3::axes();
+
+    let coarse_basic = planned_object_geometry_basic(VOLUME, spacing);
+    let split_basic = planned_object_geometry_basic([2, 2, 2], spacing);
+    assert_eq!(coarse_basic, split_basic);
+    let expected_basic =
+        object_geometry_basic_measurements(labels().view::<f64>().unwrap(), spacing).unwrap();
+    assert_eq!(split_basic, expected_basic);
+
+    for directions in [
+        directions,
+        DirectionSet3::icosahedral(),
+        DirectionSet3::fibonacci(17).unwrap(),
+    ] {
+        let coarse_feret = planned_object_directional_feret(VOLUME, spacing, directions.clone());
+        let split_feret = planned_object_directional_feret([2, 2, 2], spacing, directions.clone());
+        assert_eq!(coarse_feret, split_feret);
+        let expected_feret = object_directional_feret_measurements(
+            labels().view::<f64>().unwrap(),
+            spacing,
+            &directions,
+        )
+        .unwrap();
+        assert_eq!(split_feret, expected_feret);
+    }
+}
+
+#[test]
+fn directional_feret_handles_singleton_with_anisotropic_spacing() {
+    let spacing = PhysicalSpacing::new([2.0, 3.0, 5.0]).unwrap();
+    let directions = DirectionSet3::fibonacci(8).unwrap();
+    let mut labels = Array3::<f64>::zeros((3, 3, 3));
+    labels[[1, 1, 1]] = 7.0;
+
+    let got = object_directional_feret_measurements(labels.view(), spacing, &directions).unwrap();
+    assert_eq!(
+        got,
+        vec![ObjectDirectionalFeretMeasurements {
+            label: 7,
+            count: 1,
+            directions: directions.len(),
+            max_directional_feret_diameter: 0.0,
+        }]
+    );
 }
 
 #[test]
@@ -5280,6 +5589,75 @@ fn measurement_builder_runs_planned_object_geometry_and_enclosing_sphere() {
     let got_spheres =
         collect_enclosing_sphere_rows_with_contract(&env, &sphere_rows, VOLUME).unwrap();
     assert_eq!(got_spheres, expected_spheres);
+}
+
+#[test]
+fn measurement_builder_runs_basic_geometry_and_directional_feret() {
+    let spacing = PhysicalSpacing::new([2.0, 3.0, 5.0]).unwrap();
+    let directions = DirectionSet3::axes();
+    let expected_basic =
+        object_geometry_basic_measurements(labels().view::<f64>().unwrap(), spacing).unwrap();
+    let expected_feret = object_directional_feret_measurements(
+        labels().view::<f64>().unwrap(),
+        spacing,
+        &directions,
+    )
+    .unwrap();
+    let plan = Measurements::for_labels(0usize)
+        .object_geometry_basic(spacing)
+        .object_directional_feret(spacing, directions.clone())
+        .stream("objects")
+        .build(base([2, 2, 2]))
+        .unwrap();
+    assert_eq!(plan.rows_phase, None);
+    assert_eq!(plan.decomposition.n_phases(), 4);
+    assert_eq!(plan.phase_work().len(), 3);
+    assert_eq!(plan.object_directional_feret_rows_phase(), Some(2));
+    assert_eq!(plan.object_geometry_basic_rows_phase(), Some(3));
+    assert_eq!(plan.object_geometry_basic_spacing(), Some(spacing));
+    assert_eq!(plan.object_directional_feret_directions(), Some(directions));
+
+    let geometry_rows = plan.object_geometry_basic_rows_with_contract().unwrap();
+    assert_eq!(
+        geometry_rows.stream(),
+        plan.object_geometry_basic_stream().unwrap()
+    );
+    assert_eq!(
+        geometry_rows.phase(),
+        plan.object_geometry_basic_rows_phase().unwrap()
+    );
+    assert_eq!(geometry_rows.contract(), spacing);
+    let feret_rows = plan.object_directional_feret_rows_with_contract().unwrap();
+    assert_eq!(
+        feret_rows.stream(),
+        plan.object_directional_feret_stream().unwrap()
+    );
+    assert_eq!(
+        feret_rows.phase(),
+        plan.object_directional_feret_rows_phase().unwrap()
+    );
+    assert_eq!(feret_rows.contract_ref(), &DirectionSet3::axes());
+
+    let env = ArrayEnvironment::new(labels(), plan.decomposition.n_phases(), [2, 2, 2]).unwrap();
+    let mut work = vec![PhaseWork::Pixels];
+    work.extend(plan.phase_work());
+    execute_phases(
+        "builder object basic geometry and directional Feret",
+        &workflow(),
+        &plan.decomposition,
+        &Hints::default(),
+        &env,
+        &[],
+        &work,
+    )
+    .unwrap();
+
+    let got_basic =
+        collect_object_geometry_basic_rows_with_contract(&env, &geometry_rows, VOLUME).unwrap();
+    assert_eq!(got_basic, expected_basic);
+    let got_feret =
+        collect_object_directional_feret_rows_with_contract(&env, &feret_rows, VOLUME).unwrap();
+    assert_eq!(got_feret, expected_feret);
 }
 
 #[test]
