@@ -185,8 +185,12 @@ jobs:
           echo "pliron-derive: $(versions pliron-derive | tr '\n' ' ')"
           test "$(versions pliron)" = 0.17.0
           test "$(versions pliron-derive)" = 0.17.0
-      - name: Build
+      - name: Build tested targets
+        if: matrix.features.test != 'no'
         run: cargo build --all-targets ${{ matrix.features.flags }}
+      - name: Build compile-only targets
+        if: matrix.features.test == 'no'
+        run: cargo build --lib --bins ${{ matrix.features.flags }}
       # `--no-fail-fast` so one broken suite does not hide the state of the other
       # hundred. No `--ignored`: see the header.
       - name: Test

@@ -403,6 +403,14 @@ struct Shared {
     /// nothing for. That is what makes [`WorkerReport::starved`] answerable
     /// after the fact instead of guessed from a reply that may be stale.
     refusals: AtomicUsize,
+    /// The queue was empty only after a handout had already said "nothing now".
+    ///
+    /// This is deliberately separate from [`Self::refusals`]. A completion can
+    /// be answered with `Wait`, and then an already in-flight pull can be
+    /// answered with `Work` before the executor calls `next_task`. The refusal
+    /// did not happen *during* the wait, but it still explains the empty list
+    /// the executor is about to see.
+    empty_explained: AtomicBool,
     /// Microseconds until the puller's first reply, and of that how much its
     /// connect took. See [`WorkerReport::first_pull`].
     first_pull_us: AtomicU64,
@@ -526,6 +534,7 @@ pub fn run(options: WorkerOptions, factory: &dyn WorkflowFactory) -> Result<Work
         executing: AtomicBool::new(false),
         last: Mutex::new(LastReply::Nothing),
         refusals: AtomicUsize::new(0),
+        empty_explained: AtomicBool::new(false),
         first_pull_us: AtomicU64::new(0),
         pull_connect_us: AtomicU64::new(0),
         done: AtomicBool::new(false),
@@ -802,6 +811,7 @@ fn next_task(shared: &Arc<Shared>, report: &mut WorkerReport) -> Option<Assignme
     {
         let mut queue = shared.queue.lock_unpoisoned();
         if let Some(assignment) = queue.pop_front() {
+            shared.empty_explained.store(false, Ordering::Release);
             report.started_ready += 1;
             shared.executing.store(true, Ordering::Release);
             shared.taken.notify_one();
@@ -812,6 +822,7 @@ fn next_task(shared: &Arc<Shared>, report: &mut WorkerReport) -> Option<Assignme
     // started is ever a starve.
     let running = report.started_ready + report.started_after_waiting > 0;
     let believed_available = *shared.last.lock_unpoisoned() == LastReply::Work;
+    let already_explained = shared.empty_explained.swap(false, Ordering::AcqRel);
     let refusals_before = shared.refusals.load(Ordering::Acquire);
     let mut queue = shared.queue.lock_unpoisoned();
     loop {
@@ -825,7 +836,9 @@ fn next_task(shared: &Arc<Shared>, report: &mut WorkerReport) -> Option<Assignme
                 // had already said so when the list emptied, or said so while
                 // we waited. The two together account for every wait past a
                 // worker's first, which is what the pipeline test checks.
-                if believed_available && shared.refusals.load(Ordering::Acquire) == refusals_before
+                if believed_available
+                    && !already_explained
+                    && shared.refusals.load(Ordering::Acquire) == refusals_before
                 {
                     report.starved += 1;
                 } else {
@@ -876,6 +889,9 @@ fn replace_consumed(shared: &Arc<Shared>, reply: &serde_json::Value) -> Result<(
             Handout::Task(assignment) => queue.push_back(*assignment),
             Handout::Wait { .. } => {
                 shared.refusals.fetch_add(1, Ordering::AcqRel);
+                if queue.is_empty() {
+                    shared.empty_explained.store(true, Ordering::Release);
+                }
             }
             Handout::Finished => shared.done.store(true, Ordering::Release),
         }
@@ -1022,6 +1038,9 @@ fn spawn_puller(
                         // it already sees the refusal it is about to be
                         // classified by.
                         shared.refusals.fetch_add(1, Ordering::AcqRel);
+                        if shared.queue.lock_unpoisoned().is_empty() {
+                            shared.empty_explained.store(true, Ordering::Release);
+                        }
                         shared.arrived.notify_all();
                         std::thread::sleep(Duration::from_millis(after_ms.clamp(1, 200)));
                     }
