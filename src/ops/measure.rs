@@ -10750,7 +10750,7 @@ impl ObjectDirectionalFeretTally {
             .fold(0.0, f64::max)
     }
 
-    fn into_measurements(&self) -> ObjectDirectionalFeretMeasurements {
+    fn to_measurements(&self) -> ObjectDirectionalFeretMeasurements {
         ObjectDirectionalFeretMeasurements {
             label: self.label,
             count: self.count,
@@ -11132,7 +11132,7 @@ pub fn object_directional_feret_measurements(
     objects
         .into_values()
         .map(|tally| {
-            let row = tally.into_measurements();
+            let row = tally.to_measurements();
             validate_object_directional_feret_row(&row)?;
             Ok(row)
         })
@@ -12288,7 +12288,7 @@ impl MergeObjectDirectionalFeretOp {
             if !tally.is_owned_by(grid, block) {
                 continue;
             }
-            let row = tally.into_measurements();
+            let row = tally.to_measurements();
             validate_object_directional_feret_row(&row)?;
             rows.push(
                 tally.bbox_min,

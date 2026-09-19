@@ -142,6 +142,14 @@ jobs:
           # cache is a warm start, not a promise of the same dependency graph.
           key: ${{ runner.os }}-cargo-${{ matrix.features.key }}-${{ hashFiles('Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-${{ matrix.features.key }}-
+      # `pliron 0.17.0` declares `pliron-derive = "0"`, and a lock-free resolve
+      # can pair it with `pliron-derive 0.18`, whose macro expansion targets
+      # newer `pliron` paths. The manifest carries an optional exact dependency
+      # for feature builds, and this seeds CI's ephemeral lockfile before the
+      # expensive Burn/CubeCL row compiles.
+      - name: Pin pliron derive for Burn/CubeCL
+        if: matrix.features.key == 'cellpose-yolo'
+        run: cargo update -p pliron-derive --precise 0.17.0
       - name: Build
         run: cargo build --all-targets ${{ matrix.features.flags }}
       # `--no-fail-fast` so one broken suite does not hide the state of the other
