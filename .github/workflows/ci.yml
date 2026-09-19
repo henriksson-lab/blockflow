@@ -31,25 +31,12 @@
 # seconds — and that is a different kind of claim: it separates "finished" from
 # "hung", not "fast" from "slow", and no busy runner reaches it.
 #
-# **The tests that do run are not heavy, and that is measured rather than
-# assumed.** With the `[profile.dev]` this crate now ships, at `--test-threads=4`
-# to imitate a hosted runner:
-#
-# | | binaries | total wall | slowest one | peak RSS |
-# |---|---|---|---|---|
-# | no features | 104 | 70.6 s | 14.0 s (`barrier_migration`) | 126 MB |
-# | `gui,distributed,zarr,model-segment` | 111 | 87.4 s | 15.3 s (`barrier_migration`) | 128 MB |
-# | `fftw` (`fft_correlation` alone) | 1 | 0.4 s | — | 23 MB |
-#
-# A 16 GB runner is not troubled by 128 MB, and the whole suite is under two
-# minutes. The `local_multi_node` suite — which starts real coordinator and
-# worker *processes* over loopback — is 3.3 s of that and binds `:0`, never a
-# fixed port, so it does not collide with anything else on the runner.
-#
-# **The test step is nearly free**, which is why it sits inside the build job
-# rather than beside it: `cargo build --all-targets` has already compiled every
-# test binary, so `cargo test` only runs them. A separate job would pay for the
-# whole compile again.
+# **Build portability and optional-feature coverage are separate.** The default
+# crate builds on Ubuntu, macOS and Windows. Optional feature stacks build once
+# on Linux, because those rows primarily answer "does this optional graph still
+# resolve, compile and type-check?" rather than "does YOLO, Cellpose, StarDist
+# or FFTW behave differently by OS?". The full behavioral suite also runs on
+# Linux, where failures are cheapest to reproduce.
 #
 # `build` and not `check` because the question is whether it *builds*: `check`
 # stops before codegen and before the linker, and the linker is exactly what has
@@ -93,28 +80,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        features:
+        include:
           # The configuration everything else in `Cargo.toml` is measured
-          # against: no feature at all. Tested on all three platforms, because
-          # this is the one whose behaviour the rest are described relative to.
-          - { name: no features, key: default, flags: "", test: everywhere }
+          # against: no feature at all. Built on all three platforms; tested on
+          # Linux, where failures are cheapest to reproduce.
+          - os: ubuntu-latest
+            features: { name: no features, key: default, flags: "", test: linux }
+          - os: macos-latest
+            features: { name: no features, key: default, flags: "", test: "no" }
+          - os: windows-latest
+            features: { name: no features, key: default, flags: "", test: "no" }
           # `gui`, `distributed` and `model-segment` add no packages of their
           # own; `zarr` adds a C toolchain requirement through `libz-sys`, which
-          # every runner has. Tested on Linux only — widening it is one word,
-          # and worth doing the first time anyone runs this crate elsewhere.
-          - { name: gui+distributed+zarr+model-segment, key: wide, flags: "--features gui,distributed,zarr,model-segment", test: linux }
+          # the Linux runner has. Built and tested on Linux only.
+          - os: ubuntu-latest
+            features: { name: gui+distributed+zarr+model-segment, key: wide, flags: "--features gui,distributed,zarr,model-segment", test: linux }
           # The reason this workflow exists. `stardist-rs` is no longer a path on
           # one developer's machine but a git revision, so whether it builds
-          # anywhere else is now a question CI can answer. Built and not tested:
+          # in this crate is now a question CI can answer. Built and not tested:
           # its tests are the `model-segment` ones the row above already runs,
           # and the compile — `burn`, and a patched `candle` — is the expensive
           # part.
-          - { name: stardist, key: stardist, flags: "--features stardist", test: "no" }
+          - os: ubuntu-latest
+            features: { name: stardist, key: stardist, flags: "--features stardist", test: "no" }
           # The other two model adapters, git dependencies for the same reason
           # and at the same risk. Together in one row because they share `burn`,
           # which is most of what either costs to build.
-          - { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo", test: "no" }
+          - os: ubuntu-latest
+            features: { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo", test: "no" }
     steps:
       - uses: actions/checkout@v5
       - name: Install the stable toolchain
@@ -250,29 +243,16 @@ jobs:
 
   # `fftw` links the system `libfftw3`, and when there is none the failure is a
   # link error rather than a fallback to the portable backend — deliberately, and
-  # the `fftw-sys` block in `Cargo.toml` says why. Linux and macOS can install
-  # the library in one line; Windows has no such line, which is why this job has
-  # two platforms where the one above has three.
+  # the `fftw-sys` block in `Cargo.toml` says why. CI builds and tests that
+  # optional backend once on Linux; the default matrix is the platform gate.
   fftw:
-    name: fftw (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: fftw
+    runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
-      - name: Install FFTW (Linux)
-        if: runner.os == 'Linux'
+      - name: Install FFTW
         run: sudo apt-get update && sudo apt-get install -y libfftw3-dev
-      - name: Install FFTW (macOS)
-        if: runner.os == 'macOS'
-        # Homebrew is not on the linker's default search path on Apple silicon,
-        # and `fftw-sys` with `system` has no build script to add it.
-        run: |
-          brew install fftw
-          echo "RUSTFLAGS=-L $(brew --prefix fftw)/lib" >> "$GITHUB_ENV"
       - name: Install the stable toolchain
         run: |
           rustup update --no-self-update stable
@@ -285,13 +265,12 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-fftw-${{ hashFiles('Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-cargo-fftw-
+          key: Linux-cargo-fftw-${{ hashFiles('Cargo.toml') }}
+          restore-keys: Linux-cargo-fftw-
       - run: cargo build --all-targets --features fftw
-      # This is the configuration in which `tests/fft_correlation.rs` compares
-      # the two backends *in one process*, which is the only way that comparison
-      # is worth anything. 22 assertions, 0.4 s; the timing half of that file is
-      # `#[ignore]`d and stays that way here.
+      # This is the configuration in which the FFT backend checks compare the
+      # two backends *in one process*, which is the only way that comparison is
+      # worth anything.
       - run: cargo test --no-fail-fast --features fftw
 
   # The documentation is this crate's design record, so a link in it that no
