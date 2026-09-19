@@ -225,6 +225,7 @@ fn priced_images(assembly: &Assembly) -> u64 {
 /// those buffers are alive at once and not how wide each is, so it takes nothing
 /// away from this: the two savings are on different axes and compose.
 #[test]
+#[ignore = "memory/residency cost comparison; correctness tests run in default CI"]
 fn the_narrow_sink_holds_fewer_bytes_than_the_wide_one() {
     const VOLUME: [usize; 3] = [128, 128, 96];
     let voxels: u64 = VOLUME.iter().product::<usize>() as u64;

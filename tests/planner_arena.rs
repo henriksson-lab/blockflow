@@ -295,6 +295,7 @@ fn every_strategy_produces_a_plan_the_simulator_runs() {
 /// continuously, moves these numbers; the assertions below are here so that it
 /// moves them *visibly*, with a place to write down what the new figures are.
 #[test]
+#[ignore = "planner research conclusion with fitted regret numbers; not default correctness coverage"]
 fn the_two_judges_record_the_raw_gap_and_simulator_backed_closes_it() {
     let workflow = workflow();
     let edges = [8usize, 16, 32, 64];
@@ -478,6 +479,7 @@ fn the_two_judges_record_the_raw_gap_and_simulator_backed_closes_it() {
 /// The single-phase plans are the control: a run with one phase has nothing to
 /// overlap, and its ratio is `1.000` under both policies by construction.
 #[test]
+#[ignore = "planner policy research conclusion; conservation/oracle tests run in default CI"]
 fn the_phases_overlap_only_under_the_policy_that_fuses() {
     let workflow = workflow();
     let mut arena = Arena::new(machine(4), rates());

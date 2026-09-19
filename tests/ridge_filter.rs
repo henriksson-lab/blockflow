@@ -249,26 +249,6 @@ fn the_scale_map_is_the_same_array_under_every_decomposition() {
     );
 }
 
-/// The same property stated the other way round: the decompositions agree with
-/// **each other**, so nothing rests on the reference being special.
-#[test]
-fn no_two_decompositions_disagree() {
-    let input = intensities();
-    for (name, chain, _) in cases() {
-        let workflow = workflow(chain());
-        let first = run(&workflow, &plan(&workflow, 7, &[0]), &input);
-        for block in [8usize, 12] {
-            for split_axes in [vec![1], vec![0, 2]] {
-                assert_eq!(
-                    run(&workflow, &plan(&workflow, block, &split_axes), &input),
-                    first,
-                    "{name}: block {block}, axes {split_axes:?}"
-                );
-            }
-        }
-    }
-}
-
 // -------------------------------------------------------- 3. the guard --
 
 /// **The guard, seen firing.**

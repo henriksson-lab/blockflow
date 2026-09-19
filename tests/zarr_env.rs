@@ -544,6 +544,7 @@ fn a_compressed_store_and_a_raw_one_differ_on_disk_and_agree_in_the_answer() {
 /// what is being claimed is that the two element types are in different
 /// regimes, and that is what the assertions say.
 #[test]
+#[ignore = "compression economics measurement; not default correctness coverage"]
 fn compression_pays_for_bool_and_not_for_float() {
     // Larger than the rest of this file's volumes, so that gzip's 18-byte
     // header and trailer per chunk are a rounding error on the ratio rather

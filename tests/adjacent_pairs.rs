@@ -36,8 +36,7 @@
 // What is not here, and where it went
 // -----------------------------------
 // The reference this operation was specified against is a separate application
-// under a different licence, and blockflow may not depend on it — see
-// `tests/no_domain_vocabulary.rs` for the boundary and `README.md` for the rule.
+// under a different licence, and blockflow may not depend on it.
 // The comparison against it was made out of process, in a throwaway crate that
 // depends on this one and reads the reference's recorded output, and it agreed
 // exactly. On a recorded 96 x 96 x 32 mask with 3158 set voxels the reference's

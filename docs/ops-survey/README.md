@@ -923,13 +923,11 @@ therefore cited from the *header that quotes it*, not from the document. Where a
 header paraphrases rather than quotes, a survey may be one restatement further
 from the original than it appears. **Do not go looking for it.**
 
-**`tests/no_domain_vocabulary.rs` cannot see these documents.** It walks
-`src/` and `tests/`, keeping paths whose `extension == "rs"`. Nothing under
-`docs/` is scanned, by any of its three tests. All four workers applied the
-vocabulary rule anyway and verified with their own case-insensitive substring
-scans, as did this index, as did the correction pass that added §8 and §9 —
-which had particular reason to, since the sibling module it read for §8.4 is
-full of the vocabulary and none of it travelled. **That is a convention these documents hold themselves
+**These documents are not part of any source vocabulary scan.** All four workers
+applied the vocabulary rule anyway and verified with their own case-insensitive
+substring scans, as did this index, as did the correction pass that added §8 and
+§9 — which had particular reason to, since the sibling module it read for §8.4
+is full of the vocabulary and none of it travelled. **That is a convention these documents hold themselves
 to, not something enforced.** If it matters that it stay true, the scan needs a
 second root and a second extension — which is a change to a test, and no
 document may make it.

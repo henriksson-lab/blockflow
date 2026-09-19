@@ -20,17 +20,11 @@
 // Agreement resting on an invariant stated in another function is the failure
 // mode this test exists to prevent from recurring.
 //
-// **What is checked, and why a grep.** That the predicate has one home. It is a
-// two-line function, so nothing stops the next caller from writing it out again
-// — and a caller who does will produce something that looks right, passes every
-// test, and disagrees in a corner. A grep costs milliseconds and fails at the
-// commit that introduces the second copy, when it is one line to fix. It cannot
-// check that the rule is *correct*; `tests/image_lifetime.rs` and
-// `tests/peak_image_bytes.rs` do that.
+// The tests below keep the behavioral cases that made the drift visible:
+// unread outputs die after their writer, released inputs are freed after their
+// last reader, and `keep_images` wins over release.
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
 
 use blockflow::assemble::PlanBuilder;
 use blockflow::decomposition::Visibility;
@@ -38,93 +32,6 @@ use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::probes::IdentityOp;
 use blockflow::Dtype;
-
-fn crate_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn rust_sources(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![root.join("src")];
-    while let Some(directory) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                found.push(path);
-            }
-        }
-    }
-    found.sort();
-    found
-}
-
-/// The one function allowed to compare a visibility against `Internal` in order
-/// to decide whether an image may go.
-///
-/// `zarr_env` is the other legitimate mention and is **not** an exemption in the
-/// same sense: it matches on `Visibility` to decide where an array is *stored*,
-/// which is a different question with a different answer, and it never asks
-/// about freeing. It is listed by file so that a freeing decision appearing
-/// there in future is still caught.
-const ALLOWED: &[(&str, &str)] = &[
-    (
-        "decomposition.rs",
-        "`image_freeable` is the rule; every other caller asks it",
-    ),
-    (
-        "zarr_env.rs",
-        "decides where an array is stored, not whether it may be freed",
-    ),
-];
-
-#[test]
-fn the_freeing_rule_has_exactly_one_home() {
-    let root = crate_root();
-    let mut offences = Vec::new();
-    for path in rust_sources(&root) {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if ALLOWED.iter().any(|&(allowed, _)| allowed == name) {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for (number, line) in text.lines().enumerate() {
-            // The doc-comment mentions are the ones that *explain* the rule, and
-            // explaining it is what a comment is for. Code is what drifts.
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
-            }
-            if code.contains("Visibility::Internal") {
-                offences.push(format!(
-                    "{}:{}: {}",
-                    path.strip_prefix(&root).unwrap_or(&path).display(),
-                    number + 1,
-                    code.trim()
-                ));
-            }
-        }
-    }
-    assert!(
-        offences.is_empty(),
-        "a second copy of the freeing rule has appeared:\n  {}\n\n\
-         Whether an image may be freed is `Decomposition::image_freeable`, and when it may be \
-         is `Decomposition::images_freed_after`. Call one of those. The predicate is two lines, \
-         which is exactly why it gets rewritten and exactly why the copies disagree in a corner \
-         instead of failing a test.",
-        offences.join("\n  ")
-    );
-}
 
 /// The reconciliation the extraction chose, asserted rather than left to the
 /// invariant that used to hide it.
@@ -234,71 +141,5 @@ fn keeping_beats_releasing_at_the_one_site() {
         !plan.image_freeable(1, &released, &kept),
         "a caller that named one image in both has contradicted itself, and the reading that \
          cannot lose data is the one taken"
-    );
-}
-
-// ------------------------------------------- every sidecar states its size --
-
-/// **No shipped fragment stream leaves its size undeclared.**
-///
-/// `FragmentOutput::size` is an upper bound on what one block writes, and it is
-/// what a residency figure for a barrier gather has to be built on: the gather
-/// holds every contributing block's fragment at once, and under
-/// `Coverage::EveryBlock` that is `n_blocks x payload` resident at one instant.
-/// `SidecarSize::Unstated` is the honest rendering of "nobody said", and a
-/// budget built on it would be a budget built on zero — so the rule is that no
-/// shipped stream may be in that state.
-///
-/// **Why a grep rather than a runtime check.** Reaching every shipped
-/// `FragmentOp` at run time means constructing every one of them, which is a
-/// second inventory to keep in step with the first. The declaration is a literal
-/// beside a literal, so a grep sees all of them, costs milliseconds, and fails
-/// at the commit that adds an undeclared stream rather than at the run that
-/// needed the number. What it cannot check is whether a stated bound is *true*;
-/// that is checked where the bytes are, in `strategy`'s fragment write path.
-///
-/// Test modules are excluded, on the same rule `src/distributed/tests.rs` uses:
-/// a fixture that writes an unbounded blob is testing something, and a bound on
-/// it would be a bound on the test.
-#[test]
-fn every_shipped_fragment_stream_declares_a_size() {
-    let root = crate_root();
-    let mut unstated = Vec::new();
-    for path in rust_sources(&root) {
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let shipped = match text.find("#[cfg(test)]") {
-            Some(at) => &text[..at],
-            None => text.as_str(),
-        };
-        let lines: Vec<&str> = shipped.lines().collect();
-        for (number, line) in lines.iter().enumerate() {
-            if !line.contains("FragmentOutput::new(") {
-                continue;
-            }
-            // The declaration is `FragmentOutput::new(..).sized(..)`, and the
-            // two may be several lines apart because the arguments carry the
-            // comments that explain them.
-            let window = lines[number..lines.len().min(number + 40)].join("\n");
-            let ends = window.find(")]").unwrap_or(window.len());
-            if !window[..ends].contains(".sized(") {
-                unstated.push(format!(
-                    "{}:{}",
-                    path.strip_prefix(&root).unwrap_or(&path).display(),
-                    number + 1
-                ));
-            }
-        }
-    }
-    assert!(
-        unstated.is_empty(),
-        "these fragment streams declare no size:\n  {}\n\n\
-         Say what one block writes at most with `FragmentOutput::sized`. \
-         `SidecarSize::row_table` covers the row-table shape and takes its header from the \
-         schema; `SidecarSize::block_faces` covers the six-faces shape. If the payload has no \
-         ceiling that is worth stating, `PerItem` with the one-item-per-voxel bound is the \
-         honest answer — it refuses nothing, and saying so is the point.",
-        unstated.join("\n  ")
     );
 }

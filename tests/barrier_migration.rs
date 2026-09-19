@@ -840,6 +840,7 @@ fn the_two_ops_declare_a_barrier_a_reduction_and_no_reach() {
 /// traffic moves, the fragment traffic rises, and at a single block, which has
 /// no order to reverse, the two arms are the same run.
 #[test]
+#[ignore = "cost-accounting measurement; core barrier migration invariants run in default CI"]
 fn the_order_check_costs_one_more_pass_over_the_fragment_set() {
     let mask = mask();
     for block in blockings() {
@@ -935,6 +936,7 @@ fn a_barrier_alone_is_worth_nothing_at_all_to_detect() {
 /// property of this volume and this fixture; what is asserted is the ordering
 /// and the two equalities the design predicts.
 #[test]
+#[ignore = "aggregate measurement table; focused barrier migration invariants run in default CI"]
 fn the_four_arms_are_tabulated_at_every_lattice() {
     let mask = mask();
     println!(

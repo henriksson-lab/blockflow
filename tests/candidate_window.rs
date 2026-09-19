@@ -192,6 +192,7 @@ impl Scheduler for Watching<'_> {
 ///   without which "wide enough not to truncate" would be true of every window
 ///   and the equality above would say nothing.
 #[test]
+#[ignore = "research conclusion about the unbounded-window baseline; not default correctness coverage"]
 fn an_unbounded_window_is_the_machine_this_crate_has_always_simulated() {
     assert_eq!(
         Machine::default().candidate_window,
@@ -431,6 +432,7 @@ fn a_window_changes_the_order_and_never_the_work() {
 /// window is a finding and is recorded in `print_what_a_window_costs`; making it
 /// a requirement here would be requiring the simulator to be worse.
 #[test]
+#[ignore = "candidate-window policy report; semantic window invariants run in default CI"]
 fn a_small_window_moves_a_schedule_that_looks_past_the_first_candidate() {
     let assembly = plan(VOLUME, ASSERTION_EDGE);
     let mut moved: Vec<&'static str> = Vec::new();

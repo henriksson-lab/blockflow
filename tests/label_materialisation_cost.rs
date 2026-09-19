@@ -318,10 +318,10 @@ use blockflow::voxels::Voxels;
 /// default**.
 ///
 /// A path is machine-local, and a machine-local path written into a general
-/// library's test is a leak of exactly the kind `tests/no_domain_vocabulary.rs`
-/// exists to catch. Unset means "there is nothing to measure on here", which is
-/// reported and is not a failure. What it must name: a C- or Fortran-ordered
-/// `.npy` holding a three-dimensional `bool` array.
+/// library's test would make the fixture non-portable. Unset means "there is
+/// nothing to measure on here", which is reported and is not a failure. What it
+/// must name: a C- or Fortran-ordered `.npy` holding a three-dimensional `bool`
+/// array.
 const FIXTURE_ENV: &str = "BLOCKFLOW_LABEL_FIXTURE";
 
 /// How much of axis 0 to take. The other two axes are the tile's own, so the

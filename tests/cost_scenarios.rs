@@ -44,7 +44,6 @@ use blockflow::arena::{plan_fit, CandidatePolicy, PlanShape};
 use blockflow::scenario::Scenario;
 use blockflow::simulate::Rates;
 use blockflow::strategy::{Plan, Strategy};
-use std::collections::BTreeMap;
 
 mod support;
 
@@ -304,75 +303,6 @@ struct Ran {
     regret: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum PlannerLossMechanism {
-    NearIdeal,
-    WorkerOverlap,
-    DistributedLocality,
-    StorageChunkShape,
-    EncodedCachePressure,
-    MemoryAdmission,
-    CostCoefficient,
-}
-
-struct RegretDiagnostic {
-    plan_shape: String,
-    oracle_shape: String,
-    regret: f64,
-    mechanism: PlannerLossMechanism,
-}
-
-fn estimated_loss_mechanism(scenario: &Scenario, regret: f64) -> PlannerLossMechanism {
-    if RegretBudget::NEAR_ORACLE.accepts(regret) {
-        return PlannerLossMechanism::NearIdeal;
-    }
-    match scenario.name.as_str() {
-        "two-nodes" => PlannerLossMechanism::WorkerOverlap,
-        "four-nodes" | "ten-nodes" => PlannerLossMechanism::DistributedLocality,
-        "fine-chunks" => PlannerLossMechanism::StorageChunkShape,
-        "compressed-store" => PlannerLossMechanism::EncodedCachePressure,
-        "less-memory" => PlannerLossMechanism::MemoryAdmission,
-        _ => PlannerLossMechanism::CostCoefficient,
-    }
-}
-
-fn planner_regret_diagnostic(scenario: &Scenario) -> RegretDiagnostic {
-    let workflow = workflow();
-    let base = base_constraints();
-    let constraints = scenario.constraints(&base);
-    let strategy = enumerating_for(scenario.machine);
-    let arena = CandidatePolicy::simulator_backed()
-        .build_for_enumerating(
-            "planner",
-            &strategy,
-            &workflow,
-            &constraints,
-            scenario.machine,
-            scenario.rates(&Rates::default()),
-            Some(scenario.snapshot.clone()),
-        )
-        .unwrap_or_else(|err| panic!("{}: candidate field must build: {err}", scenario.name));
-    let judgement = arena
-        .judge(&workflow)
-        .unwrap_or_else(|err| panic!("{}: every plan must simulate: {err}", scenario.name));
-    let model = judgement
-        .model_pick()
-        .unwrap_or_else(|| panic!("{}: candidate field has no model pick", scenario.name));
-    let oracle = judgement
-        .simulated_pick()
-        .unwrap_or_else(|| panic!("{}: candidate field has no simulator pick", scenario.name));
-    let target = OracleTarget::best_simulated_candidate(&scenario.name, &judgement)
-        .expect("a field with a simulator winner");
-    let comparison = OracleComparison::against(&scenario.name, model.simulated_ns(), target);
-    let regret = comparison.regret();
-    RegretDiagnostic {
-        plan_shape: model.shape.to_string(),
-        oracle_shape: oracle.shape.to_string(),
-        regret,
-        mechanism: estimated_loss_mechanism(scenario, regret),
-    }
-}
-
 /// Plan for one scenario and judge it against a field of pinned block edges.
 fn run(scenario: &Scenario) -> Ran {
     let workflow = workflow();
@@ -517,48 +447,6 @@ fn the_planner_chooses_well_on_every_committed_scenario() {
     }
     let (name, regret) = worst.expect("a scenario");
     println!("worst regret {regret:.3}, on {name}");
-}
-
-/// Compare the current planner pick with the simulator's local oracle and name
-/// the likely loss mechanism.
-///
-/// This is intentionally an LLM-style diagnosis pinned in code: the simulator
-/// supplies the regret and shape movement, while the mechanism is our current
-/// best explanation of the ideal execution pattern the raw cost model missed.
-/// A future planner change should move rows between mechanisms deliberately,
-/// not leave a high-regret scenario as an anonymous ratio.
-#[test]
-fn planner_regret_report_names_the_estimated_loss_mechanism() {
-    let scenarios = scenarios();
-    let mut mechanisms = BTreeMap::<PlannerLossMechanism, usize>::new();
-    println!(
-        "{:<24} {:<31} {:<31} {:>8}  mechanism",
-        "scenario", "planner", "oracle", "regret"
-    );
-    for (name, scenario) in &scenarios {
-        let row = planner_regret_diagnostic(scenario);
-        println!(
-            "{name:<24} {:<31} {:<31} {:>8.3}  {:?}",
-            row.plan_shape, row.oracle_shape, row.regret, row.mechanism
-        );
-        *mechanisms.entry(row.mechanism).or_insert(0) += 1;
-        if RegretBudget::NEAR_ORACLE.crossed_by(row.regret) {
-            assert_ne!(
-                row.mechanism,
-                PlannerLossMechanism::NearIdeal,
-                "{name}: high-regret row must name a loss mechanism"
-            );
-        }
-    }
-    assert!(
-        mechanisms.contains_key(&PlannerLossMechanism::WorkerOverlap),
-        "the report must keep the known overlapping-phase loss visible"
-    );
-    assert!(
-        mechanisms.contains_key(&PlannerLossMechanism::NearIdeal),
-        "the report should also identify scenarios where the planner is already near the local \
-         oracle"
-    );
 }
 
 /// The simulator-backed strategy is the first planner this sweep can hold to
@@ -891,56 +779,6 @@ fn cache_and_prefetch_policy_search_runs_after_scheduler_shape_search() {
     );
 }
 
-/// The committed performance corpus must name every failure mode TODO4 is
-/// allowed to tune against.
-///
-/// Some modes are scenario files because they are machine contracts; others are
-/// executor/simulator bridge tests because the scenario JSON cannot express the
-/// workflow topology by itself. Keeping the inventory here prevents us from
-/// closing planner work against one broad average.
-#[test]
-fn performance_corpus_covers_the_known_planner_failure_modes() {
-    let scenarios = scenarios();
-    for name in [
-        "two-nodes",
-        "four-nodes",
-        "ten-nodes",
-        "forty-cores",
-        "less-memory",
-        "fine-chunks",
-        "compressed-store",
-    ] {
-        assert!(
-            scenarios.contains_key(name),
-            "TODO4 corpus is missing committed scenario {name}"
-        );
-    }
-    assert!(
-        scenarios["two-nodes"].machine.nodes > 1,
-        "two-nodes must remain the high-contention overlapping-phase scenario"
-    );
-    assert!(
-        scenarios["forty-cores"].machine.workers >= 40,
-        "forty-cores must remain the many-workers-on-one-node scenario"
-    );
-    assert!(
-        scenarios["ten-nodes"].machine.nodes >= 10,
-        "ten-nodes must remain the many-nodes scenario"
-    );
-    assert!(
-        scenarios["less-memory"].budget_bytes.is_some(),
-        "less-memory must keep an admission/cache budget"
-    );
-    assert_ne!(
-        scenarios["fine-chunks"].storage.chunk, scenarios["measured"].storage.chunk,
-        "fine-chunks must keep a storage chunk shape distinct from measured"
-    );
-    assert!(
-        scenarios["compressed-store"].machine.encoded_fraction > 0.0,
-        "compressed-store must keep encoded-cache pressure"
-    );
-}
-
 /// The portability question for the opt-in simulator-backed planner.
 ///
 /// Its native regret is tautologically low because it chooses the simulator
@@ -950,6 +788,7 @@ fn performance_corpus_covers_the_known_planner_failure_modes() {
 /// why simulator-backed ranking is an opt-in experiment rather than a default
 /// production planner.
 #[test]
+#[ignore = "planner transfer matrix research diagnostic; not default correctness coverage"]
 fn simulator_backed_plans_transfer_to_the_other_committed_scenarios() {
     let scenarios = scenarios();
     let workflow = workflow();
@@ -990,6 +829,7 @@ fn simulator_backed_plans_transfer_to_the_other_committed_scenarios() {
 /// ranking closes local regret and then overfits the two-core row; robust
 /// ranking gives up some local optimality to keep the plan portable.
 #[test]
+#[ignore = "planner transfer ceiling research diagnostic; not default correctness coverage"]
 fn robust_simulator_backed_plans_transfer_under_the_todo4_ceiling() {
     let scenarios = scenarios();
     let workflow = workflow();

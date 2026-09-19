@@ -201,7 +201,7 @@ Pure wiring. No new public API in any of these.
   halves travel together and a caller cannot take one without the other.
 
   **Acceptance.** No `Visibility::Internal` comparison outside the one function,
-  asserted by a grep test in the manner of `tests/no_domain_vocabulary.rs`. The
+  asserted by `tests/one_freeing_rule.rs`. The
   `None` arms are reconciled deliberately, with the chosen answer stated, rather
   than left agreeing by accident.
 

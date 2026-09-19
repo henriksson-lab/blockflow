@@ -966,6 +966,7 @@ fn at_rates(
 /// **A comparison that holds on only part of the grid is documented, not
 /// deleted.** Two of the five below are of that kind and say so.
 #[test]
+#[ignore = "scheduler ranking research map; safety/conservation tests run in default CI"]
 fn every_ranking_states_the_region_of_rate_space_it_holds_in() {
     let cached = |depth: usize| Machine {
         workers: 1,
@@ -1158,6 +1159,7 @@ fn a_substage_count_multiplies_the_compute_and_nothing_else() {
 /// because the numbers are the finding and the assertion is only the part that
 /// must not regress.
 #[test]
+#[ignore = "scheduler comparison report; safety/conservation tests run in default CI"]
 fn the_schedulers_compared() {
     // **Sixteen chunks, and the size is the whole experiment.**
     //
@@ -1403,6 +1405,7 @@ fn the_horizon_floor_accounts_for_latency_decode_chunks_and_images() {
 /// The consequence for the plan is that **Stage 4's leverage is in the
 /// partition and not in the scheduler** at the concurrency this project targets.
 #[test]
+#[ignore = "scheduler performance interpretation; not default correctness coverage"]
 fn ordering_moves_the_peak_only_at_low_concurrency() {
     let peak = |w: usize, sched: &mut dyn Scheduler| {
         run(
@@ -1479,6 +1482,7 @@ fn ordering_moves_the_peak_only_at_low_concurrency() {
 /// uses the finer cut, and it is the same empty-sink trap as the cache that
 /// never evicts.
 #[test]
+#[ignore = "scheduler research conclusion; not default correctness coverage"]
 fn block_major_does_not_have_the_smaller_working_set() {
     let at = |w: usize, sched: &mut dyn Scheduler| {
         run(

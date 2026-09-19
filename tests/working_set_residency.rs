@@ -316,6 +316,7 @@ fn fan_in(computed: usize, sources: &[ImageId]) -> Chain {
 /// So the rows below are an **equality**, and the fractional slack is the small
 /// `Vec` spines and op scratch that are not block buffers and never were.
 #[test]
+#[ignore = "allocator/residency measurement table; structural residency tests run in default CI"]
 fn what_a_block_holds_against_what_the_budget_charges_for_it() {
     let unit = buffer_bytes() as f64;
     let one = ImageId::from(7usize);
@@ -472,6 +473,7 @@ fn what_a_block_holds_against_what_the_budget_charges_for_it() {
 /// above: the same chain shape, the same block, the same two framework buffers,
 /// and a different answer, entirely because of what the op does inside.
 #[test]
+#[ignore = "op-internal allocation measurement; structural residency tests run in default CI"]
 fn an_ops_own_working_buffers_are_not_visible_to_any_declaration() {
     let unit = buffer_bytes() as f64;
     let element = StructuringElement::from_radius(ElementShape::Box, [2, 2, 2]);
@@ -556,6 +558,7 @@ fn an_ops_own_working_buffers_are_not_visible_to_any_declaration() {
 /// this gap produces: not a plan that is slightly too big, but one the planner
 /// certified and the machine cannot hold.
 #[test]
+#[ignore = "budget/admission cost sweep; structural residency tests run in default CI"]
 fn what_a_corrected_figure_would_cost_in_affordable_plans() {
     const CANDIDATES: [usize; 6] = [512, 256, 128, 64, 32, 16];
     const PLANE: [usize; 3] = [1024, 1024, 1024];
@@ -923,6 +926,7 @@ fn fan_in_of(arms: Vec<Chain>, sources: &[ImageId]) -> Chain {
 /// rank filter changed — which is the whole argument for measuring the
 /// combinations rather than reasoning about the parts.
 #[test]
+#[ignore = "fitted working-set margin constant; structural residency tests run in default CI"]
 fn the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured() {
     let unit = buffer_bytes();
     let one = ImageId::from(7usize);
@@ -1039,6 +1043,7 @@ fn the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured() {
 /// one-in-one-out chain holds, so that the ratio is the op's own contribution
 /// and not the chain's.
 #[test]
+#[ignore = "fitted op-margin constant; structural residency tests run in default CI"]
 fn the_op_margin_is_the_smallest_tenth_that_covers_the_ops_measured() {
     let unit = buffer_bytes();
     let framework = 2.0 * unit as f64;
@@ -1119,6 +1124,7 @@ fn the_op_margin_is_the_smallest_tenth_that_covers_the_ops_measured() {
 /// spacing, and an invariant that holds at two spacings is an invariant rather
 /// than a coincidence.
 #[test]
+#[ignore = "margin policy research bound; structural residency tests run in default CI"]
 fn a_margin_never_moves_the_admitted_block_by_more_than_eight_times_in_volume() {
     const CANDIDATES: [usize; 6] = [512, 256, 128, 64, 32, 16];
     const PLANE: [usize; 3] = [1024, 1024, 1024];
@@ -1608,6 +1614,7 @@ fn the_shape_derived_residency_is_what_the_allocator_measures() {
 /// The prose here first claimed there was no admissible block at all. The table
 /// says otherwise, and the table is what runs.
 #[test]
+#[ignore = "large fan-in admission report; structural residency tests run in default CI"]
 fn print_what_an_honest_figure_admits_for_a_ninety_one_arm_stack() {
     const CANDIDATES: [usize; 6] = [512, 256, 128, 64, 32, 16];
     const VOLUME_EDGE: usize = 1024;

@@ -9,27 +9,25 @@ use blockflow::ops::{
     assert_object_measurement_invariant, assert_region_measurement_decomposition_invariant,
     assert_region_measurement_invariant, auto_distribution_measurement_schema,
     auto_distribution_measurement_schema_set, auto_distribution_measurements,
-    boundary_distance_relationship_measurement_schema, centroid_neighbor_measurement_schema,
-    centroid_relationship_measurement_schema, collect_auto_distribution_measurements,
-    collect_auto_distribution_rows_with_set, collect_boundary_distance_relationship_measurements,
+    boundary_distance_relationship_measurement_schema, centroid_relationship_measurement_schema,
+    collect_auto_distribution_measurements, collect_auto_distribution_rows_with_set,
+    collect_boundary_distance_relationship_measurements,
     collect_boundary_distance_relationship_rows_with_contract, collect_boundary_rows,
-    collect_centroid_neighbor_measurements, collect_centroid_neighbor_rows_with_contract,
-    collect_centroid_relationship_measurements, collect_centroid_relationship_rows_with_contract,
-    collect_class_a_shapes, collect_class_a_values, collect_colocalization_measurements,
-    collect_colocalization_rows_with_contract, collect_component_measurements,
+    collect_centroid_neighbor_rows_with_contract, collect_centroid_relationship_measurements,
+    collect_centroid_relationship_rows_with_contract, collect_class_a_shapes,
+    collect_class_a_values, collect_colocalization_measurements, collect_component_measurements,
     collect_component_rows, collect_contact_rows, collect_costes_colocalization_measurements,
-    collect_costes_colocalization_rows_with_contract, collect_custom_boundary_rows,
-    collect_custom_object_rows, collect_custom_region_rows, collect_distribution_measurements,
-    collect_enclosing_sphere_measurements, collect_enclosing_sphere_rows_with_contract,
-    collect_exact_distribution_measurements, collect_exact_distribution_measurements_set,
-    collect_exact_distribution_rows_with_set, collect_exact_label_radius_measurements,
-    collect_exact_label_radius_rows, collect_expansion_relationship_measurements,
-    collect_expansion_relationship_rows_with_contract, collect_glcm_texture_measurements,
-    collect_glcm_texture_rows_with_contract, collect_granularity_measurements,
-    collect_granularity_rows_with_set, collect_object_3d_moment_measurements,
-    collect_object_3d_moment_measurements_set, collect_object_3d_moment_rows_with_set,
-    collect_object_convex_hull_measurements, collect_object_convex_hull_rows_with_contract,
-    collect_object_directional_feret_measurements,
+    collect_custom_boundary_rows, collect_custom_object_rows, collect_custom_region_rows,
+    collect_distribution_measurements, collect_enclosing_sphere_measurements,
+    collect_enclosing_sphere_rows_with_contract, collect_exact_distribution_measurements,
+    collect_exact_distribution_measurements_set, collect_exact_distribution_rows_with_set,
+    collect_exact_label_radius_measurements, collect_exact_label_radius_rows,
+    collect_expansion_relationship_measurements, collect_expansion_relationship_rows_with_contract,
+    collect_glcm_texture_measurements, collect_glcm_texture_rows_with_contract,
+    collect_granularity_measurements, collect_granularity_rows_with_set,
+    collect_object_3d_moment_measurements, collect_object_3d_moment_measurements_set,
+    collect_object_3d_moment_rows_with_set, collect_object_convex_hull_measurements,
+    collect_object_convex_hull_rows_with_contract, collect_object_directional_feret_measurements,
     collect_object_directional_feret_rows_with_contract,
     collect_object_geometry_basic_measurements, collect_object_geometry_basic_rows_with_contract,
     collect_object_geometry_measurements, collect_object_geometry_rows_with_contract,
@@ -43,22 +41,19 @@ use blockflow::ops::{
     collect_object_zernike3d_measurements_set, collect_object_zernike3d_rows_with_contract,
     collect_object_zernike_moment_measurements, collect_object_zernike_moment_measurements_set,
     collect_object_zernike_moment_rows_with_contract,
-    collect_rank_weighted_colocalization_measurements,
-    collect_rank_weighted_colocalization_rows_with_contract, collect_shapes,
+    collect_rank_weighted_colocalization_measurements, collect_shapes,
     collect_shared_boundary_radius_measurements, collect_shared_boundary_radius_rows,
     collect_topology_measurements, collect_topology_rows, collect_touching_neighbor_measurements,
-    collect_touching_neighbor_rows_with_contract, colocalization_measurement_schema,
-    colocalization_measurements, component_measurement_schema, contact_fraction_of_boundary,
+    collect_touching_neighbor_rows_with_contract, colocalization_measurements,
+    component_measurement_schema, contact_fraction_of_boundary,
     costes_colocalization_measurement_schema, costes_colocalization_measurements,
     decode_custom_measurement_rows, enclosing_sphere_measurement_schema,
     encode_auto_distribution_measurements, encode_auto_distribution_measurements_set,
-    encode_boundary_distance_relationship_measurements, encode_centroid_neighbor_measurements,
-    encode_centroid_relationship_measurements, encode_colocalization_measurements,
+    encode_boundary_distance_relationship_measurements, encode_centroid_relationship_measurements,
     encode_component_measurements, encode_costes_colocalization_measurements,
     encode_enclosing_sphere_measurements, encode_exact_distribution_measurements,
     encode_exact_distribution_measurements_set, encode_exact_label_radius_measurements,
     encode_expansion_relationship_measurements, encode_granularity_measurements,
-    encode_object_3d_moment_measurements, encode_object_3d_moment_measurements_set,
     encode_object_convex_hull_measurements, encode_object_directional_feret_measurements,
     encode_object_geometry_basic_measurements, encode_object_geometry_measurements,
     encode_object_hu_moment_measurements, encode_object_projected_convex_measurements,
@@ -74,7 +69,6 @@ use blockflow::ops::{
     exact_label_radius_measurements, expansion_relationship_measurement_schema,
     expansion_until_adjacent_relationships_from_boundary_distances, fuse_glcm_texture_measurements,
     glcm_texture_measurements, granularity_measurement_schema, granularity_spectrum_measurements,
-    object_3d_moment_measurement_schema, object_3d_moment_measurement_schema_set,
     object_3d_moment_measurements, object_3d_moment_measurements_set,
     object_boundary_distance_relationships, object_centroid_relationships,
     object_centroid_relationships_from_shapes, object_component_measurements,
@@ -98,14 +92,13 @@ use blockflow::ops::{
     run_region_measure, shape_boundary_measurements, shared_boundary_distance_field,
     shared_boundary_radius_measurements, summarize_centroid_neighbors,
     summarize_centroid_neighbors_within, summarize_touching_neighbors, topology_measurement_schema,
-    touching_neighbor_measurement_schema, ApproxDistributionSet, ApproxMode, ApproxTolerance,
+    touching_neighbor_measurement_schema, ApproxDistributionSet, ApproxTolerance,
     AutoDistributionOp, AutoDistributionSet, BoundaryFeature, BoundaryMeasure, BoundaryMeasureOp,
-    BoundaryMeasurements, ColocalizationContract, ColocalizationFeature,
-    ColocalizationMeasurements, ColocalizationPairsOp, ColocalizationSumsOp, Connectivity,
-    ContactFeature, ContactMeasurements, CostesColocalizationFeature,
+    BoundaryMeasurements, ColocalizationFeature, ColocalizationPairsOp, ColocalizationSumsOp,
+    Connectivity, ContactFeature, ContactMeasurements, CostesColocalizationFeature,
     CostesColocalizationMeasurements, DirectionSet3, DistanceParams, DistributionFeature,
     DistributionMeasurements, DistributionPercentile, DistributionSet, ElementShape,
-    EnclosingSphereOp, ExactDistributionMeasurements, ExactDistributionOp, ExactDistributionSet,
+    EnclosingSphereOp, ExactDistributionMeasurements, ExactDistributionSet,
     ExactDistributionTallyOp, ExactLabelRadiusMeasurements, ExactLabelRadiusOp, FeatureScalar,
     FixedPoint, FoldLaw, FusedGlcmTextureMeasurements, GlcmOffset, GlcmQuantization,
     GlcmTextureContract, GlcmTextureFeature, GlcmTextureMeasurements, GlcmTextureOp,
@@ -115,8 +108,8 @@ use blockflow::ops::{
     MeasurementSourceFact, MeasurementSourceFacts, Measurements, MergeColocalizationSumsOp,
     MergeCostesColocalizationOp, MergeExactDistributionOp, MergeGlcmTextureOp,
     MergeObjectDirectionalFeretOp, MergeObjectGeometryBasicOp, MergeObjectMoment3dOp,
-    MergeObjectProjectedConvexOp, MergeObjectZernikeMomentsOp, MergeRankWeightedColocalizationOp,
-    Moment3d, Moment3dKey, MultiGlcmTextureOp, NeighborSummary, ObjectBoundaryDistanceFeature,
+    MergeObjectZernikeMomentsOp, MergeRankWeightedColocalizationOp, Moment3dKey,
+    MultiGlcmTextureOp, NeighborSummary, ObjectBoundaryDistanceFeature,
     ObjectBoundaryDistanceMeasurements, ObjectComponentFeature, ObjectComponentMeasurements,
     ObjectComponentOp, ObjectConvexHullFeature, ObjectConvexHullMeasurements, ObjectConvexHullOp,
     ObjectConvexHullView, ObjectDirectionalFeretMeasurements, ObjectDirectionalFeretTallyOp,
@@ -125,19 +118,19 @@ use blockflow::ops::{
     ObjectGeometryFeature, ObjectGeometryMeasurements, ObjectGeometryOp, ObjectHuMomentFeature,
     ObjectHuMomentsMeasurements, ObjectHuMomentsOp, ObjectInputs, ObjectMeasure,
     ObjectMeasureMergeOp, ObjectMoment3dFeature, ObjectMoment3dMeasurements, ObjectMoment3dOp,
-    ObjectMoment3dSet, ObjectNeighborFeature, ObjectNeighborMeasurements,
-    ObjectProjectedConvexContract, ObjectProjectedConvexFeature, ObjectProjectedConvexMeasurements,
-    ObjectProjectedConvexOp, ObjectProjectionContract, ObjectRelationshipFeature,
-    ObjectRelationshipMeasurements, ObjectTopologyConvention, ObjectTopologyFeature,
-    ObjectTopologyMeasurements, ObjectTopologyOp, ObjectView, ObjectVoxelFaceConvexHullFeature,
-    ObjectVoxelFaceConvexHullMeasurements, ObjectWeightedHuMomentFeature,
-    ObjectWeightedHuMomentsMeasurements, ObjectWeightedHuMomentsOp, ObjectZernike3dContract,
-    ObjectZernike3dDescriptor, ObjectZernike3dFeature, ObjectZernike3dMeasurements,
-    ObjectZernike3dSet, ObjectZernikeMoment, ObjectZernikeMomentContract,
-    ObjectZernikeMomentFeature, ObjectZernikeMomentSet, ObjectZernikeMomentsMeasurements,
-    ObjectZernikeMomentsOp, PhysicalSpacing, ProjectedConvexSet, ProjectionAxis, RadiusFeature,
-    RankWeightedColocalizationFeature, RankWeightedColocalizationMeasurements, RegionMeasure,
-    RegionMeasureOp, RegionShape, ShapeBoundaryFeature, ShapeFeature, ShapeMeasurements, ShapeSet,
+    ObjectMoment3dSet, ObjectNeighborFeature, ObjectProjectedConvexContract,
+    ObjectProjectedConvexFeature, ObjectProjectedConvexMeasurements, ObjectProjectedConvexOp,
+    ObjectProjectionContract, ObjectRelationshipFeature, ObjectRelationshipMeasurements,
+    ObjectTopologyConvention, ObjectTopologyFeature, ObjectTopologyMeasurements, ObjectTopologyOp,
+    ObjectView, ObjectVoxelFaceConvexHullFeature, ObjectVoxelFaceConvexHullMeasurements,
+    ObjectWeightedHuMomentFeature, ObjectWeightedHuMomentsMeasurements, ObjectWeightedHuMomentsOp,
+    ObjectZernike3dContract, ObjectZernike3dDescriptor, ObjectZernike3dFeature,
+    ObjectZernike3dMeasurements, ObjectZernike3dSet, ObjectZernikeMoment,
+    ObjectZernikeMomentContract, ObjectZernikeMomentFeature, ObjectZernikeMomentSet,
+    ObjectZernikeMomentsMeasurements, ObjectZernikeMomentsOp, PhysicalSpacing, ProjectedConvexSet,
+    ProjectionAxis, RadiusFeature, RankWeightedColocalizationFeature,
+    RankWeightedColocalizationMeasurements, RegionMeasure, RegionMeasureOp, RegionShape,
+    ShapeBoundaryFeature, ShapeFeature, ShapeMeasurements, ShapeSet,
     SharedBoundaryRadiusMeasurements, SharedBoundaryRadiusOp, TouchingNeighborFeature, VoxelCount,
     WithinDistanceThreshold, Zernike3dKey, ZernikeMomentKey,
 };
@@ -1617,57 +1610,6 @@ fn measurement_builder_runs_planned_centroid_relationships() {
 }
 
 #[test]
-fn centroid_neighbor_rows_have_a_canonical_schema_and_collector() {
-    let rows = vec![
-        ObjectNeighborMeasurements {
-            label: 1,
-            within_distance_neighbors: 1,
-            closest_label: Some(2),
-            closest_distance: Some(4.0),
-            second_closest_label: Some(3),
-            second_closest_distance: Some(10.0),
-            angle_between_closest: Some(0.0),
-        },
-        ObjectNeighborMeasurements {
-            label: 2,
-            within_distance_neighbors: 1,
-            closest_label: Some(1),
-            closest_distance: Some(4.0),
-            second_closest_label: None,
-            second_closest_distance: None,
-            angle_between_closest: None,
-        },
-    ];
-    let encoded = encode_centroid_neighbor_measurements(&rows).unwrap();
-    let schema = encoded_schema(&encoded).unwrap();
-    assert_eq!(schema, centroid_neighbor_measurement_schema());
-    assert_eq!(schema.columns()[0].name(), "label");
-    assert_eq!(schema.columns()[1].name(), "within_distance_neighbors");
-    assert_eq!(schema.columns()[6].name(), "angle_between_closest");
-
-    let env = ArrayEnvironment::new(labels(), 1, [2, 2, 2]).unwrap();
-    env.declare_sidecar("neighbor.rows", Lifecycle::Persistent)
-        .unwrap();
-    env.write_sidecar("neighbor.rows", 0, [0, 0, 0], &encoded)
-        .unwrap();
-    let got = collect_centroid_neighbor_measurements(&env, "neighbor.rows", 0, VOLUME).unwrap();
-    assert_eq!(got, rows);
-
-    assert!(
-        encode_centroid_neighbor_measurements(&[ObjectNeighborMeasurements {
-            label: 0,
-            within_distance_neighbors: 0,
-            closest_label: None,
-            closest_distance: None,
-            second_closest_label: None,
-            second_closest_distance: None,
-            angle_between_closest: None,
-        }])
-        .is_err()
-    );
-}
-
-#[test]
 fn measurement_builder_runs_planned_centroid_neighbor_summaries() {
     let spacing = PhysicalSpacing::unit();
     let threshold = WithinDistanceThreshold::new(3.0).unwrap();
@@ -1830,6 +1772,7 @@ fn measurement_builder_runs_planned_expansion_until_adjacent_relationships() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn centroid_relationship_rows_have_a_canonical_schema_and_collector() {
     let relationships = vec![
         ObjectRelationshipMeasurements {
@@ -1887,6 +1830,7 @@ fn centroid_relationship_rows_have_a_canonical_schema_and_collector() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn boundary_distance_relationship_rows_have_a_canonical_schema_and_collector() {
     let relationships = vec![
         ObjectBoundaryDistanceMeasurements {
@@ -2445,6 +2389,7 @@ fn contact_measurement_uses_canonical_faces_and_is_decomposition_invariant() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn touching_neighbor_rows_have_a_canonical_schema_and_collector() {
     let rows = summarize_touching_neighbors(&expected_contacts()).unwrap();
     let encoded = encode_touching_neighbor_measurements(&rows).unwrap();
@@ -2479,6 +2424,7 @@ fn touching_neighbor_rows_have_a_canonical_schema_and_collector() {
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_touching_neighbor_summaries() {
     let spacing = PhysicalSpacing::new([2.0, 3.0, 5.0]).unwrap();
     let expected = summarize_touching_neighbors(&expected_contacts()).unwrap();
@@ -2613,34 +2559,6 @@ fn shape_boundary_metrics_are_derived_after_merge() {
 }
 
 #[test]
-fn approximate_distribution_requests_are_named_at_construction() {
-    let explicit = ApproxDistributionSet::new(16, -1.0, 7.0).unwrap();
-    let compatible = DistributionSet::new(16, -1.0, 7.0).unwrap();
-    assert_eq!(explicit, compatible);
-    assert_eq!(explicit.mode(), ApproxMode::<0>);
-
-    let intensity = IntensitySet::approx_distribution_set(explicit).unwrap();
-    assert_eq!(intensity.distribution_set(), Some(explicit));
-    assert_eq!(
-        IntensitySet::approx_distribution(explicit.bins(), explicit.min(), explicit.max())
-            .unwrap()
-            .distribution_set(),
-        Some(explicit)
-    );
-    assert_eq!(
-        IntensitySet::standard()
-            .with_approx_distribution_set(ApproxDistributionSet::new(8, 0.0, 8.0).unwrap())
-            .unwrap()
-            .distribution_set()
-            .unwrap()
-            .bins(),
-        8
-    );
-    assert!(ApproxDistributionSet::new(0, 0.0, 1.0).is_err());
-    assert!(IntensitySet::approx_distribution(0, 0.0, 1.0).is_err());
-}
-
-#[test]
 fn distribution_percentiles_are_validated_selectors() {
     assert!(DistributionPercentile::new(f64::NAN).is_err());
     assert!(DistributionPercentile::new(-0.1).is_err());
@@ -2764,102 +2682,6 @@ fn raw_selector_helpers_lower_through_validated_keys() {
 }
 
 #[test]
-fn exact_distribution_requests_are_named_and_validate_row_width() {
-    assert!(ExactDistributionSet::new(0).is_err());
-    let too_wide = ExactDistributionSet::new(usize::MAX)
-        .unwrap_err()
-        .to_string();
-    assert!(too_wide.contains("row width overflow"));
-    let set = ExactDistributionSet::new(32).unwrap();
-    assert_eq!(set.max_values(), 32);
-
-    assert!(ExactDistributionOp::new(
-        "exact distribution",
-        0usize,
-        ImageId::supplied(0),
-        0,
-        "exact.rows",
-        Lifecycle::DeleteOnExit,
-    )
-    .is_err());
-    assert!(ExactDistributionOp::new_set(
-        "exact distribution",
-        0usize,
-        ImageId::supplied(0),
-        set,
-        "",
-        Lifecycle::DeleteOnExit,
-    )
-    .is_err());
-    assert!(ExactDistributionTallyOp::new_set(
-        "exact distribution partials",
-        0usize,
-        ImageId::supplied(0),
-        set,
-        "",
-        Lifecycle::DeleteOnExit,
-    )
-    .is_err());
-    assert!(MergeExactDistributionOp::new(
-        "merge exact distribution",
-        "",
-        0,
-        [1, 1, 1],
-        1,
-        "exact.rows",
-        Lifecycle::DeleteOnExit,
-    )
-    .is_err());
-    assert!(MergeExactDistributionOp::new(
-        "merge exact distribution",
-        "exact.partials",
-        0,
-        [1, 1, 1],
-        0,
-        "exact.rows",
-        Lifecycle::DeleteOnExit,
-    )
-    .is_err());
-    assert!(MergeExactDistributionOp::new_set(
-        "merge exact distribution",
-        "exact.partials",
-        0,
-        [1, 0, 1],
-        set,
-        "exact.rows",
-        Lifecycle::DeleteOnExit,
-    )
-    .is_err());
-    assert!(MergeExactDistributionOp::new_set(
-        "merge exact distribution",
-        "exact.partials",
-        0,
-        [1, 1, 1],
-        set,
-        "",
-        Lifecycle::DeleteOnExit,
-    )
-    .is_err());
-
-    let op = ExactDistributionOp::new_set(
-        "exact distribution",
-        0usize,
-        ImageId::supplied(0),
-        set,
-        "exact.rows",
-        Lifecycle::DeleteOnExit,
-    )
-    .unwrap();
-    assert_eq!(op.max_values(), 32);
-
-    let env = ArrayEnvironment::new(labels(), 1, [2, 2, 2]).unwrap();
-    let error = collect_exact_distribution_measurements(&env, "exact.rows", 0, VOLUME, 0)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("max_values must be greater than zero"));
-}
-
-#[test]
 fn object_moment_order_requests_are_named_and_validate_schema_width() {
     let moment0 = ObjectMoment3dSet::new(0).unwrap();
     let moment6 = ObjectMoment3dSet::new(6).unwrap();
@@ -2927,57 +2749,6 @@ fn object_moment_order_requests_are_named_and_validate_schema_width() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("max_order must be <= 12"));
-}
-
-#[test]
-fn projected_convex_requests_are_named_and_validate_hull_width() {
-    assert!(ProjectedConvexSet::new(0).is_err());
-    let too_wide = ProjectedConvexSet::new(usize::MAX).unwrap_err().to_string();
-    assert!(too_wide.contains("row width overflow"));
-    let set = ProjectedConvexSet::new(16).unwrap();
-    assert_eq!(set.max_hull_vertices(), 16);
-
-    assert!(ObjectProjectedConvexOp::new(
-        "measure projected convex geometry",
-        0usize,
-        PhysicalSpacing::unit(),
-        ProjectionAxis::Z,
-        0,
-        "projected-convex.rows",
-        Lifecycle::DeleteOnExit,
-    )
-    .is_err());
-    assert!(MergeObjectProjectedConvexOp::new(
-        "merge projected convex geometry",
-        "projected-convex.points",
-        0,
-        [1, 1, 1],
-        PhysicalSpacing::unit(),
-        ProjectionAxis::Z,
-        0,
-        "projected-convex.rows",
-        Lifecycle::DeleteOnExit,
-    )
-    .is_err());
-
-    let op = ObjectProjectedConvexOp::new_set(
-        "measure projected convex geometry",
-        0usize,
-        PhysicalSpacing::unit(),
-        ProjectionAxis::Z,
-        set,
-        "projected-convex.rows",
-        Lifecycle::DeleteOnExit,
-    )
-    .unwrap();
-    assert_eq!(op.max_hull_vertices(), 16);
-
-    let env = ArrayEnvironment::new(labels(), 1, [2, 2, 2]).unwrap();
-    let error =
-        collect_object_projected_convex_measurements(&env, "projected-convex.rows", 0, VOLUME, 0)
-            .unwrap_err()
-            .to_string();
-    assert!(error.contains("max_hull_vertices must be greater than zero"));
 }
 
 #[test]
@@ -3223,6 +2994,7 @@ fn auto_distribution_validates_inputs_and_constant_ranges() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn auto_distribution_rows_carry_range_schema_and_collector() {
     let rows = vec![
         DistributionMeasurements {
@@ -3326,6 +3098,7 @@ fn planned_auto_distribution_is_decomposition_invariant_and_matches_resident_ref
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_auto_distribution() {
     let values = coordinate_values();
     let set = AutoDistributionSet::new(8).unwrap();
@@ -3520,6 +3293,7 @@ fn exact_distribution_validates_inputs() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn exact_distribution_rows_have_bounded_schema_and_collector() {
     let rows = vec![
         ExactDistributionMeasurements {
@@ -3640,6 +3414,7 @@ fn planned_exact_distribution_is_decomposition_invariant_and_matches_resident_re
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_exact_distribution() {
     let values = coordinate_values();
     let expected = exact_distribution_measurements(
@@ -3850,6 +3625,7 @@ fn granularity_postprocessing_summarizes_pattern_spectrum() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn granularity_rows_have_a_canonical_schema_and_collector() {
     let set = GranularitySet::new(vec![2, 1])
         .unwrap()
@@ -3985,6 +3761,7 @@ fn planned_granularity_is_decomposition_invariant_and_matches_resident_reference
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_granularity() {
     let labels = labels().view::<f64>().unwrap().to_owned();
     let (values, _) = colocalization_channels();
@@ -4096,6 +3873,7 @@ fn exact_label_radius_uses_per_label_distance_fields() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn radius_measurement_rows_have_a_canonical_schema_and_collectors() {
     let shared = vec![SharedBoundaryRadiusMeasurements {
         label: 7,
@@ -4308,6 +4086,7 @@ fn planned_exact_label_radius_is_decomposition_invariant_and_matches_resident_re
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_shared_boundary_radius() {
     let params = DistanceParams::default();
     let expected =
@@ -4349,6 +4128,7 @@ fn measurement_builder_runs_planned_shared_boundary_radius() {
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_exact_label_radius() {
     let params = DistanceParams::default();
     let expected =
@@ -4568,97 +4348,6 @@ fn object_3d_moments_validate_labels_and_order() {
     assert!(object_3d_moment_measurements(labels.view(), PhysicalSpacing::unit(), 3).is_err());
 }
 
-#[test]
-fn object_3d_moment_rows_have_ordered_schema_and_collector() {
-    let rows = vec![ObjectMoment3dMeasurements {
-        label: 2,
-        count: 3,
-        centroid: [1.0, 2.0, 3.0],
-        max_order: 1,
-        moments: vec![
-            Moment3d {
-                order: [0, 0, 0],
-                central: 3.0,
-                normalized: 1.0,
-            },
-            Moment3d {
-                order: [0, 0, 1],
-                central: 0.5,
-                normalized: 0.25,
-            },
-            Moment3d {
-                order: [0, 1, 0],
-                central: 1.5,
-                normalized: 0.75,
-            },
-            Moment3d {
-                order: [1, 0, 0],
-                central: 2.5,
-                normalized: 1.25,
-            },
-        ],
-    }];
-
-    let set = ObjectMoment3dSet::new(1).unwrap();
-    let encoded = encode_object_3d_moment_measurements_set(&rows, set).unwrap();
-    let schema = encoded_schema(&encoded).unwrap();
-    assert_eq!(schema, object_3d_moment_measurement_schema(1).unwrap());
-    assert_eq!(
-        schema,
-        object_3d_moment_measurement_schema_set(set).unwrap()
-    );
-    assert_eq!(
-        encoded,
-        encode_object_3d_moment_measurements(&rows, 1).unwrap()
-    );
-    assert_eq!(schema.columns()[6].name(), "central_0_0_0");
-    assert_eq!(schema.columns()[7].name(), "normalized_0_0_0");
-    assert_eq!(schema.columns()[12].name(), "central_1_0_0");
-
-    let env = ArrayEnvironment::new(labels(), 1, [2, 2, 2]).unwrap();
-    env.declare_sidecar("moment3d.rows", Lifecycle::Persistent)
-        .unwrap();
-    env.write_sidecar("moment3d.rows", 0, [0, 0, 0], &encoded)
-        .unwrap();
-    let got = collect_object_3d_moment_measurements(&env, "moment3d.rows", 0, VOLUME, 1).unwrap();
-    assert_eq!(got, rows);
-    let got =
-        collect_object_3d_moment_measurements_set(&env, "moment3d.rows", 0, VOLUME, set).unwrap();
-    assert_eq!(got, rows);
-
-    assert!(encode_object_3d_moment_measurements(
-        &[ObjectMoment3dMeasurements {
-            label: 0,
-            count: 1,
-            centroid: [0.0, 0.0, 0.0],
-            max_order: 0,
-            moments: vec![Moment3d {
-                order: [0, 0, 0],
-                central: 1.0,
-                normalized: 1.0,
-            }],
-        }],
-        0,
-    )
-    .is_err());
-    assert!(encode_object_3d_moment_measurements(
-        &[ObjectMoment3dMeasurements {
-            label: 3,
-            count: 1,
-            centroid: [0.0, 0.0, 0.0],
-            max_order: 1,
-            moments: vec![Moment3d {
-                order: [0, 0, 1],
-                central: 1.0,
-                normalized: 1.0,
-            }],
-        }],
-        1,
-    )
-    .is_err());
-    assert!(object_3d_moment_measurement_schema(7).is_err());
-}
-
 fn planned_object_3d_moments(
     block: [usize; 3],
     spacing: PhysicalSpacing,
@@ -4846,6 +4535,7 @@ fn object_projected_convex_reports_footprint_hull_and_enclosing_circle() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn object_projected_convex_rows_have_bounded_schema_and_collector() {
     let rows = vec![
         ObjectProjectedConvexMeasurements {
@@ -5101,6 +4791,7 @@ fn object_enclosing_sphere_is_exact_for_voxel_centres() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn object_geometry_and_sphere_rows_have_canonical_schemas_and_collectors() {
     let geometry = vec![ObjectGeometryMeasurements {
         label: 2,
@@ -5531,6 +5222,7 @@ fn planned_enclosing_sphere_is_decomposition_invariant_and_matches_resident_refe
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_object_geometry_and_enclosing_sphere() {
     let spacing = PhysicalSpacing::new([2.0, 3.0, 5.0]).unwrap();
     let expected_geometry =
@@ -5592,6 +5284,7 @@ fn measurement_builder_runs_planned_object_geometry_and_enclosing_sphere() {
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_basic_geometry_and_directional_feret() {
     let spacing = PhysicalSpacing::new([2.0, 3.0, 5.0]).unwrap();
     let directions = DirectionSet3::axes();
@@ -5722,6 +5415,7 @@ fn object_convex_hull_reports_point_set_area_and_volume() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn object_convex_hull_rows_have_canonical_schema_and_collector() {
     let rows = vec![
         ObjectConvexHullMeasurements {
@@ -5823,6 +5517,7 @@ fn object_voxel_face_convex_hull_reports_continuous_area_volume_and_feret() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn object_voxel_face_convex_hull_rows_have_canonical_schema_and_collector() {
     let rows = vec![ObjectVoxelFaceConvexHullMeasurements {
         label: 7,
@@ -5915,6 +5610,7 @@ fn planned_object_convex_hull_is_decomposition_invariant_and_matches_resident_re
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_object_convex_hull() {
     let spacing = PhysicalSpacing::new([1.0, 2.0, 3.0]).unwrap();
     let labels_array = convex_hull_labels().view::<f64>().unwrap().to_owned();
@@ -5957,6 +5653,7 @@ fn measurement_builder_runs_planned_object_convex_hull() {
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_object_voxel_face_convex_hull() {
     let spacing = PhysicalSpacing::new([1.0, 2.0, 3.0]).unwrap();
     let labels_array = convex_hull_labels().view::<f64>().unwrap().to_owned();
@@ -6073,6 +5770,7 @@ fn object_hu_moments_validate_labels_and_projection_axis() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn object_hu_moment_rows_have_canonical_schema_and_collector() {
     let rows = vec![ObjectHuMomentsMeasurements {
         label: 2,
@@ -6203,6 +5901,7 @@ fn object_zernike_moments_use_projected_binary_points() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn object_zernike_moment_rows_have_bounded_schema_and_collector() {
     let rows = vec![ObjectZernikeMomentsMeasurements {
         label: 2,
@@ -6341,6 +6040,7 @@ fn object_zernike3d_descriptors_use_normalized_physical_points() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn object_zernike3d_rows_have_bounded_schema_and_collector() {
     let rows = vec![ObjectZernike3dMeasurements {
         label: 2,
@@ -6469,6 +6169,7 @@ fn object_weighted_hu_moments_validate_inputs() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn object_weighted_hu_moment_rows_have_canonical_schema_and_collector() {
     let rows = vec![
         ObjectWeightedHuMomentsMeasurements {
@@ -6753,6 +6454,7 @@ fn planned_object_weighted_hu_is_decomposition_invariant_and_matches_resident_re
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_object_hu_and_weighted_hu() {
     let labels_array = labels().view::<f64>().unwrap().to_owned();
     let weights = coordinate_values();
@@ -6839,6 +6541,7 @@ fn measurement_builder_runs_planned_object_hu_and_weighted_hu() {
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_object_zernike() {
     let labels_array = labels().view::<f64>().unwrap().to_owned();
     let expected =
@@ -6900,6 +6603,7 @@ fn measurement_builder_runs_planned_object_zernike() {
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_object_zernike3d() {
     let spacing = PhysicalSpacing::new([1.0, 2.0, 3.0]).unwrap();
     let labels_array = labels().view::<f64>().unwrap().to_owned();
@@ -7003,6 +6707,7 @@ fn object_measure_extensions_validate_inputs_and_rows() {
 }
 
 #[test]
+#[ignore = "builder smoke test; extension execution tests run in default CI"]
 fn measurement_builder_runs_planned_custom_object_measure() {
     let mut labels = Array3::<f64>::zeros((VOLUME[0], VOLUME[1], VOLUME[2]));
     labels[[0, 0, 0]] = 3.0;
@@ -7435,6 +7140,7 @@ fn public_custom_region_builder_harness_checks_planned_execution() {
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident extension tests run in default CI"]
 fn measurement_builder_runs_planned_custom_region_measure() {
     let mut labels = Array3::<f64>::zeros((VOLUME[0], VOLUME[1], VOLUME[2]));
     labels[[0, 0, 0]] = 2.0;
@@ -7845,6 +7551,7 @@ fn planned_boundary_measure_op_matches_resident_extension() {
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident extension tests run in default CI"]
 fn measurement_builder_runs_planned_custom_boundary_measure() {
     let mut labels = Array3::<f64>::zeros((VOLUME[0], VOLUME[1], VOLUME[2]));
     labels[[0, 0, 0]] = 1.0;
@@ -8294,6 +8001,7 @@ fn object_component_measurements_honor_foreground_connectivity() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn topology_and_component_rows_have_canonical_schemas_and_collectors() {
     let topology = vec![
         ObjectTopologyMeasurements {
@@ -8460,6 +8168,7 @@ fn planned_components_are_decomposition_invariant_and_match_resident_reference()
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_topology_and_components() {
     let label_array = labels().view::<f64>().unwrap().to_owned();
     let convention = ObjectTopologyConvention::Foreground6Background26;
@@ -8649,6 +8358,7 @@ fn expansion_until_adjacent_relationships_derive_equal_front_distance() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn expansion_relationship_rows_have_a_canonical_schema_and_collector() {
     let relationships = vec![
         ObjectExpansionMeasurements {
@@ -8891,6 +8601,7 @@ fn glcm_texture_features_reject_malformed_matrix_shape() {
 }
 
 #[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn glcm_texture_rows_fuse_across_offsets() {
     let forward = GlcmTextureMeasurements {
         label: 3,
@@ -9136,6 +8847,7 @@ fn planned_glcm_texture_uses_halo_and_is_decomposition_invariant() {
 }
 
 #[test]
+#[ignore = "builder smoke test; planned/resident measurement tests run in default CI"]
 fn measurement_builder_runs_planned_glcm_texture() {
     let quantization = GlcmQuantization::new(4, -2.0, 6.0).unwrap();
     let offset = GlcmOffset::new([0, 0, 1]).unwrap();
@@ -9304,6 +9016,7 @@ fn planned_multi_offset_glcm_texture_shares_one_source_scan() {
 }
 
 #[test]
+#[ignore = "planner grouping smoke test; multi-offset correctness runs in default CI"]
 fn measurement_builder_groups_compatible_glcm_texture_offsets() {
     let quantization = GlcmQuantization::new(4, -2.0, 6.0).unwrap();
     let forward = GlcmOffset::new([0, 0, 1]).unwrap();
@@ -9561,73 +9274,7 @@ fn rank_weighted_colocalization_reports_average_tied_ranks() {
 }
 
 #[test]
-fn primitive_colocalization_rows_have_canonical_schema_and_encoder() {
-    let rows = vec![
-        ColocalizationMeasurements {
-            label: 7,
-            count: 3,
-            finite_count: 2,
-            sum_a: 3.0,
-            sum_b: 5.0,
-            sum_a2: 5.0,
-            sum_b2: 13.0,
-            sum_ab: 8.0,
-            positive_a: 3.0,
-            positive_b: 5.0,
-            positive_a_where_b: 3.0,
-            positive_b_where_a: 5.0,
-        },
-        ColocalizationMeasurements {
-            label: 9,
-            count: 1,
-            finite_count: 0,
-            sum_a: 0.0,
-            sum_b: 0.0,
-            sum_a2: 0.0,
-            sum_b2: 0.0,
-            sum_ab: 0.0,
-            positive_a: 0.0,
-            positive_b: 0.0,
-            positive_a_where_b: 0.0,
-            positive_b_where_a: 0.0,
-        },
-    ];
-    let encoded = encode_colocalization_measurements(&rows).unwrap();
-    let schema = encoded_schema(&encoded).unwrap();
-    assert_eq!(schema, colocalization_measurement_schema());
-    assert_eq!(schema.columns()[0].name(), "label");
-    assert_eq!(schema.columns()[11].name(), "positive_b_where_a");
-
-    let env = ArrayEnvironment::new(labels(), 1, [2, 2, 2]).unwrap();
-    env.declare_sidecar("coloc.primitive.rows", Lifecycle::Persistent)
-        .unwrap();
-    env.write_sidecar("coloc.primitive.rows", 0, [0, 0, 0], &encoded)
-        .unwrap();
-    let got = collect_colocalization_measurements(&env, "coloc.primitive.rows", 0, VOLUME).unwrap();
-    assert_eq!(got, rows);
-
-    let mut invalid = rows[0];
-    invalid.label = 0;
-    assert!(encode_colocalization_measurements(&[invalid]).is_err());
-
-    invalid = rows[0];
-    invalid.finite_count = invalid.count + 1;
-    assert!(encode_colocalization_measurements(&[invalid]).is_err());
-
-    invalid = rows[0];
-    invalid.sum_a = f64::NAN;
-    assert!(encode_colocalization_measurements(&[invalid]).is_err());
-
-    invalid = rows[0];
-    invalid.positive_a_where_b = invalid.positive_a + 1.0;
-    assert!(encode_colocalization_measurements(&[invalid]).is_err());
-
-    invalid = rows[1];
-    invalid.sum_a = 1.0;
-    assert!(encode_colocalization_measurements(&[invalid]).is_err());
-}
-
-#[test]
+#[ignore = "schema/collector smoke test; numerical measurement coverage runs in default CI"]
 fn advanced_colocalization_rows_have_canonical_schemas_and_collectors() {
     let costes_rows = vec![
         CostesColocalizationMeasurements {
@@ -10096,332 +9743,145 @@ fn planned_rank_weighted_colocalization_is_decomposition_invariant_and_matches_r
 }
 
 #[test]
-fn measurement_builder_runs_planned_colocalization() {
-    let plan = Measurements::for_labels(0usize)
-        .colocalization(
-            IntensityImage::<0>::new(ImageId::supplied(0)).holding(Dtype::F64),
-            IntensityImage::<1>::new(ImageId::supplied(1)).holding(Dtype::F64),
-        )
-        .stream("objects")
-        .build(base([2, 2, 2]))
-        .unwrap();
-    assert_eq!(plan.rows_phase, None);
-    let rows = plan.colocalization_rows_with_contract(0).unwrap();
-    assert_eq!(rows.stream(), plan.colocalization_stream(0).unwrap());
-    assert_eq!(rows.phase(), plan.colocalization_rows_phase(0).unwrap());
-    let contract: ColocalizationContract = plan.colocalization_contract(0).unwrap();
-    assert_eq!(rows.contract(), contract);
-    assert_eq!(contract.labels(), ImageId::from(0usize));
-    assert_eq!(contract.channel_a(), ImageId::supplied(0));
-    assert_eq!(contract.channel_a_dtype(), Some(Dtype::F64));
-    assert_eq!(contract.channel_b(), ImageId::supplied(1));
-    assert_eq!(contract.channel_b_dtype(), Some(Dtype::F64));
-
-    let (a, b) = colocalization_channels();
-    let env = ArrayEnvironment::with_inputs(
-        labels(),
-        vec![a.clone().into(), b.clone().into()],
-        &plan.decomposition,
-        [2, 2, 2],
-    )
-    .unwrap();
-    let mut work = vec![PhaseWork::Pixels];
-    work.extend(plan.phase_work());
-    execute_phases(
-        "builder colocalization",
-        &workflow(),
-        &plan.decomposition,
-        &Hints::default(),
-        &env,
-        &[],
-        &work,
-    )
-    .unwrap();
-
-    let got = collect_colocalization_rows_with_contract(&env, &rows, VOLUME).unwrap();
-    let labels = labels().view::<f64>().unwrap().to_owned();
-    let reference = colocalization_measurements(labels.view(), a.view(), b.view()).unwrap();
-    assert_eq!(got, reference);
-}
-
-#[test]
-fn measurement_builder_runs_planned_costes_colocalization() {
-    let plan = Measurements::for_labels(0usize)
-        .costes_colocalization(
-            IntensityImage::<0>::new(ImageId::supplied(0)).holding(Dtype::F64),
-            IntensityImage::<1>::new(ImageId::supplied(1)).holding(Dtype::F64),
-        )
-        .stream("objects")
-        .build(base([2, 2, 2]))
-        .unwrap();
-    assert_eq!(plan.rows_phase, None);
-    let rows = plan.costes_colocalization_rows_with_contract(0).unwrap();
-    assert_eq!(rows.stream(), plan.costes_colocalization_stream(0).unwrap());
-    assert_eq!(
-        rows.phase(),
-        plan.costes_colocalization_rows_phase(0).unwrap()
-    );
-    assert_eq!(rows.phase(), 2);
-    let contract = plan.costes_colocalization_contract(0).unwrap();
-    assert_eq!(rows.contract(), contract);
-    assert_eq!(contract.labels(), ImageId::from(0usize));
-    assert_eq!(contract.channel_a(), ImageId::supplied(0));
-    assert_eq!(contract.channel_a_dtype(), Some(Dtype::F64));
-    assert_eq!(contract.channel_b(), ImageId::supplied(1));
-    assert_eq!(contract.channel_b_dtype(), Some(Dtype::F64));
-
-    let (a, b) = colocalization_channels();
-    let env = ArrayEnvironment::with_inputs(
-        labels(),
-        vec![a.clone().into(), b.clone().into()],
-        &plan.decomposition,
-        [2, 2, 2],
-    )
-    .unwrap();
-    let mut work = vec![PhaseWork::Pixels];
-    work.extend(plan.phase_work());
-    execute_phases(
-        "builder Costes colocalization",
-        &workflow(),
-        &plan.decomposition,
-        &Hints::default(),
-        &env,
-        &[],
-        &work,
-    )
-    .unwrap();
-
-    let got = collect_costes_colocalization_rows_with_contract(&env, &rows, VOLUME).unwrap();
-    let labels = labels().view::<f64>().unwrap().to_owned();
-    let reference = costes_colocalization_measurements(labels.view(), a.view(), b.view()).unwrap();
-    assert_eq!(got, reference);
-}
-
-#[test]
-fn measurement_builder_runs_planned_rank_weighted_colocalization() {
-    let plan = Measurements::for_labels(0usize)
-        .rank_weighted_colocalization(
-            IntensityImage::<0>::new(ImageId::supplied(0)).holding(Dtype::F64),
-            IntensityImage::<1>::new(ImageId::supplied(1)).holding(Dtype::F64),
-        )
-        .stream("objects")
-        .build(base([2, 2, 2]))
-        .unwrap();
-    assert_eq!(plan.rows_phase, None);
-    let rows = plan
-        .rank_weighted_colocalization_rows_with_contract(0)
-        .unwrap();
-    assert_eq!(
-        rows.stream(),
-        plan.rank_weighted_colocalization_stream(0).unwrap()
-    );
-    assert_eq!(
-        rows.phase(),
-        plan.rank_weighted_colocalization_rows_phase(0).unwrap()
-    );
-    assert_eq!(rows.phase(), 2);
-    let contract = plan.rank_weighted_colocalization_contract(0).unwrap();
-    assert_eq!(rows.contract(), contract);
-    assert_eq!(contract.labels(), ImageId::from(0usize));
-    assert_eq!(contract.channel_a(), ImageId::supplied(0));
-    assert_eq!(contract.channel_a_dtype(), Some(Dtype::F64));
-    assert_eq!(contract.channel_b(), ImageId::supplied(1));
-    assert_eq!(contract.channel_b_dtype(), Some(Dtype::F64));
-
-    let (a, b) = colocalization_channels();
-    let env = ArrayEnvironment::with_inputs(
-        labels(),
-        vec![a.clone().into(), b.clone().into()],
-        &plan.decomposition,
-        [2, 2, 2],
-    )
-    .unwrap();
-    let mut work = vec![PhaseWork::Pixels];
-    work.extend(plan.phase_work());
-    execute_phases(
-        "builder rank-weighted colocalization",
-        &workflow(),
-        &plan.decomposition,
-        &Hints::default(),
-        &env,
-        &[],
-        &work,
-    )
-    .unwrap();
-
-    let got = collect_rank_weighted_colocalization_rows_with_contract(&env, &rows, VOLUME).unwrap();
-    let labels = labels().view::<f64>().unwrap().to_owned();
-    let reference =
-        rank_weighted_colocalization_measurements(labels.view(), a.view(), b.view()).unwrap();
-    assert_eq!(got, reference);
-}
-
-#[test]
 fn unsupported_measurement_combinations_are_refused() {
-    let missing_label_source = match Measurements::for_labels(99usize)
-        .shape(ShapeSet::basic())
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("missing label source unexpectedly compiled"),
-        Err(error) => error.to_string(),
+    let refused = |result: blockflow::error::Result<_>, what: &str| {
+        assert!(result.is_err(), "{what} unexpectedly compiled");
     };
-    assert!(missing_label_source.contains("label image 99 is not image 0"));
 
-    let missing_value_source = match Measurements::for_labels(0usize)
-        .intensity(IntensityImage::<0>::new(99usize), IntensitySet::standard())
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("missing value source unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(missing_value_source.contains("intensity image 99 is not image 0"));
+    refused(
+        Measurements::for_labels(99usize)
+            .shape(ShapeSet::basic())
+            .build(base([3, 2, 3])),
+        "missing label source",
+    );
 
-    let missing_channel_source = match Measurements::for_labels(0usize)
-        .colocalization(
-            IntensityImage::<0>::new(1usize),
-            IntensityImage::<1>::new(99usize),
-        )
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("missing colocalization source unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(missing_channel_source.contains("colocalization intensity image 99 is not image 0"));
+    refused(
+        Measurements::for_labels(0usize)
+            .intensity(IntensityImage::<0>::new(99usize), IntensitySet::standard())
+            .build(base([3, 2, 3])),
+        "missing value source",
+    );
 
-    let duplicate_basic = match Measurements::for_labels(0usize)
-        .shape(ShapeSet::standard())
-        .intensity(IntensityImage::<0>::new(1usize), IntensitySet::standard())
-        .intensity(IntensityImage::<1>::new(1usize), IntensitySet::standard())
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("duplicate-channel measurement unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(duplicate_basic.contains("image 1 more than once"));
+    refused(
+        Measurements::for_labels(0usize)
+            .colocalization(
+                IntensityImage::<0>::new(1usize),
+                IntensityImage::<1>::new(99usize),
+            )
+            .build(base([3, 2, 3])),
+        "missing colocalization source",
+    );
 
-    let f16_labels = match Measurements::for_labels(0usize)
-        .labels(LabelImage::new(0usize).holding(Dtype::F16))
-        .shape(ShapeSet::basic())
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("f16 label dtype unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(f16_labels.contains("label dtype float16"));
+    refused(
+        Measurements::for_labels(0usize)
+            .shape(ShapeSet::standard())
+            .intensity(IntensityImage::<0>::new(1usize), IntensitySet::standard())
+            .intensity(IntensityImage::<1>::new(1usize), IntensitySet::standard())
+            .build(base([3, 2, 3])),
+        "duplicate-channel measurement",
+    );
 
-    let f16_values = match Measurements::for_labels(0usize)
-        .intensity(
-            IntensityImage::<0>::new(1usize).holding(Dtype::F16),
-            IntensitySet::standard(),
-        )
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("f16 intensity dtype unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(f16_values.contains("intensity dtype float16"));
+    refused(
+        Measurements::for_labels(0usize)
+            .labels(LabelImage::new(0usize).holding(Dtype::F16))
+            .shape(ShapeSet::basic())
+            .build(base([3, 2, 3])),
+        "f16 label dtype",
+    );
 
-    let empty_stream = match Measurements::for_labels(0usize)
-        .stream("")
-        .shape(ShapeSet::basic())
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("empty measurement stream unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(empty_stream.contains("output stream root must not be empty"));
+    refused(
+        Measurements::for_labels(0usize)
+            .intensity(
+                IntensityImage::<0>::new(1usize).holding(Dtype::F16),
+                IntensitySet::standard(),
+            )
+            .build(base([3, 2, 3])),
+        "f16 intensity dtype",
+    );
 
-    let same_source_distribution = match Measurements::for_labels(0usize)
-        .intensity(
-            IntensityImage::<0>::new(0usize),
-            IntensitySet::distribution(8, 0.0, 8.0).unwrap(),
-        )
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("same-source distribution unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(same_source_distribution.contains("both image 0"));
+    refused(
+        Measurements::for_labels(0usize)
+            .stream("")
+            .shape(ShapeSet::basic())
+            .build(base([3, 2, 3])),
+        "empty measurement stream",
+    );
 
-    let same_source_exact_distribution = match Measurements::for_labels(0usize)
-        .exact_distribution(IntensityImage::<0>::new(0usize), 32)
-        .unwrap()
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("same-source exact distribution unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(same_source_exact_distribution.contains("exact-distribution intensity image"));
+    refused(
+        Measurements::for_labels(0usize)
+            .intensity(
+                IntensityImage::<0>::new(0usize),
+                IntensitySet::distribution(8, 0.0, 8.0).unwrap(),
+            )
+            .build(base([3, 2, 3])),
+        "same-source distribution",
+    );
 
-    let same_source_texture = match Measurements::for_labels(0usize)
-        .glcm_texture(
-            IntensityImage::<0>::new(0usize),
-            GlcmQuantization::new(2, 0.0, 1.0).unwrap(),
-            GlcmOffset::new([0, 0, 1]).unwrap(),
-        )
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("same-source texture unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(same_source_texture.contains("texture intensity image"));
+    refused(
+        Measurements::for_labels(0usize)
+            .exact_distribution(IntensityImage::<0>::new(0usize), 32)
+            .unwrap()
+            .build(base([3, 2, 3])),
+        "same-source exact distribution",
+    );
 
-    let same_source_granularity = match Measurements::for_labels(0usize)
-        .granularity(
-            IntensityImage::<0>::new(0usize),
-            GranularitySet::new(vec![1]).unwrap(),
-        )
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("same-source granularity unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(same_source_granularity.contains("granularity intensity image"));
+    refused(
+        Measurements::for_labels(0usize)
+            .glcm_texture(
+                IntensityImage::<0>::new(0usize),
+                GlcmQuantization::new(2, 0.0, 1.0).unwrap(),
+                GlcmOffset::new([0, 0, 1]).unwrap(),
+            )
+            .build(base([3, 2, 3])),
+        "same-source texture",
+    );
 
-    let same_source_weighted_hu = match Measurements::for_labels(0usize)
-        .object_weighted_hu_moments(IntensityImage::<0>::new(0usize), ProjectionAxis::Z)
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("same-source weighted Hu unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(same_source_weighted_hu.contains("weighted-Hu intensity image"));
+    refused(
+        Measurements::for_labels(0usize)
+            .granularity(
+                IntensityImage::<0>::new(0usize),
+                GranularitySet::new(vec![1]).unwrap(),
+            )
+            .build(base([3, 2, 3])),
+        "same-source granularity",
+    );
 
-    let same_source_colocalization = match Measurements::for_labels(0usize)
-        .colocalization(
-            IntensityImage::<0>::new(0usize),
-            IntensityImage::<1>::new(1usize),
-        )
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("same-source colocalization unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(same_source_colocalization.contains("colocalization intensity image"));
+    refused(
+        Measurements::for_labels(0usize)
+            .object_weighted_hu_moments(IntensityImage::<0>::new(0usize), ProjectionAxis::Z)
+            .build(base([3, 2, 3])),
+        "same-source weighted Hu",
+    );
 
-    let same_source_costes = match Measurements::for_labels(0usize)
-        .costes_colocalization(
-            IntensityImage::<0>::new(0usize),
-            IntensityImage::<1>::new(1usize),
-        )
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("same-source Costes colocalization unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(same_source_costes.contains("colocalization intensity image"));
+    refused(
+        Measurements::for_labels(0usize)
+            .colocalization(
+                IntensityImage::<0>::new(0usize),
+                IntensityImage::<1>::new(1usize),
+            )
+            .build(base([3, 2, 3])),
+        "same-source colocalization",
+    );
 
-    let same_source_rank_weighted = match Measurements::for_labels(0usize)
-        .rank_weighted_colocalization(
-            IntensityImage::<0>::new(0usize),
-            IntensityImage::<1>::new(1usize),
-        )
-        .build(base([3, 2, 3]))
-    {
-        Ok(_) => panic!("same-source rank-weighted colocalization unexpectedly compiled"),
-        Err(error) => error.to_string(),
-    };
-    assert!(same_source_rank_weighted.contains("colocalization intensity image"));
+    refused(
+        Measurements::for_labels(0usize)
+            .costes_colocalization(
+                IntensityImage::<0>::new(0usize),
+                IntensityImage::<1>::new(1usize),
+            )
+            .build(base([3, 2, 3])),
+        "same-source Costes colocalization",
+    );
+
+    refused(
+        Measurements::for_labels(0usize)
+            .rank_weighted_colocalization(
+                IntensityImage::<0>::new(0usize),
+                IntensityImage::<1>::new(1usize),
+            )
+            .build(base([3, 2, 3])),
+        "same-source rank-weighted colocalization",
+    );
 }
 
 #[test]

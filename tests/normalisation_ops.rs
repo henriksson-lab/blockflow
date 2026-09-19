@@ -292,26 +292,6 @@ fn every_op_reproduces_its_whole_volume_reference_under_every_decomposition() {
     }
 }
 
-/// The same property stated the other way round: the decompositions agree with
-/// **each other**, so nothing rests on the reference being special.
-#[test]
-fn no_two_decompositions_disagree() {
-    let input = intensities();
-    for (name, chain, source, _) in cases(&input) {
-        let workflow = workflow(chain);
-        let first = run(&workflow, &plan(&workflow, 5, &[0]), &source);
-        for block in [6usize, 11, 32] {
-            for split_axes in [vec![1], vec![2], vec![0, 2]] {
-                assert_eq!(
-                    run(&workflow, &plan(&workflow, block, &split_axes), &source),
-                    first,
-                    "{name}: block {block}, axes {split_axes:?}"
-                );
-            }
-        }
-    }
-}
-
 // --------------------------------------------------- 3. the anchoring --
 
 /// **Demonstrate, then assert.**

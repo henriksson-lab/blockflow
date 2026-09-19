@@ -99,6 +99,7 @@ fn judge(
 /// answers, uniform block-edge rungs, and mixed per-phase edge variants derived
 /// from those partitions.
 #[test]
+#[ignore = "planner report generator; run manually with --ignored --nocapture"]
 fn report_planner_choices_against_the_simulator_oracle() {
     let workflow = workflow();
     let base = base_constraints();

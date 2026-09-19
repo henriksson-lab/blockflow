@@ -448,9 +448,8 @@ pub enum InputMap {
 /// repository**, under the headings *"F, sketched against every shape that
 /// exists"* and *"The output-side index map: a specification"*. Cited by heading
 /// rather than by line because it is rewritten under this one; not by path
-/// because `tests/no_domain_vocabulary.rs` forbids this crate's sources from
-/// naming the application it was extracted from, so "fixing" this bare citation
-/// by adding the repository will turn that test red.
+/// because this crate should not hard-code a machine-local application checkout
+/// into its public source documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Geometry {
     output_volume: [usize; 3],

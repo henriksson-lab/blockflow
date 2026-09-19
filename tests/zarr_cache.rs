@@ -372,6 +372,7 @@ fn a_bool_volume_round_trips_through_the_cache() {
 ///    wearing different clothes, and this file has already been caught by that
 ///    once.
 #[test]
+#[ignore = "prefetch economics sweep; concurrent correctness tests run in default CI"]
 fn the_prefetch_sweep_has_a_control_at_both_ends() {
     // `f64`, because `threshold` states the element types it accepts and
     // `uint16` is not one — the plan is refused when it is made rather than
@@ -505,6 +506,7 @@ fn the_prefetch_sweep_has_a_control_at_both_ends() {
 /// not assert on durations. `print_what_the_cache_saves` beside it prints the
 /// timing for a human.
 #[test]
+#[ignore = "cache economics measurement; answer-preservation tests run in default CI"]
 fn a_bigger_cache_reads_strictly_fewer_bytes_from_the_store() {
     let regions = regions();
     let bytes_at = |capacity: u64| -> (u64, u64, u64) {

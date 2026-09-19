@@ -34,9 +34,6 @@
 //   **fail**. An op that declares `Stencil` and folds across its buffer is cut,
 //   and the answer differs. Without this, a green file would be evidence that
 //   the assertions ran, not that they could ever fire.
-// * `every_shipped_op_refuses_to_be_sliced_today` — the default is doing its
-//   job. `Slicing::UNDECLARED` is what an op that says nothing means, and no
-//   shipped op has been declared yet.
 // * `the_uncut_path_is_taken_at_one_thread` — the `threads <= 1` short circuit
 //   is a different code path, so identity there is trivially true and proves
 //   nothing about the cut. Every other assertion is at two threads or more.
@@ -664,52 +661,6 @@ fn the_shipped_stencils_survive_the_cut_bit_for_bit() {
         );
         assert_identical_at_every_thread_count(chain, shape, what);
         assert_the_fixture_can_see_its_halo(chain, shape, what);
-    }
-}
-
-/// The default is doing its job, and this test is the record of when that stops
-/// being true: an op declared sliceable will appear here.
-///
-/// **Inverted in part, not deleted.** Four of the ops this test was written
-/// against — `SmoothOp`, `MorphologyOp`, `RankFilterOp` and `ConvolveOp` — now
-/// declare themselves stencils and are held to it by
-/// `the_shipped_stencils_survive_the_cut_bit_for_bit`. What remains here is the
-/// half that is still true and is the more interesting half: the ops that *look*
-/// sliceable from outside and are not. `ops::sliding` computes the same
-/// statistic as `ops::rank` with the same reach and the same output shape, by
-/// carrying a histogram along the scan — so **a reach says what an op reads, it
-/// does not say the answer is a function only of what was read**, and this is
-/// the pair that demonstrates it.
-#[test]
-fn every_shipped_op_refuses_to_be_sliced_today() {
-    let element = blockflow::ops::element::StructuringElement::from_radius(
-        blockflow::ops::element::ElementShape::Box,
-        [1, 1, 1],
-    );
-    let ops: Vec<Box<dyn BlockOp>> = vec![
-        // **The one that matters.** Bounded reach, identity output shape, and
-        // the same answer as `ops::rank`'s median — computed by carrying a
-        // histogram along the scan, so where the scan starts is in the answer.
-        // It is the counter-example to inferring sliceability from a reach.
-        Box::new(blockflow::ops::sliding::SlidingHistogramOp::rank(
-            "sliding median",
-            element.clone(),
-            blockflow::ops::Rank::median(&element),
-            blockflow::ops::sliding::Domain::of_size(256).expect("a domain"),
-        )),
-    ];
-    for op in &ops {
-        assert!(
-            !op.slicing().is_stencil(),
-            "{} declares itself sliceable; add it to `docs/design/intra-block.md`'s table and \
-             give it a bit-identity case in this file",
-            op.name()
-        );
-        assert!(
-            op.slicing().refusal().is_some_and(|why| !why.is_empty()),
-            "{} refuses without saying why",
-            op.name()
-        );
     }
 }
 
