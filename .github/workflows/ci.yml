@@ -149,7 +149,9 @@ jobs:
       # expensive Burn/CubeCL row compiles.
       - name: Pin pliron derive for Burn/CubeCL
         if: matrix.features.key == 'cellpose-yolo'
-        run: cargo update -p pliron-derive --precise 0.17.0
+        run: |
+          cargo update -p pliron-derive@0.18.0 --precise 0.17.0 || \
+            cargo update -p pliron-derive@0.17.0 --precise 0.17.0
       - name: Build
         run: cargo build --all-targets ${{ matrix.features.flags }}
       # `--no-fail-fast` so one broken suite does not hide the state of the other
