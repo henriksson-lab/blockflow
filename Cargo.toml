@@ -247,9 +247,16 @@ burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["
 candle-core = { version = "0.11", optional = true }
 yolov11 = { git = "https://github.com/henriksson-lab/YOLOv11-rs.git", rev = "f22e9fd33189830e723141078087e9f1f34d774c", optional = true }
 # Resolver guard for `burn/{wgpu,cuda}` through `cubecl -> pliron 0.17`.
-# `pliron 0.17.0` declares `pliron-derive = "0"`, so a lock-free CI resolve can
-# pair it with `pliron-derive 0.18`, whose macro expansion targets newer pliron
-# paths. Keep the pair on 0.17 until the Burn/CubeCL stack moves together.
+# `pliron 0.17.0` declares `pliron-derive = "0"`, so a lock-free resolve pairs
+# it with whatever 0.x is newest on the index — 0.18 as of this writing — whose
+# macro expansion targets paths that only exist in a newer `pliron`. This exact
+# requirement is what that `"0"` unifies onto instead. It is half of the fix:
+# a fresh resolve also brings in a *second* `pliron` (0.18, via `pliron-llvm`'s
+# own `pliron = "0"`) that pins `pliron-derive = "=0.18.0"` and would drag the
+# 0.17 one along with it, and only a `cargo update -p pliron@0.18.0 --precise
+# 0.17.0` against the lockfile can fold that; the `cellpose-yolo` row of
+# `.github/workflows/ci.yml` does exactly that and says why. Keep the pair on
+# 0.17 until the Burn/CubeCL stack moves together.
 pliron-derive = { version = "=0.17.0", optional = true }
 
 [features]

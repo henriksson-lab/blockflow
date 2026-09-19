@@ -142,16 +142,49 @@ jobs:
           # cache is a warm start, not a promise of the same dependency graph.
           key: ${{ runner.os }}-cargo-${{ matrix.features.key }}-${{ hashFiles('Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-${{ matrix.features.key }}-
-      # `pliron 0.17.0` declares `pliron-derive = "0"`, and a lock-free resolve
-      # can pair it with `pliron-derive 0.18`, whose macro expansion targets
-      # newer `pliron` paths. The manifest carries an optional exact dependency
-      # for feature builds, and this seeds CI's ephemeral lockfile before the
-      # expensive Burn/CubeCL row compiles.
-      - name: Pin pliron derive for Burn/CubeCL
+      # **Fold the fresh resolve's `pliron` pair onto 0.17.** No lockfile is
+      # committed, so this row resolves from scratch, and a scratch resolve of the
+      # Burn/CubeCL stack picks up *two* `pliron`s: `cubecl` asks for 0.17, and
+      # `pliron-llvm 0.17` asks for `pliron = "0"`, which Cargo satisfies with the
+      # newest 0.x on the index — 0.18.0 at the time of writing. That is legal (0.17
+      # and 0.18 are different semver majors) and fatal: `pliron 0.18.0` requires
+      # `pliron-derive = "=0.18.0"`, and `pliron 0.17.0`'s own `pliron-derive = "0"`
+      # then unifies onto that same 0.18.0, whose macros expand to paths
+      # (`pliron::ident`, `pliron::boxed_type_to_trait`) that only exist in 0.18.
+      # The failure is `E0433` inside `pliron-0.17.0/src/builtin/attributes.rs`,
+      # three minutes into the build.
+      #
+      # The previous step tried to downgrade `pliron-derive` alone, which cannot
+      # work — `pliron 0.18.0` pins it exactly, so the resolver refuses. The fix
+      # is to downgrade the *extra `pliron`* instead: with only 0.17.0 left,
+      # `pliron-derive 0.18.0` has no dependents and is dropped, and `pliron
+      # 0.17.0`'s `"0"` requirement unifies onto the exact `pliron-derive =
+      # "=0.17.0"` that `Cargo.toml` carries as an optional dependency for exactly
+      # this reason. The loop rather than a hard-coded `@0.18.0` so that a 0.19
+      # on the index tomorrow is folded the same way rather than failing the
+      # `cargo update` spec match, which is what took the previous step down.
+      #
+      # `shell: bash` because the default shell on the Windows runner is
+      # PowerShell, and this step is written once for three platforms. The final
+      # assertion turns a bad pairing into a failure here, in seconds, rather
+      # than in the compile of a crate this repository does not own.
+      - name: Pin pliron to 0.17 for Burn/CubeCL
         if: matrix.features.key == 'cellpose-yolo'
+        shell: bash
         run: |
-          cargo update -p pliron-derive@0.18.0 --precise 0.17.0 || \
-            cargo update -p pliron-derive@0.17.0 --precise 0.17.0
+          cargo generate-lockfile
+          versions() {
+            cargo metadata --format-version 1 ${{ matrix.features.flags }} \
+              | jq -r --arg n "$1" '.packages[] | select(.name == $n) | .version' \
+              | sort -u
+          }
+          for v in $(versions pliron | grep -vx 0.17.0); do
+            cargo update -p "pliron@$v" --precise 0.17.0
+          done
+          echo "pliron: $(versions pliron | tr '\n' ' ')"
+          echo "pliron-derive: $(versions pliron-derive | tr '\n' ' ')"
+          test "$(versions pliron)" = 0.17.0
+          test "$(versions pliron-derive)" = 0.17.0
       - name: Build
         run: cargo build --all-targets ${{ matrix.features.flags }}
       # `--no-fail-fast` so one broken suite does not hide the state of the other
