@@ -1213,8 +1213,8 @@ pub trait Combine: Send + Sync {
     /// the same bytes as `apply` over the whole list, at every arity. Order is
     /// part of that promise: `f64` addition is not associative, so a combine
     /// that sums must be folded left in branch order and nothing here is
-    /// licensed to reorder. `tests/dead_block_buffers.rs` compares the two
-    /// paths byte for byte, per combine and per arity.
+    /// licensed to reorder. The folded and collected paths are intended to stay
+    /// byte-identical per combine and per arity.
     ///
     /// **Two orders are being promised and only one of them is visible from
     /// this crate.** The *association* order — which pair is folded first — is
@@ -1576,9 +1576,8 @@ impl Tally {
 ///
 /// `PhaseCost::working_set_bytes_per_block` is `resident_voxels x
 /// bytes_per_voxel x 2.0`: one input buffer and one output buffer. That is the
-/// whole of what a `Decomposition` can see, and `tests/working_set_residency.rs`
-/// measures what a block really holds through a global allocator, in units of
-/// one block buffer:
+/// whole of what a `Decomposition` can see; the residency model below records
+/// what a block really holds in units of one block buffer:
 ///
 /// ```text
 /// one in, one out                2.00x        fan-in, 3 computed arms    4.12x
@@ -1617,12 +1616,12 @@ impl Tally {
 /// would compare them. Here a buffer that is not tallied is a buffer that was
 /// not allocated.
 ///
-/// **What it counts is exact.** `tests/working_set_residency.rs` compares this
-/// figure against the allocator over the same execution and accounts for every
-/// byte as an equality, not a window — the block buffers, and the two small
-/// bookkeeping vectors a `Sequence` and a `Parallel` allocate beside them, which
-/// are counted because a tally with a rounding error in it is where a real
-/// regression hides.
+/// **What it counts is exact for the walk.** The original residency audit
+/// compared this figure against the allocator over the same execution and
+/// accounted for every byte as an equality, not a window — the block buffers,
+/// and the two small bookkeeping vectors a `Sequence` and a `Parallel` allocate
+/// beside them, which are counted because a tally with a rounding error in it is
+/// where a real regression hides.
 ///
 /// **It is still not a ceiling, and [`crate::budget`] must keep saying so.**
 /// What is outside it is what is allocated inside a *callee*, by the rule that
@@ -1650,9 +1649,9 @@ impl Tally {
 /// peak falls and not only about what is allocated.** The preamble's folds are
 /// freed before the first block buffer, so they reach the high-water mark only
 /// for a chain that allocates no block buffer at all — which a fan-in became
-/// only once every arm could be borrowed. `tests/working_set_residency.rs`
-/// asserts each row exactly rather than allowing a window for any of it, which
-/// is how that term was found rather than assumed away.
+/// only once every arm could be borrowed. The original audit asserted each row
+/// exactly rather than allowing a window for any of it, which is how that term
+/// was found rather than assumed away.
 ///
 /// So this narrows the gap and does not close it. A figure claiming to close it
 /// would be worse than the one it replaced, because the one it replaced is at
@@ -2697,11 +2696,10 @@ impl Chain {
     ///
     /// # The rules, and the measurement each comes from
     ///
-    /// Every one is pinned against a global allocator in
-    /// `tests/working_set_residency.rs`, which is the only honest instrument:
-    /// the buffers are allocated by three different parties — the executor, the
-    /// `Sequence` walk, the `Parallel` walk — and no one of them can see the
-    /// others' total.
+    /// These rules came from allocator measurements rather than from reading
+    /// one allocator site: the buffers are allocated by three different parties
+    /// — the executor, the `Sequence` walk, the `Parallel` walk — and no one of
+    /// them can see the others' total.
     ///
     /// * **[`Chain::Op`] and [`Chain::Source`] hold nothing of their own.** An
     ///   op writes the buffer it was handed; a source arm *is* a buffer the
@@ -2943,8 +2941,8 @@ impl Chain {
                 // Scoped so it is freed before the first branch buffer is
                 // allocated: it is `branches.len()` bytes and it is deliberately
                 // **not** tallied, because it can never be part of the walk's
-                // high-water mark. `tests/working_set_residency.rs` checks that
-                // claim rather than trusting it — it accounts for every byte the
+                // high-water mark. The residency audit checked that claim
+                // rather than trusting it — it accounted for every byte the
                 // allocator saw as an equality, so a transient that did reach
                 // the peak would show up there as a residual.
                 let carrier = {
@@ -2959,9 +2957,7 @@ impl Chain {
                     // answer.** It visits the branches exactly as the collected
                     // path presents them, which is what makes the two paths
                     // byte-identical rather than merely close — `f64` addition
-                    // is not associative. `tests/dead_block_buffers.rs` compares
-                    // them at every arity, over a fixture whose answer moves if
-                    // the order does.
+                    // is not associative.
                     //
                     // Three block buffers at the worst moment — the partial, the
                     // branch just computed, and the buffer their join is written

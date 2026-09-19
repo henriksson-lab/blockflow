@@ -45,10 +45,10 @@
 // between them (`Chain::resident_block_buffers`).
 //
 // It was a literal `x 2.0` — one input buffer and one output buffer — and the
-// table below is what `tests/working_set_residency.rs` measured against it,
-// through a global allocator, in units of one `f64` block buffer. Those rows are
-// now an equality; they are kept as the record of a gap that ran from `1.00x` to
-// `3.56x` over the shapes listed and to **46.5x** for the one that was not:
+// table below records the allocator measurements against it, in units of one
+// `f64` block buffer. Those rows are now an equality; they are kept as the
+// record of a gap that ran from `1.00x` to `3.56x` over the shapes listed and to
+// **46.5x** for the one that was not:
 // a fan-in whose combine cannot fold holds one buffer per arm, and the feature
 // stack of `docs/design/pixel-classification.md` has ninety-one of them.
 //
@@ -125,7 +125,7 @@
 // three do. The buffers that went away were **computed and then not read** —
 // from the moment a branch finished until the combine ran they were bytes and
 // nothing else — so this is not a trade against locality, and
-// `tests/dead_block_buffers.rs` is the byte-for-byte identity it is only allowed under.
+// the byte-for-byte identity property is the only reason this is allowed.
 // Three combines decline the declaration and say why in their own words:
 // `Arithmetic::Subtract` and `Arithmetic::Divide` are not folds, neither is a
 // difference, and a tree walk needs every channel at a voxel at once.
@@ -145,7 +145,7 @@
 //
 // The honest position is therefore that this is an **estimate that is known to
 // run low**, not a ceiling; a caller sizing a machine should read
-// `tests/working_set_residency.rs` for the factor its own chain shape earns.
+// the shape-derived residency model for the factor its own chain shape earns.
 // Making the framework's half exact is a change to `price_phase` and to what the
 // planner is handed, and it moves which plans are affordable — that is a budget
 // review, and the numbers it needs are in the same file.
@@ -155,9 +155,9 @@
 // walk itself allocated plus the input, the output and the distinct source
 // buffers. It is measured rather than forecast — the same walk that allocates
 // keeps the tally, so a buffer that is not counted is a buffer that was not
-// allocated — and `tests/working_set_residency.rs` checks it against the
-// allocator over the same execution, accounting for every byte as an equality
-// rather than a window.
+// allocated. The original residency audit checked it against the allocator over
+// the same execution, accounting for every byte as an equality rather than a
+// window.
 //
 // **It does not make a lease a promise, and nothing here should be read as if
 // it had.** Two things stay outside any such figure: what an op allocates inside
@@ -580,9 +580,8 @@ pub fn auto_budget_bytes() -> Option<u64> {
 ///
 /// `PhaseCost::working_set_bytes_per_block` was `resident_voxels x
 /// bytes_per_voxel x 2.0` — one input buffer and one output buffer — when these
-/// were measured, and `tests/working_set_residency.rs` measured what a block
-/// really holds against it. **As multiples of that assumed charge**, which is
-/// the unit this constant is in:
+/// were measured against what a block really holds. **As multiples of that
+/// assumed charge**, which is the unit this constant is in:
 ///
 /// The framework half of that gap is closed — the charge now counts the chain's
 /// own buffers — so what a re-measurement would find is only the **op** half,
@@ -607,10 +606,8 @@ pub fn auto_budget_bytes() -> Option<u64> {
 /// figure now is **`2.1`**, and the smallest-tenth rule is unchanged; see the
 /// re-fit section below.
 ///
-/// The rule is what `tests/working_set_residency.rs`'s
-/// `the_shape_margin_is_the_smallest_tenth_that_covers_what_was_measured`
-/// asserts, in both directions — a margin above its evidence is headroom nobody
-/// can point at, and one below it is the failure it exists to prevent.
+/// The rule is deliberately two-sided: a margin above its evidence is headroom
+/// nobody can point at, and one below it is the failure it exists to prevent.
 ///
 /// **A tenth and not a whole number**, which this constant was first written as
 /// and had to be corrected. Rounding up to whole numbers reads well until a
@@ -733,8 +730,8 @@ pub enum FrameworkFigure {
     /// at the time, and is 2.1 now that it no longer has to cover the framework.
     ///
     /// The count is [`Chain::resident_block_buffers`](crate::op::Chain::resident_block_buffers),
-    /// derived from the chain's shape and held to a global allocator as an
-    /// **equality** over fourteen shapes in `tests/working_set_residency.rs`.
+    /// derived from the chain's shape and originally checked against allocator
+    /// measurements over representative shapes.
     ///
     /// **It is computed where the price is taken, not recorded on the plan**,
     /// and that is a decision worth stating because the other way was tried
@@ -805,8 +802,8 @@ pub enum FrameworkFigure {
 /// argument:
 ///
 /// * **too low** — the run holds more than the budget promised. Measured today,
-///   with no margin at all: up to `2.50x` over budget, on 13 of the 32 rows of
-///   `tests/working_set_residency.rs`'s sweep, and worst exactly where the
+///   with no margin at all: up to `2.50x` over budget in the original residency
+///   sweep, and worst exactly where the
 ///   planner has just fitted a large candidate, which is the situation a
 ///   memory-constrained run is in by definition. That is a killed run;
 /// * **too high** — the planner takes a smaller block off the candidate ladder.
@@ -843,11 +840,9 @@ pub enum FrameworkFigure {
 /// correction closer and never further — which is the refinement's own win, seen
 /// from the margin's side.
 ///
-/// `tests/block_ladder.rs` asserts both halves against the real
-/// [`admission_bytes`] and the real `price_phase` at the refined spacing, and
-/// `a_margin_never_moves_the_admitted_block_by_more_than_eight_times_in_volume`
-/// asserts the same invariant at the coarse one. Two spacings is what makes it
-/// an invariant rather than a coincidence.
+/// This argument was checked against the real [`admission_bytes`] and the real
+/// `price_phase` at both coarse and refined ladder spacings. Two spacings is
+/// what makes it an invariant rather than a coincidence.
 ///
 /// **At the coarse spacing the bound is slack, measurably so**, and the refined
 /// test is therefore the sharper of the two. A block admitted without a margin

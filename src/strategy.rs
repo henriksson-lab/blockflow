@@ -139,8 +139,8 @@ pub enum SchedulePriority {
     /// Advance one block as far through the phases as its dependencies allow.
     ///
     /// **This said "Fusion, and the smaller working set". Neither half holds in
-    /// this executor**, and `blockflow`'s `tests/simulate_ranks.rs` measures
-    /// both:
+    /// this executor**, according to the scheduler measurements that motivated
+    /// this correction:
     ///
     /// * *The working set.* Advancing one block through every phase means
     ///   **every phase's image is live at once from early in the run**, where
@@ -1064,8 +1064,8 @@ pub fn execute_phases(
 /// The extra listing is `O(blocks)` keys against a phase that irreducibly
 /// writes `blocks` fragments and reads at least `blocks` more, so the ratio is
 /// fixed as a caller cuts more finely. `Stats::sidecar_listings` and
-/// `sidecar_keys_listed` report both figures, and `tests/fragment_stats.rs`
-/// pins the listing count against the block count.
+/// `sidecar_keys_listed` report both figures so callers can inspect the
+/// listing count against the block count.
 ///
 /// Refuses a phase the plan does not mark as a barrier: without one there is no
 /// moment at which the fragment set is complete, so there is nothing well

@@ -89,8 +89,8 @@
 // quadrupled.
 //
 // The step count is exactly `n · ndim` on a lattice — one placement per box per
-// axis, no box copied — and `tests/tiling_scaling.rs` pins that with
-// `tiling_work` rather than with a stopwatch.
+// axis, no box copied — and `tiling_work` reports that count directly rather
+// than relying on a stopwatch.
 //
 // Provenance
 // ----------

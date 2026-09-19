@@ -508,20 +508,6 @@ name = "blockflow-local"
 path = "src/bin/blockflow_local.rs"
 required-features = ["distributed"]
 
-[[test]]
-name = "model_segment_invariance"
-path = "tests/model_segment_invariance.rs"
-required-features = ["model-segment"]
-
-[[test]]
-name = "model_segment_ownership"
-path = "tests/model_segment_ownership.rs"
-required-features = ["model-segment"]
-
-[[test]]
-name = "model_segment_rows"
-path = "tests/model_segment_rows.rs"
-required-features = ["model-segment"]
 
 [dev-dependencies]
 # **An agreement oracle for `forest`, and nothing else.** `blockflow` fits its

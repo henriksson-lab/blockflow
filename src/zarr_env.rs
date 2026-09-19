@@ -1427,11 +1427,10 @@ impl ZarrEnvironment {
     ///   wanted it runs.
     ///
     /// **The simulator's answer is about `lookahead` and not about `threads`.**
-    /// `tests/simulate_ranks.rs` sweeps a lookahead of 0 to 64 across three
-    /// worker counts and three cache sizes and finds **1 optimal in every
-    /// configuration where prefetch can act at all** (1.4% to 3.1%), 2 already
-    /// behind it, and 4 and up worse than not prefetching — two mechanisms, a
-    /// prefetched chunk evicting one that was about to be used, and a run of
+    /// Scheduler sweeps found `1` optimal in every configuration where prefetch
+    /// can act at all, `2` already behind it, and `4` and up worse than not
+    /// prefetching — two mechanisms, a prefetched chunk evicting one that was
+    /// about to be used, and a run of
     /// fetches ahead making the next demand fetch queue behind all of it. That
     /// model has **one serial IO channel and therefore cannot say anything about
     /// `threads` at all**, which is exactly the quantity a real store's

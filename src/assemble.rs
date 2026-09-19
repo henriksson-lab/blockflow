@@ -1222,8 +1222,8 @@ impl PlanBuilder {
     /// of pricing a candidate: `445 ms` at `8192` blocks against `11 ms` to
     /// build the phases themselves, and half a minute at the block counts a
     /// fine grid asks for. `tiling`'s header has the algorithm that replaced it
-    /// and the before/after; `tests/tiling_scaling.rs` pins the scaling with a
-    /// step counter rather than a stopwatch.
+    /// and the before/after; `tiling_work` exposes the scaling as a step counter
+    /// rather than a stopwatch.
     pub fn finish(self) -> Result<Assembly> {
         if self.phases.is_empty() {
             return Err(Error::InvalidArgument(

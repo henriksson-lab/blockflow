@@ -17,7 +17,7 @@
 //!
 //! | | varies | held fixed | judge |
 //! |---|---|---|---|
-//! | `tests/simulate_ranks.rs` | the scheduler | the plan | the simulator |
+//! | scheduler sweeps | the scheduler | the plan | the simulator |
 //! | **this file** | **the plan** | the scheduler | the simulator |
 //!
 //! # The two judges, and why both are here
@@ -72,9 +72,8 @@
 //! would be inventing a number for the half of the comparison that is supposed
 //! to be the planner's. [`price_plan`](crate::arena::price_plan) refuses such a
 //! phase rather than charging it something. `simulate` itself is happy with
-//! fragment and iterative work — `tests/simulate_ranks.rs` runs both — so what
-//! this file would need to judge one is an objective to compare against, which
-//! the planner does not have.
+//! fragment and iterative work, so what this file would need to judge one is an
+//! objective to compare against, which the planner does not have.
 //!
 //! [`Scheduler`]: crate::simulate::Scheduler
 //! [`Machine::contention`]: crate::simulate::Machine::contention
@@ -464,7 +463,7 @@ impl Arena {
     /// shipped default, `Hints::default()`'s own policy, and the one that shares
     /// `strategy::priority_key` with the real dispatcher — so that what varies
     /// between entrants is the plan and not the order a scheduler happens to
-    /// like. The arena ranks plans; `tests/simulate_ranks.rs` ranks schedulers.
+    /// like. The arena ranks plans; scheduler comparisons rank schedulers.
     /// [`Self::judge_with`] states a different one.
     pub fn judge(&self, workflow: &Workflow) -> Result<Judgement> {
         self.judge_with(workflow, &mut || Box::new(ExecutorOrder::phase_major()))
@@ -1290,8 +1289,7 @@ pub fn price_plan(
 /// **What the makespan cannot say.** A plan that is fast on the machine it was
 /// planned for may not *fit* on another one at all, and a transfer sweep that
 /// reported only durations would rank an impossible plan against feasible ones.
-/// `tests/cost_scenarios.rs` uses this to mark those cells rather than time
-/// them.
+/// transfer sweeps should mark those cells rather than time them.
 pub fn working_set_bytes(
     workflow: &Workflow,
     decomposition: &Decomposition,

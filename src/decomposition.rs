@@ -3058,9 +3058,9 @@ pub fn price_phase(
         //
         // A flat `2.0` here is an under-charge for everything else, in the
         // direction that admits a plan the run cannot afford: 93 buffers against
-        // 2 for the feature stack of `docs/design/pixel-classification.md`. See
-        // `tests/working_set_residency.rs`, which holds the shape-derived count
-        // to a global allocator as an equality over fourteen shapes.
+        // 2 for the feature stack of `docs/design/pixel-classification.md`.
+        // The shape-derived count came from allocator measurements over
+        // representative chain shapes.
         working_set_bytes_per_block: resident_voxels
             * bytes_per_voxel
             * (traffic.images_read + usize::from(traffic.writes_an_image) + traffic.chain_buffers)

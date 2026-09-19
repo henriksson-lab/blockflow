@@ -109,10 +109,10 @@
 // The writer reproduces numpy's own header spelling, its key order and its
 // padding rule exactly — 64-byte alignment of the data, a version chosen by
 // header length, `(5,)` for a one-axis shape and `()` for none — so a file
-// written here is byte-identical to the one `numpy.save` writes for the same
-// array. `tests/npy_files.rs` asserts that against bytes numpy actually
-// produced, which is a stronger statement than a round trip through this crate's
-// own reader: a round trip only proves the two halves agree with each other.
+// written here is intended to be byte-identical to the one `numpy.save` writes
+// for the same array. That is a stronger statement than a round trip through
+// this crate's own reader: a round trip only proves the two halves agree with
+// each other.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};

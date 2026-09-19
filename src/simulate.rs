@@ -1518,9 +1518,9 @@ pub enum RateBasis {
     /// over the volume's surface.
     ///
     /// It is not wrong about any single task — a face block really does retire
-    /// more output per voxel read. It is wrong about the run.
-    /// `tests/simulate_ranks.rs` measures it inducing **7% more cache misses
-    /// than plan order** and 16% more than the IO tie-break alone.
+    /// more output per voxel read. It is wrong about the run: scheduler
+    /// measurements showed it inducing more cache misses than plan order and
+    /// the IO tie-break alone.
     ///
     /// Kept, and public, because a failure mode that is only described is a
     /// failure mode that comes back.

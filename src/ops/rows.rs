@@ -1129,12 +1129,9 @@ fn block_rows(
 /// Every other op here follows a phase that already emitted rows; the header's
 /// note on how a gather gets its image turns on exactly that. So a plan whose
 /// *input is a table* — a table of measurements from an earlier program, a
-/// coordinate list read off disk — had no op to start with and had to write
-/// one. It was written twice in this exact form: once by a consumer of this
-/// crate, and once by **this crate's own `tests/rows_group.rs`**, which is the
-/// sharper of the two facts. A library whose test suite has to supply the
-/// missing half of its own module is a library with a hole in it, and the copy
-/// sat there beside the very reduction it was feeding.
+/// coordinate list read off disk — had no op to start with and callers had to
+/// write one. A library whose consumers have to supply the missing half of its
+/// own module is a library with a hole in it.
 ///
 /// **The point-flavoured twin is not a case of this op**, and the difference is
 /// one line of [`crate::points`]' header rather than a matter of taste: *a

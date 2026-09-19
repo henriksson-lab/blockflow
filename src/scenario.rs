@@ -19,9 +19,8 @@
 //!
 //! A [`Scenario`](crate::scenario::Scenario) is therefore a **machine that need not exist**: a snapshot of
 //! coefficients, the machine the simulator models, and what the planner is
-//! allowed to spend. `costs/` holds one per plausible shape of machine, they are
-//! files in the repository rather than figures in a test, and
-//! `tests/cost_scenarios.rs` runs the planner against every one of them.
+//! allowed to spend. `costs/` holds one per plausible shape of machine, and
+//! they are files in the repository rather than figures embedded in tests.
 //!
 //! # One source of coefficients, two judges
 //!
@@ -553,9 +552,8 @@ impl Scenario {
             // runs on. Every committed scenario was recorded unbounded, so
             // carrying it would add a field to all of them that only ever
             // states the default. (This once also cited a byte-for-byte
-            // comparison against `costs/`; that check is gone —
-            // `tests/cost_scenarios.rs` records why it had to go — and the
-            // reason above is the one that still holds.)
+            // comparison against `costs/`; that check is gone, and the reason
+            // above is the one that still holds.)
             candidate_window: 0,
         };
         let chunk = value
