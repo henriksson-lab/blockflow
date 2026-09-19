@@ -1,6 +1,6 @@
 # blockflow
 
-**ready to be used by early adopters. depend on a particular git commit as API is not yet frozen**
+**Ready to be used by early adopters. Have your code depend on a particular git commit as API is not yet frozen**
 
 This is an **experimental** crate for processing of large scale imaging data.
 Modern microscopes are able to churn out TB-scale datasets, making it impossible
@@ -27,11 +27,9 @@ This crate aims to resolve the problem using the following ingredients:
 
 * Operations are represented as a DAG (direct acyclic graph), representing dependencies
 * Borrowing from database query planners, statistics about compute times are gathered during execution 
-* A 4d scheduler figures out the best order and adapts in realtime based on statistics
+* A 6d scheduler figures out the best order and adapts in realtime based on statistics
 * Designed for multiple compute nodes, GPUs and heterogenous compute environments from day one
 * OME-Zarr is used to enable distributed computing on chunks of image data
-
-This crate is not yet ready for general consumption.
 
 ## Benchmarks
 
