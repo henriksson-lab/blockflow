@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: MIT
 
+#[path = "../../../support/planning.rs"]
+mod example_planning;
+
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use blockflow::assemble::{ImageId, PlanBuilder};
 use blockflow::dtype::Dtype;
-use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::ops::{
     collect_object_geometry_basic_rows, Measurements, ObjectGeometryBasicMeasurements,
     PhysicalSpacing,
 };
-use blockflow::probes::IdentityOp;
 use blockflow::sidecar::Lifecycle;
-use blockflow::strategy::{execute_phases, Hints};
+use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::ZarrEnvironment;
 use blockflow::{AttachedImage, Error, Result};
@@ -43,6 +43,8 @@ struct Config {
     zarr_dir: PathBuf,
     #[arg(long, value_parser = parse_chunk, default_value = "8x16x16")]
     chunk: [usize; 3],
+    #[arg(long, default_value_t = false)]
+    prepare_only: bool,
 }
 
 #[derive(Debug)]
@@ -87,31 +89,46 @@ fn run() -> Result<()> {
     let mut rows = Vec::new();
     let mut timings = Timings::default();
     for image in 0..config.images {
-        let labels = if let Some(dir) = &config.fixture_dir {
-            let started = Instant::now();
-            let boxes = load_fixture_boxes(dir, image)?;
-            timings.fixture_load += started.elapsed();
-            let started = Instant::now();
-            let labels = labels_from_boxes(&boxes);
-            timings.label_construction += started.elapsed();
-            labels
+        let prepared = config
+            .zarr_dir
+            .join(format!("image-{image:03}.zarr/level0"));
+        let input_zarr = if prepared.join("zarr.json").exists() {
+            prepared
         } else {
+            let labels = if let Some(dir) = &config.fixture_dir {
+                let started = Instant::now();
+                let boxes = load_fixture_boxes(dir, image)?;
+                timings.fixture_load += started.elapsed();
+                let started = Instant::now();
+                let labels = labels_from_boxes(&boxes);
+                timings.label_construction += started.elapsed();
+                labels
+            } else {
+                let started = Instant::now();
+                let labels = synthetic_labels(image);
+                timings.label_construction += started.elapsed();
+                labels
+            };
             let started = Instant::now();
-            let labels = synthetic_labels(image);
-            timings.label_construction += started.elapsed();
-            labels
+            let input_zarr = ensure_label_zarr(&config, image, labels)?;
+            timings.zarr_prepare += started.elapsed();
+            input_zarr
         };
+        if config.prepare_only {
+            continue;
+        }
         let started = Instant::now();
-        let input_zarr = ensure_label_zarr(&config, image, labels)?;
-        timings.zarr_prepare += started.elapsed();
-        let started = Instant::now();
-        let mut measurements = planned_object_geometry_basic(&input_zarr, spacing, config.chunk)?;
+        let mut measurements = planned_object_geometry_basic(&input_zarr, spacing, &config.out)?;
         timings.measurement += started.elapsed();
         measurements.sort_by_key(|row| row.label);
         rows.extend(measurements.into_iter().map(|measurements| ObjectRow {
             image,
             measurements,
         }));
+    }
+
+    if config.prepare_only {
+        return Ok(());
     }
 
     let started = Instant::now();
@@ -171,37 +188,25 @@ fn ensure_label_zarr(config: &Config, image: usize, labels: Array3<u32>) -> Resu
 fn planned_object_geometry_basic(
     input_zarr: &Path,
     spacing: PhysicalSpacing,
-    chunk: [usize; 3],
+    output_dir: &Path,
 ) -> Result<Vec<ObjectGeometryBasicMeasurements>> {
-    let (_, volume) = AttachedImage::at(input_zarr).metadata()?;
-    let grid = BlockGrid::new(volume, chunk)?;
-    let mut builder = PlanBuilder::new(volume, Dtype::U32, grid);
-    builder.pixels(Chain::op(IdentityOp::new(
-        "object-3d-label-source",
-        [0, 0, 0],
-    )))?;
-    let base = builder.finish()?;
-    let labels = ImageId::from(base.n_phases());
-    let measurements = Measurements::for_labels(labels)
+    let images = [AttachedImage::at(input_zarr)];
+    let (dtype, volume) = images[0].metadata()?;
+    let measurements = Measurements::for_labels(0usize)
         .object_geometry_basic(spacing)
         .stream("object-3d.measurements")
         .lifecycle(Lifecycle::DeleteOnExit)
-        .build(base.decomposition.clone())?;
+        .plan_on_attached(&images, &example_planning::constraints(volume))?;
     let rows = measurements.object_geometry_basic_rows().ok_or_else(|| {
         Error::invalid("object-3d-measurement: planned object geometry rows are missing")
     })?;
-    let env = ZarrEnvironment::attach(
-        input_zarr
-            .parent()
-            .ok_or_else(|| Error::invalid("object-3d-measurement: input zarr has no parent"))?
-            .join("work"),
-        &[AttachedImage::at(input_zarr)],
-    )?;
-    let mut work = base.work();
-    work.extend(measurements.phase_work());
+    let scratch = tempfile::tempdir_in(output_dir).map_err(Error::backend)?;
+    let env = ZarrEnvironment::attach(scratch.path(), &images)?;
+    let workflow = Workflow::new(Chain::sequence(Vec::new()), volume, dtype);
+    let work = measurements.phase_work();
     execute_phases(
         "object-3d planned measurement",
-        &base.workflow,
+        &workflow,
         &measurements.decomposition,
         &Hints::default(),
         &env,

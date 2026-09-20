@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
 
+#[path = "../../../support/planning.rs"]
+mod example_planning;
+
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -9,7 +12,7 @@ use blockflow::assemble::{ImageId, PlanBuilder};
 use blockflow::dtype::Dtype;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
-use blockflow::ops::label::LabelComponentsOp;
+use blockflow::ops::label::{LabelComponentsOp, RelabelComponentsOp};
 use blockflow::ops::{
     append_global_threshold_phases, append_remove_small_objects_phases, append_warp_phase,
     collect_class_a_shapes, Boundary, Connectivity, ElementShape, Gaussian, GlobalThreshold,
@@ -28,8 +31,17 @@ use ndarray::Array3;
 #[derive(Debug, Parser)]
 #[command(name = "skimage-pipeline")]
 struct Config {
+    #[arg(long, required_unless_present = "input_zarr")]
+    input: Option<PathBuf>,
+    /// Existing rank-3 Zarr array (for an OME-Zarr pyramid, pass its level directory).
     #[arg(long)]
-    input: PathBuf,
+    input_zarr: Option<PathBuf>,
+    /// Channel index when the rank-3 input array is [channel, y, x].
+    #[arg(long)]
+    channel: Option<usize>,
+    /// Convert a fixture to Zarr and exit before processing.
+    #[arg(long, default_value_t = false)]
+    prepare_only: bool,
     #[arg(long, default_value = ".tmp/skimage-pipeline/blockflow")]
     out: PathBuf,
     #[arg(long, default_value_t = 1.5)]
@@ -82,6 +94,10 @@ fn run() -> Result<()> {
     let started = Instant::now();
     let input_zarr = ensure_input_zarr(&config)?;
     let load_seconds = started.elapsed().as_secs_f64();
+    if config.prepare_only {
+        println!("prepared {}", input_zarr.display());
+        return Ok(());
+    }
 
     let pipeline_started = Instant::now();
     let rows = planned_pipeline(&config, &input_zarr)?;
@@ -130,6 +146,10 @@ impl Config {
 }
 
 fn ensure_input_zarr(config: &Config) -> Result<PathBuf> {
+    if let Some(array) = &config.input_zarr {
+        AttachedImage::at(array).metadata()?;
+        return Ok(array.clone());
+    }
     let array = config.zarr_dir.join("level0");
     if array.join("zarr.json").exists() {
         let (dtype, _) = AttachedImage::at(&array).metadata()?;
@@ -142,16 +162,28 @@ fn ensure_input_zarr(config: &Config) -> Result<PathBuf> {
         return Ok(array);
     }
 
-    let input = load_luma(&config.input)?;
+    let input = load_luma(
+        config
+            .input
+            .as_ref()
+            .ok_or_else(|| Error::invalid("--input or --input-zarr is required"))?,
+    )?;
     let voxels: Voxels = input.into();
     ZarrEnvironment::create(&config.zarr_dir, &voxels, config.chunk)?;
     Ok(array)
 }
 
 fn planned_pipeline(config: &Config, input_zarr: &Path) -> Result<Vec<ObjectRow>> {
-    let (_, volume) = AttachedImage::at(input_zarr).metadata()?;
+    let source = AttachedImage::at(input_zarr);
+    let source = if let Some(channel) = config.channel {
+        let (_, shape) = source.metadata()?;
+        source.plane(channel, [shape[1], shape[2]])
+    } else {
+        source
+    };
+    let (dtype, volume) = source.metadata()?;
     let grid = BlockGrid::new(volume, config.chunk)?;
-    let mut builder = PlanBuilder::new(volume, Dtype::F64, grid.clone());
+    let mut builder = PlanBuilder::new(volume, dtype, grid.clone());
     if config.mode == Mode::Transform {
         append_warp_phase(
             &mut builder,
@@ -167,10 +199,13 @@ fn planned_pipeline(config: &Config, input_zarr: &Path) -> Result<Vec<ObjectRow>
             grid,
         )?;
     }
-    builder.pixels(Chain::op(SmoothOp::new(
-        "skimage-gaussian-smooth",
-        Gaussian::new([0.0, config.sigma, config.sigma], 3.0)?.with_boundary(Boundary::Reflect),
-    )))?;
+    example_planning::pixels(
+        &mut builder,
+        Chain::op(SmoothOp::new(
+            "skimage-gaussian-smooth",
+            Gaussian::new([0.0, config.sigma, config.sigma], 3.0)?.with_boundary(Boundary::Reflect),
+        )),
+    )?;
     append_global_threshold_phases(
         &mut builder,
         "skimage-threshold",
@@ -180,16 +215,21 @@ fn planned_pipeline(config: &Config, input_zarr: &Path) -> Result<Vec<ObjectRow>
         },
     )?;
     let element = StructuringElement::from_radius(ElementShape::Box, [0, 1, 1]);
-    builder.pixels(Chain::op(MorphologyOp::new(
-        "skimage-open-3x3",
-        Morphology::Open,
-        element.clone(),
-    )))?;
-    builder.pixels(Chain::op(MorphologyOp::new(
-        "skimage-close-3x3",
-        Morphology::Close,
-        element,
-    )))?;
+    example_planning::pixels(
+        &mut builder,
+        Chain::sequence(vec![
+            Chain::op(MorphologyOp::new(
+                "skimage-open-3x3",
+                Morphology::Open,
+                element.clone(),
+            )),
+            Chain::op(MorphologyOp::new(
+                "skimage-close-3x3",
+                Morphology::Close,
+                element,
+            )),
+        ]),
+    )?;
     append_remove_small_objects_phases(
         &mut builder,
         "skimage-remove-small",
@@ -197,11 +237,20 @@ fn planned_pipeline(config: &Config, input_zarr: &Path) -> Result<Vec<ObjectRow>
         Connectivity::Faces,
         config.min_size,
     )?;
-    builder.fragments(
+    let faces = builder.fragments(
         LabelComponentsOp::new(
             "skimage-label-components",
             "skimage.components",
             Lifecycle::DeleteOnExit,
+        )
+        .connecting(Connectivity::Faces),
+    )?;
+    builder.fragments(
+        RelabelComponentsOp::reading(
+            "skimage-relabel-components",
+            "skimage.components",
+            faces,
+            builder.grid(),
         )
         .connecting(Connectivity::Faces),
     )?;
@@ -215,10 +264,8 @@ fn planned_pipeline(config: &Config, input_zarr: &Path) -> Result<Vec<ObjectRow>
     let shape_rows = measurements
         .class_a_rows()
         .ok_or_else(|| Error::invalid("skimage-pipeline: planned shape rows are missing"))?;
-    let env = ZarrEnvironment::attach(
-        config.zarr_dir.join("work.zarr"),
-        &[AttachedImage::at(input_zarr)],
-    )?;
+    let scratch = tempfile::tempdir_in(&config.out).map_err(Error::backend)?;
+    let env = ZarrEnvironment::attach(scratch.path(), &[source])?;
     let mut work = base.work();
     work.extend(measurements.phase_work());
     execute_phases(
@@ -299,7 +346,8 @@ fn write_summary(
         "min_size": config.min_size,
         "load_seconds": load_seconds,
         "pipeline_seconds": pipeline_seconds,
-        "input_zarr": config.zarr_dir.join("level0"),
+        "input_zarr": config.input_zarr.clone().unwrap_or_else(|| config.zarr_dir.join("level0")),
+        "channel": config.channel,
         "chunk_shape": config.chunk,
         "execution": "planned segmentation over attached Zarr input",
     });

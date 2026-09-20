@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
 
+#[path = "../../../support/planning.rs"]
+mod example_planning;
+
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -10,7 +13,6 @@ use blockflow::env::Environment;
 use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::ops::VoxelwiseMaskOp;
-use blockflow::region::Region;
 use blockflow::strategy::{execute_phases, Hints};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::ZarrEnvironment;
@@ -40,6 +42,8 @@ struct Config {
     zarr_dir: PathBuf,
     #[arg(long, value_parser = parse_chunk, default_value = "1x32x32")]
     chunk: [usize; 3],
+    #[arg(long, default_value_t = false)]
+    prepare_only: bool,
 }
 
 #[derive(Debug)]
@@ -70,19 +74,37 @@ fn run() -> Result<()> {
     let mut profile = vec![0u64; WIDTH];
     let mut total_open = 0u64;
     for image in 0..config.images {
-        let input = if let Some(dir) = &config.fixture_dir {
-            image_from_fixture(dir, image)?
+        let root = config.zarr_dir.join(format!("image-{image:03}"));
+        let array = root.join("image.zarr/level0");
+        let input_zarr = if array.join("zarr.json").exists() {
+            WoundZarr { image: array }
         } else {
-            synthetic_image(image)
+            let input = if let Some(dir) = &config.fixture_dir {
+                image_from_fixture(dir, image)?
+            } else {
+                synthetic_image(image)
+            };
+            ensure_wound_zarr(&config, image, input)?
         };
-        let input_zarr = ensure_wound_zarr(&config, image, input)?;
-        let mask = planned_open_mask(&input_zarr, config.threshold, config.chunk)?;
-        let (row, image_profile) = measure_mask(image, mask.view())?;
+        if config.prepare_only {
+            continue;
+        }
+        let (row, image_profile) = planned_open_profile(
+            image,
+            &input_zarr,
+            config.threshold,
+            config.chunk,
+            &config.out,
+        )?;
         total_open += row.open_area;
         for (dst, count) in profile.iter_mut().zip(image_profile) {
             *dst += count;
         }
         rows.push(row);
+    }
+
+    if config.prepare_only {
+        return Ok(());
     }
 
     write_images(&rows, &config.out.join("images.csv"))?;
@@ -120,7 +142,6 @@ impl Config {
 
 struct WoundZarr {
     image: PathBuf,
-    work: PathBuf,
 }
 
 fn ensure_wound_zarr(config: &Config, image: usize, input: Array3<f64>) -> Result<WoundZarr> {
@@ -140,23 +161,32 @@ fn ensure_wound_zarr(config: &Config, image: usize, input: Array3<f64>) -> Resul
         let voxels: Voxels = input.into();
         ZarrEnvironment::create(&store, &voxels, config.chunk)?;
     }
-    Ok(WoundZarr {
-        image: path,
-        work: root.join("work.zarr"),
-    })
+    Ok(WoundZarr { image: path })
 }
 
-fn planned_open_mask(input: &WoundZarr, threshold: f64, chunk: [usize; 3]) -> Result<Array3<bool>> {
+fn planned_open_profile(
+    image: usize,
+    input: &WoundZarr,
+    threshold: f64,
+    chunk: [usize; 3],
+    output_dir: &Path,
+) -> Result<(ImageRow, Vec<u64>)> {
     let (_, volume) = AttachedImage::at(&input.image).metadata()?;
+    if volume != [1, HEIGHT, WIDTH] {
+        return Err(Error::invalid("wound-assay: unexpected image shape"));
+    }
     let grid = BlockGrid::new(volume, chunk)?;
     let mut builder = PlanBuilder::new(volume, Dtype::F64, grid);
-    builder.pixels(Chain::op(VoxelwiseMaskOp::new(
-        "wound-open-mask",
-        move |value| value < threshold,
-    )))?;
+    example_planning::pixels(
+        &mut builder,
+        Chain::op(VoxelwiseMaskOp::new("wound-open-mask", move |value| {
+            value < threshold
+        })),
+    )?;
     let base = builder.finish()?;
     let mask_image = ImageId::from(base.n_phases());
-    let env = ZarrEnvironment::attach(&input.work, &[AttachedImage::at(&input.image)])?;
+    let scratch = tempfile::tempdir_in(output_dir).map_err(Error::backend)?;
+    let env = ZarrEnvironment::attach(scratch.path(), &[AttachedImage::at(&input.image)])?;
     let mut hints = Hints::default();
     hints.keep_images.insert(mask_image);
     execute_phases(
@@ -168,8 +198,35 @@ fn planned_open_mask(input: &WoundZarr, threshold: f64, chunk: [usize; 3]) -> Re
         &[],
         &base.work(),
     )?;
-    let block = env.read(mask_image.index(), &Region::whole(&volume))?;
-    block.as_array()?.view::<bool>().map(|view| view.to_owned())
+    let mut open_area = 0u64;
+    let mut profile = vec![0u64; WIDTH];
+    for core in base
+        .decomposition
+        .phases
+        .last()
+        .expect("mask phase")
+        .grid
+        .cores()
+    {
+        let block = env.read(mask_image.index(), &core.core)?;
+        let pixels = block.as_array()?.view::<bool>()?;
+        for ((_, _, x), &open) in pixels.indexed_iter() {
+            if open {
+                open_area += 1;
+                profile[core.core.start[2] + x] += 1;
+            }
+        }
+    }
+    let total = (HEIGHT * WIDTH) as u64;
+    Ok((
+        ImageRow {
+            image,
+            open_area,
+            covered_area: total - open_area,
+            open_fraction: open_area as f64 / total as f64,
+        },
+        profile,
+    ))
 }
 
 fn synthetic_image(image: usize) -> Array3<f64> {
@@ -300,32 +357,6 @@ where
             path.display()
         ))
     })
-}
-
-fn measure_mask(image: usize, mask: ndarray::ArrayView3<'_, bool>) -> Result<(ImageRow, Vec<u64>)> {
-    if mask.shape() != [1, HEIGHT, WIDTH] {
-        return Err(Error::invalid("wound-assay: unexpected mask shape"));
-    }
-    let mut open_area = 0u64;
-    let mut profile = vec![0u64; WIDTH];
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            if mask[[0, y, x]] {
-                open_area += 1;
-                profile[x] += 1;
-            }
-        }
-    }
-    let pixels = (HEIGHT * WIDTH) as u64;
-    Ok((
-        ImageRow {
-            image,
-            open_area,
-            covered_area: pixels - open_area,
-            open_fraction: open_area as f64 / pixels as f64,
-        },
-        profile,
-    ))
 }
 
 fn write_images(rows: &[ImageRow], path: &PathBuf) -> Result<()> {

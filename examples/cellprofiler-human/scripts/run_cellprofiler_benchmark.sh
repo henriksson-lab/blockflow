@@ -50,6 +50,7 @@ fi
 image="$1"
 output_dir="$2"
 reference_csv="${3:-}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ ! -f "$image" ]]; then
   echo "Input image not found: $image" >&2
@@ -100,6 +101,16 @@ reference_labels="${BF_REFERENCE_LABELS:-}"
 planned_objects_csv="$output_dir/blockflow/planned_objects.csv"
 input_zarr_store="${BF_INPUT_ZARR:-$output_dir/input.zarr}"
 
+# Prepare the source once. The timed Blockflow path reads the same Zarr array
+# that a normal invocation of cellprofiler-human reads.
+if [[ ! -f "$input_zarr_store/zarr.json" && ! -f "$input_zarr_store/level0/zarr.json" ]]; then
+  "$script_dir/prepare_input_zarr.sh" "$image" "$input_zarr_store"
+fi
+input_zarr_array="$input_zarr_store"
+if [[ -f "$input_zarr_store/level0/zarr.json" ]]; then
+  input_zarr_array="$input_zarr_store/level0"
+fi
+
 size_args=(--min-size "$min_size")
 if [[ "${BF_NO_MAX_SIZE:-}" == "1" ]]; then
   size_args+=(--no-max-size)
@@ -134,8 +145,8 @@ fi
 
 {
   printf 'blockflow_command='
-  printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
-    --input "$image" --ensure-input-zarr "$input_zarr_store" \
+  printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
+    --input-zarr "$input_zarr_array" \
     --out "$output_dir/plan-probe.json" --chunk "$chunk_shape" \
     --workers "$workers" --cache-bytes "$cache_bytes" --sigma "$sigma" \
     --threshold-method "$threshold_method" --threshold-bins "$threshold_bins" \
@@ -149,9 +160,8 @@ fi
   printf '\n'
 } > "$output_dir/benchmark-command.txt"
 
-cargo run -p blockflow-cellprofiler-human --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
-  --input "$image" \
-  --ensure-input-zarr "$input_zarr_store" \
+cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
+  --input-zarr "$input_zarr_array" \
   --out "$output_dir/plan-probe.json" \
   --chunk "$chunk_shape" \
   --workers "$workers" \
@@ -171,7 +181,7 @@ cargo run -p blockflow-cellprofiler-human --bin cellprofiler-plan-probe "${cargo
 if [[ "$enable_resident_reference" == "1" ]]; then
   {
     printf 'resident_reference_command='
-    printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
+    printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-resident-reference "${cargo_bin_flags[@]}" -- \
       --input "$image" --out "$output_dir/resident" "${size_args[@]}" --sigma "$sigma" \
       --declump-sigma "$declump_sigma" --threshold-method "$threshold_method" --threshold-bins "$threshold_bins" \
       --seed-min-distance "$seed_min_distance" --maxima-downsample "$maxima_downsample" \
@@ -180,7 +190,7 @@ if [[ "$enable_resident_reference" == "1" ]]; then
     printf '\n'
   } >> "$output_dir/benchmark-command.txt"
 
-  cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
+  cargo run -p blockflow-cellprofiler-human --bin cellprofiler-resident-reference "${cargo_bin_flags[@]}" -- \
     --input "$image" \
     --out "$output_dir/resident" \
     "${size_args[@]}" \
@@ -304,7 +314,7 @@ report = {
             "cache_bytes": requested_cache_bytes,
         },
         "applies_requested_execution_config": plan_probe is not None,
-        "reason": "the Blockflow example path is planned execution; chunk, worker and cache settings are consumed by cellprofiler-plan-probe and its materialization path",
+        "reason": "the Blockflow example path is planned execution; chunk, worker and cache settings are consumed by cellprofiler-human and its materialization path",
     },
     "wall_time": {
         "blockflow_pipeline_seconds": None if blockflow is None else blockflow.get("seconds"),

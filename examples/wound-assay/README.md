@@ -4,8 +4,8 @@ This example measures open wound area from deterministic scratch-assay-like PGM
 fixtures. It emits image-level summary rows and an aggregate per-column profile
 that can be compared with scikit-image/imageio and OpenCV references.
 The Blockflow side prepares each input image as Zarr, attaches it, runs a
-planned fixed-threshold open-wound mask, and derives the CSVs from that planned
-mask output.
+planned fixed-threshold open-wound mask, and reduces its output block by block
+into the CSVs.
 
 The implementation is intentionally example-local. A general axis-profile helper
 should only move into `blockflow` if another workflow needs the same operation.
@@ -31,4 +31,5 @@ examples/wound-assay/scripts/run_benchmark.sh 50
 
 Generated outputs live under `.tmp/wound-assay/`.
 Benchmark runs place prepared Zarr inputs under the benchmark directory as
-`input.zarr`.
+`input.zarr`. Fixture conversion happens before the measured Blockflow run;
+the run attaches those prepared arrays.

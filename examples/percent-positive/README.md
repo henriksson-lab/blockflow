@@ -40,5 +40,8 @@ examples/percent-positive/scripts/run_benchmark.sh 10
 examples/percent-positive/scripts/run_benchmark.sh 50
 ```
 
-The fixture is generated in memory by both implementations. Outputs live under
+The Blockflow benchmark prepares Zarr fixture arrays first, then measures the
+attached label and marker arrays directly. The measurement planner selects a
+compute grid; `--chunk` controls fixture storage chunks. The Python reference generates
+the same deterministic fixture in memory. Outputs live under
 `.tmp/percent-positive/` and are not committed.

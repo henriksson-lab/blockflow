@@ -1,7 +1,7 @@
 # 3-D Object Measurement Example
 
 This example measures labelled 3-D objects with physical voxel spacing. It uses
-the resident `blockflow` basic object-geometry measurement surface and compares
+the planned Blockflow basic object-geometry measurement surface and compares
 count, bounding boxes, physical extents, and voxel totals with a scikit-image
 `regionprops` reference over the same fixture files.
 
@@ -25,3 +25,7 @@ examples/object-3d-measurement/scripts/run_benchmark.sh 50
 ```
 
 Generated outputs live under `.tmp/object-3d-measurement/`.
+`--zarr-dir` can point to prepared per-image label arrays. The benchmark
+prepares these arrays before timing the normal processing command.
+The measurement planner chooses the compute grid for attached labels;
+`--chunk` controls storage chunks when preparing fixtures.

@@ -13,6 +13,7 @@ run_timed() {
 
 "$script_dir/fetch_fixture.sh" "$count" "$bench/fixtures"
 cargo build -p blockflow-wound-assay --release
+BF_PREPARE_ONLY=1 "$script_dir/run_blockflow.sh" "$bench/preparation" "$count" "$bench/fixtures" "$bench/input.zarr"
 run_timed blockflow "$script_dir/run_blockflow.sh" "$bench/blockflow" "$count" "$bench/fixtures" "$bench/input.zarr"
 run_timed skimage env BF_REFERENCE=skimage "$script_dir/run_reference.sh" "$bench/skimage" "$count" "$bench/fixtures"
 run_timed opencv env BF_REFERENCE=opencv "$script_dir/run_reference.sh" "$bench/opencv" "$count" "$bench/fixtures"

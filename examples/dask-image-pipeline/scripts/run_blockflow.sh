@@ -45,12 +45,23 @@ mkdir -p "$output_dir/runs"
 zarr_root="$output_dir/input-zarr"
 mkdir -p "$zarr_root"
 
+# Fixture conversion is outside the measured normal Zarr processing path.
+prep_index=0
+for image in "$input_dir"/*.bmp; do
+  prepared="$zarr_root/run-$(printf "%03d" "$prep_index").zarr"
+  if [[ ! -f "$prepared/level0/zarr.json" ]]; then
+    "$blockflow_bin" --input "$image" --zarr-dir "$prepared" \
+      --out "$output_dir/preparation" --prepare-only >/dev/null
+  fi
+  prep_index=$((prep_index + 1))
+done
+
 start="${EPOCHREALTIME:-$(date +%s)}"
 i=0
 for image in "$input_dir"/*.bmp; do
   run_dir="$output_dir/runs/run-$(printf "%03d" "$i")"
   "$blockflow_bin" \
-    --input "$image" \
+    --input-zarr "$zarr_root/run-$(printf "%03d" "$i").zarr/level0" \
     --out "$run_dir" \
     --zarr-dir "$zarr_root/run-$(printf "%03d" "$i").zarr" \
     --sigma "$sigma" \

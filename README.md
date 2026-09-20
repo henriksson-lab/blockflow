@@ -33,18 +33,18 @@ This crate aims to resolve the problem using the following ingredients:
 
 ## Benchmarks
 
-Benchmark results and reproduction commands live in
-[`BENCHMARKS.md`](BENCHMARKS.md).
+In the [current example benchmarks](BENCHMARKS.md), Blockflow's planned Zarr
+pipelines were approximately:
 
-In short, this crate is designed for high performance and for some sets of workloads it is
+* **5× faster than ImgLib2** on 10-image segmentation batches
+* **4.5× faster than OpenCV** on the same batches
+* **9× faster than scikit-image** on the same batches
+* **3× faster than Dask-image** on two larger images
 
-* 50x faster than CellProfiler
-* 25x faster than scikit-image/SciPy
-* 20x faster than ImgLib (FIJI/ImageJ)
-* 8x faster than OpenCV
-* a bit faster than DASK-Image, which is the only other framework also designed to process large images
-
-These numbers are workload dependent but gives an idea
+These are single-run wall-time ratios for the specified workloads, excluding
+fixture preparation and compilation. See [BENCHMARKS.md](BENCHMARKS.md) for
+the measurements, output checks, and reproduction commands. Earlier results
+are archived in [OLD_BENCHMARKS.md](OLD_BENCHMARKS.md).
 
 ## Design notes
 

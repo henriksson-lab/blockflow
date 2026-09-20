@@ -3471,8 +3471,26 @@ pub fn predicted_makespan(
     model: &super::decomposition::CostModel,
     workers: usize,
 ) -> Result<f64> {
+    Ok(
+        predicted_phase_prices(chain, decomposition, work, model, workers)?
+            .into_iter()
+            .map(|(_, makespan)| makespan)
+            .sum(),
+    )
+}
+
+/// Price every phase, including fragment and iterative phases, using the same
+/// objective as `predicted_makespan`. The cost is exposed so a caller choosing
+/// a grid can apply `Constraints::affords_working_set` before ranking it.
+pub fn predicted_phase_prices(
+    chain: &Chain,
+    decomposition: &Decomposition,
+    work: &[crate::fragment::PhaseWork<'_>],
+    model: &super::decomposition::CostModel,
+    workers: usize,
+) -> Result<Vec<(super::decomposition::PhaseCost, f64)>> {
     let slots = chain.slots();
-    let mut total = 0.0_f64;
+    let mut priced = Vec::with_capacity(decomposition.phases.len());
     for (index, phase) in decomposition.phases.iter().enumerate() {
         if phase.slots.iter().any(|&slot| slot >= slots.len()) {
             return Err(Error::InvalidArgument(format!(
@@ -3505,9 +3523,10 @@ pub fn predicted_makespan(
         // Zero for a phase that writes no image, so that the channel bound below
         // counts the same bytes `price_phase` charged for. See `PhaseTraffic`.
         let write = write_charge(model, traffic, is_materialised);
-        total += phase_makespan(&cost, &phase.grid, workers, model, write);
+        let makespan = phase_makespan(&cost, &phase.grid, workers, model, write);
+        priced.push((cost, makespan));
     }
-    Ok(total)
+    Ok(priced)
 }
 
 /// What the partition search looked at, and what it threw away.

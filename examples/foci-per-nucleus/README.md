@@ -43,3 +43,6 @@ examples/foci-per-nucleus/scripts/run_benchmark.sh 50
 Generated outputs live under `.tmp/foci-per-nucleus/`.
 Benchmark runs place prepared Zarr inputs under the benchmark directory as
 `input.zarr`.
+The fixture arrays are prepared before the planned measurement run. Labels and
+intensities are measured directly from attached arrays, with a planner-selected
+compute grid; `--chunk` controls fixture storage chunks.

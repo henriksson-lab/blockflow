@@ -27,6 +27,12 @@ the installed `numpy`, `scipy`, `scikit-image` and `imageio` packages.
 
 ## Run
 
+The Blockflow binary reads a Zarr array directly with `--input-zarr`. For a
+multiscale OME-Zarr store, pass the selected rank-3 level directory, such as
+`image.zarr/0`, and use `--channel N` for a `[channel, y, x]` array. `--zarr-dir` names the prepared input store when converting a fixture. The benchmark
+script converts BMP fixtures with `--prepare-only` before timing the normal
+`--input-zarr` run.
+
 Generate a deterministic 10-image fixture and run the Blockflow side:
 
 ```sh

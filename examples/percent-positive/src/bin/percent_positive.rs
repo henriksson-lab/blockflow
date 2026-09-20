@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: MIT
 
+#[path = "../../../support/planning.rs"]
+mod example_planning;
+
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::assemble::ImageId;
 use blockflow::dtype::Dtype;
-use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::ops::measure::{
     collect_class_a_shapes, collect_class_a_values, IntensityImage, IntensityMeasurements,
     IntensitySet, Measurements, ShapeMeasurements, ShapeSet,
 };
-use blockflow::probes::IdentityOp;
 use blockflow::sidecar::Lifecycle;
-use blockflow::strategy::{execute_phases, Hints};
+use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::ZarrEnvironment;
 use blockflow::{AttachedImage, Error, Result};
@@ -42,6 +43,8 @@ struct Config {
     zarr_dir: PathBuf,
     #[arg(long, value_parser = parse_chunk, default_value = "1x32x32")]
     chunk: [usize; 3],
+    #[arg(long, default_value_t = false)]
+    prepare_only: bool,
 }
 
 #[derive(Debug)]
@@ -72,14 +75,31 @@ fn run() -> Result<()> {
 
     let mut rows = Vec::new();
     for image in 0..config.images {
-        let (labels, marker) = synthetic_fixture(image);
-        let input_zarr = ensure_percent_positive_zarr(&config, image, labels, marker)?;
+        let root = config.zarr_dir.join(format!("image-{image:03}"));
+        let labels_path = root.join("labels.zarr/level0");
+        let marker_path = root.join("marker.zarr/level0");
+        let input_zarr =
+            if labels_path.join("zarr.json").exists() && marker_path.join("zarr.json").exists() {
+                PercentPositiveZarr {
+                    labels: labels_path,
+                    marker: marker_path,
+                }
+            } else {
+                let (labels, marker) = synthetic_fixture(image);
+                ensure_percent_positive_zarr(&config, image, labels, marker)?
+            };
+        if config.prepare_only {
+            continue;
+        }
         rows.extend(planned_percent_positive(
             image,
             &input_zarr,
             config.threshold,
-            config.chunk,
+            &config.out,
         )?);
+    }
+    if config.prepare_only {
+        return Ok(());
     }
     rows.sort_by_key(|row| (row.image, row.label));
 
@@ -124,7 +144,6 @@ impl Config {
 struct PercentPositiveZarr {
     labels: PathBuf,
     marker: PathBuf,
-    work: PathBuf,
 }
 
 fn ensure_percent_positive_zarr(
@@ -136,11 +155,7 @@ fn ensure_percent_positive_zarr(
     let root = config.zarr_dir.join(format!("image-{image:03}"));
     let labels = ensure_array_zarr(&root.join("labels.zarr"), labels, config.chunk)?;
     let marker = ensure_array_zarr(&root.join("marker.zarr"), marker, config.chunk)?;
-    Ok(PercentPositiveZarr {
-        labels,
-        marker,
-        work: root.join("work.zarr"),
-    })
+    Ok(PercentPositiveZarr { labels, marker })
 }
 
 fn ensure_array_zarr<T>(store: &Path, array: Array3<T>, chunk: [usize; 3]) -> Result<PathBuf>
@@ -170,18 +185,14 @@ fn planned_percent_positive(
     image: usize,
     input: &PercentPositiveZarr,
     threshold: f64,
-    chunk: [usize; 3],
+    output_dir: &Path,
 ) -> Result<Vec<ObjectRow>> {
-    let (_, volume) = AttachedImage::at(&input.labels).metadata()?;
-    let grid = BlockGrid::new(volume, chunk)?;
-    let mut builder = PlanBuilder::new(volume, Dtype::U32, grid);
-    builder.pixels(Chain::op(IdentityOp::new(
-        "percent-positive-label-source",
-        [0, 0, 0],
-    )))?;
-    let base = builder.finish()?;
-    let labels = ImageId::from(base.n_phases());
-    let measurements = Measurements::for_labels(labels)
+    let images = [
+        AttachedImage::at(&input.labels),
+        AttachedImage::at(&input.marker),
+    ];
+    let (dtype, volume) = images[0].metadata()?;
+    let measurements = Measurements::for_labels(ImageId::from(0))
         .shape(ShapeSet::standard())
         .intensity(
             IntensityImage::<0>::new(ImageId::supplied(0)).holding(Dtype::F64),
@@ -189,25 +200,20 @@ fn planned_percent_positive(
         )
         .stream("percent-positive.measurements")
         .lifecycle(Lifecycle::DeleteOnExit)
-        .build(base.decomposition.clone())?;
+        .plan_on_attached(&images, &example_planning::constraints(volume))?;
     let shape_rows = measurements
         .class_a_rows()
         .ok_or_else(|| Error::invalid("percent-positive: planned shape rows are missing"))?;
     let intensity_rows = measurements
         .class_a_intensity_rows(0)
         .ok_or_else(|| Error::invalid("percent-positive: planned intensity rows are missing"))?;
-    let env = ZarrEnvironment::attach(
-        &input.work,
-        &[
-            AttachedImage::at(&input.labels),
-            AttachedImage::at(&input.marker),
-        ],
-    )?;
-    let mut work = base.work();
-    work.extend(measurements.phase_work());
+    let scratch = tempfile::tempdir_in(output_dir).map_err(Error::backend)?;
+    let env = ZarrEnvironment::attach(scratch.path(), &images)?;
+    let workflow = Workflow::new(Chain::sequence(Vec::new()), volume, dtype);
+    let work = measurements.phase_work();
     execute_phases(
         "percent-positive planned measurement",
-        &base.workflow,
+        &workflow,
         &measurements.decomposition,
         &Hints::default(),
         &env,

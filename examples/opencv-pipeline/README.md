@@ -30,6 +30,20 @@ examples/opencv-pipeline/reference-opencv/build.sh
 
 ## Run
 
+The Blockflow binary normally reads an existing Zarr array. For a multiscale
+OME-Zarr store, pass the selected rank-3 level directory (for example `image.zarr/0`) and
+`--channel N` for a `[channel, y, x]` array:
+
+```sh
+cargo run -p blockflow-opencv-pipeline --bin opencv-pipeline --release -- \
+  --input-zarr image.zarr/0 --zarr-dir .tmp/opencv-work.zarr \
+  --out .tmp/opencv-results
+```
+
+`--input IMAGE --prepare-only --zarr-dir STORE` converts a BMP fixture to
+`STORE/level0`. The benchmark script prepares those stores before starting its
+timer, then invokes the same `--input-zarr` processing path.
+
 Generate a deterministic 10-image fixture and run the Blockflow side:
 
 ```sh

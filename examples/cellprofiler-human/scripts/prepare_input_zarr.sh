@@ -37,8 +37,9 @@ fi
 chunk_shape="${BF_CHUNK_SHAPE:-1x256x256}"
 read -r -a cargo_bin_flags <<< "${CARGO_BIN_FLAGS:-}"
 
-cargo run -p blockflow-cellprofiler-human --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
+cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
   --input "$image" \
   --ensure-input-zarr "$store" \
+  --prepare-only \
   --chunk "$chunk_shape" \
   --out "$store/prepare-plan.json"

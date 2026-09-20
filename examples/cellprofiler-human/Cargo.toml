@@ -6,6 +6,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
+tempfile = "3"
 blockflow = { path = "../..", features = ["zarr"] }
 clap = { version = "4.5", features = ["derive"] }
 csv = "1"
@@ -14,7 +15,7 @@ ndarray = "0.17"
 serde_json = "1"
 
 [[bin]]
-name = "cellprofiler-human"
+name = "cellprofiler-resident-reference"
 path = "src/bin/cellprofiler_human.rs"
 
 [[bin]]
@@ -22,5 +23,5 @@ name = "cellprofiler-compare"
 path = "src/bin/cellprofiler_compare.rs"
 
 [[bin]]
-name = "cellprofiler-plan-probe"
+name = "cellprofiler-human"
 path = "src/bin/cellprofiler_plan_probe.rs"

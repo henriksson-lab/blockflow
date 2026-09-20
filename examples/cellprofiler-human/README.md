@@ -9,12 +9,23 @@ differences; it is not the usage pattern this crate should teach.
 
 ## Binaries
 
-- `cellprofiler-plan-probe` builds, simulates and materializes the planned DAPI
+- `cellprofiler-human` builds, simulates and materializes the planned DAPI
   nuclei path. This is the primary Blockflow example binary.
 - `cellprofiler-compare` compares Blockflow object tables with a CellProfiler
   reference table by semantic columns.
-- `cellprofiler-human` runs the old resident DAPI nuclei path for internal
+- `cellprofiler-resident-reference` runs the old resident DAPI nuclei path for internal
   debugging only.
+
+For normal use, pass a prepared rank-3 `f64` Zarr array directly. The command
+materializes labels and object rows by default:
+
+```sh
+cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human --release -- \
+  --input-zarr input.zarr/level0 --out run.json \
+  --materialize-objects results
+```
+
+The benchmark uses this command after preparing its fixture array.
 
 Build them from the workspace root:
 

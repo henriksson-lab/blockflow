@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: MIT
 
+#[path = "../../../support/planning.rs"]
+mod example_planning;
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::assemble::ImageId;
 use blockflow::dtype::Dtype;
-use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::ops::measure::{
     collect_class_a_shapes, collect_class_a_values, IntensityImage, IntensityMeasurements,
     IntensitySet, Measurements, ShapeMeasurements, ShapeSet,
 };
-use blockflow::probes::IdentityOp;
 use blockflow::sidecar::Lifecycle;
-use blockflow::strategy::{execute_phases, Hints};
+use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::ZarrEnvironment;
 use blockflow::{AttachedImage, Error, Result};
@@ -41,6 +42,8 @@ struct Config {
     zarr_dir: PathBuf,
     #[arg(long, value_parser = parse_chunk, default_value = "1x32x32")]
     chunk: [usize; 3],
+    #[arg(long, default_value_t = false)]
+    prepare_only: bool,
 }
 
 #[derive(Debug)]
@@ -91,11 +94,32 @@ fn run() -> Result<()> {
         let labels = synthetic_nuclei(image);
         let specs = synthetic_foci(image);
         let image_foci = focus_rows(image, labels.view(), &specs);
-        let (focus_counts, focus_intensities) = foci_images(&specs);
-        let input = ensure_foci_zarr(&config, image, labels, focus_counts, focus_intensities)?;
-        let mut image_nuclei = planned_nucleus_foci(image, &input, config.chunk)?;
+        let root = config.zarr_dir.join(format!("image-{image:03}"));
+        let labels_path = root.join("labels.zarr/level0");
+        let counts_path = root.join("focus-counts.zarr/level0");
+        let intensities_path = root.join("focus-intensities.zarr/level0");
+        let input = if [&labels_path, &counts_path, &intensities_path]
+            .iter()
+            .all(|path| path.join("zarr.json").exists())
+        {
+            FociZarr {
+                labels: labels_path,
+                counts: counts_path,
+                intensities: intensities_path,
+            }
+        } else {
+            let (focus_counts, focus_intensities) = foci_images(&specs);
+            ensure_foci_zarr(&config, image, labels, focus_counts, focus_intensities)?
+        };
+        if config.prepare_only {
+            continue;
+        }
+        let mut image_nuclei = planned_nucleus_foci(image, &input, &config.out)?;
         nuclei.append(&mut image_nuclei);
         foci.extend(image_foci);
+    }
+    if config.prepare_only {
+        return Ok(());
     }
     nuclei.sort_by_key(|row| (row.image, row.label));
     foci.sort_by_key(|row| (row.image, row.focus));
@@ -139,7 +163,6 @@ struct FociZarr {
     labels: PathBuf,
     counts: PathBuf,
     intensities: PathBuf,
-    work: PathBuf,
 }
 
 fn ensure_foci_zarr(
@@ -161,7 +184,6 @@ fn ensure_foci_zarr(
         labels,
         counts,
         intensities,
-        work: root.join("work.zarr"),
     })
 }
 
@@ -191,18 +213,15 @@ where
 fn planned_nucleus_foci(
     image: usize,
     input: &FociZarr,
-    chunk: [usize; 3],
+    output_dir: &Path,
 ) -> Result<Vec<NucleusRow>> {
-    let (_, volume) = AttachedImage::at(&input.labels).metadata()?;
-    let grid = BlockGrid::new(volume, chunk)?;
-    let mut builder = PlanBuilder::new(volume, Dtype::U32, grid);
-    builder.pixels(Chain::op(IdentityOp::new(
-        "foci-per-nucleus-label-source",
-        [0, 0, 0],
-    )))?;
-    let base = builder.finish()?;
-    let labels = ImageId::from(base.n_phases());
-    let measurements = Measurements::for_labels(labels)
+    let images = [
+        AttachedImage::at(&input.labels),
+        AttachedImage::at(&input.counts),
+        AttachedImage::at(&input.intensities),
+    ];
+    let (dtype, volume) = images[0].metadata()?;
+    let measurements = Measurements::for_labels(ImageId::from(0))
         .shape(ShapeSet::basic())
         .intensity(
             IntensityImage::<0>::new(ImageId::supplied(0)).holding(Dtype::F64),
@@ -214,7 +233,7 @@ fn planned_nucleus_foci(
         )
         .stream("foci-per-nucleus.measurements")
         .lifecycle(Lifecycle::DeleteOnExit)
-        .build(base.decomposition.clone())?;
+        .plan_on_attached(&images, &example_planning::constraints(volume))?;
     let shape_rows = measurements
         .class_a_rows()
         .ok_or_else(|| Error::invalid("foci-per-nucleus: planned shape rows are missing"))?;
@@ -224,19 +243,13 @@ fn planned_nucleus_foci(
     let intensity_rows = measurements.class_a_intensity_rows(1).ok_or_else(|| {
         Error::invalid("foci-per-nucleus: planned focus-intensity rows are missing")
     })?;
-    let env = ZarrEnvironment::attach(
-        &input.work,
-        &[
-            AttachedImage::at(&input.labels),
-            AttachedImage::at(&input.counts),
-            AttachedImage::at(&input.intensities),
-        ],
-    )?;
-    let mut work = base.work();
-    work.extend(measurements.phase_work());
+    let scratch = tempfile::tempdir_in(output_dir).map_err(Error::backend)?;
+    let env = ZarrEnvironment::attach(scratch.path(), &images)?;
+    let workflow = Workflow::new(Chain::sequence(Vec::new()), volume, dtype);
+    let work = measurements.phase_work();
     execute_phases(
         "foci-per-nucleus planned measurement",
-        &base.workflow,
+        &workflow,
         &measurements.decomposition,
         &Hints::default(),
         &env,

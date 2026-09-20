@@ -3672,13 +3672,113 @@ impl Measurements {
     }
 
     pub fn build_checked(
-        mut self,
+        self,
         base: Decomposition,
         facts: MeasurementSourceFacts,
     ) -> Result<MeasurementPlan> {
-        let registry = merged_measurement_source_facts(&base, &facts)?;
-        self.apply_source_facts(&base, &registry)?;
-        self.build(base)
+        let grid = base
+            .phases
+            .last()
+            .ok_or_else(|| Error::invalid("measurements: the base plan has no lattice to reuse"))?
+            .grid
+            .clone();
+        self.build_with_grid(base, grid, Some(&facts))
+    }
+
+    /// Measure labels already attached as image 0, without first copying them
+    /// through an identity phase. Further entries in `images` are supplied
+    /// inputs, in the same order as `ZarrEnvironment::attach`.
+    #[cfg(feature = "zarr")]
+    pub fn build_on_attached(
+        self,
+        images: &[crate::zarr_env::AttachedImage],
+        grid: BlockGrid,
+    ) -> Result<MeasurementPlan> {
+        let Some(input) = images.first() else {
+            return Err(Error::invalid(
+                "measurements: at least one input must be attached",
+            ));
+        };
+        let (dtype, volume) = input.metadata()?;
+        if grid.volume() != volume {
+            return Err(Error::invalid(format!(
+                "measurements: input volume {volume:?} disagrees with grid {:?}",
+                grid.volume()
+            )));
+        }
+        let facts = MeasurementSourceFacts::from_attached_images(images)?;
+        let base = Decomposition {
+            volume,
+            dtype,
+            phases: Vec::new(),
+            chain_reach: [0, 0, 0],
+        };
+        self.build_with_grid(base, grid, Some(&facts))
+    }
+
+    /// Choose a block grid for measurements over attached arrays. Each
+    /// candidate compiles the actual fragment phases and is ranked by their
+    /// predicted makespan; the working-set constraint applies to every phase.
+    #[cfg(feature = "zarr")]
+    pub fn plan_on_attached(
+        self,
+        images: &[crate::zarr_env::AttachedImage],
+        constraints: &crate::decomposition::Constraints,
+    ) -> Result<MeasurementPlan> {
+        let Some(input) = images.first() else {
+            return Err(Error::invalid(
+                "measurements: at least one input must be attached",
+            ));
+        };
+        let (_, volume) = input.metadata()?;
+        let mut candidates = constraints.block_candidates.clone();
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return Err(Error::invalid(
+                "measurements: no block candidates were offered",
+            ));
+        }
+        let empty = Chain::sequence(Vec::new());
+        let mut best: Option<(f64, usize, MeasurementPlan)> = None;
+        let mut refusal = None;
+        for edge in candidates {
+            let grid = BlockGrid::along(volume, &constraints.split_axes, edge)?;
+            let plan = match self.clone().build_on_attached(images, grid) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    refusal.get_or_insert(error);
+                    continue;
+                }
+            };
+            let prices = crate::strategy::predicted_phase_prices(
+                &empty,
+                &plan.decomposition,
+                &plan.phase_work(),
+                &constraints.model,
+                constraints.expected_concurrency,
+            )?;
+            if prices
+                .iter()
+                .any(|(cost, _)| !constraints.affords_working_set(cost))
+            {
+                continue;
+            }
+            let makespan: f64 = prices.iter().map(|(_, makespan)| makespan).sum();
+            if !makespan.is_finite() {
+                return Err(Error::invalid("measurements: non-finite candidate cost"));
+            }
+            if best.as_ref().is_none_or(|(best_cost, best_edge, _)| {
+                (makespan, std::cmp::Reverse(edge)) < (*best_cost, std::cmp::Reverse(*best_edge))
+            }) {
+                best = Some((makespan, edge, plan));
+            }
+        }
+        best.map(|(_, _, plan)| plan).ok_or_else(|| {
+            refusal.unwrap_or_else(|| {
+                Error::invalid("measurements: no block candidate fits the supplied constraints")
+            })
+        })
     }
 
     fn apply_source_facts(
@@ -3806,7 +3906,28 @@ impl Measurements {
     /// from the same pass because `tabulate` already stores count, coordinate
     /// sums and second moments while it reduces the value image.
     pub fn build(self, base: Decomposition) -> Result<MeasurementPlan> {
-        let registry = MeasurementSourceFacts::from_decomposition(&base)?;
+        let grid = base
+            .phases
+            .last()
+            .ok_or_else(|| Error::invalid("measurements: the base plan has no lattice to reuse"))?
+            .grid
+            .clone();
+        self.build_with_grid(base, grid, None)
+    }
+
+    fn build_with_grid(
+        mut self,
+        base: Decomposition,
+        grid: BlockGrid,
+        facts: Option<&MeasurementSourceFacts>,
+    ) -> Result<MeasurementPlan> {
+        let registry = match facts {
+            Some(facts) => merged_measurement_source_facts(&base, facts)?,
+            None => MeasurementSourceFacts::from_decomposition(&base)?,
+        };
+        if facts.is_some() {
+            self.apply_source_facts(&base, &registry)?;
+        }
         let labels = validate_label_source_fact(self.labels, &base, &registry)?;
         let label_extent = labels.extent();
         let rows = MeasurementOutputRoot::new(self.stream)?;
@@ -4012,12 +4133,6 @@ impl Measurements {
         } else {
             None
         };
-        let grid = base
-            .phases
-            .last()
-            .ok_or_else(|| Error::invalid("measurements: the base plan has no lattice to reuse"))?
-            .grid
-            .clone();
         let mut decomposition = base;
         let mut class_a = None;
         let mut distribution = None;

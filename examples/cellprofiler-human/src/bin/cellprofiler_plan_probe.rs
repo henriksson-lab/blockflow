@@ -6,6 +6,9 @@
     clippy::manual_is_multiple_of
 )]
 
+#[path = "../../../support/planning.rs"]
+mod example_planning;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -48,7 +51,7 @@ use ndarray::Array3;
 use serde_json::json;
 
 #[derive(Debug, Parser)]
-#[command(name = "cellprofiler-plan-probe")]
+#[command(name = "cellprofiler-human")]
 struct Cli {
     #[arg(long, required_unless_present = "input_zarr")]
     input: Option<PathBuf>,
@@ -56,7 +59,10 @@ struct Cli {
     input_zarr: Option<PathBuf>,
     #[arg(long)]
     ensure_input_zarr: Option<PathBuf>,
-    #[arg(long, default_value = "cellprofiler-plan-probe.json")]
+    /// Prepare the input array and exit before planning or processing.
+    #[arg(long, default_value_t = false)]
+    prepare_only: bool,
+    #[arg(long, default_value = "cellprofiler-human.json")]
     out: PathBuf,
     #[arg(long, value_parser = parse_chunk, default_value = "1x256x256")]
     chunk: [usize; 3],
@@ -94,7 +100,7 @@ struct Cli {
     merge_line_max_saddle_drop: Option<f64>,
     #[arg(long, default_value_t = 256)]
     distance_block: usize,
-    #[arg(long)]
+    #[arg(long, default_value = "cellprofiler-output")]
     materialize_objects: Option<PathBuf>,
     #[arg(long, default_value_t = 1)]
     materialize_repeats: usize,
@@ -105,6 +111,7 @@ struct Config {
     input: Option<PathBuf>,
     input_zarr: Option<PathBuf>,
     ensure_input_zarr: Option<PathBuf>,
+    prepare_only: bool,
     out: PathBuf,
     chunk: [usize; 3],
     workers: usize,
@@ -173,6 +180,7 @@ impl Config {
             input: cli.input,
             input_zarr: cli.input_zarr,
             ensure_input_zarr: cli.ensure_input_zarr,
+            prepare_only: cli.prepare_only,
             out: cli.out,
             chunk: cli.chunk,
             workers: cli.workers,
@@ -200,78 +208,78 @@ impl Config {
     fn validate(self) -> Result<Self> {
         if self.chunk.contains(&0) {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: --chunk dimensions must be positive",
+                "cellprofiler-human: --chunk dimensions must be positive",
             ));
         }
         if self.input_zarr.is_some() && self.ensure_input_zarr.is_some() {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: use either --input-zarr or --ensure-input-zarr, not both",
+                "cellprofiler-human: use either --input-zarr or --ensure-input-zarr, not both",
             ));
         }
         if self.ensure_input_zarr.is_some() && self.input.is_none() {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: --ensure-input-zarr needs --input for fixture preparation",
+                "cellprofiler-human: --ensure-input-zarr needs --input for fixture preparation",
             ));
         }
         if self.workers == 0 {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: --workers must be positive",
+                "cellprofiler-human: --workers must be positive",
             ));
         }
         if self.threshold_bins < 2 {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: --threshold-bins must be at least 2",
+                "cellprofiler-human: --threshold-bins must be at least 2",
             ));
         }
         if self.sigma < 0.0 || !self.sigma.is_finite() {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: --sigma must be finite and non-negative",
+                "cellprofiler-human: --sigma must be finite and non-negative",
             ));
         }
         if let Some(percentile) = self.background_percentile {
             if !(0.0..=100.0).contains(&percentile) || !percentile.is_finite() {
                 return Err(Error::invalid(
-                    "cellprofiler-plan-probe: --background-percentile must be finite and in [0, 100]",
+                    "cellprofiler-human: --background-percentile must be finite and in [0, 100]",
                 ));
             }
         }
         if self.distance_block == 0 {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: --distance-block must be positive",
+                "cellprofiler-human: --distance-block must be positive",
             ));
         }
         if let Some(max_size) = self.max_size {
             if max_size < self.min_size {
                 return Err(Error::invalid(
-                    "cellprofiler-plan-probe: --max-size must be at least --min-size",
+                    "cellprofiler-human: --max-size must be at least --min-size",
                 ));
             }
         }
         if self.seed_min_distance < 0.0 || !self.seed_min_distance.is_finite() {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: --seed-min-distance must be finite and non-negative",
+                "cellprofiler-human: --seed-min-distance must be finite and non-negative",
             ));
         }
         if self.maxima_downsample == 0 {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: --maxima-downsample must be at least 1",
+                "cellprofiler-human: --maxima-downsample must be at least 1",
             ));
         }
         if self.declump_sigma < 0.0 || !self.declump_sigma.is_finite() {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: --declump-sigma must be finite and non-negative",
+                "cellprofiler-human: --declump-sigma must be finite and non-negative",
             ));
         }
         if let Some(max_saddle_drop) = self.merge_line_max_saddle_drop {
             if !max_saddle_drop.is_finite() {
                 return Err(Error::invalid(
-                    "cellprofiler-plan-probe: --merge-line-max-saddle-drop must be finite",
+                    "cellprofiler-human: --merge-line-max-saddle-drop must be finite",
                 ));
             }
         }
         if self.materialize_repeats == 0 {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: --materialize-repeats must be at least 1",
+                "cellprofiler-human: --materialize-repeats must be at least 1",
             ));
         }
         Ok(self)
@@ -288,6 +296,10 @@ fn main() {
 fn run() -> Result<()> {
     let config = Config::parse()?;
     let source = input_source(&config)?;
+    if config.prepare_only {
+        println!("prepared {}", source.array.display());
+        return Ok(());
+    }
     let volume = source.volume;
     let planned = build_planned_probe(volume, &config)?;
     let rates = Rates {
@@ -433,10 +445,10 @@ fn run() -> Result<()> {
         "materialized_outputs": materialized
     });
     let text = serde_json::to_string_pretty(&report)
-        .map_err(|err| Error::invalid(format!("cellprofiler-plan-probe: encode JSON: {err}")))?;
+        .map_err(|err| Error::invalid(format!("cellprofiler-human: encode JSON: {err}")))?;
     fs::write(&config.out, format!("{text}\n")).map_err(|err| {
         Error::invalid(format!(
-            "cellprofiler-plan-probe: write {}: {err}",
+            "cellprofiler-human: write {}: {err}",
             config.out.display()
         ))
     })?;
@@ -487,13 +499,13 @@ fn materialize_planned_objects(
 ) -> Result<serde_json::Value> {
     fs::create_dir_all(out_dir).map_err(|err| {
         Error::invalid(format!(
-            "cellprofiler-plan-probe: create materialization directory {}: {err}",
+            "cellprofiler-human: create materialization directory {}: {err}",
             out_dir.display()
         ))
     })?;
     let started = Instant::now();
-    let work_dir = out_dir.join("zarr-work");
-    let env = ZarrEnvironment::attach(&work_dir, &[AttachedImage::at(source.array.clone())])?;
+    let scratch = tempfile::tempdir_in(out_dir).map_err(Error::backend)?;
+    let env = ZarrEnvironment::attach(scratch.path(), &[AttachedImage::at(source.array.clone())])?;
     let label_image = planned.measurement_base.decomposition.n_phases();
     let mut work = planned.measurement_base.work();
     work.extend(planned.measurements.phase_work());
@@ -526,18 +538,17 @@ fn materialize_planned_objects(
         "objects_csv": objects_csv.display().to_string(),
         "measurement_intensity_source": "input_luma_normalized_0_1",
         "input_zarr": source.array.display().to_string(),
-        "work_zarr": work_dir.display().to_string(),
         "seconds": started.elapsed().as_secs_f64()
     });
     let summary_path = out_dir.join("planned-summary.json");
     let summary_text = serde_json::to_string_pretty(&summary).map_err(|err| {
         Error::invalid(format!(
-            "cellprofiler-plan-probe: encode materialization summary: {err}"
+            "cellprofiler-human: encode materialization summary: {err}"
         ))
     })?;
     fs::write(&summary_path, format!("{summary_text}\n")).map_err(|err| {
         Error::invalid(format!(
-            "cellprofiler-plan-probe: write {}: {err}",
+            "cellprofiler-human: write {}: {err}",
             summary_path.display()
         ))
     })?;
@@ -566,7 +577,7 @@ fn materialize_planned_objects_repeated(
     if summaries.len() == 1 {
         return summaries
             .pop()
-            .ok_or_else(|| Error::invalid("cellprofiler-plan-probe: missing materialization run"));
+            .ok_or_else(|| Error::invalid("cellprofiler-human: missing materialization run"));
     }
 
     let seconds = summaries
@@ -581,12 +592,12 @@ fn materialize_planned_objects_repeated(
     let last = summaries
         .last()
         .cloned()
-        .ok_or_else(|| Error::invalid("cellprofiler-plan-probe: missing materialization run"))?;
+        .ok_or_else(|| Error::invalid("cellprofiler-human: missing materialization run"))?;
     let mut out = match last {
         serde_json::Value::Object(map) => map,
         _ => {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: materialization summary was not an object",
+                "cellprofiler-human: materialization summary was not an object",
             ));
         }
     };
@@ -640,7 +651,7 @@ fn save_planned_labels(env: &ZarrEnvironment, image: usize, path: &Path) -> Resu
     let labels = labels.view::<u32>()?;
     if labels.shape()[0] != 1 {
         return Err(Error::invalid(
-            "cellprofiler-plan-probe: planned label PNG export currently expects a single Z plane",
+            "cellprofiler-human: planned label PNG export currently expects a single Z plane",
         ));
     }
     let mut image =
@@ -653,7 +664,7 @@ fn save_planned_labels(env: &ZarrEnvironment, image: usize, path: &Path) -> Resu
     }
     image
         .save(path)
-        .map_err(|err| Error::invalid(format!("cellprofiler-plan-probe: save labels: {err}")))
+        .map_err(|err| Error::invalid(format!("cellprofiler-human: save labels: {err}")))
 }
 
 struct PlannedObjectRow {
@@ -668,13 +679,13 @@ fn collect_planned_object_rows(
 ) -> Result<Vec<PlannedObjectRow>> {
     let volume = planned.measurements.decomposition.volume;
     let shape_rows = planned.measurements.class_a_rows().ok_or_else(|| {
-        Error::invalid("cellprofiler-plan-probe: planned measurements have no shape rows")
+        Error::invalid("cellprofiler-human: planned measurements have no shape rows")
     })?;
     let intensity_rows = planned
         .measurements
         .class_a_intensity_rows(0)
         .ok_or_else(|| {
-            Error::invalid("cellprofiler-plan-probe: planned measurements have no intensity rows")
+            Error::invalid("cellprofiler-human: planned measurements have no intensity rows")
         })?;
     let shapes = collect_class_a_shapes(env, &shape_rows, volume, planned.measurements.fixed)?;
     let intensities =
@@ -693,7 +704,7 @@ fn collect_planned_object_rows(
         let shape = ShapeMeasurements::from_shape(&shape);
         let intensity = intensity_by_label.remove(&shape.label).ok_or_else(|| {
             Error::invalid(format!(
-                "cellprofiler-plan-probe: no intensity row for label {}",
+                "cellprofiler-human: no intensity row for label {}",
                 shape.label
             ))
         })?;
@@ -708,7 +719,7 @@ fn collect_planned_object_rows(
 
 fn write_planned_object_csv(rows: &[PlannedObjectRow], path: &Path) -> Result<()> {
     let file = File::create(path)
-        .map_err(|err| Error::invalid(format!("cellprofiler-plan-probe: create CSV: {err}")))?;
+        .map_err(|err| Error::invalid(format!("cellprofiler-human: create CSV: {err}")))?;
     let mut out = BufWriter::new(file);
     writeln!(
         out,
@@ -769,14 +780,17 @@ fn build_planned_skeleton(
     let corrected_image = ImageId::from(builder.n_phases());
     if config.sigma != 0.0 {
         let input = corrected_image;
-        builder.pixels(Chain::sequence(vec![
-            Chain::source(input, Dtype::F64),
-            Chain::op(SmoothOp::new(
-                "cellprofiler-threshold-smoothing",
-                Gaussian::new([0.0, config.sigma, config.sigma], 3.0)?
-                    .with_boundary(Boundary::Reflect),
-            )),
-        ]))?;
+        example_planning::pixels(
+            &mut builder,
+            Chain::sequence(vec![
+                Chain::source(input, Dtype::F64),
+                Chain::op(SmoothOp::new(
+                    "cellprofiler-threshold-smoothing",
+                    Gaussian::new([0.0, config.sigma, config.sigma], 3.0)?
+                        .with_boundary(Boundary::Reflect),
+                )),
+            ]),
+        )?;
     }
     append_global_threshold_phases(
         &mut builder,
@@ -800,14 +814,17 @@ fn build_planned_skeleton(
     let mask_image = ImageId::from(builder.n_phases());
     let declump_image = match config.declump_method {
         DeclumpMethod::Intensity => {
-            builder.pixels(Chain::sequence(vec![
-                Chain::source(corrected_image, Dtype::F64),
-                Chain::op(SmoothOp::new(
-                    "cellprofiler-intensity-declump-smoothing",
-                    Gaussian::new([0.0, config.declump_sigma, config.declump_sigma], 3.0)?
-                        .with_boundary(Boundary::Reflect),
-                )),
-            ]))?;
+            example_planning::pixels(
+                &mut builder,
+                Chain::sequence(vec![
+                    Chain::source(corrected_image, Dtype::F64),
+                    Chain::op(SmoothOp::new(
+                        "cellprofiler-intensity-declump-smoothing",
+                        Gaussian::new([0.0, config.declump_sigma, config.declump_sigma], 3.0)?
+                            .with_boundary(Boundary::Reflect),
+                    )),
+                ]),
+            )?;
             ImageId::from(builder.n_phases())
         }
         DeclumpMethod::Distance => {
@@ -865,21 +882,27 @@ fn build_planned_skeleton(
         .connecting(Connectivity::Faces),
     )?;
     let seeds_image = ImageId::from(builder.n_phases());
-    builder.pixels(Chain::sequence(vec![
-        Chain::source(declump_image, Dtype::F64),
-        Chain::op(VoxelwiseMapOp::new(
-            "cellprofiler-negate-declump-source",
-            |value| -value,
-        )),
-    ]))?;
-    builder.pixels(Chain::op(
-        SeededWatershedOp::new(
-            "cellprofiler-seeded-watershed",
-            seeds_image,
-            Separation::Line,
-        )
-        .within(mask_image),
-    ))?;
+    example_planning::pixels(
+        &mut builder,
+        Chain::sequence(vec![
+            Chain::source(declump_image, Dtype::F64),
+            Chain::op(VoxelwiseMapOp::new(
+                "cellprofiler-negate-declump-source",
+                |value| -value,
+            )),
+        ]),
+    )?;
+    example_planning::pixels(
+        &mut builder,
+        Chain::op(
+            SeededWatershedOp::new(
+                "cellprofiler-seeded-watershed",
+                seeds_image,
+                Separation::Line,
+            )
+            .within(mask_image),
+        ),
+    )?;
     append_fill_label_holes_2d_by_label_phase(&mut builder)?;
     if config.merge_line_basin_pixels != 0 {
         let labels = ImageId::from(builder.n_phases());
@@ -996,7 +1019,7 @@ impl FragmentOp for WatershedLineMergeOp {
 
     fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
         Err(Error::invalid(
-            "cellprofiler-plan-probe: watershed-line merge op reads declared sources and uses apply_with",
+            "cellprofiler-human: watershed-line merge op reads declared sources and uses apply_with",
         ))
     }
 }
@@ -1009,7 +1032,7 @@ fn merge_labels_across_watershed_lines_for_probe(
 ) -> Result<Array3<u32>> {
     if labels.shape() != intensity.shape() {
         return Err(Error::invalid(
-            "cellprofiler-plan-probe: line-merge labels and intensity shape mismatch",
+            "cellprofiler-human: line-merge labels and intensity shape mismatch",
         ));
     }
     let mut pair_evidence = BTreeMap::<(u32, u32), LineMergeEvidence>::new();
@@ -1303,7 +1326,7 @@ fn percentile_value(values: impl IntoIterator<Item = f64>, percentile: f64) -> R
     let mut values = values.into_iter().collect::<Vec<_>>();
     if values.is_empty() {
         return Err(Error::invalid(
-            "cellprofiler-plan-probe: background percentile needs at least one finite value",
+            "cellprofiler-human: background percentile needs at least one finite value",
         ));
     }
     values.sort_by(f64::total_cmp);
@@ -1324,15 +1347,15 @@ fn decode_background_samples(bytes: &[u8]) -> Result<Vec<f64>> {
     let words = decode_words(bytes, "background sample fragment")?;
     if words.len() < 2 || words[0] != BACKGROUND_SAMPLES_MAGIC {
         return Err(Error::invalid(
-            "cellprofiler-plan-probe: background sample fragment has the wrong magic",
+            "cellprofiler-human: background sample fragment has the wrong magic",
         ));
     }
     let rows = usize::try_from(words[1]).map_err(|_| {
-        Error::invalid("cellprofiler-plan-probe: background sample count does not fit usize")
+        Error::invalid("cellprofiler-human: background sample count does not fit usize")
     })?;
     if words.len() != 2 + rows {
         return Err(Error::invalid(format!(
-            "cellprofiler-plan-probe: background sample fragment declares {rows} values but has {} words",
+            "cellprofiler-human: background sample fragment declares {rows} values but has {} words",
             words.len()
         )));
     }
@@ -1350,7 +1373,7 @@ fn decode_background_level(bytes: &[u8]) -> Result<f64> {
     let words = decode_words(bytes, "background level reduction")?;
     if words.len() != 2 || words[0] != BACKGROUND_LEVEL_MAGIC {
         return Err(Error::invalid(
-            "cellprofiler-plan-probe: background level reduction has the wrong shape or magic",
+            "cellprofiler-human: background level reduction has the wrong shape or magic",
         ));
     }
     Ok(f64::from_bits(words[1]))
@@ -1447,7 +1470,7 @@ impl FragmentOp for SeedCandidateOp {
         let mask = mask_pixels.view::<bool>()?;
         if maxima.shape() != distance.shape() || maxima.shape() != mask.shape() {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: seed candidate source shape mismatch",
+                "cellprofiler-human: seed candidate source shape mismatch",
             ));
         }
         let mut candidates = Vec::new();
@@ -1471,7 +1494,7 @@ impl FragmentOp for SeedCandidateOp {
 
     fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
         Err(Error::invalid(
-            "cellprofiler-plan-probe: seed candidate op reads declared sources and uses apply_with",
+            "cellprofiler-human: seed candidate op reads declared sources and uses apply_with",
         ))
     }
 }
@@ -1666,7 +1689,7 @@ impl FragmentOp for DownsampledSeedBinOp {
         let mask = sources.get(self.mask.index())?.as_array()?.view::<bool>()?;
         if values.shape() != mask.shape() {
             return Err(Error::invalid(
-                "cellprofiler-plan-probe: downsampled seed source shape mismatch",
+                "cellprofiler-human: downsampled seed source shape mismatch",
             ));
         }
         let mut bins = BTreeMap::<[usize; 3], DownsampledSeedBin>::new();
@@ -1705,7 +1728,7 @@ impl FragmentOp for DownsampledSeedBinOp {
 
     fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
         Err(Error::invalid(
-            "cellprofiler-plan-probe: downsampled seed bin op reads declared sources and uses apply_with",
+            "cellprofiler-human: downsampled seed bin op reads declared sources and uses apply_with",
         ))
     }
 }
@@ -1897,15 +1920,15 @@ fn decode_downsampled_seed_bins(bytes: &[u8]) -> Result<Vec<DownsampledSeedBin>>
     let words = decode_words(bytes, "downsampled seed bin fragment")?;
     if words.len() < 2 || words[0] != DOWNSAMPLED_SEED_BIN_MAGIC {
         return Err(Error::invalid(
-            "cellprofiler-plan-probe: downsampled seed bin fragment has the wrong magic",
+            "cellprofiler-human: downsampled seed bin fragment has the wrong magic",
         ));
     }
     let rows = usize::try_from(words[1]).map_err(|_| {
-        Error::invalid("cellprofiler-plan-probe: downsampled seed bin count does not fit usize")
+        Error::invalid("cellprofiler-human: downsampled seed bin count does not fit usize")
     })?;
     if words.len() != 2 + rows * 8 {
         return Err(Error::invalid(format!(
-            "cellprofiler-plan-probe: downsampled seed bin fragment declares {rows} rows but has {} words",
+            "cellprofiler-human: downsampled seed bin fragment declares {rows} rows but has {} words",
             words.len()
         )));
     }
@@ -1916,37 +1939,31 @@ fn decode_downsampled_seed_bins(bytes: &[u8]) -> Result<Vec<DownsampledSeedBin>>
             1 => true,
             _ => {
                 return Err(Error::invalid(
-                    "cellprofiler-plan-probe: downsampled seed bin mask flag is invalid",
+                    "cellprofiler-human: downsampled seed bin mask flag is invalid",
                 ));
             }
         };
         out.push(DownsampledSeedBin {
             low: [
                 usize::try_from(row[0]).map_err(|_| {
-                    Error::invalid(
-                        "cellprofiler-plan-probe: downsampled seed low z does not fit usize",
-                    )
+                    Error::invalid("cellprofiler-human: downsampled seed low z does not fit usize")
                 })?,
                 usize::try_from(row[1]).map_err(|_| {
-                    Error::invalid(
-                        "cellprofiler-plan-probe: downsampled seed low y does not fit usize",
-                    )
+                    Error::invalid("cellprofiler-human: downsampled seed low y does not fit usize")
                 })?,
                 usize::try_from(row[2]).map_err(|_| {
-                    Error::invalid(
-                        "cellprofiler-plan-probe: downsampled seed low x does not fit usize",
-                    )
+                    Error::invalid("cellprofiler-human: downsampled seed low x does not fit usize")
                 })?,
             ],
             at: [
                 usize::try_from(row[3]).map_err(|_| {
-                    Error::invalid("cellprofiler-plan-probe: downsampled seed z does not fit usize")
+                    Error::invalid("cellprofiler-human: downsampled seed z does not fit usize")
                 })?,
                 usize::try_from(row[4]).map_err(|_| {
-                    Error::invalid("cellprofiler-plan-probe: downsampled seed y does not fit usize")
+                    Error::invalid("cellprofiler-human: downsampled seed y does not fit usize")
                 })?,
                 usize::try_from(row[5]).map_err(|_| {
-                    Error::invalid("cellprofiler-plan-probe: downsampled seed x does not fit usize")
+                    Error::invalid("cellprofiler-human: downsampled seed x does not fit usize")
                 })?,
             ],
             score: f64::from_bits(row[6]),
@@ -1967,7 +1984,7 @@ fn encode_words(words: &[u64]) -> Vec<u8> {
 fn decode_words(bytes: &[u8], noun: &'static str) -> Result<Vec<u64>> {
     if !bytes.len().is_multiple_of(std::mem::size_of::<u64>()) {
         return Err(Error::invalid(format!(
-            "cellprofiler-plan-probe: {noun} byte length {} is not a whole number of words",
+            "cellprofiler-human: {noun} byte length {} is not a whole number of words",
             bytes.len()
         )));
     }
@@ -1996,15 +2013,15 @@ fn decode_seed_candidates(bytes: &[u8]) -> Result<Vec<SeedCandidate>> {
     let words = decode_words(bytes, "seed candidate fragment")?;
     if words.len() < 2 || words[0] != SEED_CANDIDATE_MAGIC {
         return Err(Error::invalid(
-            "cellprofiler-plan-probe: seed candidate fragment has the wrong magic",
+            "cellprofiler-human: seed candidate fragment has the wrong magic",
         ));
     }
     let rows = usize::try_from(words[1]).map_err(|_| {
-        Error::invalid("cellprofiler-plan-probe: seed candidate count does not fit usize")
+        Error::invalid("cellprofiler-human: seed candidate count does not fit usize")
     })?;
     if words.len() != 2 + rows * 4 {
         return Err(Error::invalid(format!(
-            "cellprofiler-plan-probe: seed candidate fragment declares {rows} rows but has {} words",
+            "cellprofiler-human: seed candidate fragment declares {rows} rows but has {} words",
             words.len()
         )));
     }
@@ -2013,13 +2030,13 @@ fn decode_seed_candidates(bytes: &[u8]) -> Result<Vec<SeedCandidate>> {
         out.push(SeedCandidate {
             at: [
                 usize::try_from(row[0]).map_err(|_| {
-                    Error::invalid("cellprofiler-plan-probe: seed z coordinate does not fit usize")
+                    Error::invalid("cellprofiler-human: seed z coordinate does not fit usize")
                 })?,
                 usize::try_from(row[1]).map_err(|_| {
-                    Error::invalid("cellprofiler-plan-probe: seed y coordinate does not fit usize")
+                    Error::invalid("cellprofiler-human: seed y coordinate does not fit usize")
                 })?,
                 usize::try_from(row[2]).map_err(|_| {
-                    Error::invalid("cellprofiler-plan-probe: seed x coordinate does not fit usize")
+                    Error::invalid("cellprofiler-human: seed x coordinate does not fit usize")
                 })?,
             ],
             score: f64::from_bits(row[3]),
@@ -2042,15 +2059,15 @@ fn decode_accepted_seeds(bytes: &[u8]) -> Result<HashSet<[usize; 3]>> {
     let words = decode_words(bytes, "accepted seed reduction")?;
     if words.len() < 2 || words[0] != SEED_ACCEPTED_MAGIC {
         return Err(Error::invalid(
-            "cellprofiler-plan-probe: accepted seed reduction has the wrong magic",
+            "cellprofiler-human: accepted seed reduction has the wrong magic",
         ));
     }
     let rows = usize::try_from(words[1]).map_err(|_| {
-        Error::invalid("cellprofiler-plan-probe: accepted seed count does not fit usize")
+        Error::invalid("cellprofiler-human: accepted seed count does not fit usize")
     })?;
     if words.len() != 2 + rows * 3 {
         return Err(Error::invalid(format!(
-            "cellprofiler-plan-probe: accepted seed reduction declares {rows} rows but has {} words",
+            "cellprofiler-human: accepted seed reduction declares {rows} rows but has {} words",
             words.len()
         )));
     }
@@ -2058,13 +2075,13 @@ fn decode_accepted_seeds(bytes: &[u8]) -> Result<HashSet<[usize; 3]>> {
     for row in words[2..].chunks_exact(3) {
         out.insert([
             usize::try_from(row[0]).map_err(|_| {
-                Error::invalid("cellprofiler-plan-probe: accepted seed z coordinate overflow")
+                Error::invalid("cellprofiler-human: accepted seed z coordinate overflow")
             })?,
             usize::try_from(row[1]).map_err(|_| {
-                Error::invalid("cellprofiler-plan-probe: accepted seed y coordinate overflow")
+                Error::invalid("cellprofiler-human: accepted seed y coordinate overflow")
             })?,
             usize::try_from(row[2]).map_err(|_| {
-                Error::invalid("cellprofiler-plan-probe: accepted seed x coordinate overflow")
+                Error::invalid("cellprofiler-human: accepted seed x coordinate overflow")
             })?,
         ]);
     }
@@ -2124,15 +2141,15 @@ mod tests {
 
 fn image_volume(path: &Path) -> Result<[usize; 3]> {
     let image = image::ImageReader::open(path)
-        .map_err(|err| Error::invalid(format!("cellprofiler-plan-probe: open image: {err}")))?
+        .map_err(|err| Error::invalid(format!("cellprofiler-human: open image: {err}")))?
         .with_guessed_format()
-        .map_err(|err| Error::invalid(format!("cellprofiler-plan-probe: guess format: {err}")))?
+        .map_err(|err| Error::invalid(format!("cellprofiler-human: guess format: {err}")))?
         .decode()
-        .map_err(|err| Error::invalid(format!("cellprofiler-plan-probe: decode image: {err}")))?;
+        .map_err(|err| Error::invalid(format!("cellprofiler-human: decode image: {err}")))?;
     let width = usize::try_from(image.width())
-        .map_err(|_| Error::invalid("cellprofiler-plan-probe: image width does not fit usize"))?;
+        .map_err(|_| Error::invalid("cellprofiler-human: image width does not fit usize"))?;
     let height = usize::try_from(image.height())
-        .map_err(|_| Error::invalid("cellprofiler-plan-probe: image height does not fit usize"))?;
+        .map_err(|_| Error::invalid("cellprofiler-human: image height does not fit usize"))?;
     Ok([1, height, width])
 }
 
@@ -2148,7 +2165,7 @@ fn input_source(config: &Config) -> Result<InputSource> {
 
     if let Some(store) = &config.ensure_input_zarr {
         let input = config.input.as_ref().ok_or_else(|| {
-            Error::invalid("cellprofiler-plan-probe: --ensure-input-zarr needs --input")
+            Error::invalid("cellprofiler-human: --ensure-input-zarr needs --input")
         })?;
         let array = ensure_input_zarr(input, store, config.chunk)?;
         let (_, volume) = AttachedImage::at(&array).metadata()?;
@@ -2160,7 +2177,7 @@ fn input_source(config: &Config) -> Result<InputSource> {
     }
 
     let input = config.input.as_ref().ok_or_else(|| {
-        Error::invalid("cellprofiler-plan-probe: either --input or --input-zarr is required")
+        Error::invalid("cellprofiler-human: either --input or --input-zarr is required")
     })?;
     let volume = image_volume(input)?;
     let fallback_store = config
@@ -2185,7 +2202,7 @@ fn ensure_input_zarr(input_path: &Path, store: &Path, chunk: [usize; 3]) -> Resu
         let image_volume = image_volume(input_path)?;
         if stored_volume != image_volume {
             return Err(Error::invalid(format!(
-                "cellprofiler-plan-probe: prepared input store {} has volume {:?}, but {} is {:?}; remove the stale store or choose another --ensure-input-zarr path",
+                "cellprofiler-human: prepared input store {} has volume {:?}, but {} is {:?}; remove the stale store or choose another --ensure-input-zarr path",
                 array.display(),
                 stored_volume,
                 input_path.display(),
@@ -2212,17 +2229,17 @@ fn chunk_bytes(chunk: [usize; 3], bytes_per_voxel: u64) -> u64 {
 
 fn load_luma_as_volume(path: &Path) -> Result<Array3<f64>> {
     let image = image::ImageReader::open(path)
-        .map_err(|err| Error::invalid(format!("cellprofiler-plan-probe: open image: {err}")))?
+        .map_err(|err| Error::invalid(format!("cellprofiler-human: open image: {err}")))?
         .with_guessed_format()
-        .map_err(|err| Error::invalid(format!("cellprofiler-plan-probe: guess format: {err}")))?
+        .map_err(|err| Error::invalid(format!("cellprofiler-human: guess format: {err}")))?
         .decode()
-        .map_err(|err| Error::invalid(format!("cellprofiler-plan-probe: decode image: {err}")))?
+        .map_err(|err| Error::invalid(format!("cellprofiler-human: decode image: {err}")))?
         .to_luma16();
     let (width, height) = image.dimensions();
     let width = usize::try_from(width)
-        .map_err(|_| Error::invalid("cellprofiler-plan-probe: image width does not fit usize"))?;
+        .map_err(|_| Error::invalid("cellprofiler-human: image width does not fit usize"))?;
     let height = usize::try_from(height)
-        .map_err(|_| Error::invalid("cellprofiler-plan-probe: image height does not fit usize"))?;
+        .map_err(|_| Error::invalid("cellprofiler-human: image height does not fit usize"))?;
     let mut out = Array3::<f64>::zeros((1, height, width));
     for (x, y, pixel) in image.enumerate_pixels() {
         out[[0, y as usize, x as usize]] = f64::from(pixel.0[0]);
@@ -2235,7 +2252,7 @@ fn optional(value: Option<f64>) -> f64 {
 }
 
 fn write_error(err: std::io::Error) -> Error {
-    Error::invalid(format!("cellprofiler-plan-probe: write CSV: {err}"))
+    Error::invalid(format!("cellprofiler-human: write CSV: {err}"))
 }
 
 fn parse_chunk(raw: &str) -> std::result::Result<[usize; 3], String> {
@@ -2245,13 +2262,13 @@ fn parse_chunk(raw: &str) -> std::result::Result<[usize; 3], String> {
         .collect::<Vec<_>>();
     if parts.len() != 3 {
         return Err(format!(
-            "cellprofiler-plan-probe: chunk shape {raw:?} must have three dimensions"
+            "cellprofiler-human: chunk shape {raw:?} must have three dimensions"
         ));
     }
     let mut out = [0usize; 3];
     for (index, part) in parts.iter().enumerate() {
         out[index] = part.parse::<usize>().map_err(|err| {
-            format!("cellprofiler-plan-probe: could not parse chunk shape {raw:?}: {err}")
+            format!("cellprofiler-human: could not parse chunk shape {raw:?}: {err}")
         })?;
     }
     Ok(out)

@@ -5,6 +5,7 @@ count="${1:-10}"
 bench="${2:-.tmp/percent-positive/bench-${count}}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+BF_PREPARE_ONLY=1 "$script_dir/run_blockflow.sh" "$bench/preparation" "$count" "$bench/input.zarr"
 "$script_dir/run_blockflow.sh" "$bench/blockflow" "$count" "$bench/input.zarr"
 "$script_dir/run_reference.sh" "$bench/reference" "$count"
 

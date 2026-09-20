@@ -27,12 +27,13 @@ use std::path::PathBuf;
 
 use ndarray::Array3;
 
-use blockflow::decomposition::Decomposition;
+use blockflow::decomposition::{Constraints, Decomposition};
 use blockflow::env::{ArrayEnvironment, Environment};
 use blockflow::op::Chain;
+use blockflow::ops::measure::{collect_class_a_shapes, Measurements, ShapeSet};
 use blockflow::ops::rank::RankFilterOp;
 use blockflow::ops::{ElementShape, StructuringElement};
-use blockflow::strategy::{execute, Hints, Workflow};
+use blockflow::strategy::{execute, execute_phases, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::ZarrEnvironment;
@@ -172,6 +173,48 @@ fn an_attached_array_describes_itself() {
     assert_eq!(env.image_dtype(0).unwrap(), Dtype::F64);
     assert_eq!(env.chunk_at(0).unwrap(), [4, 5, 6]);
     assert_same(&input, &env.image(0).unwrap(), "attached image 0");
+}
+
+#[test]
+fn measurements_plan_and_run_on_attached_labels_without_a_copy_phase() {
+    let mut labels = Array3::<u32>::zeros((1, 8, 8));
+    labels[[0, 1, 1]] = 7;
+    labels[[0, 1, 2]] = 7;
+    labels[[0, 6, 6]] = 9;
+    let source = scratch("measurement-source");
+    let array = stored(source.path(), &labels.into(), [1, 4, 4]);
+    let images = [AttachedImage::at(&array)];
+    let constraints = Constraints {
+        split_axes: vec![1, 2],
+        block_candidates: vec![2, 4],
+        ..Constraints::default()
+    };
+    let plan = Measurements::for_labels(0usize)
+        .shape(ShapeSet::basic())
+        .plan_on_attached(&images, &constraints)
+        .unwrap();
+    assert!(plan
+        .decomposition
+        .phases
+        .iter()
+        .all(|phase| phase.slots.is_empty()));
+    let rows = plan.class_a_rows().unwrap();
+    let work = scratch("measurement-work");
+    let env = ZarrEnvironment::attach(work.path(), &images).unwrap();
+    let workflow = Workflow::new(Chain::sequence(Vec::new()), [1, 8, 8], Dtype::U32);
+    execute_phases(
+        "attached measurements",
+        &workflow,
+        &plan.decomposition,
+        &Hints::default(),
+        &env,
+        &[],
+        &plan.phase_work(),
+    )
+    .unwrap();
+    let measured = collect_class_a_shapes(&env, &rows, [1, 8, 8], plan.fixed).unwrap();
+    assert_eq!(measured.len(), 2);
+    assert_eq!(measured.iter().map(|row| row.count).sum::<u64>(), 3);
 }
 
 // ---------------------------------------------------------- the window --

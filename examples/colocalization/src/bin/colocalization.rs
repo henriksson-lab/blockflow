@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: MIT
 
+#[path = "../../../support/planning.rs"]
+mod example_planning;
+
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::assemble::ImageId;
 use blockflow::dtype::Dtype;
-use blockflow::geometry::BlockGrid;
 use blockflow::op::Chain;
 use blockflow::ops::measure::{
     collect_colocalization_rows, ColocalizationMeasurements, IntensityImage, Measurements,
 };
-use blockflow::probes::IdentityOp;
 use blockflow::sidecar::Lifecycle;
-use blockflow::strategy::{execute_phases, Hints};
+use blockflow::strategy::{execute_phases, Hints, Workflow};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::ZarrEnvironment;
 use blockflow::{AttachedImage, Error, Result};
@@ -41,6 +42,8 @@ struct Config {
     zarr_dir: PathBuf,
     #[arg(long, value_parser = parse_chunk, default_value = "1x32x32")]
     chunk: [usize; 3],
+    #[arg(long, default_value_t = false)]
+    prepare_only: bool,
 }
 
 #[derive(Debug)]
@@ -67,18 +70,40 @@ fn run() -> Result<()> {
 
     let mut rows = Vec::new();
     for image in 0..config.images {
-        let (labels, channel_a, channel_b) = if let Some(dir) = &config.fixture_dir {
-            fixture_from_file(dir, image)?
+        let root = config.zarr_dir.join(format!("image-{image:03}"));
+        let labels_path = root.join("labels.zarr/level0");
+        let channel_a_path = root.join("channel-a.zarr/level0");
+        let channel_b_path = root.join("channel-b.zarr/level0");
+        let input_zarr = if [&labels_path, &channel_a_path, &channel_b_path]
+            .iter()
+            .all(|path| path.join("zarr.json").exists())
+        {
+            ColocalizationZarr {
+                labels: labels_path,
+                channel_a: channel_a_path,
+                channel_b: channel_b_path,
+            }
         } else {
-            synthetic_fixture(image)
+            let (labels, channel_a, channel_b) = if let Some(dir) = &config.fixture_dir {
+                fixture_from_file(dir, image)?
+            } else {
+                synthetic_fixture(image)
+            };
+            ensure_colocalization_zarr(&config, image, labels, channel_a, channel_b)?
         };
-        let input_zarr = ensure_colocalization_zarr(&config, image, labels, channel_a, channel_b)?;
-        let mut measurements = planned_colocalization(&input_zarr, config.chunk)?;
+        if config.prepare_only {
+            continue;
+        }
+        let mut measurements = planned_colocalization(&input_zarr, &config.out)?;
         measurements.sort_by_key(|row| row.label);
         rows.extend(measurements.into_iter().map(|measurements| ObjectRow {
             image,
             measurements,
         }));
+    }
+
+    if config.prepare_only {
+        return Ok(());
     }
 
     write_objects(&rows, &config.out.join("objects.csv"))?;
@@ -117,7 +142,6 @@ struct ColocalizationZarr {
     labels: PathBuf,
     channel_a: PathBuf,
     channel_b: PathBuf,
-    work: PathBuf,
 }
 
 fn ensure_colocalization_zarr(
@@ -135,7 +159,6 @@ fn ensure_colocalization_zarr(
         labels: labels_path,
         channel_a: channel_a_path,
         channel_b: channel_b_path,
-        work: root.join("work.zarr"),
     })
 }
 
@@ -160,41 +183,32 @@ fn ensure_array_zarr(store: &Path, array: Array3<f64>, chunk: [usize; 3]) -> Res
 
 fn planned_colocalization(
     input: &ColocalizationZarr,
-    chunk: [usize; 3],
+    output_dir: &Path,
 ) -> Result<Vec<ColocalizationMeasurements>> {
-    let (_, volume) = AttachedImage::at(&input.labels).metadata()?;
-    let grid = BlockGrid::new(volume, chunk)?;
-    let mut builder = PlanBuilder::new(volume, Dtype::F64, grid);
-    builder.pixels(Chain::op(IdentityOp::new(
-        "colocalization-label-source",
-        [0, 0, 0],
-    )))?;
-    let base = builder.finish()?;
-    let labels = ImageId::from(base.n_phases());
-    let measurements = Measurements::for_labels(labels)
+    let images = [
+        AttachedImage::at(&input.labels),
+        AttachedImage::at(&input.channel_a),
+        AttachedImage::at(&input.channel_b),
+    ];
+    let (dtype, volume) = images[0].metadata()?;
+    let measurements = Measurements::for_labels(ImageId::from(0))
         .colocalization(
             IntensityImage::<0>::new(ImageId::supplied(0)).holding(Dtype::F64),
             IntensityImage::<1>::new(ImageId::supplied(1)).holding(Dtype::F64),
         )
         .stream("colocalization.measurements")
         .lifecycle(Lifecycle::DeleteOnExit)
-        .build(base.decomposition.clone())?;
+        .plan_on_attached(&images, &example_planning::constraints(volume))?;
     let rows = measurements
         .colocalization_rows(0)
         .ok_or_else(|| Error::invalid("colocalization: planned rows are missing"))?;
-    let env = ZarrEnvironment::attach(
-        &input.work,
-        &[
-            AttachedImage::at(&input.labels),
-            AttachedImage::at(&input.channel_a),
-            AttachedImage::at(&input.channel_b),
-        ],
-    )?;
-    let mut work = base.work();
-    work.extend(measurements.phase_work());
+    let scratch = tempfile::tempdir_in(output_dir).map_err(Error::backend)?;
+    let env = ZarrEnvironment::attach(scratch.path(), &images)?;
+    let workflow = Workflow::new(Chain::sequence(Vec::new()), volume, dtype);
+    let work = measurements.phase_work();
     execute_phases(
         "colocalization planned measurement",
-        &base.workflow,
+        &workflow,
         &measurements.decomposition,
         &Hints::default(),
         &env,
