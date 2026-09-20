@@ -13,7 +13,7 @@ run_timed() {
 
 "$script_dir/fetch_fixture.sh" "$count" "$bench/fixtures"
 cargo build -p blockflow-colocalization --release
-run_timed blockflow "$script_dir/run_blockflow.sh" "$bench/blockflow" "$count" "$bench/fixtures"
+run_timed blockflow "$script_dir/run_blockflow.sh" "$bench/blockflow" "$count" "$bench/fixtures" "$bench/input.zarr"
 run_timed reference "$script_dir/run_reference.sh" "$bench/reference" "$count" "$bench/fixtures"
 
 python3 - "$bench/blockflow/summary.json" "$bench/reference/summary.json" <<'PY'

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: MIT
 
-use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::dtype::Dtype;
+use blockflow::geometry::BlockGrid;
+use blockflow::op::Chain;
 use blockflow::ops::{
-    object_geometry_basic_measurements_u32, ObjectGeometryBasicMeasurements, PhysicalSpacing,
+    collect_object_geometry_basic_rows, Measurements, ObjectGeometryBasicMeasurements,
+    PhysicalSpacing,
 };
-use blockflow::{Error, Result};
+use blockflow::probes::IdentityOp;
+use blockflow::sidecar::Lifecycle;
+use blockflow::strategy::{execute_phases, Hints};
+use blockflow::voxels::Voxels;
+use blockflow::zarr_env::ZarrEnvironment;
+use blockflow::{AttachedImage, Error, Result};
+use clap::Parser;
 use ndarray::Array3;
 use serde_json::json;
 
@@ -17,11 +27,22 @@ const SHAPE: [usize; 3] = [32, 48, 56];
 const SPACING: [f64; 3] = [1.5, 0.75, 0.5];
 const OBJECTS_PER_IMAGE: usize = 4;
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(
+    name = "object-3d-measurement",
+    about = "Measures deterministic labelled 3-D objects with physical geometry."
+)]
 struct Config {
+    #[arg(long, default_value = ".tmp/object-3d-measurement/blockflow")]
     out: PathBuf,
+    #[arg(long, default_value_t = 10)]
     images: usize,
+    #[arg(long)]
     fixture_dir: Option<PathBuf>,
+    #[arg(long, default_value = ".tmp/object-3d-measurement/input.zarr")]
+    zarr_dir: PathBuf,
+    #[arg(long, value_parser = parse_chunk, default_value = "8x16x16")]
+    chunk: [usize; 3],
 }
 
 #[derive(Debug)]
@@ -34,6 +55,7 @@ struct ObjectRow {
 struct Timings {
     fixture_load: Duration,
     label_construction: Duration,
+    zarr_prepare: Duration,
     measurement: Duration,
     csv_write: Duration,
 }
@@ -80,7 +102,10 @@ fn run() -> Result<()> {
             labels
         };
         let started = Instant::now();
-        let mut measurements = object_geometry_basic_measurements_u32(labels.view(), spacing)?;
+        let input_zarr = ensure_label_zarr(&config, image, labels)?;
+        timings.zarr_prepare += started.elapsed();
+        let started = Instant::now();
+        let mut measurements = planned_object_geometry_basic(&input_zarr, spacing, config.chunk)?;
         timings.measurement += started.elapsed();
         measurements.sort_by_key(|row| row.label);
         rows.extend(measurements.into_iter().map(|measurements| ObjectRow {
@@ -106,67 +131,84 @@ fn run() -> Result<()> {
 
 impl Config {
     fn parse() -> Result<Self> {
-        let mut out = PathBuf::from(".tmp/object-3d-measurement/blockflow");
-        let mut images = 10usize;
-        let mut fixture_dir = None;
+        let config = <Self as Parser>::parse();
 
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--out" => out = path_arg(&mut args, "--out")?,
-                "--images" => images = parse_arg(&mut args, "--images")?,
-                "--fixture-dir" => fixture_dir = Some(path_arg(&mut args, "--fixture-dir")?),
-                "--help" | "-h" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(Error::invalid(format!(
-                        "object-3d-measurement: unknown argument {other:?}; use --help"
-                    )));
-                }
-            }
-        }
-
-        if images == 0 {
+        if config.images == 0 {
             return Err(Error::invalid(
                 "object-3d-measurement: --images must be at least 1",
             ));
         }
+        if config.chunk.contains(&0) {
+            return Err(Error::invalid(
+                "object-3d-measurement: --chunk dimensions must be positive",
+            ));
+        }
 
-        Ok(Self {
-            out,
-            images,
-            fixture_dir,
-        })
+        Ok(config)
     }
 }
 
-fn path_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
-    args.next()
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::invalid(format!("object-3d-measurement: {name} needs a path")))
+fn ensure_label_zarr(config: &Config, image: usize, labels: Array3<u32>) -> Result<PathBuf> {
+    let store = config.zarr_dir.join(format!("image-{image:03}.zarr"));
+    let array = store.join("level0");
+    if array.join("zarr.json").exists() {
+        let (dtype, volume) = AttachedImage::at(&array).metadata()?;
+        if dtype != Dtype::U32 || volume != SHAPE {
+            return Err(Error::invalid(format!(
+                "object-3d-measurement: prepared store {} is {dtype:?} {volume:?}, expected U32 {:?}",
+                array.display(),
+                SHAPE
+            )));
+        }
+        return Ok(array);
+    }
+
+    let voxels: Voxels = labels.into();
+    ZarrEnvironment::create(&store, &voxels, config.chunk)?;
+    Ok(array)
 }
 
-fn parse_arg<T: std::str::FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    let raw = args
-        .next()
-        .ok_or_else(|| Error::invalid(format!("object-3d-measurement: {name} needs a value")))?;
-    raw.parse::<T>().map_err(|err| {
-        Error::invalid(format!(
-            "object-3d-measurement: could not parse {name} value {raw:?}: {err}"
-        ))
-    })
-}
-
-fn print_help() {
-    println!(
-        "object-3d-measurement --out DIR [--images 10] [--fixture-dir DIR]\n\
-         Measures deterministic labelled 3-D objects with physical geometry."
-    );
+fn planned_object_geometry_basic(
+    input_zarr: &Path,
+    spacing: PhysicalSpacing,
+    chunk: [usize; 3],
+) -> Result<Vec<ObjectGeometryBasicMeasurements>> {
+    let (_, volume) = AttachedImage::at(input_zarr).metadata()?;
+    let grid = BlockGrid::new(volume, chunk)?;
+    let mut builder = PlanBuilder::new(volume, Dtype::U32, grid);
+    builder.pixels(Chain::op(IdentityOp::new(
+        "object-3d-label-source",
+        [0, 0, 0],
+    )))?;
+    let base = builder.finish()?;
+    let labels = ImageId::from(base.n_phases());
+    let measurements = Measurements::for_labels(labels)
+        .object_geometry_basic(spacing)
+        .stream("object-3d.measurements")
+        .lifecycle(Lifecycle::DeleteOnExit)
+        .build(base.decomposition.clone())?;
+    let rows = measurements.object_geometry_basic_rows().ok_or_else(|| {
+        Error::invalid("object-3d-measurement: planned object geometry rows are missing")
+    })?;
+    let env = ZarrEnvironment::attach(
+        input_zarr
+            .parent()
+            .ok_or_else(|| Error::invalid("object-3d-measurement: input zarr has no parent"))?
+            .join("work"),
+        &[AttachedImage::at(input_zarr)],
+    )?;
+    let mut work = base.work();
+    work.extend(measurements.phase_work());
+    execute_phases(
+        "object-3d planned measurement",
+        &base.workflow,
+        &measurements.decomposition,
+        &Hints::default(),
+        &env,
+        &[],
+        &work,
+    )?;
+    collect_object_geometry_basic_rows(&env, &rows, volume)
 }
 
 fn synthetic_labels(image: usize) -> Array3<u32> {
@@ -199,7 +241,7 @@ fn object_box(image: usize, local: usize) -> ([usize; 3], [usize; 3]) {
     (start, extent)
 }
 
-fn load_fixture_boxes(dir: &PathBuf, image: usize) -> Result<Vec<BoxSpec>> {
+fn load_fixture_boxes(dir: &Path, image: usize) -> Result<Vec<BoxSpec>> {
     let path = dir.join(format!("boxes-{image:03}.csv"));
     let file = File::open(&path).map_err(|err| {
         Error::invalid(format!(
@@ -275,7 +317,7 @@ fn labels_from_boxes(boxes: &[BoxSpec]) -> Array3<u32> {
     labels
 }
 
-fn parse_field<T: std::str::FromStr>(raw: &str, name: &str, path: &PathBuf) -> Result<T>
+fn parse_field<T: std::str::FromStr>(raw: &str, name: &str, path: &Path) -> Result<T>
 where
     T::Err: std::fmt::Display,
 {
@@ -357,9 +399,13 @@ fn write_summary_with_seconds(
         "total_voxels": total_voxels,
         "fixture_load_seconds": timings.fixture_load.as_secs_f64(),
         "label_construction_seconds": timings.label_construction.as_secs_f64(),
+        "zarr_prepare_seconds": timings.zarr_prepare.as_secs_f64(),
         "measurement_seconds": timings.measurement.as_secs_f64(),
         "csv_write_seconds": timings.csv_write.as_secs_f64(),
         "summary_write_seconds": summary_write_seconds,
+        "input_zarr_dir": config.zarr_dir.display().to_string(),
+        "chunk_shape": config.chunk,
+        "execution": "planned measurement over attached Zarr inputs",
     });
     fs::write(
         path,
@@ -370,4 +416,23 @@ fn write_summary_with_seconds(
 
 fn write_error(err: std::io::Error) -> Error {
     Error::invalid(format!("object-3d-measurement: write output: {err}"))
+}
+
+fn parse_chunk(raw: &str) -> std::result::Result<[usize; 3], String> {
+    let parts = raw
+        .split(['x', 'X', ',', ':'])
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(format!(
+            "object-3d-measurement: chunk shape {raw:?} must have three dimensions"
+        ));
+    }
+    let mut out = [0usize; 3];
+    for (index, part) in parts.iter().enumerate() {
+        out[index] = part.parse::<usize>().map_err(|err| {
+            format!("object-3d-measurement: could not parse chunk shape {raw:?}: {err}")
+        })?;
+    }
+    Ok(out)
 }

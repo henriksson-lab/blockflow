@@ -1,18 +1,24 @@
 // SPDX-License-Identifier: MIT
 
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 
 use blockflow::{Error, Result};
+use clap::Parser;
 use serde_json::json;
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(name = "dask-image-compare")]
 struct Config {
+    #[arg(long)]
     blockflow: PathBuf,
+    #[arg(long)]
     dask_image: PathBuf,
+    #[arg(long, default_value = "dask-image-comparison.json")]
     out: PathBuf,
+    #[arg(long, default_value_t = 0)]
     max_object_delta: u64,
+    #[arg(long, default_value_t = 0.02)]
     max_area_relative_error: f64,
 }
 
@@ -72,72 +78,15 @@ fn run() -> Result<()> {
 
 impl Config {
     fn parse() -> Result<Self> {
-        let mut blockflow = None;
-        let mut dask_image = None;
-        let mut out = PathBuf::from("dask-image-comparison.json");
-        let mut max_object_delta = 0;
-        let mut max_area_relative_error = 0.02;
-
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--blockflow" => blockflow = Some(path_arg(&mut args, "--blockflow")?),
-                "--dask-image" => dask_image = Some(path_arg(&mut args, "--dask-image")?),
-                "--out" => out = path_arg(&mut args, "--out")?,
-                "--max-object-delta" => {
-                    max_object_delta = parse_arg(&mut args, "--max-object-delta")?
-                }
-                "--max-area-relative-error" => {
-                    max_area_relative_error = parse_arg(&mut args, "--max-area-relative-error")?
-                }
-                "--help" | "-h" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(Error::invalid(format!(
-                        "dask-image-compare: unknown argument {other:?}; use --help"
-                    )));
-                }
-            }
+        let config = <Self as Parser>::parse();
+        if !config.max_area_relative_error.is_finite() {
+            return Err(Error::invalid(
+                "dask-image-compare: --max-area-relative-error must be finite",
+            ));
         }
 
-        Ok(Self {
-            blockflow: blockflow
-                .ok_or_else(|| Error::invalid("dask-image-compare: missing --blockflow"))?,
-            dask_image: dask_image
-                .ok_or_else(|| Error::invalid("dask-image-compare: missing --dask-image"))?,
-            out,
-            max_object_delta,
-            max_area_relative_error,
-        })
+        Ok(config)
     }
-}
-
-fn path_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
-    args.next()
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::invalid(format!("dask-image-compare: {name} needs a path")))
-}
-
-fn parse_arg<T: std::str::FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    let raw = args
-        .next()
-        .ok_or_else(|| Error::invalid(format!("dask-image-compare: {name} needs a value")))?;
-    raw.parse::<T>().map_err(|err| {
-        Error::invalid(format!(
-            "dask-image-compare: could not parse {name} value {raw:?}: {err}"
-        ))
-    })
-}
-
-fn print_help() {
-    println!(
-        "dask-image-compare --blockflow SUMMARY.json --dask-image SUMMARY.json [--out REPORT.json]"
-    );
 }
 
 fn read_summary(path: &PathBuf) -> Result<Summary> {

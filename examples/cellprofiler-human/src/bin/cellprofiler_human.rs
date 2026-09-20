@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -15,8 +14,52 @@ use blockflow::ops::{
     ShapeMeasurements, PAIRS,
 };
 use blockflow::{Error, Result};
+use clap::{ArgAction, Parser, ValueEnum};
 use image::{ImageBuffer, Luma};
 use ndarray::Array3;
+
+#[derive(Debug, Parser)]
+#[command(name = "cellprofiler-human")]
+struct Cli {
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long = "out", default_value = ".tmp/cellprofiler-human/run")]
+    out_dir: PathBuf,
+    #[arg(long, default_value_t = 1.0)]
+    sigma: f64,
+    #[arg(long, default_value_t = 1.3488)]
+    declump_sigma: f64,
+    #[arg(long, value_enum, default_value = "li")]
+    threshold_method: ThresholdMethod,
+    #[arg(long, default_value_t = 256)]
+    threshold_bins: usize,
+    #[arg(long, default_value_t = 50)]
+    min_size: u64,
+    #[arg(long, default_value_t = 5027)]
+    max_size: u64,
+    #[arg(long)]
+    no_max_size: bool,
+    #[arg(long, default_value_t = 6.0)]
+    seed_min_distance: f64,
+    #[arg(long, default_value_t = 3)]
+    maxima_downsample: usize,
+    #[arg(long, value_enum, default_value = "intensity")]
+    declump_method: DeclumpMethod,
+    #[arg(long = "no-fill-holes-after-declumping", action = ArgAction::SetFalse, default_value_t = true)]
+    fill_holes_after_declumping: bool,
+    #[arg(long, default_value_t = 0)]
+    merge_line_basin_pixels: usize,
+    #[arg(long)]
+    merge_line_max_saddle_drop: Option<f64>,
+    #[arg(long, default_value_t = 1.0)]
+    background_percentile: f64,
+    #[arg(long)]
+    no_background_subtract: bool,
+    #[arg(long)]
+    keep_border: bool,
+    #[arg(long = "adjacent-basins", action = ArgAction::SetFalse, default_value_t = true)]
+    watershed_line: bool,
+}
 
 #[derive(Debug)]
 struct Config {
@@ -39,23 +82,14 @@ struct Config {
     watershed_line: bool,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum ThresholdMethod {
+    #[value(alias = "minimum-cross-entropy", alias = "minimum_cross_entropy")]
     Li,
     Otsu,
 }
 
 impl ThresholdMethod {
-    fn parse(raw: &str) -> Result<Self> {
-        match raw {
-            "li" | "minimum-cross-entropy" | "minimum_cross_entropy" => Ok(Self::Li),
-            "otsu" => Ok(Self::Otsu),
-            other => Err(Error::invalid(format!(
-                "cellprofiler-human: unknown --threshold-method {other:?}; expected li or otsu"
-            ))),
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Li => "li",
@@ -64,23 +98,14 @@ impl ThresholdMethod {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum DeclumpMethod {
     Intensity,
+    #[value(alias = "shape")]
     Distance,
 }
 
 impl DeclumpMethod {
-    fn parse(raw: &str) -> Result<Self> {
-        match raw {
-            "intensity" => Ok(Self::Intensity),
-            "distance" | "shape" => Ok(Self::Distance),
-            other => Err(Error::invalid(format!(
-                "cellprofiler-human: unknown --declump-method {other:?}; expected intensity or distance"
-            ))),
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Intensity => "intensity",
@@ -91,95 +116,27 @@ impl DeclumpMethod {
 
 impl Config {
     fn parse() -> Result<Self> {
-        let mut input = None;
-        let mut out_dir = None;
-        let mut sigma = 1.0;
-        let mut declump_sigma = 1.3488;
-        let mut threshold_method = ThresholdMethod::Li;
-        let mut threshold_bins = 256usize;
-        let mut min_size = 50u64;
-        let mut max_size = Some(5027u64);
-        let mut seed_min_distance = 6.0;
-        let mut maxima_downsample = 3usize;
-        let mut declump_method = DeclumpMethod::Intensity;
-        let mut fill_holes_after_declumping = true;
-        let mut merge_line_basin_pixels = 0usize;
-        let mut merge_line_max_saddle_drop = None;
-        let mut background_percentile = Some(1.0);
-        let mut keep_border = false;
-        let mut watershed_line = true;
-
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--input" => input = Some(path_arg(&mut args, "--input")?),
-                "--out" => out_dir = Some(path_arg(&mut args, "--out")?),
-                "--sigma" => sigma = parse_arg(&mut args, "--sigma")?,
-                "--declump-sigma" => declump_sigma = parse_arg(&mut args, "--declump-sigma")?,
-                "--threshold-method" => {
-                    threshold_method =
-                        ThresholdMethod::parse(&string_arg(&mut args, "--threshold-method")?)?
-                }
-                "--threshold-bins" => threshold_bins = parse_arg(&mut args, "--threshold-bins")?,
-                "--min-size" => min_size = parse_arg(&mut args, "--min-size")?,
-                "--max-size" => max_size = Some(parse_arg(&mut args, "--max-size")?),
-                "--no-max-size" => max_size = None,
-                "--seed-min-distance" => {
-                    seed_min_distance = parse_arg(&mut args, "--seed-min-distance")?
-                }
-                "--maxima-downsample" => {
-                    maxima_downsample = parse_arg(&mut args, "--maxima-downsample")?
-                }
-                "--declump-method" => {
-                    declump_method =
-                        DeclumpMethod::parse(&string_arg(&mut args, "--declump-method")?)?
-                }
-                "--no-fill-holes-after-declumping" => fill_holes_after_declumping = false,
-                "--merge-line-basin-pixels" => {
-                    merge_line_basin_pixels = parse_arg(&mut args, "--merge-line-basin-pixels")?
-                }
-                "--merge-line-max-saddle-drop" => {
-                    merge_line_max_saddle_drop =
-                        Some(parse_arg(&mut args, "--merge-line-max-saddle-drop")?)
-                }
-                "--background-percentile" => {
-                    background_percentile = Some(parse_arg(&mut args, "--background-percentile")?)
-                }
-                "--no-background-subtract" => background_percentile = None,
-                "--keep-border" => keep_border = true,
-                "--adjacent-basins" => watershed_line = false,
-                "--help" | "-h" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(Error::invalid(format!(
-                        "cellprofiler-human: unknown argument {other:?}; use --help"
-                    )));
-                }
-            }
-        }
+        let cli = Cli::parse();
 
         Self {
-            input: input.ok_or_else(|| {
-                Error::invalid("cellprofiler-human: missing required --input IMAGE")
-            })?,
-            out_dir: out_dir.unwrap_or_else(|| PathBuf::from(".tmp/cellprofiler-human/run")),
-            sigma,
-            declump_sigma,
-            threshold_method,
-            threshold_bins,
-            min_size,
-            max_size,
-            seed_min_distance,
-            maxima_downsample,
-            declump_method,
-            fill_holes_after_declumping,
-            merge_line_basin_pixels,
-            merge_line_max_saddle_drop,
-            background_percentile,
-            keep_border,
-            watershed_line,
+            input: cli.input,
+            out_dir: cli.out_dir,
+            sigma: cli.sigma,
+            declump_sigma: cli.declump_sigma,
+            threshold_method: cli.threshold_method,
+            threshold_bins: cli.threshold_bins,
+            min_size: cli.min_size,
+            max_size: (!cli.no_max_size).then_some(cli.max_size),
+            seed_min_distance: cli.seed_min_distance,
+            maxima_downsample: cli.maxima_downsample,
+            declump_method: cli.declump_method,
+            fill_holes_after_declumping: cli.fill_holes_after_declumping,
+            merge_line_basin_pixels: cli.merge_line_basin_pixels,
+            merge_line_max_saddle_drop: cli.merge_line_max_saddle_drop,
+            background_percentile: (!cli.no_background_subtract)
+                .then_some(cli.background_percentile),
+            keep_border: cli.keep_border,
+            watershed_line: cli.watershed_line,
         }
         .validate()
     }
@@ -357,61 +314,6 @@ fn run() -> Result<()> {
         config.out_dir.display()
     );
     Ok(())
-}
-
-fn print_help() {
-    println!(
-        "cellprofiler-human --input IMAGE [--out DIR]\n\
-         \n\
-         Runs a small CellProfiler-style nuclei/cell segmentation benchmark path:\n\
-          background subtraction, XY Gaussian smoothing, Li/Otsu threshold,\n\
-           mask cleanup, distance-transform watershed, and object measurements.\n\
-         \n\
-         Options:\n\
-           --sigma FLOAT                    XY Gaussian sigma, default 1.0\n\
-           --declump-sigma FLOAT            intensity declumping Gaussian sigma, default 1.3488\n\
-           --threshold-method li|otsu       global threshold method, default li\n\
-           --threshold-bins N               Otsu histogram bins, default 256\n\
-           --min-size N                     remove objects below N voxels, default 50\n\
-           --max-size N                     remove objects above N voxels, default 5027\n\
-           --no-max-size                    disable large-object filtering\n\
-           --seed-min-distance FLOAT        suppress watershed seeds closer than this, default 6\n\
-           --maxima-downsample N            find seed maxima on lower-resolution XY blocks, default 3\n\
-           --declump-method intensity|distance watershed source, default intensity\n\
-           --no-fill-holes-after-declumping skip CellProfiler-style post-declump hole filling\n\
-           --merge-line-basin-pixels N      merge labels separated by at least N watershed-line pixels\n\
-           --merge-line-max-saddle-drop N   require weak-boundary mean minus line mean to be at most N\n\
-           --background-percentile FLOAT    subtract this percentile, default 1.0\n\
-           --no-background-subtract         leave intensities unchanged before smoothing\n\
-           --keep-border                    keep objects touching the image border\n\
-           --adjacent-basins                watershed basins touch instead of carving lines"
-    );
-}
-
-fn path_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from(args.next().ok_or_else(|| {
-        Error::invalid(format!("cellprofiler-human: {name} needs a path"))
-    })?))
-}
-
-fn string_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
-    args.next()
-        .ok_or_else(|| Error::invalid(format!("cellprofiler-human: {name} needs a value")))
-}
-
-fn parse_arg<T>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    let raw = args
-        .next()
-        .ok_or_else(|| Error::invalid(format!("cellprofiler-human: {name} needs a value")))?;
-    raw.parse::<T>().map_err(|err| {
-        Error::invalid(format!(
-            "cellprofiler-human: could not parse {name} value {raw:?}: {err}"
-        ))
-    })
 }
 
 fn load_luma_as_volume(path: &Path) -> Result<Array3<f64>> {
@@ -810,10 +712,10 @@ impl ObjectTally {
     fn add(&mut self, at: [usize; 3], value: f64) {
         self.count += 1;
         let coords = [at[0] as u64, at[1] as u64, at[2] as u64];
-        for axis in 0..3 {
-            self.position[axis] += coords[axis];
-            self.bbox_min[axis] = self.bbox_min[axis].min(coords[axis]);
-            self.bbox_max[axis] = self.bbox_max[axis].max(coords[axis] + 1);
+        for (axis, coord) in coords.iter().copied().enumerate() {
+            self.position[axis] += coord;
+            self.bbox_min[axis] = self.bbox_min[axis].min(coord);
+            self.bbox_max[axis] = self.bbox_max[axis].max(coord + 1);
         }
         for (slot, [a, b]) in self.second.iter_mut().zip(PAIRS) {
             *slot += coords[a] as i128 * coords[b] as i128;
@@ -822,8 +724,8 @@ impl ObjectTally {
             self.sum += value;
             self.min = self.min.min(value);
             self.max = self.max.max(value);
-            for axis in 0..3 {
-                self.weighted_position[axis] += value * coords[axis] as f64;
+            for (axis, coord) in coords.iter().copied().enumerate() {
+                self.weighted_position[axis] += value * coord as f64;
             }
         } else {
             self.nonfinite += 1;

@@ -6,13 +6,13 @@ image-analysis frameworks and record the commands used to reproduce them.
 
 ## CellProfiler-Style Benchmark
 
-One current benchmark is the CellProfiler ExampleHuman HT29 image set. To keep
-startup overhead from dominating, this benchmark duplicates the small
-three-channel example into 10-image and 50-image batches. The Blockflow rows
-below are the release `cellprofiler-human` binary running the current DAPI
-nuclei path over the DAPI images. The CellProfiler rows are
-`cellprofiler/cellprofiler:4.2.8` running the downloaded `ExampleHuman.cppipe`
-pipeline in Docker over the same three-channel image sets.
+One current benchmark target is the CellProfiler ExampleHuman HT29 image set. To
+keep startup overhead from dominating, this benchmark duplicates the small
+three-channel example into 10-image and 50-image batches. Blockflow examples
+must use planned execution; the old resident `cellprofiler-human` path is kept
+only as a debugging reference and is not a representative library benchmark.
+The Blockflow numbers below are therefore retired until rerun through
+`cellprofiler-plan-probe --materialize-objects`.
 
 Measured on 2026-09-17 on an Intel Xeon Gold 6138 machine. Compile time is not
 included. The CellProfiler run uses a warm local Docker image and reports peak
@@ -21,14 +21,14 @@ container memory sampled with `docker stats`; Blockflow RSS is Linux
 
 | runner | scope | wall time | max RSS / peak memory | output |
 |---|---:|---:|---:|---:|
-| Blockflow `target/release/cellprofiler-human` | 10 DAPI nuclei runs | 1.09 s | 23,708 KiB / 23.2 MiB | 2,880 nuclei |
+| Blockflow resident reference, retired | 10 DAPI nuclei runs | 1.09 s | 23,708 KiB / 23.2 MiB | 2,880 nuclei |
 | CellProfiler 4.2.8 Docker | 10 full ExampleHuman image sets | 54.93 s | 504.4 MiB | 2,890 nuclei |
-| Blockflow `target/release/cellprofiler-human` | 50 DAPI nuclei runs | 5.17 s | 23,928 KiB / 23.4 MiB | 14,400 nuclei |
+| Blockflow resident reference, retired | 50 DAPI nuclei runs | 5.17 s | 23,928 KiB / 23.4 MiB | 14,400 nuclei |
 | CellProfiler 4.2.8 Docker | 50 full ExampleHuman image sets | 238.13 s | 671.2 MiB | 14,450 nuclei |
 
 That is about a 50x wall-time difference on 10 image sets and 46x on 50 image
 sets, with about 22x lower peak memory on 10 image sets and 29x lower peak
-memory on 50 image sets for the current Blockflow path. This is a
+memory on 50 image sets for the retired resident reference path. This is a
 pipeline-reference benchmark, not a claim of exact operation-for-operation
 parity: the CellProfiler pipeline also identifies secondary/tertiary objects
 and exports more measurements. The current semantic comparison is documented in
@@ -38,7 +38,7 @@ reference drift for this milestone.
 Reproduction commands:
 
 ```sh
-cargo build -p blockflow-cellprofiler-human --release --bin cellprofiler-human
+cargo build -p blockflow-cellprofiler-human --release --bin cellprofiler-plan-probe
 
 N=50
 bench=target/cellprofiler-readme-bench-${N}
@@ -57,15 +57,17 @@ done
   bench=target/cellprofiler-readme-bench-50
   i=0
   for img in "$bench"/images/*d0.tif; do
-    target/release/cellprofiler-human \
+    target/release/cellprofiler-plan-probe \
       --input "$img" \
-      --out "$bench/blockflow-output/run-${i}" \
+      --out "$bench/blockflow-output/run-${i}/plan-probe.json" \
+      --chunk 1x256x256 --workers 1 --cache-bytes 0 \
       --min-size 50 --max-size 5027 \
       --sigma 1.0 --declump-sigma 1.3488 \
       --threshold-method li --threshold-bins 256 \
       --seed-min-distance 6 --maxima-downsample 3 \
       --declump-method intensity \
-      --merge-line-basin-pixels 16 --merge-line-max-saddle-drop 0 >/dev/null
+      --merge-line-basin-pixels 16 --merge-line-max-saddle-drop 0 \
+      --materialize-objects "$bench/blockflow-output/run-${i}" >/dev/null
     i=$((i + 1))
   done'
 ```

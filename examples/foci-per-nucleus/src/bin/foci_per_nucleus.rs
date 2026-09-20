@@ -1,12 +1,25 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use blockflow::{Error, Result};
+use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::dtype::Dtype;
+use blockflow::geometry::BlockGrid;
+use blockflow::op::Chain;
+use blockflow::ops::measure::{
+    collect_class_a_shapes, collect_class_a_values, IntensityImage, IntensityMeasurements,
+    IntensitySet, Measurements, ShapeMeasurements, ShapeSet,
+};
+use blockflow::probes::IdentityOp;
+use blockflow::sidecar::Lifecycle;
+use blockflow::strategy::{execute_phases, Hints};
+use blockflow::voxels::Voxels;
+use blockflow::zarr_env::ZarrEnvironment;
+use blockflow::{AttachedImage, Error, Result};
+use clap::Parser;
 use ndarray::Array3;
 use serde_json::json;
 
@@ -14,10 +27,20 @@ const HEIGHT: usize = 104;
 const WIDTH: usize = 136;
 const NUCLEI_PER_IMAGE: usize = 5;
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(
+    name = "foci-per-nucleus",
+    about = "Generates deterministic nucleus labels and foci, then counts foci by containing nucleus."
+)]
 struct Config {
+    #[arg(long, default_value = ".tmp/foci-per-nucleus/blockflow")]
     out: PathBuf,
+    #[arg(long, default_value_t = 10)]
     images: usize,
+    #[arg(long, default_value = ".tmp/foci-per-nucleus/input.zarr")]
+    zarr_dir: PathBuf,
+    #[arg(long, value_parser = parse_chunk, default_value = "1x32x32")]
+    chunk: [usize; 3],
 }
 
 #[derive(Debug)]
@@ -67,10 +90,15 @@ fn run() -> Result<()> {
     for image in 0..config.images {
         let labels = synthetic_nuclei(image);
         let specs = synthetic_foci(image);
-        let (mut image_nuclei, mut image_foci) = count_foci(image, labels.view(), &specs)?;
+        let image_foci = focus_rows(image, labels.view(), &specs);
+        let (focus_counts, focus_intensities) = foci_images(&specs);
+        let input = ensure_foci_zarr(&config, image, labels, focus_counts, focus_intensities)?;
+        let mut image_nuclei = planned_nucleus_foci(image, &input, config.chunk)?;
         nuclei.append(&mut image_nuclei);
-        foci.append(&mut image_foci);
+        foci.extend(image_foci);
     }
+    nuclei.sort_by_key(|row| (row.image, row.label));
+    foci.sort_by_key(|row| (row.image, row.focus));
 
     write_nuclei(&nuclei, &config.out.join("nuclei.csv"))?;
     write_foci(&foci, &config.out.join("foci.csv"))?;
@@ -90,61 +118,173 @@ fn run() -> Result<()> {
 
 impl Config {
     fn parse() -> Result<Self> {
-        let mut out = PathBuf::from(".tmp/foci-per-nucleus/blockflow");
-        let mut images = 10usize;
+        let config = <Self as Parser>::parse();
 
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--out" => out = path_arg(&mut args, "--out")?,
-                "--images" => images = parse_arg(&mut args, "--images")?,
-                "--help" | "-h" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(Error::invalid(format!(
-                        "foci-per-nucleus: unknown argument {other:?}; use --help"
-                    )));
-                }
-            }
-        }
-
-        if images == 0 {
+        if config.images == 0 {
             return Err(Error::invalid(
                 "foci-per-nucleus: --images must be at least 1",
             ));
         }
+        if config.chunk.contains(&0) {
+            return Err(Error::invalid(
+                "foci-per-nucleus: --chunk dimensions must be positive",
+            ));
+        }
 
-        Ok(Self { out, images })
+        Ok(config)
     }
 }
 
-fn path_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
-    args.next()
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::invalid(format!("foci-per-nucleus: {name} needs a path")))
+struct FociZarr {
+    labels: PathBuf,
+    counts: PathBuf,
+    intensities: PathBuf,
+    work: PathBuf,
 }
 
-fn parse_arg<T: std::str::FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    let raw = args
-        .next()
-        .ok_or_else(|| Error::invalid(format!("foci-per-nucleus: {name} needs a value")))?;
-    raw.parse::<T>().map_err(|err| {
-        Error::invalid(format!(
-            "foci-per-nucleus: could not parse {name} value {raw:?}: {err}"
-        ))
+fn ensure_foci_zarr(
+    config: &Config,
+    image: usize,
+    labels: Array3<u32>,
+    counts: Array3<f64>,
+    intensities: Array3<f64>,
+) -> Result<FociZarr> {
+    let root = config.zarr_dir.join(format!("image-{image:03}"));
+    let labels = ensure_array_zarr(&root.join("labels.zarr"), labels, config.chunk)?;
+    let counts = ensure_array_zarr(&root.join("focus-counts.zarr"), counts, config.chunk)?;
+    let intensities = ensure_array_zarr(
+        &root.join("focus-intensities.zarr"),
+        intensities,
+        config.chunk,
+    )?;
+    Ok(FociZarr {
+        labels,
+        counts,
+        intensities,
+        work: root.join("work.zarr"),
     })
 }
 
-fn print_help() {
-    println!(
-        "foci-per-nucleus --out DIR [--images 10]\n\
-         Generates deterministic nucleus labels and foci, then counts foci by containing nucleus."
-    );
+fn ensure_array_zarr<T>(store: &Path, array: Array3<T>, chunk: [usize; 3]) -> Result<PathBuf>
+where
+    T: blockflow::voxels::VoxelElement + 'static,
+    Voxels: From<Array3<T>>,
+{
+    let path = store.join("level0");
+    if path.join("zarr.json").exists() {
+        let (_, volume) = AttachedImage::at(&path).metadata()?;
+        if volume != [1, HEIGHT, WIDTH] {
+            return Err(Error::invalid(format!(
+                "foci-per-nucleus: prepared store {} is volume {volume:?}, expected {:?}",
+                path.display(),
+                [1, HEIGHT, WIDTH]
+            )));
+        }
+        return Ok(path);
+    }
+
+    let voxels: Voxels = array.into();
+    ZarrEnvironment::create(store, &voxels, chunk)?;
+    Ok(path)
+}
+
+fn planned_nucleus_foci(
+    image: usize,
+    input: &FociZarr,
+    chunk: [usize; 3],
+) -> Result<Vec<NucleusRow>> {
+    let (_, volume) = AttachedImage::at(&input.labels).metadata()?;
+    let grid = BlockGrid::new(volume, chunk)?;
+    let mut builder = PlanBuilder::new(volume, Dtype::U32, grid);
+    builder.pixels(Chain::op(IdentityOp::new(
+        "foci-per-nucleus-label-source",
+        [0, 0, 0],
+    )))?;
+    let base = builder.finish()?;
+    let labels = ImageId::from(base.n_phases());
+    let measurements = Measurements::for_labels(labels)
+        .shape(ShapeSet::basic())
+        .intensity(
+            IntensityImage::<0>::new(ImageId::supplied(0)).holding(Dtype::F64),
+            IntensitySet::standard(),
+        )
+        .intensity(
+            IntensityImage::<1>::new(ImageId::supplied(1)).holding(Dtype::F64),
+            IntensitySet::standard(),
+        )
+        .stream("foci-per-nucleus.measurements")
+        .lifecycle(Lifecycle::DeleteOnExit)
+        .build(base.decomposition.clone())?;
+    let shape_rows = measurements
+        .class_a_rows()
+        .ok_or_else(|| Error::invalid("foci-per-nucleus: planned shape rows are missing"))?;
+    let count_rows = measurements
+        .class_a_intensity_rows(0)
+        .ok_or_else(|| Error::invalid("foci-per-nucleus: planned focus-count rows are missing"))?;
+    let intensity_rows = measurements.class_a_intensity_rows(1).ok_or_else(|| {
+        Error::invalid("foci-per-nucleus: planned focus-intensity rows are missing")
+    })?;
+    let env = ZarrEnvironment::attach(
+        &input.work,
+        &[
+            AttachedImage::at(&input.labels),
+            AttachedImage::at(&input.counts),
+            AttachedImage::at(&input.intensities),
+        ],
+    )?;
+    let mut work = base.work();
+    work.extend(measurements.phase_work());
+    execute_phases(
+        "foci-per-nucleus planned measurement",
+        &base.workflow,
+        &measurements.decomposition,
+        &Hints::default(),
+        &env,
+        &[],
+        &work,
+    )?;
+
+    let shapes = collect_class_a_shapes(&env, &shape_rows, volume, measurements.fixed)?;
+    let mut counts = collect_class_a_values(&env, &count_rows, volume, measurements.fixed)?
+        .into_iter()
+        .map(|values| {
+            let measurement = IntensityMeasurements::from_values(&values);
+            (measurement.label, measurement)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut intensities =
+        collect_class_a_values(&env, &intensity_rows, volume, measurements.fixed)?
+            .into_iter()
+            .map(|values| {
+                let measurement = IntensityMeasurements::from_values(&values);
+                (measurement.label, measurement)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+    let mut rows = Vec::with_capacity(shapes.len());
+    for shape in shapes {
+        let shape = ShapeMeasurements::from_shape(&shape);
+        let count = counts.remove(&shape.label).ok_or_else(|| {
+            Error::invalid(format!(
+                "foci-per-nucleus: no planned focus count for label {}",
+                shape.label
+            ))
+        })?;
+        let intensity = intensities.remove(&shape.label).ok_or_else(|| {
+            Error::invalid(format!(
+                "foci-per-nucleus: no planned focus intensity for label {}",
+                shape.label
+            ))
+        })?;
+        rows.push(NucleusRow {
+            image,
+            label: shape.label,
+            area: shape.count,
+            foci_count: count.sum.round() as u64,
+            foci_intensity_sum: intensity.sum,
+        });
+    }
+    Ok(rows)
 }
 
 fn synthetic_nuclei(image: usize) -> Array3<u32> {
@@ -195,41 +335,24 @@ fn synthetic_foci(image: usize) -> Vec<FocusSpec> {
     specs
 }
 
-fn count_foci(
+fn foci_images(specs: &[FocusSpec]) -> (Array3<f64>, Array3<f64>) {
+    let mut counts = Array3::<f64>::zeros((1, HEIGHT, WIDTH));
+    let mut intensities = Array3::<f64>::zeros((1, HEIGHT, WIDTH));
+    for spec in specs {
+        counts[[0, spec.y, spec.x]] += 1.0;
+        intensities[[0, spec.y, spec.x]] += spec.intensity;
+    }
+    (counts, intensities)
+}
+
+fn focus_rows(
     image: usize,
     labels: ndarray::ArrayView3<'_, u32>,
     specs: &[FocusSpec],
-) -> Result<(Vec<NucleusRow>, Vec<FocusRow>)> {
-    let mut nuclei = BTreeMap::<u64, NucleusRow>::new();
-    for &raw_label in labels.iter() {
-        if raw_label == 0 {
-            continue;
-        }
-        let label = u64::from(raw_label);
-        nuclei
-            .entry(label)
-            .and_modify(|row| row.area += 1)
-            .or_insert(NucleusRow {
-                image,
-                label,
-                area: 1,
-                foci_count: 0,
-                foci_intensity_sum: 0.0,
-            });
-    }
-
+) -> Vec<FocusRow> {
     let mut foci = Vec::with_capacity(specs.len());
     for (index, spec) in specs.iter().enumerate() {
         let label = u64::from(labels[[0, spec.y, spec.x]]);
-        if label != 0 {
-            let row = nuclei.get_mut(&label).ok_or_else(|| {
-                Error::invalid(format!(
-                    "foci-per-nucleus: focus assigned to missing nucleus label {label}"
-                ))
-            })?;
-            row.foci_count += 1;
-            row.foci_intensity_sum += spec.intensity;
-        }
         foci.push(FocusRow {
             image,
             focus: (image * 1000 + index + 1) as u64,
@@ -239,8 +362,7 @@ fn count_foci(
             nucleus_label: label,
         });
     }
-
-    Ok((nuclei.into_values().collect(), foci))
+    foci
 }
 
 fn write_nuclei(rows: &[NucleusRow], path: &PathBuf) -> Result<()> {
@@ -284,7 +406,10 @@ fn write_summary(
     let assigned = foci.iter().filter(|row| row.nucleus_label != 0).count();
     let summary = json!({
         "assigned_foci": assigned,
+        "chunk_shape": config.chunk,
+        "execution": "planned nucleus shape and foci intensity reductions over attached Zarr inputs",
         "images": config.images,
+        "input_zarr_dir": config.zarr_dir.display().to_string(),
         "nuclei": nuclei.len(),
         "total_foci": foci.len(),
         "unassigned_foci": foci.len() - assigned,
@@ -298,4 +423,23 @@ fn write_summary(
 
 fn write_error(err: std::io::Error) -> Error {
     Error::invalid(format!("foci-per-nucleus: write output: {err}"))
+}
+
+fn parse_chunk(raw: &str) -> std::result::Result<[usize; 3], String> {
+    let parts = raw
+        .split(['x', 'X', ',', ':'])
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(format!(
+            "foci-per-nucleus: chunk shape {raw:?} must have three dimensions"
+        ));
+    }
+    let mut out = [0usize; 3];
+    for (index, part) in parts.iter().enumerate() {
+        out[index] = part.parse::<usize>().map_err(|err| {
+            format!("foci-per-nucleus: could not parse chunk shape {raw:?}: {err}")
+        })?;
+    }
+    Ok(out)
 }

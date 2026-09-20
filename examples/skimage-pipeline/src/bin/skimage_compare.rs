@@ -1,18 +1,24 @@
 // SPDX-License-Identifier: MIT
 
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 
 use blockflow::{Error, Result};
+use clap::Parser;
 use serde_json::json;
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(name = "skimage-compare")]
 struct Config {
+    #[arg(long)]
     blockflow: PathBuf,
+    #[arg(long)]
     skimage: PathBuf,
+    #[arg(long, default_value = "skimage-comparison.json")]
     out: PathBuf,
+    #[arg(long, default_value_t = 0)]
     max_object_delta: u64,
+    #[arg(long, default_value_t = 0.01)]
     max_area_relative_error: f64,
 }
 
@@ -72,69 +78,15 @@ fn run() -> Result<()> {
 
 impl Config {
     fn parse() -> Result<Self> {
-        let mut blockflow = None;
-        let mut skimage = None;
-        let mut out = PathBuf::from("skimage-comparison.json");
-        let mut max_object_delta = 0;
-        let mut max_area_relative_error = 0.01;
-
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--blockflow" => blockflow = Some(path_arg(&mut args, "--blockflow")?),
-                "--skimage" => skimage = Some(path_arg(&mut args, "--skimage")?),
-                "--out" => out = path_arg(&mut args, "--out")?,
-                "--max-object-delta" => {
-                    max_object_delta = parse_arg(&mut args, "--max-object-delta")?
-                }
-                "--max-area-relative-error" => {
-                    max_area_relative_error = parse_arg(&mut args, "--max-area-relative-error")?
-                }
-                "--help" | "-h" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(Error::invalid(format!(
-                        "skimage-compare: unknown argument {other:?}; use --help"
-                    )));
-                }
-            }
+        let config = <Self as Parser>::parse();
+        if !config.max_area_relative_error.is_finite() {
+            return Err(Error::invalid(
+                "skimage-compare: --max-area-relative-error must be finite",
+            ));
         }
 
-        Ok(Self {
-            blockflow: blockflow
-                .ok_or_else(|| Error::invalid("skimage-compare: missing --blockflow"))?,
-            skimage: skimage.ok_or_else(|| Error::invalid("skimage-compare: missing --skimage"))?,
-            out,
-            max_object_delta,
-            max_area_relative_error,
-        })
+        Ok(config)
     }
-}
-
-fn path_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
-    args.next()
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::invalid(format!("skimage-compare: {name} needs a path")))
-}
-
-fn parse_arg<T: std::str::FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    let raw = args
-        .next()
-        .ok_or_else(|| Error::invalid(format!("skimage-compare: {name} needs a value")))?;
-    raw.parse::<T>().map_err(|err| {
-        Error::invalid(format!(
-            "skimage-compare: could not parse {name} value {raw:?}: {err}"
-        ))
-    })
-}
-
-fn print_help() {
-    println!("skimage-compare --blockflow SUMMARY.json --skimage SUMMARY.json [--out REPORT.json]");
 }
 
 fn read_summary(path: &PathBuf) -> Result<Summary> {

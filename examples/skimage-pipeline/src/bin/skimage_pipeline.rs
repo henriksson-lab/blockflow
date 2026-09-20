@@ -1,45 +1,56 @@
 // SPDX-License-Identifier: MIT
 
-use std::collections::BTreeMap;
-use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use blockflow::ops::components;
+use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::dtype::Dtype;
+use blockflow::geometry::BlockGrid;
+use blockflow::op::Chain;
+use blockflow::ops::label::LabelComponentsOp;
 use blockflow::ops::{
-    gaussian_smooth_into_with, remove_small_objects_into, Boundary, Connectivity, Gaussian,
+    append_global_threshold_phases, append_remove_small_objects_phases, append_warp_phase,
+    collect_class_a_shapes, Boundary, Connectivity, ElementShape, Gaussian, GlobalThreshold,
+    GlobalThresholdOutput, GlobalThresholdSelection, Measurements, Morphology, MorphologyOp,
+    ShapeMeasurements, ShapeSet, SmoothOp, StructuringElement, ThresholdTest, TransformBoundary,
+    TransformInterpolation, WarpOp,
 };
-use blockflow::{Error, Result};
+use blockflow::sidecar::Lifecycle;
+use blockflow::strategy::{execute_phases, Hints};
+use blockflow::voxels::Voxels;
+use blockflow::zarr_env::ZarrEnvironment;
+use blockflow::{AttachedImage, Error, Result};
+use clap::{Parser, ValueEnum};
 use ndarray::Array3;
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(name = "skimage-pipeline")]
 struct Config {
+    #[arg(long)]
     input: PathBuf,
+    #[arg(long, default_value = ".tmp/skimage-pipeline/blockflow")]
     out: PathBuf,
+    #[arg(long, default_value_t = 1.5)]
     sigma: f64,
+    #[arg(long, default_value_t = 20)]
     min_size: u64,
+    #[arg(long, value_enum, default_value = "segment")]
     mode: Mode,
+    #[arg(long, default_value = ".tmp/skimage-pipeline/input.zarr")]
+    zarr_dir: PathBuf,
+    #[arg(long, value_parser = parse_chunk, default_value = "1x256x256")]
+    chunk: [usize; 3],
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum Mode {
     Segment,
     Transform,
 }
 
 impl Mode {
-    fn parse(raw: &str) -> Result<Self> {
-        match raw {
-            "segment" => Ok(Self::Segment),
-            "transform" => Ok(Self::Transform),
-            other => Err(Error::invalid(format!(
-                "skimage-pipeline: unknown --mode {other:?}; expected segment or transform"
-            ))),
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Segment => "segment",
@@ -50,7 +61,7 @@ impl Mode {
 
 #[derive(Debug)]
 struct ObjectRow {
-    label: u32,
+    label: u64,
     count: u64,
     centroid_y: f64,
     centroid_x: f64,
@@ -69,30 +80,11 @@ fn run() -> Result<()> {
         .map_err(|err| Error::invalid(format!("skimage-pipeline: create output dir: {err}")))?;
 
     let started = Instant::now();
-    let input = load_luma(&config.input)?;
+    let input_zarr = ensure_input_zarr(&config)?;
     let load_seconds = started.elapsed().as_secs_f64();
 
     let pipeline_started = Instant::now();
-    let prepared = transform_if_requested(input.view(), config.mode);
-    let smoothed = smooth(prepared.view(), config.sigma)?;
-    let threshold = otsu_threshold(smoothed.iter().copied());
-    let raw_mask = smoothed.mapv(|value| value > threshold);
-    let raw_mask = close3x3(&open3x3(&raw_mask));
-    let mut mask = Array3::<bool>::from_elem(raw_mask.raw_dim(), false);
-    remove_small_objects_into(
-        raw_mask.view(),
-        Connectivity::Faces,
-        config.min_size,
-        mask.view_mut(),
-    )?;
-    let mut labels = Array3::<u32>::zeros(mask.raw_dim());
-    components::label_members_into_with(
-        [mask.shape()[0], mask.shape()[1], mask.shape()[2]],
-        Connectivity::Faces,
-        |at| mask[[at[0], at[1], at[2]]],
-        labels.view_mut(),
-    )?;
-    let rows = measure(labels.view());
+    let rows = planned_pipeline(&config, &input_zarr)?;
     let pipeline_seconds = pipeline_started.elapsed().as_secs_f64();
 
     write_objects(&rows, &config.out.join("objects.csv"))?;
@@ -100,14 +92,13 @@ fn run() -> Result<()> {
         &config,
         rows.len(),
         rows.iter().map(|row| row.count).sum(),
-        threshold,
         load_seconds,
         pipeline_seconds,
         &config.out.join("summary.json"),
     )?;
 
     println!(
-        "objects={} threshold={threshold:.6} output={}",
+        "objects={} threshold_method=otsu output={}",
         rows.len(),
         config.out.display()
     );
@@ -116,84 +107,144 @@ fn run() -> Result<()> {
 
 impl Config {
     fn parse() -> Result<Self> {
-        let mut input = None;
-        let mut out = None;
-        let mut sigma = 1.5f64;
-        let mut min_size = 20;
-        let mut mode = Mode::Segment;
+        let config = <Self as Parser>::parse();
 
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--input" => input = Some(path_arg(&mut args, "--input")?),
-                "--out" => out = Some(path_arg(&mut args, "--out")?),
-                "--sigma" => sigma = parse_arg(&mut args, "--sigma")?,
-                "--min-size" => min_size = parse_arg(&mut args, "--min-size")?,
-                "--mode" => mode = Mode::parse(&string_arg(&mut args, "--mode")?)?,
-                "--help" | "-h" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(Error::invalid(format!(
-                        "skimage-pipeline: unknown argument {other:?}; use --help"
-                    )));
-                }
-            }
-        }
-
-        if sigma < 0.0 || !sigma.is_finite() {
+        if config.sigma < 0.0 || !config.sigma.is_finite() {
             return Err(Error::invalid(
                 "skimage-pipeline: --sigma must be finite and non-negative",
             ));
         }
-        if min_size == 0 {
+        if config.min_size == 0 {
             return Err(Error::invalid(
                 "skimage-pipeline: --min-size must be at least 1",
             ));
         }
+        if config.chunk.contains(&0) {
+            return Err(Error::invalid(
+                "skimage-pipeline: --chunk dimensions must be positive",
+            ));
+        }
 
-        Ok(Self {
-            input: input
-                .ok_or_else(|| Error::invalid("skimage-pipeline: missing required --input"))?,
-            out: out.unwrap_or_else(|| PathBuf::from(".tmp/skimage-pipeline/blockflow")),
-            sigma,
-            min_size,
-            mode,
-        })
+        Ok(config)
     }
 }
 
-fn path_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
-    args.next()
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::invalid(format!("skimage-pipeline: {name} needs a path")))
+fn ensure_input_zarr(config: &Config) -> Result<PathBuf> {
+    let array = config.zarr_dir.join("level0");
+    if array.join("zarr.json").exists() {
+        let (dtype, _) = AttachedImage::at(&array).metadata()?;
+        if dtype != Dtype::F64 {
+            return Err(Error::invalid(format!(
+                "skimage-pipeline: prepared input {} is {dtype:?}, expected F64",
+                array.display()
+            )));
+        }
+        return Ok(array);
+    }
+
+    let input = load_luma(&config.input)?;
+    let voxels: Voxels = input.into();
+    ZarrEnvironment::create(&config.zarr_dir, &voxels, config.chunk)?;
+    Ok(array)
 }
 
-fn parse_arg<T: std::str::FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    let raw = args
-        .next()
-        .ok_or_else(|| Error::invalid(format!("skimage-pipeline: {name} needs a value")))?;
-    raw.parse::<T>().map_err(|err| {
-        Error::invalid(format!(
-            "skimage-pipeline: could not parse {name} value {raw:?}: {err}"
-        ))
-    })
-}
-
-fn string_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
-    args.next()
-        .ok_or_else(|| Error::invalid(format!("skimage-pipeline: {name} needs a value")))
-}
-
-fn print_help() {
-    println!(
-        "skimage-pipeline --input IMAGE --out DIR [--sigma 1.5] [--min-size 20] [--mode segment|transform]\n\
-         Runs the Blockflow side of the scikit-image comparison benchmark."
-    );
+fn planned_pipeline(config: &Config, input_zarr: &Path) -> Result<Vec<ObjectRow>> {
+    let (_, volume) = AttachedImage::at(input_zarr).metadata()?;
+    let grid = BlockGrid::new(volume, config.chunk)?;
+    let mut builder = PlanBuilder::new(volume, Dtype::F64, grid.clone());
+    if config.mode == Mode::Transform {
+        append_warp_phase(
+            &mut builder,
+            WarpOp::affine(
+                "skimage-translate",
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [0.0, -5.0, -7.0],
+                volume,
+                TransformInterpolation::Linear,
+                TransformBoundary::Constant(0.0),
+            )?,
+            volume,
+            grid,
+        )?;
+    }
+    builder.pixels(Chain::op(SmoothOp::new(
+        "skimage-gaussian-smooth",
+        Gaussian::new([0.0, config.sigma, config.sigma], 3.0)?.with_boundary(Boundary::Reflect),
+    )))?;
+    append_global_threshold_phases(
+        &mut builder,
+        "skimage-threshold",
+        GlobalThresholdSelection::single(GlobalThreshold::otsu(256)?),
+        GlobalThresholdOutput::Mask {
+            test: ThresholdTest::Above,
+        },
+    )?;
+    let element = StructuringElement::from_radius(ElementShape::Box, [0, 1, 1]);
+    builder.pixels(Chain::op(MorphologyOp::new(
+        "skimage-open-3x3",
+        Morphology::Open,
+        element.clone(),
+    )))?;
+    builder.pixels(Chain::op(MorphologyOp::new(
+        "skimage-close-3x3",
+        Morphology::Close,
+        element,
+    )))?;
+    append_remove_small_objects_phases(
+        &mut builder,
+        "skimage-remove-small",
+        Lifecycle::DeleteOnExit,
+        Connectivity::Faces,
+        config.min_size,
+    )?;
+    builder.fragments(
+        LabelComponentsOp::new(
+            "skimage-label-components",
+            "skimage.components",
+            Lifecycle::DeleteOnExit,
+        )
+        .connecting(Connectivity::Faces),
+    )?;
+    let base = builder.finish()?;
+    let labels = ImageId::from(base.n_phases());
+    let measurements = Measurements::for_labels(labels)
+        .shape(ShapeSet::basic())
+        .stream("skimage.measurements")
+        .lifecycle(Lifecycle::DeleteOnExit)
+        .build(base.decomposition.clone())?;
+    let shape_rows = measurements
+        .class_a_rows()
+        .ok_or_else(|| Error::invalid("skimage-pipeline: planned shape rows are missing"))?;
+    let env = ZarrEnvironment::attach(
+        config.zarr_dir.join("work.zarr"),
+        &[AttachedImage::at(input_zarr)],
+    )?;
+    let mut work = base.work();
+    work.extend(measurements.phase_work());
+    execute_phases(
+        "skimage planned pipeline",
+        &base.workflow,
+        &measurements.decomposition,
+        &Hints::default(),
+        &env,
+        &[],
+        &work,
+    )?;
+    let mut rows = collect_class_a_shapes(&env, &shape_rows, volume, measurements.fixed)?
+        .into_iter()
+        .map(|shape| {
+            let shape = ShapeMeasurements::from_shape(&shape);
+            let centroid = shape.centroid.unwrap_or([f64::NAN; 3]);
+            ObjectRow {
+                label: shape.label,
+                count: shape.count,
+                centroid_y: centroid[1],
+                centroid_x: centroid[2],
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.label);
+    Ok(rows)
 }
 
 fn load_luma(path: &Path) -> Result<Array3<f64>> {
@@ -212,159 +263,6 @@ fn load_luma(path: &Path) -> Result<Array3<f64>> {
         out[[0, y as usize, x as usize]] = f64::from(pixel.0[0]);
     }
     Ok(out)
-}
-
-fn smooth(input: ndarray::ArrayView3<'_, f64>, sigma: f64) -> Result<Array3<f64>> {
-    let gaussian = Gaussian::new([0.0, sigma, sigma], 3.0)?;
-    let mut out = Array3::<f64>::zeros(input.raw_dim());
-    gaussian_smooth_into_with(input, gaussian.kernels(), Boundary::Reflect, out.view_mut())?;
-    Ok(out)
-}
-
-fn transform_if_requested(input: ndarray::ArrayView3<'_, f64>, mode: Mode) -> Array3<f64> {
-    if mode == Mode::Segment {
-        return input.to_owned();
-    }
-    let shape = input.shape();
-    let mut out = Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
-    for z in 0..shape[0] {
-        for y in 0..shape[1] {
-            for x in 0..shape[2] {
-                if y >= 5 && x >= 7 {
-                    out[[z, y, x]] = input[[z, y - 5, x - 7]];
-                }
-            }
-        }
-    }
-    out
-}
-
-fn open3x3(input: &Array3<bool>) -> Array3<bool> {
-    dilate3x3(&erode3x3(input))
-}
-
-fn close3x3(input: &Array3<bool>) -> Array3<bool> {
-    erode3x3(&dilate3x3(input))
-}
-
-fn erode3x3(input: &Array3<bool>) -> Array3<bool> {
-    let shape = input.shape();
-    let mut out = Array3::<bool>::from_elem(input.raw_dim(), false);
-    for z in 0..shape[0] {
-        for y in 0..shape[1] {
-            for x in 0..shape[2] {
-                let mut keep = true;
-                for dy in -1isize..=1 {
-                    for dx in -1isize..=1 {
-                        let yy = y.checked_add_signed(dy);
-                        let xx = x.checked_add_signed(dx);
-                        if yy.is_none_or(|yy| yy >= shape[1])
-                            || xx.is_none_or(|xx| xx >= shape[2])
-                            || !input[[z, yy.unwrap(), xx.unwrap()]]
-                        {
-                            keep = false;
-                        }
-                    }
-                }
-                out[[z, y, x]] = keep;
-            }
-        }
-    }
-    out
-}
-
-fn dilate3x3(input: &Array3<bool>) -> Array3<bool> {
-    let shape = input.shape();
-    let mut out = Array3::<bool>::from_elem(input.raw_dim(), false);
-    for z in 0..shape[0] {
-        for y in 0..shape[1] {
-            for x in 0..shape[2] {
-                let mut keep = false;
-                for dy in -1isize..=1 {
-                    for dx in -1isize..=1 {
-                        let Some(yy) = y.checked_add_signed(dy) else {
-                            continue;
-                        };
-                        let Some(xx) = x.checked_add_signed(dx) else {
-                            continue;
-                        };
-                        if yy < shape[1] && xx < shape[2] && input[[z, yy, xx]] {
-                            keep = true;
-                        }
-                    }
-                }
-                out[[z, y, x]] = keep;
-            }
-        }
-    }
-    out
-}
-
-fn otsu_threshold(values: impl Iterator<Item = f64>) -> f64 {
-    let mut hist = [0u64; 256];
-    let mut total = 0u64;
-    for value in values {
-        if value.is_finite() {
-            let bin = value.round().clamp(0.0, 255.0) as usize;
-            hist[bin] += 1;
-            total += 1;
-        }
-    }
-    if total == 0 {
-        return 0.0;
-    }
-    let sum_total: f64 = hist
-        .iter()
-        .enumerate()
-        .map(|(bin, &count)| bin as f64 * count as f64)
-        .sum();
-    let mut weight_background = 0u64;
-    let mut sum_background = 0.0;
-    let mut best_bin = 0usize;
-    let mut best_variance = f64::NEG_INFINITY;
-    for (bin, &count) in hist.iter().enumerate() {
-        weight_background += count;
-        if weight_background == 0 {
-            continue;
-        }
-        let weight_foreground = total - weight_background;
-        if weight_foreground == 0 {
-            break;
-        }
-        sum_background += bin as f64 * count as f64;
-        let mean_background = sum_background / weight_background as f64;
-        let mean_foreground = (sum_total - sum_background) / weight_foreground as f64;
-        let variance = weight_background as f64
-            * weight_foreground as f64
-            * (mean_background - mean_foreground).powi(2);
-        if variance > best_variance {
-            best_variance = variance;
-            best_bin = bin;
-        }
-    }
-    best_bin as f64
-}
-
-fn measure(labels: ndarray::ArrayView3<'_, u32>) -> Vec<ObjectRow> {
-    let mut tallies = BTreeMap::<u32, (u64, u64, u64)>::new();
-    for ((_, y, x), &label) in labels.indexed_iter() {
-        if label == 0 {
-            continue;
-        }
-        let tally = tallies.entry(label).or_insert((0, 0, 0));
-        tally.0 += 1;
-        tally.1 += y as u64;
-        tally.2 += x as u64;
-    }
-    tallies
-        .into_iter()
-        .map(|(label, (count, sum_y, sum_x))| ObjectRow {
-            label,
-            count,
-            centroid_y: sum_y as f64 / count as f64,
-            centroid_x: sum_x as f64 / count as f64,
-        })
-        .collect()
 }
 
 fn write_objects(rows: &[ObjectRow], path: &Path) -> Result<()> {
@@ -387,7 +285,6 @@ fn write_summary(
     config: &Config,
     objects: usize,
     total_area: u64,
-    threshold: f64,
     load_seconds: f64,
     pipeline_seconds: f64,
     path: &Path,
@@ -397,11 +294,14 @@ fn write_summary(
         "mode": config.mode.as_str(),
         "objects": objects,
         "total_foreground_area": total_area,
-        "threshold": threshold,
+        "threshold_method": "otsu",
         "sigma": config.sigma,
         "min_size": config.min_size,
         "load_seconds": load_seconds,
         "pipeline_seconds": pipeline_seconds,
+        "input_zarr": config.zarr_dir.join("level0"),
+        "chunk_shape": config.chunk,
+        "execution": "planned segmentation over attached Zarr input",
     });
     let text = serde_json::to_string_pretty(&summary)
         .map_err(|err| Error::invalid(format!("skimage-pipeline: encode summary: {err}")))?;
@@ -411,4 +311,23 @@ fn write_summary(
 
 fn write_error(err: std::io::Error) -> Error {
     Error::invalid(format!("skimage-pipeline: write output: {err}"))
+}
+
+fn parse_chunk(raw: &str) -> std::result::Result<[usize; 3], String> {
+    let parts = raw
+        .split(['x', 'X', ',', ':'])
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(format!(
+            "skimage-pipeline: chunk shape {raw:?} must have three dimensions"
+        ));
+    }
+    let mut out = [0usize; 3];
+    for (index, part) in parts.iter().enumerate() {
+        out[index] = part.parse::<usize>().map_err(|err| {
+            format!("skimage-pipeline: could not parse chunk shape {raw:?}: {err}")
+        })?;
+    }
+    Ok(out)
 }

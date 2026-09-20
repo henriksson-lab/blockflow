@@ -13,7 +13,7 @@ run_timed() {
 
 "$script_dir/fetch_fixture.sh" "$count" "$bench/fixtures"
 cargo build -p blockflow-object-3d-measurement --release
-run_timed blockflow "$script_dir/run_blockflow.sh" "$bench/blockflow" "$count" "$bench/fixtures"
+run_timed blockflow "$script_dir/run_blockflow.sh" "$bench/blockflow" "$count" "$bench/fixtures" "$bench/input.zarr"
 run_timed skimage "$script_dir/run_reference.sh" "$bench/skimage" "$count" "$bench/fixtures"
 
 python3 - "$bench/blockflow/summary.json" "$bench/skimage/summary.json" <<'PY'

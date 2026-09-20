@@ -1,12 +1,85 @@
 // SPDX-License-Identifier: MIT
 
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use blockflow::{compare_labels, Error, Result};
+use clap::Parser;
 use ndarray::Array3;
 use serde_json::json;
+
+#[derive(Debug, Parser)]
+#[command(name = "cellprofiler-compare")]
+struct Cli {
+    #[arg(long)]
+    blockflow: PathBuf,
+    #[arg(long)]
+    reference: PathBuf,
+    #[arg(long)]
+    blockflow_labels: Option<PathBuf>,
+    #[arg(long)]
+    reference_labels: Option<PathBuf>,
+    #[arg(long, default_value = "cellprofiler-comparison.json")]
+    out: PathBuf,
+    #[arg(long, default_value_t = 5.0)]
+    max_centroid_distance: f64,
+    #[arg(long, default_value_t = 0.20)]
+    max_area_relative_error: f64,
+    #[arg(long, default_value_t = 0.20)]
+    max_mean_intensity_relative_error: f64,
+    #[arg(long, default_value_t = 0.5)]
+    min_label_overlap: f64,
+    #[arg(long, default_value_t = 0.5)]
+    min_mean_label_iou: f64,
+    #[arg(long)]
+    blockflow_area: Option<String>,
+    #[arg(long)]
+    blockflow_centroid_z: Option<String>,
+    #[arg(long)]
+    blockflow_centroid_y: Option<String>,
+    #[arg(long)]
+    blockflow_centroid_x: Option<String>,
+    #[arg(long)]
+    blockflow_mean_intensity: Option<String>,
+    #[arg(long)]
+    blockflow_integrated_intensity: Option<String>,
+    #[arg(long)]
+    blockflow_bbox_min_z: Option<String>,
+    #[arg(long)]
+    blockflow_bbox_min_y: Option<String>,
+    #[arg(long)]
+    blockflow_bbox_min_x: Option<String>,
+    #[arg(long)]
+    blockflow_bbox_max_z: Option<String>,
+    #[arg(long)]
+    blockflow_bbox_max_y: Option<String>,
+    #[arg(long)]
+    blockflow_bbox_max_x: Option<String>,
+    #[arg(long)]
+    reference_area: Option<String>,
+    #[arg(long)]
+    reference_centroid_z: Option<String>,
+    #[arg(long)]
+    reference_centroid_y: Option<String>,
+    #[arg(long)]
+    reference_centroid_x: Option<String>,
+    #[arg(long)]
+    reference_mean_intensity: Option<String>,
+    #[arg(long)]
+    reference_integrated_intensity: Option<String>,
+    #[arg(long)]
+    reference_bbox_min_z: Option<String>,
+    #[arg(long)]
+    reference_bbox_min_y: Option<String>,
+    #[arg(long)]
+    reference_bbox_min_x: Option<String>,
+    #[arg(long)]
+    reference_bbox_max_z: Option<String>,
+    #[arg(long)]
+    reference_bbox_max_y: Option<String>,
+    #[arg(long)]
+    reference_bbox_max_x: Option<String>,
+}
 
 #[derive(Debug)]
 struct Config {
@@ -26,142 +99,94 @@ struct Config {
 
 impl Config {
     fn parse() -> Result<Self> {
-        let mut blockflow = None;
-        let mut reference = None;
-        let mut blockflow_labels = None;
-        let mut reference_labels = None;
-        let mut out = PathBuf::from("cellprofiler-comparison.json");
-        let mut max_centroid_distance = 5.0;
-        let mut max_area_relative_error = 0.20;
-        let mut max_mean_intensity_relative_error = 0.20;
-        let mut min_label_overlap = 0.5;
-        let mut min_mean_label_iou = 0.5;
+        let cli = Cli::parse();
         let mut blockflow_columns = ColumnConfig::blockflow_defaults();
         let mut reference_columns = ColumnConfig::cellprofiler_defaults();
 
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--blockflow" => blockflow = Some(path_arg(&mut args, "--blockflow")?),
-                "--reference" => reference = Some(path_arg(&mut args, "--reference")?),
-                "--blockflow-labels" => {
-                    blockflow_labels = Some(path_arg(&mut args, "--blockflow-labels")?);
-                }
-                "--reference-labels" => {
-                    reference_labels = Some(path_arg(&mut args, "--reference-labels")?);
-                }
-                "--out" => out = path_arg(&mut args, "--out")?,
-                "--max-centroid-distance" => {
-                    max_centroid_distance = parse_arg(&mut args, "--max-centroid-distance")?;
-                }
-                "--max-area-relative-error" => {
-                    max_area_relative_error = parse_arg(&mut args, "--max-area-relative-error")?;
-                }
-                "--max-mean-intensity-relative-error" => {
-                    max_mean_intensity_relative_error =
-                        parse_arg(&mut args, "--max-mean-intensity-relative-error")?;
-                }
-                "--min-label-overlap" => {
-                    min_label_overlap = parse_arg(&mut args, "--min-label-overlap")?;
-                }
-                "--min-mean-label-iou" => {
-                    min_mean_label_iou = parse_arg(&mut args, "--min-mean-label-iou")?;
-                }
-                "--blockflow-area" => blockflow_columns.area = Some(next_arg(&mut args, &arg)?),
-                "--blockflow-centroid-z" => {
-                    blockflow_columns.centroid_z = Some(next_arg(&mut args, &arg)?);
-                }
-                "--blockflow-centroid-y" => {
-                    blockflow_columns.centroid_y = Some(next_arg(&mut args, &arg)?);
-                }
-                "--blockflow-centroid-x" => {
-                    blockflow_columns.centroid_x = Some(next_arg(&mut args, &arg)?);
-                }
-                "--blockflow-mean-intensity" => {
-                    blockflow_columns.mean_intensity = Some(next_arg(&mut args, &arg)?);
-                }
-                "--blockflow-integrated-intensity" => {
-                    blockflow_columns.integrated_intensity = Some(next_arg(&mut args, &arg)?);
-                }
-                "--blockflow-bbox-min-z" => {
-                    blockflow_columns.bbox_min_z = Some(next_arg(&mut args, &arg)?);
-                }
-                "--blockflow-bbox-min-y" => {
-                    blockflow_columns.bbox_min_y = Some(next_arg(&mut args, &arg)?);
-                }
-                "--blockflow-bbox-min-x" => {
-                    blockflow_columns.bbox_min_x = Some(next_arg(&mut args, &arg)?);
-                }
-                "--blockflow-bbox-max-z" => {
-                    blockflow_columns.bbox_max_z = Some(next_arg(&mut args, &arg)?);
-                }
-                "--blockflow-bbox-max-y" => {
-                    blockflow_columns.bbox_max_y = Some(next_arg(&mut args, &arg)?);
-                }
-                "--blockflow-bbox-max-x" => {
-                    blockflow_columns.bbox_max_x = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-area" => reference_columns.area = Some(next_arg(&mut args, &arg)?),
-                "--reference-centroid-z" => {
-                    reference_columns.centroid_z = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-centroid-y" => {
-                    reference_columns.centroid_y = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-centroid-x" => {
-                    reference_columns.centroid_x = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-mean-intensity" => {
-                    reference_columns.mean_intensity = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-integrated-intensity" => {
-                    reference_columns.integrated_intensity = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-bbox-min-z" => {
-                    reference_columns.bbox_min_z = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-bbox-min-y" => {
-                    reference_columns.bbox_min_y = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-bbox-min-x" => {
-                    reference_columns.bbox_min_x = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-bbox-max-z" => {
-                    reference_columns.bbox_max_z = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-bbox-max-y" => {
-                    reference_columns.bbox_max_y = Some(next_arg(&mut args, &arg)?);
-                }
-                "--reference-bbox-max-x" => {
-                    reference_columns.bbox_max_x = Some(next_arg(&mut args, &arg)?);
-                }
-                "--help" | "-h" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(Error::invalid(format!(
-                        "cellprofiler-compare: unknown argument {other:?}; use --help"
-                    )));
-                }
-            }
+        if let Some(value) = cli.blockflow_area {
+            blockflow_columns.area = Some(value);
+        }
+        if let Some(value) = cli.blockflow_centroid_z {
+            blockflow_columns.centroid_z = Some(value);
+        }
+        if let Some(value) = cli.blockflow_centroid_y {
+            blockflow_columns.centroid_y = Some(value);
+        }
+        if let Some(value) = cli.blockflow_centroid_x {
+            blockflow_columns.centroid_x = Some(value);
+        }
+        if let Some(value) = cli.blockflow_mean_intensity {
+            blockflow_columns.mean_intensity = Some(value);
+        }
+        if let Some(value) = cli.blockflow_integrated_intensity {
+            blockflow_columns.integrated_intensity = Some(value);
+        }
+        if let Some(value) = cli.blockflow_bbox_min_z {
+            blockflow_columns.bbox_min_z = Some(value);
+        }
+        if let Some(value) = cli.blockflow_bbox_min_y {
+            blockflow_columns.bbox_min_y = Some(value);
+        }
+        if let Some(value) = cli.blockflow_bbox_min_x {
+            blockflow_columns.bbox_min_x = Some(value);
+        }
+        if let Some(value) = cli.blockflow_bbox_max_z {
+            blockflow_columns.bbox_max_z = Some(value);
+        }
+        if let Some(value) = cli.blockflow_bbox_max_y {
+            blockflow_columns.bbox_max_y = Some(value);
+        }
+        if let Some(value) = cli.blockflow_bbox_max_x {
+            blockflow_columns.bbox_max_x = Some(value);
+        }
+        if let Some(value) = cli.reference_area {
+            reference_columns.area = Some(value);
+        }
+        if let Some(value) = cli.reference_centroid_z {
+            reference_columns.centroid_z = Some(value);
+        }
+        if let Some(value) = cli.reference_centroid_y {
+            reference_columns.centroid_y = Some(value);
+        }
+        if let Some(value) = cli.reference_centroid_x {
+            reference_columns.centroid_x = Some(value);
+        }
+        if let Some(value) = cli.reference_mean_intensity {
+            reference_columns.mean_intensity = Some(value);
+        }
+        if let Some(value) = cli.reference_integrated_intensity {
+            reference_columns.integrated_intensity = Some(value);
+        }
+        if let Some(value) = cli.reference_bbox_min_z {
+            reference_columns.bbox_min_z = Some(value);
+        }
+        if let Some(value) = cli.reference_bbox_min_y {
+            reference_columns.bbox_min_y = Some(value);
+        }
+        if let Some(value) = cli.reference_bbox_min_x {
+            reference_columns.bbox_min_x = Some(value);
+        }
+        if let Some(value) = cli.reference_bbox_max_z {
+            reference_columns.bbox_max_z = Some(value);
+        }
+        if let Some(value) = cli.reference_bbox_max_y {
+            reference_columns.bbox_max_y = Some(value);
+        }
+        if let Some(value) = cli.reference_bbox_max_x {
+            reference_columns.bbox_max_x = Some(value);
         }
 
         Ok(Self {
-            blockflow: blockflow.ok_or_else(|| {
-                Error::invalid("cellprofiler-compare: missing required --blockflow CSV")
-            })?,
-            reference: reference.ok_or_else(|| {
-                Error::invalid("cellprofiler-compare: missing required --reference CSV")
-            })?,
-            blockflow_labels,
-            reference_labels,
-            out,
-            max_centroid_distance,
-            max_area_relative_error,
-            max_mean_intensity_relative_error,
-            min_label_overlap,
-            min_mean_label_iou,
+            blockflow: cli.blockflow,
+            reference: cli.reference,
+            blockflow_labels: cli.blockflow_labels,
+            reference_labels: cli.reference_labels,
+            out: cli.out,
+            max_centroid_distance: cli.max_centroid_distance,
+            max_area_relative_error: cli.max_area_relative_error,
+            max_mean_intensity_relative_error: cli.max_mean_intensity_relative_error,
+            min_label_overlap: cli.min_label_overlap,
+            min_mean_label_iou: cli.min_mean_label_iou,
             blockflow_columns,
             reference_columns,
         })
@@ -400,28 +425,6 @@ fn run() -> Result<()> {
         config.out.display()
     );
     Ok(())
-}
-
-fn print_help() {
-    println!(
-        "cellprofiler-compare --blockflow objects.csv --reference CellProfiler.csv [--out report.json]\n\
-         \n\
-         Compares semantic object measurements without requiring CellProfiler-compatible\n\
-         column names. Objects are greedily matched by centroid distance, then count,\n\
-         area, centroid and intensity deltas are reported.\n\
-         \n\
-         Defaults:\n\
-           Blockflow area=count, centroid_z/y/x, intensity_mean, intensity_sum\n\
-           Reference area=AreaShape_Area, centroid_y/x=Location_Center_Y/X\n\
-         \n\
-         Use --reference-mean-intensity and --reference-integrated-intensity to name\n\
-         CellProfiler intensity columns for the chosen channel.\n\
-         \n\
-         Use --blockflow-labels labels.png --reference-labels reference_labels.png to\n\
-         add foreground Dice/Jaccard plus overlap-based split/merge/miss/spurious\n\
-         label agreement. Label images must be grayscale integer images with 0 as\n\
-         background."
-    );
 }
 
 #[derive(Debug)]
@@ -1011,28 +1014,6 @@ fn mean(values: impl Iterator<Item = f64>) -> Option<f64> {
         sum += value;
     }
     (count != 0).then_some(sum / count as f64)
-}
-
-fn path_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from(next_arg(args, name)?))
-}
-
-fn parse_arg<T>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    let raw = next_arg(args, name)?;
-    raw.parse::<T>().map_err(|err| {
-        Error::invalid(format!(
-            "cellprofiler-compare: could not parse {name} value {raw:?}: {err}"
-        ))
-    })
-}
-
-fn next_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
-    args.next()
-        .ok_or_else(|| Error::invalid(format!("cellprofiler-compare: {name} needs a value")))
 }
 
 #[cfg(test)]

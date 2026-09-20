@@ -1,23 +1,45 @@
 // SPDX-License-Identifier: MIT
 
-use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use blockflow::{Error, Result};
+use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::dtype::Dtype;
+use blockflow::env::Environment;
+use blockflow::geometry::BlockGrid;
+use blockflow::op::Chain;
+use blockflow::ops::VoxelwiseMaskOp;
+use blockflow::region::Region;
+use blockflow::strategy::{execute_phases, Hints};
+use blockflow::voxels::Voxels;
+use blockflow::zarr_env::ZarrEnvironment;
+use blockflow::{AttachedImage, Error, Result};
+use clap::Parser;
 use ndarray::Array3;
 use serde_json::json;
 
 const HEIGHT: usize = 96;
 const WIDTH: usize = 144;
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(
+    name = "wound-assay",
+    about = "Measures scratch-assay images and reports open wound area."
+)]
 struct Config {
+    #[arg(long, default_value = ".tmp/wound-assay/blockflow")]
     out: PathBuf,
+    #[arg(long, default_value_t = 10)]
     images: usize,
+    #[arg(long, default_value_t = 100.0)]
     threshold: f64,
+    #[arg(long)]
     fixture_dir: Option<PathBuf>,
+    #[arg(long, default_value = ".tmp/wound-assay/input.zarr")]
+    zarr_dir: PathBuf,
+    #[arg(long, value_parser = parse_chunk, default_value = "1x32x32")]
+    chunk: [usize; 3],
 }
 
 #[derive(Debug)]
@@ -53,7 +75,9 @@ fn run() -> Result<()> {
         } else {
             synthetic_image(image)
         };
-        let (row, image_profile) = measure_image(image, input.view(), config.threshold)?;
+        let input_zarr = ensure_wound_zarr(&config, image, input)?;
+        let mask = planned_open_mask(&input_zarr, config.threshold, config.chunk)?;
+        let (row, image_profile) = measure_mask(image, mask.view())?;
         total_open += row.open_area;
         for (dst, count) in profile.iter_mut().zip(image_profile) {
             *dst += count;
@@ -76,71 +100,76 @@ fn run() -> Result<()> {
 
 impl Config {
     fn parse() -> Result<Self> {
-        let mut out = PathBuf::from(".tmp/wound-assay/blockflow");
-        let mut images = 10usize;
-        let mut threshold = 100.0f64;
-        let mut fixture_dir = None;
+        let config = <Self as Parser>::parse();
 
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--out" => out = path_arg(&mut args, "--out")?,
-                "--images" => images = parse_arg(&mut args, "--images")?,
-                "--threshold" => threshold = parse_arg(&mut args, "--threshold")?,
-                "--fixture-dir" => fixture_dir = Some(path_arg(&mut args, "--fixture-dir")?),
-                "--help" | "-h" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(Error::invalid(format!(
-                        "wound-assay: unknown argument {other:?}; use --help"
-                    )));
-                }
-            }
-        }
-
-        if images == 0 {
+        if config.images == 0 {
             return Err(Error::invalid("wound-assay: --images must be at least 1"));
         }
-        if !threshold.is_finite() {
+        if !config.threshold.is_finite() {
             return Err(Error::invalid("wound-assay: --threshold must be finite"));
         }
+        if config.chunk.contains(&0) {
+            return Err(Error::invalid(
+                "wound-assay: --chunk dimensions must be positive",
+            ));
+        }
 
-        Ok(Self {
-            out,
-            images,
-            threshold,
-            fixture_dir,
-        })
+        Ok(config)
     }
 }
 
-fn path_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
-    args.next()
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::invalid(format!("wound-assay: {name} needs a path")))
+struct WoundZarr {
+    image: PathBuf,
+    work: PathBuf,
 }
 
-fn parse_arg<T: std::str::FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    let raw = args
-        .next()
-        .ok_or_else(|| Error::invalid(format!("wound-assay: {name} needs a value")))?;
-    raw.parse::<T>().map_err(|err| {
-        Error::invalid(format!(
-            "wound-assay: could not parse {name} value {raw:?}: {err}"
-        ))
+fn ensure_wound_zarr(config: &Config, image: usize, input: Array3<f64>) -> Result<WoundZarr> {
+    let root = config.zarr_dir.join(format!("image-{image:03}"));
+    let store = root.join("image.zarr");
+    let path = store.join("level0");
+    if path.join("zarr.json").exists() {
+        let (dtype, volume) = AttachedImage::at(&path).metadata()?;
+        if dtype != Dtype::F64 || volume != [1, HEIGHT, WIDTH] {
+            return Err(Error::invalid(format!(
+                "wound-assay: prepared store {} is {dtype:?} {volume:?}, expected F64 {:?}",
+                path.display(),
+                [1, HEIGHT, WIDTH]
+            )));
+        }
+    } else {
+        let voxels: Voxels = input.into();
+        ZarrEnvironment::create(&store, &voxels, config.chunk)?;
+    }
+    Ok(WoundZarr {
+        image: path,
+        work: root.join("work.zarr"),
     })
 }
 
-fn print_help() {
-    println!(
-        "wound-assay --out DIR [--images 10] [--threshold 100] [--fixture-dir DIR]\n\
-         Measures scratch-assay images and reports open wound area."
-    );
+fn planned_open_mask(input: &WoundZarr, threshold: f64, chunk: [usize; 3]) -> Result<Array3<bool>> {
+    let (_, volume) = AttachedImage::at(&input.image).metadata()?;
+    let grid = BlockGrid::new(volume, chunk)?;
+    let mut builder = PlanBuilder::new(volume, Dtype::F64, grid);
+    builder.pixels(Chain::op(VoxelwiseMaskOp::new(
+        "wound-open-mask",
+        move |value| value < threshold,
+    )))?;
+    let base = builder.finish()?;
+    let mask_image = ImageId::from(base.n_phases());
+    let env = ZarrEnvironment::attach(&input.work, &[AttachedImage::at(&input.image)])?;
+    let mut hints = Hints::default();
+    hints.keep_images.insert(mask_image);
+    execute_phases(
+        "wound-assay planned open mask",
+        &base.workflow,
+        &base.decomposition,
+        &hints,
+        &env,
+        &[],
+        &base.work(),
+    )?;
+    let block = env.read(mask_image.index(), &Region::whole(&volume))?;
+    block.as_array()?.view::<bool>().map(|view| view.to_owned())
 }
 
 fn synthetic_image(image: usize) -> Array3<f64> {
@@ -170,7 +199,7 @@ fn wound_bounds(image: usize, y: usize) -> (usize, usize) {
     )
 }
 
-fn image_from_fixture(dir: &PathBuf, image: usize) -> Result<Array3<f64>> {
+fn image_from_fixture(dir: &Path, image: usize) -> Result<Array3<f64>> {
     let path = dir.join(format!("wound-{image:03}.pgm"));
     let file = File::open(&path).map_err(|err| {
         Error::invalid(format!(
@@ -211,7 +240,7 @@ fn image_from_fixture(dir: &PathBuf, image: usize) -> Result<Array3<f64>> {
     Ok(out)
 }
 
-fn read_pgm_token(reader: &mut BufReader<File>, path: &PathBuf) -> Result<String> {
+fn read_pgm_token(reader: &mut BufReader<File>, path: &Path) -> Result<String> {
     let mut token = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -259,7 +288,7 @@ fn read_pgm_token(reader: &mut BufReader<File>, path: &PathBuf) -> Result<String
 fn parse_pgm_token<T: std::str::FromStr>(
     reader: &mut BufReader<File>,
     name: &str,
-    path: &PathBuf,
+    path: &Path,
 ) -> Result<T>
 where
     T::Err: std::fmt::Display,
@@ -273,19 +302,15 @@ where
     })
 }
 
-fn measure_image(
-    image: usize,
-    input: ndarray::ArrayView3<'_, f64>,
-    threshold: f64,
-) -> Result<(ImageRow, Vec<u64>)> {
-    if input.shape() != [1, HEIGHT, WIDTH] {
-        return Err(Error::invalid("wound-assay: unexpected fixture shape"));
+fn measure_mask(image: usize, mask: ndarray::ArrayView3<'_, bool>) -> Result<(ImageRow, Vec<u64>)> {
+    if mask.shape() != [1, HEIGHT, WIDTH] {
+        return Err(Error::invalid("wound-assay: unexpected mask shape"));
     }
     let mut open_area = 0u64;
     let mut profile = vec![0u64; WIDTH];
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
-            if input[[0, y, x]] < threshold {
+            if mask[[0, y, x]] {
                 open_area += 1;
                 profile[x] += 1;
             }
@@ -337,8 +362,11 @@ fn write_summary(config: &Config, open_area: u64, path: &PathBuf) -> Result<()> 
         "covered_area": total - open_area,
         "height": HEIGHT,
         "images": config.images,
+        "input_zarr_dir": config.zarr_dir.display().to_string(),
         "open_area": open_area,
         "open_fraction": open_area as f64 / total as f64,
+        "chunk_shape": config.chunk,
+        "execution": "planned fixed-threshold open mask over attached Zarr inputs",
         "threshold": config.threshold,
         "width": WIDTH,
     });
@@ -351,4 +379,23 @@ fn write_summary(config: &Config, open_area: u64, path: &PathBuf) -> Result<()> 
 
 fn write_error(err: std::io::Error) -> Error {
     Error::invalid(format!("wound-assay: write output: {err}"))
+}
+
+fn parse_chunk(raw: &str) -> std::result::Result<[usize; 3], String> {
+    let parts = raw
+        .split(['x', 'X', ',', ':'])
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(format!(
+            "wound-assay: chunk shape {raw:?} must have three dimensions"
+        ));
+    }
+    let mut out = [0usize; 3];
+    for (index, part) in parts.iter().enumerate() {
+        out[index] = part
+            .parse::<usize>()
+            .map_err(|err| format!("wound-assay: could not parse chunk shape {raw:?}: {err}"))?;
+    }
+    Ok(out)
 }

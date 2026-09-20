@@ -6,8 +6,8 @@ usage() {
 Usage:
   examples/cellprofiler-human/scripts/run_cellprofiler_benchmark.sh IMAGE OUTPUT_DIR [REFERENCE_OBJECT_CSV]
 
-Runs the Blockflow CellProfiler-style benchmark binary and, when a reference
-object CSV is supplied, runs semantic table comparison against it.
+Runs the planned Blockflow CellProfiler-style benchmark path and, when a
+reference object CSV is supplied, runs semantic table comparison against it.
 
 Environment variables:
   CARGO_BIN_FLAGS   Extra cargo flags before "--", for example "--release".
@@ -22,14 +22,14 @@ Environment variables:
   BF_DECLUMP_METHOD Declump watershed source, intensity or distance, default intensity.
   BF_ADJACENT_BASINS Set to 1 to let watershed basins touch instead of carving lines.
   BF_NO_FILL_HOLES_AFTER_DECLUMPING Set to 1 to skip post-declump hole filling.
-  BF_MERGE_LINE_BASIN_PIXELS Merge resident labels separated by at least this many watershed-line pixels, default 0.
+  BF_MERGE_LINE_BASIN_PIXELS Merge planned labels separated by at least this many watershed-line pixels, default 0.
   BF_MERGE_LINE_MAX_SADDLE_DROP Optional maximum weak-boundary-minus-line mean for line merges.
-  BF_WORKERS       Requested worker count metadata for sweep reports.
-  BF_CHUNK_SHAPE   Requested chunk shape metadata, for example 1x256x256.
-  BF_CACHE_BYTES   Requested cache budget metadata in bytes.
+  BF_WORKERS       Planned worker count, default 1.
+  BF_CHUNK_SHAPE   Planned chunk shape, for example 1x256x256.
+  BF_CACHE_BYTES   Planned cache budget in bytes.
   BF_DISTANCE_BLOCK Distance-transform block edge for the planned simulator probe, default 256.
-  BF_ENABLE_PLAN_PROBE Set to 0 to skip planned simulator probing.
-  BF_ENABLE_PLAN_MATERIALIZATION Set to 0 to skip planned object CSV materialization.
+  BF_INPUT_ZARR    Prepared rank-3 Zarr input array or store. Defaults to OUTPUT_DIR/input.zarr.
+  BF_ENABLE_RESIDENT_REFERENCE Set to 1 to also run the old resident reference binary.
   BF_PLAN_MATERIALIZATION_REPEATS Repeat planned materialization timing, default 1.
   BF_REFERENCE_SUMMARY Optional CellProfiler reference-summary.json.
   BF_REFERENCE_LABELS Optional grayscale/integer reference label image.
@@ -93,12 +93,12 @@ workers="${BF_WORKERS:-1}"
 chunk_shape="${BF_CHUNK_SHAPE:-1x256x256}"
 cache_bytes="${BF_CACHE_BYTES:-0}"
 distance_block="${BF_DISTANCE_BLOCK:-256}"
-enable_plan_probe="${BF_ENABLE_PLAN_PROBE:-1}"
-enable_plan_materialization="${BF_ENABLE_PLAN_MATERIALIZATION:-1}"
+enable_resident_reference="${BF_ENABLE_RESIDENT_REFERENCE:-0}"
 plan_materialization_repeats="${BF_PLAN_MATERIALIZATION_REPEATS:-1}"
 reference_summary="${BF_REFERENCE_SUMMARY:-}"
 reference_labels="${BF_REFERENCE_LABELS:-}"
-planned_objects_csv="$output_dir/planned/planned_objects.csv"
+planned_objects_csv="$output_dir/blockflow/planned_objects.csv"
+input_zarr_store="${BF_INPUT_ZARR:-$output_dir/input.zarr}"
 
 size_args=(--min-size "$min_size")
 if [[ "${BF_NO_MAX_SIZE:-}" == "1" ]]; then
@@ -134,108 +134,90 @@ fi
 
 {
   printf 'blockflow_command='
-  printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
-    --input "$image" --out "$output_dir/blockflow" "${size_args[@]}" --sigma "$sigma" \
-    --declump-sigma "$declump_sigma" --threshold-method "$threshold_method" --threshold-bins "$threshold_bins" \
-    --seed-min-distance "$seed_min_distance" --maxima-downsample "$maxima_downsample" \
-    --declump-method "$declump_method" \
-    "${basin_args[@]}" "${hole_args[@]}" "${merge_args[@]}"
-  printf '\n'
-} > "$output_dir/benchmark-command.txt"
-
-cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
-  --input "$image" \
-  --out "$output_dir/blockflow" \
-  "${size_args[@]}" \
-  --sigma "$sigma" \
-  --declump-sigma "$declump_sigma" \
-  --threshold-method "$threshold_method" \
-  --threshold-bins "$threshold_bins" \
-  --seed-min-distance "$seed_min_distance" \
-  --maxima-downsample "$maxima_downsample" \
-  --declump-method "$declump_method" \
-  "${basin_args[@]}" \
-  "${hole_args[@]}" \
-  "${merge_args[@]}"
-
-if [[ "$enable_plan_probe" != "0" ]]; then
-  plan_materialize_args=()
-  if [[ "$enable_plan_materialization" != "0" ]]; then
-    plan_materialize_args=(--materialize-objects "$output_dir/planned")
-  fi
-  {
-    printf 'plan_probe_command='
-    printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
-      --input "$image" --out "$output_dir/plan-probe.json" --chunk "$chunk_shape" \
-      --workers "$workers" --cache-bytes "$cache_bytes" --sigma "$sigma" \
-      --threshold-method "$threshold_method" --threshold-bins "$threshold_bins" \
-      "${plan_size_args[@]}" --seed-min-distance "$seed_min_distance" \
-      --maxima-downsample "$maxima_downsample" \
-      --declump-method "$declump_method" \
-      "${merge_args[@]}" \
-      --distance-block "$distance_block" \
-      --materialize-repeats "$plan_materialization_repeats" \
-      "${plan_materialize_args[@]}"
-    printf '\n'
-  } >> "$output_dir/benchmark-command.txt"
-
-  cargo run -p blockflow-cellprofiler-human --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
-    --input "$image" \
-    --out "$output_dir/plan-probe.json" \
-    --chunk "$chunk_shape" \
-    --workers "$workers" \
-    --cache-bytes "$cache_bytes" \
-    --sigma "$sigma" \
-    --threshold-method "$threshold_method" \
-    --threshold-bins "$threshold_bins" \
-    "${plan_size_args[@]}" \
-    --seed-min-distance "$seed_min_distance" \
+  printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
+    --input "$image" --ensure-input-zarr "$input_zarr_store" \
+    --out "$output_dir/plan-probe.json" --chunk "$chunk_shape" \
+    --workers "$workers" --cache-bytes "$cache_bytes" --sigma "$sigma" \
+    --threshold-method "$threshold_method" --threshold-bins "$threshold_bins" \
+    "${plan_size_args[@]}" --seed-min-distance "$seed_min_distance" \
     --maxima-downsample "$maxima_downsample" \
     --declump-method "$declump_method" \
     "${merge_args[@]}" \
     --distance-block "$distance_block" \
     --materialize-repeats "$plan_materialization_repeats" \
-    "${plan_materialize_args[@]}"
+    --materialize-objects "$output_dir/blockflow"
+  printf '\n'
+} > "$output_dir/benchmark-command.txt"
+
+cargo run -p blockflow-cellprofiler-human --bin cellprofiler-plan-probe "${cargo_bin_flags[@]}" -- \
+  --input "$image" \
+  --ensure-input-zarr "$input_zarr_store" \
+  --out "$output_dir/plan-probe.json" \
+  --chunk "$chunk_shape" \
+  --workers "$workers" \
+  --cache-bytes "$cache_bytes" \
+  --sigma "$sigma" \
+  --threshold-method "$threshold_method" \
+  --threshold-bins "$threshold_bins" \
+  "${plan_size_args[@]}" \
+  --seed-min-distance "$seed_min_distance" \
+  --maxima-downsample "$maxima_downsample" \
+  --declump-method "$declump_method" \
+  "${merge_args[@]}" \
+  --distance-block "$distance_block" \
+  --materialize-repeats "$plan_materialization_repeats" \
+  --materialize-objects "$output_dir/blockflow"
+
+if [[ "$enable_resident_reference" == "1" ]]; then
+  {
+    printf 'resident_reference_command='
+    printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
+      --input "$image" --out "$output_dir/resident" "${size_args[@]}" --sigma "$sigma" \
+      --declump-sigma "$declump_sigma" --threshold-method "$threshold_method" --threshold-bins "$threshold_bins" \
+      --seed-min-distance "$seed_min_distance" --maxima-downsample "$maxima_downsample" \
+      --declump-method "$declump_method" \
+      "${basin_args[@]}" "${hole_args[@]}" "${merge_args[@]}"
+    printf '\n'
+  } >> "$output_dir/benchmark-command.txt"
+
+  cargo run -p blockflow-cellprofiler-human --bin cellprofiler-human "${cargo_bin_flags[@]}" -- \
+    --input "$image" \
+    --out "$output_dir/resident" \
+    "${size_args[@]}" \
+    --sigma "$sigma" \
+    --declump-sigma "$declump_sigma" \
+    --threshold-method "$threshold_method" \
+    --threshold-bins "$threshold_bins" \
+    --seed-min-distance "$seed_min_distance" \
+    --maxima-downsample "$maxima_downsample" \
+    --declump-method "$declump_method" \
+    "${basin_args[@]}" \
+    "${hole_args[@]}" \
+    "${merge_args[@]}"
 fi
 
 if [[ -n "$reference_csv" ]]; then
   {
     printf 'compare_command='
     printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
-      --blockflow "$output_dir/blockflow/objects.csv" --reference "$reference_csv" \
+      --blockflow "$planned_objects_csv" --reference "$reference_csv" \
       --out "$output_dir/comparison.json" "${label_args[@]}" "${compare_args[@]}"
     printf '\n'
   } >> "$output_dir/benchmark-command.txt"
 
   cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
-    --blockflow "$output_dir/blockflow/objects.csv" \
+    --blockflow "$planned_objects_csv" \
     --reference "$reference_csv" \
     --out "$output_dir/comparison.json" \
     "${label_args[@]}" \
     "${compare_args[@]}"
-
-  if [[ "$enable_plan_probe" != "0" && "$enable_plan_materialization" != "0" && -f "$planned_objects_csv" ]]; then
-    {
-      printf 'planned_compare_command='
-      printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
-        --blockflow "$planned_objects_csv" --reference "$reference_csv" \
-        --out "$output_dir/planned-comparison.json" "${compare_args[@]}"
-      printf '\n'
-    } >> "$output_dir/benchmark-command.txt"
-
-    cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
-      --blockflow "$planned_objects_csv" \
-      --reference "$reference_csv" \
-      --out "$output_dir/planned-comparison.json" \
-      "${compare_args[@]}"
-  fi
 fi
 
-if [[ "$enable_plan_probe" != "0" && "$enable_plan_materialization" != "0" && -f "$planned_objects_csv" && -f "$output_dir/blockflow/objects.csv" ]]; then
+if [[ "$enable_resident_reference" == "1" && -f "$planned_objects_csv" && -f "$output_dir/resident/objects.csv" ]]; then
   {
     printf 'planned_resident_compare_command='
     printf '%q ' cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
-      --blockflow "$planned_objects_csv" --reference "$output_dir/blockflow/objects.csv" \
+      --blockflow "$planned_objects_csv" --reference "$output_dir/resident/objects.csv" \
       --out "$output_dir/planned-resident-comparison.json" \
       --reference-area count --reference-centroid-z centroid_z --reference-centroid-y centroid_y \
       --reference-centroid-x centroid_x --reference-mean-intensity intensity_mean \
@@ -248,7 +230,7 @@ if [[ "$enable_plan_probe" != "0" && "$enable_plan_materialization" != "0" && -f
 
   cargo run -p blockflow-cellprofiler-human --bin cellprofiler-compare "${cargo_bin_flags[@]}" -- \
     --blockflow "$planned_objects_csv" \
-    --reference "$output_dir/blockflow/objects.csv" \
+    --reference "$output_dir/resident/objects.csv" \
     --out "$output_dir/planned-resident-comparison.json" \
     --reference-area count \
     --reference-centroid-z centroid_z \
@@ -284,23 +266,21 @@ def read_json(path):
             return json.load(handle)
     return None
 
-blockflow = read_json(out_dir / "blockflow" / "summary.json")
+blockflow = read_json(out_dir / "blockflow" / "planned-summary.json")
 comparison = read_json(out_dir / "comparison.json")
 plan_probe = read_json(out_dir / "plan-probe.json")
-planned_comparison = read_json(out_dir / "planned-comparison.json")
 planned_resident_comparison = read_json(out_dir / "planned-resident-comparison.json")
 reference = read_json(reference_summary_path) if reference_summary_path else None
-hole_filling = None if blockflow is None else blockflow.get("fill_holes_after_declumping")
-declump_method = None if blockflow is None else blockflow.get("declump_method")
 plan_materialized = None if plan_probe is None else plan_probe.get("materialized_outputs")
+input_zarr = None if plan_probe is None else plan_probe.get("input_zarr")
 planner_missing = []
 if plan_probe is not None and not plan_materialized:
-    planner_missing.append("planned object CSV/table materialization")
+    planner_missing.append("object CSV/table materialization")
 elif (
     plan_materialized is not None
     and (plan_materialized.get("objects") or 0) == 0
 ):
-    planner_missing.append("validated non-empty planned object CSV/table materialization")
+    planner_missing.append("validated non-empty object CSV/table materialization")
 requested_execution = {
     "workers": requested_workers,
     "chunk_shape": requested_chunk_shape,
@@ -309,41 +289,39 @@ requested_execution = {
 
 report = {
     "blockflow": blockflow,
+    "input_zarr": input_zarr,
     "cellprofiler_reference": reference,
     "comparison": comparison,
-    "planned_comparison": planned_comparison,
     "planned_resident_comparison": planned_resident_comparison,
     "execution_config": {
         "requested": requested_execution,
-        "resident_maxima_downsample": maxima_downsample,
-        "resident_merge_line_basin_pixels": merge_line_basin_pixels,
-        "resident_merge_line_max_saddle_drop": merge_line_max_saddle_drop,
+        "maxima_downsample": maxima_downsample,
+        "merge_line_basin_pixels": merge_line_basin_pixels,
+        "merge_line_max_saddle_drop": merge_line_max_saddle_drop,
         "applied": {
-            "workers": "resident",
-            "chunk_shape": "whole_image",
-            "cache_bytes": "none",
+            "workers": requested_workers,
+            "chunk_shape": requested_chunk_shape,
+            "cache_bytes": requested_cache_bytes,
         },
-        "applies_requested_execution_config": False,
-        "planned_probe_applies_requested_execution_config": plan_probe is not None,
-        "planned_prefix_applies_requested_execution_config": plan_probe is not None,
-        "reason": "cellprofiler-human currently runs resident kernels directly; worker, chunk and cache settings are recorded for sweeps but not applied to execution yet",
+        "applies_requested_execution_config": plan_probe is not None,
+        "reason": "the Blockflow example path is planned execution; chunk, worker and cache settings are consumed by cellprofiler-plan-probe and its materialization path",
     },
     "wall_time": {
-        "blockflow_pipeline_seconds": None if blockflow is None else blockflow.get("pipeline_seconds"),
+        "blockflow_pipeline_seconds": None if blockflow is None else blockflow.get("seconds"),
         "cellprofiler_wall_seconds": None if reference is None else reference.get("wall_seconds"),
     },
     "planner_simulator": {
         "status": None if plan_probe is None else plan_probe.get("status", "planned_segmentation_with_measurements_simulated"),
-        "observed_pipeline_seconds": None if blockflow is None else blockflow.get("pipeline_seconds"),
+        "observed_pipeline_seconds": None if blockflow is None else blockflow.get("seconds"),
         "estimated_pipeline_seconds": None if plan_probe is None else plan_probe.get("simulator", {}).get("estimated_pipeline_seconds"),
         "estimate_error_ratio": None,
         "scope": None if plan_probe is None else plan_probe.get("scope"),
         "not_included": planner_missing if plan_probe is not None else None,
         "materialized_outputs": plan_materialized,
-        "planned_vs_reference": planned_comparison,
+        "planned_vs_reference": comparison,
         "planned_vs_resident": planned_resident_comparison,
         "plan_probe": plan_probe,
-        "reason": "the simulator covers the planned segmentation skeleton, min-distance seed suppression, optional watershed-line basin merging, final object-size filtering and shape/intensity measurement phases; when enabled, the same planned path also materializes a diagnostic object table for comparison against resident and reference outputs",
+        "reason": "the simulator covers the planned segmentation skeleton, min-distance seed suppression, optional watershed-line basin merging, final object-size filtering and shape/intensity measurement phases; the same planned path materializes the primary Blockflow object table",
     },
 }
 

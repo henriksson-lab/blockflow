@@ -42,6 +42,8 @@ fi
 blockflow_bin="target/$profile_dir/skimage-pipeline"
 
 mkdir -p "$output_dir/runs"
+zarr_root="$output_dir/input-zarr"
+mkdir -p "$zarr_root"
 
 start="${EPOCHREALTIME:-$(date +%s)}"
 i=0
@@ -50,6 +52,7 @@ for image in "$input_dir"/*.bmp; do
   "$blockflow_bin" \
     --input "$image" \
     --out "$run_dir" \
+    --zarr-dir "$zarr_root/run-$(printf "%03d" "$i").zarr" \
     --sigma "$sigma" \
     --min-size "$min_size" \
     --mode "$mode" >/dev/null

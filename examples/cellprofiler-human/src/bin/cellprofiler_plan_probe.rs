@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: MIT
 
+#![allow(
+    clippy::chunks_exact_to_as_chunks,
+    clippy::items_after_test_module,
+    clippy::manual_is_multiple_of
+)]
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -9,7 +14,7 @@ use std::time::Instant;
 
 use blockflow::assemble::{ImageId, Phase, PlanBuilder};
 use blockflow::dtype::Dtype;
-use blockflow::env::{ArrayEnvironment, BlockBuf};
+use blockflow::env::BlockBuf;
 use blockflow::fragment::{
     BlockOutput, BlockView, Coverage, FragmentInput, FragmentOp, FragmentOutput, PhaseView,
     SeamFold, SourceBlocks,
@@ -35,13 +40,71 @@ use blockflow::reach::Reach;
 use blockflow::sidecar::Lifecycle;
 use blockflow::simulate::{ExecutorOrder, Machine, Rates, Run};
 use blockflow::strategy::{execute_phases, Hints};
-use blockflow::{Error, Result};
+use blockflow::zarr_env::ZarrEnvironment;
+use blockflow::{AttachedImage, Error, Result};
+use clap::Parser;
+use image::{ImageBuffer, Luma};
 use ndarray::Array3;
 use serde_json::json;
 
+#[derive(Debug, Parser)]
+#[command(name = "cellprofiler-plan-probe")]
+struct Cli {
+    #[arg(long, required_unless_present = "input_zarr")]
+    input: Option<PathBuf>,
+    #[arg(long)]
+    input_zarr: Option<PathBuf>,
+    #[arg(long)]
+    ensure_input_zarr: Option<PathBuf>,
+    #[arg(long, default_value = "cellprofiler-plan-probe.json")]
+    out: PathBuf,
+    #[arg(long, value_parser = parse_chunk, default_value = "1x256x256")]
+    chunk: [usize; 3],
+    #[arg(long, default_value_t = 1)]
+    workers: usize,
+    #[arg(long, default_value_t = 0)]
+    cache_bytes: u64,
+    #[arg(long, default_value_t = 1.0)]
+    sigma: f64,
+    #[arg(long, default_value_t = 1.0)]
+    background_percentile: f64,
+    #[arg(long)]
+    no_background_subtract: bool,
+    #[arg(long, value_enum, default_value = "li")]
+    threshold_method: ThresholdMethod,
+    #[arg(long, default_value_t = 256)]
+    threshold_bins: usize,
+    #[arg(long, default_value_t = 50)]
+    min_size: u64,
+    #[arg(long, default_value_t = 5027)]
+    max_size: u64,
+    #[arg(long)]
+    no_max_size: bool,
+    #[arg(long, default_value_t = 6.0)]
+    seed_min_distance: f64,
+    #[arg(long, default_value_t = 3)]
+    maxima_downsample: usize,
+    #[arg(long, default_value_t = 1.3488)]
+    declump_sigma: f64,
+    #[arg(long, value_enum, default_value = "intensity")]
+    declump_method: DeclumpMethod,
+    #[arg(long, default_value_t = 0)]
+    merge_line_basin_pixels: usize,
+    #[arg(long)]
+    merge_line_max_saddle_drop: Option<f64>,
+    #[arg(long, default_value_t = 256)]
+    distance_block: usize,
+    #[arg(long)]
+    materialize_objects: Option<PathBuf>,
+    #[arg(long, default_value_t = 1)]
+    materialize_repeats: usize,
+}
+
 #[derive(Debug)]
 struct Config {
-    input: PathBuf,
+    input: Option<PathBuf>,
+    input_zarr: Option<PathBuf>,
+    ensure_input_zarr: Option<PathBuf>,
     out: PathBuf,
     chunk: [usize; 3],
     workers: usize,
@@ -63,23 +126,14 @@ struct Config {
     materialize_repeats: usize,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
 enum ThresholdMethod {
+    #[value(alias = "minimum-cross-entropy", alias = "minimum_cross_entropy")]
     Li,
     Otsu,
 }
 
 impl ThresholdMethod {
-    fn parse(raw: &str) -> Result<Self> {
-        match raw {
-            "li" | "minimum-cross-entropy" | "minimum_cross_entropy" => Ok(Self::Li),
-            "otsu" => Ok(Self::Otsu),
-            other => Err(Error::invalid(format!(
-                "cellprofiler-plan-probe: unknown --threshold-method {other:?}; expected li or otsu"
-            ))),
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Li => "li",
@@ -95,23 +149,14 @@ impl ThresholdMethod {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, clap::ValueEnum)]
 enum DeclumpMethod {
     Intensity,
+    #[value(alias = "shape")]
     Distance,
 }
 
 impl DeclumpMethod {
-    fn parse(raw: &str) -> Result<Self> {
-        match raw {
-            "intensity" => Ok(Self::Intensity),
-            "distance" | "shape" => Ok(Self::Distance),
-            other => Err(Error::invalid(format!(
-                "cellprofiler-plan-probe: unknown --declump-method {other:?}; expected intensity or distance"
-            ))),
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Intensity => "intensity",
@@ -122,108 +167,32 @@ impl DeclumpMethod {
 
 impl Config {
     fn parse() -> Result<Self> {
-        let mut input = None;
-        let mut out = None;
-        let mut chunk = [1usize, 256, 256];
-        let mut workers = 1usize;
-        let mut cache_bytes = 0u64;
-        let mut sigma = 1.0;
-        let mut background_percentile = Some(1.0);
-        let mut threshold_method = ThresholdMethod::Li;
-        let mut threshold_bins = 256usize;
-        let mut min_size = 50u64;
-        let mut max_size = Some(5027u64);
-        let mut seed_min_distance = 6.0;
-        let mut maxima_downsample = 3usize;
-        let mut declump_sigma = 1.3488;
-        let mut declump_method = DeclumpMethod::Intensity;
-        let mut merge_line_basin_pixels = 0usize;
-        let mut merge_line_max_saddle_drop = None;
-        let mut distance_block = 256usize;
-        let mut materialize_objects = None;
-        let mut materialize_repeats = 1usize;
-
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--input" => input = Some(path_arg(&mut args, "--input")?),
-                "--out" => out = Some(path_arg(&mut args, "--out")?),
-                "--chunk" => chunk = parse_shape_arg(&mut args, "--chunk")?,
-                "--workers" => workers = parse_arg(&mut args, "--workers")?,
-                "--cache-bytes" => cache_bytes = parse_arg(&mut args, "--cache-bytes")?,
-                "--sigma" => sigma = parse_arg(&mut args, "--sigma")?,
-                "--background-percentile" => {
-                    background_percentile = Some(parse_arg(&mut args, "--background-percentile")?)
-                }
-                "--no-background-subtract" => background_percentile = None,
-                "--threshold-method" => {
-                    threshold_method =
-                        ThresholdMethod::parse(&string_arg(&mut args, "--threshold-method")?)?
-                }
-                "--threshold-bins" => threshold_bins = parse_arg(&mut args, "--threshold-bins")?,
-                "--min-size" => min_size = parse_arg(&mut args, "--min-size")?,
-                "--max-size" => max_size = Some(parse_arg(&mut args, "--max-size")?),
-                "--no-max-size" => max_size = None,
-                "--seed-min-distance" => {
-                    seed_min_distance = parse_arg(&mut args, "--seed-min-distance")?
-                }
-                "--maxima-downsample" => {
-                    maxima_downsample = parse_arg(&mut args, "--maxima-downsample")?
-                }
-                "--declump-sigma" => declump_sigma = parse_arg(&mut args, "--declump-sigma")?,
-                "--declump-method" => {
-                    declump_method =
-                        DeclumpMethod::parse(&string_arg(&mut args, "--declump-method")?)?
-                }
-                "--merge-line-basin-pixels" => {
-                    merge_line_basin_pixels = parse_arg(&mut args, "--merge-line-basin-pixels")?
-                }
-                "--merge-line-max-saddle-drop" => {
-                    merge_line_max_saddle_drop =
-                        Some(parse_arg(&mut args, "--merge-line-max-saddle-drop")?)
-                }
-                "--distance-block" => distance_block = parse_arg(&mut args, "--distance-block")?,
-                "--materialize-objects" => {
-                    materialize_objects = Some(path_arg(&mut args, "--materialize-objects")?)
-                }
-                "--materialize-repeats" => {
-                    materialize_repeats = parse_arg(&mut args, "--materialize-repeats")?
-                }
-                "--help" | "-h" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(Error::invalid(format!(
-                        "cellprofiler-plan-probe: unknown argument {other:?}; use --help"
-                    )));
-                }
-            }
-        }
+        let cli = Cli::parse();
 
         let config = Self {
-            input: input.ok_or_else(|| {
-                Error::invalid("cellprofiler-plan-probe: missing required --input IMAGE")
-            })?,
-            out: out.unwrap_or_else(|| PathBuf::from("cellprofiler-plan-probe.json")),
-            chunk,
-            workers,
-            cache_bytes,
-            sigma,
-            background_percentile,
-            threshold_method,
-            threshold_bins,
-            min_size,
-            max_size,
-            seed_min_distance,
-            maxima_downsample,
-            declump_sigma,
-            declump_method,
-            merge_line_basin_pixels,
-            merge_line_max_saddle_drop,
-            distance_block,
-            materialize_objects,
-            materialize_repeats,
+            input: cli.input,
+            input_zarr: cli.input_zarr,
+            ensure_input_zarr: cli.ensure_input_zarr,
+            out: cli.out,
+            chunk: cli.chunk,
+            workers: cli.workers,
+            cache_bytes: cli.cache_bytes,
+            sigma: cli.sigma,
+            background_percentile: (!cli.no_background_subtract)
+                .then_some(cli.background_percentile),
+            threshold_method: cli.threshold_method,
+            threshold_bins: cli.threshold_bins,
+            min_size: cli.min_size,
+            max_size: (!cli.no_max_size).then_some(cli.max_size),
+            seed_min_distance: cli.seed_min_distance,
+            maxima_downsample: cli.maxima_downsample,
+            declump_sigma: cli.declump_sigma,
+            declump_method: cli.declump_method,
+            merge_line_basin_pixels: cli.merge_line_basin_pixels,
+            merge_line_max_saddle_drop: cli.merge_line_max_saddle_drop,
+            distance_block: cli.distance_block,
+            materialize_objects: cli.materialize_objects,
+            materialize_repeats: cli.materialize_repeats,
         };
         config.validate()
     }
@@ -232,6 +201,16 @@ impl Config {
         if self.chunk.contains(&0) {
             return Err(Error::invalid(
                 "cellprofiler-plan-probe: --chunk dimensions must be positive",
+            ));
+        }
+        if self.input_zarr.is_some() && self.ensure_input_zarr.is_some() {
+            return Err(Error::invalid(
+                "cellprofiler-plan-probe: use either --input-zarr or --ensure-input-zarr, not both",
+            ));
+        }
+        if self.ensure_input_zarr.is_some() && self.input.is_none() {
+            return Err(Error::invalid(
+                "cellprofiler-plan-probe: --ensure-input-zarr needs --input for fixture preparation",
             ));
         }
         if self.workers == 0 {
@@ -308,7 +287,8 @@ fn main() {
 
 fn run() -> Result<()> {
     let config = Config::parse()?;
-    let volume = image_volume(&config.input)?;
+    let source = input_source(&config)?;
+    let volume = source.volume;
     let planned = build_planned_probe(volume, &config)?;
     let rates = Rates {
         chunk: config.chunk,
@@ -329,10 +309,7 @@ fn run() -> Result<()> {
         .go(&mut scheduler)?;
     let materialized = match &config.materialize_objects {
         Some(out_dir) => Some(materialize_planned_objects_repeated(
-            &planned,
-            &config.input,
-            out_dir,
-            &config,
+            &planned, &source, out_dir, &config,
         )?),
         None => None,
     };
@@ -396,16 +373,17 @@ fn run() -> Result<()> {
     let not_included = match materialized_object_count {
         Some(1..) => Vec::<&str>::new(),
         Some(0) => vec!["validated non-empty planned CSV/table materialization"],
-        None => vec!["resident CSV/table materialization"],
+        None => vec!["planned CSV/table materialization"],
     };
     let report = json!({
         "status": "planned_segmentation_with_measurements_simulated",
         "scope": {
             "included": included,
             "not_included": not_included,
-            "reason": "the resident benchmark remains authoritative for CellProfiler-reference output parity; this probe exposes the planned segmentation skeleton, min-distance seed suppression, optional watershed-line basin merging, final object-size filtering and shape/intensity measurement phases to the simulator, and can optionally materialize planned measurement rows as a diagnostic CSV artifact"
+            "reason": "this is the primary Blockflow example path: it exposes the planned segmentation skeleton, min-distance seed suppression, optional watershed-line basin merging, final object-size filtering and shape/intensity measurement phases to the simulator, and materializes planned measurement rows when requested"
         },
-        "input": config.input.display().to_string(),
+        "input": source.description,
+        "input_zarr": source.array.display().to_string(),
         "volume": volume,
         "requested": {
             "workers": config.workers,
@@ -478,6 +456,12 @@ struct PlannedProbe {
     measurements: blockflow::ops::measure::MeasurementPlan,
 }
 
+struct InputSource {
+    array: PathBuf,
+    volume: [usize; 3],
+    description: String,
+}
+
 fn build_planned_probe(volume: [usize; 3], config: &Config) -> Result<PlannedProbe> {
     let skeleton = build_planned_skeleton(volume, config)?;
     let measurement_base = build_planned_skeleton(volume, config)?;
@@ -497,9 +481,9 @@ fn build_planned_probe(volume: [usize; 3], config: &Config) -> Result<PlannedPro
 
 fn materialize_planned_objects(
     planned: &PlannedProbe,
-    input_path: &Path,
+    source: &InputSource,
     out_dir: &Path,
-    config: &Config,
+    _config: &Config,
 ) -> Result<serde_json::Value> {
     fs::create_dir_all(out_dir).map_err(|err| {
         Error::invalid(format!(
@@ -508,12 +492,8 @@ fn materialize_planned_objects(
         ))
     })?;
     let started = Instant::now();
-    let input = load_luma_as_volume(input_path)?;
-    let env = ArrayEnvironment::for_decomposition(
-        input.into(),
-        &planned.measurements.decomposition,
-        config.chunk,
-    )?;
+    let work_dir = out_dir.join("zarr-work");
+    let env = ZarrEnvironment::attach(&work_dir, &[AttachedImage::at(source.array.clone())])?;
     let label_image = planned.measurement_base.decomposition.n_phases();
     let mut work = planned.measurement_base.work();
     work.extend(planned.measurements.phase_work());
@@ -531,6 +511,8 @@ fn materialize_planned_objects(
         &work,
     )?;
     let label_stats = planned_label_stats(&env, label_image)?;
+    let labels_png = out_dir.join("labels.png");
+    save_planned_labels(&env, label_image, &labels_png)?;
     let rows = collect_planned_object_rows(&env, planned)?;
     let objects_csv = out_dir.join("planned_objects.csv");
     write_planned_object_csv(&rows, &objects_csv)?;
@@ -540,8 +522,11 @@ fn materialize_planned_objects(
         "total_foreground_area": total_area,
         "mean_object_area": if rows.is_empty() { 0.0 } else { total_area as f64 / rows.len() as f64 },
         "label_image": label_stats,
+        "labels_png": labels_png.display().to_string(),
         "objects_csv": objects_csv.display().to_string(),
         "measurement_intensity_source": "input_luma_normalized_0_1",
+        "input_zarr": source.array.display().to_string(),
+        "work_zarr": work_dir.display().to_string(),
         "seconds": started.elapsed().as_secs_f64()
     });
     let summary_path = out_dir.join("planned-summary.json");
@@ -561,20 +546,21 @@ fn materialize_planned_objects(
         "summary_json": summary_path.display().to_string(),
         "objects": rows.len(),
         "label_image": label_stats,
+        "labels_png": labels_png.display().to_string(),
         "seconds": started.elapsed().as_secs_f64()
     }))
 }
 
 fn materialize_planned_objects_repeated(
     planned: &PlannedProbe,
-    input_path: &Path,
+    source: &InputSource,
     out_dir: &Path,
     config: &Config,
 ) -> Result<serde_json::Value> {
     let mut summaries = Vec::with_capacity(config.materialize_repeats);
     for _ in 0..config.materialize_repeats {
         summaries.push(materialize_planned_objects(
-            planned, input_path, out_dir, config,
+            planned, source, out_dir, config,
         )?);
     }
     if summaries.len() == 1 {
@@ -627,8 +613,8 @@ fn median_seconds(mut seconds: Vec<f64>) -> Option<f64> {
     }
 }
 
-fn planned_label_stats(env: &ArrayEnvironment, image: usize) -> Result<serde_json::Value> {
-    let labels = env.image(image);
+fn planned_label_stats(env: &ZarrEnvironment, image: usize) -> Result<serde_json::Value> {
+    let labels = env.image(image)?;
     let labels = labels.view::<u32>()?;
     let mut nonzero_voxels = 0u64;
     let mut max_label = 0u32;
@@ -649,6 +635,27 @@ fn planned_label_stats(env: &ArrayEnvironment, image: usize) -> Result<serde_jso
     }))
 }
 
+fn save_planned_labels(env: &ZarrEnvironment, image: usize, path: &Path) -> Result<()> {
+    let labels = env.image(image)?;
+    let labels = labels.view::<u32>()?;
+    if labels.shape()[0] != 1 {
+        return Err(Error::invalid(
+            "cellprofiler-plan-probe: planned label PNG export currently expects a single Z plane",
+        ));
+    }
+    let mut image =
+        ImageBuffer::<Luma<u16>, Vec<u16>>::new(labels.shape()[2] as u32, labels.shape()[1] as u32);
+    for y in 0..labels.shape()[1] {
+        for x in 0..labels.shape()[2] {
+            let label = labels[[0, y, x]].min(u32::from(u16::MAX)) as u16;
+            image.put_pixel(x as u32, y as u32, Luma([label]));
+        }
+    }
+    image
+        .save(path)
+        .map_err(|err| Error::invalid(format!("cellprofiler-plan-probe: save labels: {err}")))
+}
+
 struct PlannedObjectRow {
     label: u64,
     shape: ShapeMeasurements,
@@ -656,7 +663,7 @@ struct PlannedObjectRow {
 }
 
 fn collect_planned_object_rows(
-    env: &ArrayEnvironment,
+    env: &ZarrEnvironment,
     planned: &PlannedProbe,
 ) -> Result<Vec<PlannedObjectRow>> {
     let volume = planned.measurements.decomposition.volume;
@@ -2129,6 +2136,71 @@ fn image_volume(path: &Path) -> Result<[usize; 3]> {
     Ok([1, height, width])
 }
 
+fn input_source(config: &Config) -> Result<InputSource> {
+    if let Some(array) = &config.input_zarr {
+        let (_, volume) = AttachedImage::at(array).metadata()?;
+        return Ok(InputSource {
+            array: array.clone(),
+            volume,
+            description: format!("zarr:{}", array.display()),
+        });
+    }
+
+    if let Some(store) = &config.ensure_input_zarr {
+        let input = config.input.as_ref().ok_or_else(|| {
+            Error::invalid("cellprofiler-plan-probe: --ensure-input-zarr needs --input")
+        })?;
+        let array = ensure_input_zarr(input, store, config.chunk)?;
+        let (_, volume) = AttachedImage::at(&array).metadata()?;
+        return Ok(InputSource {
+            array,
+            volume,
+            description: format!("prepared-zarr-from:{}", input.display()),
+        });
+    }
+
+    let input = config.input.as_ref().ok_or_else(|| {
+        Error::invalid("cellprofiler-plan-probe: either --input or --input-zarr is required")
+    })?;
+    let volume = image_volume(input)?;
+    let fallback_store = config
+        .materialize_objects
+        .as_ref()
+        .map(|out| out.join("input.zarr"));
+    let array = match fallback_store {
+        Some(store) => ensure_input_zarr(input, &store, config.chunk)?,
+        None => PathBuf::new(),
+    };
+    Ok(InputSource {
+        array,
+        volume,
+        description: input.display().to_string(),
+    })
+}
+
+fn ensure_input_zarr(input_path: &Path, store: &Path, chunk: [usize; 3]) -> Result<PathBuf> {
+    let array = store.join("level0");
+    if array.join("zarr.json").exists() {
+        let (_, stored_volume) = AttachedImage::at(&array).metadata()?;
+        let image_volume = image_volume(input_path)?;
+        if stored_volume != image_volume {
+            return Err(Error::invalid(format!(
+                "cellprofiler-plan-probe: prepared input store {} has volume {:?}, but {} is {:?}; remove the stale store or choose another --ensure-input-zarr path",
+                array.display(),
+                stored_volume,
+                input_path.display(),
+                image_volume
+            )));
+        }
+        return Ok(array);
+    }
+
+    let input = load_luma_as_volume(input_path)?;
+    let voxels = input.into();
+    ZarrEnvironment::create(store, &voxels, chunk)?;
+    Ok(array)
+}
+
 fn chunk_bytes(chunk: [usize; 3], bytes_per_voxel: u64) -> u64 {
     chunk
         .iter()
@@ -2136,38 +2208,6 @@ fn chunk_bytes(chunk: [usize; 3], bytes_per_voxel: u64) -> u64 {
         .map(|value| value as u64)
         .product::<u64>()
         .saturating_mul(bytes_per_voxel)
-}
-
-fn print_help() {
-    println!(
-        "cellprofiler-plan-probe --input IMAGE --out REPORT.json [options]\n\
-         \n\
-         Builds and simulates the planned CellProfiler benchmark skeleton:\n\
-         global threshold, cleanup, distance transform, regional maxima,\n\
-         seeded watershed and shape/intensity measurement phases.\n\
-         \n\
-         Options:\n\
-           --chunk ZxYxX              chunk shape, default 1x256x256\n\
-           --workers N                simulated workers, default 1\n\
-           --cache-bytes N            simulated cache budget, default 0\n\
-           --sigma N                  threshold-smoothing XY Gaussian sigma, default 1.0\n\
-           --background-percentile N  subtract this percentile before smoothing, default 1.0\n\
-           --no-background-subtract   leave intensities unchanged before threshold smoothing\n\
-           --threshold-method li|otsu global threshold method, default li\n\
-           --threshold-bins N         threshold histogram metadata, default 256\n\
-           --min-size N               remove-small-object threshold, default 50\n\
-           --max-size N               remove-large-object threshold, default 5027\n\
-           --no-max-size              disable large-object filtering\n\
-           --seed-min-distance N      watershed seed suppression distance, default 6\n\
-           --maxima-downsample N      find seed maxima on lower-resolution XY blocks, default 3\n\
-           --declump-sigma N          XY Gaussian sigma for intensity declumping, default 1.3488\n\
-           --declump-method intensity|distance watershed source, default intensity\n\
-           --merge-line-basin-pixels N merge basins sharing at least this many watershed-line pixels\n\
-           --merge-line-max-saddle-drop N optional maximum accepted line saddle drop\n\
-           --distance-block N         distance-transform cubic block edge, default 256\n\
-           --materialize-objects DIR  execute the planned path and write planned_objects.csv\n\
-           --materialize-repeats N    repeat planned materialization for timing, default 1"
-    );
 }
 
 fn load_luma_as_volume(path: &Path) -> Result<Array3<f64>> {
@@ -2198,55 +2238,20 @@ fn write_error(err: std::io::Error) -> Error {
     Error::invalid(format!("cellprofiler-plan-probe: write CSV: {err}"))
 }
 
-fn path_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from(args.next().ok_or_else(|| {
-        Error::invalid(format!("cellprofiler-plan-probe: {name} needs a path"))
-    })?))
-}
-
-fn string_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
-    args.next()
-        .ok_or_else(|| Error::invalid(format!("cellprofiler-plan-probe: {name} needs a value")))
-}
-
-fn parse_arg<T>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    let raw = args
-        .next()
-        .ok_or_else(|| Error::invalid(format!("cellprofiler-plan-probe: {name} needs a value")))?;
-    raw.parse::<T>().map_err(|err| {
-        Error::invalid(format!(
-            "cellprofiler-plan-probe: could not parse {name} value {raw:?}: {err}"
-        ))
-    })
-}
-
-fn parse_shape_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<[usize; 3]> {
-    let raw = args
-        .next()
-        .ok_or_else(|| Error::invalid(format!("cellprofiler-plan-probe: {name} needs a value")))?;
-    parse_shape(&raw)
-}
-
-fn parse_shape(raw: &str) -> Result<[usize; 3]> {
+fn parse_chunk(raw: &str) -> std::result::Result<[usize; 3], String> {
     let parts = raw
         .split(['x', 'X', ',', ':'])
         .map(str::trim)
         .collect::<Vec<_>>();
     if parts.len() != 3 {
-        return Err(Error::invalid(format!(
+        return Err(format!(
             "cellprofiler-plan-probe: chunk shape {raw:?} must have three dimensions"
-        )));
+        ));
     }
     let mut out = [0usize; 3];
     for (index, part) in parts.iter().enumerate() {
         out[index] = part.parse::<usize>().map_err(|err| {
-            Error::invalid(format!(
-                "cellprofiler-plan-probe: could not parse chunk shape {raw:?}: {err}"
-            ))
+            format!("cellprofiler-plan-probe: could not parse chunk shape {raw:?}: {err}")
         })?;
     }
     Ok(out)

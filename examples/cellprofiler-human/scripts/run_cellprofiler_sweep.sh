@@ -7,12 +7,9 @@ Usage:
   examples/cellprofiler-human/scripts/run_cellprofiler_sweep.sh IMAGE OUTPUT_DIR [REFERENCE_OBJECT_CSV]
 
 Runs a small worker/chunk/cache sweep around the CellProfiler-style benchmark.
-The current output-generating benchmark path is resident-only, so
-worker/chunk/cache values are recorded as requested execution metadata for that
-path. The planned simulator probe applies those knobs to the segmentation, seed
-suppression, final-filtering and shape/intensity measurement skeleton. By
-default, the benchmark also materializes planned object rows and compares them
-against resident and reference tables when those inputs are available.
+Each sweep point uses the planned Blockflow path. Worker, chunk and cache
+values are applied to the simulator and to planned object-table materialization,
+then compared against reference tables when those inputs are available.
 
 Environment variables:
   BF_SWEEP_WORKERS      Space-separated worker counts, default "1 4".
