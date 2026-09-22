@@ -1,0 +1,20 @@
+[package]
+name = "blockflow-cellpose-ome-zarr"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+cuda = ["blockflow/cellpose-cuda"]
+
+[dependencies]
+blockflow = { path = "../..", features = ["zarr", "cellpose"] }
+cellpose = { git = "https://github.com/henriksson-lab/cellpose-rs.git", rev = "4e428d0d20da2b6ac7f12b59d8f3263d2e9c362f" }
+clap = { version = "4.5", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "cellpose-ome-zarr"
+path = "src/main.rs"

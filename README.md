@@ -40,11 +40,27 @@ pipelines were approximately:
 * **4.5× faster than OpenCV** on the same batches
 * **9× faster than scikit-image** on the same batches
 * **3× faster than Dask-image** on two larger images
+* **1.2× faster than Python Cellpose** end to end on a real DAPI subset
 
-These are single-run wall-time ratios for the specified workloads, excluding
-fixture preparation and compilation. See [BENCHMARKS.md](BENCHMARKS.md) for
-the measurements, output checks, and reproduction commands. Earlier results
-are archived in [OLD_BENCHMARKS.md](OLD_BENCHMARKS.md).
+These are wall-time ratios for the specified workloads, excluding fixture
+preparation and compilation. See [BENCHMARKS.md](BENCHMARKS.md) for the run
+counts, measurements, output checks, and reproduction commands. Earlier
+results are archived in [OLD_BENCHMARKS.md](OLD_BENCHMARKS.md).
+
+## Whole-slide StarDist annotation example
+
+[`examples/stardist-ome-zarr`](examples/stardist-ome-zarr) shows normal
+out-of-core use on an OME-Zarr channel: attach the DAPI plane, price the real
+StarDist phase with the planner, execute it, and write a multiscale label layer
+plus an ID-linked measurement table. The result is discovered directly by
+newvolim and preserves the cell IDs needed for later per-channel measurements.
+
+## Whole-slide Cellpose annotation example
+
+[`examples/cellpose-ome-zarr`](examples/cellpose-ome-zarr) runs the same normal
+OME-Zarr reader, planner, executor, multiscale label writer, and linked table
+flow with Cellpose. It supports CPU and an optional CUDA build and writes a
+second annotation layer that newvolim discovers directly.
 
 ## Design notes
 
@@ -59,14 +75,12 @@ Details about the design are located in [`docs/design/`](docs/design) ; docs nee
 ## Testing
 
 ```
-cargo test
-cargo test --features gui,distributed,zarr,model-segment
+cargo test --release
+cargo test --release --features gui,distributed,zarr,model-segment
 ```
 
-Both are what CI runs, and both take about a minute — `[profile.dev]` compiles
-this crate at `opt-level = 1` and its dependencies at `2`, which is the
-difference between a suite of 2002 tests that takes **63 s** and one that takes
-**622 s**. The manifest has the measurements.
+Use release builds for local tests and examples. This keeps execution behavior
+and performance measurements consistent with the documented benchmarks.
 
 The suite that asserts is the suite that runs. The 39 `#[ignore]`d tests are
 **measurements** — tables of nanoseconds per voxel, of resident bytes, of how

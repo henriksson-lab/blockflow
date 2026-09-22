@@ -19,9 +19,12 @@
 //! such an image are measurements of fragments.
 //!
 //! So the measurement happens **inside the op**, where the whole object is
-//! present in the halo'd buffer, and what comes out is rows rather than pixels.
-//! That is `blockflow`'s [`FragmentOp`], and it is the
-//! same program `blockflow::ops::detect` runs.
+//! present in the halo'd buffer, and the primary output is rows. That is
+//! `blockflow`'s [`FragmentOp`], and it is the same program
+//! `blockflow::ops::detect` runs. A caller may additionally materialise the
+//! labels: each block then writes every instance visible in its non-overlapping
+//! valid region, while centroid ownership still decides which block emits the
+//! object's one table row.
 //!
 //! # The two rules that make the answer independent of the cut
 //!
@@ -231,7 +234,8 @@ pub fn centroid(row: &[u64]) -> ([u64; 3], u64) {
 // ------------------------------------------------------------- the op --
 
 /// Segment each block, keep the objects whose centroids it owns, measure them,
-/// and emit a row each.
+/// and emit a row each. [`Self::writing_labels`] additionally writes a dense
+/// label image whose values are the same stable IDs as those rows.
 ///
 /// # The halo, which is the one parameter that can be silently wrong
 ///
@@ -285,6 +289,10 @@ pub struct InstanceSegment {
     ///
     /// `None` runs the backend everywhere.
     empty_below: Option<f64>,
+    /// Materialise the detected instances as a `u64` label image as well as
+    /// emitting the object table. Zero is background; every non-zero voxel is
+    /// the same stable id stored in the table's `id` column.
+    write_labels: bool,
 }
 
 impl InstanceSegment {
@@ -312,7 +320,19 @@ impl InstanceSegment {
             measured,
             scale: 0,
             empty_below: None,
+            write_labels: false,
         }
+    }
+
+    /// Write a dense label image alongside the object rows.
+    ///
+    /// IDs are derived from each object's first voxel in volume coordinates,
+    /// so the image and table agree and a different block decomposition does
+    /// not renumber an object. The default remains rows only.
+    #[must_use]
+    pub fn writing_labels(mut self) -> Self {
+        self.write_labels = true;
+        self
     }
 
     /// Skip blocks whose core holds nothing above `level`. See [`Self::empty_below`].
@@ -481,7 +501,15 @@ impl FragmentOp for InstanceSegment {
     }
 
     fn writes_pixels(&self) -> bool {
-        false
+        self.write_labels
+    }
+
+    fn produces(&self, input: Dtype) -> Dtype {
+        if self.write_labels {
+            Dtype::U64
+        } else {
+            input
+        }
     }
 
     fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
@@ -542,11 +570,19 @@ impl FragmentOp for InstanceSegment {
         let schema = Arc::new(self.schema()?);
         let mut rows = RowBuilder::new(Arc::clone(&schema));
 
+        let mut label_output = self
+            .write_labels
+            .then(|| at.output_buffer(0.0))
+            .transpose()?;
         let BlockBuf::Array(pixels) = at.pixels()? else {
             // An accounting run has no data. It still writes the blob, because
             // what such a run measures is the IO, and a phase that silently
             // produced nothing would be measuring a different program.
-            return Ok(BlockOutput::fragment(self.stream.clone(), rows.encode()));
+            let output = BlockOutput::fragment(self.stream.clone(), rows.encode());
+            return Ok(match label_output {
+                Some(labels) => output.with_pixels(labels),
+                None => output,
+            });
         };
 
         // The values, widened once. `widened` is `f64` for every element type a
@@ -578,7 +614,11 @@ impl FragmentOp for InstanceSegment {
                 // An empty blob, not an absent one: the stream declares
                 // `Coverage::EveryBlock`, and "owned nothing" must stay
                 // distinguishable from "never ran".
-                return Ok(BlockOutput::fragment(self.stream.clone(), rows.encode()));
+                let output = BlockOutput::fragment(self.stream.clone(), rows.encode());
+                return Ok(match label_output {
+                    Some(labels) => output.with_pixels(labels),
+                    None => output,
+                });
             }
         }
         let tile = intensity.mapv(|value| value as f32);
@@ -668,7 +708,26 @@ impl FragmentOp for InstanceSegment {
             rows.push(centroid, &values)?;
         }
 
-        Ok(BlockOutput::fragment(self.stream.clone(), rows.encode()))
+        if let Some(BlockBuf::Array(buffer)) = &mut label_output {
+            let mut out = buffer.view_mut::<u64>()?;
+            for ((i, j, k), local) in labels.indexed_iter() {
+                if *local != 0 {
+                    let object = objects.get(local).ok_or_else(|| {
+                        Error::backend(format!(
+                            "backend {:?} returned label {local} without an accumulated object",
+                            self.backend.name()
+                        ))
+                    })?;
+                    out[[i, j, k]] = identify(object.first, volume);
+                }
+            }
+        }
+
+        let output = BlockOutput::fragment(self.stream.clone(), rows.encode());
+        Ok(match label_output {
+            Some(labels) => output.with_pixels(labels),
+            None => output,
+        })
     }
 }
 

@@ -10,10 +10,9 @@
 //! **The GPU is one device and the executor runs blocks concurrently.** The
 //! model is held behind a `Mutex`, so inference is serialised while everything
 //! around it — the reads, the per-object accumulation, the row encoding — stays
-//! parallel across `Hints::concurrency` workers. That is the v1 arrangement and
-//! it is stated rather than assumed: whether it is the *right* one is a
-//! measurement nobody has taken yet, and `blockflow`'s `Stats` is where the
-//! answer will be. See `BLOCKFLOW_PLAN.md` §4.4.
+//! parallel across `Hints::concurrency` workers. Measurements on the whole-slide
+//! example found that sharing one model without this lock did not improve wall
+//! time and increased peak host memory, so the bounded arrangement stays.
 //!
 //! **`ndarray` 0.16 against 0.17.** `cellpose` is on 0.16 and `blockflow` on
 //! 0.17, which are different crates to the compiler even though the types have
@@ -22,9 +21,10 @@
 //! leaking into the op.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use cellpose::models::EvalTiming;
 use cellpose::{CellposeModel, EvalParams};
 use ndarray::{Array3, ArrayView3};
 
@@ -54,6 +54,33 @@ pub struct CellposeBackend {
     params: EvalParams,
     /// What one tile costs, per voxel, in `blockflow`'s units.
     cost: f64,
+    profile: Option<CellposeProfile>,
+}
+
+/// Opt-in per-block Cellpose timings.
+///
+/// Precise CUDA timings synchronize the device between stages, so collecting
+/// them is deliberately separate from normal execution.
+#[derive(Clone, Default)]
+pub struct CellposeProfile {
+    samples: Arc<Mutex<Vec<EvalTiming>>>,
+}
+
+impl CellposeProfile {
+    #[must_use]
+    pub fn samples(&self) -> Vec<EvalTiming> {
+        self.samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn push(&self, timing: EvalTiming) {
+        self.samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(timing);
+    }
 }
 
 impl CellposeBackend {
@@ -80,7 +107,20 @@ impl CellposeBackend {
             // ordinary voxelwise pass. Stating it is what stops a planner
             // scheduling a three-second tile as if it were a memcpy.
             cost: 3.0,
+            profile: None,
         })
+    }
+
+    /// Collect detailed Cellpose stage timings for every segmented block.
+    ///
+    /// Returns a handle that remains readable after this backend is moved into
+    /// an [`Arc`]. Profiling adds CUDA synchronizations and is unsuitable for
+    /// performance measurements of the uninstrumented path.
+    #[must_use]
+    pub fn with_profile(mut self) -> (Self, CellposeProfile) {
+        let profile = CellposeProfile::default();
+        self.profile = Some(profile.clone());
+        (self, profile)
     }
 
     /// Say what a tile costs, when it has been measured on the hardware in
@@ -137,21 +177,30 @@ impl SegmentBackend for CellposeBackend {
             Error::backend(format!("cellpose: tile does not reshape: {error}"))
         })?;
 
-        let output = {
+        let masks = {
             let model = self
                 .model
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            model
-                .eval(&image, &self.params)
-                .map_err(|error| Error::backend(format!("cellpose: {error}")))?
+            if let Some(profile) = &self.profile {
+                let mut timing = EvalTiming::default();
+                let masks = model
+                    .eval_masks_with_timing(&image, &self.params, Some(&mut timing))
+                    .map_err(|error| Error::backend(format!("cellpose: {error}")))?;
+                profile.push(timing);
+                masks
+            } else {
+                model
+                    .eval_masks(&image, &self.params)
+                    .map_err(|error| Error::backend(format!("cellpose: {error}")))?
+            }
         };
 
         // Back out. Cellpose labels are `i32` with 0 for background; negative
         // values would be a contract this crate cannot represent, so they are
         // refused by name rather than cast into something enormous.
         let mut labels = Array3::<u32>::zeros((1, height, width));
-        for (index, value) in output.masks.iter().enumerate() {
+        for (index, value) in masks.iter().enumerate() {
             if *value < 0 {
                 return Err(Error::backend(format!(
                     "cellpose returned label {value} at index {index}. Labels are region \

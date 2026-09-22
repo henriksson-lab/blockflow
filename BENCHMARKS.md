@@ -1,9 +1,9 @@
 # Benchmarks
 
 These results were measured on 2026-09-20 on an Intel Xeon Gold 6138 host.
-They replace the results in [OLD_BENCHMARKS.md](OLD_BENCHMARKS.md). Each row is
-one run, not a statistical estimate; small wall-time differences may change on
-another run or machine. Release builds and fixture conversion were completed
+They replace the results in [OLD_BENCHMARKS.md](OLD_BENCHMARKS.md). Rows are
+single runs unless a median is stated; small wall-time differences may change
+on another run or machine. Release builds and fixture conversion were completed
 before timing Blockflow. The Blockflow commands read prepared rank-3 Zarr
 arrays, build plans, execute them, and write their reported results.
 References used OpenCV C++ 4.5.4, OpenJDK 19 for ImgLib2, NumPy 2.4.2,
@@ -196,3 +196,38 @@ The CellProfiler command was:
   cellprofiler/cellprofiler:4.2.8 \
   -c -r -p ExampleHuman.cppipe -i images -o cellprofiler-output
 ```
+
+## Cellpose CUDA annotation
+
+This comparison used a 2048 x 6144 DAPI subset from the 2079 OME-Zarr slide,
+CP-SAM, CUDA, batch size 8, and Cellpose's default thresholds. Blockflow ran the
+normal reader, planner, executor, label writer, and linked-table writer. Python
+Cellpose 4.1.1 read the same pixels as one TIFF and returned its normal in-memory
+outputs. Compilation and fixture conversion were outside the timers.
+
+| Runner | Wall | Ratio | Peak host RSS | Cells |
+|---|---:|---:|---:|---:|
+| Blockflow, release, masks only, 1 worker | **48.92 s median** | **1.20× faster** | 1.44 GiB | 962 |
+| Python Cellpose 4.1.1 | 58.58 s | 1.00× | 2.79 GiB | 1,145 |
+
+The Blockflow median is from 48.92, 48.54, and 52.98 second runs. Python was one
+run and spent 47.92 seconds inside `model.eval`. Blockflow evaluates three
+overlapping outer blocks, normalizes each block independently, assigns objects
+by centroid, and writes the annotation. Python evaluates the strip as one
+image, so the cell counts are stable outputs for each runner rather than an
+exact semantic-parity assertion.
+
+The masks-only Cellpose API produced byte-identical Blockflow labels and an
+identical table compared with the full-output API. Its 48.92 second median was
+4.7% faster than the matched full-output median of 51.34 seconds. Exploratory
+batch-size 16 and 32 runs took 48.76 and 49.30 seconds, so batch size 8 remains
+the default. Two-worker runs took 48.29, 53.57, and 56.39 seconds: their 53.57
+second median was 9.5% slower and their median peak host RSS rose to 1.57 GiB.
+One worker remains the default because one model and CUDA stream serialize
+inference.
+
+Detailed release profiling attributed 40.35 of 50.04 Cellpose seconds to the
+network forward pass. Upload and prediction download totaled 0.27 seconds,
+while unused flow-color rendering took 3.00 seconds. These measurements support
+the masks-only change and do not support adding a pinned-memory copy pipeline or
+multiple model instances on this GPU.

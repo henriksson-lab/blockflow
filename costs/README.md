@@ -50,7 +50,7 @@ So there are two ways to change one, and they are different acts:
 
 * **edit the file**, to correct or add a machine. Legitimate. It has to parse
   and round-trip; the suite says so;
-* **regenerate the family**: `cargo test --test cost_scenarios -- --ignored
+* **regenerate the family**: `cargo test --release --test cost_scenarios -- --ignored
   regenerate_the_scenario_files`, which writes this directory from
   `scenario::measured_baseline` and the transform list in that test. This
   *replaces* the record, so it is a decision rather than a tidy-up. Add a new
