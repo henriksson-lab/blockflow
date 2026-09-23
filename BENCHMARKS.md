@@ -231,3 +231,41 @@ network forward pass. Upload and prediction download totaled 0.27 seconds,
 while unused flow-color rendering took 3.00 seconds. These measurements support
 the masks-only change and do not support adding a pinned-memory copy pipeline or
 multiple model instances on this GPU.
+
+## StarDist CUDA annotation
+
+This comparison, measured on 2026-09-22, used the same 2048 x 6144 DAPI subset
+as the Cellpose comparison, the official `2D_versatile_fluo` model, CUDA, fixed
+normalization from 1 to 70, and the model's default probability and NMS
+thresholds. Blockflow used three 2048 pixel blocks with a 64 pixel halo and ran
+the normal reader, planner, executor, label writer, and linked-table writer.
+Python StarDist 0.9.2 read the same Zarr pixels and returned its normal in-memory
+label and polygon outputs for one image.
+
+| Runner | Wall | Ratio | Peak host RSS | Cells |
+|---|---:|---:|---:|---:|
+| Blockflow, release, 1 worker | **6.57 s median** | **5.30× faster** | 746 MiB | 15 |
+| Python StarDist 0.9.2 | 34.80 s median | 1.00× | 2.93 GiB | 15 |
+
+Blockflow runs took 6.66, 6.57, and 6.52 seconds. Python runs took 54.61,
+34.71, and 34.80 seconds; its median `predict_instances` time was 28.05
+seconds. Giving Python a comparable `n_tiles=(1, 3)` took 40.80 seconds and
+2.64 GiB in one probe, so it did not narrow the gap. Both runners reported 15
+objects. Matching counts are a useful sanity check, not a label-equivalence
+claim, because the two runners use different outer tiling and ownership rules.
+
+The result does not justify StarDist speed optimization before a whole-slide
+run. Segmentation quality on representative tissue should be reviewed first,
+because performance headroom does not establish that the model and thresholds
+are biologically suitable for this slide.
+
+The Python timing entry point is
+`examples/stardist-ome-zarr/scripts/benchmark_python.py`. For example:
+
+```sh
+/usr/bin/time -v .tmp/stardist-python/bin/python \
+  examples/stardist-ome-zarr/scripts/benchmark_python.py \
+  --zarr .tmp/cellpose-bench-2048x6144.zarr \
+  --model .tmp/stardist-models --low 1 --high 70 \
+  --output .tmp/stardist-python.json
+```

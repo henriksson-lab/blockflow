@@ -40,6 +40,7 @@ pipelines were approximately:
 * **4.5× faster than OpenCV** on the same batches
 * **9× faster than scikit-image** on the same batches
 * **3× faster than Dask-image** on two larger images
+* **5.3× faster than Python StarDist** end to end on a real DAPI subset
 * **1.2× faster than Python Cellpose** end to end on a real DAPI subset
 
 These are wall-time ratios for the specified workloads, excluding fixture

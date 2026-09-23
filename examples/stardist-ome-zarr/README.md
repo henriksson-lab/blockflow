@@ -73,3 +73,16 @@ paint labels by area or mean DAPI intensity.
 The table already establishes the later quantification contract: `label_id` is the join key. Further
 channels can be measured over `labels/stardist-dapi/0` with `Measurements::for_labels`, without
 running StarDist again.
+
+## CUDA benchmark
+
+On a 2048 × 6144 DAPI subset and an RTX 5000, the normal release example took
+6.57 seconds median end to end. Official Python StarDist 0.9.2 took 34.80
+seconds median on the same pixels, model, normalization, and thresholds. That is
+a **5.30× Blockflow speed advantage**. Both runners reported 15 objects. See
+[`BENCHMARKS.md`](../../BENCHMARKS.md#stardist-cuda-annotation) for the run
+values, memory measurements, scope, and Python timing command.
+
+This result gives enough performance margin to proceed without a StarDist
+optimization pass. Review representative annotations before a whole-slide run
+to validate the model and thresholds against the tissue.
