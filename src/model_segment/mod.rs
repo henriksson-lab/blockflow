@@ -150,6 +150,96 @@ pub fn schema(measured: usize) -> Result<Schema> {
     Schema::new(columns)
 }
 
+/// Finalise the one-channel instance measurements used by the OME-Zarr
+/// examples into the native, spatially indexed object-table format.
+#[cfg(feature = "zarr")]
+pub fn finalize_instances(
+    env: &dyn crate::Environment,
+    stream: &str,
+    phase: usize,
+    volume: [usize; 3],
+    input_schema: Schema,
+    root: impl AsRef<std::path::Path>,
+    temporary_parent: impl AsRef<std::path::Path>,
+    layer: &str,
+    area_per_pixel: f64,
+) -> Result<ngff_object_table::TableReader> {
+    use crate::object_table::{
+        finalize_object_table, ColumnRole, ColumnSpec, CoordinateColumn, DType, ObjectValue,
+        SpatialIndexSpec, TableSpec,
+    };
+
+    let columns = vec![
+        ColumnSpec::new("label_id", DType::U64, ColumnRole::Identity),
+        ColumnSpec::new("centroid_y", DType::F32, ColumnRole::Coordinate),
+        ColumnSpec::new("centroid_x", DType::F32, ColumnRole::Coordinate),
+        ColumnSpec::new("area_pixels", DType::U32, ColumnRole::Measurement),
+        ColumnSpec::new("area_um2", DType::F32, ColumnRole::Measurement),
+        ColumnSpec::new("dapi_mean", DType::F32, ColumnRole::Intensity),
+        ColumnSpec::new("dapi_min", DType::U8, ColumnRole::Intensity),
+        ColumnSpec::new("dapi_max", DType::U8, ColumnRole::Intensity),
+    ];
+    let tile_shape = vec![1024, 1024];
+    let grid_shape = vec![
+        volume[1].div_ceil(tile_shape[0] as usize) as u64,
+        volume[2].div_ceil(tile_shape[1] as usize) as u64,
+    ];
+    let spatial_index = SpatialIndexSpec {
+        coordinates: vec![
+            CoordinateColumn {
+                axis: "y".into(),
+                column: "centroid_y".into(),
+            },
+            CoordinateColumn {
+                axis: "x".into(),
+                column: "centroid_x".into(),
+            },
+        ],
+        tile_shape,
+        grid_shape,
+        tile_order: "row_major".into(),
+        within_tile_order: "lexicographic_coordinates_then_identity".into(),
+    };
+    let mut spec = TableSpec::new(0, 2048, "../../", "label_id", columns, spatial_index);
+    spec.region = Some(format!("../../labels/{layer}"));
+    finalize_object_table(
+        env,
+        stream,
+        phase,
+        volume,
+        input_schema,
+        root,
+        temporary_parent,
+        spec,
+        |row| {
+            let id = row.u64(0)?;
+            let count = row.u64(1)?;
+            if count == 0 {
+                return Ok(None);
+            }
+            let y = row.u64(3)? as f64 / count as f64;
+            let x = row.u64(4)? as f64 / count as f64;
+            let mean = row.u64(5)? as f64 / count as f64;
+            Ok(Some(vec![
+                ObjectValue::U64(id),
+                ObjectValue::F32(y as f32),
+                ObjectValue::F32(x as f32),
+                ObjectValue::U32(u32::try_from(count).map_err(|_| {
+                    Error::invalid(format!("object {id} area {count} does not fit u32"))
+                })?),
+                ObjectValue::F32((count as f64 * area_per_pixel) as f32),
+                ObjectValue::F32(mean as f32),
+                ObjectValue::U8(u8::try_from(row.u64(6)?).map_err(|_| {
+                    Error::invalid(format!("object {id} minimum intensity does not fit u8"))
+                })?),
+                ObjectValue::U8(u8::try_from(row.u64(7)?).map_err(|_| {
+                    Error::invalid(format!("object {id} maximum intensity does not fit u8"))
+                })?),
+            ]))
+        },
+    )
+}
+
 /// The fixed columns every row carries, before the measured ones.
 pub const FIXED_COLUMNS: usize = 5;
 

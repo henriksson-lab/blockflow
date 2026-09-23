@@ -2,10 +2,12 @@
 
 This example segments a fluorescence channel without loading the slide into memory. It uses the
 normal Blockflow path: attach a plane from the OME-Zarr pyramid, ask the planner to choose a block
-size for the real Cellpose operation, execute the plan, and write results that newvolim discovers:
+size for the real Cellpose operation, execute the plan, and write a viewer label layer plus its
+linked native table:
 
 - `labels/<layer>/`: a tiled, multiscale `uint64` label image with stable cell IDs;
-- `tables/<layer>/table.csv`: area, centroid, and source-channel intensity keyed by those IDs.
+- `tables/<layer>/`: a typed, chunked native object table with area, centroid,
+  and source-channel intensity keyed by those IDs.
 
 The label pyramid is the annotation. newvolim can render it filled or as outlines and can inspect an
 exact label ID without loading one whole-slide vector file.
@@ -87,6 +89,7 @@ Point newvolim at the original dataset after the run:
   --dataset 2079=/husky/otherdataset/teresa/2079_merged_registered.zarr
 ```
 
-Enable `cellpose-dapi` under **Labels** and select **Outlines**. The table can color labels by area
-or mean DAPI intensity. Its `label_id` is also the join key for measuring other channels later with
-`Measurements::for_labels`, without running Cellpose again.
+Enable `cellpose-dapi` under **Labels** and select **Outlines**. Its `label_id` is the join key for
+measuring other channels later with `Measurements::for_labels`, without running Cellpose again.
+newvolim still needs its native object-table reader connected before this table can color labels by
+area or mean DAPI intensity.

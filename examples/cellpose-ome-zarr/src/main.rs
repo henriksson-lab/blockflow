@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,15 +9,14 @@ use blockflow::assemble::PlanBuilder;
 use blockflow::decomposition::{Constraints, Decomposition};
 use blockflow::fragment::{fragment_phase, FragmentOp, PhaseWork};
 use blockflow::geometry::BlockGrid;
+use blockflow::label_pyramid::{build_nearest_label_pyramid, refresh_label_registry};
 use blockflow::model_segment::{
     cellpose::{CellposeBackend, Device},
-    InstanceSegment,
+    finalize_instances, InstanceSegment,
 };
 use blockflow::op::Chain;
-use blockflow::ops::{collect_rows, resample_phase, Interpolation, Resample, ResampleOp};
 use blockflow::sidecar::Lifecycle;
-use blockflow::strategy::{execute, execute_phases, predicted_phase_prices, Hints, Workflow};
-use blockflow::table::Value;
+use blockflow::strategy::{execute_phases, predicted_phase_prices, Hints};
 use blockflow::zarr_env::ZarrEnvironment;
 use blockflow::{AttachedImage, Dtype, Error, Result};
 use cellpose::EvalParams;
@@ -219,14 +217,36 @@ fn run() -> Result<()> {
         )?;
     }
     drop(env);
-    build_label_pyramid(&config, &levels, &staged_layer, &work)?;
+    let label_shapes = levels
+        .iter()
+        .map(|level| [1, level.shape[1], level.shape[2]])
+        .collect::<Vec<_>>();
+    build_nearest_label_pyramid(
+        &staged_layer,
+        &work,
+        &label_shapes,
+        &config.blocks,
+        config.workers,
+    )?;
     let rows_env = ZarrEnvironment::attach(&work, &[source])?;
-    let rows = collect_rows(&rows_env, STREAM, phase, volume, row_schema)?;
+    let table = finalize_instances(
+        &rows_env,
+        STREAM,
+        phase,
+        volume,
+        row_schema,
+        &staged_table,
+        &work,
+        &config.layer,
+        pixel_area(&levels[0]),
+    )?;
     drop(rows_env);
     write_label_metadata(&staged_layer, &levels)?;
-    write_table(&staged_table, &config.layer, &rows, pixel_area(&levels[0]))?;
+    let cells = table.spec().row_count;
+    drop(table);
     replace_with(&staged_layer, &layer_root, config.overwrite)?;
     replace_with(&staged_table, &table_root, config.overwrite)?;
+    refresh_label_registry(&config.zarr.join("labels"))?;
     fs::remove_dir_all(&work).map_err(Error::backend)?;
 
     if let (Some(path), Some(profile)) = (&config.profile_json, profile) {
@@ -240,9 +260,9 @@ fn run() -> Result<()> {
 
     println!(
         "cells={} label={} table={}",
-        rows.len(),
+        cells,
         layer_root.display(),
-        table_root.join("table.csv").display()
+        table_root.display()
     );
     Ok(())
 }
@@ -406,95 +426,6 @@ fn planned_fragment_grid(
         .ok_or_else(|| Error::invalid("no Cellpose block candidate fits the supplied constraints"))
 }
 
-fn build_label_pyramid(
-    config: &Config,
-    levels: &[SourceLevel],
-    label_root: &Path,
-    work: &Path,
-) -> Result<()> {
-    for (index, level) in levels.iter().enumerate().skip(1) {
-        let destination = label_root.join(index.to_string());
-        if destination.is_dir() {
-            continue;
-        }
-        let input = AttachedImage::at(label_root.join((index - 1).to_string()));
-        let (_, input_shape) = input.metadata()?;
-        let output_shape = [1, level.shape[1], level.shape[2]];
-        let resample = Resample::to_extent(input_shape, output_shape, Interpolation::Nearest)?;
-        let chain = Chain::op(ResampleOp::new("label-pyramid-nearest", resample));
-        let workflow = Workflow::new(chain, input_shape, Dtype::U64);
-        let mut constraints = constraints(config, output_shape);
-        constraints.block_candidates = config.blocks.clone();
-        let decomposition = planned_resample(
-            &workflow,
-            &resample,
-            input_shape,
-            output_shape,
-            &constraints,
-        )?;
-        let hints = Hints {
-            concurrency: config.workers.max(1),
-            ..Hints::default()
-        };
-        let level_work = work.join(format!("pyramid-{index}"));
-        let env = ZarrEnvironment::attach(&level_work, &[input.clone()])?;
-        execute(
-            "Cellpose label pyramid",
-            &workflow,
-            &decomposition,
-            &hints,
-            &env,
-        )?;
-        move_path(&level_work.join("level1"), &destination)?;
-    }
-    Ok(())
-}
-
-fn planned_resample(
-    workflow: &Workflow,
-    resample: &Resample,
-    input: [usize; 3],
-    output: [usize; 3],
-    constraints: &Constraints,
-) -> Result<Decomposition> {
-    let mut best: Option<(f64, usize, Decomposition)> = None;
-    for &edge in &constraints.block_candidates {
-        let grid = BlockGrid::along(output, &constraints.split_axes, edge)?;
-        let phase = resample_phase(
-            vec![0],
-            vec!["label-pyramid-nearest".to_owned()],
-            resample,
-            input,
-            grid,
-        )?;
-        let decomposition = Decomposition {
-            volume: input,
-            dtype: Dtype::U64,
-            phases: vec![phase],
-            chain_reach: workflow.chain.reach3(&input),
-        };
-        decomposition.check()?;
-        let prices = predicted_phase_prices(
-            &workflow.chain,
-            &decomposition,
-            &[PhaseWork::Pixels],
-            &constraints.model,
-            constraints.expected_concurrency,
-        )?;
-        let (cost, makespan) = &prices[0];
-        if !constraints.affords_working_set(cost) {
-            continue;
-        }
-        if best.as_ref().is_none_or(|(old, old_edge, _)| {
-            (*makespan, std::cmp::Reverse(edge)) < (*old, std::cmp::Reverse(*old_edge))
-        }) {
-            best = Some((*makespan, edge, decomposition));
-        }
-    }
-    best.map(|(_, _, decomposition)| decomposition)
-        .ok_or_else(|| Error::invalid("no label-pyramid block candidate fits the constraints"))
-}
-
 fn source_levels(root: &Path) -> Result<Vec<SourceLevel>> {
     let metadata: Json =
         serde_json::from_slice(&fs::read(root.join("zarr.json")).map_err(Error::backend)?)
@@ -554,60 +485,6 @@ fn write_label_metadata(root: &Path, levels: &[SourceLevel]) -> Result<()> {
             },
             "image-label": {"version":"0.5", "source":{"image":"../../"}}
         }
-    });
-    fs::write(
-        root.join("zarr.json"),
-        serde_json::to_vec_pretty(&metadata).map_err(Error::backend)?,
-    )
-    .map_err(Error::backend)
-}
-
-fn write_table(
-    root: &Path,
-    layer: &str,
-    rows: &[blockflow::ops::RowValues],
-    area_per_pixel: f64,
-) -> Result<()> {
-    fs::create_dir_all(root).map_err(Error::backend)?;
-    let file = File::create(root.join("table.csv")).map_err(Error::backend)?;
-    let mut out = BufWriter::new(file);
-    writeln!(
-        out,
-        "label_id,area_pixels,area_um2,centroid_y,centroid_x,dapi_mean,dapi_min,dapi_max"
-    )
-    .map_err(Error::backend)?;
-    for row in rows {
-        let values = row
-            .values
-            .iter()
-            .map(|value| match value {
-                Value::U64(v) => Ok(*v),
-                _ => Err(Error::invalid("Cellpose row contains a non-integer column")),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let count = values[1];
-        if count == 0 {
-            continue;
-        }
-        writeln!(
-            out,
-            "{},{},{},{},{},{},{},{}",
-            values[0],
-            count,
-            count as f64 * area_per_pixel,
-            values[3] as f64 / count as f64,
-            values[4] as f64 / count as f64,
-            values[5] as f64 / count as f64,
-            values[6],
-            values[7]
-        )
-        .map_err(Error::backend)?;
-    }
-    out.flush().map_err(Error::backend)?;
-    let metadata = json!({
-        "zarr_format": 3,
-        "node_type": "group",
-        "attributes": {"type":"feature_table", "region":{"path":format!("../../labels/{layer}")}}
     });
     fs::write(
         root.join("zarr.json"),

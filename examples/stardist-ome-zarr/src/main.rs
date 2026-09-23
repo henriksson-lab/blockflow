@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,12 +8,11 @@ use blockflow::assemble::PlanBuilder;
 use blockflow::decomposition::{Constraints, Decomposition};
 use blockflow::fragment::{fragment_phase, FragmentOp, PhaseWork};
 use blockflow::geometry::BlockGrid;
-use blockflow::model_segment::{stardist::StardistBackend, InstanceSegment};
+use blockflow::label_pyramid::{build_nearest_label_pyramid, refresh_label_registry};
+use blockflow::model_segment::{finalize_instances, stardist::StardistBackend, InstanceSegment};
 use blockflow::op::Chain;
-use blockflow::ops::{collect_rows, resample_phase, Interpolation, Resample, ResampleOp};
 use blockflow::sidecar::Lifecycle;
-use blockflow::strategy::{execute, execute_phases, predicted_phase_prices, Hints, Workflow};
-use blockflow::table::Value;
+use blockflow::strategy::{execute_phases, predicted_phase_prices, Hints};
 use blockflow::zarr_env::ZarrEnvironment;
 use blockflow::{AttachedImage, Dtype, Error, Result};
 use clap::Parser;
@@ -70,6 +68,9 @@ struct Config {
     /// Replace an existing layer and table with the same name.
     #[arg(long, default_value_t = false)]
     overwrite: bool,
+    /// Resume finalization from an existing labels/.<layer>-blockflow-work directory.
+    #[arg(long, default_value_t = false, hide = true)]
+    resume_work: bool,
 }
 
 #[derive(Clone)]
@@ -108,12 +109,21 @@ fn run() -> Result<()> {
         .zarr
         .join("labels")
         .join(format!(".{}-blockflow-work", config.layer));
-    if work.exists() {
-        fs::remove_dir_all(&work).map_err(Error::backend)?;
-    }
-    fs::create_dir_all(&work).map_err(Error::backend)?;
     let staged_layer = work.join("layer");
     let staged_table = work.join("table");
+    if config.resume_work {
+        if !staged_layer.join("0").is_dir() {
+            return Err(Error::invalid(format!(
+                "cannot resume: {} is missing",
+                staged_layer.join("0").display()
+            )));
+        }
+    } else {
+        if work.exists() {
+            fs::remove_dir_all(&work).map_err(Error::backend)?;
+        }
+        fs::create_dir_all(&work).map_err(Error::backend)?;
+    }
 
     let source = AttachedImage::at(config.zarr.join(&level0.path))
         .plane(config.channel, [level0.shape[1], level0.shape[2]]);
@@ -147,44 +157,70 @@ fn run() -> Result<()> {
     let mut builder = PlanBuilder::new(volume, dtype, grid);
     builder.fragments(op)?;
     let assembly = builder.finish()?;
-    let env = ZarrEnvironment::attach(&work, &[source])?;
-    let work_kinds = assembly.work();
-    let hints = Hints {
-        concurrency: config.workers.max(1),
-        cache_bytes: constraints.cache_bytes,
-        prefetch_depth: constraints.prefetch_depth,
-        prefetch_chunk_bytes: constraints.prefetch_chunk_bytes,
-        ..Hints::default()
-    };
-    execute_phases(
-        "stardist OME-Zarr",
-        &assembly.workflow,
-        &assembly.decomposition,
-        &hints,
-        &env,
-        &[],
-        &work_kinds,
-    )?;
-
+    let env = ZarrEnvironment::attach(&work, &[source.clone()])?;
     let phase = assembly.n_phases() - 1;
-    let rows = collect_rows(&env, STREAM, phase, volume, row_schema)?;
-    fs::create_dir_all(&staged_layer).map_err(Error::backend)?;
-    move_path(
-        &work.join(format!("level{}", phase + 1)),
-        &staged_layer.join("0"),
+    if !config.resume_work {
+        let work_kinds = assembly.work();
+        let hints = Hints {
+            concurrency: config.workers.max(1),
+            cache_bytes: constraints.cache_bytes,
+            prefetch_depth: constraints.prefetch_depth,
+            prefetch_chunk_bytes: constraints.prefetch_chunk_bytes,
+            ..Hints::default()
+        };
+        execute_phases(
+            "stardist OME-Zarr",
+            &assembly.workflow,
+            &assembly.decomposition,
+            &hints,
+            &env,
+            &[],
+            &work_kinds,
+        )?;
+        fs::create_dir_all(&staged_layer).map_err(Error::backend)?;
+        move_path(
+            &work.join(format!("level{}", phase + 1)),
+            &staged_layer.join("0"),
+        )?;
+    }
+    drop(env);
+    let label_shapes = levels
+        .iter()
+        .map(|level| [1, level.shape[1], level.shape[2]])
+        .collect::<Vec<_>>();
+    build_nearest_label_pyramid(
+        &staged_layer,
+        &work,
+        &label_shapes,
+        &config.blocks,
+        config.workers,
     )?;
-    build_label_pyramid(&config, &levels, &staged_layer, &work)?;
+    let rows_env = ZarrEnvironment::attach(&work, &[source])?;
+    let table = finalize_instances(
+        &rows_env,
+        STREAM,
+        phase,
+        volume,
+        row_schema,
+        &staged_table,
+        &work,
+        &config.layer,
+        pixel_area(&levels[0]),
+    )?;
+    drop(rows_env);
     write_label_metadata(&staged_layer, &levels)?;
-    write_table(&staged_table, &config.layer, &rows, pixel_area(&levels[0]))?;
+    let cells = table.spec().row_count;
+    drop(table);
     replace_with(&staged_layer, &layer_root, config.overwrite)?;
     replace_with(&staged_table, &table_root, config.overwrite)?;
+    refresh_label_registry(&config.zarr.join("labels"))?;
     fs::remove_dir_all(&work).map_err(Error::backend)?;
 
     println!(
         "cells={} label={} table={}",
-        rows.len(),
+        cells,
         layer_root.display(),
-        table_root.join("table.csv").display()
+        table_root.display()
     );
     Ok(())
 }
@@ -272,94 +308,6 @@ fn planned_fragment_grid(
         .ok_or_else(|| Error::invalid("no StarDist block candidate fits the supplied constraints"))
 }
 
-fn build_label_pyramid(
-    config: &Config,
-    levels: &[SourceLevel],
-    label_root: &Path,
-    work: &Path,
-) -> Result<()> {
-    let input = AttachedImage::at(label_root.join("0"));
-    let (_, input_shape) = input.metadata()?;
-    for (index, level) in levels.iter().enumerate().skip(1) {
-        let output_shape = [1, level.shape[1], level.shape[2]];
-        let resample = Resample::to_extent(input_shape, output_shape, Interpolation::Nearest)?;
-        let chain = Chain::op(ResampleOp::new("label-pyramid-nearest", resample));
-        let workflow = Workflow::new(chain, input_shape, Dtype::U64);
-        let mut constraints = constraints(config, output_shape);
-        constraints.block_candidates = config.blocks.clone();
-        let decomposition = planned_resample(
-            &workflow,
-            &resample,
-            input_shape,
-            output_shape,
-            &constraints,
-        )?;
-        let hints = Hints {
-            concurrency: config.workers.max(1),
-            ..Hints::default()
-        };
-        let level_work = work.join(format!("pyramid-{index}"));
-        let env = ZarrEnvironment::attach(&level_work, &[input.clone()])?;
-        execute(
-            "StarDist label pyramid",
-            &workflow,
-            &decomposition,
-            &hints,
-            &env,
-        )?;
-        move_path(
-            &level_work.join("level1"),
-            &label_root.join(index.to_string()),
-        )?;
-    }
-    Ok(())
-}
-
-fn planned_resample(
-    workflow: &Workflow,
-    resample: &Resample,
-    input: [usize; 3],
-    output: [usize; 3],
-    constraints: &Constraints,
-) -> Result<Decomposition> {
-    let mut best: Option<(f64, usize, Decomposition)> = None;
-    for &edge in &constraints.block_candidates {
-        let grid = BlockGrid::along(output, &constraints.split_axes, edge)?;
-        let phase = resample_phase(
-            vec![0],
-            vec!["label-pyramid-nearest".to_owned()],
-            resample,
-            input,
-            grid,
-        )?;
-        let decomposition = Decomposition {
-            volume: input,
-            dtype: Dtype::U64,
-            phases: vec![phase],
-            chain_reach: workflow.chain.reach3(&input),
-        };
-        decomposition.check()?;
-        let prices = predicted_phase_prices(
-            &workflow.chain,
-            &decomposition,
-            &[PhaseWork::Pixels],
-            &constraints.model,
-            constraints.expected_concurrency,
-        )?;
-        let (cost, makespan) = &prices[0];
-        if !constraints.affords_working_set(cost) {
-            continue;
-        }
-        if best.as_ref().is_none_or(|(old, old_edge, _)| {
-            (*makespan, std::cmp::Reverse(edge)) < (*old, std::cmp::Reverse(*old_edge))
-        }) {
-            best = Some((*makespan, edge, decomposition));
-        }
-    }
-    best.map(|(_, _, decomposition)| decomposition)
-        .ok_or_else(|| Error::invalid("no label-pyramid block candidate fits the constraints"))
-}
-
 fn source_levels(root: &Path) -> Result<Vec<SourceLevel>> {
     let metadata: Json =
         serde_json::from_slice(&fs::read(root.join("zarr.json")).map_err(Error::backend)?)
@@ -419,60 +367,6 @@ fn write_label_metadata(root: &Path, levels: &[SourceLevel]) -> Result<()> {
             },
             "image-label": {"version":"0.5", "source":{"image":"../../"}}
         }
-    });
-    fs::write(
-        root.join("zarr.json"),
-        serde_json::to_vec_pretty(&metadata).map_err(Error::backend)?,
-    )
-    .map_err(Error::backend)
-}
-
-fn write_table(
-    root: &Path,
-    layer: &str,
-    rows: &[blockflow::ops::RowValues],
-    area_per_pixel: f64,
-) -> Result<()> {
-    fs::create_dir_all(root).map_err(Error::backend)?;
-    let file = File::create(root.join("table.csv")).map_err(Error::backend)?;
-    let mut out = BufWriter::new(file);
-    writeln!(
-        out,
-        "label_id,area_pixels,area_um2,centroid_y,centroid_x,dapi_mean,dapi_min,dapi_max"
-    )
-    .map_err(Error::backend)?;
-    for row in rows {
-        let values = row
-            .values
-            .iter()
-            .map(|value| match value {
-                Value::U64(v) => Ok(*v),
-                _ => Err(Error::invalid("StarDist row contains a non-integer column")),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let count = values[1];
-        if count == 0 {
-            continue;
-        }
-        writeln!(
-            out,
-            "{},{},{},{},{},{},{},{}",
-            values[0],
-            count,
-            count as f64 * area_per_pixel,
-            values[3] as f64 / count as f64,
-            values[4] as f64 / count as f64,
-            values[5] as f64 / count as f64,
-            values[6],
-            values[7]
-        )
-        .map_err(Error::backend)?;
-    }
-    out.flush().map_err(Error::backend)?;
-    let metadata = json!({
-        "zarr_format": 3,
-        "node_type": "group",
-        "attributes": {"type":"feature_table", "region":{"path":format!("../../labels/{layer}")}}
     });
     fs::write(
         root.join("zarr.json"),

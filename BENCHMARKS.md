@@ -259,6 +259,17 @@ run. Segmentation quality on representative tissue should be reviewed first,
 because performance headroom does not establish that the model and thresholds
 are biologically suitable for this slide.
 
+An Nsight Systems follow-up on one release run measured 1.56 seconds of GPU
+kernels and 0.323 seconds of GPU copies. Device-to-host copies moved 432.5 MB
+in 0.315 seconds; host-to-device copies moved 58.1 MB in 0.008 seconds. All
+kernels and copies used one CUDA stream. Pure copy overlap can therefore save
+at most about 5% of the 6.57 second median. The trace also showed 1.34 second
+host gaps between one block's dense distance download and the next block's
+upload. If StarDist is optimized later, the first candidate should threshold
+probabilities and gather only selected ray distances on the GPU, then pipeline
+CPU instance construction with the next inference. Pinning or asynchronously
+copying the current dense buffers alone has a much smaller ceiling.
+
 The Python timing entry point is
 `examples/stardist-ome-zarr/scripts/benchmark_python.py`. For example:
 
@@ -269,3 +280,25 @@ The Python timing entry point is
   --model .tmp/stardist-models --low 1 --high 70 \
   --output .tmp/stardist-python.json
 ```
+
+### Full 2079 slide completion
+
+The StarDist example was also run over the complete 157,440 x 66,048 DAPI
+plane. It published 404,695 cells as a ten-level, 1.2 GiB label pyramid at
+`labels/stardist-dapi` and a 35 MiB linked table at
+`tables/stardist-dapi/table.csv`. The existing Cellpose label and table remain
+beside it, so newvolim can display either annotation on the same image.
+
+The elapsed time from starting segmentation to publishing the repaired output
+was **1:28:06**. The two process segments totaled **1:24:04**. This is an
+end-to-end completion record, not a benchmark of the current implementation:
+the run exposed an old StarDist-only pyramid builder that repeatedly read level
+0. It was stopped after staging levels 0 through 7 at 157.4 GiB peak host RSS,
+then resumed after both annotation examples were moved to the shared
+planner-driven label-pyramid builder. The release resume built levels 8 and 9,
+collected the table, and published the result in 12.95 seconds at 412 MiB peak
+host RSS.
+
+A future small-data experiment should compare one and two StarDist workers.
+The current CUDA path uses one model and stream, so this must be measured rather
+than assumed to improve GPU occupancy.

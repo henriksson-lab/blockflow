@@ -5,6 +5,7 @@
 members = [
     ".",
     "crates/blockflow-progress",
+    "crates/ngff-object-table",
     "examples/cellprofiler-human",
     "examples/imglib2-pipeline",
     "examples/opencv-pipeline",
@@ -238,6 +239,7 @@ zarrs = { version = "0.23.13", optional = true, default-features = false, featur
     "filesystem",
     "gzip",
 ] }
+ngff-object-table = { path = "crates/ngff-object-table", optional = true }
 anyhow = { version = "1", optional = true }
 csv = { version = "1", optional = true }
 image = { version = "0.25", optional = true }
@@ -305,7 +307,7 @@ gui = []
 # file's. `default-features = false` on `zarrs` is part of the same accounting:
 # only its filesystem store is asked for, not blosc, zstd, sharding, transpose,
 # crc32c or its own (different, second) `ndarray`.
-zarr = ["dep:zarrs"]
+zarr = ["dep:zarrs", "dep:ngff-object-table"]
 # `ops::fft` on the system's FFTW 3 instead of `rustfft` + `realfft`. Off by
 # default, and off is the configuration everything else is measured against: with
 # `fftw` disabled the package graph is **29**, exactly what it was before this

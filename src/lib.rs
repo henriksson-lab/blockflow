@@ -155,6 +155,9 @@ pub mod http;
 /// live storage is two private buffers whatever the substage count turns out to
 /// be.
 pub mod iterate;
+/// Planner-driven, out-of-core nearest-neighbour pyramids for stored labels.
+#[cfg(feature = "zarr")]
+pub mod label_pyramid;
 pub mod listener;
 pub(crate) mod lock;
 pub mod log;
@@ -168,6 +171,9 @@ pub mod net;
 /// is transposed**; a caller that can take only one says so and gets a refusal
 /// naming the order it found.
 pub mod npy;
+/// Bounded-memory finalisation of fragment rows into native NGFF object tables.
+#[cfg(feature = "zarr")]
+pub mod object_table;
 pub mod observed_io;
 pub mod op;
 /// Image-processing operations: voxelwise combination, rank filtering,

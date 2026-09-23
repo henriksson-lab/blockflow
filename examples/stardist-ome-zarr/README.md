@@ -2,10 +2,11 @@
 
 This example segments fluorescent nuclei without loading the slide into memory. It attaches one
 channel of an existing `[c, y, x]` OME-Zarr pyramid, offers the actual StarDist fragment phase to the
-block planner, executes the chosen plan, and writes results back in forms that newvolim discovers:
+block planner, executes the chosen plan, and writes a viewer label layer plus its linked native table:
 
 - `labels/<layer>/`: a multiscale `uint64` label image with stable cell IDs;
-- `tables/<layer>/table.csv`: area, centroid, and DAPI intensity keyed by the same IDs.
+- `tables/<layer>/`: a typed, chunked native object table with area, centroid,
+  and DAPI intensity keyed by the same IDs.
 
 The label pyramid is the annotation. In newvolim it can be shown filled or as outlines, clicked to
 inspect an exact ID, and colored by a measurement-table column. A vector GeoJSON file is a poor fit
@@ -67,8 +68,10 @@ Point newvolim at the original dataset after the run:
   --dataset 2079=/husky/otherdataset/teresa/2079_merged_registered.zarr
 ```
 
-Enable `stardist-dapi` under **Labels** and select **Outlines**. The matching measurement table can
-paint labels by area or mean DAPI intensity.
+Enable `stardist-dapi` under **Labels** and select **Outlines**. This dataset also contains the
+independently generated `cellpose-dapi` label and table, so both annotations can be selected and
+compared in the viewer. newvolim still needs its native object-table reader connected before these
+new tables can paint labels by area or mean DAPI intensity.
 
 The table already establishes the later quantification contract: `label_id` is the join key. Further
 channels can be measured over `labels/stardist-dapi/0` with `Measurements::for_labels`, without
@@ -86,3 +89,18 @@ values, memory measurements, scope, and Python timing command.
 This result gives enough performance margin to proceed without a StarDist
 optimization pass. Review representative annotations before a whole-slide run
 to validate the model and thresholds against the tissue.
+
+## Completed full-slide output
+
+The command above completed on the 157,440 x 66,048 DAPI plane and published
+404,695 cells. The result is a ten-level, 1.2 GiB label pyramid plus a 35 MiB
+linked table. The elapsed time from the initial start through publication was
+1:28:06, with 1:24:04 spent in the two process segments.
+
+That timing includes diagnosis and recovery from the example's former duplicate
+pyramid builder, so it is a completion record rather than a clean benchmark.
+The current example uses Blockflow's shared planner-driven label-pyramid builder,
+derives each level from the preceding level, and can resume at the first missing
+level. The recovery step built the last two levels and published the staged
+result in 12.95 seconds with 412 MiB peak host memory. Full details are recorded
+in [`BENCHMARKS.md`](../../BENCHMARKS.md#full-2079-slide-completion).
