@@ -28,11 +28,11 @@ fn main() -> Result<()> {
         return verify(Path::new(&arguments[1]));
     }
     if arguments.len() != 5 {
-        return Err(format!(
+        return Err(
             "usage: ngff-object-table-convert INPUT.csv OUTPUT.zarr LABEL HEIGHT WIDTH\n       \
              ngff-object-table-convert --verify TABLE.zarr"
-        )
-        .into());
+                .into(),
+        );
     }
     let input = PathBuf::from(&arguments[0]);
     let output = PathBuf::from(&arguments[1]);

@@ -524,9 +524,7 @@ impl TableWriter {
             ));
         }
         self.write("@identity_ids", start, ids, DType::U64)?;
-        if let Err(error) = self.write("@identity_rows", start, rows, DType::U64) {
-            return Err(error);
-        }
+        self.write("@identity_rows", start, rows, DType::U64)?;
         Ok(())
     }
 
