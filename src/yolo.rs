@@ -7,19 +7,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::op::{Chain, SourceInput};
-use crate::strategy::{execute_phases, Hints, Workflow};
+use crate::op::SourceInput;
+use crate::strategy::{execute_phases, Hints};
 use crate::table::{Column, ColumnType, Row, RowBuilder, Schema, Table, Value};
 use crate::{
-    env::Environment, fragment_phase, AttachedImage, BlockBuf, BlockGrid, BlockOutput, BlockView,
-    Coverage, Decomposition, Dtype, FragmentOp, FragmentOutput, ImageId, Lifecycle, PhaseWork,
-    Reach, Region, SourceBlocks, ZarrEnvironment,
+    env::Environment, AttachedImage, BlockBuf, BlockGrid, BlockOutput, BlockView, Coverage, Dtype,
+    FragmentOp, FragmentOutput, ImageId, Lifecycle, PlanBuilder, Reach, Region, SourceBlocks,
+    ZarrEnvironment,
 };
 use anyhow::{bail, Context, Result};
 use burn::prelude::*;
-#[cfg(feature = "yolo-cuda")]
+#[cfg(any(feature = "yolo-cuda", feature = "yolo-libtorch"))]
 use burn::tensor::DeviceIndex;
-#[cfg(not(feature = "yolo-cuda"))]
+#[cfg(not(any(feature = "yolo-cuda", feature = "yolo-libtorch")))]
 use burn::tensor::DeviceKind;
 use image::{DynamicImage, RgbImage};
 
@@ -31,6 +31,8 @@ pub struct PredictConfig {
     pub weights: PathBuf,
     pub config: PathBuf,
     pub channels: Vec<usize>,
+    /// Optional `[y, x, height, width]` window within the selected level.
+    pub region: Option<[usize; 4]>,
     pub normalize_range: (f64, f64),
     pub block: usize,
     pub halo: usize,
@@ -55,17 +57,31 @@ pub fn run(config: &PredictConfig) -> Result<()> {
             level_dir.display()
         );
     }
-    let (height, width) = level_extent(&level_dir)?;
+    let (level_height, level_width) = level_extent(&level_dir)?;
+    let [origin_y, origin_x, height, width] =
+        config.region.unwrap_or([0, 0, level_height, level_width]);
+    if height == 0
+        || width == 0
+        || origin_y.saturating_add(height) > level_height
+        || origin_x.saturating_add(width) > level_width
+    {
+        bail!(
+            "region [{origin_y}, {origin_x}, {height}, {width}] is outside level extent \
+             [{level_height}, {level_width}]"
+        );
+    }
     let volume = [1, height, width];
     println!(
-        "YOLO over level {}: {} x {}, channels {:?}",
-        config.level, width, height, config.channels
+        "YOLO over level {} region y={} x={} height={} width={}, channels {:?}",
+        config.level, origin_y, origin_x, height, width, config.channels
     );
 
     let images: Vec<AttachedImage> = config
         .channels
         .iter()
-        .map(|channel| AttachedImage::at(&level_dir).plane(*channel, [height, width]))
+        .map(|channel| {
+            AttachedImage::at(&level_dir).window([*channel, origin_y, origin_x], [1, height, width])
+        })
         .collect();
     let env = ZarrEnvironment::attach(&config.work, &images)
         .map_err(|error| anyhow::anyhow!("attaching {}: {error}", level_dir.display()))?;
@@ -73,21 +89,19 @@ pub fn run(config: &PredictConfig) -> Result<()> {
         .image_dtype(0)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let detector = Arc::new(YoloBlockDetector::new(config, dtype)?);
+    let detector = YoloBlockDetector::new(config, dtype, [origin_y, origin_x])?;
+    detector.warmup()?;
+    let schema = detector.schema_data()?;
     let grid = BlockGrid::new(volume, [1, config.block, config.block])
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let blocks = grid.n_blocks();
-    let phase = fragment_phase(detector.as_ref(), grid.clone())
+    let mut builder = PlanBuilder::new(volume, dtype, grid.clone());
+    let phase = builder
+        .fragments(detector)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let plan = Decomposition {
-        volume,
-        dtype,
-        phases: vec![phase],
-        chain_reach: [0, 0, 0],
-    };
-    plan.check().map_err(|error| anyhow::anyhow!("{error}"))?;
-
-    let workflow = Workflow::new(Chain::sequence(Vec::new()), volume, dtype);
+    let assembly = builder
+        .finish()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let hints = Hints {
         concurrency: config.concurrency.max(1),
         ..Hints::default()
@@ -100,26 +114,25 @@ pub fn run(config: &PredictConfig) -> Result<()> {
     let started = std::time::Instant::now();
     let stats = execute_phases(
         "yolo-slide",
-        &workflow,
-        &plan,
+        &assembly.workflow,
+        &assembly.decomposition,
         &hints,
         &env,
         &[],
-        &[PhaseWork::Fragments(detector.as_ref())],
+        &assembly.work(),
     )
     .map_err(|error| anyhow::anyhow!("the run: {error}"))?;
     let elapsed = started.elapsed().as_secs_f64();
     println!(
-        "Ran {blocks} block(s) in {elapsed:.1}s, {} reads, {:.1} Mpx read",
+        "Ran {blocks} block(s) in {elapsed:.3}s, {} reads, {:.1} Mpx read",
         stats.reads,
         stats.read_voxels as f64 / 1e6
     );
 
-    let schema = detector.schema_data()?;
     let mut table = Table::new(volume, schema).map_err(|error| anyhow::anyhow!("{error}"))?;
     for core in grid.cores() {
         let bytes = env
-            .read_sidecar(STREAM, 0, core.index)
+            .read_sidecar(STREAM, phase.index(), core.index)
             .map_err(|error| anyhow::anyhow!("{error}"))?
             .with_context(|| format!("block {:?} wrote no detection blob", core.index))?;
         table
@@ -159,13 +172,16 @@ struct YoloBlockDetector {
     conf_threshold: f32,
     input_size: u32,
     source_dtype: Dtype,
+    origin: [usize; 2],
 }
 
 impl YoloBlockDetector {
-    fn new(config: &PredictConfig, source_dtype: Dtype) -> Result<Self> {
-        #[cfg(feature = "yolo-cuda")]
+    fn new(config: &PredictConfig, source_dtype: Dtype, origin: [usize; 2]) -> Result<Self> {
+        #[cfg(feature = "yolo-libtorch")]
+        let device = Device::libtorch_cuda(DeviceIndex::Default);
+        #[cfg(all(feature = "yolo-cuda", not(feature = "yolo-libtorch")))]
         let device = Device::cuda(DeviceIndex::Default);
-        #[cfg(not(feature = "yolo-cuda"))]
+        #[cfg(not(any(feature = "yolo-cuda", feature = "yolo-libtorch")))]
         let device = Device::wgpu(DeviceKind::DefaultDevice);
         let yolo_config = yolov11::train::config::Config::load(&config.config)?;
         let num_classes = yolo_config.num_classes();
@@ -190,6 +206,7 @@ impl YoloBlockDetector {
                 .try_load_file(&config.weights)
                 .map_err(|error| anyhow::anyhow!("loading weights: {error}"))?;
         }
+        model = model.fuse();
 
         Ok(Self {
             model: Mutex::new(model),
@@ -200,7 +217,34 @@ impl YoloBlockDetector {
             conf_threshold: config.conf_threshold,
             input_size: config.input_size,
             source_dtype,
+            origin,
         })
+    }
+
+    fn warmup(&self) -> Result<()> {
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for _ in 0..3 {
+            let input = Tensor::<4>::zeros(
+                [1, 3, self.input_size as usize, self.input_size as usize],
+                &self.device,
+            );
+            match model.forward(input, false) {
+                yolov11::model::model::YOLOOutput::Infer(output) => {
+                    let _ = yolov11::model::nms::non_max_suppression(
+                        &output,
+                        self.conf_threshold,
+                        0.45,
+                    );
+                }
+                yolov11::model::model::YOLOOutput::Train(_) => {
+                    bail!("YOLO warmup returned training output")
+                }
+            }
+        }
+        Ok(())
     }
 
     fn schema_data(&self) -> crate::error::Result<Schema> {
@@ -275,6 +319,8 @@ impl FragmentOp for YoloBlockDetector {
         at: &BlockView<'_>,
         sources: SourceBlocks<'_>,
     ) -> crate::error::Result<BlockOutput> {
+        let profile = std::env::var_os("BLOCKFLOW_YOLO_PROFILE").is_some();
+        let total_started = std::time::Instant::now();
         let schema = self.schema()?;
         let mut rows = RowBuilder::new(schema);
         let BlockBuf::Array(primary) = at.pixels()? else {
@@ -291,13 +337,29 @@ impl FragmentOp for YoloBlockDetector {
             channels.push(buf.widened());
         }
 
+        let preprocess_started = std::time::Instant::now();
         let rgb = rgb_from_channels(&channels, self.range)
             .map_err(|error| crate::error::Error::backend(format!("yolo: {error}")))?;
+        let rgb_elapsed = preprocess_started.elapsed();
+        let resize_started = std::time::Instant::now();
         let dyn_img = DynamicImage::ImageRgb8(rgb);
         let (letterboxed, (ratio_w, ratio_h), (pad_w, pad_h)) =
             yolov11::data::resize::resize(&dyn_img, self.input_size, false)
                 .map_err(|error| crate::error::Error::backend(format!("yolo: {error}")))?;
-        let tensor = image_to_tensor(&letterboxed, &self.device).unsqueeze::<4>();
+        let resize_elapsed = resize_started.elapsed();
+        let planar_started = std::time::Instant::now();
+        let (sample, height, width) = image_to_chw(&letterboxed);
+        let planar_elapsed = planar_started.elapsed();
+        let upload_started = std::time::Instant::now();
+        let tensor = Tensor::<1>::from_floats(sample.as_slice(), &self.device)
+            .reshape([1, 3, height, width]);
+        if profile {
+            self.device
+                .sync()
+                .map_err(|error| crate::error::Error::backend(format!("yolo sync: {error}")))?;
+        }
+        let upload_elapsed = upload_started.elapsed();
+        let forward_started = std::time::Instant::now();
         let output = {
             let model = self
                 .model
@@ -312,9 +374,18 @@ impl FragmentOp for YoloBlockDetector {
                 }
             }
         };
+        if profile {
+            self.device
+                .sync()
+                .map_err(|error| crate::error::Error::backend(format!("yolo sync: {error}")))?;
+        }
+        let forward_elapsed = forward_started.elapsed();
+        let nms_started = std::time::Instant::now();
         let detections =
             yolov11::model::nms::non_max_suppression(&output, self.conf_threshold, 0.45);
+        let nms_elapsed = nms_started.elapsed();
 
+        let rows_started = std::time::Instant::now();
         if let Some(tile_dets) = detections.first() {
             for det in tile_dets {
                 let x = (((det[0] + det[2]) * 0.5) - pad_w) as f64 / ratio_w.max(1e-6) as f64;
@@ -322,16 +393,18 @@ impl FragmentOp for YoloBlockDetector {
                 if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
                     continue;
                 }
-                let global_y = at.at.offset[1] as f64 + y;
-                let global_x = at.at.offset[2] as f64 + x;
+                let local_y = at.at.offset[1] as f64 + y;
+                let local_x = at.at.offset[2] as f64 + x;
                 let centre = [
                     0usize,
-                    global_y.round().max(0.0) as usize,
-                    global_x.round().max(0.0) as usize,
+                    local_y.round().max(0.0) as usize,
+                    local_x.round().max(0.0) as usize,
                 ];
                 if !owns(at.core, centre) {
                     continue;
                 }
+                let global_y = local_y + self.origin[0] as f64;
+                let global_x = local_x + self.origin[1] as f64;
                 let class = det[5].max(0.0) as u64;
                 rows.push(
                     centre,
@@ -344,6 +417,22 @@ impl FragmentOp for YoloBlockDetector {
                     ],
                 )?;
             }
+        }
+        let rows_elapsed = rows_started.elapsed();
+
+        if profile {
+            eprintln!(
+                "YOLO_PROFILE block={:?} rgb_us={} resize_us={} planar_us={} upload_us={} forward_us={} nms_us={} rows_us={} total_us={}",
+                at.core.start,
+                rgb_elapsed.as_micros(),
+                resize_elapsed.as_micros(),
+                planar_elapsed.as_micros(),
+                upload_elapsed.as_micros(),
+                forward_elapsed.as_micros(),
+                nms_elapsed.as_micros(),
+                rows_elapsed.as_micros(),
+                total_started.elapsed().as_micros(),
+            );
         }
 
         Ok(BlockOutput::fragment(STREAM.to_string(), rows.encode()))
@@ -403,7 +492,7 @@ fn detection_id(at: [usize; 3], volume: [usize; 3], class: u64) -> u64 {
         + at[2] as u64
 }
 
-fn image_to_tensor(img: &image::RgbImage, device: &Device) -> Tensor<3> {
+fn image_to_chw(img: &image::RgbImage) -> (Vec<f32>, usize, usize) {
     let (w, h) = img.dimensions();
     let raw = img.as_raw();
     let hw = (h * w) as usize;
@@ -411,12 +500,12 @@ fn image_to_tensor(img: &image::RgbImage, device: &Device) -> Tensor<3> {
     for y in 0..h as usize {
         for x in 0..w as usize {
             let idx = (y * w as usize + x) * 3;
-            sample[y * w as usize + x] = raw[idx + 2] as f32;
+            sample[y * w as usize + x] = raw[idx] as f32;
             sample[hw + y * w as usize + x] = raw[idx + 1] as f32;
-            sample[2 * hw + y * w as usize + x] = raw[idx] as f32;
+            sample[2 * hw + y * w as usize + x] = raw[idx + 2] as f32;
         }
     }
-    Tensor::<1>::from_floats(sample.as_slice(), device).reshape([3, h as usize, w as usize])
+    (sample, h as usize, w as usize)
 }
 
 fn level_extent(level_dir: &Path) -> Result<(usize, usize)> {

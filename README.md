@@ -42,9 +42,10 @@ pipelines were approximately:
 * **3× faster than Dask-image** on two larger images
 * **5.3× faster than Python StarDist** end to end on a real DAPI subset
 * **1.2× faster than Python Cellpose** end to end on a real DAPI subset
+* **1.11× faster than original YOLOv11** on matched FP32 CUDA inference
 
-These are wall-time ratios for the specified workloads, excluding fixture
-preparation and compilation. See [BENCHMARKS.md](BENCHMARKS.md) for the run
+These are ratios for the specified workloads, excluding fixture preparation and
+compilation. See [BENCHMARKS.md](BENCHMARKS.md) for each run's timed region,
 counts, measurements, output checks, and reproduction commands. Earlier
 results are archived in [OLD_BENCHMARKS.md](OLD_BENCHMARKS.md).
 

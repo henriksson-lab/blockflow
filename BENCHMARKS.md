@@ -197,6 +197,63 @@ The CellProfiler command was:
   -c -r -p ExampleHuman.cppipe -i images -o cellprofiler-output
 ```
 
+## YOLOv11 CUDA inference
+
+Measured on 2026-09-24 on the Quadro RTX 5000. Sixteen COCO validation images
+were losslessly letterboxed to 640 x 640 and repeated twice. The original read
+the 32 prepared PNG entries; Blockflow read the same pixels from 32 aligned,
+gzip-compressed OME-Zarr blocks. Both used batch size one, FP32, confidence
+0.25, IoU 0.45, three untimed warmup forwards, PyTorch/LibTorch 2.9 with CUDA
+12.8, and the same converted weights. Blockflow used four workers to overlap
+reading and preprocessing with GPU execution.
+The timed regions include input decoding, host preprocessing, GPU transfer,
+forward inference, and NMS. Blockflow additionally writes fragment rows during
+its timed phase. Model loading, warmup, final table assembly, and fixture
+preparation are outside both timers.
+
+| Runner | Median | Throughput | Ratio | Detections |
+|---|---:|---:|---:|---:|
+| Blockflow YOLO, release LibTorch CUDA | 0.758 s | 42.22 images/s | **1.11× faster** | 158 |
+| Original `jahongir7174/YOLOv11-pt`, FP32 CUDA | 0.838 s | 38.18 images/s | 1.00× | 158 |
+
+Blockflow runs were 0.767, 0.758, and 0.734 seconds. Original runs were 0.806,
+0.838, and 0.839 seconds. All 158 detections matched by class and centre within
+0.006 pixels; mean centre distance was 0.0038 pixels and maximum confidence
+difference was `4.85e-5`. The original's normal FP16 path took 0.852 seconds in
+one run and produced 156 detections, so FP16 did not improve throughput at batch
+size one on this GPU and moved two predictions across the confidence threshold.
+
+The initial CubeCL implementation took 2.200 seconds median. Nsight attributed
+71.4% of its GPU kernel time to direct convolution. Switching the same Burn
+model graph to LibTorch/cuDNN and fusing Conv plus BatchNorm reduced the model
+forward from 27-29 ms to about 7.5 ms per image. Four workers were optimal on
+this workload; one took 1.359 seconds, two took 0.782 seconds, and eight took
+0.986 seconds.
+
+Setting up this comparison also found and fixed an RGB-to-BGR reversal in the
+Blockflow adapter. Both runners perform three forwards before their timed
+regions. The fixture generator, original runner, agreement checker, release
+commands, and scope are documented in
+[`examples/yolo-ome-zarr`](examples/yolo-ome-zarr/README.md).
+
+### Zero-shot DAPI baseline
+
+The same release LibTorch path was run over the central 25% by area of the 2079
+level-0 DAPI plane: `y=39360..118080`, `x=16512..49536`. DAPI was replicated to
+RGB. A 512 pixel core and 64 pixel halo produced 640 pixel model inputs, and
+four workers processed 10,010 blocks. The fragment phase took **209.62 s** and
+the whole process took **211.90 s**, or 47.75 model inputs/s during execution.
+Peak host RSS was 3.73 GiB.
+
+This standard COCO checkpoint is not useful as a zero-shot cell detector. It
+returned 2,766 detections while the existing Cellpose table contains 323,028
+cells in the same window, a count ratio of **0.86%**. Detection centres landed
+inside 2,100 Cellpose masks but touched only 2,026 distinct cells, an upper-bound
+recall of **0.63%**. The three most common predicted COCO classes were `clock`
+(1,743), `spoon` (714), and `pizza` (236). These numbers establish the
+untrained baseline; they do not measure the potential of a YOLO model trained
+from the Cellpose annotations.
+
 ## Cellpose CUDA annotation
 
 This comparison used a 2048 x 6144 DAPI subset from the 2079 OME-Zarr slide,
