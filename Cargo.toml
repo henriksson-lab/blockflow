@@ -250,7 +250,7 @@ stardist-rs = { git = "https://github.com/henriksson-lab/stardist-rs.git", rev =
 burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["std", "safetensors"], optional = true }
 candle-core = { version = "0.11", optional = true }
-yolov11 = { git = "https://github.com/henriksson-lab/YOLOv11-rs.git", rev = "f22e9fd33189830e723141078087e9f1f34d774c", optional = true }
+yolov11 = { path = "../YOLOv11-rs", optional = true }
 # Resolver guard for `burn/{wgpu,cuda}` through `cubecl -> pliron 0.17`.
 # `pliron 0.17.0` declares `pliron-derive = "0"`, so a lock-free resolve pairs
 # it with whatever 0.x is newest on the index — 0.18 as of this writing — whose
@@ -477,8 +477,8 @@ inherits = "release"
 debug-assertions = true
 
 [patch.crates-io]
-burn = { git = "https://github.com/mahogny/burn.git", rev = "1d6ef1b6f23a5a884dd1576d019f7a34ee93974c" }
-burn-store = { git = "https://github.com/mahogny/burn.git", rev = "1d6ef1b6f23a5a884dd1576d019f7a34ee93974c" }
+burn = { path = "../burn/crates/burn" }
+burn-store = { path = "../burn/crates/burn-store" }
 candle-core = { git = "https://github.com/mahogny/candle.git", branch = "pr/stardist-candle-integration" }
 candle-kernels = { git = "https://github.com/mahogny/candle.git", branch = "pr/stardist-candle-integration" }
 candle-metal-kernels = { git = "https://github.com/mahogny/candle.git", branch = "pr/stardist-candle-integration" }

@@ -4,6 +4,9 @@ The proposed training architecture, including Cellpose-derived targets and
 reuse of Blockflow's cache and prefetcher, is described in
 [`YOLO_TRAINING.md`](../../YOLO_TRAINING.md).
 
+The implemented Cellpose-to-YOLO transfer workflow, release command, and first
+DAPI experiment are documented in [`DAPI_TRAINING.md`](DAPI_TRAINING.md).
+
 This is the normal Blockflow entry point for the YOLO fragment operation. It
 reads an OME-Zarr level through `ZarrEnvironment`, assembles the fragment phase
 with `PlanBuilder`, runs one model invocation per configured image block, owns
