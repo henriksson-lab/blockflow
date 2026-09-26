@@ -254,6 +254,40 @@ recall of **0.63%**. The three most common predicted COCO classes were `clock`
 untrained baseline; they do not measure the potential of a YOLO model trained
 from the Cellpose annotations.
 
+### Trained DAPI model over the full image
+
+Measured on 2026-09-26 on the same Quadro RTX 5000. The model selected after
+80 epochs on Cellpose-derived nucleus boxes was applied to the complete
+157,440 x 66,048 level-0 DAPI plane. This is a 10.40-gigapixel image. The
+release LibTorch CUDA executable used 512 pixel cores, 64 pixel halo, four
+workers, confidence `0.42642644` selected on the validation partition, IoU
+`0.65`, and a 1,000-detection per-window limit.
+
+| Scope | Time | Throughput |
+|---|---:|---:|
+| Planned fragment execution, 39,732 model inputs | **666.03 s** | **59.65 inputs/s** |
+| Complete process and native table materialization | **675.32 s** | **15.40 source MP/s** |
+
+The full workflow finished in **11 minutes 15.32 seconds**. Work outside the
+fragment executor added 9.29 seconds, including model startup, planning, seam
+deduplication, CSV output, and indexed NGFF object-table materialization. Peak
+host RSS was 12,793,472 KiB, about 12.2 GiB.
+
+It produced 468,345 detections after merging 999 duplicates at window seams,
+or about 694 final detections per second end to end. The existing full-image
+Cellpose table contains 490,379 objects, so the YOLO count is **95.5%** of the
+Cellpose count. This count ratio is descriptive: it does not show whether the
+same nuclei were detected or whether Cellpose errors were corrected. The
+frozen spatial test split measured mAP `0.6046`, mAP50 `0.8552`, recall
+`0.7755`, and precision `0.8329` against Cellpose-derived boxes.
+
+The native table contains 468,345 verified rows with stable IDs, centroids,
+bounding boxes, confidence, class, spatial indexes, and an occupancy pyramid.
+newvolim discovered every row through the current CSV compatibility path and
+returned 893 objects for a representative 1,000 x 1,000 viewport. The exact
+release command and output location are recorded in
+[`examples/yolo-ome-zarr`](examples/yolo-ome-zarr/README.md#trained-dapi-model-over-the-full-image).
+
 ## Cellpose CUDA annotation
 
 This comparison used a 2048 x 6144 DAPI subset from the 2079 OME-Zarr slide,

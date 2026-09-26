@@ -1,0 +1,19 @@
+# Successive-halving pilot for transfer from the retained DAPI checkpoint.
+# The Cartesian product is 3 learning rates x 2 trainable-layer policies x
+# 2 BatchNorm policies = 12 initial trials. Geometry, decay, and clipping stay
+# fixed so the first sweep isolates optimization and transfer behavior.
+rounds:
+  - epochs: 2
+    keep: 4
+  - epochs: 3
+    keep: 2
+  - epochs: 5
+    keep: 1
+
+max_lr: [0.000005, 0.00001, 0.00002]
+min_lr_ratio: [0.1]
+weight_decay: [0.0005]
+gradient_clip: [10.0]
+geometry: [d4]
+trainable_layers: [all, head-and-neck]
+batch_norm: [update, frozen]

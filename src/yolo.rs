@@ -4,6 +4,7 @@
 //! Blockflow path: one fragment phase reads haloed Zarr blocks, runs YOLO, owns
 //! detections by centre-in-core, and emits one table row per spot.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +23,10 @@ use burn::tensor::DeviceIndex;
 #[cfg(not(any(feature = "yolo-cuda", feature = "yolo-libtorch")))]
 use burn::tensor::DeviceKind;
 use image::{DynamicImage, RgbImage};
+use ngff_object_table::{
+    ColumnRole, ColumnSpec, CoordinateColumn, DType as TableDType, SpatialIndexSpec, TableSpec,
+    TableWriter,
+};
 
 const STREAM: &str = "yolo_detections";
 
@@ -37,11 +42,14 @@ pub struct PredictConfig {
     pub block: usize,
     pub halo: usize,
     pub conf_threshold: f32,
+    pub nms_iou: f32,
+    pub max_detections: usize,
     pub input_size: u32,
     pub concurrency: usize,
     pub min_separation: f64,
     pub out: PathBuf,
     pub summary: PathBuf,
+    pub table: Option<PathBuf>,
     pub work: PathBuf,
 }
 
@@ -153,8 +161,18 @@ pub fn run(config: &PredictConfig) -> Result<()> {
     if merged > 0 {
         println!("{merged} duplicate detection(s) merged by centre distance");
     }
+    detections.sort_by(|left, right| {
+        left.y
+            .total_cmp(&right.y)
+            .then(left.x.total_cmp(&right.x))
+            .then(left.class.cmp(&right.class))
+            .then(right.confidence.total_cmp(&left.confidence))
+    });
+    for (index, detection) in detections.iter_mut().enumerate() {
+        detection.id = index as u64 + 1;
+    }
 
-    write_outputs(config, &detections)?;
+    write_outputs(config, &detections, level_height, level_width)?;
     println!(
         "{} detection(s) written to {}",
         detections.len(),
@@ -170,6 +188,8 @@ struct YoloBlockDetector {
     range: (f64, f64),
     halo: [usize; 3],
     conf_threshold: f32,
+    nms_iou: f32,
+    max_detections: usize,
     input_size: u32,
     source_dtype: Dtype,
     origin: [usize; 2],
@@ -215,6 +235,8 @@ impl YoloBlockDetector {
             range: config.normalize_range,
             halo: [0, config.halo, config.halo],
             conf_threshold: config.conf_threshold,
+            nms_iou: config.nms_iou,
+            max_detections: config.max_detections,
             input_size: config.input_size,
             source_dtype,
             origin,
@@ -233,10 +255,14 @@ impl YoloBlockDetector {
             );
             match model.forward(input, false) {
                 yolov11::model::model::YOLOOutput::Infer(output) => {
-                    let _ = yolov11::model::nms::non_max_suppression(
+                    let _ = yolov11::model::nms::non_max_suppression_with_options(
                         &output,
-                        self.conf_threshold,
-                        0.45,
+                        yolov11::model::nms::NmsOptions {
+                            confidence_threshold: self.conf_threshold,
+                            iou_threshold: self.nms_iou,
+                            max_detections: self.max_detections,
+                            ..Default::default()
+                        },
                     );
                 }
                 yolov11::model::model::YOLOOutput::Train(_) => {
@@ -254,6 +280,10 @@ impl YoloBlockDetector {
             Column::new("y", ColumnType::F64),
             Column::new("confidence", ColumnType::F64),
             Column::new("class", ColumnType::U64),
+            Column::new("x1", ColumnType::F64),
+            Column::new("y1", ColumnType::F64),
+            Column::new("x2", ColumnType::F64),
+            Column::new("y2", ColumnType::F64),
         ])
     }
 
@@ -381,8 +411,15 @@ impl FragmentOp for YoloBlockDetector {
         }
         let forward_elapsed = forward_started.elapsed();
         let nms_started = std::time::Instant::now();
-        let detections =
-            yolov11::model::nms::non_max_suppression(&output, self.conf_threshold, 0.45);
+        let detections = yolov11::model::nms::non_max_suppression_with_options(
+            &output,
+            yolov11::model::nms::NmsOptions {
+                confidence_threshold: self.conf_threshold,
+                iou_threshold: self.nms_iou,
+                max_detections: self.max_detections,
+                ..Default::default()
+            },
+        );
         let nms_elapsed = nms_started.elapsed();
 
         let rows_started = std::time::Instant::now();
@@ -405,6 +442,18 @@ impl FragmentOp for YoloBlockDetector {
                 }
                 let global_y = local_y + self.origin[0] as f64;
                 let global_x = local_x + self.origin[1] as f64;
+                let global_x1 = at.at.offset[2] as f64
+                    + ((det[0] - pad_w) as f64 / ratio_w.max(1e-6) as f64)
+                    + self.origin[1] as f64;
+                let global_y1 = at.at.offset[1] as f64
+                    + ((det[1] - pad_h) as f64 / ratio_h.max(1e-6) as f64)
+                    + self.origin[0] as f64;
+                let global_x2 = at.at.offset[2] as f64
+                    + ((det[2] - pad_w) as f64 / ratio_w.max(1e-6) as f64)
+                    + self.origin[1] as f64;
+                let global_y2 = at.at.offset[1] as f64
+                    + ((det[3] - pad_h) as f64 / ratio_h.max(1e-6) as f64)
+                    + self.origin[0] as f64;
                 let class = det[5].max(0.0) as u64;
                 rows.push(
                     centre,
@@ -414,6 +463,10 @@ impl FragmentOp for YoloBlockDetector {
                         Value::F64(global_y),
                         Value::F64(det[4] as f64),
                         Value::U64(class),
+                        Value::F64(global_x1),
+                        Value::F64(global_y1),
+                        Value::F64(global_x2),
+                        Value::F64(global_y2),
                     ],
                 )?;
             }
@@ -536,6 +589,10 @@ struct Detection {
     y: f64,
     confidence: f64,
     class: u64,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
 }
 
 impl Detection {
@@ -546,6 +603,10 @@ impl Detection {
             y: row.f64(2).expect("y"),
             confidence: row.f64(3).expect("confidence"),
             class: row.u64(4).expect("class"),
+            x1: row.f64(5).expect("x1"),
+            y1: row.f64(6).expect("y1"),
+            x2: row.f64(7).expect("x2"),
+            y2: row.f64(8).expect("y2"),
         }
     }
 }
@@ -561,36 +622,59 @@ fn deduplicate(mut detections: Vec<Detection>, radius: f64) -> Vec<Detection> {
             .partial_cmp(&left.confidence)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let mut keep = vec![true; detections.len()];
     let radius_sq = radius * radius;
-    for i in 0..detections.len() {
-        if !keep[i] {
-            continue;
+    let mut accepted = Vec::<Detection>::with_capacity(detections.len());
+    let mut cells = HashMap::<(u64, i64, i64), Vec<usize>>::new();
+    for detection in detections {
+        let cell_x = (detection.x / radius).floor() as i64;
+        let cell_y = (detection.y / radius).floor() as i64;
+        let mut duplicate = false;
+        'neighbors: for dy in -1..=1 {
+            for dx in -1..=1 {
+                let key = (detection.class, cell_y + dy, cell_x + dx);
+                for &index in cells.get(&key).into_iter().flatten() {
+                    let previous = &accepted[index];
+                    let delta_x = detection.x - previous.x;
+                    let delta_y = detection.y - previous.y;
+                    if delta_x * delta_x + delta_y * delta_y <= radius_sq {
+                        duplicate = true;
+                        break 'neighbors;
+                    }
+                }
+            }
         }
-        for j in (i + 1)..detections.len() {
-            if !keep[j] || detections[i].class != detections[j].class {
-                continue;
-            }
-            let dx = detections[i].x - detections[j].x;
-            let dy = detections[i].y - detections[j].y;
-            if dx * dx + dy * dy <= radius_sq {
-                keep[j] = false;
-            }
+        if !duplicate {
+            let index = accepted.len();
+            cells
+                .entry((detection.class, cell_y, cell_x))
+                .or_default()
+                .push(index);
+            accepted.push(detection);
         }
     }
-    let mut out: Vec<_> = detections
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, detection)| keep[index].then_some(detection))
-        .collect();
-    out.sort_by_key(|detection| detection.id);
-    out
+    accepted.sort_by_key(|detection| detection.id);
+    accepted
 }
 
-fn write_outputs(config: &PredictConfig, detections: &[Detection]) -> Result<()> {
+fn write_outputs(
+    config: &PredictConfig,
+    detections: &[Detection],
+    height: usize,
+    width: usize,
+) -> Result<()> {
     let mut writer = csv::Writer::from_path(&config.out)
         .with_context(|| format!("writing {}", config.out.display()))?;
-    writer.write_record(["id", "x", "y", "confidence", "class"])?;
+    writer.write_record([
+        "id",
+        "x",
+        "y",
+        "confidence",
+        "class",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+    ])?;
     for detection in detections {
         writer.write_record([
             detection.id.to_string(),
@@ -598,6 +682,10 @@ fn write_outputs(config: &PredictConfig, detections: &[Detection]) -> Result<()>
             format!("{:.2}", detection.y),
             format!("{:.4}", detection.confidence),
             detection.class.to_string(),
+            format!("{:.2}", detection.x1),
+            format!("{:.2}", detection.y1),
+            format!("{:.2}", detection.x2),
+            format!("{:.2}", detection.y2),
         ])?;
     }
     writer.flush()?;
@@ -610,5 +698,172 @@ fn write_outputs(config: &PredictConfig, detections: &[Detection]) -> Result<()>
         detections.len().to_string(),
     ])?;
     summary.flush()?;
+    if let Some(table) = &config.table {
+        write_object_table(table, detections, height as u64, width as u64)?;
+        std::fs::copy(&config.out, table.join("table.csv"))?;
+    }
+    Ok(())
+}
+
+fn write_object_table(
+    output: &Path,
+    detections: &[Detection],
+    height: u64,
+    width: u64,
+) -> Result<()> {
+    const TILE: u64 = 1024;
+    const CHUNK: usize = 2048;
+    anyhow::ensure!(
+        !output.exists(),
+        "object-table output {} already exists",
+        output.display()
+    );
+    let parent = output
+        .parent()
+        .with_context(|| format!("{} has no parent directory", output.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let parent_metadata = parent.join("zarr.json");
+    if !parent_metadata.exists() {
+        let temporary = parent.join(format!(".zarr.json.{}.tmp", std::process::id()));
+        std::fs::write(
+            &temporary,
+            b"{\n  \"zarr_format\": 3,\n  \"node_type\": \"group\",\n  \"attributes\": {}\n}\n",
+        )?;
+        match std::fs::rename(&temporary, &parent_metadata) {
+            Ok(()) => {}
+            Err(error) if parent_metadata.exists() => {
+                let _ = std::fs::remove_file(&temporary);
+                drop(error);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("object-table output needs a UTF-8 file name")?;
+    let staging = parent.join(format!(".{name}.partial"));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+
+    let grid_shape = vec![height.div_ceil(TILE), width.div_ceil(TILE)];
+    let tile_id = |detection: &Detection| {
+        (detection.y.max(0.0) as u64 / TILE) * grid_shape[1] + detection.x.max(0.0) as u64 / TILE
+    };
+    let mut order = (0..detections.len()).collect::<Vec<_>>();
+    order.sort_unstable_by(|&left, &right| {
+        tile_id(&detections[left])
+            .cmp(&tile_id(&detections[right]))
+            .then(detections[left].y.total_cmp(&detections[right].y))
+            .then(detections[left].x.total_cmp(&detections[right].x))
+            .then(detections[left].id.cmp(&detections[right].id))
+    });
+
+    let columns = vec![
+        ColumnSpec::new("detection_id", TableDType::U64, ColumnRole::Identity),
+        ColumnSpec::new("centroid_y", TableDType::F32, ColumnRole::Coordinate),
+        ColumnSpec::new("centroid_x", TableDType::F32, ColumnRole::Coordinate),
+        ColumnSpec::new("bbox_y1", TableDType::F32, ColumnRole::Measurement),
+        ColumnSpec::new("bbox_x1", TableDType::F32, ColumnRole::Measurement),
+        ColumnSpec::new("bbox_y2", TableDType::F32, ColumnRole::Measurement),
+        ColumnSpec::new("bbox_x2", TableDType::F32, ColumnRole::Measurement),
+        ColumnSpec::new("confidence", TableDType::F32, ColumnRole::Measurement),
+        ColumnSpec::new("class", TableDType::U64, ColumnRole::Category),
+    ];
+    let spatial_index = SpatialIndexSpec {
+        coordinates: vec![
+            CoordinateColumn {
+                axis: "y".into(),
+                column: "centroid_y".into(),
+            },
+            CoordinateColumn {
+                axis: "x".into(),
+                column: "centroid_x".into(),
+            },
+        ],
+        tile_shape: vec![TILE, TILE],
+        grid_shape: grid_shape.clone(),
+        tile_order: "row_major".into(),
+        within_tile_order: "lexicographic_coordinates_then_identity".into(),
+    };
+    let spec = TableSpec::new(
+        detections.len() as u64,
+        CHUNK as u64,
+        "../../",
+        "detection_id",
+        columns,
+        spatial_index,
+    );
+    let writer = TableWriter::create(&staging, spec)?;
+    for (chunk_index, indices) in order.chunks(CHUNK).enumerate() {
+        let start = (chunk_index * CHUNK) as u64;
+        let rows = indices
+            .iter()
+            .map(|&index| &detections[index])
+            .collect::<Vec<_>>();
+        writer.write_u64(
+            "detection_id",
+            start,
+            &rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        )?;
+        writer.write_f32(
+            "centroid_y",
+            start,
+            &rows.iter().map(|row| row.y as f32).collect::<Vec<_>>(),
+        )?;
+        writer.write_f32(
+            "centroid_x",
+            start,
+            &rows.iter().map(|row| row.x as f32).collect::<Vec<_>>(),
+        )?;
+        let float_columns: [(&str, Vec<f32>); 5] = [
+            ("bbox_y1", rows.iter().map(|row| row.y1 as f32).collect()),
+            ("bbox_x1", rows.iter().map(|row| row.x1 as f32).collect()),
+            ("bbox_y2", rows.iter().map(|row| row.y2 as f32).collect()),
+            ("bbox_x2", rows.iter().map(|row| row.x2 as f32).collect()),
+            (
+                "confidence",
+                rows.iter().map(|row| row.confidence as f32).collect(),
+            ),
+        ];
+        for (name, values) in float_columns {
+            writer.write_f32(name, start, &values)?;
+        }
+        writer.write_u64(
+            "class",
+            start,
+            &rows.iter().map(|row| row.class).collect::<Vec<_>>(),
+        )?;
+    }
+
+    let mut identities = order
+        .iter()
+        .enumerate()
+        .map(|(physical, &index)| (detections[index].id, physical as u64))
+        .collect::<Vec<_>>();
+    identities.sort_unstable();
+    for (chunk_index, chunk) in identities.chunks(CHUNK).enumerate() {
+        writer.write_identity_index(
+            (chunk_index * CHUNK) as u64,
+            &chunk.iter().map(|row| row.0).collect::<Vec<_>>(),
+            &chunk.iter().map(|row| row.1).collect::<Vec<_>>(),
+        )?;
+    }
+
+    let mut counts = vec![0u64; grid_shape.iter().product::<u64>() as usize];
+    for &index in &order {
+        counts[tile_id(&detections[index]) as usize] += 1;
+    }
+    let mut starts = vec![0u64; counts.len()];
+    let mut next = 0u64;
+    for (start, count) in starts.iter_mut().zip(&counts) {
+        *start = next;
+        next += count;
+    }
+    writer.write_spatial_index(&starts, &counts)?;
+    writer.finish()?;
+    std::fs::rename(&staging, output)?;
+    println!("native object table written to {}", output.display());
     Ok(())
 }

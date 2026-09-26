@@ -10,8 +10,9 @@ DAPI experiment are documented in [`DAPI_TRAINING.md`](DAPI_TRAINING.md).
 This is the normal Blockflow entry point for the YOLO fragment operation. It
 reads an OME-Zarr level through `ZarrEnvironment`, assembles the fragment phase
 with `PlanBuilder`, runs one model invocation per configured image block, owns
-detections by their centre, merges fragment rows, and writes a CSV detection
-table.
+detections by their centre, merges fragment rows, and writes an indexed NGFF
+object table. A CSV can also be written for tools that have not yet adopted the
+native table reader.
 
 The fastest GPU path uses Burn's LibTorch backend. It requires PyTorch 2.9 with
 CUDA and uses four workers to overlap Zarr reading and preparation with model
@@ -26,6 +27,7 @@ cargo run --release -p blockflow-yolo-ome-zarr \
   --weights model.safetensors \
   --config default_args.yaml \
   --block 640 --halo 0 --workers 4 \
+  --table image.zarr/tables/yolo-cells \
   --out detections.csv --summary summary.csv --work work
 ```
 
@@ -57,6 +59,40 @@ upper-bound recall of 0.63%. A cell-specific model is required before YOLO can
 be compared with Cellpose for segmentation quality.
 
 The pure CubeCL CUDA backend remains available as `--features cuda`.
+
+## Trained DAPI model over the full image
+
+The Cellpose-box transfer model was run over level 0 of the complete
+`2079_merged_registered` image with the confidence threshold selected on the
+validation partition:
+
+```bash
+target/release/yolo-ome-zarr \
+  --zarr /husky/otherdataset/teresa/2079_merged_registered.zarr \
+  --weights .tmp/yolo-dapi-training/full-all-e80-lr5e-4/best.bpk \
+  --config examples/yolo-ome-zarr/dapi_corrected.yaml \
+  --channels 0 --normalize-low 1 --normalize-high 70 \
+  --block 512 --halo 64 --workers 4 \
+  --conf-threshold 0.42642644 --nms-iou 0.65 \
+  --max-detections 1000 --min-separation 4 \
+  --table /husky/otherdataset/teresa/2079_merged_registered.zarr/tables/yolo-dapi \
+  --out .tmp/yolo-dapi-full/detections.csv \
+  --summary .tmp/yolo-dapi-full/summary.csv \
+  --work .tmp/yolo-dapi-full/work
+```
+
+The run processed 39,732 blocks and produced 468,345 detections after merging
+999 duplicates at window seams. CUDA fragment execution took 666.03 seconds;
+the complete process took 675.32 seconds (11 minutes 15.32 seconds) and reached
+about 12.2 GiB resident memory. The native table stores stable IDs, centroids,
+bounding boxes, confidence, class, spatial indexes, and an occupancy pyramid.
+Its `table.csv` compatibility copy lets the current newvolim reader display the
+same detections. A 1000 by 1000 pixel viewport query returned 893 objects,
+confirming that the layer can be loaded selectively by the viewer.
+
+This model predicts boxes learned from Cellpose instance masks. It supports
+visual comparison and counting, but it does not reproduce Cellpose masks and
+is not yet suitable for per-cell intensity measurements in crowded regions.
 
 ## Matched GPU benchmark
 

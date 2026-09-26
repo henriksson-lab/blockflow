@@ -16,7 +16,11 @@ blockflow = { path = "../..", features = ["yolo"] }
 burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
+ngff-object-table = { path = "../../crates/ngff-object-table" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 yolov11 = { path = "../../../YOLOv11-rs" }
 
 [[bin]]

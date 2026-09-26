@@ -32,6 +32,10 @@ struct Args {
     halo: usize,
     #[arg(long, default_value_t = 0.25)]
     conf_threshold: f32,
+    #[arg(long, default_value_t = 0.65)]
+    nms_iou: f32,
+    #[arg(long, default_value_t = 1000)]
+    max_detections: usize,
     #[arg(long, default_value_t = 640)]
     input_size: u32,
     #[arg(long, default_value_t = 1)]
@@ -42,6 +46,9 @@ struct Args {
     out: PathBuf,
     #[arg(long)]
     summary: PathBuf,
+    /// Optional native spatial object-table output, normally tables/<layer>.
+    #[arg(long)]
+    table: Option<PathBuf>,
     #[arg(long)]
     work: PathBuf,
 }
@@ -67,11 +74,14 @@ fn main() -> anyhow::Result<()> {
         block: args.block,
         halo: args.halo,
         conf_threshold: args.conf_threshold,
+        nms_iou: args.nms_iou,
+        max_detections: args.max_detections,
         input_size: args.input_size,
         concurrency: args.workers,
         min_separation: args.min_separation,
         out: args.out,
         summary: args.summary,
+        table: args.table,
         work: args.work,
     })
 }

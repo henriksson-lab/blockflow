@@ -66,9 +66,56 @@ cargo run --release --manifest-path /path/to/YOLOv11-rs/Cargo.toml \
   --output /path/to/run/training-progress.svg
 ```
 
+Reload and score a checkpoint on the recorded validation split without touching
+the frozen test partition:
+
+```bash
+LIBTORCH_USE_PYTORCH=1 cargo run --release \
+  -p blockflow-yolo-ome-zarr --features libtorch --bin yolo-dapi-train -- \
+  --zarr /path/to/image.zarr \
+  --weights /path/to/run/best.bpk --output /path/to/run \
+  --train-tiles 256 --validation-tiles 64 --test-tiles 64 \
+  --batch-size 16 --workers 2 --queue-batches 2 \
+  --cache-mib 8192 --geometry d4 --evaluate-only
+```
+
+This writes `validation-evaluation.json`. A completed training stage also
+reloads `best.bpk` internally and requires its recall, precision, mAP@50, and
+mAP to match the in-memory best model before committing `resume.json`.
+
 The best validation checkpoint is evaluated exactly once against the test
 partition only when `--finalize` is passed. Test metrics are stored separately
 in `training-run.json`.
+
+## Hyperparameter sweeps
+
+`--sweep` runs trials sequentially on one GPU. Every trial uses the same
+in-memory stores, decoded Zarr cache, spatial split, and seed. A sweep never
+evaluates the test partition. Its YAML defines Cartesian axes and
+successive-halving rounds; omitted axes retain the ordinary training setting.
+
+```bash
+LIBTORCH_USE_PYTORCH=1 cargo run --release \
+  -p blockflow-yolo-ome-zarr --features libtorch --bin yolo-dapi-train -- \
+  --zarr /path/to/image.zarr \
+  --weights /path/to/dapi-best.bpk \
+  --output /path/to/sweep \
+  --train-tiles 512 --validation-tiles 128 --test-tiles 128 \
+  --batch-size 16 --workers 2 --queue-batches 2 --cache-mib 16384 \
+  --sweep examples/yolo-ome-zarr/dapi_sweep.yaml
+```
+
+The supplied sweep varies peak learning rate, trainable layers, and BatchNorm
+policy. `head-and-neck` freezes DarkNet and trains the feature pyramid plus
+detection head. `head-only` also freezes the feature pyramid. Each trial has a
+resumable directory under `trials/`. `sweep.csv` and `sweep.json` are rewritten
+after every round and rank trials by validation mAP. Re-running the same command
+resumes trials at completed round boundaries. `dapi_head_sweep.yaml` is the
+narrow follow-up that compares those two freezing policies and weight decay.
+
+Only D4 or no geometry is active in the source-neutral OME-Zarr loader. The
+HSV, translation, scale, mosaic, and probabilistic flip fields retained in the
+model YAML belong to the legacy file loader and are not sweep axes here.
 
 ## Staged training and exact resume
 
@@ -139,6 +186,25 @@ group and add a recorded fraction of negative tiles. The exact coordinate lists
 are written to the run manifest so changes to the resulting split cannot
 silently change a resumed run.
 
+For a full spatial training pass, `--train-tiles all` selects every occupied
+ownership tile in the eligible training region. `--negative-tile-fraction 0.1`
+adds deterministic background tiles whose 3 by 3 ownership-tile neighborhood
+contains no labeled centroid. The same fraction is applied to bounded
+validation and test selections. Samples stream from OME-Zarr through the
+bounded cache; they are grouped into small spatial blocks and the blocks and
+samples are shuffled deterministically each epoch. This retains I/O locality
+without keeping a smaller resident training subset.
+
+```bash
+LIBTORCH_USE_PYTORCH=1 cargo run --release \
+  -p blockflow-yolo-ome-zarr --features libtorch --bin yolo-dapi-train -- \
+  --zarr /path/to/image.zarr --output /path/to/run \
+  --weights /path/to/best.bpk \
+  --train-tiles all --validation-tiles 256 --test-tiles 256 \
+  --negative-tile-fraction 0.1 \
+  --epochs 20 --schedule-epochs 80 --batch-size 16 --cache-mib 8192
+```
+
 ## Recorded experiments
 
 Dataset: `/husky/otherdataset/teresa/2079_merged_registered.zarr`, DAPI channel
@@ -160,13 +226,97 @@ Dataset: `/husky/otherdataset/teresa/2079_merged_registered.zarr`, DAPI channel
 - Batch 16 used about 8.3 GB of GPU memory. Active samples reached 65-92% SM
   utilization; batch 8 typically reached 47-75%.
 
+A follow-up warm-start stage used the retained checkpoint with 512 training,
+128 validation, and 128 frozen test tiles, batch 16, two loader workers, D4,
+and a 0.00001 to 0.00005 learning-rate range. It ran 20 epochs of a planned
+120-epoch schedule in 372.92 seconds end to end. Validation mAP was 0.05649 at
+epoch 1 and fell to 0.029 by epoch 20; the unchanged warm-start checkpoint
+scored 0.05829 on the same 128 validation tiles. The reloaded epoch-1 best
+checkpoint reproduced mAP 0.05649 and mAP@50 0.15101 exactly. The frozen test
+partition was not evaluated. Do not continue this schedule unchanged.
+
+The first successive-halving sweep screened 12 configurations on the same
+512/128 split. It varied peak learning rates `0.000005`, `0.00001`, and
+`0.00002`, DarkNet freezing, and BatchNorm policy. All six configurations that
+updated BatchNorm ranked below all six that kept its population statistics
+fixed. The selected trial froze DarkNet and BatchNorm and used peak LR
+`0.000005`; its epoch-2 mAP was 0.05843 versus 0.05829 for the unchanged input
+checkpoint, a 0.25% relative difference. Its later epochs declined to mAP
+0.053 by epoch 10. Trial training consumed 1,694.37 seconds in total. This is
+not evidence of a useful quality improvement, and the test partition remained
+untouched.
+
+The narrower eight-trial follow-up compared neck-and-head against head-only
+training, weight decay `0` against `0.0005`, and peak LR `0.000005` against
+`0.00001`, always with frozen BatchNorm. It completed in 600.56 seconds wall
+time. Neck-and-head at peak LR `0.000005` won again; zero decay and `0.0005`
+differed by only 0.00000002 mAP, while head-only trailed by 0.000054. The
+selected mAP remained 0.05843 at epoch 2 and declined afterward. These results
+do not justify another sweep over freezing policy or weight decay.
+
 This establishes a working end-to-end training and held-out evaluation path and
 produces loadable Burn checkpoints. The result remains well below Cellpose as a
 cell detector. More spatially balanced training data and a longer stable
 schedule are needed before comparing runtime at a fixed quality target.
 
-The reference learning rate range (0.0001 to 0.01) diverged on these dense
-pseudo-labels without clipping. A 0.001 peak stayed finite with clipping but
-damaged the model after warmup: a 256-tile run selected epoch 3 at validation
-mAP 0.009 and scored zero on the held-out test partition. The 0.0002 cap is
-therefore the current DAPI example default.
+The earlier learning-rate experiments and weak overfit results were produced
+with a reversed SiLU backward call in the local Burn libtorch backend. Those
+runs remain useful as records of the data and runtime path, but they do not
+constrain the corrected optimizer settings. After fixing SiLU backward, the
+same 16 dense tiles improved from best mAP 0.119 to 0.473 in 100 updates using
+the conservative `5e-6` to `5e-5` schedule. Learning-rate selection must be
+repeated before choosing a full microscopy training schedule.
+
+The corrected follow-up used 256 training, 64 validation, and 64 frozen test
+tiles, batch 16, two loader workers, frozen BatchNorm, D4 geometry, and an
+80-epoch schedule with learning rates from `0.0005` down to `0.00005`. It ran
+as four exactly resumed 20-epoch stages. Best validation mAP was `0.4419` at
+epoch 72, with mAP50 `0.7164`, recall `0.6534`, and precision `0.7553`. The
+single final evaluation of the held-out test region reached mAP `0.5457`,
+mAP50 `0.8114`, recall `0.7376`, and precision `0.8094`. The successful stages
+took about 837 seconds of process wall time in total. The last epochs had
+plateaued, so this pilot should not be extended past its fixed horizon.
+
+The subsequent all-tiles inspection selected 2,004 training tiles, including
+200 conservative background tiles, plus 256 validation and 256 frozen test
+tiles with 26 backgrounds in each. The training split contains 209,318 visible
+targets. Its median, 90th percentile, and maximum target counts per tile are
+46, 300, and 540. The 1,000-detection evaluation limit retains every oracle
+prediction. A stride-8 assignment check found 6,585 targets, 3.1%, with no
+candidate location; retain this result for the later P2 comparison.
+
+The first 20 epochs of the all-tiles run took 1,444.8 seconds. Epoch 20 was
+best, with validation mAP `0.4804`, mAP50 `0.7671`, recall `0.6797`, and
+precision `0.7737`. The bounded decoded cache ended at about 8.6 GB while
+streaming and evicting chunks across the full spatial dataset.
+
+All four stages completed their 80-epoch horizon in about 5,014 seconds of
+process wall time. Epoch 80 was best on validation: mAP `0.5295`, mAP50
+`0.7973`, recall `0.7037`, and precision `0.8004`. The single final evaluation
+of the frozen 256-tile test split reached mAP `0.6046`, mAP50 `0.8552`, recall
+`0.7755`, and precision `0.8329`. The run artifacts are in
+`.tmp/yolo-dapi-training/full-all-e80-lr5e-4`.
+
+This detector is trained against boxes derived from Cellpose instance masks.
+The reported metrics quantify Cellpose-box agreement rather than independent
+biological correctness. Before production use, review a small stratified set
+for missed nuclei, false objects, merges, and splits. Box detections support
+localization and counting; quantitative per-cell color measurements require
+mask prediction or a local segmentation refinement around each detection.
+
+## Full-image inference
+
+The validation split selected confidence threshold `0.42642644` by maximum F1.
+Using that threshold, the validation-selected epoch-80 checkpoint was applied
+to all of level 0 with 512 pixel blocks, 64 pixel halo, and four CUDA workers.
+The 39,732 fragment tasks took 666.03 seconds. End-to-end runtime, including
+model loading, planning, duplicate merging, CSV output, and native table
+materialization, was 675.32 seconds. Peak resident memory was about 12.2 GiB.
+
+The completed output contains 468,345 detections after 999 seam duplicates were
+merged. It is stored at
+`/husky/otherdataset/teresa/2079_merged_registered.zarr/tables/yolo-dapi` as an
+indexed NGFF object table. A `table.csv` compatibility file in the same folder
+makes it visible to the current newvolim object reader. Viewer discovery found
+all 468,345 rows, and a 1000 by 1000 pixel viewport returned 893 rows without
+triggering its density guard.
