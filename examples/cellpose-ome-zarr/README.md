@@ -82,9 +82,9 @@ are insufficient when those device nodes are hidden.
 Point newvolim at the original dataset after the run:
 
 ```bash
-/home/mahogny/github/claude/newvolim/target/release/newvolim-server \
+/path/to/newvolim/target/release/newvolim-server \
   --bind 127.0.0.1:9876 \
-  --page-dir /home/mahogny/github/claude/newvolim/crates/newvolim-ui/dist \
+  --page-dir /path/to/newvolim/crates/newvolim-ui/dist \
   --allow-root /husky/otherdataset/teresa \
   --dataset 2079=/husky/otherdataset/teresa/2079_merged_registered.zarr
 ```
