@@ -418,17 +418,40 @@ epoch-80 2D DAPI YOLOv11-n checkpoint and trained only axial fusion and 3D
 center heads on the same leakage-safe PBMC split. Its selected first epoch
 reached center AP 0.6469 on validation and 0.6261 on the frozen test partition.
 
-Full-volume release CUDA inference took **149.718s application time** and
-**149.94s wall time**, with 905,136 KiB peak host RSS. This is **1.89x faster**
-than the native Conv3D YOLO detector and **65.0x faster** than the Cellpose3D
-teacher workflow by application elapsed time. The validation-selected
-high-recall threshold published 159 detections at
-`0/tables/yolo-slicefuse3d-cell-centers-v1`. Its count exceeds the manual
-77--90-cell estimate, so the speed ratio does not imply better biological
-accuracy and the layer requires false-positive review.
-Release `newvolim-server` discovered the table as a reviewable 3D layer and
-returned all 159 rows from a full-volume viewport query without density
-clipping.
+The original full-volume release CUDA run took **149.94s wall time**. Rebuilding
+the same revision later produced an 88.60s direct baseline, so the original
+number includes costs that are no longer present in the current dependency
+stack. The optimized path first encodes each detector-aligned XY window across
+all 60 Z planes, retains P3/P4/P5 on the GPU, and then runs the original
+`12 x 144 x 144` detector blocks from those features. It also submits the 12
+head downloads through one Burn transaction.
+
+| Release CUDA path | Wall time | Ratio vs original | Ratio vs current direct | Detections |
+|---|---:|---:|---:|---:|
+| Original recorded run | 149.94s | 1.00x | 0.59x | 159 |
+| Current direct inference | 88.60s | **1.69x** | 1.00x | 159 |
+| Optimized, warm median of 3 | **76.12s** | **1.97x** | **1.16x** | 159 |
+| Optimized, client-cache cold | 77.15s | **1.94x** | **1.15x** | 159 |
+
+The warm optimized repetitions were 77.51, 76.12, and 76.08 seconds. The cold
+run applied `POSIX_FADV_DONTNEED` to all 2,651 level-0 files, totaling 31,112,443
+compressed bytes; it cannot evict the NFS server cache. Peak host RSS was
+1,261,052 KiB and sampled peak GPU memory was 4,884 MiB. Sampled whole-run GPU
+utilization averaged 22.7%, with a 58% 95th percentile and 65% maximum.
+
+The optimized and reference tables both contain 159 rows and the same schema.
+One-to-one sorted comparison found maximum center displacement of 0.00007 voxel,
+maximum box-coordinate difference of 0.00004 voxel, and maximum confidence
+difference of 1.2e-8. Thus the validation/test AP remains the checkpoint's
+0.6469/0.6261 within the exact-output tolerance. Fresh release
+`newvolim-server` discovery reported the selected result as the reviewable layer
+`0/tables/yolo-slicefuse3d-cell-centers-fp32-opt-v1` with all 159 objects.
+
+Nsight Systems measured 515,650 CUDA kernel launches and 29.5s aggregate GPU
+kernel time for the current direct path, versus 258,193 launches and 17.0s for
+the optimized path. Dense device-to-host transfer occupied only 0.13s in both
+traces. A GPU sparse decode therefore has too little remaining transfer time to
+justify a custom kernel in this version.
 
 ## StarDist CUDA annotation
 

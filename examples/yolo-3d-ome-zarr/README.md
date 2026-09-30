@@ -192,14 +192,17 @@ cargo run --release -p blockflow-yolo-3d-ome-zarr --features cuda \
   --device cuda --block-z 12 --block 144 --halo-z 6 --halo 24 \
   --normalize-low 1 --normalize-high 70 \
   --threshold 0.0052330033 \
-  --layer yolo-slicefuse3d-cell-centers-v1
+  --precompute-features --transaction-download \
+  --layer yolo-slicefuse3d-cell-centers-fp32-opt-v1
 ```
 
-On the clustered PBMC volume, the selected first epoch reached center AP
-0.6469 on validation and 0.6261 on the frozen test partition. Full-volume
-inference took 149.718 application seconds and 2:29.94 wall time and published
-159 centers at `0/tables/yolo-slicefuse3d-cell-centers-v1`. This threshold was
-selected on validation and favors recall; the count exceeds the manual estimate
-and therefore requires visual false-positive review.
-Release `newvolim-server` discovery reported it as a reviewable 3D object layer,
-and a full-volume viewport query returned all 159 rows without density clipping.
+On the clustered PBMC volume, the selected first epoch reached center AP 0.6469
+on validation and 0.6261 on the frozen test partition. The optimized command
+above took a 76.12s median across three full-volume release CUDA runs, **1.97x
+faster** than the original 149.94s run and **1.16x faster** than the current
+88.60s direct path. A client-cache-cold run took 77.15s. It published 159 centers
+at `0/tables/yolo-slicefuse3d-cell-centers-fp32-opt-v1`; every reference center
+matched within 0.00007 voxel. This threshold was selected on validation and
+favors recall, so the count still requires visual false-positive review. Fresh
+release `newvolim-server` discovery reported the result as a reviewable 3D
+object layer with all 159 rows.

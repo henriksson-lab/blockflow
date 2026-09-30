@@ -1,12 +1,15 @@
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use blockflow::ome_zarr::{ensure_zarr_group, OmeVolumePyramid};
 use blockflow::strategy::{execute_phases, Hints};
-use blockflow::yolo3d::{finalize_detections, InferenceDevice, YoloSliceFuse3dDetector};
-use blockflow::{BlockGrid, Error, PlanBuilder, Result, ZarrEnvironment};
+use blockflow::yolo3d::{
+    finalize_detections, InferenceDevice, SliceFuseProfiler, YoloSliceFuse3dDetector,
+};
+use blockflow::{BlockGrid, Environment, Error, PlanBuilder, Result, ZarrEnvironment};
 use clap::{Parser, ValueEnum};
 use yolo3d::SliceFuseConfig;
 
@@ -50,6 +53,26 @@ struct Args {
     layer: String,
     #[arg(long, default_value_t = false)]
     overwrite: bool,
+    /// Synchronize CUDA stages and print a detailed timing profile. Profiling
+    /// changes execution boundaries and is not a normal speed measurement.
+    #[arg(long, default_value_t = false)]
+    profile: bool,
+    /// Retain frozen 2D encoder features on the device and reuse Z-overlap.
+    #[arg(long, default_value_t = false)]
+    feature_cache: bool,
+    /// Precompute every detector-aligned XY window across the complete Z axis
+    /// in a separate Blockflow pass before running the 3D heads.
+    #[arg(long, default_value_t = false, conflicts_with = "feature_cache")]
+    precompute_features: bool,
+    /// Number of adjacent XY windows encoded together by the precompute pass.
+    #[arg(long, default_value_t = 1, requires = "precompute_features")]
+    precompute_spatial_batch: usize,
+    /// Read all twelve head tensors with one backend transaction.
+    #[arg(long, default_value_t = false)]
+    transaction_download: bool,
+    /// Run the model in FP16 while keeping host decoding in FP32.
+    #[arg(long, default_value_t = false)]
+    fp16: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -73,6 +96,9 @@ fn run() -> Result<()> {
     if args.block_z == 0 || args.block == 0 || args.halo_z == 0 || args.halo == 0 {
         return Err(Error::invalid("block and halo dimensions must be positive"));
     }
+    if args.precompute_spatial_batch == 0 {
+        return Err(Error::invalid("precompute spatial batch must be positive"));
+    }
     let started = Instant::now();
     let pyramid = OmeVolumePyramid::open(&args.zarr, args.channel, args.time)?;
     let image_root = pyramid.image_root();
@@ -85,7 +111,8 @@ fn run() -> Result<()> {
         DeviceChoice::Cpu => InferenceDevice::Cpu,
         DeviceChoice::Cuda => InferenceDevice::Cuda(args.cuda_device),
     };
-    let detector = YoloSliceFuse3dDetector::load(
+    let model_load_started = Instant::now();
+    let mut detector = YoloSliceFuse3dDetector::load(
         detector_config,
         &args.checkpoint,
         device,
@@ -94,8 +121,45 @@ fn run() -> Result<()> {
         args.threshold,
         args.nms_iou,
     )?;
+    let model_load = model_load_started.elapsed();
+    let profiler = args.profile.then(|| Arc::new(SliceFuseProfiler::default()));
+    if let Some(profiler) = &profiler {
+        detector = detector.with_profiler(profiler.clone());
+    }
+    if args.transaction_download {
+        detector = detector.with_transaction_download();
+    }
+    if args.fp16 {
+        detector = detector.with_fp16();
+    }
+    if args.feature_cache {
+        detector = detector.with_feature_cache();
+    }
     let schema = YoloSliceFuse3dDetector::schema()?;
     let grid = BlockGrid::new(volume, [args.block_z, args.block, args.block])?;
+    let precompute = if args.precompute_features {
+        let (encoder, cached_detector) =
+            detector.with_precomputed_feature_cache([args.block, args.block]);
+        detector = cached_detector;
+        let mut builder = PlanBuilder::new(
+            volume,
+            dtype,
+            BlockGrid::new(
+                volume,
+                [
+                    volume[0],
+                    args.block,
+                    args.block
+                        .checked_mul(args.precompute_spatial_batch)
+                        .ok_or_else(|| Error::invalid("precompute spatial batch is too large"))?,
+                ],
+            )?,
+        );
+        builder.fragments(encoder)?;
+        Some(builder.finish()?)
+    } else {
+        None
+    };
     let mut builder = PlanBuilder::new(volume, dtype, grid);
     let phase = builder.fragments(detector)?;
     let assembly = builder.finish()?;
@@ -116,6 +180,21 @@ fn run() -> Result<()> {
         fs::remove_dir_all(&work).map_err(Error::backend)?;
     }
     let env = ZarrEnvironment::attach(&work, &[source])?;
+    let inference_started = Instant::now();
+    if let Some(precompute) = &precompute {
+        execute_phases(
+            "YOLO-SliceFuse3D feature precompute",
+            &precompute.workflow,
+            &precompute.decomposition,
+            &Hints {
+                concurrency: args.workers.max(1),
+                ..Hints::default()
+            },
+            &env,
+            &[],
+            &precompute.work(),
+        )?;
+    }
     execute_phases(
         "YOLO-SliceFuse3D OME-Zarr",
         &assembly.workflow,
@@ -128,10 +207,14 @@ fn run() -> Result<()> {
         &[],
         &assembly.work(),
     )?;
+    let inference = inference_started.elapsed();
+    let (reads, _, read_voxels, _, chunks_read, _, peak_resident_bytes) = env.counters().snapshot();
+    let finalize_started = Instant::now();
     let temporary = work.join("table");
     let table = finalize_detections(&env, phase.index(), volume, &temporary, &work)?;
     let detections = table.spec().row_count;
     write_compatibility_csv(&table, &temporary.join("table.csv"))?;
+    let finalize = finalize_started.elapsed();
     drop(table);
     drop(env);
     ensure_zarr_group(destination.parent().expect("table has parent"))?;
@@ -144,6 +227,39 @@ fn run() -> Result<()> {
         destination.display(),
         schema.len()
     );
+    if let Some(profiler) = profiler {
+        let profile = profiler.snapshot();
+        let seconds = |duration: std::time::Duration| duration.as_secs_f64();
+        println!(
+            "profile_json={}",
+            serde_json::json!({
+                "model_load_seconds": seconds(model_load),
+                "inference_seconds": seconds(inference),
+                "finalize_seconds": seconds(finalize),
+                "blocks": profile.blocks,
+                "input_voxels": profile.input_voxels,
+                "unique_voxels": volume.iter().product::<usize>(),
+                "input_redundancy": profile.input_voxels as f64 / volume.iter().product::<usize>() as f64,
+                "environment_reads": reads,
+                "environment_read_voxels": read_voxels,
+                "environment_chunks_read": chunks_read,
+                "peak_resident_bytes": peak_resident_bytes,
+                "tensor_downloads": profile.tensor_downloads,
+                "preprocess_seconds": seconds(profile.preprocess),
+                "upload_seconds": seconds(profile.upload),
+                "model_lock_wait_seconds": seconds(profile.model_lock_wait),
+                "encoder_seconds": seconds(profile.encoder),
+                "fusion_and_heads_seconds": seconds(profile.fusion_and_heads),
+                "download_seconds": seconds(profile.download),
+                "decode_seconds": seconds(profile.decode),
+                "nms_seconds": seconds(profile.nms),
+                "rows_seconds": seconds(profile.rows),
+                "feature_cache_hits": profile.feature_cache_hits,
+                "feature_cache_misses": profile.feature_cache_misses,
+                "feature_cache_entries": profile.feature_cache_entries,
+            })
+        );
+    }
     Ok(())
 }
 

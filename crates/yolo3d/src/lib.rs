@@ -3,12 +3,14 @@
 //! do not benefit from emitting six box-distance distributions at every voxel.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use burn::module::{Module, Param};
+use burn::module::{Module, ModuleMapper, Param};
 use burn::nn::conv::{Conv3d, Conv3dConfig};
 use burn::nn::{GroupNorm, GroupNormConfig, PaddingConfig3d};
 use burn::prelude::{Device, Tensor};
 use burn::tensor::activation::{sigmoid, silu};
+use burn::tensor::FloatDType;
 use serde::{Deserialize, Serialize};
 use yolov11::model::model::{yolo_v11_n, YOLO};
 
@@ -265,6 +267,12 @@ pub struct SliceFuseDetector {
     heads: Vec<CenterHead>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SliceFuseForwardTimes {
+    pub encoder: Duration,
+    pub fusion_and_heads: Duration,
+}
+
 impl SliceFuseDetector {
     pub fn from_encoder_checkpoint(
         config: &SliceFuseConfig,
@@ -302,32 +310,95 @@ impl SliceFuseDetector {
         })
     }
 
-    pub fn forward(&self, input: Tensor<5>) -> Vec<ScaleOutput> {
+    /// Cast every floating-point parameter and running statistic in the model.
+    /// Checkpoints remain FP32; this is an inference-time representation.
+    pub fn cast_float(self, dtype: FloatDType) -> Self {
+        struct CastFloat(FloatDType);
+
+        impl ModuleMapper for CastFloat {
+            fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
+                let (id, tensor, mapper) = param.consume();
+                Param::from_mapped_value(id, tensor.cast(self.0), mapper)
+            }
+        }
+
+        self.map(&mut CastFloat(dtype))
+    }
+
+    /// Encode a batch of independent grayscale slices into P3/P4/P5 features.
+    /// The returned tensors keep the slice batch as dimension zero so callers
+    /// can cache and reassemble individual Z planes.
+    pub fn encode_slices(&self, input: Tensor<4>) -> [Tensor<4>; 3] {
+        let [_, channels, _, _] = input.dims();
+        assert_eq!(channels, 1, "YOLO-SliceFuse3D expects one image channel");
+        let slices = input.repeat_dim(1, 3);
+        let (p3, p4, p5) = self.encoder.forward_features_with_batch_norm(slices, true);
+        [p3, p4, p5]
+    }
+
+    fn encode(&self, input: Tensor<5>) -> [Tensor<5>; 3] {
         let [batch, channels, depth, height, width] = input.dims();
         assert_eq!(channels, 1, "YOLO-SliceFuse3D expects one image channel");
         let slices = input
             .swap_dims(1, 2)
-            .reshape([batch * depth, channels, height, width])
-            .repeat_dim(1, 3);
-        let (p3, p4, p5) = self.encoder.forward_features_with_batch_norm(slices, true);
-        [p3, p4, p5]
+            .reshape([batch * depth, channels, height, width]);
+        self.encode_slices(slices).map(|feature| {
+            let [_, feature_channels, feature_height, feature_width] = feature.dims();
+            feature
+                .reshape([
+                    batch,
+                    depth,
+                    feature_channels,
+                    feature_height,
+                    feature_width,
+                ])
+                .swap_dims(1, 2)
+        })
+    }
+
+    /// Fuse already encoded slice features along Z and run the 3D heads.
+    pub fn predict_encoded(&self, features: [Tensor<5>; 3]) -> Vec<ScaleOutput> {
+        features
             .into_iter()
             .zip(&self.fusion)
             .zip(&self.heads)
-            .map(|((feature, fusion), head)| {
-                let [_, feature_channels, feature_height, feature_width] = feature.dims();
-                let feature = feature
-                    .reshape([
-                        batch,
-                        depth,
-                        feature_channels,
-                        feature_height,
-                        feature_width,
-                    ])
-                    .swap_dims(1, 2);
-                head.forward(fusion.forward(feature))
-            })
+            .map(|((feature, fusion), head)| head.forward(fusion.forward(feature)))
             .collect()
+    }
+
+    pub fn forward(&self, input: Tensor<5>) -> Vec<ScaleOutput> {
+        self.predict_encoded(self.encode(input))
+    }
+
+    /// Profile the two GPU stages with explicit synchronization boundaries.
+    /// This intentionally prevents fusion across the boundary and is therefore
+    /// diagnostic; normal inference should use [`Self::forward`].
+    pub fn forward_profiled(
+        &self,
+        input: Tensor<5>,
+        device: &Device,
+    ) -> Result<(Vec<ScaleOutput>, SliceFuseForwardTimes), Error> {
+        device
+            .sync()
+            .map_err(|error| Error::Config(format!("synchronizing input upload: {error}")))?;
+        let started = Instant::now();
+        let features = self.encode(input);
+        device
+            .sync()
+            .map_err(|error| Error::Config(format!("synchronizing 2D encoder: {error}")))?;
+        let encoder = started.elapsed();
+        let started = Instant::now();
+        let outputs = self.predict_encoded(features);
+        device
+            .sync()
+            .map_err(|error| Error::Config(format!("synchronizing 3D heads: {error}")))?;
+        Ok((
+            outputs,
+            SliceFuseForwardTimes {
+                encoder,
+                fusion_and_heads: started.elapsed(),
+            },
+        ))
     }
 }
 

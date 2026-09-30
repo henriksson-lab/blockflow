@@ -1,14 +1,18 @@
 //! Blockflow adapter for the separate `yolo3d` center detector.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use burn::module::Module;
 use burn::prelude::{Device, Tensor};
 #[cfg(feature = "yolo3d-cuda")]
 use burn::tensor::DeviceIndex;
+use burn::tensor::{FloatDType, Transaction};
 use yolo3d_model::{
-    decode_scale, nms, Box3d, Detector, DetectorConfig, SliceFuseConfig, SliceFuseDetector,
+    decode_scale, nms, Box3d, Detector, DetectorConfig, ScaleOutput, SliceFuseConfig,
+    SliceFuseDetector,
 };
 
 use crate::table::{Column, ColumnType, RowBuilder, Schema, Value};
@@ -110,7 +114,7 @@ impl Yolo3dDetector {
 /// Blockflow adapter for YOLO-SliceFuse3D. The checkpoint contains the reused
 /// 2D microscopy encoder, axial fusion layers, and 3D center heads.
 pub struct YoloSliceFuse3dDetector {
-    model: Mutex<SliceFuseDetector>,
+    model: Arc<Mutex<SliceFuseDetector>>,
     config: SliceFuseConfig,
     device: Device,
     halo: [usize; 3],
@@ -118,6 +122,78 @@ pub struct YoloSliceFuse3dDetector {
     threshold: f32,
     nms_iou: f32,
     cost: f64,
+    profiler: Option<Arc<SliceFuseProfiler>>,
+    feature_cache: Option<Arc<Mutex<HashMap<SliceFeatureKey, [Tensor<4>; 3]>>>>,
+    precomputed_feature_cache: bool,
+    transaction_download: bool,
+    fp16: bool,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct SliceFeatureKey {
+    z: usize,
+    y: usize,
+    x: usize,
+    height: usize,
+    width: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SliceFuseProfile {
+    pub blocks: u64,
+    pub input_voxels: u64,
+    pub tensor_downloads: u64,
+    pub preprocess: Duration,
+    pub upload: Duration,
+    pub model_lock_wait: Duration,
+    pub encoder: Duration,
+    pub fusion_and_heads: Duration,
+    pub download: Duration,
+    pub decode: Duration,
+    pub nms: Duration,
+    pub rows: Duration,
+    pub feature_cache_hits: u64,
+    pub feature_cache_misses: u64,
+    pub feature_cache_entries: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct SliceFuseProfiler {
+    totals: Mutex<SliceFuseProfile>,
+}
+
+impl SliceFuseProfiler {
+    #[must_use]
+    pub fn snapshot(&self) -> SliceFuseProfile {
+        self.totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn record(&self, block: SliceFuseProfile) {
+        let mut totals = self
+            .totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        totals.blocks += block.blocks;
+        totals.input_voxels += block.input_voxels;
+        totals.tensor_downloads += block.tensor_downloads;
+        totals.preprocess += block.preprocess;
+        totals.upload += block.upload;
+        totals.model_lock_wait += block.model_lock_wait;
+        totals.encoder += block.encoder;
+        totals.fusion_and_heads += block.fusion_and_heads;
+        totals.download += block.download;
+        totals.decode += block.decode;
+        totals.nms += block.nms;
+        totals.rows += block.rows;
+        totals.feature_cache_hits += block.feature_cache_hits;
+        totals.feature_cache_misses += block.feature_cache_misses;
+        totals.feature_cache_entries = totals
+            .feature_cache_entries
+            .max(block.feature_cache_entries);
+    }
 }
 
 impl YoloSliceFuse3dDetector {
@@ -144,7 +220,7 @@ impl YoloSliceFuse3dDetector {
                 Error::backend(format!("loading {}: {error}", checkpoint.display()))
             })?;
         Ok(Self {
-            model: Mutex::new(model),
+            model: Arc::new(Mutex::new(model)),
             config,
             device,
             halo,
@@ -152,6 +228,11 @@ impl YoloSliceFuse3dDetector {
             threshold,
             nms_iou,
             cost: 6.0,
+            profiler: None,
+            feature_cache: None,
+            precomputed_feature_cache: false,
+            transaction_download: false,
+            fp16: false,
         })
     }
 
@@ -161,8 +242,337 @@ impl YoloSliceFuse3dDetector {
         self
     }
 
+    #[must_use]
+    pub fn with_profiler(mut self, profiler: Arc<SliceFuseProfiler>) -> Self {
+        self.profiler = Some(profiler);
+        self
+    }
+
+    /// Cache frozen 2D encoder features on the inference device. Entries use
+    /// the exact XY read window and absolute Z, preserving padding and feature
+    /// grid alignment while overlapping Z blocks reuse their shared slices.
+    #[must_use]
+    pub fn with_feature_cache(mut self) -> Self {
+        self.feature_cache = Some(Arc::new(Mutex::new(HashMap::new())));
+        self
+    }
+
+    /// Build an encoder pass that fills the same feature cache consumed by this
+    /// detector. Run it to completion on a whole-depth grid with matching XY
+    /// cores before executing the detector plan.
+    #[must_use]
+    pub fn with_precomputed_feature_cache(
+        mut self,
+        xy_core: [usize; 2],
+    ) -> (YoloSliceFuse3dEncoder, Self) {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        self.feature_cache = Some(cache.clone());
+        self.precomputed_feature_cache = true;
+        let encoder = YoloSliceFuse3dEncoder {
+            model: self.model.clone(),
+            device: self.device.clone(),
+            xy_core,
+            xy_halo: [self.halo[1], self.halo[2]],
+            range: self.range,
+            cache,
+            fp16: self.fp16,
+            profiler: self.profiler.clone(),
+        };
+        (encoder, self)
+    }
+
+    /// Download all head tensors in one backend transaction instead of twelve
+    /// individually synchronized reads.
+    #[must_use]
+    pub fn with_transaction_download(mut self) -> Self {
+        self.transaction_download = true;
+        self
+    }
+
+    /// Store model parameters and activations as FP16 while retaining FP32
+    /// host-side decoding and thresholds.
+    #[must_use]
+    pub fn with_fp16(mut self) -> Self {
+        let mut model = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *model = model.clone().cast_float(FloatDType::F16);
+        drop(model);
+        self.fp16 = true;
+        self
+    }
+
+    fn forward_cached(
+        &self,
+        model: &SliceFuseDetector,
+        tensor: Option<Tensor<5>>,
+        read: &Region,
+        profile: &mut SliceFuseProfile,
+    ) -> Result<Vec<yolo3d_model::ScaleOutput>> {
+        let [depth, height, width] = read.shape3();
+        if let Some(tensor) = &tensor {
+            let [batch, channels, tensor_depth, tensor_height, tensor_width] = tensor.dims();
+            if batch != 1
+                || channels != 1
+                || [tensor_depth, tensor_height, tensor_width] != [depth, height, width]
+            {
+                return Err(Error::invalid(
+                    "YOLO-SliceFuse3D feature cache received inconsistent pixels",
+                ));
+            }
+        }
+        let keys = (0..depth)
+            .map(|local_z| SliceFeatureKey {
+                z: read.start[0] + local_z,
+                y: read.start[1],
+                x: read.start[2],
+                height,
+                width,
+            })
+            .collect::<Vec<_>>();
+        let mut cache = self
+            .feature_cache
+            .as_ref()
+            .expect("cache path requires a cache")
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let missing = keys
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| (!cache.contains_key(key)).then_some(index))
+            .collect::<Vec<_>>();
+        profile.feature_cache_hits += (depth - missing.len()) as u64;
+        profile.feature_cache_misses += missing.len() as u64;
+        if !missing.is_empty() {
+            let tensor = tensor.ok_or_else(|| {
+                Error::backend(format!(
+                    "precomputed SliceFuse cache is missing {} slices for read window {:?}",
+                    missing.len(),
+                    read.start
+                ))
+            })?;
+            let slices = tensor.swap_dims(1, 2).reshape([depth, 1, height, width]);
+            let started = Instant::now();
+            let input = Tensor::cat(
+                missing
+                    .iter()
+                    .map(|&index| slices.clone().slice_dim(0, index..index + 1))
+                    .collect(),
+                0,
+            );
+            let encoded = model.encode_slices(input);
+            self.device.sync().map_err(|error| {
+                Error::backend(format!("synchronizing cached SliceFuse features: {error}"))
+            })?;
+            profile.encoder += started.elapsed();
+            for (batch_index, &local_z) in missing.iter().enumerate() {
+                cache.insert(
+                    keys[local_z],
+                    std::array::from_fn(|level| {
+                        encoded[level]
+                            .clone()
+                            .slice_dim(0, batch_index..batch_index + 1)
+                    }),
+                );
+            }
+        }
+        profile.feature_cache_entries = cache.len() as u64;
+        let features = std::array::from_fn(|level| {
+            let slices = keys
+                .iter()
+                .map(|key| cache.get(key).expect("feature was populated")[level].clone())
+                .collect();
+            let feature = Tensor::cat(slices, 0);
+            let [_, feature_channels, feature_height, feature_width] = feature.dims();
+            feature
+                .reshape([1, depth, feature_channels, feature_height, feature_width])
+                .swap_dims(1, 2)
+        });
+        drop(cache);
+        let started = Instant::now();
+        let outputs = model.predict_encoded(features);
+        if self.profiler.is_some() {
+            self.device.sync().map_err(|error| {
+                Error::backend(format!("synchronizing cached SliceFuse heads: {error}"))
+            })?;
+        }
+        profile.fusion_and_heads += started.elapsed();
+        Ok(outputs)
+    }
+
     pub fn schema() -> Result<Schema> {
         Yolo3dDetector::schema()
+    }
+}
+
+const FEATURE_READY_STREAM: &str = "yolo3d.features.ready";
+
+/// First phase of the staged SliceFuse path. Each block spans the complete Z
+/// axis and one detector-aligned XY window, so the 2D encoder sees every slice
+/// in one efficient batch and no Z overlap is encoded twice.
+pub struct YoloSliceFuse3dEncoder {
+    model: Arc<Mutex<SliceFuseDetector>>,
+    device: Device,
+    xy_core: [usize; 2],
+    xy_halo: [usize; 2],
+    range: (f32, f32),
+    cache: Arc<Mutex<HashMap<SliceFeatureKey, [Tensor<4>; 3]>>>,
+    fp16: bool,
+    profiler: Option<Arc<SliceFuseProfiler>>,
+}
+
+impl FragmentOp for YoloSliceFuse3dEncoder {
+    fn name(&self) -> &'static str {
+        "YOLO-SliceFuse3D encode slices"
+    }
+
+    fn reach(&self, axis: usize, _volume_len: usize) -> usize {
+        match axis {
+            0 => 0,
+            1 => self.xy_halo[0],
+            _ => self.xy_halo[1],
+        }
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        6.0
+    }
+
+    fn reads_pixels(&self) -> bool {
+        true
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![FragmentOutput::new(
+            FEATURE_READY_STREAM,
+            Lifecycle::DeleteOnExit,
+            Coverage::EveryBlock,
+        )]
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let BlockBuf::Array(voxels) = at.pixels()? else {
+            return Ok(BlockOutput::fragment(FEATURE_READY_STREAM, Vec::new()));
+        };
+        let values = voxels.widened();
+        let shape = values.dim();
+        let volume = at.grid.volume();
+        let span = (self.range.1 - self.range.0).max(f32::EPSILON);
+        let started = Instant::now();
+        struct Window {
+            start: [usize; 3],
+            input: Vec<f32>,
+        }
+        let mut windows: BTreeMap<(usize, usize), Vec<Window>> = BTreeMap::new();
+        let core_y0 = at.core.start[1];
+        let core_y1 = core_y0 + at.core.shape[1];
+        let read_y0 = core_y0.saturating_sub(self.xy_halo[0]);
+        let read_y1 = core_y1.saturating_add(self.xy_halo[0]).min(volume[1]);
+        let mut core_x0 = at.core.start[2];
+        let combined_x1 = core_x0 + at.core.shape[2];
+        while core_x0 < combined_x1 {
+            let core_x1 = core_x0.saturating_add(self.xy_core[1]).min(combined_x1);
+            let read_x0 = core_x0.saturating_sub(self.xy_halo[1]);
+            let read_x1 = core_x1.saturating_add(self.xy_halo[1]).min(volume[2]);
+            let height = read_y1 - read_y0;
+            let width = read_x1 - read_x0;
+            let local_y0 = read_y0 - at.read.start[1];
+            let local_x0 = read_x0 - at.read.start[2];
+            let mut input = Vec::with_capacity(shape.0 * height * width);
+            for z in 0..shape.0 {
+                for y in local_y0..local_y0 + height {
+                    for x in local_x0..local_x0 + width {
+                        input.push(
+                            ((values[[z, y, x]] as f32 - self.range.0) / span).clamp(0.0, 1.0),
+                        );
+                    }
+                }
+            }
+            windows.entry((height, width)).or_default().push(Window {
+                start: [at.read.start[0], read_y0, read_x0],
+                input,
+            });
+            core_x0 = core_x1;
+        }
+        let preprocess = started.elapsed();
+        let mut upload = Duration::ZERO;
+        let mut encoder = Duration::ZERO;
+        let window_count = windows.values().map(Vec::len).sum::<usize>();
+        let started = Instant::now();
+        let model = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock_wait = started.elapsed();
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for ((height, width), group) in windows {
+            let started = Instant::now();
+            let tensors = group
+                .iter()
+                .map(|window| {
+                    Tensor::<1>::from_floats(window.input.as_slice(), &self.device)
+                        .reshape([shape.0, 1, height, width])
+                })
+                .collect();
+            let tensor = Tensor::cat(tensors, 0);
+            let tensor = if self.fp16 {
+                tensor.cast(FloatDType::F16)
+            } else {
+                tensor
+            };
+            if self.profiler.is_some() {
+                self.device.sync().map_err(|error| {
+                    Error::backend(format!("SliceFuse encoder upload: {error}"))
+                })?;
+            }
+            upload += started.elapsed();
+            let started = Instant::now();
+            let encoded = model.encode_slices(tensor);
+            self.device.sync().map_err(|error| {
+                Error::backend(format!("synchronizing SliceFuse encoder: {error}"))
+            })?;
+            encoder += started.elapsed();
+            for (window_index, window) in group.iter().enumerate() {
+                for local_z in 0..shape.0 {
+                    let batch_index = window_index * shape.0 + local_z;
+                    let key = SliceFeatureKey {
+                        z: window.start[0] + local_z,
+                        y: window.start[1],
+                        x: window.start[2],
+                        height,
+                        width,
+                    };
+                    cache.insert(
+                        key,
+                        std::array::from_fn(|level| {
+                            encoded[level]
+                                .clone()
+                                .slice_dim(0, batch_index..batch_index + 1)
+                        }),
+                    );
+                }
+            }
+        }
+        let entries = cache.len() as u64;
+        drop(cache);
+        drop(model);
+        if let Some(profiler) = &self.profiler {
+            profiler.record(SliceFuseProfile {
+                input_voxels: voxels.len() as u64,
+                preprocess,
+                upload,
+                model_lock_wait: lock_wait,
+                encoder,
+                feature_cache_misses: (window_count * shape.0) as u64,
+                feature_cache_entries: entries,
+                ..SliceFuseProfile::default()
+            });
+        }
+        Ok(BlockOutput::fragment(FEATURE_READY_STREAM, Vec::new()))
     }
 }
 
@@ -359,7 +769,7 @@ impl FragmentOp for YoloSliceFuse3dDetector {
     }
 
     fn reads_pixels(&self) -> bool {
-        true
+        !self.precomputed_feature_cache
     }
 
     fn writes_pixels(&self) -> bool {
@@ -382,37 +792,100 @@ impl FragmentOp for YoloSliceFuse3dDetector {
     }
 
     fn apply_with(&self, at: &BlockView<'_>, _sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let mut profile = SliceFuseProfile {
+            blocks: 1,
+            ..SliceFuseProfile::default()
+        };
         let schema = Arc::new(Self::schema()?);
         let mut rows = RowBuilder::new(schema);
-        let BlockBuf::Array(voxels) = at.pixels()? else {
-            return Ok(BlockOutput::fragment(STREAM, rows.encode()));
+        let tensor = if self.precomputed_feature_cache {
+            None
+        } else {
+            let BlockBuf::Array(voxels) = at.pixels()? else {
+                return Ok(BlockOutput::fragment(STREAM, rows.encode()));
+            };
+            profile.input_voxels = voxels.len() as u64;
+            let started = Instant::now();
+            let values = voxels.widened();
+            let shape = values.dim();
+            let span = (self.range.1 - self.range.0).max(f32::EPSILON);
+            let input = values
+                .iter()
+                .map(|value| ((*value as f32 - self.range.0) / span).clamp(0.0, 1.0))
+                .collect::<Vec<_>>();
+            profile.preprocess = started.elapsed();
+            let started = Instant::now();
+            let tensor = Tensor::<1>::from_floats(input.as_slice(), &self.device)
+                .reshape([1, 1, shape.0, shape.1, shape.2]);
+            let tensor = if self.fp16 {
+                tensor.cast(FloatDType::F16)
+            } else {
+                tensor
+            };
+            if self.profiler.is_some() {
+                self.device
+                    .sync()
+                    .map_err(|error| Error::backend(format!("yolo-slicefuse3d upload: {error}")))?;
+            }
+            profile.upload = started.elapsed();
+            Some(tensor)
         };
-        let values = voxels.widened();
-        let shape = values.dim();
-        let span = (self.range.1 - self.range.0).max(f32::EPSILON);
-        let input = values
-            .iter()
-            .map(|value| ((*value as f32 - self.range.0) / span).clamp(0.0, 1.0))
-            .collect::<Vec<_>>();
-        let tensor = Tensor::<1>::from_floats(input.as_slice(), &self.device)
-            .reshape([1, 1, shape.0, shape.1, shape.2]);
-        let outputs = self
+        let started = Instant::now();
+        let model = self
             .model
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .forward(tensor);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        profile.model_lock_wait = started.elapsed();
+        let outputs = if self.feature_cache.is_some() {
+            self.forward_cached(&model, tensor, at.read, &mut profile)?
+        } else if self.profiler.is_some() {
+            let tensor = tensor.expect("uncached SliceFuse inference reads pixels");
+            let (outputs, times) = model
+                .forward_profiled(tensor, &self.device)
+                .map_err(|error| Error::backend(format!("yolo-slicefuse3d profile: {error}")))?;
+            profile.encoder = times.encoder;
+            profile.fusion_and_heads = times.fusion_and_heads;
+            outputs
+        } else {
+            model.forward(tensor.expect("uncached SliceFuse inference reads pixels"))
+        };
+        drop(model);
         let strides = self.config.cumulative_strides();
         let mut detections = Vec::new();
-        for (level, output) in outputs.into_iter().enumerate() {
-            let dims = output.heatmap.dims();
-            let spatial = [dims[2], dims[3], dims[4]];
+        let downloaded = if self.transaction_download {
+            let started = Instant::now();
+            let downloaded = download_scale_outputs(outputs)?;
+            profile.download += started.elapsed();
+            profile.tensor_downloads += 1;
+            downloaded
+        } else {
+            outputs
+                .into_iter()
+                .map(|output| {
+                    let dims = output.heatmap.dims();
+                    let started = Instant::now();
+                    let downloaded = DownloadedScale {
+                        spatial: [dims[2], dims[3], dims[4]],
+                        heatmap: tensor_values(output.heatmap)?,
+                        offset: tensor_values(output.offset)?,
+                        size: tensor_values(output.size)?,
+                        quality: tensor_values(output.quality)?,
+                    };
+                    profile.download += started.elapsed();
+                    profile.tensor_downloads += 4;
+                    Ok(downloaded)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        for (level, output) in downloaded.into_iter().enumerate() {
+            let started = Instant::now();
             detections.extend(
                 decode_scale(
-                    &tensor_values(output.heatmap)?,
-                    &tensor_values(output.offset)?,
-                    &tensor_values(output.size)?,
-                    &tensor_values(output.quality)?,
-                    spatial,
+                    &output.heatmap,
+                    &output.offset,
+                    &output.size,
+                    &output.quality,
+                    output.spatial,
                     self.config.classes,
                     strides[level],
                     self.config.voxel_size,
@@ -420,9 +893,18 @@ impl FragmentOp for YoloSliceFuse3dDetector {
                 )
                 .map_err(|error| Error::backend(format!("yolo-slicefuse3d decode: {error}")))?,
             );
+            profile.decode += started.elapsed();
         }
-        for detection in nms(detections, self.nms_iou) {
+        let started = Instant::now();
+        let detections = nms(detections, self.nms_iou);
+        profile.nms = started.elapsed();
+        let started = Instant::now();
+        for detection in detections {
             emit_detection(&mut rows, detection, self.config.voxel_size, at)?;
+        }
+        profile.rows = started.elapsed();
+        if let Some(profiler) = &self.profiler {
+            profiler.record(profile);
         }
         Ok(BlockOutput::fragment(STREAM, rows.encode()))
     }
@@ -430,9 +912,67 @@ impl FragmentOp for YoloSliceFuse3dDetector {
 
 fn tensor_values<const D: usize>(tensor: Tensor<D>) -> Result<Vec<f32>> {
     tensor
+        .cast(FloatDType::F32)
         .into_data()
         .try_to_vec::<f32>()
         .map_err(|error| Error::backend(format!("reading yolo3d tensor: {error}")))
+}
+
+struct DownloadedScale {
+    spatial: [usize; 3],
+    heatmap: Vec<f32>,
+    offset: Vec<f32>,
+    size: Vec<f32>,
+    quality: Vec<f32>,
+}
+
+fn download_scale_outputs(outputs: Vec<ScaleOutput>) -> Result<Vec<DownloadedScale>> {
+    let spatial = outputs
+        .iter()
+        .map(|output| {
+            let dims = output.heatmap.dims();
+            [dims[2], dims[3], dims[4]]
+        })
+        .collect::<Vec<_>>();
+    let mut transaction = Transaction::default();
+    for output in outputs {
+        transaction = transaction
+            .register(output.heatmap.cast(FloatDType::F32))
+            .register(output.offset.cast(FloatDType::F32))
+            .register(output.size.cast(FloatDType::F32))
+            .register(output.quality.cast(FloatDType::F32));
+    }
+    let data = transaction
+        .try_execute()
+        .map_err(|error| Error::backend(format!("reading SliceFuse tensors: {error}")))?;
+    if data.len() != spatial.len() * 4 {
+        return Err(Error::backend(format!(
+            "SliceFuse transaction returned {} tensors, expected {}",
+            data.len(),
+            spatial.len() * 4
+        )));
+    }
+    let mut data = data.into_iter();
+    spatial
+        .into_iter()
+        .map(|spatial| {
+            let mut convert = || {
+                data.next()
+                    .expect("transaction tensor count was checked")
+                    .try_to_vec::<f32>()
+                    .map_err(|error| {
+                        Error::backend(format!("decoding SliceFuse tensor data: {error}"))
+                    })
+            };
+            Ok(DownloadedScale {
+                spatial,
+                heatmap: convert()?,
+                offset: convert()?,
+                size: convert()?,
+                quality: convert()?,
+            })
+        })
+        .collect()
 }
 
 fn emit_detection(

@@ -43,6 +43,7 @@ pipelines were approximately:
 * **5.3× faster than Python StarDist** end to end on a real DAPI subset
 * **1.2× faster than Python Cellpose** end to end on a real DAPI subset
 * **1.11× faster than original YOLOv11** on matched FP32 CUDA inference
+* **1.97× faster than the initial YOLO-SliceFuse3D run** with equivalent output
 * **within 7% of Python Cellpose3D**, with matching object counts on two real crops
 * **1.24× faster than Python StarDist3D** on the crowded crop and within 8% on the isolated crop, with exact labels
 
