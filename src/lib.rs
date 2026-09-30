@@ -118,6 +118,7 @@ pub mod arena;
 pub mod assemble;
 pub mod budget;
 pub mod cache;
+pub mod classical_centers;
 pub mod cpu;
 pub mod decomposition;
 /// Multi-node execution: a coordinator, workers that pull, and pluggable
@@ -175,6 +176,8 @@ pub mod npy;
 #[cfg(feature = "zarr")]
 pub mod object_table;
 pub mod observed_io;
+#[cfg(feature = "zarr")]
+pub mod ome_zarr;
 pub mod op;
 /// Image-processing operations: voxelwise combination, rank filtering,
 /// morphology, windowed statistics on a globally anchored sample lattice, and
@@ -236,6 +239,8 @@ pub mod tiling;
 pub mod voxels;
 #[cfg(feature = "yolo")]
 pub mod yolo;
+#[cfg(feature = "yolo3d")]
+pub mod yolo3d;
 /// Images as Zarr v3 arrays on a filesystem store: the `Environment` that moves
 /// bytes. Behind the `zarr` feature; with it off this crate is unchanged and
 /// pulls no extra dependency.
@@ -334,4 +339,6 @@ pub use table::{
 pub use tiling::boxes_tile_exactly;
 pub use voxels::{SideBuf, VoxelElement, Voxels, VoxelsMut};
 #[cfg(feature = "zarr")]
-pub use zarr_env::{chunk_for_block, zarr_data_type, AttachedImage, Window, ZarrEnvironment};
+pub use zarr_env::{
+    chunk_for_block, zarr_data_type, AttachedImage, VolumeSelection, Window, ZarrEnvironment,
+};

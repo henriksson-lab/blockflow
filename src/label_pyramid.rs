@@ -35,10 +35,32 @@ pub fn build_nearest_label_pyramid(
     block_candidates: &[usize],
     workers: usize,
 ) -> Result<()> {
+    let candidates = block_candidates
+        .iter()
+        .map(|&edge| [edge, edge, edge])
+        .collect::<Vec<_>>();
+    build_nearest_label_pyramid_with_blocks(label_root, work, level_shapes, &candidates, workers)
+}
+
+/// [`build_nearest_label_pyramid`] with independent `[z, y, x]` block shapes.
+/// Volumetric model outputs normally need a much shallower z block than their
+/// y/x edge, so forcing one scalar edge can exceed memory by orders of
+/// magnitude.
+pub fn build_nearest_label_pyramid_with_blocks(
+    label_root: &Path,
+    work: &Path,
+    level_shapes: &[[usize; 3]],
+    block_candidates: &[[usize; 3]],
+    workers: usize,
+) -> Result<()> {
     if level_shapes.is_empty() {
         return Err(Error::invalid("a label pyramid needs level 0"));
     }
-    if block_candidates.is_empty() || block_candidates.contains(&0) {
+    if block_candidates.is_empty()
+        || block_candidates
+            .iter()
+            .any(|candidate| candidate.contains(&0))
+    {
         return Err(Error::invalid(
             "label-pyramid block candidates must be positive",
         ));
@@ -58,7 +80,7 @@ pub fn build_nearest_label_pyramid(
         let workflow = Workflow::new(chain, input_shape, Dtype::U64);
         let constraints = Constraints {
             expected_concurrency: concurrency,
-            block_candidates: block_candidates.to_vec(),
+            block_candidates: block_candidates.iter().map(|block| block[1]).collect(),
             split_axes: if output_shape[0] == 1 {
                 vec![1, 2]
             } else {
@@ -72,6 +94,7 @@ pub fn build_nearest_label_pyramid(
             input_shape,
             output_shape,
             &constraints,
+            block_candidates,
         )?;
         let level_work = work.join(format!("pyramid-{index}"));
         let env = ZarrEnvironment::attach(&level_work, &[input])?;
@@ -228,10 +251,11 @@ fn planned_resample(
     input: [usize; 3],
     output: [usize; 3],
     constraints: &Constraints,
+    block_candidates: &[[usize; 3]],
 ) -> Result<Decomposition> {
     let mut best: Option<(f64, usize, Decomposition)> = None;
-    for &edge in &constraints.block_candidates {
-        let grid = BlockGrid::along(output, &constraints.split_axes, edge)?;
+    for &block in block_candidates {
+        let grid = BlockGrid::new(output, block)?;
         let phase = resample_phase(
             vec![0],
             vec!["label-pyramid-nearest".to_owned()],
@@ -257,10 +281,11 @@ fn planned_resample(
         if !constraints.affords_working_set(cost) {
             continue;
         }
-        if best.as_ref().is_none_or(|(old, old_edge, _)| {
-            (*makespan, std::cmp::Reverse(edge)) < (*old, std::cmp::Reverse(*old_edge))
+        let block_size = block.iter().product();
+        if best.as_ref().is_none_or(|(old, old_size, _)| {
+            (*makespan, std::cmp::Reverse(block_size)) < (*old, std::cmp::Reverse(*old_size))
         }) {
-            best = Some((*makespan, edge, decomposition));
+            best = Some((*makespan, block_size, decomposition));
         }
     }
     best.map(|(_, _, decomposition)| decomposition)

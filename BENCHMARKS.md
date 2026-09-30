@@ -323,6 +323,94 @@ while unused flow-color rendering took 3.00 seconds. These measurements support
 the masks-only change and do not support adding a pinned-memory copy pipeline or
 multiple model instances on this GPU.
 
+## 3D segmentation CUDA kernels
+
+Measured on 2026-09-29 on the Quadro RTX 5000. These direct comparisons use
+the same two 16 x 64 x 64 crops from the PBMC volume, one crowded and one with
+an isolated cell. Both implementations used GPU inference, one warmup,
+anisotropy 1.98, batch size 8 for Cellpose, and release Rust binaries. Model
+loading is excluded.
+
+| Cellpose3D crop | Python 4.1.1 | Rust | Rust/Python time | Objects Python/Rust | Foreground Dice |
+|---|---:|---:|---:|---:|---:|
+| Isolated | 20.625 s | 21.785 s | **1.06x** | 1 / 1 | 0.9876 |
+| Crowded | 20.686 s | 22.152 s | **1.07x** | 8 / 8 | 0.9874 |
+
+All eight crowded-crop objects matched above 0.5 IoU; their mean matched IoU
+was 0.9238. The small numerical differences are consistent with converted
+weights and different GPU backends. The 6–7% timing difference does not justify
+Cellpose3D optimization before larger quality evaluation.
+
+| StarDist3D crop | Python total | Rust total | Rust/Python time | Rust raw-inference speed | Labels |
+|---|---:|---:|---:|---:|---|
+| Isolated | 0.160 s | 0.172 s | **1.08x** | **1.45x faster** | exact |
+| Crowded | 0.237 s | 0.191 s | **0.81x** | **1.37x faster** | exact |
+
+StarDist used the bundled `3D_demo` model. Total time includes sparse prediction
+and polyhedron instance construction. The native labels matched Python exactly,
+so no StarDist3D speed work is indicated by these crops. The model found only
+two objects where Cellpose found eight in the crowded crop; this particular
+model is therefore a format and performance reference rather than the selected
+teacher.
+
+The normal Blockflow crop workflows, including OME-Zarr reading, planning,
+label writing, pyramid construction, and indexed table finalization, took
+21.430 s for Cellpose (8 objects) and 0.567 s for StarDist (2 objects). The
+fixed crop coordinates and reproduction commands are documented in the two 3D
+example directories.
+
+### Full PBMC volume
+
+The release CUDA Cellpose3D example processed the complete
+60 x 1,592 x 3,333 level-0 volume as one outer Blockflow block. CP-SAM used
+anisotropy 1.98, batch size 8, and one worker. The complete workflow took
+**9,738.827 s (2 h 42 min 18.8 s)** and published 115 instances. Peak host RSS
+was 61,089,056 KiB (58.3 GiB). GPU inference stayed near full utilization; the
+whole-volume mode avoids repeating Cellpose's three sets of internally tiled
+orthogonal planes across overlapping outer blocks.
+
+The result is a five-level 34 MiB label pyramid at
+`labels/cellpose3d-cpsam` plus a 392 KiB indexed object table at
+`tables/cellpose3d-cpsam`. The label source correctly resolves the Bio-Formats
+series as `../../0`, and the temporary work tree was removed after publication.
+This timing is accepted for the current project; Cellpose3D and StarDist3D
+inference optimization is closed unless a future matched benchmark shows a
+material regression.
+
+### YOLO3D distilled center detector
+
+The separate native 3D detector was trained from the Cellpose3D labels with
+24 x 192 x 192 input patches, 6 x 24 x 24 ownership halos, CUDA, and release
+builds. Its leakage-safe split grouped overlapping positive windows and added
+two empty background windows per positive window. The final split contained
+36 training, 57 validation, and 66 frozen test windows.
+
+The AP-selected checkpoint came from epoch 2 of an eight-epoch run. The full
+run took 7m29.69s including validation after every epoch. Dataset-derived size
+priors were essential: without them, matched predicted extents oscillated from
+less than half to more than 18 times teacher size under momentum.
+
+| Partition | Complete teacher objects | Center AP | Precision | Recall | Box AP50 |
+|---|---:|---:|---:|---:|---:|
+| Validation, threshold 0.01961601 | 18 | **0.7298** | 0.7647 | 0.7222 | 0.0556 |
+| Frozen test, ranked curve | 15 | **0.6233** | 0.6087 | 0.9333 | 0.0000 |
+
+The test precision and recall are reported at the test curve's diagnostic best
+point; the deployment threshold remained fixed from validation. These are
+agreement metrics against the Cellpose teacher, not manually reviewed
+biological accuracy. The low box AP means the current model is a center
+detector with approximate extents.
+
+Full-volume Blockflow inference at the validation-selected threshold processed
+the 60 x 1,592 x 3,333 volume in **283.572s application time** and **286.83s
+wall time** with 761,708 KiB peak host RSS. It published 74 detections in a
+432 KiB spatially indexed object table. Relative to the 2h42m18.8s Cellpose3D
+teacher run, end-to-end YOLO3D inference was **34.4x faster**. The count is
+64.3% of the 115-object teacher count, consistent with held-out recall and not
+a claim of label parity. The compatibility CSV was discovered by release
+newvolim alongside the Cellpose label, and a full-volume viewport query returned
+all 74 YOLO rows.
+
 ## StarDist CUDA annotation
 
 This comparison, measured on 2026-09-22, used the same 2048 x 6144 DAPI subset

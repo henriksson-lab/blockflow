@@ -213,6 +213,76 @@ impl SegmentBackend for CellposeBackend {
     }
 }
 
+/// Cellpose's native volumetric inference, adapted to blockflow's `[z, y, x]`
+/// tiles. The model still performs its orthogonal-view inference internally;
+/// blockflow owns only the outer volume decomposition and object ownership.
+pub struct Cellpose3dBackend {
+    model: Mutex<CellposeModel>,
+    params: EvalParams,
+    cost: f64,
+}
+
+impl Cellpose3dBackend {
+    pub fn new(weights: &Path, device: Device, mut params: EvalParams) -> Result<Self> {
+        let model = CellposeModel::new(weights, device.into(), None)
+            .map_err(|error| Error::backend(format!("cellpose: {error}")))?;
+        params.do_3d = true;
+        params.z_axis = Some(0);
+        params.channel_axis = None;
+        params.stitch_threshold = 0.0;
+        Ok(Self {
+            model: Mutex::new(model),
+            params,
+            cost: 9.0,
+        })
+    }
+
+    #[must_use]
+    pub fn with_cost_per_voxel(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+impl SegmentBackend for Cellpose3dBackend {
+    fn name(&self) -> &'static str {
+        "cellpose-3d"
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+
+    fn segment(&self, tile: ArrayView3<'_, f32>, _at: &crate::Anchor) -> Result<Array3<u32>> {
+        let shape = tile.dim();
+        let values = tile.iter().copied().collect();
+        let image = ndarray16::ArrayD::from_shape_vec(
+            ndarray16::IxDyn(&[shape.0, shape.1, shape.2]),
+            values,
+        )
+        .map_err(|error| Error::backend(format!("cellpose: volume does not reshape: {error}")))?;
+        let masks = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .eval_masks(&image, &self.params)
+            .map_err(|error| Error::backend(format!("cellpose 3d: {error}")))?;
+        if masks.shape() != [shape.0, shape.1, shape.2] {
+            return Err(Error::ShapeMismatch {
+                expected: vec![shape.0, shape.1, shape.2],
+                got: masks.shape().to_vec(),
+            });
+        }
+        let mut labels = Array3::<u32>::zeros(shape);
+        for (output, &label) in labels.iter_mut().zip(masks.iter()) {
+            *output = u32::try_from(label).map_err(|_| {
+                Error::backend(format!("cellpose returned negative 3d label {label}"))
+            })?;
+        }
+        Ok(labels)
+    }
+}
+
 // ------------------------------------------------- the anchored backend --
 
 /// **Cellpose with its windows anchored to the image, not to the buffer.**

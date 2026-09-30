@@ -1,0 +1,28 @@
+[package]
+name = "blockflow-yolo-3d-ome-zarr"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+cuda = ["blockflow/yolo3d-cuda", "burn/cuda"]
+
+[dependencies]
+anyhow = "1"
+blockflow = { path = "../..", features = ["zarr", "yolo3d"] }
+burn = { version = "0.22.0-pre.2", default-features = false, features = ["std", "flex", "optim"] }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ngff-object-table = { path = "../../crates/ngff-object-table" }
+yolo3d = { path = "../../crates/yolo3d" }
+
+[[bin]]
+name = "yolo-3d-ome-zarr"
+path = "src/main.rs"
+
+[[bin]]
+name = "yolo-3d-train"
+path = "src/bin/train.rs"

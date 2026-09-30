@@ -241,6 +241,72 @@ impl FiniteHistogram {
         })
     }
 
+    pub(crate) fn from_counts(
+        minimum: f64,
+        maximum: f64,
+        counts: Vec<f64>,
+        name: &str,
+    ) -> Result<Self> {
+        if !minimum.is_finite() || !maximum.is_finite() || maximum < minimum {
+            return Err(Error::InvalidArgument(format!(
+                "{name} has invalid finite range [{minimum}, {maximum}]"
+            )));
+        }
+        if counts.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "{name} needs at least one histogram bin"
+            )));
+        }
+        if counts
+            .iter()
+            .any(|count| !count.is_finite() || *count < 0.0)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "{name} contains an invalid bin count"
+            )));
+        }
+        let total_count = counts.iter().sum::<f64>();
+        if total_count <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "{name} needs at least one finite value"
+            )));
+        }
+        let constant = maximum == minimum;
+        let width = if constant {
+            0.0
+        } else {
+            (maximum - minimum) / counts.len() as f64
+        };
+        let centres: Vec<f64> = if constant {
+            vec![minimum; counts.len()]
+        } else {
+            (0..counts.len())
+                .map(|index| minimum + (index as f64 + 0.5) * width)
+                .collect()
+        };
+        let mut cumulative_count = Vec::with_capacity(counts.len());
+        let mut cumulative_intensity = Vec::with_capacity(counts.len());
+        let mut running_count = 0.0;
+        let mut running_intensity = 0.0;
+        for (count, centre) in counts.iter().zip(&centres) {
+            running_count += count;
+            running_intensity += count * centre;
+            cumulative_count.push(running_count);
+            cumulative_intensity.push(running_intensity);
+        }
+        Ok(Self {
+            counts,
+            centres,
+            cumulative_count,
+            cumulative_intensity,
+            total_count: running_count,
+            total_intensity: running_intensity,
+            constant,
+            minimum,
+            width,
+        })
+    }
+
     pub fn index(&self, value: f64) -> usize {
         if self.constant {
             0

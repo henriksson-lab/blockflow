@@ -47,6 +47,8 @@ use crate::model_segment::SegmentBackend;
 use candle_core::{Device as CandleDevice, Tensor as CandleTensor};
 #[cfg(feature = "stardist-candle-cuda")]
 use stardist_rs::model::candle::StarDist2D as Network;
+#[cfg(feature = "stardist-candle-cuda")]
+use stardist_rs::model::candle::StarDist3D as Network3d;
 
 #[cfg(not(feature = "stardist-candle-cuda"))]
 use burn::tensor::{Tensor, TensorData};
@@ -258,6 +260,193 @@ impl SegmentBackend for StardistBackend {
     }
 }
 
+/// Native StarDist 3-D inference on Candle CUDA.
+///
+/// This is deliberately a separate backend from [`StardistBackend`]: the model
+/// configuration, rays, NMS and polyhedron renderer are all three dimensional,
+/// rather than a 2-D model applied independently to slices.
+#[cfg(feature = "stardist-candle-cuda")]
+pub struct Stardist3dBackend {
+    inner: Mutex<Inner3d>,
+    config: stardist_rs::Config3D,
+    prob_threshold: Option<f32>,
+    nms_threshold: Option<f32>,
+    range: (f32, f32),
+    cost: f64,
+}
+
+#[cfg(feature = "stardist-candle-cuda")]
+struct Inner3d {
+    predictor: stardist_rs::StarDist3D,
+    network: Network3d,
+    device: CandleDevice,
+}
+
+#[cfg(feature = "stardist-candle-cuda")]
+impl Stardist3dBackend {
+    pub fn new(
+        model_dir: &Path,
+        weights: &Path,
+        prob_threshold: Option<f32>,
+        nms_threshold: Option<f32>,
+        range: (f32, f32),
+    ) -> Result<Self> {
+        let predictor = stardist_rs::StarDist3D::from_model_dir(model_dir)
+            .map_err(|error| Error::backend(format!("stardist 3d: {error:?}")))?;
+        let config = predictor.config.clone();
+        let device = CandleDevice::new_cuda(0)
+            .map_err(|error| Error::backend(format!("stardist 3d cuda: {error:?}")))?;
+        let keras = stardist_rs::weights::load_keras_hdf5_weights(weights)
+            .map_err(|error| Error::backend(format!("stardist 3d weights: {error:?}")))?;
+        let network = Network3d::init(config.clone(), &device)
+            .load_keras_weights(&keras, &device)
+            .map_err(|error| Error::backend(format!("stardist 3d weights: {error:?}")))?;
+        Ok(Self {
+            inner: Mutex::new(Inner3d {
+                predictor,
+                network,
+                device,
+            }),
+            config,
+            prob_threshold,
+            nms_threshold,
+            range,
+            cost: 3.0,
+        })
+    }
+
+    #[must_use]
+    pub fn with_cost_per_voxel(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+#[cfg(feature = "stardist-candle-cuda")]
+impl SegmentBackend for Stardist3dBackend {
+    fn name(&self) -> &'static str {
+        "stardist-3d"
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+
+    fn segment(&self, tile: ArrayView3<'_, f32>, _at: &crate::Anchor) -> Result<Array3<u32>> {
+        let (depth, height, width) = tile.dim();
+        let (low, high) = self.range;
+        let span = (high - low).max(1e-6);
+        let values: Vec<f32> = tile
+            .iter()
+            .map(|value| ((value - low) / span).clamp(0.0, 1.0))
+            .collect();
+        let config = self.config.clone();
+        let instances = {
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner
+                .predictor
+                .predict_instances(
+                    &values,
+                    &[depth, height, width],
+                    Some("ZYX"),
+                    true,
+                    self.prob_threshold,
+                    self.nms_threshold,
+                    None,
+                    None,
+                    true,
+                    None,
+                    false,
+                    // Match StarDist3D's normal sparse prediction boundary.
+                    // The two grid cells suppress incomplete polyhedra whose
+                    // centers lie at the fetched tile edge; the Blockflow halo
+                    // still leaves the owned core well inside this boundary.
+                    2,
+                    true,
+                    true,
+                    true,
+                    stardist_rs::PolyhedronRenderMode::Full,
+                    |x, shape, axes| forward_3d(&inner, &config, x, shape, axes),
+                )
+                .map_err(|error| Error::backend(format!("stardist 3d: {error:?}")))?
+                .instances
+        };
+        let labels = instances.labels.ok_or_else(|| {
+            Error::backend("stardist 3d returned no label volume although one was requested")
+        })?;
+        if labels.dim() != (depth, height, width) {
+            return Err(Error::ShapeMismatch {
+                expected: vec![depth, height, width],
+                got: labels.shape().to_vec(),
+            });
+        }
+        let mut out = Array3::<u32>::zeros((depth, height, width));
+        for (output, &label) in out.iter_mut().zip(labels.iter()) {
+            *output = u32::try_from(label).map_err(|_| {
+                Error::backend(format!("stardist returned negative 3d label {label}"))
+            })?;
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "stardist-candle-cuda")]
+fn forward_3d(
+    inner: &Inner3d,
+    config: &stardist_rs::Config3D,
+    x: &[f32],
+    x_shape: &[usize],
+    axes: &str,
+) -> std::result::Result<StarDistDirectPrediction, StarDistPredictError> {
+    if axes != "ZYXC" || x_shape.len() != 4 || x_shape[3] != 1 {
+        return Err(StarDistPredictError::OutputShapeMismatch);
+    }
+    let (depth, height, width) = (x_shape[0], x_shape[1], x_shape[2]);
+    let input = CandleTensor::from_vec(x.to_vec(), (1, 1, depth, height, width), &inner.device)
+        .map_err(|_| StarDistPredictError::OutputShapeMismatch)?;
+    let outputs = inner
+        .network
+        .forward(&input)
+        .map_err(|_| StarDistPredictError::OutputShapeMismatch)?;
+    let probability =
+        tensor_to_vec(outputs.prob).map_err(|_| StarDistPredictError::OutputShapeMismatch)?;
+    let distances =
+        tensor_to_vec(outputs.dist).map_err(|_| StarDistPredictError::OutputShapeMismatch)?;
+    let output = [
+        depth / config.grid[0],
+        height / config.grid[1],
+        width / config.grid[2],
+    ];
+    Ok(StarDistDirectPrediction {
+        prob: probability,
+        prob_shape: vec![output[0], output[1], output[2], 1],
+        dist: ncdhw_dist_to_zyxc(&distances, config.n_rays, output),
+        dist_shape: vec![output[0], output[1], output[2], config.n_rays],
+        prob_class: None,
+        prob_class_shape: None,
+    })
+}
+
+#[cfg(feature = "stardist-candle-cuda")]
+fn ncdhw_dist_to_zyxc(dist: &[f32], rays: usize, shape: [usize; 3]) -> Vec<f32> {
+    let [depth, height, width] = shape;
+    let mut out = vec![0.0; depth * height * width * rays];
+    for ray in 0..rays {
+        for z in 0..depth {
+            for y in 0..height {
+                for x in 0..width {
+                    out[((z * height + y) * width + x) * rays + ray] =
+                        dist[((ray * depth + z) * height + y) * width + x];
+                }
+            }
+        }
+    }
+    out
+}
+
 fn forward_inner(
     inner: &Inner,
     config: &Config2D,
@@ -267,7 +456,7 @@ fn forward_inner(
 ) -> std::result::Result<StarDistDirectPrediction, StarDistPredictError> {
     #[cfg(feature = "stardist-candle-cuda")]
     {
-        return forward(&inner.network, config, &inner.device, x, x_shape, axes);
+        forward(&inner.network, config, &inner.device, x, x_shape, axes)
     }
     #[cfg(not(feature = "stardist-candle-cuda"))]
     {

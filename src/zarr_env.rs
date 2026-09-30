@@ -140,7 +140,7 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use ndarray::{Array3, ArrayD, IxDyn};
 
 use zarrs::array::codec::api::BytesToBytesCodecTraits;
-use zarrs::array::codec::GzipCodec;
+use zarrs::array::codec::{GzipCodec, ZstdCodec};
 use zarrs::array::data_type;
 use zarrs::array::{
     Array as ZarrArray, ArrayBuilder, ArraySubset, DataType, Element, ElementOwned, FillValue,
@@ -244,17 +244,15 @@ fn unwritten_fill(dtype: Dtype) -> Result<FillValue> {
 /// what makes the byte-identity claim in `tests/zarr_env.rs` a claim about
 /// storage rather than about arithmetic.
 ///
-/// Two variants and no more, deliberately. Zarr v3 has a long list of codecs and
+/// Three variants and no more, deliberately. Zarr v3 has a long list of codecs and
 /// `zarrs` can build most of them; what this environment exposes is the subset
 /// that is a **core** Zarr codec (so a reader in another language is not being
 /// asked to implement an extension), **lossless** (so the byte-identity claim
 /// survives), and already paid for in this crate's dependency graph. `gzip` is
-/// the only one of those, because `zarrs`'s `gzip` feature is `dep:flate2` and
-/// `flate2` is already here for `cache::DeflateCodec` — enabling it adds **no
-/// package** to the graph. `zstd`, `blosc` and `bz2` each add crates and a C
-/// build for a ratio that would have to be argued rather than assumed; the shape
-/// of this enum leaves room for them and this version does not spend the
-/// dependency.
+/// the original one because `zarrs`'s `gzip` feature is `dep:flate2` and
+/// `flate2` is already here for `cache::DeflateCodec`. Zstd is also supported
+/// because it is common in Bio-Formats OME-Zarr 0.5 input. Blosc and bz2 remain
+/// outside this deliberately small surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Compression {
     /// The `bytes` codec alone: elements in native byte order, verbatim.
@@ -265,6 +263,9 @@ pub enum Compression {
     /// The Zarr v3 `gzip` codec at a deflate level of 0..=9, clamped on the way
     /// in so a caller cannot build an array `zarrs` will refuse.
     Gzip(u32),
+    /// The Zarr v3 `zstd` codec. The level and frame-checksum flag are retained
+    /// when describing an attached array.
+    Zstd(i32, bool),
 }
 
 impl Compression {
@@ -376,6 +377,7 @@ impl Compression {
                 let codec = GzipCodec::new(level.min(9)).map_err(Error::backend)?;
                 vec![Arc::new(codec)]
             }
+            Self::Zstd(level, checksum) => vec![Arc::new(ZstdCodec::new(level, checksum))],
         })
     }
 
@@ -384,6 +386,7 @@ impl Compression {
         match self {
             Self::None => "bytes".to_string(),
             Self::Gzip(level) => format!("gzip{}", level.min(9)),
+            Self::Zstd(level, checksum) => format!("zstd{level}-checksum{checksum}"),
         }
     }
 }
@@ -613,6 +616,12 @@ struct StoredArray {
     /// Where the image starts inside the array. `[0, 0, 0]` for every array
     /// this environment creates, because it creates them at the image's shape.
     offset: [usize; 3],
+    /// Source-array axes which become the image's `[z, y, x]` axes. Created
+    /// arrays and ordinary rank-three attachments use `[0, 1, 2]`.
+    axes: [usize; 3],
+    /// Source-array indices held fixed while exposing a rank-three image.
+    /// `None` entries are the three axes above.
+    fixed: Vec<Option<usize>>,
     chunk: Vec<usize>,
     /// What this array's chunks are encoded with. Kept so that
     /// [`ZarrEnvironment::compression_at`] can answer without re-reading the
@@ -734,6 +743,8 @@ impl StoredArray {
             dtype,
             shape: shape.to_vec(),
             offset: [0, 0, 0],
+            axes: [0, 1, 2],
+            fixed: vec![None; 3],
             chunk: chunk.iter().map(|&value| value.max(1)).collect(),
             compression,
         })
@@ -745,33 +756,45 @@ impl StoredArray {
     /// — is read off the array's own metadata, because the array is the
     /// authority on all four and a caller restating them is a caller who can be
     /// wrong.
-    fn open(store: &Arc<Store>, path: &str, id: u64, window: Option<Window>) -> Result<Self> {
+    fn open(
+        store: &Arc<Store>,
+        path: &str,
+        id: u64,
+        window: Option<Window>,
+        selection: Option<VolumeSelection>,
+    ) -> Result<Self> {
         let array = ZarrArray::open(store.clone(), path).map_err(Error::backend)?;
         let array_shape: Vec<usize> = array.shape().iter().map(|&value| value as usize).collect();
-        if array_shape.len() != 3 {
-            return Err(Error::InvalidArgument(format!(
-                "attached array {path} has rank {}, and an image is rank 3. An array with extra                  axes — an OME-Zarr `[t, c, z, y, x]`, say — is not refused because rank 3 is a                  limitation; it is refused because which of its axes are the image's, and where                  the others are held, is a question only the caller can answer and this                  constructor has nowhere to hear it.",
-                array_shape.len()
-            )));
-        }
+        let (axes, fixed) = match selection {
+            Some(selection) => selection.resolve(path, &array_shape)?,
+            None if array_shape.len() == 3 => ([0, 1, 2], vec![None; 3]),
+            None => {
+                return Err(Error::InvalidArgument(format!(
+                    "attached array {path} has rank {}; select its `[z, y, x]` axes and fix every other axis with `AttachedImage::volume`",
+                    array_shape.len()
+                )))
+            }
+        };
 
         let dtype = dtype_from_zarr(array.data_type(), path)?;
-        let chunk: Vec<usize> = array
-            .chunk_shape(&[0, 0, 0])
+        let source_chunk: Vec<usize> = array
+            .chunk_shape(&vec![0; array_shape.len()])
             .map_err(Error::backend)?
             .iter()
             .map(|value| value.get() as usize)
             .collect();
+        let chunk = axes.iter().map(|&axis| source_chunk[axis]).collect();
         let compression = compression_of(&array, path)?;
 
+        let view_shape = axes.map(|axis| array_shape[axis]);
         let (offset, shape) = match window {
-            None => ([0, 0, 0], array_shape.clone()),
+            None => ([0, 0, 0], view_shape.to_vec()),
             Some(window) => {
                 for axis in 0..3 {
                     let end = window.start[axis] + window.shape[axis];
-                    if window.shape[axis] == 0 || end > array_shape[axis] {
+                    if window.shape[axis] == 0 || end > view_shape[axis] {
                         return Err(Error::InvalidArgument(format!(
-                            "window {:?}..{:?} does not fit inside {path}, which is {array_shape:?}",
+                            "window {:?}..{:?} does not fit inside {path}'s selected volume, which is {view_shape:?}",
                             window.start,
                             [
                                 window.start[0] + window.shape[0],
@@ -791,6 +814,8 @@ impl StoredArray {
             dtype,
             shape,
             offset,
+            axes,
+            fixed,
             chunk,
             compression,
         })
@@ -815,11 +840,19 @@ impl StoredArray {
 
     fn subset(&self, region: &Region) -> Result<ArraySubset> {
         let region = self.stored_region(region);
-        ArraySubset::new_with_start_shape(
-            region.start.iter().map(|&value| value as u64).collect(),
-            region.shape.iter().map(|&value| value as u64).collect(),
-        )
-        .map_err(Error::backend)
+        let mut start = vec![0u64; self.fixed.len()];
+        let mut shape = vec![1u64; self.fixed.len()];
+        for (axis, fixed) in self.fixed.iter().copied().enumerate() {
+            if let Some(index) = fixed {
+                start[axis] = index as u64;
+            }
+        }
+        for image_axis in 0..3 {
+            let source_axis = self.axes[image_axis];
+            start[source_axis] = region.start[image_axis] as u64;
+            shape[source_axis] = region.shape[image_axis] as u64;
+        }
+        ArraySubset::new_with_start_shape(start, shape).map_err(Error::backend)
     }
 
     /// Read `region` as `T`.
@@ -903,7 +936,7 @@ fn dtype_from_zarr(data_type: &DataType, path: &str) -> Result<Dtype> {
 /// What an existing array is compressed with, in this environment's terms.
 ///
 /// The refusal is the point. This crate builds `zarrs` with
-/// `default-features = false` and exactly `filesystem` and `gzip`, so an array
+/// `default-features = false` and exactly `filesystem`, `gzip`, and `zstd`, so an array
 /// compressed with anything else is not merely undescribable here — **it cannot
 /// be decoded**, and the first symptom would otherwise be a decode error on
 /// some block, half way through a run, naming a codec rather than a file. Said
@@ -925,8 +958,8 @@ fn compression_of(array: &Stored, path: &str) -> Result<Compression> {
     let mut found = Compression::None;
     for codec in codecs {
         let name = codec
-            .get("name")
-            .and_then(serde_json::Value::as_str)
+            .as_str()
+            .or_else(|| codec.get("name").and_then(serde_json::Value::as_str))
             .unwrap_or("");
         match name {
             // The array-to-bytes codec every array here uses, and the identity
@@ -940,13 +973,26 @@ fn compression_of(array: &Stored, path: &str) -> Result<Compression> {
                     .unwrap_or(1) as u32;
                 found = Compression::Gzip(level);
             }
+            "zstd" => {
+                let configuration = codec.get("configuration");
+                let level = configuration
+                    .and_then(|configuration| configuration.get("level"))
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|level| i32::try_from(level).ok())
+                    .unwrap_or(0);
+                let checksum = configuration
+                    .and_then(|configuration| configuration.get("checksum"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                found = Compression::Zstd(level, checksum);
+            }
             other => {
                 return Err(Error::InvalidArgument(format!(
-                    "attached array {path} uses the `{other}` codec, which this crate cannot \
+                    "attached array {path} uses the `{other}` codec ({codec}), which this crate cannot \
                      decode: `zarrs` is built here with `default-features = false` and only \
-                     `filesystem` and `gzip`, for the reasons `Cargo.toml` gives — so `blosc`, \
-                     `zstd`, `sharding_indexed` and `transpose` are all absent. Write the array \
-                     with `gzip`, or with no compressor at all."
+                     `filesystem`, `gzip`, and `zstd`, for the reasons `Cargo.toml` gives — so \
+                     `blosc`, `sharding_indexed` and `transpose` are absent. Write the array \
+                     with `gzip`, `zstd`, or no compressor."
                 )))
             }
         }
@@ -978,6 +1024,63 @@ pub struct Window {
     pub shape: [usize; 3],
 }
 
+/// A rank-three `[z, y, x]` view of a higher-rank stored array.
+///
+/// OME-Zarr commonly stores a level as `[c, z, y, x]` or
+/// `[t, c, z, y, x]`, while blockflow deliberately presents every operation
+/// with one rank-three image. `spatial_axes` names the source axes that become
+/// `[z, y, x]`; `fixed` selects one index on every remaining axis.
+///
+/// The spatial axes must occur in increasing source order. This is the order
+/// used by OME-Zarr and lets a decoded C-order subset be exposed without a
+/// transpose or another full-volume allocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeSelection {
+    pub spatial_axes: [usize; 3],
+    pub fixed: Vec<(usize, usize)>,
+}
+
+impl VolumeSelection {
+    pub fn new(spatial_axes: [usize; 3], fixed: Vec<(usize, usize)>) -> Self {
+        Self {
+            spatial_axes,
+            fixed,
+        }
+    }
+
+    fn resolve(&self, path: &str, shape: &[usize]) -> Result<([usize; 3], Vec<Option<usize>>)> {
+        let [z, y, x] = self.spatial_axes;
+        if !(z < y && y < x) || x >= shape.len() {
+            return Err(Error::InvalidArgument(format!(
+                "volume selection for {path} has spatial axes {:?}; they must be three distinct, increasing axes within rank {}",
+                self.spatial_axes,
+                shape.len()
+            )));
+        }
+        let mut selected = vec![None; shape.len()];
+        for &(axis, index) in &self.fixed {
+            if axis >= shape.len() || self.spatial_axes.contains(&axis) {
+                return Err(Error::InvalidArgument(format!(
+                    "volume selection for {path} fixes axis {axis}, but it is absent or spatial"
+                )));
+            }
+            if index >= shape[axis] || selected[axis].replace(index).is_some() {
+                return Err(Error::InvalidArgument(format!(
+                    "volume selection for {path} has an invalid or repeated index {index} for axis {axis} of shape {shape:?}"
+                )));
+            }
+        }
+        for axis in 0..shape.len() {
+            if !self.spatial_axes.contains(&axis) && selected[axis].is_none() {
+                return Err(Error::InvalidArgument(format!(
+                    "volume selection for {path} does not fix non-spatial axis {axis} of shape {shape:?}"
+                )));
+            }
+        }
+        Ok((self.spatial_axes, selected))
+    }
+}
+
 /// One image of a run, bound to an array that already exists on a disk.
 ///
 /// `dir` is the array's own directory — the thing holding its `zarr.json` —
@@ -989,6 +1092,7 @@ pub struct Window {
 pub struct AttachedImage {
     dir: PathBuf,
     window: Option<Window>,
+    selection: Option<VolumeSelection>,
 }
 
 impl AttachedImage {
@@ -997,12 +1101,25 @@ impl AttachedImage {
         Self {
             dir: dir.into(),
             window: None,
+            selection: None,
         }
     }
 
-    /// A sub-box of it. See [`Window`].
+    /// A sub-box of its exposed `[z, y, x]` image. See [`Window`].
+    ///
+    /// This composes with [`Self::volume`]: non-spatial axes are fixed first,
+    /// then the window is applied in the selected volume's coordinates.
     pub fn window(mut self, start: [usize; 3], shape: [usize; 3]) -> Self {
         self.window = Some(Window { start, shape });
+        self
+    }
+
+    /// Expose a `[z, y, x]` volume from a higher-rank array.
+    ///
+    /// For `[t, c, z, y, x]`, channel 2 at time 0 is
+    /// `volume([2, 3, 4], vec![(0, 0), (1, 2)])`.
+    pub fn volume(mut self, spatial_axes: [usize; 3], fixed: Vec<(usize, usize)>) -> Self {
+        self.selection = Some(VolumeSelection::new(spatial_axes, fixed));
         self
     }
 
@@ -1027,7 +1144,7 @@ impl AttachedImage {
 
     fn open(&self, id: u64) -> Result<StoredArray> {
         let store = Arc::new(FilesystemStore::new(&self.dir).map_err(Error::backend)?);
-        StoredArray::open(&store, "/", id, self.window)
+        StoredArray::open(&store, "/", id, self.window, self.selection.clone())
     }
 }
 

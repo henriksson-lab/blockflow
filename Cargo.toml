@@ -6,6 +6,7 @@ members = [
     ".",
     "crates/blockflow-progress",
     "crates/ngff-object-table",
+    "crates/yolo3d",
     "examples/cellprofiler-human",
     "examples/imglib2-pipeline",
     "examples/opencv-pipeline",
@@ -18,7 +19,11 @@ members = [
     "examples/object-3d-measurement",
     "examples/stardist-ome-zarr",
     "examples/cellpose-ome-zarr",
+    "examples/stardist-3d-ome-zarr",
+    "examples/cellpose-3d-ome-zarr",
     "examples/yolo-ome-zarr",
+    "examples/yolo-3d-ome-zarr",
+    "examples/classical-3d-centers-ome-zarr",
 ]
 
 [package]
@@ -211,10 +216,10 @@ fftw-sys = { version = "0.8", optional = true, default-features = false, feature
 # only dependency here that is not the framework's own machinery: a level has to
 # live somewhere, and everything before it was proven against arrays in memory.
 #
-# `default-features = false` and two features back on, deliberately. The
-# defaults add blosc (which builds C), zstd, sharding, transpose and crc32c, none
-# of which `zarr_env` asks for — it reads and writes through the element API
-# (`Vec<T>`).
+# `default-features = false` and the required features back on deliberately.
+# Blosc, sharding, transpose and crc32c remain excluded. Zstd is included because
+# Bio-Formats OME-Zarr 0.5 output commonly uses the standard Zarr v3 zstd codec;
+# rejecting it prevents Blockflow from attaching normal microscopy volumes.
 #
 # They used to add **a second `ndarray`** as well, and that was the sharpest of
 # these reasons: `zarrs` was on 0.17 against this crate's 0.16, so its ndarray
@@ -226,19 +231,18 @@ fftw-sys = { version = "0.8", optional = true, default-features = false, feature
 # The two that are asked for:
 #
 # * `filesystem` — the store. A level has to live somewhere.
-# * `gzip` — the codec `zarr_env::Compression` offers, and **it costs nothing**.
+# * `gzip` — one codec `zarr_env::Compression` offers, and **it costs nothing**.
 #   `zarrs`'s `gzip` feature is exactly `dep:flate2`, and `flate2` is already a
 #   dependency of this crate for `cache::DeflateCodec`, at the same major
 #   version. The package count with `--features zarr` is therefore unchanged at
 #   156, no build script is added, and the incremental build cost is the codec
 #   module itself. That — rather than "gzip is the best compressor" — is why the
-#   one compressor this environment offers is gzip: `zstd` (3 packages, a C
-#   build), `blosc` (2 packages, a C build) and `bz2` would each have to buy
-#   their ratio, and the ratio that matters most here is on `bool` data where
-#   deflate is already near the ceiling.
+# * `zstd` — required to read standard Bio-Formats OME-Zarr input and available
+#   explicitly for callers that want to preserve that codec in generated arrays.
 zarrs = { version = "0.23.13", optional = true, default-features = false, features = [
     "filesystem",
     "gzip",
+    "zstd",
 ] }
 ngff-object-table = { path = "crates/ngff-object-table", optional = true }
 anyhow = { version = "1", optional = true }
@@ -247,6 +251,7 @@ image = { version = "0.25", optional = true }
 ndarray16 = { package = "ndarray", version = "0.16", optional = true }
 cellpose = { git = "https://github.com/henriksson-lab/cellpose-rs.git", rev = "4e428d0d20da2b6ac7f12b59d8f3263d2e9c362f", optional = true }
 stardist-rs = { git = "https://github.com/henriksson-lab/stardist-rs.git", rev = "20cb2375f53540ad0f2b490d4e8a7f65d96c95ee", optional = true }
+yolo3d-model = { package = "yolo3d", path = "crates/yolo3d", optional = true }
 burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["std", "safetensors"], optional = true }
 candle-core = { version = "0.11", optional = true }
@@ -329,6 +334,8 @@ stardist = ["model-segment", "dep:stardist-rs", "dep:burn", "dep:ndarray16"]
 cellpose-cuda = ["cellpose", "cellpose/cuda"]
 stardist-candle-cuda = ["stardist", "dep:candle-core", "stardist-rs/candle-cuda"]
 stardist-cuda = ["stardist", "burn/cuda", "dep:pliron-derive"]
+yolo3d = ["model-segment", "dep:burn", "burn/flex", "dep:yolo3d-model"]
+yolo3d-cuda = ["yolo3d", "burn/cuda", "dep:pliron-derive"]
 yolo = ["zarr", "dep:anyhow", "dep:csv", "dep:image", "dep:burn", "burn/wgpu", "dep:burn-store", "dep:yolov11", "dep:pliron-derive"]
 yolo-cuda = ["yolo", "burn/cuda", "yolov11/cuda"]
 yolo-libtorch = ["yolo", "burn/tch"]

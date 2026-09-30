@@ -43,6 +43,8 @@ pipelines were approximately:
 * **5.3× faster than Python StarDist** end to end on a real DAPI subset
 * **1.2× faster than Python Cellpose** end to end on a real DAPI subset
 * **1.11× faster than original YOLOv11** on matched FP32 CUDA inference
+* **within 7% of Python Cellpose3D**, with matching object counts on two real crops
+* **1.24× faster than Python StarDist3D** on the crowded crop and within 8% on the isolated crop, with exact labels
 
 These are ratios for the specified workloads, excluding fixture preparation and
 compilation. See [BENCHMARKS.md](BENCHMARKS.md) for each run's timed region,
@@ -63,6 +65,12 @@ newvolim and preserves the cell IDs needed for later per-channel measurements.
 OME-Zarr reader, planner, executor, multiscale label writer, and linked table
 flow with Cellpose. It supports CPU and an optional CUDA build and writes a
 second annotation layer that newvolim discovers directly.
+
+Volumetric fluorescence uses the axis-aware variants:
+[`cellpose-3d-ome-zarr`](examples/cellpose-3d-ome-zarr),
+[`stardist-3d-ome-zarr`](examples/stardist-3d-ome-zarr), and the separate
+[`yolo-3d-ome-zarr`](examples/yolo-3d-ome-zarr) distillation, training, and
+inference workflow. All commands in those examples use `cargo run --release`.
 
 ## Design notes
 

@@ -1,0 +1,11 @@
+[package]
+name = "yolo3d"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Anisotropy-aware 3D center detector for dense volumetric microscopy"
+
+[dependencies]
+burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

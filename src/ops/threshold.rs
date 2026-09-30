@@ -29,6 +29,8 @@ use super::histogram::{
 use super::voxelwise::ThresholdTest;
 
 const THRESHOLD_LEVELS_MAGIC: u64 = 0x5448_5245_534c_564c;
+const FINITE_RANGE_MAGIC: u64 = 0x5448_5245_534c_5247;
+const FINITE_HISTOGRAM_MAGIC: u64 = 0x5448_5245_5348_4953;
 
 /// Which global threshold rule to apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -390,6 +392,347 @@ pub fn append_global_threshold_phases(
     )
 }
 
+/// Append a bounded-memory Otsu threshold pipeline.
+///
+/// The three phases first reduce block ranges, then emit fixed-size block
+/// histograms, and finally select and apply the global threshold. Sidecar use
+/// is `O(blocks * bins)` rather than `O(voxels)`.
+pub fn append_bounded_otsu_threshold_phases(
+    plan: &mut PlanBuilder,
+    image: crate::assemble::ImageId,
+    stream: impl Into<String>,
+    bins: usize,
+    output: GlobalThresholdOutput,
+) -> Result<Phase> {
+    GlobalThreshold::checked_bins("a bounded Otsu threshold", bins)?;
+    let stream = stream.into();
+    let ranges_stream = format!("{stream}-ranges");
+    let histograms_stream = format!("{stream}-histograms");
+    let ranges = plan.fragments(GlobalThresholdRangeOp::new(
+        "global threshold ranges",
+        ranges_stream.clone(),
+        image.index(),
+    ))?;
+    let histograms = plan.fragments(
+        GlobalThresholdHistogramOp::new(
+            "global threshold histograms",
+            ranges_stream,
+            ranges.index(),
+            histograms_stream.clone(),
+            bins,
+        )
+        .reading_image(image.index()),
+    )?;
+    plan.fragments(
+        ApplyGlobalHistogramThresholdOp::new(
+            "apply bounded Otsu threshold",
+            histograms_stream,
+            histograms.index(),
+            output,
+        )
+        .reading_image(image.index()),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GlobalThresholdRangeOp {
+    name: &'static str,
+    stream: String,
+    image: usize,
+}
+
+impl GlobalThresholdRangeOp {
+    fn new(name: &'static str, stream: impl Into<String>, image: usize) -> Self {
+        Self {
+            name,
+            stream: stream.into(),
+            image,
+        }
+    }
+}
+
+impl FragmentOp for GlobalThresholdRangeOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        vec![SourceInput::voxelwise(self.image)]
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![
+            FragmentOutput::new(&self.stream, Lifecycle::DeleteOnExit, Coverage::EveryBlock)
+                .sized(SidecarSize::fixed(32)),
+        ]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::PerBlock)
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "global threshold range must be applied with its source image",
+        ))
+    }
+
+    fn apply_with(&self, _at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let pixels = sources.get(self.image)?.as_array()?.widened();
+        let mut count = 0u64;
+        let mut minimum = f64::INFINITY;
+        let mut maximum = f64::NEG_INFINITY;
+        for value in pixels.iter().copied().filter(|value| value.is_finite()) {
+            count += 1;
+            minimum = minimum.min(value);
+            maximum = maximum.max(value);
+        }
+        Ok(BlockOutput::fragment(
+            &self.stream,
+            encode_finite_range(count, minimum, maximum),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GlobalThresholdHistogramOp {
+    name: &'static str,
+    ranges_stream: String,
+    ranges_phase: usize,
+    histograms_stream: String,
+    bins: usize,
+    image: usize,
+}
+
+impl GlobalThresholdHistogramOp {
+    fn new(
+        name: &'static str,
+        ranges_stream: impl Into<String>,
+        ranges_phase: usize,
+        histograms_stream: impl Into<String>,
+        bins: usize,
+    ) -> Self {
+        Self {
+            name,
+            ranges_stream: ranges_stream.into(),
+            ranges_phase,
+            histograms_stream: histograms_stream.into(),
+            bins,
+            image: 0,
+        }
+    }
+
+    fn reading_image(mut self, image: usize) -> Self {
+        self.image = image;
+        self
+    }
+}
+
+impl FragmentOp for GlobalThresholdHistogramOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![FragmentInput::own(&self.ranges_stream, self.ranges_phase)]
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![FragmentOutput::new(
+            &self.histograms_stream,
+            Lifecycle::DeleteOnExit,
+            Coverage::EveryBlock,
+        )
+        .sized(SidecarSize::fixed(32 + self.bins as u64 * 8))]
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        vec![SourceInput::voxelwise(self.image)]
+    }
+
+    fn barrier(&self) -> bool {
+        true
+    }
+
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        let mut count = 0u64;
+        let mut minimum = f64::INFINITY;
+        let mut maximum = f64::NEG_INFINITY;
+        at.stream_fragments(&self.ranges_stream, &mut |_key, bytes| {
+            let (block_count, block_minimum, block_maximum) = decode_finite_range(bytes)?;
+            if block_count > 0 {
+                count = count.saturating_add(block_count);
+                minimum = minimum.min(block_minimum);
+                maximum = maximum.max(block_maximum);
+            }
+            Ok(())
+        })?;
+        if count == 0 {
+            return Err(Error::invalid(
+                "a bounded Otsu threshold needs at least one finite value",
+            ));
+        }
+        Ok(encode_finite_range(count, minimum, maximum))
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::Unordered)
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "global histogram construction must be applied with its source image",
+        ))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let (_count, minimum, maximum) = decode_finite_range(at.reduced)?;
+        let pixels = sources.get(self.image)?.as_array()?.widened();
+        let mut counts = vec![0u64; self.bins];
+        let width = (maximum - minimum) / self.bins as f64;
+        for value in pixels.iter().copied().filter(|value| value.is_finite()) {
+            let index = if width <= 0.0 {
+                0
+            } else {
+                (((value - minimum) / width) as usize).min(self.bins - 1)
+            };
+            counts[index] = counts[index].saturating_add(1);
+        }
+        Ok(BlockOutput::fragment(
+            &self.histograms_stream,
+            encode_histogram(minimum, maximum, &counts),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApplyGlobalHistogramThresholdOp {
+    name: &'static str,
+    stream: String,
+    histograms_phase: usize,
+    output: GlobalThresholdOutput,
+    image: usize,
+}
+
+impl ApplyGlobalHistogramThresholdOp {
+    fn new(
+        name: &'static str,
+        stream: impl Into<String>,
+        histograms_phase: usize,
+        output: GlobalThresholdOutput,
+    ) -> Self {
+        Self {
+            name,
+            stream: stream.into(),
+            histograms_phase,
+            output,
+            image: 0,
+        }
+    }
+
+    fn reading_image(mut self, image: usize) -> Self {
+        self.image = image;
+        self
+    }
+}
+
+impl FragmentOp for ApplyGlobalHistogramThresholdOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn writes_pixels(&self) -> bool {
+        true
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        self.output.dtype()
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![FragmentInput::own(&self.stream, self.histograms_phase)]
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        vec![SourceInput::voxelwise(self.image)]
+    }
+
+    fn barrier(&self) -> bool {
+        true
+    }
+
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        let mut range = None;
+        let mut counts: Vec<u64> = Vec::new();
+        at.stream_fragments(&self.stream, &mut |_key, bytes| {
+            let (minimum, maximum, block_counts) = decode_histogram(bytes)?;
+            match range {
+                None => {
+                    range = Some((minimum, maximum));
+                    counts = block_counts;
+                }
+                Some(expected) => {
+                    if expected != (minimum, maximum) || counts.len() != block_counts.len() {
+                        return Err(Error::invalid("global histogram fragments disagree"));
+                    }
+                    for (total, count) in counts.iter_mut().zip(block_counts) {
+                        *total = total.saturating_add(count);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        let (minimum, maximum) = range.ok_or_else(|| Error::invalid("no global histograms"))?;
+        let histogram = FiniteHistogram::from_counts(
+            minimum,
+            maximum,
+            counts.iter().map(|count| *count as f64).collect(),
+            "a bounded Otsu threshold",
+        )?;
+        encode_threshold_levels(&[otsu_histogram_threshold(&histogram)?])
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::Unordered)
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::invalid(
+            "bounded global threshold must be applied with its source image",
+        ))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let levels = decode_threshold_levels(at.reduced)?;
+        let pixels = sources.get(self.image)?.as_array()?;
+        let mut buffer = at.output_buffer(0.0)?;
+        if let Some(out) = buffer.as_array_mut() {
+            apply_threshold_levels(pixels, &levels, self.output, out)?;
+        }
+        Ok(BlockOutput::nothing().with_pixels(buffer))
+    }
+}
+
 pub fn mean_threshold(values: &[f64]) -> f64 {
     values.iter().copied().sum::<f64>() / values.len() as f64
 }
@@ -463,13 +806,17 @@ pub fn otsu_threshold(values: &[f64], bins: usize) -> Result<f64> {
         ));
     }
     let histogram = FiniteHistogram::new(values, bins, "an Otsu threshold")?;
+    otsu_histogram_threshold(&histogram)
+}
+
+fn otsu_histogram_threshold(histogram: &FiniteHistogram) -> Result<f64> {
     if histogram.constant {
         return Ok(histogram.centres[0]);
     }
 
     let mut best_score = f64::NEG_INFINITY;
     let mut best = histogram.centres[0];
-    for index in 0..bins.saturating_sub(1) {
+    for index in 0..histogram.counts.len().saturating_sub(1) {
         let Some(score) = histogram.between_class_score(&[index]) else {
             continue;
         };
@@ -812,6 +1159,59 @@ fn decode_f64_values(magic: u64, bytes: &[u8], what: &str) -> Result<Vec<f64>> {
     Ok(values)
 }
 
+fn encode_finite_range(count: u64, minimum: f64, maximum: f64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(&FINITE_RANGE_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(&minimum.to_bits().to_le_bytes());
+    bytes.extend_from_slice(&maximum.to_bits().to_le_bytes());
+    bytes
+}
+
+fn decode_finite_range(bytes: &[u8]) -> Result<(u64, f64, f64)> {
+    let mut cursor = BytesCursor::new(bytes, "global threshold finite range");
+    cursor.expect_magic(FINITE_RANGE_MAGIC)?;
+    let count = cursor.take_u64()?;
+    let minimum = f64::from_bits(cursor.take_u64()?);
+    let maximum = f64::from_bits(cursor.take_u64()?);
+    cursor.expect_end()?;
+    if count > 0 && (!minimum.is_finite() || !maximum.is_finite() || maximum < minimum) {
+        return Err(Error::invalid("global threshold range is invalid"));
+    }
+    Ok((count, minimum, maximum))
+}
+
+fn encode_histogram(minimum: f64, maximum: f64, counts: &[u64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32 + counts.len() * 8);
+    bytes.extend_from_slice(&FINITE_HISTOGRAM_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&minimum.to_bits().to_le_bytes());
+    bytes.extend_from_slice(&maximum.to_bits().to_le_bytes());
+    bytes.extend_from_slice(&(counts.len() as u64).to_le_bytes());
+    for count in counts {
+        bytes.extend_from_slice(&count.to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_histogram(bytes: &[u8]) -> Result<(f64, f64, Vec<u64>)> {
+    let mut cursor = BytesCursor::new(bytes, "global threshold histogram");
+    cursor.expect_magic(FINITE_HISTOGRAM_MAGIC)?;
+    let minimum = f64::from_bits(cursor.take_u64()?);
+    let maximum = f64::from_bits(cursor.take_u64()?);
+    let bins = cursor.take_u64()? as usize;
+    if bins == 0 || !minimum.is_finite() || !maximum.is_finite() || maximum < minimum {
+        return Err(Error::invalid(
+            "global threshold histogram header is invalid",
+        ));
+    }
+    let mut counts = Vec::with_capacity(bins);
+    for _ in 0..bins {
+        counts.push(cursor.take_u64()?);
+    }
+    cursor.expect_end()?;
+    Ok((minimum, maximum, counts))
+}
+
 fn encode_threshold_levels(levels: &[f64]) -> Result<Vec<u8>> {
     if levels.is_empty() {
         return Err(Error::InvalidArgument(
@@ -961,6 +1361,19 @@ mod tests {
         let values = [0.0, 0.0, 0.0, 10.0, 10.0, 10.0];
         let threshold = GlobalThreshold::otsu(2).unwrap().of(values).unwrap();
         assert_eq!(threshold, 2.5);
+    }
+
+    #[test]
+    fn merged_histogram_otsu_matches_direct_samples() {
+        let values = [0.0, 0.0, 1.0, 4.0, 9.0, 10.0, 10.0];
+        let direct = FiniteHistogram::new(&values, 8, "test histogram").unwrap();
+        let merged =
+            FiniteHistogram::from_counts(0.0, 10.0, direct.counts.clone(), "merged test histogram")
+                .unwrap();
+        assert_eq!(
+            otsu_histogram_threshold(&merged).unwrap(),
+            otsu_threshold(&values, 8).unwrap()
+        );
     }
 
     #[test]
