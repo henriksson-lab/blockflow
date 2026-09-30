@@ -3,7 +3,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use blockflow::ome_zarr::OmeVolumePyramid;
+use blockflow::ome_zarr::{ensure_zarr_group, OmeVolumePyramid};
 use blockflow::strategy::{execute_phases, Hints};
 use blockflow::yolo3d::{finalize_detections, InferenceDevice, Yolo3dDetector};
 use blockflow::{BlockGrid, Error, PlanBuilder, Result, ZarrEnvironment};
@@ -75,6 +75,7 @@ fn run() -> Result<()> {
     }
     let started = Instant::now();
     let pyramid = OmeVolumePyramid::open(&args.zarr, args.channel, args.time)?;
+    let image_root = pyramid.image_root();
     let source = pyramid.attached_level(0)?;
     let (dtype, volume) = source.metadata()?;
     let detector_config: DetectorConfig =
@@ -98,11 +99,10 @@ fn run() -> Result<()> {
     let mut builder = PlanBuilder::new(volume, dtype, grid);
     let phase = builder.fragments(detector)?;
     let assembly = builder.finish()?;
-    let work = args
-        .zarr
+    let work = image_root
         .join("tables")
         .join(format!(".{}-blockflow-work", args.layer));
-    let destination = args.zarr.join("tables").join(&args.layer);
+    let destination = image_root.join("tables").join(&args.layer);
     if destination.exists() {
         if !args.overwrite {
             return Err(Error::invalid(format!(
@@ -134,7 +134,7 @@ fn run() -> Result<()> {
     write_compatibility_csv(&table, &temporary.join("table.csv"))?;
     drop(table);
     drop(env);
-    fs::create_dir_all(destination.parent().expect("table has parent")).map_err(Error::backend)?;
+    ensure_zarr_group(destination.parent().expect("table has parent"))?;
     fs::rename(&temporary, &destination).map_err(Error::backend)?;
     fs::remove_dir_all(&work).map_err(Error::backend)?;
     println!(

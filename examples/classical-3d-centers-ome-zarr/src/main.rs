@@ -9,11 +9,11 @@ use blockflow::classical_centers::{
     WatershedInstanceTable,
 };
 use blockflow::label_pyramid::{build_nearest_label_pyramid_with_blocks, refresh_label_registry};
-use blockflow::ome_zarr::{write_label_metadata, OmeVolumePyramid};
+use blockflow::ome_zarr::{ensure_zarr_group, write_label_metadata, OmeVolumePyramid};
 use blockflow::ops::{
     append_bounded_otsu_threshold_phases, BlobResponse, Boundary, FixedPoint, Gaussian,
-    GlobalThresholdOutput, MergeTabulationOp, SeededWatershedOp, Separation, SmoothOp,
-    TabulateValuesOp, ThresholdTest, VoxelwiseMapOp,
+    GlobalThresholdOutput, MergeTabulationOp, ScalableWatershedConfig, ScalableWatershedOp,
+    Separation, SmoothOp, TabulateValuesOp, ThresholdTest, VoxelwiseMapOp,
 };
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints};
@@ -60,6 +60,9 @@ struct Args {
     /// Also produce a foreground-constrained instance watershed.
     #[arg(long, default_value_t = false)]
     watershed: bool,
+    /// Largest foreground-component bounding box handled by the exact global queue.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    watershed_exact_max_bbox_voxels: usize,
     /// Optional level-0 crop origin as z,y,x. Center coordinates remain global.
     #[arg(long, value_delimiter = ',', num_args = 3, requires = "crop_shape")]
     crop_start: Option<Vec<usize>>,
@@ -158,8 +161,9 @@ fn run() -> Result<()> {
             ))?
             .image()?;
 
-        // The exact flood has whole-volume reach. One whole-volume block avoids
-        // recomputing the same global watershed once per storage block.
+        // Component discovery currently has whole-volume reach. Inside that
+        // phase, bounded components use the exact reference flood and oversized
+        // ones use persistent block-local minimax queues.
         builder.regrid(BlockGrid::new(volume, volume)?);
         let gaussian = Gaussian::new(sigma, args.truncate)?.with_boundary(Boundary::Reflect);
         builder.pixels(Chain::sequence(vec![
@@ -171,8 +175,16 @@ fn run() -> Result<()> {
             )),
         ]))?;
         let labels = builder.pixels(Chain::op(
-            SeededWatershedOp::new("classical centre watershed", seeds, Separation::Line)
-                .within(mask),
+            ScalableWatershedOp::new(
+                "classical centre watershed",
+                seeds,
+                ScalableWatershedConfig {
+                    exact_component_max_bbox_voxels: args.watershed_exact_max_bbox_voxels,
+                    block: [args.block_z, args.block, args.block],
+                    separation: Separation::Line,
+                },
+            )
+            .within(mask),
         ))?;
         Some(labels)
     } else {
@@ -180,8 +192,8 @@ fn run() -> Result<()> {
     };
     let assembly = builder.finish()?;
 
-    let work = args
-        .zarr
+    let image_root = pyramid.image_root();
+    let work = image_root
         .join("tables")
         .join(format!(".{}-blockflow-work", args.layer));
     let center_layer = if args.watershed {
@@ -189,9 +201,9 @@ fn run() -> Result<()> {
     } else {
         args.layer.clone()
     };
-    let center_destination = args.zarr.join("tables").join(center_layer);
-    let label_destination = args.zarr.join("labels").join(&args.layer);
-    let instance_destination = args.zarr.join("tables").join(&args.layer);
+    let center_destination = image_root.join("tables").join(center_layer);
+    let label_destination = image_root.join("labels").join(&args.layer);
+    let instance_destination = image_root.join("tables").join(&args.layer);
     check_destination(&center_destination, args.overwrite)?;
     if args.watershed {
         check_destination(&label_destination, args.overwrite)?;
@@ -300,6 +312,7 @@ fn run() -> Result<()> {
     } else {
         None
     };
+    ensure_zarr_group(&image_root.join("tables"))?;
     replace_with(&staged, &center_destination, args.overwrite)?;
     if let Some((staged_labels, staged_instances, count)) = watershed_objects {
         let shapes = pyramid
@@ -317,7 +330,7 @@ fn run() -> Result<()> {
         write_label_metadata(&staged_labels, pyramid.levels(), pyramid.label_source())?;
         replace_with(&staged_labels, &label_destination, args.overwrite)?;
         replace_with(&staged_instances, &instance_destination, args.overwrite)?;
-        refresh_label_registry(&args.zarr.join("labels"))?;
+        refresh_label_registry(&image_root.join("labels"))?;
         println!(
             "watershed_objects={} label={} table={}",
             count,

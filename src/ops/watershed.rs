@@ -78,6 +78,20 @@
 // `a_blocked_run_is_not_the_whole_volume_answer` runs one by hand and counts the
 // voxels that move rather than arguing about it.
 //
+// The scalable alternative has a different, stated answer
+// ---------------------------------------------------------
+// [`scalable_seeded_watershed`] keeps this exact flood for bounded connected
+// components and sends a component whose bounding box is too large to
+// [`blockwise_minimax_watershed`]. That fallback defines the watershed as a
+// deterministic minimax path problem instead of reproducing the reference
+// heap's global `age`. It first settles the least barrier at every voxel, then
+// settles the shortest optimal-barrier path with label as the final tie. Each
+// block retains its queues between activations; boundary
+// improvements dirty only the receiving blocks, and one dirty wave runs in
+// parallel. The exact op remains here unchanged because the two contracts are
+// useful for different reasons and neither should silently impersonate the
+// other.
+//
 // What a barrier costs, as arithmetic
 // -----------------------------------
 // One block spanning the volume means the phase's resident set is the volume,
@@ -131,16 +145,22 @@
 // faces fall in background — which is a decision about the data that this crate
 // has no way to make, and is why there is no parameter here for it.
 
-use ndarray::{Array3, ArrayView3, ArrayViewMut3};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::sync::Mutex;
+
+use ndarray::{s, Array3, ArrayView3, ArrayViewMut3};
+use rayon::prelude::*;
 
 use crate::dtype::Dtype;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::op::{Anchor, BlockOp, SourceInput, SourceInputs};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
 
 use super::scikitimage_watershed::watershed_raveled_reporting_peak;
 use super::shapes_agree;
+use super::{components::label_members_into, components::FACE_NEIGHBOURS};
 use super::{LabelSeedSource, MaskSource};
 
 /// What happens where two floods meet.
@@ -153,6 +173,170 @@ pub enum Separation {
     /// Every masked voxel takes a label. Basins touch, and the boundary between
     /// two of them is wherever the floods happened to meet.
     Adjacent,
+}
+
+/// How the scalable watershed chooses between the exact reference flood and
+/// the blockwise fallback.
+///
+/// The limit is on a component's **bounding box**, rather than on its foreground
+/// voxel count, because the reference flood materialises that box densely. A
+/// thin component winding through a large region is therefore correctly sent
+/// to the bounded-work fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalableWatershedConfig {
+    /// Largest component bounding box passed to [`seeded_watershed`].
+    pub exact_component_max_bbox_voxels: usize,
+    /// Core extent of one fallback block.
+    pub block: [usize; 3],
+    /// What happens where fallback basins meet.
+    pub separation: Separation,
+}
+
+impl Default for ScalableWatershedConfig {
+    fn default() -> Self {
+        Self {
+            exact_component_max_bbox_voxels: 16 * 1024 * 1024,
+            block: [128, 128, 128],
+            separation: Separation::Adjacent,
+        }
+    }
+}
+
+/// Work performed by [`scalable_seeded_watershed`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScalableWatershedStats {
+    pub components: usize,
+    pub exact_components: usize,
+    pub minimax_components: usize,
+    pub seedless_components: usize,
+    /// Times a fallback block was taken from the dirty workset.
+    pub block_activations: usize,
+    /// Successful improvements of a voxel's path key.
+    pub relaxations: usize,
+}
+
+/// Work performed by one blockwise minimax flood.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MinimaxWatershedStats {
+    /// Parallel dirty-set waves, including the initial seed wave.
+    pub waves: usize,
+    pub block_activations: usize,
+    pub relaxations: usize,
+}
+
+/// The deterministic path order used by the scalable fallback.
+///
+/// A classical watershed minimises the highest cost crossed by a path. The
+/// fallback first settles that scalar barrier field, then uses this key to
+/// resolve equal-barrier paths by length and label. Separating those passes is
+/// essential: a later ridge can make two
+/// previously unequal barriers equal and reverse a secondary tie. Once the
+/// barrier field is fixed, every field below travels monotonically with a
+/// candidate, so block activation and worker order cannot move the answer.
+#[derive(Debug, Clone, Copy)]
+struct PathKey {
+    steps: u64,
+    label: u32,
+}
+
+impl PartialEq for PathKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.steps == other.steps && self.label == other.label
+    }
+}
+
+impl Eq for PathKey {}
+
+impl PartialOrd for PathKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PathKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.steps
+            .cmp(&other.steps)
+            .then_with(|| self.label.cmp(&other.label))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct QueueEntry {
+    key: PathKey,
+    index: usize,
+}
+
+struct BlockSolve {
+    updates: BTreeMap<usize, PathKey>,
+    outgoing: Vec<QueueEntry>,
+    relaxations: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BarrierEntry {
+    barrier: f64,
+    index: usize,
+}
+
+impl PartialEq for BarrierEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.barrier.to_bits() == other.barrier.to_bits() && self.index == other.index
+    }
+}
+
+impl Eq for BarrierEntry {}
+
+impl PartialOrd for BarrierEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BarrierEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.barrier
+            .total_cmp(&other.barrier)
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+struct BarrierBlockSolve {
+    updates: BTreeMap<usize, f64>,
+    outgoing: Vec<BarrierEntry>,
+    relaxations: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComponentBox {
+    label: u32,
+    lo: [usize; 3],
+    hi: [usize; 3],
+    seeds: usize,
+}
+
+impl ComponentBox {
+    fn shape(self) -> [usize; 3] {
+        [
+            self.hi[0] - self.lo[0],
+            self.hi[1] - self.lo[1],
+            self.hi[2] - self.lo[2],
+        ]
+    }
+
+    fn bbox_voxels(self) -> usize {
+        let shape = self.shape();
+        shape[0].saturating_mul(shape[1]).saturating_mul(shape[2])
+    }
+}
+
+#[derive(Debug)]
+struct ComponentResult {
+    labels: Option<([usize; 3], Array3<u32>)>,
+    exact: bool,
+    seedless: bool,
+    block_activations: usize,
+    relaxations: usize,
 }
 
 impl Separation {
@@ -274,6 +458,668 @@ pub fn seeded_watershed(
     let mut out = Array3::zeros(cost.raw_dim());
     seeded_watershed_into(cost, seeds, mask, separation, out.view_mut())?;
     Ok(out)
+}
+
+/// A deterministic watershed for a region too large for one global queue.
+///
+/// Each block owns a persistent priority queue. Processing a block drains that
+/// queue to a local fixed point; an improved candidate crossing a block face
+/// enters the neighbour's queue and marks that neighbour dirty. The run ends
+/// when no dirty block remains. A block is never recomputed merely because a
+/// global round advanced.
+///
+/// This is a minimax watershed, not a parallel spelling of scikit-image's
+/// `(value, age)` heap. Equal barriers prefer the shortest path and then the
+/// lower label. Keep [`seeded_watershed`] when bit parity with scikit-image is
+/// the contract.
+pub fn blockwise_minimax_watershed(
+    cost: ArrayView3<'_, f64>,
+    seeds: ArrayView3<'_, u32>,
+    mask: Option<ArrayView3<'_, bool>>,
+    block: [usize; 3],
+    separation: Separation,
+) -> Result<(Array3<u32>, MinimaxWatershedStats)> {
+    shapes_agree(
+        cost.shape(),
+        seeds.shape(),
+        "blockwise_minimax_watershed (seeds)",
+    )?;
+    if let Some(mask) = mask.as_ref() {
+        shapes_agree(
+            cost.shape(),
+            mask.shape(),
+            "blockwise_minimax_watershed (mask)",
+        )?;
+    }
+    if block.contains(&0) {
+        return Err(Error::InvalidArgument(format!(
+            "blockwise_minimax_watershed needs a positive block extent on every axis, got \
+             {block:?}"
+        )));
+    }
+
+    let shape = [cost.shape()[0], cost.shape()[1], cost.shape()[2]];
+    let len = shape[0] * shape[1] * shape[2];
+    let inside = |at: [usize; 3]| mask.as_ref().is_none_or(|mask| mask[at]);
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                if inside([i, j, k]) && !cost[[i, j, k]].is_finite() {
+                    return Err(Error::InvalidArgument(format!(
+                        "blockwise_minimax_watershed needs finite costs inside its mask; \
+                         [{i}, {j}, {k}] holds {}",
+                        cost[[i, j, k]]
+                    )));
+                }
+            }
+        }
+    }
+
+    let block = [
+        block[0].min(shape[0]),
+        block[1].min(shape[1]),
+        block[2].min(shape[2]),
+    ];
+    let block_counts = [
+        shape[0].div_ceil(block[0]),
+        shape[1].div_ceil(block[1]),
+        shape[2].div_ceil(block[2]),
+    ];
+    let n_blocks = block_counts[0] * block_counts[1] * block_counts[2];
+    let block_of = |at: [usize; 3]| {
+        let index = [at[0] / block[0], at[1] / block[1], at[2] / block[2]];
+        (index[0] * block_counts[1] + index[1]) * block_counts[2] + index[2]
+    };
+
+    // First solve only the minimax barrier. A secondary tie key cannot safely
+    // travel in this pass: two unequal barriers may become equal when both paths
+    // cross a later ridge, at which point their secondary order can reverse.
+    // With the final barrier field fixed, hop distance and label form an
+    // ordinary monotone shortest-path problem, solved in the second pass below.
+    let (barriers, mut stats) =
+        minimax_barriers(cost, seeds, mask, shape, block, block_counts, n_blocks);
+
+    // Label 0 is already reserved for "unassigned", so a plain PathKey avoids
+    // the discriminant and padding of Option<PathKey>. Together with the f64
+    // infinity sentinel in the barrier pass, fallback state is 24 bytes per
+    // voxel rather than about 56 bytes on 64-bit targets.
+    let mut state = vec![
+        PathKey {
+            steps: u64::MAX,
+            label: 0
+        };
+        len
+    ];
+    let mut queues: Vec<BinaryHeap<Reverse<QueueEntry>>> =
+        (0..n_blocks).map(|_| BinaryHeap::new()).collect();
+    let mut dirty = BTreeSet::new();
+
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let at = [i, j, k];
+                let label = seeds[at];
+                if label == 0 || !inside(at) {
+                    continue;
+                }
+                let index = ravel(at, shape);
+                let key = PathKey { steps: 0, label };
+                if state[index].label == 0 || key < state[index] {
+                    state[index] = key;
+                    let owner = block_of(at);
+                    queues[owner].push(Reverse(QueueEntry { key, index }));
+                    dirty.insert(owner);
+                }
+            }
+        }
+    }
+
+    while !dirty.is_empty() {
+        stats.waves += 1;
+        let active = std::mem::take(&mut dirty).into_iter().collect::<Vec<_>>();
+        stats.block_activations += active.len();
+        let jobs = active
+            .iter()
+            .map(|&owner| (owner, std::mem::take(&mut queues[owner])))
+            .collect::<Vec<_>>();
+        let solved = jobs
+            .into_par_iter()
+            .map(|(owner, queue)| {
+                solve_dirty_block(
+                    owner,
+                    queue,
+                    &state,
+                    &barriers,
+                    cost,
+                    mask,
+                    shape,
+                    block,
+                    block_counts,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // Local cores are disjoint, so publish them first in block order. The
+        // outgoing boundary candidates are then folded in that same order;
+        // PathKey's total order makes the answer independent of the order, and
+        // fixing it also makes the trace and counters reproducible.
+        for result in &solved {
+            stats.relaxations += result.relaxations;
+            for (&index, &key) in &result.updates {
+                if state[index].label == 0 || key < state[index] {
+                    state[index] = key;
+                }
+            }
+        }
+        for result in solved {
+            for entry in result.outgoing {
+                if state[entry.index].label != 0 && entry.key >= state[entry.index] {
+                    continue;
+                }
+                state[entry.index] = entry.key;
+                stats.relaxations += 1;
+                let neighbour_owner = block_of(unravel(entry.index, shape));
+                queues[neighbour_owner].push(Reverse(entry));
+                dirty.insert(neighbour_owner);
+            }
+        }
+    }
+
+    let mut out = Array3::<u32>::zeros((shape[0], shape[1], shape[2]));
+    for (index, key) in state.iter().enumerate() {
+        if key.label != 0 {
+            out[unravel(index, shape)] = key.label;
+        }
+    }
+    if separation == Separation::Line {
+        carve_deterministic_line(&mut out, seeds, mask, &state, shape);
+    }
+    Ok((out, stats))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn minimax_barriers(
+    cost: ArrayView3<'_, f64>,
+    seeds: ArrayView3<'_, u32>,
+    mask: Option<ArrayView3<'_, bool>>,
+    shape: [usize; 3],
+    block: [usize; 3],
+    block_counts: [usize; 3],
+    n_blocks: usize,
+) -> (Vec<f64>, MinimaxWatershedStats) {
+    let len = shape[0] * shape[1] * shape[2];
+    let inside = |at: [usize; 3]| mask.as_ref().is_none_or(|mask| mask[at]);
+    let block_of = |at: [usize; 3]| {
+        let index = [at[0] / block[0], at[1] / block[1], at[2] / block[2]];
+        (index[0] * block_counts[1] + index[1]) * block_counts[2] + index[2]
+    };
+    let mut state = vec![f64::INFINITY; len];
+    let mut queues: Vec<BinaryHeap<Reverse<BarrierEntry>>> =
+        (0..n_blocks).map(|_| BinaryHeap::new()).collect();
+    let mut dirty = BTreeSet::new();
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let at = [i, j, k];
+                if seeds[at] == 0 || !inside(at) {
+                    continue;
+                }
+                let index = ravel(at, shape);
+                let barrier = normalise_zero(cost[at]);
+                if barrier.total_cmp(&state[index]).is_lt() {
+                    state[index] = barrier;
+                    let owner = block_of(at);
+                    queues[owner].push(Reverse(BarrierEntry { barrier, index }));
+                    dirty.insert(owner);
+                }
+            }
+        }
+    }
+
+    let mut stats = MinimaxWatershedStats::default();
+    while !dirty.is_empty() {
+        stats.waves += 1;
+        let active = std::mem::take(&mut dirty).into_iter().collect::<Vec<_>>();
+        stats.block_activations += active.len();
+        let jobs = active
+            .iter()
+            .map(|&owner| (owner, std::mem::take(&mut queues[owner])))
+            .collect::<Vec<_>>();
+        let solved = jobs
+            .into_par_iter()
+            .map(|(owner, queue)| {
+                solve_barrier_block(owner, queue, &state, cost, mask, shape, block, block_counts)
+            })
+            .collect::<Vec<_>>();
+        for result in &solved {
+            stats.relaxations += result.relaxations;
+            for (&index, &barrier) in &result.updates {
+                if barrier.total_cmp(&state[index]).is_lt() {
+                    state[index] = barrier;
+                }
+            }
+        }
+        for result in solved {
+            for entry in result.outgoing {
+                if entry.barrier.total_cmp(&state[entry.index]).is_ge() {
+                    continue;
+                }
+                state[entry.index] = entry.barrier;
+                stats.relaxations += 1;
+                let neighbour_owner = block_of(unravel(entry.index, shape));
+                queues[neighbour_owner].push(Reverse(entry));
+                dirty.insert(neighbour_owner);
+            }
+        }
+    }
+    (state, stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_barrier_block(
+    owner: usize,
+    mut queue: BinaryHeap<Reverse<BarrierEntry>>,
+    state: &[f64],
+    cost: ArrayView3<'_, f64>,
+    mask: Option<ArrayView3<'_, bool>>,
+    shape: [usize; 3],
+    block: [usize; 3],
+    block_counts: [usize; 3],
+) -> BarrierBlockSolve {
+    let block_index = [
+        owner / (block_counts[1] * block_counts[2]),
+        (owner / block_counts[2]) % block_counts[1],
+        owner % block_counts[2],
+    ];
+    let lo = [
+        block_index[0] * block[0],
+        block_index[1] * block[1],
+        block_index[2] * block[2],
+    ];
+    let hi = [
+        (lo[0] + block[0]).min(shape[0]),
+        (lo[1] + block[1]).min(shape[1]),
+        (lo[2] + block[2]).min(shape[2]),
+    ];
+    let belongs_here =
+        |at: [usize; 3]| (0..3).all(|axis| lo[axis] <= at[axis] && at[axis] < hi[axis]);
+    let inside = |at: [usize; 3]| mask.as_ref().is_none_or(|mask| mask[at]);
+    let mut updates = BTreeMap::new();
+    let mut outgoing = Vec::new();
+    let mut relaxations = 0usize;
+
+    while let Some(Reverse(entry)) = queue.pop() {
+        let held = updates
+            .get(&entry.index)
+            .copied()
+            .unwrap_or(state[entry.index]);
+        if held.to_bits() != entry.barrier.to_bits() {
+            continue;
+        }
+        let at = unravel(entry.index, shape);
+        for (axis, step) in FACE_NEIGHBOURS {
+            let Some(neighbour) = stepped(at, axis, step, shape) else {
+                continue;
+            };
+            if !inside(neighbour) {
+                continue;
+            }
+            let neighbour_index = ravel(neighbour, shape);
+            let barrier = normalise_zero(entry.barrier.max(cost[neighbour]));
+            if belongs_here(neighbour) {
+                let held = updates
+                    .get(&neighbour_index)
+                    .copied()
+                    .unwrap_or(state[neighbour_index]);
+                if barrier.total_cmp(&held).is_ge() {
+                    continue;
+                }
+                updates.insert(neighbour_index, barrier);
+                relaxations += 1;
+                queue.push(Reverse(BarrierEntry {
+                    barrier,
+                    index: neighbour_index,
+                }));
+            } else if barrier.total_cmp(&state[neighbour_index]).is_lt() {
+                outgoing.push(BarrierEntry {
+                    barrier,
+                    index: neighbour_index,
+                });
+            }
+        }
+    }
+    BarrierBlockSolve {
+        updates,
+        outgoing,
+        relaxations,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_dirty_block(
+    owner: usize,
+    mut queue: BinaryHeap<Reverse<QueueEntry>>,
+    state: &[PathKey],
+    barriers: &[f64],
+    cost: ArrayView3<'_, f64>,
+    mask: Option<ArrayView3<'_, bool>>,
+    shape: [usize; 3],
+    block: [usize; 3],
+    block_counts: [usize; 3],
+) -> BlockSolve {
+    let block_index = [
+        owner / (block_counts[1] * block_counts[2]),
+        (owner / block_counts[2]) % block_counts[1],
+        owner % block_counts[2],
+    ];
+    let lo = [
+        block_index[0] * block[0],
+        block_index[1] * block[1],
+        block_index[2] * block[2],
+    ];
+    let hi = [
+        (lo[0] + block[0]).min(shape[0]),
+        (lo[1] + block[1]).min(shape[1]),
+        (lo[2] + block[2]).min(shape[2]),
+    ];
+    let belongs_here =
+        |at: [usize; 3]| (0..3).all(|axis| lo[axis] <= at[axis] && at[axis] < hi[axis]);
+    let inside = |at: [usize; 3]| mask.as_ref().is_none_or(|mask| mask[at]);
+    let mut updates = BTreeMap::new();
+    let mut outgoing = Vec::new();
+    let mut relaxations = 0usize;
+
+    while let Some(Reverse(entry)) = queue.pop() {
+        let held = updates
+            .get(&entry.index)
+            .copied()
+            .unwrap_or(state[entry.index]);
+        if held != entry.key {
+            continue;
+        }
+        let at = unravel(entry.index, shape);
+        for (axis, step) in FACE_NEIGHBOURS {
+            let Some(neighbour) = stepped(at, axis, step, shape) else {
+                continue;
+            };
+            if !inside(neighbour) {
+                continue;
+            }
+            let neighbour_index = ravel(neighbour, shape);
+            let neighbour_barrier = barriers[neighbour_index];
+            if !neighbour_barrier.is_finite() {
+                continue;
+            }
+            let crossed = normalise_zero(barriers[entry.index].max(cost[neighbour]));
+            if crossed.to_bits() != neighbour_barrier.to_bits() {
+                continue;
+            }
+            let candidate = PathKey {
+                steps: entry.key.steps.saturating_add(1),
+                label: entry.key.label,
+            };
+            if belongs_here(neighbour) {
+                let held = updates
+                    .get(&neighbour_index)
+                    .copied()
+                    .unwrap_or(state[neighbour_index]);
+                if held.label != 0 && candidate >= held {
+                    continue;
+                }
+                updates.insert(neighbour_index, candidate);
+                relaxations += 1;
+                queue.push(Reverse(QueueEntry {
+                    key: candidate,
+                    index: neighbour_index,
+                }));
+            } else if state[neighbour_index].label == 0 || candidate < state[neighbour_index] {
+                outgoing.push(QueueEntry {
+                    key: candidate,
+                    index: neighbour_index,
+                });
+            }
+        }
+    }
+    BlockSolve {
+        updates,
+        outgoing,
+        relaxations,
+    }
+}
+
+/// Split a mask into independent components and choose a bounded implementation
+/// for each one.
+///
+/// Components whose dense bounding box fits the configured limit use the exact
+/// scikit-image-compatible flood. Oversized components use
+/// [`blockwise_minimax_watershed`]. Independent components are evaluated in
+/// parallel and assembled in component-label order, so worker count cannot
+/// change the result.
+///
+/// "Exact" here means the reference algorithm on that masked component. It is
+/// not a promise of bit identity with one reference flood over all components:
+/// scikit-image's equal-valued seeds are ordered by the internal layout of one
+/// global heap, and removing the other components' seeds can change that layout.
+/// Use [`seeded_watershed`] when whole-volume scikit-image parity is required.
+pub fn scalable_seeded_watershed(
+    cost: ArrayView3<'_, f64>,
+    seeds: ArrayView3<'_, u32>,
+    mask: Option<ArrayView3<'_, bool>>,
+    config: ScalableWatershedConfig,
+) -> Result<(Array3<u32>, ScalableWatershedStats)> {
+    shapes_agree(cost.shape(), seeds.shape(), "scalable watershed (seeds)")?;
+    if let Some(mask) = mask.as_ref() {
+        shapes_agree(cost.shape(), mask.shape(), "scalable watershed (mask)")?;
+    }
+    if config.block.contains(&0) {
+        return Err(Error::InvalidArgument(format!(
+            "scalable watershed needs a positive fallback block extent on every axis, got {:?}",
+            config.block
+        )));
+    }
+
+    let shape = [cost.shape()[0], cost.shape()[1], cost.shape()[2]];
+    let mut component_labels = Array3::<u32>::zeros((shape[0], shape[1], shape[2]));
+    let count = label_members_into(
+        shape,
+        |at| mask.as_ref().is_none_or(|mask| mask[at]),
+        component_labels.view_mut(),
+    )?;
+    let mut boxes = (1..=count)
+        .map(|label| ComponentBox {
+            label,
+            lo: [usize::MAX; 3],
+            hi: [0; 3],
+            seeds: 0,
+        })
+        .collect::<Vec<_>>();
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let label = component_labels[[i, j, k]];
+                if label == 0 {
+                    continue;
+                }
+                let info = &mut boxes[(label - 1) as usize];
+                for (axis, value) in [i, j, k].into_iter().enumerate() {
+                    info.lo[axis] = info.lo[axis].min(value);
+                    info.hi[axis] = info.hi[axis].max(value + 1);
+                }
+                if seeds[[i, j, k]] != 0 {
+                    info.seeds += 1;
+                }
+            }
+        }
+    }
+
+    let out = Mutex::new(Array3::<u32>::zeros((shape[0], shape[1], shape[2])));
+    let results: Vec<Result<ComponentResult>> = boxes
+        .par_iter()
+        .map(|component| {
+            let mut result =
+                solve_component(cost, seeds, component_labels.view(), *component, config)?;
+            if let Some((lo, labels)) = result.labels.take() {
+                // Components are disjoint, but their bounding boxes may overlap.
+                // Publish only labelled voxels under one short lock, then release
+                // the local dense box before another component has to finish.
+                let mut target = out.lock().unwrap_or_else(|poison| poison.into_inner());
+                for ((i, j, k), &label) in labels.indexed_iter() {
+                    if label != 0 {
+                        target[[lo[0] + i, lo[1] + j, lo[2] + k]] = label;
+                    }
+                }
+            }
+            Ok(result)
+        })
+        .collect();
+
+    let mut stats = ScalableWatershedStats {
+        components: boxes.len(),
+        ..Default::default()
+    };
+    for result in results {
+        let result = result?;
+        stats.exact_components += usize::from(result.exact);
+        stats.minimax_components += usize::from(!result.exact && !result.seedless);
+        stats.seedless_components += usize::from(result.seedless);
+        stats.block_activations += result.block_activations;
+        stats.relaxations += result.relaxations;
+    }
+    let out = out
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner());
+    Ok((out, stats))
+}
+
+fn solve_component(
+    cost: ArrayView3<'_, f64>,
+    seeds: ArrayView3<'_, u32>,
+    components: ArrayView3<'_, u32>,
+    component: ComponentBox,
+    config: ScalableWatershedConfig,
+) -> Result<ComponentResult> {
+    if component.seeds == 0 {
+        return Ok(ComponentResult {
+            labels: None,
+            exact: false,
+            seedless: true,
+            block_activations: 0,
+            relaxations: 0,
+        });
+    }
+    let [z0, y0, x0] = component.lo;
+    let [z1, y1, x1] = component.hi;
+    let local_cost = cost.slice(s![z0..z1, y0..y1, x0..x1]);
+    let local_seeds = seeds.slice(s![z0..z1, y0..y1, x0..x1]);
+    let local_components = components.slice(s![z0..z1, y0..y1, x0..x1]);
+    let local_mask = local_components.mapv(|label| label == component.label);
+    let exact = component.bbox_voxels() <= config.exact_component_max_bbox_voxels;
+    let (labels, minimax) = if exact {
+        (
+            seeded_watershed(
+                local_cost,
+                local_seeds,
+                Some(local_mask.view()),
+                config.separation,
+            )?,
+            MinimaxWatershedStats::default(),
+        )
+    } else {
+        blockwise_minimax_watershed(
+            local_cost,
+            local_seeds,
+            Some(local_mask.view()),
+            config.block,
+            config.separation,
+        )?
+    };
+
+    Ok(ComponentResult {
+        labels: Some((component.lo, labels)),
+        exact,
+        seedless: false,
+        block_activations: minimax.block_activations,
+        relaxations: minimax.relaxations,
+    })
+}
+
+fn carve_deterministic_line(
+    labels: &mut Array3<u32>,
+    seeds: ArrayView3<'_, u32>,
+    mask: Option<ArrayView3<'_, bool>>,
+    state: &[PathKey],
+    shape: [usize; 3],
+) {
+    let mut clear = vec![false; state.len()];
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let at = [i, j, k];
+                let index = ravel(at, shape);
+                let label = labels[at];
+                if label == 0 || mask.as_ref().is_some_and(|mask| !mask[at]) {
+                    continue;
+                }
+                for (axis, step) in [(0, 1), (1, 1), (2, 1)] {
+                    let Some(other) = stepped(at, axis, step, shape) else {
+                        continue;
+                    };
+                    let other_label = labels[other];
+                    if other_label == 0 || other_label == label {
+                        continue;
+                    }
+                    let other_index = ravel(other, shape);
+                    let loser = match (seeds[at] != 0, seeds[other] != 0) {
+                        (true, true) => continue,
+                        (true, false) => other_index,
+                        (false, true) => index,
+                        (false, false) => {
+                            if (state[index], index) > (state[other_index], other_index) {
+                                index
+                            } else {
+                                other_index
+                            }
+                        }
+                    };
+                    clear[loser] = true;
+                }
+            }
+        }
+    }
+    for (index, clear) in clear.into_iter().enumerate() {
+        if clear {
+            labels[unravel(index, shape)] = 0;
+        }
+    }
+}
+
+fn normalise_zero(value: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else {
+        value
+    }
+}
+
+fn ravel(at: [usize; 3], shape: [usize; 3]) -> usize {
+    (at[0] * shape[1] + at[1]) * shape[2] + at[2]
+}
+
+fn unravel(index: usize, shape: [usize; 3]) -> [usize; 3] {
+    [
+        index / (shape[1] * shape[2]),
+        (index / shape[2]) % shape[1],
+        index % shape[2],
+    ]
+}
+
+fn stepped(mut at: [usize; 3], axis: usize, step: isize, shape: [usize; 3]) -> Option<[usize; 3]> {
+    let value = at[axis].checked_add_signed(step)?;
+    if value >= shape[axis] {
+        return None;
+    }
+    at[axis] = value;
+    Some(at)
 }
 
 // ---------------------------------------------------------------- the op --
@@ -419,6 +1265,118 @@ impl BlockOp for SeededWatershedOp {
     }
 }
 
+/// [`scalable_seeded_watershed`] as a planner operation.
+///
+/// This first planner surface still declares [`Reach::all`]: discovering the
+/// globally connected mask components currently happens inside the kernel.
+/// Unlike [`SeededWatershedOp`], however, it never requires one priority queue
+/// spanning every masked voxel. Independent components run concurrently and an
+/// oversized component uses persistent block queues. Moving component discovery
+/// into preceding fragment phases can later remove this barrier without changing
+/// the operation's partition semantics.
+/// It likewise does not claim whole-volume scikit-image parity; use
+/// [`SeededWatershedOp`] for that contract.
+pub struct ScalableWatershedOp {
+    name: &'static str,
+    seeds: LabelSeedSource,
+    mask: Option<MaskSource>,
+    config: ScalableWatershedConfig,
+    cost: f64,
+}
+
+impl ScalableWatershedOp {
+    pub fn new(
+        name: &'static str,
+        seeds: impl Into<crate::assemble::ImageId>,
+        config: ScalableWatershedConfig,
+    ) -> Self {
+        Self {
+            name,
+            seeds: LabelSeedSource::new(seeds),
+            mask: None,
+            config,
+            cost: match config.separation {
+                Separation::Line => WATERSHED_LINE_COST,
+                Separation::Adjacent => WATERSHED_COST,
+            },
+        }
+    }
+
+    pub fn within(mut self, mask: impl Into<crate::assemble::ImageId>) -> Self {
+        self.mask = Some(MaskSource::new(mask));
+        self
+    }
+
+    pub fn config(&self) -> ScalableWatershedConfig {
+        self.config
+    }
+
+    pub fn with_cost(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+}
+
+impl BlockOp for ScalableWatershedOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, volume_len: usize) -> usize {
+        volume_len
+    }
+
+    fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+        Reach::all()
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        let mut declared = vec![self.seeds.source_input(Reach::all())];
+        if let Some(mask) = self.mask {
+            declared.push(mask.source_input(Reach::all()));
+        }
+        declared
+    }
+
+    fn accepts(&self, dtype: Dtype) -> bool {
+        dtype == Dtype::F64
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::U32
+    }
+
+    fn apply(&self, _input: &Voxels, _out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        Err(self.seeds.input_only_error(self.name))
+    }
+
+    fn apply_with(
+        &self,
+        input: &Voxels,
+        sources: SourceInputs<'_>,
+        out: &mut Voxels,
+        _at: &Anchor,
+    ) -> Result<()> {
+        let seeds = self.seeds.u32_view(self.name, sources)?;
+        let mask = match self.mask {
+            Some(mask) => Some(mask.bool_view(self.name, sources)?),
+            None => None,
+        };
+        let (labels, _) =
+            scalable_seeded_watershed(input.view::<f64>()?, seeds, mask, self.config)?;
+        out.view_mut::<u32>()?.assign(&labels);
+        Ok(())
+    }
+
+    fn constant_maps_to(&self, _value: f64) -> Option<f64> {
+        None
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+}
+
 /// Measured, for [`Separation::Adjacent`]; see `super::COST_MEASUREMENT`.
 ///
 /// **Not taken through `ops::cost::measure`**, which builds one shared `f64`
@@ -535,6 +1493,103 @@ mod tests {
         (cost, seeds, mask)
     }
 
+    fn global_minimax_reference(
+        cost: ArrayView3<'_, f64>,
+        seeds: ArrayView3<'_, u32>,
+        mask: ArrayView3<'_, bool>,
+    ) -> Array3<u32> {
+        let shape = [cost.shape()[0], cost.shape()[1], cost.shape()[2]];
+        let len = shape.into_iter().product();
+        let mut barriers = vec![f64::INFINITY; len];
+        let mut barrier_queue = BinaryHeap::new();
+        for (at, &label) in seeds.indexed_iter() {
+            if label == 0 || !mask[at] {
+                continue;
+            }
+            let at = [at.0, at.1, at.2];
+            let index = ravel(at, shape);
+            barriers[index] = cost[at];
+            barrier_queue.push(Reverse(BarrierEntry {
+                barrier: cost[at],
+                index,
+            }));
+        }
+        while let Some(Reverse(entry)) = barrier_queue.pop() {
+            if entry.barrier.to_bits() != barriers[entry.index].to_bits() {
+                continue;
+            }
+            let at = unravel(entry.index, shape);
+            for (axis, step) in FACE_NEIGHBOURS {
+                let Some(next) = stepped(at, axis, step, shape) else {
+                    continue;
+                };
+                if !mask[next] {
+                    continue;
+                }
+                let next_index = ravel(next, shape);
+                let candidate = entry.barrier.max(cost[next]);
+                if candidate.total_cmp(&barriers[next_index]).is_lt() {
+                    barriers[next_index] = candidate;
+                    barrier_queue.push(Reverse(BarrierEntry {
+                        barrier: candidate,
+                        index: next_index,
+                    }));
+                }
+            }
+        }
+
+        let unset = PathKey {
+            steps: u64::MAX,
+            label: 0,
+        };
+        let mut paths = vec![unset; len];
+        let mut path_queue = BinaryHeap::new();
+        for (at, &label) in seeds.indexed_iter() {
+            if label == 0 || !mask[at] {
+                continue;
+            }
+            let index = ravel([at.0, at.1, at.2], shape);
+            let key = PathKey { steps: 0, label };
+            if paths[index].label == 0 || key < paths[index] {
+                paths[index] = key;
+                path_queue.push(Reverse(QueueEntry { key, index }));
+            }
+        }
+        while let Some(Reverse(entry)) = path_queue.pop() {
+            if entry.key != paths[entry.index] {
+                continue;
+            }
+            let at = unravel(entry.index, shape);
+            for (axis, step) in FACE_NEIGHBOURS {
+                let Some(next) = stepped(at, axis, step, shape) else {
+                    continue;
+                };
+                if !mask[next] {
+                    continue;
+                }
+                let next_index = ravel(next, shape);
+                if barriers[entry.index].max(cost[next]).to_bits() != barriers[next_index].to_bits()
+                {
+                    continue;
+                }
+                let key = PathKey {
+                    steps: entry.key.steps + 1,
+                    label: entry.key.label,
+                };
+                if paths[next_index].label == 0 || key < paths[next_index] {
+                    paths[next_index] = key;
+                    path_queue.push(Reverse(QueueEntry {
+                        key,
+                        index: next_index,
+                    }));
+                }
+            }
+        }
+        Array3::from_shape_fn((shape[0], shape[1], shape[2]), |at| {
+            paths[ravel([at.0, at.1, at.2], shape)].label
+        })
+    }
+
     /// The whole point, through the shell rather than the kernel.
     #[test]
     fn the_shell_reproduces_the_reference_partition() {
@@ -583,6 +1638,186 @@ mod tests {
         let labels =
             seeded_watershed(cost.view(), seeds.view(), None, Separation::Adjacent).unwrap();
         assert!(labels.iter().all(|&label| label != 0));
+    }
+
+    #[test]
+    fn minimax_fallback_is_block_size_invariant() {
+        let cost = Array3::from_shape_fn((5, 7, 11), |(i, j, k)| {
+            ((i * 13 + j * 7 + k * 3) % 9) as f64
+        });
+        let mut seeds = Array3::<u32>::zeros(cost.raw_dim());
+        seeds[[0, 0, 0]] = 7;
+        seeds[[4, 6, 10]] = 2;
+        seeds[[2, 3, 5]] = 11;
+
+        let whole = blockwise_minimax_watershed(
+            cost.view(),
+            seeds.view(),
+            None,
+            [5, 7, 11],
+            Separation::Adjacent,
+        )
+        .expect("one block")
+        .0;
+        for block in [[3, 4, 5], [2, 2, 3], [1, 1, 1]] {
+            let divided = blockwise_minimax_watershed(
+                cost.view(),
+                seeds.view(),
+                None,
+                block,
+                Separation::Adjacent,
+            )
+            .expect("a divided flood")
+            .0;
+            assert_eq!(divided, whole, "block {block:?} changed the partition");
+        }
+    }
+
+    #[test]
+    fn blockwise_fallback_matches_a_single_global_minimax_queue() {
+        let cost = Array3::from_shape_fn((5, 8, 13), |(i, j, k)| {
+            ((i * 19 + j * 11 + k * 5) % 17) as f64
+        });
+        let mask = Array3::from_shape_fn(cost.raw_dim(), |(i, j, k)| (i + 2 * j + 3 * k) % 11 != 0);
+        let mut seeds = Array3::<u32>::zeros(cost.raw_dim());
+        seeds[[0, 0, 1]] = 7;
+        seeds[[4, 7, 12]] = 2;
+        seeds[[2, 3, 6]] = 11;
+        let expected = global_minimax_reference(cost.view(), seeds.view(), mask.view());
+        let actual = blockwise_minimax_watershed(
+            cost.view(),
+            seeds.view(),
+            Some(mask.view()),
+            [2, 3, 4],
+            Separation::Adjacent,
+        )
+        .expect("a blockwise minimax flood")
+        .0;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn one_large_component_is_worker_count_invariant() {
+        let cost = Array3::from_shape_fn((7, 13, 17), |(i, j, k)| {
+            ((i * 17 + j * 5 + k * 11) % 29) as f64
+        });
+        let mut seeds = Array3::<u32>::zeros(cost.raw_dim());
+        seeds[[0, 0, 0]] = 9;
+        seeds[[6, 12, 16]] = 2;
+        seeds[[3, 6, 8]] = 5;
+        let run = |workers| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("a pool")
+                .install(|| {
+                    blockwise_minimax_watershed(
+                        cost.view(),
+                        seeds.view(),
+                        None,
+                        [2, 4, 5],
+                        Separation::Adjacent,
+                    )
+                    .expect("a fallback flood")
+                    .0
+                })
+        };
+        assert_eq!(run(1), run(4));
+    }
+
+    #[test]
+    fn scalable_dispatches_by_component_bbox_and_drops_seedless_components() {
+        let cost = Array3::from_shape_fn((1, 5, 12), |(_, j, k)| (j + k) as f64);
+        let mut mask = Array3::<bool>::from_elem(cost.raw_dim(), false);
+        let mut seeds = Array3::<u32>::zeros(cost.raw_dim());
+
+        // Three disconnected components: a small exact one, a long fallback
+        // one, and one with no seed.
+        for k in 0..3 {
+            mask[[0, 0, k]] = true;
+        }
+        seeds[[0, 0, 0]] = 1;
+        for k in 2..12 {
+            mask[[0, 2, k]] = true;
+        }
+        seeds[[0, 2, 2]] = 2;
+        seeds[[0, 2, 11]] = 3;
+        for k in 7..10 {
+            mask[[0, 4, k]] = true;
+        }
+
+        let (labels, stats) = scalable_seeded_watershed(
+            cost.view(),
+            seeds.view(),
+            Some(mask.view()),
+            ScalableWatershedConfig {
+                exact_component_max_bbox_voxels: 4,
+                block: [1, 1, 3],
+                separation: Separation::Adjacent,
+            },
+        )
+        .expect("a scalable flood");
+        assert_eq!(stats.components, 3);
+        assert_eq!(stats.exact_components, 1);
+        assert_eq!(stats.minimax_components, 1);
+        assert_eq!(stats.seedless_components, 1);
+        assert!(stats.block_activations > 1);
+        assert!((0..3).all(|k| labels[[0, 0, k]] == 1));
+        assert!((7..10).all(|k| labels[[0, 4, k]] == 0));
+        assert!((2..12).all(|k| labels[[0, 2, k]] != 0));
+    }
+
+    #[test]
+    fn component_parallelism_does_not_move_a_voxel() {
+        let cost = Array3::from_shape_fn((3, 17, 19), |(i, j, k)| {
+            ((i * 5 + j * 11 + k * 7) % 23) as f64
+        });
+        let mask = Array3::from_shape_fn(cost.raw_dim(), |(_, j, _)| j % 3 != 2);
+        let mut seeds = Array3::<u32>::zeros(cost.raw_dim());
+        let mut label = 1u32;
+        for j in (0..17).step_by(3) {
+            seeds[[1, j, 1]] = label;
+            label += 1;
+            seeds[[1, j + 1, 17]] = label;
+            label += 1;
+        }
+        let config = ScalableWatershedConfig {
+            exact_component_max_bbox_voxels: 0,
+            block: [2, 4, 5],
+            separation: Separation::Adjacent,
+        };
+        let run = |workers| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("a pool")
+                .install(|| {
+                    scalable_seeded_watershed(cost.view(), seeds.view(), Some(mask.view()), config)
+                        .expect("a scalable flood")
+                        .0
+                })
+        };
+        assert_eq!(run(1), run(4));
+    }
+
+    #[test]
+    fn deterministic_line_keeps_seed_voxels() {
+        let cost = Array3::<f64>::zeros((1, 1, 9));
+        let mut seeds = Array3::<u32>::zeros(cost.raw_dim());
+        seeds[[0, 0, 0]] = 1;
+        seeds[[0, 0, 8]] = 2;
+        let labels = blockwise_minimax_watershed(
+            cost.view(),
+            seeds.view(),
+            None,
+            [1, 1, 2],
+            Separation::Line,
+        )
+        .expect("a line flood")
+        .0;
+        assert_eq!(labels[[0, 0, 0]], 1);
+        assert_eq!(labels[[0, 0, 8]], 2);
+        assert!(labels.iter().any(|label| *label == 0));
     }
 
     /// The two separations are the same partition up to the line, which is what

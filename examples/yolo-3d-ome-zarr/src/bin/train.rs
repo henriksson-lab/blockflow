@@ -183,7 +183,13 @@ fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&args.output)?;
     let pyramid = OmeVolumePyramid::open(&args.zarr, args.channel, args.time)?;
     let image = pyramid.attached_level(0)?;
-    let labels = AttachedImage::at(args.zarr.join("labels").join(&args.teacher).join("0"));
+    let labels = AttachedImage::at(
+        pyramid
+            .image_root()
+            .join("labels")
+            .join(&args.teacher)
+            .join("0"),
+    );
     let (_, volume) = image.metadata()?;
     let (_, label_volume) = labels.metadata()?;
     anyhow::ensure!(

@@ -7,6 +7,34 @@ use serde_json::{json, Map, Value};
 
 use crate::{AttachedImage, Error, Result};
 
+/// Ensure `root` is a Zarr v3 group without replacing existing metadata.
+pub fn ensure_zarr_group(root: &Path) -> Result<()> {
+    fs::create_dir_all(root).map_err(Error::backend)?;
+    let metadata_path = root.join("zarr.json");
+    if metadata_path.is_file() {
+        let metadata = read_json(&metadata_path)?;
+        if metadata.get("zarr_format").and_then(Value::as_u64) != Some(3)
+            || metadata.get("node_type").and_then(Value::as_str) != Some("group")
+        {
+            return Err(Error::invalid(format!(
+                "{} is not a Zarr v3 group",
+                metadata_path.display()
+            )));
+        }
+        return Ok(());
+    }
+    let metadata = json!({
+        "zarr_format": 3,
+        "node_type": "group",
+        "attributes": {}
+    });
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).map_err(Error::backend)?,
+    )
+    .map_err(Error::backend)
+}
+
 #[derive(Clone, Debug)]
 pub struct OmeVolumeLevel {
     pub path: String,
@@ -17,7 +45,6 @@ pub struct OmeVolumeLevel {
 #[derive(Clone, Debug)]
 pub struct OmeVolumePyramid {
     root: PathBuf,
-    label_source: String,
     spatial_axes: [usize; 3],
     fixed: Vec<(usize, usize)>,
     levels: Vec<OmeVolumeLevel>,
@@ -30,18 +57,6 @@ impl OmeVolumePyramid {
     pub fn open(root: impl Into<PathBuf>, channel: usize, time: usize) -> Result<Self> {
         let container_root = root.into();
         let (root, metadata) = locate_image_group(&container_root)?;
-        let image_path = root.strip_prefix(&container_root).map_err(|_| {
-            Error::invalid(format!(
-                "OME image group {} is outside container {}",
-                root.display(),
-                container_root.display()
-            ))
-        })?;
-        let label_source = if image_path.as_os_str().is_empty() {
-            "../../".to_owned()
-        } else {
-            format!("../../{}", image_path.to_string_lossy())
-        };
         let multiscale = metadata
             .pointer("/attributes/ome/multiscales/0")
             .or_else(|| metadata.pointer("/attributes/multiscales/0"))
@@ -124,7 +139,6 @@ impl OmeVolumePyramid {
         }
         Ok(Self {
             root,
-            label_source,
             spatial_axes,
             fixed: fixed.unwrap_or_default(),
             levels,
@@ -135,9 +149,17 @@ impl OmeVolumePyramid {
         &self.levels
     }
 
+    /// Zarr group that owns the multiscale image.
+    ///
+    /// Derived labels and tables belong below this group. It can differ from
+    /// the path passed to [`Self::open`] when that path is an image collection.
+    pub fn image_root(&self) -> &Path {
+        &self.root
+    }
+
     /// Relative NGFF image path from a sibling `labels/<name>` group.
     pub fn label_source(&self) -> &str {
-        &self.label_source
+        "../../"
     }
 
     pub fn attached_level(&self, level: usize) -> Result<AttachedImage> {
@@ -215,7 +237,8 @@ pub fn write_label_metadata(root: &Path, levels: &[OmeVolumeLevel], source: &str
 }
 
 /// Return the image group for either a direct multiscale image or the first
-/// series in the OME-Zarr 0.5 Bio-Formats layout (`OME/zarr.json`).
+/// series in the transitional OME-Zarr image-collection layout
+/// (`OME/zarr.json`).
 fn locate_image_group(container: &Path) -> Result<(PathBuf, Value)> {
     let metadata = read_json(&container.join("zarr.json"))?;
     if multiscale(&metadata).is_some() {

@@ -10,6 +10,7 @@ use blockflow::fragment::{fragment_phase, FragmentOp, PhaseWork};
 use blockflow::geometry::BlockGrid;
 use blockflow::label_pyramid::{build_nearest_label_pyramid, refresh_label_registry};
 use blockflow::model_segment::{finalize_instances, stardist::StardistBackend, InstanceSegment};
+use blockflow::ome_zarr::ensure_zarr_group;
 use blockflow::op::Chain;
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, predicted_phase_prices, Hints};
@@ -157,7 +158,7 @@ fn run() -> Result<()> {
     let mut builder = PlanBuilder::new(volume, dtype, grid);
     builder.fragments(op)?;
     let assembly = builder.finish()?;
-    let env = ZarrEnvironment::attach(&work, &[source.clone()])?;
+    let env = ZarrEnvironment::attach(&work, std::slice::from_ref(&source))?;
     let phase = assembly.n_phases() - 1;
     if !config.resume_work {
         let work_kinds = assembly.work();
@@ -212,6 +213,7 @@ fn run() -> Result<()> {
     let cells = table.spec().row_count;
     drop(table);
     replace_with(&staged_layer, &layer_root, config.overwrite)?;
+    ensure_zarr_group(&config.zarr.join("tables"))?;
     replace_with(&staged_table, &table_root, config.overwrite)?;
     refresh_label_registry(&config.zarr.join("labels"))?;
     fs::remove_dir_all(&work).map_err(Error::backend)?;
@@ -226,7 +228,7 @@ fn run() -> Result<()> {
 }
 
 fn validate(config: &Config) -> Result<()> {
-    if !(config.high > config.low) {
+    if config.high.partial_cmp(&config.low) != Some(std::cmp::Ordering::Greater) {
         return Err(Error::invalid("--high must be greater than --low"));
     }
     if config.halo == 0 || config.blocks.is_empty() || config.blocks.contains(&0) {

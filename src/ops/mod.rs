@@ -750,9 +750,10 @@ pub use walk::{
     walk_blob, walk_from, walk_into, walk_schema, walked_distance, OffsetSequence, OffsetWalkOp,
 };
 pub use watershed::{
-    cost_report as watershed_cost_report, seeded_watershed, seeded_watershed_into,
-    seeded_watershed_into_reporting_peak, SeededWatershedOp, Separation, WATERSHED_COST,
-    WATERSHED_LINE_COST,
+    blockwise_minimax_watershed, cost_report as watershed_cost_report, scalable_seeded_watershed,
+    seeded_watershed, seeded_watershed_into, seeded_watershed_into_reporting_peak,
+    MinimaxWatershedStats, ScalableWatershedConfig, ScalableWatershedOp, ScalableWatershedStats,
+    SeededWatershedOp, Separation, WATERSHED_COST, WATERSHED_LINE_COST,
 };
 
 /// **The exact Euclidean distance transform**, as three separable whole-axis

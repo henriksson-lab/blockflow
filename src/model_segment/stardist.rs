@@ -460,7 +460,7 @@ fn forward_inner(
     }
     #[cfg(not(feature = "stardist-candle-cuda"))]
     {
-        return forward(&inner.network, config, x, x_shape, axes);
+        forward(&inner.network, config, x, x_shape, axes)
     }
 }
 

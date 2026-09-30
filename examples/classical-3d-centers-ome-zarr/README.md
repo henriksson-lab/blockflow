@@ -28,8 +28,12 @@ The watershed foreground threshold uses a distributed fixed-bin Otsu
 histogram. Its temporary storage is proportional to the number of blocks and
 histogram bins, rather than the number of voxels. Voxels below the foreground
 threshold never enter the watershed queue. The exact watershed currently uses
-whole-volume dense arrays, so validate memory on a representative crop before
-using `--watershed` on a large volume.
+one queue per bounded foreground component. Components with a bounding box above
+`--watershed-exact-max-bbox-voxels` use the deterministic minimax fallback:
+persistent local queues exchange improved boundary paths and only dirty blocks
+run again. Component discovery is still a whole-volume planner barrier, so
+validate dense-array memory on a representative crop before using `--watershed`
+on a very large volume.
 
 ```sh
 cargo run --release -p blockflow-classical-3d-centers-ome-zarr -- \
@@ -55,8 +59,9 @@ The release binary was run on
 | Crowded `60 x 512 x 512` crop | 41 | 34 | 13.57 s | 735 MiB |
 | Full `60 x 1592 x 3333` volume, centres only | 80 | — | 4 min 26.99 s | 591 MiB |
 
-The full table contains 40 centres inside the crowded crop box and 40 outside
-it. This agrees with the manual sanity ranges of about 40--50 cells in the
+The full table at `0/tables/classical3d-dog-v1` contains 40 centres inside the
+crowded crop box and 40 outside it. This agrees with the manual sanity ranges
+of about 40--50 cells in the
 dense centre and 37--40 cells in the sparse outer parts. These approximate
-counts do not replace object-level manual review. The published full result is
-`tables/classical3d-dog-v1`.
+counts do not replace object-level manual review. The `0/` prefix is the image
+group selected from this imported collection.

@@ -14,6 +14,7 @@ use blockflow::model_segment::{
     cellpose::{CellposeBackend, Device},
     finalize_instances, InstanceSegment,
 };
+use blockflow::ome_zarr::ensure_zarr_group;
 use blockflow::op::Chain;
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, predicted_phase_prices, Hints};
@@ -190,7 +191,7 @@ fn run() -> Result<()> {
     let mut builder = PlanBuilder::new(volume, dtype, grid);
     builder.fragments(op)?;
     let assembly = builder.finish()?;
-    let env = ZarrEnvironment::attach(&work, &[source.clone()])?;
+    let env = ZarrEnvironment::attach(&work, std::slice::from_ref(&source))?;
     let phase = assembly.n_phases() - 1;
     if !config.resume_work {
         let work_kinds = assembly.work();
@@ -245,6 +246,7 @@ fn run() -> Result<()> {
     let cells = table.spec().row_count;
     drop(table);
     replace_with(&staged_layer, &layer_root, config.overwrite)?;
+    ensure_zarr_group(&config.zarr.join("tables"))?;
     replace_with(&staged_table, &table_root, config.overwrite)?;
     refresh_label_registry(&config.zarr.join("labels"))?;
     fs::remove_dir_all(&work).map_err(Error::backend)?;

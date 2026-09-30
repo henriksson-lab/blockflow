@@ -68,6 +68,8 @@ cargo run --release -p blockflow-cellpose-3d-ome-zarr --features cuda \
 ```
 
 It completed in 9,738.827 seconds, found 115 objects, and wrote a five-level
-label pyramid plus an indexed object table. Peak host RSS was 58.3 GiB. The
+label pyramid at `0/labels/cellpose3d-cpsam` plus an indexed object table at
+`0/tables/cellpose3d-cpsam`. The `0/` prefix is the image group selected from
+this imported collection. Peak host RSS was 58.3 GiB. The
 whole-volume setting is recommended for this 318-million-voxel image on a host
 with sufficient memory.

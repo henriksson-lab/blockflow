@@ -13,7 +13,7 @@ use blockflow::label_pyramid::{build_nearest_label_pyramid_with_blocks, refresh_
 use blockflow::model_segment::{
     finalize_instances_3d, stardist::Stardist3dBackend, InstanceSegment,
 };
-use blockflow::ome_zarr::{OmeVolumeLevel, OmeVolumePyramid};
+use blockflow::ome_zarr::{ensure_zarr_group, OmeVolumeLevel, OmeVolumePyramid};
 use blockflow::op::Chain;
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, predicted_phase_prices, Hints};
@@ -103,12 +103,12 @@ fn run() -> Result<()> {
         return Err(Error::invalid("OME-Zarr image has no multiscale levels"));
     }
 
-    let layer_root = config.zarr.join("labels").join(&config.layer);
-    let table_root = config.zarr.join("tables").join(&config.layer);
+    let image_root = pyramid.image_root();
+    let layer_root = image_root.join("labels").join(&config.layer);
+    let table_root = image_root.join("tables").join(&config.layer);
     check_destination(&layer_root, config.overwrite)?;
     check_destination(&table_root, config.overwrite)?;
-    let work = config
-        .zarr
+    let work = image_root
         .join("labels")
         .join(format!(".{}-blockflow-work", config.layer));
     let staged_layer = work.join("layer");
@@ -211,8 +211,9 @@ fn run() -> Result<()> {
     let cells = table.spec().row_count;
     drop(table);
     replace_with(&staged_layer, &layer_root, config.overwrite)?;
+    ensure_zarr_group(&image_root.join("tables"))?;
     replace_with(&staged_table, &table_root, config.overwrite)?;
-    refresh_label_registry(&config.zarr.join("labels"))?;
+    refresh_label_registry(&image_root.join("labels"))?;
     fs::remove_dir_all(&work).map_err(Error::backend)?;
 
     println!(
