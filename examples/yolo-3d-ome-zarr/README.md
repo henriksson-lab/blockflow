@@ -146,7 +146,8 @@ model as a center detector with approximate boxes.
 
 Full-volume inference used the validation-selected threshold and finished in
 283.572 application seconds (286.83 seconds wall) with 744 MiB peak host RSS.
-It published 74 rows at `tables/yolo3d-cell-centers-v1`. The spatially indexed
+It published 74 rows at `0/tables/yolo3d-cell-centers-v1`. The `0/` prefix is
+the image group selected from this imported collection. The spatially indexed
 NGFF object table is 432 KiB, contains all 12 center/confidence/box columns, and
 left no temporary work tree. The example also emits `table.csv` for the current
 newvolim compatibility path. A release newvolim server discovered the Cellpose
@@ -157,3 +158,48 @@ recall, while 0.005 increased recall to 0.8333 at only 0.2586 precision.
 
 The detailed rationale and literature review are in
 [`YOLO3D_RESEARCH.md`](../../YOLO3D_RESEARCH.md).
+
+## YOLO-SliceFuse3D transfer model
+
+`yolo-slicefuse3d-train` is a separate architecture that reuses the fine-tuned
+2D YOLOv11-n DAPI feature path. It freezes the 2D backbone and FPN, applies them
+to every Z slice, fuses P3/P4/P5 features along Z, and trains new 3D center
+heads. Its checkpoints and model configuration are incompatible with the
+native Conv3D detector above by design.
+
+```sh
+cargo run --release -p blockflow-yolo-3d-ome-zarr --features cuda \
+  --bin yolo-slicefuse3d-train -- \
+  --zarr /path/to/image.ome.zarr \
+  --teacher cellpose3d-cpsam \
+  --encoder-checkpoint /path/to/2d-dapi-best.bpk \
+  --patch-z 24 --patch 192 \
+  --ownership-halo-z 6 --ownership-halo 24 \
+  --split /path/to/split.json \
+  --normalize-low 1 --normalize-high 70 \
+  --epochs 1 --device cuda \
+  --output .tmp/yolo-slicefuse3d/run-1
+```
+
+Full-volume inference uses its distinct binary and layer name:
+
+```sh
+cargo run --release -p blockflow-yolo-3d-ome-zarr --features cuda \
+  --bin yolo-slicefuse3d-ome-zarr -- \
+  --zarr /path/to/image.ome.zarr \
+  --checkpoint .tmp/yolo-slicefuse3d/run-1/best.bpk \
+  --model-config .tmp/yolo-slicefuse3d/run-1/model-config.json \
+  --device cuda --block-z 12 --block 144 --halo-z 6 --halo 24 \
+  --normalize-low 1 --normalize-high 70 \
+  --threshold 0.0052330033 \
+  --layer yolo-slicefuse3d-cell-centers-v1
+```
+
+On the clustered PBMC volume, the selected first epoch reached center AP
+0.6469 on validation and 0.6261 on the frozen test partition. Full-volume
+inference took 149.718 application seconds and 2:29.94 wall time and published
+159 centers at `0/tables/yolo-slicefuse3d-cell-centers-v1`. This threshold was
+selected on validation and favors recall; the count exceeds the manual estimate
+and therefore requires visual false-positive review.
+Release `newvolim-server` discovery reported it as a reviewable 3D object layer,
+and a full-volume viewport query returned all 159 rows without density clipping.

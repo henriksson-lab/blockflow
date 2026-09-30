@@ -9,3 +9,4 @@ description = "Anisotropy-aware 3D center detector for dense volumetric microsco
 burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+yolov11 = { git = "https://github.com/henriksson-lab/YOLOv11-rs.git", rev = "a9bc208a234a30422efcde47efc5dece4af735e9" }

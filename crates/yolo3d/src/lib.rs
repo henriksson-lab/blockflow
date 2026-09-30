@@ -2,12 +2,15 @@
 //! workflow. It uses a center heatmap because dense, mostly single-class cells
 //! do not benefit from emitting six box-distance distributions at every voxel.
 
+use std::path::Path;
+
 use burn::module::{Module, Param};
 use burn::nn::conv::{Conv3d, Conv3dConfig};
 use burn::nn::{GroupNorm, GroupNormConfig, PaddingConfig3d};
 use burn::prelude::{Device, Tensor};
 use burn::tensor::activation::{sigmoid, silu};
 use serde::{Deserialize, Serialize};
+use yolov11::model::model::{yolo_v11_n, YOLO};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DetectorConfig {
@@ -180,6 +183,152 @@ pub struct ScaleOutput {
     /// Positive z/y/x extents in feature-grid units.
     pub size: Tensor<5>,
     pub quality: Tensor<5>,
+}
+
+/// Configuration for the slice-encoder model. The embedded encoder is the
+/// YOLOv11-n microscopy model; its P3/P4/P5 tensors are fused only along Z and
+/// fed to newly initialized 3D center heads.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SliceFuseConfig {
+    pub classes: usize,
+    pub encoder_classes: usize,
+    pub voxel_size: [f32; 3],
+    #[serde(default = "default_size_priors")]
+    pub size_priors: [[f32; 3]; 3],
+}
+
+impl SliceFuseConfig {
+    pub fn new(classes: usize, encoder_classes: usize, voxel_size: [f32; 3]) -> Self {
+        Self {
+            classes,
+            encoder_classes,
+            voxel_size,
+            size_priors: default_size_priors(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.classes == 0 || self.encoder_classes == 0 {
+            return Err(Error::Config("classes must be positive".into()));
+        }
+        if self
+            .voxel_size
+            .iter()
+            .chain(self.size_priors.iter().flatten())
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(Error::Config(
+                "voxel sizes and size priors must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn cumulative_strides(&self) -> [[usize; 3]; 3] {
+        [[1, 8, 8], [1, 16, 16], [1, 32, 32]]
+    }
+}
+
+#[derive(Module, Debug)]
+struct AxialFusion {
+    conv: Conv3d,
+    norm: GroupNorm,
+}
+
+impl AxialFusion {
+    fn new(channels: usize, device: &Device) -> Self {
+        let groups = (1..=8)
+            .rev()
+            .find(|groups| channels.is_multiple_of(*groups))
+            .unwrap_or(1);
+        Self {
+            conv: Conv3dConfig::new([channels, channels], [3, 1, 1])
+                .with_padding(PaddingConfig3d::Explicit(1, 0, 0))
+                .with_bias(false)
+                .init(device),
+            norm: GroupNormConfig::new(groups, channels).init(device),
+        }
+    }
+
+    fn forward(&self, input: Tensor<5>) -> Tensor<5> {
+        let residual = input.clone();
+        silu(self.norm.forward(self.conv.forward(input))) + residual
+    }
+}
+
+/// YOLO-SliceFuse3D: a frozen, fine-tuned 2D microscopy encoder followed by
+/// lightweight axial fusion and trainable 3D center heads.
+#[derive(Module, Debug)]
+pub struct SliceFuseDetector {
+    encoder: YOLO,
+    fusion: Vec<AxialFusion>,
+    heads: Vec<CenterHead>,
+}
+
+impl SliceFuseDetector {
+    pub fn from_encoder_checkpoint(
+        config: &SliceFuseConfig,
+        checkpoint: &Path,
+        device: &Device,
+    ) -> Result<Self, Error> {
+        let encoder = yolo_v11_n(config.encoder_classes, device)
+            .try_load_file(checkpoint)
+            .map_err(|error| Error::Config(format!("loading 2D encoder: {error}")))?;
+        Self::new(config, encoder, device)
+    }
+
+    pub fn uninitialized(config: &SliceFuseConfig, device: &Device) -> Result<Self, Error> {
+        Self::new(config, yolo_v11_n(config.encoder_classes, device), device)
+    }
+
+    pub fn new(config: &SliceFuseConfig, encoder: YOLO, device: &Device) -> Result<Self, Error> {
+        config.validate()?;
+        let channels = [64, 128, 256];
+        let fusion = channels
+            .into_iter()
+            .map(|channels| AxialFusion::new(channels, device))
+            .collect();
+        let heads = channels
+            .into_iter()
+            .zip(config.size_priors)
+            .map(|(channels, prior)| CenterHead::new(channels, config.classes, prior, device))
+            .collect();
+        Ok(Self {
+            // The prediction head is unused, while this freezes the complete
+            // feature-producing path whose checkpoint we want to preserve.
+            encoder: encoder.freeze_backbone_and_neck(),
+            fusion,
+            heads,
+        })
+    }
+
+    pub fn forward(&self, input: Tensor<5>) -> Vec<ScaleOutput> {
+        let [batch, channels, depth, height, width] = input.dims();
+        assert_eq!(channels, 1, "YOLO-SliceFuse3D expects one image channel");
+        let slices = input
+            .swap_dims(1, 2)
+            .reshape([batch * depth, channels, height, width])
+            .repeat_dim(1, 3);
+        let (p3, p4, p5) = self.encoder.forward_features_with_batch_norm(slices, true);
+        [p3, p4, p5]
+            .into_iter()
+            .zip(&self.fusion)
+            .zip(&self.heads)
+            .map(|((feature, fusion), head)| {
+                let [_, feature_channels, feature_height, feature_width] = feature.dims();
+                let feature = feature
+                    .reshape([
+                        batch,
+                        depth,
+                        feature_channels,
+                        feature_height,
+                        feature_width,
+                    ])
+                    .swap_dims(1, 2);
+                head.forward(fusion.forward(feature))
+            })
+            .collect()
+    }
 }
 
 pub struct ScaleTargets {

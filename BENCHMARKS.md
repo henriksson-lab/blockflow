@@ -370,9 +370,9 @@ whole-volume mode avoids repeating Cellpose's three sets of internally tiled
 orthogonal planes across overlapping outer blocks.
 
 The result is a five-level 34 MiB label pyramid at
-`labels/cellpose3d-cpsam` plus a 392 KiB indexed object table at
-`tables/cellpose3d-cpsam`. The label source correctly resolves the Bio-Formats
-series as `../../0`, and the temporary work tree was removed after publication.
+`0/labels/cellpose3d-cpsam` plus a 392 KiB indexed object table at
+`0/tables/cellpose3d-cpsam`. The label source resolves its parent image group as
+`../../`, and the temporary work tree was removed after publication.
 This timing is accepted for the current project; Cellpose3D and StarDist3D
 inference optimization is closed unless a future matched benchmark shows a
 material regression.
@@ -410,6 +410,25 @@ teacher run, end-to-end YOLO3D inference was **34.4x faster**. The count is
 a claim of label parity. The compatibility CSV was discovered by release
 newvolim alongside the Cellpose label, and a full-volume viewport query returned
 all 74 YOLO rows.
+
+### YOLO-SliceFuse3D transferred center detector
+
+The transfer model reused the frozen P3/P4/P5 feature path from the selected
+epoch-80 2D DAPI YOLOv11-n checkpoint and trained only axial fusion and 3D
+center heads on the same leakage-safe PBMC split. Its selected first epoch
+reached center AP 0.6469 on validation and 0.6261 on the frozen test partition.
+
+Full-volume release CUDA inference took **149.718s application time** and
+**149.94s wall time**, with 905,136 KiB peak host RSS. This is **1.89x faster**
+than the native Conv3D YOLO detector and **65.0x faster** than the Cellpose3D
+teacher workflow by application elapsed time. The validation-selected
+high-recall threshold published 159 detections at
+`0/tables/yolo-slicefuse3d-cell-centers-v1`. Its count exceeds the manual
+77--90-cell estimate, so the speed ratio does not imply better biological
+accuracy and the layer requires false-positive review.
+Release `newvolim-server` discovered the table as a reviewable 3D layer and
+returned all 159 rows from a full-volume viewport query without density
+clipping.
 
 ## StarDist CUDA annotation
 

@@ -255,7 +255,7 @@ yolo3d-model = { package = "yolo3d", path = "crates/yolo3d", optional = true }
 burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["std", "safetensors"], optional = true }
 candle-core = { version = "0.11", optional = true }
-yolov11 = { git = "https://github.com/henriksson-lab/YOLOv11-rs.git", rev = "697198bffa4a7fc6bdc302d54db98dd5092f9ef1", optional = true }
+yolov11 = { git = "https://github.com/henriksson-lab/YOLOv11-rs.git", rev = "a9bc208a234a30422efcde47efc5dece4af735e9", optional = true }
 # Resolver guard for `burn/{wgpu,cuda}` through `cubecl -> pliron 0.17`.
 # `pliron 0.17.0` declares `pliron-derive = "0"`, so a lock-free resolve pairs
 # it with whatever 0.x is newest on the index — 0.18 as of this writing — whose

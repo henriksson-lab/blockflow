@@ -7,7 +7,9 @@ use burn::module::Module;
 use burn::prelude::{Device, Tensor};
 #[cfg(feature = "yolo3d-cuda")]
 use burn::tensor::DeviceIndex;
-use yolo3d_model::{decode_scale, nms, Box3d, Detector, DetectorConfig};
+use yolo3d_model::{
+    decode_scale, nms, Box3d, Detector, DetectorConfig, SliceFuseConfig, SliceFuseDetector,
+};
 
 use crate::table::{Column, ColumnType, RowBuilder, Schema, Value};
 use crate::{
@@ -102,6 +104,83 @@ impl Yolo3dDetector {
             Column::new("y1", ColumnType::F64),
             Column::new("x1", ColumnType::F64),
         ])
+    }
+}
+
+/// Blockflow adapter for YOLO-SliceFuse3D. The checkpoint contains the reused
+/// 2D microscopy encoder, axial fusion layers, and 3D center heads.
+pub struct YoloSliceFuse3dDetector {
+    model: Mutex<SliceFuseDetector>,
+    config: SliceFuseConfig,
+    device: Device,
+    halo: [usize; 3],
+    range: (f32, f32),
+    threshold: f32,
+    nms_iou: f32,
+    cost: f64,
+}
+
+impl YoloSliceFuse3dDetector {
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        config: SliceFuseConfig,
+        checkpoint: &Path,
+        device: InferenceDevice,
+        halo: [usize; 3],
+        range: (f32, f32),
+        threshold: f32,
+        nms_iou: f32,
+    ) -> Result<Self> {
+        if range.1.partial_cmp(&range.0) != Some(std::cmp::Ordering::Greater) {
+            return Err(Error::invalid(
+                "YOLO-SliceFuse3D normalization high must exceed low",
+            ));
+        }
+        let device = inference_device(device)?;
+        let model = SliceFuseDetector::uninitialized(&config, &device)
+            .map_err(|error| Error::backend(format!("yolo-slicefuse3d: {error}")))?
+            .try_load_file(checkpoint)
+            .map_err(|error| {
+                Error::backend(format!("loading {}: {error}", checkpoint.display()))
+            })?;
+        Ok(Self {
+            model: Mutex::new(model),
+            config,
+            device,
+            halo,
+            range,
+            threshold,
+            nms_iou,
+            cost: 6.0,
+        })
+    }
+
+    #[must_use]
+    pub fn with_cost_per_voxel(mut self, cost: f64) -> Self {
+        self.cost = cost;
+        self
+    }
+
+    pub fn schema() -> Result<Schema> {
+        Yolo3dDetector::schema()
+    }
+}
+
+fn inference_device(device: InferenceDevice) -> Result<Device> {
+    match device {
+        InferenceDevice::Cpu => Ok(Device::flex()),
+        InferenceDevice::Cuda(index) => {
+            #[cfg(feature = "yolo3d-cuda")]
+            {
+                Ok(Device::cuda(DeviceIndex::new(index)))
+            }
+            #[cfg(not(feature = "yolo3d-cuda"))]
+            {
+                Err(Error::invalid(format!(
+                    "CUDA device {index} requested, but blockflow was built without yolo3d-cuda"
+                )))
+            }
+        }
     }
 }
 
@@ -257,6 +336,89 @@ impl FragmentOp for Yolo3dDetector {
                     self.threshold,
                 )
                 .map_err(|error| Error::backend(format!("yolo3d decode: {error}")))?,
+            );
+        }
+        for detection in nms(detections, self.nms_iou) {
+            emit_detection(&mut rows, detection, self.config.voxel_size, at)?;
+        }
+        Ok(BlockOutput::fragment(STREAM, rows.encode()))
+    }
+}
+
+impl FragmentOp for YoloSliceFuse3dDetector {
+    fn name(&self) -> &'static str {
+        "yolo-slicefuse3d"
+    }
+
+    fn reach(&self, axis: usize, _volume_len: usize) -> usize {
+        self.halo[axis]
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+
+    fn reads_pixels(&self) -> bool {
+        true
+    }
+
+    fn writes_pixels(&self) -> bool {
+        false
+    }
+
+    fn seam_fold(&self) -> Option<crate::SeamFold> {
+        Some(crate::SeamFold::PerBlock)
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        let size = Self::schema()
+            .map(|schema| crate::fragment::SidecarSize::row_table(&Arc::new(schema), 1))
+            .unwrap_or(crate::fragment::SidecarSize::Unstated);
+        vec![FragmentOutput::new(STREAM, Lifecycle::Persistent, Coverage::EveryBlock).sized(size)]
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        self.apply_with(at, SourceBlocks::none())
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, _sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let schema = Arc::new(Self::schema()?);
+        let mut rows = RowBuilder::new(schema);
+        let BlockBuf::Array(voxels) = at.pixels()? else {
+            return Ok(BlockOutput::fragment(STREAM, rows.encode()));
+        };
+        let values = voxels.widened();
+        let shape = values.dim();
+        let span = (self.range.1 - self.range.0).max(f32::EPSILON);
+        let input = values
+            .iter()
+            .map(|value| ((*value as f32 - self.range.0) / span).clamp(0.0, 1.0))
+            .collect::<Vec<_>>();
+        let tensor = Tensor::<1>::from_floats(input.as_slice(), &self.device)
+            .reshape([1, 1, shape.0, shape.1, shape.2]);
+        let outputs = self
+            .model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .forward(tensor);
+        let strides = self.config.cumulative_strides();
+        let mut detections = Vec::new();
+        for (level, output) in outputs.into_iter().enumerate() {
+            let dims = output.heatmap.dims();
+            let spatial = [dims[2], dims[3], dims[4]];
+            detections.extend(
+                decode_scale(
+                    &tensor_values(output.heatmap)?,
+                    &tensor_values(output.offset)?,
+                    &tensor_values(output.size)?,
+                    &tensor_values(output.quality)?,
+                    spatial,
+                    self.config.classes,
+                    strides[level],
+                    self.config.voxel_size,
+                    self.threshold,
+                )
+                .map_err(|error| Error::backend(format!("yolo-slicefuse3d decode: {error}")))?,
             );
         }
         for detection in nms(detections, self.nms_iou) {

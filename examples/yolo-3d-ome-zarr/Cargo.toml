@@ -26,3 +26,11 @@ path = "src/main.rs"
 [[bin]]
 name = "yolo-3d-train"
 path = "src/bin/train.rs"
+
+[[bin]]
+name = "yolo-slicefuse3d-train"
+path = "src/bin/train_slicefuse.rs"
+
+[[bin]]
+name = "yolo-slicefuse3d-ome-zarr"
+path = "src/bin/infer_slicefuse.rs"
