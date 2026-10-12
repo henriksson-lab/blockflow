@@ -127,6 +127,7 @@ fn convert(input: &Path, output: &Path, label: &str, height: u64, width: u64) ->
         grid_shape: grid_shape.clone(),
         tile_order: "row_major".into(),
         within_tile_order: "lexicographic_coordinates_then_identity".into(),
+        downsample: None,
     };
     let mut spec = TableSpec::new(
         rows.len() as u64,

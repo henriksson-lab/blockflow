@@ -786,6 +786,7 @@ fn write_object_table(
         grid_shape: grid_shape.clone(),
         tile_order: "row_major".into(),
         within_tile_order: "lexicographic_coordinates_then_identity".into(),
+        downsample: None,
     };
     let spec = TableSpec::new(
         detections.len() as u64,

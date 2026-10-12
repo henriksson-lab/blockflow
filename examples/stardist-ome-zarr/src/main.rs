@@ -12,6 +12,7 @@ use blockflow::label_pyramid::{build_nearest_label_pyramid, refresh_label_regist
 use blockflow::model_segment::{finalize_instances, stardist::StardistBackend, InstanceSegment};
 use blockflow::ome_zarr::ensure_zarr_group;
 use blockflow::op::Chain;
+use blockflow::progress::{ProgressMeta, StreamingLog};
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, predicted_phase_prices, Hints};
 use blockflow::zarr_env::ZarrEnvironment;
@@ -129,6 +130,7 @@ fn run() -> Result<()> {
     let source = AttachedImage::at(config.zarr.join(&level0.path))
         .plane(config.channel, [level0.shape[1], level0.shape[2]]);
     let (dtype, volume) = source.metadata()?;
+    let (profile_memory_bytes, source_cache_bytes) = job_memory_policy()?;
     let weights = config
         .weights
         .clone()
@@ -152,14 +154,25 @@ fn run() -> Result<()> {
     .writing_labels();
     let row_schema = op.schema()?;
 
-    let constraints = constraints(&config, volume);
+    let constraints = constraints(&config, volume, profile_memory_bytes, source_cache_bytes);
     let grid = planned_fragment_grid(&op, dtype, volume, &constraints)?;
     println!("planned block {:?} over {:?}", grid.block(), volume);
     let mut builder = PlanBuilder::new(volume, dtype, grid);
     builder.fragments(op)?;
     let assembly = builder.finish()?;
     let env = ZarrEnvironment::attach(&work, std::slice::from_ref(&source))?;
+    let env = match source_cache_bytes {
+        Some(bytes) => env.with_cache(bytes),
+        None => env,
+    };
     let phase = assembly.n_phases() - 1;
+    let mut runtime_metrics = json!({
+        "schema": "rozt.model-runtime/v1",
+        "jobId": std::env::var("ROZT_JOB_ID").ok(),
+        "resumed": config.resume_work,
+        "profileMemoryBytes": profile_memory_bytes,
+        "sourceCacheCapacityBytes": source_cache_bytes,
+    });
     if !config.resume_work {
         let work_kinds = assembly.work();
         let hints = Hints {
@@ -169,15 +182,71 @@ fn run() -> Result<()> {
             prefetch_chunk_bytes: constraints.prefetch_chunk_bytes,
             ..Hints::default()
         };
-        execute_phases(
+        let progress = StreamingLog::from_jobman_env(ProgressMeta::from_plan(
+            std::env::var("ROZT_JOB_ID").unwrap_or_else(|_| "stardist".into()),
+            "stardist OME-Zarr",
+            &assembly.workflow,
+            &assembly.decomposition,
+        ))
+        .map_err(Error::backend)?
+        .map(Arc::new);
+        let listeners = progress
+            .iter()
+            .map(|listener| listener.clone() as Arc<dyn blockflow::listener::EventListener>)
+            .collect::<Vec<_>>();
+        let execution = execute_phases(
             "stardist OME-Zarr",
             &assembly.workflow,
             &assembly.decomposition,
             &hints,
             &env,
-            &[],
+            &listeners,
             &work_kinds,
-        )?;
+        );
+        if let Some(progress) = progress {
+            progress.finish(
+                if execution.is_ok() { "ok" } else { "failed" },
+                execution.as_ref().err().map(ToString::to_string),
+            );
+        }
+        let stats = execution?;
+        let cache = env.cache_stats();
+        runtime_metrics = json!({
+            "schema": "rozt.model-runtime/v1",
+            "jobId": std::env::var("ROZT_JOB_ID").ok(),
+            "resumed": false,
+            "profileMemoryBytes": profile_memory_bytes,
+            "sourceCacheCapacityBytes": source_cache_bytes,
+            "execution": {
+                "tasks": stats.tasks,
+                "blocksAdmitted": stats.blocks_admitted,
+                "fragmentApplications": stats.fragment_applications,
+                "reads": stats.reads,
+                "writes": stats.writes,
+                "readVoxels": stats.read_voxels,
+                "writeVoxels": stats.write_voxels,
+                "chunksRead": stats.chunks_read,
+                "sidecarReads": stats.sidecar_reads,
+                "sidecarWrites": stats.sidecar_writes,
+                "sidecarBytesRead": stats.sidecar_bytes_read,
+                "sidecarBytesWritten": stats.sidecar_bytes_written,
+                "peakResidentBytes": stats.peak_resident_bytes,
+            },
+            "sourceCache": cache.map(|cache| json!({
+                "residentBytes": cache.resident_bytes,
+                "residentChunks": cache.resident_chunks,
+                "hitsDecoded": cache.hits_decoded,
+                "hitsEncoded": cache.hits_encoded,
+                "misses": cache.misses,
+                "hitRate": cache.hit_rate(),
+                "sourceReads": cache.source_reads,
+                "sourceBytes": cache.source_bytes,
+                "evictions": cache.evictions,
+                "refusals": cache.refusals,
+                "knownEmpty": cache.known_empty,
+                "encodedRatio": cache.encoded_ratio(),
+            })),
+        });
         fs::create_dir_all(&staged_layer).map_err(Error::backend)?;
         move_path(
             &work.join(format!("level{}", phase + 1)),
@@ -217,6 +286,7 @@ fn run() -> Result<()> {
     replace_with(&staged_table, &table_root, config.overwrite)?;
     refresh_label_registry(&config.zarr.join("labels"))?;
     fs::remove_dir_all(&work).map_err(Error::backend)?;
+    write_job_runtime_metrics(&runtime_metrics)?;
 
     println!(
         "cells={} label={} table={}",
@@ -258,8 +328,14 @@ fn validate(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn constraints(config: &Config, volume: [usize; 3]) -> Constraints {
+fn constraints(
+    config: &Config,
+    volume: [usize; 3],
+    budget_bytes: Option<u64>,
+    cache_bytes: Option<u64>,
+) -> Constraints {
     Constraints {
+        budget_bytes,
         expected_concurrency: config.workers.max(1),
         block_candidates: config.blocks.clone(),
         split_axes: if volume[0] == 1 {
@@ -269,6 +345,43 @@ fn constraints(config: &Config, volume: [usize; 3]) -> Constraints {
         },
         ..Constraints::default()
     }
+    .with_cache_bytes(cache_bytes.unwrap_or(0))
+}
+
+fn job_memory_policy() -> Result<(Option<u64>, Option<u64>)> {
+    let Some(raw) = std::env::var_os("ROZT_MAX_MEMORY_PER_NODE_BYTES") else {
+        return Ok((None, None));
+    };
+    let total = raw
+        .to_str()
+        .ok_or_else(|| Error::invalid("ROZT_MAX_MEMORY_PER_NODE_BYTES is not UTF-8"))?
+        .parse::<u64>()
+        .map_err(|error| {
+            Error::invalid(format!("invalid ROZT_MAX_MEMORY_PER_NODE_BYTES: {error}"))
+        })?;
+    if total == 0 {
+        return Err(Error::invalid(
+            "ROZT_MAX_MEMORY_PER_NODE_BYTES must be positive",
+        ));
+    }
+    Ok((Some(total), Some((total / 4).max(1).min(512 << 20))))
+}
+
+fn write_job_runtime_metrics(metrics: &Json) -> Result<()> {
+    let Some(path) = std::env::var_os("ROZT_JOB_METRICS_FILE").map(PathBuf::from) else {
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::invalid("ROZT_JOB_METRICS_FILE has no parent"))?;
+    fs::create_dir_all(parent).map_err(Error::backend)?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(metrics).map_err(Error::backend)?,
+    )
+    .map_err(Error::backend)?;
+    fs::rename(temporary, path).map_err(Error::backend)
 }
 
 fn planned_fragment_grid(

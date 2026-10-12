@@ -24,6 +24,7 @@ members = [
     "examples/yolo-ome-zarr",
     "examples/yolo-3d-ome-zarr",
     "examples/classical-3d-centers-ome-zarr",
+    "examples/plate-timelapse-tracking",
 ]
 
 [package]
@@ -41,7 +42,10 @@ description = "Out-of-core block processing: op chains, reach-derived valid regi
 flate2 = "1"
 ndarray = "0.17"
 rayon = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 blockflow-progress = { path = "crates/blockflow-progress" }
 # `ops::fft` only, and the one exception to the rule stated at the top of this
 # block: an FFT is not the framework's own machinery, it is what one op needs.
@@ -216,34 +220,14 @@ fftw-sys = { version = "0.8", optional = true, default-features = false, feature
 # only dependency here that is not the framework's own machinery: a level has to
 # live somewhere, and everything before it was proven against arrays in memory.
 #
-# `default-features = false` and the required features back on deliberately.
-# Blosc, sharding, transpose and crc32c remain excluded. Zstd is included because
-# Bio-Formats OME-Zarr 0.5 output commonly uses the standard Zarr v3 zstd codec;
-# rejecting it prevents Blockflow from attaching normal microscopy volumes.
-#
-# They used to add **a second `ndarray`** as well, and that was the sharpest of
-# these reasons: `zarrs` was on 0.17 against this crate's 0.16, so its ndarray
-# bridge would have handed back arrays of a type nothing here could hold. **That
-# is no longer true** — all three crates and `zarrs` are on 0.17 together, so the
-# bridge is now merely unused rather than unusable. The flag stays off for the
-# other five, which are unchanged.
-#
-# The two that are asked for:
-#
-# * `filesystem` — the store. A level has to live somewhere.
-# * `gzip` — one codec `zarr_env::Compression` offers, and **it costs nothing**.
-#   `zarrs`'s `gzip` feature is exactly `dep:flate2`, and `flate2` is already a
-#   dependency of this crate for `cache::DeflateCodec`, at the same major
-#   version. The package count with `--features zarr` is therefore unchanged at
-#   156, no build script is added, and the incremental build cost is the codec
-#   module itself. That — rather than "gzip is the best compressor" — is why the
-# * `zstd` — required to read standard Bio-Formats OME-Zarr input and available
-#   explicitly for callers that want to preserve that codec in generated arrays.
-zarrs = { version = "0.23.13", optional = true, default-features = false, features = [
-    "filesystem",
-    "gzip",
-    "zstd",
-] }
+# **`zarrs`'s default features, deliberately: compatibility over build size.**
+# Real OME-Zarr 0.5 input (bf2zarr, `zarrs`, ome-zarr-py, Bio-Formats) is
+# routinely `sharding_indexed` with `blosc` inside and a `crc32c` shard index,
+# and an array this crate cannot decode is an array it cannot attach. The
+# defaults are `filesystem`, `ndarray`, `blosc`, `crc32c`, `gzip`, `sharding`,
+# `transpose` and `zstd`; the cost is a larger graph and a C compiler for
+# `blosc-src`, which `libz-sys` already asked for.
+zarrs = { version = "0.23.13", optional = true }
 ngff-object-table = { path = "crates/ngff-object-table", optional = true }
 anyhow = { version = "1", optional = true }
 csv = { version = "1", optional = true }
@@ -251,6 +235,10 @@ image = { version = "0.25", optional = true }
 ndarray16 = { package = "ndarray", version = "0.16", optional = true }
 cellpose = { git = "https://github.com/henriksson-lab/cellpose-rs.git", rev = "4e428d0d20da2b6ac7f12b59d8f3263d2e9c362f", optional = true }
 stardist-rs = { git = "https://github.com/henriksson-lab/stardist-rs.git", rev = "20cb2375f53540ad0f2b490d4e8a7f65d96c95ee", optional = true }
+sam2-rs = { path = "../../em/found/sam2-rs", optional = true }
+sam2-candle-core = { package = "candle-core", path = "../candle/candle-core", optional = true }
+sam2-candle-nn = { package = "candle-nn", path = "../candle/candle-nn", optional = true }
+sam1-candle-transformers = { package = "candle-transformers", path = "../candle/candle-transformers", optional = true }
 yolo3d-model = { package = "yolo3d", path = "crates/yolo3d", optional = true }
 burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["std", "safetensors"], optional = true }
@@ -310,9 +298,8 @@ gui = []
 # That is a fair price for reading and writing real arrays and an unreasonable
 # one for a framework that is only counting bytes or only holding them in memory
 # — and which of those a caller is doing is the caller's business, not this
-# file's. `default-features = false` on `zarrs` is part of the same accounting:
-# only its filesystem store is asked for, not blosc, zstd, sharding, transpose,
-# crc32c or its own (different, second) `ndarray`.
+# file's. `zarrs` itself is taken with its default codecs (blosc, sharding,
+# crc32c, transpose, gzip, zstd): see its dependency entry for why.
 zarr = ["dep:zarrs", "dep:ngff-object-table"]
 # `ops::fft` on the system's FFTW 3 instead of `rustfft` + `realfft`. Off by
 # default, and off is the configuration everything else is measured against: with
@@ -331,6 +318,8 @@ fftw = ["dep:fftw-sys"]
 model-segment = []
 cellpose = ["model-segment", "dep:cellpose", "dep:ndarray16"]
 stardist = ["model-segment", "dep:stardist-rs", "dep:burn", "dep:ndarray16"]
+sam = ["model-segment", "dep:sam2-rs", "dep:sam2-candle-core", "dep:sam2-candle-nn", "dep:sam1-candle-transformers"]
+sam-cuda = ["sam", "sam2-rs/cuda", "sam2-candle-core/cuda", "sam2-candle-nn/cuda"]
 cellpose-cuda = ["cellpose", "cellpose/cuda"]
 stardist-candle-cuda = ["stardist", "dep:candle-core", "stardist-rs/candle-cuda"]
 stardist-cuda = ["stardist", "burn/cuda", "dep:pliron-derive"]
@@ -520,6 +509,13 @@ required-features = ["distributed"]
 name = "blockflow-local"
 path = "src/bin/blockflow_local.rs"
 required-features = ["distributed"]
+
+# Add an intensity pyramid to an existing OME-Zarr image; see
+# `src/intensity_pyramid.rs`.
+[[bin]]
+name = "blockflow-pyramid"
+path = "src/bin/blockflow_pyramid.rs"
+required-features = ["zarr"]
 
 
 [dev-dependencies]

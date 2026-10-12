@@ -119,6 +119,10 @@ pub mod assemble;
 pub mod budget;
 pub mod cache;
 pub mod classical_centers;
+/// Plates, wells and fields: enumerating image series from OME-NGFF HCS
+/// metadata or an explicit collection manifest.
+#[cfg(feature = "zarr")]
+pub mod collection;
 pub mod cpu;
 pub mod decomposition;
 /// Multi-node execution: a coordinator, workers that pull, and pluggable
@@ -148,6 +152,10 @@ pub mod gui;
 /// no-feature configuration is the one everything else is measured against —
 /// and see its header for the measured defect it exists instead of.
 pub mod http;
+/// Out-of-core, anisotropy-aware intensity pyramids added to an existing
+/// OME-Zarr image in place.
+#[cfg(feature = "zarr")]
+pub mod intensity_pyramid;
 /// One phase that runs an unknown number of substages, with more than one
 /// operand available at every substage. The shape an iteration takes when its
 /// step depends on both a running estimate and something fixed — which
@@ -156,14 +164,24 @@ pub mod http;
 /// live storage is two private buffers whatever the substage count turns out to
 /// be.
 pub mod iterate;
+/// Atomic publication of sparse interactive masks as OME-Zarr label pyramids.
+#[cfg(feature = "zarr")]
+pub mod label_publish;
 /// Planner-driven, out-of-core nearest-neighbour pyramids for stored labels.
 #[cfg(feature = "zarr")]
 pub mod label_pyramid;
 pub mod listener;
 pub(crate) mod lock;
 pub mod log;
+/// Immutable segmentation model bundles, semantic class schemas, and the native runtime
+/// capability contract shared by interactive and batch workflows.
+pub mod model_registry;
 #[cfg(feature = "model-segment")]
 pub mod model_segment;
+/// Immutable annotation snapshots, typed native training recipes and comparable evaluation.
+pub mod model_training;
+/// Versioned, bounded wire contract for server-configured native model workers.
+pub mod model_worker;
 pub mod net;
 /// The `.npy` array file format: a header, an element type, a memory order and
 /// a flat contiguous buffer. Whole arrays of any rank, `Voxels` for the rank-3
@@ -201,6 +219,11 @@ pub mod pyramid;
 /// space it is counted. See [`reach::Reach`].
 pub mod reach;
 pub mod region;
+#[cfg(feature = "sam")]
+pub mod sam;
+/// Native SAM-family training policy over the faithful sam2-rs operation boundary.
+#[cfg(feature = "sam")]
+pub mod sam_training;
 /// **Cost scenarios**: a measured baseline and the plausible machines around
 /// it — slower disk, less memory, fewer cores — as files, so that a planner
 /// change can be held to more than the machine it was written on.
@@ -233,6 +256,13 @@ pub mod synthetic;
 /// was a one-column special case of; `points` is now exactly that special case.
 pub mod table;
 pub mod tiling;
+/// Time-lapse OME-Zarr images one frame at a time, and the `t,[z,]y,x` label
+/// stack frames write their planes into.
+#[cfg(feature = "zarr")]
+pub mod time_series;
+/// Linking per-frame detections into tracks: rows in, a validated track graph
+/// out. Time is a collection axis here, never a block-grid axis.
+pub mod track;
 /// A block's data: rank 3, element type carried as a tag. Also the
 /// dynamic-rank buffer a side output goes to, which is a different question and
 /// says so.
@@ -246,6 +276,10 @@ pub mod yolo3d;
 /// pulls no extra dependency.
 #[cfg(feature = "zarr")]
 pub mod zarr_env;
+/// How a Zarr v3 array is grouped on disk: chunks, `sharding_indexed` shards,
+/// and the compression inside them.
+#[cfg(feature = "zarr")]
+pub mod zarr_layout;
 
 #[cfg(test)]
 mod cache_tests;
@@ -340,5 +374,6 @@ pub use tiling::boxes_tile_exactly;
 pub use voxels::{SideBuf, VoxelElement, Voxels, VoxelsMut};
 #[cfg(feature = "zarr")]
 pub use zarr_env::{
-    chunk_for_block, zarr_data_type, AttachedImage, VolumeSelection, Window, ZarrEnvironment,
+    chunk_for_block, zarr_data_type, AttachedImage, SpatialAxis, VolumeSelection, Window,
+    ZarrEnvironment,
 };

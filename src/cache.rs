@@ -734,6 +734,61 @@ impl ChunkCache {
         Ok(id)
     }
 
+    /// Register a stable external array once, returning the existing identity on later opens.
+    ///
+    /// Viewer sessions and batch environments often open the same immutable Zarr array through
+    /// different objects. Plain [`Self::register`] deliberately treats those as distinct arrays;
+    /// this method lets the storage authority state that `identity` denotes the same bytes.
+    pub fn register_shared(
+        &self,
+        identity: &str,
+        shape: &[usize],
+        chunk: &[usize],
+        dtype: Dtype,
+        policy: ArrayPolicy,
+        fetcher: Arc<dyn ChunkFetcher>,
+    ) -> Result<ArrayId> {
+        if chunk.len() != shape.len() {
+            return Err(Error::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: chunk.to_vec(),
+            });
+        }
+        if chunk.contains(&0) || shape.contains(&0) {
+            return Err(Error::invalid(format!(
+                "{identity}: shape {shape:?} and chunk {chunk:?} must both be positive on every axis"
+            )));
+        }
+        let mut arrays = self.arrays.write_unpoisoned();
+        if let Some(existing) = arrays.iter().find(|array| array.name == identity) {
+            if existing.shape != shape || existing.chunk != chunk || existing.dtype != dtype {
+                return Err(Error::invalid(format!(
+                    "shared array identity {identity:?} was already registered as {:?}/{:?}/{:?}, not {shape:?}/{chunk:?}/{dtype:?}",
+                    existing.shape, existing.chunk, existing.dtype
+                )));
+            }
+            return Ok(existing.id);
+        }
+        let grid = shape
+            .iter()
+            .zip(chunk.iter())
+            .map(|(&dim, &extent)| dim.div_ceil(extent))
+            .collect();
+        let id = ArrayId(arrays.len() as u32);
+        arrays.push(Arc::new(Registered {
+            id,
+            name: identity.to_owned(),
+            shape: shape.to_vec(),
+            chunk: chunk.to_vec(),
+            grid,
+            dtype,
+            fetcher,
+        }));
+        // Keep the lock order identical to `register`: arrays, then policies.
+        self.policies.write_unpoisoned().push(policy);
+        Ok(id)
+    }
+
     /// Change an array's policy mid-run. The planner's lever: a stage that has
     /// stopped being read can be demoted without dropping what it already holds.
     pub fn set_policy(&self, array: ArrayId, policy: ArrayPolicy) -> Result<()> {
@@ -1543,6 +1598,35 @@ impl<T: CacheElement> CachingSource<T> {
             array,
             shape,
             name: name.to_string(),
+            element: std::marker::PhantomData,
+        })
+    }
+
+    /// Attach an immutable source under a process-wide stable identity.
+    ///
+    /// A later attachment with the same identity reads entries populated by the first one. The
+    /// cache validates the source geometry and dtype before permitting that alias.
+    pub fn attach_shared<S: RegionSource<T> + 'static>(
+        cache: Arc<ChunkCache>,
+        identity: &str,
+        chunk: &[usize],
+        policy: ArrayPolicy,
+        source: S,
+    ) -> Result<Self> {
+        let shape = source.shape().to_vec();
+        let array = cache.register_shared(
+            identity,
+            &shape,
+            chunk,
+            T::DTYPE,
+            policy,
+            Arc::new(RegionSourceFetcher::<T, S>::new(source)),
+        )?;
+        Ok(Self {
+            cache,
+            array,
+            shape,
+            name: identity.to_string(),
             element: std::marker::PhantomData,
         })
     }

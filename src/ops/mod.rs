@@ -322,6 +322,7 @@ pub mod features;
 pub mod fft;
 pub mod fill;
 pub(crate) mod histogram;
+pub mod intensity_statistics;
 pub mod interest;
 pub mod label;
 pub mod lattice;
@@ -372,14 +373,14 @@ pub use cleanup::{
     append_clear_border_on_axes_phases, append_clear_border_phases, append_expand_labels_phase,
     append_fill_label_holes_2d_by_label_phase, append_filter_labels_by_size_phases,
     append_filter_labels_touching_border_on_axes_phase, append_object_distance_prune_phases,
-    append_remove_small_holes_phases, append_remove_small_objects_phases, clear_border_into,
-    clear_border_on_axes_into, expand_labels_into, fill_label_holes_2d_by_label_into,
-    filter_labels_touching_border_on_axes_into, object_distance_prune_set,
-    prune_by_object_distance_into, remove_small_holes_into, remove_small_objects_into,
-    ApplyComponentMaskOp, ApplyLabelSizeFilterOp, ApplyObjectDistancePruneOp,
-    ApplyRemoveSmallHolesOp, ExpandLabelsOp, FillLabelHoles2dByLabelOp,
+    append_remove_small_holes_phases, append_remove_small_objects_phases, append_ring_labels_phase,
+    clear_border_into, clear_border_on_axes_into, expand_labels_into,
+    fill_label_holes_2d_by_label_into, filter_labels_touching_border_on_axes_into,
+    object_distance_prune_set, prune_by_object_distance_into, remove_small_holes_into,
+    remove_small_objects_into, ring_labels_into, ApplyComponentMaskOp, ApplyLabelSizeFilterOp,
+    ApplyObjectDistancePruneOp, ApplyRemoveSmallHolesOp, ExpandLabelsOp, FillLabelHoles2dByLabelOp,
     FilterLabelsTouchingBorderOnAxesOp, LabelBackgroundRegionsOp, LabelSizeCountsOp,
-    ObjectDistanceSamplesOp,
+    ObjectDistanceSamplesOp, RingLabelsOp,
 };
 /// The only thing in `components` a *caller* chooses rather than a builder of
 /// ops uses. The rest of that module stays behind its own path, because it is
@@ -436,6 +437,9 @@ pub use fft::{
 pub use fill::{
     agree_on_connectivity, fill_phases, label_background_into_with, merge_faces_with, FillHolesOp,
     LabelBackgroundOp,
+};
+pub use intensity_statistics::{
+    IntensityStatistics, IntensityStatisticsPartial, DEFAULT_STATISTICS_FRACTION_BITS,
 };
 pub use interest::{
     append_response_peak_table_phases, difference_of_gaussians_response_into,

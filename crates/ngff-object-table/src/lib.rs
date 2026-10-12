@@ -163,6 +163,24 @@ pub struct SpatialIndexSpec {
     pub tile_order: String,
     #[serde(default = "default_row_order")]
     pub within_tile_order: String,
+    /// Which coordinate axes the occupancy pyramid halves at each level.
+    ///
+    /// Absent means every axis, which is what tables written before this field
+    /// existed have. A time-lapse table indexed by `(t, y, x)` sets
+    /// `[false, true, true]`: coarse occupancy levels then keep one entry per
+    /// frame and halve only space, so a viewer zoomed out on frame `t` sees
+    /// frame `t`'s counts and not a sum over neighbouring frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downsample: Option<Vec<bool>>,
+}
+
+impl SpatialIndexSpec {
+    /// Whether each coordinate axis is halved by the occupancy pyramid.
+    pub fn downsampled_axes(&self) -> Vec<bool> {
+        self.downsample
+            .clone()
+            .unwrap_or_else(|| vec![true; self.coordinates.len()])
+    }
 }
 
 fn default_tile_order() -> String {
@@ -184,6 +202,12 @@ pub struct TableSpec {
     pub identity: String,
     pub columns: Vec<ColumnSpec>,
     pub spatial_index: SpatialIndexSpec,
+    /// Producer- or consumer-defined metadata, by namespace, round-tripped verbatim. The format
+    /// itself never interprets it. A tracker declares a table's role here, for example
+    /// `extensions["tracking"] = {"version": 1, "role": "detections", ...}`, so a viewer can
+    /// tell detections, tracks and links apart without guessing from column names.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extensions: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl TableSpec {
@@ -204,6 +228,7 @@ impl TableSpec {
             identity: identity.into(),
             columns,
             spatial_index,
+            extensions: std::collections::BTreeMap::new(),
         }
     }
 
@@ -260,6 +285,15 @@ impl TableSpec {
                     .into(),
             ));
         }
+        if let Some(downsample) = &spatial.downsample {
+            if downsample.len() != spatial.coordinates.len() {
+                return Err(Error::Invalid(format!(
+                    "spatial downsample flags have rank {}, coordinates have rank {}",
+                    downsample.len(),
+                    spatial.coordinates.len()
+                )));
+            }
+        }
         if spatial.tile_shape.contains(&0) || spatial.grid_shape.contains(&0) {
             return Err(Error::Invalid(
                 "spatial tile and grid dimensions must be positive".into(),
@@ -288,6 +322,9 @@ impl TableSpec {
                     coordinate.column
                 )));
             }
+        }
+        for name in self.extensions.keys() {
+            validate_component(name, "extension")?;
         }
         if spatial.tile_order != "row_major"
             || spatial.within_tile_order != "lexicographic_coordinates_then_identity"
@@ -474,9 +511,12 @@ impl TableWriter {
             &spec.spatial_index.grid_shape,
             DType::U64,
         )?;
-        for (level, shape) in occupancy_shapes(&spec.spatial_index.grid_shape)
-            .into_iter()
-            .enumerate()
+        for (level, shape) in occupancy_shapes(
+            &spec.spatial_index.grid_shape,
+            &spec.spatial_index.downsampled_axes(),
+        )
+        .into_iter()
+        .enumerate()
         {
             create_grid_array(
                 &store,
@@ -550,11 +590,15 @@ impl TableWriter {
             .map_err(Error::storage)?;
         let mut previous_shape = self.spec.spatial_index.grid_shape.clone();
         let mut previous = counts.to_vec();
-        for (level, shape) in occupancy_shapes(&previous_shape).into_iter().enumerate() {
+        let downsample = self.spec.spatial_index.downsampled_axes();
+        for (level, shape) in occupancy_shapes(&previous_shape, &downsample)
+            .into_iter()
+            .enumerate()
+        {
             let values = if level == 0 {
                 previous.clone()
             } else {
-                sum_occupancy(&previous, &previous_shape, &shape)?
+                sum_occupancy(&previous, &previous_shape, &shape, &downsample)?
             };
             let array = Array::open(
                 Arc::new(FilesystemStore::new(&self.root).map_err(Error::storage)?),
@@ -814,7 +858,10 @@ impl TableReader {
     }
 
     pub fn occupancy_shapes(&self) -> Vec<Vec<u64>> {
-        occupancy_shapes(&self.spec.spatial_index.grid_shape)
+        occupancy_shapes(
+            &self.spec.spatial_index.grid_shape,
+            &self.spec.spatial_index.downsampled_axes(),
+        )
     }
 
     /// Read a region from one level of the summed occupancy pyramid.
@@ -912,25 +959,33 @@ fn write_group(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn occupancy_shapes(base: &[u64]) -> Vec<Vec<u64>> {
+fn occupancy_shapes(base: &[u64], downsample: &[bool]) -> Vec<Vec<u64>> {
     let mut levels = vec![base.to_vec()];
-    while levels
-        .last()
-        .is_some_and(|shape| shape.iter().any(|&n| n > 1))
-    {
+    while levels.last().is_some_and(|shape| {
+        shape
+            .iter()
+            .zip(downsample)
+            .any(|(&n, &halve)| halve && n > 1)
+    }) {
         levels.push(
             levels
                 .last()
                 .expect("level zero exists")
                 .iter()
-                .map(|&n| n.div_ceil(2))
+                .zip(downsample)
+                .map(|(&n, &halve)| if halve { n.div_ceil(2) } else { n })
                 .collect(),
         );
     }
     levels
 }
 
-fn sum_occupancy(previous: &[u64], old_shape: &[u64], new_shape: &[u64]) -> Result<Vec<u64>> {
+fn sum_occupancy(
+    previous: &[u64],
+    old_shape: &[u64],
+    new_shape: &[u64],
+    downsample: &[bool],
+) -> Result<Vec<u64>> {
     let old_len = element_count(old_shape)?;
     if previous.len() != old_len {
         return Err(Error::Invalid(
@@ -942,8 +997,10 @@ fn sum_occupancy(previous: &[u64], old_shape: &[u64], new_shape: &[u64]) -> Resu
     let mut coordinate = vec![0u64; old_shape.len()];
     for (linear, &value) in previous.iter().enumerate() {
         unravel(linear as u64, old_shape, &mut coordinate);
-        for value in &mut coordinate {
-            *value /= 2;
+        for (value, &halve) in coordinate.iter_mut().zip(downsample) {
+            if halve {
+                *value /= 2;
+            }
         }
         let target = ravel(&coordinate, new_shape)?;
         out[target] = out[target]

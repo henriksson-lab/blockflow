@@ -113,6 +113,71 @@ pub fn build_nearest_label_pyramid_with_blocks(
     Ok(())
 }
 
+/// Nearest-neighbour downsample one label plane into another, through the
+/// planner and executor, writing straight into `target`.
+///
+/// `input` is plane `t` of level `k - 1` and `target` plane `t` of level `k`
+/// of a [`crate::time_series::LabelStack`] — so a time-bearing label pyramid
+/// is built frame by frame with only spatial axes downsampled and no copy
+/// step. Block candidates are `[z, y, x]`, clipped to the output extent; each
+/// must be a whole number of `target`'s chunks (or cover an axis entirely),
+/// which `prepare` checks and refuses by name. `work` is private scratch for
+/// this one plane.
+pub fn downsample_label_plane(
+    input: AttachedImage,
+    target: AttachedImage,
+    work: &Path,
+    block_candidates: &[[usize; 3]],
+    workers: usize,
+) -> Result<()> {
+    let (_, input_shape) = input.metadata()?;
+    let (_, output_shape) = target.metadata()?;
+    let resample = Resample::to_extent(input_shape, output_shape, Interpolation::Nearest)?;
+    let chain = Chain::op(ResampleOp::new("label-pyramid-nearest", resample));
+    let workflow = Workflow::new(chain, input_shape, Dtype::U64);
+    let env = ZarrEnvironment::attach(work, &[input])?.with_output_target(target)?;
+    let concurrency = workers.max(1);
+    let candidates: Vec<[usize; 3]> = block_candidates
+        .iter()
+        .map(|block| {
+            let mut block = *block;
+            for axis in 0..3 {
+                block[axis] = block[axis].min(output_shape[axis]).max(1);
+            }
+            block
+        })
+        .collect();
+    let constraints = Constraints {
+        expected_concurrency: concurrency,
+        block_candidates: candidates.iter().map(|block| block[1]).collect(),
+        split_axes: if output_shape[0] == 1 {
+            vec![1, 2]
+        } else {
+            vec![0, 1, 2]
+        },
+        ..Constraints::default()
+    };
+    let decomposition = planned_resample(
+        &workflow,
+        &resample,
+        input_shape,
+        output_shape,
+        &constraints,
+        &candidates,
+    )?;
+    execute(
+        "label plane pyramid",
+        &workflow,
+        &decomposition,
+        &Hints {
+            concurrency,
+            ..Hints::default()
+        },
+        &env,
+    )?;
+    Ok(())
+}
+
 /// Rebuild the OME-Zarr label-container registry from published label images.
 ///
 /// A label image is an immediate child group with both `image-label` and

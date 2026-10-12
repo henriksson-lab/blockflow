@@ -1,0 +1,34 @@
+[package]
+name = "blockflow-plate-timelapse-tracking"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Segment, measure and track cells in multiwell-plate 2-D time-lapse OME-Zarr data with Blockflow."
+
+[features]
+default = []
+# Model segmenters. The threshold segmenter is always available and is what the
+# tests run against; these add the network backends.
+stardist = ["blockflow/stardist"]
+stardist-cuda = ["stardist", "blockflow/stardist-candle-cuda"]
+cellpose = ["blockflow/cellpose", "dep:cellpose"]
+cellpose-cuda = ["cellpose", "blockflow/cellpose-cuda"]
+
+[dependencies]
+blockflow = { path = "../..", features = ["zarr", "model-segment"] }
+cellpose = { git = "https://github.com/henriksson-lab/cellpose-rs.git", rev = "4e428d0d20da2b6ac7f12b59d8f3263d2e9c362f", optional = true }
+clap = { version = "4.5", features = ["derive"] }
+ndarray = "0.17"
+ngff-object-table = { path = "../../crates/ngff-object-table" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zarrs = "0.23.13"
+
+[lib]
+name = "plate_timelapse_tracking"
+path = "src/lib.rs"
+
+[[bin]]
+name = "plate-timelapse-tracking"
+path = "src/main.rs"

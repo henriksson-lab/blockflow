@@ -635,6 +635,7 @@ pub fn finalize_detections(
         tile_shape,
         tile_order: "row_major".into(),
         within_tile_order: "lexicographic_coordinates_then_identity".into(),
+        downsample: None,
     };
     let spec = TableSpec::new(0, 2048, "../../", "detection_id", columns, spatial_index);
     finalize_object_table(

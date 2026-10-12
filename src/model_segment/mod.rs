@@ -199,6 +199,7 @@ pub fn finalize_instances(
         grid_shape,
         tile_order: "row_major".into(),
         within_tile_order: "lexicographic_coordinates_then_identity".into(),
+        downsample: None,
     };
     let mut spec = TableSpec::new(0, 2048, "../../", "label_id", columns, spatial_index);
     spec.region = Some(format!("../../labels/{layer}"));
@@ -287,6 +288,7 @@ pub fn finalize_instances_3d(
         grid_shape,
         tile_order: "row_major".into(),
         within_tile_order: "lexicographic_coordinates_then_identity".into(),
+        downsample: None,
     };
     let mut spec = TableSpec::new(0, 2048, "../../", "label_id", columns, spatial_index);
     spec.region = Some(format!("../../labels/{layer}"));
@@ -471,6 +473,9 @@ pub struct InstanceSegment {
     /// emitting the object table. Zero is background; every non-zero voxel is
     /// the same stable id stored in the table's `id` column.
     write_labels: bool,
+    /// Added to every id this op emits, in rows and in label pixels alike. See
+    /// [`Self::with_id_offset`].
+    id_offset: u64,
 }
 
 impl InstanceSegment {
@@ -499,6 +504,7 @@ impl InstanceSegment {
             scale: 0,
             empty_below: None,
             write_labels: false,
+            id_offset: 0,
         }
     }
 
@@ -511,6 +517,31 @@ impl InstanceSegment {
     pub fn writing_labels(mut self) -> Self {
         self.write_labels = true;
         self
+    }
+
+    /// Add `offset` to every id, in the rows and in the label pixels.
+    ///
+    /// For a series of frames segmented one at a time: frame `t` of a
+    /// `[Z, Y, X]` series passes `t * Z * Y * X`, and since [`identify`] is at
+    /// most `Z * Y * X` the ids of different frames cannot collide, while each
+    /// frame's rows and labels are already in their final numbering — there is
+    /// no relabel pass afterwards. The addition is checked; an id that would
+    /// overflow `u64` is an error, not a wrapped number.
+    #[must_use]
+    pub fn with_id_offset(mut self, offset: u64) -> Self {
+        self.id_offset = offset;
+        self
+    }
+
+    fn id(&self, first: [usize; 3], volume: [usize; 3]) -> Result<u64> {
+        identify(first, volume)
+            .checked_add(self.id_offset)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "op {:?}: id offset {} overflows u64 for a voxel at {first:?}",
+                    self.name, self.id_offset
+                ))
+            })
     }
 
     /// Skip blocks whose core holds nothing above `level`. See [`Self::empty_below`].
@@ -873,7 +904,7 @@ impl FragmentOp for InstanceSegment {
                 continue;
             }
             let mut values = Vec::with_capacity(schema.width());
-            values.push(Value::U64(identify(object.first, volume)));
+            values.push(Value::U64(self.id(object.first, volume)?));
             values.push(Value::U64(object.count));
             for axis in 0..3 {
                 values.push(Value::U64(object.position[axis]));
@@ -896,7 +927,7 @@ impl FragmentOp for InstanceSegment {
                             self.backend.name()
                         ))
                     })?;
-                    out[[i, j, k]] = identify(object.first, volume);
+                    out[[i, j, k]] = self.id(object.first, volume)?;
                 }
             }
         }

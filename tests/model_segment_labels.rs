@@ -14,8 +14,9 @@ use blockflow::table::Value;
 use blockflow::{Dtype, Voxels};
 use ndarray::Array3;
 
-#[test]
-fn materialised_labels_use_the_same_stable_ids_as_the_object_rows() {
+type Counts = BTreeMap<u64, u64>;
+
+fn segment_fixture(offset: u64) -> blockflow::Result<(Counts, Counts)> {
     let volume = [1, 8, 8];
     let mut input = Array3::<u8>::zeros(volume);
     for y in 2..6 {
@@ -33,7 +34,8 @@ fn materialised_labels_use_the_same_stable_ids_as_the_object_rows() {
         Lifecycle::Persistent,
         Vec::new(),
     )
-    .writing_labels();
+    .writing_labels()
+    .with_id_offset(offset);
     let schema = segment.schema().unwrap();
     let mut builder = PlanBuilder::new(
         volume,
@@ -41,7 +43,7 @@ fn materialised_labels_use_the_same_stable_ids_as_the_object_rows() {
         BlockGrid::new(volume, [1, 4, 4]).unwrap(),
     );
     builder.fragments(segment).unwrap();
-    let assembly = builder.finish().unwrap();
+    let assembly = builder.finish()?;
     let env = ArrayEnvironment::for_decomposition(
         Voxels::from(input),
         &assembly.decomposition,
@@ -56,8 +58,7 @@ fn materialised_labels_use_the_same_stable_ids_as_the_object_rows() {
         &env,
         &[],
         &assembly.work(),
-    )
-    .unwrap();
+    )?;
 
     let rows = collect_rows(&env, "instances", 0, volume, schema).unwrap();
     let row_counts = rows
@@ -83,7 +84,28 @@ fn materialised_labels_use_the_same_stable_ids_as_the_object_rows() {
     {
         *image_counts.entry(id).or_default() += 1;
     }
+    Ok((row_counts, image_counts))
+}
 
+#[test]
+fn materialised_labels_use_the_same_stable_ids_as_the_object_rows() {
+    let (row_counts, image_counts) = segment_fixture(0).unwrap();
     assert_eq!(row_counts, image_counts);
     assert_eq!(row_counts.keys().copied().collect::<BTreeSet<_>>().len(), 2);
+}
+
+#[test]
+fn an_id_offset_moves_rows_and_labels_together() {
+    let (base, _) = segment_fixture(0).unwrap();
+    // Frame 3 of an [1, 8, 8] series.
+    let offset = 3 * 64;
+    let (rows, labels) = segment_fixture(offset).unwrap();
+    assert_eq!(rows, labels);
+    let shifted: Counts = base.iter().map(|(id, n)| (id + offset, *n)).collect();
+    assert_eq!(rows, shifted);
+}
+
+#[test]
+fn an_overflowing_id_offset_is_refused() {
+    assert!(segment_fixture(u64::MAX - 3).is_err());
 }

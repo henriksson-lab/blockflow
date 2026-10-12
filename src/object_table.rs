@@ -243,6 +243,90 @@ where
     writer.finish().map_err(native_error)
 }
 
+/// Write rows held in memory as a native object table.
+///
+/// The bounded-memory path is [`finalize_object_table`], which folds fragment
+/// streams. This is for rows that already sit in memory because they were
+/// assembled from somewhere else — for example one field of a time-lapse,
+/// gathered from per-frame artifacts, with a few million rows at most. The
+/// layout written is identical: rows in tile order, then by coordinates, then
+/// by identity; the identity index sorted by id; the spatial index and its
+/// occupancy pyramid. `spec.row_count` is set from `rows`.
+pub fn write_object_rows(
+    output_root: impl AsRef<Path>,
+    mut spec: TableSpec,
+    rows: Vec<Vec<ObjectValue>>,
+) -> Result<TableReader> {
+    spec.validate().map_err(native_error)?;
+    let coordinate_columns = spec
+        .spatial_index
+        .coordinates
+        .iter()
+        .map(|coordinate| column_index(&spec, &coordinate.column))
+        .collect::<Result<Vec<_>>>()?;
+    let identity_column = column_index(&spec, &spec.identity)?;
+    let tile_count = spec.tile_count().map_err(native_error)? as usize;
+    let mut tile_counts = vec![0u64; tile_count];
+    let mut records = Vec::with_capacity(rows.len());
+    for values in rows {
+        validate_values(&spec, &values)?;
+        let tile = tile_id(&spec, &coordinate_columns, &values)?;
+        tile_counts[tile as usize] += 1;
+        let mut key = Vec::with_capacity(coordinate_columns.len() + 2);
+        key.push(tile);
+        for &column in &coordinate_columns {
+            key.push(values[column].order_key()?);
+        }
+        key.push(values[identity_column].identity()?);
+        records.push(Record {
+            key,
+            values: values.into_iter().map(ObjectValue::bits).collect(),
+        });
+    }
+    records.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+    spec.row_count = records.len() as u64;
+    let writer = TableWriter::create(output_root.as_ref(), spec.clone()).map_err(native_error)?;
+    let chunk = spec.row_chunk as usize;
+    for (index, block) in records.chunks(chunk).enumerate() {
+        let start = (index * chunk) as u64;
+        for (column_number, column) in spec.columns.iter().enumerate() {
+            let words: Vec<u64> = block.iter().map(|r| r.values[column_number]).collect();
+            write_column(&writer, &column.name, column.dtype, start, &words)?;
+        }
+    }
+    let mut identities: Vec<(u64, u64)> = records
+        .iter()
+        .enumerate()
+        .map(|(row, record)| (record.values[identity_column], row as u64))
+        .collect();
+    identities.sort_unstable();
+    for pair in identities.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(Error::invalid(format!(
+                "object-table identity {} occurs more than once",
+                pair[0].0
+            )));
+        }
+    }
+    for (index, block) in identities.chunks(chunk).enumerate() {
+        let ids: Vec<u64> = block.iter().map(|&(id, _)| id).collect();
+        let positions: Vec<u64> = block.iter().map(|&(_, row)| row).collect();
+        writer
+            .write_identity_index((index * chunk) as u64, &ids, &positions)
+            .map_err(native_error)?;
+    }
+    let mut starts = vec![0u64; tile_counts.len()];
+    let mut next = 0u64;
+    for (start, count) in starts.iter_mut().zip(&tile_counts) {
+        *start = next;
+        next += *count;
+    }
+    writer
+        .write_spatial_index(&starts, &tile_counts)
+        .map_err(native_error)?;
+    writer.finish().map_err(native_error)
+}
+
 fn column_index(spec: &TableSpec, name: &str) -> Result<usize> {
     spec.columns
         .iter()
@@ -646,6 +730,7 @@ mod tests {
             grid_shape: vec![2, 2],
             tile_order: "row_major".into(),
             within_tile_order: "lexicographic_coordinates_then_identity".into(),
+            downsample: None,
         };
         let spec = TableSpec::new(0, 2, "../../", "id", columns, spatial_index);
         let scratch = TemporaryDirectory::create(&std::env::temp_dir()).unwrap();
@@ -681,5 +766,56 @@ mod tests {
             (vec![0, 2, 3, 4], vec![2, 1, 1, 0])
         );
         assert_eq!(reader.read_occupancy(1, &[0, 0], &[1, 1]).unwrap(), [4]);
+    }
+
+    #[test]
+    fn in_memory_rows_are_written_in_tile_coordinate_identity_order() {
+        let coordinate = |axis: &str| CoordinateColumn {
+            axis: axis.into(),
+            column: axis.into(),
+        };
+        let columns = vec![
+            ColumnSpec::new("id", DType::U64, ColumnRole::Identity),
+            ColumnSpec::new("t", DType::F64, ColumnRole::Coordinate),
+            ColumnSpec::new("y", DType::F64, ColumnRole::Coordinate),
+            ColumnSpec::new("x", DType::F64, ColumnRole::Coordinate),
+        ];
+        let spatial_index = SpatialIndexSpec {
+            coordinates: vec![coordinate("t"), coordinate("y"), coordinate("x")],
+            tile_shape: vec![1, 4, 4],
+            grid_shape: vec![2, 2, 2],
+            tile_order: "row_major".into(),
+            within_tile_order: "lexicographic_coordinates_then_identity".into(),
+            downsample: Some(vec![false, true, true]),
+        };
+        let spec = TableSpec::new(0, 2, "../../", "id", columns, spatial_index);
+        let row = |id, t, y, x| {
+            vec![
+                ObjectValue::U64(id),
+                ObjectValue::F64(t),
+                ObjectValue::F64(y),
+                ObjectValue::F64(x),
+            ]
+        };
+        let rows = vec![
+            row(70, 1.0, 1.0, 1.0),
+            row(5, 0.0, 6.0, 6.0),
+            row(9, 0.0, 1.0, 2.0),
+            row(8, 0.0, 1.0, 1.0),
+        ];
+        let scratch = TemporaryDirectory::create(&std::env::temp_dir()).unwrap();
+        let reader = write_object_rows(scratch.path.join("table"), spec.clone(), rows).unwrap();
+        assert_eq!(reader.read_u64("id", 0..4).unwrap(), [8, 9, 5, 70]);
+        assert_eq!(
+            reader.read_identity_index(0..4).unwrap(),
+            (vec![5, 8, 9, 70], vec![2, 0, 1, 3])
+        );
+        assert_eq!(reader.occupancy_shapes(), [vec![2, 2, 2], vec![2, 1, 1]]);
+        assert_eq!(
+            reader.read_occupancy(1, &[0, 0, 0], &[2, 1, 1]).unwrap(),
+            [3, 1]
+        );
+        let duplicate = vec![row(1, 0.0, 0.0, 0.0), row(1, 1.0, 0.0, 0.0)];
+        assert!(write_object_rows(scratch.path.join("dup"), spec, duplicate).is_err());
     }
 }

@@ -134,13 +134,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use ndarray::{Array3, ArrayD, IxDyn};
 
 use zarrs::array::codec::api::BytesToBytesCodecTraits;
-use zarrs::array::codec::{GzipCodec, ZstdCodec};
+use zarrs::array::codec::{BloscCodec, GzipCodec, ZstdCodec};
 use zarrs::array::data_type;
 use zarrs::array::{
     Array as ZarrArray, ArrayBuilder, ArraySubset, DataType, Element, ElementOwned, FillValue,
@@ -248,11 +248,11 @@ fn unwritten_fill(dtype: Dtype) -> Result<FillValue> {
 /// `zarrs` can build most of them; what this environment exposes is the subset
 /// that is a **core** Zarr codec (so a reader in another language is not being
 /// asked to implement an extension), **lossless** (so the byte-identity claim
-/// survives), and already paid for in this crate's dependency graph. `gzip` is
-/// the original one because `zarrs`'s `gzip` feature is `dep:flate2` and
-/// `flate2` is already here for `cache::DeflateCodec`. Zstd is also supported
-/// because it is common in Bio-Formats OME-Zarr 0.5 input. Blosc and bz2 remain
-/// outside this deliberately small surface.
+/// survives). `gzip` is the original one because `flate2` is already here for
+/// `cache::DeflateCodec`. Zstd and Blosc are supported because they are what
+/// real OME-Zarr 0.5 input is written with (Bio-Formats, bf2zarr, zarrs,
+/// ome-zarr-py), usually inside a `sharding_indexed` shard — see
+/// [`crate::zarr_layout::StorageLayout`] for the shard half of that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Compression {
     /// The `bytes` codec alone: elements in native byte order, verbatim.
@@ -266,6 +266,88 @@ pub enum Compression {
     /// The Zarr v3 `zstd` codec. The level and frame-checksum flag are retained
     /// when describing an attached array.
     Zstd(i32, bool),
+    /// The Zarr v3 `blosc` codec. `typesize` is not a field: it is the element
+    /// size, supplied when the codec is built for a concrete element type.
+    Blosc {
+        cname: BloscCname,
+        clevel: u8,
+        shuffle: BloscShuffle,
+    },
+}
+
+/// The inner compressor of a [`Compression::Blosc`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BloscCname {
+    BloscLz,
+    Lz4,
+    Lz4hc,
+    Snappy,
+    Zlib,
+    Zstd,
+}
+
+impl BloscCname {
+    /// The name the Zarr v3 `blosc` configuration uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BloscLz => "blosclz",
+            Self::Lz4 => "lz4",
+            Self::Lz4hc => "lz4hc",
+            Self::Snappy => "snappy",
+            Self::Zlib => "zlib",
+            Self::Zstd => "zstd",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "blosclz" => Self::BloscLz,
+            "lz4" => Self::Lz4,
+            "lz4hc" => Self::Lz4hc,
+            "snappy" => Self::Snappy,
+            "zlib" => Self::Zlib,
+            "zstd" => Self::Zstd,
+            _ => return None,
+        })
+    }
+}
+
+/// The shuffle filter of a [`Compression::Blosc`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BloscShuffle {
+    None,
+    Byte,
+    Bit,
+}
+
+impl BloscShuffle {
+    /// The name the Zarr v3 `blosc` configuration uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "noshuffle",
+            Self::Byte => "shuffle",
+            Self::Bit => "bitshuffle",
+        }
+    }
+
+    /// Accepts the v3 names and the numcodecs integers (`0`, `1`, `2`).
+    pub fn parse(value: &serde_json::Value) -> Option<Self> {
+        match value {
+            serde_json::Value::String(name) => match name.as_str() {
+                "noshuffle" => Some(Self::None),
+                "shuffle" => Some(Self::Byte),
+                "bitshuffle" => Some(Self::Bit),
+                _ => None,
+            },
+            serde_json::Value::Number(number) => match number.as_i64()? {
+                0 => Some(Self::None),
+                1 => Some(Self::Byte),
+                2 => Some(Self::Bit),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 impl Compression {
@@ -370,7 +452,7 @@ impl Compression {
     /// environment wrote before compression existed — so an array built with
     /// `None` is byte-for-byte the array the previous version built, metadata
     /// included.
-    fn bytes_to_bytes(self) -> Result<Vec<Arc<dyn BytesToBytesCodecTraits>>> {
+    fn bytes_to_bytes(self, dtype: Dtype) -> Result<Vec<Arc<dyn BytesToBytesCodecTraits>>> {
         Ok(match self {
             Self::None => Vec::new(),
             Self::Gzip(level) => {
@@ -378,6 +460,46 @@ impl Compression {
                 vec![Arc::new(codec)]
             }
             Self::Zstd(level, checksum) => vec![Arc::new(ZstdCodec::new(level, checksum))],
+            Self::Blosc { .. } => {
+                let configuration = self
+                    .codec_json(dtype)
+                    .and_then(|codec| codec.get("configuration").cloned())
+                    .expect("blosc always has a configuration");
+                let configuration =
+                    serde_json::from_value(configuration).map_err(Error::backend)?;
+                let codec =
+                    BloscCodec::new_with_configuration(&configuration).map_err(Error::backend)?;
+                vec![Arc::new(codec)]
+            }
+        })
+    }
+
+    /// The Zarr v3 metadata entry for this codec, or `None` for
+    /// [`Compression::None`] (which is the `bytes` codec alone).
+    pub fn codec_json(self, dtype: Dtype) -> Option<serde_json::Value> {
+        Some(match self {
+            Self::None => return None,
+            Self::Gzip(level) => {
+                serde_json::json!({"name": "gzip", "configuration": {"level": level.min(9)}})
+            }
+            Self::Zstd(level, checksum) => serde_json::json!({
+                "name": "zstd",
+                "configuration": {"level": level, "checksum": checksum}
+            }),
+            Self::Blosc {
+                cname,
+                clevel,
+                shuffle,
+            } => serde_json::json!({
+                "name": "blosc",
+                "configuration": {
+                    "cname": cname.as_str(),
+                    "clevel": clevel.min(9),
+                    "shuffle": shuffle.as_str(),
+                    "typesize": dtype.size_of(),
+                    "blocksize": 0
+                }
+            }),
         })
     }
 
@@ -387,6 +509,16 @@ impl Compression {
             Self::None => "bytes".to_string(),
             Self::Gzip(level) => format!("gzip{}", level.min(9)),
             Self::Zstd(level, checksum) => format!("zstd{level}-checksum{checksum}"),
+            Self::Blosc {
+                cname,
+                clevel,
+                shuffle,
+            } => format!(
+                "blosc-{}{}-{}",
+                cname.as_str(),
+                clevel.min(9),
+                shuffle.as_str()
+            ),
         }
     }
 }
@@ -609,6 +741,9 @@ struct StoredArray {
     /// A stable id for the lock stripes. Distinct per array, and stable for the
     /// life of the environment.
     id: u64,
+    /// Canonical identity of an attached immutable array. Created intermediates have no shared
+    /// identity because another environment cannot assume that their bytes are identical.
+    cache_identity: Option<String>,
     dtype: Dtype,
     /// **The image's** shape, which is the array's only when the image is the
     /// whole array. See [`Window`].
@@ -617,8 +752,10 @@ struct StoredArray {
     /// this environment creates, because it creates them at the image's shape.
     offset: [usize; 3],
     /// Source-array axes which become the image's `[z, y, x]` axes. Created
-    /// arrays and ordinary rank-three attachments use `[0, 1, 2]`.
-    axes: [usize; 3],
+    /// arrays and ordinary rank-three attachments use `[0, 1, 2]`. `None` is a
+    /// virtual singleton: an image axis of extent one with no source axis, the
+    /// `z` of a `(t, c, y, x)` array.
+    axes: [Option<usize>; 3],
     /// Source-array indices held fixed while exposing a rank-three image.
     /// `None` entries are the three axes above.
     fixed: Vec<Option<usize>>,
@@ -731,7 +868,7 @@ impl StoredArray {
         // Left unset for `Compression::None`, rather than set to an empty list:
         // an array built with `None` must be the array this environment built
         // before compression existed, metadata document included.
-        let codecs = compression.bytes_to_bytes()?;
+        let codecs = compression.bytes_to_bytes(dtype)?;
         if !codecs.is_empty() {
             builder.bytes_to_bytes_codecs(codecs);
         }
@@ -740,10 +877,11 @@ impl StoredArray {
         Ok(Self {
             array,
             id,
+            cache_identity: None,
             dtype,
             shape: shape.to_vec(),
             offset: [0, 0, 0],
-            axes: [0, 1, 2],
+            axes: [Some(0), Some(1), Some(2)],
             fixed: vec![None; 3],
             chunk: chunk.iter().map(|&value| value.max(1)).collect(),
             compression,
@@ -762,12 +900,13 @@ impl StoredArray {
         id: u64,
         window: Option<Window>,
         selection: Option<VolumeSelection>,
+        cache_identity: Option<String>,
     ) -> Result<Self> {
         let array = ZarrArray::open(store.clone(), path).map_err(Error::backend)?;
         let array_shape: Vec<usize> = array.shape().iter().map(|&value| value as usize).collect();
         let (axes, fixed) = match selection {
             Some(selection) => selection.resolve(path, &array_shape)?,
-            None if array_shape.len() == 3 => ([0, 1, 2], vec![None; 3]),
+            None if array_shape.len() == 3 => ([Some(0), Some(1), Some(2)], vec![None; 3]),
             None => {
                 return Err(Error::InvalidArgument(format!(
                     "attached array {path} has rank {}; select its `[z, y, x]` axes and fix every other axis with `AttachedImage::volume`",
@@ -777,16 +916,20 @@ impl StoredArray {
         };
 
         let dtype = dtype_from_zarr(array.data_type(), path)?;
-        let source_chunk: Vec<usize> = array
-            .chunk_shape(&vec![0; array_shape.len()])
-            .map_err(Error::backend)?
+        // **The read lattice, which for a sharded array is the inner chunk.**
+        // The cache and the alignment counters are keyed by this shape, and a
+        // shard (often hundreds of MB) is the wrong unit for either: `zarrs`
+        // decodes a region of a shard by its inner chunks. An attached array is
+        // never written by this environment, so the write lock granularity —
+        // which would be the shard — never applies to it.
+        let source_chunk: Vec<usize> = crate::zarr_layout::read_chunk_shape(&array)?;
+        let chunk = axes
             .iter()
-            .map(|value| value.get() as usize)
+            .map(|&axis| axis.map_or(1, |axis| source_chunk[axis]))
             .collect();
-        let chunk = axes.iter().map(|&axis| source_chunk[axis]).collect();
         let compression = compression_of(&array, path)?;
 
-        let view_shape = axes.map(|axis| array_shape[axis]);
+        let view_shape = axes.map(|axis| axis.map_or(1, |axis| array_shape[axis]));
         let (offset, shape) = match window {
             None => ([0, 0, 0], view_shape.to_vec()),
             Some(window) => {
@@ -811,6 +954,7 @@ impl StoredArray {
         Ok(Self {
             array,
             id,
+            cache_identity,
             dtype,
             shape,
             offset,
@@ -848,9 +992,21 @@ impl StoredArray {
             }
         }
         for image_axis in 0..3 {
-            let source_axis = self.axes[image_axis];
-            start[source_axis] = region.start[image_axis] as u64;
-            shape[source_axis] = region.shape[image_axis] as u64;
+            match self.axes[image_axis] {
+                Some(source_axis) => {
+                    start[source_axis] = region.start[image_axis] as u64;
+                    shape[source_axis] = region.shape[image_axis] as u64;
+                }
+                // A virtual singleton has one index and no source axis; any
+                // region inside the image has start 0 and extent 1 on it.
+                None if region.start[image_axis] == 0 && region.shape[image_axis] <= 1 => {}
+                None => {
+                    return Err(Error::InvalidArgument(format!(
+                        "region {:?}+{:?} leaves the virtual singleton axis {image_axis}",
+                        region.start, region.shape
+                    )))
+                }
+            }
         }
         ArraySubset::new_with_start_shape(start, shape).map_err(Error::backend)
     }
@@ -935,17 +1091,15 @@ fn dtype_from_zarr(data_type: &DataType, path: &str) -> Result<Dtype> {
 
 /// What an existing array is compressed with, in this environment's terms.
 ///
-/// The refusal is the point. This crate builds `zarrs` with
-/// `default-features = false` and exactly `filesystem`, `gzip`, and `zstd`, so an array
-/// compressed with anything else is not merely undescribable here — **it cannot
-/// be decoded**, and the first symptom would otherwise be a decode error on
-/// some block, half way through a run, naming a codec rather than a file. Said
-/// here, it is one message at attach time naming the array and what to write
-/// instead.
+/// Read off the metadata document rather than the built codec chain: the
+/// chain's contents are private, the document is `serde`, and the document is
+/// what a person looking at the file sees. A `sharding_indexed` array is
+/// described by the codecs **inside** its shards; `transpose`, `crc32c` and the
+/// `bytes` codec are layout and integrity, not compression.
+///
+/// The refusal stays the point: a codec outside the list is refused here, by
+/// name, at attach time, rather than as a decode error half way through a run.
 fn compression_of(array: &Stored, path: &str) -> Result<Compression> {
-    // Read off the metadata document rather than the built codec chain: the
-    // chain's contents are private, the document is `serde` and `serde_json` is
-    // already here, and the document is what a person looking at the file sees.
     let metadata = serde_json::to_value(array.metadata())
         .map_err(|error| Error::backend(format!("{path}: {error}")))?;
     let codecs = metadata
@@ -954,45 +1108,83 @@ fn compression_of(array: &Stored, path: &str) -> Result<Compression> {
         .ok_or_else(|| {
             Error::InvalidArgument(format!("attached array {path} declares no codec chain"))
         })?;
+    compression_of_codecs(codecs, path)
+}
 
+/// [`compression_of`] over a Zarr v3 `codecs` list, recursing into
+/// `sharding_indexed`.
+pub(crate) fn compression_of_codecs(
+    codecs: &[serde_json::Value],
+    path: &str,
+) -> Result<Compression> {
     let mut found = Compression::None;
     for codec in codecs {
         let name = codec
             .as_str()
             .or_else(|| codec.get("name").and_then(serde_json::Value::as_str))
             .unwrap_or("");
+        let configuration = codec.get("configuration");
+        let field = |key: &str| configuration.and_then(|configuration| configuration.get(key));
         match name {
-            // The array-to-bytes codec every array here uses, and the identity
-            // as far as compression goes.
-            "bytes" => {}
+            "bytes" | "transpose" | "crc32c" => {}
             "gzip" => {
-                let level = codec
-                    .get("configuration")
-                    .and_then(|configuration| configuration.get("level"))
+                let level = field("level")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(1) as u32;
                 found = Compression::Gzip(level);
             }
             "zstd" => {
-                let configuration = codec.get("configuration");
-                let level = configuration
-                    .and_then(|configuration| configuration.get("level"))
+                let level = field("level")
                     .and_then(serde_json::Value::as_i64)
                     .and_then(|level| i32::try_from(level).ok())
                     .unwrap_or(0);
-                let checksum = configuration
-                    .and_then(|configuration| configuration.get("checksum"))
+                let checksum = field("checksum")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 found = Compression::Zstd(level, checksum);
             }
+            "blosc" => {
+                let cname = field("cname")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("blosclz");
+                let cname = BloscCname::parse(cname).ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "attached array {path} uses blosc with unknown compressor `{cname}`"
+                    ))
+                })?;
+                let clevel = field("clevel")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(5)
+                    .min(9) as u8;
+                let shuffle = match field("shuffle") {
+                    None => BloscShuffle::None,
+                    Some(value) => BloscShuffle::parse(value).ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "attached array {path} uses blosc with unknown shuffle {value}"
+                        ))
+                    })?,
+                };
+                found = Compression::Blosc {
+                    cname,
+                    clevel,
+                    shuffle,
+                };
+            }
+            "sharding_indexed" => {
+                let inner = field("codecs")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "attached array {path} is sharded but declares no inner codecs"
+                        ))
+                    })?;
+                found = compression_of_codecs(inner, path)?;
+            }
             other => {
                 return Err(Error::InvalidArgument(format!(
-                    "attached array {path} uses the `{other}` codec ({codec}), which this crate cannot \
-                     decode: `zarrs` is built here with `default-features = false` and only \
-                     `filesystem`, `gzip`, and `zstd`, for the reasons `Cargo.toml` gives — so \
-                     `blosc`, `sharding_indexed` and `transpose` are absent. Write the array \
-                     with `gzip`, `zstd`, or no compressor."
+                    "attached array {path} uses the `{other}` codec ({codec}), which this crate \
+                     does not describe. Supported: `bytes`, `transpose`, `crc32c`, `gzip`, \
+                     `zstd`, `blosc`, and `sharding_indexed` around any of them."
                 )))
             }
         }
@@ -1034,32 +1226,68 @@ pub struct Window {
 /// The spatial axes must occur in increasing source order. This is the order
 /// used by OME-Zarr and lets a decoded C-order subset be exposed without a
 /// transpose or another full-volume allocation.
+///
+/// An image axis may also be a [`SpatialAxis::Singleton`]: extent one, no
+/// source axis. That is how a `(t, c, y, x)` array — 2-D, no `z` — is exposed
+/// as `[1, Y, X]`, rather than by naming some other source axis as `z` and
+/// hoping its length is one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeSelection {
-    pub spatial_axes: [usize; 3],
+    pub axes: [SpatialAxis; 3],
     pub fixed: Vec<(usize, usize)>,
+}
+
+/// Where one image axis comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SpatialAxis {
+    /// This source-array axis.
+    Source(usize),
+    /// No source axis; the image has extent one here.
+    Singleton,
 }
 
 impl VolumeSelection {
     pub fn new(spatial_axes: [usize; 3], fixed: Vec<(usize, usize)>) -> Self {
         Self {
-            spatial_axes,
+            axes: spatial_axes.map(SpatialAxis::Source),
             fixed,
         }
     }
 
-    fn resolve(&self, path: &str, shape: &[usize]) -> Result<([usize; 3], Vec<Option<usize>>)> {
-        let [z, y, x] = self.spatial_axes;
-        if !(z < y && y < x) || x >= shape.len() {
+    /// A selection whose image axes may include virtual singletons.
+    pub fn with_axes(axes: [SpatialAxis; 3], fixed: Vec<(usize, usize)>) -> Self {
+        Self { axes, fixed }
+    }
+
+    fn sources(&self) -> Vec<usize> {
+        self.axes
+            .iter()
+            .filter_map(|axis| match axis {
+                SpatialAxis::Source(axis) => Some(*axis),
+                SpatialAxis::Singleton => None,
+            })
+            .collect()
+    }
+
+    fn resolve(
+        &self,
+        path: &str,
+        shape: &[usize],
+    ) -> Result<([Option<usize>; 3], Vec<Option<usize>>)> {
+        let sources = self.sources();
+        if sources.is_empty()
+            || sources.windows(2).any(|pair| pair[0] >= pair[1])
+            || sources.iter().any(|&axis| axis >= shape.len())
+        {
             return Err(Error::InvalidArgument(format!(
-                "volume selection for {path} has spatial axes {:?}; they must be three distinct, increasing axes within rank {}",
-                self.spatial_axes,
+                "volume selection for {path} has spatial axes {:?}; the source axes must be distinct, increasing and within rank {}",
+                self.axes,
                 shape.len()
             )));
         }
         let mut selected = vec![None; shape.len()];
         for &(axis, index) in &self.fixed {
-            if axis >= shape.len() || self.spatial_axes.contains(&axis) {
+            if axis >= shape.len() || sources.contains(&axis) {
                 return Err(Error::InvalidArgument(format!(
                     "volume selection for {path} fixes axis {axis}, but it is absent or spatial"
                 )));
@@ -1071,13 +1299,17 @@ impl VolumeSelection {
             }
         }
         for axis in 0..shape.len() {
-            if !self.spatial_axes.contains(&axis) && selected[axis].is_none() {
+            if !sources.contains(&axis) && selected[axis].is_none() {
                 return Err(Error::InvalidArgument(format!(
                     "volume selection for {path} does not fix non-spatial axis {axis} of shape {shape:?}"
                 )));
             }
         }
-        Ok((self.spatial_axes, selected))
+        let axes = self.axes.map(|axis| match axis {
+            SpatialAxis::Source(axis) => Some(axis),
+            SpatialAxis::Singleton => None,
+        });
+        Ok((axes, selected))
     }
 }
 
@@ -1123,6 +1355,14 @@ impl AttachedImage {
         self
     }
 
+    /// [`Self::volume`] with image axes that may be virtual singletons. A
+    /// `(t, c, y, x)` array at channel 1, time 4 is
+    /// `selected([Singleton, Source(2), Source(3)], vec![(0, 4), (1, 1)])`.
+    pub fn selected(mut self, axes: [SpatialAxis; 3], fixed: Vec<(usize, usize)>) -> Self {
+        self.selection = Some(VolumeSelection::with_axes(axes, fixed));
+        self
+    }
+
     /// One index of axis 0 — the channel, for an OME-Zarr `[c, y, x]` level —
     /// and the whole of the other two.
     ///
@@ -1143,8 +1383,22 @@ impl AttachedImage {
     }
 
     fn open(&self, id: u64) -> Result<StoredArray> {
-        let store = Arc::new(FilesystemStore::new(&self.dir).map_err(Error::backend)?);
-        StoredArray::open(&store, "/", id, self.window, self.selection.clone())
+        let canonical = self.dir.canonicalize().map_err(Error::backend)?;
+        let identity = format!(
+            "zarr:{}:window={:?}:selection={:?}",
+            canonical.display(),
+            self.window,
+            self.selection
+        );
+        let store = Arc::new(FilesystemStore::new(&canonical).map_err(Error::backend)?);
+        StoredArray::open(
+            &store,
+            "/",
+            id,
+            self.window,
+            self.selection.clone(),
+            Some(identity),
+        )
     }
 }
 
@@ -1290,6 +1544,12 @@ pub struct ZarrEnvironment {
     /// has to be a whole multiple of it, and a plan where it is not is refused by
     /// `prepare` rather than quietly given straddling writes.
     output_chunk: Option<[usize; 3]>,
+    /// An existing array — or one selected plane of one — that the published
+    /// output is written into instead of an array this environment creates.
+    /// See [`Self::with_output_target`].
+    output_target: Option<AttachedImage>,
+    /// The image `prepare` bound to `output_target`; `usize::MAX` for none.
+    targeted: AtomicUsize,
     /// Image `l` at index `l`. Image 0 exists from construction; `prepare` adds
     /// the rest, because only the plan knows their shapes and element types.
     images: RwLock<Vec<Arc<StoredArray>>>,
@@ -1494,6 +1754,21 @@ impl ZarrEnvironment {
         self
     }
 
+    /// Use a cache owned by the surrounding process.
+    ///
+    /// Attached arrays use canonical storage identities, so independently opened viewer and job
+    /// environments hit the same entries. Intermediates remain environment-local registrations
+    /// and are invalidated on writes as before.
+    pub fn with_shared_cache(mut self, cache: Arc<ChunkCache>) -> Self {
+        self.cache = Some(cache);
+        self.prefetcher = None;
+        self.cached
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self
+    }
+
     /// Read through a chunk cache of at most `capacity_bytes`.
     ///
     /// Every image is cached, intermediates included; see
@@ -1666,33 +1941,41 @@ impl ZarrEnvironment {
             }
         }
         let cache = self.cache.as_ref()?;
-        let source = CachingSource::<T>::attach(
-            Arc::clone(cache),
-            &format!("image-{image}"),
+        let chunk =
             // **The array's own chunk shape, and it has to be.** A cache whose
             // lattice differs from the store's decodes units the store does not
             // hold, so every entry would be a partial chunk assembled from
             // several — which is the shape `cache.rs` refuses by name. The value
             // exists here because `StoredArray` keeps it.
-            &array.chunk,
-            // `Tier::Decoded`, `retain: true` — the default, and stated rather
-            // than taken.
-            //
-            // **Decoded is right for the read this serves.** A halo re-read
-            // wants the neighbour's chunks back without paying the codec again,
-            // and this cache only ever holds the source, which is read many
-            // times over.
-            //
-            // The alternative is real and is not chosen: `Tier::Encoded` holds
-            // roughly **19.7x** more chunks in the same bytes on a compressed
-            // `bool` volume, per `cache.rs`'s own figure, at a decode per hit.
-            // That trade is worth making where the volume is far larger than
-            // the budget and the codec is cheap, and it is a per-array decision
-            // — which is exactly why `ArrayPolicy` is a parameter. Choosing it
-            // per image needs a measurement this file does not have.
-            ArrayPolicy::default(),
-            StoredArraySource::<T>::new(Arc::clone(array)),
-        )
+            &array.chunk;
+        // `Tier::Decoded`, `retain: true` — the default, and stated rather
+        // than taken.
+        //
+        // **Decoded is right for the read this serves.** A halo re-read
+        // wants the neighbour's chunks back without paying the codec again,
+        // and this cache only ever holds the source, which is read many
+        // times over.
+        //
+        // The alternative is real and is not chosen: `Tier::Encoded` holds
+        // roughly **19.7x** more chunks in the same bytes on a compressed
+        // `bool` volume, per `cache.rs`'s own figure, at a decode per hit.
+        // That trade is worth making where the volume is far larger than
+        // the budget and the codec is cheap, and it is a per-array decision
+        // — which is exactly why `ArrayPolicy` is a parameter. Choosing it
+        // per image needs a measurement this file does not have.
+        let policy = ArrayPolicy::default();
+        let backend = StoredArraySource::<T>::new(Arc::clone(array));
+        let source = if let Some(identity) = array.cache_identity.as_deref() {
+            CachingSource::<T>::attach_shared(Arc::clone(cache), identity, chunk, policy, backend)
+        } else {
+            CachingSource::<T>::attach(
+                Arc::clone(cache),
+                &format!("environment-{}-image-{image}", self.root.display()),
+                chunk,
+                policy,
+                backend,
+            )
+        }
         .ok()?;
         let source = Arc::new(source);
         let mut registered = self
@@ -1751,6 +2034,8 @@ impl ZarrEnvironment {
             volume,
             input_chunk: chunk,
             output_chunk: None,
+            output_target: None,
+            targeted: AtomicUsize::new(usize::MAX),
             images: RwLock::new(vec![Arc::new(image0)]),
             supplied: RwLock::new(Vec::new()),
             side: RwLock::new(BTreeMap::new()),
@@ -1845,6 +2130,8 @@ impl ZarrEnvironment {
             volume,
             input_chunk,
             output_chunk: None,
+            output_target: None,
+            targeted: AtomicUsize::new(usize::MAX),
             images: RwLock::new(vec![Arc::new(image0)]),
             supplied: RwLock::new(supplied),
             side: RwLock::new(BTreeMap::new()),
@@ -1946,6 +2233,66 @@ impl ZarrEnvironment {
         self
     }
 
+    /// Write the published output into `target` — an array that already
+    /// exists, typically one plane of a higher-rank staging array selected with
+    /// [`AttachedImage::selected`] — instead of an array of this environment's
+    /// own.
+    ///
+    /// This is how one frame of a time series writes its labels straight into
+    /// plane `t` of a `[t, y, x]` array: the result is produced once, where it
+    /// will be published, with no copy afterwards. The target is **owned by
+    /// the run**, not an attached input made writable: it must be distinct
+    /// from every input, and the caller is responsible for no other run
+    /// writing the same chunks at the same time — for a time series, a stored
+    /// time chunk of one makes every plane its own set of chunks.
+    ///
+    /// The target's selected chunk shape becomes the dictated output layout,
+    /// exactly as [`Self::with_output_chunk`], so a plan whose last-phase
+    /// blocks would share a chunk is refused by `prepare`. Sharded targets are
+    /// refused: their write unit is the shard, which this environment's chunk
+    /// locks do not model. `prepare` also checks the element type and extent.
+    pub fn with_output_target(mut self, target: AttachedImage) -> Result<Self> {
+        let array = target.open(u64::MAX)?;
+        let metadata = serde_json::to_value(array.array.metadata()).map_err(Error::backend)?;
+        let sharded = metadata
+            .get("codecs")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|codecs| {
+                codecs.iter().any(|codec| {
+                    codec.get("name").and_then(serde_json::Value::as_str)
+                        == Some("sharding_indexed")
+                })
+            });
+        if sharded {
+            return Err(Error::InvalidArgument(format!(
+                "output target {} is sharded; write into an unsharded staging array and reshard \
+                 when publishing",
+                target.dir.display()
+            )));
+        }
+        let canonical = target.dir.canonicalize().map_err(Error::backend)?;
+        for input in self
+            .supplied
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .chain(self.images_guard().iter().take(1))
+        {
+            if input.cache_identity.as_deref().is_some_and(|identity| {
+                identity.starts_with(&format!("zarr:{}:", canonical.display()))
+            }) {
+                return Err(Error::InvalidArgument(format!(
+                    "output target {} is also an input of this run",
+                    canonical.display()
+                )));
+            }
+        }
+        let chunk = [array.chunk[0], array.chunk[1], array.chunk[2]];
+        self.output_chunk = Some(chunk);
+        self.output_target = Some(target);
+        Ok(self)
+    }
+
     /// The chunk shape this environment will give each image of `decomposition`,
     /// indexed by image.
     ///
@@ -2001,6 +2348,25 @@ impl ZarrEnvironment {
     /// planner's alignment advice exists to avoid.
     pub fn unaligned_reads(&self) -> u64 {
         self.unaligned_reads.load(Ordering::SeqCst)
+    }
+
+    /// The one output image an output target binds, if a target was given.
+    fn targeted_image(&self, decomposition: &Decomposition) -> Result<Option<usize>> {
+        if self.output_target.is_none() {
+            return Ok(None);
+        }
+        let outputs: Vec<usize> = (1..decomposition.n_images())
+            .filter(|&image| {
+                decomposition.image_kind(image) == crate::decomposition::ImageKind::Output
+            })
+            .collect();
+        match outputs.as_slice() {
+            [image] => Ok(Some(*image)),
+            _ => Err(Error::InvalidArgument(format!(
+                "an output target binds exactly one output image; this plan has {}",
+                outputs.len()
+            ))),
+        }
     }
 
     fn images_guard(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<StoredArray>>> {
@@ -2604,6 +2970,9 @@ impl Environment for ZarrEnvironment {
 
         let mut images = Vec::with_capacity(decomposition.n_images());
         images.push(self.image_array(0)?);
+        let targeted = self.targeted_image(decomposition)?;
+        self.targeted
+            .store(targeted.unwrap_or(usize::MAX), Ordering::SeqCst);
         for image in 1..decomposition.n_images() {
             // The plan's own element type for this image, asked twice: once for
             // what to store and once for how. Deriving the codec here rather
@@ -2611,6 +2980,28 @@ impl Environment for ZarrEnvironment {
             // — image 0 is the only one whose type this environment knew before
             // it saw a plan.
             let dtype = decomposition.dtype_at(image);
+            if Some(image) == targeted {
+                let target = self
+                    .output_target
+                    .as_ref()
+                    .expect("targeted implies a target");
+                let mut array = target.open(image as u64)?;
+                // Written by this run, so never shared with another
+                // environment's cache under the input's identity.
+                array.cache_identity = None;
+                let shape = block_shape(&Region::whole(&array.shape))?;
+                if shape != decomposition.volume_at(image) || array.dtype != dtype {
+                    return Err(Error::InvalidArgument(format!(
+                        "output target {} is {} {shape:?}; the plan's output is {} {:?}",
+                        target.dir.display(),
+                        array.dtype.numpy_name(),
+                        dtype.numpy_name(),
+                        decomposition.volume_at(image)
+                    )));
+                }
+                images.push(Arc::new(array));
+                continue;
+            }
             images.push(Arc::new(StoredArray::create(
                 &self.store,
                 &image_path(image),
@@ -2900,6 +3291,12 @@ impl Environment for ZarrEnvironment {
     /// chunks and what is left behind is nothing rather than an array with no
     /// data — which a reader would otherwise find and read as fill values.
     fn discard_image(&self, image: usize) -> Result<()> {
+        if self.targeted.load(Ordering::SeqCst) == image {
+            return Err(Error::InvalidArgument(format!(
+                "cannot discard image {image}: it is written into an output target outside this \
+                 environment's store"
+            )));
+        }
         // An intermediate may be dropped and rebuilt by re-running the phase
         // that wrote it; an input cannot be rebuilt at any price, because no
         // phase produces it. See `decomposition::ImageKind`.
@@ -3139,7 +3536,7 @@ mod tests {
     #[test]
     fn an_out_of_range_compression_level_is_clamped_rather_than_refused() {
         assert_eq!(Compression::Gzip(12).name(), "gzip9");
-        assert!(Compression::Gzip(12).bytes_to_bytes().is_ok());
+        assert!(Compression::Gzip(12).bytes_to_bytes(Dtype::U8).is_ok());
         let root = scratch("clamped");
         let input = ramp(Dtype::U8, [4, 4, 4]);
         let env = ZarrEnvironment::create_with_compression(

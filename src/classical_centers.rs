@@ -548,6 +548,7 @@ pub fn finalize_centers(
         tile_shape,
         tile_order: "row_major".into(),
         within_tile_order: "lexicographic_coordinates_then_identity".into(),
+        downsample: None,
     };
     let spec = TableSpec::new(0, 2048, "../../", "detection_id", columns, spatial_index);
     finalize_object_table(
@@ -626,6 +627,7 @@ pub fn finalize_watershed_instances(
         tile_shape,
         tile_order: "row_major".into(),
         within_tile_order: "lexicographic_coordinates_then_identity".into(),
+        downsample: None,
     };
     let mut spec = TableSpec::new(0, 2048, "../../", "label_id", columns, spatial_index);
     spec.region = Some(format!("../../labels/{}", config.layer));

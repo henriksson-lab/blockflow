@@ -3649,6 +3649,18 @@ impl Measurements {
         self
     }
 
+    /// Opt-in intensity statistics of one channel (dispersion, mass displacement, threshold
+    /// counts; see [`super::intensity_statistics`]). Runs as a custom region measure, so its
+    /// rows are read with [`MeasurementPlan::custom_region_rows`] at the index this request
+    /// takes among the custom region requests.
+    pub fn intensity_statistics<const CHANNEL: usize>(
+        self,
+        statistics: super::intensity_statistics::IntensityStatistics,
+        image: IntensityImage<CHANNEL>,
+    ) -> Self {
+        self.custom_region(statistics, vec![image])
+    }
+
     pub fn custom_boundary<M: BoundaryMeasure>(mut self, measure: M) -> Self {
         self.custom_boundary.push(CustomBoundaryRequest {
             measure: Arc::new(measure),
@@ -18095,6 +18107,12 @@ pub struct MeasureValues<'a> {
 }
 
 impl<'a> MeasureValues<'a> {
+    /// Values in declared-source order, as the planner hands them to [`RegionMeasure::add`].
+    /// Public so a measure can be exercised directly.
+    pub fn new(values: &'a [f64]) -> Self {
+        Self { values }
+    }
+
     pub fn get(self, index: usize) -> Option<f64> {
         self.values.get(index).copied()
     }

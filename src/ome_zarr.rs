@@ -239,7 +239,7 @@ pub fn write_label_metadata(root: &Path, levels: &[OmeVolumeLevel], source: &str
 /// Return the image group for either a direct multiscale image or the first
 /// series in the transitional OME-Zarr image-collection layout
 /// (`OME/zarr.json`).
-fn locate_image_group(container: &Path) -> Result<(PathBuf, Value)> {
+pub(crate) fn locate_image_group(container: &Path) -> Result<(PathBuf, Value)> {
     let metadata = read_json(&container.join("zarr.json"))?;
     if multiscale(&metadata).is_some() {
         return Ok((container.to_owned(), metadata));

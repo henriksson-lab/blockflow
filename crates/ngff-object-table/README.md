@@ -19,6 +19,14 @@ The initial representation provides:
 - root completion metadata written only by `TableWriter::finish`;
 - partial column and index reads through `TableReader`.
 
+Index coordinates need not all be spatial. A time-lapse detection table is
+indexed by `(t, y, x)` with a time tile of one, and sets
+`spatial_index.downsample = [false, true, true]` so the occupancy pyramid halves
+only `y` and `x`: every level keeps one entry per frame, and a viewer can read
+one frame's occupancy at any zoom without mixing in neighbouring frames. The
+field is optional; when it is absent every axis is halved, which is what tables
+written before it existed mean.
+
 Blockflow's `object_table` module is one producer. It externally sorts fragment
 rows into this representation with bounded memory; the storage crate itself has
 no dependency on Blockflow's planner or fragment types.

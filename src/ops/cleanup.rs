@@ -1419,6 +1419,191 @@ fn expand_labels_cost(distance: f64) -> f64 {
 
 const EXPAND_LABELS_COST_PER_CANDIDATE: f64 = 2.0;
 
+/// A ring of background voxels around each label: local background and cytoplasmic rings.
+///
+/// Every zero voxel whose nearest label voxel lies at Euclidean distance `d` with
+/// `inner < d <= outer` (voxel units) takes that label; every other voxel, labelled ones
+/// included, is zero. Ties are resolved like [`expand_labels_into`]: smaller label, then
+/// lexicographic source coordinate. Ring voxels keep the object's label, so a measurement of
+/// the ring image joins its object's row by label.
+///
+/// - Local background: `inner` a few voxels (a gap clear of the object's blurred edge),
+///   `outer` a few more. Because a voxel takes its *nearest* label, the gap also keeps every
+///   ring voxel more than `inner` from every other object.
+/// - Cytoplasmic ring around a nucleus label (translocation reporters): `inner = 0`,
+///   `outer` = ring width.
+pub fn ring_labels_into<T>(
+    labels: ArrayView3<'_, T>,
+    inner: f64,
+    outer: f64,
+    mut out: ArrayViewMut3<'_, T>,
+) -> Result<()>
+where
+    T: Copy + Default + PartialEq + Ord,
+{
+    shapes_agree(labels.shape(), out.shape(), "ring_labels_into")?;
+    validate_ring(inner, outer)?;
+    let zero = T::default();
+    let radius = outer.floor() as isize;
+    let (inner2, outer2) = (inner * inner, outer * outer);
+    let shape = [
+        labels.shape()[0] as isize,
+        labels.shape()[1] as isize,
+        labels.shape()[2] as isize,
+    ];
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let here = [i as usize, j as usize, k as usize];
+                if labels[here] != zero {
+                    out[here] = zero;
+                    continue;
+                }
+                // Nearest label voxel in the window, by (distance², label, source).
+                let mut best: Option<(isize, T, [isize; 3])> = None;
+                for a in (i - radius).max(0)..=(i + radius).min(shape[0] - 1) {
+                    for b in (j - radius).max(0)..=(j + radius).min(shape[1] - 1) {
+                        for c in (k - radius).max(0)..=(k + radius).min(shape[2] - 1) {
+                            let label = labels[[a as usize, b as usize, c as usize]];
+                            if label == zero {
+                                continue;
+                            }
+                            let distance2 =
+                                (a - i) * (a - i) + (b - j) * (b - j) + (c - k) * (c - k);
+                            if distance2 as f64 > outer2 {
+                                continue;
+                            }
+                            let candidate = (distance2, label, [a, b, c]);
+                            if best.map(|held| candidate < held).unwrap_or(true) {
+                                best = Some(candidate);
+                            }
+                        }
+                    }
+                }
+                out[here] = match best {
+                    Some((distance2, label, _)) if distance2 as f64 > inner2 => label,
+                    _ => zero,
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`ring_labels_into`] as a stencil op over an integer label image.
+pub struct RingLabelsOp {
+    name: &'static str,
+    inner: f64,
+    outer: f64,
+    cost: f64,
+}
+
+impl RingLabelsOp {
+    pub fn new(name: &'static str, inner: f64, outer: f64) -> Result<Self> {
+        validate_ring(inner, outer)?;
+        Ok(Self {
+            name,
+            inner,
+            outer,
+            cost: expand_labels_cost(outer),
+        })
+    }
+
+    pub fn inner(&self) -> f64 {
+        self.inner
+    }
+
+    pub fn outer(&self) -> f64 {
+        self.outer
+    }
+
+    fn radius(&self) -> usize {
+        self.outer.floor() as usize
+    }
+}
+
+impl BlockOp for RingLabelsOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        self.radius()
+    }
+
+    fn reach_spec(&self, _volume: [usize; 3]) -> Reach {
+        Reach::symmetric([self.radius(); 3])
+    }
+
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
+    fn accepts(&self, dtype: Dtype) -> bool {
+        matches!(
+            dtype,
+            Dtype::U8
+                | Dtype::U16
+                | Dtype::U32
+                | Dtype::U64
+                | Dtype::I8
+                | Dtype::I16
+                | Dtype::I32
+                | Dtype::I64
+        )
+    }
+
+    fn produces(&self, input: Dtype) -> Dtype {
+        input
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        macro_rules! run {
+            ($ty:ty) => {
+                ring_labels_into(
+                    input.view::<$ty>()?,
+                    self.inner,
+                    self.outer,
+                    out.view_mut::<$ty>()?,
+                )
+            };
+        }
+        match input.dtype() {
+            Dtype::U8 => run!(u8),
+            Dtype::U16 => run!(u16),
+            Dtype::U32 => run!(u32),
+            Dtype::U64 => run!(u64),
+            Dtype::I8 => run!(i8),
+            Dtype::I16 => run!(i16),
+            Dtype::I32 => run!(i32),
+            Dtype::I64 => run!(i64),
+            dtype => Err(Error::InvalidArgument(format!(
+                "{} accepts integer label images, not {}",
+                self.name,
+                dtype.numpy_name()
+            ))),
+        }
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        self.cost
+    }
+}
+
+pub fn append_ring_labels_phase(plan: &mut PlanBuilder, inner: f64, outer: f64) -> Result<Phase> {
+    plan.pixels(Chain::op(RingLabelsOp::new("ring labels", inner, outer)?))
+}
+
+fn validate_ring(inner: f64, outer: f64) -> Result<()> {
+    if !inner.is_finite() || !outer.is_finite() || inner < 0.0 || outer <= inner {
+        return Err(Error::InvalidArgument(format!(
+            "ring labels needs finite distances with 0 <= inner < outer, got inner {inner} \
+             and outer {outer}"
+        )));
+    }
+    Ok(())
+}
+
 const OBJECT_DISTANCE_SAMPLES_MAGIC: u64 = 0x4f44_5052_5341_4d50;
 const OBJECT_DISTANCE_REMOVE_MAGIC: u64 = 0x4f44_5052_524d_4f56;
 const OBJECT_DISTANCE_NOUN: &str = "an object-distance pruning reduction";
@@ -2079,6 +2264,47 @@ mod tests {
             vec![2, 2, 1, 1, 1],
             "the middle voxel is equally close to both labels and takes the smaller label"
         );
+    }
+
+    #[test]
+    fn ring_labels_keep_a_gap_take_the_nearest_label_and_clear_the_objects() {
+        // Two single-voxel objects on a row: 3 at x=2 and 5 at x=9.
+        let mut labels = Array3::from_elem((1, 1, 12), 0u16);
+        labels[[0, 0, 2]] = 3;
+        labels[[0, 0, 9]] = 5;
+        let mut out = Array3::from_elem(labels.raw_dim(), 9u16);
+        ring_labels_into(labels.view(), 1.0, 3.0, out.view_mut()).unwrap();
+        assert_eq!(
+            out.iter().copied().collect::<Vec<_>>(),
+            // x:  0  1  2  3  4  5  6  7  8  9 10 11
+            vec![3, 0, 0, 0, 3, 3, 5, 5, 0, 0, 0, 5],
+            "distance 1 is the gap, (1, 3] the ring, objects cleared, nearest label wins"
+        );
+
+        // inner = 0: a ring that starts at the object's edge (a cytoplasmic ring).
+        let mut disc = Array3::from_elem((1, 9, 9), 0u32);
+        disc[[0, 4, 4]] = 7;
+        let mut ring = Array3::from_elem(disc.raw_dim(), 0u32);
+        ring_labels_into(disc.view(), 0.0, 1.5, ring.view_mut()).unwrap();
+        assert_eq!(
+            ring.iter().filter(|&&v| v == 7).count(),
+            8,
+            "the 8-neighbourhood"
+        );
+        assert_eq!(ring[[0, 4, 4]], 0);
+
+        // The stencil op gives the same answer as the function.
+        let op = RingLabelsOp::new("ring labels", 0.0, 1.5).unwrap();
+        assert_eq!(op.reach(1, 9), 1);
+        let input: Voxels = disc.clone().into();
+        let mut planned = Voxels::zeros(Dtype::U32, input.shape()).unwrap();
+        op.apply(&input, &mut planned, &Anchor::whole(input.shape()))
+            .unwrap();
+        assert_eq!(planned.view::<u32>().unwrap(), ring.view());
+
+        for (inner, outer) in [(-1.0, 2.0), (2.0, 2.0), (0.0, f64::NAN)] {
+            assert!(RingLabelsOp::new("ring labels", inner, outer).is_err());
+        }
     }
 
     #[test]
