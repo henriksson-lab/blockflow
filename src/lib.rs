@@ -254,6 +254,9 @@ pub mod strategy;
 /// placed in global coordinates and rendered by region, so a block and the whole
 /// volume agree bit for bit.
 pub mod synthetic;
+/// Dense space-filling tissue (neurites, fibre bundles, somata, fill) with exact
+/// labels and skeletons, and a label → EM image formation model.
+pub mod synthetic_tissue;
 /// A row per object, keyed by position, with typed columns — a size, a total, a
 /// measure — written per block and read by region. The node kind a point set
 /// was a one-column special case of; `points` is now exactly that special case.

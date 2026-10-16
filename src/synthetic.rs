@@ -1022,7 +1022,7 @@ fn gaussian_at(seed: u64, z: usize, y: usize, x: usize) -> f64 {
 
 /// SplitMix64's finalising mix. Used both as the stream's output stage and, on
 /// its own, as the hash that makes per-voxel quantities positional.
-fn mix(mut z: u64) -> u64 {
+pub(crate) fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
@@ -1035,38 +1035,38 @@ fn mix(mut z: u64) -> u64 {
 /// on. Each coordinate is multiplied by a distinct odd constant and mixed in
 /// turn, so no permutation of coordinates collides and a change of one voxel in
 /// any axis changes every bit of the result.
-fn hash3(seed: u64, first: u64, second: u64, third: u64) -> u64 {
+pub(crate) fn hash3(seed: u64, first: u64, second: u64, third: u64) -> u64 {
     let mut hash = mix(seed);
     hash = mix(hash ^ first.wrapping_mul(0xff51_afd7_ed55_8ccd));
     hash = mix(hash ^ second.wrapping_mul(0xc4ce_b9fe_1a85_ec53));
     mix(hash ^ third.wrapping_mul(0x9e37_79b9_7f4a_7c15))
 }
 
-fn unit_from(hash: u64) -> f64 {
+pub(crate) fn unit_from(hash: u64) -> f64 {
     // The top 53 bits, which is every bit an f64 in 0.0..1.0 can hold.
     (hash >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
 }
 
 /// A SplitMix64 stream, seeded from a base seed and an index so that streams can
 /// be created independently rather than split off one another.
-struct Stream {
+pub(crate) struct Stream {
     state: u64,
 }
 
 impl Stream {
-    fn new(seed: u64, index: u64) -> Self {
+    pub(crate) fn new(seed: u64, index: u64) -> Self {
         Self {
             state: mix(seed ^ index.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         mix(self.state)
     }
 
     /// The next value in `0.0..1.0`.
-    fn unit(&mut self) -> f64 {
+    pub(crate) fn unit(&mut self) -> f64 {
         unit_from(self.next_u64())
     }
 }
