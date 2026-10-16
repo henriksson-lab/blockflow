@@ -298,6 +298,7 @@ pub(crate) fn expect_extent(
 }
 
 pub mod adjacency;
+pub mod agglomerate;
 pub mod align;
 pub mod background;
 pub mod boundaries;
@@ -332,6 +333,7 @@ pub mod measure;
 pub mod mixing;
 pub mod morphology;
 pub mod normalise;
+pub mod rag;
 pub mod random_walker;
 pub mod rank;
 pub mod rasterise;
