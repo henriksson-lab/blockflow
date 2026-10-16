@@ -228,6 +228,9 @@ pub mod sam_training;
 /// it — slower disk, less memory, fewer cores — as files, so that a planner
 /// change can be held to more than the machine it was written on.
 pub mod scenario;
+/// Segmentation scores against ground truth: VOI, adapted Rand, edit counts,
+/// boundary F1, and skeleton ERL / NERL.
+pub mod segmentation_metrics;
 /// Block-keyed output that is not a pixel region: `(stream, phase, block) ->
 /// bytes`, on the environment beside the region writes. Storage only; what
 /// produces and consumes fragments is `fragment`.
@@ -351,6 +354,10 @@ pub use probes::{
 pub use progress::{ProgressLevel, ProgressMeta, StreamingLog};
 pub use reach::{AxisReach, Frame, Reach, Space, Units};
 pub use region::{ArrayRegionSink, ArrayRegionSource, Region, RegionSink, RegionSource};
+pub use segmentation_metrics::{
+    score_segmentation, score_skeletons, Contingency, ContingencyOptions, SegmentationOptions,
+    SegmentationScores, Skeletons,
+};
 pub use sidecar::{
     Discarded, FileSidecars, FragmentKey, Lifecycle, MemorySidecars, SidecarBackend, Sidecars,
     StreamRemoval,
