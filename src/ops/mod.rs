@@ -309,6 +309,7 @@ pub mod configuration;
 pub mod coordinates;
 pub mod cost;
 pub mod deconvolve;
+pub mod destripe;
 pub mod detect;
 pub mod diffuse;
 pub mod directional;
@@ -350,8 +351,10 @@ pub mod rows;
 /// `watershed` is the MIT shell over it. See that file's header.
 pub mod scikitimage_watershed;
 pub mod skeleton;
+pub mod slice_normalise;
 pub mod sliding;
 pub mod smooth;
+pub mod stack_align;
 pub mod structure_tensor;
 pub mod tabulate;
 pub mod threshold;
@@ -720,7 +723,7 @@ pub use resample::{
 pub use ridge::{
     gaussian_radius, gaussian_smooth_into, gaussian_smooth_into_with, gaussian_weights, hessian_at,
     ridge_response_into, symmetric_eigenvalues, Boundary, EigenResponse, HessianEigenvalueOp,
-    Polarity, RatioResponse, Response, RidgeFilterOp, RidgeResponse, ScaleSpace,
+    PlateResponse, Polarity, RatioResponse, Response, RidgeFilterOp, RidgeResponse, ScaleSpace,
 };
 pub use rows::{
     append_group_phases, collect_groups, collect_rows, decode_groups, encode_groups, filter_blob,

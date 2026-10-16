@@ -6,7 +6,7 @@
 //
 // A multi-scale second-derivative structure filter: the response is large where
 // the local intensity forms an **elongated ridge** and small where it forms a
-// blob or a sheet.
+// blob or a sheet — or, with [`PlateResponse`], large on a **sheet** instead.
 //
 // The construction, in four steps
 // -------------------------------
@@ -27,7 +27,7 @@
 //    See [`symmetric_eigenvalues`] for what "closed form" costs and what is done
 //    about it.
 // 4. **Combine.** A [`Response`] folds the eigenvalues into one number. There
-//    are two of them and they answer differently, which is why the choice is a
+//    are three of them and they answer differently, which is why the choice is a
 //    parameter rather than a constant:
 //    * [`RidgeResponse`] orders the eigenvalues by magnitude and multiplies
 //      three saturating terms — the two shape ratios that separate a line from a
@@ -37,6 +37,9 @@
 //      curvature's **magnitude** through two power-law terms. Unbounded, and in
 //      the units of the input's own second derivative. See its documentation for
 //      why no setting of the first is the second.
+//    * [`PlateResponse`] asks the other question: a **sheet** (one large
+//      curvature, two small), Descoteaux-2005 style, which both of the above
+//      score as zero. Bounded by one. This is the response for membranes.
 //
 // The multi-scale form runs 1-4 at each scale in the list and keeps the largest
 // response, which is what makes the filter answer for structures of a range of
@@ -1064,9 +1067,92 @@ fn powf_exact(base: f64, exponent: f64) -> f64 {
     }
 }
 
-/// Which of the two responses a filter folds its eigenvalues with.
+/// The **third** response, and the one the other two refuse: it scores a
+/// **sheet** (a plate, a membrane) rather than a line.
 ///
-/// An enum rather than a trait object because there are two of them and both are
+/// Ordered by magnitude as `|e1| <= |e2| <= |e3|`, a sheet curves strongly in
+/// one direction only — across it — so `|e3|` is large and carries the
+/// polarity's sign while `|e1|` and `|e2|` are both small. The measure is the
+/// plate form of Descoteaux, Collins and Siddiqi (2005), built from three
+/// terms with one parameter each, exactly as [`RidgeResponse`] is:
+///
+/// | term | large when | parameter |
+/// |---|---|---|
+/// | `exp(-(\|e2\|/\|e3\|)^2 / 2a^2)` | only one direction curves, so a sheet and not a line | `line` |
+/// | `1 - exp(-(\|2\|e3\| - \|e2\| - \|e1\|\| / \|e3\|)^2 / 2b^2)` | the curvature is not shared by all three axes, so a sheet and not a blob | `blob` |
+/// | `1 - exp(-\|e\|^2 / 2c^2)` | there is curvature at all, so structure and not background | `strength` |
+///
+/// The second ratio is near `2` for a sheet, near `1` for a line and near `0`
+/// for a blob, which is why it separates a sheet from a blob and leaves the
+/// line to the first term. The response is the product of the three, bounded
+/// by one, and zero wherever `e3` does not have [`Polarity`]'s sign: negative
+/// for a bright sheet ([`Polarity::Ridge`]), positive for a dark one
+/// ([`Polarity::Valley`]) — the dark membranes of an electron micrograph are
+/// the second.
+///
+/// No defaults, for [`RidgeResponse`]'s reason; `strength` is in the units of
+/// the input's own (scale-normalised) second derivative.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlateResponse {
+    line: f64,
+    blob: f64,
+    strength: f64,
+    polarity: Polarity,
+}
+
+impl PlateResponse {
+    pub fn new(line: f64, blob: f64, strength: f64, polarity: Polarity) -> Result<Self> {
+        for (what, value) in [("line", line), ("blob", blob), ("strength", strength)] {
+            if !(value > 0.0) || !value.is_finite() {
+                return Err(Error::InvalidArgument(format!(
+                    "the plate {what} sensitivity divides an exponent and must be positive \
+                     and finite; got {value}"
+                )));
+            }
+        }
+        Ok(Self {
+            line,
+            blob,
+            strength,
+            polarity,
+        })
+    }
+
+    pub fn polarity(&self) -> Polarity {
+        self.polarity
+    }
+
+    /// Fold eigenvalues in **descending algebraic order** — what
+    /// [`symmetric_eigenvalues`] returns — into the response.
+    ///
+    /// A largest magnitude of exactly zero returns `0.0` before any division,
+    /// which is the exit a constant block takes.
+    pub fn evaluate(&self, eigenvalues: [f64; 3]) -> f64 {
+        let mut ordered = eigenvalues;
+        ordered.sort_by(|left, right| left.abs().total_cmp(&right.abs()));
+        let [small, middle, large] = ordered;
+        let wanted = match self.polarity {
+            Polarity::Ridge => -1.0,
+            Polarity::Valley => 1.0,
+        };
+        if !(large * wanted > 0.0) {
+            return 0.0;
+        }
+        let (small, middle, large) = (small.abs(), middle.abs(), large.abs());
+        let flatness = middle / large;
+        let spread = (2.0 * large - middle - small).abs() / large;
+        let energy = small * small + middle * middle + large * large;
+
+        let sheet = (-(flatness * flatness) / (2.0 * self.line * self.line)).exp();
+        let blob = 1.0 - (-(spread * spread) / (2.0 * self.blob * self.blob)).exp();
+        let present = 1.0 - (-energy / (2.0 * self.strength * self.strength)).exp();
+        sheet * blob * present
+    }
+}
+
+/// Which of the three responses a filter folds its eigenvalues with.
+///
+/// An enum rather than a trait object because there are three of them and all are
 /// small `Copy` structs: the whole point of [`EigenResponse`] below is that the
 /// kernel can be generic and pay nothing, and a `Box<dyn>` per voxel would undo
 /// that.
@@ -1078,6 +1164,9 @@ pub enum Response {
     /// [`RatioResponse`]: the largest curvature's magnitude scaled by two
     /// powers, unbounded.
     Ratio(RatioResponse),
+    /// [`PlateResponse`]: three saturating terms that score a **sheet** rather
+    /// than a line, bounded by one.
+    Plate(PlateResponse),
 }
 
 impl Response {
@@ -1085,6 +1174,7 @@ impl Response {
         match self {
             Response::Saturating(response) => response.polarity(),
             Response::Ratio(response) => response.polarity(),
+            Response::Plate(response) => response.polarity(),
         }
     }
 }
@@ -1098,6 +1188,12 @@ impl From<RidgeResponse> for Response {
 impl From<RatioResponse> for Response {
     fn from(response: RatioResponse) -> Self {
         Response::Ratio(response)
+    }
+}
+
+impl From<PlateResponse> for Response {
+    fn from(response: PlateResponse) -> Self {
+        Response::Plate(response)
     }
 }
 
@@ -1129,11 +1225,18 @@ impl EigenResponse for RatioResponse {
     }
 }
 
+impl EigenResponse for PlateResponse {
+    fn evaluate(&self, eigenvalues: [f64; 3]) -> f64 {
+        PlateResponse::evaluate(self, eigenvalues)
+    }
+}
+
 impl EigenResponse for Response {
     fn evaluate(&self, eigenvalues: [f64; 3]) -> f64 {
         match self {
             Response::Saturating(response) => response.evaluate(eigenvalues),
             Response::Ratio(response) => response.evaluate(eigenvalues),
+            Response::Plate(response) => response.evaluate(eigenvalues),
         }
     }
 }
@@ -1564,7 +1667,7 @@ pub struct RidgeFilterOp {
 }
 
 impl RidgeFilterOp {
-    /// `response` is either of the two folds — see [`Response`] — and is taken
+    /// `response` is any of the three folds — see [`Response`] — and is taken
     /// as `impl Into<Response>`, so either may be handed over directly.
     pub fn new(name: &'static str, scales: ScaleSpace, response: impl Into<Response>) -> Self {
         let cost = cost_for(&scales);
@@ -1682,11 +1785,11 @@ impl BlockOp for RidgeFilterOp {
     /// **The last step is asked rather than assumed.** What is exactly true is
     /// that the eigenvalues are `[0, 0, 0]`; what that *becomes* is the
     /// response's business, so the declaration evaluates the response on that
-    /// triple instead of writing its answer down. Both folds return zero there
-    /// — one takes its "largest magnitude is zero" exit, the other its "no
-    /// curvature across the structure" exit — so the number is unchanged, but a
-    /// third fold that did something else would be declared correctly rather
-    /// than wrongly.
+    /// triple instead of writing its answer down. All three folds return zero
+    /// there — the saturating and plate folds take their "largest magnitude is
+    /// zero" exit, the ratio fold its "no curvature across the structure" exit —
+    /// so the number is unchanged, but a fold that did something else would be
+    /// declared correctly rather than wrongly.
     fn constant_maps_to(&self, _value: f64) -> Option<f64> {
         Some(self.response.evaluate([0.0, 0.0, 0.0]))
     }
@@ -3228,5 +3331,140 @@ mod tests {
             bases.iter().filter(|&&b| b != 1.0 && b.is_finite()).count() > 20_000,
             "the sweep must contain bases that distinguish one exponent from another"
         );
+    }
+
+    // -------------------------------------------------- plate response --
+
+    /// On eigenvalues directly: a sheet beats a line and a blob, the wrong
+    /// polarity is nothing, and the dark sheet is the negated bright one.
+    #[test]
+    fn the_plate_response_ranks_a_sheet_above_a_line_and_a_blob() {
+        let response = PlateResponse::new(0.5, 0.5, 1.0, Polarity::Ridge).unwrap();
+        let sheet = response.evaluate([0.0, 0.0, -10.0]);
+        let line = response.evaluate([0.0, -10.0, -10.0]);
+        let blob = response.evaluate([-10.0, -10.0, -10.0]);
+        assert!(
+            sheet > 0.9,
+            "a clean sheet is a strong response, got {sheet}"
+        );
+        assert!(sheet > 5.0 * line, "sheet {sheet}, line {line}");
+        assert!(sheet > 5.0 * blob, "sheet {sheet}, blob {blob}");
+        assert_eq!(response.evaluate([10.0, 0.0, 0.0]), 0.0);
+        assert_eq!(response.evaluate([0.0; 3]), 0.0);
+        let valley = PlateResponse::new(0.5, 0.5, 1.0, Polarity::Valley).unwrap();
+        assert_eq!(valley.evaluate([10.0, 0.0, 0.0]), sheet);
+        assert!(PlateResponse::new(0.0, 0.5, 1.0, Polarity::Ridge).is_err());
+        assert!(PlateResponse::new(0.5, f64::NAN, 1.0, Polarity::Ridge).is_err());
+    }
+
+    fn gaussian_profile(distance_squared: f64, width: f64) -> f64 {
+        (-distance_squared / (2.0 * width * width)).exp()
+    }
+
+    fn plate_at_centre(field: &Array3<f64>, scales: &ScaleSpace, response: PlateResponse) -> f64 {
+        let op = RidgeFilterOp::new("plate", scales.clone(), response);
+        let shape = field.shape();
+        let dim = [shape[0], shape[1], shape[2]];
+        let input: Voxels = field.clone().into();
+        let mut out = Voxels::zeros(Dtype::F64, dim).unwrap();
+        op.apply(&input, &mut out, &Anchor::whole(dim)).unwrap();
+        out.view::<f64>().unwrap()[[dim[0] / 2, dim[1] / 2, dim[2] / 2]]
+    }
+
+    /// Through the op, on synthetic volumes: a bright plane responds strongly,
+    /// a bright line and a bright blob of the same profile weakly.
+    #[test]
+    fn a_bright_plane_responds_and_a_line_and_a_blob_do_not() {
+        let dim = (21usize, 21usize, 21usize);
+        let c = 10.0;
+        let plane = Array3::from_shape_fn(dim, |(i, _, _)| {
+            gaussian_profile((i as f64 - c).powi(2), 1.5)
+        });
+        let line = Array3::from_shape_fn(dim, |(_, j, k)| {
+            gaussian_profile((j as f64 - c).powi(2) + (k as f64 - c).powi(2), 1.5)
+        });
+        let blob = Array3::from_shape_fn(dim, |(i, j, k)| {
+            gaussian_profile(
+                (i as f64 - c).powi(2) + (j as f64 - c).powi(2) + (k as f64 - c).powi(2),
+                1.5,
+            )
+        });
+        let scales = ScaleSpace::isotropic(&[1.5], 3.0, 1.0).unwrap();
+        let response = PlateResponse::new(0.5, 0.5, 0.02, Polarity::Ridge).unwrap();
+        let on_plane = plate_at_centre(&plane, &scales, response);
+        let on_line = plate_at_centre(&line, &scales, response);
+        let on_blob = plate_at_centre(&blob, &scales, response);
+        assert!(on_plane > 0.8, "plane {on_plane}");
+        assert!(on_line < 0.2 * on_plane, "line {on_line}, plane {on_plane}");
+        assert!(on_blob < 0.2 * on_plane, "blob {on_blob}, plane {on_plane}");
+
+        // the line filter, by contrast, scores the same plane as nothing much
+        let lines = RidgeResponse::new(0.5, 0.5, 0.02, Polarity::Ridge).unwrap();
+        let mut out = Array3::zeros(dim);
+        ridge_response_into(plane.view(), &scales, &lines, out.view_mut(), None).unwrap();
+        assert!(out[[10, 10, 10]] < 0.05, "{}", out[[10, 10, 10]]);
+    }
+
+    /// A dark plane on a bright ground — a membrane in a micrograph — is found
+    /// by the valley polarity and not by the ridge one.
+    #[test]
+    fn a_dark_plane_is_found_with_valley_polarity() {
+        let dim = (21usize, 21usize, 21usize);
+        let plane = Array3::from_shape_fn(dim, |(_, j, _)| {
+            1.0 - 0.6 * gaussian_profile((j as f64 - 10.0).powi(2), 1.0)
+        });
+        let scales = ScaleSpace::isotropic(&[1.0, 2.0], 3.0, 1.0).unwrap();
+        let valley = PlateResponse::new(0.5, 0.5, 0.02, Polarity::Valley).unwrap();
+        let ridge = PlateResponse::new(0.5, 0.5, 0.02, Polarity::Ridge).unwrap();
+        assert!(plate_at_centre(&plane, &scales, valley) > 0.8);
+        assert_eq!(plate_at_centre(&plane, &scales, ridge), 0.0);
+    }
+
+    /// Anisotropic voxels: z sampled at twice the xy spacing, so a plane normal
+    /// to z is half as many voxels thick as one normal to y. With the per-axis
+    /// sigma matched to the sampling both respond equally strongly, the
+    /// constant declaration holds, and the scale map is declared.
+    #[test]
+    fn the_plate_response_takes_an_anisotropic_scale_and_a_scale_map() {
+        let dim = (21usize, 31usize, 21usize);
+        let normal_to_z = Array3::from_shape_fn(dim, |(i, _, _)| {
+            gaussian_profile((i as f64 - 10.0).powi(2), 1.0)
+        });
+        let normal_to_y = Array3::from_shape_fn(dim, |(_, j, _)| {
+            gaussian_profile((j as f64 - 15.0).powi(2), 2.0)
+        });
+        let scales = ScaleSpace::new(vec![[1.0, 2.0, 2.0]], 3.0, 1.0).unwrap();
+        let response = PlateResponse::new(0.5, 0.5, 0.02, Polarity::Ridge).unwrap();
+        let z = plate_at_centre(&normal_to_z, &scales, response);
+        let y = plate_at_centre(&normal_to_y, &scales, response);
+        assert!(z > 0.8 && y > 0.8, "normal to z {z}, normal to y {y}");
+
+        let op = RidgeFilterOp::new("plate", scales.clone(), response).with_scale_map("scale");
+        assert_eq!(op.reach(0, 21), gaussian_radius(1.0, 3.0) + 1);
+        assert_eq!(op.reach(1, 31), gaussian_radius(2.0, 3.0) + 1);
+        assert_eq!(op.constant_maps_to(3.5), Some(0.0));
+        assert_eq!(op.side_outputs([21, 31, 21]).len(), 1);
+
+        // the argmax over scales picks the wider scale for the wider plane
+        let two = ScaleSpace::isotropic(&[0.8, 3.0], 3.0, 1.0).unwrap();
+        let narrow = Array3::from_shape_fn(dim, |(_, j, _)| {
+            gaussian_profile((j as f64 - 15.0).powi(2), 0.8)
+        });
+        let wide = Array3::from_shape_fn(dim, |(_, j, _)| {
+            gaussian_profile((j as f64 - 15.0).powi(2), 3.0)
+        });
+        for (field, want) in [(narrow, 0.0), (wide, 1.0)] {
+            let mut out = Array3::zeros(dim);
+            let mut chosen = Array3::zeros(dim);
+            ridge_response_into(
+                field.view(),
+                &two,
+                &response,
+                out.view_mut(),
+                Some(chosen.view_mut()),
+            )
+            .unwrap();
+            assert_eq!(chosen[[10, 15, 10]], want);
+        }
     }
 }
