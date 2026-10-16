@@ -57,6 +57,19 @@
 // is the oracle a decomposed run is checked against, and it is the **only** way
 // to reconstruct from an externally supplied seed today — see below.
 //
+// The resident form does not iterate
+// ----------------------------------
+// The loop costs one whole-volume pass per voxel of the longest flooding path —
+// 149 passes and minutes on a 64 x 384 x 384 distance map. [`reconstruct`] is
+// Vincent's (1993) hybrid algorithm instead: a raster scan, an anti-raster scan,
+// then a FIFO queue of the voxels that can still raise a neighbour. It reaches
+// the same least fixed point by single-voxel relaxations of the same step, so its
+// output is the iterated output, bit for bit (bar the sign of a zero), and
+// [`h_extrema`] uses it; [`h_extrema_iterative`] keeps the loop as the reference
+// and as the model of the phase's substage count, which the queue cannot give.
+// The phase itself still iterates: a queue that crosses blocks is a different
+// executor, not a different kernel.
+//
 // The step asks the element what it reads, rather than assuming
 // -------------------------------------------------------------
 // One element in this crate has more than one offset set: a step counted from
@@ -446,7 +459,7 @@ pub fn reconstruct_step_into_at<T: Copy + PartialOrd>(
 /// [`crate::iterate::SubstageLimit`]'s argument, and exceeding it is an error
 /// rather than a partial answer. Note that a *phase* spends one substage
 /// deriving its seed, so its count is one greater than this function's over the
-/// same data; [`h_extrema`] does that arithmetic so that the two agree exactly.
+/// same data; [`h_extrema_iterative`] does that arithmetic so that the two agree exactly.
 ///
 /// The stop is `next == current`, which is the executor's own predicate — the
 /// reference must converge where the real run converges or the counts cannot be
@@ -460,23 +473,7 @@ pub fn reconstruct_to_fixed_point<T: Copy + PartialOrd>(
     limit: SubstageLimit,
 ) -> Result<(Array3<T>, usize)> {
     shapes_agree(seed.shape(), mask.shape(), "reconstruct_to_fixed_point")?;
-    for i in 0..seed.shape()[0] {
-        for j in 0..seed.shape()[1] {
-            for k in 0..seed.shape()[2] {
-                if !method.admits(&seed[[i, j, k]], &mask[[i, j, k]]) {
-                    bail!(
-                        "reconstruct_to_fixed_point: the seed does not satisfy the \
-                         precondition at [{i}, {j}, {k}] — a {:?} reconstruction needs the \
-                         seed on the mask's own side of it everywhere, and an unordered value \
-                         on either side satisfies nothing. The step would cap the violation \
-                         away at the first substage and hand back a well-formed answer to a \
-                         different question, so it is refused here instead.",
-                        method
-                    );
-                }
-            }
-        }
-    }
+    check_precondition(seed, mask, method, "reconstruct_to_fixed_point")?;
 
     let mut current = seed.to_owned();
     let mut steps = 0usize;
@@ -506,8 +503,28 @@ pub fn reconstruct_to_fixed_point<T: Copy + PartialOrd>(
     }
 }
 
-/// The h-maxima (or h-minima) transform over the **whole volume**, and how many
-/// substages it took **counted the way a phase counts them**.
+/// The h-maxima (or h-minima) transform over the **whole volume**, by the fast
+/// queue algorithm: [`reconstruct`] from the seed `f - h` (or `f + h`).
+///
+/// Bit-identical to [`h_extrema_iterative`] up to the sign of a zero (see
+/// [`reconstruct`]), and linear in the volume rather than linear times the
+/// longest flooding path. A mask holding a NaN is refused, as the iterative form
+/// refuses it.
+pub fn h_extrema(
+    values: ArrayView3<'_, f64>,
+    element: &StructuringElement,
+    method: Reconstruction,
+    h: f64,
+) -> Result<Array3<f64>> {
+    check_h(h, method)?;
+    let seed = values.mapv(|value| method.seed_from(value, h));
+    reconstruct(seed.view(), values, element, method)
+}
+
+/// The h-maxima (or h-minima) transform over the **whole volume** by the
+/// iterated step, and how many substages it took **counted the way a phase
+/// counts them**. The reference [`h_extrema`] is checked against; it costs one
+/// whole-volume pass per voxel of the longest flooding path.
 ///
 /// `HMAX_h(f) = reconstruct_by_dilation(seed = f - h, mask = f)`, composed here
 /// out of the same seed derivation and the same kernel [`HExtremaOp`] runs, so a
@@ -523,7 +540,7 @@ pub fn reconstruct_to_fixed_point<T: Copy + PartialOrd>(
 /// and `HMAX_0` costs one pass rather than two. Modelled by the comparison below
 /// rather than by a test on `h`, because it is the array the executor compares
 /// and not the parameter.
-pub fn h_extrema(
+pub fn h_extrema_iterative(
     values: ArrayView3<'_, f64>,
     element: &StructuringElement,
     method: Reconstruction,
@@ -542,6 +559,275 @@ pub fn h_extrema(
     let steps = SubstageLimit::of(limit.substages().saturating_sub(1).max(1))?;
     let (out, ran) = reconstruct_to_fixed_point(seed.view(), values, element, method, steps)?;
     Ok((out, ran + 1))
+}
+
+// ------------------------------------------------- the fast whole-volume form --
+
+/// One element offset, with the coordinate step and the linear step in a
+/// C-ordered buffer, so the hot loops add one integer and test bounds only where
+/// a voxel is near a face.
+#[derive(Clone, Copy)]
+struct Step {
+    d: [isize; 3],
+    linear: isize,
+}
+
+/// Reconstruct `seed` under `mask` over the **whole volume**, by Vincent's
+/// hybrid algorithm: one raster scan, one anti-raster scan, then FIFO-queue
+/// propagation of whatever is still unstable. Linear in the volume (each voxel
+/// is re-queued only when it rises), where [`reconstruct_to_fixed_point`] pays a
+/// whole-volume pass per voxel of the longest flooding path.
+///
+/// **The same answer as the iterated step, not an approximation of it.** The
+/// iteration converges to the *least* fixed point of `g <- min(dilate(g), f)`
+/// above the seed. Every relaxation here is that step applied at one voxel from
+/// one neighbour, so no value ever exceeds that fixed point; and the queue holds
+/// the source of every edge that could still raise a voxel, so the run ends only
+/// at a fixed point. Both therefore end at the same array, and since a
+/// reconstruction only ever *selects* a value that was read — from the seed or
+/// from the mask, with the same strict comparisons [`Reconstruction`] defines —
+/// the values are the same bits. The one exception is the sign of a zero: `-0.0`
+/// and `0.0` compare equal, so where both are present at the same level which of
+/// them reaches a voxel can depend on visiting order.
+///
+/// **Any element with a fixed offset set**, symmetric or not and of any size —
+/// 6-, 18- and 26-connectivity, ellipsoids, boxes, an even extent. Value flows
+/// from `p + o` into `p` for each offset `o`, exactly as the step reads it, so an
+/// asymmetric element is a directed graph and is handled as one. An element
+/// whose window **re-phases** at the volume's low faces
+/// ([`StepOrigin::ClippedStart`]) has offsets that depend on position and is
+/// **not** accelerated: it falls back to [`reconstruct_to_fixed_point`] under the
+/// sound ceiling of one step per voxel, so it is correct and slow.
+///
+/// The precondition is checked as [`reconstruct_to_fixed_point`] checks it, so a
+/// NaN on either side is refused. The edge convention is the step's: offsets
+/// outside the volume are skipped.
+pub fn reconstruct<T: Copy + PartialOrd>(
+    seed: ArrayView3<'_, T>,
+    mask: ArrayView3<'_, T>,
+    element: &StructuringElement,
+    method: Reconstruction,
+) -> Result<Array3<T>> {
+    shapes_agree(seed.shape(), mask.shape(), "reconstruct")?;
+    if element.is_empty() {
+        bail!(
+            "reconstruct: an empty element has nothing to reduce over, so the flood would never \
+             leave the voxel it started on"
+        );
+    }
+    check_precondition(seed, mask, method, "reconstruct")?;
+    if element.origin() != StepOrigin::Anchor {
+        // A geodesic visits distinct voxels, so one step per voxel (plus the
+        // step that sees nothing move) can never refuse a correct run.
+        let limit = SubstageLimit::of(seed.len().saturating_add(1))?;
+        return reconstruct_to_fixed_point(seed, mask, element, method, limit).map(|(g, _)| g);
+    }
+
+    match method {
+        Reconstruction::ByDilation => Ok(hybrid::<T, true>(seed, mask, element)),
+        Reconstruction::ByErosion => Ok(hybrid::<T, false>(seed, mask, element)),
+    }
+}
+
+/// `a` displaces `b`: greater under dilation, lesser under erosion. Strict, as
+/// [`Reconstruction::spreads`] is; monomorphised so the hot loops do not branch
+/// on the method.
+#[inline(always)]
+fn above<T: PartialOrd, const DILATE: bool>(a: &T, b: &T) -> bool {
+    if DILATE {
+        a > b
+    } else {
+        a < b
+    }
+}
+
+/// The step at `to` from the single neighbour `from`: rise towards `g[from]`,
+/// capped by the mask — the same two strict comparisons the step makes. True
+/// when `to` moved.
+#[inline(always)]
+fn relax<T: Copy + PartialOrd, const DILATE: bool>(
+    g: &mut [T],
+    f: &[T],
+    from: usize,
+    to: usize,
+) -> bool {
+    let candidate = g[from];
+    let held = g[to];
+    if !above::<T, DILATE>(&candidate, &held) {
+        return false;
+    }
+    let cap = f[to];
+    let next = if above::<T, DILATE>(&candidate, &cap) {
+        cap
+    } else {
+        candidate
+    };
+    if above::<T, DILATE>(&next, &held) {
+        g[to] = next;
+        true
+    } else {
+        false
+    }
+}
+
+#[inline(always)]
+fn inside(c: [usize; 3], d: [isize; 3], n: [usize; 3]) -> bool {
+    (0..3).all(|a| {
+        let x = c[a] as isize + d[a];
+        x >= 0 && x < n[a] as isize
+    })
+}
+
+/// The step at `p` over a subset of its offsets, written once: the extreme of
+/// its own value and those neighbours', then capped by the mask — the step
+/// kernel's own reduction, in its own order.
+#[inline(always)]
+fn pull<T: Copy + PartialOrd, const DILATE: bool>(
+    g: &mut [T],
+    f: &[T],
+    p: usize,
+    fast: bool,
+    c: [usize; 3],
+    n: [usize; 3],
+    steps: &[Step],
+) {
+    let mut extreme = g[p];
+    for s in steps {
+        if fast || inside(c, s.d, n) {
+            let candidate = g[(p as isize + s.linear) as usize];
+            if above::<T, DILATE>(&candidate, &extreme) {
+                extreme = candidate;
+            }
+        }
+    }
+    let cap = f[p];
+    g[p] = if above::<T, DILATE>(&extreme, &cap) {
+        cap
+    } else {
+        extreme
+    };
+}
+
+/// Vincent's hybrid algorithm over a fixed offset set; see [`reconstruct`].
+fn hybrid<T: Copy + PartialOrd, const DILATE: bool>(
+    seed: ArrayView3<'_, T>,
+    mask: ArrayView3<'_, T>,
+    element: &StructuringElement,
+) -> Array3<T> {
+    let n = [seed.shape()[0], seed.shape()[1], seed.shape()[2]];
+    let strides = [(n[1] * n[2]) as isize, n[2] as isize, 1isize];
+    let mut g: Vec<T> = seed.iter().copied().collect();
+    let f: Vec<T> = mask.iter().copied().collect();
+
+    // `p` reads `p + o` for every offset `o`, so value flows from `p + o` into
+    // `p`. Raster order visits the smaller linear index first: the raster scan
+    // pulls from the neighbours it has already updated and the anti-raster scan
+    // from the rest.
+    let mut earlier: Vec<Step> = Vec::new();
+    let mut later: Vec<Step> = Vec::new();
+    let mut margin = [0usize; 3];
+    for &d in element.offsets() {
+        if d == [0, 0, 0] {
+            continue;
+        }
+        for axis in 0..3 {
+            margin[axis] = margin[axis].max(d[axis].unsigned_abs());
+        }
+        let linear = d[0] * strides[0] + d[1] * strides[1] + d[2] * strides[2];
+        if linear < 0 {
+            earlier.push(Step { d, linear });
+        } else {
+            later.push(Step { d, linear });
+        }
+    }
+    let negate = |s: &Step| Step {
+        d: [-s.d[0], -s.d[1], -s.d[2]],
+        linear: -s.linear,
+    };
+    // Who `p` feeds: `p - o`. After the anti-raster scan the only edges that
+    // can still be unstable run from `p` to a reader the scan visited *before*
+    // `p`, i.e. one later in raster order — those are the negated `earlier`.
+    // Every reader earlier in raster order was visited after `p` had its final
+    // scan value and pulled from it.
+    let feeds_later: Vec<Step> = earlier.iter().map(negate).collect();
+    let feeds: Vec<Step> = earlier.iter().chain(later.iter()).map(negate).collect();
+
+    let row_inside = |i: usize, j: usize| {
+        i >= margin[0] && i + margin[0] < n[0] && j >= margin[1] && j + margin[1] < n[1]
+    };
+    let k_inside = |k: usize| k >= margin[2] && k + margin[2] < n[2];
+
+    for i in 0..n[0] {
+        for j in 0..n[1] {
+            let row = row_inside(i, j);
+            let base = i * n[1] * n[2] + j * n[2];
+            for k in 0..n[2] {
+                let p = base + k;
+                let fast = row && k_inside(k);
+                pull::<T, DILATE>(&mut g, &f, p, fast, [i, j, k], n, &earlier);
+            }
+        }
+    }
+
+    let mut queue = std::collections::VecDeque::new();
+    for i in (0..n[0]).rev() {
+        for j in (0..n[1]).rev() {
+            let row = row_inside(i, j);
+            let base = i * n[1] * n[2] + j * n[2];
+            for k in (0..n[2]).rev() {
+                let p = base + k;
+                let fast = row && k_inside(k);
+                pull::<T, DILATE>(&mut g, &f, p, fast, [i, j, k], n, &later);
+                let unstable = feeds_later.iter().any(|s| {
+                    if !(fast || inside([i, j, k], s.d, n)) {
+                        return false;
+                    }
+                    let r = (p as isize + s.linear) as usize;
+                    above::<T, DILATE>(&g[p], &g[r]) && above::<T, DILATE>(&f[r], &g[r])
+                });
+                if unstable {
+                    queue.push_back(p);
+                }
+            }
+        }
+    }
+
+    let plane = n[1] * n[2];
+    while let Some(q) = queue.pop_front() {
+        let c = [q / plane, (q % plane) / n[2], q % n[2]];
+        let fast = row_inside(c[0], c[1]) && k_inside(c[2]);
+        for s in &feeds {
+            if fast || inside(c, s.d, n) {
+                let r = (q as isize + s.linear) as usize;
+                if relax::<T, DILATE>(&mut g, &f, q, r) {
+                    queue.push_back(r);
+                }
+            }
+        }
+    }
+    Array3::from_shape_vec((n[0], n[1], n[2]), g).expect("the buffer has the volume's size")
+}
+
+fn check_precondition<T: PartialOrd>(
+    seed: ArrayView3<'_, T>,
+    mask: ArrayView3<'_, T>,
+    method: Reconstruction,
+    who: &str,
+) -> Result<()> {
+    for ((index, s), m) in seed.indexed_iter().zip(mask.iter()) {
+        if !method.admits(s, m) {
+            let (i, j, k) = index;
+            bail!(
+                "{who}: the seed does not satisfy the precondition at [{i}, {j}, {k}] — a {:?} \
+                 reconstruction needs the seed on the mask's own side of it everywhere, and an \
+                 unordered value on either side satisfies nothing. The step would cap the \
+                 violation away at the first substage and hand back a well-formed answer to a \
+                 different question, so it is refused here instead.",
+                method
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The substage limit the **geometry** gives: the volume's L1 diameter over the
@@ -1241,7 +1527,7 @@ mod tests {
         assert!(!element.is_empty());
 
         let values = Array3::from_shape_vec((3, 1, 1), vec![1.0, 9.0, 1.0]).unwrap();
-        let (got, substages) = h_extrema(
+        let (got, substages) = h_extrema_iterative(
             values.view(),
             &element,
             Reconstruction::ByDilation,
@@ -1249,6 +1535,8 @@ mod tests {
             generous(),
         )
         .unwrap();
+        let fast = h_extrema(values.view(), &element, Reconstruction::ByDilation, 2.0).unwrap();
+        assert_eq!(fast, got);
         assert_eq!(
             got.iter().copied().collect::<Vec<_>>(),
             vec![-1.0, 7.0, -1.0]
@@ -1356,6 +1644,344 @@ mod tests {
             small,
         );
         assert!(cheap.cost_per_voxel() > sweep.cost_per_voxel());
+    }
+
+    /// A small deterministic generator, so the fixtures need no dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    fn connectivity(degree: usize) -> StructuringElement {
+        let offsets = (-1isize..=1)
+            .flat_map(|a| (-1isize..=1).flat_map(move |b| (-1isize..=1).map(move |c| [a, b, c])))
+            .filter(|o| {
+                let order = o.iter().filter(|&&x| x != 0).count();
+                match degree {
+                    6 => order <= 1,
+                    18 => order <= 2,
+                    _ => true,
+                }
+            });
+        StructuringElement::from_offsets(offsets).unwrap()
+    }
+
+    /// Every element the fast form claims, including asymmetric and wider ones.
+    fn elements() -> Vec<(&'static str, StructuringElement)> {
+        vec![
+            ("6-connected", connectivity(6)),
+            ("18-connected", connectivity(18)),
+            ("26-connected", connectivity(26)),
+            ("box 1", box3()),
+            (
+                "ellipsoid 2,2,1",
+                StructuringElement::from_radius(ElementShape::Ellipsoid, [2, 2, 1]),
+            ),
+            (
+                "flat box 0,1,2",
+                StructuringElement::from_radius(ElementShape::Box, [0, 1, 2]),
+            ),
+            (
+                "even extent 4,1,2",
+                StructuringElement::from_size(ElementShape::Box, [4, 1, 2]).unwrap(),
+            ),
+            (
+                "one-way",
+                StructuringElement::from_sides(ElementShape::Box, [2, 0, 1], [0, 1, 0]),
+            ),
+            (
+                "centre-free pair",
+                StructuringElement::from_offsets([[0, 0, 1], [0, 1, 0]]).unwrap(),
+            ),
+        ]
+    }
+
+    fn same_bits(a: &Array3<f64>, b: &Array3<f64>) -> bool {
+        a.shape() == b.shape()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// A field with plateaus and ridges: smooth noise, optionally quantised to a
+    /// few integer levels so that long equal-valued runs exist.
+    fn field(shape: [usize; 3], rng: &mut Rng, levels: Option<f64>) -> Array3<f64> {
+        let raw = Array3::from_shape_fn((shape[0], shape[1], shape[2]), |_| rng.unit());
+        let mut smooth = raw.clone();
+        for axis in 0..3 {
+            let prev = smooth.clone();
+            for ((i, j, k), slot) in smooth.indexed_iter_mut() {
+                let mut sum = 0.0;
+                let mut count = 0.0;
+                for d in -1isize..=1 {
+                    let mut c = [i as isize, j as isize, k as isize];
+                    c[axis] += d;
+                    if c[axis] >= 0 && (c[axis] as usize) < shape[axis] {
+                        sum += prev[[c[0] as usize, c[1] as usize, c[2] as usize]];
+                        count += 1.0;
+                    }
+                }
+                *slot = sum / count;
+            }
+        }
+        match levels {
+            Some(l) => smooth.mapv(|v| (v * l).floor()),
+            None => smooth.mapv(|v| v * 10.0),
+        }
+    }
+
+    /// **The fast form is the iterated form, bit for bit**, on random fields with
+    /// and without plateaus, under every element, by both methods, from both an
+    /// h-seed and a random seed on the right side of the mask.
+    #[test]
+    fn the_queue_reconstruction_is_bit_identical_to_the_iterated_step() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let shapes = [[9, 11, 7], [1, 17, 5], [6, 1, 1], [12, 8, 10]];
+        let mut cases = 0;
+        for shape in shapes {
+            for levels in [None, Some(4.0), Some(12.0)] {
+                let mask = field(shape, &mut rng, levels);
+                for (name, element) in elements() {
+                    for method in [Reconstruction::ByDilation, Reconstruction::ByErosion] {
+                        let limit = SubstageLimit::of(mask.len() + 2).unwrap();
+                        for h in [0.0, 1.0, 2.5] {
+                            let fast = h_extrema(mask.view(), &element, method, h).unwrap();
+                            let (slow, _) =
+                                h_extrema_iterative(mask.view(), &element, method, h, limit)
+                                    .unwrap();
+                            assert!(same_bits(&fast, &slow), "{name} {method:?} h={h} {shape:?}");
+                        }
+                        // a random seed on the mask's side of it, which floods from
+                        // isolated points rather than from everywhere at once
+                        let seed = Array3::from_shape_fn(mask.raw_dim(), |at| {
+                            let m = mask[at];
+                            let keep = rng.next() % 17 == 0;
+                            match (method, keep) {
+                                (_, true) => m,
+                                (Reconstruction::ByDilation, false) => m - 3.0 - rng.unit() * 5.0,
+                                (Reconstruction::ByErosion, false) => m + 3.0 + rng.unit() * 5.0,
+                            }
+                        });
+                        let fast = reconstruct(seed.view(), mask.view(), &element, method).unwrap();
+                        let (slow, _) = reconstruct_to_fixed_point(
+                            seed.view(),
+                            mask.view(),
+                            &element,
+                            method,
+                            limit,
+                        )
+                        .unwrap();
+                        assert!(
+                            same_bits(&fast, &slow),
+                            "{name} {method:?} random seed {shape:?}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 4 * 3 * 9 * 2);
+    }
+
+    /// The kernel is generic and so is the fast form: integer volumes, where
+    /// plateaus are the common case rather than the exception.
+    #[test]
+    fn the_queue_reconstruction_matches_on_integer_volumes() {
+        let mut rng = Rng(42);
+        let shape = (10, 9, 8);
+        for (name, element) in elements() {
+            for method in [Reconstruction::ByDilation, Reconstruction::ByErosion] {
+                let mask = Array3::from_shape_fn(shape, |_| (rng.next() % 6) as i32);
+                let seed = mask.mapv(|v| match method {
+                    Reconstruction::ByDilation => v - 2,
+                    Reconstruction::ByErosion => v + 2,
+                });
+                let limit = SubstageLimit::of(mask.len() + 2).unwrap();
+                let fast = reconstruct(seed.view(), mask.view(), &element, method).unwrap();
+                let (slow, _) =
+                    reconstruct_to_fixed_point(seed.view(), mask.view(), &element, method, limit)
+                        .unwrap();
+                assert_eq!(fast, slow, "{name} {method:?}");
+            }
+        }
+    }
+
+    /// The serpentine corridor the geometric bound cannot cover is a long path
+    /// for the iteration and nothing special for the queue.
+    #[test]
+    fn a_serpentine_corridor_floods_to_its_far_end() {
+        let (rows, cols) = (9, 9);
+        let mut mask = Array3::from_elem((1, rows, cols), 0.0);
+        for i in (0..rows).step_by(2) {
+            for j in 0..cols {
+                mask[[0, i, j]] = 5.0;
+            }
+            if i + 1 < rows {
+                let j = if (i / 2) % 2 == 0 { cols - 1 } else { 0 };
+                mask[[0, i + 1, j]] = 5.0;
+            }
+        }
+        let mut seed = Array3::from_elem(mask.raw_dim(), 0.0);
+        seed[[0, 0, 0]] = 5.0;
+        let element = connectivity(6);
+        let got = reconstruct(
+            seed.view(),
+            mask.view(),
+            &element,
+            Reconstruction::ByDilation,
+        )
+        .unwrap();
+        assert_eq!(got, mask);
+        let (slow, steps) = reconstruct_to_fixed_point(
+            seed.view(),
+            mask.view(),
+            &element,
+            Reconstruction::ByDilation,
+            generous(),
+        )
+        .unwrap();
+        assert_eq!(slow, got);
+        assert!(
+            steps > 40,
+            "the corridor is long for the iteration: {steps}"
+        );
+    }
+
+    /// A re-phasing element is not accelerated, and the fallback still answers.
+    #[test]
+    fn a_re_phasing_element_falls_back_to_the_iteration() {
+        let element = StructuringElement::from_size_stepped_at(
+            ElementShape::Box,
+            [5, 1, 3],
+            [2, 1, 1],
+            StepOrigin::ClippedStart,
+        )
+        .unwrap();
+        let mut rng = Rng(7);
+        let mask = field([14, 3, 9], &mut rng, Some(5.0));
+        let fast = h_extrema(mask.view(), &element, Reconstruction::ByDilation, 1.0).unwrap();
+        let (slow, _) = h_extrema_iterative(
+            mask.view(),
+            &element,
+            Reconstruction::ByDilation,
+            1.0,
+            generous(),
+        )
+        .unwrap();
+        assert!(same_bits(&fast, &slow));
+    }
+
+    /// The fast form refuses what the iterated form refuses.
+    #[test]
+    fn the_queue_reconstruction_refuses_a_broken_precondition_and_a_nan() {
+        let mask = Array3::from_elem((3, 3, 3), 1.0);
+        let mut seed = Array3::from_elem((3, 3, 3), 0.0);
+        seed[[1, 2, 0]] = 5.0;
+        let message = reconstruct(
+            seed.view(),
+            mask.view(),
+            &box3(),
+            Reconstruction::ByDilation,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("[1, 2, 0]") && message.contains("precondition"),
+            "{message}"
+        );
+        let mut values = Array3::from_elem((3, 3, 3), 1.0);
+        values[[2, 2, 2]] = f64::NAN;
+        assert!(h_extrema(values.view(), &box3(), Reconstruction::ByDilation, 1.0).is_err());
+        assert!(h_extrema(mask.view(), &box3(), Reconstruction::ByDilation, -1.0).is_err());
+    }
+
+    /// Old against new on a field the size that made the iteration unusable.
+    ///
+    /// ```text
+    /// cargo test --release --lib -- --ignored --nocapture time_the_queue_against_the_iteration
+    /// ```
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn time_the_queue_against_the_iteration() {
+        let shape = [64, 384, 384];
+        let mut rng = Rng(1234);
+        // smooth noise at a few voxels' correlation length, scaled so h = 2 is
+        // a few percent of the range, as on a distance map
+        let mut values = field(shape, &mut rng, None);
+        for _ in 0..3 {
+            values = field_smooth(values.view());
+        }
+        let (lo, hi) = values
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+                (a.min(v), b.max(v))
+            });
+        values.mapv_inplace(|v| (v - lo) / (hi - lo) * 40.0);
+        compare_on("smooth noise", &values);
+        // and a distance map of the field's upper half, the case that took 149
+        // passes: long ridges of slowly varying height
+        let interior = values.mapv(|v| v > 20.0);
+        let distance = super::super::distance::distance_transform(
+            interior.view(),
+            &super::super::distance::DistanceParams::default().with_sampling([2.0, 1.0, 1.0]),
+        )
+        .unwrap();
+        compare_on("distance map", &distance);
+    }
+
+    fn compare_on(name: &str, values: &Array3<f64>) {
+        let element = box3();
+        let clock = std::time::Instant::now();
+        let fast = h_extrema(values.view(), &element, Reconstruction::ByDilation, 2.0).unwrap();
+        let new = clock.elapsed().as_secs_f64();
+        println!("{name}: queue reconstruction {new:.2}s");
+        let clock = std::time::Instant::now();
+        let (slow, passes) = h_extrema_iterative(
+            values.view(),
+            &element,
+            Reconstruction::ByDilation,
+            2.0,
+            SubstageLimit::of(100_000).unwrap(),
+        )
+        .unwrap();
+        let old = clock.elapsed().as_secs_f64();
+        println!(
+            "{name}: iterated reconstruction {old:.2}s over {passes} passes; speed-up {:.0}x, \
+             identical: {}",
+            old / new,
+            same_bits(&fast, &slow)
+        );
+        assert!(same_bits(&fast, &slow), "{name}");
+    }
+
+    fn field_smooth(values: ArrayView3<'_, f64>) -> Array3<f64> {
+        let mut out = values.to_owned();
+        let shape = out.shape().to_vec();
+        for axis in 0..3 {
+            let prev = out.clone();
+            for ((i, j, k), slot) in out.indexed_iter_mut() {
+                let mut sum = 0.0;
+                let mut count = 0.0;
+                for d in -2isize..=2 {
+                    let mut c = [i as isize, j as isize, k as isize];
+                    c[axis] += d;
+                    if c[axis] >= 0 && (c[axis] as usize) < shape[axis] {
+                        sum += prev[[c[0] as usize, c[1] as usize, c[2] as usize]];
+                        count += 1.0;
+                    }
+                }
+                *slot = sum / count;
+            }
+        }
+        out
     }
 
     /// Retaking the measurement. Ignored because timing in a test suite is a

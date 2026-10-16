@@ -707,8 +707,8 @@ pub use rank::{
     ExcludedCentre, MaskedRankFilterOp, RankFilterOp,
 };
 pub use reconstruct::{
-    flooding_bound, h_extrema, reconstruct_step_into, reconstruct_step_into_at,
-    reconstruct_to_fixed_point, HExtremaOp, Reconstruction,
+    flooding_bound, h_extrema, h_extrema_iterative, reconstruct, reconstruct_step_into,
+    reconstruct_step_into_at, reconstruct_to_fixed_point, HExtremaOp, Reconstruction,
 };
 pub use regional::{
     ascending_neighbours, ascending_neighbours_with, label_plateaux_into, label_plateaux_into_with,
