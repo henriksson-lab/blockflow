@@ -327,6 +327,7 @@ pub(crate) mod histogram;
 pub mod intensity_statistics;
 pub mod interest;
 pub mod label;
+pub mod label_energy;
 pub mod lattice;
 pub mod level_set;
 pub mod local;
