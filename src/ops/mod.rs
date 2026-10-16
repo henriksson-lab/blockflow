@@ -310,6 +310,7 @@ pub mod coordinates;
 pub mod cost;
 pub mod deconvolve;
 pub mod detect;
+pub mod diffuse;
 pub mod directional;
 pub mod edges;
 pub mod element;
@@ -333,6 +334,7 @@ pub mod measure;
 pub mod mixing;
 pub mod morphology;
 pub mod normalise;
+pub mod path_opening;
 pub mod rag;
 pub mod random_walker;
 pub mod rank;
@@ -410,6 +412,11 @@ pub use detect::{
     centroid_points, detect_phases, detect_regions, detect_regions_with, label_regions_into,
     label_regions_into_with, merge_moments, merge_moments_with, moments_of_labels, owner_of,
     points_owned_by, LabelRegionsOp, Moments, RegionMoments, RegionPointsOp,
+};
+pub use diffuse::{
+    append_diffusion_phases, diffuse_into, diffusion_chain, diffusion_step_into, max_stable_dt,
+    tv_denoise_into, tv_energy, DiffusionModel, DiffusionParams, DiffusionStepOp, Diffusivity,
+    TvParams,
 };
 pub use directional::{
     border_mask, clear_faces, directional_pass, directional_pass_into, directional_passes_into,
@@ -669,6 +676,9 @@ pub use morphology::{
 pub use normalise::{
     bounded_gain_into, bounded_gain_value, normalise_against_into, normalise_value,
     LevelCorrectionOp, LocalContrastOp, LocalGainOp, Removal,
+};
+pub use path_opening::{
+    path_opening_into, PathCones, PathOpeningOp, PathOperator, PathParams,
 };
 pub use random_walker::{
     append_grady_weight_phase, append_random_walker_binary_seed_image_phases,
