@@ -63,6 +63,36 @@ use crate::error::{Error, Result};
 /// struct is not.
 pub const LEAF: u32 = u32::MAX;
 
+const FOREST_MAGIC: &[u8; 8] = b"BFFOREST";
+const FOREST_VERSION: u32 = 1;
+
+/// A bounds-checked cursor for [`Forest::from_bytes`].
+struct ByteReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(n)
+            .filter(|&end| end <= self.bytes.len())
+            .ok_or_else(|| Error::InvalidArgument("forest bytes are truncated".to_string()))?;
+        let slice = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+    }
+
+    fn len(&mut self) -> Result<usize> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes")) as usize)
+    }
+}
+
 /// One node: a split, or a leaf.
 ///
 /// 24 bytes — `f64` threshold, three `u32` — and the threshold is `f64` rather
@@ -262,6 +292,86 @@ impl Forest {
 
     pub fn votes(&self) -> &[f32] {
         &self.votes
+    }
+
+    /// The forest as bytes, so a trained classifier can be stored and reused.
+    ///
+    /// Little-endian, prefixed by a magic and a version; no serde, for the
+    /// reason `ops::rag::Rag::to_bytes` gives (blockflow's stored fragments
+    /// are plain bytes). Equal forests give equal bytes, and
+    /// [`Self::from_bytes`] re-runs every check [`Self::new`] makes, so a
+    /// corrupted file is refused rather than walked.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + self.nodes.len() * 20 + self.votes.len() * 4);
+        out.extend_from_slice(FOREST_MAGIC);
+        out.extend_from_slice(&FOREST_VERSION.to_le_bytes());
+        out.extend_from_slice(&(self.classes as u64).to_le_bytes());
+        out.extend_from_slice(&(self.channels.len() as u64).to_le_bytes());
+        for name in &self.channels {
+            out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+        out.extend_from_slice(&(self.roots.len() as u64).to_le_bytes());
+        for root in &self.roots {
+            out.extend_from_slice(&root.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.nodes.len() as u64).to_le_bytes());
+        for node in &self.nodes {
+            out.extend_from_slice(&node.feature.to_le_bytes());
+            out.extend_from_slice(&node.left.to_le_bytes());
+            out.extend_from_slice(&node.right.to_le_bytes());
+            out.extend_from_slice(&node.threshold.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.votes.len() as u64).to_le_bytes());
+        for vote in &self.votes {
+            out.extend_from_slice(&vote.to_le_bytes());
+        }
+        out
+    }
+
+    /// Inverse of [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = ByteReader { bytes, at: 0 };
+        if r.take(FOREST_MAGIC.len())? != FOREST_MAGIC {
+            return Err(Error::InvalidArgument("not a blockflow forest".to_string()));
+        }
+        let version = r.u32()?;
+        if version != FOREST_VERSION {
+            return Err(Error::InvalidArgument(format!(
+                "forest format version {version}, expected {FOREST_VERSION}"
+            )));
+        }
+        let classes = r.len()?;
+        let channel_count = r.len()?;
+        let mut channels = Vec::with_capacity(channel_count.min(1 << 16));
+        for _ in 0..channel_count {
+            let length = r.len()?;
+            let name = std::str::from_utf8(r.take(length)?).map_err(|_| {
+                Error::InvalidArgument("forest channel name is not UTF-8".to_string())
+            })?;
+            channels.push(name.to_string());
+        }
+        let root_count = r.len()?;
+        let mut roots = Vec::with_capacity(root_count.min(1 << 20));
+        for _ in 0..root_count {
+            roots.push(r.u32()?);
+        }
+        let node_count = r.len()?;
+        let mut nodes = Vec::with_capacity(node_count.min(1 << 24));
+        for _ in 0..node_count {
+            let (feature, left, right) = (r.u32()?, r.u32()?, r.u32()?);
+            let threshold = f64::from_le_bytes(r.take(8)?.try_into().expect("8 bytes"));
+            nodes.push(Node { feature, left, right, threshold });
+        }
+        let vote_count = r.len()?;
+        let mut votes = Vec::with_capacity(vote_count.min(1 << 26));
+        for _ in 0..vote_count {
+            votes.push(f32::from_le_bytes(r.take(4)?.try_into().expect("4 bytes")));
+        }
+        if r.at != bytes.len() {
+            return Err(Error::InvalidArgument("trailing bytes after the forest".to_string()));
+        }
+        Forest::new(nodes, roots, votes, classes, channels)
     }
 
     /// The deepest path in any tree, in nodes visited.
@@ -796,4 +906,51 @@ fn gini(tally: &[f64], total: f64) -> f64 {
             share * share
         })
         .sum::<f64>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toy_forest() -> Forest {
+        // Two columns; class 1 where the first column exceeds 0.5.
+        let mut features = Vec::new();
+        let mut labels = Vec::new();
+        for i in 0..200 {
+            let a = (i % 20) as f64 / 20.0;
+            let b = (i / 20) as f64 / 10.0;
+            features.extend_from_slice(&[a, b]);
+            labels.push(u32::from(a > 0.5));
+        }
+        let samples = Samples::new(features, labels, vec!["a".into(), "b".into()]).unwrap();
+        Forest::train(
+            &samples,
+            &TrainingSpec {
+                trees: 5,
+                ..TrainingSpec::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bytes_round_trip_exactly() {
+        let forest = toy_forest();
+        let bytes = forest.to_bytes();
+        let back = Forest::from_bytes(&bytes).unwrap();
+        assert_eq!(back, forest);
+        assert_eq!(back.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn corrupted_bytes_are_refused() {
+        let bytes = toy_forest().to_bytes();
+        assert!(Forest::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(Forest::from_bytes(&extra).is_err());
+        let mut wrong = bytes;
+        wrong[0] = b'X';
+        assert!(Forest::from_bytes(&wrong).is_err());
+    }
 }
