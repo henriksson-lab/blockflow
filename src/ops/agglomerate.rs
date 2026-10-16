@@ -789,59 +789,110 @@ pub fn multicut(n_nodes: usize, edges: &[(usize, usize, f64)], options: KlOption
 
 // ------------------------------------------------------------- relabel --
 
+/// A supervoxel -> cluster lookup, built once and applied to many blocks.
+///
+/// Dense (a `Vec<u32>` indexed by label) when the largest label is not much
+/// larger than the number of entries, otherwise a sorted pair list searched by
+/// bisection. Label 0, and any label not in the table, maps to 0.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LabelLookup {
+    Dense(Vec<u32>),
+    Sorted(Vec<(u32, u32)>),
+}
+
+impl LabelLookup {
+    /// `labels[n] -> clusters[n]`, e.g. [`super::rag::RagGraph::labels`] and a
+    /// partition. Refuses unequal lengths and a label mapped twice to
+    /// different clusters.
+    pub fn new(labels: &[u32], clusters: &[u32]) -> Result<Self> {
+        if labels.len() != clusters.len() {
+            return Err(Error::invalid(format!(
+                "relabel_volume: {} labels but {} clusters",
+                labels.len(),
+                clusters.len()
+            )));
+        }
+        Self::from_pairs(
+            labels
+                .iter()
+                .copied()
+                .zip(clusters.iter().copied())
+                .collect(),
+        )
+    }
+
+    /// From `(label, cluster)` pairs in any order.
+    pub fn from_pairs(mut pairs: Vec<(u32, u32)>) -> Result<Self> {
+        pairs.sort_unstable();
+        pairs.dedup();
+        if let Some(w) = pairs.windows(2).find(|w| w[0].0 == w[1].0) {
+            return Err(Error::invalid(format!(
+                "relabel_volume: label {} is mapped to both {} and {}",
+                w[0].0, w[0].1, w[1].1
+            )));
+        }
+        let max = pairs.last().map_or(0, |p| p.0) as usize;
+        if max <= pairs.len() * 8 + (1 << 20) {
+            let mut table = vec![0u32; max + 1];
+            for &(l, c) in &pairs {
+                table[l as usize] = c;
+            }
+            table[0] = 0;
+            Ok(LabelLookup::Dense(table))
+        } else {
+            Ok(LabelLookup::Sorted(pairs))
+        }
+    }
+
+    /// The cluster of `label` (0 for 0 and for a label not in the table).
+    #[inline]
+    pub fn get(&self, label: u32) -> u32 {
+        match self {
+            LabelLookup::Dense(table) => table.get(label as usize).copied().unwrap_or(0),
+            LabelLookup::Sorted(pairs) => {
+                if label == 0 {
+                    return 0;
+                }
+                pairs
+                    .binary_search_by_key(&label, |p| p.0)
+                    .map_or(0, |i| pairs[i].1)
+            }
+        }
+    }
+
+    /// Map `volume` into `out` (same shape), in parallel over z-planes.
+    pub fn apply_into(
+        &self,
+        volume: ArrayView3<'_, u32>,
+        mut out: ArrayViewMut3<'_, u32>,
+    ) -> Result<()> {
+        if volume.shape() != out.shape() {
+            return Err(Error::invalid(format!(
+                "relabel_volume: output shape {:?} differs from input {:?}",
+                out.shape(),
+                volume.shape()
+            )));
+        }
+        let mut planes: Vec<_> = out.axis_iter_mut(Axis(0)).collect();
+        planes.par_iter_mut().enumerate().for_each(|(z, plane)| {
+            let source = volume.index_axis(Axis(0), z);
+            plane.zip_mut_with(&source, |o, &l| *o = self.get(l));
+        });
+        Ok(())
+    }
+}
+
 /// Map each voxel's supervoxel label through `labels[n] -> clusters[n]` (for
 /// example [`super::rag::RagGraph::labels`] and a partition), in parallel over
-/// z-planes. Label 0, and any label not in `labels`, maps to 0.
+/// z-planes. Label 0, and any label not in `labels`, maps to 0. See
+/// [`LabelLookup`] to build the table once for many blocks.
 pub fn relabel_volume_into(
     volume: ArrayView3<'_, u32>,
     labels: &[u32],
     clusters: &[u32],
-    mut out: ArrayViewMut3<'_, u32>,
+    out: ArrayViewMut3<'_, u32>,
 ) -> Result<()> {
-    if labels.len() != clusters.len() {
-        return Err(Error::invalid(format!(
-            "relabel_volume: {} labels but {} clusters",
-            labels.len(),
-            clusters.len()
-        )));
-    }
-    if volume.shape() != out.shape() {
-        return Err(Error::invalid(format!(
-            "relabel_volume: output shape {:?} differs from input {:?}",
-            out.shape(),
-            volume.shape()
-        )));
-    }
-    let max = labels.iter().copied().max().unwrap_or(0) as usize;
-    let lookup: Box<dyn Fn(u32) -> u32 + Sync> = if max <= labels.len() * 8 + (1 << 20) {
-        let mut table = vec![0u32; max + 1];
-        for (&l, &c) in labels.iter().zip(clusters) {
-            table[l as usize] = c;
-        }
-        table[0] = 0;
-        Box::new(move |l| table.get(l as usize).copied().unwrap_or(0))
-    } else {
-        let mut pairs: Vec<(u32, u32)> = labels
-            .iter()
-            .copied()
-            .zip(clusters.iter().copied())
-            .collect();
-        pairs.sort_unstable();
-        Box::new(move |l| {
-            if l == 0 {
-                return 0;
-            }
-            pairs
-                .binary_search_by_key(&l, |p| p.0)
-                .map_or(0, |i| pairs[i].1)
-        })
-    };
-    let mut planes: Vec<_> = out.axis_iter_mut(Axis(0)).collect();
-    planes.par_iter_mut().enumerate().for_each(|(z, plane)| {
-        let source = volume.index_axis(Axis(0), z);
-        plane.zip_mut_with(&source, |o, &l| *o = lookup(l));
-    });
-    Ok(())
+    LabelLookup::new(labels, clusters)?.apply_into(volume, out)
 }
 
 /// [`relabel_volume_into`] into a new array.

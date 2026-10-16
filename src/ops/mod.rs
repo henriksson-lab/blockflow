@@ -338,6 +338,7 @@ pub mod morphology;
 pub mod normalise;
 pub mod path_opening;
 pub mod rag;
+pub mod rag_phases;
 pub mod random_walker;
 pub mod rank;
 pub mod rasterise;

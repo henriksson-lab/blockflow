@@ -36,7 +36,9 @@
 //   (1, or 2 with bridging), clipped at the volume's end.
 //
 // Merging the blocks of any tiling then equals the whole-volume graph up to
-// floating-point summation order. [`rag`] is exactly this over rayon z-slabs.
+// floating-point summation order. [`rag`] is exactly this over rayon z-slabs;
+// [`super::rag_phases`] is the same over a planned, out-of-core decomposition,
+// with each block's graph carried as [`Rag::to_bytes`] in a sidecar stream.
 //
 // Why not `ops::measure`'s `BoundaryMeasure` / `ContactRows`
 // ----------------------------------------------------------
@@ -97,7 +99,7 @@ impl RagOptions {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let (lo, hi) = self.range;
         if self.bins > 0 && !(lo.is_finite() && hi.is_finite() && hi > lo) {
             return Err(Error::invalid(format!(
@@ -359,6 +361,19 @@ impl Rag {
         }
     }
 
+    /// [`Rag::merge`], refusing rather than panicking when the two graphs were
+    /// accumulated under different options (as decoded fragments can be).
+    pub fn try_merge(&mut self, other: Rag) -> Result<()> {
+        if self.options != other.options {
+            return Err(Error::invalid(format!(
+                "rag: cannot merge a graph accumulated under {:?} into one under {:?}",
+                other.options, self.options
+            )));
+        }
+        self.merge(other);
+        Ok(())
+    }
+
     fn slot(&mut self, lo: u32, hi: u32) -> usize {
         let next = self.edges.len();
         let at = *self.index.entry(key(lo, hi)).or_insert(next);
@@ -420,6 +435,233 @@ impl Rag {
             1 => s[0] * s[2],
             _ => s[0] * s[1],
         }
+    }
+}
+
+// --------------------------------------------------------- serialisation --
+//
+// A per-block `Rag` travels as a sidecar fragment (`super::rag_phases`), so it
+// needs bytes. Little-endian, fixed-width, no serde — the sidecar convention is
+// that the writer and the reader own the format. Edges are written in
+// `(lo, hi)` order and nodes in label order, so equal graphs encode to equal
+// bytes whatever order they were accumulated in.
+//
+// header  : b"BFRG", version u32,
+//           spacing 3 x f64, bins u32, bridge_lines u32, range 2 x f64,
+//           edge count u64, node count u64                          (72 B)
+// edge    : lo u32, hi u32, axis_faces 3 x u64, bridged u64,
+//           area, sum, sum_sq, min, max f64, then `bins` x u32       (80 + 4 bins B)
+// node    : label u32, voxels u64, sum f64, sum_sq f64              (28 B)
+
+const RAG_MAGIC: [u8; 4] = *b"BFRG";
+const RAG_VERSION: u32 = 1;
+
+/// Bytes of an encoded [`Rag`]'s header.
+pub const RAG_HEADER_BYTES: usize = 72;
+/// Bytes per encoded node.
+pub const RAG_NODE_BYTES: usize = 28;
+
+/// Bytes per encoded edge with a `bins`-bin histogram.
+pub fn rag_edge_bytes(bins: usize) -> usize {
+    80 + 4 * bins
+}
+
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize, what: &str) -> Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(n)
+            .filter(|&end| end <= self.bytes.len());
+        let Some(end) = end else {
+            return Err(Error::invalid(format!(
+                "rag: an encoded graph of {} bytes ends inside {what} (at byte {})",
+                self.bytes.len(),
+                self.at
+            )));
+        };
+        let out = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(out)
+    }
+    fn u32(&mut self, what: &str) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4, what)?.try_into().unwrap()))
+    }
+    fn u64(&mut self, what: &str) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8, what)?.try_into().unwrap()))
+    }
+    fn f64(&mut self, what: &str) -> Result<f64> {
+        Ok(f64::from_le_bytes(self.take(8, what)?.try_into().unwrap()))
+    }
+}
+
+impl Rag {
+    /// Encode as compact little-endian bytes (see the format above). Canonical:
+    /// equal graphs give equal bytes regardless of accumulation order.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let bins = self.options.bins;
+        let mut out = Vec::with_capacity(
+            RAG_HEADER_BYTES
+                + self.edges.len() * rag_edge_bytes(bins)
+                + self.nodes.len() * RAG_NODE_BYTES,
+        );
+        out.extend_from_slice(&RAG_MAGIC);
+        out.extend_from_slice(&RAG_VERSION.to_le_bytes());
+        for s in self.options.spacing {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        out.extend_from_slice(&(bins as u32).to_le_bytes());
+        out.extend_from_slice(&(self.options.bridge_lines as u32).to_le_bytes());
+        out.extend_from_slice(&self.options.range.0.to_le_bytes());
+        out.extend_from_slice(&self.options.range.1.to_le_bytes());
+        out.extend_from_slice(&(self.edges.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(self.nodes.len() as u64).to_le_bytes());
+        for i in self.sorted() {
+            let (lo, hi) = self.keys[i];
+            let e = &self.edges[i];
+            out.extend_from_slice(&lo.to_le_bytes());
+            out.extend_from_slice(&hi.to_le_bytes());
+            for count in e.axis_faces {
+                out.extend_from_slice(&count.to_le_bytes());
+            }
+            out.extend_from_slice(&e.bridged.to_le_bytes());
+            for value in [e.area, e.sum, e.sum_sq, e.min, e.max] {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            for count in self.histogram(i) {
+                out.extend_from_slice(&count.to_le_bytes());
+            }
+        }
+        let mut labels: Vec<u32> = self.nodes.keys().copied().collect();
+        labels.sort_unstable();
+        for label in labels {
+            let n = &self.nodes[&label];
+            out.extend_from_slice(&label.to_le_bytes());
+            out.extend_from_slice(&n.voxels.to_le_bytes());
+            out.extend_from_slice(&n.sum.to_le_bytes());
+            out.extend_from_slice(&n.sum_sq.to_le_bytes());
+        }
+        out
+    }
+
+    /// The inverse of [`Rag::to_bytes`]. Refuses a wrong magic or version, a
+    /// truncated or over-long buffer, an edge that is not `0 < lo < hi`, a
+    /// repeated edge or node, and invalid options.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Rag> {
+        let mut r = Reader { bytes, at: 0 };
+        if r.take(4, "the magic")? != RAG_MAGIC {
+            return Err(Error::invalid(
+                "rag: the bytes do not start with the encoded-graph magic \"BFRG\"",
+            ));
+        }
+        let version = r.u32("the version")?;
+        if version != RAG_VERSION {
+            return Err(Error::invalid(format!(
+                "rag: encoded graph version {version}, this build reads {RAG_VERSION}"
+            )));
+        }
+        let spacing = [
+            r.f64("the spacing")?,
+            r.f64("the spacing")?,
+            r.f64("the spacing")?,
+        ];
+        let bins = r.u32("the bin count")? as usize;
+        let bridge_lines = match r.u32("the bridging flag")? {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(Error::invalid(format!(
+                    "rag: bridging flag {other} is neither 0 nor 1"
+                )))
+            }
+        };
+        let range = (r.f64("the range")?, r.f64("the range")?);
+        let options = RagOptions {
+            spacing,
+            bins,
+            range,
+            bridge_lines,
+        };
+        options.validate()?;
+        let n_edges = r.u64("the edge count")? as usize;
+        let n_nodes = r.u64("the node count")? as usize;
+        let expected = n_edges
+            .checked_mul(rag_edge_bytes(bins))
+            .and_then(|e| {
+                n_nodes
+                    .checked_mul(RAG_NODE_BYTES)
+                    .and_then(|n| e.checked_add(n))
+            })
+            .and_then(|body| body.checked_add(RAG_HEADER_BYTES));
+        if expected != Some(bytes.len()) {
+            return Err(Error::invalid(format!(
+                "rag: an encoded graph declaring {n_edges} edges and {n_nodes} nodes at {bins} \
+                 bins is {expected:?} bytes, and this one is {}",
+                bytes.len()
+            )));
+        }
+        let mut rag = Rag::new(options);
+        rag.keys.reserve(n_edges);
+        rag.edges.reserve(n_edges);
+        rag.histograms.reserve(n_edges * bins);
+        for _ in 0..n_edges {
+            let lo = r.u32("an edge")?;
+            let hi = r.u32("an edge")?;
+            if lo == 0 || lo >= hi {
+                return Err(Error::invalid(format!(
+                    "rag: encoded edge ({lo}, {hi}) is not 0 < lo < hi"
+                )));
+            }
+            let axis_faces = [r.u64("an edge")?, r.u64("an edge")?, r.u64("an edge")?];
+            let bridged = r.u64("an edge")?;
+            let [area, sum, sum_sq, min, max] = [
+                r.f64("an edge")?,
+                r.f64("an edge")?,
+                r.f64("an edge")?,
+                r.f64("an edge")?,
+                r.f64("an edge")?,
+            ];
+            let at = rag.edges.len();
+            if rag.index.insert(key(lo, hi), at).is_some() {
+                return Err(Error::invalid(format!(
+                    "rag: encoded edge ({lo}, {hi}) appears twice"
+                )));
+            }
+            rag.keys.push((lo, hi));
+            rag.edges.push(EdgeStats {
+                faces: axis_faces.iter().sum(),
+                axis_faces,
+                bridged,
+                area,
+                sum,
+                sum_sq,
+                min,
+                max,
+            });
+            for _ in 0..bins {
+                let count = r.u32("a histogram")?;
+                rag.histograms.push(count);
+            }
+        }
+        rag.nodes.reserve(n_nodes);
+        for _ in 0..n_nodes {
+            let label = r.u32("a node")?;
+            let stats = NodeStats {
+                voxels: r.u64("a node")?,
+                sum: r.f64("a node")?,
+                sum_sq: r.f64("a node")?,
+            };
+            if label == 0 || rag.nodes.insert(label, stats).is_some() {
+                return Err(Error::invalid(format!(
+                    "rag: encoded node {label} is 0 or appears twice"
+                )));
+            }
+        }
+        Ok(rag)
     }
 }
 
@@ -760,6 +1002,33 @@ mod tests {
             }
             assert_same(&whole, &merged);
         }
+    }
+
+    #[test]
+    fn bytes_round_trip_and_are_canonical() {
+        let (lab, ev) = random_volume((5, 6, 7), 9, 3);
+        let opts = RagOptions::new([2.0, 1.0, 1.0], 6, (0.0, 1.0)).bridging_lines(true);
+        let g = rag(lab.view(), ev.view(), Some(ev.view()), &opts).unwrap();
+        let bytes = g.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            RAG_HEADER_BYTES + g.edge_count() * rag_edge_bytes(6) + g.node_count() * RAG_NODE_BYTES
+        );
+        let back = Rag::from_bytes(&bytes).unwrap();
+        assert_eq!(back.options(), g.options());
+        assert_same(&g, &back);
+        assert_eq!(back.to_bytes(), bytes);
+        // Accumulated in another order (one block), same bytes up to f64 sums:
+        // the edge and node sets and integer fields encode identically.
+        let one = rag_block(lab.view(), ev.view(), Some(ev.view()), [5, 6, 7], &opts).unwrap();
+        assert_same(&one, &back);
+        // Empty graph, truncation, garbage.
+        let empty = Rag::new(opts.clone());
+        assert_eq!(Rag::from_bytes(&empty.to_bytes()).unwrap().edge_count(), 0);
+        assert!(Rag::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        assert!(Rag::from_bytes(b"nope").is_err());
+        let mut other = Rag::new(RagOptions::new([1.0; 3], 6, (0.0, 1.0)));
+        assert!(other.try_merge(back).is_err());
     }
 
     #[test]
