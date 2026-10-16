@@ -141,6 +141,10 @@ pub mod export;
 pub mod forest;
 pub mod fragment;
 pub mod geometry;
+/// GPU implementations of block ops, selected at run time beside the CPU
+/// reference. The device code is behind `gpu-cuda` / `gpu-wgpu`; without them
+/// only the device-agnostic layer is compiled and everything runs on the host.
+pub mod gpu;
 pub mod graph;
 /// An HTTP server and a browser view over the event stream — live, or replayed
 /// from an exported order log. Behind the `gui` feature; with it off this crate

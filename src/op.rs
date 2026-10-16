@@ -1095,6 +1095,22 @@ pub trait BlockOp: Send + Sync {
     fn block_constraint(&self, _volume: [usize; 3]) -> Option<BlockConstraint> {
         None
     }
+
+    // ------------------------------------------------------------ device --
+
+    /// Device (GPU) memory this op needs to run a block whose input is `block`,
+    /// or `None` — the default — when it will run on the host.
+    ///
+    /// `Some` is a promise about *this* run: an op that has a GPU path but no
+    /// device to run it on answers `None` (see [`crate::gpu::Accelerated`]). The
+    /// chain walk leases the bytes from the process-wide device budget around
+    /// the call, so the number of blocks on the device at once falls out of the
+    /// device's memory the way host concurrency falls out of
+    /// [`crate::budget::MemoryBudget`]. See `src/gpu/mod.rs` for what the
+    /// planner does and does not yet do with it.
+    fn device_bytes(&self, _block: [usize; 3]) -> Option<u64> {
+        None
+    }
 }
 
 /// What joins the branches of a [`Chain::Parallel`] back into one result.
@@ -1312,6 +1328,12 @@ pub trait Combine: Send + Sync {
     /// one. Measured, not guessed; the default of `1.0` is a placeholder.
     fn cost_per_voxel(&self, _branches: usize) -> f64 {
         1.0
+    }
+
+    /// [`BlockOp::device_bytes`], for a fan-in: device memory to run a block
+    /// whose output is `block`, or `None` (the default) for a host combine.
+    fn device_bytes(&self, _block: [usize; 3]) -> Option<u64> {
+        None
     }
 
     /// Arrays this combine writes **besides** the image it returns, declared the
@@ -2901,7 +2923,13 @@ impl Chain {
             )));
         }
         match self {
-            Chain::Op(op) => op.apply_placed(input, sources, out, at),
+            Chain::Op(op) => {
+                // Device admission (`src/gpu`): held across the call so at most
+                // as many blocks are on the device as its memory admits. `None`,
+                // and therefore free, for every host op.
+                let _device = op.device_bytes(input.shape()).map(crate::gpu::admit);
+                op.apply_placed(input, sources, out, at)
+            }
             // The one node that answers from something other than `input`. The
             // buffer holds the block's read extent of the image, so this is a
             // copy and not a slice: the executor already asked for exactly the
@@ -3117,6 +3145,8 @@ impl Chain {
                 // nothing here can see it. See `BlockResidency`, which says so
                 // where a reader will meet the number.
                 let buffers: Vec<&Voxels> = results.iter().map(BranchResult::buffer).collect();
+                // Device admission, as for `Chain::Op` above.
+                let _device = combine.device_bytes(out.shape()).map(crate::gpu::admit);
                 let done = combine.apply(&buffers, out, &at.output);
                 tally.give(held);
                 done
