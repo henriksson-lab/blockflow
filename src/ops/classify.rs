@@ -36,7 +36,9 @@
 //! The block executor already parallelises across blocks, and
 //! `simulate::Machine::contention` exists because nested parallelism is what
 //! makes forty workers behave like 2.41. A predictor spawning its own threads
-//! would fight it.
+//! would fight it. [`gather_samples`] and [`crate::forest::Forest::train`] are
+//! the exception, because they run outside any executor: both use rayon's
+//! current pool, and both give the same answer at any thread count.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -394,39 +396,51 @@ impl ClassMap {
 }
 
 /// **Gather training rows**: run the feature stack, and take one row at every
-/// voxel whose label is not `unlabelled`.
+/// voxel whose label is not `unlabelled`, in volume order.
 ///
-/// # It computes the stack over the labels' neighbourhood, not the volume
+/// # It computes each channel over the labels' neighbourhood, not the volume
 ///
 /// Labels are sparse by construction — a few thousand brush-stroke voxels — and
-/// a feature at a voxel depends only on the voxels within the chain's reach of
-/// it. So the stack is computed over the **bounding box of the labelled voxels,
-/// grown by that reach and clamped to the volume**, and nothing outside it is
-/// touched.
+/// a feature at a voxel depends only on the voxels within its chain's reach of
+/// it. So each channel is computed over **boxes around the labelled voxels,
+/// grown by that channel's own reach and clamped to the volume**, and nothing
+/// outside them is touched.
 ///
 /// **The rows are bit-identical to what the whole volume would have given**, and
 /// that is a property rather than an approximation. Two cases, both exact: a
-/// labelled voxel at least `reach` inside the crop reads only voxels the crop
-/// holds, and one whose neighbourhood runs past the crop has a crop edge that
+/// labelled voxel at least `reach` inside a box reads only voxels the box
+/// holds, and one whose neighbourhood runs past the box has a box edge that
 /// *is* the volume edge — because the box was grown by the full reach before
 /// clamping — so it meets the same boundary rule it would have met anyway.
-/// `tests/forest_predict.rs` asserts the equality rather than arguing it.
+/// The tests below assert the equality, bit for bit, rather than arguing it.
 ///
-/// For labels scattered to opposite corners the box is the volume again: this is
-/// a crop, not a sparse traversal.
+/// # In parallel, and the same rows at any thread count
+///
+/// The labelled region is cut into slabs along its longest axis, each channel
+/// gets its own slab thickness — at least twice its reach on that axis, so the
+/// halo recomputed is at most as large as the slab — and every (channel, slab)
+/// pair is an independent task on rayon's current pool. Each task keeps only
+/// the values at the labelled voxels of its slab, so what is held at the end is
+/// the rows, not a feature image per channel. The cut depends on the labels and
+/// the stack alone and, by the argument above, does not change any value.
+///
+/// For labels scattered to opposite corners the boxes cover the volume again:
+/// this is a crop, not a sparse traversal.
 ///
 /// # The blocked alternative
 ///
-/// This holds every channel of every voxel of the crop in memory, so it works on
-/// an annotator's working crop and falls over on a volume. [`sample_workflow`]
-/// is the blocked path: it gathers the same rows as a side output of the fan-in
-/// itself, one block at a time.
+/// Every task holds one channel over one slab, and up to a pool's worth run at
+/// once, so this works on an annotator's working crop and falls over on a whole
+/// volume. [`sample_workflow`] is the blocked path: it gathers the same rows as
+/// a side output of the fan-in itself, one block at a time.
 pub fn gather_samples(
     stack: &FeatureStack,
     input: &Voxels,
     labels: &Voxels,
     unlabelled: u32,
 ) -> Result<(Samples, ClassMap)> {
+    use rayon::prelude::*;
+
     if labels.shape() != input.shape() {
         return Err(Error::ShapeMismatch {
             expected: input.shape().to_vec(),
@@ -437,39 +451,22 @@ pub fn gather_samples(
     let names = stack.channel_names()?;
     let channels = stack.branches()?;
 
-    // The box the labels actually occupy, grown by what a feature reads. See
-    // this function's header for why the rows this yields are the whole
-    // volume's rows and not an approximation of them.
     let label_view = labels.view::<u32>()?;
-    let reach = stack.reach(volume)?;
-    let Some((start, extent)) = labelled_extent(label_view, unlabelled, reach, volume) else {
+    let mut positions: Vec<[usize; 3]> = Vec::new();
+    let mut drawn: Vec<u32> = Vec::new();
+    for ((i, j, k), &label) in label_view.indexed_iter() {
+        if label != unlabelled {
+            positions.push([i, j, k]);
+            drawn.push(label);
+        }
+    }
+    if positions.is_empty() {
         return Err(Error::InvalidArgument(format!(
             "no voxel of the label volume differs from {unlabelled}, so there is nothing \
              to fit"
         )));
-    };
-
-    // `slice_region` and not a copy written here: it is the crate's own sub-box
-    // copy, generic over the element type, and a second one would be a second
-    // chance to get the striding wrong.
-    let cropped_input = input.slice_region(&Region::new(&start, &extent))?;
-    let mut columns: Vec<Vec<f64>> = Vec::with_capacity(channels.len());
-    for arm in &channels {
-        // One arm at a time, so the peak is one feature image and not
-        // ninety-one. The same fusion argument the block executor makes, taken
-        // here because a training crop is small enough to hold whole but a stack
-        // over it is not.
-        let mut out = Voxels::zeros(arm.produces(cropped_input.dtype())?, extent)?;
-        arm.apply(&cropped_input, &mut out, &Anchor::whole(extent))?;
-        let view = out.view::<f64>()?;
-        columns.push(view.iter().copied().collect());
     }
-
-    let mut distinct: Vec<u32> = label_view
-        .iter()
-        .copied()
-        .filter(|&label| label != unlabelled)
-        .collect();
+    let mut distinct = drawn.clone();
     distinct.sort_unstable();
     distinct.dedup();
     if distinct.len() < 2 {
@@ -480,28 +477,89 @@ pub fn gather_samples(
             if distinct.len() == 1 { "" } else { "es" }
         )));
     }
+    let rows: Vec<u32> = drawn
+        .iter()
+        .map(|label| distinct.binary_search(label).expect("collected from the same labels") as u32)
+        .collect();
 
-    let mut features = Vec::new();
-    let mut rows = Vec::new();
-    for i in 0..extent[0] {
-        for j in 0..extent[1] {
-            for k in 0..extent[2] {
-                let label = label_view[[start[0] + i, start[1] + j, start[2] + k]];
-                if label == unlabelled {
-                    continue;
-                }
-                let at = (i * extent[1] + j) * extent[2] + k;
-                for column in &columns {
-                    features.push(column[at]);
-                }
-                rows.push(distinct.iter().position(|&found| found == label).unwrap() as u32);
+    // The cut: slabs along the longest axis of the labels' bounding box.
+    let (low, high) = bounds(&positions);
+    let axis = (0..3)
+        .max_by_key(|&axis| (high[axis] - low[axis], std::cmp::Reverse(axis)))
+        .expect("three axes");
+    let span = high[axis] - low[axis] + 1;
+    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
+    for (arm, chain) in channels.iter().enumerate() {
+        let reach = chain.reach3(&volume);
+        let thickness = (2 * reach[axis]).max(MIN_SLAB).min(span);
+        for from in (low[axis]..=high[axis]).step_by(thickness) {
+            tasks.push((arm, from, (from + thickness).min(high[axis] + 1)));
+        }
+    }
+
+    let columns = channels.len();
+    let gathered = tasks
+        .par_iter()
+        .with_max_len(1)
+        .map(|&(arm, from, to)| -> Result<(usize, Vec<usize>, Vec<f64>)> {
+            let chain = &channels[arm];
+            let members: Vec<usize> = (0..positions.len())
+                .filter(|&row| (from..to).contains(&positions[row][axis]))
+                .collect();
+            if members.is_empty() {
+                return Ok((arm, members, Vec::new()));
             }
+            let inside: Vec<[usize; 3]> = members.iter().map(|&row| positions[row]).collect();
+            let (low, high) = bounds(&inside);
+            let reach = chain.reach3(&volume);
+            let mut start = [0usize; 3];
+            let mut extent = [0usize; 3];
+            for axis in 0..3 {
+                start[axis] = low[axis].saturating_sub(reach[axis]);
+                extent[axis] = (high[axis] + reach[axis] + 1).min(volume[axis]) - start[axis];
+            }
+            // `slice_region` and not a copy written here: it is the crate's own
+            // sub-box copy, generic over the element type, and a second one
+            // would be a second chance to get the striding wrong.
+            let crop = input.slice_region(&Region::new(&start, &extent))?;
+            let mut out = Voxels::zeros(chain.produces(crop.dtype())?, extent)?;
+            chain.apply(&crop, &mut out, &Anchor::whole(extent))?;
+            let view = out.view::<f64>()?;
+            let values = inside
+                .iter()
+                .map(|p| view[[p[0] - start[0], p[1] - start[1], p[2] - start[2]]])
+                .collect();
+            Ok((arm, members, values))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut features = vec![0.0f64; positions.len() * columns];
+    for (arm, members, values) in gathered {
+        for (row, value) in members.into_iter().zip(values) {
+            features[row * columns + arm] = value;
         }
     }
     Ok((
         Samples::new(features, rows, names)?,
         ClassMap { labels: distinct },
     ))
+}
+
+/// The thinnest slab [`gather_samples`] cuts, in voxels: below this the
+/// per-task overhead of a copy and a chain walk outweighs the parallelism.
+const MIN_SLAB: usize = 16;
+
+/// The smallest and largest coordinate on each axis.
+fn bounds(positions: &[[usize; 3]]) -> ([usize; 3], [usize; 3]) {
+    let mut low = [usize::MAX; 3];
+    let mut high = [0usize; 3];
+    for position in positions {
+        for axis in 0..3 {
+            low[axis] = low[axis].min(position[axis]);
+            high[axis] = high[axis].max(position[axis]);
+        }
+    }
+    (low, high)
 }
 
 /// **Train**: a feature stack, a volume, its labels, and a fitting spec, to a
@@ -520,43 +578,6 @@ pub fn train_workflow(
 ) -> Result<(Forest, ClassMap)> {
     let (samples, classes) = gather_samples(stack, input, labels, unlabelled)?;
     Ok((Forest::train(&samples, spec)?, classes))
-}
-
-/// The bounding box of the voxels whose label is not `unlabelled`, grown by
-/// `reach` on every side and clamped to the volume.
-///
-/// `None` when nothing is labelled. The growth is what makes the crop's rows the
-/// whole volume's rows; see [`gather_samples`].
-fn labelled_extent(
-    labels: ndarray::ArrayView3<'_, u32>,
-    unlabelled: u32,
-    reach: [usize; 3],
-    volume: [usize; 3],
-) -> Option<([usize; 3], [usize; 3])> {
-    let mut low = [usize::MAX; 3];
-    let mut high = [0usize; 3];
-    let mut any = false;
-    for ((i, j, k), &label) in labels.indexed_iter() {
-        if label == unlabelled {
-            continue;
-        }
-        any = true;
-        for (axis, at) in [i, j, k].into_iter().enumerate() {
-            low[axis] = low[axis].min(at);
-            high[axis] = high[axis].max(at);
-        }
-    }
-    if !any {
-        return None;
-    }
-    let mut start = [0usize; 3];
-    let mut extent = [0usize; 3];
-    for axis in 0..3 {
-        start[axis] = low[axis].saturating_sub(reach[axis]);
-        let end = (high[axis] + reach[axis] + 1).min(volume[axis]);
-        extent[axis] = end - start[axis];
-    }
-    Some((start, extent))
 }
 
 // ------------------------------------------------------- the row sampler --
@@ -988,4 +1009,126 @@ pub fn samples_from_rows(
         labels.push(value as u32);
     }
     Samples::new(rows.iter().copied().collect(), labels, channels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array3;
+
+    fn hash(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9e3779b97f4a7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    fn fixture(shape: [usize; 3], every: u64) -> (Voxels, Voxels) {
+        let dim = (shape[0], shape[1], shape[2]);
+        let input = Array3::from_shape_fn(dim, |(i, j, k)| {
+            (i as f64 * 0.3).sin() + (j as f64 * 0.2).cos() * (k as f64 * 0.15).sin()
+                + (hash(((i * shape[1] + j) * shape[2] + k) as u64) % 1000) as f64 / 2000.0
+        });
+        let labels = Array3::from_shape_fn(dim, |(i, j, k)| {
+            let at = ((i * shape[1] + j) * shape[2] + k) as u64;
+            if hash(at ^ 0x5a5a) % every != 0 {
+                0
+            } else {
+                1 + (hash(at) % 3) as u32 * 2
+            }
+        });
+        (Voxels::F64(input), Voxels::U32(labels))
+    }
+
+    /// The rows the whole volume gives: every channel over every voxel, read at
+    /// the labelled ones in volume order — the definition `gather_samples` is
+    /// held to.
+    fn reference(stack: &FeatureStack, input: &Voxels, labels: &Voxels) -> Vec<f64> {
+        let shape = input.shape();
+        let images: Vec<Voxels> = stack
+            .branches()
+            .unwrap()
+            .iter()
+            .map(|chain| {
+                let mut out = Voxels::zeros(Dtype::F64, shape).unwrap();
+                chain.apply(input, &mut out, &Anchor::whole(shape)).unwrap();
+                out
+            })
+            .collect();
+        let mut rows = Vec::new();
+        for ((i, j, k), &label) in labels.view::<u32>().unwrap().indexed_iter() {
+            if label != 0 {
+                for image in &images {
+                    rows.push(image.view::<f64>().unwrap()[[i, j, k]]);
+                }
+            }
+        }
+        rows
+    }
+
+    fn gather_on(threads: usize, stack: &FeatureStack, input: &Voxels, labels: &Voxels) -> Samples {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| gather_samples(stack, input, labels, 0).unwrap().0)
+    }
+
+    fn all_rows(samples: &Samples) -> Vec<u64> {
+        (0..samples.rows())
+            .flat_map(|row| samples.row(row).iter().map(|v| v.to_bits()).collect::<Vec<_>>())
+            .collect()
+    }
+
+    #[test]
+    fn gathered_rows_are_the_whole_volumes_rows_at_any_thread_count() {
+        let shape = [14, 48, 40];
+        let stack = FeatureStack::labkit(&[0.7, 1.6]).unwrap();
+        for every in [7, 151] {
+            let (input, labels) = fixture(shape, every);
+            let expected: Vec<u64> =
+                reference(&stack, &input, &labels).iter().map(|v| v.to_bits()).collect();
+            let one = gather_on(1, &stack, &input, &labels);
+            assert_eq!(all_rows(&one), expected, "one in {every} labelled");
+            assert_eq!(all_rows(&gather_on(5, &stack, &input, &labels)), expected);
+            // Classes are remapped through the sorted distinct labels {1, 3, 5}.
+            let drawn: Vec<u32> = labels.view::<u32>().unwrap().iter().copied().filter(|&l| l != 0).collect();
+            let back: Vec<u32> = one.labels().iter().map(|&c| [1, 3, 5][c as usize]).collect();
+            assert_eq!(back, drawn);
+        }
+    }
+
+    #[test]
+    fn gathered_rows_hold_under_anisotropic_spacing() {
+        let shape = [12, 40, 36];
+        let stack = FeatureStack::labkit(&[1.0, 2.0])
+            .unwrap()
+            .with_spacing([2.0, 1.0, 1.0])
+            .unwrap();
+        let (input, labels) = fixture(shape, 11);
+        let expected: Vec<u64> =
+            reference(&stack, &input, &labels).iter().map(|v| v.to_bits()).collect();
+        assert_eq!(all_rows(&gather_on(3, &stack, &input, &labels)), expected);
+    }
+
+    #[test]
+    fn a_forest_trained_at_one_spacing_is_refused_at_another() {
+        let shape = [10, 24, 24];
+        let (input, labels) = fixture(shape, 5);
+        let anisotropic = FeatureStack::labkit(&[1.0])
+            .unwrap()
+            .with_spacing([2.0, 1.0, 1.0])
+            .unwrap();
+        let spec = TrainingSpec {
+            trees: 3,
+            ..TrainingSpec::default()
+        };
+        let (forest, _) = train_workflow(&anisotropic, &input, &labels, 0, &spec).unwrap();
+        let forest = Arc::new(forest);
+        assert!(predict_workflow(&anisotropic, Arc::clone(&forest), Prediction::Label).is_ok());
+        let isotropic = FeatureStack::labkit(&[1.0]).unwrap();
+        assert!(predict_workflow(&isotropic, Arc::clone(&forest), Prediction::Label).is_err());
+        let other = isotropic.with_spacing([1.5, 1.0, 1.0]).unwrap();
+        assert!(predict_workflow(&other, forest, Prediction::Label).is_err());
+    }
 }

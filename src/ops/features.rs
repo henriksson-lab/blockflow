@@ -89,18 +89,22 @@ pub enum Geometry {
 }
 
 impl Geometry {
-    /// The scale, per axis, for a caller-supplied isotropic sigma.
-    fn scale(self, sigma: f64) -> [f64; 3] {
-        let mut scale = [sigma; 3];
+    /// The scale, per axis and in voxels, for a caller-supplied sigma in the
+    /// units of `spacing`: `sigma / spacing[axis]`, and zero on a plane normal.
+    fn scale(self, sigma: f64, spacing: [f64; 3]) -> [f64; 3] {
+        let mut scale = [0.0; 3];
+        for axis in 0..3 {
+            scale[axis] = sigma / spacing[axis];
+        }
         if let Geometry::PlaneWise { normal } = self {
             scale[normal] = 0.0;
         }
         scale
     }
 
-    /// The radius, per axis, for a caller-supplied isotropic radius.
-    fn radius(self, radius: usize) -> [usize; 3] {
-        let mut sides = [radius; 3];
+    /// The radius, per axis, for a caller-supplied per-axis radius: zero on a
+    /// plane normal.
+    fn radius(self, mut sides: [usize; 3]) -> [usize; 3] {
         if let Geometry::PlaneWise { normal } = self {
             sides[normal] = 0;
         }
@@ -180,14 +184,17 @@ impl Family {
 
 /// One channel: what it is, and the chain that computes it.
 pub struct FeatureChannel {
-    /// Unique within a stack, and readable: `"hessian/1.6/largest"`. This is the
-    /// name a trained forest's split refers to, so it is the thing that has to
-    /// stay stable — see [`FeatureStack::channel_names`].
+    /// Unique within a stack, and readable: `"hessian/1.6/largest"`, or
+    /// `"hessian/1.6@2,1,1/largest"` under a non-unit
+    /// [`FeatureStack::with_spacing`]. This is the name a trained forest's split
+    /// refers to, so it is the thing that has to stay stable — see
+    /// [`FeatureStack::channel_names`].
     pub name: String,
     pub family: Family,
-    /// The scale this channel was computed at, where it has one. `None` for the
-    /// original image; the difference of Gaussians carries the **smaller** of
-    /// its pair, with both in the name.
+    /// The scale this channel was computed at, where it has one, in the units
+    /// of the stack's spacing (voxels, at the default). `None` for the original
+    /// image; the difference of Gaussians carries the **smaller** of its pair,
+    /// with both in the name.
     pub sigma: Option<f64>,
     /// The chain from the input image to this channel's image.
     pub chain: Chain,
@@ -201,6 +208,7 @@ pub struct FeatureStack {
     truncate: f64,
     families: Vec<Family>,
     exact_deviation: bool,
+    spacing: [f64; 3],
 }
 
 impl FeatureStack {
@@ -247,7 +255,59 @@ impl FeatureStack {
             truncate: 3.0,
             families: Family::ALL.to_vec(),
             exact_deviation: false,
+            spacing: [1.0; 3],
         })
+    }
+
+    /// **Anisotropic voxels**: the voxel spacing per axis, in the units the
+    /// sigmas are given in.
+    ///
+    /// A sigma `s` becomes `s / spacing[axis]` voxels on each axis, so at
+    /// `[2.0, 1.0, 1.0]` — z sampled at twice the xy spacing — sigma 1.6 is
+    /// `[0.8, 1.6, 1.6]` voxels and every filter covers the same physical
+    /// neighbourhood on every axis. The morphological box follows: its radius
+    /// is `floor(1 + 2 s / spacing[axis])` per axis.
+    ///
+    /// What scales is the *extent* of each filter, which is this crate's
+    /// convention for anisotropic data (`ops::ridge`'s scale spaces take a
+    /// per-axis sigma the same way). Derivatives stay in voxel units, so a
+    /// Hessian or a gradient is not re-expressed in physical units; a forest
+    /// learns from the values as they are, and the same stack at training and
+    /// at prediction gives the same values.
+    ///
+    /// **A non-unit spacing is in every scaled channel's name** (`gaussian/1.6`
+    /// becomes `gaussian/1.6@2,1,1`), so a forest trained at one spacing is
+    /// refused by [`crate::ops::classify::predict_workflow`] against a stack at
+    /// another, rather than reading features computed at the wrong scale. The
+    /// default, `[1.0; 3]`, leaves the names as they were.
+    pub fn with_spacing(mut self, spacing: [f64; 3]) -> Result<Self> {
+        if spacing.iter().any(|&s| !s.is_finite() || s <= 0.0) {
+            return Err(Error::InvalidArgument(format!(
+                "a voxel spacing must be positive and finite on every axis; got {spacing:?}"
+            )));
+        }
+        self.spacing = spacing;
+        Ok(self)
+    }
+
+    pub fn spacing(&self) -> [f64; 3] {
+        self.spacing
+    }
+
+    /// What a non-unit spacing appends to a scale in a channel name: empty at
+    /// the default, `"@2,1,1"` otherwise.
+    fn spacing_tag(&self) -> String {
+        if self.spacing == [1.0; 3] {
+            String::new()
+        } else {
+            let [a, b, c] = self.spacing;
+            format!("@{a},{b},{c}")
+        }
+    }
+
+    /// The scale in voxels, per axis, for a sigma in the stack's units.
+    fn scale(&self, sigma: f64) -> [f64; 3] {
+        self.geometry.scale(sigma, self.spacing)
     }
 
     pub fn with_geometry(mut self, geometry: Geometry) -> Result<Self> {
@@ -397,6 +457,7 @@ impl FeatureStack {
     /// and within a family scale by scale ascending.
     pub fn channels(&self) -> Result<Vec<FeatureChannel>> {
         let mut channels = Vec::with_capacity(self.len());
+        let tag = self.spacing_tag();
         for &family in &self.families {
             match family {
                 Family::Original => channels.push(FeatureChannel {
@@ -408,7 +469,7 @@ impl FeatureStack {
                 Family::Gaussian => {
                     for &sigma in &self.sigmas {
                         channels.push(FeatureChannel {
-                            name: format!("gaussian/{sigma}"),
+                            name: format!("gaussian/{sigma}{tag}"),
                             family,
                             sigma: Some(sigma),
                             chain: self.smoothed(sigma, "gaussian")?,
@@ -419,7 +480,7 @@ impl FeatureStack {
                     for (index, &narrow) in self.sigmas.iter().enumerate() {
                         for &wide in &self.sigmas[index + 1..] {
                             channels.push(FeatureChannel {
-                                name: format!("dog/{narrow}-{wide}"),
+                                name: format!("dog/{narrow}-{wide}{tag}"),
                                 family,
                                 sigma: Some(narrow),
                                 // `narrow - wide`, in that branch order. The
@@ -441,12 +502,12 @@ impl FeatureStack {
                 Family::GradientMagnitude => {
                     for &sigma in &self.sigmas {
                         channels.push(FeatureChannel {
-                            name: format!("gradient/{sigma}"),
+                            name: format!("gradient/{sigma}{tag}"),
                             family,
                             sigma: Some(sigma),
                             chain: Chain::op(GradientMagnitudeOp::new(
                                 "gradient",
-                                self.geometry.scale(sigma),
+                                self.scale(sigma),
                                 self.truncate,
                             )?),
                         });
@@ -455,7 +516,7 @@ impl FeatureStack {
                 Family::LaplacianOfGaussian => {
                     for &sigma in &self.sigmas {
                         channels.push(FeatureChannel {
-                            name: format!("log/{sigma}"),
+                            name: format!("log/{sigma}{tag}"),
                             family,
                             sigma: Some(sigma),
                             // A sequence, and therefore a reach that **adds**:
@@ -482,12 +543,12 @@ impl FeatureStack {
                     for &sigma in &self.sigmas {
                         for which in self.eigenvalues() {
                             channels.push(FeatureChannel {
-                                name: format!("hessian/{sigma}/{}", which.as_str()),
+                                name: format!("hessian/{sigma}{tag}/{}", which.as_str()),
                                 family,
                                 sigma: Some(sigma),
                                 chain: Chain::op(HessianEigenvalueOp::new(
                                     "hessian",
-                                    self.geometry.scale(sigma),
+                                    self.scale(sigma),
                                     self.truncate,
                                     which,
                                 )?),
@@ -500,13 +561,13 @@ impl FeatureStack {
                         for &gamma in INTEGRATION_SCALES {
                             for which in self.eigenvalues() {
                                 channels.push(FeatureChannel {
-                                    name: format!("structure/{sigma}/g{gamma}/{}", which.as_str()),
+                                    name: format!("structure/{sigma}{tag}/g{gamma}/{}", which.as_str()),
                                     family,
                                     sigma: Some(sigma),
                                     chain: Chain::op(StructureTensorOp::new(
                                         "structure",
                                         StructureTensor::at_gamma(
-                                            self.geometry.scale(sigma),
+                                            self.scale(sigma),
                                             gamma,
                                             self.truncate,
                                         )?,
@@ -519,23 +580,25 @@ impl FeatureStack {
                 }
                 Family::Morphological => {
                     for &sigma in &self.sigmas {
-                        let radius = self.geometry.radius(morphological_radius(sigma));
+                        let radius = self.geometry.radius(
+                            self.spacing.map(|spacing| morphological_radius(sigma / spacing)),
+                        );
                         for (label, rank) in [("min", Extreme::Min), ("max", Extreme::Max)] {
                             channels.push(FeatureChannel {
-                                name: format!("morphology/{sigma}/{label}"),
+                                name: format!("morphology/{sigma}{tag}/{label}"),
                                 family,
                                 sigma: Some(sigma),
                                 chain: separable_extreme(radius, rank)?,
                             });
                         }
                         channels.push(FeatureChannel {
-                            name: format!("morphology/{sigma}/mean"),
+                            name: format!("morphology/{sigma}{tag}/mean"),
                             family,
                             sigma: Some(sigma),
                             chain: separable_mean(radius)?,
                         });
                         channels.push(FeatureChannel {
-                            name: format!("morphology/{sigma}/deviation"),
+                            name: format!("morphology/{sigma}{tag}/deviation"),
                             family,
                             sigma: Some(sigma),
                             chain: if self.exact_deviation {
@@ -574,7 +637,7 @@ impl FeatureStack {
     fn smoothed(&self, sigma: f64, name: &'static str) -> Result<Chain> {
         Ok(Chain::op(SmoothOp::new(
             name,
-            Gaussian::new(self.geometry.scale(sigma), self.truncate)?,
+            Gaussian::new(self.scale(sigma), self.truncate)?,
         )))
     }
 
@@ -604,7 +667,7 @@ impl FeatureStack {
     /// the whole point of the mode, and is derived from the element rather than
     /// declared.
     fn laplacian_kernel(&self) -> Result<Kernel> {
-        let sides = self.geometry.radius(1);
+        let sides = self.geometry.radius([1; 3]);
         let extent = [2 * sides[0] + 1, 2 * sides[1] + 1, 2 * sides[2] + 1];
         let centre = sides;
         let mut weights = vec![0.0; extent[0] * extent[1] * extent[2]];
@@ -631,7 +694,8 @@ enum Extreme {
     Max,
 }
 
-/// Labkit's rule: a box of radius `floor(1 + 2 sigma)`.
+/// Labkit's rule: a box of radius `floor(1 + 2 sigma)`, with `sigma` in voxels
+/// on the axis in question.
 fn morphological_radius(sigma: f64) -> usize {
     (1.0 + 2.0 * sigma).floor() as usize
 }
@@ -853,3 +917,72 @@ impl Combine for DeviationCombine {
 /// of the derivative scale. Six channels per scale in 3-D is `2 * 3`, and this
 /// is the 2.
 pub const INTEGRATION_SCALES: &[f64] = &[1.0, 3.0];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::ridge::gaussian_radius;
+
+    #[test]
+    fn unit_spacing_keeps_the_names_and_the_chains() {
+        let plain = FeatureStack::labkit(&[0.7, 1.6]).unwrap();
+        let unit = plain.clone().with_spacing([1.0; 3]).unwrap();
+        assert_eq!(unit.channel_names().unwrap(), plain.channel_names().unwrap());
+        assert_eq!(unit.reach([64; 3]).unwrap(), plain.reach([64; 3]).unwrap());
+        assert!(plain.channel_names().unwrap().contains(&"hessian/1.6/largest".to_string()));
+    }
+
+    #[test]
+    fn spacing_divides_the_scale_per_axis_and_is_named() {
+        let stack = FeatureStack::labkit(&[0.7, 1.6])
+            .unwrap()
+            .with_spacing([2.0, 1.0, 1.0])
+            .unwrap();
+        let channels = stack.channels().unwrap();
+        let gaussian = channels.iter().find(|c| c.name == "gaussian/1.6@2,1,1").unwrap();
+        assert_eq!(
+            gaussian.chain.reach3(&[64; 3]),
+            [gaussian_radius(0.8, 3.0), gaussian_radius(1.6, 3.0), gaussian_radius(1.6, 3.0)]
+        );
+        // floor(1 + 2 * 0.8) = 2 on z, floor(1 + 2 * 1.6) = 4 in-plane, and the
+        // separable box adds one pass per axis: reach r on each axis.
+        let min = channels.iter().find(|c| c.name == "morphology/1.6@2,1,1/min").unwrap();
+        assert_eq!(min.chain.reach3(&[64; 3]), [2, 4, 4]);
+
+        let names = stack.channel_names().unwrap();
+        let plain = FeatureStack::labkit(&[0.7, 1.6]).unwrap().channel_names().unwrap();
+        assert_eq!(names.len(), plain.len());
+        let mut distinct = names.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), names.len());
+        // Every channel with a scale differs from the isotropic stack's.
+        for (spaced, unit) in names.iter().zip(&plain) {
+            assert_eq!(spaced == unit, unit == "original", "{spaced} vs {unit}");
+        }
+    }
+
+    #[test]
+    fn spacing_is_validated() {
+        let stack = FeatureStack::labkit(&[1.0]).unwrap();
+        for bad in [[0.0, 1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, f64::NAN]] {
+            assert!(stack.clone().with_spacing(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn plane_wise_ignores_the_normals_spacing() {
+        let stack = FeatureStack::labkit(&[1.0])
+            .unwrap()
+            .with_geometry(Geometry::PlaneWise { normal: 0 })
+            .unwrap()
+            .with_spacing([3.0, 1.0, 2.0])
+            .unwrap();
+        let channels = stack.channels().unwrap();
+        let gaussian = channels.iter().find(|c| c.name == "gaussian/1@3,1,2").unwrap();
+        assert_eq!(
+            gaussian.chain.reach3(&[64; 3]),
+            [0, gaussian_radius(1.0, 3.0), gaussian_radius(0.5, 3.0)]
+        );
+    }
+}

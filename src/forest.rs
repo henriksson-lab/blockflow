@@ -586,10 +586,6 @@ impl Samples {
         let columns = self.channels.len();
         &self.features[row * columns..(row + 1) * columns]
     }
-
-    fn at(&self, row: usize, column: usize) -> f64 {
-        self.features[row * self.channels.len() + column]
-    }
 }
 
 /// How a forest is fitted. Every field has a default that matches what the two
@@ -610,7 +606,8 @@ pub struct TrainingSpec {
     /// A node with fewer rows than this becomes a leaf.
     pub min_samples_leaf: usize,
     /// The bagging and `mtry` draws. **The whole fit is a function of this**, so
-    /// two runs with the same seed give the same forest, byte for byte.
+    /// two runs with the same seed give the same forest, byte for byte, whatever
+    /// the number of threads [`Forest::train`] runs on.
     pub seed: u64,
 }
 
@@ -670,6 +667,59 @@ struct Building {
     depth: usize,
 }
 
+/// The samples as the trainer reads them: one contiguous column per channel.
+///
+/// [`Samples`] is row-major because that is how a row is gathered and how the
+/// predictor reads one. A split search reads *one column* at the rows of a node,
+/// and over a row-major table that is a stride of the channel count per read, so
+/// the trainer transposes once up front. It changes no value and no order, only
+/// where the values sit.
+struct Columns<'a> {
+    values: Vec<f64>,
+    rows: usize,
+    labels: &'a [u32],
+    classes: usize,
+}
+
+impl<'a> Columns<'a> {
+    fn new(samples: &'a Samples) -> Self {
+        let (rows, columns) = (samples.rows(), samples.columns());
+        let mut values = vec![0.0; rows * columns];
+        for row in 0..rows {
+            for (column, &value) in samples.row(row).iter().enumerate() {
+                values[column * rows + row] = value;
+            }
+        }
+        Self {
+            values,
+            rows,
+            labels: samples.labels(),
+            classes: samples.classes(),
+        }
+    }
+
+    fn columns(&self) -> usize {
+        self.values.len() / self.rows
+    }
+
+    fn column(&self, column: usize) -> &[f64] {
+        &self.values[column * self.rows..(column + 1) * self.rows]
+    }
+}
+
+/// The seed of tree `tree`'s own stream: the `tree`-th draw of a
+/// [`SplitMix`] seeded with the forest's seed.
+///
+/// Each tree draws from a stream of its own, so trees can be grown in any order
+/// and on any number of threads and still give the same forest. One sequential
+/// stream shared by every tree — what this trainer used before — cannot be split
+/// that way, because how many draws a tree consumes depends on the data it is
+/// grown on, so tree `t`'s first draw is not known until tree `t - 1` is done.
+fn tree_seeds(seed: u64, trees: usize) -> Vec<u64> {
+    let mut seeder = SplitMix(seed);
+    (0..trees).map(|_| seeder.next()).collect()
+}
+
 impl Forest {
     /// **Fit a forest.** Bagging, `mtry` column subsampling, and Gini.
     ///
@@ -679,10 +729,23 @@ impl Forest {
     /// has to be is *deterministic*, so that a fit can be reproduced and
     /// compared against an oracle, and that is what `spec.seed` buys.
     ///
+    /// # Parallel, and the same forest at any thread count
+    ///
+    /// Trees are grown in parallel on rayon's current pool, each from its own
+    /// random stream (see [`tree_seeds`]), and concatenated in tree order. The
+    /// result is therefore a function of `samples` and `spec` alone — **the same
+    /// forest, byte for byte, on one thread or forty** — and a forest of `n`
+    /// trees is the first `n` trees of one of `n + 1` at the same seed. Forests
+    /// fitted before per-tree streams were introduced drew every tree from one
+    /// shared stream and are not reproduced by this version for the same seed;
+    /// they remain valid forests and still load.
+    ///
     /// The trees are built depth-first with each subtree appended after its
     /// parent, which is what establishes the invariant [`Forest::new`] checks:
     /// every child index exceeds its parent's, so a walk terminates.
     pub fn train(samples: &Samples, spec: &TrainingSpec) -> Result<Forest> {
+        use rayon::prelude::*;
+
         if spec.trees == 0 {
             return Err(Error::InvalidArgument(
                 "a forest of no trees has no vote to take".to_string(),
@@ -699,31 +762,51 @@ impl Forest {
             .unwrap_or_else(|| ((columns as f64).sqrt().round() as usize).max(1))
             .clamp(1, columns);
         let min_leaf = spec.min_samples_leaf.max(1);
+        let table = Columns::new(samples);
 
-        let mut rng = SplitMix(spec.seed);
-        let mut nodes: Vec<Node> = Vec::new();
-        let mut roots: Vec<u32> = Vec::new();
-        let mut votes: Vec<f32> = Vec::new();
+        // Each tree is grown into its own arrays, indexed from zero, and the
+        // arrays are rebased as they are concatenated. Rebasing adds the same
+        // offset to a parent and its children, so the children-after-parents
+        // invariant survives it.
+        let grown: Vec<(Vec<Node>, Vec<f32>)> = tree_seeds(spec.seed, spec.trees)
+            .into_par_iter()
+            .map(|seed| {
+                let mut rng = SplitMix(seed);
+                // Bagging: `rows` draws with replacement, which is the bootstrap.
+                let bag: Vec<usize> = (0..samples.rows())
+                    .map(|_| rng.next_below(samples.rows()))
+                    .collect();
+                let (mut nodes, mut votes) = (Vec::new(), Vec::new());
+                grow(
+                    &table,
+                    Building { rows: bag, depth: 1 },
+                    spec.max_depth,
+                    min_leaf,
+                    mtry,
+                    &mut rng,
+                    &mut nodes,
+                    &mut votes,
+                );
+                (nodes, votes)
+            })
+            .collect();
 
-        for _ in 0..spec.trees {
-            // Bagging: `rows` draws with replacement, which is the bootstrap.
-            let bag: Vec<usize> = (0..samples.rows())
-                .map(|_| rng.next_below(samples.rows()))
-                .collect();
-            roots.push(nodes.len() as u32);
-            grow(
-                samples,
-                Building {
-                    rows: bag,
-                    depth: 1,
-                },
-                spec.max_depth,
-                min_leaf,
-                mtry,
-                &mut rng,
-                &mut nodes,
-                &mut votes,
-            );
+        let mut nodes: Vec<Node> = Vec::with_capacity(grown.iter().map(|t| t.0.len()).sum());
+        let mut votes: Vec<f32> = Vec::with_capacity(grown.iter().map(|t| t.1.len()).sum());
+        let mut roots: Vec<u32> = Vec::with_capacity(spec.trees);
+        for (tree_nodes, tree_votes) in grown {
+            let (node_base, vote_base) = (nodes.len() as u32, votes.len() as u32);
+            roots.push(node_base);
+            nodes.extend(tree_nodes.into_iter().map(|mut node| {
+                if node.is_leaf() {
+                    node.left += vote_base;
+                } else {
+                    node.left += node_base;
+                    node.right += node_base;
+                }
+                node
+            }));
+            votes.extend(tree_votes);
         }
 
         Forest::new(
@@ -740,7 +823,7 @@ impl Forest {
 /// `nodes` stood when it called.
 #[allow(clippy::too_many_arguments)]
 fn grow(
-    samples: &Samples,
+    table: &Columns<'_>,
     node: Building,
     max_depth: usize,
     min_leaf: usize,
@@ -749,10 +832,10 @@ fn grow(
     nodes: &mut Vec<Node>,
     votes: &mut Vec<f32>,
 ) {
-    let classes = samples.classes();
+    let classes = table.classes;
     let mut tally = vec![0.0f32; classes];
     for &row in &node.rows {
-        tally[samples.labels[row] as usize] += 1.0;
+        tally[table.labels[row] as usize] += 1.0;
     }
     let pure = tally.iter().filter(|&&count| count > 0.0).count() <= 1;
 
@@ -772,14 +855,15 @@ fn grow(
         return;
     }
 
-    let Some((column, threshold)) = best_split(samples, &node.rows, mtry, min_leaf, rng) else {
+    let Some((column, threshold)) = best_split(table, &node.rows, mtry, min_leaf, rng) else {
         leaf(nodes, votes, &tally);
         return;
     };
 
+    let values = table.column(column);
     let (mut left, mut right) = (Vec::new(), Vec::new());
     for &row in &node.rows {
-        if samples.at(row, column) <= threshold {
+        if values[row] <= threshold {
             left.push(row);
         } else {
             right.push(row);
@@ -793,7 +877,7 @@ fn grow(
     nodes.push(Node::split(column as u32, threshold, 0, 0));
     let left_at = nodes.len() as u32;
     grow(
-        samples,
+        table,
         Building {
             rows: left,
             depth: node.depth + 1,
@@ -807,7 +891,7 @@ fn grow(
     );
     let right_at = nodes.len() as u32;
     grow(
-        samples,
+        table,
         Building {
             rows: right,
             depth: node.depth + 1,
@@ -833,48 +917,54 @@ fn grow(
 /// caller reading the tree would expect from `x <= v` and the split that
 /// separates the two groups differ by exactly the ties. A midpoint has no ties
 /// by construction.
+///
+/// The candidates are `(value, label)` pairs sorted by value, unstably. The
+/// order *within* a run of equal values is therefore unspecified, and it does
+/// not matter: a candidate is only scored where the value changes, and there
+/// the left and right tallies are counts of whole runs.
 fn best_split(
-    samples: &Samples,
+    table: &Columns<'_>,
     rows: &[usize],
     mtry: usize,
     min_leaf: usize,
     rng: &mut SplitMix,
 ) -> Option<(usize, f64)> {
-    let classes = samples.classes();
-    let columns = samples.columns();
+    let classes = table.classes;
+    let columns = table.columns();
     let mut best: Option<(f64, usize, f64)> = None;
+
+    // The node's class counts, which every column starts its right side from.
+    let mut node_tally = vec![0.0f64; classes];
+    for &row in rows {
+        node_tally[table.labels[row] as usize] += 1.0;
+    }
 
     // Drawn with replacement, which is `mtry` *tries* rather than `mtry`
     // distinct columns. The difference is small at `sqrt(91) = 10` out of 91 and
     // it removes a rejection loop from the inner search; scikit-learn draws
     // without replacement and the distinction is not one any published
     // comparison of forests turns on.
-    let mut order: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut order: Vec<(f64, u32)> = Vec::with_capacity(rows.len());
+    let mut left_tally = vec![0.0f64; classes];
+    let mut right_tally = vec![0.0f64; classes];
     for _ in 0..mtry {
         let column = rng.next_below(columns);
+        let values = table.column(column);
         order.clear();
-        order.extend_from_slice(rows);
-        order.sort_by(|&left, &right| {
-            samples
-                .at(left, column)
-                .total_cmp(&samples.at(right, column))
-        });
+        order.extend(rows.iter().map(|&row| (values[row], table.labels[row])));
+        order.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
 
-        let mut left_tally = vec![0.0f64; classes];
-        let mut right_tally = vec![0.0f64; classes];
-        for &row in &order {
-            right_tally[samples.labels[row] as usize] += 1.0;
-        }
+        left_tally.fill(0.0);
+        right_tally.copy_from_slice(&node_tally);
         let total = order.len() as f64;
 
         for at in 0..order.len().saturating_sub(1) {
-            let row = order[at];
-            let label = samples.labels[row] as usize;
+            let (here, label) = order[at];
+            let label = label as usize;
             left_tally[label] += 1.0;
             right_tally[label] -= 1.0;
 
-            let here = samples.at(row, column);
-            let next = samples.at(order[at + 1], column);
+            let next = order[at + 1].0;
             if here == next {
                 continue;
             }
@@ -931,6 +1021,125 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// Three columns, one of them coarsely quantised so that ties are common,
+    /// and three classes.
+    fn noisy_samples(rows: usize) -> Samples {
+        let mut rng = SplitMix(7);
+        let mut features = Vec::new();
+        let mut labels = Vec::new();
+        for _ in 0..rows {
+            let a = rng.next_below(1000) as f64 / 1000.0;
+            let b = rng.next_below(5) as f64;
+            let c = rng.next_below(1000) as f64 / 100.0;
+            features.extend_from_slice(&[a, b, c]);
+            let noisy = rng.next_below(10) == 0;
+            labels.push(if noisy { rng.next_below(3) as u32 } else { (a * 2.0 + b / 4.0) as u32 % 3 });
+        }
+        Samples::new(features, labels, vec!["a".into(), "b".into(), "c".into()]).unwrap()
+    }
+
+    fn train_on(threads: usize, samples: &Samples, spec: &TrainingSpec) -> Forest {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| Forest::train(samples, spec).unwrap())
+    }
+
+    #[test]
+    fn the_forest_does_not_depend_on_the_thread_count() {
+        let samples = noisy_samples(600);
+        let spec = TrainingSpec {
+            trees: 24,
+            ..TrainingSpec::default()
+        };
+        let one = train_on(1, &samples, &spec);
+        for threads in [2, 3, 8] {
+            assert_eq!(train_on(threads, &samples, &spec).to_bytes(), one.to_bytes());
+        }
+        // And the seed is what the fit is a function of.
+        let other = train_on(1, &samples, &TrainingSpec { seed: 1, ..spec });
+        assert_ne!(other.to_bytes(), one.to_bytes());
+    }
+
+    /// Tree `t` depends on the seed and `t` only, so a smaller forest is a
+    /// prefix of a larger one.
+    #[test]
+    fn a_smaller_forest_is_a_prefix_of_a_larger_one() {
+        let samples = noisy_samples(300);
+        let spec = TrainingSpec {
+            trees: 10,
+            ..TrainingSpec::default()
+        };
+        let large = train_on(4, &samples, &spec);
+        let small = train_on(4, &samples, &TrainingSpec { trees: 4, ..spec });
+        let cut = large.roots_used()[4] as usize;
+        assert_eq!(small.nodes(), &large.nodes()[..cut]);
+        assert_eq!(small.roots_used(), &large.roots_used()[..4]);
+        assert_eq!(small.votes(), &large.votes()[..small.votes().len()]);
+    }
+
+    /// The split search sorts `(value, label)` pairs unstably; this is the
+    /// previous search, which sorted row indices stably, kept as a witness that
+    /// the two choose the same split at every node they are offered.
+    fn reference_split(
+        samples: &Samples,
+        rows: &[usize],
+        mtry: usize,
+        min_leaf: usize,
+        rng: &mut SplitMix,
+    ) -> Option<(usize, f64)> {
+        let at = |row: usize, column: usize| samples.row(row)[column];
+        let mut best: Option<(f64, usize, f64)> = None;
+        let mut order: Vec<usize> = Vec::new();
+        for _ in 0..mtry {
+            let column = rng.next_below(samples.columns());
+            order.clear();
+            order.extend_from_slice(rows);
+            order.sort_by(|&l, &r| at(l, column).total_cmp(&at(r, column)));
+            let mut left = vec![0.0f64; samples.classes()];
+            let mut right = vec![0.0f64; samples.classes()];
+            for &row in &order {
+                right[samples.labels()[row] as usize] += 1.0;
+            }
+            let total = order.len() as f64;
+            for i in 0..order.len().saturating_sub(1) {
+                let label = samples.labels()[order[i]] as usize;
+                left[label] += 1.0;
+                right[label] -= 1.0;
+                let (here, next) = (at(order[i], column), at(order[i + 1], column));
+                if here == next || (i + 1) < min_leaf || (order.len() - i - 1) < min_leaf {
+                    continue;
+                }
+                let (lc, rc) = ((i + 1) as f64, total - (i + 1) as f64);
+                let impurity = lc * gini(&left, lc) + rc * gini(&right, rc);
+                if best.is_none_or(|(current, _, _)| impurity < current) {
+                    best = Some((impurity, column, here + (next - here) / 2.0));
+                }
+            }
+        }
+        best.map(|(_, column, threshold)| (column, threshold))
+    }
+
+    #[test]
+    fn the_split_search_matches_the_stable_index_sort() {
+        let samples = noisy_samples(500);
+        let table = Columns::new(&samples);
+        let mut draw = SplitMix(99);
+        for trial in 0..200u64 {
+            let size = 2 + draw.next_below(400);
+            let rows: Vec<usize> = (0..size).map(|_| draw.next_below(samples.rows())).collect();
+            let min_leaf = 1 + draw.next_below(3);
+            let ours = best_split(&table, &rows, 2, min_leaf, &mut SplitMix(trial));
+            let theirs = reference_split(&samples, &rows, 2, min_leaf, &mut SplitMix(trial));
+            assert_eq!(
+                ours.map(|(c, t)| (c, t.to_bits())),
+                theirs.map(|(c, t)| (c, t.to_bits())),
+                "trial {trial}"
+            );
+        }
     }
 
     #[test]
