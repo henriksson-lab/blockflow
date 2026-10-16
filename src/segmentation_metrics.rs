@@ -359,11 +359,32 @@ impl Contingency {
     /// 1)`. Label `0` on either side is never an object here, whatever the
     /// options, and unassigned singletons need no edit.
     pub fn edit_counts(&self, min_overlap_voxels: u64) -> EditCounts {
+        self.edit_counts_relative(min_overlap_voxels, 0.0)
+    }
+
+    /// [`Self::edit_counts`] with a second, relative significance rule: a
+    /// pair must also share at least `min_fraction` of **the smaller** of the
+    /// two objects (the rule `agreement::compare_labels` uses).
+    ///
+    /// The absolute threshold alone does not scale: on a large cell a
+    /// boundary displaced by one voxel shares thousands of voxels with its
+    /// neighbour, which no proofreader would call a split. A fraction of the
+    /// smaller object ignores that sliver and still sees a small process
+    /// glued to a large cell, because the process is the smaller object.
+    pub fn edit_counts_relative(&self, min_overlap_voxels: u64, min_fraction: f64) -> EditCounts {
+        let truth_sizes = if min_fraction > 0.0 { self.truth_sizes() } else { HashMap::new() };
+        let produced_sizes = if min_fraction > 0.0 { self.produced_sizes() } else { HashMap::new() };
         let mut per_truth: HashMap<u32, u64> = HashMap::new();
         let mut per_produced: HashMap<u32, u64> = HashMap::new();
         for (&(t, p), &count) in &self.pairs {
             if t == 0 || p == 0 || count < min_overlap_voxels.max(1) {
                 continue;
+            }
+            if min_fraction > 0.0 {
+                let smaller = truth_sizes[&t].min(produced_sizes[&p]) as f64;
+                if (count as f64) < min_fraction * smaller {
+                    continue;
+                }
             }
             *per_truth.entry(t).or_default() += 1;
             *per_produced.entry(p).or_default() += 1;
@@ -373,6 +394,7 @@ impl Contingency {
             merges: excess(&per_truth),
             splits: excess(&per_produced),
             min_overlap_voxels,
+            min_fraction,
         }
     }
 }
@@ -405,14 +427,16 @@ pub struct AdaptedRand {
 
 /// Proofreading operations to turn produced into truth. See
 /// [`Contingency::edit_counts`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EditCounts {
     /// Split operations needed (produced objects covering several truths).
     pub splits: u64,
     /// Merge operations needed (truth objects cut into several pieces).
     pub merges: u64,
-    /// The threshold the counts were taken at.
+    /// The thresholds the counts were taken at.
     pub min_overlap_voxels: u64,
+    /// Fraction of the smaller object; 0 when only the absolute rule applied.
+    pub min_fraction: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -514,8 +538,10 @@ pub fn boundary_f1(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SegmentationOptions {
     pub contingency: ContingencyOptions,
-    /// See [`Contingency::edit_counts`].
+    /// See [`Contingency::edit_counts_relative`].
     pub min_overlap_voxels: u64,
+    /// See [`Contingency::edit_counts_relative`]; 0 = absolute rule only.
+    pub min_overlap_fraction: f64,
     /// In-plane tolerance in pixels for [`boundary_f1`]; `None` skips it (it
     /// costs two distance transforms per slice).
     pub boundary_tolerance: Option<f64>,
@@ -576,7 +602,12 @@ pub fn score_segmentation(
         )?),
         None => None,
     };
-    Ok(scores_from_table(&table, options.min_overlap_voxels, boundary))
+    Ok(scores_from_table(
+        &table,
+        options.min_overlap_voxels,
+        options.min_overlap_fraction,
+        boundary,
+    ))
 }
 
 /// The table-derived part of [`SegmentationScores`], for a table accumulated
@@ -584,12 +615,13 @@ pub fn score_segmentation(
 pub fn scores_from_table(
     table: &Contingency,
     min_overlap_voxels: u64,
+    min_overlap_fraction: f64,
     boundary: Option<BoundaryF1>,
 ) -> SegmentationScores {
     SegmentationScores {
         voi: table.voi(),
         rand: table.adapted_rand(),
-        edits: table.edit_counts(min_overlap_voxels),
+        edits: table.edit_counts_relative(min_overlap_voxels, min_overlap_fraction),
         boundary,
         voxels: table.total(),
     }
@@ -850,9 +882,25 @@ mod tests {
         let options = SegmentationOptions {
             contingency: o,
             min_overlap_voxels: 1,
+            min_overlap_fraction: 0.0,
             boundary_tolerance: Some(0.0),
         };
         score_segmentation(t.view(), p.view(), &options).unwrap()
+    }
+
+    #[test]
+    fn relative_overlap_ignores_slivers_on_large_objects() {
+        // Truth: two 1 x 10 x 10 halves. Produced: the boundary displaced by
+        // one column, so produced 1 takes a 10-voxel sliver of truth 2.
+        let truth = Array3::from_shape_fn((1, 10, 10), |(_, _, x)| if x < 5 { 1 } else { 2 });
+        let produced = Array3::from_shape_fn((1, 10, 10), |(_, _, x)| if x < 6 { 1 } else { 2 });
+        let table =
+            Contingency::from_volumes(truth.view(), produced.view(), ContingencyOptions::all_objects())
+                .unwrap();
+        assert_eq!(table.edit_counts(5).splits, 1);
+        // 10 shared voxels are 20% of the smaller object (truth 2, 50 voxels).
+        assert_eq!(table.edit_counts_relative(5, 0.3).splits, 0);
+        assert_eq!(table.edit_counts_relative(5, 0.2).splits, 1);
     }
 
     #[test]
