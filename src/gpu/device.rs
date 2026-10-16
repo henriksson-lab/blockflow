@@ -199,7 +199,7 @@ impl Device {
     /// or 0.14 s (`create`), and the same bytes as 1 MiB writes into one
     /// allocation 0.026 s, about 2.6 GB/s. The chunks are written in order on
     /// this thread's stream, so a kernel launched after them sees them all.
-    fn upload_elements<T: Copy, E: DeviceElement>(
+    pub(crate) fn upload_elements<T: Copy, E: DeviceElement>(
         &self,
         source: &[T],
         convert: impl Fn(T) -> E,
@@ -281,7 +281,7 @@ fn fill<S: Copy, T>(array: &mut Array3<T>, values: &[S], convert: impl Fn(S) -> 
 pub const UPLOAD_CHUNK: usize = 1 << 20;
 
 /// An element type a device block holds.
-trait DeviceElement: Copy {
+pub(crate) trait DeviceElement: Copy {
     fn into_bytes(values: Vec<Self>) -> Bytes;
 }
 

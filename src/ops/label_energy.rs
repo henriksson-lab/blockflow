@@ -96,9 +96,13 @@
 //! face-connected tube. `(26, 6)` is available through
 //! [`is_simple_label_flip_with`].
 //!
-//! The test reuses [`super::skeleton::is_simple_point`], which is the `(26, 6)`
+//! The test is [`super::skeleton::is_simple_point`], which is the `(26, 6)`
 //! characterisation, through the standard duality: `v` is `(6, 26)`-simple in `X`
-//! exactly when it is `(26, 6)`-simple in `X̄ ∪ {v}`. Because every voxel lies in
+//! exactly when it is `(26, 6)`-simple in `X̄ ∪ {v}`. It is answered from a
+//! 2^26-bit table of that predicate ([`simple_point_table`], 8 MiB, built once
+//! per process and checked against the flood fill over every configuration in
+//! the tests), which makes the flip test about ten times cheaper than the flood
+//! fill and is the same table the GPU kernel reads. Because every voxel lies in
 //! the 3×3×3 window of no other voxel of its own parity class, the simplicity of
 //! one flip cannot be changed by a simultaneous flip in the same class, so the
 //! parallel update preserves topology exactly as a sequential one would.
@@ -121,7 +125,8 @@
 //! compares its current label with every distinct neighbour label: at `T = 0`
 //! (ICM) it takes the lowest-scoring flip if that is negative, at `T > 0`
 //! (Metropolis) it draws one candidate uniformly and accepts with
-//! `min(1, exp(−ΔE / T))`. A flip failing the simple-point test is rejected.
+//! `min(1, exp(−ΔE / T))`, the acceptance draw taken on 2^16 levels
+//! ([`Acceptance`]). A flip failing the simple-point test is rejected.
 //!
 //! The randomness is a counter-based hash of `(seed, sweep, class, global voxel
 //! index)`, so the answer does not depend on the block decomposition, on the
@@ -129,8 +134,32 @@
 //!
 //! The per-voxel decision is one pure function, [`decide`], of the 3×3×3 label
 //! and `p` windows, the centre's `f`, the means table, the parameters and the
-//! two random draws. Everything else here is gathering and bookkeeping; a GPU
-//! port reimplements `decide` and the gather and keeps this as the reference.
+//! two counter words. Everything else here is gathering and bookkeeping;
+//! `gpu::label_energy` reimplements `decide` and the gather as a kernel and keeps
+//! this as the reference.
+//!
+//! Fixed point: why every decision is an integer
+//! ---------------------------------------------
+//! So that a GPU takes **the same decisions to the bit**, the energy is defined
+//! in integer units of a [`LabelEnergy::quantum`] chosen from the parameters
+//! alone (the largest boundary weight is 2^16 units, or `λ_smooth / 256` is when
+//! that is larger), never from the data, so it is the same in every block:
+//!
+//! * `p` is quantised to [`P_LEVELS`] levels and `w_uv` read from a table by
+//!   direction and level sum, rounded to units on the host;
+//! * the data cost of one voxel is `min((f − μ)² · λ/(σ² quantum), 2^29)` in
+//!   `f32`, truncated: a subtraction and two products, which every device
+//!   rounds alike and no compiler can fuse. **It saturates** at `2^29` units
+//!   (`2^13` largest boundary weights), past which a voxel's appearance no longer
+//!   ranks two labels whose means are both that far away;
+//! * the smoothing bias is an integer multiple of `λ_smooth` in units;
+//! * Metropolis compares the integer score with a per-sweep integer threshold
+//!   table, and the candidate pick is an integer product of a hash word.
+//!
+//! Every score then fits an `i32` and sums exactly, `E` ([`label_energy`]) is an
+//! exact integer sum times the quantum, and ICM is exactly monotone. The
+//! quantisation is far below anything the evidence resolves (`p` to 1/4096, a
+//! boundary weight to 1/65536 of the largest).
 //!
 //! As a `BlockOp`
 //! --------------
@@ -161,9 +190,9 @@ use crate::op::{Anchor, BlockOp, Chain, SourceInput, SourceInputs};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
 
-use super::skeleton::{
-    is_simple_point, neighbour_offset, Adjacency, Subfield, CENTRE, NEIGHBOURHOOD,
-};
+#[cfg(test)]
+use super::skeleton::is_simple_point;
+use super::skeleton::{neighbour_offset, Adjacency, Subfield, CENTRE, NEIGHBOURHOOD};
 
 /// The label a gathered neighbourhood holds where it runs past the buffer.
 ///
@@ -174,16 +203,176 @@ pub const OUTSIDE: u32 = u32::MAX;
 
 // ------------------------------------------------------------ topology --
 
+/// The 26 neighbours of a window as bits: bit `k` for neighbour `k < CENTRE`,
+/// bit `k - 1` above it. The index into [`simple_point_table`].
+#[inline]
+pub fn neighbour_bits(mut member: impl FnMut(usize) -> bool) -> u32 {
+    let mut bits = 0u32;
+    for k in 0..NEIGHBOURHOOD {
+        if k != CENTRE && member(k) {
+            bits |= 1 << (k - usize::from(k > CENTRE));
+        }
+    }
+    bits
+}
+
+/// Bit `c` (word `c >> 5`, bit `c & 31`) says whether the centre is a simple
+/// point ([`super::skeleton::is_simple_point`], the `(26, 6)`
+/// characterisation) of the object whose 26 neighbours are the bits of `c`
+/// ([`neighbour_bits`]).
+///
+/// 2^26 bits, 8 MiB, built once per process on first use (a fraction of a
+/// second on all cores) by a bitmask flood fill that is checked against
+/// `is_simple_point` over every configuration in this module's tests. It
+/// turns the simple-point test of a flip into two lookups, on the CPU and the
+/// GPU alike.
+pub fn simple_point_table() -> &'static [u32] {
+    static TABLE: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    // Built on threads of its own, not rayon's: a rayon worker that reaches
+    // this while another thread initialises it would block inside the pool
+    // the initialiser needs.
+    TABLE.get_or_init(|| {
+        let masks = BitNeighbourhood::new();
+        let mut table = vec![0u32; 1 << 21];
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let per = table.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (chunk, words) in table.chunks_mut(per).enumerate() {
+                let masks = &masks;
+                scope.spawn(move || {
+                    for (offset, slot) in words.iter_mut().enumerate() {
+                        let word = (chunk * per + offset) as u32;
+                        for bit in 0..32 {
+                            if masks.is_simple(word << 5 | bit) {
+                                *slot |= 1 << bit;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        table
+    })
+}
+
+/// Adjacency within the 3×3×3 window as 27-bit masks, for the flood fills that
+/// build [`simple_point_table`].
+struct BitNeighbourhood {
+    /// Window positions 26-adjacent to each position, the centre excluded.
+    adjacent26: [u32; NEIGHBOURHOOD],
+    /// Window positions 6-adjacent to each position, the centre excluded.
+    adjacent6: [u32; NEIGHBOURHOOD],
+    /// The 18-neighbourhood (no corners), the centre excluded.
+    n18: u32,
+    faces: u32,
+}
+
+impl BitNeighbourhood {
+    fn new() -> Self {
+        let mut adjacent26 = [0u32; NEIGHBOURHOOD];
+        let mut adjacent6 = [0u32; NEIGHBOURHOOD];
+        let mut n18 = 0;
+        let mut faces = 0;
+        for i in 0..NEIGHBOURHOOD {
+            let a = neighbour_offset(i);
+            let l1: isize = a.iter().map(|v| v.abs()).sum();
+            if i != CENTRE && l1 <= 2 {
+                n18 |= 1 << i;
+            }
+            if l1 == 1 {
+                faces |= 1 << i;
+            }
+            for j in 0..NEIGHBOURHOOD {
+                if i == j || j == CENTRE {
+                    continue;
+                }
+                let b = neighbour_offset(j);
+                let d: [isize; 3] = std::array::from_fn(|axis| (a[axis] - b[axis]).abs());
+                if d.iter().all(|&v| v <= 1) {
+                    adjacent26[i] |= 1 << j;
+                }
+                if d.iter().sum::<isize>() == 1 {
+                    adjacent6[i] |= 1 << j;
+                }
+            }
+        }
+        Self {
+            adjacent26,
+            adjacent6,
+            n18,
+            faces,
+        }
+    }
+
+    /// The component of `within` containing `seed` under `adjacent`.
+    fn flood(seed: u32, within: u32, adjacent: &[u32; NEIGHBOURHOOD]) -> u32 {
+        let mut component = seed;
+        let mut frontier = seed;
+        while frontier != 0 {
+            let mut next = 0;
+            let mut rest = frontier;
+            while rest != 0 {
+                next |= adjacent[rest.trailing_zeros() as usize];
+                rest &= rest - 1;
+            }
+            frontier = next & within & !component;
+            component |= frontier;
+        }
+        component
+    }
+
+    /// `C* = 1` and `Cbar = 1` for the 26-neighbour configuration `config`.
+    fn is_simple(&self, config: u32) -> bool {
+        let low = (1u32 << CENTRE) - 1;
+        let object = (config & low) | ((config & !low) << 1);
+        if object == 0 {
+            return false;
+        }
+        let first = object.isolate_lowest_one();
+        if Self::flood(first, object, &self.adjacent26) != object {
+            return false;
+        }
+        let background = !object & self.n18;
+        let faces = background & self.faces;
+        if faces == 0 {
+            return false;
+        }
+        let first = faces.isolate_lowest_one();
+        faces & !Self::flood(first, background, &self.adjacent6) == 0
+    }
+}
+
+#[inline]
+fn table_says(table: &[u32], config: u32) -> bool {
+    (table[(config >> 5) as usize] >> (config & 31)) & 1 == 1
+}
+
+/// The [`simple_point_table`] index for `v` leaving `{label == x}`: the set
+/// itself under `(26, 6)`, its complement under `(6, 26)` (the duality in the
+/// module header).
+#[inline]
+pub fn removal_config(n: &[u32; NEIGHBOURHOOD], x: u32, adjacency: Adjacency) -> u32 {
+    match adjacency {
+        Adjacency::TwentySix => neighbour_bits(|k| n[k] == x),
+        Adjacency::Six => neighbour_bits(|k| n[k] != x),
+    }
+}
+
 /// Can `v` leave the set `{label == x}` (with `v` counted in it) without
 /// changing its topology, `x` being `adjacency`-connected and its complement
 /// the other one?
 fn removable(n: &[u32; NEIGHBOURHOOD], x: u32, adjacency: Adjacency) -> bool {
+    table_says(simple_point_table(), removal_config(n, x, adjacency))
+}
+
+/// [`removable`] by the flood fill of [`is_simple_point`]: the definition the
+/// table is tested against.
+#[cfg(test)]
+fn removable_by_flood(n: &[u32; NEIGHBOURHOOD], x: u32, adjacency: Adjacency) -> bool {
     let mut mask = [false; NEIGHBOURHOOD];
     for (index, slot) in mask.iter_mut().enumerate() {
         *slot = match adjacency {
-            // (26, 6): the set itself, as `is_simple_point` expects.
             Adjacency::TwentySix => n[index] == x,
-            // (6, 26): by duality, the complement with `v` added.
             Adjacency::Six => n[index] != x,
         };
     }
@@ -372,18 +561,105 @@ impl LabelEnergyParams {
     }
 }
 
-/// The parameters with the geometric weights computed from them, once.
+// ----------------------------------------------------------- fixed point --
+
+/// Levels `p` is quantised to before it weights a boundary: `p` stands for
+/// `⌊clamp(p, 0, 1) · P_LEVELS + ½⌋ / P_LEVELS` ([`quantise_p`]).
+pub const P_LEVELS: u32 = 4096;
+
+/// Entries per direction of the edge table: every sum of two quantised `p`.
+pub const PAIR_LEVELS: usize = 2 * P_LEVELS as usize + 1;
+
+/// Rows of the edge table: one per undirected direction, `k` and its antipode
+/// `26 − k` sharing row `min(k, 26 − k)`.
+pub const EDGE_ROWS: usize = CENTRE;
+
+/// The largest boundary weight, or `λ_smooth / SMOOTH_HEADROOM` when that is
+/// larger, is this many energy units.
+const BASE_UNITS: f64 = 65536.0;
+
+/// How many largest boundary weights `λ_smooth` may be before it, rather than
+/// the boundary, sets the unit.
+const SMOOTH_HEADROOM: f64 = 256.0;
+
+/// Ceiling on one voxel's data cost, in energy units.
+pub const DATA_CAP: i32 = 1 << 29;
+
+/// Accept-draw levels of Metropolis: the acceptance draw is `(k + ½) / ACCEPT_LEVELS`.
+pub const ACCEPT_LEVELS: usize = 1 << 16;
+
+/// `p` as the integer level the energy uses. `NaN` is level 0.
+#[inline]
+pub fn quantise_p(p: f64) -> u32 {
+    (p.clamp(0.0, 1.0) * f64::from(P_LEVELS) + 0.5) as u32
+}
+
+/// The edge-table row of neighbour `k`.
+#[inline]
+pub const fn edge_row(k: usize) -> usize {
+    if k < CENTRE {
+        k
+    } else {
+        NEIGHBOURHOOD - 1 - k
+    }
+}
+
+/// The parameters with the geometric weights computed from them, once, and the
+/// fixed-point tables every decision is taken in (see the module header).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LabelEnergy {
     params: LabelEnergyParams,
     weights: [f64; NEIGHBOURHOOD],
+    quantum: f64,
+    edges: EdgeTable,
+    smooth_units: i32,
+    data_scale: f32,
+}
+
+/// `w` in energy units by `(edge_row(k), q_u + q_v)`; behind an `Arc` so the
+/// energy stays cheap to clone, and with a `Debug` that does not print it.
+#[derive(Clone, PartialEq)]
+struct EdgeTable(Arc<[i32]>);
+
+impl std::fmt::Debug for EdgeTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EdgeTable({} entries)", self.0.len())
+    }
 }
 
 impl LabelEnergy {
     pub fn new(params: LabelEnergyParams) -> Result<Self> {
         params.validate()?;
         let weights = geometric_weights(params.spacing)?;
-        Ok(Self { params, weights })
+        let largest = weights.iter().copied().fold(0.0, f64::max);
+        let mut base = (params.beta * largest * (1.0 + params.epsilon))
+            .max(params.lambda_smooth / SMOOTH_HEADROOM);
+        if base <= 0.0 {
+            base = params.lambda_data; // data alone: one unit (f − μ)² / σ²
+        }
+        if base <= 0.0 {
+            base = 1.0; // nothing to weigh
+        }
+        let quantum = base / BASE_UNITS;
+        let mut edges = vec![0i32; EDGE_ROWS * PAIR_LEVELS];
+        for row in 0..EDGE_ROWS {
+            for sum in 0..PAIR_LEVELS {
+                let open = (1.0 - sum as f64 / f64::from(2 * P_LEVELS)).max(0.0);
+                let w = params.beta * weights[row] * (open.powf(params.alpha) + params.epsilon);
+                edges[row * PAIR_LEVELS + sum] = (w / quantum).round() as i32;
+            }
+        }
+        let smooth_units = (params.lambda_smooth / quantum).round() as i32;
+        let data_scale = ((params.lambda_data / (params.sigma * params.sigma)) / quantum)
+            .min(f64::from(f32::MAX)) as f32;
+        Ok(Self {
+            params,
+            weights,
+            quantum,
+            edges: EdgeTable(edges.into()),
+            smooth_units,
+            data_scale,
+        })
     }
 
     pub fn params(&self) -> &LabelEnergyParams {
@@ -395,27 +671,112 @@ impl LabelEnergy {
         &self.weights
     }
 
-    /// `w_uv` for the neighbour at index `k`, given `p` at both ends.
+    /// The energy of one unit: every term of `E` is an integer multiple of it.
+    pub fn quantum(&self) -> f64 {
+        self.quantum
+    }
+
+    /// `w_uv` in units, by `edge_row(k) * PAIR_LEVELS + q_u + q_v`.
+    pub fn edge_table(&self) -> &[i32] {
+        &self.edges.0
+    }
+
+    /// `λ_smooth` in units.
+    pub fn smooth_units(&self) -> i32 {
+        self.smooth_units
+    }
+
+    /// `λ_data / (σ² · quantum)` as the `f32` the data cost is computed with;
+    /// zero when the data term is off.
+    pub fn data_scale(&self) -> f32 {
+        self.data_scale
+    }
+
+    /// `w_uv` in units for the neighbour at index `k`, given quantised `p` at
+    /// both ends.
     #[inline]
-    fn edge(&self, k: usize, p_u: f64, p_v: f64) -> f64 {
-        let open = (1.0 - 0.5 * (p_u + p_v)).max(0.0);
-        self.params.beta * self.weights[k] * (open.powf(self.params.alpha) + self.params.epsilon)
+    fn edge(&self, k: usize, q_u: u32, q_v: u32) -> i64 {
+        i64::from(self.edges.0[edge_row(k) * PAIR_LEVELS + (q_u + q_v) as usize])
+    }
+
+    /// One voxel's data cost in units: `min((f − μ)² · data_scale, DATA_CAP)`,
+    /// truncated, every step an `f32` operation a GPU rounds alike.
+    #[inline]
+    pub fn data_units(&self, f: f32, mu: f32) -> i32 {
+        let d = f - mu;
+        ((d * d) * self.data_scale).min(DATA_CAP as f32) as i32
     }
 
     fn uses_data(&self) -> bool {
         self.params.lambda_data > 0.0
     }
+
+    /// Whether the data term can contribute at all.
+    pub fn data_on(&self) -> bool {
+        self.uses_data() && self.data_scale > 0.0
+    }
+}
+
+/// The mean of `label` as the data term uses it: `f32`, and absent when it is
+/// not finite.
+#[inline]
+pub fn mean_f32(means: &HashMap<u32, f64>, label: u32) -> Option<f32> {
+    means
+        .get(&label)
+        .map(|&mu| mu as f32)
+        .filter(|mu| mu.is_finite())
+}
+
+/// The temperature of one sweep, as the integer thresholds Metropolis accepts
+/// against. Built once per sweep; ICM carries none.
+///
+/// A positive score `s` (in units) is accepted with draw level `k` iff
+/// `s < thresholds[k]`, `thresholds[k] = ⌈−T · ln((k + ½) / ACCEPT_LEVELS) / quantum⌉`:
+/// `u < exp(−s · quantum / T)` for `u` the bucket's midpoint, decided in
+/// integers so that every device decides it alike.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Acceptance {
+    temperature: f64,
+    thresholds: Option<Arc<[i32]>>,
+}
+
+impl Acceptance {
+    pub fn new(energy: &LabelEnergy, temperature: f64) -> Self {
+        let thresholds = (temperature > 0.0).then(|| {
+            (0..ACCEPT_LEVELS)
+                .map(|k| {
+                    let u = (k as f64 + 0.5) / ACCEPT_LEVELS as f64;
+                    let x = -temperature * u.ln() / energy.quantum;
+                    x.ceil().min(f64::from(i32::MAX)) as i32
+                })
+                .collect()
+        });
+        Self {
+            temperature,
+            thresholds,
+        }
+    }
+
+    pub fn temperature(&self) -> f64 {
+        self.temperature
+    }
+
+    /// The Metropolis thresholds, `None` for ICM (`T <= 0`).
+    pub fn thresholds(&self) -> Option<&[i32]> {
+        self.thresholds.as_deref()
+    }
 }
 
 // --------------------------------------------------------------- kernel --
 
-/// What one voxel sees: its 3×3×3 label and `p` windows and its own `f`
-/// (`NaN` when there is no appearance field).
+/// What one voxel sees: its 3×3×3 label window, its quantised `p` window
+/// ([`quantise_p`]) and its own `f` as `f32` (`NaN` when there is no
+/// appearance field).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Neighbourhood {
     pub labels: [u32; NEIGHBOURHOOD],
-    pub p: [f64; NEIGHBOURHOOD],
-    pub f: f64,
+    pub p: [u32; NEIGHBOURHOOD],
+    pub f: f32,
 }
 
 /// The outcome of [`decide`].
@@ -423,31 +784,43 @@ pub struct Neighbourhood {
 pub struct Decision {
     /// The voxel's label after the update.
     pub label: u32,
-    /// The exact change in `E` (smoothing bias excluded); zero when kept.
-    pub delta: f64,
+    /// The exact change in `E` (smoothing bias excluded) in energy units
+    /// ([`LabelEnergy::quantum`]); zero when kept.
+    pub delta_units: i64,
     /// Whether a flip that would otherwise have been taken was refused by the
     /// topology constraint.
     pub blocked: bool,
 }
 
-/// The per-voxel update: a pure function of the neighbourhood, the parameters,
-/// the means table, the temperature and two uniform draws in `[0, 1)`.
+/// The candidate index and acceptance level of a Metropolis step, from the two
+/// counter words ([`counter_words`]): `pick = ⌊(h >> 32) · count / 2^32⌋`,
+/// `level = g >> 48`. Integer, so every device draws alike.
+#[inline]
+pub fn metropolis_draw(words: [u64; 2], count: usize) -> (usize, usize) {
+    let pick = (((words[0] >> 32) * count as u64) >> 32) as usize;
+    (pick, (words[1] >> 48) as usize)
+}
+
+/// The per-voxel update: a pure function of the neighbourhood, the energy, the
+/// means table, the sweep's [`Acceptance`] and two counter words.
 ///
-/// `T <= 0` is ICM: the candidate with the lowest score (energy change plus
+/// ICM (no thresholds): the candidate with the lowest score (energy change plus
 /// smoothing bias) is taken if the score is negative, falling back to the next
-/// if the topology refuses it; ties go to the lower label. `T > 0` is
-/// Metropolis: `draws[0]` picks one candidate, `draws[1]` decides acceptance.
+/// if the topology refuses it; ties go to the lower label. Metropolis: the
+/// words pick one candidate and an acceptance level ([`metropolis_draw`]).
+/// Every quantity is an integer number of energy units, so the decision is
+/// reproducible to the bit on any device.
 pub fn decide(
     energy: &LabelEnergy,
     n: &Neighbourhood,
     means: &HashMap<u32, f64>,
-    temperature: f64,
-    draws: [f64; 2],
+    acceptance: &Acceptance,
+    words: [u64; 2],
 ) -> Decision {
     let a = n.labels[CENTRE];
     let keep = Decision {
         label: a,
-        delta: 0.0,
+        delta_units: 0,
         blocked: false,
     };
     let mut candidates = [0u32; NEIGHBOURHOOD];
@@ -471,8 +844,8 @@ pub fn decide(
     }
 
     let params = &energy.params;
-    let mut weight = [0.0; NEIGHBOURHOOD];
-    let mut keep_cost = 0.0; // boundary the centre has to label `a` now: Σ_{L_u = a} w
+    let mut weight = [0i64; NEIGHBOURHOOD];
+    let mut keep_cost = 0i64; // boundary the centre has to label `a` now: Σ_{L_u = a} w
     let mut like_a = 0u32;
     for k in 0..NEIGHBOURHOOD {
         let label = n.labels[k];
@@ -485,13 +858,17 @@ pub fn decide(
             like_a += 1;
         }
     }
-    let data_on = params.lambda_data > 0.0 && n.f.is_finite();
-    let mu_a = means.get(&a).copied();
-    let hinge = |like: u32| f64::from(params.smooth_threshold.saturating_sub(like + outside));
+    let data_a = if energy.data_on() && n.f.is_finite() {
+        mean_f32(means, a).map(|mu| energy.data_units(n.f, mu))
+    } else {
+        None
+    };
+    let smooth = i64::from(energy.smooth_units);
+    let hinge = |like: u32| i64::from(params.smooth_threshold.saturating_sub(like + outside));
 
     // (score, delta) for flipping to `b`
-    let evaluate = |b: u32| -> (f64, f64) {
-        let mut gain = 0.0;
+    let evaluate = |b: u32| -> (i64, i64) {
+        let mut gain = 0i64;
         let mut like_b = 0u32;
         for k in 0..NEIGHBOURHOOD {
             if k != CENTRE && n.labels[k] == b {
@@ -500,16 +877,13 @@ pub fn decide(
             }
         }
         let mut delta = keep_cost - gain;
-        if data_on {
-            if let (Some(mu_a), Some(mu_b)) = (mu_a, means.get(&b).copied()) {
-                let (da, db) = (n.f - mu_a, n.f - mu_b);
-                delta += params.lambda_data * (db * db - da * da) / (params.sigma * params.sigma);
-            }
+        if let (Some(data_a), Some(mu_b)) = (data_a, mean_f32(means, b)) {
+            delta += i64::from(energy.data_units(n.f, mu_b)) - i64::from(data_a);
         }
-        let bias = if params.lambda_smooth > 0.0 {
-            params.lambda_smooth * (hinge(like_b) - hinge(like_a))
+        let bias = if smooth > 0 {
+            smooth * (hinge(like_b) - hinge(like_a))
         } else {
-            0.0
+            0
         };
         (delta + bias, delta)
     };
@@ -518,47 +892,50 @@ pub fn decide(
         Some(adjacency) => is_simple_label_flip_with(&n.labels, a, b, adjacency),
     };
 
-    if temperature <= 0.0 {
-        let mut scored = [(0.0f64, 0u32, 0.0f64); NEIGHBOURHOOD];
-        for (slot, &b) in candidates[..count].iter().enumerate() {
-            let (score, delta) = evaluate(b);
-            scored[slot] = (score, b, delta);
+    match acceptance.thresholds() {
+        None => {
+            let mut scored = [(0i64, 0u32, 0i64); NEIGHBOURHOOD];
+            for (slot, &b) in candidates[..count].iter().enumerate() {
+                let (score, delta) = evaluate(b);
+                scored[slot] = (score, b, delta);
+            }
+            let scored = &mut scored[..count];
+            scored.sort_unstable_by_key(|&(score, b, _)| (score, b));
+            let mut blocked = false;
+            for &(score, b, delta) in scored.iter() {
+                if score >= 0 {
+                    break;
+                }
+                if allowed(b) {
+                    return Decision {
+                        label: b,
+                        delta_units: delta,
+                        blocked,
+                    };
+                }
+                blocked = true;
+            }
+            Decision { blocked, ..keep }
         }
-        let scored = &mut scored[..count];
-        scored.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
-        let mut blocked = false;
-        for &(score, b, delta) in scored.iter() {
-            if score >= 0.0 {
-                break;
+        Some(thresholds) => {
+            let (pick, level) = metropolis_draw(words, count);
+            let b = candidates[pick];
+            let (score, delta) = evaluate(b);
+            let accept = score <= 0 || score < i64::from(thresholds[level]);
+            if !accept {
+                return keep;
             }
             if allowed(b) {
-                return Decision {
+                Decision {
                     label: b,
-                    delta,
-                    blocked,
-                };
-            }
-            blocked = true;
-        }
-        Decision { blocked, ..keep }
-    } else {
-        let pick = ((draws[0] * count as f64) as usize).min(count - 1);
-        let b = candidates[pick];
-        let (score, delta) = evaluate(b);
-        let accept = score <= 0.0 || draws[1] < (-score / temperature).exp();
-        if !accept {
-            return keep;
-        }
-        if allowed(b) {
-            Decision {
-                label: b,
-                delta,
-                blocked: false,
-            }
-        } else {
-            Decision {
-                blocked: true,
-                ..keep
+                    delta_units: delta,
+                    blocked: false,
+                }
+            } else {
+                Decision {
+                    blocked: true,
+                    ..keep
+                }
             }
         }
     }
@@ -566,21 +943,37 @@ pub fn decide(
 
 // ------------------------------------------------------------ randomness --
 
+/// The splitmix64 finaliser.
 #[inline]
-fn mix(mut z: u64) -> u64 {
+pub fn splitmix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
 }
 
-/// Two uniform draws in `[0, 1)` that are a function of the counter alone.
+/// The part of the counter hash shared by every voxel of one class of one
+/// sweep: `mix(mix(mix(seed) ^ sweep) ^ class)`.
+#[inline]
+pub fn class_prefix(seed: u64, sweep: u64, class: u64) -> u64 {
+    splitmix(splitmix(splitmix(seed) ^ sweep) ^ class)
+}
+
+/// The second word is derived from the first with this salt.
+pub const SECOND_WORD_SALT: u64 = 0xd1b5_4a32_d192_ed03;
+
+/// Two 64-bit words that are a function of the counter alone.
 ///
 /// A splitmix64 finaliser folded over the four words: no state, so any thread
 /// visiting any voxel in any block draws the same numbers for it.
+pub fn counter_words(seed: u64, sweep: u64, class: u64, index: u64) -> [u64; 2] {
+    let h = splitmix(class_prefix(seed, sweep, class) ^ index);
+    [h, splitmix(h ^ SECOND_WORD_SALT)]
+}
+
+/// [`counter_words`] as two uniform draws in `[0, 1)` (53 bits each).
 pub fn counter_draws(seed: u64, sweep: u64, class: u64, index: u64) -> [f64; 2] {
-    let h = mix(mix(mix(mix(seed) ^ sweep) ^ class) ^ index);
-    let g = mix(h ^ 0xd1b5_4a32_d192_ed03);
+    let [h, g] = counter_words(seed, sweep, class, index);
     const SCALE: f64 = 1.0 / (1u64 << 53) as f64;
     [(h >> 11) as f64 * SCALE, (g >> 11) as f64 * SCALE]
 }
@@ -654,8 +1047,8 @@ fn gather(
     let centre = labels[at];
     let mut n = Neighbourhood {
         labels: [OUTSIDE; NEIGHBOURHOOD],
-        p: [0.0; NEIGHBOURHOOD],
-        f: f64::NAN,
+        p: [0; NEIGHBOURHOOD],
+        f: f32::NAN,
     };
     let mut differs = false;
     for k in 0..NEIGHBOURHOOD {
@@ -686,10 +1079,10 @@ fn gather(
             (at[1] as isize + o[1]) as usize,
             (at[2] as isize + o[2]) as usize,
         ];
-        n.p[k] = p[q];
+        n.p[k] = quantise_p(p[q]);
     }
     if let Some(f) = f {
-        n.f = f[at];
+        n.f = f[at] as f32;
     }
     Some(n)
 }
@@ -704,7 +1097,7 @@ fn class_updates(
     f: Option<ArrayView3<'_, f64>>,
     means: &HashMap<u32, f64>,
     sweep: usize,
-    temperature: f64,
+    acceptance: &Acceptance,
     class: usize,
     at: &Anchor,
 ) -> (Vec<([usize; 3], u32)>, SweepStats) {
@@ -713,14 +1106,16 @@ fn class_updates(
     // first local index along each axis whose global coordinate has the parity
     let first: [usize; 3] = std::array::from_fn(|axis| (parity[axis] + (at.offset[axis] & 1)) & 1);
     let volume = at.volume;
-    let seed = energy.params.seed;
-    let planes: Vec<(Vec<([usize; 3], u32)>, SweepStats)> = (first[0]..shape[0])
+    let prefix = class_prefix(energy.params.seed, sweep as u64, class as u64);
+    let metropolis = acceptance.thresholds().is_some();
+    let planes: Vec<(Vec<([usize; 3], u32)>, SweepStats, i64)> = (first[0]..shape[0])
         .step_by(2)
         .collect::<Vec<_>>()
         .into_par_iter()
         .map(|i| {
             let mut updates = Vec::new();
             let mut stats = SweepStats::default();
+            let mut delta_units = 0i64;
             for j in (first[1]..shape[1]).step_by(2) {
                 for k in (first[2]..shape[2]).step_by(2) {
                     let Some(n) = gather(&labels, &p, f.as_ref(), [i, j, k], shape) else {
@@ -728,35 +1123,38 @@ fn class_updates(
                     };
                     let g = [at.offset[0] + i, at.offset[1] + j, at.offset[2] + k];
                     let index = ((g[0] * volume[1] + g[1]) * volume[2] + g[2]) as u64;
-                    let draws = if temperature > 0.0 {
-                        counter_draws(seed, sweep as u64, class as u64, index)
+                    let words = if metropolis {
+                        let h = splitmix(prefix ^ index);
+                        [h, splitmix(h ^ SECOND_WORD_SALT)]
                     } else {
-                        [0.0, 0.0]
+                        [0, 0]
                     };
-                    let decision = decide(energy, &n, means, temperature, draws);
+                    let decision = decide(energy, &n, means, acceptance, words);
                     stats.topology_rejections += u64::from(decision.blocked);
                     if decision.label != n.labels[CENTRE] {
                         stats.flips += 1;
-                        stats.delta_energy += decision.delta;
+                        delta_units += decision.delta_units;
                         updates.push(([i, j, k], decision.label));
                     }
                 }
             }
-            (updates, stats)
+            (updates, stats, delta_units)
         })
         .collect();
     let mut all = Vec::new();
     let mut stats = SweepStats::default();
-    for (updates, plane) in planes {
+    let mut delta_units = 0i64;
+    for (updates, plane, units) in planes {
         all.extend(updates);
         stats.flips += plane.flips;
         stats.topology_rejections += plane.topology_rejections;
-        stats.delta_energy += plane.delta_energy;
+        delta_units += units;
     }
+    stats.delta_energy = delta_units as f64 * energy.quantum;
     (all, stats)
 }
 
-fn check_inputs(
+pub(crate) fn check_inputs(
     labels: &ArrayView3<'_, u32>,
     p: &ArrayView3<'_, f64>,
     f: Option<&ArrayView3<'_, f64>>,
@@ -817,6 +1215,7 @@ pub fn label_energy_sweep_into(
         "label energy: temperature must be finite, got {temperature}"
     );
     out.assign(&labels);
+    let acceptance = Acceptance::new(energy, temperature);
     let mut stats = SweepStats {
         sweep,
         temperature,
@@ -832,7 +1231,7 @@ pub fn label_energy_sweep_into(
             f,
             means,
             sweep,
-            temperature,
+            &acceptance,
             class,
             at,
         );
@@ -874,17 +1273,16 @@ pub fn label_energy(
 ) -> Result<EnergyTerms> {
     check_inputs(&labels, &p, f.as_ref(), energy)?;
     let shape = shape3(&labels);
-    let params = &energy.params;
-    let data_on = energy.uses_data();
-    let planes: Vec<(f64, f64)> = (0..shape[0])
+    let data_on = energy.data_on();
+    let planes: Vec<(i64, i64)> = (0..shape[0])
         .into_par_iter()
         .map(|i| {
-            let mut boundary = 0.0;
-            let mut data = 0.0;
+            let mut boundary = 0i64;
+            let mut data = 0i64;
             for j in 0..shape[1] {
                 for k in 0..shape[2] {
                     let label = labels[[i, j, k]];
-                    let pv = p[[i, j, k]];
+                    let pv = quantise_p(p[[i, j, k]]);
                     // each undirected pair once: the offsets after the centre
                     for index in CENTRE + 1..NEIGHBOURHOOD {
                         let o = neighbour_offset(index);
@@ -894,13 +1292,15 @@ pub fn label_energy(
                         }
                         let q = [q[0] as usize, q[1] as usize, q[2] as usize];
                         if labels[q] != label {
-                            boundary += energy.edge(index, pv, p[q]);
+                            boundary += energy.edge(index, pv, quantise_p(p[q]));
                         }
                     }
                     if data_on {
-                        if let (Some(f), Some(mu)) = (f.as_ref(), means.get(&label)) {
-                            let d = f[[i, j, k]] - mu;
-                            data += params.lambda_data * d * d / (params.sigma * params.sigma);
+                        if let (Some(f), Some(mu)) = (f.as_ref(), mean_f32(means, label)) {
+                            let fv = f[[i, j, k]] as f32;
+                            if fv.is_finite() {
+                                data += i64::from(energy.data_units(fv, mu));
+                            }
                         }
                     }
                 }
@@ -908,15 +1308,13 @@ pub fn label_energy(
             (boundary, data)
         })
         .collect();
-    let mut terms = EnergyTerms {
-        boundary: 0.0,
-        data: 0.0,
-    };
-    for (boundary, data) in planes {
-        terms.boundary += boundary;
-        terms.data += data;
-    }
-    Ok(terms)
+    let (boundary, data) = planes
+        .into_iter()
+        .fold((0i64, 0i64), |acc, (b, d)| (acc.0 + b, acc.1 + d));
+    Ok(EnergyTerms {
+        boundary: boundary as f64 * energy.quantum,
+        data: data as f64 * energy.quantum,
+    })
 }
 
 /// Mean of `f` per label: the global reduction that refreshes the data term's
@@ -1125,6 +1523,27 @@ impl LabelEnergySweepOp {
     pub fn with_cost(mut self, cost: f64) -> Self {
         self.cost = cost;
         self
+    }
+
+    pub fn energy(&self) -> &LabelEnergy {
+        &self.energy
+    }
+
+    /// The boundary-evidence image and the appearance image, if any.
+    pub fn images(&self) -> (ImageId, Option<ImageId>) {
+        (self.p, self.f)
+    }
+
+    pub fn means(&self) -> &Arc<HashMap<u32, f64>> {
+        &self.means
+    }
+
+    pub fn sweep(&self) -> usize {
+        self.sweep
+    }
+
+    pub fn temperature(&self) -> f64 {
+        self.temperature
     }
 
     fn reach3(&self) -> [usize; 3] {
@@ -1345,6 +1764,44 @@ mod tests {
         assert!(!is_simple_label_flip(&flat, 1, 1));
     }
 
+    #[test]
+    fn the_simple_point_table_is_the_flood_fill_definition() {
+        let table = simple_point_table();
+        let step = if cfg!(debug_assertions) { 997 } else { 1 };
+        let mismatches = (0..1u32 << 26)
+            .into_par_iter()
+            .step_by(step)
+            .filter(|&config| {
+                let mut mask = [false; NEIGHBOURHOOD];
+                for (k, slot) in mask.iter_mut().enumerate() {
+                    *slot = k == CENTRE || (config >> (k - usize::from(k > CENTRE))) & 1 == 1;
+                }
+                table_says(table, config) != is_simple_point(&mask)
+            })
+            .count();
+        assert_eq!(mismatches, 0);
+        // and through the label windows, both connectivities
+        for salt in 0..20_000u64 {
+            let window: [u32; NEIGHBOURHOOD] = std::array::from_fn(|k| {
+                let r = counter_words(salt, 1, 2, k as u64)[0];
+                if r % 11 == 0 {
+                    OUTSIDE
+                } else {
+                    (r % 3) as u32
+                }
+            });
+            for x in 0..3 {
+                for how in [Adjacency::Six, Adjacency::TwentySix] {
+                    assert_eq!(
+                        removable(&window, x, how),
+                        removable_by_flood(&window, x, how),
+                        "{window:?} {x} {how:?}"
+                    );
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------- weights --
 
     #[test]
@@ -1507,10 +1964,10 @@ mod tests {
         let decide_on = |labels: [u32; NEIGHBOURHOOD]| {
             let n = Neighbourhood {
                 labels,
-                p: [0.0; NEIGHBOURHOOD],
-                f: f64::NAN,
+                p: [0; NEIGHBOURHOOD],
+                f: f32::NAN,
             };
-            decide(&energy, &n, &none, 0.0, [0.0; 2]).label
+            decide(&energy, &n, &none, &Acceptance::new(&energy, 0.0), [0; 2]).label
         };
         // a bump of 1 on a flat face of 1 against 2: the centre has 9 like neighbours
         let bump = window(|o| if o[0] < 0 || o == [0, 0, 0] { 1 } else { 2 });

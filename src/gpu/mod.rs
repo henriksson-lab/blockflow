@@ -62,7 +62,9 @@
 // * Kernels (behind the runtime features): `smooth` (separable Gaussian, the
 //   GPU twin of `ops::smooth::SmoothOp`) and [`stencil`] (a 26-neighbourhood
 //   colour-class update on `u32` labels and an `f32` field — the template for a
-//   checkerboard label-energy sweep; its CPU reference is compiled always).
+//   checkerboard label-energy sweep; its CPU reference is compiled always), and
+//   [`label_energy`] (the Potts/topology sweep of `ops::label_energy`, bit-identical
+//   to the CPU, labels resident on the device across classes and sweeps).
 //
 // What the planner still ignores
 // ------------------------------
@@ -96,7 +98,7 @@ use std::sync::Arc;
 use crate::budget::{Lease, MemoryBudget};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::op::{Anchor, BlockConstraint, BlockOp, Combine, Slicing};
+use crate::op::{Anchor, BlockConstraint, BlockOp, Combine, Slicing, SourceInput, SourceInputs};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
 
@@ -104,6 +106,8 @@ pub mod stencil;
 
 #[cfg(feature = "gpu")]
 pub mod device;
+#[cfg(feature = "gpu")]
+pub mod label_energy;
 #[cfg(feature = "gpu")]
 pub mod smooth;
 #[cfg(feature = "gpu")]
@@ -241,6 +245,19 @@ pub trait GpuKernel: Send + Sync {
     fn cost_per_voxel(&self) -> f64;
 
     fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, at: &Anchor) -> Result<()>;
+
+    /// [`BlockOp::apply_with`]: for the GPU twin of an op that reads stored
+    /// source images. The default is `apply` on the input alone, which is right
+    /// only for an op that declares none.
+    fn apply_with(
+        &self,
+        input: &Voxels,
+        _sources: SourceInputs<'_>,
+        out: &mut Voxels,
+        at: &Anchor,
+    ) -> Result<()> {
+        self.apply(&[input], out, at)
+    }
 }
 
 /// A CPU op with an optional GPU implementation, chosen per call.
@@ -250,9 +267,10 @@ pub trait GpuKernel: Send + Sync {
 /// with the device. What changes is `apply`, `cost_per_voxel` and
 /// `device_bytes`, each answered from [`Self::runs_on_gpu`].
 ///
-/// **Only ops whose whole behaviour is `apply`.** The wrapper does not forward
-/// source inputs, placement or side outputs, so an op that overrides
-/// `apply_with` / `apply_placed` / `side_outputs` must not be wrapped.
+/// **Only ops whose whole behaviour is `apply`, or `apply_with` over declared
+/// source inputs** (forwarded to [`GpuKernel::apply_with`]). The wrapper does
+/// not forward placement or side outputs, so an op that overrides
+/// `apply_placed` / `side_outputs` must not be wrapped.
 pub struct Accelerated<O> {
     cpu: O,
     gpu: Option<Arc<dyn GpuKernel>>,
@@ -352,6 +370,23 @@ impl<O: BlockOp> BlockOp for Accelerated<O> {
         match self.kernel(self.cpu.name())? {
             Some(kernel) => kernel.apply(&[input], out, at),
             None => self.cpu.apply(input, out, at),
+        }
+    }
+
+    fn source_inputs(&self, volume: [usize; 3]) -> Vec<SourceInput> {
+        self.cpu.source_inputs(volume)
+    }
+
+    fn apply_with(
+        &self,
+        input: &Voxels,
+        sources: SourceInputs<'_>,
+        out: &mut Voxels,
+        at: &Anchor,
+    ) -> Result<()> {
+        match self.kernel(self.cpu.name())? {
+            Some(kernel) => kernel.apply_with(input, sources, out, at),
+            None => self.cpu.apply_with(input, sources, out, at),
         }
     }
 
