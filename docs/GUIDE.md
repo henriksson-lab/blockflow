@@ -260,10 +260,12 @@ Both default `accepts` to `F64` only, like `BlockOp`.
   column `label_id` equal to the label values, coordinates `centroid_z/y/x` in
   level-0 voxels. A `deleted` (and `toggled`) column, if present, is read as the
   default review state.
-- Stage label and table side by side, then rename into place (the examples
-  hand-roll this; there is no shared helper yet). `label_publish.rs` has a
-  transactional label + table writer, but for sparse masks edited in the UI,
-  not for planned runs.
+- `ome_zarr::publish_label` installs a planned label image and its table: it
+  moves a run's `work/level{N}` (pin it with `Hints::keep_images`; it must be
+  `uint64` — `ops::WidenLabelsOp` converts), builds the pyramid and metadata,
+  swaps in label and table, and refreshes the registry. Older examples
+  hand-roll the same steps. `label_publish.rs` is the transactional writer for
+  sparse masks edited in the UI.
 
 ## 6. Anatomy of an example
 
@@ -284,7 +286,10 @@ Reusable ops and `append_*_phases` / `finalize_*` helpers go in blockflow's
 `src/`; CLI, configuration, publishing and reports stay in the example. Good
 references: `classical-3d-centers-ome-zarr` (planned detection, watershed,
 tables), `cellpose-3d-ome-zarr` (instances, grid choice, resume),
-`plate-timelapse-tracking` (library-shaped example with tests).
+`plate-timelapse-tracking` (library-shaped example with tests),
+`bead-layer-distance` (several channels in one plan, global surfaces, sampled
+thresholds, components, rows from barrier ops, `publish_label`,
+`finalize_object_table`, a synthetic end-to-end test across block grids).
 
 ## 7. Conventions
 

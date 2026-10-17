@@ -1,0 +1,22 @@
+[package]
+name = "blockflow-bead-layer-distance"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Beads on a mucus layer over an epithelium: layer surfaces, bead detection and bead-to-epithelium distances, planned over OME-Zarr."
+
+[dependencies]
+blockflow = { path = "../..", features = ["zarr"] }
+clap = { version = "4.5", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+ndarray = "0.17"
+serde_json = "1"
+zarrs = "0.23.13"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bead-layer-distance"
+path = "src/main.rs"
