@@ -1905,7 +1905,13 @@ mod robust_tests {
     fn percentile_interpolates_like_numpy() {
         // numpy.percentile([5, 1, 4, 2, 3], [0, 12.5, 50, 99.5, 100])
         let values = [5.0, 1.0, 4.0, 2.0, 3.0, f64::NAN];
-        for (p, expected) in [(0.0, 1.0), (12.5, 1.5), (50.0, 3.0), (99.5, 4.98), (100.0, 5.0)] {
+        for (p, expected) in [
+            (0.0, 1.0),
+            (12.5, 1.5),
+            (50.0, 3.0),
+            (99.5, 4.98),
+            (100.0, 5.0),
+        ] {
             let t = GlobalThreshold::percentile(p).unwrap().of(values).unwrap();
             assert!((t - expected).abs() < 1e-12, "p {p}: {t} != {expected}");
         }

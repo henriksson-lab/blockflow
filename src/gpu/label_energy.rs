@@ -790,8 +790,15 @@ pub fn refine_labels_gpu(
             let mut stats = Vec::with_capacity(sweeps.len());
             for sweep in sweeps {
                 let means = label_means(current.view(), f)?;
-                let (next, s) =
-                    label_energy_sweeps_gpu(energy, current.view(), p, Some(f), &means, &[sweep], &at)?;
+                let (next, s) = label_energy_sweeps_gpu(
+                    energy,
+                    current.view(),
+                    p,
+                    Some(f),
+                    &means,
+                    &[sweep],
+                    &at,
+                )?;
                 current = next;
                 stats.extend(s);
             }
@@ -1014,12 +1021,21 @@ mod tests {
             }
             let energy = LabelEnergy::new(params).unwrap();
             let fv = data.then(|| f.view());
-            let (cpu, cpu_stats) = refine_labels(&energy, labels.view(), p.view(), fv, &schedule).unwrap();
-            let (gpu, gpu_stats) = refine_labels_gpu(&energy, labels.view(), p.view(), fv, &schedule).unwrap();
+            let (cpu, cpu_stats) =
+                refine_labels(&energy, labels.view(), p.view(), fv, &schedule).unwrap();
+            let (gpu, gpu_stats) =
+                refine_labels_gpu(&energy, labels.view(), p.view(), fv, &schedule).unwrap();
             assert_eq!(cpu, gpu, "data {data}: labels");
             let flips = |s: &[SweepStats]| s.iter().map(|s| s.flips).collect::<Vec<_>>();
-            assert_eq!(flips(&cpu_stats), flips(&gpu_stats), "data {data}: flips per sweep");
-            assert!(cpu_stats.iter().map(|s| s.flips).sum::<u64>() > 0, "the fixture moves");
+            assert_eq!(
+                flips(&cpu_stats),
+                flips(&gpu_stats),
+                "data {data}: flips per sweep"
+            );
+            assert!(
+                cpu_stats.iter().map(|s| s.flips).sum::<u64>() > 0,
+                "the fixture moves"
+            );
         }
     }
 

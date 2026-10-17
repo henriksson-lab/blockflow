@@ -3791,7 +3791,9 @@ mod fn_combine_tests {
 
     #[test]
     fn fn_combine_reads_any_exact_type_and_writes_the_stated_one() {
-        let a: Voxels = Array3::from_shape_vec((1, 2, 2), vec![1u16, 2, 3, 4]).unwrap().into();
+        let a: Voxels = Array3::from_shape_vec((1, 2, 2), vec![1u16, 2, 3, 4])
+            .unwrap()
+            .into();
         let b: Voxels = Array3::from_shape_vec((1, 2, 2), vec![true, false, true, false])
             .unwrap()
             .into();
@@ -3799,11 +3801,19 @@ mod fn_combine_tests {
             .unwrap()
             .into();
         let at = Anchor::whole([1, 2, 2]);
-        let blend = FnCombine::new("blend", 3, |x| if x[1] != 0.0 { x[0] * x[2] } else { -x[0] }).unwrap();
+        let blend = FnCombine::new(
+            "blend",
+            3,
+            |x| if x[1] != 0.0 { x[0] * x[2] } else { -x[0] },
+        )
+        .unwrap();
         assert!(blend.accepts(&[Dtype::U16, Dtype::Bool, Dtype::F64]));
         assert!(!blend.accepts(&[Dtype::U16, Dtype::Bool]));
         assert!(!blend.accepts(&[Dtype::U64, Dtype::Bool, Dtype::F64]));
-        assert_eq!(blend.produces(&[Dtype::U16, Dtype::Bool, Dtype::F64]), Dtype::F64);
+        assert_eq!(
+            blend.produces(&[Dtype::U16, Dtype::Bool, Dtype::F64]),
+            Dtype::F64
+        );
         let mut out = Voxels::zeros(Dtype::F64, [1, 2, 2]).unwrap();
         blend.apply(&[&a, &b, &c], &mut out, &at).unwrap();
         let got: Vec<f64> = out.view::<f64>().unwrap().iter().copied().collect();

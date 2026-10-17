@@ -3587,9 +3587,16 @@ mod tests {
         assert_eq!(whole, input);
         let windowed = AttachedImage::at(&level0).window([1, 1, 2], [2, 3, 4]);
         let region = windowed.read_region([1, 0, 1], [1, 2, 2]).unwrap();
-        let expected = input.view::<u16>().unwrap().slice(ndarray::s![2..3, 1..3, 3..5]).to_owned();
+        let expected = input
+            .view::<u16>()
+            .unwrap()
+            .slice(ndarray::s![2..3, 1..3, 3..5])
+            .to_owned();
         assert_eq!(region.view::<u16>().unwrap(), expected.view());
-        assert!(windowed.read_region([1, 0, 1], [2, 2, 2]).is_err(), "outside the window");
+        assert!(
+            windowed.read_region([1, 0, 1], [2, 2, 2]).is_err(),
+            "outside the window"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
