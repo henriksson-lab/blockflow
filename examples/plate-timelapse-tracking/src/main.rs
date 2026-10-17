@@ -181,9 +181,6 @@ struct RunArgs {
     #[arg(long, default_value_t = false)]
     track_labels: bool,
 
-    /// Write results under this directory instead of inside each field image.
-    #[arg(long)]
-    output: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     overwrite: bool,
     /// Re-hash completed frames' label planes when resuming.
@@ -361,7 +358,9 @@ fn run_command(args: RunArgs) -> Result<()> {
         track_labels: args.track_labels,
         overwrite: args.overwrite,
         verify_planes: args.verify_planes,
-        output: args.output,
+        // The command publishes labels, tables and tracking metadata in each image group.
+        // Separate overlay roots remain an internal regression-test facility.
+        output: None,
         stop_after: args.stop_after_frames.then_some(Stage::Frames),
     };
     let report = run(&input, &params)?;

@@ -57,6 +57,10 @@ Three ways to name what to process:
 Each field image is a multiscale `t,c,y,x` (or `t,c,z,y,x`) image. Elapsed
 time comes from the `t` scale when its unit is a time unit.
 
+Results are written into each field image under `labels/`, `tables/` and
+`tracking/`. The command does not create a separate overlay dataset. This keeps
+the image and its derived tracking data together in the OME-Zarr hierarchy.
+
 ## Run
 
 Synthetic data with ground truth:
