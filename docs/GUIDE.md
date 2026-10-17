@@ -295,4 +295,5 @@ tables), `cellpose-3d-ome-zarr` (instances, grid choice, resume),
   to the layout; prefer chaining with `Chain::source` / `SourceInput`, or
   `env.image(i)` for small images.
 - Module headers cite `docs/design/BLOCK_OPS.md`, which does not exist.
-- There is no max-flow, graph-cut or optimal-surface code in the crate yet.
+- `graph_cut::CutGraph` is an exact in-memory min cut; there is no planned
+  optimal-surface op yet.
