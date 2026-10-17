@@ -63,9 +63,10 @@ pub struct Config {
     pub out: PathBuf,
     #[arg(long, default_value_t = 8)]
     pub workers: usize,
-    /// Surface solve: `exact`, `multigrid:F:B` (exact on columns pooled F
-    /// times further, then refinement within B slices) or `compare:F:B`
-    /// (both, logs the difference, uses exact).
+    /// Surface solve: `exact`, `multigrid:F:B:T` (exact on columns pooled F
+    /// times further, then exact cuts on T x T-column tiles with shifting
+    /// edges, within B slices) or `compare:F:B:T` (both; logs the difference,
+    /// uses exact).
     #[arg(long, default_value = "exact", value_parser = parse_method)]
     pub surface_method: SurfaceMethod,
     /// At most this many voxels are sampled per global statistic (thresholds,
@@ -143,23 +144,26 @@ struct Results {
 
 fn parse_method(text: &str) -> std::result::Result<SurfaceMethod, String> {
     let parts: Vec<&str> = text.split(':').collect();
-    let numbers = |parts: &[&str]| -> std::result::Result<(usize, usize), String> {
-        match parts {
-            [f, b] => Ok((
-                f.parse().map_err(|e| format!("{e}"))?,
-                b.parse().map_err(|e| format!("{e}"))?,
-            )),
-            _ => Err("expected NAME:FACTOR:BAND".into()),
-        }
+    let numbers = |parts: &[&str]| -> std::result::Result<[usize; 3], String> {
+        let n: Vec<usize> = parts
+            .iter()
+            .map(|p| p.parse().map_err(|e| format!("{e}")))
+            .collect::<std::result::Result<_, _>>()?;
+        n.try_into()
+            .map_err(|_| "expected NAME:FACTOR:BAND:TILE".to_string())
     };
     match parts[0] {
         "exact" if parts.len() == 1 => Ok(SurfaceMethod::Exact),
-        "multigrid" => {
-            numbers(&parts[1..]).map(|(factor, band)| SurfaceMethod::Multigrid { factor, band })
-        }
-        "compare" => {
-            numbers(&parts[1..]).map(|(factor, band)| SurfaceMethod::Compare { factor, band })
-        }
+        "multigrid" => numbers(&parts[1..]).map(|[factor, band, tile]| SurfaceMethod::Multigrid {
+            factor,
+            band,
+            tile,
+        }),
+        "compare" => numbers(&parts[1..]).map(|[factor, band, tile]| SurfaceMethod::Compare {
+            factor,
+            band,
+            tile,
+        }),
         _ => Err(format!("unknown surface method {text:?}")),
     }
 }

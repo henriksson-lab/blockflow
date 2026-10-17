@@ -432,13 +432,21 @@ pub enum SurfaceMethod {
     Exact,
     /// Exact cut on columns pooled `factor` times further (step limits scaled
     /// by `factor`, so the allowed slope is the same), then refinement at the
-    /// stride by exact per-column moves within `band` slices of it
-    /// ([`refine_heights`]). A local optimum near the global one, from a graph
-    /// `factor²` times smaller.
-    Multigrid { factor: usize, band: usize },
+    /// stride by exact cuts on `tile x tile`-column tiles with shifting edges,
+    /// within `band` slices of it ([`refine_tiled`]). A local optimum near the
+    /// global one, from graphs bounded by the coarse level and the tile.
+    Multigrid {
+        factor: usize,
+        band: usize,
+        tile: usize,
+    },
     /// Both; logs how far the multigrid answer is from the exact one, and uses
     /// the exact one. For deciding whether `Multigrid` is good enough.
-    Compare { factor: usize, band: usize },
+    Compare {
+        factor: usize,
+        band: usize,
+        tile: usize,
+    },
 }
 
 /// Energy of `heights` under scaled `costs`: the sum over surfaces and
@@ -608,12 +616,137 @@ pub fn refine_heights(
     )
 }
 
+/// Refine `start` heights by exact cuts on tiles of `tile x tile` columns:
+/// each tile is re-solved with every column outside it held fixed (its
+/// border columns may only take heights within the step limit of their
+/// outside neighbours) and every column within `band` slices of `start`.
+/// Tile edges shift by half a tile on alternate passes, so a region held at
+/// one pass's edge lies inside a tile on the next. Every move is the exact
+/// optimum of its tile given the rest, so the energy never rises; stops after
+/// two consecutive passes (both offsets) that change nothing, or `max_passes`.
+/// Each tile's graph spans only the heights its band allows, so memory is set
+/// by the tile, not the image.
+pub fn refine_tiled(
+    costs: &[Array3<f64>],
+    shape: &SurfaceShape,
+    start: &[Array2<f32>],
+    band: usize,
+    tile: usize,
+    max_passes: usize,
+) -> Result<(Vec<Array2<f32>>, usize)> {
+    let (nz, cy, cx) = costs[0].dim();
+    let k_count = costs.len();
+    let tile = tile.max(2);
+    let mut h: Vec<Array2<i64>> = start.iter().map(|s| s.mapv(|v| v as i64)).collect();
+    let anchor = h.clone();
+    let (mut passes, mut quiet) = (0, 0);
+    while passes < max_passes && quiet < 2 {
+        let offset = if passes % 2 == 0 { 0 } else { tile / 2 };
+        passes += 1;
+        let mut changed = 0usize;
+        let starts = |n: usize| -> Vec<(usize, usize)> {
+            let mut out = Vec::new();
+            let mut a = 0usize;
+            let first = if offset == 0 { tile } else { offset };
+            let mut b = first.min(n);
+            while a < n {
+                out.push((a, b));
+                a = b;
+                b = (b + tile).min(n);
+            }
+            out
+        };
+        for &(j0, j1) in &starts(cy) {
+            for &(i0, i1) in &starts(cx) {
+                let (th, tw) = (j1 - j0, i1 - i0);
+                // allowed heights per surface and column
+                let mut lo = vec![Array2::<i64>::zeros((th, tw)); k_count];
+                let mut hi = vec![Array2::<i64>::zeros((th, tw)); k_count];
+                for k in 0..k_count {
+                    let step = shape.max_steps[k] as i64;
+                    for j in j0..j1 {
+                        for i in i0..i1 {
+                            let a = anchor[k][[j, i]];
+                            let (mut l, mut u) = (
+                                (a - band as i64).max(0),
+                                (a + band as i64).min(nz as i64 - 1),
+                            );
+                            for (dj, di) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                                let (jj, ii) = (j as i64 + dj, i as i64 + di);
+                                let outside = jj < j0 as i64
+                                    || jj >= j1 as i64
+                                    || ii < i0 as i64
+                                    || ii >= i1 as i64;
+                                if outside
+                                    && jj >= 0
+                                    && ii >= 0
+                                    && (jj as usize) < cy
+                                    && (ii as usize) < cx
+                                {
+                                    let n = h[k][[jj as usize, ii as usize]];
+                                    l = l.max(n - step);
+                                    u = u.min(n + step);
+                                }
+                            }
+                            lo[k][[j - j0, i - i0]] = l;
+                            hi[k][[j - j0, i - i0]] = u.max(l);
+                        }
+                    }
+                }
+                let zlo = lo
+                    .iter()
+                    .flat_map(|a| a.iter())
+                    .copied()
+                    .min()
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                let zhi = hi
+                    .iter()
+                    .flat_map(|a| a.iter())
+                    .copied()
+                    .max()
+                    .unwrap_or(0)
+                    .min(nz as i64 - 1) as usize;
+                let sub: Vec<Array3<f64>> = (0..k_count)
+                    .map(|k| {
+                        Array3::from_shape_fn((zhi - zlo + 1, th, tw), |(z, j, i)| {
+                            let zz = (z + zlo) as i64;
+                            let penalty = if zz < lo[k][[j, i]] || zz > hi[k][[j, i]] {
+                                1.0e3
+                            } else {
+                                0.0
+                            };
+                            costs[k][[z + zlo, j + j0, i + i0]] + penalty
+                        })
+                    })
+                    .collect();
+                let local = solve_scaled(&sub, shape)?;
+                for k in 0..k_count {
+                    for ((j, i), &z) in local[k].indexed_iter() {
+                        let z = z as i64 + zlo as i64;
+                        if h[k][[j + j0, i + i0]] != z {
+                            h[k][[j + j0, i + i0]] = z;
+                            changed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        quiet = if changed == 0 { quiet + 1 } else { 0 };
+    }
+    Ok((
+        h.into_iter().map(|a| a.mapv(|v| v as f32)).collect(),
+        passes,
+    ))
+}
+
 /// [`SurfaceMethod::Multigrid`] on scaled stride-level `costs`.
 pub fn solve_multigrid(
     costs: &[Array3<f64>],
     shape: &SurfaceShape,
     factor: usize,
     band: usize,
+    tile: usize,
 ) -> Result<(Vec<Array2<f32>>, usize)> {
     let factor = factor.max(1);
     let (_, cy, cx) = costs[0].dim();
@@ -634,7 +767,7 @@ pub fn solve_multigrid(
             Array2::from_shape_fn((cy, cx), |(j, i)| upsampled_height(h, factor, j, i).round())
         })
         .collect();
-    Ok(refine_heights(costs, shape, &start, band, 10_000))
+    refine_tiled(costs, shape, &start, band, tile, 1_000)
 }
 
 /// Bilinear height at voxel `(y, x)` from column heights `h` (column centres).
@@ -1139,14 +1272,14 @@ impl FragmentOp for SurfaceSolveOp {
         let costs = scale_pooled(pooled, &self.shape);
         let columns = match self.method {
             SurfaceMethod::Exact => solve_scaled(&costs, &self.shape)?,
-            SurfaceMethod::Multigrid { factor, band } => {
-                solve_multigrid(&costs, &self.shape, factor, band)?.0
+            SurfaceMethod::Multigrid { factor, band, tile } => {
+                solve_multigrid(&costs, &self.shape, factor, band, tile)?.0
             }
-            SurfaceMethod::Compare { factor, band } => {
+            SurfaceMethod::Compare { factor, band, tile } => {
                 let t0 = std::time::Instant::now();
                 let exact = solve_scaled(&costs, &self.shape)?;
                 let t1 = std::time::Instant::now();
-                let (multi, sweeps) = solve_multigrid(&costs, &self.shape, factor, band)?;
+                let (multi, sweeps) = solve_multigrid(&costs, &self.shape, factor, band, tile)?;
                 let t2 = std::time::Instant::now();
                 let (e_exact, e_multi) = (
                     surface_energy(&costs, &exact),
@@ -1156,7 +1289,7 @@ impl FragmentOp for SurfaceSolveOp {
                     let diff: Vec<f32> = a.iter().zip(b).map(|(x, y)| (x - y).abs()).collect();
                     let n = diff.len() as f64;
                     eprintln!(
-                        "  surface {k}: multigrid x{factor} band {band}: columns differing {:.2}%, >1 slice {:.2}%, \
+                        "  surface {k}: multigrid x{factor} band {band} tile {tile}: columns differing {:.2}%, >1 slice {:.2}%, \
                          mean |diff| {:.3}, max {}",
                         100.0 * diff.iter().filter(|d| **d > 0.0).count() as f64 / n,
                         100.0 * diff.iter().filter(|d| **d > 1.0).count() as f64 / n,
@@ -1166,7 +1299,7 @@ impl FragmentOp for SurfaceSolveOp {
                 }
                 eprintln!(
                     "  energy exact {e_exact:.3} multigrid {e_multi:.3} (gap {:.4}%), violations {}, \
-                     sweeps {sweeps}, exact {:.1}s, multigrid {:.1}s",
+                     passes {sweeps}, exact {:.1}s, multigrid {:.1}s",
                     100.0 * (e_multi - e_exact) / e_exact.abs().max(1e-12),
                     surface_violations(&multi, &self.shape),
                     (t1 - t0).as_secs_f64(),
@@ -1534,7 +1667,7 @@ mod tests {
             &sh,
         );
         let exact = solve_scaled(&costs, &sh).unwrap();
-        let (multi, sweeps) = solve_multigrid(&costs, &sh, 4, 3).unwrap();
+        let (multi, sweeps) = solve_multigrid(&costs, &sh, 4, 3, 8).unwrap();
         assert_eq!(surface_violations(&exact, &sh), 0);
         assert_eq!(surface_violations(&multi, &sh), 0);
         let (e, m) = (
