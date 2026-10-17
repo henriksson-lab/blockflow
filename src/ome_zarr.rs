@@ -288,6 +288,12 @@ pub struct LabelPublication<'a> {
     /// `object_table::finalize_object_table`), moved to `tables/<name>`. Its
     /// spec's `region` should be `../../labels/<name>`.
     pub table: Option<&'a Path>,
+    /// Replace an existing `labels/<name>` or `tables/<name>`; when `false`
+    /// either existing is refused (checked again just before the swap, so one
+    /// that appeared during the run is refused too).
+    pub replace: bool,
+    /// Block shapes tried for the label pyramid; empty means `[32, 256, 256]`.
+    pub pyramid_blocks: Vec<[usize; 3]>,
 }
 
 /// Install a label image (and its table) in `pyramid`'s image: build the
@@ -315,6 +321,19 @@ pub fn publish_label(
         )));
     }
     let labels_dir = pyramid.image_root().join("labels");
+    let tables_dir = pyramid.image_root().join("tables");
+    let refuse_existing = || -> Result<()> {
+        for existing in [labels_dir.join(name), tables_dir.join(name)] {
+            if !publication.replace && existing.exists() {
+                return Err(Error::invalid(format!(
+                    "{} already exists and replacing it was not asked for",
+                    existing.display()
+                )));
+            }
+        }
+        Ok(())
+    };
+    refuse_existing()?;
     ensure_zarr_group(&labels_dir)?;
     let staging = labels_dir.join(format!(".{name}-publish"));
     if staging.exists() {
@@ -328,7 +347,11 @@ pub fn publish_label(
         &layer,
         &staging.join("pyramid-work"),
         &shapes,
-        &[[32, 256, 256]],
+        if publication.pyramid_blocks.is_empty() {
+            &[[32, 256, 256]]
+        } else {
+            &publication.pyramid_blocks
+        },
         workers,
     )?;
     write_label_metadata(&layer, pyramid.levels(), pyramid.label_source())?;
@@ -352,9 +375,9 @@ pub fn publish_label(
         }
         None => None,
     };
+    refuse_existing()?;
     replace_path(&layer, &labels_dir.join(name))?;
     if let Some(staged) = table {
-        let tables_dir = pyramid.image_root().join("tables");
         ensure_zarr_group(&tables_dir)?;
         replace_path(&staged, &tables_dir.join(name))?;
     }
@@ -569,6 +592,8 @@ mod publish_tests {
                     level0: &level0,
                     image_label: Some(style),
                     table: Some(&table),
+                    replace: true,
+                    pyramid_blocks: Vec::new(),
                 },
                 2,
             )
@@ -607,9 +632,28 @@ mod publish_tests {
                 level0: &narrow,
                 image_label: None,
                 table: None,
+                replace: true,
+                pyramid_blocks: Vec::new(),
             },
             1,
         );
         assert!(refused.unwrap_err().to_string().contains("WidenLabelsOp"));
+        // an existing label is refused unless replacing was asked for
+        let level0 = root.0.join("work/level4");
+        fs::create_dir_all(&level0).unwrap();
+        array(&level0, data_type::uint64(), FillValue::from(0u64));
+        let kept = publish_label(
+            &pyramid,
+            LabelPublication {
+                name: "cells",
+                level0: &level0,
+                image_label: None,
+                table: None,
+                replace: false,
+                pyramid_blocks: Vec::new(),
+            },
+            1,
+        );
+        assert!(kept.unwrap_err().to_string().contains("already exists"));
     }
 }

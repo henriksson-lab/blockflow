@@ -8,12 +8,11 @@ use blockflow::classical_centers::{
     CenterSeedsOp, CenterTable, ClassicalCenterConfig, ClassicalCenterResponse,
     WatershedInstanceTable,
 };
-use blockflow::label_pyramid::{build_nearest_label_pyramid_with_blocks, refresh_label_registry};
-use blockflow::ome_zarr::{ensure_zarr_group, write_label_metadata, OmeVolumePyramid};
+use blockflow::ome_zarr::{ensure_zarr_group, publish_label, LabelPublication, OmeVolumePyramid};
 use blockflow::ops::{
     append_bounded_otsu_threshold_phases, BlobResponse, Boundary, FixedPoint, Gaussian,
     GlobalThresholdOutput, MergeTabulationOp, ScalableWatershedConfig, ScalableWatershedOp,
-    Separation, SmoothOp, TabulateValuesOp, ThresholdTest, VoxelwiseMapOp,
+    Separation, SmoothOp, TabulateValuesOp, ThresholdTest, VoxelwiseMapOp, WidenLabelsOp,
 };
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints};
@@ -186,7 +185,10 @@ fn run() -> Result<()> {
             )
             .within(mask),
         ))?;
-        Some(labels)
+        // published as uint64, which the label pyramid needs; the u32 image
+        // is what the measurements read
+        let published = builder.pixels(Chain::op(WidenLabelsOp))?;
+        Some((labels, published))
     } else {
         None
     };
@@ -219,6 +221,12 @@ fn run() -> Result<()> {
         &assembly.decomposition,
         &Hints {
             concurrency: args.workers.max(1),
+            keep_images: match &watershed_phase {
+                Some((labels, published)) => {
+                    [labels.image()?, published.image()?].into_iter().collect()
+                }
+                None => Default::default(),
+            },
             ..Hints::default()
         },
         &env,
@@ -242,14 +250,9 @@ fn run() -> Result<()> {
     write_csv(&table, &staged.join("table.csv"))?;
     drop(table);
     drop(env);
-    let watershed_objects = if let Some(labels) = watershed_phase {
-        let staged_labels = work.join("labels");
-        fs::create_dir_all(&staged_labels).map_err(Error::backend)?;
-        fs::rename(
-            work.join(format!("level{}", labels.image()?.index())),
-            staged_labels.join("0"),
-        )
-        .map_err(Error::backend)?;
+    let watershed_objects = if let Some((labels, published)) = watershed_phase {
+        let label_level = work.join(format!("level{}", labels.image()?.index()));
+        let published_level = work.join(format!("level{}", published.image()?.index()));
 
         let measurement_work = work.join("measurements");
         let measurement_grid = BlockGrid::new(volume, [args.block_z, args.block, args.block])?;
@@ -276,7 +279,7 @@ fn run() -> Result<()> {
             Lifecycle::Persistent,
         ))?;
         let measurement_assembly = measurements.finish()?;
-        let label_source = AttachedImage::at(staged_labels.join("0"));
+        let label_source = AttachedImage::at(&label_level);
         let measurement_env =
             ZarrEnvironment::attach(&measurement_work, &[label_source, source.clone()])?;
         execute_phases(
@@ -308,29 +311,25 @@ fn run() -> Result<()> {
         let count = instances.spec().row_count;
         drop(instances);
         drop(measurement_env);
-        Some((staged_labels, staged_instances, count))
+        Some((published_level, staged_instances, count))
     } else {
         None
     };
     ensure_zarr_group(&image_root.join("tables"))?;
     replace_with(&staged, &center_destination, args.overwrite)?;
-    if let Some((staged_labels, staged_instances, count)) = watershed_objects {
-        let shapes = pyramid
-            .levels()
-            .iter()
-            .map(|level| level.shape)
-            .collect::<Vec<_>>();
-        build_nearest_label_pyramid_with_blocks(
-            &staged_labels,
-            &work.join("pyramid-work"),
-            &shapes,
-            &[[args.block_z, args.block, args.block]],
+    if let Some((published_level, staged_instances, count)) = watershed_objects {
+        publish_label(
+            &pyramid,
+            LabelPublication {
+                name: &args.layer,
+                level0: &published_level,
+                image_label: None,
+                table: Some(&staged_instances),
+                replace: args.overwrite,
+                pyramid_blocks: vec![[args.block_z, args.block, args.block]],
+            },
             args.workers,
         )?;
-        write_label_metadata(&staged_labels, pyramid.levels(), pyramid.label_source())?;
-        replace_with(&staged_labels, &label_destination, args.overwrite)?;
-        replace_with(&staged_instances, &instance_destination, args.overwrite)?;
-        refresh_label_registry(&image_root.join("labels"))?;
         println!(
             "watershed_objects={} label={} table={}",
             count,

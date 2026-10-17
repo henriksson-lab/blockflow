@@ -766,6 +766,8 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
                 level0: &work.join(format!("level{}", phase.image()?.index())),
                 image_label: style,
                 table: table.exists().then_some(table.as_path()),
+                replace: true,
+                pyramid_blocks: Vec::new(),
             },
             args.workers,
         )?;
