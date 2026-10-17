@@ -226,8 +226,16 @@ impl From<GlobalThreshold> for GlobalThresholdSelection {
 /// The image a global threshold application writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GlobalThresholdOutput {
-    Mask { test: ThresholdTest },
+    Mask {
+        test: ThresholdTest,
+    },
     Classes,
+    /// The input value where it is at or above the (first) level, `-inf`
+    /// elsewhere, as `f64`. Every regional maximum at or above the level
+    /// survives unchanged — its lower neighbours stay lower — so this turns a
+    /// data-dependent level into a fixed one for a peak detector that takes a
+    /// constant minimum.
+    KeepAtOrAbove,
 }
 
 impl GlobalThresholdOutput {
@@ -235,6 +243,7 @@ impl GlobalThresholdOutput {
         match self {
             GlobalThresholdOutput::Mask { .. } => Dtype::Bool,
             GlobalThresholdOutput::Classes => Dtype::U32,
+            GlobalThresholdOutput::KeepAtOrAbove => Dtype::F64,
         }
     }
 }
@@ -1305,6 +1314,16 @@ fn apply_threshold_levels(
             let mut out = out.view_mut::<u32>()?;
             let input = input.widened();
             apply_threshold_classes_into(input.view(), levels, out.view_mut())
+        }
+        GlobalThresholdOutput::KeepAtOrAbove => {
+            let level = *levels.first().ok_or_else(|| {
+                Error::InvalidArgument("keeping values above a threshold needs a level".to_string())
+            })?;
+            let mut out = out.view_mut::<f64>()?;
+            ndarray::Zip::from(&mut out)
+                .and(&input.widened())
+                .for_each(|o, &v| *o = if v >= level { v } else { f64::NEG_INFINITY });
+            Ok(())
         }
     }
 }

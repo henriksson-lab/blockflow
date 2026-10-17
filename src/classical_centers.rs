@@ -335,23 +335,10 @@ impl FragmentOp for SelectCentersOp {
                 .total_cmp(&left.response)
                 .then_with(|| left.at.cmp(&right.at))
         });
-        let distance2 = self.minimum_distance_physical.powi(2);
-        let mut accepted: Vec<CenterCandidate> = Vec::new();
-        for candidate in candidates {
-            let separated = accepted.iter().all(|other| {
-                let squared = (0..3)
-                    .map(|axis| {
-                        let delta = (candidate.at[axis] as f64 - other.at[axis] as f64)
-                            * self.voxel_size[axis];
-                        delta * delta
-                    })
-                    .sum::<f64>();
-                squared >= distance2
-            });
-            if separated {
-                accepted.push(candidate);
-            }
-        }
+        let positions: Vec<[usize; 3]> = candidates.iter().map(|row| row.at).collect();
+        let kept =
+            suppress_within_distance(&positions, self.minimum_distance_physical, self.voxel_size)?;
+        let mut accepted: Vec<CenterCandidate> = kept.into_iter().map(|i| candidates[i]).collect();
         accepted.sort_by_key(|row| row.at);
         Ok(encode_candidates(SELECTED_MAGIC, &accepted))
     }
@@ -378,6 +365,74 @@ impl FragmentOp for SelectCentersOp {
         }
         Ok(BlockOutput::fragment(&self.output, rows.encode()))
     }
+}
+
+/// Greedy minimum-distance suppression: walk `positions` in priority order
+/// (strongest first) and keep each one that is at least
+/// `minimum_distance_physical` from every position already kept, distances
+/// measured with `voxel_size` (z, y, x). Returns the kept indices in priority
+/// order.
+///
+/// The answer is the all-pairs one; a grid of cells one distance wide means
+/// each candidate is compared only with kept positions in its own and the
+/// neighbouring cells, so the cost is linear in the candidates rather than
+/// quadratic.
+pub fn suppress_within_distance(
+    positions: &[[usize; 3]],
+    minimum_distance_physical: f64,
+    voxel_size: [f64; 3],
+) -> Result<Vec<usize>> {
+    if !minimum_distance_physical.is_finite() || minimum_distance_physical < 0.0 {
+        return Err(Error::invalid(
+            "suppression needs a finite non-negative distance",
+        ));
+    }
+    if voxel_size.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return Err(Error::invalid("voxel spacing must be finite and positive"));
+    }
+    if minimum_distance_physical == 0.0 {
+        return Ok((0..positions.len()).collect());
+    }
+    let distance2 = minimum_distance_physical.powi(2);
+    let cell: [usize; 3] = std::array::from_fn(|a| {
+        ((minimum_distance_physical / voxel_size[a]).ceil() as usize).max(1)
+    });
+    let mut grid: std::collections::HashMap<[usize; 3], Vec<[usize; 3]>> =
+        std::collections::HashMap::new();
+    let mut kept = Vec::new();
+    for (index, &at) in positions.iter().enumerate() {
+        let home: [usize; 3] = std::array::from_fn(|a| at[a] / cell[a]);
+        let mut separated = true;
+        'cells: for dz in 0..3usize {
+            for dy in 0..3usize {
+                for dx in 0..3usize {
+                    let delta = [dz, dy, dx];
+                    if (0..3).any(|a| home[a] + delta[a] < 1) {
+                        continue;
+                    }
+                    let key: [usize; 3] = std::array::from_fn(|a| home[a] + delta[a] - 1);
+                    for other in grid.get(&key).map(Vec::as_slice).unwrap_or_default() {
+                        let squared = (0..3)
+                            .map(|axis| {
+                                let delta =
+                                    (at[axis] as f64 - other[axis] as f64) * voxel_size[axis];
+                                delta * delta
+                            })
+                            .sum::<f64>();
+                        if squared < distance2 {
+                            separated = false;
+                            break 'cells;
+                        }
+                    }
+                }
+            }
+        }
+        if separated {
+            grid.entry(home).or_default().push(at);
+            kept.push(index);
+        }
+    }
+    Ok(kept)
 }
 
 pub fn append_classical_center_phases(
@@ -745,4 +800,44 @@ fn decode_candidates(expected: u64, bytes: &[u8]) -> Result<Vec<CenterCandidate>
         out.push(candidate);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The grid version keeps exactly what the all-pairs walk keeps.
+    #[test]
+    fn suppression_matches_all_pairs() {
+        let mut seed = 99u64;
+        let mut random = |m: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % m
+        };
+        let voxel = [5.0, 2.158, 2.158];
+        for distance in [0.0, 3.0, 6.0, 13.0] {
+            let positions: Vec<[usize; 3]> = (0..800)
+                .map(|_| [random(30), random(120), random(120)])
+                .collect();
+            let mut expected: Vec<usize> = Vec::new();
+            for (i, p) in positions.iter().enumerate() {
+                let far = expected.iter().all(|&j| {
+                    let q = positions[j];
+                    (0..3)
+                        .map(|a| ((p[a] as f64 - q[a] as f64) * voxel[a]).powi(2))
+                        .sum::<f64>()
+                        >= distance * distance
+                });
+                if far {
+                    expected.push(i);
+                }
+            }
+            assert_eq!(
+                suppress_within_distance(&positions, distance, voxel).unwrap(),
+                expected
+            );
+        }
+    }
 }

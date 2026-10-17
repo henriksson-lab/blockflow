@@ -474,7 +474,7 @@ pub fn paint_regions(
 const SAMPLES_MAGIC: &[u8; 4] = b"SSa1";
 const POOLED_MAGIC: &[u8; 4] = b"SPo1";
 const SCALES_MAGIC: &[u8; 4] = b"SSc1";
-const HEIGHTS_MAGIC: &[u8; 4] = b"SHe1";
+const HEIGHTS_MAGIC: &[u8; 4] = b"SHe2";
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -765,17 +765,56 @@ impl FragmentOp for SurfacePoolOp {
 pub struct SurfaceSolveOp {
     pooled_stream: String,
     pooled_phase: usize,
+    heights_stream: String,
     shape: SurfaceShape,
 }
 
-impl SurfaceSolveOp {
-    /// Column heights from a solve phase's reduction.
-    pub fn decode_heights(bytes: &[u8]) -> Result<Vec<Array2<f32>>> {
+/// The solved surfaces at column resolution, as the solve phase publishes them
+/// on `<stream>.heights` for later phases.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceColumns {
+    pub stride: usize,
+    /// Per surface, integer height per column.
+    pub columns: Vec<Array2<f32>>,
+}
+
+impl SurfaceColumns {
+    pub fn encode(&self) -> Vec<u8> {
+        let (cy, cx) = self.columns.first().map_or((0, 0), |c| c.dim());
+        let mut out = HEIGHTS_MAGIC.to_vec();
+        for v in [self.stride, self.columns.len(), cy, cx] {
+            put_u64(&mut out, v);
+        }
+        for h in &self.columns {
+            out.extend(h.iter().flat_map(|v| v.to_le_bytes()));
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes, HEIGHTS_MAGIC, "surface heights")?;
-        let (k, cy, cx) = (r.u64()?, r.u64()?, r.u64()?);
-        (0..k)
+        let (stride, k, cy, cx) = (r.u64()?, r.u64()?, r.u64()?, r.u64()?);
+        let columns = (0..k)
             .map(|_| Array2::from_shape_vec((cy, cx), r.f32s(cy * cx)?).map_err(Error::backend))
-            .collect()
+            .collect::<Result<_>>()?;
+        Ok(Self { stride, columns })
+    }
+
+    /// In a later barrier op's `reduce`: the columns published on `stream`
+    /// (declare `FragmentInput::own(stream, solve_phase)` as an input).
+    pub fn from_stream(at: &PhaseView<'_>, stream: &str) -> Result<Self> {
+        let mut found = None;
+        at.stream_fragments(stream, &mut |_key, bytes| {
+            found = Some(Self::decode(bytes)?);
+            Ok(())
+        })?;
+        found.ok_or_else(|| Error::invalid(format!("no surface heights on stream {stream:?}")))
+    }
+
+    /// Surface `k` at voxel `(y, x)`: the upsampled height rounded to a slice —
+    /// the first z labelled below it in the region image.
+    pub fn slice_at(&self, k: usize, y: usize, x: usize) -> f32 {
+        upsampled_height(&self.columns[k], self.stride, y, x).round()
     }
 }
 
@@ -798,6 +837,14 @@ impl FragmentOp for SurfaceSolveOp {
 
     fn inputs(&self) -> Vec<FragmentInput> {
         vec![FragmentInput::own(&self.pooled_stream, self.pooled_phase)]
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![FragmentOutput::new(
+            &self.heights_stream,
+            Lifecycle::DeleteOnExit,
+            Coverage::Sparse,
+        )]
     }
 
     fn barrier(&self) -> bool {
@@ -843,32 +890,38 @@ impl FragmentOp for SurfaceSolveOp {
             }
             Ok(())
         })?;
-        let heights = solve_pooled(pooled, &self.shape)?;
-        let mut out = HEIGHTS_MAGIC.to_vec();
-        for v in [k_count, cy, cx] {
-            put_u64(&mut out, v);
-        }
-        for h in &heights {
-            out.extend(h.iter().flat_map(|v| v.to_le_bytes()));
-        }
-        Ok(out)
+        let columns = solve_pooled(pooled, &self.shape)?;
+        Ok(SurfaceColumns { stride: s, columns }.encode())
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
-        let columns = Self::decode_heights(at.reduced)?;
+        let surfaces = SurfaceColumns::decode(at.reduced)?;
         let mut buffer = at.output_buffer(0.0)?;
         if let Some(out) = buffer.as_array_mut() {
             let offset = [at.read.start[0], at.read.start[1], at.read.start[2]];
-            paint_regions(&columns, self.shape.stride, offset, out.view_mut::<u32>()?);
+            paint_regions(
+                &surfaces.columns,
+                surfaces.stride,
+                offset,
+                out.view_mut::<u32>()?,
+            );
         }
-        Ok(BlockOutput::nothing().with_pixels(buffer))
+        // one block publishes the columns for later phases
+        let output = if at.index == [0, 0, 0] {
+            BlockOutput::fragment(&self.heights_stream, at.reduced.to_vec())
+        } else {
+            BlockOutput::nothing()
+        };
+        Ok(output.with_pixels(buffer))
     }
 }
 
 /// Append the three phases that find `surfaces` and write a `u32` region-label
 /// image (0 above the first surface, `K` at and below the last). Streams are
-/// named `<stream>.samples` and `<stream>.pooled`. Block edges in y and x must
-/// be multiples of `surfaces.stride`.
+/// named `<stream>.samples` and `<stream>.pooled`; the solved columns are
+/// published on `<stream>.heights` by the returned phase (read them with
+/// [`SurfaceColumns::from_stream`]). Block edges in y and x must be multiples
+/// of `surfaces.stride`.
 pub fn append_layered_surface_phases(
     plan: &mut PlanBuilder,
     stream: &str,
@@ -897,8 +950,105 @@ pub fn append_layered_surface_phases(
     plan.fragments(SurfaceSolveOp {
         pooled_stream,
         pooled_phase: pool.index(),
+        heights_stream: format!("{stream}.heights"),
         shape,
     })
+}
+
+// ---------------------------------------------------------------- band --
+
+/// A `u8` mask of the voxels between two solved surfaces, each shifted:
+/// `z >= slice(upper) - upper_shift` and `z < slice(lower) - lower_shift`
+/// (slices; `slice` as in [`SurfaceColumns::slice_at`]). A barrier that reads
+/// the columns a solve phase published, so it can follow it anywhere in the
+/// plan.
+#[derive(Debug, Clone)]
+pub struct SurfaceBandOp {
+    heights_stream: String,
+    heights_phase: usize,
+    upper: (usize, f32),
+    lower: (usize, f32),
+}
+
+impl SurfaceBandOp {
+    /// `heights` is the phase [`append_layered_surface_phases`] returned and
+    /// `stream` the name it was given.
+    pub fn new(stream: &str, heights: Phase, upper: (usize, f32), lower: (usize, f32)) -> Self {
+        Self {
+            heights_stream: format!("{stream}.heights"),
+            heights_phase: heights.index(),
+            upper,
+            lower,
+        }
+    }
+}
+
+impl FragmentOp for SurfaceBandOp {
+    fn name(&self) -> &'static str {
+        "band between surfaces"
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn writes_pixels(&self) -> bool {
+        true
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::U8
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![FragmentInput::own(&self.heights_stream, self.heights_phase)]
+    }
+
+    fn barrier(&self) -> bool {
+        true
+    }
+
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::PerBlock)
+    }
+
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        let surfaces = SurfaceColumns::from_stream(at, &self.heights_stream)?;
+        let k = surfaces.columns.len();
+        if self.upper.0 >= k || self.lower.0 >= k {
+            return Err(Error::invalid(format!(
+                "a band between surfaces {} and {} of a stack of {k}",
+                self.upper.0, self.lower.0
+            )));
+        }
+        Ok(surfaces.encode())
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let surfaces = SurfaceColumns::decode(at.reduced)?;
+        let mut buffer = at.output_buffer(0.0)?;
+        if let Some(out) = buffer.as_array_mut() {
+            let start = [at.read.start[0], at.read.start[1], at.read.start[2]];
+            let mut view = out.view_mut::<u8>()?;
+            let (_, by, bx) = view.dim();
+            for y in 0..by {
+                for x in 0..bx {
+                    let (gy, gx) = (start[1] + y, start[2] + x);
+                    let top = surfaces.slice_at(self.upper.0, gy, gx) - self.upper.1;
+                    let bottom = surfaces.slice_at(self.lower.0, gy, gx) - self.lower.1;
+                    for (z, v) in view.slice_mut(ndarray::s![.., y, x]).iter_mut().enumerate() {
+                        let zf = (start[0] + z) as f32;
+                        *v = u8::from(zf >= top && zf < bottom);
+                    }
+                }
+            }
+        }
+        Ok(BlockOutput::nothing().with_pixels(buffer))
+    }
 }
 
 #[cfg(test)]
@@ -1035,11 +1185,23 @@ mod tests {
         let columns = solve_pooled(pooled, &shape).unwrap();
         let mut expected = Array3::<u32>::zeros((40, 24, 24));
         paint_regions(&columns, 2, [0, 0, 0], expected.view_mut());
+        let solved = SurfaceColumns {
+            stride: 2,
+            columns: columns.clone(),
+        };
+        let expected_band = Array3::from_shape_fn((40, 24, 24), |(z, y, x)| {
+            let zf = z as f32;
+            u8::from(zf >= solved.slice_at(0, y, x) - 2.0 && zf < solved.slice_at(1, y, x) - 1.5)
+        });
+        assert!(expected_band.iter().any(|&v| v == 1) && expected_band.iter().any(|&v| v == 0));
 
         for block in [[40, 24, 24], [8, 8, 8], [16, 4, 12]] {
             let mut plan =
                 PlanBuilder::new(volume, Dtype::F64, BlockGrid::new(volume, block).unwrap());
             let phase = append_layered_surface_phases(&mut plan, "surf", surfaces.clone()).unwrap();
+            let band = plan
+                .fragments(SurfaceBandOp::new("surf", phase, (0, 2.0), (1, 1.5)))
+                .unwrap();
             let assembly = plan.finish().unwrap();
             let env = ArrayEnvironment::with_inputs(
                 Voxels::from(top.clone()),
@@ -1052,7 +1214,10 @@ mod tests {
                 "surfaces",
                 &assembly.workflow,
                 &assembly.decomposition,
-                &Hints::default(),
+                &Hints {
+                    keep_images: [phase.image().unwrap()].into_iter().collect(),
+                    ..Hints::default()
+                },
                 &env,
                 &[],
                 &assembly.work(),
@@ -1063,6 +1228,12 @@ mod tests {
                 got.view::<u32>().unwrap(),
                 expected.view(),
                 "block {block:?}"
+            );
+            let got_band = env.image(band.image().unwrap().index());
+            assert_eq!(
+                got_band.view::<u8>().unwrap(),
+                expected_band.view(),
+                "band, block {block:?}"
             );
         }
     }
