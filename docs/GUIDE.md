@@ -263,8 +263,10 @@ Both default `accepts` to `F64` only, like `BlockOp`.
 - `ome_zarr::publish_label` installs a planned label image and its table: it
   moves a run's `work/level{N}` (pin it with `Hints::keep_images`; it must be
   `uint64` — `ops::WidenLabelsOp` converts), builds the pyramid and metadata,
-  swaps in label and table, and refreshes the registry. Older examples
-  hand-roll the same steps. `label_publish.rs` is the transactional writer for
+  swaps in label and table, and refreshes the registry; `replace: false`
+  refuses existing output. `bead-layer-distance`, `classical-3d-centers`,
+  `cellpose-3d` and `stardist-3d` use it; the 2D cellpose and stardist
+  examples still hand-roll the steps for their 2D levels. `label_publish.rs` is the transactional writer for
   sparse masks edited in the UI.
 
 ## 6. Anatomy of an example
