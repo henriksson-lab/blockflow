@@ -450,7 +450,10 @@ pub enum ValueSampling {
 }
 
 impl ValueSampling {
-    fn takes(self, at: [usize; 3], volume: [usize; 3]) -> bool {
+    /// Whether the voxel at `at` of a `volume` is on the lattice: the test
+    /// [`SampledValuesOp`] applies, for a caller drawing the same sample from
+    /// an array on the host.
+    pub fn takes(self, at: [usize; 3], volume: [usize; 3]) -> bool {
         match self {
             ValueSampling::Every => true,
             ValueSampling::LinearIndex { every } => {
