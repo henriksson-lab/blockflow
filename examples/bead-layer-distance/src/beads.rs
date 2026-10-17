@@ -28,9 +28,8 @@ use blockflow::region::Region;
 use blockflow::sidecar::Lifecycle;
 use blockflow::table::{Column, RowBuilder, Schema, Table, Value};
 use blockflow::{Error, ImageId, Reach, Result};
-use ndarray::Array2;
 
-use crate::measure::{measure_one, Candidate, Class, HeightMaps, MeasureParams, Measured};
+use crate::measure::{measure_one, Candidate, Class, MeasureParams, Measured};
 
 // ---------------------------------------------------------------- bytes --
 
@@ -44,7 +43,7 @@ impl<'a> Bytes<'a> {
         Ok(Self(&bytes[4..]))
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.0.len() < n {
             return Err(Error::invalid("bjorn: reduction blob truncated"));
         }
@@ -59,14 +58,6 @@ impl<'a> Bytes<'a> {
 
     pub(crate) fn f64(&mut self) -> Result<f64> {
         Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
-    fn f32s(&mut self, n: usize) -> Result<Vec<f32>> {
-        Ok(self
-            .take(n * 4)?
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-            .collect())
     }
 }
 
@@ -250,7 +241,6 @@ impl FragmentOp for BeadSelectOp {
     }
 
     fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
-        let [_, ny, nx] = at.volume();
         // maxima, strongest first, ties in raster order
         let table = rows_of(at, &self.peaks_stream, &self.peaks_schema)?;
         let mut peaks: Vec<([usize; 3], f64)> = Vec::with_capacity(table.len());
@@ -276,13 +266,10 @@ impl FragmentOp for BeadSelectOp {
 
         let mut out = SELECT_MAGIC.to_vec();
         put_f64(&mut out, background);
-        for k in [0, 1] {
-            for y in 0..ny {
-                for x in 0..nx {
-                    out.extend(surfaces.slice_at(k, y, x).to_le_bytes());
-                }
-            }
-        }
+        // the surfaces at column resolution; blocks expand only their window
+        let columns = surfaces.encode();
+        put_u64(&mut out, columns.len() as u64);
+        out.extend(columns);
         put_u64(&mut out, kept.len() as u64);
         for i in kept {
             let (p, response) = peaks[i];
@@ -304,9 +291,24 @@ impl FragmentOp for BeadSelectOp {
         let [nz, ny, nx] = at.volume();
         let mut r = Bytes::new(at.reduced, SELECT_MAGIC)?;
         let background = r.f64()?;
-        let mucus = Array2::from_shape_vec((ny, nx), r.f32s(ny * nx)?).map_err(Error::backend)?;
-        let epi = Array2::from_shape_vec((ny, nx), r.f32s(ny * nx)?).map_err(Error::backend)?;
-        let heights = HeightMaps { mucus, epi };
+        let n = r.u64()? as usize;
+        let surfaces = SurfaceColumns::decode(r.take(n)?)?;
+        // heights over this block and as far around it as a nearest-point
+        // search can reach: the vertical distance bounds it, at most the depth
+        let [dz, dy, dx] = self.params.measure.voxel;
+        let reach = (nz as f64 * dz + dz) / dy.min(dx);
+        let reach = reach.ceil() as usize + 1;
+        let lo = [
+            at.core.start[1].saturating_sub(reach),
+            at.core.start[2].saturating_sub(reach),
+        ];
+        let core = at.core.shape3();
+        let hi = [
+            (at.core.start[1] + core[1] + reach).min(ny),
+            (at.core.start[2] + core[2] + reach).min(nx),
+        ];
+        let heights =
+            crate::measure::heights_window(&surfaces, lo, [hi[0] - lo[0], hi[1] - lo[1]], [ny, nx]);
         let raw = sources.get(self.raw.index())?.as_array()?.widened();
         let origin = [at.read.start[0], at.read.start[1], at.read.start[2]];
         if raw.shape() != at.read.shape3().as_slice() {

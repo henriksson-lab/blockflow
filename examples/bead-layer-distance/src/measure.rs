@@ -12,6 +12,11 @@ pub struct HeightMaps {
     pub mucus: Array2<f32>,
     /// Epithelium apical surface (first z labelled tissue).
     pub epi: Array2<f32>,
+    /// Where `[0, 0]` of the maps sits in the volume's (y, x): the maps may
+    /// cover only a window of it.
+    pub origin: [usize; 2],
+    /// The volume's (y, x) extent.
+    pub extent: [usize; 2],
 }
 
 /// Height maps at voxel resolution from the solved surface columns: the same
@@ -21,9 +26,25 @@ pub fn heights_from_columns(
     ny: usize,
     nx: usize,
 ) -> HeightMaps {
+    heights_window(surfaces, [0, 0], [ny, nx], [ny, nx])
+}
+
+/// The same over the window of `shape` at `origin` of a volume `extent` wide.
+pub fn heights_window(
+    surfaces: &blockflow::ops::surfaces::SurfaceColumns,
+    origin: [usize; 2],
+    shape: [usize; 2],
+    extent: [usize; 2],
+) -> HeightMaps {
     HeightMaps {
-        mucus: Array2::from_shape_fn((ny, nx), |(y, x)| surfaces.slice_at(0, y, x)),
-        epi: Array2::from_shape_fn((ny, nx), |(y, x)| surfaces.slice_at(1, y, x)),
+        mucus: Array2::from_shape_fn((shape[0], shape[1]), |(y, x)| {
+            surfaces.slice_at(0, origin[0] + y, origin[1] + x)
+        }),
+        epi: Array2::from_shape_fn((shape[0], shape[1]), |(y, x)| {
+            surfaces.slice_at(1, origin[0] + y, origin[1] + x)
+        }),
+        origin,
+        extent,
     }
 }
 
@@ -152,12 +173,14 @@ pub struct MeasureParams {
 /// Distances to the surfaces and the automatic class before the brightness
 /// split (`Dim`) and the large-object flag, which need every candidate.
 pub fn measure_one(c: &Candidate, h: &HeightMaps, p: &MeasureParams) -> Measured {
-    let (ny, nx) = h.epi.dim();
+    let [ny, nx] = h.extent;
+    let [oy, ox] = h.origin;
+    let (wy, wx) = h.epi.dim();
     let [dz, dy, dx] = p.voxel;
     let yi = (c.y.round() as usize).min(ny - 1);
     let xi = (c.x.round() as usize).min(nx - 1);
-    let he = h.epi[[yi, xi]] as f64;
-    let hm = h.mucus[[yi, xi]] as f64;
+    let he = h.epi[[yi - oy, xi - ox]] as f64;
+    let hm = h.mucus[[yi - oy, xi - ox]] as f64;
     let vertical = (he - c.z) * dz;
     // nearest surface point, searched within |vertical| (the vertical
     // distance is an upper bound on the Euclidean one)
@@ -166,9 +189,24 @@ pub fn measure_one(c: &Candidate, h: &HeightMaps, p: &MeasureParams) -> Measured
     let r = vertical.abs() + dz;
     let (ry, rx) = ((r / dy).ceil() as isize, (r / dx).ceil() as isize);
     let mut best = f64::INFINITY;
-    for j in (yi as isize - ry).max(0)..=(yi as isize + ry).min(ny as isize - 1) {
-        for i in (xi as isize - rx).max(0)..=(xi as isize + rx).min(nx as isize - 1) {
-            let sz = h.epi[[j as usize, i as usize]] as f64 * dz;
+    // the window must cover the search; a narrower one would answer differently
+    debug_assert!(
+        (yi as isize - ry).max(0) >= oy as isize
+            && (yi as isize + ry).min(ny as isize - 1) < (oy + wy) as isize
+            && (xi as isize - rx).max(0) >= ox as isize
+            && (xi as isize + rx).min(nx as isize - 1) < (ox + wx) as isize
+    );
+    for j in (yi as isize - ry).max(oy as isize)
+        ..=(yi as isize + ry)
+            .min(ny as isize - 1)
+            .min((oy + wy) as isize - 1)
+    {
+        for i in (xi as isize - rx).max(ox as isize)
+            ..=(xi as isize + rx)
+                .min(nx as isize - 1)
+                .min((ox + wx) as isize - 1)
+        {
+            let sz = h.epi[[j as usize - oy, i as usize - ox]] as f64 * dz;
             let d2 =
                 (sz - pz).powi(2) + (j as f64 * dy - py).powi(2) + (i as f64 * dx - px).powi(2);
             best = best.min(d2);
