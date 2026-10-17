@@ -53,6 +53,7 @@
 // | `configuration` | a mask rewritten by a table indexed on the 3x3x3 neighbourhood | the first op whose rule is **data rather than code** — 2^27 entries the caller supplies — and the first written as *both* shells over one kernel, so what a stated pass count and a fixed point cost differently is a comparison rather than an argument |
 // | `mixing` | a K-ary reach-0 shell (`TupleOp`), its kernel trait and the per-voxel matrix | the first op parameterised by **arity** rather than by a window — K co-located arrays in, K' out, every value read at the voxel it is written to. A window is what `Reach` describes and needs an axis to be stated over; arity needs only somewhere for the operands to come from, which is why this became reachable when a run could be handed images it did not compute. This is the register's G10 closed |
 // | `watershed` | a cost volume partitioned into one basin per seed | the first op that **declares itself a planning barrier** rather than being one by arithmetic: its answer is a function of one global queue's pop order, so `AxisReach::All` is the honest reach and the cost of saying so is written down as memory per voxel rather than as an adjective |
+// | `tiled_watershed` | supervoxels as a watershed per fixed tile and halo, seeded by the minima found inside each buffer | the first op whose answer is **defined on a tile grid it pins**: an over-segmentation does not need the global queue `watershed` declares a barrier for, so the resident set is one tile and its halo |
 // | `random_walker` | seeded random-walker probabilities from an intensity volume and seed image | the first volume op whose answer is a **sparse linear solve** assembled from block fragments: row IDs are a planner-visible image, sparse rows are emitted per block, and the barrier solve writes a dense probability image back through those row IDs |
 // | `level_set` | signed-distance initialisation and geodesic active-contour evolution | the first op whose natural shape is an explicit PDE step over a running scalar field and a separate fixed image. The resident kernel is the reference; the one-step shell is a `BlockOp` with two-voxel reach, while the multi-step phase waits for `IterativeOp` to name fixed source images rather than only the phase input |
 // | `fft` | a real plane's Fourier transform, and a squared-difference landscape over integer lags through the correlation theorem | the first thing here that is **not an op at all**, and could not be: two inputs of different extents, an output indexed by *lag* rather than by position, and a complex intermediate `Voxels` cannot hold. `watershed` declares the barrier and still fits the shape; this one does not fit the shape, so it is free functions and a plan, and the absent `BlockOp` is the statement |
@@ -361,6 +362,7 @@ pub mod stack_align;
 pub mod structure_tensor;
 pub mod tabulate;
 pub mod threshold;
+pub mod tiled_watershed;
 pub mod transform;
 pub mod voxelize;
 pub mod voxelwise;
