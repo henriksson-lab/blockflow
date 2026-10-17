@@ -122,9 +122,10 @@ fn config(zarr: &Path, out: &Path, block: &str) -> Config {
         "2",
         "--block",
         block,
-        // nine equal beads have no dim/bright split for log-Otsu to find
+        // nine equal beads have no dim/bright split for log-Otsu to find; a
+        // fixed level well above the noise peaks does the same job
         "--bead-min-response",
-        "1",
+        "50",
     ])
 }
 
@@ -166,11 +167,10 @@ fn finds_layers_beads_and_the_large_object_on_any_grid() {
         );
     }
 
-    // The surfaces follow what was drawn, **two slices above** the first
-    // stained slice: the edge cost is taken after Gaussian smoothing (sigma_z
-    // 1) and a log, and the log is steepest on the dark side of the step. A
-    // known bias of the cost recipe, pinned here so a change to it is seen.
-    const BIAS: f32 = -2.0;
+    // The surfaces sit at the first stained slice: the default edge recipe
+    // (`relative`) has no position bias. (The original `log` recipe put them
+    // two slices above it.)
+    const BIAS: f32 = 0.0;
     let epi: ndarray::ArrayD<f32> = blockflow::npy::read_array_file(
         &outputs[0].join("height_epi.npy"),
         blockflow::npy::OrderPolicy::Either,

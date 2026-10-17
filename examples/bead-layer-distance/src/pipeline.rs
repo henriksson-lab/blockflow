@@ -63,6 +63,15 @@ pub struct Config {
     pub out: PathBuf,
     #[arg(long, default_value_t = 8)]
     pub workers: usize,
+    /// How a layer's upper surface is costed: `relative` (boundary
+    /// difference over a broadly smoothed brightness; unbiased) or `log`
+    /// (central difference of the log; puts surfaces 1-2 slices above the
+    /// first stained slice — the original recipe, kept for comparison).
+    #[arg(long, value_enum, default_value_t = EdgeRecipe::Relative)]
+    pub edge_recipe: EdgeRecipe,
+    /// Broad smoothing sigma (voxels, z,y,x) for the relative edge's brightness.
+    #[arg(long, value_delimiter = ',', default_values_t = vec![5.0, 4.0, 4.0])]
+    pub broad_sigma: Vec<f64>,
     /// Surface solve: `exact`, `multigrid:F:B:T` (exact on columns pooled F
     /// times further, then exact cuts on T x T-column tiles with shifting
     /// edges, within B slices) or `compare:F:B:T` (both; logs the difference,
@@ -167,6 +176,13 @@ fn parse_method(text: &str) -> std::result::Result<SurfaceMethod, String> {
         }),
         _ => Err(format!("unknown surface method {text:?}")),
     }
+}
+
+/// See [`Config::edge_recipe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum EdgeRecipe {
+    Relative,
+    Log,
 }
 
 /// Counts of what a run found.
@@ -334,13 +350,16 @@ pub fn run(config: &Config) -> Result<Summary> {
 
 /// Smooth, log (background ~50 counts; log makes contrasts relative, so depth
 /// fading and saturation matter less), then a z filter.
+/// Dark offset of the detectors (background is ~50-60 counts).
+const DARK: f64 = 30.0;
+
 fn cue_chain(sigma: [f64; 3], leaf: Option<Chain>, last: ops::ZTapsOp) -> Result<Chain> {
     let gaussian = Gaussian::new(sigma, 3.0)?.with_boundary(Boundary::Reflect);
     let mut steps = Vec::new();
     steps.extend(leaf);
     steps.push(Chain::op(SmoothOp::new("cue smoothing", gaussian)));
     steps.push(Chain::op(VoxelwiseMapOp::new("log intensity", |v: f64| {
-        (v - 30.0).max(1.0).ln()
+        (v - DARK).max(1.0).ln()
     })));
     steps.push(Chain::op(last));
     Ok(Chain::sequence(steps))
@@ -368,29 +387,42 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
 
     // ---- layers
     let sigma = triple(&args.cost_sigma, "--cost-sigma")?;
-    let p_epi = b.pixels(cue_chain(
-        sigma,
-        None,
-        ops::ZTapsOp::edge_cost("epithelium apical edge cost", 1),
-    )?)?;
-    let p_muc = b.pixels(cue_chain(
-        sigma,
-        Some(Chain::source(mucus, dtype)),
-        ops::ZTapsOp::edge_cost("mucus top edge cost", 1),
-    )?)?;
+    let broad_sigma = triple(&args.broad_sigma, "--broad-sigma")?;
+    // a layer's upper surface: dark above, bright from its first slice down
+    let mut edge = |channel: ImageId, name: &'static str| -> Result<blockflow::Phase> {
+        match args.edge_recipe {
+            EdgeRecipe::Log => b.pixels(cue_chain(
+                sigma,
+                Some(Chain::source(channel, dtype)),
+                ops::ZTapsOp::edge_cost(name, 1),
+            )?),
+            EdgeRecipe::Relative => {
+                let gaussian = |s: [f64; 3]| -> Result<Gaussian> {
+                    Ok(Gaussian::new(s, 3.0)?.with_boundary(Boundary::Reflect))
+                };
+                let broad = b.pixels(Chain::sequence(vec![
+                    Chain::source(channel, dtype),
+                    Chain::op(SmoothOp::new("broad smoothing", gaussian(broad_sigma)?)),
+                ]))?;
+                b.pixels(Chain::sequence(vec![
+                    Chain::source(channel, dtype),
+                    Chain::op(SmoothOp::new("cue smoothing", gaussian(sigma)?)),
+                    Chain::op(ops::RelativeEdgeOp::new(name, broad.image()?, DARK)),
+                ]))
+            }
+        }
+    };
+    let p_epi = edge(ImageId::from(0), "epithelium apical edge cost")?;
+    let p_muc = edge(mucus, "mucus top edge cost")?;
+    // C-Blue also stains the epithelium (nuclei): a second apical-edge cue that
+    // does not bleed into mucus lumps the way AF488 does
+    let p_blue = edge(blue, "epithelium nuclear edge cost")?;
     // tissue under the apical surface is dark in AF594; a mucus lump that also
-    // carries AF488 is not
+    // carries AF488 is not (a penalty, not an edge: kept on the log scale)
     let p_muc_below = b.pixels(cue_chain(
         sigma,
         Some(Chain::source(mucus, dtype)),
         ops::ZTapsOp::below("mucus stain below", 2),
-    )?)?;
-    // C-Blue also stains the epithelium (nuclei): a second apical-edge cue that
-    // does not bleed into mucus lumps the way AF488 does
-    let p_blue = b.pixels(cue_chain(
-        sigma,
-        Some(Chain::source(blue, dtype)),
-        ops::ZTapsOp::edge_cost("epithelium nuclear edge cost", 1),
     )?)?;
     let mut surfaces = LayeredSurfaces {
         layers: vec![
