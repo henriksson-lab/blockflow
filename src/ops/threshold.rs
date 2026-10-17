@@ -56,6 +56,10 @@ pub enum GlobalThreshold {
     /// Otsu over the logarithm of the positive values, mapped back. For
     /// populations spanning orders of magnitude, e.g. detector responses.
     LogOtsu { bins: usize },
+    /// The `p`-th percentile (`0..=100`) by linear interpolation between the
+    /// two bracketing order statistics (NumPy's default rule). Over a
+    /// [`SampledValuesOp`] stream it is the out-of-core percentile.
+    Percentile { p: Multiplier },
 }
 
 /// A finite `f64` factor that can live in a hashable rule; compared by bits.
@@ -115,6 +119,15 @@ impl GlobalThreshold {
         GlobalThreshold::RobustSigma { k: Multiplier(0.0) }
     }
 
+    pub fn percentile(p: f64) -> Result<Self> {
+        if !(p.is_finite() && (0.0..=100.0).contains(&p)) {
+            return Err(Error::InvalidArgument(format!(
+                "a percentile threshold needs p in [0, 100], got {p}"
+            )));
+        }
+        Ok(GlobalThreshold::Percentile { p: Multiplier(p) })
+    }
+
     pub fn log_otsu(bins: usize) -> Result<Self> {
         Self::checked_bins("a log-Otsu threshold", bins)?;
         Ok(GlobalThreshold::LogOtsu { bins })
@@ -163,6 +176,10 @@ impl GlobalThreshold {
             } => minimum_threshold(&values, bins, max_smoothings),
             GlobalThreshold::RobustSigma { k } => robust_sigma_threshold(&values, k.0),
             GlobalThreshold::LogOtsu { bins } => log_otsu_threshold(&values, bins),
+            GlobalThreshold::Percentile { p } => {
+                let mut values = values;
+                Ok(percentile_of(&mut values, p.0))
+            }
         }
     }
 }
@@ -1030,6 +1047,22 @@ pub fn robust_sigma_threshold(values: &[f64], k: f64) -> Result<f64> {
     Ok(median + k * sigma)
 }
 
+/// The `p`-th percentile (`0..=100`) of `values`, by linear interpolation
+/// between the two bracketing order statistics. Reorders `values`, which must
+/// be non-empty and finite.
+pub fn percentile_of(values: &mut [f64], p: f64) -> f64 {
+    let n = values.len();
+    let rank = p / 100.0 * (n - 1) as f64;
+    let below = rank.floor() as usize;
+    let fraction = rank - below as f64;
+    let (_, &mut lower, rest) = values.select_nth_unstable_by(below, f64::total_cmp);
+    if fraction == 0.0 || rest.is_empty() {
+        return lower;
+    }
+    let upper = rest.iter().copied().min_by(f64::total_cmp).unwrap();
+    lower + fraction * (upper - lower)
+}
+
 fn upper_median(values: &mut [f64]) -> f64 {
     let middle = values.len() / 2;
     *values.select_nth_unstable_by(middle, f64::total_cmp).1
@@ -1866,6 +1899,18 @@ mod robust_tests {
         // the outlier does not move it, where the mean would
         assert!(robust_sigma_threshold(&[1.0, 2.0, 3.0, 4.0, 1e9], 2.0).unwrap() < 10.0);
         assert!(GlobalThreshold::robust_sigma(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn percentile_interpolates_like_numpy() {
+        // numpy.percentile([5, 1, 4, 2, 3], [0, 12.5, 50, 99.5, 100])
+        let values = [5.0, 1.0, 4.0, 2.0, 3.0, f64::NAN];
+        for (p, expected) in [(0.0, 1.0), (12.5, 1.5), (50.0, 3.0), (99.5, 4.98), (100.0, 5.0)] {
+            let t = GlobalThreshold::percentile(p).unwrap().of(values).unwrap();
+            assert!((t - expected).abs() < 1e-12, "p {p}: {t} != {expected}");
+        }
+        assert!(GlobalThreshold::percentile(100.5).is_err());
+        assert!(GlobalThreshold::percentile(f64::NAN).is_err());
     }
 
     #[test]

@@ -88,20 +88,7 @@ pub struct SliceLevels {
     pub count: usize,
 }
 
-/// The `p`-th percentile (`0..=100`) of `values`, by linear interpolation
-/// between the two bracketing order statistics. Reorders `values`.
-fn percentile(values: &mut [f64], p: f64) -> f64 {
-    let n = values.len();
-    let rank = p / 100.0 * (n - 1) as f64;
-    let below = rank.floor() as usize;
-    let fraction = rank - below as f64;
-    let (_, &mut lower, rest) = values.select_nth_unstable_by(below, f64::total_cmp);
-    if fraction == 0.0 || rest.is_empty() {
-        return lower;
-    }
-    let upper = rest.iter().copied().min_by(f64::total_cmp).unwrap();
-    lower + fraction * (upper - lower)
-}
+use super::threshold::percentile_of as percentile;
 
 /// Per z-plane low and high percentiles of `volume`.
 ///
