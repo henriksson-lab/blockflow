@@ -47,11 +47,11 @@
 // seam; with that, the result is the same, bit for bit, for every block grid,
 // and the same as [`solve_layered_surfaces`] on the whole arrays.
 //
-// What does not scale yet, stated: phase 1 keeps one sample per 7 voxels per
-// normalised cue (4 bytes each) until the reduce, and phase 3 holds the pooled
-// graph — `K x nz x (ny/stride) x (nx/stride)` nodes — in memory. The stride is
-// therefore the knob that bounds memory. Refining at a finer stride without the
-// whole graph is future work.
+// Memory: phase 1 keeps at most `max_scale_samples` magnitudes per normalised
+// cue (4 bytes each) for the reduce, and phase 3 holds the pooled graph —
+// `K x nz x (ny/stride) x (nx/stride)` nodes, about 200 bytes each — in memory.
+// The stride is therefore the knob that bounds memory. Refining at a finer
+// stride without the whole graph is future work.
 
 use ndarray::{Array2, Array3, ArrayView3, ArrayViewMut3, Axis};
 
@@ -161,9 +161,25 @@ pub struct LayeredSurfaces {
     /// Per consecutive pair: `[min, max]` of `h_{k+1} - h_k`, in slices.
     pub separations: Vec<[usize; 2]>,
     pub stride: usize,
+    /// At most this many magnitudes are sampled per normalised cue for its
+    /// robust scale: every 7th voxel, or a wider multiple of 7 when the volume
+    /// is larger than `7 * max_scale_samples`. Bounds phase 2's reduce.
+    pub max_scale_samples: usize,
+    pub method: SurfaceMethod,
 }
 
 impl LayeredSurfaces {
+    /// Nodes of the cut graph for a `[nz, ny, nx]` volume at `stride`; the
+    /// solve holds about 200 bytes per node.
+    pub fn graph_nodes(&self, volume: [usize; 3], stride: usize) -> usize {
+        self.layers.len() * volume[0] * volume[1].div_ceil(stride) * volume[2].div_ceil(stride)
+    }
+
+    /// Voxels between scale samples for a volume of `voxels`: 7, or the
+    /// smallest multiple of 7 that keeps the count within the cap.
+    pub fn scale_sample_spacing(&self, voxels: usize) -> usize {
+        7 * voxels.div_ceil(7 * self.max_scale_samples.max(1)).max(1)
+    }
     pub fn shape(&self) -> SurfaceShape {
         SurfaceShape {
             stride: self.stride,
@@ -289,7 +305,14 @@ pub fn solve_pooled(pooled: Vec<Array3<f64>>, shape: &SurfaceShape) -> Result<Ve
     if nz == 0 || cy == 0 || cx == 0 {
         return Err(Error::invalid("surface costs are empty"));
     }
-    let costs: Vec<Array3<f64>> = pooled
+    let costs = scale_pooled(pooled, shape);
+    solve_scaled(&costs, shape)
+}
+
+/// Each pooled cost scaled to unit robust magnitude and weighted: the
+/// energy [`solve_pooled`] minimises.
+pub fn scale_pooled(pooled: Vec<Array3<f64>>, shape: &SurfaceShape) -> Vec<Array3<f64>> {
+    pooled
         .into_iter()
         .zip(&shape.weights)
         .map(|(mut c, &w)| {
@@ -297,8 +320,12 @@ pub fn solve_pooled(pooled: Vec<Array3<f64>>, shape: &SurfaceShape) -> Result<Ve
             c.mapv_inplace(|v| v / scale * w);
             c
         })
-        .collect();
+        .collect()
+}
 
+/// The exact cut on already scaled costs.
+pub fn solve_scaled(costs: &[Array3<f64>], shape: &SurfaceShape) -> Result<Vec<Array2<f32>>> {
+    let (nz, cy, cx) = costs[0].dim();
     let k_count = costs.len();
     let ncol = cy * cx;
     let per_surface = nz * ncol;
@@ -393,6 +420,221 @@ pub fn solve_pooled(pooled: Vec<Array3<f64>>, shape: &SurfaceShape) -> Result<Ve
             })
         })
         .collect())
+}
+
+// ----------------------------------------------------------- multigrid --
+
+/// How the solve phase finds the surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SurfaceMethod {
+    /// One exact cut on the pooled columns.
+    #[default]
+    Exact,
+    /// Exact cut on columns pooled `factor` times further (step limits scaled
+    /// by `factor`, so the allowed slope is the same), then refinement at the
+    /// stride by exact per-column moves within `band` slices of it
+    /// ([`refine_heights`]). A local optimum near the global one, from a graph
+    /// `factor²` times smaller.
+    Multigrid { factor: usize, band: usize },
+    /// Both; logs how far the multigrid answer is from the exact one, and uses
+    /// the exact one. For deciding whether `Multigrid` is good enough.
+    Compare { factor: usize, band: usize },
+}
+
+/// Energy of `heights` under scaled `costs`: the sum over surfaces and
+/// columns of the cost at the column's height. What the cut minimises.
+pub fn surface_energy(costs: &[Array3<f64>], heights: &[Array2<f32>]) -> f64 {
+    costs
+        .iter()
+        .zip(heights)
+        .map(|(c, h)| {
+            h.indexed_iter()
+                .map(|((j, i), &z)| c[[z as usize, j, i]])
+                .sum::<f64>()
+        })
+        .sum()
+}
+
+/// Largest step between 4-neighbouring columns beyond `max_steps[k]`, and
+/// separation violations, summed over columns: zero for a feasible answer.
+pub fn surface_violations(heights: &[Array2<f32>], shape: &SurfaceShape) -> usize {
+    let mut bad = 0;
+    for (k, h) in heights.iter().enumerate() {
+        let (cy, cx) = h.dim();
+        for j in 0..cy {
+            for i in 0..cx {
+                for (jj, ii) in [(j + 1, i), (j, i + 1)] {
+                    if jj < cy
+                        && ii < cx
+                        && (h[[j, i]] - h[[jj, ii]]).abs() > shape.max_steps[k] as f32
+                    {
+                        bad += 1;
+                    }
+                }
+                if let Some(&[lo, hi]) = shape.separations.get(k) {
+                    let d = heights[k + 1][[j, i]] - h[[j, i]];
+                    if d < lo as f32 || d > hi as f32 {
+                        bad += 1;
+                    }
+                }
+            }
+        }
+    }
+    bad
+}
+
+/// Refine `start` heights on scaled `costs` by exact per-column moves: each
+/// sweep visits the columns in two checkerboard colours, and every column
+/// takes the heights (all surfaces jointly) that minimise its cost given its
+/// neighbours' current heights, the step and separation limits and a band of
+/// `band` slices around `start`. Neighbours never move together, so the energy
+/// never rises; stops when a sweep changes nothing or after `max_sweeps`.
+/// Returns the heights and the number of sweeps.
+pub fn refine_heights(
+    costs: &[Array3<f64>],
+    shape: &SurfaceShape,
+    start: &[Array2<f32>],
+    band: usize,
+    max_sweeps: usize,
+) -> (Vec<Array2<f32>>, usize) {
+    let (nz, cy, cx) = costs[0].dim();
+    let k_count = costs.len();
+    let mut h: Vec<Array2<i64>> = start.iter().map(|s| s.mapv(|v| v as i64)).collect();
+    let anchor = h.clone();
+    let mut sweeps = 0;
+    for _ in 0..max_sweeps {
+        sweeps += 1;
+        let mut changed = 0usize;
+        for colour in 0..2 {
+            for j in 0..cy {
+                for i in 0..cx {
+                    if (j + i) % 2 != colour {
+                        continue;
+                    }
+                    // feasible range per surface from neighbours and band
+                    let mut range = Vec::with_capacity(k_count);
+                    for k in 0..k_count {
+                        let step = shape.max_steps[k] as i64;
+                        let a = anchor[k][[j, i]];
+                        let (mut lo, mut hi) = (
+                            (a - band as i64).max(0),
+                            (a + band as i64).min(nz as i64 - 1),
+                        );
+                        for (dj, di) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                            let (jj, ii) = (j as i64 + dj, i as i64 + di);
+                            if jj >= 0 && ii >= 0 && (jj as usize) < cy && (ii as usize) < cx {
+                                let n = h[k][[jj as usize, ii as usize]];
+                                lo = lo.max(n - step);
+                                hi = hi.min(n + step);
+                            }
+                        }
+                        range.push((lo, hi));
+                    }
+                    if range.iter().any(|(lo, hi)| lo > hi) {
+                        continue; // neighbours disagree beyond the limits: leave it
+                    }
+                    // chain DP over the surfaces with the separation limits
+                    let mut best: Vec<Vec<(f64, i64)>> = Vec::with_capacity(k_count);
+                    for k in 0..k_count {
+                        let (lo, hi) = range[k];
+                        let row: Vec<(f64, i64)> = (lo..=hi)
+                            .map(|z| {
+                                let own = costs[k][[z as usize, j, i]];
+                                if k == 0 {
+                                    return (own, -1);
+                                }
+                                let [smin, smax] = shape.separations[k - 1];
+                                let (plo, _) = range[k - 1];
+                                let mut pick = (f64::INFINITY, -1);
+                                for (p, &(f, _)) in best[k - 1].iter().enumerate() {
+                                    let zp = plo + p as i64;
+                                    let d = z - zp;
+                                    if d >= smin as i64 && d <= smax as i64 && f < pick.0 {
+                                        pick = (f, zp);
+                                    }
+                                }
+                                (own + pick.0, pick.1)
+                            })
+                            .collect();
+                        best.push(row);
+                    }
+                    let (lo_last, _) = range[k_count - 1];
+                    let Some((p, &(total, _))) = best[k_count - 1]
+                        .iter()
+                        .enumerate()
+                        .min_by(|a, b| a.1 .0.total_cmp(&b.1 .0))
+                    else {
+                        continue;
+                    };
+                    if !total.is_finite() {
+                        continue;
+                    }
+                    let mut chosen = vec![0i64; k_count];
+                    chosen[k_count - 1] = lo_last + p as i64;
+                    for k in (1..k_count).rev() {
+                        let (lo, _) = range[k];
+                        chosen[k - 1] = best[k][(chosen[k] - lo) as usize].1;
+                    }
+                    // keep the current heights on a tie
+                    let current: Vec<i64> = (0..k_count).map(|k| h[k][[j, i]]).collect();
+                    let feasible_now = current
+                        .iter()
+                        .zip(&range)
+                        .all(|(z, (lo, hi))| z >= lo && z <= hi)
+                        && (1..k_count).all(|k| {
+                            let d = current[k] - current[k - 1];
+                            let [smin, smax] = shape.separations[k - 1];
+                            d >= smin as i64 && d <= smax as i64
+                        });
+                    let now: f64 = (0..k_count)
+                        .map(|k| costs[k][[current[k] as usize, j, i]])
+                        .sum();
+                    if chosen != current && (!feasible_now || total < now) {
+                        for k in 0..k_count {
+                            h[k][[j, i]] = chosen[k];
+                        }
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        if changed == 0 {
+            break;
+        }
+    }
+    (
+        h.into_iter().map(|a| a.mapv(|v| v as f32)).collect(),
+        sweeps,
+    )
+}
+
+/// [`SurfaceMethod::Multigrid`] on scaled stride-level `costs`.
+pub fn solve_multigrid(
+    costs: &[Array3<f64>],
+    shape: &SurfaceShape,
+    factor: usize,
+    band: usize,
+) -> Result<(Vec<Array2<f32>>, usize)> {
+    let factor = factor.max(1);
+    let (_, cy, cx) = costs[0].dim();
+    let coarse: Vec<Array3<f64>> = costs
+        .iter()
+        .map(|c| pool_columns(c.view(), factor))
+        .collect();
+    let coarse_shape = SurfaceShape {
+        stride: shape.stride * factor,
+        weights: shape.weights.clone(),
+        max_steps: shape.max_steps.iter().map(|s| s * factor).collect(),
+        separations: shape.separations.clone(),
+    };
+    let rough = solve_scaled(&coarse, &coarse_shape)?;
+    let start: Vec<Array2<f32>> = rough
+        .iter()
+        .map(|h| {
+            Array2::from_shape_fn((cy, cx), |(j, i)| upsampled_height(h, factor, j, i).round())
+        })
+        .collect();
+    Ok(refine_heights(costs, shape, &start, band, 10_000))
 }
 
 /// Bilinear height at voxel `(y, x)` from column heights `h` (column centres).
@@ -536,6 +778,7 @@ pub struct SurfaceScaleSamplesOp {
     stream: String,
     images: Vec<ImageId>,
     sources: Vec<SourceInput>,
+    every: usize,
 }
 
 impl FragmentOp for SurfaceScaleSamplesOp {
@@ -578,7 +821,7 @@ impl FragmentOp for SurfaceScaleSamplesOp {
             let mut kept = Vec::new();
             for ((z, y, x), &v) in cue.indexed_iter() {
                 let global = ((start[0] + z) * ny + start[1] + y) * nx + start[2] + x;
-                if global % 7 == 0 {
+                if global % self.every == 0 {
                     kept.push(v.abs() as f32);
                 }
             }
@@ -767,6 +1010,7 @@ pub struct SurfaceSolveOp {
     pooled_phase: usize,
     heights_stream: String,
     shape: SurfaceShape,
+    method: SurfaceMethod,
 }
 
 /// The solved surfaces at column resolution, as the solve phase publishes them
@@ -891,7 +1135,46 @@ impl FragmentOp for SurfaceSolveOp {
             }
             Ok(())
         })?;
-        let columns = solve_pooled(pooled, &self.shape)?;
+        self.shape.check()?;
+        let costs = scale_pooled(pooled, &self.shape);
+        let columns = match self.method {
+            SurfaceMethod::Exact => solve_scaled(&costs, &self.shape)?,
+            SurfaceMethod::Multigrid { factor, band } => {
+                solve_multigrid(&costs, &self.shape, factor, band)?.0
+            }
+            SurfaceMethod::Compare { factor, band } => {
+                let t0 = std::time::Instant::now();
+                let exact = solve_scaled(&costs, &self.shape)?;
+                let t1 = std::time::Instant::now();
+                let (multi, sweeps) = solve_multigrid(&costs, &self.shape, factor, band)?;
+                let t2 = std::time::Instant::now();
+                let (e_exact, e_multi) = (
+                    surface_energy(&costs, &exact),
+                    surface_energy(&costs, &multi),
+                );
+                for (k, (a, b)) in exact.iter().zip(&multi).enumerate() {
+                    let diff: Vec<f32> = a.iter().zip(b).map(|(x, y)| (x - y).abs()).collect();
+                    let n = diff.len() as f64;
+                    eprintln!(
+                        "  surface {k}: multigrid x{factor} band {band}: columns differing {:.2}%, >1 slice {:.2}%, \
+                         mean |diff| {:.3}, max {}",
+                        100.0 * diff.iter().filter(|d| **d > 0.0).count() as f64 / n,
+                        100.0 * diff.iter().filter(|d| **d > 1.0).count() as f64 / n,
+                        diff.iter().map(|d| *d as f64).sum::<f64>() / n,
+                        diff.iter().cloned().fold(0.0f32, f32::max)
+                    );
+                }
+                eprintln!(
+                    "  energy exact {e_exact:.3} multigrid {e_multi:.3} (gap {:.4}%), violations {}, \
+                     sweeps {sweeps}, exact {:.1}s, multigrid {:.1}s",
+                    100.0 * (e_multi - e_exact) / e_exact.abs().max(1e-12),
+                    surface_violations(&multi, &self.shape),
+                    (t1 - t0).as_secs_f64(),
+                    (t2 - t1).as_secs_f64()
+                );
+                exact
+            }
+        };
         Ok(SurfaceColumns { stride: s, columns }.encode())
     }
 
@@ -936,12 +1219,15 @@ pub fn append_layered_surface_phases(
     let pooled_stream = format!("{stream}.pooled");
     let images = surfaces.normalised_images();
     let sources = images.iter().map(|&i| surfaces.source(i)).collect();
+    let every = surfaces.scale_sample_spacing(plan.grid().volume().iter().product());
     let samples = plan.fragments(SurfaceScaleSamplesOp {
         stream: samples_stream.clone(),
         images,
         sources,
+        every,
     })?;
     let shape = surfaces.shape();
+    let method = surfaces.method;
     let pool = plan.fragments(SurfacePoolOp {
         samples_stream,
         samples_phase: samples.index(),
@@ -953,6 +1239,7 @@ pub fn append_layered_surface_phases(
         pooled_phase: pool.index(),
         heights_stream: format!("{stream}.heights"),
         shape,
+        method,
     })
 }
 
@@ -1236,6 +1523,36 @@ mod tests {
         }
     }
 
+    /// Multigrid lands on a feasible answer whose energy is at least the exact
+    /// one's, and on these planes very close to it.
+    #[test]
+    fn multigrid_is_feasible_and_close_to_exact() {
+        let (top, bot, _, _) = planes();
+        let sh = shape(1);
+        let costs = scale_pooled(
+            vec![pool_columns(top.view(), 1), pool_columns(bot.view(), 1)],
+            &sh,
+        );
+        let exact = solve_scaled(&costs, &sh).unwrap();
+        let (multi, sweeps) = solve_multigrid(&costs, &sh, 4, 3).unwrap();
+        assert_eq!(surface_violations(&exact, &sh), 0);
+        assert_eq!(surface_violations(&multi, &sh), 0);
+        let (e, m) = (
+            surface_energy(&costs, &exact),
+            surface_energy(&costs, &multi),
+        );
+        assert!(m >= e - 1e-9, "multigrid {m} below the exact optimum {e}");
+        let differing = exact
+            .iter()
+            .zip(&multi)
+            .map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x != y).count())
+            .sum::<usize>();
+        assert!(
+            differing <= 24 * 24 * 2 / 20,
+            "{differing} columns differ after {sweeps} sweeps"
+        );
+    }
+
     #[test]
     fn region_labels_count_surfaces_above() {
         let columns = vec![
@@ -1280,6 +1597,8 @@ mod tests {
             ],
             separations: vec![[2, 35]],
             stride: 2,
+            max_scale_samples: 1 << 24,
+            method: SurfaceMethod::Exact,
         };
         let scale = |a: &Array3<f64>| sampled_magnitude(a.iter());
         let (s0, s1) = (scale(&bot), scale(&cue2));
@@ -1325,7 +1644,9 @@ mod tests {
                 &assembly.workflow,
                 &assembly.decomposition,
                 &Hints {
-                    keep_images: [phase.image().unwrap(), lines.image().unwrap()].into_iter().collect(),
+                    keep_images: [phase.image().unwrap(), lines.image().unwrap()]
+                        .into_iter()
+                        .collect(),
                     ..Hints::default()
                 },
                 &env,

@@ -18,7 +18,7 @@ use blockflow::ops::label::{LabelComponentsOp, RelabelComponentsOp};
 use blockflow::ops::rows::collect_rows;
 use blockflow::ops::surfaces::{
     append_layered_surface_phases, LayeredSurfaces, SurfaceBandOp, SurfaceColumns, SurfaceCue,
-    SurfaceLayer, SurfaceLinesOp,
+    SurfaceLayer, SurfaceLinesOp, SurfaceMethod,
 };
 use blockflow::ops::{
     append_response_peak_table_phases, ApplyGlobalThresholdOp, BlobResponseOp, Boundary,
@@ -63,7 +63,20 @@ pub struct Config {
     pub out: PathBuf,
     #[arg(long, default_value_t = 8)]
     pub workers: usize,
-    /// Block edge z,y,x; y and x must be multiples of --stride.
+    /// Surface solve: `exact`, `multigrid:F:B` (exact on columns pooled F
+    /// times further, then refinement within B slices) or `compare:F:B`
+    /// (both, logs the difference, uses exact).
+    #[arg(long, default_value = "exact", value_parser = parse_method)]
+    pub surface_method: SurfaceMethod,
+    /// At most this many voxels are sampled per global statistic (thresholds,
+    /// scales); the sampling lattice widens past it.
+    #[arg(long, default_value_t = 16_000_000)]
+    pub max_samples: usize,
+    /// Largest surface graph (nodes, about 200 bytes each); the stride doubles
+    /// until the graph fits.
+    #[arg(long, default_value_t = 20_000_000)]
+    pub max_surface_nodes: usize,
+    /// Block edge z,y,x; y and x must be multiples of the surface stride.
     #[arg(long, value_delimiter = ',', default_values_t = vec![32, 256, 256])]
     pub block: Vec<usize>,
     /// xy pooling between voxels and surface-graph columns.
@@ -126,6 +139,29 @@ struct Results {
     heights: measure::HeightMaps,
     beads: Vec<Measured>,
     large: Vec<LargeObject>,
+}
+
+fn parse_method(text: &str) -> std::result::Result<SurfaceMethod, String> {
+    let parts: Vec<&str> = text.split(':').collect();
+    let numbers = |parts: &[&str]| -> std::result::Result<(usize, usize), String> {
+        match parts {
+            [f, b] => Ok((
+                f.parse().map_err(|e| format!("{e}"))?,
+                b.parse().map_err(|e| format!("{e}"))?,
+            )),
+            _ => Err("expected NAME:FACTOR:BAND".into()),
+        }
+    };
+    match parts[0] {
+        "exact" if parts.len() == 1 => Ok(SurfaceMethod::Exact),
+        "multigrid" => {
+            numbers(&parts[1..]).map(|(factor, band)| SurfaceMethod::Multigrid { factor, band })
+        }
+        "compare" => {
+            numbers(&parts[1..]).map(|(factor, band)| SurfaceMethod::Compare { factor, band })
+        }
+        _ => Err(format!("unknown surface method {text:?}")),
+    }
 }
 
 /// Counts of what a run found.
@@ -321,6 +357,9 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
         .try_into()
         .map_err(|_| Error::invalid("--block needs z,y,x"))?;
     let mut b = PlanBuilder::new(volume, dtype, BlockGrid::new(volume, block)?);
+    // sample every `base` voxels, or a wider multiple of it on large volumes
+    let voxels: usize = volume.iter().product();
+    let spaced = |base: usize| base * voxels.div_ceil(base * args.max_samples.max(1)).max(1);
 
     // ---- layers
     let sigma = triple(&args.cost_sigma, "--cost-sigma")?;
@@ -348,30 +387,46 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
         Some(Chain::source(blue, dtype)),
         ops::ZTapsOp::edge_cost("epithelium nuclear edge cost", 1),
     )?)?;
-    let p_lab = append_layered_surface_phases(
-        &mut b,
-        SURFACES,
-        LayeredSurfaces {
-            layers: vec![
-                SurfaceLayer {
-                    cues: vec![SurfaceCue::raw(p_muc.image()?, 1.0)],
-                    weight: 1.0,
-                    max_step: args.delta_mucus,
-                },
-                SurfaceLayer {
-                    cues: vec![
-                        SurfaceCue::normalised(p_epi.image()?, 1.0),
-                        SurfaceCue::normalised(p_blue.image()?, args.epi_blue_weight),
-                        SurfaceCue::normalised(p_muc_below.image()?, args.epi_mucus_below_weight),
-                    ],
-                    weight: 1.0,
-                    max_step: args.delta_epi,
-                },
-            ],
-            separations: vec![[args.min_mucus_slices, volume[0]]],
-            stride: args.stride,
-        },
-    )?;
+    let mut surfaces = LayeredSurfaces {
+        layers: vec![
+            SurfaceLayer {
+                cues: vec![SurfaceCue::raw(p_muc.image()?, 1.0)],
+                weight: 1.0,
+                max_step: args.delta_mucus,
+            },
+            SurfaceLayer {
+                cues: vec![
+                    SurfaceCue::normalised(p_epi.image()?, 1.0),
+                    SurfaceCue::normalised(p_blue.image()?, args.epi_blue_weight),
+                    SurfaceCue::normalised(p_muc_below.image()?, args.epi_mucus_below_weight),
+                ],
+                weight: 1.0,
+                max_step: args.delta_epi,
+            },
+        ],
+        separations: vec![[args.min_mucus_slices, volume[0]]],
+        stride: args.stride,
+        max_scale_samples: args.max_samples,
+        method: args.surface_method,
+    };
+    while surfaces.graph_nodes(volume, surfaces.stride) > args.max_surface_nodes {
+        surfaces.stride *= 2;
+        if block[1] % surfaces.stride != 0 || block[2] % surfaces.stride != 0 {
+            return Err(Error::invalid(format!(
+                "the surface graph needs a stride of {} to stay within {} nodes, which does not \
+                 divide the block {block:?}; raise --max-surface-nodes or the block edge",
+                surfaces.stride, args.max_surface_nodes
+            )));
+        }
+    }
+    if surfaces.stride != args.stride {
+        eprintln!(
+            "  surface stride {} (graph of {} nodes)",
+            surfaces.stride,
+            surfaces.graph_nodes(volume, surfaces.stride)
+        );
+    }
+    let p_lab = append_layered_surface_phases(&mut b, SURFACES, surfaces)?;
 
     // published as uint64; a pixel phase reads the image just written
     let p_layers = b.pixels(Chain::op(WidenLabelsOp))?;
@@ -396,7 +451,7 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
     let in_band = |image: ImageId, name: &'static str, stream: &str| -> Result<SampledValuesOp> {
         Ok(
             SampledValuesOp::new(name, stream, SourceInput::voxelwise(image))
-                .on(ValueSampling::CoordinateSum { every: 3 })?
+                .on(ValueSampling::CoordinateSum { every: spaced(3) })?
                 .within(SourceInput::voxelwise(p_band.image()?)),
         )
     };
@@ -457,7 +512,7 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
             Boundary::Reflect,
         )?),
     ]))?;
-    let every5 = ValueSampling::LinearIndex { every: 5 };
+    let every5 = ValueSampling::LinearIndex { every: spaced(5) };
     let response_samples = b.fragments(
         SampledValuesOp::new(
             "bead response samples",
