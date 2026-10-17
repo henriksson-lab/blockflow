@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
-// Original work for this crate.
+// Written for this crate from the published algorithm. Its structure and
+// field names (`tr_cap`, `r_cap`, orphans, timestamps) follow the paper and the
+// authors' reference implementation, `maxflow-v3`, whose licence (GPL) is not
+// MIT; no source was copied from it, but anyone auditing provenance should
+// know the resemblance is deliberate.
 //
 // **Exact minimum s-t cut on a graph held in memory.**
 //
