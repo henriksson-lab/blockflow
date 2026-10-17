@@ -875,6 +875,21 @@ impl<'a> PhaseView<'a> {
         Ok(seen)
     }
 
+    /// The fragment one block wrote to `stream`, or `None` if it wrote none.
+    ///
+    /// For a reduction that works through the lattice piece by piece — reading
+    /// the blocks under one region at a time, perhaps more than once — and so
+    /// holds only what that region weighs rather than the whole set.
+    pub fn fragment(&self, stream: &str, block: [usize; 3]) -> Result<Option<Vec<u8>>> {
+        let (env, from) = self.resolve(stream)?;
+        env.read_sidecar(stream, from, block)
+    }
+
+    /// The lattice this phase is cut on.
+    pub fn grid(&self) -> &BlockGrid {
+        self.grid
+    }
+
     /// Every fragment of `stream` over the whole lattice, in key order.
     ///
     /// The convenience form of [`Self::stream_fragments`], for a reduction whose

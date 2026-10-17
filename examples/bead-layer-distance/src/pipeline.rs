@@ -73,8 +73,9 @@ pub struct Config {
     /// scales); the sampling lattice widens past it.
     #[arg(long, default_value_t = 16_000_000)]
     pub max_samples: usize,
-    /// Largest surface graph (nodes, about 200 bytes each); the stride doubles
-    /// until the graph fits.
+    /// Largest surface graph (nodes, about 200 bytes each). Beyond it the
+    /// exact cut is replaced by multigrid: exact on coarser columns, then
+    /// refined on tiles at full resolution.
     #[arg(long, default_value_t = 20_000_000)]
     pub max_surface_nodes: usize,
     /// Block edge z,y,x; y and x must be multiples of the surface stride.
@@ -413,20 +414,31 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
         max_scale_samples: args.max_samples,
         method: args.surface_method,
     };
-    while surfaces.graph_nodes(volume, surfaces.stride) > args.max_surface_nodes {
-        surfaces.stride *= 2;
-        if block[1] % surfaces.stride != 0 || block[2] % surfaces.stride != 0 {
+    // Too large a graph for one exact cut: keep the stride and solve exactly on
+    // coarser columns, then refine on tiles (blockflow SurfaceMethod::Multigrid)
+    if surfaces.method == SurfaceMethod::Exact
+        && surfaces.graph_nodes(volume, surfaces.stride) > args.max_surface_nodes
+    {
+        let mut factor = 2;
+        while surfaces.graph_nodes(volume, surfaces.stride * factor) > args.max_surface_nodes {
+            factor *= 2;
+        }
+        let edge = surfaces.stride * factor;
+        if block[1] % edge != 0 || block[2] % edge != 0 {
             return Err(Error::invalid(format!(
-                "the surface graph needs a stride of {} to stay within {} nodes, which does not \
-                 divide the block {block:?}; raise --max-surface-nodes or the block edge",
-                surfaces.stride, args.max_surface_nodes
+                "the surface graph needs columns {factor}x coarser to stay within {} nodes, and the block \
+                 {block:?} is not a multiple of {edge} in y and x; raise --max-surface-nodes or the block edge",
+                args.max_surface_nodes
             )));
         }
-    }
-    if surfaces.stride != args.stride {
+        surfaces.method = SurfaceMethod::Multigrid {
+            factor,
+            band: 10,
+            tile: 32,
+        };
         eprintln!(
-            "  surface stride {} (graph of {} nodes)",
-            surfaces.stride,
+            "  surfaces: multigrid x{factor} (coarse graph {} nodes, exact would be {})",
+            surfaces.graph_nodes(volume, edge),
             surfaces.graph_nodes(volume, surfaces.stride)
         );
     }

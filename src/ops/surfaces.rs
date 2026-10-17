@@ -634,8 +634,38 @@ pub fn refine_tiled(
     tile: usize,
     max_passes: usize,
 ) -> Result<(Vec<Array2<f32>>, usize)> {
-    let (nz, cy, cx) = costs[0].dim();
-    let k_count = costs.len();
+    let dim = costs[0].dim();
+    let mut tile_costs =
+        |z: [usize; 2], j: [usize; 2], i: [usize; 2]| -> Result<Vec<Array3<f64>>> {
+            Ok(costs
+                .iter()
+                .map(|c| {
+                    c.slice(ndarray::s![z[0]..z[1], j[0]..j[1], i[0]..i[1]])
+                        .to_owned()
+                })
+                .collect())
+        };
+    refine_tiled_with(dim, &mut tile_costs, shape, start, band, tile, max_passes)
+}
+
+/// Scaled costs of surfaces `0..K` over slices `z`, column rows `j` and
+/// column columns `i` (half-open), for [`refine_tiled_with`].
+pub type TileCosts<'a> =
+    dyn FnMut([usize; 2], [usize; 2], [usize; 2]) -> Result<Vec<Array3<f64>>> + 'a;
+
+/// [`refine_tiled`] over costs fetched one tile at a time, so they never
+/// need to be in memory together. `dim` is `(nz, column rows, column columns)`.
+pub fn refine_tiled_with(
+    dim: (usize, usize, usize),
+    tile_costs: &mut TileCosts<'_>,
+    shape: &SurfaceShape,
+    start: &[Array2<f32>],
+    band: usize,
+    tile: usize,
+    max_passes: usize,
+) -> Result<(Vec<Array2<f32>>, usize)> {
+    let (nz, cy, cx) = dim;
+    let k_count = start.len();
     let tile = tile.max(2);
     let mut h: Vec<Array2<i64>> = start.iter().map(|s| s.mapv(|v| v as i64)).collect();
     let anchor = h.clone();
@@ -707,19 +737,15 @@ pub fn refine_tiled(
                     .max()
                     .unwrap_or(0)
                     .min(nz as i64 - 1) as usize;
-                let sub: Vec<Array3<f64>> = (0..k_count)
-                    .map(|k| {
-                        Array3::from_shape_fn((zhi - zlo + 1, th, tw), |(z, j, i)| {
-                            let zz = (z + zlo) as i64;
-                            let penalty = if zz < lo[k][[j, i]] || zz > hi[k][[j, i]] {
-                                1.0e3
-                            } else {
-                                0.0
-                            };
-                            costs[k][[z + zlo, j + j0, i + i0]] + penalty
-                        })
-                    })
-                    .collect();
+                let mut sub = tile_costs([zlo, zhi + 1], [j0, j1], [i0, i1])?;
+                for (k, c) in sub.iter_mut().enumerate() {
+                    for ((z, j, i), v) in c.indexed_iter_mut() {
+                        let zz = (z + zlo) as i64;
+                        if zz < lo[k][[j, i]] || zz > hi[k][[j, i]] {
+                            *v += 1.0e3;
+                        }
+                    }
+                }
                 let local = solve_scaled(&sub, shape)?;
                 for k in 0..k_count {
                     for ((j, i), &z) in local[k].indexed_iter() {
@@ -740,7 +766,30 @@ pub fn refine_tiled(
     ))
 }
 
-/// [`SurfaceMethod::Multigrid`] on scaled stride-level `costs`.
+/// The coarse shape of a multigrid solve: columns `factor` times wider, step
+/// limits `factor` times larger (the same slope).
+fn coarse_shape(shape: &SurfaceShape, factor: usize) -> SurfaceShape {
+    SurfaceShape {
+        stride: shape.stride * factor,
+        weights: shape.weights.clone(),
+        max_steps: shape.max_steps.iter().map(|s| s * factor).collect(),
+        separations: shape.separations.clone(),
+    }
+}
+
+/// Coarse heights interpolated to the fine columns and rounded.
+fn multigrid_start(rough: &[Array2<f32>], factor: usize, cy: usize, cx: usize) -> Vec<Array2<f32>> {
+    rough
+        .iter()
+        .map(|h| {
+            Array2::from_shape_fn((cy, cx), |(j, i)| upsampled_height(h, factor, j, i).round())
+        })
+        .collect()
+}
+
+/// [`SurfaceMethod::Multigrid`] on scaled stride-level `costs` held in memory.
+/// The solve phase runs the same steps over its fragments without holding
+/// them ([`SurfaceSolveOp`]).
 pub fn solve_multigrid(
     costs: &[Array3<f64>],
     shape: &SurfaceShape,
@@ -754,20 +803,15 @@ pub fn solve_multigrid(
         .iter()
         .map(|c| pool_columns(c.view(), factor))
         .collect();
-    let coarse_shape = SurfaceShape {
-        stride: shape.stride * factor,
-        weights: shape.weights.clone(),
-        max_steps: shape.max_steps.iter().map(|s| s * factor).collect(),
-        separations: shape.separations.clone(),
-    };
-    let rough = solve_scaled(&coarse, &coarse_shape)?;
-    let start: Vec<Array2<f32>> = rough
-        .iter()
-        .map(|h| {
-            Array2::from_shape_fn((cy, cx), |(j, i)| upsampled_height(h, factor, j, i).round())
-        })
-        .collect();
-    refine_tiled(costs, shape, &start, band, tile, 1_000)
+    let rough = solve_scaled(&coarse, &coarse_shape(shape, factor))?;
+    refine_tiled(
+        costs,
+        shape,
+        &multigrid_start(&rough, factor, cy, cx),
+        band,
+        tile,
+        1_000,
+    )
 }
 
 /// Bilinear height at voxel `(y, x)` from column heights `h` (column centres).
@@ -1144,6 +1188,7 @@ pub struct SurfaceSolveOp {
     heights_stream: String,
     shape: SurfaceShape,
     method: SurfaceMethod,
+    max_samples: usize,
 }
 
 /// The solved surfaces at column resolution, as the solve phase publishes them
@@ -1195,6 +1240,146 @@ impl SurfaceColumns {
     }
 }
 
+/// One block's pooled costs: `(z0, bz, cy0, ncy, cx0, ncx)` and per surface
+/// `bz x ncy x ncx` values.
+fn decode_pooled(bytes: &[u8], k_count: usize) -> Result<([usize; 6], Vec<Array3<f64>>)> {
+    let mut r = Reader::new(bytes, POOLED_MAGIC, "pooled surface costs")?;
+    let head = [r.u64()?, r.u64()?, r.u64()?, r.u64()?, r.u64()?, r.u64()?];
+    if r.u64()? != k_count {
+        return Err(Error::invalid(
+            "pooled surface costs: surface count changed",
+        ));
+    }
+    let [_, bz, _, ncy, _, ncx] = head;
+    let costs = (0..k_count)
+        .map(|_| {
+            Array3::from_shape_vec((bz, ncy, ncx), r.f64s(bz * ncy * ncx)?).map_err(Error::backend)
+        })
+        .collect::<Result<_>>()?;
+    Ok((head, costs))
+}
+
+impl SurfaceSolveOp {
+    /// [`SurfaceMethod::Multigrid`] over the pooled fragments without holding
+    /// them: one streaming pass builds the coarse costs and the scale samples,
+    /// the coarse cut is solved, and the tiled refinement fetches the blocks
+    /// under each tile as it goes. Holds the coarse costs, the 2D heights and
+    /// one tile's costs.
+    fn multigrid_streamed(
+        &self,
+        at: &PhaseView<'_>,
+        factor: usize,
+        band: usize,
+        tile: usize,
+    ) -> Result<(Vec<Array2<f32>>, usize)> {
+        self.shape.check()?;
+        let factor = factor.max(1);
+        let s = self.shape.stride;
+        let [nz, ny, nx] = at.volume();
+        let (cy, cx) = (ny.div_ceil(s), nx.div_ceil(s));
+        let (ccy, ccx) = (cy.div_ceil(factor), cx.div_ceil(factor));
+        let k_count = self.shape.weights.len();
+        let block = at.grid().block();
+        // each coarse column inside one block: its sum is added in the same
+        // order on every grid
+        if (block[1] % (s * factor) != 0 && block[1] < ny)
+            || (block[2] % (s * factor) != 0 && block[2] < nx)
+        {
+            return Err(Error::invalid(format!(
+                "multigrid surfaces need blocks that are multiples of stride x factor = {} in y and x; \
+                 the block is {block:?}",
+                s * factor
+            )));
+        }
+        let every = 7 * (nz * cy * cx).div_ceil(7 * self.max_samples.max(1)).max(1);
+        let mut sums = vec![Array3::<f64>::zeros((nz, ccy, ccx)); k_count];
+        let mut samples: Vec<Vec<f64>> = vec![Vec::new(); k_count];
+        at.stream_fragments(&self.pooled_stream, &mut |_key, bytes| {
+            let ([z0, _, cy0, _, cx0, _], costs) = decode_pooled(bytes, k_count)?;
+            for (k, c) in costs.iter().enumerate() {
+                for ((z, j, i), &v) in c.indexed_iter() {
+                    let (gz, gj, gi) = (z0 + z, cy0 + j, cx0 + i);
+                    sums[k][[gz, gj / factor, gi / factor]] += v;
+                    if ((gz * cy + gj) * cx + gi) % every == 0 {
+                        samples[k].push(v.abs());
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        let scales: Vec<f64> = samples.into_iter().map(robust_magnitude).collect();
+        let count = |n: usize, c: usize| ((c + 1) * factor).min(n) - c * factor;
+        let coarse: Vec<Array3<f64>> = sums
+            .into_iter()
+            .enumerate()
+            .map(|(k, mut c)| {
+                for ((_, j, i), v) in c.indexed_iter_mut() {
+                    let n = (count(cy, j) * count(cx, i)) as f64;
+                    *v = *v / n / scales[k] * self.shape.weights[k];
+                }
+                c
+            })
+            .collect();
+        let rough = solve_scaled(&coarse, &coarse_shape(&self.shape, factor))?;
+        let start = multigrid_start(&rough, factor, cy, cx);
+
+        // the blocks under a tile, read when the tile is refined
+        let lattice = at.grid().blocks_per_axis();
+        let mut tile_costs = |z: [usize; 2],
+                              j: [usize; 2],
+                              i: [usize; 2]|
+         -> Result<Vec<Array3<f64>>> {
+            let mut out =
+                vec![Array3::<f64>::zeros((z[1] - z[0], j[1] - j[0], i[1] - i[0])); k_count];
+            let (by0, by1) = ((j[0] * s) / block[1], ((j[1] * s).min(ny) - 1) / block[1]);
+            let (bx0, bx1) = ((i[0] * s) / block[2], ((i[1] * s).min(nx) - 1) / block[2]);
+            let (bz0, bz1) = (z[0] / block[0], (z[1] - 1) / block[0]);
+            for bz in bz0..=bz1.min(lattice[0] - 1) {
+                for by in by0..=by1.min(lattice[1] - 1) {
+                    for bx in bx0..=bx1.min(lattice[2] - 1) {
+                        let Some(bytes) = at.fragment(&self.pooled_stream, [bz, by, bx])? else {
+                            continue;
+                        };
+                        let ([z0, fz, cy0, fy, cx0, fx], costs) = decode_pooled(&bytes, k_count)?;
+                        let (za, zb) = (z0.max(z[0]), (z0 + fz).min(z[1]));
+                        let (ja, jb) = (cy0.max(j[0]), (cy0 + fy).min(j[1]));
+                        let (ia, ib) = (cx0.max(i[0]), (cx0 + fx).min(i[1]));
+                        if za >= zb || ja >= jb || ia >= ib {
+                            continue;
+                        }
+                        for (k, c) in costs.iter().enumerate() {
+                            let scaled = c
+                                .slice(ndarray::s![
+                                    za - z0..zb - z0,
+                                    ja - cy0..jb - cy0,
+                                    ia - cx0..ib - cx0
+                                ])
+                                .mapv(|v| v / scales[k] * self.shape.weights[k]);
+                            out[k]
+                                .slice_mut(ndarray::s![
+                                    za - z[0]..zb - z[0],
+                                    ja - j[0]..jb - j[0],
+                                    ia - i[0]..ib - i[0]
+                                ])
+                                .assign(&scaled);
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        };
+        refine_tiled_with(
+            (nz, cy, cx),
+            &mut tile_costs,
+            &self.shape,
+            &start,
+            band,
+            tile,
+            1_000,
+        )
+    }
+}
+
 impl FragmentOp for SurfaceSolveOp {
     fn name(&self) -> &'static str {
         "layered surface solve"
@@ -1242,6 +1427,10 @@ impl FragmentOp for SurfaceSolveOp {
         let [nz, ny, nx] = at.volume();
         let (cy, cx) = (ny.div_ceil(s), nx.div_ceil(s));
         let k_count = self.shape.weights.len();
+        if let SurfaceMethod::Multigrid { factor, band, tile } = self.method {
+            let columns = self.multigrid_streamed(at, factor, band, tile)?.0;
+            return Ok(SurfaceColumns { stride: s, columns }.encode());
+        }
         let mut pooled = vec![Array3::<f64>::zeros((nz, cy, cx)); k_count];
         at.stream_fragments(&self.pooled_stream, &mut |_key, bytes| {
             let mut r = Reader::new(bytes, POOLED_MAGIC, "pooled surface costs")?;
@@ -1279,7 +1468,7 @@ impl FragmentOp for SurfaceSolveOp {
                 let t0 = std::time::Instant::now();
                 let exact = solve_scaled(&costs, &self.shape)?;
                 let t1 = std::time::Instant::now();
-                let (multi, sweeps) = solve_multigrid(&costs, &self.shape, factor, band, tile)?;
+                let (multi, sweeps) = self.multigrid_streamed(at, factor, band, tile)?;
                 let t2 = std::time::Instant::now();
                 let (e_exact, e_multi) = (
                     surface_energy(&costs, &exact),
@@ -1361,6 +1550,7 @@ pub fn append_layered_surface_phases(
     })?;
     let shape = surfaces.shape();
     let method = surfaces.method;
+    let max_samples = surfaces.max_scale_samples;
     let pool = plan.fragments(SurfacePoolOp {
         samples_stream,
         samples_phase: samples.index(),
@@ -1373,6 +1563,7 @@ pub fn append_layered_surface_phases(
         heights_stream: format!("{stream}.heights"),
         shape,
         method,
+        max_samples,
     })
 }
 
@@ -1683,6 +1874,97 @@ mod tests {
         assert!(
             differing <= 24 * 24 * 2 / 20,
             "{differing} columns differ after {sweeps} sweeps"
+        );
+    }
+
+    /// The streamed multigrid solve gives the same labels on block grids that
+    /// are multiples of stride x factor, and a feasible answer close to exact.
+    #[test]
+    fn planned_multigrid_is_grid_independent() {
+        use crate::env::ArrayEnvironment;
+        use crate::geometry::BlockGrid;
+        use crate::strategy::{execute_phases, Hints};
+        use crate::voxels::Voxels;
+
+        let (top, bot, _, _) = planes();
+        let volume = [40, 24, 24];
+        let surfaces = LayeredSurfaces {
+            layers: vec![
+                SurfaceLayer {
+                    cues: vec![SurfaceCue::raw(0, 1.0)],
+                    weight: 1.0,
+                    max_step: 1,
+                },
+                SurfaceLayer {
+                    cues: vec![
+                        SurfaceCue::normalised(ImageId::supplied(0), 1.0).holding(Dtype::F64)
+                    ],
+                    weight: 1.0,
+                    max_step: 1,
+                },
+            ],
+            separations: vec![[2, 35]],
+            stride: 1,
+            max_scale_samples: 1 << 24,
+            method: SurfaceMethod::Multigrid {
+                factor: 4,
+                band: 4,
+                tile: 6,
+            },
+        };
+        let mut answers = Vec::new();
+        for block in [[40, 24, 24], [8, 8, 8], [16, 4, 12]] {
+            let mut plan =
+                PlanBuilder::new(volume, Dtype::F64, BlockGrid::new(volume, block).unwrap());
+            let phase = append_layered_surface_phases(&mut plan, "surf", surfaces.clone()).unwrap();
+            let assembly = plan.finish().unwrap();
+            let env = ArrayEnvironment::with_inputs(
+                Voxels::from(top.clone()),
+                vec![Voxels::from(bot.clone())],
+                &assembly.decomposition,
+                [8, 8, 8],
+            )
+            .unwrap();
+            execute_phases(
+                "mg",
+                &assembly.workflow,
+                &assembly.decomposition,
+                &Hints::default(),
+                &env,
+                &[],
+                &assembly.work(),
+            )
+            .unwrap();
+            answers.push(
+                env.image(phase.image().unwrap().index())
+                    .view::<u32>()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        assert_eq!(answers[0], answers[1]);
+        assert_eq!(answers[0], answers[2]);
+        // close to the exact answer on the same costs
+        let sh = surfaces.shape();
+        let scale = |a: &Array3<f64>| sampled_magnitude(a.iter());
+        let mut b = Array3::<f64>::zeros(bot.raw_dim());
+        let s0 = scale(&bot);
+        b.zip_mut_with(&bot, |o, &c| *o += 1.0 * c / s0);
+        let exact = solve_pooled(
+            vec![pool_columns(top.view(), 1), pool_columns(b.view(), 1)],
+            &sh,
+        )
+        .unwrap();
+        let mut expected = Array3::<u32>::zeros((40, 24, 24));
+        paint_regions(&exact, 1, [0, 0, 0], expected.view_mut());
+        let differing = answers[0]
+            .iter()
+            .zip(expected.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing < 40 * 24 * 24 / 50,
+            "{differing} voxels differ from the exact answer"
         );
     }
 
