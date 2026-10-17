@@ -753,9 +753,11 @@ pub use tabulate::{
 };
 pub use threshold::{
     append_bounded_otsu_threshold_phases, append_global_threshold_phases, li_threshold,
-    mean_threshold, minimum_threshold, multi_otsu_thresholds, otsu_threshold, threshold_classes,
+    log_otsu_threshold, mean_threshold, minimum_threshold, multi_otsu_thresholds,
+    otsu_threshold, robust_sigma_threshold, sampled_thresholds, threshold_classes,
     threshold_mask, triangle_threshold, yen_threshold, ApplyGlobalThresholdOp, GlobalThreshold,
-    GlobalThresholdOutput, GlobalThresholdSamplesOp, GlobalThresholdSelection,
+    GlobalThresholdOutput, GlobalThresholdSamplesOp, GlobalThresholdSelection, Multiplier,
+    SampledValuesOp, ValueSampling,
 };
 pub use transform::{
     affine_transform_into, append_warp_phase, log_polar_transform_into, polar_transform_into,

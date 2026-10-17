@@ -47,6 +47,33 @@ pub enum GlobalThreshold {
     Triangle { bins: usize },
     /// The minimum threshold over a smoothed `bins`-bin histogram.
     Minimum { bins: usize, max_smoothings: usize },
+    /// `median + k * 1.4826 * MAD`: a level referenced to the noise of the
+    /// majority (the MAD scaled to a Gaussian sigma), robust to the bright
+    /// minority it is meant to separate. Otsu splits the population into two
+    /// classes and so lands between "saturated" and "everything else" when a
+    /// few objects saturate; this does not. `k = 0` is the median.
+    RobustSigma { k: Multiplier },
+    /// Otsu over the logarithm of the positive values, mapped back. For
+    /// populations spanning orders of magnitude, e.g. detector responses.
+    LogOtsu { bins: usize },
+}
+
+/// A finite `f64` factor that can live in a hashable rule; compared by bits.
+#[derive(Debug, Clone, Copy)]
+pub struct Multiplier(pub f64);
+
+impl PartialEq for Multiplier {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for Multiplier {}
+
+impl std::hash::Hash for Multiplier {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state)
+    }
 }
 
 impl GlobalThreshold {
@@ -72,6 +99,25 @@ impl GlobalThreshold {
     pub fn triangle(bins: usize) -> Result<Self> {
         Self::checked_bins("a triangle threshold", bins)?;
         Ok(GlobalThreshold::Triangle { bins })
+    }
+
+    pub fn robust_sigma(k: f64) -> Result<Self> {
+        if !k.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "a robust-sigma threshold needs a finite factor, got {k}"
+            )));
+        }
+        Ok(GlobalThreshold::RobustSigma { k: Multiplier(k) })
+    }
+
+    /// The median: [`Self::RobustSigma`] with `k = 0`.
+    pub fn median() -> Self {
+        GlobalThreshold::RobustSigma { k: Multiplier(0.0) }
+    }
+
+    pub fn log_otsu(bins: usize) -> Result<Self> {
+        Self::checked_bins("a log-Otsu threshold", bins)?;
+        Ok(GlobalThreshold::LogOtsu { bins })
     }
 
     pub fn minimum(bins: usize, max_smoothings: usize) -> Result<Self> {
@@ -115,6 +161,8 @@ impl GlobalThreshold {
                 bins,
                 max_smoothings,
             } => minimum_threshold(&values, bins, max_smoothings),
+            GlobalThreshold::RobustSigma { k } => robust_sigma_threshold(&values, k.0),
+            GlobalThreshold::LogOtsu { bins } => log_otsu_threshold(&values, bins),
         }
     }
 }
@@ -361,6 +409,166 @@ impl FragmentOp for ApplyGlobalThresholdOp {
         }
         Ok(BlockOutput::nothing().with_pixels(buffer))
     }
+}
+
+/// Which voxels a [`SampledValuesOp`] takes, by global position — so the
+/// sample is the same whatever the block grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueSampling {
+    /// Every voxel.
+    Every,
+    /// Voxels whose row-major linear index in the volume is a multiple of `every`.
+    LinearIndex { every: usize },
+    /// Voxels whose `z + y + x` is a multiple of `every`.
+    CoordinateSum { every: usize },
+}
+
+impl ValueSampling {
+    fn takes(self, at: [usize; 3], volume: [usize; 3]) -> bool {
+        match self {
+            ValueSampling::Every => true,
+            ValueSampling::LinearIndex { every } => {
+                ((at[0] * volume[1] + at[1]) * volume[2] + at[2]) % every == 0
+            }
+            ValueSampling::CoordinateSum { every } => (at[0] + at[1] + at[2]) % every == 0,
+        }
+    }
+}
+
+/// Finite values of one image on a [`ValueSampling`], optionally only where
+/// a mask image is non-zero, as a fragment per block for a later barrier to
+/// reduce (see [`sampled_thresholds`]). Unlike [`GlobalThresholdSamplesOp`] it
+/// names the image it reads, so it can sample any image of the plan, and a
+/// sparse lattice bounds what the reduce holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampledValuesOp {
+    name: &'static str,
+    stream: String,
+    lifecycle: Lifecycle,
+    image: SourceInput,
+    lattice: ValueSampling,
+    mask: Option<SourceInput>,
+}
+
+impl SampledValuesOp {
+    pub fn new(name: &'static str, stream: impl Into<String>, image: SourceInput) -> Self {
+        Self {
+            name,
+            stream: stream.into(),
+            lifecycle: Lifecycle::DeleteOnExit,
+            image,
+            lattice: ValueSampling::Every,
+            mask: None,
+        }
+    }
+
+    pub fn on(mut self, lattice: ValueSampling) -> Result<Self> {
+        if matches!(
+            lattice,
+            ValueSampling::LinearIndex { every: 0 } | ValueSampling::CoordinateSum { every: 0 }
+        ) {
+            return Err(Error::InvalidArgument(
+                "a sample lattice needs a positive spacing".to_string(),
+            ));
+        }
+        self.lattice = lattice;
+        Ok(self)
+    }
+
+    /// Sample only where `mask` is non-zero.
+    pub fn within(mut self, mask: SourceInput) -> Self {
+        self.mask = Some(mask);
+        self
+    }
+
+    pub fn lifecycle(mut self, lifecycle: Lifecycle) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+}
+
+impl FragmentOp for SampledValuesOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![
+            FragmentOutput::new(&self.stream, self.lifecycle, Coverage::EveryBlock).sized(
+                SidecarSize::Terms {
+                    fixed: FINITE_SAMPLE_HEADER_BYTES,
+                    per_core_voxel: 8.0,
+                    per_read_voxel: 0.0,
+                    per_face_voxel: 0.0,
+                    tight: false,
+                },
+            ),
+        ]
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<SourceInput> {
+        let mut inputs = vec![self.image.clone()];
+        inputs.extend(self.mask.clone());
+        inputs
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::PerBlock)
+    }
+
+    fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
+        Err(Error::InvalidArgument(format!(
+            "fragment op {:?} reads its image through `apply_with`",
+            self.name
+        )))
+    }
+
+    fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
+        let volume = at.volume();
+        let start = [at.core.start[0], at.core.start[1], at.core.start[2]];
+        let values = sources.get(self.image.image.index())?.as_array()?.widened();
+        let mask = match &self.mask {
+            Some(mask) => Some(sources.get(mask.image.index())?.as_array()?.widened()),
+            None => None,
+        };
+        let mut kept = Vec::new();
+        for ((z, y, x), &v) in values.indexed_iter() {
+            let at = [start[0] + z, start[1] + y, start[2] + x];
+            if v.is_finite()
+                && self.lattice.takes(at, volume)
+                && mask.as_ref().is_none_or(|m| m[[z, y, x]] != 0.0)
+            {
+                kept.push(v);
+            }
+        }
+        Ok(BlockOutput::fragment(
+            &self.stream,
+            encode_finite_samples(&kept),
+        ))
+    }
+}
+
+/// In a barrier op's `reduce`: every sample on `stream` (written by
+/// [`SampledValuesOp`] or [`GlobalThresholdSamplesOp`]), reduced by `selection`.
+pub fn sampled_thresholds(
+    at: &PhaseView<'_>,
+    stream: &str,
+    selection: impl Into<GlobalThresholdSelection>,
+) -> Result<Vec<f64>> {
+    let mut values = Vec::new();
+    at.stream_fragments(stream, &mut |_key, bytes| {
+        values.extend(decode_finite_samples(bytes, "sampled values")?);
+        Ok(())
+    })?;
+    selection.into().thresholds_of(values)
 }
 
 /// Append the two planner-visible phases for a global threshold.
@@ -796,6 +1004,43 @@ pub fn threshold_classes(values: &[f64], thresholds: &[f64]) -> Result<Vec<u32>>
             Ok(thresholds.partition_point(|&threshold| value > threshold) as u32)
         })
         .collect()
+}
+
+/// `median + k * 1.4826 * MAD` of the finite values. The median is the upper
+/// one (element `n / 2` in order), for the values and for the deviations.
+pub fn robust_sigma_threshold(values: &[f64], k: f64) -> Result<f64> {
+    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        return Err(Error::InvalidArgument(
+            "a robust-sigma threshold needs at least one finite value".to_string(),
+        ));
+    }
+    let median = upper_median(&mut finite);
+    let mut deviations: Vec<f64> = finite.iter().map(|v| (v - median).abs()).collect();
+    let sigma = 1.4826 * upper_median(&mut deviations);
+    Ok(median + k * sigma)
+}
+
+fn upper_median(values: &mut [f64]) -> f64 {
+    let middle = values.len() / 2;
+    *values.select_nth_unstable_by(middle, f64::total_cmp).1
+}
+
+/// Otsu over `ln` of the positive values, mapped back with `exp`. Refuses
+/// fewer than two positive values.
+pub fn log_otsu_threshold(values: &[f64], bins: usize) -> Result<f64> {
+    let logs: Vec<f64> = values
+        .iter()
+        .filter(|v| **v > 0.0 && v.is_finite())
+        .map(|v| v.ln())
+        .collect();
+    if logs.len() < 2 {
+        return Err(Error::InvalidArgument(format!(
+            "a log-Otsu threshold needs at least two positive values, got {}",
+            logs.len()
+        )));
+    }
+    Ok(otsu_threshold(&logs, bins)?.exp())
 }
 
 pub fn otsu_threshold(values: &[f64], bins: usize) -> Result<f64> {
@@ -1577,5 +1822,100 @@ mod tests {
         assert!(minimum_threshold(&[0.0, 1.0, 2.0], 3, 1).is_err());
         assert!(multi_otsu_thresholds(&[0.0, 1.0], 2, 1).is_err());
         assert!(multi_otsu_thresholds(&[0.0, 1.0], 2, 3).is_err());
+    }
+}
+
+#[cfg(test)]
+mod robust_tests {
+    use super::*;
+    use crate::assemble::ImageId;
+    use crate::env::ArrayEnvironment;
+    use crate::geometry::BlockGrid;
+    use crate::strategy::{execute_phases, Hints};
+    use ndarray::Array3;
+
+    #[test]
+    fn robust_sigma_is_median_plus_scaled_mad() {
+        // median 3 (upper), deviations [2, 1, 0, 1, 97] -> MAD 1
+        let values = [1.0, 2.0, 3.0, 4.0, 100.0];
+        assert_eq!(robust_sigma_threshold(&values, 0.0).unwrap(), 3.0);
+        assert_eq!(
+            robust_sigma_threshold(&values, 2.0).unwrap(),
+            3.0 + 2.0 * 1.4826
+        );
+        assert_eq!(GlobalThreshold::median().of(values).unwrap(), 3.0);
+        // the outlier does not move it, where the mean would
+        assert!(robust_sigma_threshold(&[1.0, 2.0, 3.0, 4.0, 1e9], 2.0).unwrap() < 10.0);
+        assert!(GlobalThreshold::robust_sigma(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn log_otsu_splits_orders_of_magnitude() {
+        let mut values: Vec<f64> = (0..100).map(|i| 1.0 + i as f64 * 0.01).collect();
+        values.extend((0..100).map(|i| 100.0 + i as f64));
+        let t = log_otsu_threshold(&values, 128).unwrap();
+        assert!(t > 1.5 && t < 100.0, "{t}"); // a bin edge, so near the lower group
+        assert!(log_otsu_threshold(&[-1.0, 0.0, 5.0], 16).is_err());
+    }
+
+    /// Lattice and mask sampling under the planner give the resident sample,
+    /// whatever the block grid.
+    #[test]
+    fn sampled_values_do_not_depend_on_the_grid() {
+        let volume = [6, 7, 5];
+        let image = Array3::from_shape_fn((6, 7, 5), |(z, y, x)| (z * 100 + y * 10 + x) as f64);
+        let mask =
+            Array3::from_shape_fn((6, 7, 5), |(z, y, _)| f64::from(u8::from(z > 1 && y < 5)));
+        for lattice in [
+            ValueSampling::LinearIndex { every: 5 },
+            ValueSampling::CoordinateSum { every: 3 },
+        ] {
+            let mut expected: Vec<f64> = image
+                .indexed_iter()
+                .filter(|&((z, y, x), _)| {
+                    lattice.takes([z, y, x], volume) && mask[[z, y, x]] != 0.0
+                })
+                .map(|(_, &v)| v)
+                .collect();
+            expected.sort_by(f64::total_cmp);
+            for block in [[6, 7, 5], [2, 3, 2]] {
+                let mut plan =
+                    PlanBuilder::new(volume, Dtype::F64, BlockGrid::new(volume, block).unwrap());
+                let op = SampledValuesOp::new("s", "s.values", SourceInput::voxelwise(0))
+                    .on(lattice)
+                    .unwrap()
+                    .within(SourceInput::voxelwise(ImageId::supplied(0)).holding(Dtype::F64))
+                    .lifecycle(Lifecycle::Persistent);
+                let phase = plan.fragments(op).unwrap();
+                let assembly = plan.finish().unwrap();
+                let env = ArrayEnvironment::with_inputs(
+                    Voxels::from(image.clone()),
+                    vec![Voxels::from(mask.clone())],
+                    &assembly.decomposition,
+                    [2, 2, 2],
+                )
+                .unwrap();
+                execute_phases(
+                    "s",
+                    &assembly.workflow,
+                    &assembly.decomposition,
+                    &Hints::default(),
+                    &env,
+                    &[],
+                    &assembly.work(),
+                )
+                .unwrap();
+                let mut got = Vec::new();
+                crate::fragment::fold_fragments(&env, "s.values", &mut |key, bytes| {
+                    if key.phase == phase.index() {
+                        got.extend(decode_finite_samples(bytes, "test").unwrap());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                got.sort_by(f64::total_cmp);
+                assert_eq!(got, expected, "{lattice:?} {block:?}");
+            }
+        }
     }
 }
