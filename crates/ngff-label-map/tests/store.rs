@@ -257,6 +257,24 @@ fn snapshot_files_are_replaced_not_left_behind() {
 }
 
 #[test]
+fn zarr_v2_labels_carry_the_attribute_in_zattrs() {
+    let temp = tempfile::tempdir().unwrap();
+    let label = temp.path().join("labels/v2");
+    fs::create_dir_all(&label).unwrap();
+    fs::write(label.join(".zattrs"), r#"{"multiscales":[]}"#).unwrap();
+    store::create_for_label(&label, &initial()).unwrap();
+    let attributes: serde_json::Value =
+        serde_json::from_slice(&fs::read(label.join(".zattrs")).unwrap()).unwrap();
+    assert_eq!(attributes["multiscales"], serde_json::json!([]));
+    assert_eq!(attributes["segment_map"]["path"], "segment-map");
+    assert!(store::discover(&label).unwrap().unwrap().exists());
+    assert!(!label.join("zarr.json").exists());
+    let bare = temp.path().join("labels/bare");
+    fs::create_dir_all(&bare).unwrap();
+    assert!(store::write_attribute(&bare, "segment-map").is_err());
+}
+
+#[test]
 fn discovery_rejects_paths_leaving_the_label() {
     let temp = tempfile::tempdir().unwrap();
     let label = label_dir(temp.path());

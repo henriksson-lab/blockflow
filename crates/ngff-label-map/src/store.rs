@@ -396,19 +396,39 @@ pub fn discover(label_dir: &Path) -> Result<Option<SegmentMapStore>> {
     Ok(Some(SegmentMapStore::new(label_dir.join(relative_path))))
 }
 
-/// Declare `relative` as the label group's segment map in its `zarr.json` (atomic rewrite that
-/// keeps every other key).
+/// Declare `relative` as the label group's segment map: under `attributes` in its Zarr v3
+/// `zarr.json`, or at the top level of a Zarr v2 `.zattrs` when there is no `zarr.json`. The
+/// file is rewritten atomically and keeps every other key.
 pub fn write_attribute(label_dir: &Path, relative: &str) -> Result<()> {
-    let path = label_dir.join("zarr.json");
-    let mut value: Json = serde_json::from_slice(&fs::read(&path)?)
-        .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+    let v3 = label_dir.join("zarr.json");
+    let path = if v3.is_file() {
+        v3
+    } else {
+        label_dir.join(".zattrs")
+    };
+    let mut value: Json = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::Invalid(format!(
+                "{} has neither zarr.json nor .zattrs",
+                label_dir.display()
+            )))
+        }
+        Err(error) => return Err(error.into()),
+    };
     let object = value
         .as_object_mut()
         .ok_or_else(|| Error::Corrupt(format!("{} is not an object", path.display())))?;
-    let attributes = object.entry("attributes").or_insert_with(|| json!({}));
-    let attributes = attributes
-        .as_object_mut()
-        .ok_or_else(|| Error::Corrupt("zarr.json attributes is not an object".into()))?;
+    let attributes = if path.ends_with("zarr.json") {
+        object
+            .entry("attributes")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| Error::Corrupt("zarr.json attributes is not an object".into()))?
+    } else {
+        object
+    };
     attributes.insert(
         ATTRIBUTE.into(),
         json!({"version": ATTRIBUTE_VERSION, "path": relative}),

@@ -41,8 +41,9 @@ labels/<layer>/segment-map/
 labels/<layer>/.segment-map.lock    writer lock (sibling of the store; created on first edit)
 ```
 
-`path` is relative to the label group and may not leave it. A Zarr v2
-`.zattrs` with the same `segment_map` key is also read.
+`path` is relative to the label group and may not leave it. For a Zarr v2
+label without `zarr.json`, the same `segment_map` key sits at the top level of
+`.zattrs`.
 
 The map at revision N is `snapshot.bin` (at revision R <= N) with records R+1..N
 replayed. Revision = number of records. History is never rewritten: undo
