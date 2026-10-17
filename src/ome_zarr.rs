@@ -273,6 +273,149 @@ pub(crate) fn locate_image_group(container: &Path) -> Result<(PathBuf, Value)> {
     Ok((image_root, image_metadata))
 }
 
+/// A label image, and optionally its object table, to install in an OME-Zarr
+/// image with [`publish_label`].
+pub struct LabelPublication<'a> {
+    /// `labels/<name>` and `tables/<name>`.
+    pub name: &'a str,
+    /// A finished level-0 `uint64` label array — typically a run's
+    /// `work/level{N}`, pinned with `Hints::keep_images`. It is moved, or
+    /// copied when it lives on another filesystem.
+    pub level0: &'a Path,
+    /// Extra `image-label` attributes, e.g. `colors` and `properties`.
+    pub image_label: Option<Map<String, Value>>,
+    /// A finished object table directory (e.g. from
+    /// `object_table::finalize_object_table`), moved to `tables/<name>`. Its
+    /// spec's `region` should be `../../labels/<name>`.
+    pub table: Option<&'a Path>,
+}
+
+/// Install a label image (and its table) in `pyramid`'s image: build the
+/// nearest-neighbour label pyramid matching the image's levels, write the
+/// label metadata, replace any previous `labels/<name>` and `tables/<name>`,
+/// and refresh the `labels` registry. Everything is staged next to the
+/// destination first, so a failure leaves the previous output in place.
+pub fn publish_label(
+    pyramid: &OmeVolumePyramid,
+    publication: LabelPublication<'_>,
+    workers: usize,
+) -> Result<()> {
+    let name = publication.name;
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return Err(Error::invalid(format!(
+            "label name {name:?} must be one plain path component"
+        )));
+    }
+    let level0 = read_json(&publication.level0.join("zarr.json"))?;
+    if level0.get("data_type").and_then(Value::as_str) != Some("uint64") {
+        return Err(Error::invalid(format!(
+            "{} is not a uint64 array; label pyramids here are uint64 — widen it first \
+             (ops::WidenLabelsOp)",
+            publication.level0.display()
+        )));
+    }
+    let labels_dir = pyramid.image_root().join("labels");
+    ensure_zarr_group(&labels_dir)?;
+    let staging = labels_dir.join(format!(".{name}-publish"));
+    if staging.exists() {
+        fs::remove_dir_all(&staging).map_err(Error::backend)?;
+    }
+    let layer = staging.join("layer");
+    fs::create_dir_all(&layer).map_err(Error::backend)?;
+    move_path(publication.level0, &layer.join("0"))?;
+    let shapes: Vec<[usize; 3]> = pyramid.levels().iter().map(|l| l.shape).collect();
+    crate::label_pyramid::build_nearest_label_pyramid_with_blocks(
+        &layer,
+        &staging.join("pyramid-work"),
+        &shapes,
+        &[[32, 256, 256]],
+        workers,
+    )?;
+    write_label_metadata(&layer, pyramid.levels(), pyramid.label_source())?;
+    if let Some(extra) = publication.image_label {
+        let path = layer.join("zarr.json");
+        let mut metadata = read_json(&path)?;
+        if let Some(Value::Object(label)) = metadata.pointer_mut("/attributes/image-label") {
+            label.extend(extra);
+        }
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&metadata).map_err(Error::backend)?,
+        )
+        .map_err(Error::backend)?;
+    }
+    let table = match publication.table {
+        Some(table) => {
+            let staged = staging.join("table");
+            move_path(table, &staged)?;
+            Some(staged)
+        }
+        None => None,
+    };
+    replace_path(&layer, &labels_dir.join(name))?;
+    if let Some(staged) = table {
+        let tables_dir = pyramid.image_root().join("tables");
+        ensure_zarr_group(&tables_dir)?;
+        replace_path(&staged, &tables_dir.join(name))?;
+    }
+    crate::label_pyramid::refresh_label_registry(&labels_dir)?;
+    fs::remove_dir_all(&staging).map_err(Error::backend)
+}
+
+/// Rename, or copy and delete when `from` and `to` are on different
+/// filesystems.
+pub fn move_path(from: &Path, to: &Path) -> Result<()> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).map_err(Error::backend)?;
+    }
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    copy_tree(from, to)?;
+    fs::remove_dir_all(from).map_err(Error::backend)
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    if from.is_dir() {
+        fs::create_dir_all(to).map_err(Error::backend)?;
+        for entry in fs::read_dir(from).map_err(Error::backend)? {
+            let entry = entry.map_err(Error::backend)?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        fs::copy(from, to).map(|_| ()).map_err(|error| {
+            Error::backend(format!(
+                "copy {} to {}: {error}",
+                from.display(),
+                to.display()
+            ))
+        })
+    }
+}
+
+/// Swap `staged` into `destination`, removing what was there.
+fn replace_path(staged: &Path, destination: &Path) -> Result<()> {
+    let old = destination.with_file_name(format!(
+        ".{}-replaced",
+        destination
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("old")
+    ));
+    if old.exists() {
+        fs::remove_dir_all(&old).map_err(Error::backend)?;
+    }
+    if destination.exists() {
+        fs::rename(destination, &old).map_err(Error::backend)?;
+    }
+    fs::rename(staged, destination).map_err(Error::backend)?;
+    if old.exists() {
+        fs::remove_dir_all(&old).map_err(Error::backend)?;
+    }
+    Ok(())
+}
+
 fn multiscale(metadata: &Value) -> Option<&Value> {
     metadata
         .pointer("/attributes/ome/multiscales/0")
@@ -349,4 +492,124 @@ fn project_transforms(transforms: Option<&Value>, spatial: [usize; 3]) -> Value 
 
 fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&fs::read(path).map_err(Error::backend)?).map_err(Error::backend)
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    use zarrs::array::{data_type, ArrayBuilder, ArraySubset, FillValue};
+    use zarrs::filesystem::FilesystemStore;
+
+    struct TestRoot(PathBuf);
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn array(
+        dir: &Path,
+        dtype: zarrs::array::DataType,
+        fill: FillValue,
+    ) -> zarrs::array::Array<FilesystemStore> {
+        let store = std::sync::Arc::new(FilesystemStore::new(dir).unwrap());
+        let a = ArrayBuilder::new(vec![4, 8, 8], vec![2, 8, 8], dtype, fill)
+            .build(store, "/")
+            .unwrap();
+        a.store_metadata().unwrap();
+        a
+    }
+
+    #[test]
+    fn publish_installs_and_replaces_a_label_and_its_table() {
+        let root = TestRoot(
+            std::env::temp_dir().join(format!("blockflow-publish-{}", std::process::id())),
+        );
+        let image = root.0.join("image.ome.zarr");
+        fs::create_dir_all(&image).unwrap();
+        fs::write(
+            image.join("zarr.json"),
+            serde_json::to_vec_pretty(&json!({
+                "zarr_format":3,"node_type":"group","attributes":{"ome":{
+                    "version":"0.5","multiscales":[{"version":"0.5",
+                    "axes":[{"name":"z","type":"space","unit":"micrometer"},
+                            {"name":"y","type":"space","unit":"micrometer"},
+                            {"name":"x","type":"space","unit":"micrometer"}],
+                    "datasets":[{"path":"0","coordinateTransformations":[{
+                        "type":"scale","scale":[2.0,0.5,0.5]}]}]}]}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(image.join("0")).unwrap();
+        array(&image.join("0"), data_type::uint8(), FillValue::from(0u8));
+        let pyramid = OmeVolumePyramid::open(&image, 0, 0).unwrap();
+
+        for value in [7u64, 9] {
+            let level0 = root.0.join("work/level3");
+            fs::create_dir_all(&level0).unwrap();
+            let a = array(&level0, data_type::uint64(), FillValue::from(0u64));
+            a.store_array_subset(
+                &ArraySubset::new_with_shape(vec![4, 8, 8]),
+                &vec![value; 256],
+            )
+            .unwrap();
+            let table = root.0.join("work/table");
+            ensure_zarr_group(&table).unwrap();
+            let mut style = Map::new();
+            style.insert(
+                "colors".into(),
+                json!([{"label-value": value, "rgba": [1, 2, 3, 4]}]),
+            );
+            publish_label(
+                &pyramid,
+                LabelPublication {
+                    name: "cells",
+                    level0: &level0,
+                    image_label: Some(style),
+                    table: Some(&table),
+                },
+                2,
+            )
+            .unwrap();
+            assert!(!level0.exists() && !table.exists(), "inputs are moved");
+            let meta = read_json(&image.join("labels/cells/zarr.json")).unwrap();
+            assert_eq!(
+                meta.pointer("/attributes/image-label/colors/0/label-value"),
+                Some(&json!(value))
+            );
+            let registry = read_json(&image.join("labels/zarr.json")).unwrap();
+            assert_eq!(
+                registry.pointer("/attributes/ome/labels"),
+                Some(&json!(["cells"]))
+            );
+            assert!(image.join("tables/cells/zarr.json").is_file());
+            let store =
+                std::sync::Arc::new(FilesystemStore::new(image.join("labels/cells")).unwrap());
+            let written = zarrs::array::Array::open(store, "/0").unwrap();
+            let got: Vec<u64> = written
+                .retrieve_array_subset(&ArraySubset::new_with_shape(vec![4, 8, 8]))
+                .unwrap();
+            assert!(
+                got.iter().all(|&v| v == value),
+                "the second run replaces the first"
+            );
+        }
+        // a u32 label array is refused by name
+        let narrow = root.0.join("work/narrow");
+        fs::create_dir_all(&narrow).unwrap();
+        array(&narrow, data_type::uint32(), FillValue::from(0u32));
+        let refused = publish_label(
+            &pyramid,
+            LabelPublication {
+                name: "cells",
+                level0: &narrow,
+                image_label: None,
+                table: None,
+            },
+            1,
+        );
+        assert!(refused.unwrap_err().to_string().contains("WidenLabelsOp"));
+    }
 }

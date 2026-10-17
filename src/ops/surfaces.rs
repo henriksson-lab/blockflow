@@ -840,9 +840,10 @@ impl FragmentOp for SurfaceSolveOp {
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
+        // persistent: a caller reads the solved surfaces back after the run
         vec![FragmentOutput::new(
             &self.heights_stream,
-            Lifecycle::DeleteOnExit,
+            Lifecycle::Persistent,
             Coverage::Sparse,
         )]
     }
@@ -1051,6 +1052,111 @@ impl FragmentOp for SurfaceBandOp {
     }
 }
 
+// --------------------------------------------------------------- lines --
+
+/// One-voxel surfaces for display: surface `k` is painted `k + 1` from its
+/// slice down to one above its lowest 4-neighbour, so the line stays connected
+/// across height steps in XZ and YZ views. Later surfaces win where they meet.
+/// `out` is a block at `offset` of a volume `[nz, ny, nx]`.
+pub fn paint_surface_lines(
+    surfaces: &SurfaceColumns,
+    offset: [usize; 3],
+    volume: [usize; 3],
+    mut out: ArrayViewMut3<u64>,
+) {
+    let (bz, by, bx) = out.dim();
+    let [nz, ny, nx] = volume;
+    for k in 0..surfaces.columns.len() {
+        for y in 0..by {
+            for x in 0..bx {
+                let (gy, gx) = (offset[1] + y, offset[2] + x);
+                let z0 = surfaces.slice_at(k, gy, gx) as usize;
+                if z0 >= nz {
+                    continue;
+                }
+                let mut z1 = z0;
+                for (dy, dx) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                    let (j, i) = (gy as i64 + dy, gx as i64 + dx);
+                    if j >= 0 && i >= 0 && (j as usize) < ny && (i as usize) < nx {
+                        let zn = surfaces.slice_at(k, j as usize, i as usize) as usize;
+                        if zn < nz {
+                            z1 = z1.max(zn.saturating_sub(1));
+                        }
+                    }
+                }
+                for z in z0.max(offset[0])..=z1.min(offset[0] + bz - 1) {
+                    out[[z - offset[0], y, x]] = k as u64 + 1;
+                }
+            }
+        }
+    }
+}
+
+/// Writes [`paint_surface_lines`] as a `u64` label image, from the columns a
+/// solve phase published.
+#[derive(Debug, Clone)]
+pub struct SurfaceLinesOp {
+    heights_stream: String,
+    heights_phase: usize,
+}
+
+impl SurfaceLinesOp {
+    pub fn new(stream: &str, heights: Phase) -> Self {
+        Self {
+            heights_stream: format!("{stream}.heights"),
+            heights_phase: heights.index(),
+        }
+    }
+}
+
+impl FragmentOp for SurfaceLinesOp {
+    fn name(&self) -> &'static str {
+        "surface lines"
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn writes_pixels(&self) -> bool {
+        true
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::U64
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![FragmentInput::own(&self.heights_stream, self.heights_phase)]
+    }
+
+    fn barrier(&self) -> bool {
+        true
+    }
+
+    fn gathers(&self) -> bool {
+        false
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::PerBlock)
+    }
+
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        Ok(SurfaceColumns::from_stream(at, &self.heights_stream)?.encode())
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let surfaces = SurfaceColumns::decode(at.reduced)?;
+        let mut buffer = at.output_buffer(0.0)?;
+        if let Some(out) = buffer.as_array_mut() {
+            let offset = [at.read.start[0], at.read.start[1], at.read.start[2]];
+            paint_surface_lines(&surfaces, offset, at.volume(), out.view_mut::<u64>()?);
+        }
+        Ok(BlockOutput::nothing().with_pixels(buffer))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1189,6 +1295,9 @@ mod tests {
             stride: 2,
             columns: columns.clone(),
         };
+        let mut expected_lines = Array3::<u64>::zeros((40, 24, 24));
+        paint_surface_lines(&solved, [0, 0, 0], volume, expected_lines.view_mut());
+        assert!(expected_lines.iter().filter(|&&v| v == 1).count() >= 24 * 24);
         let expected_band = Array3::from_shape_fn((40, 24, 24), |(z, y, x)| {
             let zf = z as f32;
             u8::from(zf >= solved.slice_at(0, y, x) - 2.0 && zf < solved.slice_at(1, y, x) - 1.5)
@@ -1199,6 +1308,7 @@ mod tests {
             let mut plan =
                 PlanBuilder::new(volume, Dtype::F64, BlockGrid::new(volume, block).unwrap());
             let phase = append_layered_surface_phases(&mut plan, "surf", surfaces.clone()).unwrap();
+            let lines = plan.fragments(SurfaceLinesOp::new("surf", phase)).unwrap();
             let band = plan
                 .fragments(SurfaceBandOp::new("surf", phase, (0, 2.0), (1, 1.5)))
                 .unwrap();
@@ -1215,7 +1325,7 @@ mod tests {
                 &assembly.workflow,
                 &assembly.decomposition,
                 &Hints {
-                    keep_images: [phase.image().unwrap()].into_iter().collect(),
+                    keep_images: [phase.image().unwrap(), lines.image().unwrap()].into_iter().collect(),
                     ..Hints::default()
                 },
                 &env,
@@ -1228,6 +1338,12 @@ mod tests {
                 got.view::<u32>().unwrap(),
                 expected.view(),
                 "block {block:?}"
+            );
+            let got_lines = env.image(lines.image().unwrap().index());
+            assert_eq!(
+                got_lines.view::<u64>().unwrap(),
+                expected_lines.view(),
+                "lines, block {block:?}"
             );
             let got_band = env.image(band.image().unwrap().index());
             assert_eq!(

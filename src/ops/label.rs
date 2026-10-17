@@ -2054,6 +2054,52 @@ impl Environment for RelabelledEnvironment<'_> {
     }
 }
 
+/// Labels of any unsigned integer type (or `bool`) rewritten as `u64`, voxel
+/// by voxel. OME-Zarr label pyramids here are `uint64`
+/// (`crate::label_pyramid`), while label-producing ops mostly write `u32`; this
+/// is the last phase before a label image is published.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WidenLabelsOp;
+
+impl crate::op::BlockOp for WidenLabelsOp {
+    fn name(&self) -> &'static str {
+        "widen labels to u64"
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn accepts(&self, dtype: Dtype) -> bool {
+        matches!(
+            dtype,
+            Dtype::Bool | Dtype::U8 | Dtype::U16 | Dtype::U32 | Dtype::U64
+        )
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::U64
+    }
+
+    fn apply(&self, input: &Voxels, out: &mut Voxels, _at: &crate::op::Anchor) -> Result<()> {
+        let mut out = out.view_mut::<u64>()?;
+        match input.dtype() {
+            Dtype::U64 => out.assign(&input.view::<u64>()?),
+            Dtype::U32 => out.zip_mut_with(&input.view::<u32>()?, |o, &v| *o = u64::from(v)),
+            Dtype::U16 => out.zip_mut_with(&input.view::<u16>()?, |o, &v| *o = u64::from(v)),
+            Dtype::U8 => out.zip_mut_with(&input.view::<u8>()?, |o, &v| *o = u64::from(v)),
+            Dtype::Bool => out.zip_mut_with(&input.view::<bool>()?, |o, &v| *o = u64::from(v)),
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "labels to widen must be unsigned integers, got {}",
+                    other.numpy_name()
+                )))
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

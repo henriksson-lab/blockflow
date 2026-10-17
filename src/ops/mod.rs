@@ -464,7 +464,8 @@ pub use interest::{
     ResponsePeakRowsOp, RESPONSE_COLUMN,
 };
 pub use label::{
-    label_ceiling, label_of, label_points_into, labelled_points, LabelPointsOp, MAX_EXACT_LABEL,
+    label_ceiling, label_of, label_points_into, labelled_points, LabelPointsOp, WidenLabelsOp,
+    MAX_EXACT_LABEL,
 };
 pub use lattice::{
     interpolate_block_edge, lattice_interpolate_into, lattice_interpolate_into_with,
