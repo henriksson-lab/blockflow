@@ -523,3 +523,27 @@ host RSS.
 A future small-data experiment should compare one and two StarDist workers.
 The current CUDA path uses one model and stream, so this must be measured rather
 than assumed to improve GPU occupancy.
+
+## Bead-layer distance (`examples/bead-layer-distance`)
+
+Measured 2026-10-17 on the same Intel Xeon Gold 6138 host, shared and loaded
+(load average 10–25), 8 workers, release build; single runs. The whole
+analysis is one planned run: layered surfaces (exact cut, or multigrid past
+the node budget), sampled robust thresholds, planned components, exact
+regional maxima, label + table publication. Large images are the good sample
+mirror-tiled; `BLOCKFLOW_MEMORY_BUDGET_BYTES=4000000000` unless stated.
+
+| image (z × y × x) | voxels | surfaces | wall | peak RSS | candidates | beads |
+|---|---:|---|---:|---:|---:|---:|
+| 115 × 512 × 512 (real, default budget) | 30 M | exact, stride 4 | 42 s | 3.7 GB | 9,452 | 335 |
+| 115 × 2048 × 2048 (default budget) | 482 M | exact, stride 8 | 4:56 | 29.0 GB | 149,968 | 5,264 |
+| 115 × 2048 × 2048 | 482 M | exact, stride 8 | 5:05 | 5.9 GB | 149,968 | 5,264 |
+| 115 × 2048 × 2048 | 482 M | multigrid ×2, stride 4 | 8:45 | 5.6 GB | 149,968 | 5,264 |
+| 115 × 4096 × 4096 | 1.93 G | multigrid ×4, stride 4 | 57:01 | 6.6 GB | 599,104 | 20,576 |
+
+The default budget lets the chunk cache take a quarter of half the machine's
+RAM (196 GB here); with a 4 GB budget the same run is as fast and its results
+identical. The 2048² rows used the earlier `log` edge recipe; the 512² and
+4096² rows the default `relative` one. Peak memory is nearly flat across a
+64-fold increase in voxels; what still grows is the 2D surface state and the
+bead candidates held by the selection step.
