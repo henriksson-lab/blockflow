@@ -3,6 +3,10 @@
 //! Revision `n` is the state after the first `n` records. Undo never removes a record: it
 //! appends the inverse of the most recent edit that has not been undone yet, so the log is a
 //! complete history and every revision can be reconstructed.
+//!
+//! Redo is the same idea once more: it appends the inverse of the most recent *undo* record that
+//! has not been redone, provided no new merge or assign came after it (a new edit clears the redo
+//! stack, as in every editor). A redo record is itself a live edit, so it can be undone again.
 
 use std::collections::HashSet;
 
@@ -22,6 +26,9 @@ pub enum EditOp {
     Assign,
     /// The record `undoes` was reverted; `moves` are its inverse.
     Undo,
+    /// The undo record `redoes` was reverted, re-applying the edit it undid; `moves` are the
+    /// inverse of the undo's moves.
+    Redo,
 }
 
 /// One line of `edits.jsonl`.
@@ -36,6 +43,9 @@ pub struct EditRecord {
     /// For [`EditOp::Undo`]: the revision of the record it reverts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undoes: Option<u64>,
+    /// For [`EditOp::Redo`]: the revision of the undo record it reverts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redoes: Option<u64>,
     /// `[fragment, from, to]` triples, applied in order.
     pub moves: Vec<Move>,
     /// Milliseconds since the Unix epoch, when the writer knows it.
@@ -52,6 +62,8 @@ pub struct SegmentMapState {
     map: SegmentMap,
     records: Vec<EditRecord>,
     undone: HashSet<u64>,
+    /// Undo records that can be redone, most recent last.
+    redo_stack: Vec<u64>,
 }
 
 impl SegmentMapState {
@@ -61,6 +73,7 @@ impl SegmentMapState {
             map,
             records: Vec::new(),
             undone: HashSet::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -122,6 +135,15 @@ impl SegmentMapState {
         self.undo_target().is_some()
     }
 
+    /// The undo record [`Self::plan_redo`] would revert, if any.
+    pub fn redo_target(&self) -> Option<u64> {
+        self.redo_stack.last().copied()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.redo_target().is_some()
+    }
+
     /// The record merging segments `a` and `b` (small-to-large; see
     /// [`SegmentMap::plan_merge`]). Nothing is applied until [`Self::commit`].
     pub fn plan_merge(&self, a: u64, b: u64) -> Result<EditRecord> {
@@ -156,6 +178,20 @@ impl SegmentMapState {
         Ok(self.record(EditOp::Undo, record.segments.clone(), Some(target), moves))
     }
 
+    /// The record re-applying the edit the most recent redoable undo reverted. The state is the
+    /// one that undo left (every later record was an undo/redo pair or the stack was cleared), so
+    /// the inverse is exact.
+    pub fn plan_redo(&self) -> Result<EditRecord> {
+        let target = self
+            .redo_target()
+            .ok_or_else(|| Error::Invalid("there is no undone edit to redo".into()))?;
+        let record = &self.records[target as usize - 1];
+        let moves = record.moves.iter().rev().map(|m| m.inverse()).collect();
+        let mut redo = self.record(EditOp::Redo, record.segments.clone(), None, moves);
+        redo.redoes = Some(target);
+        Ok(redo)
+    }
+
     /// Apply a planned (or replayed) record. It must carry the next revision, and its moves must
     /// start from the current segments.
     pub fn commit(&mut self, record: EditRecord) -> Result<()> {
@@ -172,6 +208,16 @@ impl SegmentMapState {
             if Some(target) != self.undo_target() {
                 return Err(Error::Corrupt(format!(
                     "undo record reverts revision {target}, which is not the latest live edit"
+                )));
+            }
+        }
+        if record.op == EditOp::Redo {
+            let target = record
+                .redoes
+                .ok_or_else(|| Error::Corrupt("redo record names no revision".into()))?;
+            if Some(target) != self.redo_target() {
+                return Err(Error::Corrupt(format!(
+                    "redo record reverts revision {target}, which is not the latest redoable undo"
                 )));
             }
         }
@@ -202,9 +248,25 @@ impl SegmentMapState {
         Ok(self.records.last().expect("just pushed"))
     }
 
+    /// Redo the most recently undone edit in memory; returns the redo record.
+    pub fn redo(&mut self) -> Result<&EditRecord> {
+        let record = self.plan_redo()?;
+        self.commit(record)?;
+        Ok(self.records.last().expect("just pushed"))
+    }
+
     fn note(&mut self, record: &EditRecord) {
-        if let Some(target) = record.undoes {
-            self.undone.insert(target);
+        match record.op {
+            EditOp::Undo => {
+                if let Some(target) = record.undoes {
+                    self.undone.insert(target);
+                }
+                self.redo_stack.push(record.revision);
+            }
+            EditOp::Redo => {
+                self.redo_stack.pop();
+            }
+            EditOp::Merge | EditOp::Assign => self.redo_stack.clear(),
         }
     }
 
@@ -220,6 +282,7 @@ impl SegmentMapState {
             op,
             segments,
             undoes,
+            redoes: None,
             moves,
             time_ms: None,
             author: None,
@@ -261,6 +324,46 @@ mod tests {
         let ops: Vec<_> = state.records().iter().map(|r| r.op).collect();
         use EditOp::*;
         assert_eq!(ops, [Merge, Merge, Undo, Assign, Undo, Undo]);
+    }
+
+    #[test]
+    fn redo_reapplies_undone_edits_in_order_and_a_new_edit_clears_them() {
+        let mut state = start();
+        let initial = state.map().clone();
+        state.merge(10, 20).unwrap();
+        let first = state.map().clone();
+        state.assign(&[6], 99).unwrap();
+        let second = state.map().clone();
+        assert!(!state.can_redo());
+        state.undo().unwrap();
+        state.undo().unwrap();
+        assert_eq!(*state.map(), initial);
+        assert_eq!(state.redo_target(), Some(4));
+        let redo = state.redo().unwrap().clone();
+        assert_eq!(
+            (redo.op, redo.redoes, redo.revision),
+            (EditOp::Redo, Some(4), 5)
+        );
+        assert_eq!(*state.map(), first);
+        state.redo().unwrap();
+        assert_eq!(*state.map(), second);
+        assert!(state.redo().is_err());
+        // a redo is a live edit: undo takes it back, and redo re-applies it again
+        state.undo().unwrap();
+        assert_eq!(*state.map(), first);
+        state.redo().unwrap();
+        assert_eq!(*state.map(), second);
+        // a new edit after an undo drops the redo stack
+        state.undo().unwrap();
+        state.merge(10, 30).unwrap();
+        assert!(!state.can_redo());
+        // replay reproduces the redo stack
+        state.undo().unwrap();
+        let replayed =
+            SegmentMapState::from_snapshot(initial, 0, state.records().to_vec()).unwrap();
+        assert_eq!(replayed.map(), state.map());
+        assert_eq!(replayed.redo_target(), state.redo_target());
+        assert!(replayed.can_redo());
     }
 
     #[test]

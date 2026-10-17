@@ -24,11 +24,11 @@ adds the directory store.
 | `SegmentMap::plan_assign(fragments, s)` / `assign` | put fragments into `s` (a new id, or `0` for background). A split is an assign of one side of a cut. |
 | `fragments_of(s)`, `segments_of(&[f])`, `segment_size(s)` | queries; the reverse index is built on first use |
 | `with_complete(true)` | declares that every fragment has an entry (a pipeline's full grouping), so a segment id that is not also a fragment id never counts as its own fragment |
-| `SegmentMapState` | map + edit log; `plan_*` then `commit`, `undo`, `undo_target`, `revision` |
+| `SegmentMapState` | map + edit log; `plan_*` then `commit`, `undo`/`redo`, `undo_target`/`redo_target`, `revision` |
 | `IdTransform`, `Chain`, `FnTransform` | ids -> ids, composable |
 | `remap_ids_in_place(ids, &[&dyn IdTransform])` | per-tile applier: evaluates the chain once per distinct id (run cache + local open-addressed table) |
 | `snapshot::{encode, decode, decode_header}` | binary snapshot codec |
-| `store::SegmentMapStore` (`fs`) | `create`, `create_if_missing`, `copy_if_missing`, `load`, `refresh`, `merge`/`assign`/`undo`/`edit` with an expected revision, `compact` |
+| `store::SegmentMapStore` (`fs`) | `create`, `create_if_missing`, `copy_if_missing`, `load`, `refresh`, `merge`/`assign`/`undo`/`redo`/`edit` with an expected revision, `compact` |
 | `store::{discover, write_attribute, create_for_label}` (`fs`) | metadata discovery and publication |
 
 ## On-disk format, version 1
@@ -47,7 +47,10 @@ label without `zarr.json`, the same `segment_map` key sits at the top level of
 
 The map at revision N is `snapshot.bin` (at revision R <= N) with records R+1..N
 replayed. Revision = number of records. History is never rewritten: undo
-appends the inverse of the latest edit that is not yet undone.
+appends the inverse of the latest edit that is not yet undone, and redo appends
+the inverse of the latest undo record that is not yet redone, as long as no new
+`merge`/`assign` came after it (a new edit clears the redo stack). A redo is a
+live edit and can itself be undone.
 
 ### `snapshot.bin`
 
@@ -80,10 +83,13 @@ open("edits.jsonl", "wb").close()
 ```json
 {"revision":3,"op":"merge","segments":[12,40],"moves":[[40,40,12],[41,40,12]],"time_ms":1760000000000,"author":"jo"}
 {"revision":4,"op":"undo","segments":[12,40],"undoes":3,"moves":[[41,12,40],[40,12,40]],"time_ms":1760000001000}
+{"revision":5,"op":"redo","segments":[12,40],"redoes":4,"moves":[[40,40,12],[41,40,12]],"time_ms":1760000002000}
 ```
 
 `op` is `merge` (`segments = [survivor, absorbed]`), `assign`
-(`segments = [target]`) or `undo` (`undoes` = reverted revision). `moves` are
+(`segments = [target]`), `undo` (`undoes` = reverted revision) or `redo`
+(`redoes` = the reverted undo record; readers older than `redo` refuse such a
+log as corrupt rather than misread it). `moves` are
 `[fragment, from, to]` applied in order; `from` must equal the fragment's
 current segment, so a replay that does not match is reported as corrupt.
 

@@ -295,6 +295,16 @@ impl SegmentMapStore {
         self.edit(loaded, expected_revision, meta, SegmentMapState::plan_undo)
     }
 
+    /// Redo the most recently undone edit if the store is at `expected_revision`.
+    pub fn redo(
+        &self,
+        loaded: &mut LoadedSegmentMap,
+        expected_revision: u64,
+        meta: EditMeta,
+    ) -> Result<EditRecord> {
+        self.edit(loaded, expected_revision, meta, SegmentMapState::plan_redo)
+    }
+
     /// The general edit transaction: under the writer lock, refresh `loaded` from disk, refuse
     /// with [`Error::Conflict`] unless it is at `expected_revision`, plan the record, append it
     /// durably, then apply it in memory (and compact when due). `loaded` is left current.

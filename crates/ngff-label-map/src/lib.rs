@@ -36,7 +36,8 @@
 //! ```
 //!
 //! with `op` one of `merge` (`segments = [survivor, absorbed]`), `assign`
-//! (`segments = [target]`) or `undo` (with `"undoes": <revision>`), and `moves` the
+//! (`segments = [target]`), `undo` (with `"undoes": <revision>`) or `redo` (with
+//! `"redoes": <revision of the undo record>`), and `moves` the
 //! `[fragment, from, to]` changes in order. A pipeline publishing a fresh segmentation writes
 //! `snapshot.bin` at revision 0 and an empty `edits.jsonl` (see `store::create_for_label`).
 //!
