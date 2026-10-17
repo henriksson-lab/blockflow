@@ -183,6 +183,9 @@ does this). It is planned and correct, but memory grows with the volume, so it
 caps the image size. Prefer §4.3: reduce the volume to the small global
 structure the algorithm actually needs, solve that in `reduce`, and apply it
 blockwise.
+`ops::surfaces` is a worked example: an exact global min cut over stacked
+height-field surfaces, where blocks pool their own columns, a barrier `reduce`
+solves the small graph, and blocks paint the region labels.
 
 ### 4.7 Peaks and points
 
@@ -295,5 +298,5 @@ tables), `cellpose-3d-ome-zarr` (instances, grid choice, resume),
   to the layout; prefer chaining with `Chain::source` / `SourceInput`, or
   `env.image(i)` for small images.
 - Module headers cite `docs/design/BLOCK_OPS.md`, which does not exist.
-- `graph_cut::CutGraph` is an exact in-memory min cut; there is no planned
-  optimal-surface op yet.
+- `graph_cut::CutGraph` is an exact in-memory min cut. For surfaces use
+  `ops::surfaces::append_layered_surface_phases` (§4.6).
