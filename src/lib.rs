@@ -146,6 +146,9 @@ pub mod geometry;
 /// only the device-agnostic layer is compiled and everything runs on the host.
 pub mod gpu;
 pub mod graph;
+/// Exact minimum s-t cut (Boykov–Kolmogorov max-flow) on an in-memory graph,
+/// for energies such as optimal surfaces; built from pooled or reduced data.
+pub mod graph_cut;
 /// An HTTP server and a browser view over the event stream — live, or replayed
 /// from an exported order log. Behind the `gui` feature; with it off this crate
 /// is unchanged and pulls no extra dependency.
