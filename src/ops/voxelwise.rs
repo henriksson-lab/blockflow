@@ -2697,6 +2697,176 @@ pub fn cost_report(shape: [usize; 3], repetitions: usize) -> String {
     out
 }
 
+// ------------------------------------------------------------ FnCombine --
+
+/// A caller's pure function of several co-located values, as a closure.
+pub type CombineFn = Arc<dyn Fn(&[f64]) -> f64 + Send + Sync>;
+
+/// `out = f(x_0, ..., x_{n-1})`, voxelwise, over exactly `arity` branches:
+/// the closure counterpart of [`ArithmeticCombine`] and [`LogicCombine`], for a
+/// join neither names (a blend of three response maps, a seed code computed
+/// from a mask and two levels).
+///
+/// **What it reads.** Every branch is read as `f64`. That is exact for every
+/// input type it accepts — `bool` through [`from_set`], integers up to 32
+/// bits, `f32` and `f64` — and it refuses `u64`, `i64` and `f16`, where the
+/// reading would not be the value.
+///
+/// **What it writes is stated, not inferred**: `f64` unless
+/// [`Self::producing`] says otherwise, converted by
+/// [`VoxelElement::from_f64`] (non-zero is true for `bool`; Rust's `as` for
+/// the numbers, so integers truncate toward zero and saturate, and `NaN`
+/// becomes `0`). A caller narrowing to a type writes the function so its
+/// answer is already a value of that type.
+///
+/// The closure is called once per voxel through an `Arc<dyn Fn>`, so this is
+/// the convenient join, not the fast one; a hot join deserves its own
+/// [`Combine`].
+pub struct FnCombine {
+    name: &'static str,
+    arity: usize,
+    out: Dtype,
+    f: CombineFn,
+}
+
+impl FnCombine {
+    /// `f` must be pure: same arguments, same answer, wherever it is called.
+    pub fn new(
+        name: &'static str,
+        arity: usize,
+        f: impl Fn(&[f64]) -> f64 + Send + Sync + 'static,
+    ) -> Result<Self> {
+        if arity == 0 {
+            return Err(Error::InvalidArgument(format!(
+                "{name}: a combine joins at least one branch"
+            )));
+        }
+        Ok(Self {
+            name,
+            arity,
+            out: Dtype::F64,
+            f: Arc::new(f),
+        })
+    }
+
+    /// Write `dtype` instead of `f64`. `f16` is refused: there is no element
+    /// type to convert into.
+    pub fn producing(mut self, dtype: Dtype) -> Result<Self> {
+        if dtype == Dtype::F16 {
+            return Err(Error::InvalidArgument(format!(
+                "{}: cannot write f16 voxels",
+                self.name
+            )));
+        }
+        self.out = dtype;
+        Ok(self)
+    }
+
+    fn readable(dtype: Dtype) -> bool {
+        !matches!(dtype, Dtype::U64 | Dtype::I64 | Dtype::F16)
+    }
+}
+
+fn write_from_f64<T: VoxelElement>(out: &mut Voxels, values: &[f64]) -> Result<()> {
+    let mut view = out.view_mut::<T>()?;
+    for (slot, &value) in view.iter_mut().zip(values) {
+        *slot = T::from_f64(value);
+    }
+    Ok(())
+}
+
+impl Combine for FnCombine {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    /// Reach zero and pure, so a slab cut is one more partition of the same
+    /// kind as the block grid (see [`VoxelwiseMapOp`]).
+    fn slicing(&self) -> Slicing {
+        Slicing::Stencil
+    }
+
+    fn accepts(&self, inputs: &[Dtype]) -> bool {
+        inputs.len() == self.arity && inputs.iter().all(|&dtype| Self::readable(dtype))
+    }
+
+    fn produces(&self, _inputs: &[Dtype]) -> Dtype {
+        self.out
+    }
+
+    fn output_shape(&self, inputs: &[[usize; 3]]) -> Result<[usize; 3]> {
+        if inputs.len() != self.arity {
+            return Err(Error::InvalidArgument(format!(
+                "{}: joins {} branches and was handed {}",
+                self.name,
+                self.arity,
+                inputs.len()
+            )));
+        }
+        let first = inputs[0];
+        for (branch, shape) in inputs.iter().enumerate() {
+            if shape != &first {
+                return Err(Error::InvalidArgument(format!(
+                    "{}: branch 0 produced {first:?} and branch {branch} produced {shape:?}; a \
+                     voxelwise join pairs co-located voxels",
+                    self.name
+                )));
+            }
+        }
+        Ok(first)
+    }
+
+    fn apply(&self, inputs: &[&Voxels], out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        if inputs.len() != self.arity {
+            return Err(Error::InvalidArgument(format!(
+                "{}: joins {} branches and was handed {}",
+                self.name,
+                self.arity,
+                inputs.len()
+            )));
+        }
+        let widened: Vec<_> = inputs
+            .iter()
+            .map(|voxels| voxels.widened().as_standard_layout().into_owned())
+            .collect();
+        let columns: Vec<&[f64]> = widened
+            .iter()
+            .map(|array| array.as_slice().expect("standard layout"))
+            .collect();
+        let n = columns[0].len();
+        let mut arguments = vec![0.0; columns.len()];
+        let values: Vec<f64> = (0..n)
+            .map(|i| {
+                for (slot, column) in arguments.iter_mut().zip(&columns) {
+                    *slot = column[i];
+                }
+                (self.f)(&arguments)
+            })
+            .collect();
+        match self.out {
+            Dtype::Bool => write_from_f64::<bool>(out, &values),
+            Dtype::U8 => write_from_f64::<u8>(out, &values),
+            Dtype::U16 => write_from_f64::<u16>(out, &values),
+            Dtype::U32 => write_from_f64::<u32>(out, &values),
+            Dtype::U64 => write_from_f64::<u64>(out, &values),
+            Dtype::I8 => write_from_f64::<i8>(out, &values),
+            Dtype::I16 => write_from_f64::<i16>(out, &values),
+            Dtype::I32 => write_from_f64::<i32>(out, &values),
+            Dtype::I64 => write_from_f64::<i64>(out, &values),
+            Dtype::F32 => write_from_f64::<f32>(out, &values),
+            Dtype::F64 => write_from_f64::<f64>(out, &values),
+            Dtype::F16 => Err(Error::InvalidArgument(format!(
+                "{}: cannot write f16 voxels",
+                self.name
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3614,6 +3784,47 @@ impl BlockOp for NarrowOp {
 /// filters, the decomposition invariance and the negative controls are in
 /// `tests/image_arithmetic_and_convolution.rs`; this module is the algebra and
 /// the refusals.
+#[cfg(test)]
+mod fn_combine_tests {
+    use super::*;
+    use ndarray::Array3;
+
+    #[test]
+    fn fn_combine_reads_any_exact_type_and_writes_the_stated_one() {
+        let a: Voxels = Array3::from_shape_vec((1, 2, 2), vec![1u16, 2, 3, 4]).unwrap().into();
+        let b: Voxels = Array3::from_shape_vec((1, 2, 2), vec![true, false, true, false])
+            .unwrap()
+            .into();
+        let c: Voxels = Array3::from_shape_vec((1, 2, 2), vec![0.5f64, 0.5, f64::NAN, 2.0])
+            .unwrap()
+            .into();
+        let at = Anchor::whole([1, 2, 2]);
+        let blend = FnCombine::new("blend", 3, |x| if x[1] != 0.0 { x[0] * x[2] } else { -x[0] }).unwrap();
+        assert!(blend.accepts(&[Dtype::U16, Dtype::Bool, Dtype::F64]));
+        assert!(!blend.accepts(&[Dtype::U16, Dtype::Bool]));
+        assert!(!blend.accepts(&[Dtype::U64, Dtype::Bool, Dtype::F64]));
+        assert_eq!(blend.produces(&[Dtype::U16, Dtype::Bool, Dtype::F64]), Dtype::F64);
+        let mut out = Voxels::zeros(Dtype::F64, [1, 2, 2]).unwrap();
+        blend.apply(&[&a, &b, &c], &mut out, &at).unwrap();
+        let got: Vec<f64> = out.view::<f64>().unwrap().iter().copied().collect();
+        assert_eq!(got[0], 0.5);
+        assert_eq!(got[1], -2.0);
+        assert!(got[2].is_nan());
+        assert_eq!(got[3], -4.0);
+
+        let code = FnCombine::new("code", 2, |x| x[0] * 100.0 + x[1])
+            .unwrap()
+            .producing(Dtype::U8)
+            .unwrap();
+        let mut out = Voxels::zeros(Dtype::U8, [1, 2, 2]).unwrap();
+        code.apply(&[&a, &b], &mut out, &at).unwrap();
+        let got: Vec<u8> = out.view::<u8>().unwrap().iter().copied().collect();
+        assert_eq!(got, vec![101, 200, 255, 255], "saturating");
+        assert!(FnCombine::new("none", 0, |_| 0.0).is_err());
+        assert!(code.output_shape(&[[1, 2, 2], [1, 2, 3]]).is_err());
+    }
+}
+
 #[cfg(test)]
 mod arithmetic_tests {
     use super::*;

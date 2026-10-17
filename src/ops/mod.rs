@@ -812,7 +812,7 @@ pub use convolve::{transform_convolve_cost_report, TransformConvolveOp, TRANSFOR
 /// The arithmetic and selection sinks of a diamond, beside `voxelwise`'s
 /// Boolean ones: add, subtract, multiply, divide, per-voxel minimum and maximum
 /// between two images.
-pub use voxelwise::{arithmetic_into, selection_into, Arithmetic, ArithmeticCombine, Arithmetical};
+pub use voxelwise::{arithmetic_into, selection_into, Arithmetic, ArithmeticCombine, Arithmetical, CombineFn, FnCombine};
 
 /// How the costs in this module were obtained, and what they are relative to.
 ///
