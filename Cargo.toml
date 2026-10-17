@@ -6,6 +6,7 @@ members = [
     ".",
     "crates/blockflow-progress",
     "crates/ngff-object-table",
+    "crates/ngff-label-map",
     "crates/yolo3d",
     "examples/cellprofiler-human",
     "examples/imglib2-pipeline",

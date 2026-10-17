@@ -1,0 +1,22 @@
+[package]
+name = "ngff-label-map"
+version = "0.1.0"
+edition = "2021"
+# `std::fs::File::lock` (the store's writer lock) is stable from 1.89.
+rust-version = "1.89"
+license = "MIT"
+description = "Editable id transform layers (fragment -> segment maps) for NGFF label images"
+
+[features]
+default = ["fs"]
+# Directory store: snapshot + append-only edit log, atomic replace, writer lock,
+# and discovery through the label group's `zarr.json`. Without it the crate is
+# pure in-memory logic and builds for wasm32-unknown-unknown.
+fs = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
