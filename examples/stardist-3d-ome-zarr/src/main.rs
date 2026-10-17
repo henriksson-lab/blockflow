@@ -9,18 +9,16 @@ use blockflow::assemble::PlanBuilder;
 use blockflow::decomposition::{Constraints, Decomposition};
 use blockflow::fragment::{fragment_phase, FragmentOp, PhaseWork};
 use blockflow::geometry::BlockGrid;
-use blockflow::label_pyramid::{build_nearest_label_pyramid_with_blocks, refresh_label_registry};
 use blockflow::model_segment::{
     finalize_instances_3d, stardist::Stardist3dBackend, InstanceSegment,
 };
-use blockflow::ome_zarr::{ensure_zarr_group, OmeVolumeLevel, OmeVolumePyramid};
+use blockflow::ome_zarr::{publish_label, LabelPublication, OmeVolumePyramid};
 use blockflow::op::Chain;
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, predicted_phase_prices, Hints};
 use blockflow::zarr_env::ZarrEnvironment;
 use blockflow::{Dtype, Error, Result};
 use clap::Parser;
-use serde_json::json;
 
 const STREAM: &str = "stardist.instances";
 
@@ -185,15 +183,6 @@ fn run() -> Result<()> {
         )?;
     }
     drop(env);
-    let label_shapes = levels.iter().map(|level| level.shape).collect::<Vec<_>>();
-    let pyramid_blocks = volume_block_candidates(&config.z_blocks, &config.blocks);
-    build_nearest_label_pyramid_with_blocks(
-        &staged_layer,
-        &work,
-        &label_shapes,
-        &pyramid_blocks,
-        config.workers,
-    )?;
     let rows_env = ZarrEnvironment::attach(&work, &[source])?;
     let table = finalize_instances_3d(
         &rows_env,
@@ -207,13 +196,20 @@ fn run() -> Result<()> {
         pyramid.voxel_volume(),
     )?;
     drop(rows_env);
-    write_label_metadata(&staged_layer, levels, pyramid.label_source())?;
     let cells = table.spec().row_count;
     drop(table);
-    replace_with(&staged_layer, &layer_root, config.overwrite)?;
-    ensure_zarr_group(&image_root.join("tables"))?;
-    replace_with(&staged_table, &table_root, config.overwrite)?;
-    refresh_label_registry(&image_root.join("labels"))?;
+    publish_label(
+        &pyramid,
+        LabelPublication {
+            name: &config.layer,
+            level0: &staged_layer.join("0"),
+            image_label: None,
+            table: Some(&staged_table),
+            replace: config.overwrite,
+            pyramid_blocks: volume_block_candidates(&config.z_blocks, &config.blocks),
+        },
+        config.workers,
+    )?;
     fs::remove_dir_all(&work).map_err(Error::backend)?;
 
     println!(
@@ -329,40 +325,6 @@ fn volume_block_candidates(z: &[usize], xy: &[usize]) -> Vec<[usize; 3]> {
         .collect()
 }
 
-fn write_label_metadata(root: &Path, levels: &[OmeVolumeLevel], source: &str) -> Result<()> {
-    let datasets = levels
-        .iter()
-        .enumerate()
-        .map(|(index, level)| {
-            json!({"path": index.to_string(), "coordinateTransformations": level.coordinate_transformations})
-        })
-        .collect::<Vec<_>>();
-    let metadata = json!({
-        "zarr_format": 3,
-        "node_type": "group",
-        "attributes": {
-            "ome": {
-                "version": "0.5",
-                "multiscales": [{
-                    "version": "0.5",
-                    "axes": [
-                        {"name":"z", "type":"space", "unit":"micrometer"},
-                        {"name":"y", "type":"space", "unit":"micrometer"},
-                        {"name":"x", "type":"space", "unit":"micrometer"}
-                    ],
-                    "datasets": datasets
-                }]
-            },
-            "image-label": {"version":"0.5", "source":{"image":source}}
-        }
-    });
-    fs::write(
-        root.join("zarr.json"),
-        serde_json::to_vec_pretty(&metadata).map_err(Error::backend)?,
-    )
-    .map_err(Error::backend)
-}
-
 fn check_destination(path: &Path, overwrite: bool) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -374,19 +336,6 @@ fn check_destination(path: &Path, overwrite: bool) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn replace_with(staged: &Path, destination: &Path, overwrite: bool) -> Result<()> {
-    if destination.exists() {
-        if !overwrite {
-            return Err(Error::invalid(format!(
-                "{} appeared during the run and will not be replaced",
-                destination.display()
-            )));
-        }
-        fs::remove_dir_all(destination).map_err(Error::backend)?;
-    }
-    move_path(staged, destination)
 }
 
 fn move_path(from: &Path, to: &Path) -> Result<()> {
