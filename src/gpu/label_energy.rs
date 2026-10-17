@@ -764,6 +764,43 @@ impl GpuKernel for GpuLabelEnergySweep {
 /// dominated) against ~500 ns a voxel on one CPU thread.
 pub const LABEL_ENERGY_SWEEP_GPU_COST: f64 = 1.5;
 
+/// [`crate::ops::label_energy::refine_labels`] on the GPU: the same sweeps,
+/// the same labels to the bit.
+///
+/// Without the data term (or without `f`) the means are never read, so every
+/// sweep runs in one call with the labels resident on the device. With it,
+/// the means move with the labels, so each sweep is its own call with the
+/// table refreshed on the host in between, as the CPU driver does. The
+/// statistics carry exact `flips` and `topology_rejections`; the energies are
+/// `NaN` (see [`label_energy_sweeps_gpu`]).
+pub fn refine_labels_gpu(
+    energy: &LabelEnergy,
+    labels: ArrayView3<'_, u32>,
+    p: ArrayView3<'_, f64>,
+    f: Option<ArrayView3<'_, f64>>,
+    schedule: &crate::ops::label_energy::AnnealingSchedule,
+) -> Result<(Array3<u32>, Vec<SweepStats>)> {
+    use crate::ops::label_energy::label_means;
+    let shape = [labels.shape()[0], labels.shape()[1], labels.shape()[2]];
+    let at = Anchor::whole(shape);
+    let sweeps: Vec<(usize, f64)> = schedule.temperatures().into_iter().enumerate().collect();
+    match f {
+        Some(f) if energy.data_on() => {
+            let mut current = labels.to_owned();
+            let mut stats = Vec::with_capacity(sweeps.len());
+            for sweep in sweeps {
+                let means = label_means(current.view(), f)?;
+                let (next, s) =
+                    label_energy_sweeps_gpu(energy, current.view(), p, Some(f), &means, &[sweep], &at)?;
+                current = next;
+                stats.extend(s);
+            }
+            Ok((current, stats))
+        }
+        _ => label_energy_sweeps_gpu(energy, labels, p, None, &HashMap::new(), &sweeps, &at),
+    }
+}
+
 /// [`LabelEnergySweepOp`] with its GPU implementation attached, under `policy`.
 pub fn accelerated(
     op: LabelEnergySweepOp,
@@ -955,6 +992,35 @@ mod tests {
             }
         }
         assert!(total_flips > 10_000, "the fixture moves: {total_flips}");
+    }
+
+    /// The whole-volume driver gives `refine_labels`' labels and flip counts,
+    /// with the data term (means refreshed per sweep) and without.
+    #[test]
+    fn refine_labels_gpu_matches_refine_labels() {
+        if !device_or_skip("refine_labels_gpu_matches_refine_labels") {
+            return;
+        }
+        use crate::ops::label_energy::{refine_labels, AnnealingSchedule};
+        let n = [17, 30, 26];
+        let (labels, p, f) = fixture(n, 6, 0.05, false);
+        let schedule = AnnealingSchedule::new(1, 1.0, 0.5, 3, 1).unwrap();
+        for data in [false, true] {
+            let mut params = LabelEnergyParams::new([1.5, 1.0, 1.0], 1.0, 2.0, 0.05)
+                .with_topology(Some(Adjacency::Six))
+                .with_seed(3);
+            if data {
+                params = params.with_data(0.4, 0.5);
+            }
+            let energy = LabelEnergy::new(params).unwrap();
+            let fv = data.then(|| f.view());
+            let (cpu, cpu_stats) = refine_labels(&energy, labels.view(), p.view(), fv, &schedule).unwrap();
+            let (gpu, gpu_stats) = refine_labels_gpu(&energy, labels.view(), p.view(), fv, &schedule).unwrap();
+            assert_eq!(cpu, gpu, "data {data}: labels");
+            let flips = |s: &[SweepStats]| s.iter().map(|s| s.flips).collect::<Vec<_>>();
+            assert_eq!(flips(&cpu_stats), flips(&gpu_stats), "data {data}: flips per sweep");
+            assert!(cpu_stats.iter().map(|s| s.flips).sum::<u64>() > 0, "the fixture moves");
+        }
     }
 
     /// A block inside a larger volume, at an odd offset: the parity classes

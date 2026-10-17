@@ -1640,6 +1640,40 @@ pub fn append_label_energy_phases(
     temperatures: &[f64],
     first_sweep: usize,
 ) -> Result<Vec<Phase>> {
+    append_label_energy_phases_on(
+        builder,
+        energy,
+        p,
+        f,
+        means,
+        temperatures,
+        first_sweep,
+        crate::gpu::DevicePolicy::Cpu,
+    )
+}
+
+/// [`append_label_energy_phases`] with each sweep run where `device` says:
+/// wrapped in `gpu::label_energy::accelerated` in a build with a GPU runtime
+/// (bit-identical to the CPU sweep), and on the CPU otherwise. In a build
+/// without one, [`crate::gpu::DevicePolicy::Gpu`] is refused here rather than
+/// at the first block.
+#[allow(clippy::too_many_arguments)]
+pub fn append_label_energy_phases_on(
+    builder: &mut PlanBuilder,
+    energy: &LabelEnergy,
+    p: impl Into<ImageId> + Copy,
+    f: Option<ImageId>,
+    means: Arc<HashMap<u32, f64>>,
+    temperatures: &[f64],
+    first_sweep: usize,
+    device: crate::gpu::DevicePolicy,
+) -> Result<Vec<Phase>> {
+    #[cfg(not(feature = "gpu"))]
+    ensure!(
+        device != crate::gpu::DevicePolicy::Gpu,
+        "label energy: DevicePolicy::Gpu needs a build with a GPU runtime (feature gpu-cuda or \
+         gpu-wgpu); use DevicePolicy::Auto to fall back to the CPU"
+    );
     let mut phases = Vec::with_capacity(temperatures.len());
     for (offset, &temperature) in temperatures.iter().enumerate() {
         let op = LabelEnergySweepOp::new(
@@ -1650,6 +1684,12 @@ pub fn append_label_energy_phases(
             first_sweep + offset,
             temperature,
         )?;
+        #[cfg(feature = "gpu")]
+        if device != crate::gpu::DevicePolicy::Cpu {
+            let fast = crate::gpu::label_energy::accelerated(op, device);
+            phases.push(builder.pixels(Chain::op(fast))?);
+            continue;
+        }
         phases.push(builder.pixels(Chain::op(op))?);
     }
     Ok(phases)
