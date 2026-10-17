@@ -57,6 +57,7 @@
 // | `level_set` | signed-distance initialisation and geodesic active-contour evolution | the first op whose natural shape is an explicit PDE step over a running scalar field and a separate fixed image. The resident kernel is the reference; the one-step shell is a `BlockOp` with two-voxel reach, while the multi-step phase waits for `IterativeOp` to name fixed source images rather than only the phase input |
 // | `fft` | a real plane's Fourier transform, and a squared-difference landscape over integer lags through the correlation theorem | the first thing here that is **not an op at all**, and could not be: two inputs of different extents, an output indexed by *lag* rather than by position, and a complex intermediate `Voxels` cannot hold. `watershed` declares the barrier and still fits the shape; this one does not fit the shape, so it is free functions and a plan, and the absent `BlockOp` is the statement |
 // | `align` | block-reduced fitting of a 3-D coordinate map between two scalar volumes | the first op whose output is a small global state rather than a volume or row set. Each iteration maps blocks to local evidence, reduces it, and performs one global update before the next iteration. |
+// | `surfaces` | stacked height-field surfaces found as one exact minimum cut, and the region labels between them | a **global combinatorial optimum** under the planner without the volume in memory: the cut needs each surface's cost pooled into columns, so blocks pool their own columns, a barrier `reduce` solves the small graph with `crate::graph_cut`, and blocks paint the answer. Bit-identical across block grids whose edges are multiples of the stride |
 //
 // Four modules here have no row, and this is the list saying which and why —
 // under the rule above, an absence has to be a statement rather than a gap in
@@ -352,6 +353,7 @@ pub mod rows;
 /// `watershed` is the MIT shell over it. See that file's header.
 pub mod scikitimage_watershed;
 pub mod skeleton;
+pub mod surfaces;
 pub mod slice_normalise;
 pub mod sliding;
 pub mod smooth;

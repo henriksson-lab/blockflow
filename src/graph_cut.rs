@@ -165,11 +165,19 @@ impl CutGraph {
 
     /// Add `i -> j` with capacity `capacity` (paid when `i` is on the source
     /// side and `j` on the sink side) and `j -> i` with `reverse_capacity`.
-    pub fn add_edge(&mut self, i: usize, j: usize, capacity: i64, reverse_capacity: i64) -> Result<()> {
+    pub fn add_edge(
+        &mut self,
+        i: usize,
+        j: usize,
+        capacity: i64,
+        reverse_capacity: i64,
+    ) -> Result<()> {
         self.check_node(i, "add_edge")?;
         self.check_node(j, "add_edge")?;
         if i == j {
-            return Err(Error::invalid(format!("add_edge: a self-loop on node {i} never crosses a cut")));
+            return Err(Error::invalid(format!(
+                "add_edge: a self-loop on node {i} never crosses a cut"
+            )));
         }
         if capacity < 0 || reverse_capacity < 0 {
             return Err(Error::invalid(format!(
@@ -179,7 +187,9 @@ impl CutGraph {
         let a = u32::try_from(self.head.len())
             .ok()
             .filter(|&a| a < ORPHAN - 1)
-            .ok_or_else(|| Error::invalid("too many arcs for the u32 arc indices of a cut graph"))?;
+            .ok_or_else(|| {
+                Error::invalid("too many arcs for the u32 arc indices of a cut graph")
+            })?;
         self.head.push(j as u32);
         self.next.push(self.first[i]);
         self.r_cap.push(capacity);
@@ -527,7 +537,9 @@ mod tests {
     fn matches_exhaustive_search_on_random_graphs() {
         let mut seed = 12345u64;
         let mut random = |m: i64| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) as i64) % m
         };
         for _ in 0..400 {
