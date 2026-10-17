@@ -1382,6 +1382,26 @@ impl AttachedImage {
         Ok((array.dtype, shape))
     }
 
+    /// The voxels of `shape` at `start` in this image's exposed `[z, y, x]`
+    /// coordinates (after any window and selection), read straight from the
+    /// array: no run, no work directory, no cache.
+    ///
+    /// For a caller that wants voxels on the host — a crop to inspect, one
+    /// z-slab of a stored result to reduce — rather than a plan. A plan reads
+    /// through its environment instead, which is what charges and caches reads.
+    pub fn read_region(&self, start: [usize; 3], shape: [usize; 3]) -> Result<Voxels> {
+        let array = self.open(0)?;
+        let region = Region::new(&start, &shape);
+        region_within(&region, &array.shape, "AttachedImage::read_region")?;
+        by_dtype!(array.dtype, |Element| array.read_as::<Element>(&region))
+    }
+
+    /// The whole image, as [`Self::read_region`] reads a region.
+    pub fn read(&self) -> Result<Voxels> {
+        let (_, shape) = self.metadata()?;
+        self.read_region([0; 3], shape)
+    }
+
     fn open(&self, id: u64) -> Result<StoredArray> {
         let canonical = self.dir.canonicalize().map_err(Error::backend)?;
         let identity = format!(
@@ -3556,6 +3576,23 @@ mod tests {
     /// This is the half of the claim `stored_bytes` cannot make: a reader in
     /// another language opens `zarr.json`, and what it finds there has to be the
     /// truth about the bytes beside it.
+    /// A direct read gives the stored voxels, through a window, without a run.
+    #[test]
+    fn an_attached_image_reads_its_voxels_directly() {
+        let root = scratch("direct-read");
+        let input = ramp(Dtype::U16, [4, 5, 6]);
+        ZarrEnvironment::create(&root, &input, [2, 2, 2]).unwrap();
+        let level0 = root.join("level0");
+        let whole = AttachedImage::at(&level0).read().unwrap();
+        assert_eq!(whole, input);
+        let windowed = AttachedImage::at(&level0).window([1, 1, 2], [2, 3, 4]);
+        let region = windowed.read_region([1, 0, 1], [1, 2, 2]).unwrap();
+        let expected = input.view::<u16>().unwrap().slice(ndarray::s![2..3, 1..3, 3..5]).to_owned();
+        assert_eq!(region.view::<u16>().unwrap(), expected.view());
+        assert!(windowed.read_region([1, 0, 1], [2, 2, 2]).is_err(), "outside the window");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_stored_metadata_names_the_codec_and_omits_it_when_there_is_none() {
         for (compression, expect_gzip) in [(Compression::None, false), (Compression::Gzip(4), true)]
