@@ -133,7 +133,13 @@ pub fn append_bounded_otsu_threshold_phases(plan: &mut PlanBuilder, image: Image
 ```
 
 `GlobalThresholdSelection` is `Single(GlobalThreshold)` (Otsu, Yen, triangle,
-minimum) or `MultiOtsu`. The bounded variant keeps O(blocks × bins) state, not
+minimum, `RobustSigma` = median + k·1.4826·MAD, `LogOtsu`) or `MultiOtsu`.
+To threshold a sample of any image — on a grid-independent lattice
+(`ValueSampling`), optionally inside a mask — emit it with `SampledValuesOp`
+and reduce it in your own barrier op with `sampled_thresholds(at, stream, rule)`.
+`GlobalThresholdOutput::KeepAtOrAbove` writes the value where it reaches the
+level and `-inf` elsewhere, which turns a data-dependent level into a fixed
+one for ops that take a constant minimum (e.g. the peak table below). The bounded variant keeps O(blocks × bins) state, not
 O(voxels). The same barrier-and-reduce pattern serves anything small and
 global; a 2D height map is a reduce result like any other.
 
@@ -185,7 +191,10 @@ structure the algorithm actually needs, solve that in `reduce`, and apply it
 blockwise.
 `ops::surfaces` is a worked example: an exact global min cut over stacked
 height-field surfaces, where blocks pool their own columns, a barrier `reduce`
-solves the small graph, and blocks paint the region labels.
+solves the small graph, and blocks paint the region labels. The solve phase
+also publishes the solved columns (`SurfaceColumns`) on `<stream>.heights`,
+which later barrier ops read in their `reduce` (`SurfaceColumns::from_stream`)
+— e.g. `SurfaceBandOp`, a mask between two shifted surfaces.
 
 ### 4.7 Peaks and points
 
@@ -198,8 +207,8 @@ solves the small graph, and blocks paint the region labels.
   and on smoothed intensity) and does greedy minimum-distance suppression in
   physical units (`minimum_distance_physical`, strongest first); `apply` emits
   each centre from its owning block. **The thresholds are hard-coded Otsu**,
-  which fails when bright objects saturate, and the suppression is O(n²) in
-  the number of candidates.
+  which fails when bright objects saturate. The suppression itself is
+  `classical_centers::suppress_within_distance`, usable on its own.
 - `ops::interest::response_peak_points` is the resident (whole-array) helper,
   for tests and small arrays.
 
@@ -288,6 +297,14 @@ tables), `cellpose-3d-ome-zarr` (instances, grid choice, resume),
 - A new ops module gets a row in the table at the top of `src/ops/mod.rs`.
 
 ## 8. Traps
+
+- A barrier whose `seam_fold` is `SeamFold::Unordered` has its `reduce` run
+  **twice**, walking the blocks forwards and backwards, and the run is refused
+  if the answers differ. Budget for it, and do not log from `reduce` expecting
+  one line.
+- An intermediate image is freed after its last reader. To read one after the
+  run (e.g. from `work/level{N}` or `env.image`), pin it with
+  `Hints { keep_images, .. }`.
 
 - `BlockOp::accepts` defaults to `F64` only (see §3).
 - Label pyramids need `uint64` labels.
