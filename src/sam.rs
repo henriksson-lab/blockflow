@@ -676,30 +676,7 @@ pub fn rasterize_mask_strokes(
         let MaskRasterShape::Brush(radius) = shape else {
             unreachable!()
         };
-        let radius = (*radius * scale[0].min(scale[1])).max(0.5);
-        if let Some(point) = points.first().filter(|_| points.len() == 1) {
-            paint_circle(
-                &mut mask,
-                [SIDE, SIDE],
-                [point[0] * scale[0], point[1] * scale[1]],
-                radius,
-                value,
-            );
-        }
-        for segment in points.windows(2) {
-            let start = segment[0];
-            let end = *segment.last().unwrap_or(&start);
-            let distance = (end[0] - start[0]).hypot(end[1] - start[1]);
-            let steps = (distance * scale[0].max(scale[1])).ceil().max(1.0) as usize;
-            for step in 0..=steps {
-                let t = step as f32 / steps as f32;
-                let centre = [
-                    (start[0] + (end[0] - start[0]) * t) * scale[0],
-                    (start[1] + (end[1] - start[1]) * t) * scale[1],
-                ];
-                paint_circle(&mut mask, [SIDE, SIDE], centre, radius, value);
-            }
-        }
+        paint_brush(&mut mask, [SIDE, SIDE], points, scale, *radius, value);
     }
     mask
 }
@@ -733,35 +710,7 @@ pub fn apply_binary_mask_strokes(
                 paint_polygon(&mut footprint, target_size, points, scale, 1.0)
             }
             MaskRasterShape::Brush(radius) => {
-                let radius = (*radius * scale[0].min(scale[1])).max(0.5);
-                if let Some(point) = points.first().filter(|_| points.len() == 1) {
-                    paint_circle(
-                        &mut footprint,
-                        target_size,
-                        [point[0] * scale[0], point[1] * scale[1]],
-                        radius,
-                        1.0,
-                    );
-                }
-                for segment in points.windows(2) {
-                    let start = segment[0];
-                    let end = segment[1];
-                    let distance = (end[0] - start[0]).hypot(end[1] - start[1]);
-                    let steps = (distance * scale[0].max(scale[1])).ceil().max(1.0) as usize;
-                    for step in 0..=steps {
-                        let t = step as f32 / steps as f32;
-                        paint_circle(
-                            &mut footprint,
-                            target_size,
-                            [
-                                (start[0] + (end[0] - start[0]) * t) * scale[0],
-                                (start[1] + (end[1] - start[1]) * t) * scale[1],
-                            ],
-                            radius,
-                            1.0,
-                        );
-                    }
-                }
+                paint_brush(&mut footprint, target_size, points, scale, *radius, 1.0);
             }
         }
         for (index, _) in footprint
@@ -773,6 +722,38 @@ pub fn apply_binary_mask_strokes(
         }
     }
     Ok(corrected)
+}
+
+fn paint_brush(
+    mask: &mut [f32],
+    size: [usize; 2],
+    points: &[[f32; 2]],
+    scale: [f32; 2],
+    radius: f32,
+    value: f32,
+) {
+    let Ok(width) = u32::try_from(size[0]) else {
+        return;
+    };
+    let Ok(height) = u32::try_from(size[1]) else {
+        return;
+    };
+    let points = points
+        .iter()
+        .map(|point| {
+            [
+                f64::from(point[0] * scale[0]),
+                f64::from(point[1] * scale[1]),
+            ]
+        })
+        .collect();
+    let stroke = blockflow_label_edit::BrushStroke {
+        points,
+        diameter: f64::from((radius * scale[0].min(scale[1])).max(0.5) * 2.0),
+    };
+    for [x, y] in blockflow_label_edit::rasterize_brush([width, height], &stroke) {
+        mask[y as usize * size[0] + x as usize] = value;
+    }
 }
 
 fn paint_polygon(
@@ -830,22 +811,6 @@ fn paint_polygon(
                 previous = current;
             }
             if inside {
-                mask[y * width + x] = value;
-            }
-        }
-    }
-}
-
-fn paint_circle(mask: &mut [f32], size: [usize; 2], centre: [f32; 2], radius: f32, value: f32) {
-    let [width, height] = size;
-    let x0 = (centre[0] - radius).floor().max(0.0) as usize;
-    let y0 = (centre[1] - radius).floor().max(0.0) as usize;
-    let x1 = (centre[0] + radius).ceil().min((width - 1) as f32) as usize;
-    let y1 = (centre[1] + radius).ceil().min((height - 1) as f32) as usize;
-    let radius_squared = radius * radius;
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            if (x as f32 - centre[0]).powi(2) + (y as f32 - centre[1]).powi(2) <= radius_squared {
                 mask[y * width + x] = value;
             }
         }

@@ -24,13 +24,46 @@ use blockflow::track::{
     TrackGraph,
 };
 use blockflow::{Error, Result};
+use ngff_label_map::{ScopedId, TrackingIdentityState};
 use serde_json::{json, Value};
 
 use crate::frame::{write_atomic, FrameRow};
 use crate::params::{fnv64, hash_json, Normalization, Params};
 use crate::pool::parallel;
 use crate::segment::{default_drift_level, estimate_drift, movie_sample, percentiles};
-use crate::tables::{write_detections, write_links, write_tracks, TableContext};
+use crate::tables::{identity_graph, write_detections, write_links, write_tracks, TableContext};
+
+fn durable_lineages(tracks: &[blockflow::track::Track]) -> BTreeMap<u64, u64> {
+    let by_id = tracks
+        .iter()
+        .map(|track| (track.track_id, track))
+        .collect::<BTreeMap<_, _>>();
+    let mut result = BTreeMap::new();
+    for &seed in by_id.keys() {
+        if result.contains_key(&seed) {
+            continue;
+        }
+        let mut component = std::collections::BTreeSet::new();
+        let mut pending = vec![seed];
+        while let Some(id) = pending.pop() {
+            if !component.insert(id) {
+                continue;
+            }
+            if let Some(track) = by_id.get(&id) {
+                pending.extend(track.parents.iter().copied());
+                pending.extend(track.children.iter().copied());
+            }
+        }
+        // Initial output allocates a stable lineage from its oldest existing track. The explicit
+        // map in identity-state.json owns this decision during later relinking.
+        let lineage = *component
+            .iter()
+            .next()
+            .expect("component contains its seed");
+        result.extend(component.into_iter().map(|track| (track, lineage)));
+    }
+    result
+}
 
 /// One series, validated and staged.
 pub struct SeriesJob {
@@ -403,6 +436,7 @@ pub fn finalize(
     let graph = linker.link(&set, &candidates)?;
     let tracks = graph.tracks(&set, params.border_distance)?;
     let track_of = TrackGraph::track_ids(&tracks);
+    let lineage_of = durable_lineages(&tracks);
     let linked = Instant::now();
 
     // Pyramids, frame by frame, space only.
@@ -458,12 +492,13 @@ pub fn finalize(
         track_labels: params.track_labels,
     };
     let layer = &params.layer;
-    write_detections(&tables.join(layer), &context, &rows, &track_of)?;
+    write_detections(&tables.join(layer), &context, &rows, &track_of, &lineage_of)?;
     write_tracks(
         &tables.join(format!("{layer}-tracks")),
         &context,
         &set,
         &tracks,
+        &lineage_of,
     )?;
     write_links(
         &tables.join(format!("{layer}-links")),
@@ -478,6 +513,39 @@ pub fn finalize(
         fs::remove_dir_all(&tracking).map_err(Error::backend)?;
     }
     fs::create_dir_all(tracking.join("ctc")).map_err(Error::backend)?;
+    let detection_time = rows
+        .iter()
+        .map(|row| (row.detection_id, row.t_index as u32))
+        .collect::<BTreeMap<_, _>>();
+    let track_state = track_of
+        .iter()
+        .map(|(&detection, &track)| {
+            (
+                ScopedId::at_time(detection_time[&detection], detection),
+                track,
+            )
+        })
+        .collect();
+    let links = graph
+        .links()
+        .iter()
+        .map(|link| {
+            (
+                (
+                    ScopedId::at_time(detection_time[&link.from], link.from),
+                    ScopedId::at_time(detection_time[&link.to], link.to),
+                ),
+                link.kind.code(),
+            )
+        })
+        .collect();
+    let identity_state = TrackingIdentityState::new(track_state, lineage_of.clone(), links)
+        .map_err(Error::backend)?;
+    fs::write(
+        tracking.join("identity-state.json"),
+        serde_json::to_vec_pretty(&identity_state).map_err(Error::backend)?,
+    )
+    .map_err(Error::backend)?;
     match export::ctc_tracks(&tracks) {
         Ok((text, labels)) => {
             fs::write(tracking.join("ctc").join("res_track.txt"), text).map_err(Error::backend)?;
@@ -537,6 +605,7 @@ pub fn finalize(
             "detections": format!("tables/{layer}"),
             "tracks": format!("tables/{layer}-tracks"),
             "links": format!("tables/{layer}-links"),
+            "identity_state": format!("tracking/{layer}/identity-state.json"),
             "exports": ["tracks.csv", "graph.json", "detections.csv", "ctc/res_track.txt"],
         },
         "frame_shape": job.frame_shape,
@@ -663,6 +732,16 @@ fn publish(job: &SeriesJob, params: &Params) -> Result<()> {
             ))
         })?;
     }
+    let label_metadata = root.join("labels").join(layer).join("zarr.json");
+    let mut label_json: Value =
+        serde_json::from_slice(&fs::read(&label_metadata).map_err(Error::backend)?)
+            .map_err(Error::backend)?;
+    label_json["attributes"]["identity_graph"] =
+        serde_json::to_value(identity_graph(layer)).map_err(Error::backend)?;
+    write_atomic(
+        &label_metadata,
+        &serde_json::to_vec_pretty(&label_json).map_err(Error::backend)?,
+    )?;
     if params.track_labels {
         fs::rename(
             job.work.join("tracks-stack"),

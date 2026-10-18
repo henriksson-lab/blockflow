@@ -85,7 +85,9 @@ impl<'a> ByteReader<'a> {
     }
 
     fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
     }
 
     fn len(&mut self) -> Result<usize> {
@@ -361,7 +363,12 @@ impl Forest {
         for _ in 0..node_count {
             let (feature, left, right) = (r.u32()?, r.u32()?, r.u32()?);
             let threshold = f64::from_le_bytes(r.take(8)?.try_into().expect("8 bytes"));
-            nodes.push(Node { feature, left, right, threshold });
+            nodes.push(Node {
+                feature,
+                left,
+                right,
+                threshold,
+            });
         }
         let vote_count = r.len()?;
         let mut votes = Vec::with_capacity(vote_count.min(1 << 26));
@@ -369,7 +376,9 @@ impl Forest {
             votes.push(f32::from_le_bytes(r.take(4)?.try_into().expect("4 bytes")));
         }
         if r.at != bytes.len() {
-            return Err(Error::InvalidArgument("trailing bytes after the forest".to_string()));
+            return Err(Error::InvalidArgument(
+                "trailing bytes after the forest".to_string(),
+            ));
         }
         Forest::new(nodes, roots, votes, classes, channels)
     }
@@ -779,7 +788,10 @@ impl Forest {
                 let (mut nodes, mut votes) = (Vec::new(), Vec::new());
                 grow(
                     &table,
-                    Building { rows: bag, depth: 1 },
+                    Building {
+                        rows: bag,
+                        depth: 1,
+                    },
                     spec.max_depth,
                     min_leaf,
                     mtry,
@@ -1035,7 +1047,11 @@ mod tests {
             let c = rng.next_below(1000) as f64 / 100.0;
             features.extend_from_slice(&[a, b, c]);
             let noisy = rng.next_below(10) == 0;
-            labels.push(if noisy { rng.next_below(3) as u32 } else { (a * 2.0 + b / 4.0) as u32 % 3 });
+            labels.push(if noisy {
+                rng.next_below(3) as u32
+            } else {
+                (a * 2.0 + b / 4.0) as u32 % 3
+            });
         }
         Samples::new(features, labels, vec!["a".into(), "b".into(), "c".into()]).unwrap()
     }
@@ -1057,7 +1073,10 @@ mod tests {
         };
         let one = train_on(1, &samples, &spec);
         for threads in [2, 3, 8] {
-            assert_eq!(train_on(threads, &samples, &spec).to_bytes(), one.to_bytes());
+            assert_eq!(
+                train_on(threads, &samples, &spec).to_bytes(),
+                one.to_bytes()
+            );
         }
         // And the seed is what the fit is a function of.
         let other = train_on(1, &samples, &TrainingSpec { seed: 1, ..spec });

@@ -1,0 +1,13 @@
+[package]
+name = "blockflow-label-edit"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Deterministic brush rasterization and label edit primitives shared by ROZT clients and servers"
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

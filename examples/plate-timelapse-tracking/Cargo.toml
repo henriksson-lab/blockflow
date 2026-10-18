@@ -21,6 +21,7 @@ cellpose = { git = "https://github.com/henriksson-lab/cellpose-rs.git", rev = "4
 clap = { version = "4.5", features = ["derive"] }
 ndarray = "0.17"
 ngff-object-table = { path = "../../crates/ngff-object-table" }
+ngff-label-map = { path = "../../crates/ngff-label-map", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zarrs = "0.23.13"

@@ -20,12 +20,85 @@ use blockflow::object_table::{
 };
 use blockflow::track::{DetectionSet, Track, TrackGraph};
 use blockflow::{Error, Result};
+use ngff_label_map::{
+    DomainId, IdScope, IdentityDomain, IdentityGraphMetadata, RelationDescriptor, RelationKind,
+    UnmappedBehavior,
+};
 use serde_json::json;
 
 use crate::frame::FrameRow;
 
 const SPATIAL_TILE: u64 = 512;
 const ROW_CHUNK: u64 = 65536;
+
+fn domain(layer: &str, role: &str) -> DomainId {
+    DomainId::new(format!("{layer}.{role}")).expect("a layer name already valid for an NGFF path")
+}
+
+/// Identity contract shared by the label raster and its detections table. Detection IDs are
+/// globally unique because frame segmentation reserves a disjoint numeric interval per frame.
+pub fn identity_graph(layer: &str) -> IdentityGraphMetadata {
+    let detection = domain(layer, "detections");
+    let track = domain(layer, "tracks");
+    let lineage = domain(layer, "lineages");
+    let domains = [
+        (
+            detection.clone(),
+            IdentityDomain {
+                role: "detection".into(),
+                scope: IdScope::Dataset,
+            },
+        ),
+        (
+            track.clone(),
+            IdentityDomain {
+                role: "track".into(),
+                scope: IdScope::Dataset,
+            },
+        ),
+        (
+            lineage.clone(),
+            IdentityDomain {
+                role: "lineage".into(),
+                scope: IdScope::Dataset,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let mut tracking_parameters = serde_json::Map::new();
+    tracking_parameters.insert("table".into(), json!(format!("../../tables/{layer}")));
+    tracking_parameters.insert("source_column".into(), json!("detection_id"));
+    tracking_parameters.insert("target_column".into(), json!("track_id"));
+    let mut lineage_parameters = serde_json::Map::new();
+    lineage_parameters.insert("links".into(), json!(format!("../../tables/{layer}-links")));
+    IdentityGraphMetadata {
+        version: 1,
+        stored_domain: detection.clone(),
+        default_display_domain: detection.clone(),
+        domains,
+        relations: vec![
+            RelationDescriptor {
+                name: "tracking".into(),
+                kind: RelationKind::Column,
+                from: detection,
+                to: track.clone(),
+                editable: false,
+                unmapped: UnmappedBehavior::Missing,
+                parameters: tracking_parameters,
+            },
+            RelationDescriptor {
+                name: "lineage".into(),
+                kind: RelationKind::GraphComponent,
+                from: track,
+                to: lineage,
+                editable: false,
+                unmapped: UnmappedBehavior::Missing,
+                parameters: lineage_parameters,
+            },
+        ],
+    }
+}
 
 fn index(has_z: bool, extent: [usize; 3], frames: u64, prefix: &str) -> SpatialIndexSpec {
     let mut axes = vec!["t"];
@@ -120,6 +193,7 @@ pub fn write_detections(
     context: &TableContext<'_>,
     rows: &[FrameRow],
     track_of: &BTreeMap<u64, u64>,
+    lineage_of: &BTreeMap<u64, u64>,
 ) -> Result<()> {
     let mut columns = vec![ColumnSpec::new(
         "detection_id",
@@ -131,6 +205,7 @@ pub fn write_detections(
     let intensity = |name: &str| ColumnSpec::new(name, DType::F64, ColumnRole::Intensity);
     columns.extend([
         ColumnSpec::new("track_id", DType::U64, ColumnRole::Measurement),
+        ColumnSpec::new("lineage_id", DType::U64, ColumnRole::Measurement),
         ColumnSpec::new("t_index", DType::U64, ColumnRole::Measurement),
         measurement("elapsed_seconds"),
         ColumnSpec::new("area_pixels", DType::U64, ColumnRole::Measurement),
@@ -158,10 +233,14 @@ pub fn write_detections(
         let track = *track_of.get(&row.detection_id).ok_or_else(|| {
             Error::invalid(format!("detection {} has no track", row.detection_id))
         })?;
+        let lineage = *lineage_of
+            .get(&track)
+            .ok_or_else(|| Error::invalid(format!("track {track} has no lineage")))?;
         let mut v = vec![ObjectValue::U64(row.detection_id)];
         v.extend(coordinates(context.has_z, row.t_index, row.centroid));
         v.extend([
             ObjectValue::U64(track),
+            ObjectValue::U64(lineage),
             ObjectValue::U64(row.t_index),
             optional(context.elapsed.get(&row.t_index).copied().flatten()),
             ObjectValue::U64(row.area),
@@ -206,6 +285,10 @@ pub fn write_detections(
             "track_label": context.track_labels.then(|| format!("../../labels/{layer}-tracks")),
         }),
     );
+    spec.extensions.insert(
+        "identity_graph".into(),
+        serde_json::to_value(identity_graph(layer)).expect("identity graph serializes"),
+    );
     write_object_rows(root, spec, values)?;
     Ok(())
 }
@@ -215,6 +298,7 @@ pub fn write_tracks(
     context: &TableContext<'_>,
     detections: &DetectionSet,
     tracks: &[Track],
+    lineage_of: &BTreeMap<u64, u64>,
 ) -> Result<()> {
     let mut columns = vec![ColumnSpec::new(
         "track_id",
@@ -225,6 +309,7 @@ pub fn write_tracks(
     let u64_column = |name: &str| ColumnSpec::new(name, DType::U64, ColumnRole::Measurement);
     let u8_column = |name: &str| ColumnSpec::new(name, DType::U8, ColumnRole::Measurement);
     columns.extend([
+        u64_column("lineage_id"),
         u64_column("t_start"),
         u64_column("t_end"),
         u64_column("first_id"),
@@ -248,6 +333,7 @@ pub fn write_tracks(
         let mut v = vec![ObjectValue::U64(track.track_id)];
         v.extend(coordinates(context.has_z, track.t_start, first.native));
         v.extend([
+            ObjectValue::U64(lineage_of[&track.track_id]),
             ObjectValue::U64(track.t_start),
             ObjectValue::U64(track.t_end),
             ObjectValue::U64(track.first_id()),

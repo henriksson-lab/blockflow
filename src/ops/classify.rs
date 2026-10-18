@@ -479,7 +479,11 @@ pub fn gather_samples(
     }
     let rows: Vec<u32> = drawn
         .iter()
-        .map(|label| distinct.binary_search(label).expect("collected from the same labels") as u32)
+        .map(|label| {
+            distinct
+                .binary_search(label)
+                .expect("collected from the same labels") as u32
+        })
         .collect();
 
     // The cut: slabs along the longest axis of the labels' bounding box.
@@ -501,36 +505,38 @@ pub fn gather_samples(
     let gathered = tasks
         .par_iter()
         .with_max_len(1)
-        .map(|&(arm, from, to)| -> Result<(usize, Vec<usize>, Vec<f64>)> {
-            let chain = &channels[arm];
-            let members: Vec<usize> = (0..positions.len())
-                .filter(|&row| (from..to).contains(&positions[row][axis]))
-                .collect();
-            if members.is_empty() {
-                return Ok((arm, members, Vec::new()));
-            }
-            let inside: Vec<[usize; 3]> = members.iter().map(|&row| positions[row]).collect();
-            let (low, high) = bounds(&inside);
-            let reach = chain.reach3(&volume);
-            let mut start = [0usize; 3];
-            let mut extent = [0usize; 3];
-            for axis in 0..3 {
-                start[axis] = low[axis].saturating_sub(reach[axis]);
-                extent[axis] = (high[axis] + reach[axis] + 1).min(volume[axis]) - start[axis];
-            }
-            // `slice_region` and not a copy written here: it is the crate's own
-            // sub-box copy, generic over the element type, and a second one
-            // would be a second chance to get the striding wrong.
-            let crop = input.slice_region(&Region::new(&start, &extent))?;
-            let mut out = Voxels::zeros(chain.produces(crop.dtype())?, extent)?;
-            chain.apply(&crop, &mut out, &Anchor::whole(extent))?;
-            let view = out.view::<f64>()?;
-            let values = inside
-                .iter()
-                .map(|p| view[[p[0] - start[0], p[1] - start[1], p[2] - start[2]]])
-                .collect();
-            Ok((arm, members, values))
-        })
+        .map(
+            |&(arm, from, to)| -> Result<(usize, Vec<usize>, Vec<f64>)> {
+                let chain = &channels[arm];
+                let members: Vec<usize> = (0..positions.len())
+                    .filter(|&row| (from..to).contains(&positions[row][axis]))
+                    .collect();
+                if members.is_empty() {
+                    return Ok((arm, members, Vec::new()));
+                }
+                let inside: Vec<[usize; 3]> = members.iter().map(|&row| positions[row]).collect();
+                let (low, high) = bounds(&inside);
+                let reach = chain.reach3(&volume);
+                let mut start = [0usize; 3];
+                let mut extent = [0usize; 3];
+                for axis in 0..3 {
+                    start[axis] = low[axis].saturating_sub(reach[axis]);
+                    extent[axis] = (high[axis] + reach[axis] + 1).min(volume[axis]) - start[axis];
+                }
+                // `slice_region` and not a copy written here: it is the crate's own
+                // sub-box copy, generic over the element type, and a second one
+                // would be a second chance to get the striding wrong.
+                let crop = input.slice_region(&Region::new(&start, &extent))?;
+                let mut out = Voxels::zeros(chain.produces(crop.dtype())?, extent)?;
+                chain.apply(&crop, &mut out, &Anchor::whole(extent))?;
+                let view = out.view::<f64>()?;
+                let values = inside
+                    .iter()
+                    .map(|p| view[[p[0] - start[0], p[1] - start[1], p[2] - start[2]]])
+                    .collect();
+                Ok((arm, members, values))
+            },
+        )
         .collect::<Result<Vec<_>>>()?;
 
     let mut features = vec![0.0f64; positions.len() * columns];
@@ -1026,7 +1032,8 @@ mod tests {
     fn fixture(shape: [usize; 3], every: u64) -> (Voxels, Voxels) {
         let dim = (shape[0], shape[1], shape[2]);
         let input = Array3::from_shape_fn(dim, |(i, j, k)| {
-            (i as f64 * 0.3).sin() + (j as f64 * 0.2).cos() * (k as f64 * 0.15).sin()
+            (i as f64 * 0.3).sin()
+                + (j as f64 * 0.2).cos() * (k as f64 * 0.15).sin()
                 + (hash(((i * shape[1] + j) * shape[2] + k) as u64) % 1000) as f64 / 2000.0
         });
         let labels = Array3::from_shape_fn(dim, |(i, j, k)| {
@@ -1076,7 +1083,13 @@ mod tests {
 
     fn all_rows(samples: &Samples) -> Vec<u64> {
         (0..samples.rows())
-            .flat_map(|row| samples.row(row).iter().map(|v| v.to_bits()).collect::<Vec<_>>())
+            .flat_map(|row| {
+                samples
+                    .row(row)
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
@@ -1086,14 +1099,26 @@ mod tests {
         let stack = FeatureStack::labkit(&[0.7, 1.6]).unwrap();
         for every in [7, 151] {
             let (input, labels) = fixture(shape, every);
-            let expected: Vec<u64> =
-                reference(&stack, &input, &labels).iter().map(|v| v.to_bits()).collect();
+            let expected: Vec<u64> = reference(&stack, &input, &labels)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
             let one = gather_on(1, &stack, &input, &labels);
             assert_eq!(all_rows(&one), expected, "one in {every} labelled");
             assert_eq!(all_rows(&gather_on(5, &stack, &input, &labels)), expected);
             // Classes are remapped through the sorted distinct labels {1, 3, 5}.
-            let drawn: Vec<u32> = labels.view::<u32>().unwrap().iter().copied().filter(|&l| l != 0).collect();
-            let back: Vec<u32> = one.labels().iter().map(|&c| [1, 3, 5][c as usize]).collect();
+            let drawn: Vec<u32> = labels
+                .view::<u32>()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|&l| l != 0)
+                .collect();
+            let back: Vec<u32> = one
+                .labels()
+                .iter()
+                .map(|&c| [1, 3, 5][c as usize])
+                .collect();
             assert_eq!(back, drawn);
         }
     }
@@ -1106,8 +1131,10 @@ mod tests {
             .with_spacing([2.0, 1.0, 1.0])
             .unwrap();
         let (input, labels) = fixture(shape, 11);
-        let expected: Vec<u64> =
-            reference(&stack, &input, &labels).iter().map(|v| v.to_bits()).collect();
+        let expected: Vec<u64> = reference(&stack, &input, &labels)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
         assert_eq!(all_rows(&gather_on(3, &stack, &input, &labels)), expected);
     }
 

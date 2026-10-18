@@ -5,6 +5,7 @@
 members = [
     ".",
     "crates/blockflow-progress",
+    "crates/blockflow-label-edit",
     "crates/ngff-object-table",
     "crates/ngff-label-map",
     "crates/yolo3d",
@@ -49,6 +50,7 @@ serde_json = "1"
 schemars = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 blockflow-progress = { path = "crates/blockflow-progress" }
+blockflow-label-edit = { path = "crates/blockflow-label-edit" }
 # `ops::fft` only, and the one exception to the rule stated at the top of this
 # block: an FFT is not the framework's own machinery, it is what one op needs.
 # It is here rather than in a consumer because the rule that decides *which*

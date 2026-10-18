@@ -178,6 +178,7 @@ refused together with drift correction.
 | `tables/<layer>/` | one row per detection: `detection_id, t, y, x, track_id, t_index, elapsed_seconds, area_pixels, area_physical, equivalent_diameter, eccentricity, major/minor_axis_length, orientation_yx, segment_{mean,min,max}, measure_{sum,mean,min,max}` |
 | `tables/<layer>-tracks/` | one row per maximal unbranched track: start/end frame and ids, parents/children, `start_reason`, `end_reason`, border flags |
 | `tables/<layer>-links/` | one row per edge: `from_id, to_id, dt, elapsed_seconds, cost, kind` |
+| `tracking/<layer>/identity-state.json` | revisioned durable detection, track, lineage, and link identities used by interactive editors |
 | `tracking/<layer>/tracking-summary.json` | counts, events, every parameter and hash, linker name and capabilities, code tables |
 | `tracking/<layer>/detections.csv` | the detection table as CSV, for quick plotting |
 | `tracking/<layer>/tracks.csv`, `graph.json` | napari `Tracks` layer data and parent graph |

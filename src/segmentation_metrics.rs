@@ -308,9 +308,18 @@ impl Contingency {
     pub fn voi(&self) -> Voi {
         let n = self.total as f64;
         if self.total == 0 {
-            return Voi { split: 0.0, merge: 0.0 };
+            return Voi {
+                split: 0.0,
+                merge: 0.0,
+            };
         }
-        let xlogx = |x: u64| if x == 0 { 0.0 } else { x as f64 * (x as f64).log2() };
+        let xlogx = |x: u64| {
+            if x == 0 {
+                0.0
+            } else {
+                x as f64 * (x as f64).log2()
+            }
+        };
         // Singleton cells have n = 1: x log x = 0, on both the joint and the
         // produced side.
         let joint: f64 = self.pairs.values().map(|&c| xlogx(c)).sum();
@@ -333,8 +342,12 @@ impl Contingency {
         let singletons = self.singleton_count() as u128;
         let joint: u128 = self.pairs.values().map(|&c| square(c)).sum::<u128>() + singletons;
         let truth: u128 = self.truth_sizes().values().map(|&c| square(c)).sum();
-        let produced: u128 =
-            self.produced_sizes().values().map(|&c| square(c)).sum::<u128>() + singletons;
+        let produced: u128 = self
+            .produced_sizes()
+            .values()
+            .map(|&c| square(c))
+            .sum::<u128>()
+            + singletons;
         let ratio = |a: u128, b: u128| if b == 0 { 1.0 } else { a as f64 / b as f64 };
         let precision = ratio(joint, produced);
         let recall = ratio(joint, truth);
@@ -372,8 +385,16 @@ impl Contingency {
     /// smaller object ignores that sliver and still sees a small process
     /// glued to a large cell, because the process is the smaller object.
     pub fn edit_counts_relative(&self, min_overlap_voxels: u64, min_fraction: f64) -> EditCounts {
-        let truth_sizes = if min_fraction > 0.0 { self.truth_sizes() } else { HashMap::new() };
-        let produced_sizes = if min_fraction > 0.0 { self.produced_sizes() } else { HashMap::new() };
+        let truth_sizes = if min_fraction > 0.0 {
+            self.truth_sizes()
+        } else {
+            HashMap::new()
+        };
+        let produced_sizes = if min_fraction > 0.0 {
+            self.produced_sizes()
+        } else {
+            HashMap::new()
+        };
         let mut per_truth: HashMap<u32, u64> = HashMap::new();
         let mut per_produced: HashMap<u32, u64> = HashMap::new();
         for (&(t, p), &count) in &self.pairs {
@@ -496,8 +517,7 @@ pub fn boundary_f1(
             let to_truth = distance_transform(tb.mapv(|b| !b).view(), &params)?;
             let to_produced = distance_transform(pb.mapv(|b| !b).view(), &params)?;
             let mut c = [0u64; 4]; // produced total, produced hit, truth total, truth hit
-            for ((index, &label), (&is_t, &is_p)) in
-                t.indexed_iter().zip(tb.iter().zip(pb.iter()))
+            for ((index, &label), (&is_t, &is_p)) in t.indexed_iter().zip(tb.iter().zip(pb.iter()))
             {
                 if ignore_truth_zero && label == 0 {
                     continue;
@@ -513,8 +533,17 @@ pub fn boundary_f1(
             }
             Ok(c)
         })
-        .try_reduce(|| [0u64; 4], |a, b| Ok([a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]))?;
-    let ratio = |hit: u64, all: u64| if all == 0 { 1.0 } else { hit as f64 / all as f64 };
+        .try_reduce(
+            || [0u64; 4],
+            |a, b| Ok([a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]),
+        )?;
+    let ratio = |hit: u64, all: u64| {
+        if all == 0 {
+            1.0
+        } else {
+            hit as f64 / all as f64
+        }
+    };
     let precision = ratio(counts[1], counts[0]);
     let recall = ratio(counts[3], counts[2]);
     let f1 = if precision + recall == 0.0 {
@@ -716,7 +745,10 @@ pub fn score_skeletons(
         "score_skeletons: spacing {spacing:?} must be finite and positive"
     );
     for &[a, b] in &skeletons.edges {
-        ensure!(a < n && b < n, "score_skeletons: edge [{a}, {b}] names a missing node");
+        ensure!(
+            a < n && b < n,
+            "score_skeletons: edge [{a}, {b}] names a missing node"
+        );
         ensure!(
             skeletons.skeleton_ids[a] == skeletons.skeleton_ids[b],
             "score_skeletons: edge [{a}, {b}] joins two skeletons"
@@ -755,8 +787,11 @@ pub fn score_skeletons(
             })
             .or_insert(Some(id));
     }
-    let mut merger_labels: Vec<u32> =
-        owner.iter().filter(|(_, o)| o.is_none()).map(|(&l, _)| l).collect();
+    let mut merger_labels: Vec<u32> = owner
+        .iter()
+        .filter(|(_, o)| o.is_none())
+        .map(|(&l, _)| l)
+        .collect();
     merger_labels.sort_unstable();
     let is_merger = |label: u32| matches!(owner.get(&label), Some(None));
 
@@ -832,7 +867,11 @@ pub fn score_skeletons(
         .collect();
     let (recall, erl, max_erl) = if total > 0.0 {
         (
-            per_skeleton.iter().map(|s| s.recall * s.length).sum::<f64>() / total,
+            per_skeleton
+                .iter()
+                .map(|s| s.recall * s.length)
+                .sum::<f64>()
+                / total,
             squared_runs / total,
             length.values().map(|l| l * l).sum::<f64>() / total,
         )
@@ -894,9 +933,12 @@ mod tests {
         // one column, so produced 1 takes a 10-voxel sliver of truth 2.
         let truth = Array3::from_shape_fn((1, 10, 10), |(_, _, x)| if x < 5 { 1 } else { 2 });
         let produced = Array3::from_shape_fn((1, 10, 10), |(_, _, x)| if x < 6 { 1 } else { 2 });
-        let table =
-            Contingency::from_volumes(truth.view(), produced.view(), ContingencyOptions::all_objects())
-                .unwrap();
+        let table = Contingency::from_volumes(
+            truth.view(),
+            produced.view(),
+            ContingencyOptions::all_objects(),
+        )
+        .unwrap();
         assert_eq!(table.edit_counts(5).splits, 1);
         // 10 shared voxels are 20% of the smaller object (truth 2, 50 voxels).
         assert_eq!(table.edit_counts_relative(5, 0.3).splits, 0);
@@ -923,7 +965,11 @@ mod tests {
         // A split relabelled stays the same split.
         let split = Array3::from_shape_fn((1, 2, 4), |(_, _, x)| x as u32 + 1);
         let a = scores(&t, &split, ContingencyOptions::all_objects());
-        let b = scores(&t, &split.mapv(|l| 100 - l), ContingencyOptions::all_objects());
+        let b = scores(
+            &t,
+            &split.mapv(|l| 100 - l),
+            ContingencyOptions::all_objects(),
+        );
         assert_eq!(a.voi, b.voi);
         assert_eq!(a.rand, b.rand);
         assert_eq!(a.edits, b.edits);
@@ -964,8 +1010,9 @@ mod tests {
         let t = halves();
         let mut p = t.clone();
         p[[0, 0, 2]] = 1; // one voxel of truth 2 goes to produced 1
-        let table = Contingency::from_volumes(t.view(), p.view(), ContingencyOptions::all_objects())
-            .unwrap();
+        let table =
+            Contingency::from_volumes(t.view(), p.view(), ContingencyOptions::all_objects())
+                .unwrap();
         assert_eq!(table.edit_counts(1).splits, 1);
         assert_eq!(table.edit_counts(2).splits, 0);
     }
@@ -975,8 +1022,8 @@ mod tests {
         // Truth: 0 on the first column, 1 elsewhere. Produced: 0 on x == 1.
         let t = Array3::from_shape_fn((1, 1, 4), |(_, _, x)| (x > 0) as u32);
         let p = Array3::from_shape_fn((1, 1, 4), |(_, _, x)| if x == 1 { 0 } else { 5 });
-        let cremi = Contingency::from_volumes(t.view(), p.view(), ContingencyOptions::cremi())
-            .unwrap();
+        let cremi =
+            Contingency::from_volumes(t.view(), p.view(), ContingencyOptions::cremi()).unwrap();
         // Truth 0 dropped: 3 voxels, one unassigned singleton under truth 1.
         assert_eq!(cremi.total(), 3);
         assert_eq!(cremi.unassigned().collect::<Vec<_>>(), vec![(1, 1)]);
@@ -1007,7 +1054,10 @@ mod tests {
     fn tables_of_blocks_merge_to_the_whole() {
         let t = Array3::from_shape_fn((4, 5, 6), |(z, y, x)| ((z + 2 * y + x) % 4) as u32);
         let p = Array3::from_shape_fn((4, 5, 6), |(z, y, x)| ((z * y + x) % 3) as u32);
-        for options in [ContingencyOptions::cremi(), ContingencyOptions::all_objects()] {
+        for options in [
+            ContingencyOptions::cremi(),
+            ContingencyOptions::all_objects(),
+        ] {
             let whole = Contingency::from_volumes(t.view(), p.view(), options).unwrap();
             let mut parts = Contingency::new(options);
             for range in [0..1, 1..4] {
@@ -1022,7 +1072,9 @@ mod tests {
             assert_eq!(whole, parts);
         }
         let mut a = Contingency::new(ContingencyOptions::cremi());
-        assert!(a.merge(Contingency::new(ContingencyOptions::all_objects())).is_err());
+        assert!(a
+            .merge(Contingency::new(ContingencyOptions::all_objects()))
+            .is_err());
     }
 
     #[test]
@@ -1079,9 +1131,12 @@ mod tests {
         assert_eq!(s.per_skeleton[0].majority_label, 1);
         assert!((s.per_skeleton[0].recall - 1.0 / 3.0).abs() < EPS);
         // Spacing scales lengths, and ERL with them.
-        let scaled =
-            score_skeletons(&two_lines(), rows([1, 1, 3, 3], [2; 4]).view(), [1.0, 1.0, 2.0])
-                .unwrap();
+        let scaled = score_skeletons(
+            &two_lines(),
+            rows([1, 1, 3, 3], [2; 4]).view(),
+            [1.0, 1.0, 2.0],
+        )
+        .unwrap();
         assert!((scaled.erl - 2.0 * 11.0 / 6.0).abs() < EPS);
     }
 

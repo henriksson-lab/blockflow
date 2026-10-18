@@ -49,18 +49,37 @@
 
 mod apply;
 mod history;
+mod identity;
+#[cfg(feature = "fs")]
+mod identity_store;
 mod map;
+mod relation;
 pub mod snapshot;
 #[cfg(feature = "fs")]
 pub mod store;
+mod tracking_edit;
 
 use std::fmt;
 
 pub use apply::{remap_ids, remap_ids_in_place, Chain, FnTransform, IdTransform, RemapStats};
 pub use history::{EditOp, EditRecord, SegmentMapState};
+pub use identity::{
+    DomainId, EntityKey, Generation, IdScope, IdentityDomain, IdentityGraph, IdentityGraphMetadata,
+    IdentityResolver, MemberSet, RelationDescriptor, RelationGeneration, RelationKind,
+    RelationPath, ResolvedBatch, ScopedId, UnmappedBehavior,
+};
+#[cfg(feature = "fs")]
+pub use identity_store::{
+    migrate_legacy_identity_graph, read_identity_graph, validate_identity_group,
+    write_identity_graph,
+};
 pub use map::{Layout, MergePlan, Move, SegmentMap};
+pub use relation::{RelationEntry, ScopedRelation};
 #[cfg(feature = "fs")]
 pub use store::{EditMeta, LoadedSegmentMap, SegmentMapStore};
+pub use tracking_edit::{
+    DurableIdAllocator, TrackingEdit, TrackingEditLog, TrackingEditOperation, TrackingIdentityState,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

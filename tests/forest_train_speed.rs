@@ -44,7 +44,10 @@ fn hash(mut z: u64) -> u64 {
 }
 
 fn env(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[test]
@@ -60,7 +63,9 @@ fn gather_and_train_timing() {
         Gaussian::new([2.0; 3], 3.0).unwrap(),
     ));
     let mut input = Voxels::zeros(blockflow::dtype::Dtype::F64, shape).unwrap();
-    smooth.apply(&noise, &mut input, &Anchor::whole(shape)).unwrap();
+    smooth
+        .apply(&noise, &mut input, &Anchor::whole(shape))
+        .unwrap();
 
     let values = input.view::<f64>().unwrap();
     let mean = values.iter().sum::<f64>() / values.len() as f64;
@@ -113,14 +118,20 @@ fn gather_and_train_timing() {
 #[ignore = "release benchmark; run with --ignored --nocapture"]
 fn per_channel_timing() {
     let shape = [env("FOREST_BENCH_Z", 64), 256, 256];
-    let input = Voxels::F64(Array3::from_shape_fn((shape[0], shape[1], shape[2]), |(i, j, k)| {
-        (hash(((i * shape[1] + j) * shape[2] + k) as u64) >> 11) as f64 / (1u64 << 53) as f64
-    }));
+    let input = Voxels::F64(Array3::from_shape_fn(
+        (shape[0], shape[1], shape[2]),
+        |(i, j, k)| {
+            (hash(((i * shape[1] + j) * shape[2] + k) as u64) >> 11) as f64 / (1u64 << 53) as f64
+        },
+    ));
     let stack = FeatureStack::labkit(&[0.7, 1.0, 1.6, 3.5]).unwrap();
     for channel in stack.channels().unwrap() {
         let mut out = Voxels::zeros(blockflow::dtype::Dtype::F64, shape).unwrap();
         let started = Instant::now();
-        channel.chain.apply(&input, &mut out, &Anchor::whole(shape)).unwrap();
+        channel
+            .chain
+            .apply(&input, &mut out, &Anchor::whole(shape))
+            .unwrap();
         println!(
             "{:>32} {:>8.3} s  reach {:?}",
             channel.name,

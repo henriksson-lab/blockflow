@@ -356,12 +356,12 @@ pub mod rows;
 pub mod scikitimage_watershed;
 pub mod segment_split;
 pub mod skeleton;
-pub mod surfaces;
 pub mod slice_normalise;
 pub mod sliding;
 pub mod smooth;
 pub mod stack_align;
 pub mod structure_tensor;
+pub mod surfaces;
 pub mod tabulate;
 pub mod threshold;
 pub mod tiled_watershed;
@@ -689,9 +689,7 @@ pub use normalise::{
     bounded_gain_into, bounded_gain_value, normalise_against_into, normalise_value,
     LevelCorrectionOp, LocalContrastOp, LocalGainOp, Removal,
 };
-pub use path_opening::{
-    path_opening_into, PathCones, PathOpeningOp, PathOperator, PathParams,
-};
+pub use path_opening::{path_opening_into, PathCones, PathOpeningOp, PathOperator, PathParams};
 pub use random_walker::{
     append_grady_weight_phase, append_random_walker_binary_seed_image_phases,
     append_random_walker_row_id_phase, assemble_random_walker_system,
@@ -758,9 +756,9 @@ pub use tabulate::{
 };
 pub use threshold::{
     append_bounded_otsu_threshold_phases, append_global_threshold_phases, li_threshold,
-    log_otsu_threshold, mean_threshold, minimum_threshold, multi_otsu_thresholds,
-    otsu_threshold, robust_sigma_threshold, sampled_thresholds, threshold_classes,
-    threshold_mask, triangle_threshold, yen_threshold, ApplyGlobalThresholdOp, GlobalThreshold,
+    log_otsu_threshold, mean_threshold, minimum_threshold, multi_otsu_thresholds, otsu_threshold,
+    robust_sigma_threshold, sampled_thresholds, threshold_classes, threshold_mask,
+    triangle_threshold, yen_threshold, ApplyGlobalThresholdOp, GlobalThreshold,
     GlobalThresholdOutput, GlobalThresholdSamplesOp, GlobalThresholdSelection, Multiplier,
     SampledValuesOp, ValueSampling,
 };
@@ -816,7 +814,10 @@ pub use convolve::{transform_convolve_cost_report, TransformConvolveOp, TRANSFOR
 /// The arithmetic and selection sinks of a diamond, beside `voxelwise`'s
 /// Boolean ones: add, subtract, multiply, divide, per-voxel minimum and maximum
 /// between two images.
-pub use voxelwise::{arithmetic_into, selection_into, Arithmetic, ArithmeticCombine, Arithmetical, CombineFn, FnCombine};
+pub use voxelwise::{
+    arithmetic_into, selection_into, Arithmetic, ArithmeticCombine, Arithmetical, CombineFn,
+    FnCombine,
+};
 
 /// How the costs in this module were obtained, and what they are relative to.
 ///

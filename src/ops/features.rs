@@ -561,7 +561,10 @@ impl FeatureStack {
                         for &gamma in INTEGRATION_SCALES {
                             for which in self.eigenvalues() {
                                 channels.push(FeatureChannel {
-                                    name: format!("structure/{sigma}{tag}/g{gamma}/{}", which.as_str()),
+                                    name: format!(
+                                        "structure/{sigma}{tag}/g{gamma}/{}",
+                                        which.as_str()
+                                    ),
                                     family,
                                     sigma: Some(sigma),
                                     chain: Chain::op(StructureTensorOp::new(
@@ -581,7 +584,8 @@ impl FeatureStack {
                 Family::Morphological => {
                     for &sigma in &self.sigmas {
                         let radius = self.geometry.radius(
-                            self.spacing.map(|spacing| morphological_radius(sigma / spacing)),
+                            self.spacing
+                                .map(|spacing| morphological_radius(sigma / spacing)),
                         );
                         for (label, rank) in [("min", Extreme::Min), ("max", Extreme::Max)] {
                             channels.push(FeatureChannel {
@@ -927,9 +931,15 @@ mod tests {
     fn unit_spacing_keeps_the_names_and_the_chains() {
         let plain = FeatureStack::labkit(&[0.7, 1.6]).unwrap();
         let unit = plain.clone().with_spacing([1.0; 3]).unwrap();
-        assert_eq!(unit.channel_names().unwrap(), plain.channel_names().unwrap());
+        assert_eq!(
+            unit.channel_names().unwrap(),
+            plain.channel_names().unwrap()
+        );
         assert_eq!(unit.reach([64; 3]).unwrap(), plain.reach([64; 3]).unwrap());
-        assert!(plain.channel_names().unwrap().contains(&"hessian/1.6/largest".to_string()));
+        assert!(plain
+            .channel_names()
+            .unwrap()
+            .contains(&"hessian/1.6/largest".to_string()));
     }
 
     #[test]
@@ -939,18 +949,31 @@ mod tests {
             .with_spacing([2.0, 1.0, 1.0])
             .unwrap();
         let channels = stack.channels().unwrap();
-        let gaussian = channels.iter().find(|c| c.name == "gaussian/1.6@2,1,1").unwrap();
+        let gaussian = channels
+            .iter()
+            .find(|c| c.name == "gaussian/1.6@2,1,1")
+            .unwrap();
         assert_eq!(
             gaussian.chain.reach3(&[64; 3]),
-            [gaussian_radius(0.8, 3.0), gaussian_radius(1.6, 3.0), gaussian_radius(1.6, 3.0)]
+            [
+                gaussian_radius(0.8, 3.0),
+                gaussian_radius(1.6, 3.0),
+                gaussian_radius(1.6, 3.0)
+            ]
         );
         // floor(1 + 2 * 0.8) = 2 on z, floor(1 + 2 * 1.6) = 4 in-plane, and the
         // separable box adds one pass per axis: reach r on each axis.
-        let min = channels.iter().find(|c| c.name == "morphology/1.6@2,1,1/min").unwrap();
+        let min = channels
+            .iter()
+            .find(|c| c.name == "morphology/1.6@2,1,1/min")
+            .unwrap();
         assert_eq!(min.chain.reach3(&[64; 3]), [2, 4, 4]);
 
         let names = stack.channel_names().unwrap();
-        let plain = FeatureStack::labkit(&[0.7, 1.6]).unwrap().channel_names().unwrap();
+        let plain = FeatureStack::labkit(&[0.7, 1.6])
+            .unwrap()
+            .channel_names()
+            .unwrap();
         assert_eq!(names.len(), plain.len());
         let mut distinct = names.clone();
         distinct.sort();
@@ -979,7 +1002,10 @@ mod tests {
             .with_spacing([3.0, 1.0, 2.0])
             .unwrap();
         let channels = stack.channels().unwrap();
-        let gaussian = channels.iter().find(|c| c.name == "gaussian/1@3,1,2").unwrap();
+        let gaussian = channels
+            .iter()
+            .find(|c| c.name == "gaussian/1@3,1,2")
+            .unwrap();
         assert_eq!(
             gaussian.chain.reach3(&[64; 3]),
             [0, gaussian_radius(1.0, 3.0), gaussian_radius(0.5, 3.0)]
