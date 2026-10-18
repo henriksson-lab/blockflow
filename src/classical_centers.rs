@@ -371,12 +371,7 @@ impl FragmentOp for SelectCentersOp {
 /// (strongest first) and keep each one that is at least
 /// `minimum_distance_physical` from every position already kept, distances
 /// measured with `voxel_size` (z, y, x). Returns the kept indices in priority
-/// order.
-///
-/// The answer is the all-pairs one; a grid of cells one distance wide means
-/// each candidate is compared only with kept positions in its own and the
-/// neighbouring cells, so the cost is linear in the candidates rather than
-/// quadratic.
+/// order. The fixed-radius case of [`crate::ops::suppress_points`].
 pub fn suppress_within_distance(
     positions: &[[usize; 3]],
     minimum_distance_physical: f64,
@@ -387,52 +382,14 @@ pub fn suppress_within_distance(
             "suppression needs a finite non-negative distance",
         ));
     }
-    if voxel_size.iter().any(|v| !v.is_finite() || *v <= 0.0) {
-        return Err(Error::invalid("voxel spacing must be finite and positive"));
-    }
-    if minimum_distance_physical == 0.0 {
-        return Ok((0..positions.len()).collect());
-    }
-    let distance2 = minimum_distance_physical.powi(2);
-    let cell: [usize; 3] = std::array::from_fn(|a| {
-        ((minimum_distance_physical / voxel_size[a]).ceil() as usize).max(1)
-    });
-    let mut grid: std::collections::HashMap<[usize; 3], Vec<[usize; 3]>> =
-        std::collections::HashMap::new();
-    let mut kept = Vec::new();
-    for (index, &at) in positions.iter().enumerate() {
-        let home: [usize; 3] = std::array::from_fn(|a| at[a] / cell[a]);
-        let mut separated = true;
-        'cells: for dz in 0..3usize {
-            for dy in 0..3usize {
-                for dx in 0..3usize {
-                    let delta = [dz, dy, dx];
-                    if (0..3).any(|a| home[a] + delta[a] < 1) {
-                        continue;
-                    }
-                    let key: [usize; 3] = std::array::from_fn(|a| home[a] + delta[a] - 1);
-                    for other in grid.get(&key).map(Vec::as_slice).unwrap_or_default() {
-                        let squared = (0..3)
-                            .map(|axis| {
-                                let delta =
-                                    (at[axis] as f64 - other[axis] as f64) * voxel_size[axis];
-                                delta * delta
-                            })
-                            .sum::<f64>();
-                        if squared < distance2 {
-                            separated = false;
-                            break 'cells;
-                        }
-                    }
-                }
-            }
-        }
-        if separated {
-            grid.entry(home).or_default().push(at);
-            kept.push(index);
-        }
-    }
-    Ok(kept)
+    let positions: Vec<[f64; 3]> = positions.iter().map(|p| p.map(|v| v as f64)).collect();
+    crate::ops::suppress_points(
+        &positions,
+        &vec![minimum_distance_physical; positions.len()],
+        crate::ops::RadiusPair::Smaller,
+        1.0,
+        voxel_size,
+    )
 }
 
 pub fn append_classical_center_phases(

@@ -250,6 +250,7 @@ pub mod simulate;
 /// the block, and the arithmetic that says what a cut costs. Not a policy —
 /// nothing here decides when to slice. See `docs/design/intra-block.md`.
 pub mod slab;
+pub mod sphere;
 /// Measured cost coefficients, accumulated from real runs and fed back into
 /// planning. Nanoseconds per unit of *declared* cost, keyed by machine and
 /// persisted across runs; an absent or empty store leaves the shipped constants

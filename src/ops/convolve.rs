@@ -131,7 +131,7 @@ pub enum Sense {
 
 impl Sense {
     /// The index this sense reads for the offset `offset`.
-    fn displace(self, offset: [isize; 3]) -> [isize; 3] {
+    pub(crate) fn displace(self, offset: [isize; 3]) -> [isize; 3] {
         match self {
             Sense::Correlate => offset,
             Sense::Convolve => [-offset[0], -offset[1], -offset[2]],
@@ -1269,73 +1269,17 @@ impl TransformConvolveOp {
         self.length
     }
 
-    /// One tile, from a buffer that is already resolved to `f64` on demand.
-    #[allow(clippy::too_many_arguments)]
-    fn tile_into<T>(
-        &self,
-        input: &ArrayView3<'_, T>,
-        out: &mut ArrayViewMut3<'_, f64>,
-        at: &Anchor,
-        origin: [usize; 3],
-        transform: &mut RealTransform3,
-        window: &mut Array3<f64>,
-        spectrum: &mut Spectrum3,
-        result: &mut Array3<f64>,
-    ) -> Result<()>
+    /// The window of the tile at `origin`, `lo` below and `hi` above it, read
+    /// from a buffer that is already resolved to `f64` on demand. The boundary
+    /// convention is resolved at the **buffer's** edge, exactly as `ConvolveOp`
+    /// resolves it and for the same reason: a sufficient halo makes the buffer's
+    /// edge a halo edge everywhere but a volume face, and a halo voxel's value
+    /// is discarded.
+    fn read_window<T>(&self, input: &ArrayView3<'_, T>, at: &Anchor, origin: [usize; 3], window: &mut Array3<f64>)
     where
         T: Copy + Into<f64>,
     {
-        let extent = [input.shape()[0], input.shape()[1], input.shape()[2]];
-        // Where each window sample reads inside the buffer. The boundary
-        // convention is resolved at the **buffer's** edge, exactly as
-        // `ConvolveOp` resolves it and for the same reason: a sufficient halo
-        // makes the buffer's edge a halo edge everywhere but a volume face, and
-        // a halo voxel's value is discarded.
-        let mut source = [Vec::new(), Vec::new(), Vec::new()];
-        for axis in 0..3 {
-            let span = self.tile[axis] + self.lo[axis] + self.hi[axis];
-            let mut resolved = Vec::with_capacity(span);
-            for step in 0..span {
-                let global = origin[axis] as isize - self.lo[axis] as isize + step as isize;
-                let local = global - at.offset[axis] as isize;
-                resolved.push(self.boundary.index(local, extent[axis]));
-            }
-            source[axis] = resolved;
-        }
-        for (a, &i) in source[0].iter().enumerate() {
-            for (b, &j) in source[1].iter().enumerate() {
-                for (c, &k) in source[2].iter().enumerate() {
-                    window[[a, b, c]] = input[[i, j, k]].into();
-                }
-            }
-        }
-        transform.forward_zero_padded(window.view(), spectrum)?;
-        for (value, factor) in spectrum.iter_mut().zip(self.kernel_spectrum.iter()) {
-            *value *= *factor;
-        }
-        transform.inverse(spectrum, result)?;
-        // Where each tile position lands inside the buffer, or nowhere.
-        let mut sink = [Vec::new(), Vec::new(), Vec::new()];
-        for axis in 0..3 {
-            let mut landing = Vec::with_capacity(self.tile[axis]);
-            for step in 0..self.tile[axis] {
-                let local = (origin[axis] + step) as isize - at.offset[axis] as isize;
-                landing
-                    .push((local >= 0 && local < extent[axis] as isize).then_some(local as usize));
-            }
-            sink[axis] = landing;
-        }
-        for (a, &i) in sink[0].iter().enumerate() {
-            let Some(i) = i else { continue };
-            for (b, &j) in sink[1].iter().enumerate() {
-                let Some(j) = j else { continue };
-                for (c, &k) in sink[2].iter().enumerate() {
-                    let Some(k) = k else { continue };
-                    out[[i, j, k]] = result[[a, b, c]];
-                }
-            }
-        }
-        Ok(())
+        fill_window(input, at, origin, self.tile, self.lo, self.hi, self.boundary, window);
     }
 
     fn run<T>(
@@ -1345,46 +1289,174 @@ impl TransformConvolveOp {
         at: &Anchor,
     ) -> Result<()>
     where
-        T: Copy + Into<f64>,
+        T: Copy + Into<f64> + Sync,
     {
         shapes_agree(input.shape(), out.shape(), "transform convolution")?;
-        let extent = [input.shape()[0], input.shape()[1], input.shape()[2]];
-        if extent.contains(&0) {
-            return Ok(());
-        }
-        let mut transform = self.transform.clone();
-        let mut window = Array3::<f64>::zeros((
+        let window_shape = (
             self.tile[0] + self.lo[0] + self.hi[0],
             self.tile[1] + self.lo[1] + self.hi[1],
             self.tile[2] + self.lo[2] + self.hi[2],
-        ));
-        let mut spectrum = transform.spectrum();
-        let mut result = Array3::<f64>::zeros((self.length[0], self.length[1], self.length[2]));
-        let mut first = [0usize; 3];
-        let mut last = [0usize; 3];
-        for axis in 0..3 {
-            first[axis] = at.offset[axis] / self.tile[axis];
-            last[axis] = (at.offset[axis] + extent[axis] - 1) / self.tile[axis];
-        }
-        for t0 in first[0]..=last[0] {
-            for t1 in first[1]..=last[1] {
-                for t2 in first[2]..=last[2] {
-                    let origin = [t0 * self.tile[0], t1 * self.tile[1], t2 * self.tile[2]];
-                    self.tile_into(
-                        &input,
-                        &mut out,
-                        at,
-                        origin,
-                        &mut transform,
-                        &mut window,
-                        &mut spectrum,
-                        &mut result,
-                    )?;
+        );
+        run_tiles(
+            at,
+            self.tile,
+            (self.lo, self.hi),
+            &mut out,
+            || {
+                let transform = self.transform.clone();
+                let spectrum = transform.spectrum();
+                (
+                    transform,
+                    Array3::<f64>::zeros(window_shape),
+                    spectrum,
+                    Array3::<f64>::zeros((self.length[0], self.length[1], self.length[2])),
+                )
+            },
+            |(transform, window, spectrum, result), origin, landing, mut piece| {
+                self.read_window(&input, at, origin, window);
+                transform.forward_zero_padded(window.view(), spectrum)?;
+                for (value, factor) in spectrum.iter_mut().zip(self.kernel_spectrum.iter()) {
+                    *value *= *factor;
                 }
+                transform.inverse(spectrum, result)?;
+                piece.assign(&result.slice(landing_slice(landing)));
+                Ok(())
+            },
+        )
+    }
+}
+
+/// Fill `window` with the tile at `origin` grown by `lo`/`hi`, resolving
+/// indices outside `input` by `boundary` at the buffer's edge.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_window<T>(
+    input: &ArrayView3<'_, T>,
+    at: &Anchor,
+    origin: [usize; 3],
+    tile: [usize; 3],
+    lo: [usize; 3],
+    hi: [usize; 3],
+    boundary: Boundary,
+    window: &mut Array3<f64>,
+) where
+    T: Copy + Into<f64>,
+{
+    let extent = [input.shape()[0], input.shape()[1], input.shape()[2]];
+    let source: [Vec<usize>; 3] = std::array::from_fn(|axis| {
+        (0..tile[axis] + lo[axis] + hi[axis])
+            .map(|step| {
+                let global = origin[axis] as isize - lo[axis] as isize + step as isize;
+                boundary.index(global - at.offset[axis] as isize, extent[axis])
+            })
+            .collect()
+    });
+    for (a, &i) in source[0].iter().enumerate() {
+        for (b, &j) in source[1].iter().enumerate() {
+            for (c, &k) in source[2].iter().enumerate() {
+                window[[a, b, c]] = input[[i, j, k]].into();
             }
         }
-        Ok(())
     }
+}
+
+/// The tile positions `[lo, hi)` per axis that land in the buffer, as a slice
+/// of a tile-anchored result.
+pub(crate) fn landing_slice(landing: [[usize; 2]; 3]) -> ndarray::SliceInfo<[ndarray::SliceInfoElem; 3], ndarray::Ix3, ndarray::Ix3> {
+    ndarray::s![landing[0][0]..landing[0][1], landing[1][0]..landing[1][1], landing[2][0]..landing[2][1]]
+}
+
+/// **Every volume-anchored tile a block touches, computed in parallel.**
+///
+/// The tile grid is anchored to the volume, so which tiles a block holds and
+/// what each computes does not depend on which thread computes it: the answer
+/// is the same bits as a serial loop. `compute` is handed per-thread state from
+/// `init`, the tile's origin, the positions of the tile that land in the buffer
+/// and the buffer region they land in, which it fills. Tiles go in batches so
+/// the pieces in flight stay a bounded multiple of the thread count.
+///
+/// This is how a one-block phase — a coarse grid that fits in one block — uses
+/// more than one thread without a cut that would have to respect the tile
+/// grid.
+///
+/// **Only tiles that can hold a valid voxel are computed.** An output within
+/// the kernel's own side (`lo` below, `hi` above) of a buffer edge that is not a
+/// volume face reads samples the buffer does not have, so the executor discards
+/// it whatever it holds; such positions are left zero. That is every tile of the
+/// halo but the ones straddling into the valid region: at a block edge that is
+/// a whole number of tiles, exactly the core's tiles, where computing every tile
+/// the buffer touches ran up to `3^3` of them per core tile.
+pub(crate) fn run_tiles<S, I, F>(
+    at: &Anchor,
+    tile: [usize; 3],
+    sides: ([usize; 3], [usize; 3]),
+    out: &mut ArrayViewMut3<'_, f64>,
+    init: I,
+    compute: F,
+) -> Result<()>
+where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, [usize; 3], [[usize; 2]; 3], ArrayViewMut3<'_, f64>) -> Result<()> + Sync,
+{
+    use rayon::prelude::*;
+    let extent = [out.shape()[0], out.shape()[1], out.shape()[2]];
+    if extent.contains(&0) {
+        return Ok(());
+    }
+    out.fill(0.0);
+    let (lo, hi) = sides;
+    let valid: [[usize; 2]; 3] = std::array::from_fn(|a| {
+        let end = at.offset[a] + extent[a];
+        [
+            if at.offset[a] == 0 { 0 } else { at.offset[a] + lo[a] },
+            if end >= at.volume[a] { end } else { end.saturating_sub(hi[a]) },
+        ]
+    });
+    if (0..3).any(|a| valid[a][0] >= valid[a][1]) {
+        return Ok(());
+    }
+    let first: [usize; 3] = std::array::from_fn(|a| valid[a][0] / tile[a]);
+    let last: [usize; 3] = std::array::from_fn(|a| (valid[a][1] - 1) / tile[a]);
+    let mut origins = Vec::new();
+    for t0 in first[0]..=last[0] {
+        for t1 in first[1]..=last[1] {
+            for t2 in first[2]..=last[2] {
+                origins.push([t0 * tile[0], t1 * tile[1], t2 * tile[2]]);
+            }
+        }
+    }
+    let land = |origin: [usize; 3]| -> [[usize; 2]; 3] {
+        std::array::from_fn(|a| {
+            let lo = at.offset[a].saturating_sub(origin[a]);
+            let hi = tile[a].min(at.offset[a] + extent[a] - origin[a]);
+            [lo, hi]
+        })
+    };
+    let batch = 4 * rayon::current_num_threads().max(1);
+    for origins in origins.chunks(batch) {
+        let pieces = origins
+            .par_iter()
+            .map_init(&init, |state, &origin| {
+                let landing = land(origin);
+                let mut piece = Array3::<f64>::zeros((
+                    landing[0][1] - landing[0][0],
+                    landing[1][1] - landing[1][0],
+                    landing[2][1] - landing[2][0],
+                ));
+                compute(state, origin, landing, piece.view_mut())?;
+                Ok((origin, landing, piece))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (origin, landing, piece) in pieces {
+            let start: [usize; 3] = std::array::from_fn(|a| origin[a] + landing[a][0] - at.offset[a]);
+            out.slice_mut(ndarray::s![
+                start[0]..start[0] + piece.shape()[0],
+                start[1]..start[1] + piece.shape()[1],
+                start[2]..start[2] + piece.shape()[2]
+            ])
+            .assign(&piece);
+        }
+    }
+    Ok(())
 }
 
 impl BlockOp for TransformConvolveOp {

@@ -303,7 +303,9 @@ pub fn non_maximum_suppression_into(
     Ok(())
 }
 
-fn trilinear_at(values: ArrayView3<'_, f64>, at: [f64; 3]) -> Option<f64> {
+/// Trilinear interpolation of `values` at a fractional `[z, y, x]` index, or
+/// `None` outside `[0, len - 1]` on any axis.
+pub fn trilinear_at(values: ArrayView3<'_, f64>, at: [f64; 3]) -> Option<f64> {
     let shape = [values.shape()[0], values.shape()[1], values.shape()[2]];
     for axis in 0..3 {
         if at[axis] < 0.0 || at[axis] > (shape[axis] - 1) as f64 {

@@ -480,6 +480,13 @@ fn ordered_rows(table: &mut Table, volume: [usize; 3]) -> Result<Vec<RowValues>>
 ///
 /// The one decode path in this module; see the module header on why it goes
 /// through [`Table`] rather than through a second reader of the wire format.
+/// One blob's rows in the canonical order, decoded.
+pub(crate) fn sealed_rows(volume: [usize; 3], schema: &Schema, blob: &[u8]) -> Result<Vec<RowValues>> {
+    let mut table = Table::new(volume, schema.clone())?;
+    table.write([0, 0, 0], blob)?;
+    ordered_rows(&mut table, volume)
+}
+
 fn sealed(volume: [usize; 3], schema: Schema, blob: &[u8]) -> Result<Table> {
     let mut table = Table::new(volume, schema)?;
     table.write([0, 0, 0], blob)?;

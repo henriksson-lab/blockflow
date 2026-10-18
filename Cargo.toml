@@ -28,6 +28,7 @@ members = [
     "examples/classical-3d-centers-ome-zarr",
     "examples/plate-timelapse-tracking",
     "examples/bead-layer-distance",
+    "examples/shell-objects-3d-ome-zarr",
 ]
 
 [package]

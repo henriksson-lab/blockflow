@@ -1741,7 +1741,11 @@ fn read_declared_source_images(
 /// simulated run holds no array, so the pixel comparison is skipped there rather
 /// than passing vacuously; the fragments are where a partial accumulator lives
 /// and they are compared in both kinds of run.
-fn order_disagreement(first: &BlockOutput, second: &BlockOutput) -> Option<String> {
+/// Pixels are compared over `within`, the part of the buffer the executor
+/// writes: everything else is discarded whichever order produced it, and a
+/// buffer shaped like a wide read extent (a fragment reach of whole blocks) is
+/// many times the region that matters.
+fn order_disagreement(first: &BlockOutput, second: &BlockOutput, within: &Region) -> Option<String> {
     if first.fragments.len() != second.fragments.len() {
         return Some(format!(
             "{} fragment(s) rather than {}",
@@ -1758,8 +1762,12 @@ fn order_disagreement(first: &BlockOutput, second: &BlockOutput) -> Option<Strin
         }
     }
     match (&first.pixels, &second.pixels) {
-        (Some(BlockBuf::Array(one)), Some(BlockBuf::Array(two))) if one != two => {
-            Some("a different pixel block".to_string())
+        (Some(BlockBuf::Array(one)), Some(BlockBuf::Array(two))) => {
+            match (one.slice_region(within), two.slice_region(within)) {
+                (Ok(one), Ok(two)) if one == two => None,
+                (Ok(_), Ok(_)) => Some("a different pixel block".to_string()),
+                _ => (one != two).then(|| "a different pixel block".to_string()),
+            }
         }
         _ => None,
     }
@@ -1950,7 +1958,7 @@ fn run_fragment_task(
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             op.apply_with(&view, SourceBlocks::new(&borrowed))?
         };
-        let disagreement = order_disagreement(&produced, &again);
+        let disagreement = order_disagreement(&produced, &again, &task.geometry.valid_within_read());
         // Everything the second application allocated, and everything this block
         // holds, released before the refusal rather than after it: a run that
         // ends here still has to leave the residency counters meaning what they

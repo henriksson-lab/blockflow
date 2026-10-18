@@ -1651,6 +1651,152 @@ fn check_fetch_covers_valid(
     Ok(())
 }
 
+/// Append a planner-visible resampling phase over `output_grid`.
+///
+/// The shape-changing counterpart of `PlanBuilder::pixels`, as
+/// `transform::append_warp_phase` is for warps: the phase's decomposition is
+/// [`resample_phase`]'s, derived from the op's own geometry, and later phases
+/// run on `output_grid`'s lattice.
+pub fn append_resample_phase(
+    builder: &mut crate::assemble::PlanBuilder,
+    op: ResampleOp,
+    output_grid: BlockGrid,
+) -> Result<crate::assemble::Phase> {
+    let input_volume = builder.grid().volume();
+    let phase = resample_phase(
+        vec![0],
+        vec![op.name().to_string()],
+        op.resample(),
+        input_volume,
+        output_grid,
+    )?;
+    builder.pixels_decomposed(crate::op::Chain::op(op), phase)
+}
+
+/// The box whose correlation, sampled by [`Interpolation::Nearest`] at
+/// `Ratio::smaller(factor)`, is the mean of each `factor` block.
+///
+/// Nearest at `1/k` reads source `k*o + floor(k/2)` for output `o` (ties go
+/// up), so a box over offsets `-floor(k/2) ..= k - 1 - floor(k/2)` centred
+/// there covers exactly `k*o .. k*o + k`. Weights are `1 / (kz * ky * kx)`.
+pub fn block_mean_kernel(factor: [usize; 3]) -> Result<crate::ops::convolve::Kernel> {
+    if factor.contains(&0) {
+        return Err(Error::invalid("a block mean needs positive factors"));
+    }
+    let span = |k: usize| -(k as isize / 2)..=(k as isize - 1 - k as isize / 2);
+    let mut offsets = Vec::new();
+    for z in span(factor[0]) {
+        for y in span(factor[1]) {
+            for x in span(factor[2]) {
+                offsets.push([z, y, x]);
+            }
+        }
+    }
+    let n = offsets.len();
+    crate::ops::convolve::Kernel::new(
+        crate::ops::element::StructuringElement::from_offsets(offsets)?,
+        vec![1.0 / n as f64; n],
+    )
+}
+
+/// Downsample by the mean of each `factor` block, as two planned phases: a box
+/// correlation on the current lattice, then a nearest resample onto
+/// `output_block` cells of the reduced volume.
+///
+/// **Composed, not a mode of [`ResampleOp`]**: the module header says why the
+/// low-pass belongs in its own op. The output extent is floored, so a partial
+/// block at a far face is dropped, and every output voxel is the exact mean of
+/// a full block. The output is `f64`.
+pub fn append_block_mean_phases(
+    builder: &mut crate::assemble::PlanBuilder,
+    factor: [usize; 3],
+    output_block: [usize; 3],
+) -> Result<crate::assemble::Phase> {
+    let kernel = block_mean_kernel(factor)?;
+    builder.pixels(crate::op::Chain::op(crate::ops::convolve::ConvolveOp::new(
+        "block-mean-box",
+        kernel,
+        crate::ops::convolve::Sense::Correlate,
+        crate::ops::Boundary::Clamp,
+    )))?;
+    let resample = Resample::new(
+        [
+            Ratio::smaller(factor[0])?,
+            Ratio::smaller(factor[1])?,
+            Ratio::smaller(factor[2])?,
+        ],
+        Interpolation::Nearest,
+    );
+    let output = resample.output_volume(builder.grid().volume())?;
+    let block: [usize; 3] = std::array::from_fn(|a| output_block[a].min(output[a]).max(1));
+    append_resample_phase(
+        builder,
+        ResampleOp::new("block-mean-sample", resample),
+        BlockGrid::new(output, block)?,
+    )
+}
+
+#[cfg(test)]
+mod block_mean_tests {
+    use super::*;
+    use crate::assemble::PlanBuilder;
+    use crate::env::ArrayEnvironment;
+    use crate::strategy::{execute_phases, Hints};
+    use ndarray::Array3;
+
+    /// Planned, over several input and output lattices, the block mean equals
+    /// the resident mean of each full block, and drops the partial ones.
+    #[test]
+    fn planned_block_mean_is_the_mean_of_each_block() {
+        let volume = [13, 10, 9];
+        let input = Array3::from_shape_fn((13, 10, 9), |(z, y, x)| {
+            ((z * 131 + y * 17 + x * 7) % 251) as f64
+        });
+        for factor in [[4, 1, 1], [4, 2, 3], [1, 1, 1], [2, 5, 2]] {
+            let out: [usize; 3] = std::array::from_fn(|a| volume[a] / factor[a]);
+            let expected = Array3::from_shape_fn((out[0], out[1], out[2]), |(z, y, x)| {
+                let mut sum = 0.0;
+                for dz in 0..factor[0] {
+                    for dy in 0..factor[1] {
+                        for dx in 0..factor[2] {
+                            sum += input[[z * factor[0] + dz, y * factor[1] + dy, x * factor[2] + dx]];
+                        }
+                    }
+                }
+                sum / (factor[0] * factor[1] * factor[2]) as f64
+            });
+            for (in_block, out_block) in [([13, 10, 9], [9, 9, 9]), ([4, 3, 5], [2, 2, 1])] {
+                let mut builder =
+                    PlanBuilder::new(volume, Dtype::F64, BlockGrid::new(volume, in_block).unwrap());
+                append_block_mean_phases(&mut builder, factor, out_block).unwrap();
+                let assembly = builder.finish().unwrap();
+                let env = ArrayEnvironment::for_decomposition(
+                    Voxels::from(input.clone()),
+                    &assembly.decomposition,
+                    in_block,
+                )
+                .unwrap();
+                execute_phases(
+                    "block mean",
+                    &assembly.workflow,
+                    &assembly.decomposition,
+                    &Hints::default(),
+                    &env,
+                    &[],
+                    &assembly.work(),
+                )
+                .unwrap();
+                let got = env.output();
+                let got = got.view::<f64>().unwrap();
+                assert_eq!(got.shape(), expected.shape(), "{factor:?} {in_block:?}");
+                for (g, e) in got.iter().zip(expected.iter()) {
+                    assert!((g - e).abs() < 1e-9, "{factor:?} {in_block:?}: {g} vs {e}");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

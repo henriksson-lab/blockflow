@@ -58,6 +58,10 @@
 // | `level_set` | signed-distance initialisation and geodesic active-contour evolution | the first op whose natural shape is an explicit PDE step over a running scalar field and a separate fixed image. The resident kernel is the reference; the one-step shell is a `BlockOp` with two-voxel reach, while the multi-step phase waits for `IterativeOp` to name fixed source images rather than only the phase input |
 // | `fft` | a real plane's Fourier transform, and a squared-difference landscape over integer lags through the correlation theorem | the first thing here that is **not an op at all**, and could not be: two inputs of different extents, an output indexed by *lag* rather than by position, and a complex intermediate `Voxels` cannot hold. `watershed` declares the barrier and still fits the shape; this one does not fit the shape, so it is free functions and a plan, and the absent `BlockOp` is the statement |
 // | `align` | block-reduced fitting of a 3-D coordinate map between two scalar volumes | the first op whose output is a small global state rather than a volume or row set. Each iteration maps blocks to local evidence, reduces it, and performs one global update before the next iteration. |
+// | `star_convex` | a star-convex shell fitted along rays from a candidate centre, and the shapes painted as labels | the first row op that reads a **window of the image around each row** and emits a *shape*: per-ray radii on a side stream, so the row table stays scalar. Its halo is derived from its parameters to bound every sample, which keeps the fit independent of the block grid; the painter reads rows and shapes of neighbouring blocks and resolves overlaps by relative depth |
+// | `template_match` | normalised cross-correlation with radial (shell) templates, at one or several radii | **a configuration, not an op**: one `transform_bank` with the image and its square as inputs and, per radius, a group of three correlations — template, support, support over the square — combined to the NCC, folded by a maximum. What it contributes is the radial template (sampled around an exemplar, averaged over many) and the kernel geometry |
+// | `transform_bank` | several correlations of one input (and pointwise maps of it), combined per voxel in groups and folded across groups | `convolve`'s transform correlation with the input transformed **once per tile for all kernels**, `m + k` transforms instead of `2k`; tiles anchored to the volume and computed in parallel, like `TransformConvolveOp` |
+// | `suppress` | greedy suppression of nearby rows, strongest first, by a pair rule over per-row radii | the first row op whose fate for one row depends on rows in **any** block: a barrier `reduce` runs the kernel once over every row and each block emits its kept rows, so the output is a subsequence of the input like `rows`' filter. The fixed-distance suppression `classical_centers` uses is the `Fixed` radius of this kernel |
 // | `surfaces` | stacked height-field surfaces found as one exact minimum cut, and the region labels between them | a **global combinatorial optimum** under the planner without the volume in memory: the cut needs each surface's cost pooled into columns, so blocks pool their own columns, a barrier `reduce` solves the small graph with `crate::graph_cut`, and blocks paint the answer. Bit-identical across block grids whose edges are multiples of the stride |
 // | `segment_split` | one segment of a fragment grouping split in two (or k) along its weakest membrane, from user seeds | the first op that **edits a grouping rather than computing one**: an exact minimum s-t cut (`crate::graph_cut`) over one segment's subgraph of a `rag::Rag`, with `-ln p`, area-weighted capacities and seeds as hard constraints. It is the proofreading counterpart of `agglomerate`, called per edit on a resident graph |
 //
@@ -360,12 +364,16 @@ pub mod slice_normalise;
 pub mod sliding;
 pub mod smooth;
 pub mod stack_align;
+pub mod star_convex;
 pub mod structure_tensor;
+pub mod suppress;
 pub mod surfaces;
 pub mod tabulate;
+pub mod template_match;
 pub mod threshold;
 pub mod tiled_watershed;
 pub mod transform;
+pub mod transform_bank;
 pub mod voxelize;
 pub mod voxelwise;
 pub mod walk;
@@ -437,7 +445,7 @@ pub use directional::{
 };
 pub use edges::{
     append_canny_edges_phases, append_hysteresis_threshold_phases, canny_edges_into,
-    canny_response_into, hysteresis_threshold_into, non_maximum_suppression_into,
+    canny_response_into, hysteresis_threshold_into, non_maximum_suppression_into, trilinear_at,
     ApplyHysteresisOp, CannyResponseOp, HysteresisLabelsOp,
 };
 pub use element::{
@@ -723,7 +731,7 @@ pub use regional::{
 };
 pub use resample::{
     resample_linear_into, resample_linear_into_with, resample_nearest_into,
-    resample_nearest_into_with, resample_phase, Interpolation, OutputExtent, Ratio, Resample,
+    resample_nearest_into_with, resample_phase, append_resample_phase, append_block_mean_phases, block_mean_kernel, Interpolation, OutputExtent, Ratio, Resample,
     ResampleOp,
 };
 pub use ridge::{
@@ -731,6 +739,15 @@ pub use ridge::{
     ridge_response_into, symmetric_eigenvalues, Boundary, EigenResponse, HessianEigenvalueOp,
     PlateResponse, Polarity, RatioResponse, Response, RidgeFilterOp, RidgeResponse, ScaleSpace,
 };
+pub use star_convex::{
+    decode_shapes, encode_shapes, fit_shell, shape_label, shell_schema, ShellFit, ShellFitOp,
+    ShellFitParams, ShellJudge, StarConvexLabelsOp, StarShape, SHELL_COLUMNS,
+};
+pub use template_match::{
+    multi_radius_ncc_chain, ncc_chain, radial_profile, shell_kernels, RadialTemplate, ShellKernels,
+};
+pub use transform_bank::{BankGroup, GroupCombine, GroupReduce, InputMap, TransformBankOp};
+pub use suppress::{suppress_points, RadiusPair, Suppression, SuppressionRadius, SuppressRowsOp};
 pub use rows::{
     append_group_phases, collect_groups, collect_rows, decode_groups, encode_groups, filter_blob,
     filter_into, gather_blob, gather_into, gathered_schema, group_values, merge_rows, scale_blob,

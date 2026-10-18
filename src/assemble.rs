@@ -616,7 +616,10 @@ impl PlanBuilder {
         }
         let volume = self.grid.volume();
         let names: Vec<String> = slots.iter().map(|slot| slot.display_name()).collect();
-        let reach = chain.reach3(&volume);
+        // The stated reach, not its symmetric bound: a tile-aligned reach
+        // (`AxisReach::Aligned`) is discounted by `PhaseDecomposition::derive`
+        // against this phase's grid, and `reach3` would hand it the worst case.
+        let reach = chain.reach_spec(volume)?;
         // Fold the element type over exactly the slots this phase owns, by the
         // same rule `Decomposition::declare_dtypes` uses, and declare it only
         // where it changed — so a plan whose chain never retypes fingerprints
@@ -632,7 +635,7 @@ impl PlanBuilder {
         let mut phase = PhaseDecomposition::derive(
             (self.slots_used..self.slots_used + n).collect(),
             names,
-            reach,
+            reach.clone(),
             reach,
             self.grid.clone(),
         );
