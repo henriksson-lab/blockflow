@@ -638,6 +638,116 @@ where
     Ok(())
 }
 
+/// [`gaussian_smooth_into_with`] computed only over `region` of `input`:
+/// `out` (shaped like the region) gets exactly the bits the whole-array
+/// smoothing has there.
+///
+/// Each pass computes no more than the passes after it read: the first (axis
+/// 0) only the region's positions along axis 0, over the whole extent of the
+/// other two axes; the second also narrows axis 1; the last writes the region.
+/// The boundary is still resolved at the **array's** edge on every axis, so a
+/// region that does not touch an edge sees the samples beyond it. For a cube
+/// grown by the Gaussian's reach on every side this does about two thirds of
+/// the work of smoothing the grown cube and cropping it.
+pub fn gaussian_smooth_region_into<T>(
+    input: ArrayView3<'_, T>,
+    kernels: &[Vec<f64>; 3],
+    boundary: Boundary,
+    region: [[usize; 2]; 3],
+    mut out: ArrayViewMut3<'_, f64>,
+) -> Result<()>
+where
+    T: Copy + Into<f64>,
+{
+    let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+    if (0..3).any(|a| region[a][0] > region[a][1] || region[a][1] > shape[a]) {
+        return Err(Error::InvalidArgument(format!(
+            "gaussian_smooth_region_into: region {region:?} is not inside an array of {shape:?}"
+        )));
+    }
+    let extent: [usize; 3] = std::array::from_fn(|a| region[a][1] - region[a][0]);
+    shapes_agree(out.shape(), &extent, "gaussian_smooth_region_into")?;
+    if extent.contains(&0) {
+        return Ok(());
+    }
+    let owned;
+    let source: &[T] = match input.as_slice() {
+        Some(slice) => slice,
+        None => {
+            owned = input.as_standard_layout().into_owned();
+            owned.as_slice().expect("standard layout")
+        }
+    };
+    let first_shape = [extent[0], shape[1], shape[2]];
+    let mut first = vec![0.0f64; first_shape.iter().product()];
+    convolve_axis_range(source, shape, 0, &kernels[0], boundary, region[0], &mut first);
+    let second_shape = [extent[0], extent[1], shape[2]];
+    let mut second = vec![0.0f64; second_shape.iter().product()];
+    convolve_axis_range(&first, first_shape, 1, &kernels[1], boundary, region[1], &mut second);
+    match out.as_slice_mut() {
+        Some(target) => convolve_axis_range(&second, second_shape, 2, &kernels[2], boundary, region[2], target),
+        None => {
+            let mut target = vec![0.0f64; extent.iter().product()];
+            convolve_axis_range(&second, second_shape, 2, &kernels[2], boundary, region[2], &mut target);
+            out.assign(&ArrayView3::from_shape((extent[0], extent[1], extent[2]), &target).expect("region shape"));
+        }
+    }
+    Ok(())
+}
+
+/// [`convolve_axis_packed`] writing only the positions `range` along `axis`:
+/// `dst` is `src`'s shape with that axis cut to the range. Each output voxel is
+/// the same sum, in the same order, as the full pass gives it; the boundary is
+/// resolved against the whole extent of `src`.
+fn convolve_axis_range<T>(
+    src: &[T],
+    shape: [usize; 3],
+    axis: usize,
+    kernel: &[f64],
+    boundary: Boundary,
+    range: [usize; 2],
+    dst: &mut [f64],
+) where
+    T: Copy + Into<f64>,
+{
+    let extent = shape[axis];
+    let kept = range[1] - range[0];
+    let inner: usize = shape[axis + 1..].iter().product();
+    let outer: usize = shape[..axis].iter().product();
+    let radius = (kernel.len() / 2) as isize;
+    if inner == 1 {
+        // The innermost form of `convolve_innermost_packed`: each row extended
+        // once by the boundary, then accumulated with a stride of one.
+        let span = extent + kernel.len().saturating_sub(1);
+        let consecutive: Vec<usize> = (0..kernel.len()).collect();
+        let table: Vec<usize> = (0..span).map(|at| boundary.index(at as isize - radius, extent)).collect();
+        let mut padded = vec![0.0f64; span];
+        for row in 0..outer {
+            for (slot, &at) in padded.iter_mut().zip(&table) {
+                *slot = src[row * extent + at].into();
+            }
+            accumulate_row(&padded, range[0], 1, &consecutive, kernel, &mut dst[row * kept..(row + 1) * kept]);
+        }
+        return;
+    }
+    let table: Vec<usize> = (range[0]..range[1])
+        .flat_map(|position| {
+            (0..kernel.len())
+                .map(move |step| position as isize + step as isize - radius)
+                .map(|at| boundary.index(at, extent))
+        })
+        .collect();
+    for slab in 0..outer {
+        let base = slab * extent * inner;
+        let out_base = slab * kept * inner;
+        for position in 0..kept {
+            let taps = &table[position * kernel.len()..(position + 1) * kernel.len()];
+            let out_row = &mut dst[out_base + position * inner..out_base + (position + 1) * inner];
+            accumulate_row(src, base, inner, taps, kernel, out_row);
+        }
+    }
+}
+
 // ------------------------------------------------------------- Hessian --
 
 /// The six distinct components of the Hessian at `at`, as
@@ -2168,6 +2278,29 @@ pub fn smoothing_report(shape: [usize; 3], repetitions: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A region of the smoothing is the same bits as the region of the whole
+    /// smoothing, under both conventions, from a non-contiguous input, for
+    /// regions touching every face and none.
+    #[test]
+    fn a_region_of_the_smoothing_is_bit_identical() {
+        let big = Array3::from_shape_fn((15, 14, 19), |(i, j, k)| ((i * 31 + j * 17 + k * 7) % 23) as f64 - 9.5 + (i * k) as f64 * 0.125);
+        let input = big.slice(ndarray::s![1..14, 2..13, 1..18;2]);
+        let kernels = [gaussian_weights(1.0, 3.0).unwrap(), gaussian_weights(1.5, 3.0).unwrap(), gaussian_weights(0.7, 4.0).unwrap()];
+        for boundary in [Boundary::Clamp, Boundary::Reflect] {
+            let mut whole = Array3::<f64>::zeros(input.raw_dim());
+            gaussian_smooth_into_with(input, &kernels, boundary, whole.view_mut()).unwrap();
+            for region in [[[0, 13], [0, 11], [0, 9]], [[3, 9], [4, 7], [2, 6]], [[0, 2], [6, 11], [8, 9]], [[12, 13], [0, 1], [0, 9]]] {
+                let extent: [usize; 3] = std::array::from_fn(|a| region[a][1] - region[a][0]);
+                let mut out = Array3::<f64>::zeros(extent);
+                gaussian_smooth_region_into(input, &kernels, boundary, region, out.view_mut()).unwrap();
+                let expected = whole.slice(ndarray::s![region[0][0]..region[0][1], region[1][0]..region[1][1], region[2][0]..region[2][1]]);
+                for (got, want) in out.iter().zip(expected.iter()) {
+                    assert_eq!(got.to_bits(), want.to_bits(), "{boundary:?} {region:?}");
+                }
+            }
+        }
+    }
+
     use super::*;
 
     /// **The Hessian eigenvalues' closed form.** Over the quadratic

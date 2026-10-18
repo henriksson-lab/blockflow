@@ -57,7 +57,7 @@ use crate::fragment::{
 use crate::op::SourceInput;
 use crate::reach::Reach;
 use crate::ops::edges::trilinear_at;
-use crate::ops::ridge::gaussian_smooth_into_with;
+use crate::ops::ridge::gaussian_smooth_region_into;
 use crate::ops::smooth::Gaussian;
 use crate::voxels::Voxels;
 use crate::ops::rows::sealed_rows;
@@ -128,6 +128,19 @@ impl ShellFitParams {
         let evidence = self.search[1] * self.radius + 6.0;
         let rays = self.refine[1] * self.search[1] * self.radius + 4.0;
         (centre + evidence.max(rays)).ceil() as usize + 2
+    }
+
+    /// The same bound as a Euclidean distance: every voxel a sample's
+    /// trilinear interpolation reads lies within this of the candidate. The
+    /// centre search moves up to [`CENTRE_SEARCH`] on each axis at once, so its
+    /// share is that times sqrt(3); the trilinear neighbour adds sqrt(3).
+    /// Clamping a sample into the volume only moves it closer, since the
+    /// candidate is inside.
+    pub fn sample_radius(&self) -> f64 {
+        let centre = self.max_shift.max(CENTRE_SEARCH * 3f64.sqrt());
+        let evidence = self.search[1] * self.radius + 6.0;
+        let rays = self.refine[1] * self.search[1] * self.radius + 4.0;
+        centre + evidence.max(rays) + 3f64.sqrt()
     }
 }
 
@@ -200,11 +213,26 @@ impl Window<'_> {
     }
 
     fn profile(&self, centre: [f64; 3], u: [f64; 3], start: f64, count: usize, out: &mut Vec<f32>) {
+        self.profile_part(centre, u, start, count, 0..count, out);
+    }
+
+    /// A profile of `count` samples of which only `used` are taken; the rest
+    /// are left zero for a caller that never reads them.
+    fn profile_part(
+        &self,
+        centre: [f64; 3],
+        u: [f64; 3],
+        start: f64,
+        count: usize,
+        used: std::ops::Range<usize>,
+        out: &mut Vec<f32>,
+    ) {
         out.clear();
-        out.extend((0..count).map(|k| {
+        out.resize(count, 0.0);
+        for k in used {
             let r = start + k as f64 * STEP;
-            self.sample([centre[0] + r * u[0], centre[1] + r * u[1], centre[2] + r * u[2]])
-        }));
+            out[k] = self.sample([centre[0] + r * u[0], centre[1] + r * u[1], centre[2] + r * u[2]]);
+        }
     }
 }
 
@@ -232,13 +260,31 @@ fn sphere_evidence(window: &Window, centre: [f64; 3], rays: &RaySet, lo: f64, hi
     let radii = (hi - lo) as usize + 1;
     let mut total = vec![0f32; radii];
     let mut profile = Vec::with_capacity(count);
-    for &u in rays.directions() {
-        window.profile(centre, u, start, count, &mut profile);
-        for (j, t) in total.iter_mut().enumerate() {
+    // The windows of neighbouring radii overlap, so each sample's step is
+    // computed once per ray, not once per radius whose window holds it.
+    let ranges: Vec<(usize, usize)> = (0..radii)
+        .map(|j| {
             let r = lo + j as f64;
             let k0 = (((r - 1.5 - start) / STEP).round() as usize).max(8);
             let k1 = (((r + 1.5 - start) / STEP).round() as usize).min(count - 5);
-            *t += (k0..=k1).map(|k| step_response(&profile, k)).fold(0.0, f32::max);
+            (k0, k1)
+        })
+        .collect();
+    let mut steps = vec![0f32; count];
+    // samples a step window reads: 8 below its first position, 4 above its last
+    let first = ranges.iter().filter(|r| r.0 <= r.1).map(|r| r.0).min();
+    let last = ranges.iter().filter(|r| r.0 <= r.1).map(|r| r.1).max();
+    let (used, stepped) = match (first, last) {
+        (Some(first), Some(last)) => (first - 8..last + 5, first..last + 1),
+        _ => (0..0, 0..0),
+    };
+    for &u in rays.directions() {
+        window.profile_part(centre, u, start, count, used.clone(), &mut profile);
+        for k in stepped.clone() {
+            steps[k] = step_response(&profile, k);
+        }
+        for (t, &(k0, k1)) in total.iter_mut().zip(&ranges) {
+            *t += (k0..=k1).map(|k| steps[k]).fold(0.0, f32::max);
         }
     }
     let (j, e) = total
@@ -282,6 +328,11 @@ pub fn fit_shell(
         for dz in -span..=span {
             for dy in -span..=span {
                 for dx in -span..=span {
+                    if dz == 0 && dy == 0 && dx == 0 {
+                        // `around` is scored already, and only a strictly
+                        // better centre replaces it
+                        continue;
+                    }
                     let c = [
                         around[0] + dz as f64 * step,
                         around[1] + dy as f64 * step,
@@ -748,17 +799,22 @@ impl FragmentOp for ShellFitOp {
                 Some(gaussian) => {
                     let shape = raw.shape();
                     let reach = self.params.reach() as isize;
-                    let boxes: Vec<[[usize; 3]; 2]> = rows
+                    let radius = self.params.sample_radius();
+                    let sampled: Vec<Sampled> = rows
                         .iter()
                         .map(|row| {
                             let local: [isize; 3] = std::array::from_fn(|a| row.at[a] as isize - origin[a] as isize);
-                            [
-                                std::array::from_fn(|a| (local[a] - reach).clamp(0, shape[a] as isize) as usize),
-                                std::array::from_fn(|a| (local[a] + reach + 1).clamp(0, shape[a] as isize) as usize),
-                            ]
+                            Sampled {
+                                centre: local.map(|v| v as f64),
+                                radius,
+                                cube: [
+                                    std::array::from_fn(|a| (local[a] - reach).clamp(0, shape[a] as isize) as usize),
+                                    std::array::from_fn(|a| (local[a] + reach + 1).clamp(0, shape[a] as isize) as usize),
+                                ],
+                            }
                         })
                         .collect();
-                    smooth_where_sampled(raw, gaussian, &boxes, PREFILTER_TILE)?
+                    smooth_where_sampled(raw, gaussian, &sampled, PREFILTER_TILE)?
                 }
             };
             let fits: Vec<ShellFit> = rows
@@ -810,25 +866,48 @@ impl FragmentOp for ShellFitOp {
     }
 }
 
-/// `raw` smoothed by `gaussian` on the tiles of edge `tile` that meet one of
-/// `boxes` (half-open, buffer coordinates), and zero elsewhere.
+/// Where one fit can read: within `radius` of `centre` and inside `cube`
+/// (half-open), all in buffer coordinates. Either bound alone is sound; a tile
+/// is smoothed only if some voxel of it satisfies both.
+struct Sampled {
+    centre: [f64; 3],
+    radius: f64,
+    cube: [[usize; 3]; 2],
+}
+
+/// `raw` smoothed by `gaussian` on the tiles of edge `tile` that some fit can
+/// read (see [`Sampled`]), and zero elsewhere.
 ///
-/// Each tile is smoothed over itself grown by the Gaussian's reach, clamped to
-/// the buffer, so every computed voxel sums exactly the taps — in the same
-/// order, from the same values — that smoothing the whole buffer would. Tiles
-/// are done in parallel, a bounded number at a time so the pieces in flight
-/// stay small next to the result.
-fn smooth_where_sampled(raw: &Voxels, gaussian: &Gaussian, boxes: &[[[usize; 3]; 2]], tile: usize) -> Result<Array3<f64>> {
+/// Each tile is smoothed from itself grown by the Gaussian's reach (clamped to
+/// the buffer) by [`gaussian_smooth_region_into`], so every computed voxel is
+/// the bits smoothing the whole buffer would give it. Tiles are done in
+/// parallel, a bounded number at a time so the pieces in flight stay small next
+/// to the result.
+fn smooth_where_sampled(raw: &Voxels, gaussian: &Gaussian, sampled: &[Sampled], tile: usize) -> Result<Array3<f64>> {
     let shape = raw.shape();
     let mut needed = std::collections::BTreeSet::new();
-    for [lo, hi] in boxes {
+    for fit in sampled {
+        let [lo, hi] = fit.cube;
         if (0..3).any(|a| lo[a] >= hi[a]) {
             continue;
         }
         for t0 in lo[0] / tile..=(hi[0] - 1) / tile {
             for t1 in lo[1] / tile..=(hi[1] - 1) / tile {
                 for t2 in lo[2] / tile..=(hi[2] - 1) / tile {
-                    needed.insert([t0, t1, t2]);
+                    let t = [t0, t1, t2];
+                    // the nearest voxel of the tile, within the cube, to the centre
+                    let gap: f64 = (0..3)
+                        .map(|a| {
+                            let first = (t[a] * tile).max(lo[a]) as f64;
+                            let last = (((t[a] + 1) * tile).min(hi[a]) - 1) as f64;
+                            let c = fit.centre[a];
+                            let d = if c < first { first - c } else if c > last { c - last } else { 0.0 };
+                            d * d
+                        })
+                        .sum();
+                    if gap <= fit.radius * fit.radius {
+                        needed.insert(t);
+                    }
                 }
             }
         }
@@ -845,22 +924,19 @@ fn smooth_where_sampled(raw: &Voxels, gaussian: &Gaussian, boxes: &[[[usize; 3];
                     let r = gaussian.reach(a);
                     [core[a][0].saturating_sub(r), (core[a][1] + r).min(shape[a])]
                 });
-                let mut smoothed =
-                    Array3::<f64>::zeros(std::array::from_fn::<usize, 3, _>(|a| grown[a][1] - grown[a][0]));
+                let mut piece =
+                    Array3::<f64>::zeros(std::array::from_fn::<usize, 3, _>(|a| core[a][1] - core[a][0]));
                 let window = s![grown[0][0]..grown[0][1], grown[1][0]..grown[1][1], grown[2][0]..grown[2][1]];
+                let region: [[usize; 2]; 3] =
+                    std::array::from_fn(|a| [core[a][0] - grown[a][0], core[a][1] - grown[a][0]]);
                 dispatch_f64_input!(
                     raw,
                     Error::invalid("a shell fit prefilter cannot read half-precision"),
-                    |view| { gaussian_smooth_into_with(view.slice(window), gaussian.kernels(), gaussian.boundary(), smoothed.view_mut()) }
+                    |view| {
+                        gaussian_smooth_region_into(view.slice(window), gaussian.kernels(), gaussian.boundary(), region, piece.view_mut())
+                    }
                 )?;
-                let inner = smoothed
-                    .slice(s![
-                        core[0][0] - grown[0][0]..core[0][1] - grown[0][0],
-                        core[1][0] - grown[1][0]..core[1][1] - grown[1][0],
-                        core[2][0] - grown[2][0]..core[2][1] - grown[2][0]
-                    ])
-                    .to_owned();
-                Ok((core, inner))
+                Ok((core, piece))
             })
             .collect::<Result<Vec<_>>>()?;
         for (core, piece) in pieces {

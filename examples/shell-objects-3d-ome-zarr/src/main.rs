@@ -110,9 +110,11 @@ struct Args {
     min_ring_depth: f64,
     #[arg(long, default_value_t = 1.0)]
     wall_pad: f64,
-    /// Level-0 block edge z,y,x of the fit plan; at least the object diameter.
-    #[arg(long, value_delimiter = ',', default_value = "160,256,256")]
-    block: Vec<usize>,
+    /// Level-0 block edge z,y,x of the fit plan. Default: four times the fit's
+    /// reach, rounded up to a multiple of 32, which keeps the window a block
+    /// reads within a few times its core.
+    #[arg(long, value_delimiter = ',')]
+    block: Option<Vec<usize>>,
     /// Block edge of the coarse plans. A whole number of scan tiles, so the
     /// scan's halo is the kernel's reach and not a tile more.
     #[arg(long, default_value_t = 128)]
@@ -314,7 +316,7 @@ fn validate(args: &Args) -> Result<()> {
     let ok = args.scan_factor > 0
         && !args.scales.is_empty()
         && args.band.len() == 2
-        && args.block.len() == 3
+        && args.block.as_ref().is_none_or(|b| b.len() == 3 && b.iter().all(|&v| v > 0))
         && args.rays >= 20
         && args.exemplar.as_ref().is_none_or(|e| e.len() == 3)
         && args.voxel_size.as_ref().is_none_or(|v| v.len() == 3)
@@ -500,7 +502,8 @@ fn fit_pass(
     }
     let source = pyramid.attached_level(0)?;
     let (dtype, volume) = source.metadata()?;
-    let block: [usize; 3] = std::array::from_fn(|a| args.block[a].min(volume[a]));
+    let edge = (4 * params.reach()).div_ceil(32) * 32;
+    let block: [usize; 3] = std::array::from_fn(|a| args.block.as_ref().map_or(edge, |b| b[a]).min(volume[a]));
     let mut builder = PlanBuilder::new(volume, dtype, BlockGrid::new(volume, block)?);
     let candidate_schema = Schema::new(vec![Column::f64("score")])?;
     let rows: Vec<RowValues> = candidates.iter().map(|c| RowValues::new(c.at, vec![Value::F64(c.score)])).collect();

@@ -305,6 +305,7 @@ pub fn non_maximum_suppression_into(
 
 /// Trilinear interpolation of `values` at a fractional `[z, y, x]` index, or
 /// `None` outside `[0, len - 1]` on any axis.
+#[inline]
 pub fn trilinear_at(values: ArrayView3<'_, f64>, at: [f64; 3]) -> Option<f64> {
     let shape = [values.shape()[0], values.shape()[1], values.shape()[2]];
     for axis in 0..3 {
@@ -313,11 +314,9 @@ pub fn trilinear_at(values: ArrayView3<'_, f64>, at: [f64; 3]) -> Option<f64> {
         }
     }
 
-    let low = [
-        at[0].floor() as usize,
-        at[1].floor() as usize,
-        at[2].floor() as usize,
-    ];
+    // Every coordinate is non-negative here, where truncation is the floor;
+    // `f64::floor` is a library call on the baseline target.
+    let low = [at[0] as usize, at[1] as usize, at[2] as usize];
     let high = [
         (low[0] + 1).min(shape[0] - 1),
         (low[1] + 1).min(shape[1] - 1),
@@ -328,30 +327,35 @@ pub fn trilinear_at(values: ArrayView3<'_, f64>, at: [f64; 3]) -> Option<f64> {
         at[1] - low[1] as f64,
         at[2] - low[2] as f64,
     ];
+    let weights = [
+        [1.0 - fraction[0], fraction[0]],
+        [1.0 - fraction[1], fraction[1]],
+        [1.0 - fraction[2], fraction[2]],
+    ];
+    let corner = [[low[0], high[0]], [low[1], high[1]], [low[2], high[2]]];
 
+    // The eight corners in a fixed order, each weighted `(w0 * w1) * w2` and
+    // added to a sum that starts at zero; a contiguous array is read by linear
+    // offset, anything else by index, to the same bits.
     let mut out = 0.0;
-    for da in 0..=1 {
-        for db in 0..=1 {
-            for dc in 0..=1 {
-                let index = [
-                    if da == 0 { low[0] } else { high[0] },
-                    if db == 0 { low[1] } else { high[1] },
-                    if dc == 0 { low[2] } else { high[2] },
-                ];
-                let weight = if da == 0 {
-                    1.0 - fraction[0]
-                } else {
-                    fraction[0]
-                } * if db == 0 {
-                    1.0 - fraction[1]
-                } else {
-                    fraction[1]
-                } * if dc == 0 {
-                    1.0 - fraction[2]
-                } else {
-                    fraction[2]
-                };
-                out += weight * values[index];
+    if let Some(flat) = values.as_slice() {
+        let rows = [corner[0][0] * shape[1], corner[0][1] * shape[1]];
+        for (da, row) in rows.iter().enumerate() {
+            for db in 0..2 {
+                let line = (row + corner[1][db]) * shape[2];
+                for dc in 0..2 {
+                    let weight = weights[0][da] * weights[1][db] * weights[2][dc];
+                    out += weight * flat[line + corner[2][dc]];
+                }
+            }
+        }
+    } else {
+        for da in 0..2 {
+            for db in 0..2 {
+                for dc in 0..2 {
+                    let weight = weights[0][da] * weights[1][db] * weights[2][dc];
+                    out += weight * values[[corner[0][da], corner[1][db], corner[2][dc]]];
+                }
             }
         }
     }

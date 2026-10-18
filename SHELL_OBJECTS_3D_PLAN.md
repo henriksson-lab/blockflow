@@ -165,3 +165,26 @@ Open, in blockflow rather than here:
   per block; with one coarse block it was 1.5 s of the scan.
 - Read and compute of a fragment phase's source windows do not overlap
   (`Hints::prefetch_depth` is reserved, not implemented).
+
+### Third round (2026-10-18)
+
+All exact (CSV and contact sheets byte-identical):
+
+- `ridge::gaussian_smooth_region_into`: a separable Gaussian over a sub-region,
+  each pass narrowed to what the next reads, from a contiguous copy (the
+  prefilter had been running the strided fallback on a sliced view).
+- The prefilter selects tiles by the fit's Euclidean sample bound
+  (`ShellFitParams::sample_radius`) intersected with its per-axis reach, not
+  the cube alone.
+- `sphere_evidence` computes each step response once per ray (windows of
+  neighbouring radii overlap) and samples only the positions a step window
+  reads; the centre search no longer re-scores its current best.
+- `trilinear_at`: truncation instead of a libm `floor` call on non-negative
+  coordinates, linear offsets on contiguous arrays, same sum order.
+- Fit block edge defaults to 4× the fit reach (384 here): read amplification
+  ~5× → ~2×.
+
+Fit pass 19 s → 9 s (low machine load); whole run with bootstrap and publish
+71 s → ~45–49 s. Publish (label pyramid, 6–9 s) now dominates what is left;
+see `docs/GUIDE.md` §5 on why all-background label chunks are still written and
+read in full.

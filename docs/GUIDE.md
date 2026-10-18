@@ -5,7 +5,8 @@ op, assemble a plan, run it over an OME-Zarr image, and publish labels and
 object tables. It points at the code rather than restating it. The long design
 notes in [`design/`](design/) explain *why*; this file says *where* and *how*.
 
-**Status.** Written 2026-10-17 against commit `11d31fc`. Every function and type
+**Status.** Written 2026-10-17 against commit `11d31fc`; §5 and the new ops in
+§4.7–4.8 added 2026-10-18 on branch `shell-objects-3d`. Every function and type
 named here was checked to exist at that commit, and the signatures quoted were
 copied from the source. When this file and the code disagree, the code wins —
 please fix this file.
@@ -39,7 +40,7 @@ If an op you write needs the whole volume in memory, it will not scale; see
 | OME-Zarr in/out | `src/ome_zarr.rs` (`OmeVolumePyramid`, `write_label_metadata`, `ensure_zarr_group`), `src/label_pyramid.rs`, `src/object_table.rs`, `crates/ngff-object-table` |
 | rows | `src/table.rs` (`Schema`, `Column`, `RowBuilder`, `Row`, `Table`), `src/ops/rows.rs` |
 | ops by topic | `src/ops/mod.rs` — its header table lists every module and what it makes expressible |
-| finished pipelines | `examples/*` (§6) |
+| finished pipelines | `examples/*` (§7) |
 | design rationale | `docs/design/*.md` (note the trust caveat at the top of `writing-an-op.md`) |
 | known gaps | `docs/design/planner-gaps.md`, `docs/ops-survey/` |
 
@@ -207,8 +208,16 @@ which later barrier ops read in their `reduce` (`SurfaceColumns::from_stream`)
   and on smoothed intensity) and does greedy minimum-distance suppression in
   physical units (`minimum_distance_physical`, strongest first); `apply` emits
   each centre from its owning block. **The thresholds are hard-coded Otsu**,
-  which fails when bright objects saturate. The suppression itself is
-  `classical_centers::suppress_within_distance`, usable on its own.
+  which fails when bright objects saturate.
+- Suppression as its own phase: `ops::suppress::SuppressRowsOp` (barrier) keeps
+  rows by a priority column and drops one within `factor × pair(r_kept, r_row)`
+  of a kept row — fixed or per-row radius, smaller/larger/sum pairing,
+  positions from the row voxel or from columns. `suppress_points` is the
+  resident kernel; `classical_centers::suppress_within_distance` calls it.
+- Template matching: `ops::template_match` (radial templates, NCC at several
+  radii as one `ops::transform_bank::TransformBankOp`); a window fit per row
+  that emits shapes: `ops::star_convex` (`ShellFitOp`, `StarConvexLabelsOp`).
+  `examples/shell-objects-3d-ome-zarr` uses all of these.
 - `ops::interest::response_peak_points` is the resident (whole-array) helper,
   for tests and small arrays.
 
@@ -217,7 +226,9 @@ which later barrier ops read in their `reduce` (`SurfaceColumns::from_stream`)
 Every image in one plan shares one lattice; a source on a different lattice is
 refused. To work at a coarser level, either attach `pyramid.attached_level(k)`
 in a separate run and pass the small result on (§4.3 two-run form), or resample
-inside the plan with `ops::resample::{ResampleOp, resample_phase}`.
+inside the plan with `ops::resample::{ResampleOp, resample_phase}`
+(`append_resample_phase` on a `PlanBuilder`; `append_block_mean_phases` for a
+box mean to a coarser grid).
 
 ### 4.9 Iterating to a fixed point
 
@@ -242,7 +253,60 @@ inside the plan with `ops::resample::{ResampleOp, resample_phase}`.
 
 Both default `accepts` to `F64` only, like `BlockOp`.
 
-## 5. Reading inputs and publishing outputs
+## 5. Doing less work
+
+What the framework already skips, and what an op has to skip itself. Measured
+on `examples/shell-objects-3d-ome-zarr` (SHELL_OBJECTS_3D_PLAN.md, "Speed").
+
+**Free, if declared:**
+
+- **Uniform blocks.** The executor skips a block whose read extent (halo
+  included) is one value when every op in the phase declares
+  `constant_maps_to(value)` (`strategy.rs`, "The short circuit"). The block is
+  still read and scanned, and a constant output block is still written.
+- **Known-empty chunks.** The chunk cache does not fetch a chunk its backend
+  reports `is_known_empty` (`cache.rs`, `ChunkFetcher`/`RegionSource`); the
+  block buffer is left zero there. Only synthetic sources implement it — the
+  Zarr backend does not, and a Zarr array written by a run has the *unwritten*
+  sentinel as fill value (`zarr_env::unwritten_fill`: `MAX` for integers, NaN
+  for floats), so an all-zero label chunk is written and read back in full.
+- **Tile-aligned halos.** `TransformConvolveOp`/`TransformBankOp` declare
+  `AxisReach::Aligned`: on a block edge that is a whole number of tiles the
+  halo is the kernel's reach, otherwise it adds `tile - 1`. Pick block edges
+  that are multiples of the tile.
+
+**Up to the op** (none of these change a plan, a halo or a price):
+
+- Compute only outputs someone reads. A transform op computes only tiles that
+  can hold a valid voxel (`convolve::run_tiles`); a separable smoothing of a
+  sub-region uses `ridge::gaussian_smooth_region_into`, bit-identical to
+  smoothing everything and cropping.
+- Do not materialise a pre-filter a sparse consumer reads: `ShellFitOp::with_prefilter`
+  reads the raw image and smooths only the tiles its rows' fits can reach. A
+  full `SmoothOp` phase there cost a written and re-read f64 volume.
+- Several kernels on one input: `TransformBankOp` transforms each input once per
+  tile instead of once per kernel.
+- Threads inside a block (`run_tiles`, rayon in row ops) pay when there are
+  fewer blocks than cores; with many blocks in flight they share one rayon pool
+  with the executor's workers.
+
+**Costs that are easy to miss:**
+
+- **Read amplification.** A block reads `core + 2 × reach` per axis; at a reach
+  of ~90 and a 160×256×256 block that is ~5× the volume per pass. A block edge
+  of a few times the reach (the shell example uses 4×) fixed it there.
+- **`SeamFold::Unordered` fragment ops are applied twice per block** (fragments
+  reversed) whenever they gather more than one fragment, and the outputs
+  compared (pixels only over the written region). Keep per-application work
+  proportional to the core.
+- **A fragment input's reach in whole blocks widens the phase's pixel read
+  extent** (`fragment::fragment_phase`) unless the op is a barrier: a painter
+  reading neighbours' rows gets a `BlockView::output_buffer` of 3×3×3 blocks.
+  Size scratch buffers by `BlockView::core`, not `read`.
+- Profile before guessing: `perf record -g` on a release build, and per-phase
+  CPU against wall time (`cpu.rs`); a phase on one core is usually one block.
+
+## 6. Reading inputs and publishing outputs
 
 - `OmeVolumePyramid::open(root, channel, time)`: `levels()`, `voxel_size()`
   (z, y, x), `voxel_volume()`, `image_root()`, `label_source()`,
@@ -269,7 +333,7 @@ Both default `accepts` to `F64` only, like `BlockOp`.
   examples still hand-roll the steps for their 2D levels. `label_publish.rs` is the transactional writer for
   sparse masks edited in the UI.
 
-## 6. Anatomy of an example
+## 7. Anatomy of an example
 
 Examples are workspace members (root `Cargo.toml`) under `examples/<name>/` and
 follow [`OMEZARR_EXAMPLES.md`](../OMEZARR_EXAMPLES.md): attach the Zarr, run
@@ -293,7 +357,7 @@ tables), `cellpose-3d-ome-zarr` (instances, grid choice, resume),
 thresholds, components, rows from barrier ops, `publish_label`,
 `finalize_object_table`, a synthetic end-to-end test across block grids).
 
-## 7. Conventions
+## 8. Conventions
 
 - Release builds only, for runs, tests and benchmarks (`AGENTS.md`).
 - New dependencies: only what the framework needs goes in the root crate;
@@ -303,12 +367,13 @@ thresholds, components, rows from barrier ops, `publish_label`,
   numbers where performance is claimed.
 - A new ops module gets a row in the table at the top of `src/ops/mod.rs`.
 
-## 8. Traps
+## 9. Traps
 
 - A barrier whose `seam_fold` is `SeamFold::Unordered` has its `reduce` run
   **twice**, walking the blocks forwards and backwards, and the run is refused
-  if the answers differ. Budget for it, and do not log from `reduce` expecting
-  one line.
+  if the answers differ; a non-barrier one has its `apply` run twice per block
+  that gathers more than one fragment (§5). Budget for it, and do not log from
+  `reduce`/`apply` expecting one line.
 - An intermediate image is freed after its last reader. To read one after the
   run (e.g. from `work/level{N}` or `env.image`), pin it with
   `Hints { keep_images, .. }`.

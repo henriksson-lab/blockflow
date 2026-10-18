@@ -735,7 +735,8 @@ pub use resample::{
     ResampleOp,
 };
 pub use ridge::{
-    gaussian_radius, gaussian_smooth_into, gaussian_smooth_into_with, gaussian_weights, hessian_at,
+    gaussian_radius, gaussian_smooth_into, gaussian_smooth_into_with, gaussian_smooth_region_into,
+    gaussian_weights, hessian_at,
     ridge_response_into, symmetric_eigenvalues, Boundary, EigenResponse, HessianEigenvalueOp,
     PlateResponse, Polarity, RatioResponse, Response, RidgeFilterOp, RidgeResponse, ScaleSpace,
 };
