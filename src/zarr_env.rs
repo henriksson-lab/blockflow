@@ -212,6 +212,71 @@ pub fn zarr_data_type(dtype: Dtype) -> Result<DataType> {
     })
 }
 
+/// `value` as `dtype`'s fill value, refused unless it is exactly representable
+/// — a background that rounded would read back as something no op wrote.
+fn background_fill(dtype: Dtype, value: f64) -> Result<FillValue> {
+    macro_rules! exact {
+        ($t:ty) => {{
+            let cast = value as $t;
+            if cast as f64 == value || (value.is_nan() && (cast as f64).is_nan()) {
+                FillValue::from(cast)
+            } else {
+                return Err(Error::InvalidArgument(format!(
+                    "a background of {value} is not exactly a {} value",
+                    dtype.numpy_name()
+                )));
+            }
+        }};
+    }
+    Ok(match dtype {
+        Dtype::Bool => {
+            if value == 0.0 || value == 1.0 {
+                FillValue::from(value == 1.0)
+            } else {
+                return Err(Error::InvalidArgument(format!("a background of {value} is not a bool")));
+            }
+        }
+        Dtype::U8 => exact!(u8),
+        Dtype::U16 => exact!(u16),
+        Dtype::U32 => exact!(u32),
+        Dtype::U64 => exact!(u64),
+        Dtype::I8 => exact!(i8),
+        Dtype::I16 => exact!(i16),
+        Dtype::I32 => exact!(i32),
+        Dtype::I64 => exact!(i64),
+        Dtype::F32 => exact!(f32),
+        Dtype::F64 => FillValue::from(value),
+        Dtype::F16 => return zarr_data_type(Dtype::F16).map(|_| unreachable!()),
+    })
+}
+
+/// An array's fill value as `f64`, or `None` when it is NaN (a NaN block is
+/// never uniform) or not one of the element types read here.
+fn fill_as_f64(dtype: Dtype, fill: &FillValue) -> Option<f64> {
+    let bytes = fill.as_ne_bytes();
+    macro_rules! decode {
+        ($t:ty) => {{
+            let raw: [u8; std::mem::size_of::<$t>()] = bytes.try_into().ok()?;
+            <$t>::from_ne_bytes(raw) as f64
+        }};
+    }
+    let value = match dtype {
+        Dtype::Bool => f64::from(*bytes.first()? != 0),
+        Dtype::U8 => decode!(u8),
+        Dtype::U16 => decode!(u16),
+        Dtype::U32 => decode!(u32),
+        Dtype::U64 => decode!(u64),
+        Dtype::I8 => decode!(i8),
+        Dtype::I16 => decode!(i16),
+        Dtype::I32 => decode!(i32),
+        Dtype::I64 => decode!(i64),
+        Dtype::F32 => decode!(f32),
+        Dtype::F64 => decode!(f64),
+        Dtype::F16 => return None,
+    };
+    (!value.is_nan()).then_some(value)
+}
+
 /// The value a voxel nobody wrote reads back as.
 ///
 /// The same sentinel [`Voxels::unwritten`] uses, and for the same argument: an
@@ -764,6 +829,12 @@ struct StoredArray {
     /// [`ZarrEnvironment::compression_at`] can answer without re-reading the
     /// metadata, and so a message can name it.
     compression: Compression,
+    /// What a chunk absent from the store reads back as, when that is a value
+    /// worth trusting: the declared background of an image this environment
+    /// created, or the fill value of an attached array. `None` for an image
+    /// stored with the unwritten sentinel, whose absent chunks are a fault
+    /// rather than data.
+    background: Option<f64>,
 }
 
 /// How large a chunk cache a [`ZarrEnvironment`] gets when nobody says.
@@ -854,6 +925,35 @@ impl StoredArray {
         chunk: &[usize],
         compression: Compression,
     ) -> Result<Self> {
+        Self::create_with_background(store, path, id, dtype, shape, chunk, compression, None)
+    }
+
+    /// [`Self::create`], stored with `background` as its fill value when one is
+    /// declared (see `PhaseDecomposition::background`): a chunk that is all
+    /// background is then not written, and reads back the same.
+    #[allow(clippy::too_many_arguments)]
+    fn create_with_background(
+        store: &Arc<Store>,
+        path: &str,
+        id: u64,
+        dtype: Dtype,
+        shape: &[usize],
+        chunk: &[usize],
+        compression: Compression,
+        background: Option<f64>,
+    ) -> Result<Self> {
+        let fill = match background {
+            Some(value) => {
+                // Blocks that are all background are not written, so a chunk
+                // left by an earlier run under this path would be read as this
+                // run's; a background array starts from an empty prefix.
+                let prefix = StorePrefix::new(format!("{}/", path.trim_start_matches('/')))
+                    .map_err(Error::backend)?;
+                store.erase_prefix(&prefix).map_err(Error::backend)?;
+                background_fill(dtype, value)?
+            }
+            None => unwritten_fill(dtype)?,
+        };
         let zarr_shape: Vec<u64> = shape.iter().map(|&value| value as u64).collect();
         let zarr_chunk: Vec<u64> = chunk
             .iter()
@@ -863,7 +963,7 @@ impl StoredArray {
             zarr_shape,
             zarr_chunk,
             zarr_data_type(dtype)?,
-            unwritten_fill(dtype)?,
+            fill,
         );
         // Left unset for `Compression::None`, rather than set to an empty list:
         // an array built with `None` must be the array this environment built
@@ -885,6 +985,7 @@ impl StoredArray {
             fixed: vec![None; 3],
             chunk: chunk.iter().map(|&value| value.max(1)).collect(),
             compression,
+            background,
         })
     }
 
@@ -928,6 +1029,7 @@ impl StoredArray {
             .map(|&axis| axis.map_or(1, |axis| source_chunk[axis]))
             .collect();
         let compression = compression_of(&array, path)?;
+        let background = fill_as_f64(dtype, array.fill_value());
 
         let view_shape = axes.map(|axis| axis.map_or(1, |axis| array_shape[axis]));
         let (offset, shape) = match window {
@@ -962,7 +1064,25 @@ impl StoredArray {
             fixed,
             chunk,
             compression,
+            background,
         })
+    }
+
+    /// The value `region` (image coordinates) is known to hold without reading
+    /// it: every chunk under it is absent from the store and absent chunks are
+    /// [`Self::background`]. One metadata lookup per chunk, no decoding.
+    fn known_uniform(&self, region: &Region) -> Option<f64> {
+        let background = self.background?;
+        let subset = self.subset(region).ok()?;
+        let chunks = self.array.chunks_in_array_subset(&subset).ok()??;
+        let storage = self.array.storage();
+        for indices in chunks.indices().iter() {
+            let key = self.array.chunk_key(&indices);
+            if zarrs::storage::ReadableStorageTraits::size_key(&*storage, &key).ok()?.is_some() {
+                return None;
+            }
+        }
+        Some(background)
     }
 
     /// `region`, stated in the image's coordinates, in the array's.
@@ -3022,7 +3142,7 @@ impl Environment for ZarrEnvironment {
                 images.push(Arc::new(array));
                 continue;
             }
-            images.push(Arc::new(StoredArray::create(
+            images.push(Arc::new(StoredArray::create_with_background(
                 &self.store,
                 &image_path(image),
                 image as u64,
@@ -3030,6 +3150,7 @@ impl Environment for ZarrEnvironment {
                 &decomposition.volume_at(image),
                 &chunks[image],
                 self.compression.at(image, dtype),
+                decomposition.background_at(image),
             )?));
         }
         *self
@@ -3279,6 +3400,14 @@ impl Environment for ZarrEnvironment {
             array.write_as::<Element>(region, &data, Some(&self.locks))
         })?;
         Ok(())
+    }
+
+    fn known_uniform(&self, image: usize, region: &Region) -> Option<f64> {
+        self.image_array(image).ok()?.known_uniform(region)
+    }
+
+    fn background(&self, image: usize) -> Option<f64> {
+        self.image_array(image).ok()?.background
     }
 
     fn uniform(&self, buf: &BlockBuf) -> Option<f64> {

@@ -88,7 +88,7 @@ pub fn build_nearest_label_pyramid_with_blocks(
             },
             ..Constraints::default()
         };
-        let decomposition = planned_resample(
+        let mut decomposition = planned_resample(
             &workflow,
             &resample,
             input_shape,
@@ -96,6 +96,12 @@ pub fn build_nearest_label_pyramid_with_blocks(
             &constraints,
             block_candidates,
         )?;
+        // Labels are mostly background: stored with 0 as fill, a level writes
+        // only chunks that hold an object, and a block of the level below whose
+        // chunks are all absent is skipped unread.
+        for phase in &mut decomposition.phases {
+            phase.background = Some(crate::decomposition::Background(0.0));
+        }
         let level_work = work.join(format!("pyramid-{index}"));
         let env = ZarrEnvironment::attach(&level_work, &[input])?;
         execute(

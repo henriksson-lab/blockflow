@@ -44,12 +44,12 @@ max 3.2 voxels, radius difference median 0.05 / max 2.5 voxels. The 3
 prototype-only objects were borderline accepts there; one object is new.
 
 Wall time with `--exemplar` and the default bootstrap, 32 workers, release
-build, on a shared 40-thread machine (load 12–16 from other jobs): **71 s, peak
-RSS 7.3 GB**, against 83 s for the prototype. Per stage: coarse grid 1.5 s, each
-scan 3.2–3.5 s (prototype 1.2 s), first fit pass 17 s, painting pass 21–37 s
-(prototype 21 s per pass, no painting), contact sheets 1.2 s, publish 5.6 s.
+build, on a shared 40-thread machine (load ~9 from other jobs): **36 s, peak
+RSS 7.9 GB**, against 83 s for the prototype. Per stage: coarse grid 1.6 s, each
+scan 3.2–3.4 s (prototype 1.2 s), first fit pass 9 s, painting pass 12 s
+(prototype 21 s per pass, no painting), contact sheets 1.2 s, publish 3.8 s.
 The first port took 3:11 at 16 workers and 11.9 GB; the speed-ups changed no
-output byte (CSV and contact sheets identical).
+output byte (CSV, contact sheets, and the label pyramid voxel for voxel).
 
 ## Limitations
 

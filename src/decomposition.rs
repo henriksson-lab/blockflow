@@ -195,9 +195,36 @@ pub struct PhaseDecomposition {
     /// still pipeline among themselves, the phases after it likewise, and the
     /// blocks within it still run concurrently.
     pub barrier: bool,
+    /// The value most of the image this phase writes holds, when its ops said:
+    /// a label image's `0`, a mask's `false`.
+    ///
+    /// **A storage property, not a binding one.** It changes no voxel: an
+    /// environment that honours it stores the image with this as its fill
+    /// value, so a chunk that is all background is never written and reads back
+    /// as the same values; one that ignores it writes those chunks. So it is not
+    /// fingerprinted and not carried over the distributed wire. What it trades
+    /// is the "unwritten reads loud" sentinel (`zarr_env::unwritten_fill`) for
+    /// this one image: a chunk nobody wrote reads as background, not as the
+    /// sentinel. Task coverage still guarantees every block is written.
+    ///
+    /// Set by `PlanBuilder` from `FragmentOp::background`, or carried through a
+    /// pixel chain by `constant_maps_to` from the image below.
+    pub background: Option<Background>,
     /// Cores, read extents and valid regions, derived and recorded.
     pub blocks: Vec<BlockGeometry>,
 }
+
+/// A background value, compared by its bits so a plan stays `Eq`.
+#[derive(Debug, Clone, Copy)]
+pub struct Background(pub f64);
+
+impl PartialEq for Background {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for Background {}
 
 impl PhaseDecomposition {
     /// Derive the geometry for one phase.
@@ -241,6 +268,7 @@ impl PhaseDecomposition {
             supplied_dtypes: Vec::new(),
             reads_input_image: true,
             barrier: false,
+            background: None,
             blocks,
         }
     }
@@ -648,6 +676,16 @@ impl Decomposition {
     }
     /// The element type of image `image`, folded from image 0: a phase that
     /// declares no `dtype` hands on the one it read.
+    /// The declared background of image `image`: `None` for the input and for
+    /// supplied images (their storage says), else the writing phase's
+    /// [`PhaseDecomposition::background`].
+    pub fn background_at(&self, image: usize) -> Option<f64> {
+        if image == 0 || is_supplied_image(image) {
+            return None;
+        }
+        self.phases.get(image - 1)?.background.map(|b| b.0)
+    }
+
     pub fn dtype_at(&self, image: usize) -> Dtype {
         if is_supplied_image(image) {
             // No phase writes it, so there is no chain to fold: the readers'

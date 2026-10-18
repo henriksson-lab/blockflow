@@ -1544,6 +1544,23 @@ fn run_task(
     // The IO layer's own event is emitted here, around the environment call,
     // because `Environment` is the narrow waist every byte this executor moves
     // goes through — one seam rather than emission scattered through `io/`.
+    // **The short circuit without a read.** Storage may know the fetch region
+    // is one value without decoding it — no chunk there, and the image's fill
+    // value is a background (`Environment::known_uniform`). Then the block is
+    // skipped before a byte is read, on the same licence as below.
+    if let Some(value) = env.known_uniform(task.phase, fetch) {
+        if let Some(constant) = fold_constant(phase, slots, value) {
+            events.emit(Event::BlockShortCircuited {
+                phase: task.phase,
+                index: task.index,
+                from: value,
+                to: constant,
+                slots: phase.slots.clone(),
+                names: phase.names.clone(),
+            });
+            return write_uniform_block(task, decomposition, env, events, n_phases, read, constant);
+        }
+    }
     let started = Instant::now();
     let mut buf = env.read(task.phase, fetch)?;
     let read_ns = started.elapsed().as_nanos() as u64;
@@ -1571,17 +1588,9 @@ fn run_task(
     // *declared* what that value maps to. A block whose core is empty but whose
     // halo is not can still produce non-empty output, which is why the
     // predicate is over the read extent.
-    let mut short_circuited = false;
     if let Some(value) = env.uniform(&buf) {
         if let Some(constant) = fold_constant(phase, slots, value) {
-            // Shaped and typed as the phase's *output*, not its input: a
-            // short-circuited block skips the work and must still produce the
-            // block the work would have produced.
-            let replacement =
-                env.constant(decomposition.dtype_at(task.phase + 1), read, constant)?;
             env.release(&buf);
-            buf = replacement;
-            short_circuited = true;
             events.emit(Event::BlockShortCircuited {
                 phase: task.phase,
                 index: task.index,
@@ -1590,88 +1599,86 @@ fn run_task(
                 slots: phase.slots.clone(),
                 names: phase.names.clone(),
             });
+            return write_uniform_block(task, decomposition, env, events, n_phases, read, constant);
         }
     }
 
     let mut side_written: Vec<(String, Region)> = Vec::new();
-    if !short_circuited {
-        // The images this phase's source leaves read, at **the same region**:
-        // a source leaf has reach 0, so what it reads is what the block already
-        // fetches, and `check_source_images` is what makes those the same
-        // integers by requiring the two images to be on one lattice.
-        //
-        // Read here rather than beside the input read for one reason: a block
-        // that short circuits has not looked at its input, and reading a second
-        // array for it would be paying for an arm nothing consumed. (Today a
-        // phase with a source leaf never short circuits — `Chain::Source`
-        // declines `constant_maps_to` — so this is a property of the code
-        // rather than of the plan, and worth keeping true by construction.)
-        // Priced exactly like the input read, through the same event, so a run
-        // that reads two arrays per block reports two arrays' worth of bytes. A
-        // second arm that cost nothing in the counters would make every
-        // measurement of this feature a measurement of the wrong plan.
-        let sources =
-            read_declared_source_images(phase, decomposition, env, events, task.index, fetch)?;
-        for (&slot, place) in phase.slots.iter().zip(&places) {
-            let started = Instant::now();
-            // **The offer, not a demand.** `slabs` is what the policy allots
-            // from the pool and the lattice; whether it is taken is the chain's
-            // to say, and a chain that has not declared itself sliceable runs
-            // uncut on this thread exactly as it always has. See
-            // `slab::apply_at_most`, and `EnvCounters::blocks_sliced` for what
-            // says afterwards which way it went.
-            let (next, _ran) = env.apply_sliced(slots[slot], &buf, &sources, place, slabs)?;
-            let duration_ns = started.elapsed().as_nanos() as u64;
-            // Side outputs, before the input buffer is released, because the op
-            // is handed both what it read and what it produced. The regions come
-            // from the *valid* region rather than the read extent: a side output
-            // is written once per output voxel, and the halo is read twice.
-            let declared = slots[slot].side_outputs(phase.volume());
-            if !declared.is_empty() {
-                let regions = declared
-                    .iter()
-                    .enumerate()
-                    .map(|(which, _)| {
-                        slots[slot].side_region(which, &task.geometry.valid, phase.volume())
-                    })
-                    .collect::<Result<Vec<Region>>>()?;
-                let within = task.geometry.valid_within_read();
-                let block = super::op::SideBlock {
-                    at: &place.input,
-                    within: &within,
-                    regions: &regions,
-                };
-                let produced = env.apply_side(slots[slot], &buf, &sources, &next, &block)?;
-                for ((output, region), extra) in declared.iter().zip(&regions).zip(produced.iter())
-                {
-                    env.write_side(output, task.phase, region, extra)?;
-                    env.release_side(extra);
-                    events.emit(Event::SideOutputWritten {
-                        phase: task.phase,
-                        index: task.index,
-                        output: output.name.clone(),
-                        region: region.clone(),
-                        bytes: region.voxels() as u64 * output.dtype.size_of() as u64,
-                    });
-                    side_written.push((output.name.clone(), region.clone()));
-                }
+    // The images this phase's source leaves read, at **the same region**:
+    // a source leaf has reach 0, so what it reads is what the block already
+    // fetches, and `check_source_images` is what makes those the same
+    // integers by requiring the two images to be on one lattice.
+    //
+    // Read here rather than beside the input read for one reason: a block
+    // that short circuits has not looked at its input, and reading a second
+    // array for it would be paying for an arm nothing consumed. (Today a
+    // phase with a source leaf never short circuits — `Chain::Source`
+    // declines `constant_maps_to` — so this is a property of the code
+    // rather than of the plan, and worth keeping true by construction.)
+    // Priced exactly like the input read, through the same event, so a run
+    // that reads two arrays per block reports two arrays' worth of bytes. A
+    // second arm that cost nothing in the counters would make every
+    // measurement of this feature a measurement of the wrong plan.
+    let sources =
+        read_declared_source_images(phase, decomposition, env, events, task.index, fetch)?;
+    for (&slot, place) in phase.slots.iter().zip(&places) {
+        let started = Instant::now();
+        // **The offer, not a demand.** `slabs` is what the policy allots
+        // from the pool and the lattice; whether it is taken is the chain's
+        // to say, and a chain that has not declared itself sliceable runs
+        // uncut on this thread exactly as it always has. See
+        // `slab::apply_at_most`, and `EnvCounters::blocks_sliced` for what
+        // says afterwards which way it went.
+        let (next, _ran) = env.apply_sliced(slots[slot], &buf, &sources, place, slabs)?;
+        let duration_ns = started.elapsed().as_nanos() as u64;
+        // Side outputs, before the input buffer is released, because the op
+        // is handed both what it read and what it produced. The regions come
+        // from the *valid* region rather than the read extent: a side output
+        // is written once per output voxel, and the halo is read twice.
+        let declared = slots[slot].side_outputs(phase.volume());
+        if !declared.is_empty() {
+            let regions = declared
+                .iter()
+                .enumerate()
+                .map(|(which, _)| {
+                    slots[slot].side_region(which, &task.geometry.valid, phase.volume())
+                })
+                .collect::<Result<Vec<Region>>>()?;
+            let within = task.geometry.valid_within_read();
+            let block = super::op::SideBlock {
+                at: &place.input,
+                within: &within,
+                regions: &regions,
+            };
+            let produced = env.apply_side(slots[slot], &buf, &sources, &next, &block)?;
+            for ((output, region), extra) in declared.iter().zip(&regions).zip(produced.iter()) {
+                env.write_side(output, task.phase, region, extra)?;
+                env.release_side(extra);
+                events.emit(Event::SideOutputWritten {
+                    phase: task.phase,
+                    index: task.index,
+                    output: output.name.clone(),
+                    region: region.clone(),
+                    bytes: region.voxels() as u64 * output.dtype.size_of() as u64,
+                });
+                side_written.push((output.name.clone(), region.clone()));
             }
-            env.release(&buf);
-            buf = next;
-            events.emit(Event::OpApplied {
-                phase: task.phase,
-                index: task.index,
-                slot,
-                op: slots[slot].display_name(),
-                over: read.clone(),
-                duration_ns,
-            });
         }
-        // After the last slot, not after the first: a phase may fuse several
-        // slots and any of them may hold a source leaf naming the same image.
-        for (_, stored) in &sources {
-            env.release(stored);
-        }
+        env.release(&buf);
+        buf = next;
+        events.emit(Event::OpApplied {
+            phase: task.phase,
+            index: task.index,
+            slot,
+            op: slots[slot].display_name(),
+            over: read.clone(),
+            duration_ns,
+        });
+    }
+    // After the last slot, not after the first: a phase may fuse several
+    // slots and any of them may hold a source leaf naming the same image.
+    for (_, stored) in &sources {
+        env.release(stored);
     }
 
     let within = task.geometry.valid_within_read();
@@ -1699,8 +1706,61 @@ fn run_task(
 
     Ok(TaskOutcome {
         valid: task.geometry.valid.clone(),
-        short_circuited,
+        short_circuited: false,
         side_written,
+        listener_faults: 0,
+    })
+}
+
+/// The output of a short-circuited block: every voxel `constant`.
+///
+/// Shaped and typed as the phase's *output*, not its input: a skipped block
+/// must still produce the block the work would have produced. When the output
+/// image's background is `constant`, nothing is written at all — a region never
+/// written reads back as its background — and the block is reported written,
+/// because as far as any reader can tell it was.
+fn write_uniform_block(
+    task: &super::graph::Task,
+    decomposition: &Decomposition,
+    env: &dyn Environment,
+    events: &Dispatch,
+    n_phases: usize,
+    read: &Region,
+    constant: f64,
+) -> Result<TaskOutcome> {
+    let valid = &task.geometry.valid;
+    if env
+        .background(task.phase + 1)
+        .is_none_or(|b| b.to_bits() != constant.to_bits())
+    {
+        let buf = env.constant(decomposition.dtype_at(task.phase + 1), read, constant)?;
+        let within = task.geometry.valid_within_read();
+        let started = Instant::now();
+        env.write(task.phase + 1, &within, valid, &buf)?;
+        let write_ns = started.elapsed().as_nanos() as u64;
+        env.release(&buf);
+        let write_bytes_per_voxel = decomposition.dtype_at(task.phase + 1).size_of() as u64;
+        events.emit(Event::RegionWritten {
+            sink: format!("level {}", task.phase + 1),
+            image: task.phase + 1,
+            index: Some(task.index),
+            region: valid.clone(),
+            voxels: valid.voxels(),
+            bytes: valid.voxels() as u64 * write_bytes_per_voxel,
+            chunks: chunks_touched(valid, &env.chunk_shape()),
+            duration_ns: write_ns,
+        });
+    }
+    events.emit(Event::BlockWritten {
+        phase: task.phase,
+        index: task.index,
+        valid: valid.clone(),
+        materialised: task.phase + 1 < n_phases,
+    });
+    Ok(TaskOutcome {
+        valid: valid.clone(),
+        short_circuited: true,
+        side_written: Vec::new(),
         listener_faults: 0,
     })
 }
@@ -1745,7 +1805,11 @@ fn read_declared_source_images(
 /// writes: everything else is discarded whichever order produced it, and a
 /// buffer shaped like a wide read extent (a fragment reach of whole blocks) is
 /// many times the region that matters.
-fn order_disagreement(first: &BlockOutput, second: &BlockOutput, within: &Region) -> Option<String> {
+fn order_disagreement(
+    first: &BlockOutput,
+    second: &BlockOutput,
+    within: &Region,
+) -> Option<String> {
     if first.fragments.len() != second.fragments.len() {
         return Some(format!(
             "{} fragment(s) rather than {}",
@@ -1958,7 +2022,8 @@ fn run_fragment_task(
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             op.apply_with(&view, SourceBlocks::new(&borrowed))?
         };
-        let disagreement = order_disagreement(&produced, &again, &task.geometry.valid_within_read());
+        let disagreement =
+            order_disagreement(&produced, &again, &task.geometry.valid_within_read());
         // Everything the second application allocated, and everything this block
         // holds, released before the refusal rather than after it: a run that
         // ends here still has to leave the residency counters meaning what they

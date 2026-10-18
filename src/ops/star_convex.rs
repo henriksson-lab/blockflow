@@ -1009,6 +1009,11 @@ impl FragmentOp for StarConvexLabelsOp {
         Dtype::U64
     }
 
+    /// Unlabelled voxels are `0`, and most voxels are unlabelled.
+    fn background(&self) -> Option<f64> {
+        Some(0.0)
+    }
+
     fn inputs(&self) -> Vec<FragmentInput> {
         vec![
             FragmentInput::own(&self.rows.0, self.rows.1).with_reach([1, 1, 1]),

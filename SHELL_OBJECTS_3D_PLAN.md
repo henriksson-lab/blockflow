@@ -188,3 +188,13 @@ Fit pass 19 s → 9 s (low machine load); whole run with bootstrap and publish
 71 s → ~45–49 s. Publish (label pyramid, 6–9 s) now dominates what is left;
 see `docs/GUIDE.md` §5 on why all-background label chunks are still written and
 read in full.
+
+### Backgrounds (2026-10-18)
+
+`PhaseDecomposition::background` (declared by `FragmentOp::background` or
+carried through pixel chains from `PlanBuilder::with_input_background`) makes
+the Zarr environment store an image with that fill value, skip unread a block
+whose chunks are all absent, and skip writing a uniform block equal to it. The
+painter and the label pyramid declare 0. On ND_WT_5_s1 the published label
+pyramid is voxel-identical, 204 instead of 1501 level-0 chunk files (39 → 8.9
+MB), publish 8.7 → 3.8 s; whole run 36 s.

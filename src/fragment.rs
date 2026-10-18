@@ -1344,6 +1344,15 @@ pub trait FragmentOp: Send + Sync {
         Vec::new()
     }
 
+    /// The value most of the image this op writes holds, if it writes pixels
+    /// and knows: a painter of labels says `Some(0.0)`. See
+    /// [`PhaseDecomposition::background`](crate::decomposition::PhaseDecomposition::background)
+    /// for what an environment does with it. `None`, the default, changes
+    /// nothing.
+    fn background(&self) -> Option<f64> {
+        None
+    }
+
     /// What this op does with values that straddle a seam. See [`SeamFold`].
     ///
     /// `None` means "has not said", and it is the default so that nothing that

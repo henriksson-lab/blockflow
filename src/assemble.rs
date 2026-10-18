@@ -104,7 +104,7 @@
 // holds an op *and* the phase index it was built for as two fields that can
 // disagree, which was the failure this is here to remove.
 
-use crate::decomposition::{
+use crate::decomposition::{Background, 
     check_block_constraints, check_dtypes, check_source_images, phase_traffic, price_phase,
     write_charge, Constraints, Decomposition, PhaseCost, PhaseDecomposition,
 };
@@ -540,6 +540,15 @@ pub struct PlanBuilder {
     /// the same reason `Decomposition::declare_dtypes` folds it: a fragment
     /// phase owns no slot, so nothing downstream can recover what it was handed.
     reads: Dtype,
+    /// The declared background of that image, folded the same way; see
+    /// [`PhaseDecomposition::background`].
+    reads_background: Option<f64>,
+}
+
+/// A chain's slots applied to a background, by `constant_maps_to`: `None`
+/// unless every slot says what the background becomes.
+fn fold_background(slots: &[&Chain], input: Option<f64>) -> Option<f64> {
+    slots.iter().try_fold(input?, |value, slot| slot.constant_maps_to(value))
 }
 
 impl PlanBuilder {
@@ -558,7 +567,17 @@ impl PlanBuilder {
             phases: Vec::new(),
             work: Vec::new(),
             reads: dtype,
+            reads_background: None,
         }
+    }
+
+    /// Declare the value most of image 0 holds (a label image's `0`), so that
+    /// pixel phases that map it to a constant carry a background forward. See
+    /// [`PhaseDecomposition::background`].
+    #[must_use]
+    pub fn with_input_background(mut self, value: f64) -> Self {
+        self.reads_background = Some(value);
+        self
     }
 
     /// The lattice the next phase will be cut on.
@@ -629,6 +648,7 @@ impl PlanBuilder {
             produced = slot.produces(produced)?;
         }
         let declared = (produced != self.reads).then_some(produced);
+        let background = fold_background(&slots, self.reads_background);
         let n = slots.len();
         drop(slots);
 
@@ -640,6 +660,7 @@ impl PlanBuilder {
             self.grid.clone(),
         );
         phase.dtype = declared;
+        phase.background = background.map(Background);
         self.slots_used += n;
         self.fragments.push(chain);
         self.reads = produced;
@@ -688,6 +709,7 @@ impl PlanBuilder {
             produced = slot.produces(produced)?;
         }
         phase.dtype = (produced != self.reads).then_some(produced);
+        phase.background = fold_background(&slots, self.reads_background).map(Background);
         for slot in &mut phase.slots {
             *slot += self.slots_used;
         }
@@ -1175,6 +1197,7 @@ impl PlanBuilder {
         if writes {
             let produced = op.produces(self.reads);
             phase.dtype = (produced != self.reads).then_some(produced);
+            phase.background = op.background().map(Background);
             self.reads = produced;
         }
         Ok(self.push(phase, Work::Fragments(op), writes))
@@ -1183,6 +1206,9 @@ impl PlanBuilder {
     /// The one place a phase and its kind are appended, so that there is no
     /// order for them to disagree about.
     fn push(&mut self, phase: PhaseDecomposition, work: Work, writes_an_image: bool) -> Phase {
+        if writes_an_image {
+            self.reads_background = phase.background.map(|b| b.0);
+        }
         let index = self.phases.len();
         self.phases.push(phase);
         self.work.push(work);

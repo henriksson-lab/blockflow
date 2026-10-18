@@ -262,14 +262,26 @@ on `examples/shell-objects-3d-ome-zarr` (SHELL_OBJECTS_3D_PLAN.md, "Speed").
 
 - **Uniform blocks.** The executor skips a block whose read extent (halo
   included) is one value when every op in the phase declares
-  `constant_maps_to(value)` (`strategy.rs`, "The short circuit"). The block is
-  still read and scanned, and a constant output block is still written.
-- **Known-empty chunks.** The chunk cache does not fetch a chunk its backend
-  reports `is_known_empty` (`cache.rs`, `ChunkFetcher`/`RegionSource`); the
-  block buffer is left zero there. Only synthetic sources implement it — the
-  Zarr backend does not, and a Zarr array written by a run has the *unwritten*
-  sentinel as fill value (`zarr_env::unwritten_fill`: `MAX` for integers, NaN
-  for floats), so an all-zero label chunk is written and read back in full.
+  `constant_maps_to(value)` (`strategy.rs`, "The short circuit").
+- **Backgrounds.** An image that is mostly one value (labels: 0) can say so:
+  `FragmentOp::background()` on the op that writes it, or
+  `PlanBuilder::with_input_background(v)` for image 0, carried through pixel
+  chains by `constant_maps_to`; it lands in
+  `PhaseDecomposition::background` (`Decomposition::background_at`). The Zarr
+  environment then stores that image with the background as fill value, so an
+  all-background chunk is never written; a block whose chunks are all absent is
+  reported by `Environment::known_uniform` and short-circuited **without being
+  read**; and a short-circuited block equal to the output's background
+  (`Environment::background`) is not written. Voxels are unchanged
+  (`tests/background.rs`). The price: for that image a chunk nobody wrote reads
+  as background rather than as the loud unwritten sentinel
+  (`zarr_env::unwritten_fill`: `MAX` for integers, NaN for floats), which every
+  other image keeps. Not carried over the distributed wire. The label pyramid
+  (`label_pyramid`) and `StarConvexLabelsOp` declare 0; other label writers do
+  not yet.
+- **Known-empty chunks in the cache.** The chunk cache does not fetch a chunk
+  its backend reports `is_known_empty` (`cache.rs`, `ChunkFetcher`/`RegionSource`)
+  and leaves zeros there; only synthetic sources implement it.
 - **Tile-aligned halos.** `TransformConvolveOp`/`TransformBankOp` declare
   `AxisReach::Aligned`: on a block edge that is a whole number of tiles the
   halo is the kernel's reach, otherwise it adds `tile - 1`. Pick block edges

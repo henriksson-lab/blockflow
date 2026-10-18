@@ -608,6 +608,25 @@ pub trait Environment: Sync {
     /// the short circuit — the safe default, matching `constant_maps_to`.
     fn uniform(&self, buf: &BlockBuf) -> Option<f64>;
 
+    /// Is every voxel of `region` of `image` known to be one value **without
+    /// reading it** — because storage holds no chunk there and the image's fill
+    /// value is that value? `None` means "not known", and the executor reads the
+    /// block as usual. An environment that cannot tell cheaply leaves this at
+    /// the default.
+    fn known_uniform(&self, _image: usize, _region: &Region) -> Option<f64> {
+        None
+    }
+
+    /// The value a region of `image` that is never written reads back as, when
+    /// the image was stored with a declared background
+    /// ([`PhaseDecomposition::background`](crate::decomposition::PhaseDecomposition::background)).
+    /// The executor skips writing a block that is uniformly this. `None` — the
+    /// default, and every image without a declared background — means every
+    /// block is written.
+    fn background(&self, _image: usize) -> Option<f64> {
+        None
+    }
+
     /// A block of `region`'s shape and `dtype`, every element `value`.
     ///
     /// `dtype` is an argument rather than an implicit for the same reason
