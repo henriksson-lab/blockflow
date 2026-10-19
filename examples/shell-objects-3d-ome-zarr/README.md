@@ -32,6 +32,16 @@ with `--bootstrap 0` there is one pass, and it paints.
 - `labels/<layer>`: `u64`, label = linear index of the candidate voxel + 1.
 - `tables/<layer>`: `label_id`, `centroid_*` (fitted centre clamped into the
   volume), `center_*` (unclamped), `diameter_um`, and the fit features.
+- unless `--no-features`, 63 rotation-invariant features per kept object
+  (`src/features.rs`), appended to `tables/<layer>` and written to
+  `<image>__<layer>.features.csv`: radial profile in shape-adapted radius,
+  wall step and thickness, radialness (gradient energy and structure-tensor
+  alignment along the radius), radial/tangential variograms, per-shell
+  statistics, tensor anisotropies, and spherical-harmonic band power of three
+  shells with the coherence of neighbouring shells. Measured host-side on a
+  level-0 window per object, in parallel; 1–1.5 s per object and thread. Unit
+  tests check invariance under an exact grid rotation and that spoke and grain
+  phantoms separate as expected.
 - `--out`: `<image>__<layer>.csv` (every candidate with its status),
   `.template.json`, `.accepted.png` / `.rejected.png` contact sheets, and with
   `--keep-rays` the per-ray radii of the published objects.
@@ -45,6 +55,14 @@ That keeps 54 objects instead of 44. By eye, 5 of the 10 added are real
 (mostly small cysts, r ≈ 19–24 voxels) and 5 are false positives (tissue
 folds and one holder-edge artifact), and none of the 44 is lost. The
 validation below used the old defaults.
+
+## All nedal images (2026-10-19)
+
+All 25 volumes, `--template` from ND_WT_5_s1 (the bootstrap rebuilds it per
+image), no candidate cap: 1 400–5 300 candidates and 19–424 kept objects per
+image, 3 781 in all; 40–120 s and 7–16 GB per image at 32 workers. The cap
+mattered: at 600 candidates ND_WT_5_s1 kept 54, uncapped 72. False positives
+(tissue blobs, dark cavities) are left in on purpose, for curation.
 
 ## Validation (ND_WT_5_s1, 2026-10-18)
 

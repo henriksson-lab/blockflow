@@ -13,9 +13,10 @@
 //! space; the stored spacing is used only for the µm columns of the table, and
 //! `--voxel-size` overrides it.
 
+mod features;
 mod sheet;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,7 @@ use blockflow::strategy::{execute_phases, Hints};
 use blockflow::table::{Column, Schema, Value};
 use blockflow::{AttachedImage, BlockGrid, Error, ImageId, PlanBuilder, Result, ZarrEnvironment};
 use clap::Parser;
+use rayon::prelude::*;
 
 const PEAKS: &str = "scan.peaks";
 const SCAN: &str = "scan.candidates";
@@ -88,7 +90,10 @@ struct Args {
     /// Lowest scan score kept as a candidate. Low on purpose: the fit decides.
     #[arg(long, default_value_t = 0.10)]
     min_score: f64,
-    #[arg(long, default_value_t = 600)]
+    /// Cap on candidates, strongest first. The scan rank predicts the fit
+    /// poorly: on dense nedal images kept objects still turn up in the last
+    /// quarter of 4000 candidates, so the default does not cap in practice.
+    #[arg(long, default_value_t = 100_000)]
     max_candidates: usize,
     /// Rebuild the template from this many of the best fits and rescan (0: off).
     #[arg(long, default_value_t = 12)]
@@ -142,6 +147,9 @@ struct Args {
     layer: String,
     #[arg(long)]
     no_publish: bool,
+    /// Skip the rotation-invariant features of the kept objects.
+    #[arg(long)]
+    no_features: bool,
     /// Also write the per-ray radii of the published objects to the output directory.
     #[arg(long)]
     keep_rays: bool,
@@ -397,6 +405,19 @@ fn main() -> Result<()> {
     }
 
     eprintln!("reports in {:.1}s", t.elapsed().as_secs_f64());
+    let features = if args.no_features {
+        BTreeMap::new()
+    } else {
+        let t = Instant::now();
+        let features = measure_features(&pyramid, &kept, &rays, volume)?;
+        write_features(&stem.with_extension("features.csv"), &features, volume)?;
+        eprintln!(
+            "features of {} objects in {:.1}s",
+            features.len(),
+            t.elapsed().as_secs_f64()
+        );
+        features
+    };
     if let Some((env, label_image, kept_phase)) = pass.publish {
         let t = Instant::now();
         publish(
@@ -406,6 +427,7 @@ fn main() -> Result<()> {
             label_image,
             kept_phase,
             &pass.schema,
+            &features,
             volume,
             voxel_size,
             &args,
@@ -868,6 +890,7 @@ fn publish(
     label_image: ImageId,
     kept_phase: usize,
     schema: &Schema,
+    features: &BTreeMap<[usize; 3], Vec<f64>>,
     volume: [usize; 3],
     voxel_size: [f64; 3],
     args: &Args,
@@ -904,6 +927,13 @@ fn publish(
             .iter()
             .map(|m| ColumnSpec::new(*m, DType::F32, ColumnRole::Measurement)),
     );
+    if !features.is_empty() {
+        columns.extend(
+            features::COLUMNS
+                .iter()
+                .map(|m| ColumnSpec::new(*m, DType::F32, ColumnRole::Measurement)),
+        );
+    }
     let tile_shape = vec![32, 256, 256];
     let spatial_index = SpatialIndexSpec {
         coordinates: ["z", "y", "x"]
@@ -951,6 +981,12 @@ fn publish(
             ));
             for &m in &measured {
                 values.push(ObjectValue::F32(row.f64(m)? as f32));
+            }
+            if !features.is_empty() {
+                let f = features
+                    .get(&row.at())
+                    .ok_or_else(|| Error::invalid(format!("no features for {:?}", row.at())))?;
+                values.extend(f.iter().map(|&v| ObjectValue::F32(v as f32)));
             }
             Ok(Some(values))
         },
@@ -1054,6 +1090,64 @@ fn write_rays(path: &Path, kept: &[&Object], rays: &RaySet, volume: [usize; 3]) 
             radii.join(",")
         )
         .map_err(Error::backend)?;
+    }
+    Ok(())
+}
+
+/// The features of every kept object, keyed by its candidate voxel, with the
+/// wall step also relative to the median over the volume's objects.
+fn measure_features(
+    pyramid: &OmeVolumePyramid,
+    kept: &[&Object],
+    rays: &RaySet,
+    volume: [usize; 3],
+) -> Result<BTreeMap<[usize; 3], Vec<f64>>> {
+    let extractor = features::Extractor::default();
+    let mut measured = kept
+        .par_iter()
+        .map(|o| {
+            let (start, shape) = features::window(o.shape.center, &o.shape.radii, volume);
+            let raw = pyramid
+                .attached_level(0)?
+                .read_region(start, shape)?
+                .widened();
+            let f = extractor.measure(
+                rays,
+                raw.view(),
+                start,
+                volume,
+                o.shape.center,
+                &o.shape.radii,
+            )?;
+            Ok((o.at, f))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let column = |name: &str| {
+        features::COLUMNS
+            .iter()
+            .position(|&c| c == name)
+            .expect("a feature column")
+    };
+    let (step, rel) = (column("wall_step"), column("wall_step_rel"));
+    let mut steps: Vec<f64> = measured.values().map(|f| f[step]).collect();
+    steps.sort_by(f64::total_cmp);
+    let typical = steps.get(steps.len() / 2).copied().unwrap_or(1.0).max(1.0);
+    for f in measured.values_mut() {
+        f[rel] = f[step] / typical;
+    }
+    Ok(measured)
+}
+
+fn write_features(
+    path: &Path,
+    features: &BTreeMap<[usize; 3], Vec<f64>>,
+    volume: [usize; 3],
+) -> Result<()> {
+    let mut f = fs::File::create(path).map_err(Error::backend)?;
+    writeln!(f, "label_id,{}", features::COLUMNS.join(",")).map_err(Error::backend)?;
+    for (at, values) in features {
+        let v: Vec<String> = values.iter().map(|x| format!("{x:.5}")).collect();
+        writeln!(f, "{},{}", shape_label(*at, volume), v.join(",")).map_err(Error::backend)?;
     }
     Ok(())
 }
