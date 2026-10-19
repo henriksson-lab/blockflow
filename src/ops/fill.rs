@@ -694,6 +694,12 @@ impl FragmentOp for LabelBackgroundOp {
 /// seams almost everywhere, and treating a seam as the outside would drain
 /// every hole that happened to be cut by one — which is precisely the
 /// decomposition-dependent answer this op exists to avoid.
+///
+/// **An axis of extent one has no outside.** A single plane stored as
+/// `[1, y, x]` has every voxel on both of its z faces, so counting those would
+/// drain every component and fill no hole in any 2-D image. A path cannot leave
+/// along an axis that has nowhere to go, so the plane's own edges are its only
+/// outside — the 2-D hole the caller means.
 pub fn outside_flags(
     labels: ArrayView3<'_, u32>,
     count: u32,
@@ -703,6 +709,9 @@ pub fn outside_flags(
 ) -> Vec<bool> {
     let mut flags = vec![false; count as usize];
     for axis in 0..3 {
+        if volume[axis] == 1 {
+            continue;
+        }
         for side in 0..2 {
             let local = if side == 0 { 0 } else { shape[axis] - 1 };
             let global = offset[axis] + local;
@@ -1180,6 +1189,27 @@ mod tests {
             }
         }
         mask
+    }
+
+    #[test]
+    fn a_ring_in_a_single_plane_fills_its_centre() {
+        // `[1, y, x]`: a 2-D image. The ring's centre is a hole of the plane;
+        // the singleton z axis is not a way out.
+        let mut mask = Array3::from_elem((1, 9, 9), false);
+        for y in 2..7 {
+            for x in 2..7 {
+                mask[[0, y, x]] = y == 2 || y == 6 || x == 2 || x == 6;
+            }
+        }
+        let filled = fill_whole(&mask);
+        assert!(filled[[0, 4, 4]], "the centre of a closed ring must fill");
+        assert!(!filled[[0, 0, 0]], "the plane's outside must stay clear");
+        assert!(filled[[0, 2, 2]]);
+
+        // open the ring at its edge: the centre now drains through the gap
+        mask[[0, 2, 4]] = false;
+        let filled = fill_whole(&mask);
+        assert!(!filled[[0, 4, 4]]);
     }
 
     #[test]

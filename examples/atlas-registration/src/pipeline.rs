@@ -26,7 +26,9 @@ use crate::compute::{
 };
 use crate::rescale::{Frame, Rescale};
 use crate::similarity::{similarity, Similarity};
-use crate::stochastic::{fit_stochastic, AffineMap, StochasticFitParams, StochasticLevelReport};
+use crate::stochastic::{
+    fit_stochastic, AffineMap, StochasticFitParams, StochasticInitialisation, StochasticLevelReport,
+};
 use crate::volume::{lattice_over, warp, write_image, Volume};
 use crate::{AtlasTransform, ElastixTransform, PointSpace, RegisterParams};
 
@@ -66,6 +68,92 @@ pub struct RegisterConfig {
     /// Also write the moving image warped after each stage, as
     /// `stage{N}_warped.ome.zarr` in `out` (stochastic stages).
     pub warped_stages: bool,
+    /// How the first stage starts (stochastic stages).
+    pub initialisation: Initialisation,
+}
+
+/// How a registration's first stage starts: where the moving image is taken
+/// to lie against the fixed one before the fit moves it. Later stages start
+/// from the stages before them.
+///
+/// The elastix equivalents: `Parameters` follows the file's
+/// `AutomaticTransformInitialization`; `Physical` is that setting `"false"`
+/// (the images' physical frames as they stand, elastix's identity); `Centre`
+/// is `"true"` with `AutomaticTransformInitializationMethod
+/// "GeometricalCenter"`; `Translation` is the physical frames with an initial
+/// translation, as elastix's `-t0` with a translation file, except that the
+/// translation is the first stage's starting value rather than a separate
+/// transform (so it is fitted with it, and written into its file).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Initialisation {
+    #[default]
+    Parameters,
+    Physical,
+    Centre,
+    /// `[z, y, x]` in the images' physical unit: the fixed image's point `p`
+    /// starts at the moving image's point `p + t`.
+    Translation([f64; 3]),
+}
+
+impl Initialisation {
+    /// `parameters`, `physical`, `centre` (or `center`).
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "parameters" | "file" => Ok(Self::Parameters),
+            "physical" | "origins" => Ok(Self::Physical),
+            "centre" | "center" | "geometricalcenter" => Ok(Self::Centre),
+            other => Err(Error::invalid(format!(
+                "initialisation `{other}`: parameters, physical or centre"
+            ))),
+        }
+    }
+
+    /// The sidecar's record of it.
+    pub fn to_json(self) -> Value {
+        match self {
+            Self::Parameters => json!("parameters"),
+            Self::Physical => json!("physical"),
+            Self::Centre => json!("centre"),
+            Self::Translation(t) => json!({ "translation": t }),
+        }
+    }
+
+    /// Apply to the first stochastic stage on a lattice of `spacing`: the
+    /// stage's initialisation, and the explicit starting parameters (fixed
+    /// lattice voxels, `ops::align`'s internal layout) for a translation.
+    fn apply(
+        self,
+        params: &mut StochasticFitParams,
+        spacing: [f64; 3],
+    ) -> Result<Option<Vec<f64>>> {
+        match self {
+            Self::Parameters => Ok(None),
+            Self::Physical => {
+                params.initialisation = StochasticInitialisation::Identity;
+                Ok(None)
+            }
+            Self::Centre => {
+                params.initialisation = StochasticInitialisation::GeometricCentre;
+                Ok(None)
+            }
+            Self::Translation(t) => {
+                params.initialisation = StochasticInitialisation::Identity;
+                let voxels: [f64; 3] = std::array::from_fn(|a| t[a] / spacing[a]);
+                match params.model {
+                    TransformModel::Translation => Ok(Some(voxels.to_vec())),
+                    TransformModel::Affine => {
+                        let mut values = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+                        values.extend(voxels);
+                        Ok(Some(values))
+                    }
+                    TransformModel::BSpline => Err(Error::invalid(
+                        "an initial translation needs a translation or affine first stage, not a \
+                         B-spline",
+                    )),
+                }
+            }
+        }
+    }
 }
 
 /// One fit stage.
@@ -141,6 +229,10 @@ pub fn register(config: &RegisterConfig) -> Result<RegisterSummary> {
         })
         .collect();
     match (native.is_empty(), stochastic.is_empty()) {
+        (false, true) if config.initialisation != Initialisation::Parameters => Err(Error::invalid(
+            "register: an initialisation other than the parameters' applies to stochastic stages \
+             (elastix parameter files with a stochastic optimiser) only",
+        )),
         (false, true) => register_native(config, &native),
         (true, false) => register_stochastic(config, &stochastic),
         _ => Err(Error::invalid(
@@ -431,13 +523,18 @@ fn register_stochastic(
         if params.workers == 0 {
             params.workers = config.workers;
         }
+        let initial = if index == 0 {
+            config.initialisation.apply(&mut params, lattice.scale)?
+        } else {
+            None
+        };
         let fit = fit_stochastic(
             &params,
             fixed_f32.view(),
             moving_f32.view(),
             &pre,
             &prior,
-            None,
+            initial,
             frame.clone(),
         )?;
         lap(&format!("stage{index}_fit_s"), &mut timings);
@@ -519,6 +616,7 @@ fn register_stochastic(
         "transform": transform_file.file_name().and_then(|n| n.to_str()),
         "direction": "fixed physical -> moving physical",
         "optimizer": "stochastic",
+        "initialisation": config.initialisation.to_json(),
         "timings": timings,
         "fixed": side_json(&config.fixed, &fixed, fixed_level),
         "moving": side_json(&config.moving, &moving, moving_level),
@@ -564,6 +662,9 @@ pub struct ChainConfig {
     pub warped_stages: bool,
     /// Write each step's moving image warped onto its fixed lattice.
     pub warped: bool,
+    /// Per step, how its first stage starts; a step beyond the list follows
+    /// its parameters.
+    pub initialisation: Vec<Initialisation>,
 }
 
 /// Run every step of a chain into `out/step{k}/` and write `out/chain.json`.
@@ -594,6 +695,11 @@ pub fn register_chain(config: &ChainConfig) -> Result<Vec<RegisterSummary>> {
             block: config.block,
             workers: config.workers,
             warped_stages: config.warped_stages,
+            initialisation: config
+                .initialisation
+                .get(index)
+                .copied()
+                .unwrap_or_default(),
         })?;
         summaries.push(summary);
         names.push(name);

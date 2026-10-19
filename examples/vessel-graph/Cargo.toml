@@ -6,11 +6,20 @@ license = "MIT"
 publish = false
 description = "Vessel segmentation, skeleton-to-graph extraction, graph cleanup, radii, artery/vein classification and branch density."
 
+[features]
+default = []
+# The reference's deep vessel filling CNN (`segment::deep_fill`), on burn's CPU
+# backend. Off by default so the default build, and CI's `members` job, do not
+# compile burn.
+deep-fill = ["dep:burn"]
+
 [dependencies]
 blockflow = { path = "../..", features = ["zarr"] }
+burn = { version = "0.22.0-pre.2", default-features = false, features = ["std", "flex"], optional = true }
 atlas-regions = { path = "../../crates/atlas-regions", features = ["zarr"] }
 blockflow-atlas-registration = { path = "../atlas-registration" }
 clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
 ndarray = "0.17"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

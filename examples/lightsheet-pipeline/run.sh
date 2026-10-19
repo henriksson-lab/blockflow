@@ -50,6 +50,8 @@ FUSE_LEVEL=2                        # level of the whole fused volume (registrat
 REGISTRATION_RESOLUTION=25
 SIGNAL_TO_AUTO="align_affine.txt"
 AUTO_TO_ATLAS="align_affine.txt align_bspline.txt"
+SIGNAL_TO_AUTO_INITIAL=""           # how signal -> auto starts: empty (the file's: centres),
+                                    #   physical, centre, or Z,Y,X (an initial translation, um)
 REGISTRATION_ARGS=""
 # cells
 CELLS=0
@@ -130,6 +132,11 @@ if want register && ! done_or_force "$CHAIN/chain.json"; then
     params=()
     for f in $SIGNAL_TO_AUTO; do params+=(--parameters "0=$ALIGNMENT_DIR/$f"); done
     for f in $AUTO_TO_ATLAS; do params+=(--parameters "1=$ALIGNMENT_DIR/$f"); done
+    case "$SIGNAL_TO_AUTO_INITIAL" in
+        "") ;;
+        parameters|physical|centre|center) params+=(--initialise "0=$SIGNAL_TO_AUTO_INITIAL") ;;
+        *) params+=(--initial-translation "0=$SIGNAL_TO_AUTO_INITIAL") ;;
+    esac
     # shellcheck disable=SC2086
     stage register "$CHAIN" "$BIN/atlas-registration" chain \
         --image "$FUSED" --image "$SAMPLE/$AUTOFLUORESCENCE" --image "$ATLAS" \

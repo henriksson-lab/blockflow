@@ -548,11 +548,16 @@ impl VesselGraph {
         Ok(graph)
     }
 
+    /// [`Self::to_json`] written to `path`, streamed: the same text, without
+    /// the document tree in memory.
     pub fn write_json(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let text = serde_json::to_string(&self.to_json())
+        let file = std::fs::File::create(path)
+            .map_err(|error| Error::invalid(format!("writing {}: {error}", path.display())))?;
+        let mut out = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut out, &JsonGraph(self))
             .map_err(|error| Error::invalid(format!("serialising the vessel graph: {error}")))?;
-        std::fs::write(path, text)
+        std::io::Write::flush(&mut out)
             .map_err(|error| Error::invalid(format!("writing {}: {error}", path.display())))
     }
 
@@ -664,5 +669,64 @@ impl Factors {
                 "a radius column of width {width}; radii are scalar or per axis."
             ))),
         }
+    }
+}
+
+/// [`VesselGraph::to_json`]'s document as a serialiser: the same keys in the
+/// same order, each value serialised as `json!` would have built it (serde's
+/// `f64` serialiser writes a non-finite number as `null`, as `json!` makes it).
+struct JsonGraph<'a>(&'a VesselGraph);
+
+/// One level's columns, `{name: {"width": w, "values": [...]}}` by name.
+struct JsonLevel<'a>(&'a BTreeMap<String, Column>);
+
+struct JsonColumn<'a>(&'a Column);
+
+impl serde::Serialize for JsonGraph<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let graph = self.0;
+        let mut map = serializer.serialize_map(Some(10))?;
+        map.serialize_entry("format", "vessel-graph")?;
+        map.serialize_entry("version", &1)?;
+        map.serialize_entry("volume", &graph.volume)?;
+        map.serialize_entry("n_vertices", &graph.n_vertices)?;
+        map.serialize_entry("n_points", &graph.n_points)?;
+        map.serialize_entry("edges", &graph.edges)?;
+        map.serialize_entry("polylines", &graph.polylines)?;
+        map.serialize_entry("vertex", &JsonLevel(&graph.vertex))?;
+        map.serialize_entry("edge", &JsonLevel(&graph.edge))?;
+        map.serialize_entry("along", &JsonLevel(&graph.along))?;
+        map.end()
+    }
+}
+
+impl serde::Serialize for JsonLevel<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, column) in self.0 {
+            map.serialize_entry(name, &JsonColumn(column))?;
+        }
+        map.end()
+    }
+}
+
+impl serde::Serialize for JsonColumn<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("width", &self.0.width())?;
+        map.serialize_entry("values", self.0.values())?;
+        map.end()
     }
 }

@@ -14,7 +14,9 @@ use blockflow_vessel_graph::graph::cli::{run_graph, GraphArgs};
 use blockflow_vessel_graph::graph::{vessel_graph, GraphParams, GraphTables, Inputs, VesselGraph};
 use blockflow_vessel_graph::segment::cli::{run_segment, run_tract, SegmentArgs, TractArgs};
 use blockflow_vessel_graph::segment::synthetic::vessel_volume;
-use blockflow_vessel_graph::segment::{segment, tract_map, ChannelRole, TractParams};
+use blockflow_vessel_graph::segment::{
+    segment, tract_map, ChannelParams, ChannelRole, TractParams,
+};
 use clap::Parser;
 use ndarray::Array3;
 use zarrs::array::{data_type, Array, ArrayBuilder, ArraySubset, FillValue};
@@ -161,20 +163,23 @@ fn segment_publishes_the_in_memory_answer_for_two_channels() {
     // The fixture's background sits at 1000, the top of the vessel role's
     // clip range; the file moves the vessel channel's range up and leaves the
     // artery channel at its role's defaults.
-    let params = dir.join("params.json");
+    let params_path = dir.join("params.json");
     fs::write(
-        &params,
+        &params_path,
         r#"{"channels": [{"role": "vessel", "clip_range": [400, 60000]}, {"role": "artery"}]}"#,
     )
     .unwrap();
+    // Without the deep filling, which a `deep-fill` build switches on by
+    // default and which needs the trained weights.
     let parsed = Segment::parse_from([
         "segment",
+        "--no-deep-fill",
         "--zarr",
         image.to_str().unwrap(),
         "--channel",
         "0,1",
         "--params",
-        params.to_str().unwrap(),
+        params_path.to_str().unwrap(),
         "--block",
         "10,20,24",
         "--workers",
@@ -192,7 +197,13 @@ fn segment_publishes_the_in_memory_answer_for_two_channels() {
     let (params, roles) = parsed.args.params_and_roles().unwrap();
     assert_eq!(roles, [ChannelRole::Vessel, ChannelRole::Artery]);
     assert_eq!(params.channels[0].binarize.clip.range, (400.0, 60000.0));
-    assert_eq!(params.channels[1], ChannelRole::Artery.channel());
+    assert_eq!(
+        params.channels[1],
+        ChannelParams {
+            deep_fill: None,
+            ..ChannelRole::Artery.channel()
+        }
+    );
     let expected = segment(channels.to_vec(), &params, [20, 40, 48]).unwrap();
     let mask = read_label(&image, "vessel-mask");
     let skeleton = read_label(&image, "vessel-skeleton");
@@ -211,6 +222,34 @@ fn segment_publishes_the_in_memory_answer_for_two_channels() {
         "the artery mask is part of the union"
     );
     assert!(!dir.join("work").exists(), "the work directory is removed");
+
+    // The thinning over stored images, a round per phase, gives the same
+    // skeleton as the resident fixed point.
+    let stored = Segment::parse_from([
+        "segment",
+        "--no-deep-fill",
+        "--zarr",
+        image.to_str().unwrap(),
+        "--channel",
+        "0,1",
+        "--params",
+        params_path.to_str().unwrap(),
+        "--block",
+        "10,20,24",
+        "--workers",
+        "2",
+        "--thin-memory-mb",
+        "0",
+        "--work",
+        dir.join("work").to_str().unwrap(),
+    ]);
+    run_segment(&stored.args).expect("the run with stored thinning");
+    assert_eq!(read_label(&image, "vessel-mask"), mask);
+    assert_eq!(read_label(&image, "vessel-skeleton"), skeleton);
+    assert_eq!(read_label(&image, "vessel-artery-mask"), artery);
+    for leftover in ["work", "work.thin", "work.skeleton"] {
+        assert!(!dir.join(leftover).exists(), "{leftover} is removed");
+    }
 
     // `graph` reads back what `segment` published and builds the graph the
     // library builds from the in-memory answer, with the artery mask found by

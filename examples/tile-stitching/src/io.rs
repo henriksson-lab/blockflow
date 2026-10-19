@@ -20,18 +20,22 @@
 //! `grid[d]` is the tile's index along `grid_axes[d]`; `overlap[d]` is the
 //! nominal overlap in voxels along that axis. Instead of `overlap`, every tile
 //! may carry `"position": [z, y, x]`, its nominal stage position in voxels.
-//! Paths are relative to the JSON file.
+//! With positions, `"neighbours": "boxes"` finds the pairs to align from the
+//! tiles' overlapping boxes ([`TileLayout::from_boxes`]) instead of from grid
+//! indices, and `grid` may then be left out; that is the default when some
+//! tile has no `grid`. Paths are relative to the JSON file.
 
 use std::path::{Path, PathBuf};
 
 use blockflow::error::{Error, Result};
 use blockflow::ome_zarr::OmeVolumePyramid;
 use blockflow::voxels::Voxels;
-use blockflow::zarr_env::{PhysicalFrame, PyramidSpec, ZarrEnvironment};
+use blockflow::zarr_env::PhysicalFrame;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::layout::{TileLayout, TileSource};
+use crate::pyramid::{pyramid_factors, write_resident};
 use crate::wobbly::{source_status_name, status_name};
 use crate::{Aligned, Stitched};
 
@@ -42,12 +46,36 @@ pub struct TileSetFile {
     pub grid_axes: Vec<String>,
     #[serde(default)]
     pub overlap: Option<Vec<isize>>,
+    /// How alignment pairs are found: from grid indices or from boxes.
+    #[serde(default)]
+    pub neighbours: Option<Neighbours>,
     pub tiles: Vec<TileEntry>,
+}
+
+/// Which tiles are aligned with which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Neighbours {
+    /// Tiles one step apart on the grid.
+    Grid,
+    /// Tiles whose boxes at their positions overlap.
+    Boxes,
+}
+
+impl Neighbours {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Grid => "grid",
+            Self::Boxes => "boxes",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TileEntry {
     pub path: PathBuf,
+    /// Empty when the tile has no grid index (neighbours from boxes).
+    #[serde(default)]
     pub grid: Vec<isize>,
     #[serde(default)]
     pub position: Option<[isize; 3]>,
@@ -99,13 +127,22 @@ impl TileSetFile {
                 tile_position: tile.grid.clone(),
             })
             .collect::<Vec<_>>();
+        let neighbours = self.neighbours();
         if self.tiles.iter().all(|tile| tile.position.is_some()) {
             let positions = self
                 .tiles
                 .iter()
                 .map(|tile| tile.position.expect("checked"))
                 .collect();
-            return TileLayout::with_positions(sources, positions, &grid_axes);
+            return match neighbours {
+                Neighbours::Grid => TileLayout::with_positions(sources, positions, &grid_axes),
+                Neighbours::Boxes => TileLayout::from_boxes(sources, positions, &grid_axes),
+            };
+        }
+        if neighbours == Neighbours::Boxes {
+            return Err(Error::invalid(
+                "neighbours from boxes need a `position` for every tile",
+            ));
         }
         let overlap = self.overlap.as_ref().ok_or_else(|| {
             Error::invalid(
@@ -113,6 +150,17 @@ impl TileSetFile {
             )
         })?;
         TileLayout::on_grid(sources, overlap, &grid_axes)
+    }
+
+    /// How the pairs are found: as given, else from boxes when some tile has
+    /// no grid index, else from the grid.
+    pub fn neighbours(&self) -> Neighbours {
+        self.neighbours
+            .unwrap_or(if self.tiles.iter().any(|tile| tile.grid.is_empty()) {
+                Neighbours::Boxes
+            } else {
+                Neighbours::Grid
+            })
     }
 
     /// The nominal overlap along each grid axis, for the projection depth.
@@ -245,23 +293,15 @@ pub fn write_volume_at(
             root.display()
         )));
     }
-    let shape = volume.shape();
     // Halve y and x per level, and z too while it stays at least as finely
-    // sampled as the plane.
-    let mut factors = Vec::new();
-    let mut extent = shape;
-    for _ in 1..levels {
-        if extent[1] < 64 && extent[2] < 64 {
-            break;
-        }
-        let z = if extent[0] >= 64 { 2 } else { 1 };
-        factors.push([z, 2, 2]);
-        extent = [extent[0] / z, extent[1] / 2, extent[2] / 2];
-    }
-    let spec = PyramidSpec::new(factors)?
-        .with_physical(PhysicalFrame::new(voxel_size, unit).with_origin(translation));
-    ZarrEnvironment::build_multiscale(root, volume, &spec)?;
-    Ok(())
+    // sampled as the plane; written chunk-parallel (`crate::pyramid`).
+    let factors = pyramid_factors(volume.shape(), levels);
+    write_resident(
+        root,
+        volume,
+        &factors,
+        Some(PhysicalFrame::new(voxel_size, unit).with_origin(translation)),
+    )
 }
 
 /// The fitted positions as JSON: every tile's nominal and rigid position, its

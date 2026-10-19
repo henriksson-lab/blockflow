@@ -86,26 +86,13 @@ pub struct PairAlignment2 {
     pub quality: f64,
 }
 
-/// The volume axis alignment `index` is tiled along: the first grid axis on
-/// which the two tiles' grid positions differ, mapped to its volume axis.
+/// The volume axis alignment `index` is tiled along: for grid neighbours,
+/// the grid axis their grid positions differ on; for neighbours found from
+/// boxes, the axis their boxes were found offset along.
 pub fn mip_axis(layout: &TileLayout, index: usize) -> Result<usize> {
-    let alignment = layout
-        .alignments()
-        .get(index)
-        .ok_or_else(|| Error::invalid(format!("no alignment {index}")))?;
-    let pre = &layout.sources()[alignment.pre].tile_position;
-    let post = &layout.sources()[alignment.post].tile_position;
-    let grid_axis = pre
-        .iter()
-        .zip(post)
-        .position(|(left, right)| left != right)
-        .ok_or_else(|| {
-            Error::invalid(
-                "the two tiles of an alignment sit at the same grid position, so there is no axis \
-                 to project along",
-            )
-        })?;
-    Ok(layout.grid_axes()[grid_axis])
+    layout
+        .tiling_axis(index)
+        .ok_or_else(|| Error::invalid(format!("no alignment {index}")))
 }
 
 /// The plane range the correlation window is taken from, clamped to the tile.

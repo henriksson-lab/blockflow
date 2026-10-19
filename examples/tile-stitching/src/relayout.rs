@@ -11,10 +11,13 @@
 //! fuse any box at level 0, reading only the tiles and planes that box needs.
 //!
 //! **Levels.** A level `L'` position is the level `L` one times
-//! `f = s_L / s_L'` per axis, rounded. The wobble axis (z) must keep its voxel
-//! size, since the per-slice placement is per plane. With integer `f` (going
-//! to a finer level) the positions are exact multiples, so the two fused frames
-//! agree exactly.
+//! `f = s_L / s_L'` per axis, rounded. The per-slice placement is per plane,
+//! so along the wobble axis (z) `f` must be 1 or, for a pyramid that halves z
+//! too, a whole number: each stored plane `k` then stands for the finer
+//! level's planes `f k .. f k + f - 1`, at `f` times its z position plus
+//! `0 .. f - 1` and its in-plane position. With integer `f` (going to a finer
+//! level) the positions are exact multiples, so the two fused frames agree
+//! exactly.
 //!
 //! **Frame.** The fused volume's physical frame is that of its first tile:
 //! fused voxel `u` is at `t_0 + s (u - (a_0 - o) + c)` per axis, with `t_0`
@@ -29,12 +32,18 @@
 use std::path::{Path, PathBuf};
 
 use blockflow::error::{Error, Result};
+use blockflow::ome_zarr::OmeVolumePyramid;
 use blockflow::region::Region;
-use blockflow::voxels::Voxels;
+use blockflow::voxels::{VoxelElement, Voxels};
+use blockflow::zarr_env::{chunk_for_block, PhysicalFrame};
+use blockflow::Dtype;
+use ndarray::{Array3, Axis};
 use serde_json::Value;
 
 use crate::fuse::{fuse_region, FuseParams, PlacedSource, Placement};
 use crate::io::read_tile;
+use crate::planned::{fuse_planned, stored_chunk, PlannedStats, TileSource};
+use crate::pyramid::{pyramid_factors, slab_rows, sweep_axis, PyramidWriter};
 use crate::wobbly::SourceStatus;
 
 /// One tile of a stored layout.
@@ -178,7 +187,9 @@ impl StoredLayout {
     }
 
     /// The same layout for tiles of `shapes` at `voxel_size`: in-plane
-    /// positions and the origin scaled by the voxel-size ratio and rounded.
+    /// positions and the origin scaled by the voxel-size ratio and rounded;
+    /// along z the same voxel size, or a finer one by a whole factor (each
+    /// plane repeated for the planes it covers).
     pub fn rescaled(&self, voxel_size: [f64; 3], shapes: &[[usize; 3]]) -> Result<Self> {
         if shapes.len() != self.tiles.len() {
             return Err(Error::invalid(format!(
@@ -188,13 +199,16 @@ impl StoredLayout {
             )));
         }
         let factor: [f64; 3] = std::array::from_fn(|a| self.voxel_size[a] / voxel_size[a]);
-        if (factor[0] - 1.0).abs() > 1e-9 {
+        let planes = factor[0].round();
+        if planes < 1.0 || (factor[0] - planes).abs() > 1e-6 {
             return Err(Error::invalid(format!(
                 "the layout's z voxel size is {} and the tiles' is {}; the per-slice placement \
-                 is per plane, so z must keep its voxel size",
+                 is per plane, so z must keep its voxel size or be finer by a whole factor",
                 self.voxel_size[0], voxel_size[0]
             )));
         }
+        let planes = planes as usize;
+        let z_offset = self.z_offset * planes;
         let scale = |value: i64, axis: usize| (value as f64 * factor[axis]).round() as i64;
         let tiles = self
             .tiles
@@ -202,35 +216,45 @@ impl StoredLayout {
             .zip(shapes)
             .enumerate()
             .map(|(index, (tile, &shape))| {
-                if shape[0] < self.z_offset + tile.shape[0] {
+                // A finer level's last stored plane may stand for planes the
+                // tile does not have (an odd count halved rounds up).
+                let count = (tile.shape[0] * planes).min(shape[0].saturating_sub(z_offset));
+                if count + planes <= tile.shape[0] * planes || count == 0 {
                     return Err(Error::invalid(format!(
                         "tile {index} has {} planes at this level and the layout places planes \
                          {}..{}",
                         shape[0],
-                        self.z_offset,
-                        self.z_offset + tile.shape[0]
+                        z_offset,
+                        z_offset + tile.shape[0] * planes
                     )));
                 }
+                let positions = (0..count)
+                    .map(|k| {
+                        let p = tile.positions[k / planes];
+                        [
+                            p[0] * planes as i64 + (k % planes) as i64,
+                            scale(p[1], 1),
+                            scale(p[2], 2),
+                        ]
+                    })
+                    .collect();
+                let status = (0..count).map(|k| tile.status[k / planes]).collect();
                 Ok(StoredTile {
                     path: tile.path.clone(),
-                    shape: [tile.shape[0], shape[1], shape[2]],
-                    positions: tile
-                        .positions
-                        .iter()
-                        .map(|p| [p[0], scale(p[1], 1), scale(p[2], 2)])
-                        .collect(),
-                    status: tile.status.clone(),
+                    shape: [count, shape[1], shape[2]],
+                    positions,
+                    status,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             tiles,
             origin: [
-                self.origin[0],
+                self.origin[0] * planes as i64,
                 scale(self.origin[1], 1),
                 scale(self.origin[2], 2),
             ],
-            z_offset: self.z_offset,
+            z_offset,
             voxel_size,
         })
     }
@@ -268,6 +292,12 @@ impl StoredLayout {
         Placement::new(0, sources)
     }
 
+    /// Every tile's every plane at its position minus the origin: the frame
+    /// [`Self::fuse`] fuses in.
+    pub fn fused_placement(&self) -> Result<Placement> {
+        self.placement(None)
+    }
+
     /// The first tile's anchor: the fused position of its plane 0 along z, its
     /// median per-slice position in-plane (before the origin is subtracted).
     pub fn anchor(&self) -> [i64; 3] {
@@ -299,10 +329,165 @@ impl StoredLayout {
             .collect()
     }
 
+    /// Every tile's level `level` (channel `channel`) as a source for
+    /// [`crate::planned::fuse_planned`], and the tiles' element type.
+    pub fn tile_sources(&self, channel: usize, level: usize) -> Result<(Vec<TileSource>, Dtype)> {
+        let mut dtype = None;
+        let sources = self
+            .tiles
+            .iter()
+            .map(|tile| {
+                let pyramid = OmeVolumePyramid::open(&tile.path, channel, 0)?;
+                let image = pyramid.attached_level(level)?;
+                let (element, shape) = image.metadata()?;
+                if shape[1..] != tile.shape[1..] || shape[0] < self.z_offset + tile.shape[0] {
+                    return Err(Error::invalid(format!(
+                        "{} is {shape:?} at level {level} and the layout expects planes {}..{} \
+                         of {:?} in-plane",
+                        tile.path.display(),
+                        self.z_offset,
+                        self.z_offset + tile.shape[0],
+                        &tile.shape[1..]
+                    )));
+                }
+                match dtype {
+                    None => dtype = Some(element),
+                    Some(first) if first != element => {
+                        return Err(Error::invalid(format!(
+                            "{} holds {} and the first tile {}; fusion needs one element type",
+                            tile.path.display(),
+                            element.numpy_name(),
+                            first.numpy_name()
+                        )))
+                    }
+                    Some(_) => {}
+                }
+                let path = &pyramid
+                    .levels()
+                    .get(level)
+                    .ok_or_else(|| Error::invalid(format!("no level {level}")))?
+                    .path;
+                Ok(TileSource {
+                    image,
+                    offset: [self.z_offset, 0, 0],
+                    chunk: stored_chunk(pyramid.image_root(), path),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((sources, dtype.expect("a stored layout has tiles")))
+    }
+
+    fn region_or_whole(&self, region: Option<&Region>) -> Result<Region> {
+        let shape = self.shape()?;
+        Ok(match region {
+            Some(region) => {
+                region.check_within(&shape, "fused region")?;
+                region.clone()
+            }
+            None => Region::new(&[0, 0, 0], &shape),
+        })
+    }
+
     /// Fuse `region` of the fused volume (all of it when `None`), reading only
-    /// the tiles and planes it needs from `level` of each tile. Voxels no tile
-    /// covers are zero.
+    /// the tiles and planes it needs from `level` of each tile, planned
+    /// ([`crate::planned`]) and held in memory. Voxels no tile covers are
+    /// zero.
     pub fn fuse(
+        &self,
+        params: &FuseParams,
+        region: Option<&Region>,
+        channel: usize,
+        level: usize,
+    ) -> Result<Voxels> {
+        let region = self.region_or_whole(region)?;
+        let placement = self.placement(None)?;
+        let (sources, dtype) = self.tile_sources(channel, level)?;
+        let shape = [region.shape[0], region.shape[1], region.shape[2]];
+        let axis = sweep_axis(shape, dtype);
+        let chunk = chunk_for_block(shape, dtype);
+        let rows = slab_rows(shape, chunk, axis, dtype);
+        blockflow::dtype_dispatch!(
+            dtype,
+            |Element| {
+                let mut out = Array3::<Element>::from_elem(shape, Element::from_f64(0.0));
+                let mut at = 0;
+                fuse_planned::<Element>(
+                    params,
+                    &placement,
+                    &sources,
+                    &region,
+                    axis,
+                    rows,
+                    chunk,
+                    |slab| {
+                        let n = slab.len_of(Axis(axis));
+                        out.slice_axis_mut(Axis(axis), ndarray::Slice::from(at..at + n))
+                            .assign(&slab);
+                        at += n;
+                        Ok(())
+                    },
+                )?;
+                Ok(Element::wrap(out))
+            },
+            f16 => Err(Error::invalid("float16 tiles cannot be fused"))
+        )
+    }
+
+    /// [`Self::fuse`] written straight into a multiscale OME-Zarr image at
+    /// `root` (which must not exist) with `levels` levels: slab by slab, never
+    /// holding the output whole. The image is byte for byte the one
+    /// [`crate::io::write_volume_at`] writes for [`Self::fuse`]'s volume.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fuse_to_zarr(
+        &self,
+        params: &FuseParams,
+        region: Option<&Region>,
+        channel: usize,
+        level: usize,
+        root: &Path,
+        levels: usize,
+        frame: PhysicalFrame,
+    ) -> Result<(PlannedStats, [usize; 3])> {
+        if root.exists() {
+            return Err(Error::invalid(format!(
+                "{} exists; remove it or choose another output",
+                root.display()
+            )));
+        }
+        let region = self.region_or_whole(region)?;
+        let placement = self.placement(None)?;
+        let (sources, dtype) = self.tile_sources(channel, level)?;
+        let shape = [region.shape[0], region.shape[1], region.shape[2]];
+        let axis = sweep_axis(shape, dtype);
+        let factors = pyramid_factors(shape, levels);
+        blockflow::dtype_dispatch!(
+            dtype,
+            |Element| {
+                let mut writer =
+                    PyramidWriter::<Element>::create(root, shape, &factors, axis, Some(frame))?;
+                let chunk = writer.chunk();
+                let rows = slab_rows(shape, chunk, axis, dtype);
+                let stats = fuse_planned::<Element>(
+                    params,
+                    &placement,
+                    &sources,
+                    &region,
+                    axis,
+                    rows,
+                    chunk,
+                    |slab| writer.push(slab),
+                )?;
+                writer.finish()?;
+                Ok((stats, shape))
+            },
+            f16 => Err(Error::invalid("float16 tiles cannot be fused"))
+        )
+    }
+
+    /// The fusion before it was planned: every tile's planes that reach into
+    /// `region` read whole, then one single-threaded fusion of the region.
+    /// Kept as the reference [`Self::fuse`] is tested against.
+    pub fn fuse_resident(
         &self,
         params: &FuseParams,
         region: Option<&Region>,

@@ -54,6 +54,7 @@ fn a_deformable_stage_improves_on_the_rigid_start_between_two_brains() {
         block: 64,
         workers: rayon::current_num_threads(),
         warped_stages: false,
+        initialisation: Default::default(),
     };
     let start = Instant::now();
     let translation = register(&config(vec![stage(VolumeFitParams::default())])).unwrap();

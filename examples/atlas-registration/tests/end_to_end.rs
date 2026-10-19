@@ -109,6 +109,7 @@ fn config(scratch: &Scratch, stages: Vec<VolumeFitParams>) -> RegisterConfig {
         block: 8,
         workers: 2,
         warped_stages: false,
+        initialisation: Default::default(),
     }
 }
 

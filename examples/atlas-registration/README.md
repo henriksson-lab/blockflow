@@ -185,6 +185,29 @@ over 50 iterations changes by less than this fraction; elastix has no such test
 and runs every iteration), `--warped-stages` (write the moving image warped
 after each stage).
 
+### Initialisation
+
+Where the first stage starts, i.e. where the moving image is taken to lie
+against the fixed one before the fit moves it (`pipeline::Initialisation`;
+later stages start from the stages before them):
+
+| `register` | `chain` | start | elastix |
+|---|---|---|---|
+| `--initialise parameters` (default) | (default) | as the stage's file says | `AutomaticTransformInitialization` as written |
+| `--initialise physical` | `--initialise K=physical` | the two images' physical frames as they stand | `AutomaticTransformInitialization "false"` |
+| `--initialise centre` | `--initialise K=centre` | the fixed image's geometric centre on the moving image's | `"true"` with `AutomaticTransformInitializationMethod "GeometricalCenter"` |
+| `--initial-translation Z,Y,X` | `--initial-translation K=Z,Y,X` | the physical frames, the fixed image moved by `t`: its point `p` starts at the moving image's `p + t` (the images' unit) | `-t0` with a translation transform, except that here `t` is the first stage's starting value, fitted with it and written into its file |
+
+The reference's `align_affine.txt` says `"true"`, so by default a registration
+starts from the centres. That places a whole sample in its atlas, or a whole
+mosaic in its autofluorescence, but not a part of a mosaic: its centre is not
+the field's. When the frames place the part (tiles converted with their stage
+positions, an autofluorescence image with its own), `physical` starts it
+there; when they do not, `--initial-translation` does. An initialisation other
+than `parameters` applies to stochastic stages only, and a translation needs a
+translation or affine first stage. `registration.json` records it
+(`initialisation`).
+
 ## Output
 
 - `TransformParameters.N.txt`: elastix parameter files in **`z, y, x` array
@@ -206,6 +229,15 @@ after each stage).
 
 Release build, `cargo test --release -p blockflow-atlas-registration`; the
 `ops::align` kernels in `cargo test --release --features zarr --lib ops::align`.
+
+**Initialisation** (`tests/register_stochastic.rs`, a strip near one side of a
+field twice the scene's size): each mode starts where it says, to 1e-6
+voxels (the physical frames; the centres on each other; the frames moved by
+the translation given), and from the frames, or from a translation 3 µm off
+on every axis, the fit lands within a quarter of a moving voxel. On
+osf-sa3x8's nine-tile strip in its autofluorescence (lightsheet-pipeline
+README) the centres collapse the affine and the frames do not overlap; the
+measured translation registers it.
 
 **Against the reference's elastix run** (`reference-clearmap/`, full numbers
 in its README): osf-cztq2 autofluorescence resampled to 25 µm (248 × 478 × 285)

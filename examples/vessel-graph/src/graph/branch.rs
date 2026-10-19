@@ -131,6 +131,11 @@ pub fn branch_points(
 }
 
 /// Render points into an `f64` density of `shape`, one ball per point.
+///
+/// One window, serially: `voxelize_into` walks every point's whole ball
+/// whatever window it renders, so slabs rendered in parallel walk the balls
+/// that cross a seam once per slab (two-plane slabs of the atlas grid took
+/// five times the CPU time).
 pub fn density(points: &[Point], shape: [usize; 3], radius: [usize; 3]) -> Result<Voxels> {
     let grid = BlockGrid::whole(shape)?;
     let mut out = Array3::<f64>::zeros((shape[0], shape[1], shape[2]));

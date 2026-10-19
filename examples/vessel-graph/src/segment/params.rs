@@ -19,7 +19,10 @@
 //! | `artery`, `vein` | `(1000, 8000)` | 450 | off |
 //!
 //! Everything else (lightsheet, median, adaptive window, smoothing passes, fill)
-//! is the same for every role. Note that [`BinarizeParams::default`] is the
+//! is the same for every role, except the deep filling: on for every role in a
+//! build with the `deep-fill` feature (off without it), resampled by 1 for
+//! `vessel` and by 2 for `artery` and `vein`, as the reference's
+//! configuration has it. Note that [`BinarizeParams::default`] is the
 //! reference's *library* default, `(400, 60000)` with every arm on, which is
 //! not any role's default.
 //!
@@ -31,7 +34,8 @@
 //!   "channels": [
 //!     {"role": "vessel"},
 //!     {"role": "artery", "clip_range": [1000, 8000], "deconvolve_threshold": 450,
-//!      "equalize": false, "vesselize": false, "smooth_passes": 6, "fill": true}
+//!      "equalize": false, "vesselize": false, "smooth_passes": 6, "fill": true,
+//!      "deep_fill": true, "deep_fill_resample": 2, "deep_fill_threshold": 0.5}
 //!   ],
 //!   "combined": {"smooth_passes": 6, "fill": true}
 //! }
@@ -45,6 +49,7 @@ use serde::Deserialize;
 
 use super::binarize::{BinarizeParams, Deconvolve, Equalize, Lightsheet, Vesselize};
 use super::clip::ClipParams;
+use super::deep_fill::{DeepFillParams, AVAILABLE as DEEP_FILL};
 use super::pipeline::{ChannelParams, PostProcess, SegmentParams};
 use super::smooth::SmoothParams;
 
@@ -116,11 +121,21 @@ impl ChannelRole {
         }
     }
 
-    /// This role's binarisation and post-processing.
+    /// This role's deep filling, whether or not the build can run it.
+    pub fn deep_fill(self) -> DeepFillParams {
+        match self {
+            Self::Vessel => DeepFillParams::resampled(1),
+            Self::Artery | Self::Vein => DeepFillParams::resampled(2),
+        }
+    }
+
+    /// This role's binarisation and post-processing; the deep filling only in
+    /// a build that has it.
     pub fn channel(self) -> ChannelParams {
         ChannelParams {
             binarize: self.binarize(),
             post: PostProcess::default(),
+            deep_fill: DEEP_FILL.then(|| self.deep_fill()),
         }
     }
 }
@@ -155,6 +170,10 @@ pub struct ChannelOverrides {
     /// 0 turns the channel's smoothing off.
     pub smooth_passes: Option<usize>,
     pub fill: Option<bool>,
+    /// Switch the deep filling on (at the role's resampling) or off.
+    pub deep_fill: Option<bool>,
+    pub deep_fill_resample: Option<usize>,
+    pub deep_fill_threshold: Option<f64>,
 }
 
 /// Overrides of a smooth-and-fill.
@@ -212,9 +231,10 @@ impl PostOverrides {
 }
 
 impl ChannelOverrides {
-    /// Apply these overrides to `channel`. The role is not applied here: it
-    /// picks the `channel` passed in.
-    pub fn apply(&self, channel: &mut ChannelParams) -> Result<()> {
+    /// Apply these overrides to `channel`, of `role`. The role is not applied
+    /// here: it picks the `channel` passed in, and the resampling a deep
+    /// filling switched on starts at.
+    pub fn apply(&self, channel: &mut ChannelParams, role: ChannelRole) -> Result<()> {
         let b = &mut channel.binarize;
         if let Some(range) = self.clip_range {
             b.clip.range = range;
@@ -251,6 +271,22 @@ impl ChannelOverrides {
             fill: self.fill,
         }
         .apply(&mut channel.post);
+        channel.deep_fill = switch(channel.deep_fill, self.deep_fill, role.deep_fill());
+        if self.deep_fill_resample.is_some() || self.deep_fill_threshold.is_some() {
+            let Some(deep_fill) = channel.deep_fill.as_mut() else {
+                return Err(Error::invalid(
+                    "a deep fill resample or threshold was given for a channel whose deep \
+                     filling is off",
+                ));
+            };
+            if let Some(resample) = self.deep_fill_resample {
+                deep_fill.resample = resample;
+            }
+            if let Some(value) = self.deep_fill_threshold {
+                deep_fill.threshold = value;
+            }
+            deep_fill.validate()?;
+        }
         Ok(())
     }
 }
@@ -305,8 +341,10 @@ impl SegmentOverrides {
             )));
         }
         let mut params = SegmentParams::for_roles(roles);
-        for (channel, overrides) in params.channels.iter_mut().zip(&self.channels) {
-            overrides.apply(channel)?;
+        for ((channel, overrides), role) in
+            params.channels.iter_mut().zip(&self.channels).zip(roles)
+        {
+            overrides.apply(channel, *role)?;
             channel.binarize.validate()?;
         }
         self.combined.apply(&mut params.combined);
@@ -354,6 +392,43 @@ mod tests {
         assert!(vein.binarize.equalize.is_none());
         assert!(vein.post.smooth.is_none());
         assert!(params.combined.fill.is_none() && params.combined.smooth.is_some());
+    }
+
+    #[test]
+    fn the_deep_filling_follows_the_role_and_the_build() {
+        assert_eq!(ChannelRole::Vessel.deep_fill().resample, 1);
+        assert_eq!(ChannelRole::Artery.deep_fill().resample, 2);
+        assert_eq!(
+            ChannelRole::Vein.deep_fill(),
+            ChannelRole::Artery.deep_fill()
+        );
+        for role in [ChannelRole::Vessel, ChannelRole::Artery] {
+            assert_eq!(role.channel().deep_fill.is_some(), DEEP_FILL);
+        }
+        let file = SegmentOverrides::from_json(
+            r#"{"channels": [{"deep_fill": false},
+                 {"role": "artery", "deep_fill": true, "deep_fill_threshold": 0.4}]}"#,
+        )
+        .unwrap();
+        let params = file.params(&file.roles(2)).unwrap();
+        assert_eq!(params.channels[0].deep_fill, None);
+        assert_eq!(
+            params.channels[1].deep_fill,
+            Some(DeepFillParams {
+                resample: 2,
+                threshold: 0.4
+            })
+        );
+        let off = SegmentOverrides::from_json(
+            r#"{"channels": [{"deep_fill": false, "deep_fill_threshold": 0.4}]}"#,
+        )
+        .unwrap();
+        assert!(off.params(&off.roles(1)).is_err());
+        let bad = SegmentOverrides::from_json(
+            r#"{"channels": [{"deep_fill": true, "deep_fill_resample": 0}]}"#,
+        )
+        .unwrap();
+        assert!(bad.params(&bad.roles(1)).is_err());
     }
 
     #[test]

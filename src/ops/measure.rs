@@ -8237,6 +8237,11 @@ pub struct ShapeMeasurements {
     /// Planar major-axis orientation in the Y/X plane, measured from +X toward +Y.
     pub orientation_yx: Option<f64>,
     pub eccentricity: Option<f64>,
+    /// Planar eccentricity in the Y/X plane, `sqrt(1 - l2 / l1)` of the Y/X
+    /// covariance: what a 2-D image means by it. [`Self::eccentricity`] is the
+    /// 3-D one (largest against smallest axis), which is `1` for every object
+    /// of a single plane, whose z axis has length zero.
+    pub eccentricity_yx: Option<f64>,
 }
 
 /// Derived scalar that can be read from a stored shape row.
@@ -8348,6 +8353,7 @@ impl ShapeMeasurements {
             orientation: shape.orientation(),
             orientation_yx: orientation_yx(shape),
             eccentricity: shape.eccentricity(),
+            eccentricity_yx: eccentricity_yx(shape),
         }
     }
 
@@ -31404,6 +31410,19 @@ fn expansion_relationship_measurement(row: &Row<'_>) -> Result<ObjectExpansionMe
 mod tests {
     use super::*;
 
+    #[test]
+    fn planar_eccentricity_is_two_dimensional() {
+        // a circle, an ellipse with axes 2:1, and a degenerate line
+        assert_eq!(planar_eccentricity(1.0, 1.0, 0.0), Some(0.0));
+        let e = planar_eccentricity(1.0, 4.0, 0.0).unwrap();
+        assert!((e - (0.75f64).sqrt()).abs() < 1e-12);
+        // rotation does not change it: the same ellipse at 45 degrees
+        let r = planar_eccentricity(2.5, 2.5, 1.5).unwrap();
+        assert!((r - e).abs() < 1e-12);
+        assert_eq!(planar_eccentricity(0.0, 3.0, 0.0), Some(1.0));
+        assert_eq!(planar_eccentricity(0.0, 0.0, 0.0), None);
+    }
+
     fn active_inputs<'a>(labels: ImageId) -> ActiveMeasurementInputs<'a> {
         ActiveMeasurementInputs {
             shape: ShapeSet::none(),
@@ -36337,6 +36356,23 @@ pub fn orientation_yx(shape: &RegionShape) -> Option<f64> {
         return None;
     }
     Some(0.5 * (2.0 * yx).atan2(xx - yy))
+}
+
+/// [`ShapeMeasurements::eccentricity_yx`]: the eccentricity of the ellipse with
+/// the region's Y/X second moments (scikit-image's 2-D `eccentricity`).
+pub fn eccentricity_yx(shape: &RegionShape) -> Option<f64> {
+    let covariance = shape.covariance()?;
+    planar_eccentricity(covariance[1][1], covariance[2][2], covariance[1][2])
+}
+
+fn planar_eccentricity(yy: f64, xx: f64, yx: f64) -> Option<f64> {
+    let spread = ((xx - yy) * (xx - yy) + 4.0 * yx * yx).sqrt();
+    let major = 0.5 * (xx + yy + spread);
+    let minor = 0.5 * (xx + yy - spread);
+    if major <= 0.0 {
+        return None;
+    }
+    Some((1.0 - (minor / major).max(0.0)).max(0.0).sqrt())
 }
 
 /// Physical spacing between voxel centers along each axis.

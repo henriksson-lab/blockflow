@@ -6,15 +6,21 @@
 //!
 //! Every OME-Zarr image in the directory whose name carries a grid index
 //! (`tile_03x04.zarr`: the last `<row> x <column>` in the name, spaces and
-//! case of the `x` free) is one tile. The row runs along y and the column
-//! along x. Nominal positions come from the first of these that is available:
+//! case of the `x` free) is one tile; when no name carries one, every image
+//! is. The row runs along y and the column along x. Nominal positions and
+//! neighbours come from the first of these that is available:
 //!
 //! 1. **Physical translations.** When the tiles' level-0
 //!    `coordinateTransformations` carry translations that differ between
 //!    tiles, each tile's nominal position is its translation relative to the
-//!    first tile's, in voxels of the stitched level.
-//! 2. **An overlap.** Otherwise the grid with one nominal overlap per axis,
-//!    `--overlap`, in level-0 voxels.
+//!    first tile's, in voxels of the stitched level, and the tiles aligned
+//!    are those whose boxes overlap there ([`TileLayout::from_boxes`]); grid
+//!    indices are not needed.
+//! 2. **The names and an overlap.** Otherwise the grid from the names with
+//!    one nominal overlap per axis, `--overlap`, in level-0 voxels, and grid
+//!    neighbours.
+//!
+//! [`TileLayout::from_boxes`]: crate::layout::TileLayout::from_boxes
 //!
 //! Only standard OME-Zarr metadata and the file name are read; nothing
 //! specific to an instrument or to the format the tiles were converted from.
@@ -24,7 +30,7 @@ use std::path::{Path, PathBuf};
 use blockflow::error::{Error, Result};
 use serde_json::{json, Value};
 
-use crate::io::{TileEntry, TileSetFile};
+use crate::io::{Neighbours, TileEntry, TileSetFile};
 
 /// What to build a tile set from a directory with.
 #[derive(Debug, Clone, Default)]
@@ -213,7 +219,13 @@ fn is_image(path: &Path) -> bool {
     path.is_dir() && (path.join("zarr.json").exists() || path.join(".zattrs").exists())
 }
 
-/// Build the tile set for every gridded OME-Zarr image under `dir`.
+/// Build the tile set for the OME-Zarr images under `dir`.
+///
+/// The tiles are the images whose names carry a grid index, or, when no
+/// name carries one, every image. Tiles whose translations tell them apart
+/// are placed by them and aligned with the tiles their boxes overlap; grid
+/// indices are then only recorded (and select `rows`/`columns`). Otherwise
+/// the grid from the names and `overlap` place them.
 pub fn from_directory(dir: &Path, options: &TileDirOptions) -> Result<DerivedTileSet> {
     let mut entries = std::fs::read_dir(dir)
         .map_err(|error| Error::invalid(format!("listing {}: {error}", dir.display())))?
@@ -221,57 +233,86 @@ pub fn from_directory(dir: &Path, options: &TileDirOptions) -> Result<DerivedTil
         .filter(|path| is_image(path))
         .collect::<Vec<PathBuf>>();
     entries.sort();
+    let named = entries
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let grid = grid_from_name(&name);
+            (path, name, grid)
+        })
+        .collect::<Vec<_>>();
+    let gridded = named.iter().any(|(_, _, grid)| grid.is_some());
+    let selecting = options.rows.is_some() || options.columns.is_some();
+    if selecting && !gridded {
+        return Err(Error::invalid(format!(
+            "--rows/--columns select by the grid index in the names, and no image under {} has one",
+            dir.display()
+        )));
+    }
     let mut skipped = Vec::new();
-    let mut tiles = Vec::new();
-    for path in entries {
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        match grid_from_name(&name) {
+    // (path, name, [row, column] when named)
+    let mut tiles: Vec<(PathBuf, String, Option<[isize; 2]>)> = Vec::new();
+    for (path, name, grid) in named {
+        match grid {
             Some([row, column]) => {
                 let inside = |range: Option<(isize, isize)>, value: isize| {
                     range.is_none_or(|(start, stop)| (start..stop).contains(&value))
                 };
                 if inside(options.rows, row) && inside(options.columns, column) {
-                    tiles.push((path, name, row, column));
+                    tiles.push((path, name, grid));
                 }
             }
+            None if !gridded => tiles.push((path, name, None)),
             None => skipped.push(name),
         }
     }
     if tiles.is_empty() {
         return Err(Error::invalid(format!(
-            "no OME-Zarr image under {} has a grid index (`RRxCC`) in its name{}",
+            "no OME-Zarr image under {}{}",
             dir.display(),
-            if options.rows.is_some() || options.columns.is_some() {
-                " within the selected rows and columns"
+            if selecting {
+                " has a grid index within the selected rows and columns"
             } else {
                 ""
             }
         )));
     }
-    // Row-major order, so tile 0 is the lowest row and column.
-    tiles.sort_by_key(|(_, _, row, column)| (*row, *column));
-    for pair in tiles.windows(2) {
-        if (pair[0].2, pair[0].3) == (pair[1].2, pair[1].3) {
-            return Err(Error::invalid(format!(
-                "{} and {} have the same grid index {:02}x{:02}",
-                pair[0].1, pair[1].1, pair[0].2, pair[0].3
-            )));
+    if gridded {
+        // Row-major order, so tile 0 is the lowest row and column.
+        tiles.sort_by_key(|(_, _, grid)| grid.expect("gridded"));
+        for pair in tiles.windows(2) {
+            if pair[0].2 == pair[1].2 {
+                let [row, column] = pair[0].2.expect("gridded");
+                return Err(Error::invalid(format!(
+                    "{} and {} have the same grid index {row:02}x{column:02}",
+                    pair[0].1, pair[1].1
+                )));
+            }
         }
     }
-    let row0 = tiles.iter().map(|t| t.2).min().expect("non-empty");
-    let column0 = tiles.iter().map(|t| t.3).min().expect("non-empty");
+    let row0 = tiles.iter().filter_map(|t| t.2).map(|g| g[0]).min();
+    let column0 = tiles.iter().filter_map(|t| t.2).map(|g| g[1]).min();
+    // [column, row] rebased to 0, for the grid axes [x, y]
+    let rebased = |grid: Option<[isize; 2]>| -> Vec<isize> {
+        grid.map_or_else(Vec::new, |[row, column]| {
+            vec![
+                column - column0.expect("gridded"),
+                row - row0.expect("gridded"),
+            ]
+        })
+    };
 
     let mut frames = Vec::with_capacity(tiles.len());
     let mut provenance_tiles = Vec::with_capacity(tiles.len());
-    for (path, _, row, column) in &tiles {
+    for (path, _, grid) in &tiles {
         let frame = tile_frame(path, options.level)?;
         provenance_tiles.push(json!({
             "path": path.display().to_string(),
-            "name_grid": [row, column],
-            "grid": [column - column0, row - row0],
+            "name_grid": grid,
+            "grid": rebased(*grid),
             "scale0": frame.scale0,
             "translation0": frame.translation0,
         }));
@@ -282,8 +323,17 @@ pub fn from_directory(dir: &Path, options: &TileDirOptions) -> Result<DerivedTil
         .position(|frame| frame.scale != frames[0].scale)
     {
         return Err(Error::invalid(format!(
-            "{} has voxel size {:?} at level {} and {} has {:?}; the tiles must share one",
-            tiles[index].1, frames[index].scale, options.level, tiles[0].1, frames[0].scale
+            "{} has voxel size {:?} at level {} and {} has {:?}; the tiles must share one{}",
+            tiles[index].1,
+            frames[index].scale,
+            options.level,
+            tiles[0].1,
+            frames[0].scale,
+            if gridded {
+                ""
+            } else {
+                " (no name carries a grid index, so every image in the directory is a tile)"
+            }
         )));
     }
     let scale = frames[0].scale;
@@ -300,12 +350,13 @@ pub fn from_directory(dir: &Path, options: &TileDirOptions) -> Result<DerivedTil
         .is_some_and(|all| all.iter().any(|t| t != &all[0]));
     let entries = tiles
         .iter()
-        .map(|(path, _, row, column)| TileEntry {
+        .map(|(path, _, grid)| TileEntry {
             path: path.clone(),
-            grid: vec![column - column0, row - row0],
+            grid: rebased(*grid),
             position: None,
         })
         .collect::<Vec<_>>();
+    let mut notes = Vec::new();
     let (tile_set, positions_from) = if distinct {
         let translations = translations.expect("checked");
         let mut entries = entries;
@@ -314,13 +365,37 @@ pub fn from_directory(dir: &Path, options: &TileDirOptions) -> Result<DerivedTil
                 ((translation[a] - translations[0][a]) / scale[a]).round() as isize
             }));
         }
+        for (i, a) in entries.iter().enumerate() {
+            if let Some(b) = entries[i + 1..].iter().find(|b| b.position == a.position) {
+                return Err(Error::invalid(format!(
+                    "{} and {} have the same translation, so one of them is misplaced; fix the \
+                     positions (img2omezarr set-positions), or give --overlap and remove the \
+                     translations",
+                    a.path.display(),
+                    b.path.display()
+                )));
+            }
+        }
+        if options.overlap.is_some() {
+            notes.push(json!(
+                "--overlap is ignored: the tiles' translations place them"
+            ));
+        }
         let tile_set = TileSetFile {
             grid_axes: vec!["x".into(), "y".into()],
             overlap: None,
+            neighbours: Some(Neighbours::Boxes),
             tiles: entries,
         };
         (tile_set, "translation".to_string())
     } else {
+        if !gridded {
+            return Err(Error::invalid(format!(
+                "the images under {} carry no translations that tell them apart, and no name \
+                 carries a grid index (`RRxCC`), so nothing places them",
+                dir.display()
+            )));
+        }
         let overlap0 = options.overlap.ok_or_else(|| {
             Error::invalid(format!(
                 "the tiles under {} carry no translations that tell them apart; give \
@@ -336,6 +411,7 @@ pub fn from_directory(dir: &Path, options: &TileDirOptions) -> Result<DerivedTil
         let tile_set = TileSetFile {
             grid_axes: vec!["x".into(), "y".into()],
             overlap: Some(at_level.to_vec()),
+            neighbours: Some(Neighbours::Grid),
             tiles: entries,
         };
         (tile_set, "overlap option".to_string())
@@ -346,7 +422,9 @@ pub fn from_directory(dir: &Path, options: &TileDirOptions) -> Result<DerivedTil
             "level": options.level,
             "voxel_size": scale,
             "positions_from": positions_from,
+            "neighbours": tile_set.neighbours().name(),
             "skipped": skipped,
+            "notes": notes,
             "tiles": provenance_tiles,
         }),
         tile_set,
@@ -361,10 +439,10 @@ impl TileSetFile {
             .tiles
             .iter()
             .map(|tile| {
-                let mut entry = json!({
-                    "path": tile.path.display().to_string(),
-                    "grid": tile.grid,
-                });
+                let mut entry = json!({ "path": tile.path.display().to_string() });
+                if !tile.grid.is_empty() {
+                    entry["grid"] = json!(tile.grid);
+                }
                 if let Some(position) = tile.position {
                     entry["position"] = json!(position);
                 }
@@ -374,6 +452,9 @@ impl TileSetFile {
         let mut out = json!({ "grid_axes": self.grid_axes, "tiles": tiles });
         if let Some(overlap) = &self.overlap {
             out["overlap"] = json!(overlap);
+        }
+        if let Some(neighbours) = self.neighbours {
+            out["neighbours"] = json!(neighbours.name());
         }
         out
     }

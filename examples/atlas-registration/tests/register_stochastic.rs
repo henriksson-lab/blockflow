@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use blockflow::ops::align::TransformModel;
 use blockflow::voxels::Voxels;
 use blockflow_atlas_registration::pipeline::{
-    register, register_chain, ChainConfig, Input, RegisterConfig, Stage,
+    register, register_chain, ChainConfig, Initialisation, Input, RegisterConfig, Stage,
 };
 use blockflow_atlas_registration::stochastic::{
     elastix_levels, stochastic_from_elastix_map, GainSequence, ParameterScales, SampleOrder,
@@ -373,6 +373,7 @@ fn a_stochastic_registration_finds_a_known_shift_and_points_follow_it() {
         block: 16,
         workers: 2,
         warped_stages: false,
+        initialisation: Default::default(),
     })
     .expect("registers");
     let stage = &summary.stages[0];
@@ -450,6 +451,7 @@ fn a_two_step_chain_composes_its_registrations() {
         block: 16,
         workers: 2,
         warped_stages: false,
+        initialisation: Default::default(),
         warped: false,
     })
     .expect("the chain registers");
@@ -475,6 +477,168 @@ fn a_two_step_chain_composes_its_registrations() {
             "{got:?}"
         );
     }
+}
+
+/// A crop of the scene at `scene_origin` (scene units), on `shape` voxels of
+/// `spacing`, whose frame puts its first voxel at `translation`.
+fn write_crop(
+    root: &Path,
+    spacing: f64,
+    shape: [usize; 3],
+    translation: [f64; 3],
+    scene_origin: [f64; 3],
+) -> Frame {
+    let frame = Frame::new([spacing; 3], translation).unwrap();
+    let image = Array3::from_shape_fn((shape[0], shape[1], shape[2]), |(z, y, x)| {
+        let index = [z, y, x];
+        scene(std::array::from_fn(|a| {
+            scene_origin[a] + index[a] as f64 * spacing
+        }))
+        .round() as u16
+    });
+    write_image(root, &Voxels::from(image), &frame, Some("micrometer")).unwrap();
+    frame
+}
+
+/// A partial mosaic: the fixed image is a strip near one side of the moving
+/// one (as nine tiles of a whole-brain mosaic are of its autofluorescence).
+/// Each initialisation starts where it says: the physical frames as they
+/// stand, the two geometric centres on each other, or the frames moved by
+/// the translation given; and from the frames (when the strip's frame places
+/// it) or from a translation a few micrometres off (when it does not), the
+/// fit lands on the strip. (This scene's few broad blobs also lead a fit
+/// started at the centres to it; a real strip of brain does not.)
+#[test]
+fn a_partial_mosaic_is_placed_by_its_frame_or_an_initial_translation() {
+    let scratch = Scratch::new("initialise");
+    // the whole scene, coarser, at the origin, in a field twice its size
+    // (as the autofluorescence field is larger than the brain)
+    write_crop(
+        &scratch.join("moving.zarr"),
+        2.0,
+        [48, 72, 80],
+        [0.0; 3],
+        [0.0; 3],
+    );
+    // the strip: scene z 0..64, y 8..40, x 48..76
+    let strip = [0.0, 8.0, 48.0];
+    let shape = [64, 32, 28];
+    write_crop(&scratch.join("placed.zarr"), 1.0, shape, strip, strip);
+    write_crop(&scratch.join("unplaced.zarr"), 1.0, shape, [0.0; 3], strip);
+    // Per probe, the error in moving voxels of the registration from `fixed`
+    // started as `initialisation`; with `fit` false, of the start itself.
+    let run = |fixed: &str, initialisation: Initialisation, out: &str, fit: bool| {
+        let mut params = quick_translation(7);
+        if !fit {
+            // one step of a vanishing gain: the start, as written
+            params.levels = elastix_levels(1, 1, None);
+            params.optimizer = StochasticOptimizer::Standard(GainSequence {
+                a: 1e-12,
+                big_a: 1.0,
+                alpha: 1.0,
+            });
+        }
+        register(&RegisterConfig {
+            fixed: input(scratch.join(fixed)),
+            moving: input(scratch.join("moving.zarr")),
+            resolution: Some([2.0; 3]),
+            stages: vec![Stage::Stochastic(params)],
+            out: scratch.join(out),
+            warped: None,
+            warp_source: None,
+            nearest: false,
+            block: 16,
+            workers: 2,
+            warped_stages: false,
+            initialisation,
+        })
+        .expect("registers");
+        // fixed voxel -> moving voxel; the truth is (scene point) / 2
+        let transform = PointTransform::from_registration_dir(scratch.join(out)).unwrap();
+        let probes = [[20.0, 10.0, 10.0], [40.0, 20.0, 15.0], [32.0, 16.0, 20.0]];
+        let errors: Vec<[f64; 3]> = transform
+            .apply(&probes)
+            .iter()
+            .zip(&probes)
+            .map(|(got, probe)| std::array::from_fn(|a| got[a] - (strip[a] + probe[a]) / 2.0))
+            .collect();
+        errors
+    };
+    let worst = |errors: &[[f64; 3]]| {
+        errors
+            .iter()
+            .flat_map(|e| e.iter().map(|v| v.abs()))
+            .fold(0.0, f64::max)
+    };
+    // 3 um off in each axis, as a stage reading might be
+    let guess = [strip[0] + 3.0, strip[1] - 3.0, strip[2] + 3.0];
+
+    // Where each starts: the frames as they stand (exact), the centres
+    // (the strip's centre on the field's), the translation (3 um off).
+    let start = run(
+        "placed.zarr",
+        Initialisation::Physical,
+        "start-physical",
+        false,
+    );
+    assert!(worst(&start) < 1e-6, "{start:?}");
+    let start = run("placed.zarr", Initialisation::Centre, "start-centre", false);
+    let centres: [f64; 3] = std::array::from_fn(|a| {
+        let field = [96.0, 144.0, 160.0][a] - 2.0;
+        let fixed = [shape[0] as f64, shape[1] as f64, shape[2] as f64][a] - 1.0;
+        (field / 2.0 - (strip[a] + fixed / 2.0)) / 2.0
+    });
+    for e in &start {
+        for a in 0..3 {
+            assert!((e[a] - centres[a]).abs() < 1e-6, "{start:?} vs {centres:?}");
+        }
+    }
+    let start = run(
+        "unplaced.zarr",
+        Initialisation::Translation(guess),
+        "start-translation",
+        false,
+    );
+    for e in &start {
+        assert!(
+            (e[0] - 1.5).abs() < 1e-6 && (e[1] + 1.5).abs() < 1e-6 && (e[2] - 1.5).abs() < 1e-6,
+            "{start:?}"
+        );
+    }
+
+    // And where they end: on the strip.
+    let physical = worst(&run(
+        "placed.zarr",
+        Initialisation::Physical,
+        "physical",
+        true,
+    ));
+    let translated = worst(&run(
+        "unplaced.zarr",
+        Initialisation::Translation(guess),
+        "translation",
+        true,
+    ));
+    assert!(
+        physical < 0.25,
+        "physical frames: off by {physical} moving voxels"
+    );
+    assert!(
+        translated < 0.25,
+        "initial translation: off by {translated} moving voxels"
+    );
+    let sidecar: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(scratch.join("translation").join("registration.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        sidecar["initialisation"],
+        serde_json::json!({ "translation": guess })
+    );
+    // the parameters' own initialisation is the default
+    let parsed = Initialisation::parse("center").unwrap();
+    assert_eq!(parsed, Initialisation::Centre);
+    assert!(Initialisation::parse("landmarks").is_err());
 }
 
 #[test]

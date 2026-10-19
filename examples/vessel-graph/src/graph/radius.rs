@@ -152,28 +152,67 @@ impl RadiusSearch {
         points: &[[u32; 3]],
         spacing: [f64; 3],
     ) -> Result<RadiusMeasurement> {
-        for (axis, value) in spacing.iter().enumerate() {
-            if !value.is_finite() || *value <= 0.0 {
-                return Err(Error::invalid(format!(
-                    "the spacing on axis {axis} is {value}; a µm-per-voxel spacing is positive \
-                     and finite."
-                )));
-            }
-        }
+        check_spacing(spacing)?;
         let volume = source.shape();
-        let stop = Limit::AtMost(self.params.threshold);
+        let stops = points
+            .iter()
+            .map(|at| self.stop_at(source, [0, 0, 0], volume, *at))
+            .collect::<Result<Vec<_>>>()?;
+        self.from_stops(&stops, spacing)
+    }
+
+    /// The walk from one point: the index of the offset it stopped at, `None`
+    /// where it found no background. `window` holds the volume over a box
+    /// whose lowest voxel is `origin` in a volume of shape `volume`; it must
+    /// reach [`RadiusParams::max_radius`] beyond the point on every side that
+    /// is inside the volume, or the walk is refused.
+    pub fn stop_at(
+        &self,
+        window: &Voxels,
+        origin: [usize; 3],
+        volume: [usize; 3],
+        at: [u32; 3],
+    ) -> Result<Option<usize>> {
+        let at = at.map(|value| value as usize);
+        walk_from(
+            &self.sequence,
+            at,
+            volume,
+            window,
+            origin,
+            Limit::AtMost(self.params.threshold),
+        )
+    }
+
+    /// The per-axis radius in µm a stop gives, [`NOT_FOUND`] where there is
+    /// none: what [`RadiusMeasurement::radius_units_axial`] holds.
+    pub fn units_axial(&self, stopped: Option<usize>, spacing: [f64; 3]) -> [f64; 3] {
+        match stopped {
+            Some(index) => {
+                let offset = self.sequence.offsets()[index];
+                std::array::from_fn(|axis| offset[axis].unsigned_abs() as f64 * spacing[axis])
+            }
+            None => [NOT_FOUND; 3],
+        }
+    }
+
+    /// The four arrays from one stop per point, in point order.
+    pub fn from_stops(
+        &self,
+        stops: &[Option<usize>],
+        spacing: [f64; 3],
+    ) -> Result<RadiusMeasurement> {
+        check_spacing(spacing)?;
         let mut out = RadiusMeasurement {
-            radii: Vec::with_capacity(points.len()),
-            radii_axial: Vec::with_capacity(points.len()),
-            radius_units: Vec::with_capacity(points.len()),
-            radius_units_axial: Vec::with_capacity(points.len()),
-            found: Vec::with_capacity(points.len()),
-            determined: Vec::with_capacity(points.len()),
+            radii: Vec::with_capacity(stops.len()),
+            radii_axial: Vec::with_capacity(stops.len()),
+            radius_units: Vec::with_capacity(stops.len()),
+            radius_units_axial: Vec::with_capacity(stops.len()),
+            found: Vec::with_capacity(stops.len()),
+            determined: Vec::with_capacity(stops.len()),
         };
-        for at in points {
-            let at = at.map(|value| value as usize);
-            let stopped = walk_from(&self.sequence, at, volume, source, [0, 0, 0], stop)?;
-            match stopped {
+        for stopped in stops {
+            match *stopped {
                 Some(index) => {
                     let offset = self.sequence.offsets()[index];
                     let voxels = offset.map(|value| value.unsigned_abs() as f64);
@@ -200,6 +239,18 @@ impl RadiusSearch {
         }
         Ok(out)
     }
+}
+
+fn check_spacing(spacing: [f64; 3]) -> Result<()> {
+    for (axis, value) in spacing.iter().enumerate() {
+        if !value.is_finite() || *value <= 0.0 {
+            return Err(Error::invalid(format!(
+                "the spacing on axis {axis} is {value}; a µm-per-voxel spacing is positive \
+                 and finite."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// One-call form of [`RadiusSearch::measure`].

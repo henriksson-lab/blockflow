@@ -26,15 +26,19 @@
 //! [2, 1]`) and wobble along z (`wobble_axis = 0`) by default; every module
 //! takes the axes as parameters.
 //!
-//! Everything is resident: the rigid step reads a `depth`-thick slab at each
-//! facing end, the per-slice step reads the overlap cuts, and fusion writes
-//! the output; each tile is held in memory while it runs.
+//! Alignment is resident: the rigid step reads a `depth`-thick slab at each
+//! facing end, the per-slice step reads the overlap cuts, and each tile is
+//! held in memory while it runs. Fusion at stored positions is planned
+//! (`planned`): slab by slab, reading only the tile boxes each slab needs, and
+//! written slab by slab into the pyramid (`pyramid`).
 
 pub mod fuse;
 pub mod io;
 pub mod layout;
 pub mod place;
 pub mod plane;
+pub mod planned;
+pub mod pyramid;
 pub mod relayout;
 pub mod rigid;
 pub mod solve;

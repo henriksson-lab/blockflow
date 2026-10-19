@@ -23,8 +23,9 @@ examples/lightsheet-pipeline/run.sh SAMPLE_DIR PARAMS [STAGE...]
 ```
 
 - `SAMPLE_DIR` holds the converted inputs (OME-Zarr only; convert TIFFs with
-  `img2omezarr`): a directory of signal tiles named by grid index
-  (`tile_RRxCC.zarr`) and the autofluorescence image.
+  `img2omezarr`): a directory of signal tiles (named by grid index,
+  `tile_RRxCC.zarr`, unless their translations place them) and the
+  autofluorescence image.
 - `PARAMS` is a bash file of `KEY=value` lines; `params/osf-cztq2.env` is a
   worked example and `run.sh` lists every key with its default.
 - `STAGE`s: `align fuse register cells vessels` (default all; `cells` and
@@ -40,6 +41,7 @@ examples/lightsheet-pipeline/run.sh SAMPLE_DIR PARAMS [STAGE...]
 | `AUTOFLUORESCENCE` | the autofluorescence image (relative to the sample) |
 | `ATLAS` | a prepared atlas (`atlas-prepare`) in the sample's orientation |
 | `ALIGNMENT_DIR`, `SIGNAL_TO_AUTO`, `AUTO_TO_ATLAS` | elastix parameter files per step |
+| `SIGNAL_TO_AUTO_INITIAL` | how the signal -> autofluorescence step starts: empty (the file's, the centres), `physical`, `centre`, or `Z,Y,X` (an initial translation in µm; `atlas-registration --initial-translation 0=…`) |
 | `STITCH_LEVEL`, `STITCH_OVERLAP`, `STITCH_ROWS`, `STITCH_COLUMNS`, `STITCH_MAX_SHIFT`, `STITCH_RIGID_MAX_SHIFT`, `STITCH_MAX_SHIFT_Z`, `STITCH_RIGID_ONLY`, `STITCH_ARGS` | `tile-stitching --tile-dir` (search ranges in voxels of `STITCH_LEVEL`) |
 | `FUSE_LEVEL` | level of the whole fused volume, the registration's signal |
 | `REGISTRATION_RESOLUTION`, `REGISTRATION_ARGS` | `atlas-registration chain` |
@@ -152,17 +154,57 @@ registered through its own chain), `checks/compare_hand_offset.py`, output in
   hand-offset run against it: median 25 µm, 90.3%). The extra distance is the same frame
   difference as above plus the reference's own registration noise.
 
-## osf-sa3x8 (vessels): not run
+## osf-sa3x8 (vessels)
 
-The conversion holds 9 tiles (rows 03-05, columns 04-06) of a whole-brain
-mosaic: about 1.7 x 5.4 mm of a 6.6 x 11.5 mm autofluorescence field. A
-signal -> autofluorescence affine started from the two images' geometric
-centres, as elastix's `AutomaticTransformInitialization` (and ours) does, has
-no way to find where that strip sits, and the tiles' metadata cannot place it (it
-carries no translations), and there is no initial transform option in
-`atlas-registration`. The vessel stages are written but not run
-(`stack_channels.py` was smoke-tested on two copies of the cell box); running them needs either the
-whole mosaic or an initial transform (a landmark registration, plan item G).
+Run 2026-10-19, `params/osf-sa3x8.env`, outputs in
+`/husky/henriksson/lightsheet-reference/pipeline/osf-sa3x8/`. The sample
+directory is the metadata-only mirror
+`/husky/henriksson/lightsheet-reference/positions/osf-sa3x8/`, whose nine
+tiles carry their LaVision stage positions (`img2omezarr set-positions
+--from-originals`); the conversions themselves are untouched.
+
+| stage | what | wall | peak RSS | disk |
+|---|---|---|---|---|
+| align | 9 tiles (rows 03-05, columns 04-06) at level 1 (3.2 x 3.25 x 3.25 µm), placed by their translations, 12 pairs from their boxes, no overlap given | 77 s | 4.8 GB | 3 MB |
+| fuse | whole strip at level 1 (the tile pyramid halves z, so not level 2), 1686 x 1839 x 570 | 188 s | 11.0 GB | 2.3 GB |
+| register | fused signal -> autofluorescence (affine, from the initial translation) -> atlas (affine + B-spline, orientation (1, -2, 3), z 0:256), 25 µm | 91 s | 2.4 GB | <1 MB |
+| vessels-fuse-0/1 | level-0 box 512 x 512 x 256 per channel (`VESSEL_REGION`) | 11 + 12 s | 2.9 GB | 0.17 GB |
+| vessels-segment | `vessel-graph segment`, vessels + arteries | 132 s | 10.4 GB | 0.17 GB |
+| vessels-graph | `graph --registration`: 58 788 vertices, 87 683 edges (11 850 artery) | 31 s | 3.9 GB | 0.77 GB |
+
+**Placing the strip.** The nine tiles are about 1.8 x 6.0 mm of a 6.6 x 11.5
+mm autofluorescence field, and the autofluorescence carries no stage
+position: its XML says it is not part of a mosaic (`IsPartOfMosaic 0`,
+`<Offset>` all zero); its `xyz-Table` properties share the z range with the
+tiles (both start at stage z 1357.738 µm and span 5388 µm) but give no
+in-plane position (taking the `X_Offset`/`Y_Offset` of its scan settings as
+the field's centre misses by 2.1 mm in y and 0.3 mm in x). Started from the
+centres (the
+reference's file), the affine collapses (an x scale of 0.056); from the
+physical frames it finds no overlap at all. So the step starts from an
+initial translation, `SIGNAL_TO_AUTO_INITIAL=0,3420,4535` µm: where a
+normalised cross-correlation of the log intensities of the strip over the
+autofluorescence (`checks/find_translation.py`) puts it (on 50 and 30 µm grids: (9, 3432, 4530) and (-3,
+3412, 4540) µm). On a 25 µm grid the log-intensity correlation is 0.583 at
+that translation and 0.574 after the affine. The registration's own
+similarity numbers for this step are low (correlation 0.038, MI 0.012)
+because they are on raw intensities, which the sparse, bright vessels
+dominate; the autofluorescence -> atlas step reaches correlation 0.780 / MI
+0.547 after the affine and 0.795 / 0.630 after the B-spline.
+
+**The box** (`VESSEL_REGION=160:672,896:1408,320:576`, fused level-0 voxels)
+runs from above the dorsal surface about 0.5 mm into the cortex.
+`checks/vessel_labels.py` and `checks/vessel_depth.py`, outputs in
+`checks/vessel_labels.json`, `checks/vessel_depth.json`:
+
+- every vertex maps inside the atlas, and 6 of 58 788 (0.01%) get label 0;
+  99.99% are isocortex: supplemental somatosensory SSs1 (27%), SSs2/3 (49%),
+  SSs4 (21%), SSs5 (0.9%), and the neighbouring SSp-n (2.2%);
+- the layers come in order of depth below the tissue surface, measured in the
+  sample image (not from the atlas): median (10th-90th percentile) layer 1 96
+  (46-147) µm, layer 2/3 314 (187-424) µm, layer 4 512 (458-590) µm, layer 5
+  645 (618-672) µm, as in mouse somatosensory cortex; no vertex lies above the
+  surface.
 
 ## Limitations
 
@@ -173,5 +215,9 @@ whole mosaic or an initial transform (a landmark registration, plan item G).
 - The registration's signal is fused at level 2 from level-1 positions, so
   in-plane positions are rounded to 6.5 µm there (half a voxel at most);
   level-0 boxes reuse the level-1 positions doubled, exactly.
-- The stitching overlap of osf-cztq2 has to be given (`STITCH_OVERLAP`): the
-  tiles' metadata gives no usable one (tile-stitching README).
+- The stitching overlap of osf-cztq2 has to be given (`STITCH_OVERLAP`): its
+  conversion carries no translations, and its LaVision positions are refused
+  (row 07 repeats row 00; tile-stitching README).
+- A partial mosaic (osf-sa3x8) needs `SIGNAL_TO_AUTO_INITIAL`: nothing in the
+  autofluorescence's metadata places it in the tiles' stage frame, so the
+  translation is measured (`checks/find_translation.py`, run by hand).

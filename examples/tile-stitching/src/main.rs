@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use blockflow::region::Region;
+use blockflow::zarr_env::PhysicalFrame;
 use blockflow::Result;
 use clap::{Parser, ValueEnum};
 use serde_json::json;
@@ -31,13 +32,14 @@ struct Cli {
     /// the nominal overlap (see the README).
     #[arg(long, conflicts_with_all = ["tile_dir", "layout_from"])]
     tiles: Option<PathBuf>,
-    /// A directory of OME-Zarr tiles whose names carry their grid index
-    /// (`tile_03x04.zarr`: row y, column x); the tile set is built from their
-    /// metadata (see the README) and written to `<out>.tiles.json`.
+    /// A directory of OME-Zarr tiles, placed by their level-0 translations
+    /// and aligned where their boxes overlap, or else by the grid index in
+    /// their names (`tile_03x04.zarr`: row y, column x) and `--overlap`; the
+    /// tile set is written to `<out>.tiles.json` (see the README).
     #[arg(long, conflicts_with = "layout_from")]
     tile_dir: Option<PathBuf>,
-    /// With `--tile-dir`: the nominal overlap in level-0 voxels, `Y,X` or one
-    /// value for both, instead of the metadata's.
+    /// With `--tile-dir`, for tiles without distinct translations: the
+    /// nominal overlap in level-0 voxels, `Y,X` or one value for both.
     #[arg(long, value_parser = parse_overlap, requires = "tile_dir")]
     overlap: Option<[f64; 2]>,
     /// With `--tile-dir`: only grid rows `START:STOP` (half-open, as named).
@@ -384,33 +386,40 @@ fn run_relayout(cli: &Cli, path: &std::path::Path) -> Result<()> {
         method: fuse_method(cli.fuse),
         weighting: Weighting::Pyramid,
     };
-    let fused = layout.fuse(&params, region.as_ref(), cli.channel, cli.level)?;
-    let start = region
-        .as_ref()
-        .map_or([0; 3], |r| [r.start[0], r.start[1], r.start[2]]);
     let translation = fused_translation(
         first.translation,
         first.voxel_size,
         layout.anchor(),
         layout.origin,
         layout.z_offset,
-        start,
+        region
+            .as_ref()
+            .map_or([0; 3], |r| [r.start[0], r.start[1], r.start[2]]),
     );
-    write_volume_at(
+    let frame =
+        PhysicalFrame::new(first.voxel_size, first.unit.as_deref()).with_origin(translation);
+    let (stats, fused_shape) = layout.fuse_to_zarr(
+        &params,
+        region.as_ref(),
+        cli.channel,
+        cli.level,
         &cli.out,
-        &fused,
-        first.voxel_size,
-        translation,
-        first.unit.as_deref(),
         cli.out_levels,
+        frame,
     )?;
+    eprintln!(
+        "fused {fused_shape:?} in {} slabs, {:.2} G tile voxels read, {:.1} s fusing and writing",
+        stats.slabs,
+        stats.voxels_read as f64 / 1e9,
+        stats.fuse_seconds
+    );
     let report = json!({
         "layout_from": path.display().to_string(),
         "level": cli.level,
         "voxel_size": first.voxel_size,
         "fused_shape": shape,
         "region": region.as_ref().map(|r| json!({"start": r.start, "shape": r.shape})),
-        "shape": fused.shape(),
+        "shape": fused_shape,
         "translation": translation,
         "seconds": started.elapsed().as_secs_f64(),
     });
@@ -418,7 +427,7 @@ fn run_relayout(cli: &Cli, path: &std::path::Path) -> Result<()> {
     println!(
         "wrote {} {:?} (of {:?}) in {:.1?}",
         cli.out.display(),
-        fused.shape(),
+        fused_shape,
         shape,
         started.elapsed()
     );

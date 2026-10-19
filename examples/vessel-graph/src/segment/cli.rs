@@ -20,25 +20,33 @@ use blockflow::assemble::{ImageId, PlanBuilder};
 use blockflow::geometry::BlockGrid;
 use blockflow::ome_zarr::{publish_label, LabelPublication, OmeVolumePyramid};
 use blockflow::op::Chain;
+use blockflow::ops::voxelize::{ball, voxelize_into};
 use blockflow::ops::WidenLabelsOp;
+use blockflow::points::Point;
+use blockflow::region::Region;
 use blockflow::strategy::{execute_phases, Hints};
-use blockflow::{Error, Result, ZarrEnvironment};
+use blockflow::voxels::Voxels;
+use blockflow::zarr_env::AttachedImage;
+use blockflow::{Dtype, Error, Result, ZarrEnvironment};
 use clap::Args;
 
 use atlas_regions::Rounding;
 use blockflow_atlas_registration::atlas_space::{LookupParams, OpenParams, RegisteredAtlas};
 
 use crate::graph::cli::{atlas_lattice, image_frame, level_lattice, write_density};
+use crate::profile::{Listening, Profile};
 
 use super::clip::ClipParams;
 use super::crop::write_crop;
+use super::deep_fill::DeepFillSetup;
 use super::params::{ChannelOverrides, ChannelRole, PostOverrides, SegmentOverrides};
-use super::pipeline::{append_segment_phases, SegmentParams};
+use super::pipeline::{append_segment_phases, append_segment_phases_unthinned, SegmentParams};
 use super::plan::{workers, Cursor, Image};
 use super::skeleton::SkeletonParams;
+use super::thin::{thin_stored, ThinPlan};
 use super::tract::{
-    append_clip_range_phases, append_tract_phases, count_points, read_clip_range, read_points,
-    tract_binarize, Rescale, TractParams,
+    append_clip_range_phases, append_tract_phases, count_points, for_each_point_slab,
+    read_clip_range, tract_binarize, Rescale, TractParams,
 };
 
 fn triple<T: Copy>(values: &[T], what: &str) -> Result<[T; 3]> {
@@ -193,6 +201,30 @@ pub struct SegmentArgs {
     /// Keep the volume's faces when skeletonising.
     #[arg(long)]
     pub keep_border: bool,
+    /// The thinning runs resident (one iterative phase holding two bytes a
+    /// voxel) when that is at most this many MiB, and over stored images, a
+    /// round per phase, otherwise. The skeleton is the same either way.
+    #[arg(long, default_value_t = 2048)]
+    pub thin_memory_mb: u64,
+    /// Skip the deep vessel filling (the CNN that fills hollow lumens after
+    /// each channel's smooth and fill). It is on by default in a build with
+    /// the `deep-fill` feature, as in the reference's configuration, and off
+    /// without it.
+    #[arg(long, conflicts_with = "deep_fill_weights")]
+    pub no_deep_fill: bool,
+    /// The deep-filling network's weights, a safetensors file converted from
+    /// the reference's `cnn_binary_vessel_filling.pth` by
+    /// `reference-clearmap/convert_weights.py` (default: $VESSEL_FILL_WEIGHTS).
+    /// Giving it switches the deep filling on.
+    #[arg(long)]
+    pub deep_fill_weights: Option<PathBuf>,
+    /// Deep-filling probability threshold (default 0.5).
+    #[arg(long)]
+    pub deep_fill_threshold: Option<f64>,
+    /// Block edge of the deep-filling phases, z,y,x; each block runs through
+    /// the network whole, with a halo of 64 voxels (128 at resample 2).
+    #[arg(long, value_delimiter = ',', default_values_t = vec![256, 512, 512])]
+    pub deep_fill_block: Vec<usize>,
 }
 
 impl SegmentArgs {
@@ -246,6 +278,13 @@ impl SegmentArgs {
             vesselize_threshold: self.vesselize_threshold,
             smooth_passes: self.smooth_passes,
             fill: off(self.no_fill),
+            deep_fill: match (self.no_deep_fill, &self.deep_fill_weights) {
+                (true, _) => Some(false),
+                (false, Some(_)) => Some(true),
+                (false, None) => None,
+            },
+            deep_fill_resample: None,
+            deep_fill_threshold: self.deep_fill_threshold,
         })
     }
 
@@ -269,7 +308,10 @@ impl SegmentArgs {
             if b.deconvolve.is_none() {
                 flags.deconvolve_threshold = None;
             }
-            flags.apply(channel).map_err(|error| {
+            if channel.deep_fill.is_none() && flags.deep_fill != Some(true) {
+                flags.deep_fill_threshold = None;
+            }
+            flags.apply(channel, *role).map_err(|error| {
                 Error::invalid(format!("channel role {}: {error}", role.name()))
             })?;
             channel.binarize.validate()?;
@@ -282,6 +324,10 @@ impl SegmentArgs {
         params.skeleton = SkeletonParams {
             delete_border: !self.keep_border,
             ..SkeletonParams::default()
+        };
+        params.deep_fill = DeepFillSetup {
+            weights: self.deep_fill_weights.clone(),
+            block: triple(&self.deep_fill_block, "--deep-fill-block")?,
         };
         Ok((params, roles))
     }
@@ -397,9 +443,23 @@ pub fn run_segment(args: &SegmentArgs) -> Result<SegmentSummary> {
 
     let mut plan = PlanBuilder::new(volume, dtype, BlockGrid::new(volume, args.input.block()?)?);
     let mut c = Cursor::new(&mut plan, sources[0]);
-    let segmented = append_segment_phases(&mut c, &sources, &params)?;
+    // The thinning in the plan, as one iterative phase holding the volume
+    // twice, when that fits `--thin-memory-mb`; otherwise everything but the
+    // thinning, which then runs over the stored image the plan leaves
+    // (`thin::thin_stored`).
+    let voxels = volume.iter().product::<usize>() as u64;
+    let resident_thinning = 2 * voxels <= args.thin_memory_mb.saturating_mul(1 << 20);
+    let segmented = match resident_thinning {
+        true => append_segment_phases(&mut c, &sources, &params)?,
+        false => append_segment_phases_unthinned(&mut c, &sources, &params)?,
+    };
     let mask = c.pixels(c.on(segmented.mask, vec![Chain::op(WidenLabelsOp)]))?;
-    let skeleton = c.pixels(c.on(segmented.skeleton, vec![Chain::op(WidenLabelsOp)]))?;
+    // The skeleton as a label (resident thinning), or the image the stored
+    // thinning starts from.
+    let skeleton = match resident_thinning {
+        true => c.pixels(c.on(segmented.skeleton, vec![Chain::op(WidenLabelsOp)]))?,
+        false => segmented.skeleton,
+    };
     // With several channels, each channel's own mask too: the large-vessel
     // masks are what the graph's artery/vein columns read.
     let channel_masks = match segmented.channels.len() {
@@ -430,7 +490,25 @@ pub fn run_segment(args: &SegmentArgs) -> Result<SegmentSummary> {
             .join(", "),
         assembly.n_phases()
     );
-    execute_phases(
+    let deep_filled: Vec<String> = roles
+        .iter()
+        .zip(&params.channels)
+        .filter_map(|(role, channel)| {
+            channel.deep_fill.map(|d| {
+                format!(
+                    "{} (resample {}, threshold {})",
+                    role.name(),
+                    d.resample,
+                    d.threshold
+                )
+            })
+        })
+        .collect();
+    if !deep_filled.is_empty() {
+        eprintln!("segment: deep fill of {}", deep_filled.join(", "));
+    }
+    let listening = Listening::new("segment", &assembly);
+    let stats = execute_phases(
         "vessel-graph segment",
         &assembly.workflow,
         &assembly.decomposition,
@@ -442,20 +520,78 @@ pub fn run_segment(args: &SegmentArgs) -> Result<SegmentSummary> {
                 .collect::<Vec<_>>(),
         ),
         &env,
-        &[],
+        &listening.listeners(),
         &assembly.work(),
     )?;
-    drop(env);
+    listening.finish();
+    drop((stats, env));
+
+    // The stored thinning, then its answer widened to a label in a plan of
+    // its own.
+    let widen_work = work.with_extension("skeleton");
+    let skeleton = match resident_thinning {
+        true => (work.clone(), skeleton),
+        false => {
+            let thin_work = work.with_extension("thin");
+            let thinned = thin_stored(
+                &AttachedImage::at(work.join(format!("level{}", skeleton.id.index()))),
+                &ThinPlan {
+                    grid: args.input.block()?,
+                    rounds_per_plan: THIN_ROUNDS_PER_PLAN,
+                    workers: args.input.workers(),
+                    round_limit: params.skeleton.round_limit,
+                    passes: params.skeleton.passes_per_round,
+                    work: thin_work.clone(),
+                    cache_bytes: Some(THIN_CACHE_BYTES),
+                },
+            )?;
+            eprintln!(
+                "segment: thinned over stored images in {} rounds",
+                thinned.rounds
+            );
+            let mut plan = PlanBuilder::new(
+                volume,
+                Dtype::Bool,
+                BlockGrid::new(volume, args.input.block()?)?,
+            );
+            let widened = plan.pixels(Chain::op(WidenLabelsOp))?.image()?;
+            let assembly = plan.finish()?;
+            fresh(&widen_work)?;
+            let env = ZarrEnvironment::attach(&widen_work, &[AttachedImage::at(&thinned.level0)])?;
+            execute_phases(
+                "vessel-graph skeleton",
+                &assembly.workflow,
+                &assembly.decomposition,
+                &hints(&args.input, &[widened]),
+                &env,
+                &[],
+                &assembly.work(),
+            )?;
+            drop(env);
+            let _ = fs::remove_dir_all(&thin_work);
+            (widen_work.clone(), Image::new(widened, Dtype::U64))
+        }
+    };
 
     let mask_label = format!("{}-mask", args.name);
     let skeleton_label = format!("{}-skeleton", args.name);
     let workers = args.input.workers();
+    let post = Profile::new("segment");
+    post.stage("publish labels");
     publish(&pyramids[0], &work, mask, &mask_label, workers)?;
-    publish(&pyramids[0], &work, skeleton, &skeleton_label, workers)?;
+    publish(
+        &pyramids[0],
+        &skeleton.0,
+        skeleton.1,
+        &skeleton_label,
+        workers,
+    )?;
     for (image, label) in channel_masks.iter().zip(&channel_labels) {
         publish(&pyramids[0], &work, *image, label, workers)?;
     }
     let _ = fs::remove_dir_all(&work);
+    let _ = fs::remove_dir_all(&widen_work);
+    post.finish();
     eprintln!("segment: done in {:.1}s", started.elapsed().as_secs_f64());
     Ok(SegmentSummary {
         mask_label,
@@ -463,6 +599,46 @@ pub fn run_segment(args: &SegmentArgs) -> Result<SegmentSummary> {
         channel_mask_labels: channel_labels,
         phases: assembly.n_phases(),
     })
+}
+
+/// Thinning rounds per plan: a convergence test after each plan, and up to
+/// this many rounds run past the fixed point (copies, every window unchanged).
+const THIN_ROUNDS_PER_PLAN: usize = 8;
+
+/// The stored thinning's chunk cache: enough for the windows of the blocks in
+/// flight. The environment's default (an eighth of the machine) was slower on
+/// the osf-sa3x8 crop.
+const THIN_CACHE_BYTES: u64 = 1 << 30;
+
+/// The points mapped into the atlas at a time, so that the mapping's own
+/// arrays stay bounded whatever the mask holds.
+const POINT_CHUNK: usize = 1 << 20;
+
+/// The density of `counts` points per atlas voxel (row-major on `shape`):
+/// a ball of radius `radius` per point, as `RegisteredAtlas::density` renders
+/// them, from one weighted point per voxel holding any.
+fn count_density(counts: &[u32], shape: [usize; 3], radius: [usize; 3]) -> Result<Voxels> {
+    let mut placed = Vec::new();
+    for (index, count) in counts.iter().enumerate() {
+        if *count > 0 {
+            let at = [
+                index / (shape[1] * shape[2]),
+                index / shape[2] % shape[1],
+                index % shape[2],
+            ];
+            placed.push(Point::weighted(at, f64::from(*count)));
+        }
+    }
+    let grid = BlockGrid::whole(shape)?;
+    let mut out = ndarray::Array3::<f64>::zeros((shape[0], shape[1], shape[2]));
+    voxelize_into(
+        &[([0, 0, 0], placed)],
+        &grid,
+        &ball(radius),
+        &Region::whole(&shape),
+        out.view_mut(),
+    )?;
+    Ok(Voxels::from(out))
 }
 
 /// `tract`: a tract channel to a mask and a point density.
@@ -572,15 +748,17 @@ pub fn run_tract(args: &TractArgs) -> Result<TractSummary> {
     let assembly = plan.finish()?;
     fresh(&work)?;
     let env = ZarrEnvironment::attach(&work, std::slice::from_ref(&attached))?;
+    let listening = Listening::new("tract range", &assembly);
     execute_phases(
         "vessel-graph tract range",
         &assembly.workflow,
         &assembly.decomposition,
         &hints(&args.input, &[]),
         &env,
-        &[],
+        &listening.listeners(),
         &assembly.work(),
     )?;
+    listening.finish();
     let range = read_clip_range(&env)?;
     drop(env);
     eprintln!("tract: clip range {range:?}");
@@ -592,99 +770,140 @@ pub fn run_tract(args: &TractArgs) -> Result<TractSummary> {
     let assembly = plan.finish()?;
     fresh(&work)?;
     let env = ZarrEnvironment::attach(&work, std::slice::from_ref(&attached))?;
+    let listening = Listening::new("tract", &assembly);
     execute_phases(
         "vessel-graph tract",
         &assembly.workflow,
         &assembly.decomposition,
         &hints(&args.input, &[images.mask.id, images.density.id]),
         &env,
-        &[],
+        &listening.listeners(),
         &assembly.work(),
     )?;
-    let points = match args.points_csv.is_some() || registered.is_some() {
-        true => read_points(&env)?,
-        false => Vec::new(),
-    };
+    listening.finish();
+    let post = Profile::new("tract");
+    post.stage("points: map, label, csv");
     let point_count = count_points(&env)?;
-    drop(env);
-
+    // The points, streamed one row of blocks at a time (each row sorted, the
+    // rows in z order: the whole list's order), in chunks of at most
+    // `POINT_CHUNK` for the mapping.
     let mut atlas_outside = None;
+    let mut csv = args
+        .points_csv
+        .as_ref()
+        .map(|path| {
+            fs::File::create(path)
+                .map(std::io::BufWriter::new)
+                .map_err(Error::backend)
+        })
+        .transpose()?;
     if let Some(registered) = &registered {
         let image = image_frame(pyramid.image_root(), level0);
         let to_sample = registered.image_to_sample(&image, [0.0; 3])?;
         if let Some(warning) = registered.frame_warning(&to_sample, volume) {
             eprintln!("tract: warning: {warning}");
         }
-        let image_points: Vec<[f64; 3]> = points.iter().map(|p| p.map(|v| v as f64)).collect();
-        let atlas = registered.map(&to_sample, &image_points).atlas;
         let lookup = LookupParams {
             level: args.level,
             rounding: Rounding::Nearest,
         };
-        let columns = registered.lookup(&atlas, &lookup)?;
-        let outside = registered.outside(&atlas, Rounding::Nearest);
-        eprintln!("tract: {} points, {outside} outside the atlas", atlas.len());
-        atlas_outside = Some(outside);
-        if let Some(path) = &args.atlas_density {
-            let density =
-                registered.density(&atlas, None, Rounding::Nearest, params.density_radius)?;
-            write_density(
-                path,
-                &density.voxels,
-                atlas_lattice(registered),
-                "micrometer",
-            )?;
-        }
-        if let Some(path) = &args.points_csv {
-            let mut out = std::io::BufWriter::new(fs::File::create(path).map_err(Error::backend)?);
-            let hemispheres = columns.hemisphere.as_deref();
+        // Whether the rows carry a hemisphere: the atlas's, whatever the points.
+        let hemispheres = registered.lookup(&[], &lookup)?.hemisphere.is_some();
+        if let Some(out) = &mut csv {
             write!(out, "z,y,x,atlas_z,atlas_y,atlas_x,annotation").map_err(Error::backend)?;
-            writeln!(
-                out,
-                "{}",
-                if hemispheres.is_some() {
-                    ",hemisphere"
-                } else {
-                    ""
-                }
-            )
-            .map_err(Error::backend)?;
-            for (row, (at, mapped)) in points.iter().zip(&atlas).enumerate() {
-                write!(
-                    out,
-                    "{},{},{},{},{},{},{}",
-                    at[0], at[1], at[2], mapped[0], mapped[1], mapped[2], columns.region[row]
-                )
+            writeln!(out, "{}", if hemispheres { ",hemisphere" } else { "" })
                 .map_err(Error::backend)?;
-                match hemispheres {
-                    Some(hemisphere) => writeln!(out, ",{}", hemisphere[row]),
-                    None => writeln!(out),
-                }
-                .map_err(Error::backend)?;
-            }
-            out.flush().map_err(Error::backend)?;
         }
-    } else if let Some(path) = &args.points_csv {
+        // The atlas density as a count per atlas voxel: a ball of weight `c`
+        // where `c` points fall is the sum of their `c` unit balls, exactly
+        // (integer counts in `f64`).
+        let shape = registered.shape();
+        let mut counts = args
+            .atlas_density
+            .is_some()
+            .then(|| vec![0u32; shape[0] * shape[1] * shape[2]]);
+        let mut mapped_count = 0usize;
+        let mut outside = 0usize;
+        for_each_point_slab(&env, &mut |slab| {
+            for points in slab.chunks(POINT_CHUNK) {
+                let image_points: Vec<[f64; 3]> =
+                    points.iter().map(|p| p.map(|v| v as f64)).collect();
+                let atlas = registered.map(&to_sample, &image_points).atlas;
+                drop(image_points);
+                let columns = registered.lookup(&atlas, &lookup)?;
+                outside += registered.outside(&atlas, Rounding::Nearest);
+                mapped_count += atlas.len();
+                if let Some(counts) = &mut counts {
+                    for point in &atlas {
+                        if let Some(at) = registered.voxel(*point, Rounding::Nearest) {
+                            let slot = &mut counts[(at[0] * shape[1] + at[1]) * shape[2] + at[2]];
+                            *slot = slot.checked_add(1).ok_or_else(|| {
+                                Error::invalid("tract: more than 2^32 points in one atlas voxel")
+                            })?;
+                        }
+                    }
+                }
+                if let Some(out) = &mut csv {
+                    let hemisphere = columns.hemisphere.as_deref();
+                    for (row, (at, mapped)) in points.iter().zip(&atlas).enumerate() {
+                        write!(
+                            out,
+                            "{},{},{},{},{},{},{}",
+                            at[0],
+                            at[1],
+                            at[2],
+                            mapped[0],
+                            mapped[1],
+                            mapped[2],
+                            columns.region[row]
+                        )
+                        .map_err(Error::backend)?;
+                        match hemisphere {
+                            Some(hemisphere) => writeln!(out, ",{}", hemisphere[row]),
+                            None => writeln!(out),
+                        }
+                        .map_err(Error::backend)?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        eprintln!("tract: {mapped_count} points, {outside} outside the atlas");
+        atlas_outside = Some(outside);
+        if let (Some(path), Some(counts)) = (&args.atlas_density, counts) {
+            let density = count_density(&counts, shape, params.density_radius)?;
+            drop(counts);
+            write_density(path, &density, atlas_lattice(registered), "micrometer")?;
+        }
+    } else if let Some(out) = &mut csv {
         let rescale = match &args.scale_to {
             Some(shape) => Some(Rescale::between(volume, triple(shape, "--scale-to")?)?),
             None => None,
         };
-        let mut out = std::io::BufWriter::new(fs::File::create(path).map_err(Error::backend)?);
         writeln!(out, "z,y,x").map_err(Error::backend)?;
-        for at in &points {
-            let point = [at[0] as f64, at[1] as f64, at[2] as f64];
-            let point = rescale.map_or(point, |rescale| rescale.apply(point));
-            writeln!(out, "{},{},{}", point[0], point[1], point[2]).map_err(Error::backend)?;
-        }
+        for_each_point_slab(&env, &mut |slab| {
+            for at in slab {
+                let point = [at[0] as f64, at[1] as f64, at[2] as f64];
+                let point = rescale.map_or(point, |rescale| rescale.apply(point));
+                writeln!(out, "{},{},{}", point[0], point[1], point[2]).map_err(Error::backend)?;
+            }
+            Ok(())
+        })?;
+    }
+    if let Some(out) = &mut csv {
         out.flush().map_err(Error::backend)?;
     }
+    drop(csv);
+    drop(env);
 
     let mask_label = format!("{}-mask", args.name);
     let density_label = format!("{}-density", args.name);
     let workers = args.input.workers();
+    post.stage("publish labels");
     publish(&pyramid, &work, images.mask, &mask_label, workers)?;
     publish(&pyramid, &work, images.density, &density_label, workers)?;
     let _ = fs::remove_dir_all(&work);
+    post.finish();
     Ok(TractSummary {
         range,
         points: point_count,

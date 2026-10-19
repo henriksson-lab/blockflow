@@ -15,7 +15,8 @@ use blockflow::voxels::Voxels;
 use blockflow::zarr_env::{PhysicalFrame, PyramidSpec, ZarrEnvironment};
 use serde_json::json;
 use tile_stitching::fuse::FuseParams;
-use tile_stitching::io::{positions_json, read_tile};
+use tile_stitching::io::{positions_json, read_tile, Neighbours};
+use tile_stitching::layout::{TileLayout, TileSource};
 use tile_stitching::relayout::{anchor, fused_translation, StoredLayout};
 use tile_stitching::rigid::RigidParams;
 use tile_stitching::tile_dir::{from_directory, grid_from_name, TileDirOptions};
@@ -192,6 +193,226 @@ fn distinct_translations_give_the_nominal_positions() {
     }
 }
 
+/// Neighbours from boxes: on a regular grid (also jittered by a few voxels,
+/// or with a tile missing) they are the grid neighbours, in the same order and
+/// along the same axes, and no diagonal; a staggered row is aligned with both
+/// tiles it straddles.
+#[test]
+fn box_neighbours_are_the_grid_neighbours_and_no_diagonals() {
+    let grid: Vec<[isize; 2]> = (0..3).flat_map(|y| (0..3).map(move |x| [x, y])).collect();
+    let on_grid = common::grid_layout(&grid);
+    let unnamed = |n: usize| {
+        (0..n)
+            .map(|_| TileSource {
+                shape: common::TILE,
+                tile_position: Vec::new(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let pairs = |layout: &TileLayout| {
+        (0..layout.alignments().len())
+            .map(|i| {
+                let a = &layout.alignments()[i];
+                (a.pre, a.post, a.displacement, layout.tiling_axis(i))
+            })
+            .collect::<Vec<_>>()
+    };
+    let boxes = TileLayout::from_boxes(unnamed(9), on_grid.positions().to_vec(), &[2, 1])
+        .expect("a layout");
+    assert_eq!(pairs(&boxes), pairs(&on_grid));
+    assert_eq!(boxes.alignments().len(), 12);
+
+    // a few voxels of stage error change no pair
+    let jittered: Vec<[isize; 3]> = on_grid
+        .positions()
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            [
+                p[0] + (i % 2) as isize,
+                p[1] + (i % 3) as isize - 1,
+                p[2] - (i % 2) as isize * 3,
+            ]
+        })
+        .collect();
+    let boxes = TileLayout::from_boxes(unnamed(9), jittered, &[2, 1]).expect("a layout");
+    let ends = |layout: &TileLayout| {
+        layout
+            .alignments()
+            .iter()
+            .map(|a| (a.pre, a.post))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ends(&boxes), ends(&on_grid));
+
+    // the centre tile missing: the eight seams around it
+    let ring: Vec<[isize; 3]> = on_grid
+        .positions()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 4)
+        .map(|(_, p)| *p)
+        .collect();
+    let boxes = TileLayout::from_boxes(unnamed(8), ring, &[2, 1]).expect("a layout");
+    assert_eq!(boxes.alignments().len(), 8);
+
+    // a second row shifted by half a pitch in x
+    let pitch_x = common::TILE[2] as isize - common::OVERLAP_X;
+    let pitch_y = common::TILE[1] as isize - common::OVERLAP_Y;
+    let staggered = vec![[0, 0, 0], [0, 0, pitch_x], [0, pitch_y, pitch_x / 2]];
+    let boxes = TileLayout::from_boxes(unnamed(3), staggered, &[2, 1]).expect("a layout");
+    assert_eq!(ends(&boxes), vec![(0, 1), (0, 2), (1, 2)]);
+    assert_eq!(boxes.tiling_axis(0), Some(2));
+    assert_eq!(boxes.tiling_axis(1), Some(1));
+    assert_eq!(
+        boxes.alignments()[2].displacement,
+        [0, pitch_y, -pitch_x / 2]
+    );
+}
+
+/// Tiles whose names carry no grid index, placed by their translations alone:
+/// the set aligns the pairs whose boxes overlap and the stitch recovers the
+/// planted offsets. Duplicated translations, and a directory with neither
+/// translations nor names, are refused.
+#[test]
+fn translations_place_and_pair_tiles_without_grid_names() {
+    let dir = common::scratch("tile_dir_boxes");
+    let pitch = [
+        (common::TILE[1] as isize - common::OVERLAP_Y) as f64,
+        (common::TILE[2] as isize - common::OVERLAP_X) as f64,
+    ];
+    // a 2 x 2 mosaic; the true origins are the nominal ones moved by a few
+    // voxels, so the rigid step has something to find
+    let planted = [[0, 0, 0], [2, 3, -4], [1, -2, 3], [-1, 2, 2]];
+    let cells = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+    let names = ["a.zarr", "b.zarr", "c.zarr", "d.zarr"];
+    let grid_named = common::scratch("tile_dir_boxes_named");
+    for (i, ((name, cell), offset)) in names.iter().zip(cells).zip(planted).enumerate() {
+        let nominal = [0.0, cell[0] * pitch[0], cell[1] * pitch[1]];
+        let origin: [isize; 3] = std::array::from_fn(|a| nominal[a] as isize + offset[a]);
+        let tile = common::crop(origin, common::TILE, |_| [0, 0]);
+        write_tile(
+            &dir.join(name),
+            &tile,
+            [5.0 + nominal[0], -9.0 + nominal[1], 4.0 + nominal[2]],
+        );
+        // the same tiles named by grid index, at the origin
+        write_tile(
+            &grid_named.join(format!("tile_{:02}x{:02}.zarr", i / 2, i % 2)),
+            &tile,
+            [0.0; 3],
+        );
+    }
+    let derived = from_directory(
+        &dir,
+        &TileDirOptions {
+            overlap: Some([1.0, 1.0]),
+            ..TileDirOptions::default()
+        },
+    )
+    .expect("a tile set");
+    assert_eq!(derived.positions_from, "translation");
+    assert_eq!(derived.provenance["neighbours"], "boxes");
+    assert!(
+        derived.provenance["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("--overlap is ignored"),
+        "{}",
+        derived.provenance
+    );
+    let set = &derived.tile_set;
+    assert!(set.tiles.iter().all(|tile| tile.grid.is_empty()));
+    assert_eq!(set.tiles[3].position, Some([0, 56, 40]));
+    let json = set.to_json();
+    assert_eq!(json["neighbours"], "boxes");
+    assert!(json["tiles"][0].get("grid").is_none());
+
+    // The stitch is the one the grid names and the overlap give.
+    let by_grid = from_directory(
+        &grid_named,
+        &TileDirOptions {
+            overlap: Some([common::OVERLAP_Y as f64, common::OVERLAP_X as f64]),
+            ..TileDirOptions::default()
+        },
+    )
+    .expect("a gridded set");
+    assert_eq!(by_grid.provenance["neighbours"], "grid");
+    let (stitched, _) = stitch_set(set, 0);
+    let (gridded, _) = stitch_set(&by_grid.tile_set, 0);
+    let ends = |s: &Stitched| {
+        s.layout
+            .alignments()
+            .iter()
+            .map(|a| (a.pre, a.post, a.displacement))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(stitched.layout.alignments().len(), 4);
+    assert_eq!(ends(&stitched), ends(&gridded));
+    let relative = |s: &Stitched| {
+        let placed = s.placed.as_ref().expect("a per-slice placement");
+        placed
+            .positions
+            .iter()
+            .map(|slices| {
+                slices
+                    .iter()
+                    .map(|p| {
+                        std::array::from_fn::<isize, 3, _>(|a| p[a] - placed.positions[0][0][a])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(relative(&stitched), relative(&gridded));
+    // and it found the planted offsets: tile b's first plane against a's
+    let r = relative(&stitched);
+    assert_eq!(r[1][0][1..], [planted[1][1], 40 + planted[1][2]]);
+
+    // the same as a hand-written set with positions and no grid
+    let file = dir.join("set.json");
+    std::fs::write(&file, serde_json::to_string(&json).unwrap()).unwrap();
+    let read = tile_stitching::io::TileSetFile::read(&file).expect("read back");
+    assert_eq!(read.neighbours(), Neighbours::Boxes);
+    let shapes = vec![common::TILE; 4];
+    assert_eq!(
+        read.layout(&shapes).unwrap().alignments(),
+        set.layout(&shapes).unwrap().alignments()
+    );
+
+    // two tiles at one translation: refused
+    let tile = common::crop([0, 0, 0], common::TILE, |_| [0, 0]);
+    write_tile(&dir.join("e.zarr"), &tile, [5.0, -9.0, 4.0]);
+    let refused = from_directory(&dir, &TileDirOptions::default()).expect_err("a duplicate");
+    assert!(
+        refused.to_string().contains("same translation"),
+        "{refused}"
+    );
+
+    // no translations and no names: nothing places them
+    let plain = common::scratch("tile_dir_plain");
+    write_tile(&plain.join("a.zarr"), &tile, [0.0; 3]);
+    write_tile(&plain.join("b.zarr"), &tile, [0.0; 3]);
+    let refused = from_directory(
+        &plain,
+        &TileDirOptions {
+            overlap: Some([1.0, 1.0]),
+            ..TileDirOptions::default()
+        },
+    )
+    .expect_err("nothing places them");
+    assert!(refused.to_string().contains("grid index"), "{refused}");
+    let refused = from_directory(
+        &plain,
+        &TileDirOptions {
+            rows: Some((0, 1)),
+            ..TileDirOptions::default()
+        },
+    )
+    .expect_err("no names to select by");
+    assert!(refused.to_string().contains("--rows"), "{refused}");
+}
+
 /// A stitch written as a positions file and read back fuses to the same
 /// volume, any box of it equals that crop of the volume, and the same
 /// positions carried from level 1 to level 0 fuse the tiles' level 0 in the
@@ -326,6 +547,100 @@ fn a_stored_layout_fuses_again_over_a_box_and_at_another_level() {
         }
         assert!((t1[0] - t0[0]).abs() < 1e-9);
     }
+}
+
+/// A layout fitted on a level that halves z too (osf-sa3x8's pyramid) carried
+/// to level 0: each plane stands for the two it covers, at twice its z and
+/// its in-plane position doubled (a level-0 plane beyond twice the coarse
+/// count, or a coarse plane's second beyond the level-0 count, is left out),
+/// and the fusion puts every tile voxel where the scene has it.
+/// Ratios that are not whole are refused.
+#[test]
+fn a_layout_on_a_level_that_halves_z_is_carried_to_level_0() {
+    let dir = common::scratch("tile_dir_relayout_z");
+    // an odd plane count, so the halving does not divide it
+    const SHAPE: [usize; 3] = [25, 200, 80];
+    const OVERLAP: isize = 40;
+    let tiles = [
+        common::crop([0, 0, 0], SHAPE, |_| [0, 0]),
+        common::crop([2, 4, SHAPE[2] as isize - OVERLAP - 4], SHAPE, |_| [0, 0]),
+    ];
+    let halving = |path: &Path, tile: &Voxels| {
+        ZarrEnvironment::build_multiscale(
+            path,
+            tile,
+            &PyramidSpec::new(vec![[2, 2, 2]])
+                .expect("a pyramid")
+                .with_physical(PhysicalFrame::new([1.0, 1.0, 1.0], Some("micrometer"))),
+        )
+        .expect("a tile image");
+    };
+    halving(&dir.join("tile_00x00.zarr"), &tiles[0]);
+    halving(&dir.join("tile_00x01.zarr"), &tiles[1]);
+    let derived = from_directory(
+        &dir,
+        &TileDirOptions {
+            overlap: Some([OVERLAP as f64, OVERLAP as f64]),
+            level: 1,
+            ..TileDirOptions::default()
+        },
+    )
+    .expect("a tile set");
+    let (stitched, _) = stitch_set(&derived.tile_set, 1);
+    let paths = derived
+        .tile_set
+        .tiles
+        .iter()
+        .map(|t| t.path.clone())
+        .collect::<Vec<_>>();
+    let mut json = positions_json(&stitched, &stitched.layout, &paths, 0);
+    json["voxel_size"] = json!([2.0, 2.0, 2.0]);
+    let stored = StoredLayout::from_json(&json, None).expect("a stored layout");
+    let coarse_planes = stored.tiles[0].shape[0];
+    assert!(
+        coarse_planes == 12 || coarse_planes == 13,
+        "{coarse_planes}"
+    );
+    let planes = (2 * coarse_planes).min(25);
+    let shapes = tiles.iter().map(Voxels::shape).collect::<Vec<_>>();
+    let at_zero = stored.rescaled([1.0; 3], &shapes).expect("rescaled");
+    for (tile, coarse) in at_zero.tiles.iter().zip(&stored.tiles) {
+        assert_eq!(tile.shape[0], planes);
+        for k in 0..planes {
+            let p = coarse.positions[k / 2];
+            assert_eq!(
+                tile.positions[k],
+                [2 * p[0] + (k % 2) as i64, 2 * p[1], 2 * p[2]]
+            );
+        }
+    }
+    assert_eq!(at_zero.origin, stored.origin.map(|v| 2 * v));
+    let fuse = FuseParams {
+        weighting: tile_stitching::fuse::Weighting::Pyramid,
+        ..FuseParams::default()
+    };
+    let fused0 = at_zero.fuse(&fuse, None, 0, 0).expect("level 0");
+    let view = fused0.view::<u16>().expect("u16");
+    for (index, tile) in at_zero.tiles.iter().enumerate() {
+        let data = tiles[index].view::<u16>().expect("u16");
+        for (k, at) in tile.positions.iter().enumerate() {
+            for j in (0..tile.shape[1]).step_by(7) {
+                for i in (0..tile.shape[2]).step_by(5) {
+                    let g = [
+                        (at[0] - at_zero.origin[0]) as usize,
+                        (at[1] - at_zero.origin[1]) as usize + j,
+                        (at[2] - at_zero.origin[2]) as usize + i,
+                    ];
+                    assert_eq!(view[g], data[[k, j, i]], "tile {index} at {g:?}");
+                }
+            }
+        }
+    }
+    // 2 -> 1.5 is not a whole factor
+    let refused = stored
+        .rescaled([1.5, 1.0, 1.0], &shapes)
+        .expect_err("not a whole factor");
+    assert!(refused.to_string().contains("whole factor"), "{refused}");
 }
 
 /// The CLI end to end: `--tile-dir` writes the derived tile set and a positions
@@ -463,4 +778,33 @@ fn the_osf_conversions_give_their_grids_from_their_names() {
     .expect("a tile set");
     assert_eq!(derived.tile_set.tiles.len(), 9);
     assert_eq!(derived.tile_set.overlap, Some(vec![66, 212]));
+}
+
+/// osf-sa3x8's nine tiles with the LaVision stage positions img2omezarr
+/// wrote (`set-positions --from-originals`, on a metadata-only mirror): they
+/// are placed and paired from their translations alone, with no overlap and
+/// without reading the names' grid.
+#[test]
+#[ignore = "reads the metadata-only mirror /husky/henriksson/lightsheet-reference/positions/osf-sa3x8/tiles; run with --release --ignored"]
+fn the_osf_sa3x8_mirror_is_placed_by_its_stage_positions() {
+    let tiles = Path::new("/husky/henriksson/lightsheet-reference/positions/osf-sa3x8/tiles");
+    if !tiles.exists() {
+        eprintln!("no {}; skipped", tiles.display());
+        return;
+    }
+    let derived = from_directory(tiles, &TileDirOptions::default()).expect("a tile set");
+    assert_eq!(derived.positions_from, "translation");
+    let set = &derived.tile_set;
+    assert_eq!(set.tiles.len(), 9);
+    let shapes = vec![[3369, 1304, 404]; 9];
+    let layout = set.layout(&shapes).expect("a layout");
+    // a 3 x 3 grid: 6 column seams and 6 row seams
+    assert_eq!(layout.alignments().len(), 12);
+    // stage pitch 590.85 um in x (363.6 voxels of 1.625) and 1907.1 um in y
+    // (1173.6 voxels)
+    let a = set.tiles[0].position.expect("a position");
+    let b = set.tiles[1].position.expect("a position");
+    let c = set.tiles[3].position.expect("a position");
+    assert_eq!([b[1] - a[1], b[2] - a[2]], [0, 364]);
+    assert_eq!([c[1] - a[1], c[2] - a[2]], [1174, 0]);
 }

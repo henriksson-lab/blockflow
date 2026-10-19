@@ -24,13 +24,14 @@
 //! 8. [`classify`] — arteries and veins on the line graph;
 //! 9. [`branch_density`] — vertices splatted through `blockflow::ops::voxelize`.
 //!
-//! [`vessel_graph`] runs 1–6 from in-memory volumes. Everything after works on
-//! a [`VesselGraph`], which is written as NGFF object tables
-//! ([`write_graph_tables`]) or JSON ([`VesselGraph::to_json`]).
+//! [`vessel_graph`] runs 1–6 from in-memory volumes, and
+//! [`vessel_graph_stored`] the same stages over stored volumes, planned block
+//! by block ([`planned`]): the same graph, without holding a volume.
+//! Everything after works on a [`VesselGraph`], which is written as NGFF
+//! object tables ([`write_graph_tables`]) or JSON ([`VesselGraph::to_json`]).
 //!
-//! The graph stages are resident: the structural graph of a whole brain is a
-//! few GB against a skeleton volume of ~100 GB, so the volume is what needs a
-//! plan ([`raw::build_blocked`]) and the graph does not.
+//! The graph itself is resident: it grows with the vessels' length, not with
+//! the volume, so the volumes are what need a plan and the graph does not.
 
 pub mod annotate;
 pub mod branch;
@@ -39,6 +40,7 @@ pub mod clean;
 pub mod cli;
 pub mod columns;
 pub mod component;
+pub mod planned;
 pub mod radius;
 pub mod raw;
 pub mod reduce;
@@ -48,6 +50,8 @@ pub mod vessel;
 
 use blockflow::error::{Error, Result};
 use blockflow::voxels::Voxels;
+
+use crate::profile::GRAPH;
 
 pub use annotate::annotate;
 pub use branch::{branch_density, BranchParams, Selection};
@@ -140,10 +144,12 @@ pub fn vessel_graph(inputs: &Inputs<'_>, params: &GraphParams) -> Result<VesselG
             }
         }
     }
+    GRAPH.stage("build raw graph");
     let raw = build(inputs.skeleton, &params.build)?;
     let points = raw.coordinates();
     let mut carried = Vec::new();
 
+    GRAPH.stage("radii");
     let axial_um = match inputs.vessels {
         Some(vessels) => {
             let measured = radii(vessels, points, inputs.spacing, &params.radius)?;
@@ -155,6 +161,7 @@ pub fn vessel_graph(inputs: &Inputs<'_>, params: &GraphParams) -> Result<VesselG
         }
         None => vec![[0.0; 3]; points.len()],
     };
+    GRAPH.stage("signals");
     let at = |shift: f64| signal::search_radii(&axial_um, inputs.spacing, shift);
     if let Some(volume) = inputs.artery_intensity {
         let values = signal::measure(
@@ -180,14 +187,48 @@ pub fn vessel_graph(inputs: &Inputs<'_>, params: &GraphParams) -> Result<VesselG
         }
     }
 
-    let cleaned = clean(&raw, &params.clean)?;
+    finish(&raw, &carried, params, inputs.spacing)
+}
+
+/// Stages 4–6 from a raw graph and the columns carried on it: clean, reduce,
+/// assemble, the largest component (if asked) and the edge lengths.
+pub fn finish(
+    raw: &RawGraph,
+    carried: &[Carried],
+    params: &GraphParams,
+    spacing: [f64; 3],
+) -> Result<VesselGraph> {
+    GRAPH.stage("clean");
+    let cleaned = clean(raw, &params.clean)?;
     // The polylines are what every edge column is folded over.
+    GRAPH.stage("reduce");
     let reduced = reduce(&cleaned, &ReduceParams::default())?;
-    let graph = VesselGraph::assemble(&raw, &cleaned, &reduced, &carried)?;
+    GRAPH.stage("assemble");
+    let graph = VesselGraph::assemble(raw, &cleaned, &reduced, carried)?;
+    GRAPH.stage("largest component, lengths");
     let mut graph = match params.largest_component {
         true => graph.largest_component()?,
         false => graph,
     };
-    graph.set_lengths(inputs.spacing)?;
+    graph.set_lengths(spacing)?;
     Ok(graph)
+}
+
+/// Stages 1–6 over stored volumes, planned over blocks
+/// ([`planned::measure_stored`]); the same graph [`vessel_graph`] gives.
+pub fn vessel_graph_stored(
+    inputs: &planned::StoredInputs,
+    params: &GraphParams,
+    plan: &planned::PlanParams,
+) -> Result<VesselGraph> {
+    GRAPH.stage("build and measure (planned)");
+    let (raw, carried) = planned::measure_stored(inputs, params, &params.build, plan)?;
+    if crate::profile::enabled() {
+        eprintln!(
+            "profile graph: raw graph of {} vertices and {} edges",
+            raw.n_vertices(),
+            raw.n_edges()
+        );
+    }
+    finish(&raw, &carried, params, inputs.spacing)
 }

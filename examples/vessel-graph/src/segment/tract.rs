@@ -19,6 +19,8 @@
 //! resolution; mapping the points into an atlas frame belongs to registration
 //! ([`Rescale`] is the shape-ratio half of that).
 
+use std::collections::BTreeMap;
+
 use blockflow::assemble::{Phase, PlanBuilder};
 use blockflow::env::Environment;
 use blockflow::fragment::{
@@ -31,7 +33,7 @@ use blockflow::ops::threshold::{sampled_thresholds, GlobalThreshold};
 use blockflow::ops::voxelize::{ball, VoxelizeOp};
 use blockflow::ops::{SampledValuesOp, ValueSampling, WidenLabelsOp};
 use blockflow::points::{decode_points, encode_points, Point};
-use blockflow::sidecar::Lifecycle;
+use blockflow::sidecar::{FragmentKey, Lifecycle};
 use blockflow::voxels::Voxels;
 use blockflow::{Chain, Error, Result};
 
@@ -313,6 +315,37 @@ pub fn read_points(env: &dyn Environment) -> Result<Vec<[usize; 3]>> {
     })?;
     points.sort_unstable();
     Ok(points)
+}
+
+/// Every point a finished tract run emitted, one row of blocks (one block
+/// edge of z) at a time and sorted within it, the rows in z order: together
+/// the order [`read_points`] gives, holding one row's points at a time.
+pub fn for_each_point_slab(
+    env: &dyn Environment,
+    visit: &mut dyn FnMut(&[[usize; 3]]) -> Result<()>,
+) -> Result<()> {
+    let mut rows: BTreeMap<usize, Vec<FragmentKey>> = BTreeMap::new();
+    for key in env.sidecar_keys(POINTS_STREAM)? {
+        rows.entry(key.block[0]).or_default().push(key);
+    }
+    for keys in rows.values() {
+        let mut points = Vec::new();
+        for key in keys {
+            let bytes = env
+                .read_sidecar(&key.stream, key.phase, key.block)?
+                .ok_or_else(|| {
+                    Error::invalid(format!(
+                        "tract: the points of {key:?} were listed and are gone"
+                    ))
+                })?;
+            points.extend(decode_points(&bytes)?.into_iter().map(|point| point.at));
+        }
+        // A block's points are its own core's, so a row of blocks holds every
+        // point of its planes.
+        points.sort_unstable();
+        visit(&points)?;
+    }
+    Ok(())
 }
 
 /// How many points a finished tract run emitted, without holding them.

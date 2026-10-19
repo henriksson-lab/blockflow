@@ -27,6 +27,9 @@ tiles + grid + nominal overlap
   fuse     per output voxel: weighted mean of the covering     src/fuse.rs
            tiles, weight = 1 + distance to the tile's nearest
            in-plane face; blocks in parallel on a BlockGrid
+           (resident tiles), or planned slab by slab from      src/planned.rs
+           the tiles on disk (--layout-from)
+  write    multiscale OME-Zarr, slab by slab, chunk-parallel   src/pyramid.rs
 ```
 
 The rigid step corrects only the axes transverse to the tiling axis (the
@@ -58,8 +61,18 @@ by a JSON tile-set file. Paths are relative to the file.
 `grid[d]` is the tile's index along `grid_axes[d]`; `overlap[d]` is the
 nominal overlap in voxels along that axis, and is also the depth of the rigid
 step's projection. Instead of `overlap`, every tile may give
-`"position": [z, y, x]`, its nominal position in voxels; alignments are still
-between grid neighbours.
+`"position": [z, y, x]`, its nominal position in voxels. Which tiles are
+aligned (`"neighbours"`):
+
+- `"grid"`: tiles one step apart on the grid (the default when every tile has
+  a `grid`);
+- `"boxes"`: tiles whose boxes, at their positions, overlap in the plane
+  (needs a `position` for every tile; `grid` may then be left out, and is the
+  default when some tile has none). Two tiles pair along x (or y) when their
+  boxes overlap along it and their offset across it is under half a tile and
+  relatively smaller, so a regular grid gives its row and column seams and no
+  diagonals, a jittered or partial grid the same, and a staggered row pairs
+  with both tiles it straddles (`TileLayout::from_boxes`).
 
 ### From a directory of converted tiles (`--tile-dir`)
 
@@ -67,33 +80,41 @@ between grid neighbours.
 (`src/tile_dir.rs`) and writes it, with a record of where each number came
 from, to `<out>.tiles.json` (which `--tiles` reads back):
 
-- **Tiles and grid.** Every OME-Zarr image in `DIR` whose name carries a grid
-  index, the last `<row> x <column>` in it (`tile_03x04.zarr`,
-  `sample[03 x 04]_c0.ome.zarr`), is a tile; the row runs along y and the
-  column along x. Other images (an `autofluorescence.zarr` beside the tiles)
-  are skipped. `--rows A:B` and `--columns A:B` (half-open, as named) select
-  a sub-grid; grid indices are rebased to 0.
-- **Nominal positions**, the first of:
+- **Tiles.** Every OME-Zarr image in `DIR` whose name carries a grid index,
+  the last `<row> x <column>` in it (`tile_03x04.zarr`,
+  `sample[03 x 04]_c0.ome.zarr`), is a tile; other images (an
+  `autofluorescence.zarr` beside the tiles) are skipped. When no name carries
+  one, every image in `DIR` is a tile. The row runs along y and the column
+  along x. `--rows A:B` and `--columns A:B` (half-open, as named) select a
+  sub-grid by the names; grid indices are rebased to 0.
+- **Positions and neighbours**, the first of:
   1. *physical translations*: when the tiles' level-0
      `coordinateTransformations` carry translations that differ between tiles,
      each tile's position is its translation relative to the first tile's, in
-     voxels of `--level`;
-  2. `--overlap Y,X` (level-0 voxels, one value for both allowed), scaled to
-     `--level`.
+     voxels of `--level`, and the neighbours are found from the boxes
+     (`"neighbours": "boxes"`). Grid indices are not needed, and `--overlap`
+     is ignored (with a note). Two tiles at the same translation are refused:
+     one of them is misplaced (osf-cztq2's vendor metadata repeats row 00 as
+     row 07, which `img2omezarr set-positions` refuses already);
+  2. the grid from the names and `--overlap Y,X` (level-0 voxels, one value
+     for both allowed), scaled to `--level`, with grid neighbours.
 
   With neither, the directory is refused.
 
 Only standard OME-Zarr metadata and the file name are read. Nothing about the
 instrument or the format the tiles were converted from is used; that is the
-converter's job (`img2omezarr`).
+converter's job (`img2omezarr`, whose `set-positions` writes the translations
+into existing conversions: from a table, a grid, or the originals' LaVision
+stage positions).
 
-What a converter should record so that no `--overlap` is needed: each tile's
-nominal position as a level-0 NGFF `translation`, in the image's own physical
-units and axes (z, y, x), with the stage-to-image axis signs already resolved.
-The grid index in the file name is then still needed for which tiles are
-neighbours. The conversions at hand under `/husky/otherdataset/teresa/clearmap_em`
-have no translations, so they need `--overlap` (osf-cztq2: `120,120`, measured
-from the whole-sample stitch).
+The conversions under `/husky/otherdataset/teresa/clearmap_em` themselves carry
+no translations, so read directly they need `--overlap` (osf-cztq2: `120,120`,
+measured from the whole-sample stitch). Their metadata-only mirrors under
+`/husky/henriksson/lightsheet-reference/positions/` carry them: osf-sa3x8's
+nine tiles the LaVision stage positions (`positions/osf-sa3x8/tiles`, placed
+and paired with no `--overlap`), osf-cztq2's 40 a grid of 887 x 884 voxels
+(`positions/osf-cztq2`; its LaVision positions are refused, row 07 repeating
+row 00).
 
 ### Fused frame
 
@@ -106,7 +127,8 @@ at the origin (all current conversions) therefore give a fused image whose
 first tile keeps its own frame, and tiles with distinct translations keep
 them. The positions file records `level`, `voxel_size`, `unit`, `anchor` and
 `translation`. Registration (`atlas-registration`, which starts from the
-images' geometric centres) and the detectors (`cell-density`, `vessel-graph`,
+images' geometric centres, their physical frames, or a given translation:
+`--initialise`, `--initial-translation`) and the detectors (`cell-density`, `vessel-graph`,
 which read each image's level-0 scale and translation) take the frame as it
 is.
 
@@ -115,7 +137,11 @@ is.
 `--layout-from <out>.positions.json` skips the alignment and fuses at the
 stored positions, carried to `--level`: in-plane positions are scaled by the
 ratio of the voxel sizes (exact from a coarser level to a finer one by an
-integer factor), and z must keep its voxel size. `--region Z0:Z1,Y0:Y1,X0:X1`
+integer factor). The per-slice placement is per plane, so z must keep its
+voxel size or, for a pyramid that halves z too (osf-sa3x8's), be finer by a
+whole factor: each stored plane then stands for the planes it covers, at
+that factor times its z position plus 0, 1, ... and its in-plane position.
+`--region Z0:Z1,Y0:Y1,X0:X1`
 (fused voxels of `--level`) fuses only that box, reading only the tiles and
 planes that reach into it; its frame is the box's place in the fused frame,
 so it lines up with a whole-sample fusion at another level. This is how a
@@ -123,6 +149,31 @@ whole sample is stitched without holding it at full resolution: align and
 fuse at level 1 (or 2) for registration, then fuse level-0 boxes for
 detection. Writes `<out>.fuse.json` (layout, level, region, translation,
 seconds).
+
+This fusion is planned and out of core (`src/planned.rs`). Before anything is
+read, each tile's box for the region is known: the planes usable there and,
+per plane, the in-plane part inside the region at that plane's own
+position. The region is cut into slabs of whole output chunk rows along the
+axis the output's chunks cut most often (`pyramid::sweep_axis`; for
+osf-cztq2 at level 2, whose chunks are `1043 x 1 x 1142`, that is y). Each
+tile is held as one buffer covering what the current slab needs. The next
+slab keeps the rows still needed and reads the rest up to the tile's next
+stored chunk boundary, so every stored tile chunk is decoded once. The next
+slab's reads overlap the current slab's fusion and writing. A slab's chunks
+are fused in parallel by the same kernel as the resident fusion, which reads
+the same tile voxels in the same order, so the output is identical. Each
+finished slab goes straight to the pyramid writer (`src/pyramid.rs`). As soon
+as a level has a whole row of chunks, the writer encodes and stores it, chunk
+by chunk in parallel. As soon as the windows for the next level's rows are
+present, it computes those rows. No level is ever read back. The arrays and
+metadata are byte for byte those `ZarrEnvironment::build_multiscale` writes
+for the resident volume.
+
+There is no automatic choice between this and a resident fusion, because the
+planned path is the faster one at every size measured, a 512^3-voxel box
+included (see Validation). `StoredLayout::fuse_resident` (read every touching
+plane whole, fuse on one thread) is kept as the reference the tests compare
+against.
 
 ## Run
 
@@ -199,10 +250,15 @@ and `RigidParams::default()` match.
   without `--overlap`, and with it gives the hand-written set and recovers the
   planted offset; the overlap is scaled to the level;
   row/column selection; distinct translations give the nominal positions and
-  the fused frame keeps the first tile's; a positions file read back fuses
+  the fused frame keeps the first tile's; neighbours from boxes are the grid
+  neighbours on a regular, jittered or partial grid, with no diagonals, and
+  pair a staggered row with both tiles it straddles; tiles without grid names
+  placed by translations alone stitch exactly as the same tiles named and
+  given the overlap; duplicated translations are refused; a positions file read back fuses
   the same volume, any box equals that crop, and level-1 positions carried to
   level 0 put every tile voxel where the scene has it, in the frame the
-  level-1 volume describes; the CLI end to end (`--tile-dir`, then
+  level-1 volume describes, also from a level that halves z (each plane
+  standing for two), and a z ratio that is not whole is refused; the CLI end to end (`--tile-dir`, then
   `--layout-from --region`, frames compared).
 - Fusion: the weighted mean against its definition on a three-tile plane,
   the other methods, and identical output across block lattices that cut the
@@ -218,6 +274,33 @@ release build, 2026-10-18:
 | same pair, per-slice measurement | 239 overlapping slices, 80 measured, 80 aligned, 1.3 s |
 | same pair, end to end | fused `241 x 1304 x 762` in 7.4 s |
 | CLI, 3 x 3 grid, z 1200..1320 | fused `124 x 3504 x 1127` in 32 s, 2.8 GB peak RSS |
+| 2026-10-19: `--tile-dir` on the LaVision-positioned mirror (`positions/osf-sa3x8/tiles`), no `--overlap`, level 1, whole stacks, `--positions-only` | 9 tiles placed from their translations, 12 pairs from their boxes (the grid's), 77 s, 4.8 GB peak RSS; then the whole fusion at level 1, `1686 x 1839 x 570`, 188 s, 11 GB |
+
+On that run the stitched tile positions (per-slice medians) against the stage
+positions: y pitch the stage's (fitted scale 1.001), x pitch 2.7% shorter
+(0.973; osf-cztq2's vendor pitch is 2% long on both axes), residuals with the
+scale fitted 2.2 µm (y) and 6.7 µm (x) at most.
+
+Planned fusion and the slab-by-slab writer (`tests/stitch_planned.rs`):
+over a wobbly 2 x 3 grid with unusable planes and small stored chunks, the
+planned fusion equals the resident one for every method, box, sweep axis,
+slab size and chunk shape. A thin box reads under a quarter of the tile
+voxels the whole volume reads. The planned image, and `write_volume_at`
+fed any slab sizes along any axis, are the same files byte for byte as
+`build_multiscale` writes (u8, u16, f32 and bool; prime extents; one level
+only).
+
+Measured 2026-10-19, before (the resident fusion and `build_multiscale`)
+against after, on the same machine (40 cores, shared, load average 45-95
+throughout). In every case, every file of the output is byte-identical:
+
+| run | wall | user+sys | peak RSS |
+|---|---|---|---|
+| osf-cztq2, 40 tiles, level 2 whole (`1043 x 1811 x 1142`) | 809 s -> 50 s | 798 s -> 342 s | 13.9 -> 5.3 GB |
+| osf-cztq2, level-0 box `512 x 640 x 640` | 39.5 s -> 9.2 s | 33.9 s -> 28.1 s | 2.33 -> 1.43 GB |
+| osf-sa3x8, 9 tiles, level 1 whole (`1686 x 1839 x 570`) | 313 s -> 79 s | 405 s -> 278 s | 11.0 -> 2.5 GB |
+| osf-sa3x8, level-0 box `512 x 512 x 256`, 1 level | 22.3 s -> 3.9 s | 21.0 s -> 11.5 s | 2.88 -> 0.87 GB |
+| osf-sa3x8 `--tile-dir`, level 1, z 600..840, align + resident fuse | 16.4 s -> 15.3 s | 70.6 s -> 43.7 s | 1.39 -> 1.39 GB |
 
 Against ClearMap 3.1 on a 3 x 3 grid (`reference-clearmap/`, both at the
 shipped search ranges, the reference with two of its defects corrected): rigid
@@ -227,13 +310,20 @@ slices; seam offsets within a voxel in 97% (y) and 93% (x) of planes, median
 
 ## Limitations
 
-- Resident: every tile (or its `--z-range`) and the fused volume are held in
-  memory. For a whole sample, align at a coarser level with
-  `--positions-only` and fuse with `--layout-from` (only the tiles and planes a
-  `--region` needs are read); osf-cztq2's 40 tiles at level 1 peak at about
-  40 GB. The fusion is block-local and parallel, but it is driven on a
-  `BlockGrid` directly rather than through a `blockflow` plan, because no phase
-  can read several images each at its own (per-slice) translation.
+- Alignment is resident: every tile (or its `--z-range`) and, without
+  `--positions-only`, the fused volume are held in memory. For a whole
+  sample, align at a coarser level with `--positions-only` and fuse with
+  `--layout-from`, which is planned and holds only a slab's tile boxes and
+  output (see [Reusing a layout](#reusing-a-layout---layout-from));
+  osf-cztq2's 40 tiles at level 1 peak at about 40 GB in the alignment.
+- The planned fusion is planned here, not through a `blockflow` plan. A
+  phase's supplied inputs must share the plan's volume and lattice, and each
+  tile has its own shape and sits at its own translation in every plane.
+- The output's chunks are `zarr_env::chunk_for_block`'s. For a prime extent
+  (osf-cztq2's 1811 rows at level 2) that gives one-row chunks spanning the
+  other two axes. That is kept so the output stays identical to what came
+  before. It makes slabs whole-z, so a tile buffer holds every plane of its
+  rows.
 - The rigid step does not correct the tiling axis; that is left to the
   per-slice step, so `--rigid-only` keeps the nominal spacing along it.
 - The whole-stack placement is a dense solve with one unknown per tile cluster

@@ -29,6 +29,7 @@ fn main() {
         eprintln!("vessel-graph: use a release build (cargo run --release)");
         std::process::exit(2);
     }
+    limit_malloc_arenas();
     let outcome = match Cli::parse().command {
         Command::Segment(args) => run_segment(&args).map(|summary| {
             println!(
@@ -59,5 +60,20 @@ fn main() {
     if let Err(error) = outcome {
         eprintln!("{error}");
         std::process::exit(1);
+    }
+}
+
+/// Two malloc arenas instead of glibc's eight per core, unless
+/// `MALLOC_ARENA_MAX` says otherwise: forty worker threads each freeing block
+/// buffers into an arena of their own keep freed memory resident (the same
+/// setting as `cell-density`'s). Set before any thread starts.
+fn limit_malloc_arenas() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        // SAFETY: `mallopt` only sets an allocator parameter; it is called
+        // before any other thread exists.
+        unsafe {
+            libc::mallopt(libc::M_ARENA_MAX, 2);
+        }
     }
 }

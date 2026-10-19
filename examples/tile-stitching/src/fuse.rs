@@ -21,7 +21,9 @@
 //! the output can be computed alone and [`blocked`] is identical to the whole
 //! volume on every lattice. The tiles sit at different offsets per tile (and
 //! per slice), which no `blockflow` phase can declare as a source, so the
-//! lattice here is a `BlockGrid` driven directly, in parallel.
+//! lattice here is a `BlockGrid` driven directly, in parallel; and
+//! [`crate::planned`] runs the same kernel slab by slab over tiles read from
+//! disk, holding only the boxes each slab needs.
 
 use blockflow::error::{Error, Result};
 use blockflow::geometry::BlockGrid;
@@ -410,6 +412,27 @@ fn fuse_typed<T: VoxelElement>(
     placement: &Placement,
     region: &Region,
 ) -> Array3<T> {
+    fuse_with(
+        params,
+        |tile, at| tiles[tile][at].into_f64(),
+        placement,
+        region,
+    )
+}
+
+/// The fusion of `region` (output coordinates), with `sample(tile, at)` the
+/// value of tile `tile` at its own voxel `at` (tile coordinates, wobble-axis
+/// index counted from the placement's first plane of that tile).
+///
+/// `sample` is asked only for voxels [`needed_box`] reports for `region`, in
+/// ascending tile order per output voxel, so a caller holding only that box
+/// of each tile gets the same answer as one holding every tile whole.
+pub(crate) fn fuse_with<T: VoxelElement>(
+    params: &FuseParams,
+    sample: impl Fn(usize, [usize; 3]) -> f64,
+    placement: &Placement,
+    region: &Region,
+) -> Array3<T> {
     let origin = placement.origin();
     let axis = placement.axis();
     let plane = plane_axes(axis);
@@ -419,40 +442,63 @@ fn fuse_typed<T: VoxelElement>(
         T::from_f64(0.0),
     );
     let lower: [i64; 3] = std::array::from_fn(|a| origin[a] + region.start[a] as i64);
-    let mut covering = Vec::with_capacity(tiles.len());
+    let upper: [i64; 3] = std::array::from_fn(|a| lower[a] + region.shape[a] as i64);
+    let mut covering = Vec::with_capacity(placement.sources().len());
+    let mut row = Vec::with_capacity(placement.sources().len());
     for k in 0..region.shape[axis] {
         let coordinate = lower[axis] + k as i64;
-        // The tiles usable in this plane, with their plane index and in-plane
-        // position.
+        // The tiles usable in this plane that reach into the region, in
+        // ascending order, with their plane index, in-plane position and size.
+        // A tile outside the region's plane would cover none of its voxels, so
+        // leaving it out changes nothing but the time.
         let active = placement
             .sources()
             .iter()
             .enumerate()
             .filter(|(_, source)| source.is_valid(coordinate))
-            .map(|(index, source)| {
+            .filter_map(|(index, source)| {
                 let tile_plane = (coordinate - source.coordinate()) as usize;
                 let at = source.position(tile_plane);
-                (index, tile_plane, [at[plane[0]], at[plane[1]]])
+                let at = [at[plane[0]], at[plane[1]]];
+                let shape = source.shape();
+                let size = [shape[plane[0]], shape[plane[1]]];
+                let reaches = (0..2)
+                    .all(|a| at[a] < upper[plane[a]] && at[a] + size[a] as i64 > lower[plane[a]]);
+                reaches.then_some((index, tile_plane, at, size))
             })
             .collect::<Vec<_>>();
         if active.is_empty() {
             continue;
         }
         for u in 0..region.shape[plane[0]] {
+            let global_u = lower[plane[0]] + u as i64;
+            // The tiles covering this row, still in ascending order.
+            row.clear();
+            row.extend(active.iter().filter_map(|&(index, tile_plane, at, size)| {
+                let local = global_u - at[0];
+                (0..size[0] as i64).contains(&local).then_some((
+                    index,
+                    tile_plane,
+                    local as usize,
+                    at[1],
+                    size,
+                ))
+            }));
+            if row.is_empty() {
+                continue;
+            }
             for v in 0..region.shape[plane[1]] {
-                let global = [lower[plane[0]] + u as i64, lower[plane[1]] + v as i64];
+                let global_v = lower[plane[1]] + v as i64;
                 covering.clear();
-                for &(index, tile_plane, at) in &active {
-                    let shape = placement.sources()[index].shape();
-                    let size = [shape[plane[0]], shape[plane[1]]];
-                    let local = [global[0] - at[0], global[1] - at[1]];
-                    if (0..2).all(|a| (0..size[a] as i64).contains(&local[a])) {
-                        let local = local.map(|l| l as usize);
+                for &(index, tile_plane, local_u, at_v, size) in &row {
+                    let local_v = global_v - at_v;
+                    if (0..size[1] as i64).contains(&local_v) {
+                        let local = [local_u, local_v as usize];
                         let mut index3 = [0usize; 3];
                         index3[axis] = tile_plane;
                         index3[plane[0]] = local[0];
                         index3[plane[1]] = local[1];
-                        let value = tiles[index][index3].into_f64();
+                        let value = sample(index, index3);
                         covering.push((value, weight(local, size, params.weighting)));
                     }
                 }
@@ -469,6 +515,61 @@ fn fuse_typed<T: VoxelElement>(
         }
     }
     out
+}
+
+/// The box of each tile (tile coordinates, half-open `start..stop`) that
+/// [`fuse_with`] reads for `region`, or `None` for a tile it does not read.
+pub(crate) fn needed_box(
+    placement: &Placement,
+    region: &Region,
+) -> Vec<Option<([usize; 3], [usize; 3])>> {
+    let origin = placement.origin();
+    let axis = placement.axis();
+    let plane = plane_axes(axis);
+    let lower: [i64; 3] = std::array::from_fn(|a| origin[a] + region.start[a] as i64);
+    let upper: [i64; 3] = std::array::from_fn(|a| lower[a] + region.shape[a] as i64);
+    placement
+        .sources()
+        .iter()
+        .map(|source| {
+            let shape = source.shape();
+            let mut start = [usize::MAX; 3];
+            let mut stop = [0usize; 3];
+            let first = (lower[axis] - source.coordinate()).max(0);
+            let last = (upper[axis] - source.coordinate()).min(shape[axis] as i64);
+            for tile_plane in first..last {
+                if !source.is_valid(source.coordinate() + tile_plane) {
+                    continue;
+                }
+                let at = source.position(tile_plane as usize);
+                let mut lo = [0usize; 2];
+                let mut hi = [0usize; 2];
+                let mut reaches = true;
+                for a in 0..2 {
+                    let size = shape[plane[a]] as i64;
+                    let l = (lower[plane[a]] - at[plane[a]]).max(0);
+                    let h = (upper[plane[a]] - at[plane[a]]).min(size);
+                    if l >= h {
+                        reaches = false;
+                        break;
+                    }
+                    lo[a] = l as usize;
+                    hi[a] = h as usize;
+                }
+                if !reaches {
+                    continue;
+                }
+                let tile_plane = tile_plane as usize;
+                start[axis] = start[axis].min(tile_plane);
+                stop[axis] = stop[axis].max(tile_plane + 1);
+                for a in 0..2 {
+                    start[plane[a]] = start[plane[a]].min(lo[a]);
+                    stop[plane[a]] = stop[plane[a]].max(hi[a]);
+                }
+            }
+            (start[axis] < stop[axis]).then_some((start, stop))
+        })
+        .collect()
 }
 
 fn blend(method: Method, covering: &[(f64, f64)]) -> f64 {

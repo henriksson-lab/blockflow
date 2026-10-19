@@ -105,9 +105,11 @@ jobs:
             features: { name: stardist, key: stardist, flags: "--features stardist", test: "no", examples: "-p blockflow-stardist-ome-zarr -p blockflow-stardist-3d-ome-zarr" }
           # The other two model adapters, git dependencies for the same reason
           # and at the same risk. Together in one row because they share `burn`,
-          # which is most of what either costs to build.
+          # which is most of what either costs to build. `vessel-graph`'s
+          # `deep-fill` network (burn's CPU backend, as `yolo3d`) is built here
+          # too; the `members` job builds that example without the feature.
           - os: ubuntu-latest
-            features: { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo", test: "no", examples: "-p blockflow-cellpose-ome-zarr -p blockflow-cellpose-3d-ome-zarr -p blockflow-yolo-ome-zarr -p yolo3d -p blockflow-yolo-3d-ome-zarr" }
+            features: { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo", test: "no", examples: "-p blockflow-cellpose-ome-zarr -p blockflow-cellpose-3d-ome-zarr -p blockflow-yolo-ome-zarr -p yolo3d -p blockflow-yolo-3d-ome-zarr -p blockflow-vessel-graph --features blockflow-vessel-graph/deep-fill" }
     steps:
       - uses: actions/checkout@v5
       - name: Install the stable toolchain

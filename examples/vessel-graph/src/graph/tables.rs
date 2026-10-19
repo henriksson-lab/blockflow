@@ -138,6 +138,15 @@ impl Builder {
         }
     }
 
+    /// Room for `more` columns beyond those declared, in every row, so that
+    /// the rows are not grown by doubling.
+    fn reserve(&mut self, more: usize) {
+        let wanted = self.columns.len() + more;
+        for row in &mut self.rows {
+            row.reserve_exact(wanted.saturating_sub(row.len()));
+        }
+    }
+
     /// The identity, the voxel position and the physical one, per row.
     fn positions(&mut self, positions: &[[f64; 3]], lattice: &Lattice) {
         for (row, (values, at)) in self.rows.iter_mut().zip(positions).enumerate() {
@@ -240,6 +249,16 @@ impl Builder {
     }
 }
 
+/// The table columns a level's graph columns make, less `skipped` columns
+/// of width 3 (the coordinates): only a reservation, so an estimate is safe.
+fn widths<'a>(columns: impl Iterator<Item = Option<&'a Column>>, skipped: usize) -> usize {
+    columns
+        .flatten()
+        .map(Column::width)
+        .sum::<usize>()
+        .saturating_sub(3 * skipped)
+}
+
 /// Write `graph` as its three tables under `tables` (created as a Zarr group
 /// if absent), replacing any earlier tables of the same `name`. Coordinates
 /// are the graph's `coordinates` column, level-0 voxels of the image.
@@ -271,6 +290,7 @@ pub fn write_graph_tables(
     // Vertices.
     let vertices = graph.points("coordinates")?;
     let mut table = Builder::new("vertex_id", vertices.len(), unit);
+    table.reserve(1 + widths(graph.vertex_names().into_iter().map(|n| graph.vertex(n)), 1));
     table.positions(&vertices, &lattice);
     table.integers(
         "degree",
@@ -300,6 +320,7 @@ pub fn write_graph_tables(
         .map(|[start, end]| along[start + (end - start) / 2])
         .collect();
     let mut table = Builder::new("edge_id", graph.n_edges(), unit);
+    table.reserve(4 + widths(graph.edge_names().into_iter().map(|n| graph.edge(n)), 0));
     table.positions(&middles, &lattice);
     table.integers(
         "source",
@@ -341,6 +362,7 @@ pub fn write_graph_tables(
         }
     }
     let mut table = Builder::new("point_id", along.len(), unit);
+    table.reserve(2 + widths(graph.along_names().into_iter().map(|n| graph.along(n)), 1));
     table.positions(&along, &lattice);
     table.integers("edge_id", DType::U64, edge_of.into_iter());
     table.integers("index", DType::U32, index_of.into_iter());

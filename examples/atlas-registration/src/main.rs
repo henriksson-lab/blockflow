@@ -9,8 +9,8 @@ use blockflow_atlas_registration::compute::{
     params_from_elastix_map, ControlGrid, Metric, PyramidSchedule, Sampling, VolumeFitParams,
 };
 use blockflow_atlas_registration::pipeline::{
-    register, register_chain, transform_points, ChainConfig, Input, PointSource, PointsConfig,
-    RegisterConfig, RegisterSummary, Stage, Units,
+    register, register_chain, transform_points, ChainConfig, Initialisation, Input, PointSource,
+    PointsConfig, RegisterConfig, RegisterSummary, Stage, Units,
 };
 use blockflow_atlas_registration::stochastic::{
     is_stochastic, stochastic_from_elastix_map, RelativeTolerance,
@@ -77,6 +77,21 @@ struct RegisterArgs {
     /// Output directory for TransformParameters.N.txt and registration.json.
     #[arg(long)]
     out: PathBuf,
+    /// How the first stage starts (stochastic stages): `parameters` (as the
+    /// file's AutomaticTransformInitialization says), `physical` (the images'
+    /// physical frames as they stand, elastix's "false"), or `centre` (their
+    /// geometric centres, elastix's "true" with GeometricalCenter).
+    #[arg(
+        long,
+        default_value = "parameters",
+        conflicts_with = "initial_translation"
+    )]
+    initialise: String,
+    /// Start the first stage from the physical frames with the fixed image
+    /// moved by `Z,Y,X` (the images' unit): its point p starts at the moving
+    /// image's point p + t (stochastic translation or affine first stage).
+    #[arg(long, value_parser = parse_triple, allow_hyphen_values = true)]
+    initial_translation: Option<[f64; 3]>,
     #[arg(long, value_enum, default_value_t = ModelArg::Affine)]
     model: ModelArg,
     #[arg(long, value_enum, default_value_t = MetricArg::Correlation)]
@@ -151,6 +166,15 @@ struct ChainArgs {
     /// Registration voxel size, `s` or `z,y,x`.
     #[arg(long, value_parser = parse_triple)]
     resolution: Option<[f64; 3]>,
+    /// `STEP=MODE`: how step STEP's first stage starts, `parameters`
+    /// (default), `physical` or `centre` (see `register --initialise`).
+    #[arg(long = "initialise", num_args = 1)]
+    initialise: Vec<String>,
+    /// `STEP=Z,Y,X`: start step STEP from the physical frames with its fixed
+    /// image moved by this translation (see `register
+    /// --initial-translation`).
+    #[arg(long = "initial-translation", num_args = 1, allow_hyphen_values = true)]
+    initial_translation: Vec<String>,
     /// Output directory: `step{k}/` per step and `chain.json`.
     #[arg(long)]
     out: PathBuf,
@@ -350,6 +374,8 @@ fn run_chain(args: &ChainArgs) -> Result<()> {
             "chain: step {empty} has no parameter file"
         )));
     }
+    let initialisation =
+        chain_initialisation(steps_count, &args.initialise, &args.initial_translation)?;
     let summaries = register_chain(&ChainConfig {
         images: args
             .images
@@ -367,6 +393,7 @@ fn run_chain(args: &ChainArgs) -> Result<()> {
         workers: rayon::current_num_threads(),
         warped_stages: args.stochastic.warped_stages,
         warped: args.warped,
+        initialisation,
     })?;
     for (index, summary) in summaries.iter().enumerate() {
         println!("step {index}:");
@@ -374,6 +401,49 @@ fn run_chain(args: &ChainArgs) -> Result<()> {
     }
     println!("chain={}", args.out.display());
     Ok(())
+}
+
+/// Per step, from `STEP=MODE` and `STEP=Z,Y,X` entries; one entry per step
+/// at most.
+fn chain_initialisation(
+    steps: usize,
+    modes: &[String],
+    translations: &[String],
+) -> Result<Vec<Initialisation>> {
+    let mut out: Vec<Option<Initialisation>> = vec![None; steps];
+    let entries = modes.iter().map(|entry| (entry, "--initialise")).chain(
+        translations
+            .iter()
+            .map(|entry| (entry, "--initial-translation")),
+    );
+    for (entry, flag) in entries {
+        let (step, value) = entry
+            .split_once('=')
+            .ok_or_else(|| Error::invalid(format!("{flag} `{entry}`: expected STEP=VALUE")))?;
+        let step: usize = step
+            .trim()
+            .parse()
+            .map_err(|error| Error::invalid(format!("{flag} `{entry}`: {error}")))?;
+        if step >= steps {
+            return Err(Error::invalid(format!(
+                "{flag} `{entry}`: the chain has {steps} step(s)"
+            )));
+        }
+        let parsed = if flag == "--initialise" {
+            Initialisation::parse(value)?
+        } else {
+            Initialisation::Translation(
+                parse_triple(value)
+                    .map_err(|error| Error::invalid(format!("{flag} `{entry}`: {error}")))?,
+            )
+        };
+        if out[step].replace(parsed).is_some() {
+            return Err(Error::invalid(format!(
+                "step {step} is given more than one initialisation"
+            )));
+        }
+    }
+    Ok(out.into_iter().map(Option::unwrap_or_default).collect())
 }
 
 fn run_register(args: &RegisterArgs) -> Result<()> {
@@ -401,6 +471,10 @@ fn run_register(args: &RegisterArgs) -> Result<()> {
         block: args.block,
         workers: rayon::current_num_threads(),
         warped_stages: args.stochastic.warped_stages,
+        initialisation: match args.initial_translation {
+            Some(t) => Initialisation::Translation(t),
+            None => Initialisation::parse(&args.initialise)?,
+        },
     };
     let summary = register(&config)?;
     print_summary(&summary);

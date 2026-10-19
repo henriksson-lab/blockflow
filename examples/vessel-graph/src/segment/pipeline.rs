@@ -2,13 +2,13 @@
 // Original work for this crate.
 
 //! The whole segmentation as one plan: every channel binarised, smoothed and
-//! filled; the channels' masks united and post-processed again; the result
-//! skeletonised.
+//! filled (and, where asked, deep-filled); the channels' masks united and
+//! post-processed again; the result skeletonised.
 //!
 //! ```text
-//! channel k:  raw -> binarize -> smooth -> fill --\
-//!                                                  +-> OR -> smooth -> fill -> mask
-//! channel j:  raw -> binarize -> smooth -> fill --/                      \-> skeleton
+//! channel k:  raw -> binarize -> smooth -> fill [-> deep fill] --\
+//!                                                                 +-> OR -> smooth -> fill -> mask
+//! channel j:  raw -> binarize -> smooth -> fill [-> deep fill] --/                      \-> skeleton
 //! ```
 //!
 //! With one channel there is nothing to unite and the channel's own filled
@@ -27,6 +27,7 @@ use blockflow::voxels::Voxels;
 use blockflow::{Dtype, Error, Result};
 
 use super::binarize::{append_binarize_phases, BinarizeParams, Binarized};
+use super::deep_fill::{append_deep_fill, DeepFillOutput, DeepFillParams, DeepFillSetup};
 use super::plan::{read_back, run_in_memory, Cursor, Image};
 use super::skeleton::{clear_faces_node, SkeletonParams};
 use super::smooth::SmoothParams;
@@ -63,6 +64,10 @@ impl PostProcess {
 pub struct ChannelParams {
     pub binarize: BinarizeParams,
     pub post: PostProcess,
+    /// The CNN lumen filling after the post-processing; `None` (the library
+    /// default) skips it. The roles switch it on in a build with the
+    /// `deep-fill` feature, as the reference's configuration does.
+    pub deep_fill: Option<DeepFillParams>,
 }
 
 /// The whole segmentation.
@@ -73,6 +78,8 @@ pub struct SegmentParams {
     /// After the union; used only with two channels or more.
     pub combined: PostProcess,
     pub skeleton: SkeletonParams,
+    /// The weights and block grid of every channel's deep filling.
+    pub deep_fill: DeepFillSetup,
 }
 
 impl SegmentParams {
@@ -82,6 +89,7 @@ impl SegmentParams {
             channels: vec![ChannelParams::default(); channels],
             combined: PostProcess::default(),
             skeleton: SkeletonParams::default(),
+            deep_fill: DeepFillSetup::default(),
         }
     }
 }
@@ -90,7 +98,7 @@ impl SegmentParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelImages {
     pub binarized: Binarized,
-    /// After the channel's own smooth and fill.
+    /// After the channel's own smooth and fill, and deep fill where asked.
     pub processed: Image,
 }
 
@@ -158,12 +166,46 @@ pub fn append_skeleton(c: &mut Cursor<'_>, mask: Image, params: &SkeletonParams)
     c.wrote(phase)
 }
 
+/// The image the thinning starts from: `mask` with the volume's faces cleared
+/// (if asked).
+pub fn append_skeleton_input(
+    c: &mut Cursor<'_>,
+    mask: Image,
+    params: &SkeletonParams,
+) -> Result<Image> {
+    params.validate()?;
+    match params.delete_border {
+        true => c.pixels(c.on(mask, vec![clear_faces_node()])),
+        false => Ok(mask),
+    }
+}
+
 /// Append the whole segmentation. `sources[k]` is channel `k`'s raw image; the
 /// cursor's input should be image 0.
 pub fn append_segment_phases(
     c: &mut Cursor<'_>,
     sources: &[Image],
     params: &SegmentParams,
+) -> Result<Segmented> {
+    append_segment(c, sources, params, true)
+}
+
+/// [`append_segment_phases`] without the thinning: [`Segmented::skeleton`] is
+/// the image the thinning starts from ([`append_skeleton_input`]), for a
+/// caller that thins over stored images ([`super::thin::thin_stored`]).
+pub fn append_segment_phases_unthinned(
+    c: &mut Cursor<'_>,
+    sources: &[Image],
+    params: &SegmentParams,
+) -> Result<Segmented> {
+    append_segment(c, sources, params, false)
+}
+
+fn append_segment(
+    c: &mut Cursor<'_>,
+    sources: &[Image],
+    params: &SegmentParams,
+    thin: bool,
 ) -> Result<Segmented> {
     if sources.is_empty() || sources.len() != params.channels.len() {
         return Err(Error::invalid(format!(
@@ -175,12 +217,21 @@ pub fn append_segment_phases(
     let mut channels = Vec::with_capacity(sources.len());
     for (index, (raw, channel)) in sources.iter().zip(&params.channels).enumerate() {
         let binarized = append_binarize_phases(c, *raw, &channel.binarize)?;
-        let processed = append_post_process(
+        let mut processed = append_post_process(
             c,
             binarized.binary,
             &channel.post,
             &format!("segment.channel{index}.background"),
         )?;
+        if let Some(deep_fill) = &channel.deep_fill {
+            processed = append_deep_fill(
+                c,
+                processed,
+                deep_fill,
+                &params.deep_fill,
+                DeepFillOutput::Filled,
+            )?;
+        }
         channels.push(ChannelImages {
             binarized,
             processed,
@@ -198,7 +249,10 @@ pub fn append_segment_phases(
         )?)?;
         append_post_process(c, union, &params.combined, "segment.combined.background")?
     };
-    let skeleton = append_skeleton(c, mask, &params.skeleton)?;
+    let skeleton = match thin {
+        true => append_skeleton(c, mask, &params.skeleton)?,
+        false => append_skeleton_input(c, mask, &params.skeleton)?,
+    };
     Ok(Segmented {
         channels,
         mask,

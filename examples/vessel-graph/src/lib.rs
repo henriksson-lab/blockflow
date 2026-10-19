@@ -10,4 +10,5 @@
 //! `blockflow_atlas_registration::atlas_space`.
 
 pub mod graph;
+pub mod profile;
 pub mod segment;

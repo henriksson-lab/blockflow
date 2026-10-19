@@ -221,6 +221,7 @@ fn segment(image: &Path, dir: &Path, crop: Option<(&str, &Path)>) {
     let work = dir.join("work");
     let mut argv = vec![
         "segment".to_string(),
+        "--no-deep-fill".into(),
         "--zarr".into(),
         image.display().to_string(),
         "--clip-range".into(),

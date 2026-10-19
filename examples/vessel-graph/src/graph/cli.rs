@@ -26,8 +26,9 @@
 //!    the atlas grid when there is an atlas;
 //! 6. the tables ([`write_graph_tables`]) and the JSON.
 //!
-//! Resident, like the stages it calls: the skeleton, the masks, the labels and
-//! any channel read here are held whole (see the README's limitations).
+//! Stage 1 is planned over blocks of the stored labels and channels
+//! ([`super::planned`]); the atlas volumes, the branch density and the graph
+//! itself are resident (see the README's limitations).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,7 +40,7 @@ use atlas_regions::{
 use blockflow::ome_zarr::{OmeVolumeLevel, OmeVolumePyramid};
 use blockflow::ops::distance::DistanceParams;
 use blockflow::voxels::Voxels;
-use blockflow::zarr_env::{PhysicalFrame, PyramidSpec};
+use blockflow::zarr_env::{AttachedImage, PhysicalFrame, PyramidSpec};
 use blockflow::{Error, Result, ZarrEnvironment};
 use blockflow_atlas_registration::atlas_space::{
     ImageFrame, ImageToSample, LookupParams, OpenParams, RegisteredAtlas,
@@ -48,11 +49,14 @@ use clap::Args;
 use serde_json::Value;
 
 use super::annotate::ATLAS_COORDINATES;
+use crate::profile::GRAPH;
+
+use super::planned::{PlanParams, StoredInputs};
 use super::tables::{write_graph_tables, GraphTables, TableGeometry};
 use super::vessel::Factors;
 use super::{
-    annotate, branch_density, classify, vessel_graph, Affine, BranchParams, ClassifyParams,
-    GraphParams, Inputs, Lattice, PointMap,
+    annotate, branch_density, classify, vessel_graph_stored, Affine, BranchParams, ClassifyParams,
+    GraphParams, Lattice, PointMap,
 };
 
 /// `graph`: a published skeleton (and masks) to a vessel graph.
@@ -139,6 +143,24 @@ pub struct GraphArgs {
     /// Also write the graph as JSON here.
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// Block edge of the planned vertex measure (raw graph, radii, signals),
+    /// z,y,x. Does not change any result.
+    #[arg(long, value_delimiter = ',', default_values_t = vec![128, 256, 256])]
+    pub block: Vec<usize>,
+    /// Block edge of the planned narrowing of the published labels, z,y,x.
+    /// Does not change any result.
+    #[arg(long, value_delimiter = ',', default_values_t = vec![64, 64, 128])]
+    pub pack_block: Vec<usize>,
+    /// Worker threads (default: one per core).
+    #[arg(long)]
+    pub workers: Option<usize>,
+    /// Chunk cache of the stored volumes, in MiB. Does not change any result.
+    #[arg(long, default_value_t = 256)]
+    pub cache_mb: u64,
+    /// Scratch directory for the planned stages (default: next to the image).
+    /// Removed afterwards.
+    #[arg(long)]
+    pub work: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,13 +174,6 @@ pub struct GraphSummary {
     pub density_outside: Option<usize>,
     /// With `--registration`: vertices mapped outside the atlas (region 0).
     pub atlas_outside: Option<usize>,
-}
-
-/// A published label image as the mask it encodes. Labels are published as
-/// `uint64`, which the measurements refuse to widen to `f64`; every mask this
-/// command reads is 0/1, so nothing is lost.
-fn read_mask(root: &Path, name: &str) -> Result<Voxels> {
-    Ok(Voxels::from(read_label(root, name)?.1.nonzero()))
 }
 
 fn label_root(root: &Path, name: &str) -> PathBuf {
@@ -269,13 +284,22 @@ fn optional_label(root: &Path, explicit: &Option<String>, default: String) -> Op
     }
 }
 
-fn read_channel(root: &Path, channel: Option<usize>) -> Result<Option<Voxels>> {
+/// Level 0 of a published label, as a stored array.
+fn stored_label(root: &Path, name: &str) -> Result<AttachedImage> {
+    let path = label_root(root, name);
+    if !path.join("zarr.json").exists() {
+        return Err(Error::invalid(format!(
+            "the image has no label `{name}` ({} does not exist)",
+            path.display()
+        )));
+    }
+    OmeVolumePyramid::open(&path, 0, 0)?.attached_level(0)
+}
+
+/// Level 0 of a channel of the image, as a stored array.
+fn stored_channel(root: &Path, channel: Option<usize>) -> Result<Option<AttachedImage>> {
     channel
-        .map(|channel| {
-            OmeVolumePyramid::open(root, channel, 0)?
-                .attached_level(0)?
-                .read()
-        })
+        .map(|channel| OmeVolumePyramid::open(root, channel, 0)?.attached_level(0))
         .transpose()
 }
 
@@ -386,6 +410,7 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
 
     // The registration and atlas first, so that a mismatch fails before the
     // graph is built.
+    GRAPH.stage("open registration");
     let registered = args
         .registration
         .as_deref()
@@ -412,41 +437,62 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
         }
     }
 
-    // 1. The graph.
-    let skeleton = read_mask(&root, &format!("{}-skeleton", args.name))?;
-    let vessels = read_mask(&root, &format!("{}-mask", args.name))?;
+    // 1. The graph, planned over blocks of the stored labels and channels.
     let artery_label = optional_label(
         &root,
         &args.artery_mask,
         format!("{}-artery-mask", args.name),
     );
     let vein_label = optional_label(&root, &args.vein_mask, format!("{}-vein-mask", args.name));
-    let artery_mask = artery_label
-        .as_deref()
-        .map(|n| read_mask(&root, n))
-        .transpose()?;
-    let vein_mask = vein_label
-        .as_deref()
-        .map(|n| read_mask(&root, n))
-        .transpose()?;
-    let artery = read_channel(&root, args.artery_channel)?;
-    let vein = read_channel(&root, args.vein_channel)?;
     if let Some(name) = &artery_label {
         eprintln!("graph: artery mask `{name}`");
     }
-
-    let mut inputs = Inputs::new(&skeleton, image.voxel_size());
-    inputs.vessels = Some(&vessels);
-    inputs.artery_intensity = artery.as_ref();
-    inputs.artery_mask = artery_mask.as_ref();
-    inputs.vein_intensity = vein.as_ref();
-    inputs.vein_mask = vein_mask.as_ref();
+    let inputs = StoredInputs {
+        skeleton: stored_label(&root, &format!("{}-skeleton", args.name))?,
+        vessels: stored_label(&root, &format!("{}-mask", args.name))?,
+        artery_intensity: stored_channel(&root, args.artery_channel)?,
+        artery_mask: artery_label
+            .as_deref()
+            .map(|name| stored_label(&root, name))
+            .transpose()?,
+        vein_intensity: stored_channel(&root, args.vein_channel)?,
+        vein_mask: vein_label
+            .as_deref()
+            .map(|name| stored_label(&root, name))
+            .transpose()?,
+        spacing: image.voxel_size(),
+    };
     let params = GraphParams {
         largest_component: !args.all_components,
         ..GraphParams::default()
     };
-    let mut graph = vessel_graph(&inputs, &params)?;
-    drop((skeleton, vessels, artery_mask, vein_mask, artery, vein));
+    let plan = PlanParams {
+        block: args
+            .block
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::invalid("--block needs three values, z,y,x"))?,
+        pack_block: args
+            .pack_block
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::invalid("--pack-block needs three values, z,y,x"))?,
+        workers: args
+            .workers
+            .unwrap_or_else(rayon::current_num_threads)
+            .max(1),
+        cache_bytes: args.cache_mb.max(1) << 20,
+        work: args.work.clone().unwrap_or_else(|| {
+            let name = args
+                .zarr
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "image".to_string());
+            args.zarr
+                .with_file_name(format!(".{name}.vessel-graph-graph-work"))
+        }),
+    };
+    let mut graph = vessel_graph_stored(&inputs, &params, &plan)?;
     eprintln!(
         "graph: {} vertices, {} edges ({:.1}s)",
         graph.n_vertices(),
@@ -455,6 +501,7 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
     );
 
     // 2-3. Atlas coordinates and annotation.
+    GRAPH.stage("atlas: map and annotate");
     let atlas = args
         .annotation_label
         .as_deref()
@@ -502,6 +549,7 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
     }
 
     // 4. Classification.
+    GRAPH.stage("classify");
     let classified = graph.edge("artery_binary").is_some();
     if classified {
         let trace = classify(&mut graph, &ClassifyParams::default())?;
@@ -513,6 +561,7 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
     }
 
     // 5. Branch density.
+    GRAPH.stage("branch density");
     let mut density_outside = None;
     if let Some(path) = &args.branch_density {
         let radius: [usize; 3] = args
@@ -555,6 +604,7 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
     }
 
     // 6. Output.
+    GRAPH.stage("tables and json");
     let tables = match args.no_tables {
         true => None,
         false => {
@@ -577,6 +627,7 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
     if let Some(path) = &args.out {
         graph.write_json(path)?;
     }
+    GRAPH.finish();
     eprintln!("graph: done in {:.1}s", started.elapsed().as_secs_f64());
     Ok(GraphSummary {
         vertices: graph.n_vertices(),

@@ -79,6 +79,7 @@ fn the_reference_parameter_files_agree_with_elastix_on_real_data() {
         block: 64,
         workers: rayon::current_num_threads(),
         warped_stages: false,
+        initialisation: Default::default(),
     })
     .unwrap();
     let seconds = start.elapsed().as_secs_f64();

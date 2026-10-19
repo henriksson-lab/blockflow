@@ -1,0 +1,18 @@
+[package]
+name = "blockflow-lewis-synapse-spots"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Standalone for now, so building it does not touch the root workspace while
+# other work is in flight there. Move into the root `members` when settled.
+[workspace]
+
+[dependencies]
+tempfile = "3"
+blockflow = { path = "../..", features = ["zarr"] }
+clap = { version = "4.5", features = ["derive"] }
+image = "0.25"
+ndarray = "0.17"
+serde_json = "1"

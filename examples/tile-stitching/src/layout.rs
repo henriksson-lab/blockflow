@@ -4,8 +4,9 @@
 //! The tile layout and the rigid placement: how pairwise offsets become one
 //! position per tile.
 //!
-//! A layout is a grid of tiles, a position for each, and one [`Alignment`] per
-//! pair of grid neighbours. The rigid correlation ([`crate::rigid`]) writes each
+//! A layout is a set of tiles, a position for each, and one [`Alignment`] per
+//! pair of neighbours: grid neighbours, or tiles whose boxes overlap
+//! ([`TileLayout::from_boxes`]). The rigid correlation ([`crate::rigid`]) writes each
 //! alignment's shift; [`place`] turns the displacements into positions:
 //!
 //! 1. **Filter.** Alignments with `quality > min_quality` are kept, strictly, so
@@ -52,6 +53,7 @@ pub struct TileSource {
     /// The tile's shape in voxels.
     pub shape: [usize; 3],
     /// Where the tile sits on the acquisition grid, `(0, 0)`, `(1, 0)`, ...
+    /// Empty for a layout from boxes when the tile has no grid index.
     pub tile_position: Vec<isize>,
 }
 
@@ -76,6 +78,8 @@ pub struct TileLayout {
     sources: Vec<TileSource>,
     grid_axes: Vec<usize>,
     alignments: Vec<Alignment>,
+    /// Per alignment, the volume axis its tiles are tiled along.
+    tiling_axes: Vec<usize>,
     positions: Vec<[isize; 3]>,
 }
 
@@ -102,6 +106,7 @@ impl TileLayout {
             )));
         }
         let mut alignments = Vec::new();
+        let mut tiling_axes = Vec::new();
         for (grid_axis, &axis) in grid_axes.iter().enumerate() {
             let overlap = overlaps[grid_axis.min(overlaps.len() - 1)];
             for (pre, post) in neighbours(&sources, grid_axis) {
@@ -113,6 +118,7 @@ impl TileLayout {
                     displacement,
                     quality: f64::NEG_INFINITY,
                 });
+                tiling_axes.push(axis);
             }
         }
         let n = sources.len();
@@ -122,6 +128,7 @@ impl TileLayout {
             sources,
             grid_axes: grid_axes.to_vec(),
             alignments,
+            tiling_axes,
             positions,
         })
     }
@@ -134,7 +141,7 @@ impl TileLayout {
         positions: Vec<[isize; 3]>,
         grid_axes: &[usize],
     ) -> Result<Self> {
-        let tile_dim = check_sources(&sources, grid_axes)?;
+        check_sources(&sources, grid_axes)?;
         if positions.len() != sources.len() {
             return Err(Error::invalid(format!(
                 "{} tiles and {} positions",
@@ -143,7 +150,8 @@ impl TileLayout {
             )));
         }
         let mut alignments = Vec::new();
-        for grid_axis in 0..tile_dim {
+        let mut tiling_axes = Vec::new();
+        for (grid_axis, &axis) in grid_axes.iter().enumerate() {
             for (pre, post) in neighbours(&sources, grid_axis) {
                 alignments.push(Alignment {
                     pre,
@@ -153,12 +161,85 @@ impl TileLayout {
                     }),
                     quality: f64::NEG_INFINITY,
                 });
+                tiling_axes.push(axis);
             }
         }
         Ok(Self {
             sources,
             grid_axes: grid_axes.to_vec(),
             alignments,
+            tiling_axes,
+            positions,
+        })
+    }
+
+    /// A layout whose nominal positions are given, with neighbours found from
+    /// the tiles' boxes at those positions instead of from grid indices.
+    ///
+    /// Two tiles are neighbours along tiling axis `a` (one of `tiling_axes`,
+    /// the in-plane volume axes) when their boxes overlap along `a`, they are
+    /// offset along `a`, and on every other tiling axis they are offset by
+    /// less than half a tile and relatively less than along `a`. So a
+    /// regular grid gives its row and column neighbours and no diagonals,
+    /// and a staggered or partial mosaic gives the pairs that share a seam.
+    /// The tile further along `a` is the alignment's `post`. Grid indices
+    /// are not used (a source's `tile_position` may be empty).
+    pub fn from_boxes(
+        sources: Vec<TileSource>,
+        positions: Vec<[isize; 3]>,
+        tiling_axes: &[usize],
+    ) -> Result<Self> {
+        if sources.is_empty() {
+            return Err(Error::invalid("a layout needs at least one tile"));
+        }
+        if tiling_axes.is_empty() || tiling_axes.len() > 3 || tiling_axes.iter().any(|&a| a > 2) {
+            return Err(Error::invalid(format!(
+                "tiling axes {tiling_axes:?}: one to three volume axes"
+            )));
+        }
+        if positions.len() != sources.len() {
+            return Err(Error::invalid(format!(
+                "{} tiles and {} positions",
+                sources.len(),
+                positions.len()
+            )));
+        }
+        let mut alignments = Vec::new();
+        let mut alignment_axes = Vec::new();
+        for &axis in tiling_axes {
+            for i in 0..sources.len() {
+                for j in 0..sources.len() {
+                    // i is `pre`: j lies further along `axis`
+                    let d: [isize; 3] = std::array::from_fn(|a| positions[j][a] - positions[i][a]);
+                    if d[axis] <= 0 || d[axis] >= sources[i].shape[axis] as isize {
+                        continue;
+                    }
+                    let relative = |a: usize| {
+                        d[a].unsigned_abs() as f64
+                            / sources[i].shape[a].max(sources[j].shape[a]).max(1) as f64
+                    };
+                    let along = relative(axis);
+                    let aside = tiling_axes
+                        .iter()
+                        .filter(|&&other| other != axis)
+                        .all(|&other| relative(other) < 0.5 && relative(other) < along);
+                    if aside {
+                        alignments.push(Alignment {
+                            pre: i,
+                            post: j,
+                            displacement: d,
+                            quality: f64::NEG_INFINITY,
+                        });
+                        alignment_axes.push(axis);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            sources,
+            grid_axes: tiling_axes.to_vec(),
+            alignments,
+            tiling_axes: alignment_axes,
             positions,
         })
     }
@@ -174,6 +255,11 @@ impl TileLayout {
 
     pub fn alignments(&self) -> &[Alignment] {
         &self.alignments
+    }
+
+    /// The volume axis alignment `index`'s tiles are tiled along.
+    pub fn tiling_axis(&self, index: usize) -> Option<usize> {
+        self.tiling_axes.get(index).copied()
     }
 
     pub fn positions(&self) -> &[[isize; 3]] {

@@ -60,6 +60,23 @@ pub enum GlobalThreshold {
     /// two bracketing order statistics (NumPy's default rule). Over a
     /// [`SampledValuesOp`] stream it is the out-of-core percentile.
     Percentile { p: Multiplier },
+    /// A level above a background that is the **mode** of the values, for
+    /// images where the object may cover more than half of the field and so
+    /// moves the median ([`Self::RobustSigma`]) onto itself.
+    ///
+    /// The mode is the centre of the tallest bin of a `bins`-bin histogram over
+    /// the 0.1–99.9th percentiles, smoothed by a Gaussian of two bins. Its noise
+    /// `sigma` comes from the half of the peak below it (half-normal:
+    /// `sqrt(pi / 2)` times the mean shortfall). The level is
+    /// `mode + max(k * sigma, fraction * (P_upper - mode))`: noise-referenced
+    /// when the object is faint, a fraction of the object's own brightness when
+    /// the noise floor alone would admit halos and illumination gradients.
+    BackgroundMode {
+        bins: usize,
+        k: Multiplier,
+        fraction: Multiplier,
+        upper: Multiplier,
+    },
 }
 
 /// A finite `f64` factor that can live in a hashable rule; compared by bits.
@@ -128,6 +145,27 @@ impl GlobalThreshold {
         Ok(GlobalThreshold::Percentile { p: Multiplier(p) })
     }
 
+    /// [`Self::BackgroundMode`]; `upper` is a percentile in `0..=100`.
+    pub fn background_mode(bins: usize, k: f64, fraction: f64, upper: f64) -> Result<Self> {
+        Self::checked_bins("a background-mode threshold", bins)?;
+        if !(k.is_finite() && fraction.is_finite()) {
+            return Err(Error::InvalidArgument(format!(
+                "a background-mode threshold needs a finite factor and fraction, got {k} and {fraction}"
+            )));
+        }
+        if !(upper.is_finite() && (0.0..=100.0).contains(&upper)) {
+            return Err(Error::InvalidArgument(format!(
+                "a background-mode threshold needs an upper percentile in [0, 100], got {upper}"
+            )));
+        }
+        Ok(GlobalThreshold::BackgroundMode {
+            bins,
+            k: Multiplier(k),
+            fraction: Multiplier(fraction),
+            upper: Multiplier(upper),
+        })
+    }
+
     pub fn log_otsu(bins: usize) -> Result<Self> {
         Self::checked_bins("a log-Otsu threshold", bins)?;
         Ok(GlobalThreshold::LogOtsu { bins })
@@ -180,6 +218,12 @@ impl GlobalThreshold {
                 let mut values = values;
                 Ok(percentile_of(&mut values, p.0))
             }
+            GlobalThreshold::BackgroundMode {
+                bins,
+                k,
+                fraction,
+                upper,
+            } => background_mode_threshold(&values, bins, k.0, fraction.0, upper.0),
         }
     }
 }
@@ -1066,6 +1110,94 @@ pub fn percentile_of(values: &mut [f64], p: f64) -> f64 {
     lower + fraction * (upper - lower)
 }
 
+/// The background level and its noise sigma that
+/// [`GlobalThreshold::BackgroundMode`] measures: the smoothed-histogram mode,
+/// and the half-normal sigma of the values at or below it.
+pub fn background_mode(values: &[f64], bins: usize) -> Result<(f64, f64)> {
+    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() || bins == 0 {
+        return Err(Error::InvalidArgument(
+            "a background mode needs at least one finite value and one bin".to_string(),
+        ));
+    }
+    let lo = percentile_of(&mut finite, 0.1);
+    let hi = percentile_of(&mut finite, 99.9);
+    let mut counts = vec![0.0f64; bins];
+    if hi > lo {
+        let width = (hi - lo) / bins as f64;
+        for &v in &finite {
+            if v < lo || v > hi {
+                continue;
+            }
+            let bin = (((v - lo) / width) as usize).min(bins - 1);
+            counts[bin] += 1.0;
+        }
+    } else {
+        counts[0] = finite.len() as f64;
+    }
+    let smoothed = gaussian_smooth_reflect(&counts, 2.0);
+    let peak = smoothed
+        .iter()
+        .enumerate()
+        .fold(0, |best, (i, &c)| if c > smoothed[best] { i } else { best });
+    let width = (hi - lo) / bins as f64;
+    let mode = lo + (peak as f64 + 0.5) * width;
+    let (shortfall, below) = finite
+        .iter()
+        .filter(|&&v| v <= mode)
+        .fold((0.0, 0usize), |(sum, n), &v| (sum + (mode - v), n + 1));
+    let sigma = if below == 0 {
+        0.0
+    } else {
+        (std::f64::consts::PI / 2.0).sqrt() * shortfall / below as f64
+    };
+    Ok((mode, sigma))
+}
+
+/// [`GlobalThreshold::BackgroundMode`]'s level.
+pub fn background_mode_threshold(
+    values: &[f64],
+    bins: usize,
+    k: f64,
+    fraction: f64,
+    upper: f64,
+) -> Result<f64> {
+    let (mode, sigma) = background_mode(values, bins)?;
+    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    let top = percentile_of(&mut finite, upper);
+    Ok(mode + (k * sigma).max(fraction * (top - mode)))
+}
+
+/// A 1-D Gaussian over a histogram with mirrored ends (`d c b a | a b c d`),
+/// truncated at four sigma: SciPy's `gaussian_filter1d` default.
+fn gaussian_smooth_reflect(values: &[f64], sigma: f64) -> Vec<f64> {
+    let radius = (4.0 * sigma + 0.5) as isize;
+    let weights: Vec<f64> = (-radius..=radius)
+        .map(|d| (-0.5 * (d as f64 / sigma).powi(2)).exp())
+        .collect();
+    let total: f64 = weights.iter().sum();
+    let n = values.len() as isize;
+    let reflect = |mut i: isize| {
+        let period = 2 * n;
+        i = i.rem_euclid(period);
+        if i >= n {
+            period - 1 - i
+        } else {
+            i
+        }
+    };
+    (0..n)
+        .map(|i| {
+            weights
+                .iter()
+                .zip(-radius..=radius)
+                .map(|(w, d)| w * values[reflect(i + d) as usize])
+                .sum::<f64>()
+                / total
+        })
+        .collect()
+}
+
 fn upper_median(values: &mut [f64]) -> f64 {
     let middle = values.len() / 2;
     *values.select_nth_unstable_by(middle, f64::total_cmp).1
@@ -1829,6 +1961,40 @@ mod tests {
         assert_eq!(apply.inputs()[0].phase, 3);
         assert_eq!(apply.source_inputs([5, 5, 5])[0].image.index(), 0);
         assert_eq!(apply.seam_fold(), Some(SeamFold::Unordered));
+    }
+
+    #[test]
+    fn background_mode_stays_on_the_background_when_the_object_is_the_majority() {
+        // 40% background near 100 (a triangle of +-3), 60% object spread over
+        // 300..900: the median is on the object, the mode is not.
+        let mut values = Vec::new();
+        for i in 0..4000 {
+            values.push(100.0 + ((i % 7) as f64 - 3.0));
+        }
+        for i in 0..6000 {
+            values.push(300.0 + (i % 600) as f64);
+        }
+        let mut sorted = values.clone();
+        assert!(percentile_of(&mut sorted, 50.0) > 300.0);
+        let (mode, sigma) = background_mode(&values, 512).unwrap();
+        assert!((mode - 100.0).abs() < 3.0, "mode {mode}");
+        assert!(sigma > 0.5 && sigma < 4.0, "sigma {sigma}");
+
+        // noise-referenced when the fraction is zero, fraction-referenced when
+        // that is the larger
+        let noise = GlobalThreshold::background_mode(512, 5.0, 0.0, 99.5)
+            .unwrap()
+            .of(values.iter().copied())
+            .unwrap();
+        assert!((noise - (mode + 5.0 * sigma)).abs() < 1e-9);
+        let signal = GlobalThreshold::background_mode(512, 5.0, 0.15, 99.5)
+            .unwrap()
+            .of(values.iter().copied())
+            .unwrap();
+        let top = percentile_of(&mut sorted, 99.5);
+        assert!((signal - (mode + 0.15 * (top - mode))).abs() < 1e-9);
+        assert!(GlobalThreshold::background_mode(0, 5.0, 0.1, 99.5).is_err());
+        assert!(GlobalThreshold::background_mode(8, 5.0, 0.1, 101.0).is_err());
     }
 
     #[test]
