@@ -1,0 +1,36 @@
+[package]
+name = "blockflow-atlas-registration"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Atlas registration: elastix-style stochastic (Mattes mutual information) and block-parallel Gauss-Newton affine and B-spline registration of a volume to an atlas, chains of registrations, and point transforms between the spaces."
+
+[dependencies]
+blockflow = { path = "../..", features = ["zarr"] }
+atlas-regions = { path = "../../crates/atlas-regions", features = ["zarr"] }
+clap = { version = "4.5", features = ["derive"] }
+csv = "1"
+ndarray = "0.17"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "atlas-registration"
+path = "src/main.rs"
+
+[[bin]]
+name = "register-report"
+path = "src/bin/register_report.rs"
+
+# The same exception the root crate makes, for the same reason: a loop body here
+# indexes several parallel `[_; 3]` arrays by one axis, which an index says and
+# a three-way zip does not.
+[lints.clippy]
+needless_range_loop = "allow"
+# `!(x > 0.0)` refuses NaN and `x <= 0.0` does not; every such guard here is one.
+neg_cmp_op_on_partial_ord = "allow"

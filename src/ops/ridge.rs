@@ -680,16 +680,51 @@ where
     };
     let first_shape = [extent[0], shape[1], shape[2]];
     let mut first = vec![0.0f64; first_shape.iter().product()];
-    convolve_axis_range(source, shape, 0, &kernels[0], boundary, region[0], &mut first);
+    convolve_axis_range(
+        source,
+        shape,
+        0,
+        &kernels[0],
+        boundary,
+        region[0],
+        &mut first,
+    );
     let second_shape = [extent[0], extent[1], shape[2]];
     let mut second = vec![0.0f64; second_shape.iter().product()];
-    convolve_axis_range(&first, first_shape, 1, &kernels[1], boundary, region[1], &mut second);
+    convolve_axis_range(
+        &first,
+        first_shape,
+        1,
+        &kernels[1],
+        boundary,
+        region[1],
+        &mut second,
+    );
     match out.as_slice_mut() {
-        Some(target) => convolve_axis_range(&second, second_shape, 2, &kernels[2], boundary, region[2], target),
+        Some(target) => convolve_axis_range(
+            &second,
+            second_shape,
+            2,
+            &kernels[2],
+            boundary,
+            region[2],
+            target,
+        ),
         None => {
             let mut target = vec![0.0f64; extent.iter().product()];
-            convolve_axis_range(&second, second_shape, 2, &kernels[2], boundary, region[2], &mut target);
-            out.assign(&ArrayView3::from_shape((extent[0], extent[1], extent[2]), &target).expect("region shape"));
+            convolve_axis_range(
+                &second,
+                second_shape,
+                2,
+                &kernels[2],
+                boundary,
+                region[2],
+                &mut target,
+            );
+            out.assign(
+                &ArrayView3::from_shape((extent[0], extent[1], extent[2]), &target)
+                    .expect("region shape"),
+            );
         }
     }
     Ok(())
@@ -720,13 +755,22 @@ fn convolve_axis_range<T>(
         // once by the boundary, then accumulated with a stride of one.
         let span = extent + kernel.len().saturating_sub(1);
         let consecutive: Vec<usize> = (0..kernel.len()).collect();
-        let table: Vec<usize> = (0..span).map(|at| boundary.index(at as isize - radius, extent)).collect();
+        let table: Vec<usize> = (0..span)
+            .map(|at| boundary.index(at as isize - radius, extent))
+            .collect();
         let mut padded = vec![0.0f64; span];
         for row in 0..outer {
             for (slot, &at) in padded.iter_mut().zip(&table) {
                 *slot = src[row * extent + at].into();
             }
-            accumulate_row(&padded, range[0], 1, &consecutive, kernel, &mut dst[row * kept..(row + 1) * kept]);
+            accumulate_row(
+                &padded,
+                range[0],
+                1,
+                &consecutive,
+                kernel,
+                &mut dst[row * kept..(row + 1) * kept],
+            );
         }
         return;
     }
@@ -2283,17 +2327,33 @@ mod tests {
     /// regions touching every face and none.
     #[test]
     fn a_region_of_the_smoothing_is_bit_identical() {
-        let big = Array3::from_shape_fn((15, 14, 19), |(i, j, k)| ((i * 31 + j * 17 + k * 7) % 23) as f64 - 9.5 + (i * k) as f64 * 0.125);
+        let big = Array3::from_shape_fn((15, 14, 19), |(i, j, k)| {
+            ((i * 31 + j * 17 + k * 7) % 23) as f64 - 9.5 + (i * k) as f64 * 0.125
+        });
         let input = big.slice(ndarray::s![1..14, 2..13, 1..18;2]);
-        let kernels = [gaussian_weights(1.0, 3.0).unwrap(), gaussian_weights(1.5, 3.0).unwrap(), gaussian_weights(0.7, 4.0).unwrap()];
+        let kernels = [
+            gaussian_weights(1.0, 3.0).unwrap(),
+            gaussian_weights(1.5, 3.0).unwrap(),
+            gaussian_weights(0.7, 4.0).unwrap(),
+        ];
         for boundary in [Boundary::Clamp, Boundary::Reflect] {
             let mut whole = Array3::<f64>::zeros(input.raw_dim());
             gaussian_smooth_into_with(input, &kernels, boundary, whole.view_mut()).unwrap();
-            for region in [[[0, 13], [0, 11], [0, 9]], [[3, 9], [4, 7], [2, 6]], [[0, 2], [6, 11], [8, 9]], [[12, 13], [0, 1], [0, 9]]] {
+            for region in [
+                [[0, 13], [0, 11], [0, 9]],
+                [[3, 9], [4, 7], [2, 6]],
+                [[0, 2], [6, 11], [8, 9]],
+                [[12, 13], [0, 1], [0, 9]],
+            ] {
                 let extent: [usize; 3] = std::array::from_fn(|a| region[a][1] - region[a][0]);
                 let mut out = Array3::<f64>::zeros(extent);
-                gaussian_smooth_region_into(input, &kernels, boundary, region, out.view_mut()).unwrap();
-                let expected = whole.slice(ndarray::s![region[0][0]..region[0][1], region[1][0]..region[1][1], region[2][0]..region[2][1]]);
+                gaussian_smooth_region_into(input, &kernels, boundary, region, out.view_mut())
+                    .unwrap();
+                let expected = whole.slice(ndarray::s![
+                    region[0][0]..region[0][1],
+                    region[1][0]..region[1][1],
+                    region[2][0]..region[2][1]
+                ]);
                 for (got, want) in out.iter().zip(expected.iter()) {
                     assert_eq!(got.to_bits(), want.to_bits(), "{boundary:?} {region:?}");
                 }

@@ -76,7 +76,7 @@ use crate::op::{Anchor, BlockOp, Chain, SourceInput, SourceInputs};
 use crate::reach::Reach;
 use crate::voxels::Voxels;
 
-use super::components::{label_members_into_with, Connectivity};
+use super::components::{label_members_into_with, offset_by, Connectivity};
 use super::regional::regional_maxima_with;
 use super::watershed::{seeded_watershed_into, Separation};
 
@@ -227,13 +227,6 @@ pub fn tiled_watershed_into(
         "tiled watershed: the cost and the seed field must not hold NaN"
     );
 
-    let negated = field.mapv(|v| -v);
-    let minima = regional_maxima_with(negated.view(), config.connectivity)?;
-    let below = |[z, y, x]: [usize; 3]| {
-        minima[[z, y, x]]
-            && field[[z, y, x]] < config.seed_below
-            && mask.as_ref().is_none_or(|m| m[[z, y, x]])
-    };
     let tiles = config.tiles_per_axis(at.volume);
     let linear = (index[0] * tiles[1] + index[1]) * tiles[2] + index[2];
 
@@ -248,55 +241,40 @@ pub fn tiled_watershed_into(
             "tiled watershed: global seed ids must be below edge_seed_base {}",
             config.edge_seed_base
         );
-        let mut edge = Array3::<u32>::zeros(shape);
-        let count = label_members_into_with(
-            shape,
-            config.connectivity,
-            |p| global[p] == 0 && below(p),
-            edge.view_mut(),
-        )?;
-        let cut = |axis: usize, i: usize| {
-            (i == 0 && at.offset[axis] > 0)
-                || (i + 1 == shape[axis] && at.offset[axis] + shape[axis] < at.volume[axis])
-        };
-        let mut touches = vec![false; count as usize + 1];
-        for ((z, y, x), &l) in edge.indexed_iter() {
-            if l != 0 && (cut(0, z) || cut(1, y) || cut(2, x)) {
-                touches[l as usize] = true;
-            }
-        }
-        let mut ids = vec![0u32; count as usize + 1];
+        let edges = edge_seed_components(field, global, mask, config, at, shape);
         let mut next = 0u64;
         let base =
             u64::from(config.edge_seed_base) + linear as u64 * u64::from(config.ids_per_tile);
-        for l in 1..=count as usize {
-            if touches[l] {
-                next += 1;
-                ensure!(
-                    next <= u64::from(config.ids_per_tile),
-                    "tiled watershed: tile {index:?} has more than {} edge seeds; raise ids_per_tile",
-                    config.ids_per_tile
-                );
-                let id = base + next;
-                ensure!(
-                    id <= u64::from(u32::MAX),
-                    "tiled watershed: {} tiles of {} edge ids above {} do not fit u32 labels",
-                    tiles.iter().product::<usize>(),
-                    config.ids_per_tile,
-                    config.edge_seed_base
-                );
-                ids[l] = id as u32;
+        let mut all = global.to_owned();
+        for component in &edges {
+            next += 1;
+            ensure!(
+                next <= u64::from(config.ids_per_tile),
+                "tiled watershed: tile {index:?} has more than {} edge seeds; raise ids_per_tile",
+                config.ids_per_tile
+            );
+            let id = base + next;
+            ensure!(
+                id <= u64::from(u32::MAX),
+                "tiled watershed: {} tiles of {} edge ids above {} do not fit u32 labels",
+                tiles.iter().product::<usize>(),
+                config.ids_per_tile,
+                config.edge_seed_base
+            );
+            for &p in component {
+                all[p] = id as u32;
             }
         }
-        let mut all = global.to_owned();
-        all.zip_mut_with(&edge, |s, &l| {
-            if l != 0 && ids[l as usize] != 0 {
-                *s = ids[l as usize];
-            }
-        });
         return seeded_watershed_into(cost, all.view(), mask, config.separation, out);
     }
 
+    let negated = field.mapv(|v| -v);
+    let minima = regional_maxima_with(negated.view(), config.connectivity)?;
+    let below = |[z, y, x]: [usize; 3]| {
+        minima[[z, y, x]]
+            && field[[z, y, x]] < config.seed_below
+            && mask.as_ref().is_none_or(|m| m[[z, y, x]])
+    };
     let mut seeds = Array3::<u32>::zeros(shape);
     label_members_into_with(shape, config.connectivity, below, seeds.view_mut())?;
     let mut basins = Array3::<u32>::zeros(shape);
@@ -336,6 +314,131 @@ pub fn tiled_watershed_into(
     }
     out.zip_mut_with(&basins, |o, b| *o = ids.get(b).copied().unwrap_or(0));
     Ok(())
+}
+
+/// The edge seeds of one buffer: the components of the voxels that are a
+/// regional minimum of `field` within the buffer, below `seed_below`, inside
+/// `mask` and without a global seed, that touch a cut face of the buffer.
+/// Ordered by their first voxel in raster order, which is the order a raster
+/// labelling of every such component would number them in.
+///
+/// Searched from the cut faces only. A component lies inside one plateau (two
+/// adjacent minima with different values cannot both be minima), so walking it
+/// from a face voxel visits only that plateau, and whether a plateau is a
+/// minimum is decided once, by walking it, the first time one of its voxels is
+/// asked about. Taking the regional minima of the whole buffer to the same end
+/// was about a sixth of a cell-detection run's CPU.
+fn edge_seed_components(
+    field: ArrayView3<'_, f64>,
+    global: ArrayView3<'_, u32>,
+    mask: Option<ArrayView3<'_, bool>>,
+    config: &TiledWatershedConfig,
+    at: &Anchor,
+    shape: [usize; 3],
+) -> Vec<Vec<[usize; 3]>> {
+    const UNKNOWN: u8 = 0;
+    const MINIMUM: u8 = 1;
+    const NOT_MINIMUM: u8 = 2;
+    const TAKEN: u8 = 4;
+    let flat = |[z, y, x]: [usize; 3]| (z * shape[1] + y) * shape[2] + x;
+    let offsets = config.connectivity.offsets();
+    let mut state = vec![UNKNOWN; shape.iter().product()];
+    let mut plateau: Vec<[usize; 3]> = Vec::new();
+    // Whether `p`'s plateau is a regional minimum of the buffer, walking the
+    // plateau once and recording the answer on every voxel of it.
+    let mut is_minimum = |p: [usize; 3], state: &mut Vec<u8>| -> bool {
+        match state[flat(p)] & 3 {
+            MINIMUM => return true,
+            NOT_MINIMUM => return false,
+            _ => {}
+        }
+        let level = field[p];
+        let mut minimum = true;
+        plateau.clear();
+        plateau.push(p);
+        // Marked while walking so that a voxel is pushed once; the mark is
+        // replaced by the answer below.
+        state[flat(p)] |= MINIMUM;
+        let mut next = 0;
+        while next < plateau.len() {
+            let here = plateau[next];
+            next += 1;
+            for &by in offsets {
+                let Some(to) = offset_by(here, by, shape) else {
+                    continue;
+                };
+                let value = field[to];
+                if value < level {
+                    minimum = false;
+                } else if value == level && state[flat(to)] & 3 == UNKNOWN {
+                    state[flat(to)] |= MINIMUM;
+                    plateau.push(to);
+                }
+            }
+        }
+        if !minimum {
+            for &q in &plateau {
+                state[flat(q)] = (state[flat(q)] & !3) | NOT_MINIMUM;
+            }
+        }
+        minimum
+    };
+    let candidate = |p: [usize; 3]| {
+        global[p] == 0 && field[p] < config.seed_below && mask.as_ref().is_none_or(|m| m[p])
+    };
+
+    let mut components: Vec<(usize, Vec<[usize; 3]>)> = Vec::new();
+    let mut stack: Vec<[usize; 3]> = Vec::new();
+    let mut start = |p: [usize; 3], state: &mut Vec<u8>| {
+        if state[flat(p)] & TAKEN != 0 || !candidate(p) || !is_minimum(p, state) {
+            return;
+        }
+        state[flat(p)] |= TAKEN;
+        let mut members = vec![p];
+        let mut first = flat(p);
+        stack.push(p);
+        while let Some(here) = stack.pop() {
+            for &by in offsets {
+                let Some(to) = offset_by(here, by, shape) else {
+                    continue;
+                };
+                if state[flat(to)] & TAKEN != 0 || !candidate(to) || !is_minimum(to, state) {
+                    continue;
+                }
+                state[flat(to)] |= TAKEN;
+                first = first.min(flat(to));
+                members.push(to);
+                stack.push(to);
+            }
+        }
+        components.push((first, members));
+    };
+    for axis in 0..3 {
+        let low = at.offset[axis] > 0;
+        let high = at.offset[axis] + shape[axis] < at.volume[axis];
+        let planes = [(low, 0), (high, shape[axis] - 1)];
+        let (u, v) = match axis {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        for (cut, plane) in planes {
+            if !cut {
+                continue;
+            }
+            for i in 0..shape[u] {
+                for j in 0..shape[v] {
+                    let mut p = [0usize; 3];
+                    p[axis] = plane;
+                    p[u] = i;
+                    p[v] = j;
+                    start(p, &mut state);
+                }
+            }
+        }
+    }
+    components.sort_unstable_by_key(|(first, _)| *first);
+    components.into_iter().map(|(_, members)| members).collect()
 }
 
 /// The whole volume, tile by tile: the resident reference for the op.
@@ -743,6 +846,81 @@ mod tests {
         assert!(
             (16..20).all(|k| tiled[[0, 0, k]] != 7 && tiled[[0, 0, k]] >= config.edge_seed_base)
         );
+    }
+
+    /// The face search finds the components a raster labelling of the whole
+    /// buffer's minima finds, in the same order, on fields with plateaux,
+    /// masks and global seeds, under every connectivity and set of cut faces.
+    #[test]
+    fn the_face_search_finds_the_edge_seeds_the_whole_buffer_does() {
+        let shape = [9, 11, 13];
+        let mut checked = 0;
+        for connectivity in [
+            Connectivity::Faces,
+            Connectivity::FacesAndEdges,
+            Connectivity::FacesEdgesAndCorners,
+        ] {
+            for levels in [3.0, 6.0, 40.0] {
+                // Quantised, so there are plateaux of every size.
+                let field = Array3::from_shape_fn(shape, |(i, j, k)| {
+                    (hash01(i, j, k) * levels).floor() - 0.25 * (i % 3) as f64
+                });
+                let mask = Array3::from_shape_fn(shape, |(i, j, k)| hash01(k, i, j) < 0.85);
+                let global = Array3::from_shape_fn(shape, |(i, j, k)| {
+                    u32::from(hash01(j, k, i) < 0.03) * (1 + (i * 100 + j * 10 + k) as u32)
+                });
+                let mut config = TiledWatershedConfig::new([3, 3, 3], [1, 1, 1])
+                    .unwrap()
+                    .with_seed_below(levels - 1.0);
+                config.connectivity = connectivity;
+                for offset in [[0, 0, 0], [2, 0, 3], [0, 4, 0], [1, 1, 1]] {
+                    let volume = [shape[0] + 2, shape[1] + 4, shape[2] + 3];
+                    let at = Anchor::new(offset, volume);
+
+                    let negated = field.mapv(|v| -v);
+                    let minima = regional_maxima_with(negated.view(), connectivity).unwrap();
+                    let mut labels = Array3::<u32>::zeros(shape);
+                    let count = label_members_into_with(
+                        shape,
+                        connectivity,
+                        |p| global[p] == 0 && minima[p] && field[p] < levels - 1.0 && mask[p],
+                        labels.view_mut(),
+                    )
+                    .unwrap();
+                    let cut = |axis: usize, i: usize| {
+                        (i == 0 && at.offset[axis] > 0)
+                            || (i + 1 == shape[axis]
+                                && at.offset[axis] + shape[axis] < volume[axis])
+                    };
+                    let mut expected = vec![Vec::new(); count as usize + 1];
+                    let mut touches = vec![false; count as usize + 1];
+                    for ((z, y, x), &l) in labels.indexed_iter() {
+                        expected[l as usize].push([z, y, x]);
+                        if l != 0 && (cut(0, z) || cut(1, y) || cut(2, x)) {
+                            touches[l as usize] = true;
+                        }
+                    }
+                    let expected: Vec<Vec<[usize; 3]>> = (1..=count as usize)
+                        .filter(|&l| touches[l])
+                        .map(|l| expected[l].clone())
+                        .collect();
+                    let mut found = edge_seed_components(
+                        field.view(),
+                        global.view(),
+                        Some(mask.view()),
+                        &config,
+                        &at,
+                        shape,
+                    );
+                    for members in &mut found {
+                        members.sort_unstable();
+                    }
+                    assert_eq!(found, expected, "{connectivity:?}, {levels}, {offset:?}");
+                    checked += expected.len();
+                }
+            }
+        }
+        assert!(checked > 20, "only {checked} edge components were compared");
     }
 
     #[test]

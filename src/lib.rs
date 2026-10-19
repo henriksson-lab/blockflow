@@ -104,6 +104,7 @@
 /// How a produced labelling relates to a known-correct one. Overlap-based,
 /// because label ids never agree between two labellings of the same volume.
 pub mod agreement;
+pub mod analysis_artifact;
 pub mod animate;
 /// **The planner arena**: plans entered into a competition and judged by the
 /// simulator, beside the price the planner's own cost model puts on each. The

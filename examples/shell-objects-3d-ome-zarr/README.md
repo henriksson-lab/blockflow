@@ -36,6 +36,16 @@ with `--bootstrap 0` there is one pass, and it paints.
   `.template.json`, `.accepted.png` / `.rejected.png` contact sheets, and with
   `--keep-rays` the per-ray radii of the published objects.
 
+## Recall tuning (ND_WT_5_s1, 2026-10-19)
+
+The defaults favour recall: `--min-strong 0.35 --min-strong-large 0.28`
+(were 0.45 / 0.3) and `--duplicate-priority strong_margin` (was the scan
+`score`, which let an undersized fit inside a cyst displace the whole one).
+That keeps 54 objects instead of 44. By eye, 5 of the 10 added are real
+(mostly small cysts, r ≈ 19–24 voxels) and 5 are false positives (tissue
+folds and one holder-edge artifact), and none of the 44 is lost. The
+validation below used the old defaults.
+
 ## Validation (ND_WT_5_s1, 2026-10-18)
 
 Against the `cystfind` prototype's published result (46 objects, ~40 real by

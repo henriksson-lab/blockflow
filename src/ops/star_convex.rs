@@ -55,15 +55,15 @@ use crate::fragment::{
     SidecarSize, SourceBlocks,
 };
 use crate::op::SourceInput;
-use crate::reach::Reach;
 use crate::ops::edges::trilinear_at;
 use crate::ops::ridge::gaussian_smooth_region_into;
-use crate::ops::smooth::Gaussian;
-use crate::voxels::Voxels;
 use crate::ops::rows::sealed_rows;
+use crate::ops::smooth::Gaussian;
+use crate::reach::Reach;
 use crate::sidecar::Lifecycle;
 use crate::sphere::{fit_sphere, RaySet};
 use crate::table::{Column, RowBuilder, Schema, Value};
+use crate::voxels::Voxels;
 
 /// Radial sample spacing along a ray, in voxels.
 const STEP: f64 = 0.5;
@@ -116,7 +116,9 @@ impl ShellFitParams {
         if ok {
             Ok(())
         } else {
-            Err(Error::invalid(format!("invalid shell fit parameters {self:?}")))
+            Err(Error::invalid(format!(
+                "invalid shell fit parameters {self:?}"
+            )))
         }
     }
 
@@ -231,7 +233,11 @@ impl Window<'_> {
         out.resize(count, 0.0);
         for k in used {
             let r = start + k as f64 * STEP;
-            out[k] = self.sample([centre[0] + r * u[0], centre[1] + r * u[1], centre[2] + r * u[2]]);
+            out[k] = self.sample([
+                centre[0] + r * u[0],
+                centre[1] + r * u[1],
+                centre[2] + r * u[2],
+            ]);
         }
     }
 }
@@ -254,7 +260,13 @@ fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
 
 /// `(evidence, radius)` of the best sphere centred at `centre`: per radius, the
 /// sum over rays of the strongest step within 1.5 voxels of it.
-fn sphere_evidence(window: &Window, centre: [f64; 3], rays: &RaySet, lo: f64, hi: f64) -> (f32, f64) {
+fn sphere_evidence(
+    window: &Window,
+    centre: [f64; 3],
+    rays: &RaySet,
+    lo: f64,
+    hi: f64,
+) -> (f32, f64) {
     let start = (lo - 6.0).max(0.0);
     let count = ((hi + 6.0 - start) / STEP) as usize + 1;
     let radii = (hi - lo) as usize + 1;
@@ -320,8 +332,14 @@ pub fn fit_shell(
         origin,
         volume,
     };
-    let (lo, hi) = (params.search[0] * params.radius, params.search[1] * params.radius);
-    let mut best = (sphere_evidence(&window, candidate, search_rays, lo, hi), candidate);
+    let (lo, hi) = (
+        params.search[0] * params.radius,
+        params.search[1] * params.radius,
+    );
+    let mut best = (
+        sphere_evidence(&window, candidate, search_rays, lo, hi),
+        candidate,
+    );
     for step in [4.0, 2.0, 1.0] {
         let around = best.1;
         let span: i32 = if step == 4.0 { 2 } else { 1 };
@@ -371,7 +389,13 @@ pub fn fit_shell(
     Ok(fit)
 }
 
-fn fit_once(window: &Window, rays: &RaySet, centre: [f64; 3], guess: f64, p: &ShellFitParams) -> ShellFit {
+fn fit_once(
+    window: &Window,
+    rays: &RaySet,
+    centre: [f64; 3],
+    guess: f64,
+    p: &ShellFitParams,
+) -> ShellFit {
     let n = rays.len();
     let (lo, hi) = (p.refine[0] * guess, p.refine[1] * guess);
     let start = (lo - 4.0).max(0.0);
@@ -405,8 +429,15 @@ fn fit_once(window: &Window, rays: &RaySet, centre: [f64; 3], guess: f64, p: &Sh
             found
         })
         .collect();
-    let mut strongest: Vec<f32> = candidates.iter().filter_map(|c| c.first().map(|x| x.1)).collect();
-    let typical = if strongest.is_empty() { 1.0 } else { median(&mut strongest).max(1e-3) };
+    let mut strongest: Vec<f32> = candidates
+        .iter()
+        .filter_map(|c| c.first().map(|x| x.1))
+        .collect();
+    let typical = if strongest.is_empty() {
+        1.0
+    } else {
+        median(&mut strongest).max(1e-3)
+    };
     // the sphere collecting the most step evidence starts every ray
     let mut global = guess;
     let mut best = f32::NEG_INFINITY;
@@ -414,7 +445,12 @@ fn fit_once(window: &Window, rays: &RaySet, centre: [f64; 3], guess: f64, p: &Sh
     while r <= hi {
         let s: f32 = candidates
             .iter()
-            .map(|c| c.iter().filter(|x| (x.0 - r).abs() <= 2.0).map(|x| x.1).fold(0.0, f32::max))
+            .map(|c| {
+                c.iter()
+                    .filter(|x| (x.0 - r).abs() <= 2.0)
+                    .map(|x| x.1)
+                    .fold(0.0, f32::max)
+            })
             .sum();
         if s > best {
             best = s;
@@ -432,12 +468,17 @@ fn fit_once(window: &Window, rays: &RaySet, centre: [f64; 3], guess: f64, p: &Sh
             })
             .copied()
     };
-    let mut chosen: Vec<Option<(f64, f32, usize)>> = candidates.iter().map(|c| pick(c, global)).collect();
+    let mut chosen: Vec<Option<(f64, f32, usize)>> =
+        candidates.iter().map(|c| pick(c, global)).collect();
     let mut current: Vec<f64> = chosen.iter().map(|c| c.map_or(global, |x| x.0)).collect();
     for _ in 0..12 {
         let target: Vec<f64> = (0..n)
             .map(|i| {
-                let mut v: Vec<f32> = rays.neighbours(i).iter().map(|&j| current[j] as f32).collect();
+                let mut v: Vec<f32> = rays
+                    .neighbours(i)
+                    .iter()
+                    .map(|&j| current[j] as f32)
+                    .collect();
                 v.push(current[i] as f32);
                 median(&mut v) as f64
             })
@@ -466,8 +507,12 @@ fn fit_once(window: &Window, rays: &RaySet, centre: [f64; 3], guess: f64, p: &Sh
         let mut complete = true;
         for i in 0..n {
             if previous[i].is_nan() {
-                let known: Vec<f32> =
-                    rays.neighbours(i).iter().map(|&j| previous[j]).filter(|v| !v.is_nan()).collect();
+                let known: Vec<f32> = rays
+                    .neighbours(i)
+                    .iter()
+                    .map(|&j| previous[j])
+                    .filter(|v| !v.is_nan())
+                    .collect();
                 if known.is_empty() {
                     complete = false;
                 } else {
@@ -480,7 +525,10 @@ fn fit_once(window: &Window, rays: &RaySet, centre: [f64; 3], guess: f64, p: &Sh
         }
     }
     let fallback = (global + p.wall_pad) as f32;
-    radii.iter_mut().filter(|r| r.is_nan()).for_each(|r| *r = fallback);
+    radii
+        .iter_mut()
+        .filter(|r| r.is_nan())
+        .for_each(|r| *r = fallback);
     for _ in 0..p.smoothing {
         let previous = radii.clone();
         for i in 0..n {
@@ -498,9 +546,18 @@ fn fit_once(window: &Window, rays: &RaySet, centre: [f64; 3], guess: f64, p: &Sh
         .filter(|c| distance(*c, centre) < 0.3 * guess)
         .unwrap_or(centre);
     let mean_r = radii.iter().map(|&r| r as f64).sum::<f64>() / n as f64;
-    let std_r = (radii.iter().map(|&r| (r as f64 - mean_r).powi(2)).sum::<f64>() / n as f64).sqrt();
+    let std_r = (radii
+        .iter()
+        .map(|&r| (r as f64 - mean_r).powi(2))
+        .sum::<f64>()
+        / n as f64)
+        .sqrt();
     let mut supported_steps: Vec<f32> = chosen.iter().filter_map(|c| c.map(|x| x.1)).collect();
-    let step_median = if supported_steps.is_empty() { 0.0 } else { median(&mut supported_steps) as f64 };
+    let step_median = if supported_steps.is_empty() {
+        0.0
+    } else {
+        median(&mut supported_steps) as f64
+    };
     let mut all: Vec<f32> = profiles.iter().flatten().copied().collect();
     all.sort_by(|a, b| a.total_cmp(b));
     let spread = (all[all.len() * 95 / 100] - all[all.len() * 5 / 100]).max(1e-3) as f64;
@@ -508,13 +565,25 @@ fn fit_once(window: &Window, rays: &RaySet, centre: [f64; 3], guess: f64, p: &Sh
         .filter_map(|i| {
             let (r, _, k) = chosen[i]?;
             let u = rays.directions()[i];
-            let at = |rr: f64| window.sample([centre[0] + rr * u[0], centre[1] + rr * u[1], centre[2] + rr * u[2]]);
+            let at = |rr: f64| {
+                window.sample([
+                    centre[0] + rr * u[0],
+                    centre[1] + rr * u[1],
+                    centre[2] + rr * u[2],
+                ])
+            };
             let inner = (0..5).map(|q| at(r * (0.15 + 0.1 * q as f64))).sum::<f32>() / 5.0;
-            let ring = (k.saturating_sub(8)..k).map(|q| profiles[i][q]).fold(f32::INFINITY, f32::min);
+            let ring = (k.saturating_sub(8)..k)
+                .map(|q| profiles[i][q])
+                .fold(f32::INFINITY, f32::min);
             Some(inner - ring)
         })
         .collect();
-    let ring_depth = if depths.is_empty() { 0.0 } else { median(&mut depths) as f64 };
+    let ring_depth = if depths.is_empty() {
+        0.0
+    } else {
+        median(&mut depths) as f64
+    };
     let valid = (0..n)
         .map(|i| {
             (0..3).all(|a| {
@@ -634,7 +703,10 @@ pub fn encode_shapes(rays: usize, shapes: &[StarShape]) -> Vec<u8> {
 pub fn decode_shapes(bytes: &[u8]) -> Result<(usize, Vec<StarShape>)> {
     let bad = || Error::invalid("not a star-shape fragment");
     let word = |i: usize| -> Result<[u8; 8]> {
-        bytes.get(i..i + 8).map(|b| b.try_into().expect("eight")).ok_or_else(bad)
+        bytes
+            .get(i..i + 8)
+            .map(|b| b.try_into().expect("eight"))
+            .ok_or_else(bad)
     };
     if u64::from_le_bytes(word(0)?) != RAYS_MAGIC {
         return Err(bad());
@@ -783,12 +855,18 @@ impl FragmentOp for ShellFitOp {
     }
 
     fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {
-        Err(Error::invalid("the shell fit reads its image through apply_with"))
+        Err(Error::invalid(
+            "the shell fit reads its image through apply_with",
+        ))
     }
 
     fn apply_with(&self, at: &BlockView<'_>, sources: SourceBlocks<'_>) -> Result<BlockOutput> {
         let volume = at.volume();
-        let rows = sealed_rows(volume, &self.input_schema, at.own(&self.input.0).unwrap_or(&[]))?;
+        let rows = sealed_rows(
+            volume,
+            &self.input_schema,
+            at.own(&self.input.0).unwrap_or(&[]),
+        )?;
         let mut builder = RowBuilder::new(Arc::new(self.schema.clone()));
         let mut shapes = Vec::with_capacity(rows.len());
         if !rows.is_empty() {
@@ -803,13 +881,18 @@ impl FragmentOp for ShellFitOp {
                     let sampled: Vec<Sampled> = rows
                         .iter()
                         .map(|row| {
-                            let local: [isize; 3] = std::array::from_fn(|a| row.at[a] as isize - origin[a] as isize);
+                            let local: [isize; 3] =
+                                std::array::from_fn(|a| row.at[a] as isize - origin[a] as isize);
                             Sampled {
                                 centre: local.map(|v| v as f64),
                                 radius,
                                 cube: [
-                                    std::array::from_fn(|a| (local[a] - reach).clamp(0, shape[a] as isize) as usize),
-                                    std::array::from_fn(|a| (local[a] + reach + 1).clamp(0, shape[a] as isize) as usize),
+                                    std::array::from_fn(|a| {
+                                        (local[a] - reach).clamp(0, shape[a] as isize) as usize
+                                    }),
+                                    std::array::from_fn(|a| {
+                                        (local[a] + reach + 1).clamp(0, shape[a] as isize) as usize
+                                    }),
                                 ],
                             }
                         })
@@ -883,7 +966,12 @@ struct Sampled {
 /// the bits smoothing the whole buffer would give it. Tiles are done in
 /// parallel, a bounded number at a time so the pieces in flight stay small next
 /// to the result.
-fn smooth_where_sampled(raw: &Voxels, gaussian: &Gaussian, sampled: &[Sampled], tile: usize) -> Result<Array3<f64>> {
+fn smooth_where_sampled(
+    raw: &Voxels,
+    gaussian: &Gaussian,
+    sampled: &[Sampled],
+    tile: usize,
+) -> Result<Array3<f64>> {
     let shape = raw.shape();
     let mut needed = std::collections::BTreeSet::new();
     for fit in sampled {
@@ -901,7 +989,13 @@ fn smooth_where_sampled(raw: &Voxels, gaussian: &Gaussian, sampled: &[Sampled], 
                             let first = (t[a] * tile).max(lo[a]) as f64;
                             let last = (((t[a] + 1) * tile).min(hi[a]) - 1) as f64;
                             let c = fit.centre[a];
-                            let d = if c < first { first - c } else if c > last { c - last } else { 0.0 };
+                            let d = if c < first {
+                                first - c
+                            } else if c > last {
+                                c - last
+                            } else {
+                                0.0
+                            };
                             d * d
                         })
                         .sum();
@@ -924,24 +1018,39 @@ fn smooth_where_sampled(raw: &Voxels, gaussian: &Gaussian, sampled: &[Sampled], 
                     let r = gaussian.reach(a);
                     [core[a][0].saturating_sub(r), (core[a][1] + r).min(shape[a])]
                 });
-                let mut piece =
-                    Array3::<f64>::zeros(std::array::from_fn::<usize, 3, _>(|a| core[a][1] - core[a][0]));
-                let window = s![grown[0][0]..grown[0][1], grown[1][0]..grown[1][1], grown[2][0]..grown[2][1]];
+                let mut piece = Array3::<f64>::zeros(std::array::from_fn::<usize, 3, _>(|a| {
+                    core[a][1] - core[a][0]
+                }));
+                let window = s![
+                    grown[0][0]..grown[0][1],
+                    grown[1][0]..grown[1][1],
+                    grown[2][0]..grown[2][1]
+                ];
                 let region: [[usize; 2]; 3] =
                     std::array::from_fn(|a| [core[a][0] - grown[a][0], core[a][1] - grown[a][0]]);
                 dispatch_f64_input!(
                     raw,
                     Error::invalid("a shell fit prefilter cannot read half-precision"),
                     |view| {
-                        gaussian_smooth_region_into(view.slice(window), gaussian.kernels(), gaussian.boundary(), region, piece.view_mut())
+                        gaussian_smooth_region_into(
+                            view.slice(window),
+                            gaussian.kernels(),
+                            gaussian.boundary(),
+                            region,
+                            piece.view_mut(),
+                        )
                     }
                 )?;
                 Ok((core, piece))
             })
             .collect::<Result<Vec<_>>>()?;
         for (core, piece) in pieces {
-            out.slice_mut(s![core[0][0]..core[0][1], core[1][0]..core[1][1], core[2][0]..core[2][1]])
-                .assign(&piece);
+            out.slice_mut(s![
+                core[0][0]..core[0][1],
+                core[1][0]..core[1][1],
+                core[2][0]..core[2][1]
+            ])
+            .assign(&piece);
         }
     }
     Ok(out)
@@ -1075,7 +1184,9 @@ impl FragmentOp for StarConvexLabelsOp {
                 });
                 let hi: [usize; 3] = std::array::from_fn(|a| {
                     let end = core.start[a] + core.shape[a];
-                    ((shape.center[a] + reach).ceil() + 1.0).max(0.0).min(end as f64) as usize
+                    ((shape.center[a] + reach).ceil() + 1.0)
+                        .max(0.0)
+                        .min(end as f64) as usize
                 });
                 for z in lo[0]..hi[0] {
                     for y in lo[1]..hi[1] {
@@ -1089,8 +1200,8 @@ impl FragmentOp for StarConvexLabelsOp {
                             let relative = len / self.rays.interpolate(&shape.radii, d).max(1e-6);
                             let i = [z - origin[0], y - origin[1], x - origin[2]];
                             let c = [z - core.start[0], y - core.start[1], x - core.start[2]];
-                            let better = relative < depth[c]
-                                || (relative == depth[c] && label < view[i]);
+                            let better =
+                                relative < depth[c] || (relative == depth[c] && label < view[i]);
                             if relative <= 1.0 && better {
                                 depth[c] = relative;
                                 view[i] = label;
@@ -1125,7 +1236,10 @@ mod tests {
         Array3::from_shape_fn((VOLUME[0], VOLUME[1], VOLUME[2]), |(z, y, x)| {
             let mut v = 100.0 + ((z * 7 + y * 13 + x * 3) % 11) as f64;
             for c in centres {
-                let r = ((z as f64 - c[0]).powi(2) + (y as f64 - c[1]).powi(2) + (x as f64 - c[2]).powi(2)).sqrt();
+                let r = ((z as f64 - c[0]).powi(2)
+                    + (y as f64 - c[1]).powi(2)
+                    + (x as f64 - c[2]).powi(2))
+                .sqrt();
                 if r <= WALL {
                     v = if r > WALL - 2.0 {
                         220.0
@@ -1160,7 +1274,16 @@ mod tests {
         let image = phantom(&[centre]);
         let rays = RaySet::fibonacci(300, 8);
         let search = RaySet::fibonacci(120, 8);
-        let fit = fit_shell(image.view(), [0; 3], VOLUME, [31.0, 44.0, 53.0], &rays, &search, &params()).unwrap();
+        let fit = fit_shell(
+            image.view(),
+            [0; 3],
+            VOLUME,
+            [31.0, 44.0, 53.0],
+            &rays,
+            &search,
+            &params(),
+        )
+        .unwrap();
         assert!(distance(fit.center, centre) < 1.0, "{:?}", fit.center);
         // the wall peak sits inside [WALL - 2, WALL]; the pad adds one
         assert!((fit.mean_r - WALL).abs() < 1.5, "{}", fit.mean_r);
@@ -1186,10 +1309,18 @@ mod tests {
             let grid = BlockGrid::new(VOLUME, block).unwrap();
             let mut builder = PlanBuilder::new(VOLUME, Dtype::F64, grid);
             let smoothed = builder
-                .pixels(crate::op::Chain::op(crate::ops::SmoothOp::isotropic("smooth", 1.0, 4.0).unwrap()))
+                .pixels(crate::op::Chain::op(
+                    crate::ops::SmoothOp::isotropic("smooth", 1.0, 4.0).unwrap(),
+                ))
                 .unwrap();
             let source = builder
-                .fragments(RowSourceOp::new("c", "candidates", Lifecycle::DeleteOnExit, schema.clone(), candidates.clone()))
+                .fragments(RowSourceOp::new(
+                    "c",
+                    "candidates",
+                    Lifecycle::DeleteOnExit,
+                    schema.clone(),
+                    candidates.clone(),
+                ))
                 .unwrap();
             let fit = ShellFitOp::new(
                 "fit",
@@ -1216,9 +1347,22 @@ mod tests {
                 ))
                 .unwrap();
             let assembly = builder.finish().unwrap();
-            let env = ArrayEnvironment::for_decomposition(Voxels::from(image.clone()), &assembly.decomposition, block).unwrap();
-            execute_phases("shells", &assembly.workflow, &assembly.decomposition, &Hints::default(), &env, &[], &assembly.work())
-                .unwrap();
+            let env = ArrayEnvironment::for_decomposition(
+                Voxels::from(image.clone()),
+                &assembly.decomposition,
+                block,
+            )
+            .unwrap();
+            execute_phases(
+                "shells",
+                &assembly.workflow,
+                &assembly.decomposition,
+                &Hints::default(),
+                &env,
+                &[],
+                &assembly.work(),
+            )
+            .unwrap();
             let rows = collect_rows(&env, "fitted", fitted.index(), VOLUME, fitted_schema).unwrap();
             let labels = env.output().view::<u64>().unwrap().to_owned();
             answers.push((rows, labels));
@@ -1236,7 +1380,13 @@ mod tests {
         let b = shape_label([29, 52, 55], VOLUME);
         let count = |l: u64| labels.iter().filter(|&&v| v == l).count() as f64;
         let ball = 4.0 / 3.0 * std::f64::consts::PI * WALL.powi(3);
-        assert!((count(a) / ball - 1.0).abs() < 0.15 && (count(b) / ball - 1.0).abs() < 0.2, "{} {} {}", count(a), count(b), ball);
+        assert!(
+            (count(a) / ball - 1.0).abs() < 0.15 && (count(b) / ball - 1.0).abs() < 0.2,
+            "{} {} {}",
+            count(a),
+            count(b),
+            ball
+        );
         // the overlap is split, nearer to each centre goes to it
         assert_eq!(labels[[28, 48, 36]], a);
         assert_eq!(labels[[28, 49, 50]], b);

@@ -44,7 +44,10 @@ pub struct RadialTemplate {
 
 impl RadialTemplate {
     pub fn new(step: f64, values: Vec<f64>) -> Result<Self> {
-        if !(step.is_finite() && step > 0.0) || values.len() < 2 || values.iter().any(|v| !v.is_finite()) {
+        if !(step.is_finite() && step > 0.0)
+            || values.len() < 2
+            || values.iter().any(|v| !v.is_finite())
+        {
             return Err(Error::invalid(
                 "a radial template needs a positive step and at least two finite values",
             ));
@@ -75,7 +78,9 @@ impl RadialTemplate {
             .iter()
             .any(|p| p.step != first.step || p.values.len() != first.values.len())
         {
-            return Err(Error::invalid("templates to average must share step and length"));
+            return Err(Error::invalid(
+                "templates to average must share step and length",
+            ));
         }
         let n = first.values.len();
         let lo = ((band[0] / first.step) as usize).min(n - 1);
@@ -84,7 +89,8 @@ impl RadialTemplate {
         for p in profiles {
             let segment = &p.values[lo..=hi];
             let mean = segment.iter().sum::<f64>() / segment.len() as f64;
-            let sd = (segment.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / segment.len() as f64)
+            let sd = (segment.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                / segment.len() as f64)
                 .sqrt()
                 .max(1e-12);
             for (o, v) in out.iter_mut().zip(&p.values) {
@@ -107,7 +113,9 @@ pub fn radial_profile(
     extent: f64,
 ) -> Result<RadialTemplate> {
     if directions.is_empty() || !(radius > 0.0) {
-        return Err(Error::invalid("a radial profile needs directions and a positive radius"));
+        return Err(Error::invalid(
+            "a radial profile needs directions and a positive radius",
+        ));
     }
     let shape = values.shape();
     let count = (extent / step).round() as usize + 1;
@@ -140,7 +148,11 @@ pub struct ShellKernels {
 
 /// Kernels of `template` scaled to `radius` (grid voxels), over the shell
 /// `band[0] <= rho <= band[1]`.
-pub fn shell_kernels(template: &RadialTemplate, radius: f64, band: [f64; 2]) -> Result<ShellKernels> {
+pub fn shell_kernels(
+    template: &RadialTemplate,
+    radius: f64,
+    band: [f64; 2],
+) -> Result<ShellKernels> {
     if !(radius > 0.0) || !(band[0] >= 0.0 && band[1] > band[0]) {
         return Err(Error::invalid(format!(
             "a shell kernel needs a positive radius and a band lo < hi, got {radius} and {band:?}"
@@ -166,9 +178,15 @@ pub fn shell_kernels(template: &RadialTemplate, radius: f64, band: [f64; 2]) -> 
     // The element orders its offsets lexicographically; so do these loops.
     let n = taps.len();
     let mean = taps.iter().map(|t| t.1).sum::<f64>() / n as f64;
-    let norm = taps.iter().map(|t| (t.1 - mean).powi(2)).sum::<f64>().sqrt();
+    let norm = taps
+        .iter()
+        .map(|t| (t.1 - mean).powi(2))
+        .sum::<f64>()
+        .sqrt();
     if norm == 0.0 {
-        return Err(Error::invalid("a constant template has no correlation to measure"));
+        return Err(Error::invalid(
+            "a constant template has no correlation to measure",
+        ));
     }
     let offsets: Vec<[isize; 3]> = taps.iter().map(|t| t.0).collect();
     let template_kernel = Kernel::new(
@@ -190,7 +208,11 @@ fn ncc_group(kernels: &ShellKernels, variance_floor: f64) -> BankGroup {
     let n = kernels.taps as f64;
     let floor = variance_floor * n;
     BankGroup {
-        terms: vec![(0, kernels.template.clone()), (0, kernels.mask.clone()), (1, kernels.mask.clone())],
+        terms: vec![
+            (0, kernels.template.clone()),
+            (0, kernels.mask.clone()),
+            (1, kernels.mask.clone()),
+        ],
         combine: Arc::new(move |x| x[0] / (x[2] - x[1] * x[1] / n).max(floor).sqrt()),
     }
 }
@@ -213,20 +235,28 @@ pub fn multi_radius_ncc_chain(
     if radii.is_empty() {
         return Err(Error::invalid("a template scan needs at least one radius"));
     }
-    let kernels = radii.iter().map(|&r| shell_kernels(template, r, band)).collect::<Result<Vec<_>>>()?;
+    let kernels = radii
+        .iter()
+        .map(|&r| shell_kernels(template, r, band))
+        .collect::<Result<Vec<_>>>()?;
     ncc_bank(kernels, tile, variance_floor)
 }
 
 fn ncc_bank(kernels: Vec<ShellKernels>, tile: [usize; 3], variance_floor: f64) -> Result<Chain> {
     if !(variance_floor.is_finite() && variance_floor >= 0.0) {
-        return Err(Error::invalid("the NCC variance floor must be finite and non-negative"));
+        return Err(Error::invalid(
+            "the NCC variance floor must be finite and non-negative",
+        ));
     }
     let identity: InputMap = Arc::new(|v| v);
     let square: InputMap = Arc::new(|v| v * v);
     Ok(Chain::op(TransformBankOp::new(
         "ncc",
         vec![identity, square],
-        kernels.iter().map(|k| ncc_group(k, variance_floor)).collect(),
+        kernels
+            .iter()
+            .map(|k| ncc_group(k, variance_floor))
+            .collect(),
         Arc::new(f64::max),
         Sense::Correlate,
         Boundary::Clamp,
@@ -248,9 +278,18 @@ mod tests {
 
     fn shell_image(volume: [usize; 3], centre: [f64; 3], radius: f64) -> Array3<f64> {
         Array3::from_shape_fn((volume[0], volume[1], volume[2]), |(z, y, x)| {
-            let r = ((z as f64 - centre[0]).powi(2) + (y as f64 - centre[1]).powi(2) + (x as f64 - centre[2]).powi(2)).sqrt()
+            let r = ((z as f64 - centre[0]).powi(2)
+                + (y as f64 - centre[1]).powi(2)
+                + (x as f64 - centre[2]).powi(2))
+            .sqrt()
                 / radius;
-            let wall = if (0.85..1.0).contains(&r) { 3.0 } else if (0.7..0.85).contains(&r) { -1.0 } else { 0.0 };
+            let wall = if (0.85..1.0).contains(&r) {
+                3.0
+            } else if (0.7..0.85).contains(&r) {
+                -1.0
+            } else {
+                0.0
+            };
             wall + 0.3 * ((z * 5 + y * 3 + x) % 7) as f64
         })
     }
@@ -259,8 +298,16 @@ mod tests {
     fn ncc_at(image: &Array3<f64>, k: &ShellKernels, at: [usize; 3], floor: f64) -> f64 {
         let shape = image.shape();
         let (mut num, mut s1, mut s2) = (0.0, 0.0, 0.0);
-        for (o, w) in k.template.element().offsets().iter().zip(k.template.weights()) {
-            let p: [usize; 3] = std::array::from_fn(|a| (at[a] as isize + o[a]).clamp(0, shape[a] as isize - 1) as usize);
+        for (o, w) in k
+            .template
+            .element()
+            .offsets()
+            .iter()
+            .zip(k.template.weights())
+        {
+            let p: [usize; 3] = std::array::from_fn(|a| {
+                (at[a] as isize + o[a]).clamp(0, shape[a] as isize - 1) as usize
+            });
             let v = image[p];
             num += w * v;
             s1 += v;
@@ -275,27 +322,52 @@ mod tests {
         let volume = [24, 30, 28];
         let centre = [11.0, 14.0, 15.0];
         let image = shell_image(volume, centre, 7.0);
-        let template = radial_profile(image.view(), centre, 7.0, &fibonacci_sphere(200), 0.05, 1.6).unwrap();
+        let template =
+            radial_profile(image.view(), centre, 7.0, &fibonacci_sphere(200), 0.05, 1.6).unwrap();
         let radii = [5.0, 7.0, 9.0];
         let band = [0.6, 1.4];
         let floor = 0.01;
         let mut answers = Vec::new();
         for block in [[24, 30, 28], [8, 10, 7]] {
-            let mut builder = PlanBuilder::new(volume, Dtype::F64, BlockGrid::new(volume, block).unwrap());
+            let mut builder =
+                PlanBuilder::new(volume, Dtype::F64, BlockGrid::new(volume, block).unwrap());
             builder
                 .pixels(multi_radius_ncc_chain(&template, &radii, band, [8, 10, 7], floor).unwrap())
                 .unwrap();
             let assembly = builder.finish().unwrap();
-            let env = ArrayEnvironment::for_decomposition(Voxels::from(image.clone()), &assembly.decomposition, block).unwrap();
-            execute_phases("ncc", &assembly.workflow, &assembly.decomposition, &Hints::default(), &env, &[], &assembly.work())
-                .unwrap();
+            let env = ArrayEnvironment::for_decomposition(
+                Voxels::from(image.clone()),
+                &assembly.decomposition,
+                block,
+            )
+            .unwrap();
+            execute_phases(
+                "ncc",
+                &assembly.workflow,
+                &assembly.decomposition,
+                &Hints::default(),
+                &env,
+                &[],
+                &assembly.work(),
+            )
+            .unwrap();
             answers.push(env.output().view::<f64>().unwrap().to_owned());
         }
-        let kernels: Vec<ShellKernels> = radii.iter().map(|&r| shell_kernels(&template, r, band).unwrap()).collect();
+        let kernels: Vec<ShellKernels> = radii
+            .iter()
+            .map(|&r| shell_kernels(&template, r, band).unwrap())
+            .collect();
         for at in [[11, 14, 15], [3, 4, 5], [20, 25, 2], [12, 13, 16]] {
-            let expected = kernels.iter().map(|k| ncc_at(&image, k, at, floor)).fold(f64::NEG_INFINITY, f64::max);
+            let expected = kernels
+                .iter()
+                .map(|k| ncc_at(&image, k, at, floor))
+                .fold(f64::NEG_INFINITY, f64::max);
             for got in &answers {
-                assert!((got[at] - expected).abs() < 1e-6, "{at:?}: {} vs {expected}", got[at]);
+                assert!(
+                    (got[at] - expected).abs() < 1e-6,
+                    "{at:?}: {} vs {expected}",
+                    got[at]
+                );
             }
         }
         let (peak, _) = answers[0]

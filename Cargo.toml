@@ -9,6 +9,7 @@ members = [
     "crates/ngff-object-table",
     "crates/ngff-label-map",
     "crates/yolo3d",
+    "crates/atlas-regions",
     "examples/cellprofiler-human",
     "examples/imglib2-pipeline",
     "examples/opencv-pipeline",
@@ -29,6 +30,10 @@ members = [
     "examples/plate-timelapse-tracking",
     "examples/bead-layer-distance",
     "examples/shell-objects-3d-ome-zarr",
+    "examples/tile-stitching",
+    "examples/atlas-registration",
+    "examples/cell-density",
+    "examples/vessel-graph",
 ]
 
 [package]

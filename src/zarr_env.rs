@@ -233,7 +233,9 @@ fn background_fill(dtype: Dtype, value: f64) -> Result<FillValue> {
             if value == 0.0 || value == 1.0 {
                 FillValue::from(value == 1.0)
             } else {
-                return Err(Error::InvalidArgument(format!("a background of {value} is not a bool")));
+                return Err(Error::InvalidArgument(format!(
+                    "a background of {value} is not a bool"
+                )));
             }
         }
         Dtype::U8 => exact!(u8),
@@ -959,12 +961,7 @@ impl StoredArray {
             .iter()
             .map(|&value| value.max(1) as u64)
             .collect::<Vec<_>>();
-        let mut builder = ArrayBuilder::new(
-            zarr_shape,
-            zarr_chunk,
-            zarr_data_type(dtype)?,
-            fill,
-        );
+        let mut builder = ArrayBuilder::new(zarr_shape, zarr_chunk, zarr_data_type(dtype)?, fill);
         // Left unset for `Compression::None`, rather than set to an empty list:
         // an array built with `None` must be the array this environment built
         // before compression existed, metadata document included.
@@ -1078,7 +1075,10 @@ impl StoredArray {
         let storage = self.array.storage();
         for indices in chunks.indices().iter() {
             let key = self.array.chunk_key(&indices);
-            if zarrs::storage::ReadableStorageTraits::size_key(&*storage, &key).ok()?.is_some() {
+            if zarrs::storage::ReadableStorageTraits::size_key(&*storage, &key)
+                .ok()?
+                .is_some()
+            {
                 return None;
             }
         }
@@ -1608,10 +1608,43 @@ impl MultiscaleImage {
 }
 
 /// How to build storage pyramid levels from a full-resolution image.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PyramidSpec {
     factors: Vec<[usize; 3]>,
     chunk: Option<[usize; 3]>,
+    physical: Option<PhysicalFrame>,
+}
+
+/// Where a pyramid's level 0 sits in physical space, for its OME metadata.
+///
+/// Per axis in `[z, y, x]` order: the size of one voxel and the position of the
+/// centre of voxel 0, both in `unit`. A coarser level's voxel is the block mean
+/// of `factor` level-0 voxels, so its scale is `factor * voxel_size` and its
+/// first voxel's centre sits half a block in, at
+/// `origin + (factor - 1) / 2 * voxel_size`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhysicalFrame {
+    pub voxel_size: [f64; 3],
+    pub origin: [f64; 3],
+    /// An OME unit name such as `"micrometer"`; `None` writes no unit.
+    pub unit: Option<String>,
+}
+
+impl PhysicalFrame {
+    /// `voxel_size` per axis, voxel 0 at the origin.
+    pub fn new(voxel_size: [f64; 3], unit: Option<&str>) -> Self {
+        Self {
+            voxel_size,
+            origin: [0.0; 3],
+            unit: unit.map(str::to_owned),
+        }
+    }
+
+    #[must_use]
+    pub fn with_origin(mut self, origin: [f64; 3]) -> Self {
+        self.origin = origin;
+        self
+    }
 }
 
 impl PyramidSpec {
@@ -1630,6 +1663,7 @@ impl PyramidSpec {
         Ok(Self {
             factors,
             chunk: None,
+            physical: None,
         })
     }
 
@@ -1646,6 +1680,18 @@ impl PyramidSpec {
     pub fn with_chunk(mut self, chunk: [usize; 3]) -> Self {
         self.chunk = Some(chunk);
         self
+    }
+
+    /// Write physical scale, translation and unit into the image's metadata
+    /// instead of the default unit voxels.
+    #[must_use]
+    pub fn with_physical(mut self, frame: PhysicalFrame) -> Self {
+        self.physical = Some(frame);
+        self
+    }
+
+    pub fn physical(&self) -> Option<&PhysicalFrame> {
+        self.physical.as_ref()
     }
 
     pub fn levels(&self) -> usize {
@@ -1848,7 +1894,7 @@ impl ZarrEnvironment {
             levels.push(AttachedImage::at(root.join((index + 1).to_string())));
         }
 
-        write_multiscales_metadata(&root, &scales)?;
+        write_multiscales_metadata(&root, &scales, spec.physical())?;
         MultiscaleImage::new(levels, scales)
     }
 
@@ -2883,22 +2929,47 @@ where
     ))
 }
 
-fn write_multiscales_metadata(root: &Path, scales: &[[usize; 3]]) -> Result<()> {
+fn write_multiscales_metadata(
+    root: &Path,
+    scales: &[[usize; 3]],
+    physical: Option<&PhysicalFrame>,
+) -> Result<()> {
     let datasets = scales
         .iter()
         .enumerate()
         .map(|(index, scale)| {
+            // `scale` is per axis in the arrays' own `[z, y, x]` order, the
+            // order the axes below are listed in.
+            let transformations = match physical {
+                None => serde_json::json!([{"type": "scale", "scale": scale}]),
+                Some(frame) => {
+                    let size: [f64; 3] =
+                        std::array::from_fn(|axis| scale[axis] as f64 * frame.voxel_size[axis]);
+                    let at: [f64; 3] = std::array::from_fn(|axis| {
+                        frame.origin[axis]
+                            + (scale[axis] as f64 - 1.0) / 2.0 * frame.voxel_size[axis]
+                    });
+                    serde_json::json!([
+                        {"type": "scale", "scale": size},
+                        {"type": "translation", "translation": at}
+                    ])
+                }
+            };
             serde_json::json!({
                 "path": index.to_string(),
-                "coordinateTransformations": [
-                    {
-                        "type": "scale",
-                        "scale": [scale[2], scale[1], scale[0]]
-                    }
-                ]
+                "coordinateTransformations": transformations
             })
         })
         .collect::<Vec<_>>();
+    let axis = |name: &str| match physical {
+        None => serde_json::json!({"name": name, "type": "space", "unit": "voxel"}),
+        Some(PhysicalFrame {
+            unit: Some(unit), ..
+        }) => serde_json::json!({"name": name, "type": "space", "unit": unit}),
+        Some(PhysicalFrame { unit: None, .. }) => {
+            serde_json::json!({"name": name, "type": "space"})
+        }
+    };
     let metadata = serde_json::json!({
         "zarr_format": 3,
         "node_type": "group",
@@ -2908,11 +2979,7 @@ fn write_multiscales_metadata(root: &Path, scales: &[[usize; 3]]) -> Result<()> 
                 "multiscales": [
                     {
                         "version": "0.5",
-                        "axes": [
-                            {"name": "z", "type": "space", "unit": "voxel"},
-                            {"name": "y", "type": "space", "unit": "voxel"},
-                            {"name": "x", "type": "space", "unit": "voxel"}
-                        ],
+                        "axes": [axis("z"), axis("y"), axis("x")],
                         "datasets": datasets
                     }
                 ]

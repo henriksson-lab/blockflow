@@ -104,9 +104,9 @@
 // holds an op *and* the phase index it was built for as two fields that can
 // disagree, which was the failure this is here to remove.
 
-use crate::decomposition::{Background, 
+use crate::decomposition::{
     check_block_constraints, check_dtypes, check_source_images, phase_traffic, price_phase,
-    write_charge, Constraints, Decomposition, PhaseCost, PhaseDecomposition,
+    write_charge, Background, Constraints, Decomposition, PhaseCost, PhaseDecomposition,
 };
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
@@ -548,7 +548,9 @@ pub struct PlanBuilder {
 /// A chain's slots applied to a background, by `constant_maps_to`: `None`
 /// unless every slot says what the background becomes.
 fn fold_background(slots: &[&Chain], input: Option<f64>) -> Option<f64> {
-    slots.iter().try_fold(input?, |value, slot| slot.constant_maps_to(value))
+    slots
+        .iter()
+        .try_fold(input?, |value, slot| slot.constant_maps_to(value))
 }
 
 impl PlanBuilder {

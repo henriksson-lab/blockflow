@@ -730,25 +730,16 @@ pub use regional::{
     regional_phases, LabelPlateauxOp, RegionalMaximaOp,
 };
 pub use resample::{
-    resample_linear_into, resample_linear_into_with, resample_nearest_into,
-    resample_nearest_into_with, resample_phase, append_resample_phase, append_block_mean_phases, block_mean_kernel, Interpolation, OutputExtent, Ratio, Resample,
-    ResampleOp,
+    append_block_mean_phases, append_resample_phase, block_mean_kernel, resample_linear_into,
+    resample_linear_into_with, resample_nearest_into, resample_nearest_into_with, resample_phase,
+    Interpolation, OutputExtent, Ratio, Resample, ResampleOp,
 };
 pub use ridge::{
     gaussian_radius, gaussian_smooth_into, gaussian_smooth_into_with, gaussian_smooth_region_into,
-    gaussian_weights, hessian_at,
-    ridge_response_into, symmetric_eigenvalues, Boundary, EigenResponse, HessianEigenvalueOp,
-    PlateResponse, Polarity, RatioResponse, Response, RidgeFilterOp, RidgeResponse, ScaleSpace,
+    gaussian_weights, hessian_at, ridge_response_into, symmetric_eigenvalues, Boundary,
+    EigenResponse, HessianEigenvalueOp, PlateResponse, Polarity, RatioResponse, Response,
+    RidgeFilterOp, RidgeResponse, ScaleSpace,
 };
-pub use star_convex::{
-    decode_shapes, encode_shapes, fit_shell, shape_label, shell_schema, ShellFit, ShellFitOp,
-    ShellFitParams, ShellJudge, StarConvexLabelsOp, StarShape, SHELL_COLUMNS,
-};
-pub use template_match::{
-    multi_radius_ncc_chain, ncc_chain, radial_profile, shell_kernels, RadialTemplate, ShellKernels,
-};
-pub use transform_bank::{BankGroup, GroupCombine, GroupReduce, InputMap, TransformBankOp};
-pub use suppress::{suppress_points, RadiusPair, Suppression, SuppressionRadius, SuppressRowsOp};
 pub use rows::{
     append_group_phases, collect_groups, collect_rows, decode_groups, encode_groups, filter_blob,
     filter_into, gather_blob, gather_into, gathered_schema, group_values, merge_rows, scale_blob,
@@ -763,14 +754,22 @@ pub use sliding::{
     RankQuery, ScanPlan, SlidingHistogramOp,
 };
 pub use smooth::{Gaussian, SmoothOp};
+pub use star_convex::{
+    decode_shapes, encode_shapes, fit_shell, shape_label, shell_schema, ShellFit, ShellFitOp,
+    ShellFitParams, ShellJudge, StarConvexLabelsOp, StarShape, SHELL_COLUMNS,
+};
 pub use structure_tensor::{
     corner_response_into, gaussian_gradient_into, gradient_at, CornerResponse, CornerResponseOp,
     Eigenvalue, GradientMagnitudeOp, StructureTensor, StructureTensorOp,
 };
+pub use suppress::{suppress_points, RadiusPair, SuppressRowsOp, Suppression, SuppressionRadius};
 pub use tabulate::{
     append_tabulate_phases, collect_tabulation, decode_partial, encode_partial, merge_tabulation,
     region_values, tabulate_phases, tabulation_schema, FixedPoint, MergeTabulationOp, RegionValues,
     TabulateLabelsOp, TabulateValuesOp, Tally,
+};
+pub use template_match::{
+    multi_radius_ncc_chain, ncc_chain, radial_profile, shell_kernels, RadialTemplate, ShellKernels,
 };
 pub use threshold::{
     append_bounded_otsu_threshold_phases, append_global_threshold_phases, li_threshold,
@@ -785,6 +784,7 @@ pub use transform::{
     projective_transform_into, remap_into, rotate_into, warp_into, warp_phase, CoordinateMap,
     TransformBoundary, TransformInterpolation, WarpOp,
 };
+pub use transform_bank::{BankGroup, GroupCombine, GroupReduce, InputMap, TransformBankOp};
 pub use voxelize::{decode_points, encode_points, Point, VoxelizeOp};
 pub use voxelwise::{
     combine_into, from_set, is_set, logic_into, map_into, mask_logic_into, not_into, CarryOp,

@@ -131,7 +131,8 @@ pub fn suppress_points(
     let mut grid: HashMap<[i64; 3], Vec<usize>> = HashMap::new();
     let mut kept = Vec::new();
     for (index, &at) in positions.iter().enumerate() {
-        let home: [i64; 3] = std::array::from_fn(|a| (at[a] * voxel_size[a] / reach).floor() as i64);
+        let home: [i64; 3] =
+            std::array::from_fn(|a| (at[a] * voxel_size[a] / reach).floor() as i64);
         let mut separated = true;
         'cells: for dz in -1..=1i64 {
             for dy in -1..=1i64 {
@@ -306,7 +307,9 @@ impl FragmentOp for SuppressRowsOp {
                 let radius = match (&self.rule.radius, self.radius) {
                     (_, Some(column)) => number(row.values[column]),
                     (SuppressionRadius::Fixed(r), None) => *r,
-                    (SuppressionRadius::Column(_), None) => unreachable!("resolved at construction"),
+                    (SuppressionRadius::Column(_), None) => {
+                        unreachable!("resolved at construction")
+                    }
                 };
                 let position = match self.position {
                     Some(columns) => columns.map(|c| number(row.values[c])),
@@ -377,9 +380,7 @@ mod tests {
         for (i, p) in positions.iter().enumerate() {
             let far = kept.iter().all(|&j| {
                 let q = positions[j];
-                let d2: f64 = (0..3)
-                    .map(|a| ((p[a] - q[a]) * voxel[a]).powi(2))
-                    .sum();
+                let d2: f64 = (0..3).map(|a| ((p[a] - q[a]) * voxel[a]).powi(2)).sum();
                 d2 >= (factor * pair.of(radii[j], radii[i])).powi(2)
             });
             if far {
@@ -407,8 +408,9 @@ mod tests {
                         ]
                     })
                     .collect();
-                let radii: Vec<f64> =
-                    (0..600).map(|_| 0.5 + random(&mut seed, 100) as f64 / 10.0).collect();
+                let radii: Vec<f64> = (0..600)
+                    .map(|_| 0.5 + random(&mut seed, 100) as f64 / 10.0)
+                    .collect();
                 assert_eq!(
                     suppress_points(&positions, &radii, pair, factor, voxel).unwrap(),
                     all_pairs(&positions, &radii, pair, factor, voxel),
@@ -441,7 +443,11 @@ mod tests {
         let mut rows: Vec<RowValues> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         while rows.len() < 120 {
-            let at = [random(&mut seed, 12), random(&mut seed, 40), random(&mut seed, 40)];
+            let at = [
+                random(&mut seed, 12),
+                random(&mut seed, 40),
+                random(&mut seed, 40),
+            ];
             if seen.insert(at) {
                 rows.push(RowValues::new(
                     at,
@@ -454,7 +460,11 @@ mod tests {
         }
         let voxel = [1.0, 1.0, 1.0];
         let mut order: Vec<&RowValues> = rows.iter().collect();
-        order.sort_by(|a, b| number(b.values[0]).total_cmp(&number(a.values[0])).then_with(|| a.at.cmp(&b.at)));
+        order.sort_by(|a, b| {
+            number(b.values[0])
+                .total_cmp(&number(a.values[0]))
+                .then_with(|| a.at.cmp(&b.at))
+        });
         let positions: Vec<[f64; 3]> = order.iter().map(|r| r.at.map(|v| v as f64)).collect();
         let radii: Vec<f64> = order.iter().map(|r| number(r.values[1])).collect();
         let mut expected: Vec<[usize; 3]> =
@@ -464,7 +474,10 @@ mod tests {
                 .map(|i| order[i].at)
                 .collect();
         expected.sort_unstable();
-        assert!(expected.len() < rows.len() && expected.len() > 10, "fixture suppresses some");
+        assert!(
+            expected.len() < rows.len() && expected.len() > 10,
+            "fixture suppresses some"
+        );
 
         for block in [[12, 40, 40], [4, 16, 16], [3, 7, 9]] {
             let grid = BlockGrid::new(volume, block).unwrap();

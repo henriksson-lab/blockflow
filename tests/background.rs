@@ -33,7 +33,10 @@ const VOLUME: [usize; 3] = [48, 48, 64];
 const BLOCK: [usize; 3] = [16, 16, 16];
 
 fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("blockflow-background-{name}-{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "blockflow-background-{name}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&path);
     path
 }
@@ -87,13 +90,22 @@ fn run(name: &str, background: bool) -> Run {
     if background {
         builder = builder.with_input_background(0.0);
     }
-    builder.pixels(Chain::op(SmoothOp::isotropic("first", 1.0, 3.0).unwrap())).unwrap();
-    builder.pixels(Chain::op(SmoothOp::isotropic("second", 1.0, 3.0).unwrap())).unwrap();
+    builder
+        .pixels(Chain::op(SmoothOp::isotropic("first", 1.0, 3.0).unwrap()))
+        .unwrap();
+    builder
+        .pixels(Chain::op(SmoothOp::isotropic("second", 1.0, 3.0).unwrap()))
+        .unwrap();
     let assembly = builder.finish().unwrap();
-    assert_eq!(assembly.decomposition.background_at(1), background.then_some(0.0));
+    assert_eq!(
+        assembly.decomposition.background_at(1),
+        background.then_some(0.0)
+    );
     let hints = Hints {
         concurrency: 4,
-        keep_images: [blockflow::assemble::ImageId::from(1)].into_iter().collect(),
+        keep_images: [blockflow::assemble::ImageId::from(1)]
+            .into_iter()
+            .collect(),
         ..Hints::default()
     };
     let stats = execute_phases(
@@ -108,9 +120,17 @@ fn run(name: &str, background: bool) -> Run {
     .unwrap();
     let output = env.output().unwrap().view::<f64>().unwrap().to_owned();
     let level1_chunks = chunk_files(&root.join("level1"));
-    let read_voxels = env.counters().read_voxels.load(std::sync::atomic::Ordering::SeqCst);
+    let read_voxels = env
+        .counters()
+        .read_voxels
+        .load(std::sync::atomic::Ordering::SeqCst);
     let _ = std::fs::remove_dir_all(&root);
-    Run { output, stats, level1_chunks, read_voxels }
+    Run {
+        output,
+        stats,
+        level1_chunks,
+        read_voxels,
+    }
 }
 
 #[test]
@@ -120,34 +140,80 @@ fn a_background_saves_chunks_and_reads_and_changes_no_voxel() {
 
     // the oracle: the same plan in memory
     let mut builder = PlanBuilder::new(VOLUME, Dtype::U16, BlockGrid::new(VOLUME, BLOCK).unwrap());
-    builder.pixels(Chain::op(SmoothOp::isotropic("first", 1.0, 3.0).unwrap())).unwrap();
-    builder.pixels(Chain::op(SmoothOp::isotropic("second", 1.0, 3.0).unwrap())).unwrap();
-    let assembly = builder.finish().unwrap();
-    let memory =
-        ArrayEnvironment::for_decomposition(Voxels::from(sparse_input()), &assembly.decomposition, BLOCK).unwrap();
-    execute_phases("memory", &assembly.workflow, &assembly.decomposition, &Hints::default(), &memory, &[], &assembly.work())
+    builder
+        .pixels(Chain::op(SmoothOp::isotropic("first", 1.0, 3.0).unwrap()))
         .unwrap();
+    builder
+        .pixels(Chain::op(SmoothOp::isotropic("second", 1.0, 3.0).unwrap()))
+        .unwrap();
+    let assembly = builder.finish().unwrap();
+    let memory = ArrayEnvironment::for_decomposition(
+        Voxels::from(sparse_input()),
+        &assembly.decomposition,
+        BLOCK,
+    )
+    .unwrap();
+    execute_phases(
+        "memory",
+        &assembly.workflow,
+        &assembly.decomposition,
+        &Hints::default(),
+        &memory,
+        &[],
+        &assembly.work(),
+    )
+    .unwrap();
     let expected = memory.output().view::<f64>().unwrap().to_owned();
 
-    assert!(expected.iter().any(|v| *v != 0.0), "the oracle is not all background");
+    assert!(
+        expected.iter().any(|v| *v != 0.0),
+        "the oracle is not all background"
+    );
     for (name, got) in [("plain", &plain.output), ("sparse", &sparse.output)] {
-        let differing = got.iter().zip(expected.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-        assert_eq!(differing, 0, "{name}: {differing} voxels differ from memory");
+        let differing = got
+            .iter()
+            .zip(expected.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "{name}: {differing} voxels differ from memory"
+        );
     }
 
     // every chunk of image 1 written without a background; only the few
     // around the box with one
-    let total = VOLUME.iter().zip(BLOCK).map(|(v, b)| v.div_ceil(b)).product::<usize>();
+    let total = VOLUME
+        .iter()
+        .zip(BLOCK)
+        .map(|(v, b)| v.div_ceil(b))
+        .product::<usize>();
     assert_eq!(plain.level1_chunks, total);
-    assert!(sparse.level1_chunks > 0 && sparse.level1_chunks < total / 4, "{} of {total}", sparse.level1_chunks);
+    assert!(
+        sparse.level1_chunks > 0 && sparse.level1_chunks < total / 4,
+        "{} of {total}",
+        sparse.level1_chunks
+    );
 
     // the same blocks are uniform either way; with a background the second
     // phase finds them so without reading them
     assert!(plain.stats.tasks_short_circuited > 0);
-    assert_eq!(sparse.stats.tasks_short_circuited, plain.stats.tasks_short_circuited);
-    assert!(sparse.read_voxels < plain.read_voxels, "{} vs {}", sparse.read_voxels, plain.read_voxels);
+    assert_eq!(
+        sparse.stats.tasks_short_circuited,
+        plain.stats.tasks_short_circuited
+    );
+    assert!(
+        sparse.read_voxels < plain.read_voxels,
+        "{} vs {}",
+        sparse.read_voxels,
+        plain.read_voxels
+    );
     eprintln!(
         "chunks of image 1: {} vs {}; voxels read: {} vs {}; blocks short-circuited: {}",
-        sparse.level1_chunks, plain.level1_chunks, sparse.read_voxels, plain.read_voxels, sparse.stats.tasks_short_circuited
+        sparse.level1_chunks,
+        plain.level1_chunks,
+        sparse.read_voxels,
+        plain.read_voxels,
+        sparse.stats.tasks_short_circuited
     );
 }

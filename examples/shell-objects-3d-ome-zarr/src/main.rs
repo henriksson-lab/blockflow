@@ -33,16 +33,14 @@ use blockflow::ops::{
     append_block_mean_phases, append_response_peak_table_phases, decode_shapes, fit_shell,
     gaussian_smooth_into_with, multi_radius_ncc_chain, radial_profile, shape_label, Boundary,
     ColumnTest, Connectivity, FilterRowsOp, Gaussian, RadialTemplate, RadiusPair, ShellFit,
-    ShellFitOp, ShellFitParams, ShellJudge, StarConvexLabelsOp, StarShape, Suppression,
-    SuppressionRadius, SuppressRowsOp,
+    ShellFitOp, ShellFitParams, ShellJudge, StarConvexLabelsOp, StarShape, SuppressRowsOp,
+    Suppression, SuppressionRadius,
 };
 use blockflow::sidecar::Lifecycle;
 use blockflow::sphere::{fibonacci_sphere, RaySet};
 use blockflow::strategy::{execute_phases, Hints};
 use blockflow::table::{Column, Schema, Value};
-use blockflow::{
-    AttachedImage, BlockGrid, Error, ImageId, PlanBuilder, Result, ZarrEnvironment,
-};
+use blockflow::{AttachedImage, BlockGrid, Error, ImageId, PlanBuilder, Result, ZarrEnvironment};
 use clap::Parser;
 
 const PEAKS: &str = "scan.peaks";
@@ -78,7 +76,11 @@ struct Args {
     /// Isotropic downsampling of the scan, in level-0 voxels.
     #[arg(long, default_value_t = 4)]
     scan_factor: usize,
-    #[arg(long, value_delimiter = ',', default_value = "0.75,0.85,0.95,1.05,1.15,1.3")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "0.75,0.85,0.95,1.05,1.15,1.3"
+    )]
     scales: Vec<f64>,
     /// Template support in r / R; the interior below the first value is ignored.
     #[arg(long, value_delimiter = ',', default_value = "0.65,1.4")]
@@ -101,15 +103,25 @@ struct Args {
     min_contrast: f64,
     #[arg(long, default_value_t = 0.4)]
     strong_step: f64,
-    #[arg(long, default_value_t = 0.45)]
+    /// Lowest fraction of strong wall rays. Tuned for recall on ND_WT_5_s1
+    /// (2026-10-19): 0.45/0.3 kept 44, these keep 54, of which about 5 more
+    /// real cysts (mostly small ones) and 5 more false positives.
+    #[arg(long, default_value_t = 0.35)]
     min_strong: f64,
-    #[arg(long, default_value_t = 0.3)]
+    /// The same for objects of at least three quarters of the exemplar's size.
+    #[arg(long, default_value_t = 0.28)]
     min_strong_large: f64,
     /// Ring depth relative to the exemplar's wall step.
     #[arg(long, default_value_t = 0.15)]
     min_ring_depth: f64,
     #[arg(long, default_value_t = 1.0)]
     wall_pad: f64,
+    /// Table column that decides which of two overlapping accepted fits is
+    /// kept. `strong_margin` (wall evidence above the fit's own size-dependent
+    /// threshold) prefers the whole cyst over an undersized fit inside it,
+    /// which the scan `score` can rank higher.
+    #[arg(long, default_value = "strong_margin")]
+    duplicate_priority: String,
     /// Level-0 block edge z,y,x of the fit plan. Default: four times the fit's
     /// reach, rounded up to a multiple of 32, which keeps the window a block
     /// reads within a few times its core.
@@ -179,7 +191,10 @@ fn main() -> Result<()> {
         Some(v) => [v[0], v[1], v[2]],
         None => pyramid.voxel_size(),
     };
-    let work = pyramid.image_root().join("tables").join(format!(".{}-blockflow-work", args.layer));
+    let work = pyramid
+        .image_root()
+        .join("tables")
+        .join(format!(".{}-blockflow-work", args.layer));
     if work.exists() {
         fs::remove_dir_all(&work).map_err(Error::backend)?;
     }
@@ -210,26 +225,42 @@ fn main() -> Result<()> {
     let (mut template, radius, step_reference) = match (&args.exemplar, &args.template) {
         (_, Some(path)) => {
             let j: serde_json::Value =
-                serde_json::from_slice(&fs::read(path).map_err(Error::backend)?).map_err(Error::backend)?;
+                serde_json::from_slice(&fs::read(path).map_err(Error::backend)?)
+                    .map_err(Error::backend)?;
             let values = j["values"]
                 .as_array()
                 .ok_or_else(|| Error::invalid("template has no values"))?
                 .iter()
                 .map(|v| v.as_f64().unwrap_or(0.0))
                 .collect();
-            let field = |k: &str| j[k].as_f64().ok_or_else(|| Error::invalid(format!("template has no {k}")));
-            (RadialTemplate::new(field("step")?, values)?, field("radius")?, field("step_ref")?)
+            let field = |k: &str| {
+                j[k].as_f64()
+                    .ok_or_else(|| Error::invalid(format!("template has no {k}")))
+            };
+            (
+                RadialTemplate::new(field("step")?, values)?,
+                field("radius")?,
+                field("step_ref")?,
+            )
         }
         (Some(e), None) => {
-            let fit = host_fit(&pyramid, [e[0], e[1], e[2]], &ShellFitParams {
-                wall_pad: args.wall_pad,
-                ..ShellFitParams::for_radius(args.diameter / 2.0)
-            })?;
+            let fit = host_fit(
+                &pyramid,
+                [e[0], e[1], e[2]],
+                &ShellFitParams {
+                    wall_pad: args.wall_pad,
+                    ..ShellFitParams::for_radius(args.diameter / 2.0)
+                },
+            )?;
             eprintln!(
                 "exemplar: centre {:.1?} mean r {:.1} (std {:.2}) coverage {:.2} wall step {:.0}",
                 fit.center, fit.mean_r, fit.std_r, fit.coverage, fit.step_median
             );
-            (profile_at(fit.center, fit.mean_r)?, fit.mean_r, fit.step_median)
+            (
+                profile_at(fit.center, fit.mean_r)?,
+                fit.mean_r,
+                fit.step_median,
+            )
         }
         (None, None) => return Err(Error::invalid("give --exemplar or --template")),
     };
@@ -246,13 +277,35 @@ fn main() -> Result<()> {
     };
 
     // 2-3, and the bootstrap
-    let mut candidates = scan(&coarse, coarse_volume, &template, radius, variance, volume, &work.join("scan"), &args)?;
+    let mut candidates = scan(
+        &coarse,
+        coarse_volume,
+        &template,
+        radius,
+        variance,
+        volume,
+        &work.join("scan"),
+        &args,
+    )?;
     // without a bootstrap the first pass is the last, and it paints
     let single = args.bootstrap == 0;
-    let mut pass = fit_pass(&pyramid, &candidates, &params, &judge, radius, &work.join("fit"), &args, single && !args.no_publish)?;
+    let mut pass = fit_pass(
+        &pyramid,
+        &candidates,
+        &params,
+        &judge,
+        radius,
+        &work.join("fit"),
+        &args,
+        single && !args.no_publish,
+    )?;
     if !single {
         let mut best: Vec<&Object> = pass.objects.iter().filter(|o| o.kept).collect();
-        best.sort_by(|a, b| b.f(&pass.schema, "coverage").total_cmp(&a.f(&pass.schema, "coverage")).then(a.at.cmp(&b.at)));
+        best.sort_by(|a, b| {
+            b.f(&pass.schema, "coverage")
+                .total_cmp(&a.f(&pass.schema, "coverage"))
+                .then(a.at.cmp(&b.at))
+        });
         best.truncate(args.bootstrap);
         if best.len() >= 3 {
             let profiles = best
@@ -261,10 +314,31 @@ fn main() -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             template = RadialTemplate::average(&profiles, [0.0, TEMPLATE_EXTENT])?;
             let first = pass.objects.iter().filter(|o| o.kept).count();
-            eprintln!("bootstrap: template from {} objects (first pass kept {first}); rescanning", best.len());
-            candidates = scan(&coarse, coarse_volume, &template, radius, variance, volume, &work.join("scan"), &args)?;
+            eprintln!(
+                "bootstrap: template from {} objects (first pass kept {first}); rescanning",
+                best.len()
+            );
+            candidates = scan(
+                &coarse,
+                coarse_volume,
+                &template,
+                radius,
+                variance,
+                volume,
+                &work.join("scan"),
+                &args,
+            )?;
         }
-        pass = fit_pass(&pyramid, &candidates, &params, &judge, radius, &work.join("fit"), &args, !args.no_publish)?;
+        pass = fit_pass(
+            &pyramid,
+            &candidates,
+            &params,
+            &judge,
+            radius,
+            &work.join("fit"),
+            &args,
+            !args.no_publish,
+        )?;
     }
     let kept: Vec<&Object> = pass.objects.iter().filter(|o| o.kept).collect();
     eprintln!(
@@ -278,7 +352,11 @@ fn main() -> Result<()> {
     let mut tj = serde_json::json!({"step": template.step, "values": template.values});
     tj["radius"] = radius.into();
     tj["step_ref"] = step_reference.into();
-    fs::write(stem.with_extension("template.json"), serde_json::to_vec_pretty(&tj).expect("json")).map_err(Error::backend)?;
+    fs::write(
+        stem.with_extension("template.json"),
+        serde_json::to_vec_pretty(&tj).expect("json"),
+    )
+    .map_err(Error::backend)?;
     let t = Instant::now();
     write_csv(&stem.with_extension("csv"), &pass, &args, radius, volume)?;
     let rays = RaySet::fibonacci(args.rays, 8);
@@ -286,14 +364,34 @@ fn main() -> Result<()> {
     fn tiles<'a>(objects: &[&'a Object]) -> Vec<sheet::Tile<'a>> {
         objects
             .iter()
-            .map(|o| sheet::Tile { center: o.shape.center, radii: &o.shape.radii, accepted: o.kept })
+            .map(|o| sheet::Tile {
+                center: o.shape.center,
+                radii: &o.shape.radii,
+                accepted: o.kept,
+            })
             .collect()
     }
-    sheet::contact_sheet(&pyramid, &stem.with_extension("accepted.png"), &tiles(&kept), &rays, half)?;
+    sheet::contact_sheet(
+        &pyramid,
+        &stem.with_extension("accepted.png"),
+        &tiles(&kept),
+        &rays,
+        half,
+    )?;
     let mut near: Vec<&Object> = pass.objects.iter().filter(|o| !o.accepted).collect();
-    near.sort_by(|a, b| b.f(&pass.schema, "strong").total_cmp(&a.f(&pass.schema, "strong")).then(a.at.cmp(&b.at)));
+    near.sort_by(|a, b| {
+        b.f(&pass.schema, "strong")
+            .total_cmp(&a.f(&pass.schema, "strong"))
+            .then(a.at.cmp(&b.at))
+    });
     near.truncate(48);
-    sheet::contact_sheet(&pyramid, &stem.with_extension("rejected.png"), &tiles(&near), &rays, half)?;
+    sheet::contact_sheet(
+        &pyramid,
+        &stem.with_extension("rejected.png"),
+        &tiles(&near),
+        &rays,
+        half,
+    )?;
     if args.keep_rays {
         write_rays(&stem.with_extension("rays.csv"), &kept, &rays, volume)?;
     }
@@ -301,7 +399,17 @@ fn main() -> Result<()> {
     eprintln!("reports in {:.1}s", t.elapsed().as_secs_f64());
     if let Some((env, label_image, kept_phase)) = pass.publish {
         let t = Instant::now();
-        publish(&pyramid, &env, &work, label_image, kept_phase, &pass.schema, volume, voxel_size, &args)?;
+        publish(
+            &pyramid,
+            &env,
+            &work,
+            label_image,
+            kept_phase,
+            &pass.schema,
+            volume,
+            voxel_size,
+            &args,
+        )?;
         eprintln!("published in {:.1}s", t.elapsed().as_secs_f64());
         if !args.viewer.is_empty() {
             rescan_viewer(&args.viewer);
@@ -316,7 +424,10 @@ fn validate(args: &Args) -> Result<()> {
     let ok = args.scan_factor > 0
         && !args.scales.is_empty()
         && args.band.len() == 2
-        && args.block.as_ref().is_none_or(|b| b.len() == 3 && b.iter().all(|&v| v > 0))
+        && args
+            .block
+            .as_ref()
+            .is_none_or(|b| b.len() == 3 && b.iter().all(|&v| v > 0))
         && args.rays >= 20
         && args.exemplar.as_ref().is_none_or(|e| e.len() == 3)
         && args.voxel_size.as_ref().is_none_or(|v| v.len() == 3)
@@ -331,13 +442,25 @@ fn validate(args: &Args) -> Result<()> {
 
 /// The coarsest stored level whose factors divide `factor`, block-averaged for
 /// the remainder in a planned run; the result is kept and attached.
-fn block_mean(pyramid: &OmeVolumePyramid, factor: usize, work: &Path, args: &Args) -> Result<AttachedImage> {
+fn block_mean(
+    pyramid: &OmeVolumePyramid,
+    factor: usize,
+    work: &Path,
+    args: &Args,
+) -> Result<AttachedImage> {
     let s0 = pyramid.levels()[0].shape;
     let (level, stored) = pyramid
         .levels()
         .iter()
         .enumerate()
-        .map(|(i, l)| (i, std::array::from_fn::<usize, 3, _>(|a| (s0[a] as f64 / l.shape[a] as f64).round() as usize)))
+        .map(|(i, l)| {
+            (
+                i,
+                std::array::from_fn::<usize, 3, _>(|a| {
+                    (s0[a] as f64 / l.shape[a] as f64).round() as usize
+                }),
+            )
+        })
         .filter(|(_, f)| f.iter().all(|&v| v > 0 && factor.is_multiple_of(v)))
         .max_by_key(|(_, f)| f[0] * f[1] * f[2])
         .ok_or_else(|| Error::invalid("no stored level divides the scan factor"))?;
@@ -346,7 +469,18 @@ fn block_mean(pyramid: &OmeVolumePyramid, factor: usize, work: &Path, args: &Arg
     let source = pyramid.attached_level(level)?;
     let (dtype, input) = source.metadata()?;
     let block = args.scan_block.max(1);
-    let mut builder = PlanBuilder::new(input, dtype, BlockGrid::new(input, [block.min(input[0]), block.min(input[1]), block.min(input[2])])?);
+    let mut builder = PlanBuilder::new(
+        input,
+        dtype,
+        BlockGrid::new(
+            input,
+            [
+                block.min(input[0]),
+                block.min(input[1]),
+                block.min(input[2]),
+            ],
+        )?,
+    );
     let mean = append_block_mean_phases(&mut builder, remainder, [block; 3])?;
     let assembly = builder.finish()?;
     let env = ZarrEnvironment::attach(work, std::slice::from_ref(&source))?;
@@ -354,12 +488,18 @@ fn block_mean(pyramid: &OmeVolumePyramid, factor: usize, work: &Path, args: &Arg
         "shell objects: block mean",
         &assembly.workflow,
         &assembly.decomposition,
-        &Hints { concurrency: args.workers.max(1), keep_images: [mean.image()?].into_iter().collect(), ..Hints::default() },
+        &Hints {
+            concurrency: args.workers.max(1),
+            keep_images: [mean.image()?].into_iter().collect(),
+            ..Hints::default()
+        },
         &env,
         &[],
         &assembly.work(),
     )?;
-    Ok(AttachedImage::at(work.join(format!("level{}", mean.image()?.index()))))
+    Ok(AttachedImage::at(
+        work.join(format!("level{}", mean.image()?.index())),
+    ))
 }
 
 /// Variance of the coarse image, from a central box of at most 128^3 voxels:
@@ -384,25 +524,60 @@ fn coarse_profile(
 ) -> Result<RadialTemplate> {
     let c: [f64; 3] = std::array::from_fn(|a| (centre[a] - (f - 1.0) / 2.0) / f);
     let reach = (radius / f * TEMPLATE_EXTENT).ceil() as isize + 2;
-    let start: [usize; 3] = std::array::from_fn(|a| (c[a].round() as isize - reach).clamp(0, volume[a] as isize - 1) as usize);
-    let end: [usize; 3] = std::array::from_fn(|a| ((c[a].round() as isize + reach + 1).max(1) as usize).min(volume[a]));
+    let start: [usize; 3] = std::array::from_fn(|a| {
+        (c[a].round() as isize - reach).clamp(0, volume[a] as isize - 1) as usize
+    });
+    let end: [usize; 3] = std::array::from_fn(|a| {
+        ((c[a].round() as isize + reach + 1).max(1) as usize).min(volume[a])
+    });
     let shape: [usize; 3] = std::array::from_fn(|a| (end[a] - start[a]).max(1));
     let window = coarse.read_region(start, shape)?.widened();
     let local: [f64; 3] = std::array::from_fn(|a| c[a] - start[a] as f64);
-    radial_profile(window.view(), local, radius / f, directions, TEMPLATE_STEP, TEMPLATE_EXTENT)
+    radial_profile(
+        window.view(),
+        local,
+        radius / f,
+        directions,
+        TEMPLATE_STEP,
+        TEMPLATE_EXTENT,
+    )
 }
 
 /// The exemplar's fit, host-side on a smoothed level-0 window.
-fn host_fit(pyramid: &OmeVolumePyramid, centre: [f64; 3], params: &ShellFitParams) -> Result<ShellFit> {
+fn host_fit(
+    pyramid: &OmeVolumePyramid,
+    centre: [f64; 3],
+    params: &ShellFitParams,
+) -> Result<ShellFit> {
     let volume = pyramid.levels()[0].shape;
     let half = params.reach() as isize + 4;
-    let start: [usize; 3] = std::array::from_fn(|a| (centre[a].round() as isize - half).clamp(0, volume[a] as isize - 1) as usize);
-    let end: [usize; 3] = std::array::from_fn(|a| ((centre[a].round() as isize + half + 1).max(1) as usize).min(volume[a]));
+    let start: [usize; 3] = std::array::from_fn(|a| {
+        (centre[a].round() as isize - half).clamp(0, volume[a] as isize - 1) as usize
+    });
+    let end: [usize; 3] = std::array::from_fn(|a| {
+        ((centre[a].round() as isize + half + 1).max(1) as usize).min(volume[a])
+    });
     let shape: [usize; 3] = std::array::from_fn(|a| end[a] - start[a]);
-    let raw = pyramid.attached_level(0)?.read_region(start, shape)?.widened();
+    let raw = pyramid
+        .attached_level(0)?
+        .read_region(start, shape)?
+        .widened();
     let mut smoothed = ndarray::Array3::<f64>::zeros(raw.raw_dim());
-    gaussian_smooth_into_with(raw.view(), Gaussian::isotropic(1.0, 4.0)?.kernels(), Boundary::Clamp, smoothed.view_mut())?;
-    fit_shell(smoothed.view(), start, volume, centre, &RaySet::fibonacci(500, 8), &RaySet::fibonacci(120, 8), params)
+    gaussian_smooth_into_with(
+        raw.view(),
+        Gaussian::isotropic(1.0, 4.0)?.kernels(),
+        Boundary::Clamp,
+        smoothed.view_mut(),
+    )?;
+    fit_shell(
+        smoothed.view(),
+        start,
+        volume,
+        centre,
+        &RaySet::fibonacci(500, 8),
+        &RaySet::fibonacci(120, 8),
+        params,
+    )
 }
 
 /// One template scan of the coarse image: candidates in level-0 voxels,
@@ -427,7 +602,13 @@ fn scan(
     let (dtype, _) = coarse.metadata()?;
     let block: [usize; 3] = std::array::from_fn(|a| args.scan_block.min(coarse_volume[a]));
     let mut builder = PlanBuilder::new(coarse_volume, dtype, BlockGrid::new(coarse_volume, block)?);
-    builder.pixels(multi_radius_ncc_chain(template, &radii, [args.band[0], args.band[1]], [args.scan_tile.max(1); 3], 0.01 * variance)?)?;
+    builder.pixels(multi_radius_ncc_chain(
+        template,
+        &radii,
+        [args.band[0], args.band[1]],
+        [args.scan_tile.max(1); 3],
+        0.01 * variance,
+    )?)?;
     let (peaks, schema) = append_response_peak_table_phases(
         &mut builder,
         PEAKS,
@@ -438,7 +619,13 @@ fn scan(
     let smallest = radii.iter().copied().fold(f64::INFINITY, f64::min);
     let suppressed = builder.fragments(SuppressRowsOp::new(
         "scan suppression",
-        RowStreams::new(PEAKS, peaks.index(), SCAN, Lifecycle::Persistent, schema.clone())?,
+        RowStreams::new(
+            PEAKS,
+            peaks.index(),
+            SCAN,
+            Lifecycle::Persistent,
+            schema.clone(),
+        )?,
         Suppression {
             priority: "response".into(),
             radius: SuppressionRadius::Fixed(0.75 * smallest),
@@ -454,25 +641,37 @@ fn scan(
         "shell objects: template scan",
         &assembly.workflow,
         &assembly.decomposition,
-        &Hints { concurrency: args.workers.max(1), ..Hints::default() },
+        &Hints {
+            concurrency: args.workers.max(1),
+            ..Hints::default()
+        },
         &env,
         &[],
         &assembly.work(),
     )?;
-    let response = schema.index_of("response").expect("peak rows carry a response");
-    let mut found: Vec<Candidate> = collect_rows(&env, SCAN, suppressed.index(), coarse_volume, schema)?
-        .into_iter()
-        .map(|row| Candidate {
-            at: std::array::from_fn(|a| ((row.at[a] as f64 * f + (f - 1.0) / 2.0).round() as usize).min(volume[a] - 1)),
-            score: match row.values[response] {
-                Value::F64(v) => v,
-                Value::U64(v) => v as f64,
-            },
-        })
-        .collect();
+    let response = schema
+        .index_of("response")
+        .expect("peak rows carry a response");
+    let mut found: Vec<Candidate> =
+        collect_rows(&env, SCAN, suppressed.index(), coarse_volume, schema)?
+            .into_iter()
+            .map(|row| Candidate {
+                at: std::array::from_fn(|a| {
+                    ((row.at[a] as f64 * f + (f - 1.0) / 2.0).round() as usize).min(volume[a] - 1)
+                }),
+                score: match row.values[response] {
+                    Value::F64(v) => v,
+                    Value::U64(v) => v as f64,
+                },
+            })
+            .collect();
     found.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.at.cmp(&b.at)));
     found.truncate(args.max_candidates);
-    eprintln!("scan: {} candidates in {:.1}s", found.len(), t.elapsed().as_secs_f64());
+    eprintln!(
+        "scan: {} candidates in {:.1}s",
+        found.len(),
+        t.elapsed().as_secs_f64()
+    );
     Ok(found)
 }
 
@@ -503,11 +702,21 @@ fn fit_pass(
     let source = pyramid.attached_level(0)?;
     let (dtype, volume) = source.metadata()?;
     let edge = (4 * params.reach()).div_ceil(32) * 32;
-    let block: [usize; 3] = std::array::from_fn(|a| args.block.as_ref().map_or(edge, |b| b[a]).min(volume[a]));
+    let block: [usize; 3] =
+        std::array::from_fn(|a| args.block.as_ref().map_or(edge, |b| b[a]).min(volume[a]));
     let mut builder = PlanBuilder::new(volume, dtype, BlockGrid::new(volume, block)?);
     let candidate_schema = Schema::new(vec![Column::f64("score")])?;
-    let rows: Vec<RowValues> = candidates.iter().map(|c| RowValues::new(c.at, vec![Value::F64(c.score)])).collect();
-    let sourced = builder.fragments(RowSourceOp::new("shell candidates", CANDIDATES, Lifecycle::DeleteOnExit, candidate_schema.clone(), rows))?;
+    let rows: Vec<RowValues> = candidates
+        .iter()
+        .map(|c| RowValues::new(c.at, vec![Value::F64(c.score)]))
+        .collect();
+    let sourced = builder.fragments(RowSourceOp::new(
+        "shell candidates",
+        CANDIDATES,
+        Lifecycle::DeleteOnExit,
+        candidate_schema.clone(),
+        rows,
+    ))?;
     let fit = ShellFitOp::new(
         "shell fit",
         ImageId::from(0),
@@ -533,15 +742,27 @@ fn fit_pass(
     ])?;
     let accepted = builder.fragments(FilterRowsOp::new(
         "shell acceptance",
-        RowStreams::new(FITTED, fitted.index(), ACCEPTED, Lifecycle::Persistent, schema.clone())?,
+        RowStreams::new(
+            FITTED,
+            fitted.index(),
+            ACCEPTED,
+            Lifecycle::Persistent,
+            schema.clone(),
+        )?,
         filter,
     )?)?;
     // an object centred inside a better-scoring one is part of it
     let kept = builder.fragments(SuppressRowsOp::new(
         "shell duplicates",
-        RowStreams::new(ACCEPTED, accepted.index(), KEPT, Lifecycle::Persistent, schema.clone())?,
+        RowStreams::new(
+            ACCEPTED,
+            accepted.index(),
+            KEPT,
+            Lifecycle::Persistent,
+            schema.clone(),
+        )?,
         Suppression {
-            priority: "score".into(),
+            priority: args.duplicate_priority.clone(),
             radius: SuppressionRadius::Column("mean_r".into()),
             pair: RadiusPair::Larger,
             factor: 0.9,
@@ -570,13 +791,20 @@ fn fit_pass(
         "shell objects: level-0 fit",
         &assembly.workflow,
         &assembly.decomposition,
-        &Hints { concurrency: args.workers.max(1), keep_images: keep, ..Hints::default() },
+        &Hints {
+            concurrency: args.workers.max(1),
+            keep_images: keep,
+            ..Hints::default()
+        },
         &env,
         &[],
         &assembly.work(),
     )?;
     let set = |stream: &str, phase: usize| -> Result<BTreeSet<[usize; 3]>> {
-        Ok(collect_rows(&env, stream, phase, volume, schema.clone())?.into_iter().map(|r| r.at).collect())
+        Ok(collect_rows(&env, stream, phase, volume, schema.clone())?
+            .into_iter()
+            .map(|r| r.at)
+            .collect())
     };
     let accepted_set = set(ACCEPTED, accepted.index())?;
     let kept_set = set(KEPT, kept.index())?;
@@ -589,19 +817,22 @@ fn fit_pass(
         }
         Ok(())
     })?;
-    let mut objects: Vec<Object> = collect_rows(&env, FITTED, fitted.index(), volume, schema.clone())?
-        .into_iter()
-        .map(|row| {
-            let shape = shapes.remove(&row.at).ok_or_else(|| Error::invalid(format!("no shape for {:?}", row.at)))?;
-            Ok(Object {
-                at: row.at,
-                accepted: accepted_set.contains(&row.at),
-                kept: kept_set.contains(&row.at),
-                values: row.values,
-                shape,
+    let mut objects: Vec<Object> =
+        collect_rows(&env, FITTED, fitted.index(), volume, schema.clone())?
+            .into_iter()
+            .map(|row| {
+                let shape = shapes
+                    .remove(&row.at)
+                    .ok_or_else(|| Error::invalid(format!("no shape for {:?}", row.at)))?;
+                Ok(Object {
+                    at: row.at,
+                    accepted: accepted_set.contains(&row.at),
+                    kept: kept_set.contains(&row.at),
+                    values: row.values,
+                    shape,
+                })
             })
-        })
-        .collect::<Result<_>>()?;
+            .collect::<Result<_>>()?;
     let score = schema.index_of("score").expect("score column");
     objects.sort_by(|a, b| {
         let s = |o: &Object| match o.values[score] {
@@ -621,7 +852,11 @@ fn fit_pass(
         Some(labels) => Some((env, labels.image()?, kept.index())),
         None => None,
     };
-    Ok(Pass { schema, objects, publish })
+    Ok(Pass {
+        schema,
+        objects,
+        publish,
+    })
 }
 
 /// The kept rows as `tables/<layer>` and the label image as `labels/<layer>`.
@@ -641,8 +876,21 @@ fn publish(
     // face; `centroid_*` is that centre clamped into the volume, as the spatial
     // index requires
     let measurements = [
-        "center_z", "center_y", "center_x", "score", "mean_r", "std_r", "min_r", "max_r", "roughness", "coverage", "strong", "strong_margin",
-        "ring_depth", "contrast", "shift",
+        "center_z",
+        "center_y",
+        "center_x",
+        "score",
+        "mean_r",
+        "std_r",
+        "min_r",
+        "max_r",
+        "roughness",
+        "coverage",
+        "strong",
+        "strong_margin",
+        "ring_depth",
+        "contrast",
+        "shift",
     ];
     let mut columns = vec![
         ColumnSpec::new("label_id", DType::U64, ColumnRole::Identity),
@@ -651,14 +899,23 @@ fn publish(
         ColumnSpec::new("centroid_x", DType::F32, ColumnRole::Coordinate),
         ColumnSpec::new("diameter_um", DType::F32, ColumnRole::Measurement),
     ];
-    columns.extend(measurements.iter().map(|m| ColumnSpec::new(*m, DType::F32, ColumnRole::Measurement)));
+    columns.extend(
+        measurements
+            .iter()
+            .map(|m| ColumnSpec::new(*m, DType::F32, ColumnRole::Measurement)),
+    );
     let tile_shape = vec![32, 256, 256];
     let spatial_index = SpatialIndexSpec {
         coordinates: ["z", "y", "x"]
             .into_iter()
-            .map(|axis| CoordinateColumn { axis: axis.into(), column: format!("centroid_{axis}") })
+            .map(|axis| CoordinateColumn {
+                axis: axis.into(),
+                column: format!("centroid_{axis}"),
+            })
             .collect(),
-        grid_shape: (0..3).map(|a| volume[a].div_ceil(tile_shape[a] as usize) as u64).collect(),
+        grid_shape: (0..3)
+            .map(|a| volume[a].div_ceil(tile_shape[a] as usize) as u64)
+            .collect(),
         tile_shape,
         tile_order: "row_major".into(),
         within_tile_order: "lexicographic_coordinates_then_identity".into(),
@@ -673,22 +930,38 @@ fn publish(
     // isotropic grid: the diameter in µm is along x
     let micrometres = voxel_size[2];
     let staged = work.join("table");
-    finalize_object_table(env, KEPT, kept_phase, volume, schema.clone(), &staged, work, spec, |row| {
-        let mut values = vec![ObjectValue::U64(shape_label(row.at(), volume))];
-        for (a, &c) in centre.iter().enumerate() {
-            values.push(ObjectValue::F32(row.f64(c)?.clamp(0.0, (volume[a] - 1) as f64) as f32));
-        }
-        values.push(ObjectValue::F32((2.0 * row.f64(mean_r)? * micrometres) as f32));
-        for &m in &measured {
-            values.push(ObjectValue::F32(row.f64(m)? as f32));
-        }
-        Ok(Some(values))
-    })?;
+    finalize_object_table(
+        env,
+        KEPT,
+        kept_phase,
+        volume,
+        schema.clone(),
+        &staged,
+        work,
+        spec,
+        |row| {
+            let mut values = vec![ObjectValue::U64(shape_label(row.at(), volume))];
+            for (a, &c) in centre.iter().enumerate() {
+                values.push(ObjectValue::F32(
+                    row.f64(c)?.clamp(0.0, (volume[a] - 1) as f64) as f32,
+                ));
+            }
+            values.push(ObjectValue::F32(
+                (2.0 * row.f64(mean_r)? * micrometres) as f32,
+            ));
+            for &m in &measured {
+                values.push(ObjectValue::F32(row.f64(m)? as f32));
+            }
+            Ok(Some(values))
+        },
+    )?;
     publish_label(
         pyramid,
         LabelPublication {
             name: &args.layer,
-            level0: &work.join("fit").join(format!("level{}", label_image.index())),
+            level0: &work
+                .join("fit")
+                .join(format!("level{}", label_image.index())),
             image_label: None,
             table: Some(&staged),
             replace: true,
@@ -702,7 +975,12 @@ fn publish(
 
 fn write_csv(path: &Path, pass: &Pass, args: &Args, radius: f64, volume: [usize; 3]) -> Result<()> {
     let mut f = fs::File::create(path).map_err(Error::backend)?;
-    let names: Vec<String> = pass.schema.columns().iter().map(|c| c.name().to_owned()).collect();
+    let names: Vec<String> = pass
+        .schema
+        .columns()
+        .iter()
+        .map(|c| c.name().to_owned())
+        .collect();
     writeln!(f, "label_id,z,y,x,status,{}", names.join(",")).map_err(Error::backend)?;
     for o in &pass.objects {
         let status = if o.kept {
@@ -757,7 +1035,11 @@ fn reason(o: &Object, schema: &Schema, args: &Args, radius: f64) -> &'static str
 /// header line.
 fn write_rays(path: &Path, kept: &[&Object], rays: &RaySet, volume: [usize; 3]) -> Result<()> {
     let mut f = fs::File::create(path).map_err(Error::backend)?;
-    let dirs: Vec<String> = rays.directions().iter().map(|d| format!("{:.6} {:.6} {:.6}", d[0], d[1], d[2])).collect();
+    let dirs: Vec<String> = rays
+        .directions()
+        .iter()
+        .map(|d| format!("{:.6} {:.6} {:.6}", d[0], d[1], d[2]))
+        .collect();
     writeln!(f, "# directions z y x: {}", dirs.join(";")).map_err(Error::backend)?;
     writeln!(f, "label_id,center_z,center_y,center_x,radii...").map_err(Error::backend)?;
     for o in kept {

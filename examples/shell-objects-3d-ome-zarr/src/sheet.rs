@@ -35,7 +35,10 @@ fn number(img: &mut RgbImage, x0: u32, y0: u32, n: usize) {
             for col in 0..3u32 {
                 if bits & (4 >> col) != 0 {
                     for s in 0..4 {
-                        let (x, y) = (x0 + (k as u32 * 4 + col) * 2 + s % 2, y0 + row as u32 * 2 + s / 2);
+                        let (x, y) = (
+                            x0 + (k as u32 * 4 + col) * 2 + s % 2,
+                            y0 + row as u32 * 2 + s / 2,
+                        );
                         if x < img.width() && y < img.height() {
                             img.put_pixel(x, y, Rgb([255, 255, 0]));
                         }
@@ -48,7 +51,13 @@ fn number(img: &mut RgbImage, x0: u32, y0: u32, n: usize) {
 
 /// Tiles of `2 * half + 1` voxels, four objects per row, numbered by position.
 /// Objects are read and drawn in parallel.
-pub fn contact_sheet(pyramid: &OmeVolumePyramid, path: &Path, tiles: &[Tile<'_>], rays: &RaySet, half: usize) -> Result<()> {
+pub fn contact_sheet(
+    pyramid: &OmeVolumePyramid,
+    path: &Path,
+    tiles: &[Tile<'_>],
+    rays: &RaySet,
+    half: usize,
+) -> Result<()> {
     let t = 2 * half + 1;
     let per_row = 4;
     let tile_w = 3 * t + 6;
@@ -68,24 +77,40 @@ pub fn contact_sheet(pyramid: &OmeVolumePyramid, path: &Path, tiles: &[Tile<'_>]
 }
 
 /// One object's three slices, side by side.
-fn render(pyramid: &OmeVolumePyramid, tile: &Tile<'_>, rays: &RaySet, half: usize) -> Result<RgbImage> {
+fn render(
+    pyramid: &OmeVolumePyramid,
+    tile: &Tile<'_>,
+    rays: &RaySet,
+    half: usize,
+) -> Result<RgbImage> {
     let volume = pyramid.levels()[0].shape;
     let t = 2 * half + 1;
     let start: [usize; 3] = std::array::from_fn(|a| {
         (tile.center[a].round() as isize - half as isize).clamp(0, volume[a] as isize - 1) as usize
     });
     let shape: [usize; 3] = std::array::from_fn(|a| t.min(volume[a] - start[a]));
-    let crop = pyramid.attached_level(0)?.read_region(start, shape)?.widened();
+    let crop = pyramid
+        .attached_level(0)?
+        .read_region(start, shape)?
+        .widened();
     let mut sorted: Vec<f64> = crop.iter().copied().collect();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let lo = sorted[sorted.len() / 100];
     let hi = sorted[sorted.len() * 995 / 1000].max(lo + 1.0);
     let c: [isize; 3] = std::array::from_fn(|a| tile.center[a].round() as isize);
     let inside = |p: [isize; 3]| {
-        let d = [p[0] as f64 - tile.center[0], p[1] as f64 - tile.center[1], p[2] as f64 - tile.center[2]];
+        let d = [
+            p[0] as f64 - tile.center[0],
+            p[1] as f64 - tile.center[1],
+            p[2] as f64 - tile.center[2],
+        ];
         ((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() as f32) <= rays.interpolate(tile.radii, d)
     };
-    let colour = if tile.accepted { Rgb([60, 255, 60]) } else { Rgb([255, 60, 60]) };
+    let colour = if tile.accepted {
+        Rgb([60, 255, 60])
+    } else {
+        Rgb([255, 60, 60])
+    };
     let mut img = RgbImage::new((3 * t + 4) as u32, t as u32);
     for plane in 0..3 {
         let at = |i: isize, j: isize| match plane {
@@ -102,7 +127,10 @@ fn render(pyramid: &OmeVolumePyramid, tile: &Tile<'_>, rays: &RaySet, half: usiz
                 let v = local.map_or(lo, |q| crop[q]);
                 let g = (((v - lo) / (hi - lo)).clamp(0.0, 1.0) * 255.0) as u8;
                 let edge = inside(p)
-                    && !(inside(at(i + 1, j)) && inside(at(i - 1, j)) && inside(at(i, j + 1)) && inside(at(i, j - 1)));
+                    && !(inside(at(i + 1, j))
+                        && inside(at(i - 1, j))
+                        && inside(at(i, j + 1))
+                        && inside(at(i, j - 1)));
                 let x = (plane * (t + 2)) as u32 + (j + half as isize) as u32;
                 let y = (i + half as isize) as u32;
                 img.put_pixel(x, y, if edge { colour } else { Rgb([g, g, g]) });

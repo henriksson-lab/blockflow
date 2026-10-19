@@ -55,7 +55,8 @@ use blockflow::strategy::{execute, Hints, Workflow};
 use blockflow::synthetic::{Scene, SceneSpec};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::{
-    chunk_for_block, AttachedImage, Compression, CompressionPolicy, PyramidSpec, ZarrEnvironment,
+    chunk_for_block, AttachedImage, Compression, CompressionPolicy, PhysicalFrame, PyramidSpec,
+    ZarrEnvironment,
 };
 use blockflow::{Dtype, Region};
 
@@ -213,6 +214,69 @@ fn assert_same(left: &Voxels, right: &Voxels, what: &str) {
             "{what}: element {index} is {a} in memory and {b} in storage"
         );
     }
+}
+
+#[test]
+fn an_anisotropic_pyramid_writes_its_scale_in_axis_order() {
+    // Decimating z alone must say so under the `z` axis: the scale was once
+    // written reversed, which only an anisotropic pyramid can show.
+    let scratch = zarr_scratch("multiscale-anisotropic");
+    let input = Array3::from_shape_fn((8, 6, 4), |(z, y, x)| (z + 10 * y + 100 * x) as f64);
+    let spec = PyramidSpec::new(vec![[2, 1, 1]])
+        .unwrap()
+        .with_chunk([2, 2, 2]);
+    ZarrEnvironment::build_multiscale(scratch.path(), &input.into(), &spec)
+        .expect("pyramid builds");
+
+    let metadata = multiscale_metadata(scratch.path());
+    let multiscale = &metadata["attributes"]["ome"]["multiscales"][0];
+    let axes: Vec<&str> = multiscale["axes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|axis| axis["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(axes, ["z", "y", "x"]);
+    let scale = &multiscale["datasets"][1]["coordinateTransformations"][0]["scale"];
+    assert_eq!(scale, &serde_json::json!([2, 1, 1]));
+}
+
+#[test]
+fn a_physical_pyramid_writes_its_scale_translation_and_unit() {
+    let scratch = zarr_scratch("multiscale-physical");
+    let input = Array3::<f64>::zeros((8, 8, 8));
+    let frame =
+        PhysicalFrame::new([4.0, 1.0, 1.0], Some("micrometer")).with_origin([10.0, 0.0, 0.0]);
+    let spec = PyramidSpec::new(vec![[1, 2, 2], [2, 2, 2]])
+        .unwrap()
+        .with_physical(frame);
+    ZarrEnvironment::build_multiscale(scratch.path(), &input.into(), &spec)
+        .expect("pyramid builds");
+
+    let metadata = multiscale_metadata(scratch.path());
+    let multiscale = &metadata["attributes"]["ome"]["multiscales"][0];
+    assert_eq!(multiscale["axes"][0]["unit"], "micrometer");
+    let transforms = |level: usize| &multiscale["datasets"][level]["coordinateTransformations"];
+    assert_eq!(
+        transforms(0),
+        &serde_json::json!([
+            {"type": "scale", "scale": [4.0, 1.0, 1.0]},
+            {"type": "translation", "translation": [10.0, 0.0, 0.0]}
+        ])
+    );
+    // Level 2 is level 0 decimated by [2, 4, 4]: its first voxel's centre is
+    // half a block in.
+    assert_eq!(
+        transforms(2),
+        &serde_json::json!([
+            {"type": "scale", "scale": [8.0, 4.0, 4.0]},
+            {"type": "translation", "translation": [12.0, 1.5, 1.5]}
+        ])
+    );
+}
+
+fn multiscale_metadata(root: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(root.join("zarr.json")).unwrap()).unwrap()
 }
 
 #[test]

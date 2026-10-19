@@ -102,12 +102,12 @@ jobs:
           # and the compile — `burn`, and a patched `candle` — is the expensive
           # part.
           - os: ubuntu-latest
-            features: { name: stardist, key: stardist, flags: "--features stardist", test: "no" }
+            features: { name: stardist, key: stardist, flags: "--features stardist", test: "no", examples: "-p blockflow-stardist-ome-zarr -p blockflow-stardist-3d-ome-zarr" }
           # The other two model adapters, git dependencies for the same reason
           # and at the same risk. Together in one row because they share `burn`,
           # which is most of what either costs to build.
           - os: ubuntu-latest
-            features: { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo", test: "no" }
+            features: { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo", test: "no", examples: "-p blockflow-cellpose-ome-zarr -p blockflow-cellpose-3d-ome-zarr -p blockflow-yolo-ome-zarr -p yolo3d -p blockflow-yolo-3d-ome-zarr" }
     steps:
       - uses: actions/checkout@v5
       - name: Install the stable toolchain
@@ -184,11 +184,58 @@ jobs:
       - name: Build compile-only targets
         if: matrix.features.test == 'no'
         run: cargo build --lib --bins ${{ matrix.features.flags }}
+      # The workspace members that need this row's model features: the `members`
+      # job below cannot build them without compiling the model stacks a second
+      # time, and this row has already paid for that compile.
+      - name: Build the examples that need these features
+        if: matrix.features.examples
+        run: cargo build --lib --bins ${{ matrix.features.examples }}
       # `--no-fail-fast` so one broken suite does not hide the state of the other
       # hundred. No `--ignored`: see the header.
       - name: Test
         if: matrix.features.test == 'everywhere' || (matrix.features.test == 'linux' && runner.os == 'Linux')
         run: cargo test --no-fail-fast ${{ matrix.features.flags }}
+
+  # **The workspace members: examples and `crates/`.** The root is itself a
+  # package, so every `cargo` command above covers `blockflow` alone and none of
+  # the members listed in `[workspace]`. The examples are there so that a change
+  # to `blockflow` that breaks one of them fails here, not months later when
+  # somebody next runs it. That only holds if something builds and tests them.
+  #
+  # Every member except the root (the jobs above cover it) and the
+  # model-backed examples (the `stardist` and `cellpose+yolo` rows build those,
+  # because they already compile the model stacks). Linux only, like the other
+  # feature rows. Built and tested, not linted: clippy lints every workspace
+  # member it compiles, `blockflow` included, so linting a member would repeat
+  # the `lint` job.
+  members:
+    name: workspace members
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      EXCLUDE: >-
+        --exclude blockflow
+        --exclude blockflow-stardist-ome-zarr --exclude blockflow-stardist-3d-ome-zarr
+        --exclude blockflow-cellpose-ome-zarr --exclude blockflow-cellpose-3d-ome-zarr
+        --exclude blockflow-yolo-ome-zarr --exclude yolo3d --exclude blockflow-yolo-3d-ome-zarr
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the stable toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+      - run: rustc --version --verbose
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-members-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-members-
+      - run: cargo build --workspace --all-targets $EXCLUDE
+      - run: cargo test --workspace --no-fail-fast $EXCLUDE
 
   # **The lint gate.** `-D warnings` over every target, which is why the crate's
   # exceptions live in `Cargo.toml`'s `[lints.clippy]` rather than in `lib.rs`:

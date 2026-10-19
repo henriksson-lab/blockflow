@@ -46,7 +46,10 @@ pub fn fit_sphere(points: &[[f64; 3]]) -> Option<([f64; 3], f64)> {
             m[i][4] += row[i] * b;
         }
     }
-    let scale = m.iter().map(|r| r[..4].iter().map(|v| v.abs()).fold(0.0, f64::max)).fold(0.0, f64::max);
+    let scale = m
+        .iter()
+        .map(|r| r[..4].iter().map(|v| v.abs()).fold(0.0, f64::max))
+        .fold(0.0, f64::max);
     for c in 0..4 {
         let pivot = (c..4).max_by(|&i, &j| m[i][c].abs().total_cmp(&m[j][c].abs()))?;
         m.swap(c, pivot);
@@ -91,15 +94,24 @@ impl RaySet {
     pub fn fibonacci(n: usize, k: usize) -> Self {
         let directions = fibonacci_sphere(n);
         let nearest = |v: [f64; 3], m: usize| {
-            let mut d: Vec<(usize, f64)> =
-                directions.iter().enumerate().map(|(j, &w)| (j, dot(v, w))).collect();
+            let mut d: Vec<(usize, f64)> = directions
+                .iter()
+                .enumerate()
+                .map(|(j, &w)| (j, dot(v, w)))
+                .collect();
             d.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
             d.truncate(m);
             d
         };
         let neighbours = directions
             .iter()
-            .map(|&v| nearest(v, k + 1).into_iter().skip(1).map(|(j, _)| j).collect())
+            .map(|&v| {
+                nearest(v, k + 1)
+                    .into_iter()
+                    .skip(1)
+                    .map(|(j, _)| j)
+                    .collect()
+            })
             .collect();
         let table = [64, 128];
         let mut lookup = Vec::with_capacity(table[0] * table[1]);
@@ -108,7 +120,11 @@ impl RaySet {
                 let theta = (it as f64 + 0.5) * std::f64::consts::PI / table[0] as f64;
                 let phi = (ip as f64 + 0.5) * std::f64::consts::TAU / table[1] as f64
                     - std::f64::consts::PI;
-                let v = [theta.cos(), theta.sin() * phi.sin(), theta.sin() * phi.cos()];
+                let v = [
+                    theta.cos(),
+                    theta.sin() * phi.sin(),
+                    theta.sin() * phi.cos(),
+                ];
                 let mut cell = [(0u32, 0f32); 4];
                 let mut total = 0.0;
                 for (slot, (j, d)) in cell.iter_mut().zip(nearest(v, 4)) {
@@ -150,8 +166,8 @@ impl RaySet {
         let n = dot(offset, offset).sqrt().max(1e-12);
         let theta = (offset[0] / n).clamp(-1.0, 1.0).acos();
         let phi = offset[1].atan2(offset[2]);
-        let it = ((theta / std::f64::consts::PI * self.table[0] as f64) as usize)
-            .min(self.table[0] - 1);
+        let it =
+            ((theta / std::f64::consts::PI * self.table[0] as f64) as usize).min(self.table[0] - 1);
         let ip = (((phi + std::f64::consts::PI) / std::f64::consts::TAU * self.table[1] as f64)
             as usize)
             .min(self.table[1] - 1);
@@ -176,7 +192,8 @@ mod tests {
                 assert!((len - 1.0).abs() < 1e-12);
             }
             if n >= 120 {
-                let mean: [f64; 3] = std::array::from_fn(|a| u.iter().map(|d| d[a]).sum::<f64>() / n as f64);
+                let mean: [f64; 3] =
+                    std::array::from_fn(|a| u.iter().map(|d| d[a]).sum::<f64>() / n as f64);
                 assert!(mean.iter().all(|m| m.abs() < 0.02), "{n}: {mean:?}");
             }
         }
@@ -191,13 +208,19 @@ mod tests {
         assert!(rays.neighbours(0).len() == 6 && !rays.neighbours(0).contains(&0));
         let constant = vec![12.5f32; 300];
         for &u in fibonacci_sphere(97).iter() {
-            assert!((rays.interpolate(&constant, [3.0 * u[0], 3.0 * u[1], 3.0 * u[2]]) - 12.5).abs() < 1e-4);
+            assert!(
+                (rays.interpolate(&constant, [3.0 * u[0], 3.0 * u[1], 3.0 * u[2]]) - 12.5).abs()
+                    < 1e-4
+            );
         }
         let mut spike = vec![0f32; 300];
         spike[150] = 1.0;
         let along = rays.directions()[150];
         assert!(rays.interpolate(&spike, along) > 0.5);
-        assert_eq!(rays.interpolate(&spike, [-along[0], -along[1], -along[2]]), 0.0);
+        assert_eq!(
+            rays.interpolate(&spike, [-along[0], -along[1], -along[2]]),
+            0.0
+        );
     }
 
     #[test]
@@ -206,7 +229,9 @@ mod tests {
         let radius = 27.5;
         let mut seed = 11u64;
         let mut jitter = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 0.4
         };
         // a partial sphere (one hemisphere and a bit), as at a volume face
@@ -219,7 +244,9 @@ mod tests {
         assert!((0..3).all(|a| (c[a] - centre[a]).abs() < 0.1), "{c:?}");
         assert!((r - radius).abs() < 0.1, "{r}");
         assert!(fit_sphere(&points[..3]).is_none());
-        let plane: Vec<[f64; 3]> = (0..20).map(|i| [0.0, i as f64, (i * i % 7) as f64]).collect();
+        let plane: Vec<[f64; 3]> = (0..20)
+            .map(|i| [0.0, i as f64, (i * i % 7) as f64])
+            .collect();
         assert!(fit_sphere(&plane).is_none());
     }
 }

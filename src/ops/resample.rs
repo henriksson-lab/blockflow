@@ -1759,15 +1759,19 @@ mod block_mean_tests {
                 for dz in 0..factor[0] {
                     for dy in 0..factor[1] {
                         for dx in 0..factor[2] {
-                            sum += input[[z * factor[0] + dz, y * factor[1] + dy, x * factor[2] + dx]];
+                            sum +=
+                                input[[z * factor[0] + dz, y * factor[1] + dy, x * factor[2] + dx]];
                         }
                     }
                 }
                 sum / (factor[0] * factor[1] * factor[2]) as f64
             });
             for (in_block, out_block) in [([13, 10, 9], [9, 9, 9]), ([4, 3, 5], [2, 2, 1])] {
-                let mut builder =
-                    PlanBuilder::new(volume, Dtype::F64, BlockGrid::new(volume, in_block).unwrap());
+                let mut builder = PlanBuilder::new(
+                    volume,
+                    Dtype::F64,
+                    BlockGrid::new(volume, in_block).unwrap(),
+                );
                 append_block_mean_phases(&mut builder, factor, out_block).unwrap();
                 let assembly = builder.finish().unwrap();
                 let env = ArrayEnvironment::for_decomposition(

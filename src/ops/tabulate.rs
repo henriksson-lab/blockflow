@@ -402,7 +402,7 @@ use crate::env::BlockBuf;
 use crate::error::{Error, Result};
 use crate::fragment::{
     fragment_phase, pack_u64, unpack_u64, BlockOutput, BlockView, Coverage, FragmentInput,
-    FragmentOp, FragmentOutput, SidecarSize, SourceBlocks,
+    FragmentOp, FragmentOutput, PhaseView, SidecarSize, SourceBlocks,
 };
 use crate::geometry::BlockGrid;
 use crate::op::SourceInput;
@@ -410,6 +410,7 @@ use crate::ops::{expect_extent, TypedSource};
 use crate::region::Region;
 use crate::sidecar::{FragmentKey, Lifecycle};
 use crate::table::{Column, ColumnType, Row, Schema, Table, Value, POSITION_WORDS};
+use crate::voxels::Voxels;
 
 use super::detect::owner_of;
 use super::label::MAX_EXACT_LABEL;
@@ -1488,7 +1489,7 @@ impl TabulateValuesOp {
         read: &Region,
         core: &Region,
     ) -> Result<BTreeMap<u64, Tally>> {
-        let mut tallies: BTreeMap<u64, Tally> = BTreeMap::new();
+        let tallies: BTreeMap<u64, Tally> = BTreeMap::new();
         // A simulated run holds no arrays, so there is nothing to say about
         // which labels are present — not even how many. An empty fragment is
         // *present and empty*, which is a different fact from absent and is the
@@ -1512,30 +1513,116 @@ impl TabulateValuesOp {
                 array.shape(),
             )?;
         }
-        let labels = labels.widened();
         let values = values.widened();
-        let offset = [read.start[0], read.start[1], read.start[2]];
-        for (index, raw) in labels.indexed_iter() {
-            let at = [
-                offset[0] + index.0,
-                offset[1] + index.1,
-                offset[2] + index.2,
-            ];
-            if !holds(core, at) {
-                continue;
-            }
-            let label = label_at(*raw, at)?;
-            if label == 0 {
-                continue;
-            }
-            let value = values[[index.0, index.1, index.2]];
-            tallies
-                .entry(label)
-                .or_insert_with(|| Tally::new(label))
-                .add(at, value, self.fixed)?;
+        // Integer labels are read as they are stored rather than widened to
+        // `f64` first; a label too large to be exact gets `label_at`'s refusal.
+        fn integer<T: crate::voxels::VoxelElement + Into<u64>>(
+            labels: &Voxels,
+            values: &ndarray::Array3<f64>,
+            read: &Region,
+            core: &Region,
+            fixed: FixedPoint,
+        ) -> Result<BTreeMap<u64, Tally>> {
+            tally_rows(
+                labels.view::<T>()?,
+                |raw: T| raw.into() == 0,
+                |raw: T, at| {
+                    let label: u64 = raw.into();
+                    if label > MAX_EXACT_LABEL {
+                        label_at(label as f64, at)
+                    } else {
+                        Ok(label)
+                    }
+                },
+                values,
+                read,
+                core,
+                fixed,
+            )
         }
-        Ok(tallies)
+        match labels.dtype() {
+            Dtype::U8 => integer::<u8>(labels, &values, read, core, self.fixed),
+            Dtype::U16 => integer::<u16>(labels, &values, read, core, self.fixed),
+            Dtype::U32 => integer::<u32>(labels, &values, read, core, self.fixed),
+            Dtype::U64 => integer::<u64>(labels, &values, read, core, self.fixed),
+            _ => {
+                let labels = labels.widened();
+                tally_rows(
+                    labels.view(),
+                    |raw: f64| raw == 0.0,
+                    label_at,
+                    &values,
+                    read,
+                    core,
+                    self.fixed,
+                )
+            }
+        }
     }
+}
+
+/// [`TabulateValuesOp::tally_block`]'s scan: every voxel of `core` with a
+/// non-zero label, in raster order, added to its label's tally.
+///
+/// A zero is skipped before its label is decoded, which is the same answer
+/// (`0` is always a valid label, and it is never tallied); the tally of the
+/// voxel before is kept at hand, since a label comes in runs along a row.
+#[allow(clippy::too_many_arguments)]
+fn tally_rows<L: Copy>(
+    labels: ndarray::ArrayView3<'_, L>,
+    is_zero: impl Fn(L) -> bool,
+    to_label: impl Fn(L, [usize; 3]) -> Result<u64>,
+    values: &ndarray::Array3<f64>,
+    read: &Region,
+    core: &Region,
+    fixed: FixedPoint,
+) -> Result<BTreeMap<u64, Tally>> {
+    let offset = [read.start[0], read.start[1], read.start[2]];
+    let shape = [labels.shape()[0], labels.shape()[1], labels.shape()[2]];
+    // The axis ranges of the read extent that lie in the core.
+    let span = |axis: usize| {
+        let lo = core.start[axis]
+            .saturating_sub(offset[axis])
+            .min(shape[axis]);
+        let hi = (core.start[axis] + core.shape[axis])
+            .saturating_sub(offset[axis])
+            .min(shape[axis]);
+        lo..hi.max(lo)
+    };
+    let (zs, ys, xs) = (span(0), span(1), span(2));
+    let mut found: Vec<Tally> = Vec::new();
+    let mut slots: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut last: Option<(u64, usize)> = None;
+    for i in zs {
+        for j in ys.clone() {
+            let row = labels.slice(ndarray::s![i, j, ..]);
+            let row_values = values.slice(ndarray::s![i, j, ..]);
+            for k in xs.clone() {
+                let raw = row[k];
+                if is_zero(raw) {
+                    continue;
+                }
+                let at = [offset[0] + i, offset[1] + j, offset[2] + k];
+                let label = to_label(raw, at)?;
+                let slot = match last {
+                    Some((seen, slot)) if seen == label => slot,
+                    _ => {
+                        let slot = *slots.entry(label).or_insert_with(|| {
+                            found.push(Tally::new(label));
+                            found.len() - 1
+                        });
+                        last = Some((label, slot));
+                        slot
+                    }
+                };
+                found[slot].add(at, row_values[k], fixed)?;
+            }
+        }
+    }
+    Ok(found
+        .into_iter()
+        .map(|tally| (tally.label, tally))
+        .collect())
 }
 
 #[derive(Clone)]
@@ -2015,6 +2102,15 @@ impl FragmentOp for MultiTabulateValuesOp {
 /// row. Without it every block would write the whole table and a `Table` that
 /// took them all would hold every row once per block; `Table::write` has no
 /// ownership rule of its own and would be right not to.
+///
+/// **[`Self::folded_once`]** makes the fold a barrier's `reduce` instead: the
+/// partials are folded once for the phase rather than once per block, and each
+/// block copies out its own rows. The rows are byte-identical. Per block, the
+/// default form decodes every partial in the volume and holds an accumulator
+/// for every label in it, so its work grows with the square of the block count
+/// and its memory with the label count times the blocks in flight; on 1 088
+/// blocks and a million labels that was most of a run's CPU and gigabytes of
+/// accumulators.
 pub struct MergeTabulationOp {
     name: &'static str,
     input: String,
@@ -2023,7 +2119,11 @@ pub struct MergeTabulationOp {
     fixed: FixedPoint,
     stream: String,
     lifecycle: Lifecycle,
+    once: bool,
 }
+
+/// The magic of [`MergeTabulationOp::folded_once`]'s reduced blob.
+const FOLDED_MAGIC: u64 = 0x5441_4246_4f4c_4431;
 
 impl MergeTabulationOp {
     /// `lattice` is the blocks-per-axis of the phase this runs on, which is what
@@ -2045,7 +2145,15 @@ impl MergeTabulationOp {
             fixed,
             stream: stream.into(),
             lifecycle,
+            once: false,
         }
+    }
+
+    /// Fold the partials once, in a barrier, and hand each block its rows; see
+    /// the type's documentation. The same rows, in the same bytes.
+    pub fn folded_once(mut self) -> Self {
+        self.once = true;
+        self
     }
 
     pub fn fixed(&self) -> FixedPoint {
@@ -2098,10 +2206,14 @@ impl MergeTabulationOp {
             rows.push(words);
         }
         rows.sort_unstable();
+        self.encode_rows(rows.iter().copied())
+    }
 
+    /// `rows`, already this block's and in order, as the blob it writes.
+    fn encode_rows(&self, rows: impl Iterator<Item = [u64; ROW_WORDS]>) -> Result<Vec<u8>> {
         let schema = Arc::new(self.schema());
         let mut builder = crate::table::RowBuilder::new(schema.clone());
-        for row in &rows {
+        for row in rows {
             let at = [row[0] as usize, row[1] as usize, row[2] as usize];
             // Tagged from the schema rather than from a fixed list, so the two
             // `F64` columns are float-typed here because the schema says they
@@ -2143,12 +2255,67 @@ impl FragmentOp for MergeTabulationOp {
     }
 
     fn inputs(&self) -> Vec<FragmentInput> {
-        vec![FragmentInput::own(self.input.clone(), self.input_phase).with_reach(self.lattice)]
+        let input = FragmentInput::own(self.input.clone(), self.input_phase);
+        if self.once {
+            // A barrier's `reduce` sees every block's partial; no block reads
+            // one.
+            vec![input]
+        } else {
+            vec![input.with_reach(self.lattice)]
+        }
     }
 
     /// One fragment resident at a time; see the type's documentation.
     fn gathers(&self) -> bool {
         false
+    }
+
+    fn barrier(&self) -> bool {
+        self.once
+    }
+
+    /// With [`Self::folded_once`]: every partial folded, and the rows grouped
+    /// by owning block (row-major) and sorted within it, as
+    /// `[magic, blocks, offsets[blocks + 1], rows...]` in words, where
+    /// `offsets` count rows.
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        if !self.once {
+            return Ok(Vec::new());
+        }
+        let mut totals: BTreeMap<u64, Tally> = BTreeMap::new();
+        at.stream_fragments(&self.input, &mut |_: &FragmentKey, bytes: &[u8]| {
+            absorb(&mut totals, bytes)
+        })?;
+        let grid = at.grid();
+        let lattice = grid.blocks_per_axis();
+        let linear = |index: [usize; 3]| (index[0] * lattice[1] + index[1]) * lattice[2] + index[2];
+        let mut rows: Vec<(usize, [u64; ROW_WORDS])> = Vec::with_capacity(totals.len());
+        for tally in totals.into_values() {
+            let Some(words) = tally.row_words(self.fixed)? else {
+                continue;
+            };
+            let owner = owner_of(
+                grid,
+                [words[0] as usize, words[1] as usize, words[2] as usize],
+            );
+            rows.push((linear(owner), words));
+        }
+        rows.sort_unstable();
+        let blocks = lattice.iter().product::<usize>();
+        let mut words = Vec::with_capacity(3 + blocks + rows.len() * ROW_WORDS);
+        words.push(FOLDED_MAGIC);
+        words.push(blocks as u64);
+        let mut next = 0usize;
+        for block in 0..=blocks {
+            while next < rows.len() && rows[next].0 < block {
+                next += 1;
+            }
+            words.push(next as u64);
+        }
+        for (_, row) in &rows {
+            words.extend_from_slice(row);
+        }
+        Ok(pack_u64(&words))
     }
 
     fn seam_fold(&self) -> Option<crate::fragment::SeamFold> {
@@ -2164,6 +2331,12 @@ impl FragmentOp for MergeTabulationOp {
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        if self.once {
+            return Ok(BlockOutput::fragment(
+                self.stream.clone(),
+                self.encode_rows(folded_rows(at.reduced, at.grid, at.index)?)?,
+            ));
+        }
         let mut totals: BTreeMap<u64, Tally> = BTreeMap::new();
         at.stream_fragments(&self.input, &mut |_: &FragmentKey, bytes: &[u8]| {
             absorb(&mut totals, bytes)
@@ -2174,6 +2347,48 @@ impl FragmentOp for MergeTabulationOp {
             self.encode_owned(&totals, at.grid, at.index)?,
         ))
     }
+}
+
+/// The rows `block` owns in a [`MergeTabulationOp::folded_once`] blob, read in
+/// place: a block copies its own slice and decodes nothing else.
+fn folded_rows<'a>(
+    reduced: &'a [u8],
+    grid: &BlockGrid,
+    block: [usize; 3],
+) -> Result<impl Iterator<Item = [u64; ROW_WORDS]> + 'a> {
+    let word = |index: usize| -> Option<u64> {
+        let at = index.checked_mul(8)?;
+        let bytes = reduced.get(at..at + 8)?;
+        Some(u64::from_le_bytes(bytes.try_into().expect("eight bytes")))
+    };
+    let lattice = grid.blocks_per_axis();
+    let blocks = lattice.iter().product::<usize>();
+    if word(0) != Some(FOLDED_MAGIC) || word(1) != Some(blocks as u64) {
+        return Err(Error::invalid(
+            "tabulate: the folded merge's blob is missing or is for another lattice",
+        ));
+    }
+    let linear = (block[0] * lattice[1] + block[1]) * lattice[2] + block[2];
+    let (Some(start), Some(end), Some(total)) =
+        (word(2 + linear), word(3 + linear), word(2 + blocks))
+    else {
+        return Err(Error::invalid(
+            "tabulate: the folded merge's offsets are short",
+        ));
+    };
+    let base = 3 + blocks;
+    if start > end || end > total || reduced.len() != (base + total as usize * ROW_WORDS) * 8 {
+        return Err(Error::invalid(
+            "tabulate: the folded merge's blob has the wrong length",
+        ));
+    }
+    Ok((start as usize..end as usize).map(move |row| {
+        let at = (base + row * ROW_WORDS) * 8;
+        std::array::from_fn(|w| {
+            let from = at + w * 8;
+            u64::from_le_bytes(reduced[from..from + 8].try_into().expect("eight bytes"))
+        })
+    }))
 }
 
 /// One partial's tallies folded into `totals`.
@@ -3622,6 +3837,48 @@ mod tests {
         assert_eq!(tallies[&1].sum, fixed.quantise(20.0).unwrap().unwrap());
     }
 
+    /// Integer labels, read as stored, tally what the same labels as `f64`
+    /// do, inside a core smaller than the read extent on every axis.
+    #[test]
+    fn integer_labels_tally_what_their_floats_do() {
+        let fixed = FixedPoint::bits(3).unwrap();
+        let op = tabulator(fixed);
+        let shape = [5, 6, 7];
+        let read = Region::new(&[2, 3, 4], &shape);
+        let core = Region::new(&[3, 4, 5], &[3, 4, 4]);
+        let label = |i: usize, j: usize, k: usize| ((i * 7 + j * 3 + k / 2) % 5) as u32;
+        let floats = Array3::from_shape_fn((5, 6, 7), |(i, j, k)| f64::from(label(i, j, k)));
+        let integers = Array3::from_shape_fn((5, 6, 7), |(i, j, k)| label(i, j, k));
+        let values = BlockBuf::Array(Voxels::from(Array3::from_shape_fn(
+            (5, 6, 7),
+            |(i, j, k)| (i * 100 + j * 10 + k) as f64 * 0.25 - 3.0,
+        )));
+        let from_floats = op
+            .tally_block(
+                &BlockBuf::Array(Voxels::from(floats)),
+                &values,
+                &read,
+                &core,
+            )
+            .unwrap();
+        let from_integers = op
+            .tally_block(
+                &BlockBuf::Array(Voxels::from(integers)),
+                &values,
+                &read,
+                &core,
+            )
+            .unwrap();
+        assert_eq!(from_floats.len(), 4);
+        assert_eq!(from_floats, from_integers);
+        let counted: u64 = from_floats.values().map(|tally| tally.count).sum();
+        let core_nonzero = (3..6)
+            .flat_map(|z| (4..8).flat_map(move |y| (5..9).map(move |x| (z, y, x))))
+            .filter(|&(z, y, x)| label(z - 2, y - 3, x - 4) != 0)
+            .count();
+        assert_eq!(counted as usize, core_nonzero);
+    }
+
     /// Both stated outcomes at once: a `NaN` and an infinity leave the
     /// reductions alone and appear in `nonfinite`, and a negative sums exactly.
     #[test]
@@ -3853,5 +4110,120 @@ mod tests {
         assert!(failed.contains("first moment on axis 1"), "{failed}");
         assert!(failed.contains("binds first"), "{failed}");
         assert!(failed.contains("fewer fraction bits"), "{failed}");
+    }
+
+    // ------------------------------------------------- the folded merge --
+
+    /// Rows from a planned run, default merge or folded once, per block.
+    fn planned_rows(
+        grid: [usize; 3],
+        once: bool,
+        workers: usize,
+    ) -> (Vec<RegionValues>, Vec<Option<Vec<u8>>>) {
+        use crate::assemble::{ImageId, PlanBuilder};
+        use crate::env::{ArrayEnvironment, Environment};
+        use crate::op::Chain;
+        use crate::ops::voxelwise::VoxelwiseMapOp;
+        use crate::strategy::{execute_phases, Hints};
+
+        let volume = [13, 17, 19];
+        // The value encodes the position, and the label is a brick of 3 x 5 x 4
+        // voxels cut from it, so regions straddle every block grid tried.
+        let input = Array3::from_shape_fn((volume[0], volume[1], volume[2]), |(z, y, x)| {
+            (z * 10_000 + y * 100 + x) as f64
+        });
+        let fixed = FixedPoint::bits(4).expect("in range");
+        let lattice = BlockGrid::new(volume, grid).expect("a grid");
+        let mut plan = PlanBuilder::new(volume, Dtype::F64, lattice.clone());
+        let labels = plan
+            .pixels(Chain::op(VoxelwiseMapOp::new("bricks", |v: f64| {
+                let (z, y, x) = (
+                    (v / 10_000.0) as u64,
+                    (v / 100.0) as u64 % 100,
+                    v as u64 % 100,
+                );
+                ((z / 3) * 100 + (y / 5) * 10 + x / 4 + 1) as f64
+            })))
+            .expect("a phase")
+            .image()
+            .expect("an image");
+        let partial = plan
+            .fragments(
+                TabulateValuesOp::new(
+                    "tabulate",
+                    labels,
+                    ImageId::from(0usize),
+                    fixed,
+                    "partials",
+                    Lifecycle::DeleteOnExit,
+                )
+                .expect("two images"),
+            )
+            .expect("a phase");
+        let merge = MergeTabulationOp::new(
+            "merge",
+            "partials",
+            partial.index(),
+            lattice.blocks_per_axis(),
+            fixed,
+            "rows",
+            Lifecycle::Persistent,
+        );
+        let merge = if once { merge.folded_once() } else { merge };
+        let rows = plan.fragments(merge).expect("a phase").index();
+        let assembly = plan.finish().expect("a plan");
+        let env = ArrayEnvironment::for_decomposition(
+            Voxels::from(input),
+            &assembly.decomposition,
+            [4, 4, 4],
+        )
+        .expect("an environment");
+        let hints = Hints {
+            concurrency: workers,
+            ..Hints::default()
+        };
+        execute_phases(
+            "folded",
+            &assembly.workflow,
+            &assembly.decomposition,
+            &hints,
+            &env,
+            &[],
+            &assembly.work(),
+        )
+        .expect("the run");
+        let blobs = lattice
+            .cores()
+            .iter()
+            .map(|block| env.read_sidecar("rows", rows, block.index).expect("a read"))
+            .collect();
+        (
+            collect_tabulation(&env, "rows", rows, volume, fixed).expect("the rows"),
+            blobs,
+        )
+    }
+
+    #[test]
+    fn folding_once_writes_the_same_rows_in_the_same_bytes() {
+        for grid in [[4, 5, 6], [13, 17, 19], [7, 3, 19], [5, 8, 8]] {
+            let (rows, blobs) = planned_rows(grid, false, 1);
+            assert!(rows.len() > 50, "{grid:?}: {} rows", rows.len());
+            for workers in [1, 4] {
+                let (folded, folded_blobs) = planned_rows(grid, true, workers);
+                assert_eq!(rows, folded, "{grid:?}, {workers} workers");
+                assert_eq!(blobs, folded_blobs, "{grid:?}, {workers} workers");
+            }
+        }
+    }
+
+    #[test]
+    fn a_folded_blob_for_another_lattice_is_refused() {
+        let grid = BlockGrid::new([8, 8, 8], [4, 4, 4]).expect("a grid");
+        let other = BlockGrid::new([8, 8, 8], [8, 8, 8]).expect("a grid");
+        let words = [FOLDED_MAGIC, 1, 0, 0];
+        let blob = pack_u64(&words);
+        assert!(folded_rows(&blob, &other, [0, 0, 0]).is_ok());
+        assert!(folded_rows(&blob, &grid, [0, 0, 0]).is_err());
+        assert!(folded_rows(&blob[..24], &other, [0, 0, 0]).is_err());
     }
 }

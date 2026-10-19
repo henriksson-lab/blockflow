@@ -1275,11 +1275,25 @@ impl TransformConvolveOp {
     /// resolves it and for the same reason: a sufficient halo makes the buffer's
     /// edge a halo edge everywhere but a volume face, and a halo voxel's value
     /// is discarded.
-    fn read_window<T>(&self, input: &ArrayView3<'_, T>, at: &Anchor, origin: [usize; 3], window: &mut Array3<f64>)
-    where
+    fn read_window<T>(
+        &self,
+        input: &ArrayView3<'_, T>,
+        at: &Anchor,
+        origin: [usize; 3],
+        window: &mut Array3<f64>,
+    ) where
         T: Copy + Into<f64>,
     {
-        fill_window(input, at, origin, self.tile, self.lo, self.hi, self.boundary, window);
+        fill_window(
+            input,
+            at,
+            origin,
+            self.tile,
+            self.lo,
+            self.hi,
+            self.boundary,
+            window,
+        );
     }
 
     fn run<T>(
@@ -1361,8 +1375,14 @@ pub(crate) fn fill_window<T>(
 
 /// The tile positions `[lo, hi)` per axis that land in the buffer, as a slice
 /// of a tile-anchored result.
-pub(crate) fn landing_slice(landing: [[usize; 2]; 3]) -> ndarray::SliceInfo<[ndarray::SliceInfoElem; 3], ndarray::Ix3, ndarray::Ix3> {
-    ndarray::s![landing[0][0]..landing[0][1], landing[1][0]..landing[1][1], landing[2][0]..landing[2][1]]
+pub(crate) fn landing_slice(
+    landing: [[usize; 2]; 3],
+) -> ndarray::SliceInfo<[ndarray::SliceInfoElem; 3], ndarray::Ix3, ndarray::Ix3> {
+    ndarray::s![
+        landing[0][0]..landing[0][1],
+        landing[1][0]..landing[1][1],
+        landing[2][0]..landing[2][1]
+    ]
 }
 
 /// **Every volume-anchored tile a block touches, computed in parallel.**
@@ -1407,8 +1427,16 @@ where
     let valid: [[usize; 2]; 3] = std::array::from_fn(|a| {
         let end = at.offset[a] + extent[a];
         [
-            if at.offset[a] == 0 { 0 } else { at.offset[a] + lo[a] },
-            if end >= at.volume[a] { end } else { end.saturating_sub(hi[a]) },
+            if at.offset[a] == 0 {
+                0
+            } else {
+                at.offset[a] + lo[a]
+            },
+            if end >= at.volume[a] {
+                end
+            } else {
+                end.saturating_sub(hi[a])
+            },
         ]
     });
     if (0..3).any(|a| valid[a][0] >= valid[a][1]) {
@@ -1447,7 +1475,8 @@ where
             })
             .collect::<Result<Vec<_>>>()?;
         for (origin, landing, piece) in pieces {
-            let start: [usize; 3] = std::array::from_fn(|a| origin[a] + landing[a][0] - at.offset[a]);
+            let start: [usize; 3] =
+                std::array::from_fn(|a| origin[a] + landing[a][0] - at.offset[a]);
             out.slice_mut(ndarray::s![
                 start[0]..start[0] + piece.shape()[0],
                 start[1]..start[1] + piece.shape()[1],

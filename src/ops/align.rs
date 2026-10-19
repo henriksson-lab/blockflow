@@ -6,6 +6,11 @@
 // evidence, all evidence is reduced in a deterministic order, then one global
 // parameter state is updated. The transform family and sampling policy are
 // parameters; file-format adapters belong in caller crates.
+//
+// The second half of the file is a different optimiser for the same problem:
+// `fit_stochastic`, elastix's stochastic gradient descent on Mattes mutual
+// information with a random-coordinate sampler (see the section header there
+// for why it is resident rather than planned).
 
 use crate::assemble::ImageId;
 use crate::decomposition::Decomposition;
@@ -25,7 +30,8 @@ use crate::voxels::Voxels;
 use crate::Dtype;
 use crate::Reach;
 
-use ndarray::{Array3, ArrayView3};
+use ndarray::{Array3, ArrayView3, Axis};
+use rayon::prelude::*;
 #[cfg(feature = "zarr")]
 use std::path::PathBuf;
 
@@ -137,6 +143,19 @@ pub struct VolumeFitParams {
     pub bspline_final_grid_spacing: Option<[f64; 3]>,
     /// Quadratic neighbour penalty on native B-spline control coefficients.
     pub bspline_smoothness: f64,
+    /// Also stop once the cost change is no larger than this fraction of the
+    /// cost's magnitude: a tolerance that does not depend on the metric's or
+    /// the image's scale. `None` keeps the absolute tests alone.
+    pub relative_tolerance: Option<f64>,
+    /// Measure an affine step in **scaled** parameters for the step bound and
+    /// the step tolerance: each matrix entry weighted by the root mean square
+    /// of the coordinate it multiplies over the lattice, so both are in voxels
+    /// of displacement rather than in raw matrix units (elastix's
+    /// `AutomaticScalesEstimation`). `false` keeps the raw Euclidean norm.
+    pub scaled_affine_steps: bool,
+    /// Worker threads for [`resident`] and the coarse-to-fine levels; with
+    /// more than one, each level is cut into blocks of 32.
+    pub workers: usize,
 }
 
 /// Native optimizer stopping condition observed for a completed run.
@@ -185,6 +204,9 @@ impl Default for VolumeFitParams {
             bspline: ControlGrid::default(),
             bspline_final_grid_spacing: None,
             bspline_smoothness: 0.0,
+            relative_tolerance: None,
+            scaled_affine_steps: false,
+            workers: 1,
         }
     }
 }
@@ -385,6 +407,10 @@ pub struct FittedTransform {
     pub shape: [usize; 3],
     pub geometry: SpatialFrame,
     pub bspline: ControlGrid,
+    /// The B-spline control grid's placement, when it is not the implicit one
+    /// [`ControlGrid`] implies (`GridSize - 3` intervals over `shape - 2`
+    /// voxels): [`fit_stochastic`] places it as elastix does.
+    pub bspline_layout: Option<BSplineLayout>,
 }
 
 /// Gaussian smoothing applied while deriving optimization pyramid levels.
@@ -626,15 +652,21 @@ impl Evidence {
         }
     }
 
-    fn finish_metric(&mut self, metric: Metric, bins: usize, damping: f64) -> Result<()> {
+    fn finish_metric(
+        &mut self,
+        model: TransformModel,
+        metric: Metric,
+        bins: usize,
+        damping: f64,
+    ) -> Result<()> {
         match metric {
             Metric::MeanSquares => Ok(()),
-            Metric::NormalizedCorrelation => self.finish_normalized_correlation(damping),
-            Metric::MutualInformation => self.finish_mutual_information(bins, damping),
+            Metric::NormalizedCorrelation => self.finish_normalized_correlation(model, damping),
+            Metric::MutualInformation => self.finish_mutual_information(model, bins, damping),
         }
     }
 
-    fn finish_normalized_correlation(&mut self, damping: f64) -> Result<()> {
+    fn finish_normalized_correlation(&mut self, model: TransformModel, damping: f64) -> Result<()> {
         let count = self.count;
         let fixed_variance = self.fixed_square_sum - self.fixed_sum * self.fixed_sum / count;
         let moving_variance = self.moving_square_sum - self.moving_sum * self.moving_sum / count;
@@ -665,12 +697,17 @@ impl Evidence {
         self.hessian.fill(0.0);
         let scale = (1.0 + damping.max(0.0)).max(f64::EPSILON);
         for axis in 0..self.gradient.len() {
-            self.hessian[symmetric_index(axis, axis)] = scale;
+            self.hessian[diagonal_slot(model, axis)] = scale;
         }
         Ok(())
     }
 
-    fn finish_mutual_information(&mut self, bins: usize, damping: f64) -> Result<()> {
+    fn finish_mutual_information(
+        &mut self,
+        model: TransformModel,
+        bins: usize,
+        damping: f64,
+    ) -> Result<()> {
         if self.count <= 0.0 || self.joint_histogram.len() != bins * bins {
             return Err(Error::InvalidArgument(
                 "volume fit: mutual information needs overlapping histogram samples".to_string(),
@@ -726,7 +763,7 @@ impl Evidence {
         self.hessian.fill(0.0);
         let scale = (self.count + damping.max(0.0)).max(f64::EPSILON);
         for axis in 0..self.gradient.len() {
-            self.hessian[symmetric_index(axis, axis)] = scale;
+            self.hessian[diagonal_slot(model, axis)] = scale;
         }
         Ok(())
     }
@@ -851,7 +888,7 @@ fn pack_evidence(evidence: Evidence) -> Vec<u8> {
 
 fn unpack_evidence(bytes: &[u8], params: &VolumeFitParams) -> Result<Evidence> {
     let n = parameter_count(params);
-    let h = symmetric_len(n);
+    let h = hessian_len(params.model, n);
     let joint = params.metric_bins * params.metric_bins;
     let values = unpack_f64s_dynamic(bytes, 15 + 4 * n + h + joint + joint * n, "evidence")?;
     let gradient_start = 15;
@@ -913,6 +950,8 @@ fn unpack_f64s_dynamic(bytes: &[u8], count: usize, what: &str) -> Result<Vec<f64
 struct FitByMoments {
     params: VolumeFitParams,
     initial: Option<Vec<f64>>,
+    /// The lattice the fit runs over.
+    volume: [usize; 3],
 }
 
 impl IterativeReduceOp for FitByMoments {
@@ -962,7 +1001,7 @@ impl IterativeReduceOp for FitByMoments {
         let joint = self.params.metric_bins * self.params.metric_bins;
         let mut evidence = Evidence {
             gradient: vec![0.0; n],
-            hessian: vec![0.0; symmetric_len(n)],
+            hessian: vec![0.0; hessian_len(self.params.model, n)],
             jacobian_sum: vec![0.0; n],
             fixed_jacobian_sum: vec![0.0; n],
             moving_jacobian_sum: vec![0.0; n],
@@ -1069,7 +1108,7 @@ impl IterativeReduceOp for FitByMoments {
         let joint = self.params.metric_bins * self.params.metric_bins;
         let mut total = Evidence {
             gradient: vec![0.0; n],
-            hessian: vec![0.0; symmetric_len(n)],
+            hessian: vec![0.0; hessian_len(self.params.model, n)],
             jacobian_sum: vec![0.0; n],
             fixed_jacobian_sum: vec![0.0; n],
             moving_jacobian_sum: vec![0.0; n],
@@ -1109,6 +1148,7 @@ impl IterativeReduceOp for FitByMoments {
             ));
         }
         total.finish_metric(
+            self.params.model,
             self.params.metric,
             self.params.metric_bins,
             self.params.damping,
@@ -1125,20 +1165,25 @@ impl IterativeReduceOp for FitByMoments {
             total.gradient,
             self.params.damping,
         )?;
-        let step = clamp_step(step, self.params.max_step);
+        let weights = step_weights(&self.params, self.volume);
+        let step = clamp_step_weighted(step, self.params.max_step, weights.as_deref());
         let mut params = previous.params;
         for (param, delta) in params.iter_mut().zip(&step) {
             *param += *delta;
         }
-        let step_norm = norm(&step);
+        let step_norm = weighted_norm(&step, weights.as_deref());
         let cost_delta = if previous.cost.is_finite() {
             (previous.cost - total.cost).abs()
         } else {
             f64::INFINITY
         };
+        let relative = self
+            .params
+            .relative_tolerance
+            .is_some_and(|fraction| cost_delta <= fraction * total.cost.abs());
         let convergence = if step_norm <= self.params.tolerance {
             Some(FitConvergence::StepTolerance)
-        } else if cost_delta <= self.params.tolerance {
+        } else if cost_delta <= self.params.tolerance || relative {
             Some(FitConvergence::CostTolerance)
         } else {
             None
@@ -1422,13 +1467,33 @@ fn smooth_pair(
     let delta = params[a] - params[b];
     gradient[a] += weight * delta;
     gradient[b] -= weight * delta;
-    hessian[symmetric_index(a, a)] += weight;
-    hessian[symmetric_index(b, b)] += weight;
+    // B-spline evidence keeps the diagonal alone.
+    hessian[a] += weight;
+    hessian[b] += weight;
     0.5 * weight * delta * delta
 }
 
 fn bspline_flat(grid: ControlGrid, x: usize, y: usize, z: usize) -> usize {
     x + grid.size[0] * (y + grid.size[1] * z)
+}
+
+/// The Hessian evidence a model accumulates: packed symmetric `n (n + 1) / 2`
+/// for translation and affine, and **the diagonal alone** for a B-spline, whose
+/// update uses nothing else. (A packed Hessian per block grows with the square
+/// of the control point count: 25-voxel spacing on a 25 µm hemisphere is
+/// thousands of nodes and tens of gigabytes per block.)
+fn hessian_len(model: TransformModel, n: usize) -> usize {
+    match model {
+        TransformModel::BSpline => n,
+        TransformModel::Translation | TransformModel::Affine => symmetric_len(n),
+    }
+}
+
+fn diagonal_slot(model: TransformModel, axis: usize) -> usize {
+    match model {
+        TransformModel::BSpline => axis,
+        TransformModel::Translation | TransformModel::Affine => symmetric_index(axis, axis),
+    }
 }
 
 fn symmetric_len(n: usize) -> usize {
@@ -1453,7 +1518,7 @@ fn add_outer_for_model(model: TransformModel, hessian: &mut [f64], jacobian: &[f
         TransformModel::Translation | TransformModel::Affine => add_outer(hessian, jacobian),
         TransformModel::BSpline => {
             for (axis, value) in jacobian.iter().enumerate() {
-                hessian[symmetric_index(axis, axis)] += value * value;
+                hessian[axis] += value * value;
             }
         }
     }
@@ -1487,7 +1552,7 @@ fn solve_step(
 fn solve_diagonal_step(hessian: Vec<f64>, gradient: Vec<f64>, damping: f64) -> Result<Vec<f64>> {
     let mut step = vec![0.0; gradient.len()];
     for axis in 0..gradient.len() {
-        let diagonal = hessian[symmetric_index(axis, axis)] + damping.max(0.0);
+        let diagonal = hessian[axis] + damping.max(0.0);
         if diagonal <= f64::EPSILON || !diagonal.is_finite() {
             step[axis] = 0.0;
         } else {
@@ -1540,8 +1605,42 @@ fn solve_linear(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Result<Vec<f64>
     Ok(rhs)
 }
 
-fn clamp_step(mut step: Vec<f64>, max_step: f64) -> Vec<f64> {
-    let length = norm(&step);
+/// Per-parameter weights of the step norm: `None` for the raw Euclidean
+/// norm; for a scaled affine, `E[x_c^2]` over the lattice for matrix entry
+/// `(r, c)` and 1 for the translation, so `sqrt(Σ w_p Δ_p²)` is a displacement
+/// in voxels.
+fn step_weights(params: &VolumeFitParams, volume: [usize; 3]) -> Option<Vec<f64>> {
+    if !(params.scaled_affine_steps && params.model == TransformModel::Affine) {
+        return None;
+    }
+    // Mean of x^2 over 0..n is (n - 1)(2n - 1) / 6.
+    let second: [f64; 3] = volume.map(|n| {
+        let n = n as f64;
+        ((n - 1.0) * (2.0 * n - 1.0) / 6.0).max(1.0)
+    });
+    let mut weights = vec![1.0; 12];
+    for r in 0..3 {
+        for c in 0..3 {
+            weights[3 * r + c] = second[c];
+        }
+    }
+    Some(weights)
+}
+
+fn weighted_norm(vector: &[f64], weights: Option<&[f64]>) -> f64 {
+    match weights {
+        None => norm(vector),
+        Some(weights) => vector
+            .iter()
+            .zip(weights)
+            .map(|(v, w)| w * v * v)
+            .sum::<f64>()
+            .sqrt(),
+    }
+}
+
+fn clamp_step_weighted(mut step: Vec<f64>, max_step: f64, weights: Option<&[f64]>) -> Vec<f64> {
+    let length = weighted_norm(&step, weights);
     if max_step > 0.0 && length > max_step {
         for value in &mut step {
             *value *= max_step / length;
@@ -1683,6 +1782,7 @@ pub fn plan(params: &VolumeFitParams, shape: [usize; 3], block: usize) -> Result
     let op = FitByMoments {
         params: params.clone(),
         initial: None,
+        volume: shape,
     };
     let edge = block.max(1);
     let grid = BlockGrid::new(shape, [edge, edge, edge])?;
@@ -1791,6 +1891,7 @@ fn run_with_initial(
     let op = FitByMoments {
         params: params.clone(),
         initial,
+        volume: shape,
     };
     let decomposition = plan(params, shape, block)?;
     let env = ArrayEnvironment::with_inputs(
@@ -1824,6 +1925,7 @@ fn run_with_initial(
         shape,
         geometry: params.geometry.clone(),
         bspline: params.bspline,
+        bspline_layout: None,
     };
     Ok((transform, state))
 }
@@ -1960,11 +2062,18 @@ pub fn resident(
         return resident_pyramid(params, fixed, moving, schedule);
     }
     let shape = [fixed.shape()[0], fixed.shape()[1], fixed.shape()[2]];
-    run(
+    let whole = shape.iter().copied().max().unwrap_or(1);
+    let block = if params.workers > 1 {
+        32.min(whole)
+    } else {
+        whole
+    };
+    run_with_workers(
         params,
         &fixed.clone().into(),
         &moving.clone().into(),
-        shape.iter().copied().max().unwrap_or(1),
+        block,
+        params.workers.max(1),
     )
 }
 
@@ -2142,19 +2251,27 @@ pub fn resident_pyramid_levels(
         });
         let mut level_params = params.clone();
         level_params.geometry = levels[level].geometry.clone();
-        let block = levels[level]
+        // One block per level single-threaded (the reduction order, and so the
+        // answer, of the original schedule); blocks of 32 across the workers
+        // otherwise.
+        let whole = levels[level]
             .fixed
             .shape()
             .iter()
             .copied()
             .max()
             .unwrap_or(1);
+        let block = if params.workers > 1 {
+            32.min(whole)
+        } else {
+            whole
+        };
         let (next, state_at_level) = run_with_initial(
             &level_params,
             &levels[level].fixed,
             &levels[level].moving,
             block,
-            1,
+            params.workers.max(1),
             seeded,
         )?;
         initial = Some(scale_params_up(params.model, &state_at_level.params, scale));
@@ -2169,6 +2286,7 @@ pub fn resident_pyramid_levels(
         shape,
         geometry: params.geometry.clone(),
         bspline: params.bspline,
+        bspline_layout: None,
     })
 }
 
@@ -2365,6 +2483,2050 @@ fn scale_params(model: TransformModel, params: &[f64], scale: [usize; 3], up: bo
     next
 }
 
+// ------------------------------------------------------ stochastic fitting --
+//
+// A second optimiser beside the block-reduced Gauss-Newton one above: the
+// stochastic gradient descent of elastix (Klein et al., "Adaptive stochastic
+// gradient descent optimisation for image registration", IJCV 2009), on Mattes
+// mutual information with Parzen windows (Mattes et al. 2003; Thévenaz and
+// Unser 2000), with a random-coordinate sampler that draws new samples every
+// iteration.
+//
+// **Why resident and not planned.** One iteration evaluates a few thousand
+// samples scattered over the whole fixed image, and the next iteration needs
+// the parameters the previous one produced. A block decomposition would hand
+// each block a handful of samples per iteration and pay a plan step for it;
+// the moving image would also need a halo as large as the transform can move
+// a point, which for an atlas fit is the whole image. So the images are held in
+// memory (an atlas at 25 µm is tens of millions of voxels) and the samples of
+// one iteration are split into a **fixed** number of chunks evaluated in
+// parallel and reduced in chunk order. The answer depends on the seed and not
+// on the worker count.
+//
+// **Coordinates.** Everything is in voxel indices of the arrays as given,
+// `[a0, a1, a2]`. The moving image is read at `prior(T(pre(x)))` for a fixed
+// voxel `x`: `pre` and `prior` are fixed affines and `T` is fitted. With
+// `prior` the map between the two images' voxel frames, `T` is a transform in
+// the fixed image's own frame, which is what an elastix file written in the
+// fixed image's physical frame holds. A B-spline stage after an affine `A` uses
+// `pre = A`: elastix's `Compose` applies the initial transform first, so its
+// B-spline lives in the space the affine maps into, and its control grid
+// covers the box the affine maps the fixed image onto.
+
+/// How an image is read between voxel centres in a stochastic fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleOrder {
+    /// Trilinear.
+    Linear,
+    /// Cubic B-spline on prefiltered coefficients (an interpolating spline,
+    /// elastix's `BSplineInterpolator` of order 3), with mirror boundaries.
+    Cubic,
+}
+
+/// The step gain `a / (t + A + 1)^alpha` of a stochastic gradient descent, as
+/// elastix computes it (time `t` starts at 0).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GainSequence {
+    pub a: f64,
+    pub big_a: f64,
+    pub alpha: f64,
+}
+
+/// The adaptive time step of elastix's adaptive stochastic gradient descent:
+/// `t_{k+1} = max(0, t_k + f(-g_k · g_{k-1}))` with
+/// `f(x) = min + (max - min) / (1 + exp(-x / scale))`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SigmoidTime {
+    pub max: f64,
+    pub min: f64,
+    pub scale: f64,
+    pub initial_time: f64,
+}
+
+impl Default for SigmoidTime {
+    fn default() -> Self {
+        Self {
+            max: 1.0,
+            min: -0.8,
+            scale: 1.0e-8,
+            initial_time: 0.0,
+        }
+    }
+}
+
+/// elastix's automatic estimation of the gain (`AutomaticParameterEstimation`,
+/// the "Original" method): the gain is chosen so that a step moves a voxel by
+/// about `max_step` voxels, discounted by the measured noise of the stochastic
+/// gradient, and the sigmoid is set from the same measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutomaticGain {
+    /// elastix's `MaximumStepLength`, in fixed voxels.
+    pub max_step: f64,
+    /// elastix's `NumberOfGradientMeasurements`.
+    pub gradient_measurements: usize,
+    /// elastix's `NumberOfJacobianMeasurements`.
+    pub jacobian_measurements: usize,
+    /// elastix's `NumberOfSamplesForExactGradient`.
+    pub exact_gradient_samples: usize,
+    /// elastix's `SigmoidScaleFactor`.
+    pub sigmoid_scale_factor: f64,
+}
+
+impl Default for AutomaticGain {
+    fn default() -> Self {
+        Self {
+            max_step: 1.0,
+            gradient_measurements: 3,
+            jacobian_measurements: 1000,
+            exact_gradient_samples: 100_000,
+            sigmoid_scale_factor: 0.1,
+        }
+    }
+}
+
+/// How the step gain evolves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StochasticOptimizer {
+    /// elastix's `StandardGradientDescent`: `t = k`.
+    Standard(GainSequence),
+    /// elastix's `AdaptiveStochasticGradientDescent` with a fixed gain.
+    Adaptive {
+        gain: GainSequence,
+        time: SigmoidTime,
+    },
+    /// elastix's `AdaptiveStochasticGradientDescent` with
+    /// `AutomaticParameterEstimation`: `a`, `alpha` and the sigmoid are
+    /// estimated at the start of every level; `big_a` is kept.
+    AdaptiveAutomatic {
+        big_a: f64,
+        estimation: AutomaticGain,
+        initial_time: f64,
+    },
+}
+
+/// How parameters are scaled before the gradient step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParameterScales {
+    /// Every parameter steps by the gain times its gradient.
+    Unit,
+    /// elastix's `AutomaticScalesEstimation`: each parameter is divided by the
+    /// mean squared norm of the transform's derivative with respect to it over
+    /// a grid of about `samples` fixed voxels, so a matrix entry that multiplies
+    /// coordinates of hundreds of voxels steps as a translation does.
+    Automatic { samples: usize },
+}
+
+/// Where the fitted map starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StochasticInitialisation {
+    /// Identity in the fitted map's frame (zero B-spline coefficients).
+    Identity,
+    /// elastix's `AutomaticTransformInitialization` with `GeometricalCenter`:
+    /// the translation takes the fixed image's centre to the moving image's,
+    /// and an affine rotates about the fixed centre.
+    GeometricCentre,
+}
+
+/// Stop a level once the cost has stopped moving: the mean cost over the last
+/// `window` iterations differs from the window before by no more than
+/// `tolerance` times its magnitude. elastix's stochastic optimisers have no
+/// such test and always run their iteration count; this is an option.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RelativeTolerance {
+    pub window: usize,
+    pub tolerance: f64,
+}
+
+/// One resolution of a stochastic fit, coarse to fine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StochasticLevel {
+    /// Gaussian sigma applied to the fixed image, in fixed voxels. elastix's
+    /// smoothing pyramid uses `0.5 * factor`, without downsampling.
+    pub fixed_sigma: [f64; 3],
+    /// Gaussian sigma applied to the moving image, in moving voxels.
+    pub moving_sigma: [f64; 3],
+    pub iterations: usize,
+    /// B-spline control point spacing at this level, in fixed voxels.
+    pub grid_spacing: [f64; 3],
+}
+
+/// Settings of [`fit_stochastic`]. [`Default`] is elastix's affine defaults
+/// with mutual information: 4 levels of 500 iterations, 2000 samples, 32 bins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StochasticFitParams {
+    pub model: TransformModel,
+    /// Coarsest first.
+    pub levels: Vec<StochasticLevel>,
+    pub fixed_bins: usize,
+    pub moving_bins: usize,
+    /// B-spline order of the fixed Parzen window, 0 to 3.
+    pub fixed_kernel_order: usize,
+    /// B-spline order of the moving Parzen window, 1 to 3 (its derivative is
+    /// used).
+    pub moving_kernel_order: usize,
+    /// Widen each histogram's intensity range by this fraction of the image's
+    /// range at both ends (elastix's `FixedLimitRangeRatio`, default 0.01).
+    pub fixed_limit_range_ratio: f64,
+    pub moving_limit_range_ratio: f64,
+    /// Spatial samples per iteration.
+    pub samples: usize,
+    /// Draw new samples every iteration (elastix's `NewSamplesEveryIteration`);
+    /// `false` keeps one draw per level.
+    pub new_samples_every_iteration: bool,
+    /// Draw each iteration's samples inside one random box of this size, in
+    /// fixed voxels (elastix's `UseRandomSampleRegion` and `SampleRegionSize`).
+    pub sample_region: Option<[f64; 3]>,
+    pub fixed_order: SampleOrder,
+    pub moving_order: SampleOrder,
+    pub optimizer: StochasticOptimizer,
+    pub scales: ParameterScales,
+    pub initialisation: StochasticInitialisation,
+    pub seed: u64,
+    pub relative_tolerance: Option<RelativeTolerance>,
+    /// Fewer valid samples than this fraction of `samples` draws again
+    /// (elastix's `CheckNumberOfSamples`, ratio 0.25).
+    pub minimum_valid_fraction: f64,
+    /// Draws per iteration before giving up (elastix's
+    /// `MaximumNumberOfSamplingAttempts`).
+    pub sampling_attempts: usize,
+    /// Worker threads; 0 is the global pool.
+    pub workers: usize,
+}
+
+impl Default for StochasticFitParams {
+    fn default() -> Self {
+        Self {
+            model: TransformModel::Affine,
+            levels: elastix_levels(4, 500, None),
+            fixed_bins: 32,
+            moving_bins: 32,
+            fixed_kernel_order: 0,
+            moving_kernel_order: 3,
+            fixed_limit_range_ratio: 0.0,
+            moving_limit_range_ratio: 0.0,
+            samples: 2000,
+            new_samples_every_iteration: true,
+            sample_region: None,
+            fixed_order: SampleOrder::Linear,
+            moving_order: SampleOrder::Linear,
+            optimizer: StochasticOptimizer::AdaptiveAutomatic {
+                big_a: 20.0,
+                estimation: AutomaticGain::default(),
+                initial_time: 0.0,
+            },
+            scales: ParameterScales::Automatic { samples: 10_000 },
+            initialisation: StochasticInitialisation::GeometricCentre,
+            seed: 121_212,
+            relative_tolerance: None,
+            minimum_valid_fraction: 0.25,
+            sampling_attempts: 10,
+            workers: 0,
+        }
+    }
+}
+
+/// elastix's default schedule for `resolutions` levels: smoothing sigma
+/// `0.5 * 2^(n-1-l)` voxels on both images, and for a B-spline a control point
+/// spacing of `final_spacing * 2^(n-1-l)`.
+pub fn elastix_levels(
+    resolutions: usize,
+    iterations: usize,
+    final_spacing: Option<[f64; 3]>,
+) -> Vec<StochasticLevel> {
+    (0..resolutions)
+        .map(|level| {
+            let factor = (1u64 << (resolutions - 1 - level)) as f64;
+            StochasticLevel {
+                fixed_sigma: [0.5 * factor; 3],
+                moving_sigma: [0.5 * factor; 3],
+                iterations,
+                grid_spacing: final_spacing
+                    .map(|spacing| spacing.map(|axis| axis * factor))
+                    .unwrap_or([0.0; 3]),
+            }
+        })
+        .collect()
+}
+
+/// An affine map of voxel coordinates, `y = matrix · x + offset`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AffineMap {
+    pub matrix: [[f64; 3]; 3],
+    pub offset: [f64; 3],
+}
+
+impl AffineMap {
+    pub fn identity() -> Self {
+        Self {
+            matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            offset: [0.0; 3],
+        }
+    }
+
+    /// From the twelve parameters of a [`TransformModel::Affine`]
+    /// [`FittedTransform`]: the matrix row by row, then the offset.
+    pub fn from_params(params: &[f64]) -> Result<Self> {
+        if params.len() != 12 {
+            return Err(Error::InvalidArgument(format!(
+                "affine map: expected 12 parameters, got {}",
+                params.len()
+            )));
+        }
+        Ok(Self {
+            matrix: std::array::from_fn(|r| std::array::from_fn(|c| params[r * 3 + c])),
+            offset: [params[9], params[10], params[11]],
+        })
+    }
+
+    pub fn apply(&self, point: [f64; 3]) -> [f64; 3] {
+        std::array::from_fn(|r| {
+            self.matrix[r][0] * point[0]
+                + self.matrix[r][1] * point[1]
+                + self.matrix[r][2] * point[2]
+                + self.offset[r]
+        })
+    }
+
+    /// `self ∘ inner`: `inner` first.
+    pub fn then_after(&self, inner: &Self) -> Self {
+        let matrix = std::array::from_fn(|r| {
+            std::array::from_fn(|c| (0..3).map(|k| self.matrix[r][k] * inner.matrix[k][c]).sum())
+        });
+        let offset = self.apply(inner.offset);
+        Self { matrix, offset }
+    }
+
+    pub fn inverse(&self) -> Result<Self> {
+        let matrix = invert_3x3(self.matrix)?;
+        let moved: [f64; 3] =
+            std::array::from_fn(|r| (0..3).map(|k| matrix[r][k] * self.offset[k]).sum::<f64>());
+        Ok(Self {
+            matrix,
+            offset: moved.map(|v| -v),
+        })
+    }
+}
+
+/// An explicit B-spline control grid in fixed voxels: node `i` of axis `a` is
+/// at `origin[a] + i * spacing[a]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BSplineLayout {
+    pub origin: [f64; 3],
+    pub spacing: [f64; 3],
+}
+
+/// What one level of a stochastic fit did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StochasticLevelReport {
+    pub iterations: usize,
+    /// Mean cost (negative mutual information) over the first and the last
+    /// tenth of the iterations.
+    pub initial_cost: f64,
+    pub final_cost: f64,
+    /// The gain sequence used (estimated, with automatic estimation).
+    pub gain: GainSequence,
+    pub stopped_by_tolerance: bool,
+    pub seconds: f64,
+    /// B-spline control grid size at this level.
+    pub grid: Option<[usize; 3]>,
+}
+
+/// The result of [`fit_stochastic`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct StochasticFit {
+    /// The fitted map `T`, in fixed voxels, in [`FittedTransform`]'s
+    /// conventions: an affine as `y = A x + t`, a B-spline as coefficient blocks
+    /// on [`FittedTransform::bspline_layout`].
+    pub transform: FittedTransform,
+    pub levels: Vec<StochasticLevelReport>,
+    pub scales: Vec<f64>,
+    pub seconds: f64,
+}
+
+/// Fit `T` so that `moving(prior(T(pre(x))))` matches `fixed(x)` by Mattes
+/// mutual information, with elastix's stochastic optimisers.
+///
+/// `initial` replaces the initialisation with explicit parameters in the
+/// internal layout: translation `[t]`, affine `[A row-major, t]` about the
+/// centre `c = pre(fixed centre)` (`T(z) = A (z - c) + c + t`), or B-spline
+/// coefficients on the first level's grid.
+pub fn fit_stochastic(
+    params: &StochasticFitParams,
+    fixed: ArrayView3<'_, f32>,
+    moving: ArrayView3<'_, f32>,
+    pre: &AffineMap,
+    prior: &AffineMap,
+    initial: Option<Vec<f64>>,
+    geometry: SpatialFrame,
+) -> Result<StochasticFit> {
+    validate_stochastic(params, fixed.shape(), moving.shape())?;
+    let run = || fit_stochastic_inner(params, fixed, moving, pre, prior, initial, geometry);
+    if params.workers > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(params.workers)
+            .build()
+            .map_err(|error| Error::InvalidArgument(format!("stochastic fit: {error}")))?
+            .install(run)
+    } else {
+        run()
+    }
+}
+
+fn validate_stochastic(
+    params: &StochasticFitParams,
+    fixed: &[usize],
+    moving: &[usize],
+) -> Result<()> {
+    let fail = |what: String| Err(Error::InvalidArgument(format!("stochastic fit: {what}")));
+    if fixed.iter().chain(moving).any(|n| *n < 4) {
+        return fail(format!(
+            "images of shape {fixed:?} and {moving:?} are too small; every axis needs four voxels"
+        ));
+    }
+    if params.levels.is_empty() {
+        return fail("at least one level is needed".to_string());
+    }
+    if params.samples < 16 {
+        return fail(format!(
+            "{} samples per iteration is too few",
+            params.samples
+        ));
+    }
+    if params.fixed_bins < 4 || params.moving_bins < 4 {
+        return fail(format!(
+            "histograms need at least 4 bins, got {} and {}",
+            params.fixed_bins, params.moving_bins
+        ));
+    }
+    if params.fixed_kernel_order > 3 || !(1..=3).contains(&params.moving_kernel_order) {
+        return fail(format!(
+            "Parzen kernel orders must be 0..=3 (fixed) and 1..=3 (moving), got {} and {}",
+            params.fixed_kernel_order, params.moving_kernel_order
+        ));
+    }
+    if params.fixed_bins <= 2 * (params.fixed_kernel_order / 2) + 1
+        || params.moving_bins <= 2 * (params.moving_kernel_order / 2) + 1
+    {
+        return fail("too few bins for the Parzen kernel padding".to_string());
+    }
+    for (index, level) in params.levels.iter().enumerate() {
+        if level.iterations == 0 {
+            return fail(format!("level {index} has no iterations"));
+        }
+        if level
+            .fixed_sigma
+            .iter()
+            .chain(&level.moving_sigma)
+            .any(|s| *s < 0.0 || !s.is_finite())
+        {
+            return fail(format!("level {index} has a negative or non-finite sigma"));
+        }
+        if params.model == TransformModel::BSpline
+            && level
+                .grid_spacing
+                .iter()
+                .any(|s| !(*s > 0.0) || !s.is_finite())
+        {
+            return fail(format!(
+                "level {index} needs a positive B-spline grid spacing, got {:?}",
+                level.grid_spacing
+            ));
+        }
+    }
+    if let Some(region) = params.sample_region {
+        if region.iter().any(|s| !(*s > 0.0) || !s.is_finite()) {
+            return fail(format!("sample region {region:?} must be positive"));
+        }
+    }
+    if [
+        params.fixed_limit_range_ratio,
+        params.moving_limit_range_ratio,
+    ]
+    .iter()
+    .any(|r| !(*r >= 0.0) || !r.is_finite())
+    {
+        return fail("limit range ratios must be finite and non-negative".to_string());
+    }
+    if !(0.0..=1.0).contains(&params.minimum_valid_fraction) || params.sampling_attempts == 0 {
+        return fail(
+            "the valid-sample fraction must be in [0, 1] with at least one attempt".into(),
+        );
+    }
+    match params.optimizer {
+        StochasticOptimizer::Standard(gain) | StochasticOptimizer::Adaptive { gain, .. } => {
+            if !(gain.a > 0.0) || gain.big_a < 0.0 || gain.alpha < 0.0 {
+                return fail(format!("gain {gain:?} must have a > 0, A >= 0, alpha >= 0"));
+            }
+        }
+        StochasticOptimizer::AdaptiveAutomatic { estimation, .. } => {
+            if params.model == TransformModel::BSpline {
+                return fail(
+                    "automatic gain estimation is implemented for translation and affine \
+                     transforms; give a B-spline stage an explicit gain (elastix SP_a, SP_A, \
+                     SP_alpha) or the standard optimiser"
+                        .to_string(),
+                );
+            }
+            if !(estimation.max_step > 0.0) || estimation.gradient_measurements == 0 {
+                return fail(format!(
+                    "automatic gain estimation {estimation:?} is degenerate"
+                ));
+            }
+        }
+    }
+    if let Some(stop) = params.relative_tolerance {
+        if stop.window == 0 || !(stop.tolerance >= 0.0) {
+            return fail(format!(
+                "relative tolerance {stop:?} needs a window and a tolerance"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fixed number of sample chunks per iteration: the reduction order, and so
+/// the answer, does not depend on the number of threads.
+const STOCHASTIC_CHUNKS: usize = 16;
+
+struct StochasticModel {
+    kind: TransformModel,
+    /// Centre of rotation of an affine.
+    centre: [f64; 3],
+    grid: [usize; 3],
+    layout: BSplineLayout,
+}
+
+impl StochasticModel {
+    fn parameter_count(&self) -> usize {
+        match self.kind {
+            TransformModel::Translation => 3,
+            TransformModel::Affine => 12,
+            TransformModel::BSpline => 3 * self.grid[0] * self.grid[1] * self.grid[2],
+        }
+    }
+
+    fn per_axis(&self) -> usize {
+        self.grid[0] * self.grid[1] * self.grid[2]
+    }
+
+    fn apply(&self, params: &[f64], x: [f64; 3]) -> [f64; 3] {
+        match self.kind {
+            TransformModel::Translation => std::array::from_fn(|r| x[r] + params[r]),
+            TransformModel::Affine => {
+                let d = [
+                    x[0] - self.centre[0],
+                    x[1] - self.centre[1],
+                    x[2] - self.centre[2],
+                ];
+                std::array::from_fn(|r| {
+                    params[3 * r] * d[0]
+                        + params[3 * r + 1] * d[1]
+                        + params[3 * r + 2] * d[2]
+                        + self.centre[r]
+                        + params[9 + r]
+                })
+            }
+            TransformModel::BSpline => match self.support(x) {
+                Some(support) => {
+                    let per = self.per_axis();
+                    let mut out = x;
+                    support.for_each(|flat, weight| {
+                        for axis in 0..3 {
+                            out[axis] += weight * params[axis * per + flat];
+                        }
+                    });
+                    out
+                }
+                None => x,
+            },
+        }
+    }
+
+    /// The cubic support of a point on the control grid, or `None` outside the
+    /// region the deformation is defined on (`[1, size - 2)` in grid index, as
+    /// elastix and ITK).
+    fn support(&self, x: [f64; 3]) -> Option<GridSupport> {
+        let mut start = [0usize; 3];
+        let mut weights = [[0.0; 4]; 3];
+        for axis in 0..3 {
+            let u = (x[axis] - self.layout.origin[axis]) / self.layout.spacing[axis];
+            if !(u >= 1.0 && u < self.grid[axis] as f64 - 2.0) {
+                return None;
+            }
+            let base = u.floor() as usize - 1;
+            start[axis] = base;
+            for k in 0..4 {
+                weights[axis][k] = cubic_basis(u - (base + k) as f64);
+            }
+        }
+        Some(GridSupport {
+            start,
+            weights,
+            grid: self.grid,
+        })
+    }
+}
+
+struct GridSupport {
+    start: [usize; 3],
+    weights: [[f64; 4]; 3],
+    grid: [usize; 3],
+}
+
+impl GridSupport {
+    fn for_each(&self, mut visit: impl FnMut(usize, f64)) {
+        for k in 0..4 {
+            let wk = self.weights[2][k];
+            let gk = self.start[2] + k;
+            for j in 0..4 {
+                let wjk = wk * self.weights[1][j];
+                let row = self.grid[0] * (self.start[1] + j + self.grid[1] * gk);
+                for i in 0..4 {
+                    visit(row + self.start[0] + i, wjk * self.weights[0][i]);
+                }
+            }
+        }
+    }
+}
+
+/// An image as a sampler reads it: raw values (linear) or interpolating cubic
+/// coefficients, row-major `[a0, a1, a2]`.
+struct SampledImage {
+    data: Vec<f32>,
+    shape: [usize; 3],
+    order: SampleOrder,
+}
+
+impl SampledImage {
+    fn new(image: Array3<f32>, order: SampleOrder) -> Self {
+        let shape = [image.shape()[0], image.shape()[1], image.shape()[2]];
+        let image = match order {
+            SampleOrder::Linear => image,
+            SampleOrder::Cubic => cubic_coefficients(image),
+        };
+        let data = if image.is_standard_layout() {
+            image.into_raw_vec_and_offset().0
+        } else {
+            image.iter().copied().collect()
+        };
+        Self { data, shape, order }
+    }
+
+    /// Inside the buffer as ITK means it: continuous index in `[-0.5, n - 0.5)`.
+    fn inside(&self, p: [f64; 3]) -> bool {
+        (0..3).all(|a| p[a] >= -0.5 && p[a] < self.shape[a] as f64 - 0.5)
+    }
+
+    #[inline]
+    fn at(&self, i: usize, j: usize, k: usize) -> f64 {
+        self.data[(i * self.shape[1] + j) * self.shape[2] + k] as f64
+    }
+
+    fn value(&self, p: [f64; 3]) -> f64 {
+        match self.order {
+            SampleOrder::Linear => self.linear(p, false).0,
+            SampleOrder::Cubic => self.cubic(p, false).0,
+        }
+    }
+
+    fn value_and_gradient(&self, p: [f64; 3]) -> (f64, [f64; 3]) {
+        match self.order {
+            SampleOrder::Linear => self.linear(p, true),
+            SampleOrder::Cubic => self.cubic(p, true),
+        }
+    }
+
+    fn linear(&self, p: [f64; 3], gradient: bool) -> (f64, [f64; 3]) {
+        let mut lo = [0usize; 3];
+        let mut hi = [0usize; 3];
+        let mut t = [0.0; 3];
+        for a in 0..3 {
+            let n = self.shape[a];
+            let q = p[a].clamp(0.0, (n - 1) as f64);
+            let base = (q.floor() as usize).min(n - 2);
+            lo[a] = base;
+            hi[a] = base + 1;
+            t[a] = q - base as f64;
+        }
+        let c = |i: usize, j: usize, k: usize| self.at(i, j, k);
+        let c000 = c(lo[0], lo[1], lo[2]);
+        let c001 = c(lo[0], lo[1], hi[2]);
+        let c010 = c(lo[0], hi[1], lo[2]);
+        let c011 = c(lo[0], hi[1], hi[2]);
+        let c100 = c(hi[0], lo[1], lo[2]);
+        let c101 = c(hi[0], lo[1], hi[2]);
+        let c110 = c(hi[0], hi[1], lo[2]);
+        let c111 = c(hi[0], hi[1], hi[2]);
+        let c00 = lerp(c000, c001, t[2]);
+        let c01 = lerp(c010, c011, t[2]);
+        let c10 = lerp(c100, c101, t[2]);
+        let c11 = lerp(c110, c111, t[2]);
+        let c0 = lerp(c00, c01, t[1]);
+        let c1 = lerp(c10, c11, t[1]);
+        let value = lerp(c0, c1, t[0]);
+        if !gradient {
+            return (value, [0.0; 3]);
+        }
+        let g0 = c1 - c0;
+        let g1 = lerp(c01 - c00, c11 - c10, t[0]);
+        let g2 = lerp(
+            lerp(c001 - c000, c011 - c010, t[1]),
+            lerp(c101 - c100, c111 - c110, t[1]),
+            t[0],
+        );
+        (value, [g0, g1, g2])
+    }
+
+    fn cubic(&self, p: [f64; 3], gradient: bool) -> (f64, [f64; 3]) {
+        let mut index = [[0usize; 4]; 3];
+        let mut w = [[0.0; 4]; 3];
+        let mut d = [[0.0; 4]; 3];
+        for a in 0..3 {
+            let base = p[a].floor() as isize - 1;
+            for k in 0..4 {
+                let node = base + k as isize;
+                let t = p[a] - node as f64;
+                index[a][k] = mirror_index(node, self.shape[a]);
+                w[a][k] = cubic_basis(t);
+                d[a][k] = cubic_basis_derivative(t);
+            }
+        }
+        let mut value = 0.0;
+        let mut grad = [0.0; 3];
+        for i in 0..4 {
+            let mut v_i = 0.0;
+            let mut g1_i = 0.0;
+            let mut g2_i = 0.0;
+            for j in 0..4 {
+                let row = (index[0][i] * self.shape[1] + index[1][j]) * self.shape[2];
+                let mut v_ij = 0.0;
+                let mut g2_ij = 0.0;
+                for k in 0..4 {
+                    let c = self.data[row + index[2][k]] as f64;
+                    v_ij += w[2][k] * c;
+                    g2_ij += d[2][k] * c;
+                }
+                v_i += w[1][j] * v_ij;
+                g1_i += d[1][j] * v_ij;
+                g2_i += w[1][j] * g2_ij;
+            }
+            value += w[0][i] * v_i;
+            if gradient {
+                grad[0] += d[0][i] * v_i;
+                grad[1] += w[0][i] * g1_i;
+                grad[2] += w[0][i] * g2_i;
+            }
+        }
+        (value, grad)
+    }
+}
+
+/// ITK's mirror boundary: `-1 → 1`, `n → n - 2`, with period `2(n - 1)`.
+fn mirror_index(index: isize, n: usize) -> usize {
+    if n == 1 {
+        return 0;
+    }
+    let period = 2 * (n as isize - 1);
+    let mut i = index.rem_euclid(period);
+    if i >= n as isize {
+        i = period - i;
+    }
+    i as usize
+}
+
+fn cubic_basis_derivative(t: f64) -> f64 {
+    let a = t.abs();
+    if a < 1.0 {
+        -2.0 * t + 1.5 * t * a
+    } else if a < 2.0 {
+        let u = 2.0 - a;
+        -0.5 * t.signum() * u * u
+    } else {
+        0.0
+    }
+}
+
+/// The centred B-spline of order `n` (0 to 3) at `x`.
+fn bspline_kernel(order: usize, x: f64) -> f64 {
+    let a = x.abs();
+    match order {
+        0 => {
+            if a < 0.5 {
+                1.0
+            } else if a == 0.5 {
+                0.5
+            } else {
+                0.0
+            }
+        }
+        1 => (1.0 - a).max(0.0),
+        2 => {
+            if a < 0.5 {
+                0.75 - a * a
+            } else if a < 1.5 {
+                0.5 * (1.5 - a) * (1.5 - a)
+            } else {
+                0.0
+            }
+        }
+        _ => cubic_basis(x),
+    }
+}
+
+/// Its derivative, `β_n'(x) = β_{n-1}(x + 1/2) - β_{n-1}(x - 1/2)`.
+fn bspline_kernel_derivative(order: usize, x: f64) -> f64 {
+    bspline_kernel(order - 1, x + 0.5) - bspline_kernel(order - 1, x - 0.5)
+}
+
+/// One image's Parzen window: elastix's bin layout, with `order / 2` padding
+/// bins at each end and a small margin so that the extreme values fall inside.
+#[derive(Debug, Clone, Copy)]
+struct Parzen {
+    bins: usize,
+    order: usize,
+    min: f64,
+    max: f64,
+    bin_size: f64,
+    normalised_min: f64,
+}
+
+impl Parzen {
+    fn new(bins: usize, order: usize, min: f64, max: f64) -> Self {
+        let padding = (order / 2) as f64;
+        let intervals = bins as f64 - 2.0 * padding - 1.0;
+        let range = (max - min).max(f64::MIN_POSITIVE);
+        let small = 0.001 * range / intervals;
+        let bin_size = (range + 2.0 * small) / intervals;
+        let normalised_min = (min - small) / bin_size - padding;
+        Self {
+            bins,
+            order,
+            min,
+            max,
+            bin_size,
+            normalised_min,
+        }
+    }
+
+    /// The value limited to the image's range, and whether it was limited.
+    fn term(&self, value: f64) -> (f64, bool) {
+        let limited = value.clamp(self.min, self.max);
+        (
+            limited / self.bin_size - self.normalised_min,
+            limited != value,
+        )
+    }
+
+    /// The first bin of the window and the window's weights.
+    fn window(&self, term: f64) -> (usize, [f64; 4]) {
+        let start = (term + 0.5 - self.order as f64 / 2.0).floor() as isize;
+        let mut weights = [0.0; 4];
+        for (k, weight) in weights.iter_mut().enumerate().take(self.order + 1) {
+            *weight = bspline_kernel(self.order, (start + k as isize) as f64 - term);
+        }
+        (start.max(0) as usize, weights)
+    }
+
+    fn window_derivative(&self, term: f64) -> (usize, [f64; 4]) {
+        let start = (term + 0.5 - self.order as f64 / 2.0).floor() as isize;
+        let mut weights = [0.0; 4];
+        for (k, weight) in weights.iter_mut().enumerate().take(self.order + 1) {
+            *weight = bspline_kernel_derivative(self.order, (start + k as isize) as f64 - term);
+        }
+        (start.max(0) as usize, weights)
+    }
+}
+
+/// One level's images and everything a sample needs.
+struct StochasticLevelContext<'a> {
+    params: &'a StochasticFitParams,
+    fixed: SampledImage,
+    moving: SampledImage,
+    fixed_parzen: Parzen,
+    moving_parzen: Parzen,
+    model: StochasticModel,
+    pre: AffineMap,
+    prior: AffineMap,
+    /// `priorᵀ`, which carries the moving image gradient back to `T`'s output.
+    prior_transpose: [[f64; 3]; 3],
+    level: usize,
+}
+
+/// One sample that mapped inside the moving image.
+#[derive(Clone, Copy)]
+struct Sample {
+    /// `pre(x)`: where `T` and its Jacobian are evaluated.
+    x: [f64; 3],
+    fixed_term: f64,
+    moving_term: f64,
+    /// `priorᵀ ∇M`, zero where the moving value was limited.
+    gradient: [f64; 3],
+}
+
+/// Where the samples of one evaluation come from.
+#[derive(Clone, Copy)]
+enum SampleSource {
+    /// Uniform random coordinates; `key` seeds the draw.
+    Random { key: u64, count: usize },
+    /// A regular grid of about `count` points over the fixed image.
+    Grid { count: usize },
+}
+
+struct Evaluation {
+    cost: f64,
+    gradient: Vec<f64>,
+    valid: usize,
+}
+
+/// SplitMix64: a small, well-mixed, seedable generator.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn uniform(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn normal(&mut self) -> f64 {
+        let u = self.uniform().max(f64::MIN_POSITIVE);
+        let v = self.uniform();
+        (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+    }
+}
+
+fn mix_key(parts: &[u64]) -> u64 {
+    let mut state = SplitMix(0x005E_ED0F_A11C_0DE5);
+    let mut key = 0u64;
+    for part in parts {
+        state.0 ^= part.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        key = state.next_u64();
+    }
+    key
+}
+
+/// Points of a regular grid with about `count` points over `shape`, spaced
+/// `floor((voxels / count)^(1/3))` voxels and centred, as elastix's grid
+/// sampler places them.
+fn grid_points(shape: [usize; 3], count: usize) -> Vec<[f64; 3]> {
+    let voxels = (shape[0] * shape[1] * shape[2]) as f64;
+    let step = ((voxels / count.max(1) as f64).cbrt().floor() as usize).max(1);
+    let axis = |n: usize| -> Vec<f64> {
+        let points = (n - 1) / step + 1;
+        let offset = ((n - 1) - (points - 1) * step) / 2;
+        (0..points).map(|i| (offset + i * step) as f64).collect()
+    };
+    let (a, b, c) = (axis(shape[0]), axis(shape[1]), axis(shape[2]));
+    let mut out = Vec::with_capacity(a.len() * b.len() * c.len());
+    for &x in &a {
+        for &y in &b {
+            for &z in &c {
+                out.push([x, y, z]);
+            }
+        }
+    }
+    out
+}
+
+impl StochasticLevelContext<'_> {
+    fn fixed_shape(&self) -> [usize; 3] {
+        self.fixed.shape
+    }
+
+    /// The sample box of one draw: the whole fixed image, or one random region.
+    fn sample_box(&self, rng: &mut SplitMix) -> ([f64; 3], [f64; 3]) {
+        let shape = self.fixed_shape();
+        let mut lo = [0.0; 3];
+        let mut hi: [f64; 3] = std::array::from_fn(|a| (shape[a] - 1) as f64);
+        if let Some(region) = self.params.sample_region {
+            for a in 0..3 {
+                let size = region[a].min(hi[a]);
+                let corner = rng.uniform() * (hi[a] - size);
+                lo[a] = corner;
+                hi[a] = corner + size;
+            }
+        }
+        (lo, hi)
+    }
+
+    fn sample_at(&self, params: &[f64], x: [f64; 3]) -> Option<Sample> {
+        let (fixed_term, _) = self.fixed_parzen.term(self.fixed.value(x));
+        let z = self.pre.apply(x);
+        let y = self.prior.apply(self.model.apply(params, z));
+        if !self.moving.inside(y) {
+            return None;
+        }
+        let (value, gradient) = self.moving.value_and_gradient(y);
+        let (moving_term, limited) = self.moving_parzen.term(value);
+        let gradient = if limited {
+            [0.0; 3]
+        } else {
+            std::array::from_fn(|r| {
+                (0..3)
+                    .map(|k| self.prior_transpose[r][k] * gradient[k])
+                    .sum::<f64>()
+            })
+        };
+        Some(Sample {
+            x: z,
+            fixed_term,
+            moving_term,
+            gradient,
+        })
+    }
+
+    /// The samples of one evaluation, in `STOCHASTIC_CHUNKS` chunks, and the
+    /// node box their B-spline support can touch (the whole grid when the
+    /// samples cover the whole image).
+    fn draw(&self, params: &[f64], source: SampleSource) -> (Vec<Vec<Sample>>, NodeBox) {
+        match source {
+            SampleSource::Random { key, count } => {
+                let mut region_rng = SplitMix(mix_key(&[key, u64::MAX]));
+                let (lo, hi) = self.sample_box(&mut region_rng);
+                let chunks = (0..STOCHASTIC_CHUNKS)
+                    .into_par_iter()
+                    .map(|chunk| {
+                        let wanted = count / STOCHASTIC_CHUNKS
+                            + usize::from(chunk < count % STOCHASTIC_CHUNKS);
+                        let mut rng = SplitMix(mix_key(&[key, chunk as u64]));
+                        let mut out = Vec::with_capacity(wanted);
+                        for _ in 0..wanted {
+                            let x: [f64; 3] =
+                                std::array::from_fn(|a| lo[a] + rng.uniform() * (hi[a] - lo[a]));
+                            if let Some(sample) = self.sample_at(params, x) {
+                                out.push(sample);
+                            }
+                        }
+                        out
+                    })
+                    .collect();
+                (chunks, self.node_box(lo, hi))
+            }
+            SampleSource::Grid { count } => {
+                let shape = self.fixed_shape();
+                let points = grid_points(shape, count);
+                let per = points.len().div_ceil(STOCHASTIC_CHUNKS).max(1);
+                let chunks = points
+                    .par_chunks(per)
+                    .map(|chunk| {
+                        chunk
+                            .iter()
+                            .filter_map(|x| self.sample_at(params, *x))
+                            .collect()
+                    })
+                    .collect();
+                let hi = shape.map(|n| (n - 1) as f64);
+                (chunks, self.node_box([0.0; 3], hi))
+            }
+        }
+    }
+
+    fn node_box(&self, lo: [f64; 3], hi: [f64; 3]) -> NodeBox {
+        if self.model.kind != TransformModel::BSpline {
+            return NodeBox {
+                start: [0; 3],
+                size: [0; 3],
+            };
+        }
+        let (lo, hi) = mapped_box(&self.pre, lo, hi);
+        let mut start = [0usize; 3];
+        let mut size = [0usize; 3];
+        for a in 0..3 {
+            let u = |p: f64| (p - self.model.layout.origin[a]) / self.model.layout.spacing[a];
+            let first = (u(lo[a]).floor() as isize - 1).clamp(0, self.model.grid[a] as isize - 1);
+            let last = (u(hi[a]).floor() as isize + 2).clamp(0, self.model.grid[a] as isize - 1);
+            start[a] = first as usize;
+            size[a] = (last - first + 1) as usize;
+        }
+        NodeBox { start, size }
+    }
+
+    /// Negative Mattes mutual information over `source`, and its gradient
+    /// with respect to `params` when asked.
+    fn evaluate(&self, params: &[f64], source: SampleSource, gradient: bool) -> Result<Evaluation> {
+        let (chunks, nodes) = self.draw(params, source);
+        let fixed_bins = self.fixed_parzen.bins;
+        let moving_bins = self.moving_parzen.bins;
+        let valid: usize = chunks.iter().map(Vec::len).sum();
+        if valid == 0 {
+            return Ok(Evaluation {
+                cost: 0.0,
+                gradient: Vec::new(),
+                valid: 0,
+            });
+        }
+        // The joint histogram, chunk by chunk, summed in chunk order.
+        let partials: Vec<Vec<f64>> = chunks
+            .par_iter()
+            .map(|samples| {
+                let mut joint = vec![0.0; fixed_bins * moving_bins];
+                for sample in samples {
+                    self.add_to_histogram(&mut joint, sample);
+                }
+                joint
+            })
+            .collect();
+        let mut joint = vec![0.0; fixed_bins * moving_bins];
+        for partial in &partials {
+            for (slot, value) in joint.iter_mut().zip(partial) {
+                *slot += value;
+            }
+        }
+        let total: f64 = joint.iter().sum();
+        let mut fixed_marginal = vec![0.0; fixed_bins];
+        let mut moving_marginal = vec![0.0; moving_bins];
+        for f in 0..fixed_bins {
+            for m in 0..moving_bins {
+                let p = joint[f * moving_bins + m] / total;
+                joint[f * moving_bins + m] = p;
+                fixed_marginal[f] += p;
+                moving_marginal[m] += p;
+            }
+        }
+        let mut information = 0.0;
+        // `ln(p(f, m) / p_M(m))`, the factor the derivative needs.
+        let mut ratio = vec![0.0; fixed_bins * moving_bins];
+        for f in 0..fixed_bins {
+            for m in 0..moving_bins {
+                let p = joint[f * moving_bins + m];
+                if p > 0.0 {
+                    information += p * (p / (fixed_marginal[f] * moving_marginal[m])).ln();
+                    ratio[f * moving_bins + m] = (p / moving_marginal[m]).ln();
+                }
+            }
+        }
+        if !gradient {
+            return Ok(Evaluation {
+                cost: -information,
+                gradient: Vec::new(),
+                valid,
+            });
+        }
+        let count = self.model.parameter_count();
+        let scale = 1.0 / (total * self.moving_parzen.bin_size);
+        let boxed = self.model.kind == TransformModel::BSpline;
+        let local_len = if boxed { 3 * nodes.volume() } else { count };
+        let partials: Vec<Vec<f64>> = chunks
+            .par_iter()
+            .map(|samples| {
+                let mut local = vec![0.0; local_len];
+                for sample in samples {
+                    let factor = scale * self.derivative_weight(&ratio, sample);
+                    if factor == 0.0 {
+                        continue;
+                    }
+                    let g = sample.gradient.map(|v| v * factor);
+                    self.add_jacobian(&mut local, &nodes, sample.x, g);
+                }
+                local
+            })
+            .collect();
+        let mut out = vec![0.0; count];
+        for partial in &partials {
+            if boxed {
+                nodes.scatter_add(&self.model, partial, &mut out);
+            } else {
+                for (slot, value) in out.iter_mut().zip(partial) {
+                    *slot += value;
+                }
+            }
+        }
+        Ok(Evaluation {
+            cost: -information,
+            gradient: out,
+            valid,
+        })
+    }
+
+    fn add_to_histogram(&self, joint: &mut [f64], sample: &Sample) {
+        let moving_bins = self.moving_parzen.bins;
+        let (f0, fw) = self.fixed_parzen.window(sample.fixed_term);
+        let (m0, mw) = self.moving_parzen.window(sample.moving_term);
+        for (a, wf) in fw.iter().enumerate().take(self.fixed_parzen.order + 1) {
+            let f = f0 + a;
+            if *wf == 0.0 || f >= self.fixed_parzen.bins {
+                continue;
+            }
+            for (b, wm) in mw.iter().enumerate().take(self.moving_parzen.order + 1) {
+                let m = m0 + b;
+                if m < moving_bins {
+                    joint[f * moving_bins + m] += wf * wm;
+                }
+            }
+        }
+    }
+
+    /// `Σ_f Σ_m β_F(f - ft) β_M'(m - mt) ln(p(f, m) / p_M(m))`.
+    fn derivative_weight(&self, ratio: &[f64], sample: &Sample) -> f64 {
+        let moving_bins = self.moving_parzen.bins;
+        let (f0, fw) = self.fixed_parzen.window(sample.fixed_term);
+        let (m0, mw) = self.moving_parzen.window_derivative(sample.moving_term);
+        let mut sum = 0.0;
+        for (a, wf) in fw.iter().enumerate().take(self.fixed_parzen.order + 1) {
+            let f = f0 + a;
+            if *wf == 0.0 || f >= self.fixed_parzen.bins {
+                continue;
+            }
+            for (b, wm) in mw.iter().enumerate().take(self.moving_parzen.order + 1) {
+                let m = m0 + b;
+                if m < moving_bins {
+                    sum += wf * wm * ratio[f * moving_bins + m];
+                }
+            }
+        }
+        sum
+    }
+
+    /// `gradient += Jᵀ g` at `x`, for the model's Jacobian `J = ∂T/∂μ`.
+    fn add_jacobian(&self, gradient: &mut [f64], nodes: &NodeBox, x: [f64; 3], g: [f64; 3]) {
+        let model = &self.model;
+        match model.kind {
+            TransformModel::Translation => {
+                for r in 0..3 {
+                    gradient[r] += g[r];
+                }
+            }
+            TransformModel::Affine => {
+                let d = [
+                    x[0] - model.centre[0],
+                    x[1] - model.centre[1],
+                    x[2] - model.centre[2],
+                ];
+                for r in 0..3 {
+                    for c in 0..3 {
+                        gradient[3 * r + c] += g[r] * d[c];
+                    }
+                    gradient[9 + r] += g[r];
+                }
+            }
+            TransformModel::BSpline => {
+                if let Some(support) = model.support(x) {
+                    let per = nodes.volume();
+                    for k in 0..4 {
+                        let gk = support.start[2] + k - nodes.start[2];
+                        for j in 0..4 {
+                            let gj = support.start[1] + j - nodes.start[1];
+                            let wjk = support.weights[2][k] * support.weights[1][j];
+                            let row = nodes.size[0] * (gj + nodes.size[1] * gk);
+                            for i in 0..4 {
+                                let gi = support.start[0] + i - nodes.start[0];
+                                let w = wjk * support.weights[0][i];
+                                let flat = row + gi;
+                                gradient[flat] += w * g[0];
+                                gradient[per + flat] += w * g[1];
+                                gradient[2 * per + flat] += w * g[2];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The model's Jacobian at fixed voxel `x` (evaluated at `pre(x)`), dense
+    /// `3 × P`, for the small models the automatic estimation runs on.
+    fn dense_jacobian(&self, x: [f64; 3]) -> Vec<[f64; 3]> {
+        let x = self.pre.apply(x);
+        let count = self.model.parameter_count();
+        let mut columns = vec![[0.0; 3]; count];
+        for r in 0..3 {
+            let mut g = [0.0; 3];
+            g[r] = 1.0;
+            let mut row = vec![0.0; count];
+            self.add_jacobian(
+                &mut row,
+                &NodeBox {
+                    start: [0; 3],
+                    size: [0; 3],
+                },
+                x,
+                g,
+            );
+            for (p, value) in row.into_iter().enumerate() {
+                columns[p][r] = value;
+            }
+        }
+        columns
+    }
+}
+
+/// The sub-box of B-spline nodes one draw's samples can touch.
+struct NodeBox {
+    start: [usize; 3],
+    size: [usize; 3],
+}
+
+impl NodeBox {
+    fn volume(&self) -> usize {
+        self.size[0] * self.size[1] * self.size[2]
+    }
+
+    fn scatter_add(&self, model: &StochasticModel, local: &[f64], out: &mut [f64]) {
+        let per = model.per_axis();
+        let local_per = self.volume();
+        for axis in 0..3 {
+            for k in 0..self.size[2] {
+                for j in 0..self.size[1] {
+                    for i in 0..self.size[0] {
+                        let l = i + self.size[0] * (j + self.size[1] * k);
+                        let g = (self.start[0] + i)
+                            + model.grid[0]
+                                * ((self.start[1] + j) + model.grid[1] * (self.start[2] + k));
+                        out[axis * per + g] += local[axis * local_per + l];
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn fit_stochastic_inner(
+    params: &StochasticFitParams,
+    fixed: ArrayView3<'_, f32>,
+    moving: ArrayView3<'_, f32>,
+    pre: &AffineMap,
+    prior: &AffineMap,
+    initial: Option<Vec<f64>>,
+    geometry: SpatialFrame,
+) -> Result<StochasticFit> {
+    let started = std::time::Instant::now();
+    let fixed_shape = [fixed.shape()[0], fixed.shape()[1], fixed.shape()[2]];
+    let moving_shape = [moving.shape()[0], moving.shape()[1], moving.shape()[2]];
+    let centre = pre.apply(fixed_shape.map(|n| (n - 1) as f64 / 2.0));
+    let prior_inverse = prior.inverse()?;
+    let prior_transpose = std::array::from_fn(|r| std::array::from_fn(|c| prior.matrix[c][r]));
+
+    // The starting parameters, in the internal layout.
+    let mut current: Vec<f64> = match (params.model, initial) {
+        (_, Some(seed)) => seed,
+        (TransformModel::BSpline, None) => Vec::new(),
+        (model, None) => {
+            let translation = match params.initialisation {
+                StochasticInitialisation::Identity => [0.0; 3],
+                StochasticInitialisation::GeometricCentre => {
+                    let moving_centre =
+                        prior_inverse.apply(moving_shape.map(|n| (n - 1) as f64 / 2.0));
+                    std::array::from_fn(|a| moving_centre[a] - centre[a])
+                }
+            };
+            match model {
+                TransformModel::Translation => translation.to_vec(),
+                _ => {
+                    let mut values = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+                    values.extend(translation);
+                    values
+                }
+            }
+        }
+    };
+
+    let mut reports = Vec::with_capacity(params.levels.len());
+    let mut scales = Vec::new();
+    let mut previous_grid: Option<(StochasticModel, Vec<f64>)> = None;
+    let mut model = StochasticModel {
+        kind: params.model,
+        centre,
+        grid: [0; 3],
+        layout: BSplineLayout {
+            origin: [0.0; 3],
+            spacing: [1.0; 3],
+        },
+    };
+    for (level_index, level) in params.levels.iter().enumerate() {
+        let level_started = std::time::Instant::now();
+        // The level's images: smoothed, then (for cubic reads) prefiltered.
+        let (fixed_image, moving_image) = rayon::join(
+            || gaussian_smooth(fixed.to_owned(), level.fixed_sigma),
+            || gaussian_smooth(moving.to_owned(), level.moving_sigma),
+        );
+        let widen = |(lo, hi): (f64, f64), ratio: f64| {
+            let range = hi - lo;
+            (lo - ratio * range, hi + ratio * range)
+        };
+        let (fixed_min, fixed_max) = widen(extrema(&fixed_image), params.fixed_limit_range_ratio);
+        let (moving_min, moving_max) =
+            widen(extrema(&moving_image), params.moving_limit_range_ratio);
+        if !(fixed_max > fixed_min) || !(moving_max > moving_min) {
+            return Err(Error::InvalidArgument(format!(
+                "stochastic fit: level {level_index} has a flat image (fixed {fixed_min}..{fixed_max}, \
+                 moving {moving_min}..{moving_max}); mutual information has no signal"
+            )));
+        }
+        let (fixed_sampled, moving_sampled) = rayon::join(
+            || SampledImage::new(fixed_image, params.fixed_order),
+            || SampledImage::new(moving_image, params.moving_order),
+        );
+        if params.model == TransformModel::BSpline {
+            let (grid, layout) = bspline_grid_after(fixed_shape, level.grid_spacing, pre);
+            let next = StochasticModel {
+                kind: TransformModel::BSpline,
+                centre,
+                grid,
+                layout,
+            };
+            current = match previous_grid.take() {
+                Some((coarse, coefficients)) => upsample_bspline(&coarse, &coefficients, &next),
+                None if current.len() == next.parameter_count() => current,
+                None => vec![0.0; next.parameter_count()],
+            };
+            model = next;
+        }
+        let context = StochasticLevelContext {
+            params,
+            fixed: fixed_sampled,
+            moving: moving_sampled,
+            fixed_parzen: Parzen::new(
+                params.fixed_bins,
+                params.fixed_kernel_order,
+                fixed_min,
+                fixed_max,
+            ),
+            moving_parzen: Parzen::new(
+                params.moving_bins,
+                params.moving_kernel_order,
+                moving_min,
+                moving_max,
+            ),
+            model,
+            pre: *pre,
+            prior: *prior,
+            prior_transpose,
+            level: level_index,
+        };
+        if current.len() != context.model.parameter_count() {
+            return Err(Error::InvalidArgument(format!(
+                "stochastic fit: {} initial parameter(s) for a model with {}",
+                current.len(),
+                context.model.parameter_count()
+            )));
+        }
+        scales = match params.scales {
+            ParameterScales::Unit => vec![1.0; current.len()],
+            ParameterScales::Automatic { samples } => {
+                if params.model == TransformModel::BSpline {
+                    vec![1.0; current.len()]
+                } else {
+                    estimate_scales(&context, samples)
+                }
+            }
+        };
+        let (gain, time) = match params.optimizer {
+            StochasticOptimizer::Standard(gain) => (gain, None),
+            StochasticOptimizer::Adaptive { gain, time } => (gain, Some(time)),
+            StochasticOptimizer::AdaptiveAutomatic {
+                big_a,
+                estimation,
+                initial_time,
+            } => {
+                let (gain, time) = estimate_gain(
+                    &context,
+                    &current,
+                    &scales,
+                    big_a,
+                    &estimation,
+                    initial_time,
+                )?;
+                (gain, Some(time))
+            }
+        };
+        let report = run_stochastic_level(
+            &context,
+            &mut current,
+            &scales,
+            gain,
+            time,
+            level,
+            level_index,
+        )?;
+        reports.push(StochasticLevelReport {
+            seconds: level_started.elapsed().as_secs_f64(),
+            grid: (params.model == TransformModel::BSpline).then_some(context.model.grid),
+            ..report
+        });
+        model = context.model;
+        if params.model == TransformModel::BSpline {
+            previous_grid = Some((
+                StochasticModel {
+                    kind: TransformModel::BSpline,
+                    centre,
+                    grid: model.grid,
+                    layout: model.layout,
+                },
+                current.clone(),
+            ));
+        }
+    }
+
+    let transform = match params.model {
+        TransformModel::Translation => FittedTransform {
+            model: TransformModel::Translation,
+            params: current,
+            shape: fixed_shape,
+            geometry,
+            bspline: ControlGrid::default(),
+            bspline_layout: None,
+        },
+        TransformModel::Affine => {
+            // `A (x - c) + c + t = A x + (c + t - A c)`.
+            let mut values = current[..9].to_vec();
+            for r in 0..3 {
+                let moved: f64 = (0..3).map(|k| current[3 * r + k] * centre[k]).sum();
+                values.push(centre[r] + current[9 + r] - moved);
+            }
+            FittedTransform {
+                model: TransformModel::Affine,
+                params: values,
+                shape: fixed_shape,
+                geometry,
+                bspline: ControlGrid::default(),
+                bspline_layout: None,
+            }
+        }
+        TransformModel::BSpline => FittedTransform {
+            model: TransformModel::BSpline,
+            params: current,
+            shape: fixed_shape,
+            geometry,
+            bspline: ControlGrid::new(model.grid)?,
+            bspline_layout: Some(model.layout),
+        },
+    };
+    Ok(StochasticFit {
+        transform,
+        levels: reports,
+        scales,
+        seconds: started.elapsed().as_secs_f64(),
+    })
+}
+
+fn run_stochastic_level(
+    context: &StochasticLevelContext<'_>,
+    current: &mut [f64],
+    scales: &[f64],
+    gain: GainSequence,
+    sigmoid: Option<SigmoidTime>,
+    level: &StochasticLevel,
+    level_index: usize,
+) -> Result<StochasticLevelReport> {
+    let params = context.params;
+    let mut time = sigmoid.map(|s| s.initial_time).unwrap_or(0.0);
+    let mut previous: Option<Vec<f64>> = None;
+    let mut costs = Vec::with_capacity(level.iterations);
+    let mut stopped = false;
+    let required = (params.minimum_valid_fraction * params.samples as f64).ceil() as usize;
+    let root_scales: Vec<f64> = scales.iter().map(|s| s.sqrt()).collect();
+    for iteration in 0..level.iterations {
+        let mut evaluation = None;
+        for attempt in 0..params.sampling_attempts {
+            let draw = if params.new_samples_every_iteration {
+                iteration as u64
+            } else {
+                0
+            };
+            let key = mix_key(&[params.seed, level_index as u64, draw, attempt as u64]);
+            let result = context.evaluate(
+                current,
+                SampleSource::Random {
+                    key,
+                    count: params.samples,
+                },
+                true,
+            )?;
+            if result.valid >= required.max(1) {
+                evaluation = Some(result);
+                break;
+            }
+        }
+        let evaluation = evaluation.ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "stochastic fit: at level {level_index}, iteration {iteration}, fewer than {required} \
+                 of {} samples map inside the moving image in {} attempts; the images do not overlap \
+                 under the current transform",
+                params.samples, params.sampling_attempts
+            ))
+        })?;
+        // The step in scaled parameters `y = μ ⊙ √s`: `g_y = g / √s`, and
+        // `y -= a_k g_y` is `μ -= a_k g / s`.
+        let scaled: Vec<f64> = evaluation
+            .gradient
+            .iter()
+            .zip(&root_scales)
+            .map(|(g, r)| g / r)
+            .collect();
+        // elastix's `Compute_a`: `a / (A + t + 1)^alpha`.
+        let step = gain.a / (time + gain.big_a + 1.0).powf(gain.alpha);
+        for ((value, g), r) in current.iter_mut().zip(&scaled).zip(&root_scales) {
+            *value -= step * g / r;
+        }
+        match sigmoid {
+            Some(sigmoid) => {
+                if let Some(previous) = &previous {
+                    let inner: f64 = previous.iter().zip(&scaled).map(|(a, b)| a * b).sum();
+                    let f = sigmoid.min
+                        + (sigmoid.max - sigmoid.min) / (1.0 + (inner / sigmoid.scale).exp());
+                    time = (time + f).max(0.0);
+                }
+                previous = Some(scaled);
+            }
+            None => time += 1.0,
+        }
+        costs.push(evaluation.cost);
+        if let Some(stop) = params.relative_tolerance {
+            let n = costs.len();
+            if n >= 2 * stop.window && n % stop.window == 0 {
+                let mean = |range: std::ops::Range<usize>| {
+                    costs[range.clone()].iter().sum::<f64>() / range.len() as f64
+                };
+                let last = mean(n - stop.window..n);
+                let before = mean(n - 2 * stop.window..n - stop.window);
+                if (last - before).abs() <= stop.tolerance * before.abs() {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+    }
+    let tenth = (costs.len() / 10).max(1);
+    let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+    Ok(StochasticLevelReport {
+        iterations: costs.len(),
+        initial_cost: mean(&costs[..tenth]),
+        final_cost: mean(&costs[costs.len() - tenth..]),
+        gain,
+        stopped_by_tolerance: stopped,
+        seconds: 0.0,
+        grid: None,
+    })
+}
+
+/// elastix's `AutomaticScalesEstimation`: `s_p = mean_x ||∂T/∂μ_p (x)||²` over
+/// a grid of about `samples` fixed voxels.
+fn estimate_scales(context: &StochasticLevelContext<'_>, samples: usize) -> Vec<f64> {
+    let points = grid_points(context.fixed_shape(), samples);
+    let count = context.model.parameter_count();
+    let mut scales = vec![0.0; count];
+    for x in &points {
+        for (p, column) in context.dense_jacobian(*x).iter().enumerate() {
+            scales[p] += column.iter().map(|v| v * v).sum::<f64>();
+        }
+    }
+    scales
+        .into_iter()
+        .map(|s| (s / points.len() as f64).max(f64::MIN_POSITIVE))
+        .collect()
+}
+
+/// elastix's automatic parameter estimation for adaptive stochastic gradient
+/// descent, the "Original" method of Klein et al. (2009).
+///
+/// With `J_j` the model Jacobian at sample `j` with columns divided by `√s`,
+/// `C = mean_j J_jᵀ J_j`: the gain is `a = A δ / (σ₁ √max_j JCJ_j)` times the
+/// noise factor `σ₁² / (σ₁² + σ₃²)`, where `σ₁² = E||g||² / tr C` is measured
+/// from exact gradients and `σ₃² = E||g - ĝ||² / tr C` from their difference to
+/// stochastic ones, at points perturbed by `δ / √max_j JJ_j`; `alpha` is 1,
+/// and the sigmoid runs from `-0.99 + 0.98 · noise` to 1 with scale
+/// `factor · σ₃² · √tr(C²)`.
+fn estimate_gain(
+    context: &StochasticLevelContext<'_>,
+    current: &[f64],
+    scales: &[f64],
+    big_a: f64,
+    estimation: &AutomaticGain,
+    initial_time: f64,
+) -> Result<(GainSequence, SigmoidTime)> {
+    let count = context.model.parameter_count();
+    let root: Vec<f64> = scales.iter().map(|s| s.sqrt()).collect();
+    let points = grid_points(context.fixed_shape(), estimation.jacobian_measurements);
+    let jacobians: Vec<Vec<[f64; 3]>> = points
+        .iter()
+        .map(|x| {
+            let mut columns = context.dense_jacobian(*x);
+            for (column, r) in columns.iter_mut().zip(&root) {
+                *column = column.map(|v| v / r);
+            }
+            columns
+        })
+        .collect();
+    let mut covariance = vec![0.0; count * count];
+    for columns in &jacobians {
+        for p in 0..count {
+            for q in 0..count {
+                covariance[p * count + q] +=
+                    (0..3).map(|r| columns[p][r] * columns[q][r]).sum::<f64>();
+            }
+        }
+    }
+    for value in &mut covariance {
+        *value /= jacobians.len() as f64;
+    }
+    let trace_c: f64 = (0..count).map(|p| covariance[p * count + p]).sum();
+    let trace_cc: f64 = covariance.iter().map(|v| v * v).sum();
+    let root_two_two = 2.0 * std::f64::consts::SQRT_2;
+    let mut max_jj = 0.0f64;
+    let mut max_jcj = 0.0f64;
+    for columns in &jacobians {
+        // `J Jᵀ` and `J C Jᵀ`, both 3 × 3.
+        let mut jj = [[0.0; 3]; 3];
+        let mut jcj = [[0.0; 3]; 3];
+        let mut jc = vec![[0.0; 3]; count];
+        for q in 0..count {
+            for p in 0..count {
+                let c = covariance[p * count + q];
+                if c != 0.0 {
+                    for r in 0..3 {
+                        jc[q][r] += columns[p][r] * c;
+                    }
+                }
+            }
+        }
+        for r in 0..3 {
+            for s in 0..3 {
+                jj[r][s] = (0..count).map(|p| columns[p][r] * columns[p][s]).sum();
+                jcj[r][s] = (0..count).map(|q| jc[q][r] * columns[q][s]).sum();
+            }
+        }
+        let frobenius = |m: &[[f64; 3]; 3]| m.iter().flatten().map(|v| v * v).sum::<f64>().sqrt();
+        let trace = |m: &[[f64; 3]; 3]| m[0][0] + m[1][1] + m[2][2];
+        max_jj = max_jj.max(trace(&jj) + root_two_two * frobenius(&jj));
+        max_jcj = max_jcj.max(trace(&jcj) + root_two_two * frobenius(&jcj));
+    }
+    let delta = estimation.max_step;
+    let sigma4 = if max_jj > 1e-14 {
+        delta / max_jj.sqrt()
+    } else {
+        0.0
+    };
+    let mut rng = SplitMix(mix_key(&[
+        context.params.seed,
+        context.level as u64,
+        0xA11C,
+    ]));
+    let mut exact_gg = 0.0;
+    let mut diff_gg = 0.0;
+    for measurement in 0..estimation.gradient_measurements {
+        // Perturb in scaled parameters, `μ = (y + σ₄ ξ) / √s`.
+        let perturbed: Vec<f64> = current
+            .iter()
+            .zip(&root)
+            .map(|(value, r)| value + sigma4 * rng.normal() / r)
+            .collect();
+        let exact = context.evaluate(
+            &perturbed,
+            SampleSource::Grid {
+                count: estimation.exact_gradient_samples,
+            },
+            true,
+        )?;
+        let key = mix_key(&[
+            context.params.seed,
+            context.level as u64,
+            0xE57,
+            measurement as u64,
+        ]);
+        let approximate = context.evaluate(
+            &perturbed,
+            SampleSource::Random {
+                key,
+                count: context.params.samples,
+            },
+            true,
+        )?;
+        if exact.valid == 0 || approximate.valid == 0 {
+            return Err(Error::InvalidArgument(format!(
+                "stochastic fit: level {}: no samples map inside the moving image while estimating \
+                 the gain",
+                context.level
+            )));
+        }
+        for p in 0..count {
+            let e = exact.gradient[p] / root[p];
+            let a = approximate.gradient[p] / root[p];
+            exact_gg += e * e;
+            diff_gg += (e - a) * (e - a);
+        }
+    }
+    exact_gg /= estimation.gradient_measurements as f64;
+    diff_gg /= estimation.gradient_measurements as f64;
+    let sigma1 = if exact_gg > 1e-14 && trace_c > 1e-14 {
+        (exact_gg / trace_c).sqrt()
+    } else {
+        0.0
+    };
+    let sigma3 = if diff_gg > 1e-14 && trace_c > 1e-14 {
+        (diff_gg / trace_c).sqrt()
+    } else {
+        0.0
+    };
+    let a_max = if sigma1 > 1e-14 && max_jcj > 1e-14 {
+        big_a * delta / sigma1 / max_jcj.sqrt()
+    } else {
+        0.0
+    };
+    let noise = sigma1 * sigma1 / (sigma1 * sigma1 + sigma3 * sigma3 + 1e-14);
+    let a = a_max * noise;
+    if !(a > 0.0) || !a.is_finite() {
+        return Err(Error::InvalidArgument(format!(
+            "stochastic fit: level {}: the automatic gain estimate is {a} (σ₁ {sigma1}, σ₃ \
+             {sigma3}); the metric has no gradient at the starting point",
+            context.level
+        )));
+    }
+    let omega = (estimation.sigmoid_scale_factor * sigma3 * sigma3 * trace_cc.sqrt()).max(1e-14);
+    Ok((
+        GainSequence {
+            a,
+            big_a,
+            alpha: 1.0,
+        },
+        SigmoidTime {
+            max: 1.0,
+            min: -0.99 + 0.98 * noise,
+            scale: omega,
+            initial_time,
+        },
+    ))
+}
+
+/// [`bspline_grid_after`] with no initial transform.
+pub fn bspline_grid_for_spacing(
+    shape: [usize; 3],
+    spacing: [f64; 3],
+) -> ([usize; 3], BSplineLayout) {
+    bspline_grid_after(shape, spacing, &AffineMap::identity())
+}
+
+/// The bounding box of the box `[lo, hi]` mapped by `map`.
+fn mapped_box(map: &AffineMap, lo: [f64; 3], hi: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let mut out_lo = [f64::INFINITY; 3];
+    let mut out_hi = [f64::NEG_INFINITY; 3];
+    for corner in 0..8 {
+        let p: [f64; 3] = std::array::from_fn(|a| if corner >> a & 1 == 0 { lo[a] } else { hi[a] });
+        let q = map.apply(p);
+        for a in 0..3 {
+            out_lo[a] = out_lo[a].min(q[a]);
+            out_hi[a] = out_hi[a].max(q[a]);
+        }
+    }
+    (out_lo, out_hi)
+}
+
+/// elastix's B-spline grid for one level (`GridScheduleComputer`) over a
+/// fixed image of `shape` unit voxels: `ceil(n / spacing)` intervals centred
+/// on the image's `n - 1` voxel span, plus the order, so the first node is one
+/// spacing before the first interval. (Measured: a 285 × 478 × 248 image at
+/// spacing 25 gets elastix's `GridSize 15 23 13`.)
+///
+/// With an initial transform `pre` the grid covers the bounding box of the
+/// fixed image mapped by `pre`, stretched per axis so that it still has the
+/// same number of intervals: the image's voxel spacing becomes
+/// `(hi - lo) / (n - 1)` and the grid spacing `spacing` of those. (Measured on
+/// a real affine: elastix's `GridSpacing` and `GridOrigin` to 1e-6.)
+pub fn bspline_grid_after(
+    shape: [usize; 3],
+    spacing: [f64; 3],
+    pre: &AffineMap,
+) -> ([usize; 3], BSplineLayout) {
+    let (lo, hi) = mapped_box(pre, [0.0; 3], shape.map(|n| (n - 1) as f64));
+    let mut size = [0usize; 3];
+    let mut origin = [0.0; 3];
+    let mut grid_spacing = [0.0; 3];
+    for a in 0..3 {
+        let n = shape[a] as f64;
+        let voxel = if n > 1.0 {
+            (hi[a] - lo[a]) / (n - 1.0)
+        } else {
+            1.0
+        };
+        let step = spacing[a] * voxel;
+        let bare = (n / spacing[a]).ceil().max(1.0);
+        size[a] = bare as usize + 3;
+        grid_spacing[a] = step;
+        origin[a] = lo[a] - (bare * step - (n - 1.0) * voxel) / 2.0 - step;
+    }
+    (
+        size,
+        BSplineLayout {
+            origin,
+            spacing: grid_spacing,
+        },
+    )
+}
+
+/// Coefficients on `fine`'s grid that reproduce `coarse`'s deformation:
+/// the coarse spline evaluated at the fine nodes (mirror boundary, as ITK's
+/// resample of a coefficient image), then decomposed into cubic coefficients.
+fn upsample_bspline(
+    coarse: &StochasticModel,
+    coefficients: &[f64],
+    fine: &StochasticModel,
+) -> Vec<f64> {
+    let per_coarse = coarse.per_axis();
+    let mut out = Vec::with_capacity(fine.parameter_count());
+    for axis in 0..3 {
+        let block = &coefficients[axis * per_coarse..(axis + 1) * per_coarse];
+        let values =
+            Array3::from_shape_fn((fine.grid[2], fine.grid[1], fine.grid[0]), |(k, j, i)| {
+                let p = [
+                    fine.layout.origin[0] + i as f64 * fine.layout.spacing[0],
+                    fine.layout.origin[1] + j as f64 * fine.layout.spacing[1],
+                    fine.layout.origin[2] + k as f64 * fine.layout.spacing[2],
+                ];
+                let mut sum = 0.0;
+                let mut index = [[0usize; 4]; 3];
+                let mut w = [[0.0; 4]; 3];
+                for a in 0..3 {
+                    let u = (p[a] - coarse.layout.origin[a]) / coarse.layout.spacing[a];
+                    let base = u.floor() as isize - 1;
+                    for t in 0..4 {
+                        let node = base + t as isize;
+                        index[a][t] = mirror_index(node, coarse.grid[a]);
+                        w[a][t] = cubic_basis(u - node as f64);
+                    }
+                }
+                for c in 0..4 {
+                    for b in 0..4 {
+                        for a in 0..4 {
+                            let flat = index[0][a]
+                                + coarse.grid[0] * (index[1][b] + coarse.grid[1] * index[2][c]);
+                            sum += w[0][a] * w[1][b] * w[2][c] * block[flat];
+                        }
+                    }
+                }
+                sum as f32
+            });
+        // Stored `[k, j, i]` so that the flat index `i + nx (j + ny k)` is the
+        // row-major order of this array.
+        let decomposed = cubic_coefficients(values);
+        out.extend(decomposed.iter().map(|v| *v as f64));
+    }
+    out
+}
+
+fn extrema(image: &Array3<f32>) -> (f64, f64) {
+    let fold = |chunk: &[f32]| {
+        chunk
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(*v as f64), hi.max(*v as f64))
+            })
+    };
+    match image.as_slice() {
+        Some(values) => values.par_chunks(1 << 16).map(fold).reduce(
+            || (f64::INFINITY, f64::NEG_INFINITY),
+            |(a, b), (c, d)| (a.min(c), b.max(d)),
+        ),
+        None => fold(&image.iter().copied().collect::<Vec<_>>()),
+    }
+}
+
+/// Apply `filter` to every line of `image` along `axis`, lines in parallel.
+fn filter_lines(image: &mut Array3<f32>, axis: usize, filter: &(dyn Fn(&mut [f32]) + Sync)) {
+    let outer = if axis == 0 { 1 } else { 0 };
+    let views: Vec<_> = image.axis_chunks_iter_mut(Axis(outer), 1).collect();
+    views.into_par_iter().for_each(|mut view| {
+        let mut buffer = Vec::new();
+        for mut lane in view.lanes_mut(Axis(axis)) {
+            buffer.clear();
+            buffer.extend(lane.iter().copied());
+            filter(&mut buffer);
+            for (slot, value) in lane.iter_mut().zip(&buffer) {
+                *slot = *value;
+            }
+        }
+    });
+}
+
+/// Separable Gaussian smoothing, sigma in voxels per axis, kernel truncated
+/// at four sigma, edge values repeated beyond the image.
+fn gaussian_smooth(mut image: Array3<f32>, sigma: [f64; 3]) -> Array3<f32> {
+    for axis in 0..3 {
+        if sigma[axis] <= 0.0 {
+            continue;
+        }
+        let radius = (4.0 * sigma[axis]).ceil() as isize;
+        let mut kernel: Vec<f64> = (-radius..=radius)
+            .map(|k| (-0.5 * (k as f64 / sigma[axis]).powi(2)).exp())
+            .collect();
+        let total: f64 = kernel.iter().sum();
+        kernel.iter_mut().for_each(|w| *w /= total);
+        filter_lines(&mut image, axis, &|line: &mut [f32]| {
+            let n = line.len() as isize;
+            let source: Vec<f32> = line.to_vec();
+            for (i, slot) in line.iter_mut().enumerate() {
+                let mut sum = 0.0;
+                for (k, w) in kernel.iter().enumerate() {
+                    let j = (i as isize + k as isize - radius).clamp(0, n - 1);
+                    sum += w * source[j as usize] as f64;
+                }
+                *slot = sum as f32;
+            }
+        });
+    }
+    image
+}
+
+/// Interpolating cubic B-spline coefficients (Unser's recursive filter, pole
+/// `√3 - 2`, mirror boundaries), every axis.
+fn cubic_coefficients(mut image: Array3<f32>) -> Array3<f32> {
+    for axis in 0..3 {
+        if image.shape()[axis] > 1 {
+            filter_lines(&mut image, axis, &cubic_prefilter_line);
+        }
+    }
+    image
+}
+
+fn cubic_prefilter_line(line: &mut [f32]) {
+    let n = line.len();
+    if n < 2 {
+        return;
+    }
+    let z = 3.0f64.sqrt() - 2.0;
+    let lambda = (1.0 - z) * (1.0 - 1.0 / z);
+    let mut c: Vec<f64> = line.iter().map(|v| *v as f64 * lambda).collect();
+    // Causal initialisation on the mirrored signal, truncated where `z^k` is
+    // below `1e-10`.
+    let horizon = ((1.0e-10f64).ln() / z.abs().ln()).ceil() as usize;
+    let first = if horizon < n {
+        let mut sum = c[0];
+        let mut zn = z;
+        for value in c.iter().take(horizon).skip(1) {
+            sum += zn * value;
+            zn *= z;
+        }
+        sum
+    } else {
+        let mut zn = z;
+        let iz = 1.0 / z;
+        let mut z2n = z.powi(n as i32 - 1);
+        let mut sum = c[0] + z2n * c[n - 1];
+        z2n = z2n * z2n * iz;
+        for value in c.iter().take(n - 1).skip(1) {
+            sum += (zn + z2n) * value;
+            zn *= z;
+            z2n *= iz;
+        }
+        sum / (1.0 - zn * zn)
+    };
+    c[0] = first;
+    for k in 1..n {
+        c[k] += z * c[k - 1];
+    }
+    c[n - 1] = (z / (z * z - 1.0)) * (c[n - 1] + z * c[n - 2]);
+    for k in (0..n - 1).rev() {
+        c[k] = z * (c[k + 1] - c[k]);
+    }
+    for (slot, value) in line.iter_mut().zip(&c) {
+        *slot = *value as f32;
+    }
+}
+
 // ------------------------------------------------------------------ tests --
 
 /// The numerical kernels underneath the fitter, against derivatives and
@@ -2407,6 +4569,412 @@ mod tests {
     /// its sample at least `1e-3` from a cell boundary — and off a cell face
     /// entirely — so that the two evaluations stay on the same linear piece.
     const H: f64 = 1.0e-6;
+
+    // ------------------------------------------------------- stochastic --
+
+    /// A smooth, asymmetric scene: a few Gaussian blobs of different sizes and
+    /// heights, so that mutual information has one clear optimum.
+    fn blob_scene(shape: [usize; 3], shift: [f64; 3]) -> Array3<f32> {
+        blob_scene_in(shape, shape, shift)
+    }
+
+    /// The scene laid out for `scene` voxels, sampled on an array of `shape`:
+    /// four large blobs and twenty small ones at pseudo-random places.
+    fn blob_scene_in(shape: [usize; 3], scene: [usize; 3], shift: [f64; 3]) -> Array3<f32> {
+        let mut blobs = vec![
+            ([0.35, 0.40, 0.45], 0.18, 1.0),
+            ([0.65, 0.55, 0.35], 0.12, 0.6),
+            ([0.45, 0.70, 0.65], 0.09, 0.8),
+            ([0.60, 0.30, 0.70], 0.07, 0.4),
+        ];
+        let mut state: u64 = 0x5EED_2026;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for _ in 0..20 {
+            let centre = [
+                0.15 + 0.7 * next(),
+                0.15 + 0.7 * next(),
+                0.15 + 0.7 * next(),
+            ];
+            blobs.push((centre, 0.03 + 0.03 * next(), 0.2 + 0.6 * next()));
+        }
+        Array3::from_shape_fn((shape[0], shape[1], shape[2]), |(i, j, k)| {
+            let p = [
+                i as f64 - shift[0],
+                j as f64 - shift[1],
+                k as f64 - shift[2],
+            ];
+            let mut value = 0.05;
+            for (centre, width, height) in &blobs {
+                let mut d2 = 0.0;
+                for a in 0..3 {
+                    let n = scene[a] as f64;
+                    let d = (p[a] - centre[a] * n) / (width * n);
+                    d2 += d * d;
+                }
+                value += height * (-0.5 * d2).exp();
+            }
+            value as f32
+        })
+    }
+
+    fn level_context<'a>(
+        params: &'a StochasticFitParams,
+        fixed: &Array3<f32>,
+        moving: &Array3<f32>,
+        model: StochasticModel,
+    ) -> StochasticLevelContext<'a> {
+        let (fmin, fmax) = extrema(fixed);
+        let (mmin, mmax) = extrema(moving);
+        StochasticLevelContext {
+            params,
+            fixed: SampledImage::new(fixed.clone(), params.fixed_order),
+            moving: SampledImage::new(moving.clone(), params.moving_order),
+            fixed_parzen: Parzen::new(params.fixed_bins, params.fixed_kernel_order, fmin, fmax),
+            moving_parzen: Parzen::new(params.moving_bins, params.moving_kernel_order, mmin, mmax),
+            model,
+            pre: AffineMap::identity(),
+            prior: AffineMap::identity(),
+            prior_transpose: AffineMap::identity().matrix,
+            level: 0,
+        }
+    }
+
+    /// **The Mattes gradient is the derivative of the Mattes metric**, for an
+    /// affine and for a B-spline, on a fixed set of samples.
+    ///
+    /// Cubic moving reads and cubic Parzen windows make the metric smooth in
+    /// the parameters, so a central difference converges on the analytic
+    /// gradient; a sign error, a missing `1 / bin size` or a dropped `priorᵀ`
+    /// is off by a factor, not by a rounding error.
+    #[test]
+    fn the_mattes_gradient_is_the_derivative_of_the_metric() {
+        // The moving image is larger and offset by `prior`, so every fixed
+        // sample stays well inside it under the probed parameters and a
+        // central difference sees the same sample set on both sides.
+        let shape = [20, 22, 24];
+        let fixed = blob_scene(shape, [0.0; 3]);
+        let moving = blob_scene_in([30, 32, 34], shape, [6.3, 4.3, 5.9]);
+        let prior = AffineMap {
+            matrix: AffineMap::identity().matrix,
+            offset: [5.0; 3],
+        };
+        let params = StochasticFitParams {
+            fixed_kernel_order: 3,
+            moving_kernel_order: 3,
+            fixed_order: SampleOrder::Cubic,
+            moving_order: SampleOrder::Cubic,
+            fixed_bins: 16,
+            moving_bins: 16,
+            ..StochasticFitParams::default()
+        };
+        let source = SampleSource::Grid { count: 3000 };
+        let centre = shape.map(|n| (n - 1) as f64 / 2.0);
+        let affine = StochasticModel {
+            kind: TransformModel::Affine,
+            centre,
+            grid: [0; 3],
+            layout: BSplineLayout {
+                origin: [0.0; 3],
+                spacing: [1.0; 3],
+            },
+        };
+        let (grid, layout) = bspline_grid_for_spacing(shape, [8.0; 3]);
+        let bspline = StochasticModel {
+            kind: TransformModel::BSpline,
+            centre,
+            grid,
+            layout,
+        };
+        let count = 3 * grid[0] * grid[1] * grid[2];
+        let mut bspline_params = vec![0.0; count];
+        for (index, value) in bspline_params.iter_mut().enumerate() {
+            *value = 0.3 * ((index as f64) * 0.37).sin();
+        }
+        let cases = [
+            (
+                affine,
+                vec![
+                    1.02, 0.03, -0.01, -0.02, 0.98, 0.02, 0.01, -0.03, 1.01, 0.4, -0.3, 0.2,
+                ],
+                0.0,
+            ),
+            (bspline, bspline_params, 0.0),
+        ];
+        for (model, point, _) in cases {
+            let kind = model.kind;
+            let mut context = level_context(&params, &fixed, &moving, model);
+            context.prior = prior;
+            let at = context.evaluate(&point, source, true).unwrap();
+            assert!(at.valid > 1000, "{kind:?}: {} valid samples", at.valid);
+            let h = 1.0e-5;
+            let probes: Vec<usize> = if kind == TransformModel::Affine {
+                (0..12).collect()
+            } else {
+                (0..point.len()).step_by(point.len() / 23).collect()
+            };
+            let mut worst = 0.0f64;
+            let scale = at.gradient.iter().map(|g| g.abs()).fold(0.0, f64::max);
+            for p in probes {
+                let mut plus = point.clone();
+                plus[p] += h;
+                let mut minus = point.clone();
+                minus[p] -= h;
+                let up = context.evaluate(&plus, source, false).unwrap();
+                let down = context.evaluate(&minus, source, false).unwrap();
+                assert_eq!(up.valid, at.valid, "{kind:?}: the sample set moved");
+                let numeric = (up.cost - down.cost) / (2.0 * h);
+                worst = worst.max((numeric - at.gradient[p]).abs());
+            }
+            assert!(
+                worst <= 1.0e-3 * scale,
+                "{kind:?}: worst gradient error {worst:e} against a largest component {scale:e}"
+            );
+        }
+    }
+
+    /// The cubic sampler interpolates: at voxel centres it returns the voxel,
+    /// and its gradient is the derivative of its value.
+    #[test]
+    fn the_cubic_sampler_interpolates_and_differentiates() {
+        let image = blob_scene([9, 10, 11], [0.0; 3]);
+        let sampler = SampledImage::new(image.clone(), SampleOrder::Cubic);
+        for (index, value) in image.indexed_iter() {
+            let p = [index.0 as f64, index.1 as f64, index.2 as f64];
+            let got = sampler.value(p);
+            assert!(
+                (got - *value as f64).abs() < 1.0e-5,
+                "{index:?}: {got} vs {value}"
+            );
+        }
+        for p in [[3.3, 4.7, 5.1], [0.2, 9.1, 0.4], [8.4, 0.3, 10.2]] {
+            let (_, gradient) = sampler.value_and_gradient(p);
+            for a in 0..3 {
+                let mut up = p;
+                up[a] += 1.0e-4;
+                let mut down = p;
+                down[a] -= 1.0e-4;
+                let numeric = (sampler.value(up) - sampler.value(down)) / 2.0e-4;
+                assert!(
+                    (numeric - gradient[a]).abs() < 1.0e-4,
+                    "{p:?} axis {a}: {numeric} vs {}",
+                    gradient[a]
+                );
+            }
+        }
+    }
+
+    /// Refining a B-spline onto the next level's grid keeps the deformation.
+    #[test]
+    fn upsampling_a_bspline_keeps_its_deformation() {
+        let shape = [40, 44, 36];
+        let (coarse_grid, coarse_layout) = bspline_grid_for_spacing(shape, [16.0; 3]);
+        let (fine_grid, fine_layout) = bspline_grid_for_spacing(shape, [8.0; 3]);
+        let coarse = StochasticModel {
+            kind: TransformModel::BSpline,
+            centre: [0.0; 3],
+            grid: coarse_grid,
+            layout: coarse_layout,
+        };
+        let fine = StochasticModel {
+            kind: TransformModel::BSpline,
+            centre: [0.0; 3],
+            grid: fine_grid,
+            layout: fine_layout,
+        };
+        // A smooth field over the control grid: refinement onto a grid that is
+        // not nested in the coarse one is a least-error fit, not an identity, so
+        // a field that wiggles at the coarse node spacing is not reproduced.
+        let per = coarse.per_axis();
+        let coefficients: Vec<f64> = (0..coarse.parameter_count())
+            .map(|index| {
+                let (axis, flat) = (index / per, index % per);
+                let i = flat % coarse_grid[0];
+                let j = (flat / coarse_grid[0]) % coarse_grid[1];
+                let k = flat / (coarse_grid[0] * coarse_grid[1]);
+                1.5 * (0.4 * i as f64 + 0.3 * j as f64 - 0.5 * k as f64 + axis as f64).sin()
+            })
+            .collect();
+        let refined = upsample_bspline(&coarse, &coefficients, &fine);
+        let mut worst = 0.0f64;
+        for i in (0..shape[0]).step_by(3) {
+            for j in (0..shape[1]).step_by(5) {
+                for k in (0..shape[2]).step_by(4) {
+                    let x = [i as f64 + 0.3, j as f64 + 0.1, k as f64 + 0.7];
+                    let a = coarse.apply(&coefficients, x);
+                    let b = fine.apply(&refined, x);
+                    for axis in 0..3 {
+                        worst = worst.max((a[axis] - b[axis]).abs());
+                    }
+                }
+            }
+        }
+        assert!(worst < 5.0e-2, "refined field differs by {worst}");
+    }
+
+    /// elastix's grid for a 285-voxel axis at spacing 25: 12 intervals
+    /// centred on the image, plus the order, the first node one spacing before
+    /// the first interval.
+    #[test]
+    fn the_bspline_grid_is_placed_as_elastix_places_it() {
+        let (size, layout) = bspline_grid_for_spacing([285, 478, 248], [25.0; 3]);
+        assert_eq!(size, [15, 23, 13]);
+        assert_eq!(layout.origin, [-33.0, -36.5, -26.5]);
+
+        // After an affine, the grid covers the affine's image of the fixed
+        // box. The affine and the expected grid are elastix's own, from a real
+        // autofluorescence-to-atlas run (`TransformParameters.{0,1}.txt`).
+        let matrix = [
+            [1.261122, -0.172123, -0.063325],
+            [0.105534, 1.092952, -0.024395],
+            [0.053962, 0.008768, 0.999653],
+        ];
+        let centre = [142.0, 238.5, 123.5];
+        let translation = [18.769453, 54.163833, 20.403858];
+        let offset = std::array::from_fn(|r| {
+            centre[r] + translation[r] - (0..3).map(|k| matrix[r][k] * centre[k]).sum::<f64>()
+        });
+        let (size, layout) =
+            bspline_grid_after([285, 478, 248], [25.0; 3], &AffineMap { matrix, offset });
+        assert_eq!(size, [15, 23, 13]);
+        let spacing = [40.1322914792, 29.2104492227, 26.9657821803];
+        let origin = [-120.1565873936, -28.6511081593, -17.8908353149];
+        for a in 0..3 {
+            assert!((layout.spacing[a] - spacing[a]).abs() < 1e-4, "{layout:?}");
+            assert!((layout.origin[a] - origin[a]).abs() < 1e-3, "{layout:?}");
+        }
+    }
+
+    /// An affine fit recovers a known map, and its answer does not depend on
+    /// the number of workers.
+    ///
+    /// The moving image is larger than the fixed one and offset by `prior`, so
+    /// no sample leaves it near the answer. 64 bins: on a scene this smooth the
+    /// Parzen estimate with 32 bins is largest at a map that shrinks by 2 per
+    /// cent (measured independently in numpy: 1.1400 at 0.98 against 1.1361 at
+    /// 1.0), while with 128 bins it is largest at the true map. That is a
+    /// property of the estimator, which elastix shares, not of the optimiser.
+    #[test]
+    fn a_stochastic_affine_fit_recovers_a_known_map_and_is_deterministic() {
+        let shape = [40, 44, 48];
+        let fixed = blob_scene(shape, [0.0; 3]);
+        // Moving voxel `x + 6` holds the scene at `x - (2.5, -1.5, 3)`.
+        let moving = blob_scene_in([52, 56, 60], shape, [8.5, 4.5, 9.0]);
+        let prior = AffineMap {
+            matrix: AffineMap::identity().matrix,
+            offset: [6.0; 3],
+        };
+        let params = StochasticFitParams {
+            levels: elastix_levels(2, 200, None),
+            samples: 2000,
+            fixed_bins: 64,
+            moving_bins: 64,
+            fixed_order: SampleOrder::Cubic,
+            moving_order: SampleOrder::Cubic,
+            fixed_kernel_order: 3,
+            moving_kernel_order: 3,
+            initialisation: StochasticInitialisation::Identity,
+            workers: 1,
+            ..StochasticFitParams::default()
+        };
+        let fit = |workers| {
+            fit_stochastic(
+                &StochasticFitParams {
+                    workers,
+                    ..params.clone()
+                },
+                fixed.view(),
+                moving.view(),
+                &AffineMap::identity(),
+                &prior,
+                None,
+                SpatialFrame::unit(),
+            )
+            .unwrap()
+        };
+        let one = fit(1);
+        let four = fit(4);
+        assert_eq!(one.transform.params, four.transform.params);
+        let map = AffineMap::from_params(&one.transform.params).unwrap();
+        for x in [[10.0, 12.0, 30.0], [30.0, 20.0, 10.0], [20.0, 35.0, 25.0]] {
+            let y = map.apply(x);
+            let want = [x[0] + 2.5, x[1] - 1.5, x[2] + 3.0];
+            for a in 0..3 {
+                assert!(
+                    (y[a] - want[a]).abs() < 0.2,
+                    "{x:?} -> {y:?}, want {want:?}"
+                );
+            }
+        }
+        assert!(one
+            .levels
+            .iter()
+            .all(|l| l.final_cost < l.initial_cost + 1e-3));
+    }
+
+    /// A scaled affine step weighs each matrix entry by the mean square of the
+    /// coordinate it multiplies, so its norm is a displacement in voxels.
+    #[test]
+    fn scaled_affine_steps_weigh_matrix_entries_by_coordinate_size() {
+        let params = VolumeFitParams {
+            scaled_affine_steps: true,
+            ..VolumeFitParams::default().affine()
+        };
+        let weights = step_weights(&params, [10, 20, 30]).unwrap();
+        // E[x^2] over 0..n is (n - 1)(2n - 1) / 6.
+        assert_eq!(weights[0], 9.0 * 19.0 / 6.0);
+        assert_eq!(weights[4], 19.0 * 39.0 / 6.0);
+        assert_eq!(weights[8], 29.0 * 59.0 / 6.0);
+        assert_eq!(&weights[9..], &[1.0; 3]);
+        let mut step = vec![0.0; 12];
+        step[2] = 0.01;
+        let norm = weighted_norm(&step, Some(&weights));
+        assert!((norm - 0.01 * weights[2].sqrt()).abs() < 1e-15);
+        let clamped = clamp_step_weighted(step, norm / 2.0, Some(&weights));
+        assert!((weighted_norm(&clamped, Some(&weights)) - norm / 2.0).abs() < 1e-12);
+        assert!(step_weights(&VolumeFitParams::default().affine(), [10, 20, 30]).is_none());
+        assert!(step_weights(
+            &VolumeFitParams {
+                scaled_affine_steps: true,
+                ..VolumeFitParams::default()
+            },
+            [10, 20, 30]
+        )
+        .is_none());
+    }
+
+    /// A relative tolerance ends the Gauss-Newton loop on a small relative
+    /// cost change, where the absolute tolerances alone go on.
+    #[test]
+    fn a_relative_tolerance_stops_the_gauss_newton_loop() {
+        let shape = [16, 18, 20];
+        let fixed: Voxels = blob_scene(shape, [0.0; 3]).mapv(f64::from).into();
+        let moving: Voxels = blob_scene(shape, [0.6, -0.4, 0.3]).mapv(f64::from).into();
+        let base = VolumeFitParams {
+            tolerance: 1.0e-9,
+            limit: SubstageLimit::of(40).unwrap(),
+            ..VolumeFitParams::default()
+        };
+        let relative = VolumeFitParams {
+            relative_tolerance: Some(0.5),
+            ..base.clone()
+        };
+        let stopped = run_with_diagnostics(&relative, &fixed, &moving, 8, 2).unwrap();
+        assert_eq!(stopped.converged_by, FitConvergence::CostTolerance);
+        assert!(stopped.substages <= 3, "{stopped:?}");
+        let tighter = VolumeFitParams {
+            relative_tolerance: Some(1.0e-12),
+            ..base
+        };
+        let longer = run_with_diagnostics(&tighter, &fixed, &moving, 8, 2);
+        if let Ok(longer) = longer {
+            assert!(longer.substages > stopped.substages, "{longer:?}");
+        }
+    }
 
     // ------------------------------------------------------ solve_linear --
 
@@ -2576,8 +5144,17 @@ mod tests {
 
         // The B-spline branch is the diagonal of the same equations, and it is a
         // different answer here, which is what makes it worth branching on.
-        let diagonal = solve_step(TransformModel::BSpline, hessian, gradient.clone(), damping)
-            .expect("a diagonal solve never fails");
+        // B-spline evidence is held as the diagonal alone.
+        let diagonal_only = (0..n)
+            .map(|axis| hessian[symmetric_index(axis, axis)])
+            .collect();
+        let diagonal = solve_step(
+            TransformModel::BSpline,
+            diagonal_only,
+            gradient.clone(),
+            damping,
+        )
+        .expect("a diagonal solve never fails");
         for axis in 0..n {
             let expected = -gradient[axis]
                 / (jacobians.iter().map(|j| j[axis] * j[axis]).sum::<f64>() + damping);
