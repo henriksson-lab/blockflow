@@ -1,0 +1,23 @@
+[package]
+name = "atlas-regions"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Atlas region lookups: an annotation volume and its region tree, applied to points and masks."
+
+[dependencies]
+blockflow = { path = "../.." }
+clap = { version = "4.5", features = ["derive"], optional = true }
+ndarray = "0.17"
+serde_json = "1"
+
+[features]
+# OME-Zarr reading and writing of atlases, and the `atlas-prepare` CLI. Off by
+# default: the lookups need neither.
+zarr = ["blockflow/zarr", "dep:clap"]
+
+[[bin]]
+name = "atlas-prepare"
+path = "src/bin/atlas_prepare.rs"
+required-features = ["zarr"]
