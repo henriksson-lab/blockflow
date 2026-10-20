@@ -114,8 +114,8 @@ fn write_image(root: &Path) {
         .unwrap();
 }
 
-fn config(zarr: &Path, out: &Path, block: &str) -> Config {
-    Config::parse_from([
+fn config(zarr: &Path, out: &Path, block: &str, stained: bool) -> Config {
+    let mut args = vec![
         "bead-layer-distance",
         "--zarr",
         zarr.to_str().unwrap(),
@@ -132,7 +132,11 @@ fn config(zarr: &Path, out: &Path, block: &str) -> Config {
         // the synthetic sheet is 64 x 64 x 3 voxels, 0.25e6 µm³
         "--epithelium-min-volume-um3",
         "50000",
-    ])
+    ];
+    if stained {
+        args.push("--stained-epithelium");
+    }
+    Config::parse_from(args)
 }
 
 fn scratch() -> PathBuf {
@@ -155,7 +159,7 @@ fn finds_layers_beads_and_the_large_object_on_any_grid() {
     let mut outputs = Vec::new();
     for (block, name) in [("32,256,256", "a"), ("16,32,32", "b")] {
         let out = dir.join(name);
-        let summary = run(&config(&zarr, &out, block)).unwrap();
+        let summary = run(&config(&zarr, &out, block, true)).unwrap();
         assert_eq!(summary.beads, BEADS.len(), "{summary:?}");
         assert_eq!(summary.large_objects, 1, "{summary:?}");
         outputs.push(out);
@@ -283,5 +287,33 @@ fn finds_layers_beads_and_the_large_object_on_any_grid() {
             format!("../../labels/{table}")
         );
     }
+
+    // by default (no stained epithelium) a rerun drops its label and columns,
+    // and nothing else changes
+    let out = dir.join("c");
+    run(&config(&zarr, &out, "32,256,256", false)).unwrap();
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(zarr.join("labels/zarr.json")).unwrap()).unwrap();
+    let mut labels: Vec<String> =
+        serde_json::from_value(registry["attributes"]["ome"]["labels"].clone()).unwrap();
+    labels.sort();
+    assert_eq!(
+        labels,
+        [
+            "bjorn-beads",
+            "bjorn-large-af488",
+            "bjorn-layers",
+            "bjorn-surfaces"
+        ]
+    );
+    assert!(!zarr.join("labels/bjorn-epithelium").exists());
+    let plain = fs::read_to_string(out.join("beads.csv")).unwrap();
+    assert!(!plain.lines().next().unwrap().contains("epithelium_"));
+    let strip = |text: &str| -> Vec<String> {
+        text.lines()
+            .map(|l| l.split(',').take(26).collect::<Vec<_>>().join(","))
+            .collect()
+    };
+    assert_eq!(strip(&plain), strip(&csv));
     let _ = fs::remove_dir_all(&dir);
 }

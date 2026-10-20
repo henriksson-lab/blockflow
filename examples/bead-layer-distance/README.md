@@ -16,8 +16,8 @@ level 0; nothing loads a whole volume.
 | surfaces | mucus top and epithelium found jointly as one exact minimum cut over columns pooled 4 × 4: step ≤ 2 slices between neighbours, mucus ≥ 2 slices thick. Past `--max-surface-nodes`, **multigrid**: exact on coarser columns, then exact cuts on 32 × 32-column tiles with shifting edges at full resolution | `ops::surfaces` (`append_layered_surface_phases`, `SurfaceMethod`), `graph_cut` |
 | large AF488 objects | inside the mucus band, smoothed AF488 above median + 15 MAD-σ and C-Blue not above its own such level (beads are bright in AF488 too); 26-connected components ≥ 4000 µm³; IDs from each object's first voxel | `SurfaceBandOp`, `SampledValuesOp`, `LabelComponentsOp` / `RelabelComponentsOp`, `cells` (here) |
 | bead candidates | DoG on C-Blue; keep the response at or above median + 12 MAD-σ; exact regional maxima; strongest first, at least 6 µm apart | `BlobResponseOp`, `GlobalThreshold::RobustSigma`, `KeepAtOrAbove`, `append_response_peak_table_phases`, `suppress_within_distance` |
-| stained epithelium | smoothed AF488 at or above a log-Otsu level sampled within 10 slices of the fitted epithelium, closed (radius 1,2,2), pieces under 10⁶ µm³ dropped. Inside also: fitted tissue 2+ slices down, and all these seal off from the lumen (`z = 0` face), so beneath the epithelium is inside and a fold's pocket open to the mucus is not | `ApplyGlobalThresholdOp` (`Mask`), `MorphologyOp`, `append_remove_small_objects_phases`, `fill::append_open_on`, `MaskUnionOp` (here) |
-| distances | each candidate's signed closest distance (negative inside) and nearest point, to the fitted tissue region and to the stained epithelium; exact up to `--distance-cap-um` (600) | `ops::point_distance` (boundary voxels per block, searched from each point) |
+| stained epithelium (opt-in, `--stained-epithelium`; experimental) | smoothed AF488 at or above a log-Otsu level sampled within 10 slices of the fitted epithelium, closed (radius 1,2,2), pieces under 10⁶ µm³ dropped. Inside also: fitted tissue 2+ slices down, and all these seal off from the lumen (`z = 0` face), so beneath the epithelium is inside and a fold's pocket open to the mucus is not | `ApplyGlobalThresholdOp` (`Mask`), `MorphologyOp`, `append_remove_small_objects_phases`, `fill::append_open_on`, `MaskUnionOp` (here) |
+| distances | each candidate's signed closest distance (negative inside) and nearest point, to the fitted tissue region (and, opt-in, to the stained epithelium); exact up to `--distance-cap-um` (600) | `ops::point_distance` (boundary voxels per block, searched from each point) |
 | classes | `in_tissue` if more than 5 µm below the epithelium; `spike` if not PSF-shaped (neighbours below 35 % / 15 % of the peak in z / xy); `dim` below a log-Otsu split of the rest; `in_large_object` if touching one | `beads` (here) |
 | output | label images and paired object tables published into the image; CSVs; QC images from windowed reads | `ome_zarr::publish_label`, `object_table::finalize_object_table`, `WidenLabelsOp`, `SurfaceLinesOp` |
 
@@ -62,10 +62,10 @@ included):
 | `bjorn-surfaces` | one-voxel mucus top (1) and epithelium top (2) | — |
 | `bjorn-beads` | every candidate as a small ellipsoid, labelled by ID (peak voxel + 1) | one row per candidate: `deleted` (= not counted), `class`, distances, relative depth, response, PSF scores, `large_object` |
 | `bjorn-large-af488` | large AF488 objects, labelled by ID | volume, mean AF488 and C-Blue, `n_beads` |
-| `bjorn-epithelium` | 1 = stained epithelium and what lies beneath it | — |
+| `bjorn-epithelium` | only with `--stained-epithelium`: 1 = stained epithelium and what lies beneath it (removed by a run without the flag) | — |
 
-Bead table columns per mask (`surface_` = fitted tissue region, `epithelium_`
-= stained): `*_dist_um` (signed, negative inside), `*_nearest_{z,y,x}_um`,
+Bead table columns per mask (`surface_` = fitted tissue region; `epithelium_`
+= stained, only with the flag): `*_dist_um` (signed, negative inside), `*_nearest_{z,y,x}_um`,
 `*_status` (exact / capped = an upper bound / none within reach). The existing
 `vertical_dist_um` and `euclidean_dist_um` (to the fitted height map) stay;
 `surface_dist_um` equals `euclidean_dist_um` wherever the height map has no
@@ -103,8 +103,8 @@ load (load average 10–25), so times are indicative.
 | 2481-rightbis | 81 (29–153), 12 | 10 (−7–80), 498 | 16.8 % |
 
 The fitted-surface distance equals the height-map `euclidean_dist_um` on
-every candidate of all three samples. The stained mask is **not yet
-trustworthy**: AF488 in the mucus (lumps, large objects) joins the
+every candidate of all three samples. The stained mask is **not
+trustworthy**, which is why it is opt-in: AF488 in the mucus (lumps, large objects) joins the
 epithelium and pulls the nearest point up, most of all in 2481, where 10 % of
 columns have stain above the fitted mucus top. Wall time grew by 0–14 s per
 sample.

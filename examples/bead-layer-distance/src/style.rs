@@ -75,7 +75,8 @@ fn codes<T: Copy>(all: &[T], code: impl Fn(T) -> u8, name: impl Fn(T) -> &'stati
     )
 }
 
-pub fn bead_table_spec(volume: [usize; 3]) -> TableSpec {
+/// `stained`: with the stained-epithelium columns.
+pub fn bead_table_spec(volume: [usize; 3], stained: bool) -> TableSpec {
     use crate::measure::Manual;
     let um = Some("µm");
     let mut columns = identity_and_centroid();
@@ -182,7 +183,10 @@ pub fn bead_table_spec(volume: [usize; 3]) -> TableSpec {
     for (prefix, what) in [
         ("surface", "fitted tissue region"),
         ("epithelium", "stained epithelium"),
-    ] {
+    ]
+    .into_iter()
+    .take(1 + usize::from(stained))
+    {
         columns.push(col(
             &format!("{prefix}_dist_um"),
             DType::F32,
@@ -222,7 +226,7 @@ pub fn bead_table_spec(volume: [usize; 3]) -> TableSpec {
 }
 
 /// One bead-table row; `voxel` turns the nearest points into µm.
-pub fn bead_values(m: &Measured, voxel: [f64; 3]) -> Vec<ObjectValue> {
+pub fn bead_values(m: &Measured, voxel: [f64; 3], stained: bool) -> Vec<ObjectValue> {
     let c = &m.c;
     let mut values = vec![
         ObjectValue::U64(c.id),
@@ -244,7 +248,10 @@ pub fn bead_values(m: &Measured, voxel: [f64; 3]) -> Vec<ObjectValue> {
         ObjectValue::F32(c.xy_support as f32),
         ObjectValue::U64(m.large_object as u64),
     ];
-    for d in [&m.surface, &m.epithelium] {
+    for d in [&m.surface, &m.epithelium]
+        .into_iter()
+        .take(1 + usize::from(stained))
+    {
         values.push(ObjectValue::F32(d.distance_um as f32));
         for a in 0..3 {
             values.push(ObjectValue::F32((d.nearest[a] * voxel[a]) as f32));

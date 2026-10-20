@@ -294,14 +294,22 @@ impl Class {
     }
 }
 
-pub fn write_csv(rows: &[Measured], voxel: [f64; 3], path: &Path) -> Result<()> {
+/// `stained`: with the stained-epithelium columns.
+pub fn write_csv(rows: &[Measured], voxel: [f64; 3], stained: bool, path: &Path) -> Result<()> {
     let mut w = std::io::BufWriter::new(std::fs::File::create(path).map_err(Error::backend)?);
+    let distances = ["surface", "epithelium"]
+        .into_iter()
+        .take(1 + usize::from(stained))
+        .map(|p| {
+            format!("{p}_dist_um,{p}_nearest_z_um,{p}_nearest_y_um,{p}_nearest_x_um,{p}_status")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     writeln!(
         w,
         "id,kept,class,manual,z,y,x,z_um,y_um,x_um,response,raw_intensity,mucus_top_um,epi_top_um,\
          vertical_dist_um,euclidean_dist_um,mucus_thickness_um,relative_depth,z_support,xy_support,large_object,\
-         surface_dist_um,surface_nearest_z_um,surface_nearest_y_um,surface_nearest_x_um,surface_status,\
-         epithelium_dist_um,epithelium_nearest_z_um,epithelium_nearest_y_um,epithelium_nearest_x_um,epithelium_status"
+         {distances}"
     )
     .map_err(Error::backend)?;
     for m in rows {
@@ -331,6 +339,8 @@ pub fn write_csv(rows: &[Measured], voxel: [f64; 3], path: &Path) -> Result<()> 
             c.xy_support,
             m.large_object,
             [&m.surface, &m.epithelium]
+                .into_iter()
+                .take(1 + usize::from(stained))
                 .map(|d| format!(
                     "{:.2},{:.2},{:.2},{:.2},{}",
                     d.distance_um,
@@ -339,6 +349,7 @@ pub fn write_csv(rows: &[Measured], voxel: [f64; 3], path: &Path) -> Result<()> 
                     d.nearest[2] * voxel[2],
                     d.status_str()
                 ))
+                .collect::<Vec<_>>()
                 .join(",")
         )
         .map_err(Error::backend)?;
@@ -349,7 +360,11 @@ pub fn write_csv(rows: &[Measured], voxel: [f64; 3], path: &Path) -> Result<()> 
 /// Per distance (fitted surface, stained epithelium), over the counted beads:
 /// count, negatives, inexact rows and quantiles, as CSV; the lines are also
 /// returned for the log.
-pub fn write_distance_summary(rows: &[Measured], path: &Path) -> Result<Vec<String>> {
+pub fn write_distance_summary(
+    rows: &[Measured],
+    stained: bool,
+    path: &Path,
+) -> Result<Vec<String>> {
     let mut lines = vec![
         "distance,beads,negative,capped,none,min_um,p05_um,p25_um,median_um,p75_um,p95_um,max_um"
             .to_string(),
@@ -361,7 +376,10 @@ pub fn write_distance_summary(rows: &[Measured], path: &Path) -> Result<Vec<Stri
             (|m: &Measured| m.surface) as fn(&Measured) -> BoundaryDistance,
         ),
         ("epithelium", |m: &Measured| m.epithelium),
-    ] {
+    ]
+    .into_iter()
+    .take(1 + usize::from(stained))
+    {
         let all: Vec<BoundaryDistance> = kept.iter().map(|m| of(m)).collect();
         let mut d: Vec<f64> = all
             .iter()

@@ -524,7 +524,8 @@ impl FragmentOp for BeadFinalOp {
 pub struct BeadDistanceJoinOp {
     pub beads: (String, usize),
     pub surface: (String, usize),
-    pub epithelium: (String, usize),
+    /// The stained epithelium's distances, when it was segmented.
+    pub epithelium: Option<(String, usize)>,
     pub rows_stream: String,
     pub schema: Schema,
 }
@@ -539,11 +540,16 @@ impl FragmentOp for BeadDistanceJoinOp {
     }
 
     fn inputs(&self) -> Vec<FragmentInput> {
-        vec![
+        let mut inputs = vec![
             FragmentInput::own(&self.beads.0, self.beads.1),
             FragmentInput::own(&self.surface.0, self.surface.1),
-            FragmentInput::own(&self.epithelium.0, self.epithelium.1),
-        ]
+        ];
+        inputs.extend(
+            self.epithelium
+                .as_ref()
+                .map(|(stream, phase)| FragmentInput::own(stream, *phase)),
+        );
+        inputs
     }
 
     fn outputs(&self) -> Vec<FragmentOutput> {
@@ -576,14 +582,19 @@ impl FragmentOp for BeadDistanceJoinOp {
                 Ok(out)
             };
         let surface = distances(&self.surface.0)?;
-        let epithelium = distances(&self.epithelium.0)?;
+        let epithelium = match &self.epithelium {
+            Some((stream, _)) => Some(distances(stream)?),
+            None => None,
+        };
         let mut rows = RowBuilder::new(Arc::new(self.schema.clone()));
         let table = own_rows(at, &self.beads.0, &self.schema)?;
         for row in table.scan(&Region::whole(&at.volume()))? {
             let mut m = measured_from_row(&row)?;
             let missing = || Error::invalid("bead distances: a candidate has no distance row");
             m.surface = *surface.get(&row.at()).ok_or_else(missing)?;
-            m.epithelium = *epithelium.get(&row.at()).ok_or_else(missing)?;
+            if let Some(epithelium) = &epithelium {
+                m.epithelium = *epithelium.get(&row.at()).ok_or_else(missing)?;
+            }
             rows.push(row.at(), &values_of(&m))?;
         }
         Ok(BlockOutput::fragment(&self.rows_stream, rows.encode()))
