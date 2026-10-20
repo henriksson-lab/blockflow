@@ -220,6 +220,19 @@ which later barrier ops read in their `reduce` (`SurfaceColumns::from_stream`)
   `examples/shell-objects-3d-ome-zarr` uses all of these.
 - `ops::interest::response_peak_points` is the resident (whole-array) helper,
   for tests and small arrays.
+- Distance from points to a mask without a distance image:
+  `ops::point_distance::append_point_distance_phases(plan, stream, lifecycle,
+  (points_stream, phase), SourceInput::voxelwise(mask), MaskTest, pitch, cap)`.
+  Blocks list their mask's boundary voxels (sparse), and each point searches
+  the lists of the blocks within `cap`. Rows at each point give the signed
+  distance (negative inside), the nearest boundary voxel, and a `status`
+  (`STATUS_EXACT`, `STATUS_CAPPED` = upper bound, `STATUS_NONE`). Use it
+  instead of a dense `ops::distance` field when only the points' values are
+  needed. `examples/bead-layer-distance` measures beads to two masks with it.
+- "Inside" as what a layer seals off from one side:
+  `ops::fill::append_open_on(..., open)` is hole filling with only the volume
+  faces in `open` counted as outside. For example, open only `z = 0` to fill
+  everything beneath a sheet.
 
 ### 4.8 Different resolutions
 

@@ -39,6 +39,9 @@ const BEADS: [[usize; 3]; 9] = [
     [18, 32, 32],
 ];
 const BLOB: [usize; 3] = [18, 48, 48];
+/// A bead under the epithelium (stained z 26..29 here): an `in_tissue`
+/// candidate whose distances must come out negative.
+const BENEATH: [usize; 3] = [34, 48, 16];
 
 fn write_image(root: &Path) {
     fs::create_dir_all(root).unwrap();
@@ -73,7 +76,7 @@ fn write_image(root: &Path) {
                 let (hm, he) = (mucus_top(y), epithelium_top(x));
                 let epithelium = z >= he && z < he + 3;
                 let mut blue = 60.0 + noise() + if epithelium { 150.0 } else { 0.0 };
-                for b in BEADS {
+                for b in BEADS.iter().chain([&BENEATH]) {
                     let d = ((z as f64 - b[0] as f64) / 1.0).powi(2)
                         + ((y as f64 - b[1] as f64) / 1.5).powi(2)
                         + ((x as f64 - b[2] as f64) / 1.5).powi(2);
@@ -126,6 +129,9 @@ fn config(zarr: &Path, out: &Path, block: &str) -> Config {
         // fixed level well above the noise peaks does the same job
         "--bead-min-response",
         "50",
+        // the synthetic sheet is 64 x 64 x 3 voxels, 0.25e6 µm³
+        "--epithelium-min-volume-um3",
+        "50000",
     ])
 }
 
@@ -205,10 +211,50 @@ fn finds_layers_beads_and_the_large_object_on_any_grid() {
         .map(|l| l.split(',').collect::<Vec<_>>())
         .filter(|r| r[column("kept")] == "1")
         .collect();
+    let value = |row: &Vec<&str>, name: &str| -> f64 { row[column(name)].parse().unwrap() };
     for row in &kept {
-        let depth: f64 = row[column("relative_depth")].parse().unwrap();
-        let vertical: f64 = row[column("vertical_dist_um")].parse().unwrap();
+        let depth = value(row, "relative_depth");
+        let vertical = value(row, "vertical_dist_um");
         assert!((0.0..1.0).contains(&depth) && vertical > 0.0, "{row:?}");
+        // to the fitted tissue region: the height map's nearest point
+        assert!(
+            (value(row, "surface_dist_um") - value(row, "euclidean_dist_um")).abs() < 1e-6,
+            "{row:?}"
+        );
+        // to the stained epithelium: the drawn top, within a slice
+        let p = [value(row, "z"), value(row, "y"), value(row, "x")];
+        let mut drawn = f64::INFINITY;
+        for y in 0..NY {
+            for x in 0..NX {
+                let d = (((epithelium_top(x) as f64 - p[0]) * 5.0).powi(2)
+                    + ((y as f64 - p[1]) * 2.0).powi(2)
+                    + ((x as f64 - p[2]) * 2.0).powi(2))
+                .sqrt();
+                drawn = drawn.min(d);
+            }
+        }
+        let stained = value(row, "epithelium_dist_um");
+        assert!(
+            (stained - drawn).abs() <= 5.0,
+            "{stained} vs {drawn}: {row:?}"
+        );
+        assert_eq!(row[column("epithelium_status")], "exact");
+    }
+    // beneath the epithelium: negative to both
+    let beneath = csv
+        .lines()
+        .skip(1)
+        .map(|l| l.split(',').collect::<Vec<_>>())
+        .find(|r| [value(r, "z"), value(r, "y"), value(r, "x")] == BENEATH.map(|v| v as f64))
+        .expect("the bead beneath the epithelium is a candidate");
+    assert_eq!(beneath[column("class")], "in_tissue");
+    let expected = -((BENEATH[0] - epithelium_top(BENEATH[2])) as f64) * 5.0;
+    for name in ["surface_dist_um", "epithelium_dist_um"] {
+        assert!(
+            (value(&beneath, name) - expected).abs() <= 5.0,
+            "{name}: {} vs {expected}",
+            value(&beneath, name)
+        );
     }
 
     // published for a viewer: four labels, two tables paired with them
@@ -221,6 +267,7 @@ fn finds_layers_beads_and_the_large_object_on_any_grid() {
         labels,
         [
             "bjorn-beads",
+            "bjorn-epithelium",
             "bjorn-large-af488",
             "bjorn-layers",
             "bjorn-surfaces"

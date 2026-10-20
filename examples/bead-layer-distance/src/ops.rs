@@ -154,3 +154,69 @@ impl BlockOp for RelativeEdgeOp {
         Ok(())
     }
 }
+
+/// `input != 0 || other != 0` as `bool`: the union of two masks of any
+/// integer or boolean carriers.
+pub struct MaskUnionOp {
+    name: &'static str,
+    other: blockflow::op::SourceInput,
+}
+
+impl MaskUnionOp {
+    pub fn new(name: &'static str, other: blockflow::ImageId, other_dtype: Dtype) -> Self {
+        Self {
+            name,
+            other: blockflow::op::SourceInput::voxelwise(other).holding(other_dtype),
+        }
+    }
+}
+
+impl BlockOp for MaskUnionOp {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn accepts(&self, dtype: Dtype) -> bool {
+        dtype != Dtype::F16
+    }
+
+    fn produces(&self, _input: Dtype) -> Dtype {
+        Dtype::Bool
+    }
+
+    fn source_inputs(&self, _volume: [usize; 3]) -> Vec<blockflow::op::SourceInput> {
+        vec![self.other.clone()]
+    }
+
+    fn apply(&self, _input: &Voxels, _out: &mut Voxels, _at: &Anchor) -> Result<()> {
+        Err(blockflow::Error::invalid(
+            "a mask union needs its second mask",
+        ))
+    }
+
+    fn apply_with(
+        &self,
+        input: &Voxels,
+        sources: blockflow::op::SourceInputs<'_>,
+        out: &mut Voxels,
+        _at: &Anchor,
+    ) -> Result<()> {
+        let a = input.widened();
+        let b = sources.get(self.other.image)?.widened();
+        if a.shape() != b.shape() {
+            return Err(blockflow::Error::invalid(
+                "mask union: the second mask block does not match",
+            ));
+        }
+        let mut o = out.view_mut::<bool>()?;
+        ndarray::Zip::from(&mut o)
+            .and(&a)
+            .and(&b)
+            .for_each(|d, &x, &y| *d = x != 0.0 || y != 0.0);
+        Ok(())
+    }
+}

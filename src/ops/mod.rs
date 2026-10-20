@@ -344,6 +344,7 @@ pub mod mixing;
 pub mod morphology;
 pub mod normalise;
 pub mod path_opening;
+pub mod point_distance;
 pub mod rag;
 pub mod rag_phases;
 pub mod random_walker;
@@ -739,6 +740,10 @@ pub use ridge::{
     gaussian_weights, hessian_at, ridge_response_into, symmetric_eigenvalues, Boundary,
     EigenResponse, HessianEigenvalueOp, PlateResponse, Polarity, RatioResponse, Response,
     RidgeFilterOp, RidgeResponse, ScaleSpace,
+};
+pub use point_distance::{
+    append_point_distance_phases, point_distance_schema, BoundaryIndex, MaskBoundaryOp, MaskTest,
+    NearestBoundary, PointDistanceOp, STATUS_CAPPED, STATUS_EXACT, STATUS_NONE,
 };
 pub use rows::{
     append_group_phases, collect_groups, collect_rows, decode_groups, encode_groups, filter_blob,

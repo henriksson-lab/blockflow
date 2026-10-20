@@ -578,7 +578,16 @@ pub struct LabelBackgroundOp {
     /// compatibility story: every existing constructor leaves it alone, so every
     /// existing caller gets the labels it always got.
     connectivity: Connectivity,
+    /// Which of the volume's faces are open to the outside: [`ALL_FACES`]
+    /// unless a caller said otherwise.
+    open_faces: OpenFaces,
 }
+
+/// Per axis, whether the low and the high face of the volume are outside.
+pub type OpenFaces = [[bool; 2]; 3];
+
+/// Every face of the volume is outside: what hole filling has always meant.
+pub const ALL_FACES: OpenFaces = [[true; 2]; 3];
 
 impl LabelBackgroundOp {
     pub fn new(name: &'static str, stream: impl Into<String>, lifecycle: Lifecycle) -> Self {
@@ -587,7 +596,17 @@ impl LabelBackgroundOp {
             stream: stream.into(),
             lifecycle,
             connectivity: Connectivity::Faces,
+            open_faces: ALL_FACES,
         }
+    }
+
+    /// Only these faces of the volume are outside; background reaching only
+    /// the others is a hole and is filled. Opening only the `z = 0` face of a
+    /// tissue sheet imaged from above fills everything the sheet seals off
+    /// from the lumen, including what lies beneath it.
+    pub fn open_on(mut self, faces: OpenFaces) -> Self {
+        self.open_faces = faces;
+        self
     }
 
     /// The same op, labelling the background under a stated [`Connectivity`].
@@ -681,7 +700,14 @@ impl FragmentOp for LabelBackgroundOp {
         };
 
         let labels = out.view::<u32>()?;
-        let touches_outside = outside_flags(labels, count, at.at.offset, at.at.volume, shape);
+        let touches_outside = outside_flags_on(
+            labels,
+            count,
+            at.at.offset,
+            at.at.volume,
+            shape,
+            self.open_faces,
+        );
         let faces = BlockFaces::of(labels, count, touches_outside)?;
         let bytes = faces.encode();
         Ok(BlockOutput::fragment(self.stream.clone(), bytes).with_pixels(buffer))
@@ -707,6 +733,18 @@ pub fn outside_flags(
     volume: [usize; 3],
     shape: [usize; 3],
 ) -> Vec<bool> {
+    outside_flags_on(labels, count, offset, volume, shape, ALL_FACES)
+}
+
+/// [`outside_flags`], counting only the volume faces `open` says are outside.
+pub fn outside_flags_on(
+    labels: ArrayView3<'_, u32>,
+    count: u32,
+    offset: [usize; 3],
+    volume: [usize; 3],
+    shape: [usize; 3],
+    open: OpenFaces,
+) -> Vec<bool> {
     let mut flags = vec![false; count as usize];
     for axis in 0..3 {
         if volume[axis] == 1 {
@@ -720,7 +758,7 @@ pub fn outside_flags(
             } else {
                 global + 1 == volume[axis]
             };
-            if !is_volume_face {
+            if !is_volume_face || !open[axis][side] {
                 continue;
             }
             let [u, v] = face_axes(axis);
@@ -1108,11 +1146,25 @@ pub fn append_connected(
     filled: Dtype,
     connectivity: Connectivity,
 ) -> Result<Phase> {
+    append_open_on(plan, stream, lifecycle, filled, connectivity, ALL_FACES)
+}
+
+/// [`append_connected`] with only the volume faces in `open` counted as
+/// outside (see [`LabelBackgroundOp::open_on`]).
+pub fn append_open_on(
+    plan: &mut PlanBuilder,
+    stream: impl Into<String>,
+    lifecycle: Lifecycle,
+    filled: Dtype,
+    connectivity: Connectivity,
+    open: OpenFaces,
+) -> Result<Phase> {
     let stream = stream.into();
     let grid = plan.grid().clone();
     let faces = plan.fragments(
         LabelBackgroundOp::new("background labelling", stream.clone(), lifecycle)
-            .connecting(connectivity),
+            .connecting(connectivity)
+            .open_on(open),
     )?;
     plan.fragments(
         FillHolesOp::reading("hole filling", stream, faces, filled, &grid).connecting(connectivity),
@@ -1172,6 +1224,80 @@ mod tests {
         let mut out = Array3::from_elem(shape, false);
         fill_from_labels_into(labels.view(), &flags, out.view_mut()).unwrap();
         out
+    }
+
+    /// Only the top face open: what a sheet seals off from it fills — the
+    /// whole region beneath, though it reaches the sides and the bottom — and
+    /// a pocket open to the top does not. The same on every block grid.
+    #[test]
+    fn open_on_the_top_face_fills_beneath_a_sheet_but_not_an_open_pocket() {
+        use crate::assemble::PlanBuilder;
+        use crate::env::ArrayEnvironment;
+        use crate::strategy::{execute_phases, Hints};
+        use crate::voxels::Voxels;
+
+        let volume = [10, 12, 12];
+        let mut mask = Array3::from_elem((10, 12, 12), false);
+        for y in 0..12 {
+            for x in 0..12 {
+                mask[[4, y, x]] = true;
+            }
+        }
+        // a fold: the sheet dips to z = 7 around a pocket open to the top
+        for z in 4..8 {
+            for y in 3..9 {
+                for x in 3..9 {
+                    mask[[z, y, x]] = (y == 3 || y == 8 || x == 3 || x == 8) || z == 7;
+                }
+            }
+        }
+        let open_top = [[true, false], [false, false], [false, false]];
+        let mut answers = Vec::new();
+        for block in [[10, 12, 12], [3, 5, 4]] {
+            let mut plan =
+                PlanBuilder::new(volume, Dtype::Bool, BlockGrid::new(volume, block).unwrap());
+            let phase = append_open_on(
+                &mut plan,
+                "fill",
+                Lifecycle::DeleteOnExit,
+                Dtype::Bool,
+                Connectivity::Faces,
+                open_top,
+            )
+            .unwrap();
+            let assembly = plan.finish().unwrap();
+            let env = ArrayEnvironment::with_inputs(
+                Voxels::from(mask.clone()),
+                vec![],
+                &assembly.decomposition,
+                [4, 4, 4],
+            )
+            .unwrap();
+            execute_phases(
+                "fill",
+                &assembly.workflow,
+                &assembly.decomposition,
+                &Hints::default(),
+                &env,
+                &[],
+                &assembly.work(),
+            )
+            .unwrap();
+            answers.push(
+                env.image(phase.image().unwrap().index())
+                    .view::<bool>()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        assert_eq!(answers[0], answers[1]);
+        let filled = &answers[0];
+        assert!(!filled[[0, 0, 0]], "above the sheet is open to the top");
+        assert!(!filled[[5, 5, 5]], "the pocket is open to the top");
+        assert!(filled[[9, 0, 0]], "beneath the sheet is sealed off");
+        assert!(filled[[9, 5, 5]], "beneath the fold too");
+        // with every face open, beneath drains through the sides
+        assert!(!fill_whole(&mask)[[9, 0, 0]]);
     }
 
     /// A shell with a cavity in it. The cavity must fill; the shell must stay;

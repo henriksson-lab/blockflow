@@ -179,11 +179,40 @@ pub fn bead_table_spec(volume: [usize; 3]) -> TableSpec {
             "touching large AF488 object",
         ),
     ]);
+    for (prefix, what) in [
+        ("surface", "fitted tissue region"),
+        ("epithelium", "stained epithelium"),
+    ] {
+        columns.push(col(
+            &format!("{prefix}_dist_um"),
+            DType::F32,
+            ColumnRole::Measurement,
+            um,
+            &format!("signed closest distance to {what} (negative inside)"),
+        ));
+        for axis in ["z", "y", "x"] {
+            columns.push(col(
+                &format!("{prefix}_nearest_{axis}_um"),
+                DType::F32,
+                ColumnRole::Measurement,
+                um,
+                &format!("nearest {what} point, {axis}"),
+            ));
+        }
+        columns.push(col(
+            &format!("{prefix}_status"),
+            DType::U8,
+            ColumnRole::Category,
+            None,
+            &format!("distance to {what}: exact / capped / none"),
+        ));
+    }
     let ext = json!({
         "version": 1,
         "role": "bead_candidates",
         "deleted": "final decision: 1 = not counted as a bead",
         "class": codes(&Class::ALL, Class::code, Class::as_str),
+        "distance_status": {"0": "exact", "1": "capped (upper bound)", "2": "none within reach"},
         "manual": codes(&[Manual::None, Manual::Accepted, Manual::Rejected], Manual::code, |m| match m {
             Manual::None => "none",
             m => m.as_str(),
@@ -192,10 +221,10 @@ pub fn bead_table_spec(volume: [usize; 3]) -> TableSpec {
     spec(volume, columns, ext)
 }
 
-/// One bead-table row.
-pub fn bead_values(m: &Measured) -> Vec<ObjectValue> {
+/// One bead-table row; `voxel` turns the nearest points into µm.
+pub fn bead_values(m: &Measured, voxel: [f64; 3]) -> Vec<ObjectValue> {
     let c = &m.c;
-    vec![
+    let mut values = vec![
         ObjectValue::U64(c.id),
         ObjectValue::F32(c.z as f32),
         ObjectValue::F32(c.y as f32),
@@ -214,7 +243,15 @@ pub fn bead_values(m: &Measured) -> Vec<ObjectValue> {
         ObjectValue::F32(c.z_support as f32),
         ObjectValue::F32(c.xy_support as f32),
         ObjectValue::U64(m.large_object as u64),
-    ]
+    ];
+    for d in [&m.surface, &m.epithelium] {
+        values.push(ObjectValue::F32(d.distance_um as f32));
+        for a in 0..3 {
+            values.push(ObjectValue::F32((d.nearest[a] * voxel[a]) as f32));
+        }
+        values.push(ObjectValue::U8(d.status as u8));
+    }
+    values
 }
 
 pub fn object_table_spec(volume: [usize; 3]) -> TableSpec {
@@ -289,6 +326,10 @@ pub fn layer_style() -> Json {
         (LABEL_MUCUS, "mucus", [255, 200, 0, 70]),
         (LABEL_TISSUE, "tissue", [220, 60, 220, 50]),
     ])
+}
+
+pub fn epithelium_style() -> Json {
+    label_style(&[(1, "epithelium (AF488) and beneath", [0, 220, 120, 60])])
 }
 
 pub fn surface_style() -> Json {

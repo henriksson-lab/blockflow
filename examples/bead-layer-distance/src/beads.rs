@@ -29,7 +29,7 @@ use blockflow::sidecar::Lifecycle;
 use blockflow::table::{Column, RowBuilder, Schema, Table, Value};
 use blockflow::{Error, ImageId, Reach, Result};
 
-use crate::measure::{measure_one, Candidate, Class, MeasureParams, Measured};
+use crate::measure::{measure_one, BoundaryDistance, Candidate, Class, MeasureParams, Measured};
 
 // ---------------------------------------------------------------- bytes --
 
@@ -105,11 +105,24 @@ pub fn bead_schema() -> Result<Schema> {
         Column::f64("euclidean_dist_um"),
         Column::f64("mucus_thickness_um"),
         Column::f64("relative_depth"),
+        Column::f64("surface_dist_um"),
+        Column::f64("surface_nearest_z"),
+        Column::f64("surface_nearest_y"),
+        Column::f64("surface_nearest_x"),
+        Column::u64("surface_status"),
+        Column::f64("epithelium_dist_um"),
+        Column::f64("epithelium_nearest_z"),
+        Column::f64("epithelium_nearest_y"),
+        Column::f64("epithelium_nearest_x"),
+        Column::u64("epithelium_status"),
     ])
 }
 
-fn values_of(m: &Measured) -> [Value; 13] {
-    [
+/// First column of the two distances (five columns each).
+const DISTANCE_COLUMNS: usize = 13;
+
+fn values_of(m: &Measured) -> Vec<Value> {
+    let mut v = vec![
         Value::U64(m.c.id),
         Value::F64(m.c.response),
         Value::F64(m.c.raw_intensity),
@@ -123,7 +136,32 @@ fn values_of(m: &Measured) -> [Value; 13] {
         Value::F64(m.euclidean_um),
         Value::F64(m.mucus_thickness_um),
         Value::F64(m.relative_depth),
-    ]
+    ];
+    for d in [&m.surface, &m.epithelium] {
+        v.extend([
+            Value::F64(d.distance_um),
+            Value::F64(d.nearest[0]),
+            Value::F64(d.nearest[1]),
+            Value::F64(d.nearest[2]),
+            Value::U64(d.status),
+        ]);
+    }
+    v
+}
+
+fn distance_of(v: &[Value], first: usize) -> Result<BoundaryDistance> {
+    let f = |i: usize| match v[first + i] {
+        Value::F64(x) => Ok(x),
+        Value::U64(_) => Err(Error::invalid("bead row: expected f64")),
+    };
+    Ok(BoundaryDistance {
+        distance_um: f(0)?,
+        nearest: [f(1)?, f(2)?, f(3)?],
+        status: match v[first + 4] {
+            Value::U64(x) => x,
+            Value::F64(_) => return Err(Error::invalid("bead row: expected u64")),
+        },
+    })
 }
 
 /// A row back into a [`Measured`].
@@ -156,6 +194,8 @@ pub fn measured_of(at: [usize; 3], v: &[Value]) -> Result<Measured> {
         euclidean_um: f(10)?,
         mucus_thickness_um: f(11)?,
         relative_depth: f(12)?,
+        surface: distance_of(v, DISTANCE_COLUMNS)?,
+        epithelium: distance_of(v, DISTANCE_COLUMNS + 5)?,
     })
 }
 
@@ -394,7 +434,7 @@ impl FragmentOp for BeadFinalOp {
     fn outputs(&self) -> Vec<FragmentOutput> {
         vec![FragmentOutput::new(
             &self.rows_stream,
-            Lifecycle::Persistent,
+            Lifecycle::DeleteOnExit,
             Coverage::EveryBlock,
         )]
     }
@@ -472,6 +512,79 @@ impl FragmentOp for BeadFinalOp {
                 }
             }
             rows.push(c, &values_of(&m))?;
+        }
+        Ok(BlockOutput::fragment(&self.rows_stream, rows.encode()))
+    }
+}
+
+// ------------------------------------------------------------ distances --
+
+/// Every candidate's row with its two boundary distances filled in, from the
+/// rows `ops::point_distance` wrote at the same positions.
+pub struct BeadDistanceJoinOp {
+    pub beads: (String, usize),
+    pub surface: (String, usize),
+    pub epithelium: (String, usize),
+    pub rows_stream: String,
+    pub schema: Schema,
+}
+
+impl FragmentOp for BeadDistanceJoinOp {
+    fn name(&self) -> &'static str {
+        "bead distances"
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn inputs(&self) -> Vec<FragmentInput> {
+        vec![
+            FragmentInput::own(&self.beads.0, self.beads.1),
+            FragmentInput::own(&self.surface.0, self.surface.1),
+            FragmentInput::own(&self.epithelium.0, self.epithelium.1),
+        ]
+    }
+
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        vec![FragmentOutput::new(
+            &self.rows_stream,
+            Lifecycle::Persistent,
+            Coverage::EveryBlock,
+        )]
+    }
+
+    fn seam_fold(&self) -> Option<SeamFold> {
+        Some(SeamFold::PerBlock)
+    }
+
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        let distances =
+            |stream: &str| -> Result<std::collections::HashMap<[usize; 3], BoundaryDistance>> {
+                let table = own_rows(at, stream, &blockflow::ops::point_distance_schema()?)?;
+                let mut out = std::collections::HashMap::new();
+                for row in table.scan(&Region::whole(&at.volume()))? {
+                    out.insert(
+                        row.at(),
+                        BoundaryDistance {
+                            distance_um: row.f64(0)?,
+                            nearest: [row.f64(1)?, row.f64(2)?, row.f64(3)?],
+                            status: row.u64(4)?,
+                        },
+                    );
+                }
+                Ok(out)
+            };
+        let surface = distances(&self.surface.0)?;
+        let epithelium = distances(&self.epithelium.0)?;
+        let mut rows = RowBuilder::new(Arc::new(self.schema.clone()));
+        let table = own_rows(at, &self.beads.0, &self.schema)?;
+        for row in table.scan(&Region::whole(&at.volume()))? {
+            let mut m = measured_from_row(&row)?;
+            let missing = || Error::invalid("bead distances: a candidate has no distance row");
+            m.surface = *surface.get(&row.at()).ok_or_else(missing)?;
+            m.epithelium = *epithelium.get(&row.at()).ok_or_else(missing)?;
+            rows.push(row.at(), &values_of(&m))?;
         }
         Ok(BlockOutput::fragment(&self.rows_stream, rows.encode()))
     }

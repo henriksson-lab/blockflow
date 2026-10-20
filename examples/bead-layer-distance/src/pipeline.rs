@@ -14,11 +14,16 @@ use blockflow::object_table::finalize_object_table;
 use blockflow::ome_zarr::OmeVolumePyramid;
 use blockflow::ome_zarr::{publish_label, LabelPublication};
 use blockflow::op::SourceInput;
+use blockflow::ops::fill::append_open_on;
 use blockflow::ops::label::{LabelComponentsOp, RelabelComponentsOp};
 use blockflow::ops::rows::collect_rows;
 use blockflow::ops::surfaces::{
     append_layered_surface_phases, LayeredSurfaces, SurfaceBandOp, SurfaceColumns, SurfaceCue,
     SurfaceLayer, SurfaceLinesOp, SurfaceMethod,
+};
+use blockflow::ops::{
+    append_point_distance_phases, append_remove_small_objects_phases, ElementShape, MaskTest,
+    Morphology, MorphologyOp, StructuringElement, ThresholdTest, VoxelwiseMaskOp,
 };
 use blockflow::ops::{
     append_response_peak_table_phases, ApplyGlobalThresholdOp, BlobResponseOp, Boundary,
@@ -38,6 +43,7 @@ use crate::{beads, cells, measure, ops, qc, style, zio};
 /// Label + table names in the dataset.
 const BEADS: &str = "bjorn-beads";
 const OBJECTS: &str = "bjorn-large-af488";
+const EPITHELIUM: &str = "bjorn-epithelium";
 /// Stream prefix of the surface phases.
 const SURFACES: &str = "bjorn.surfaces";
 
@@ -137,6 +143,30 @@ pub struct Config {
     /// PSF shape test: min (xy neighbours / peak), background subtracted.
     #[arg(long, default_value_t = 0.15)]
     pub bead_min_xy_support: f64,
+    /// Bead to epithelium distances are exact up to this (µm); beyond it a
+    /// row says `capped` (an upper bound). Sets how many neighbouring blocks'
+    /// boundary voxels each block reads.
+    #[arg(long, default_value_t = 600.0)]
+    pub distance_cap_um: f64,
+    /// Stained epithelium: AF488 threshold sampled within this many slices
+    /// of the fitted epithelium (log-Otsu over smoothed AF488).
+    #[arg(long, default_value_t = 10.0)]
+    pub epithelium_band_slices: f32,
+    /// Stained epithelium: fixed AF488 level instead of the automatic one.
+    #[arg(long)]
+    pub epithelium_threshold: Option<f64>,
+    /// Stained epithelium: closing radius in voxels, z,y,x.
+    #[arg(long, value_delimiter = ',', default_values_t = vec![1, 2, 2])]
+    pub epithelium_close_radius: Vec<usize>,
+    /// Stained epithelium: fitted tissue this many slices below the fitted
+    /// surface counts as inside too, so a gap in the stain does not open the
+    /// tissue beneath it to the lumen.
+    #[arg(long, default_value_t = 2.0)]
+    pub epithelium_deep_slices: f32,
+    /// Stained epithelium: connected pieces smaller than this (µm³) are
+    /// dropped — beads and cells in the mucus, not the tissue sheet.
+    #[arg(long, default_value_t = 1.0e6)]
+    pub epithelium_min_volume_um3: f64,
 }
 
 fn triple(v: &[f64], what: &str) -> Result<[f64; 3]> {
@@ -220,6 +250,9 @@ pub fn run(config: &Config) -> Result<Summary> {
         &args.out.join("large_af488_objects.csv"),
     )?;
     measure::write_csv(&rows, voxel, &args.out.join("beads.csv"))?;
+    for line in measure::write_distance_summary(&rows, &args.out.join("distance_summary.csv"))? {
+        eprintln!("  {line}");
+    }
     let n_bead = rows.iter().filter(|m| m.kept()).count();
     let n_tissue = rows.iter().filter(|m| m.class == Class::InTissue).count();
     eprintln!(
@@ -548,6 +581,87 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
         schema: object_schema.clone(),
     })?;
 
+    // ---- stained epithelium: smoothed AF488 above a level set near the
+    // fitted epithelium, closed, without the small pieces (beads, cells)
+    let p_epi_band = b.fragments(SurfaceBandOp::new(
+        SURFACES,
+        p_lab,
+        (1, args.epithelium_band_slices),
+        (1, -args.epithelium_band_slices),
+    ))?;
+    match args.epithelium_threshold {
+        Some(level) => b.pixels(Chain::sequence(vec![
+            Chain::source(p_af_smooth.image()?, blockflow::Dtype::F64),
+            Chain::op(VoxelwiseMaskOp::at_or_above(
+                "stained epithelium level",
+                level,
+            )),
+        ]))?,
+        None => {
+            let epi_samples = b.fragments(
+                SampledValuesOp::new(
+                    "AF488 samples near the epithelium",
+                    "bjorn.epithelium.af488",
+                    SourceInput::voxelwise(p_af_smooth.image()?),
+                )
+                .on(ValueSampling::CoordinateSum { every: spaced(3) })?
+                .within(SourceInput::voxelwise(p_epi_band.image()?)),
+            )?;
+            b.fragments(
+                ApplyGlobalThresholdOp::new(
+                    "stained epithelium level",
+                    "bjorn.epithelium.af488",
+                    epi_samples.index(),
+                    GlobalThreshold::log_otsu(256)?,
+                    GlobalThresholdOutput::Mask {
+                        test: ThresholdTest::AtOrAbove,
+                    },
+                )
+                .reading_image(p_af_smooth.image()?.index()),
+            )?
+        }
+    };
+    let close = args
+        .epithelium_close_radius
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::invalid("--epithelium-close-radius needs z,y,x"))?;
+    b.pixels(Chain::op(MorphologyOp::new(
+        "stained epithelium closing",
+        Morphology::Close,
+        StructuringElement::from_radius(ElementShape::Ellipsoid, close),
+    )))?;
+    let p_stained = append_remove_small_objects_phases(
+        &mut b,
+        "bjorn.epithelium.pieces",
+        Lifecycle::DeleteOnExit,
+        Connectivity::FacesEdgesAndCorners,
+        (args.epithelium_min_volume_um3 / voxel.iter().product::<f64>()).ceil() as u64,
+    )?;
+    // inside = the stain, the fitted tissue a few slices down, and all they
+    // seal off from the lumen (the z = 0 face): beneath the epithelium is
+    // inside though unstained; a fold's pocket open to the mucus is not
+    b.fragments(SurfaceBandOp::new(
+        SURFACES,
+        p_lab,
+        (1, -args.epithelium_deep_slices),
+        (1, -(volume[0] as f32)),
+    ))?;
+    b.pixels(Chain::op(ops::MaskUnionOp::new(
+        "stain or deep tissue",
+        p_stained.image()?,
+        blockflow::Dtype::Bool,
+    )))?;
+    append_open_on(
+        &mut b,
+        "bjorn.epithelium.fill",
+        Lifecycle::DeleteOnExit,
+        blockflow::Dtype::Bool,
+        Connectivity::Faces,
+        [[true, false], [false, false], [false, false]],
+    )?;
+    let p_epithelium = b.pixels(Chain::op(WidenLabelsOp))?;
+
     // ---- beads
     let bead_sigma = triple(&args.bead_sigma, "--bead-sigma")?;
     let p_dog = b.pixels(Chain::sequence(vec![
@@ -628,17 +742,54 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
         schema: bead_schema.clone(),
     })?;
 
+    // ---- signed closest distances to the fitted and the stained epithelium
+    let to_boundary = |b: &mut PlanBuilder,
+                       stream: &str,
+                       mask: ImageId,
+                       test: MaskTest|
+     -> Result<blockflow::Phase> {
+        append_point_distance_phases(
+            b,
+            stream,
+            Lifecycle::DeleteOnExit,
+            ("bjorn.beads".into(), fin.index()),
+            SourceInput::voxelwise(mask),
+            test,
+            voxel,
+            args.distance_cap_um,
+        )
+    };
+    let d_surface = to_boundary(
+        &mut b,
+        "bjorn.distance.surface",
+        p_layers.image()?,
+        MaskTest::Equals(f64::from(style::LABEL_TISSUE)),
+    )?;
+    let d_epithelium = to_boundary(
+        &mut b,
+        "bjorn.distance.epithelium",
+        p_epithelium.image()?,
+        MaskTest::NonZero,
+    )?;
+    let joined = b.fragments(beads::BeadDistanceJoinOp {
+        beads: ("bjorn.beads".into(), fin.index()),
+        surface: ("bjorn.distance.surface".into(), d_surface.index()),
+        epithelium: ("bjorn.distance.epithelium".into(), d_epithelium.index()),
+        rows_stream: "bjorn.beads.measured".into(),
+        schema: bead_schema.clone(),
+    })?;
+
     // ---- what is published
     let p_lines = b.fragments(SurfaceLinesOp::new(SURFACES, p_lab))?;
     let p_bead_labels = b.fragments(beads::BeadLabelsOp {
-        rows: ("bjorn.beads".into(), fin.index()),
+        rows: ("bjorn.beads.measured".into(), joined.index()),
         schema: bead_schema.clone(),
         radius: [1.0, 2.0, 2.0],
     })?;
     let final_object_schema = cells::final_object_schema()?;
     let counts = b.fragments(cells::ObjectCountsOp {
         objects: ("bjorn.objects".into(), p_objects.index()),
-        beads: ("bjorn.beads".into(), fin.index()),
+        beads: ("bjorn.beads.measured".into(), joined.index()),
         bead_schema: bead_schema.clone(),
         bead_object_column: 6,
         object_schema: object_schema.clone(),
@@ -657,6 +808,7 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
         (&p_lines, "bjorn-surfaces"),
         (&p_objects, OBJECTS),
         (&p_bead_labels, BEADS),
+        (&p_epithelium, EPITHELIUM),
     ];
     let hints = Hints {
         concurrency: args.workers,
@@ -688,8 +840,8 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
         surfaces.ok_or_else(|| Error::invalid("the surface solve published no heights"))?;
     let mut bead_rows = collect_rows(
         &env,
-        "bjorn.beads",
-        fin.index(),
+        "bjorn.beads.measured",
+        joined.index(),
         volume,
         bead_schema.clone(),
     )?
@@ -722,14 +874,19 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
     bead_spec.region = Some(format!("../../labels/{BEADS}"));
     finalize_object_table(
         &env,
-        "bjorn.beads",
-        fin.index(),
+        "bjorn.beads.measured",
+        joined.index(),
         volume,
         bead_schema,
         tables.join(BEADS),
         work,
         bead_spec,
-        |row| Ok(Some(style::bead_values(&beads::measured_from_row(row)?))),
+        |row| {
+            Ok(Some(style::bead_values(
+                &beads::measured_from_row(row)?,
+                voxel,
+            )))
+        },
     )?;
     let mut object_spec = style::object_table_spec(volume);
     object_spec.region = Some(format!("../../labels/{OBJECTS}"));
@@ -757,6 +914,7 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
         let style = match name {
             "bjorn-layers" => style::layer_style().as_object().cloned(),
             "bjorn-surfaces" => style::surface_style().as_object().cloned(),
+            EPITHELIUM => style::epithelium_style().as_object().cloned(),
             _ => None,
         };
         publish_label(

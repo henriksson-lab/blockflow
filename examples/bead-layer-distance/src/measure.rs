@@ -149,6 +149,40 @@ pub struct Measured {
     pub relative_depth: f64,
     /// Id of the large AF488 object the candidate sits in, or 0.
     pub large_object: u32,
+    /// Closest distance to the fitted tissue region (`bjorn-layers` 2).
+    pub surface: BoundaryDistance,
+    /// Closest distance to the stained epithelium (`bjorn-epithelium`).
+    pub epithelium: BoundaryDistance,
+}
+
+/// A signed closest distance to a mask's boundary (blockflow
+/// `ops::point_distance`): negative inside the mask.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoundaryDistance {
+    pub distance_um: f64,
+    /// Voxel index (z, y, x) of the nearest boundary voxel.
+    pub nearest: [f64; 3],
+    /// `ops::STATUS_EXACT`, `STATUS_CAPPED` (an upper bound) or `STATUS_NONE`.
+    pub status: u64,
+}
+
+impl BoundaryDistance {
+    /// Not measured yet: the candidate itself, status none.
+    pub fn unset(c: &Candidate) -> Self {
+        Self {
+            distance_um: 0.0,
+            nearest: [c.z, c.y, c.x],
+            status: blockflow::ops::STATUS_NONE,
+        }
+    }
+
+    pub fn status_str(&self) -> &'static str {
+        match self.status {
+            blockflow::ops::STATUS_EXACT => "exact",
+            blockflow::ops::STATUS_CAPPED => "capped",
+            _ => "none",
+        }
+    }
 }
 
 impl Measured {
@@ -237,6 +271,8 @@ pub fn measure_one(c: &Candidate, h: &HeightMaps, p: &MeasureParams) -> Measured
         mucus_thickness_um: thickness,
         relative_depth: rel,
         large_object: 0,
+        surface: BoundaryDistance::unset(c),
+        epithelium: BoundaryDistance::unset(c),
     }
 }
 
@@ -263,14 +299,16 @@ pub fn write_csv(rows: &[Measured], voxel: [f64; 3], path: &Path) -> Result<()> 
     writeln!(
         w,
         "id,kept,class,manual,z,y,x,z_um,y_um,x_um,response,raw_intensity,mucus_top_um,epi_top_um,\
-         vertical_dist_um,euclidean_dist_um,mucus_thickness_um,relative_depth,z_support,xy_support,large_object"
+         vertical_dist_um,euclidean_dist_um,mucus_thickness_um,relative_depth,z_support,xy_support,large_object,\
+         surface_dist_um,surface_nearest_z_um,surface_nearest_y_um,surface_nearest_x_um,surface_status,\
+         epithelium_dist_um,epithelium_nearest_z_um,epithelium_nearest_y_um,epithelium_nearest_x_um,epithelium_status"
     )
     .map_err(Error::backend)?;
     for m in rows {
         let c = &m.c;
         writeln!(
             w,
-            "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.4},{:.1},{:.1},{:.1},{:.2},{:.2},{:.1},{:.3},{:.3},{:.3},{}",
+            "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.4},{:.1},{:.1},{:.1},{:.2},{:.2},{:.1},{:.3},{:.3},{:.3},{},{}",
             c.id,
             u8::from(m.kept()),
             m.class.as_str(),
@@ -291,9 +329,69 @@ pub fn write_csv(rows: &[Measured], voxel: [f64; 3], path: &Path) -> Result<()> 
             m.relative_depth,
             c.z_support,
             c.xy_support,
-            m.large_object
+            m.large_object,
+            [&m.surface, &m.epithelium]
+                .map(|d| format!(
+                    "{:.2},{:.2},{:.2},{:.2},{}",
+                    d.distance_um,
+                    d.nearest[0] * voxel[0],
+                    d.nearest[1] * voxel[1],
+                    d.nearest[2] * voxel[2],
+                    d.status_str()
+                ))
+                .join(",")
         )
         .map_err(Error::backend)?;
     }
     w.flush().map_err(Error::backend)
+}
+
+/// Per distance (fitted surface, stained epithelium), over the counted beads:
+/// count, negatives, inexact rows and quantiles, as CSV; the lines are also
+/// returned for the log.
+pub fn write_distance_summary(rows: &[Measured], path: &Path) -> Result<Vec<String>> {
+    let mut lines = vec![
+        "distance,beads,negative,capped,none,min_um,p05_um,p25_um,median_um,p75_um,p95_um,max_um"
+            .to_string(),
+    ];
+    let kept: Vec<&Measured> = rows.iter().filter(|m| m.kept()).collect();
+    for (name, of) in [
+        (
+            "surface",
+            (|m: &Measured| m.surface) as fn(&Measured) -> BoundaryDistance,
+        ),
+        ("epithelium", |m: &Measured| m.epithelium),
+    ] {
+        let all: Vec<BoundaryDistance> = kept.iter().map(|m| of(m)).collect();
+        let mut d: Vec<f64> = all
+            .iter()
+            .filter(|b| b.status != blockflow::ops::STATUS_NONE)
+            .map(|b| b.distance_um)
+            .collect();
+        d.sort_by(f64::total_cmp);
+        let q = |f: f64| {
+            if d.is_empty() {
+                f64::NAN
+            } else {
+                d[((d.len() - 1) as f64 * f).round() as usize]
+            }
+        };
+        let count = |status: u64| all.iter().filter(|b| b.status == status).count();
+        lines.push(format!(
+            "{name},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}",
+            all.len(),
+            d.iter().filter(|v| **v < 0.0).count(),
+            count(blockflow::ops::STATUS_CAPPED),
+            count(blockflow::ops::STATUS_NONE),
+            q(0.0),
+            q(0.05),
+            q(0.25),
+            q(0.5),
+            q(0.75),
+            q(0.95),
+            q(1.0)
+        ));
+    }
+    std::fs::write(path, lines.join("\n") + "\n").map_err(Error::backend)?;
+    Ok(lines)
 }
