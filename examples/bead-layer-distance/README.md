@@ -131,6 +131,7 @@ Synthetic images made by mirror-tiling the good sample, run with
 | 2048 × 2048 × 115 | 482 M | exact at stride 8 | 5:05 | 5.9 GB |
 | 2048 × 2048 × 115 | 482 M | multigrid ×2 at stride 4 | 8:45 | 5.6 GB |
 | 4096 × 4096 × 115 | 1.93 G | multigrid ×4 at stride 4 | 57:01 | 6.6 GB |
+| 2048 × 2048 × 115, with distances | 482 M | multigrid ×2 at stride 4 | 15:36 | 5.9 GB |
 
 What memory still depends on: the coarse surface graph (bounded by
 `--max-surface-nodes`, ~200 B per node), the threshold sample sets (bounded by
