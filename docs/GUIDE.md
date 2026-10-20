@@ -218,6 +218,16 @@ which later barrier ops read in their `reduce` (`SurfaceColumns::from_stream`)
   radii as one `ops::transform_bank::TransformBankOp`); a window fit per row
   that emits shapes: `ops::star_convex` (`ShellFitOp`, `StarConvexLabelsOp`).
   `examples/shell-objects-3d-ome-zarr` uses all of these.
+- What is inside each fitted shape: `ops::interior` (`InteriorOp`) segments
+  the bright sub-objects of every object once, from the block owning its row
+  (a window around the object, normalised by its own radial profile; seeded
+  watershed merged by dynamics), and emits per-object summary rows, one row
+  per sub-object keyed at its peak, and x-runs that `RunLabelsOp` paints into
+  a `u64` label image (reading the neighbouring blocks' runs; smaller label
+  wins). Overlapping objects split their voxels by relative depth, as
+  `StarConvexLabelsOp` paints, from the neighbours' shapes that
+  `NearbyShapesOp` collects per block. `segment_interior` is the resident
+  kernel.
 - `ops::interest::response_peak_points` is the resident (whole-array) helper,
   for tests and small arrays.
 - Distance from points to a mask without a distance image:

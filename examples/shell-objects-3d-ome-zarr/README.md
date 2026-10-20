@@ -42,6 +42,16 @@ with `--bootstrap 0` there is one pass, and it paints.
   level-0 window per object, in parallel; 1–1.5 s per object and thread. Unit
   tests check invariance under an exact grid rotation and that spoke and grain
   phantoms separate as expected.
+- unless `--no-interior`, the bright sub-objects inside each published object
+  (`ops::interior`, blockflow `src/`): `labels/<layer>-inside` and
+  `tables/<layer>-inside` (one row per sub-object: `parent` = the object's
+  label, `diameter_um`, `voxels`, mean `level`, radial position `s`,
+  `aspect`, `siblings` = sub-objects in its connected bright region, `peak`),
+  and per object the `inside_*` summary columns in `tables/<layer>` (count,
+  connected regions, sub-objects per region, largest share, bright fraction,
+  median diameter and its CV, median aspect, mean `s` of the bright phase,
+  spread of the dark phase). Also `<image>__<layer>.interior.csv`,
+  `.inside.csv` and the `.inside.png` contact sheet (sub-object outlines).
 - `--out`: `<image>__<layer>.csv` (every candidate with its status),
   `.template.json`, `.accepted.png` / `.rejected.png` contact sheets, and with
   `--keep-rays` the per-ray radii of the published objects.
@@ -63,6 +73,31 @@ image), no candidate cap: 1 400–5 300 candidates and 19–424 kept objects per
 image, 3 781 in all; 40–120 s and 7–16 GB per image at 32 workers. The cap
 mattered: at 600 candidates ND_WT_5_s1 kept 54, uncapped 72. False positives
 (tissue blobs, dark cavities) are left in on purpose, for curation.
+
+## Sub-objects (2026-10-20)
+
+Inside each published object, per object on a window around it, in the same
+level-0 run as the painting (`InteriorOp`, then `RunLabelsOp` paints the
+sub-object labels from x-runs): normalise by the object's own radial profile
+(dark band 0, wall peak 1), take the interior `s < 0.85` at level
+`--interior-level` (0.65) after a sigma-1 smoothing, seed at the regional
+maxima of a sigma-2 smoothing, flood with a seeded watershed, merge
+neighbouring basins whose lower peak rises less than `--interior-prominence`
+(0.1) above their saddle, and drop sub-objects under `--interior-min-diameter`
+(4 µm equivalent). Each object is segmented once, by the block owning its row;
+where objects overlap, a voxel belongs to the one it is relatively deepest in,
+as in `labels/<layer>` (`NearbyShapesOp` hands each block its neighbours'
+shapes), so every sub-object lies inside its parent's label. The answer does
+not depend on the block grid (unit test).
+
+Tuned by eye on ND_WT_5_s1's contact sheet (72 objects, 596 sub-objects at
+level 0.5, 519 at 0.65): packed cells, lobes and single bright bodies are
+outlined well. Neither a sub-object's mean nor its peak level separates
+cells from the grain of a grey interior (they overlap); size does, hence the
+diameter floor. Limitations: in cysts whose grey interior radiates from a
+bright centre the centre keeps some grey tails; a lumpy mass with shallow
+lobes is one sub-object (by the prominence rule, on purpose). Cost on
+ND_WT_5_s1: about +8 s in the painting pass and +4 s publishing (91 s in all).
 
 ## Validation (ND_WT_5_s1, 2026-10-18)
 

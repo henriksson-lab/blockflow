@@ -59,6 +59,7 @@
 // | `fft` | a real plane's Fourier transform, and a squared-difference landscape over integer lags through the correlation theorem | the first thing here that is **not an op at all**, and could not be: two inputs of different extents, an output indexed by *lag* rather than by position, and a complex intermediate `Voxels` cannot hold. `watershed` declares the barrier and still fits the shape; this one does not fit the shape, so it is free functions and a plan, and the absent `BlockOp` is the statement |
 // | `align` | block-reduced fitting of a 3-D coordinate map between two scalar volumes | the first op whose output is a small global state rather than a volume or row set. Each iteration maps blocks to local evidence, reduces it, and performs one global update before the next iteration. |
 // | `star_convex` | a star-convex shell fitted along rays from a candidate centre, and the shapes painted as labels | the first row op that reads a **window of the image around each row** and emits a *shape*: per-ray radii on a side stream, so the row table stays scalar. Its halo is derived from its parameters to bound every sample, which keeps the fit independent of the block grid; the painter reads rows and shapes of neighbouring blocks and resolves overlaps by relative depth |
+// | `interior` | bright sub-objects inside each fitted star-convex shell, segmented per object, and painted from x-runs | the first row op that **segments inside another op's objects**: per object a window, a normalisation from the object's own radial profile, a seeded watershed merged by dynamics; blobs leave as rows keyed at their peak and as runs that a painter reading its neighbours' runs turns into labels. Each object is segmented once, by the block owning its row |
 // | `template_match` | normalised cross-correlation with radial (shell) templates, at one or several radii | **a configuration, not an op**: one `transform_bank` with the image and its square as inputs and, per radius, a group of three correlations — template, support, support over the square — combined to the NCC, folded by a maximum. What it contributes is the radial template (sampled around an exemplar, averaged over many) and the kernel geometry |
 // | `transform_bank` | several correlations of one input (and pointwise maps of it), combined per voxel in groups and folded across groups | `convolve`'s transform correlation with the input transformed **once per tile for all kernels**, `m + k` transforms instead of `2k`; tiles anchored to the volume and computed in parallel, like `TransformConvolveOp` |
 // | `suppress` | greedy suppression of nearby rows, strongest first, by a pair rule over per-row radii | the first row op whose fate for one row depends on rows in **any** block: a barrier `reduce` runs the kernel once over every row and each block emits its kept rows, so the output is a subsequence of the input like `rows`' filter. The fixed-distance suppression `classical_centers` uses is the `Fixed` radius of this kernel |
@@ -334,6 +335,7 @@ pub mod fill;
 pub(crate) mod histogram;
 pub mod intensity_statistics;
 pub mod interest;
+pub mod interior;
 pub mod label;
 pub mod label_energy;
 pub mod lattice;
@@ -475,6 +477,11 @@ pub use interest::{
     hessian_determinant_response_into, laplacian_of_gaussian_response_into, response_peak_points,
     response_peak_schema, BlobDetection, BlobDetector, BlobResponse, BlobResponseOp, BlobScale,
     ResponsePeakRowsOp, RESPONSE_COLUMN,
+};
+pub use interior::{
+    blob_schema, decode_runs, encode_runs, interior_summary_schema, interior_window,
+    segment_interior, Interior, InteriorBlob, InteriorOp, InteriorParams, InteriorStreams,
+    LabelRun, NearbyShapesOp, RunLabelsOp, BLOB_COLUMNS, SUMMARY_COLUMNS,
 };
 pub use label::{
     label_ceiling, label_of, label_points_into, labelled_points, LabelPointsOp, WidenLabelsOp,

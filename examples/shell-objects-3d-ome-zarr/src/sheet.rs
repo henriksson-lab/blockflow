@@ -1,5 +1,7 @@
 //! Review contact sheets: three orthogonal slices through each object's fitted
-//! centre with its boundary drawn, green when accepted and red when not.
+//! centre with its boundary drawn, green when accepted and red when not, and
+//! optionally the boundaries of a label image (the sub-objects) in colours
+//! per label.
 
 use std::path::Path;
 
@@ -58,13 +60,26 @@ pub fn contact_sheet(
     rays: &RaySet,
     half: usize,
 ) -> Result<()> {
+    labelled_sheet(pyramid, None, path, tiles, rays, half)
+}
+
+/// [`contact_sheet`] with the boundaries of `labels` (level 0 on the same
+/// grid) drawn over the slices.
+pub fn labelled_sheet(
+    pyramid: &OmeVolumePyramid,
+    labels: Option<&OmeVolumePyramid>,
+    path: &Path,
+    tiles: &[Tile<'_>],
+    rays: &RaySet,
+    half: usize,
+) -> Result<()> {
     let t = 2 * half + 1;
     let per_row = 4;
     let tile_w = 3 * t + 6;
     let rows = tiles.len().div_ceil(per_row).max(1);
     let rendered = tiles
         .par_iter()
-        .map(|tile| render(pyramid, tile, rays, half))
+        .map(|tile| render(pyramid, labels, tile, rays, half))
         .collect::<Result<Vec<_>>>()?;
     let mut img = RgbImage::new((per_row * tile_w) as u32, (rows * (t + 4)) as u32);
     for (n, piece) in rendered.iter().enumerate() {
@@ -79,6 +94,7 @@ pub fn contact_sheet(
 /// One object's three slices, side by side.
 fn render(
     pyramid: &OmeVolumePyramid,
+    labels: Option<&OmeVolumePyramid>,
     tile: &Tile<'_>,
     rays: &RaySet,
     half: usize,
@@ -93,6 +109,14 @@ fn render(
         .attached_level(0)?
         .read_region(start, shape)?
         .widened();
+    let labelled = match labels {
+        Some(l) => Some(l.attached_level(0)?.read_region(start, shape)?),
+        None => None,
+    };
+    let labelled = match &labelled {
+        Some(v) => Some(v.view::<u64>()?),
+        None => None,
+    };
     let mut sorted: Vec<f64> = crop.iter().copied().collect();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let lo = sorted[sorted.len() / 100];
@@ -133,9 +157,43 @@ fn render(
                         && inside(at(i, j - 1)));
                 let x = (plane * (t + 2)) as u32 + (j + half as isize) as u32;
                 let y = (i + half as isize) as u32;
-                img.put_pixel(x, y, if edge { colour } else { Rgb([g, g, g]) });
+                // a sub-object voxel with an in-plane neighbour of another label
+                let sub = labelled.as_ref().and_then(|l| {
+                    let label = |p: [isize; 3]| {
+                        (0..3)
+                            .all(|a| {
+                                p[a] >= start[a] as isize && p[a] < (start[a] + shape[a]) as isize
+                            })
+                            .then(|| {
+                                l[[
+                                    p[0] as usize - start[0],
+                                    p[1] as usize - start[1],
+                                    p[2] as usize - start[2],
+                                ]]
+                            })
+                            .unwrap_or(0)
+                    };
+                    let here = label(p);
+                    let border = [at(i + 1, j), at(i - 1, j), at(i, j + 1), at(i, j - 1)]
+                        .into_iter()
+                        .any(|q| label(q) != here);
+                    (here != 0 && border).then(|| hue(here))
+                });
+                let pixel = if edge {
+                    colour
+                } else {
+                    sub.unwrap_or(Rgb([g, g, g]))
+                };
+                img.put_pixel(x, y, pixel);
             }
         }
     }
     Ok(img)
+}
+
+/// A bright colour that differs between neighbouring labels.
+fn hue(label: u64) -> Rgb<u8> {
+    let h = label.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+    let c = |k: u64| (96 + ((h >> (8 * k)) & 0xFF) * 159 / 255) as u8;
+    Rgb([c(0), c(1), c(2)])
 }

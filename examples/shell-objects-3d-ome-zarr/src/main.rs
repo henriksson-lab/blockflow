@@ -33,9 +33,10 @@ use blockflow::ops::rows::{collect_rows, RowFilter, RowSourceOp, RowStreams, Row
 use blockflow::ops::{
     append_block_mean_phases, append_response_peak_table_phases, decode_shapes, fit_shell,
     gaussian_smooth_into_with, multi_radius_ncc_chain, radial_profile, shape_label, Boundary,
-    ColumnTest, Connectivity, FilterRowsOp, Gaussian, RadialTemplate, RadiusPair, ShellFit,
-    ShellFitOp, ShellFitParams, ShellJudge, StarConvexLabelsOp, StarShape, SuppressRowsOp,
-    Suppression, SuppressionRadius,
+    ColumnTest, Connectivity, FilterRowsOp, Gaussian, InteriorOp, InteriorParams, InteriorStreams,
+    NearbyShapesOp,     RadialTemplate, RadiusPair, RunLabelsOp, ShellFit, ShellFitOp, ShellFitParams, ShellJudge,
+    StarConvexLabelsOp, StarShape, SuppressRowsOp, Suppression, SuppressionRadius, BLOB_COLUMNS,
+    SUMMARY_COLUMNS,
 };
 use blockflow::sidecar::Lifecycle;
 use blockflow::sphere::{fibonacci_sphere, RaySet};
@@ -52,6 +53,10 @@ const FITTED: &str = "shell.fitted";
 const SHAPES: &str = "shell.shapes";
 const ACCEPTED: &str = "shell.accepted";
 const KEPT: &str = "shell.kept";
+const INSIDE_SUMMARY: &str = "shell.inside.summary";
+const INSIDE_BLOBS: &str = "shell.inside.blobs";
+const INSIDE_RUNS: &str = "shell.inside.runs";
+const NEARBY: &str = "shell.nearby";
 /// Template sample spacing and extent, in r / R.
 const TEMPLATE_STEP: f64 = 0.02;
 const TEMPLATE_EXTENT: f64 = 1.6;
@@ -150,6 +155,21 @@ struct Args {
     /// Skip the rotation-invariant features of the kept objects.
     #[arg(long)]
     no_features: bool,
+    /// Skip segmenting the bright sub-objects inside the published objects
+    /// (`labels/<layer>-inside`, and the `inside_*` columns).
+    #[arg(long)]
+    no_interior: bool,
+    /// Sub-objects: a voxel is bright from this level (dark band 0, wall 1).
+    #[arg(long, default_value_t = 0.65)]
+    interior_level: f64,
+    /// Sub-objects: two neighbouring peaks stay apart when the lower rises this
+    /// far above their saddle (same units).
+    #[arg(long, default_value_t = 0.1)]
+    interior_prominence: f64,
+    /// Sub-objects: those of a smaller equivalent diameter (µm) are dropped;
+    /// below about this, what the interior holds is grain.
+    #[arg(long, default_value_t = 4.0)]
+    interior_min_diameter: f64,
     /// Also write the per-ray radii of the published objects to the output directory.
     #[arg(long)]
     keep_rays: bool,
@@ -418,20 +438,73 @@ fn main() -> Result<()> {
         );
         features
     };
-    if let Some((env, label_image, kept_phase)) = pass.publish {
+    if let Some(painted) = pass.publish {
         let t = Instant::now();
+        let interior = match &painted.interior {
+            Some(run) => {
+                let summaries = collect_rows(
+                    &painted.env,
+                    INSIDE_SUMMARY,
+                    run.phase,
+                    volume,
+                    run.summary_schema.clone(),
+                )?
+                .into_iter()
+                .map(|row| {
+                    let v = row.values.iter().map(|v| match v {
+                        Value::F64(f) => *f,
+                        Value::U64(u) => *u as f64,
+                    });
+                    (row.at, v.collect::<Vec<f64>>())
+                })
+                .collect::<BTreeMap<_, _>>();
+                write_interior(&stem, &painted.env, run, &summaries, volume, voxel_size[2])?;
+                summaries
+            }
+            None => BTreeMap::new(),
+        };
         publish(
             &pyramid,
-            &env,
+            &painted.env,
             &work,
-            label_image,
-            kept_phase,
+            painted.labels,
+            painted.kept_phase,
             &pass.schema,
             &features,
+            &interior,
             volume,
             voxel_size,
             &args,
         )?;
+        if let Some(run) = &painted.interior {
+            publish_interior(
+                &pyramid,
+                &painted.env,
+                &work,
+                run,
+                volume,
+                voxel_size,
+                &args,
+            )?;
+            let labels = OmeVolumePyramid::open(
+                pyramid
+                    .image_root()
+                    .join("labels")
+                    .join(format!("{}-inside", args.layer)),
+                0,
+                0,
+            )?;
+            let mut shown = kept.clone();
+            shown.truncate(48);
+            sheet::labelled_sheet(
+                &pyramid,
+                Some(&labels),
+                &stem.with_extension("inside.png"),
+                &tiles(&shown),
+                &rays,
+                half,
+            )?;
+        }
         eprintln!("published in {:.1}s", t.elapsed().as_secs_f64());
         if !args.viewer.is_empty() {
             rescan_viewer(&args.viewer);
@@ -700,9 +773,23 @@ fn scan(
 struct Pass {
     schema: Schema,
     objects: Vec<Object>,
-    /// The run's environment, the label image and the phase of the kept rows,
-    /// when the pass painted.
-    publish: Option<(ZarrEnvironment, ImageId, usize)>,
+    /// What the pass painted, when it did.
+    publish: Option<Painted>,
+}
+
+struct Painted {
+    env: ZarrEnvironment,
+    labels: ImageId,
+    kept_phase: usize,
+    interior: Option<InteriorRun>,
+}
+
+/// The phase that segmented the interiors, and the image of their labels.
+struct InteriorRun {
+    phase: usize,
+    labels: ImageId,
+    summary_schema: Schema,
+    blob_schema: Schema,
 }
 
 /// One level-0 pass: smooth, fit, accept, de-duplicate and, if `paint`, label.
@@ -798,8 +885,57 @@ fn fit_pass(
             (KEPT, kept.index()),
             schema.clone(),
             (SHAPES, fitted.index()),
-            rays,
+            rays.clone(),
         ))?)
+    } else {
+        None
+    };
+    // every voxel of an object lies within the fit's sample radius of its row
+    let interior = if paint && !args.no_interior {
+        // as in main: isotropic, so the spacing along x
+        let micrometres = args
+            .voxel_size
+            .as_ref()
+            .map_or(pyramid.voxel_size()[2], |v| v[2]);
+        // overlapping objects split their voxels as the painter does
+        let near = builder.fragments(NearbyShapesOp::new(
+            "shell neighbours",
+            (KEPT, kept.index()),
+            schema.clone(),
+            (SHAPES, fitted.index()),
+            rays.len(),
+            (NEARBY, Lifecycle::DeleteOnExit),
+            params.sample_radius(),
+        ))?;
+        let op = InteriorOp::new(
+            "shell interiors",
+            ImageId::from(0),
+            (KEPT, kept.index()),
+            schema.clone(),
+            (SHAPES, fitted.index()),
+            rays,
+            InteriorParams {
+                level: args.interior_level,
+                prominence: args.interior_prominence,
+                min_voxels: min_voxels(args.interior_min_diameter, micrometres),
+                ..InteriorParams::default()
+            },
+            params.sample_radius(),
+            InteriorStreams {
+                nearby: (NEARBY.into(), near.index()),
+                summary: (INSIDE_SUMMARY.into(), Lifecycle::Persistent),
+                blobs: (INSIDE_BLOBS.into(), Lifecycle::Persistent),
+                runs: (INSIDE_RUNS.into(), Lifecycle::DeleteOnExit),
+            },
+        )?;
+        let (summary_schema, blob_schema) = (op.summary_schema().clone(), op.blob_schema().clone());
+        let phase = builder.fragments(op)?;
+        let painted = builder.fragments(RunLabelsOp::new(
+            "shell interior labels",
+            (INSIDE_RUNS, phase.index()),
+            params.sample_radius(),
+        ))?;
+        Some((phase.index(), painted, summary_schema, blob_schema))
     } else {
         None
     };
@@ -808,6 +944,9 @@ fn fit_pass(
     let mut keep = BTreeSet::new();
     if let Some(labels) = &labels {
         keep.insert(labels.image()?);
+    }
+    if let Some((_, painted, _, _)) = &interior {
+        keep.insert(painted.image()?);
     }
     execute_phases(
         "shell objects: level-0 fit",
@@ -870,8 +1009,22 @@ fn fit_pass(
         kept_set.len(),
         t.elapsed().as_secs_f64()
     );
+    let interior = match interior {
+        Some((phase, painted, summary_schema, blob_schema)) => Some(InteriorRun {
+            phase,
+            labels: painted.image()?,
+            summary_schema,
+            blob_schema,
+        }),
+        None => None,
+    };
     let publish = match labels {
-        Some(labels) => Some((env, labels.image()?, kept.index())),
+        Some(labels) => Some(Painted {
+            env,
+            labels: labels.image()?,
+            kept_phase: kept.index(),
+            interior,
+        }),
         None => None,
     };
     Ok(Pass {
@@ -891,6 +1044,7 @@ fn publish(
     kept_phase: usize,
     schema: &Schema,
     features: &BTreeMap<[usize; 3], Vec<f64>>,
+    interior: &BTreeMap<[usize; 3], Vec<f64>>,
     volume: [usize; 3],
     voxel_size: [f64; 3],
     args: &Args,
@@ -932,6 +1086,13 @@ fn publish(
             features::COLUMNS
                 .iter()
                 .map(|m| ColumnSpec::new(*m, DType::F32, ColumnRole::Measurement)),
+        );
+    }
+    if !interior.is_empty() {
+        columns.extend(
+            SUMMARY_COLUMNS
+                .iter()
+                .map(|m| ColumnSpec::new(summary_name(m), DType::F32, ColumnRole::Measurement)),
         );
     }
     let tile_shape = vec![32, 256, 256];
@@ -987,6 +1148,15 @@ fn publish(
                     .get(&row.at())
                     .ok_or_else(|| Error::invalid(format!("no features for {:?}", row.at())))?;
                 values.extend(f.iter().map(|&v| ObjectValue::F32(v as f32)));
+            }
+            if !interior.is_empty() {
+                let f = interior.get(&row.at()).ok_or_else(|| {
+                    Error::invalid(format!("no interior summary for {:?}", row.at()))
+                })?;
+                values.extend(SUMMARY_COLUMNS.iter().zip(f).map(|(c, &v)| {
+                    let v = if *c == DIAMETER { v * micrometres } else { v };
+                    ObjectValue::F32(v as f32)
+                }));
             }
             Ok(Some(values))
         },
@@ -1168,4 +1338,167 @@ fn rescan_viewer(host: &str) {
         Ok(status) => eprintln!("viewer {host} rescan: {status}"),
         Err(error) => eprintln!("viewer {host} rescan failed: {error}"),
     }
+}
+
+/// Voxels of a ball of `diameter` µm.
+fn min_voxels(diameter: f64, micrometres: f64) -> usize {
+    let d = diameter / micrometres;
+    (std::f64::consts::PI / 6.0 * d * d * d).round().max(1.0) as usize
+}
+
+/// The summary column holding a diameter in voxels; published in µm.
+const DIAMETER: &str = "inside_blob_diameter_median";
+
+fn summary_name(column: &str) -> String {
+    if column == DIAMETER {
+        "inside_blob_diameter_um".into()
+    } else {
+        column.into()
+    }
+}
+
+/// `<stem>.interior.csv` (one row per object) and `<stem>.inside.csv` (one row
+/// per sub-object), lengths in µm.
+fn write_interior(
+    stem: &Path,
+    env: &ZarrEnvironment,
+    run: &InteriorRun,
+    summaries: &BTreeMap<[usize; 3], Vec<f64>>,
+    volume: [usize; 3],
+    micrometres: f64,
+) -> Result<()> {
+    let mut f = fs::File::create(stem.with_extension("interior.csv")).map_err(Error::backend)?;
+    let names: Vec<String> = SUMMARY_COLUMNS.iter().map(|c| summary_name(c)).collect();
+    writeln!(f, "label_id,{}", names.join(",")).map_err(Error::backend)?;
+    for (at, values) in summaries {
+        let v: Vec<String> = SUMMARY_COLUMNS
+            .iter()
+            .zip(values)
+            .map(|(c, &x)| format!("{:.5}", if *c == DIAMETER { x * micrometres } else { x }))
+            .collect();
+        writeln!(f, "{},{}", shape_label(*at, volume), v.join(",")).map_err(Error::backend)?;
+    }
+    let blobs = collect_rows(
+        env,
+        INSIDE_BLOBS,
+        run.phase,
+        volume,
+        run.blob_schema.clone(),
+    )?;
+    let mut f = fs::File::create(stem.with_extension("inside.csv")).map_err(Error::backend)?;
+    writeln!(f, "label_id,parent,{}", BLOB_COLUMNS.join(",")).map_err(Error::backend)?;
+    for row in &blobs {
+        let v: Vec<String> = row
+            .values
+            .iter()
+            .zip(std::iter::once(&"parent").chain(BLOB_COLUMNS.iter()))
+            .map(|(v, c)| match v {
+                Value::U64(u) => u.to_string(),
+                Value::F64(x) if *c == "diameter" => format!("{:.5}", x * micrometres),
+                Value::F64(x) => format!("{x:.5}"),
+            })
+            .collect();
+        writeln!(f, "{},{}", shape_label(row.at, volume), v.join(",")).map_err(Error::backend)?;
+    }
+    eprintln!(
+        "interiors: {} sub-objects in {} objects",
+        blobs.len(),
+        summaries.len()
+    );
+    Ok(())
+}
+
+/// The sub-objects as `labels/<layer>-inside` and `tables/<layer>-inside`,
+/// each row naming its object (`parent`, the label in `labels/<layer>`).
+fn publish_interior(
+    pyramid: &OmeVolumePyramid,
+    env: &ZarrEnvironment,
+    work: &Path,
+    run: &InteriorRun,
+    volume: [usize; 3],
+    voxel_size: [f64; 3],
+    args: &Args,
+) -> Result<()> {
+    let layer = format!("{}-inside", args.layer);
+    let measured = ["voxels", "level", "s", "aspect", "siblings", "peak"];
+    let mut columns = vec![
+        ColumnSpec::new("label_id", DType::U64, ColumnRole::Identity),
+        ColumnSpec::new("centroid_z", DType::F32, ColumnRole::Coordinate),
+        ColumnSpec::new("centroid_y", DType::F32, ColumnRole::Coordinate),
+        ColumnSpec::new("centroid_x", DType::F32, ColumnRole::Coordinate),
+        ColumnSpec::new("parent", DType::U64, ColumnRole::Category),
+        ColumnSpec::new("diameter_um", DType::F32, ColumnRole::Measurement),
+    ];
+    columns.extend(
+        measured
+            .iter()
+            .map(|m| ColumnSpec::new(*m, DType::F32, ColumnRole::Measurement)),
+    );
+    let tile_shape = vec![32, 256, 256];
+    let spatial_index = SpatialIndexSpec {
+        coordinates: ["z", "y", "x"]
+            .into_iter()
+            .map(|axis| CoordinateColumn {
+                axis: axis.into(),
+                column: format!("centroid_{axis}"),
+            })
+            .collect(),
+        grid_shape: (0..3)
+            .map(|a| volume[a].div_ceil(tile_shape[a] as usize) as u64)
+            .collect(),
+        tile_shape,
+        tile_order: "row_major".into(),
+        within_tile_order: "lexicographic_coordinates_then_identity".into(),
+        downsample: None,
+    };
+    let mut spec = TableSpec::new(0, 2048, "../../", "label_id", columns, spatial_index);
+    spec.region = Some(format!("../../labels/{layer}"));
+    let index = |c: &str| run.blob_schema.index_of(c).expect("a blob column");
+    let centre = [
+        index("centroid_z"),
+        index("centroid_y"),
+        index("centroid_x"),
+    ];
+    let (parent, diameter) = (index("parent"), index("diameter"));
+    let measured: Vec<usize> = measured.iter().map(|m| index(m)).collect();
+    let micrometres = voxel_size[2];
+    let staged = work.join("inside-table");
+    finalize_object_table(
+        env,
+        INSIDE_BLOBS,
+        run.phase,
+        volume,
+        run.blob_schema.clone(),
+        &staged,
+        work,
+        spec,
+        |row| {
+            let mut values = vec![ObjectValue::U64(shape_label(row.at(), volume))];
+            for &c in &centre {
+                values.push(ObjectValue::F32(row.f64(c)? as f32));
+            }
+            values.push(ObjectValue::U64(row.u64(parent)?));
+            values.push(ObjectValue::F32((row.f64(diameter)? * micrometres) as f32));
+            for &m in &measured {
+                values.push(ObjectValue::F32(row.f64(m)? as f32));
+            }
+            Ok(Some(values))
+        },
+    )?;
+    publish_label(
+        pyramid,
+        LabelPublication {
+            name: &layer,
+            level0: &work
+                .join("fit")
+                .join(format!("level{}", run.labels.index())),
+            image_label: None,
+            table: Some(&staged),
+            replace: true,
+            pyramid_blocks: Vec::new(),
+        },
+        args.workers,
+    )?;
+    eprintln!("published labels/{layer} and tables/{layer}");
+    Ok(())
 }
