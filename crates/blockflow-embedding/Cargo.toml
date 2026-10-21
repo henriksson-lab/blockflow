@@ -1,0 +1,13 @@
+[package]
+name = "blockflow-embedding"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Typed, scalable PCA and UMAP embeddings for Blockflow analysis jobs"
+
+[dependencies]
+hnsw_rs = "0.3.5"
+ndarray = "0.17"
+serde = { version = "1", features = ["derive"] }
+umap-rs = "0.4.5"
+
