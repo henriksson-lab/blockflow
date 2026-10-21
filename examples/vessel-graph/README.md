@@ -271,10 +271,30 @@ has a fast path (no per-offset check where the ball's box is inside the
 volume and the window), and the ball's offset list holds only offsets within
 its radius, sorted once; the answers are the same.
 
+**The block grid.** Without `--block`, `segment` and `tract` build their plan
+on each candidate grid of `blockflow::strategy::grid_candidates` (every axis
+cut into a power-of-two number of pieces, fewest blocks first) and keep the
+one the cost model prices fastest on `--workers` and the machine's memory
+(`strategy::choose_grid`, `Host::detect`); planning takes under a second. The
+heavy arms reach far in the image plane and at most two voxels across it
+(windows of 200–250 in `y, x`, a 150-voxel line along `x`, a flat blur and a
+one-plane disk), so the choice on these data is a stack of slabs: `[8, 512,
+404]` on the smoke crop at 16 workers. The thinning, which reaches 12 voxels
+on every axis, gets its own priced grid (`PlanBuilder::iterate_priced`; the
+stored rounds a grid of their own from `choose_grid`), and the partitioned
+arms are offered the plan grid's edges along the axes it cuts. The answer
+does not depend on the grid; the published labels' chunk shape does, since a
+chunk divides the block that wrote it. `--block` fixes one grid for every
+phase, as before.
+
 **`segment`, the thinning** (`segment::thin`): the in-plan fixed point is one
 iterative phase whose two private buffers are the whole volume (two bytes a
-voxel). Over `--thin-memory-mb` (default 2048, a volume of 1 G voxels) the
-thinning runs over stored images instead: each round is a pixel phase
+voxel). It declares itself stationary (`IterativeOp::stationary`), so a round
+revisits only the blocks a change in the previous round can reach (the
+executor's dirty set), and a pass visits only its border voxels, held as a
+list (`ops::directional`), rather than every voxel thirteen times. Over `--thin-memory-mb` (default 8192, a volume of 4 G voxels: a
+whole tile stays resident, a whole brain does not) the thinning runs over
+stored images instead: each round is a pixel phase
 (`ThinRoundOp`, one directional pass at the pass's own reach), eight rounds a
 plan, then a fragment phase compares the last two images (`ChangedOp`) and
 the run stops when the last round changed nothing — the iterative phase's
@@ -299,6 +319,25 @@ volumes (`--registration`, `--annotation-label`) and the branch density are
 on the atlas or density lattice, not the image's: a 25 µm atlas is fixed, and
 the density's default lattice is the coarsest pyramid level. They stay
 resident.
+
+**The graph's own memory.** On the region (555 602 skeleton voxels, the raw
+vertices, and 692 550 raw edges; 58 788 vertices, 87 683 edges and 537 860
+polyline points after clean, reduce and the largest component, with the atlas
+columns): about 430 bytes per raw vertex at the high-water mark of stages 1–9
+(the raw graph and its carried columns, the cleaned and reduced structures and
+the assembled graph together), and the table writer adds about 450 bytes per
+polyline point while it writes the points table. At the crop's density with
+the deep filling (1.9 M raw vertices and 1.7 M polyline points per mm³) a
+450 mm³ brain has about 0.9 G raw vertices: some 370 GB for the graph stages
+and 340 GB more for the tables. That density is an upper bound (the
+skeleton's length density, 3.8 m/mm³, is several times the capillary length
+density usually reported). The reference holds its raw graph in graph-tool (a
+C++ adjacency list) with numpy property arrays: int16/int32 coordinates,
+float32 physical coordinates, a float64 radius per vertex and a float64
+length per edge (`graph_processing.graph_from_skeleton`), roughly 60–90 bytes
+per raw vertex by its source (not measured here). Ours is several times that:
+four radius arrays carried per vertex, the transient structures of clean and
+reduce, and the object table writer's per-row values.
 
 `VESSEL_GRAPH_PROFILE=1` prints, per stage and per planned phase, the wall
 and CPU time and the resident set and its peak (it resets the peak through
@@ -366,7 +405,8 @@ filling's `--no-deep-fill`, `--deep-fill-weights`, `--deep-fill-threshold` and
 `tract --help` the percentiles, sampling, density radius and the CSV options;
 `graph --help` also `--block`, `--pack-block`, `--workers`, `--cache-mb` and
 `--work` for its planned stages.
-Both take `--block z,y,x` (default `64,256,256`), `--workers`, `--time`,
+Both take `--block z,y,x` (default: the grid the planner chooses, below),
+`--workers`, `--time`,
 `--work` (scratch directory, removed afterwards) and `--crop
 z0:z1,y0:y1,x0:x1` with `--crop-out <path>`: the crop of the channels is
 copied into a new one-level `c, z, y, x` OME-Zarr image (channels renumbered
@@ -652,6 +692,100 @@ other jobs; the reference with torch 2.6, without `no_grad` as it runs):
 The whole `segment` on the crop: 104.9 s and 5.6 GB with the deep filling,
 91–93 s and 5.3 GB without. Ours has no GPU path.
 
+### Out of core: before and after
+
+The same data, the same machine (40 cores, shared with other jobs: load
+averages 20–75 over the runs), the binaries before and after these changes run
+alternately (`/usr/bin/time -v`); outputs under
+`/husky/henriksson/lightsheet-reference/vessel-planned` (`runs/summary.txt`
+has every run with its load averages). The crop is the osf-sa3x8 tile 05x05
+crop above (128 x 512 x 404, 26.5 M voxels); the region the fused osf-sa3x8
+box `160:672,896:1408,320:576` (512 x 512 x 256, 67 M voxels), with
+`graph`/`tract --registration` into the atlas. `segment` takes channels 0 and
+1 as `vessel,artery`; `graph` adds `--artery-channel 1 --branch-density`;
+`tract` runs on channel 0 with `--points-csv` (and `--atlas-density` on the
+region). Wall s / CPU (user + sys) s / peak GB, each run:
+
+| | before | after |
+|---|---|---|
+| crop `segment` | 132 / 1263 / 5.24; 103 / 1155 / 5.35; 107 / 1191 / 5.30 | 136 / 1264 / 4.52; 115 / 1148 / 4.60; 88 / 1022 / 4.59; 137 / 1171 / 4.62; 104 / 1135 / 4.58 |
+| crop `segment`, deep fill | 184 / 1366 / 5.25; 129 / 1227 / 5.23 | 110 / 1170 / 4.78; 118 / 1220 / 4.50 |
+| crop `graph` | 20 / 18.0 / 1.06; 14 / 14.9 / 1.07; 18 / 16.7 / 1.06 | 9.4 / 13.6 / 0.53 |
+| crop `graph`, deep fill | 22 / 19.9 / 0.99; 15 / 17.1 / 0.97 | 9.7 / 15.2 / 0.52 |
+| crop `tract` | 49 / 337 / 3.16; 39 / 313 / 3.03 | 29 / 254 / 2.02; 34 / 270 / 2.05 |
+| region `segment` | 267 / 2266 / 9.72; 184 / 2343 / 9.87; 250 / 2324 / 9.63 | 146 / 2067 / 9.16; 175 / 2275 / 8.93 |
+| region `segment`, deep fill | 304 / 2537 / 9.85; 187 / 2301 / 10.35; 250 / 2503 / 10.56 | 204 / 2448 / 9.13; 241 / 2501 / 9.09 |
+| region `graph` | 58 / 47.9 / 3.85; 30 / 37.8 / 3.85; 45 / 43.4 / 3.85 | 26 / 36.8 / 2.09; 28 / 35.8 / 2.06 |
+| region `graph`, deep fill | 84 / 54.2 / 3.50; 34 / 41.1 / 3.51; 36 / 41.0 / 3.50 | 22 / 42.1 / 2.10; 22 / 40.0 / 1.90 |
+| region `tract` | 111 / 802 / 6.11; 72 / 752 / 6.05; 67 / 721 / 6.07 | 70 / 775 / 4.49; 74 / 773 / 4.49 |
+
+Every label, table (vertices, edges, edge points, with every column: radii,
+classes, atlas columns), graph JSON, branch density, tract CSV and tract atlas
+density is byte for byte the same before and after, on both sizes, with and
+without the deep filling.
+
+What moved:
+
+- `graph`: the volumes are no longer read whole (the crop's read stage peaked
+  at 0.90 GB, 34 bytes a voxel, the region's at 2.40 GB with the atlas), the
+  radius walk and the signal reads run on every block in parallel instead of
+  in one serial loop (crop: 2.9 s to 0.8 s of wall for radii and signals), the
+  ball maximum has a typed path, the JSON is streamed (the region's tables and
+  JSON stage peaked at 3.76 GB before, 1.54 GB after), and the heap the plans
+  freed is handed back before the resident stages;
+- `tract`: the points are streamed, and the atlas density is rendered from a
+  count per atlas voxel (the region's mapping, labelling, CSV and density:
+  16.1 s and 16.8 s of CPU before, 5.3 s and 5.9 s after); the remaining peak
+  and CPU time are the plan's;
+- `segment`: at these sizes the plan is unchanged (the thinning stays resident
+  under `--thin-memory-mb`), so wall and CPU time are within the run-to-run
+  spread (±20 % on this machine; the same binary with glibc's default arenas,
+  `MALLOC_ARENA_MAX=320`, against its own two: 101 / 94 / 111 s and 1091 /
+  1057 / 1161 s CPU against 88 / 137 / 104 s and 1022 / 1171 / 1135 s). The peak
+  falls by 0.7 GB from the two malloc arenas `main` now asks for (as
+  `cell-density` does). With the stored thinning forced (`--thin-memory-mb 0`):
+  crop 99 / 1045 / 4.55, region 207 / 2038 / 8.14, the same skeleton, 48
+  rounds either way. The thinning alone on the crop's mask
+  (`segment_thin_stored`, ignored test): resident 7–20 s of wall and 86–175 s
+  of CPU, stored 14–39 s and 74–105 s, depending on the grid and the load.
+
+### Speed: sliding percentiles, the thinning's border list and dirty set, the chosen grid
+
+Measured 2026-10-20 at `--workers 16` on the 40-core shared machine (one-minute
+load 10–60 during the runs), `segment` with profiling off, before and after
+alternated; medians of three runs on the smoke crop (`128 x 512 x 404`, two
+channels) and two on the osf-sa3x8 region (`512 x 512 x 256`). Wall s / CPU s
+(user + system) / peak RSS GB:
+
+| `segment` | before | after |
+|---|---|---|
+| smoke crop | 123 / 900 / 4.04 | 31 / 270 / 3.74 |
+| smoke crop, deep fill | 123 / 962 / 4.08 | 40 / 334 / 3.86 |
+| region | 174 / 1752 / 8.84 | 54 / 458 / 8.14 |
+| region, deep fill | 201 / 2023 / 8.89 | 92 / 702 / 8.29 |
+
+`tract` on channel 0: crop 35 / 222 / 1.98 before, 12 / 85 / 2.24–2.54 after
+(the peak is in the tubeness phase, on twice the blocks in flight); region 62 /
+558 / 3.78 before, 20 / 163 / 3.66 after. Every label (voxels and stored
+bytes), the graph JSON and the tract CSV are byte for byte the same.
+
+What moved:
+
+- the lightsheet line (150 voxels along `x`) and the vessel-background disk
+  (709 offsets) are `ops::sliding::SlidingHistogramOp` on the clip's bins
+  rather than a dense gather (crop phases 3 and 11: 173 and 439 s of CPU before,
+  29 and 30 s after);
+- the thinning: a pass visits its border list instead of scanning every
+  voxel thirteen times, the block copies are flat, and the iterative phase
+  reruns only blocks a change can reach (crop: 84 s of CPU before, 21 s after);
+  the stored rounds, `--thin-memory-mb 0`, 64 s to 30 s of CPU;
+- the grid: chosen by the planner (above). On the crop `[8, 512, 404]`: the
+  plane-wide windows read no halo in `y, x`, and sixteen blocks keep sixteen
+  workers busy where `[64, 256, 256]` gave eight; on the region `[32, 512,
+  256]`;
+- a heap release at every phase boundary (`profile::Listening`), without which
+  the region's peak was 9.1 GB on the chosen grid.
+
 ## Limitations
 
 - Agreement with the original implementation is close, not exact: the clip
@@ -659,9 +793,10 @@ The whole `segment` on the crop: 104.9 s and 5.6 GB with the deep filling,
   rather than linear-interpolated ones, the sample lattices use blockflow's
   default interpolation, and the tubeness is `ops::ridge`'s Hessian.
 - The adaptive, equalize and vessel windows (up to 250 voxels) are large: on a
-  small block every block reads a halo of most of its neighbours. The planner
-  may split the deconvolve and vessel arms into phases; the other arms are
-  fixed phases.
+  block cut in the image plane every block reads a halo of most of its
+  neighbours. The chosen grid cuts across the plane instead; a `--block` that
+  cuts `y` or `x` pays that halo. The planner may split the deconvolve and
+  vessel arms into phases; the other arms are fixed phases.
 - The equalize threshold is relative to the local 40th percentile; on a
   background that is flat after the lightsheet correction it selects the top of
   the noise. Real data, and the synthetic fixture, have enough vessel in every
@@ -677,8 +812,9 @@ The whole `segment` on the crop: 104.9 s and 5.6 GB with the deep filling,
   their own lattices. With `--density-level 0` on a one-level image the
   density is the image's lattice and is held whole (12 bytes a voxel).
 - The stored thinning (volumes over `--thin-memory-mb`) is a read, a write
-  and a barrier per round; on the crop it took about twice the wall time of
-  the resident phase for the same CPU time.
+  and a barrier per round, 48 rounds on these data: on the crop's mask it took
+  about twice the wall time of the resident phase for less CPU time, so it is
+  the default only past the resident phase's memory.
 - The deep filling runs on the CPU only (the reference runs it on a GPU),
   and only in a build with the `deep-fill` feature; its weights are not part
   of the crate. It is the network in evaluation mode, which adds about 70 %

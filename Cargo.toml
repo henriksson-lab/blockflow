@@ -6,6 +6,7 @@ members = [
     ".",
     "crates/blockflow-progress",
     "crates/blockflow-label-edit",
+    "crates/blockflow-embedding",
     "crates/ngff-object-table",
     "crates/ngff-label-map",
     "crates/yolo3d",
@@ -32,6 +33,7 @@ members = [
     "examples/shell-objects-3d-ome-zarr",
     "examples/tile-stitching",
     "examples/atlas-registration",
+    "examples/physical-plane-sampling",
     "examples/cell-density",
     "examples/vessel-graph",
 ]
@@ -55,6 +57,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+fs2 = "0.4"
 blockflow-progress = { path = "crates/blockflow-progress" }
 blockflow-label-edit = { path = "crates/blockflow-label-edit" }
 # `ops::fft` only, and the one exception to the rule stated at the top of this
@@ -271,6 +274,13 @@ pliron-derive = { version = "=0.17.0", optional = true }
 # and nothing new is fetched. No runtime is chosen here; `gpu-cuda` /
 # `gpu-wgpu` choose one. See `src/gpu/mod.rs` for why CubeCL over cudarc+NVRTC.
 cubecl = { git = "https://github.com/tracel-ai/cubecl", rev = "48348968468e433235be3db6e7c344c34bc446c0", optional = true }
+
+# `strategy`'s memory admission: `malloc_trim` between waves of blocks when a
+# run is near its memory cap, so that the resident set it measures is the
+# blocks' and the caches' rather than glibc's retained heap. Already in the
+# graph through half the dependencies above; nothing new is fetched.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
 
 [features]
 # The progress view: an HTTP surface and the browser page's asset directory.

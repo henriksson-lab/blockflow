@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
-use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::assemble::{Assembly, ImageId, PlanBuilder};
 use blockflow::env::BlockBuf;
 use blockflow::fragment::{
     fold_fragments, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput, SeamFold,
@@ -210,6 +210,22 @@ pub struct Thinned {
 
 fn level(work: &Path, image: ImageId) -> PathBuf {
     work.join(format!("level{}", image.index()))
+}
+
+/// One stored round as a plan of its own over `volume` on `grid`: the round
+/// reading the previous round's image, and the change test after it. What
+/// [`thin_stored`] runs a plan of rounds of, for a caller pricing the grid
+/// (`blockflow::strategy::choose_grid`).
+pub fn round_plan(volume: [usize; 3], grid: BlockGrid, passes: usize) -> Result<Assembly> {
+    let mut builder = PlanBuilder::new(volume, Dtype::Bool, grid);
+    builder.pixels(Chain::op(ThinRoundOp {
+        passes,
+        earlier: Some((ImageId::supplied(0), Some(Dtype::Bool))),
+    }))?;
+    builder.fragments(ChangedOp {
+        earlier: ImageId::from(0usize),
+    })?;
+    builder.finish()
 }
 
 /// Thin the stored `bool` image `mask` (a level-0 array) to its fixed point.

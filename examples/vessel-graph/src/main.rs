@@ -11,6 +11,12 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Memory cap in MiB: the most the run may hold resident (default:
+    /// $BLOCKFLOW_MEMORY_CAP, else the cgroup's limit, else a share of the
+    /// machine). The planner fits the blocks in flight under it and the chunk
+    /// caches fill what they leave; the results do not depend on it.
+    #[arg(long, global = true)]
+    memory_mb: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -30,7 +36,14 @@ fn main() {
         std::process::exit(2);
     }
     limit_malloc_arenas();
-    let outcome = match Cli::parse().command {
+    let cli = Cli::parse();
+    let cap = blockflow::budget::MemoryCap::resolve(cli.memory_mb.map(|mib| mib << 20));
+    blockflow::budget::set_process_cap(cap);
+    eprintln!(
+        "memory cap: {cap}, {} MiB for blocks in flight and caches",
+        cap.usable_bytes() >> 20
+    );
+    let outcome = match cli.command {
         Command::Segment(args) => run_segment(&args).map(|summary| {
             println!(
                 "mask={} skeleton={} channel_masks={} phases={}",

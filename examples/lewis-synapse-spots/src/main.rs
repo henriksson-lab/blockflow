@@ -22,15 +22,19 @@
 //! | per synapse component: shape and raw intensity | `Measurements` over the synapse labels |
 //!
 //! | distance to the synapse edge | `ops::distance` (exact EDT), measured per spot |
+//! | both label images as `uint64`, for publication | `WidenLabelsOp` |
 //!
 //! The host then picks the synapse (largest component, discounted by distance
-//! from the field centre) and writes one row per spot and one per image. The
+//! from the field centre) and installs the segmentation in the input image as
+//! OME-Zarr labels with object tables ([`publish`]). The CSVs under `--out`
+//! gather the same rows over all images for the cross-image analysis. The
 //! Python reference this follows is `scripts/spots_reference.py`. Per-synapse
 //! features for the cross-condition analysis are in [`features`].
 
 #[path = "../../support/planning.rs"]
 mod example_planning;
 mod features;
+mod publish;
 mod seeds;
 
 use std::collections::BTreeMap;
@@ -54,14 +58,14 @@ use blockflow::ops::{
     Connectivity, ElementShape, Gaussian, GlobalThreshold, GlobalThresholdOutput, Morphology,
     MorphologyOp, RadiusPair, RowStreams, SampledValuesOp, SeededWatershedOp, Separation,
     SmoothOp, StructuringElement, SuppressRowsOp, Suppression, SuppressionRadius, ThresholdTest,
-    VoxelwiseMapOp, VoxelwiseMaskOp,
+    VoxelwiseMapOp, VoxelwiseMaskOp, WidenLabelsOp,
 };
+use blockflow::ome_zarr::OmeVolumePyramid;
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints};
 use blockflow::zarr_env::ZarrEnvironment;
-use blockflow::{AttachedImage, Error, Result};
+use blockflow::{Error, Result};
 use clap::Parser;
-use image::{ImageBuffer, Luma};
 use ndarray::{Array2, Axis};
 
 /// Gaussian kernels end at four sigma: SciPy's default, which the reference uses.
@@ -107,9 +111,13 @@ struct Config {
     /// Disk radius of the closing that bridges the gaps between puncta.
     #[arg(long, default_value_t = 10)]
     close_radius: usize,
-    /// Write `labels/<image>.spots.png` and `.cell.png` (16-bit) for QC.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    write_labels: bool,
+    /// Published as `labels/<layer>-spots` and `labels/<layer>-synapse`, with
+    /// tables of the same names, in each input image.
+    #[arg(long, default_value = "lewis")]
+    layer: String,
+    /// Replace an existing publication of `--layer`.
+    #[arg(long, default_value_t = false)]
+    overwrite: bool,
 }
 
 /// The images a run keeps, by role.
@@ -120,6 +128,9 @@ struct Plan {
     spot_labels: ImageId,
     cell_labels: ImageId,
     edge_distance: ImageId,
+    /// The label images widened to `uint64`, as published.
+    spot_labels_u64: ImageId,
+    cell_labels_u64: ImageId,
 }
 
 #[derive(Debug, Clone)]
@@ -161,8 +172,10 @@ fn run() -> Result<()> {
     if images.is_empty() {
         return Err(Error::invalid("lewis-synapse-spots: no *.ome.zarr inputs found"));
     }
-    let labels_dir = config.out.join("labels");
-    fs::create_dir_all(&labels_dir).map_err(Error::backend)?;
+    if config.layer.is_empty() || config.layer.contains(['/', '\\']) || config.layer.starts_with('.') {
+        return Err(Error::invalid("lewis-synapse-spots: --layer must be one plain path component"));
+    }
+    fs::create_dir_all(&config.out).map_err(Error::backend)?;
     let mut spots_out = csv(
         &config.out.join("spots.csv"),
         "image,spot,y,x,wy,wx,area,raw_sum,raw_max,response_max,eccentricity,major_axis,minor_axis,cell_label,in_synapse",
@@ -179,7 +192,17 @@ fn run() -> Result<()> {
     for path in &images {
         let name = image_name(path);
         let t0 = Instant::now();
-        let (height, width, cells, spots, planes) = process(&config, path, &labels_dir, &name)?;
+        let pyramid = OmeVolumePyramid::open(path, 0, 0)?;
+        let Processed {
+            height,
+            width,
+            cells,
+            spots,
+            planes,
+            work,
+            spot_level,
+            cell_level,
+        } = process(&config, &pyramid)?;
         let synapse = main_component(&cells, [height as f64, width as f64]);
         let synapse_label = synapse.map_or(0, |c| c.label);
         let mut in_synapse = 0usize;
@@ -206,6 +229,7 @@ fn run() -> Result<()> {
             )
             .map_err(Error::backend)?;
         }
+        let mut synapse_features = None;
         if let Some(c) = synapse {
             let synapse_mask = planes.cell_labels.mapv(|l| u64::from(l) == c.label);
             let feature_spots: Vec<features::Spot> = spots
@@ -217,6 +241,8 @@ fn run() -> Result<()> {
                     area: s.area as f64,
                     raw_sum: s.raw_sum,
                     ecc: s.eccentricity,
+                    major_axis: s.major_axis,
+                    minor_axis: s.minor_axis,
                     edge_distance: s.edge_distance,
                 })
                 .collect();
@@ -224,21 +250,45 @@ fn run() -> Result<()> {
             let distance = ndarray::Zip::from(&planes.edge_distance)
                 .and(&synapse_mask)
                 .map_collect(|&d, &m| if m { d } else { 0.0 });
-            let row = features::row(&features::Inputs {
+            let values = features::compute(&features::Inputs {
                 raw: planes.raw.view(),
                 synapse: synapse_mask.view(),
                 distance: distance.view(),
                 spot_pixels: spot_pixels.view(),
                 spots: &feature_spots,
                 eccentricity: c.eccentricity,
-                pixel_um: pixel_size_um(path)?,
+                pixel_um: pyramid.voxel_size()[1],
                 seed: name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
                     (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
                 }),
             });
             let (condition, field, roi) = identity(&name);
+            let row = features::row(&values);
             writeln!(features_out, "{name},{condition},{field},{roi},{row}").map_err(Error::backend)?;
+            synapse_features = Some(values);
         }
+        let volume = [1, height, width];
+        let (spots_label, synapse_label_name) =
+            (publish::spots_name(&config.layer), publish::synapse_name(&config.layer));
+        let tables = work.join("tables");
+        publish::spot_table(&tables.join(&spots_label), volume, &spots_label, &spots, synapse_label)?;
+        publish::synapse_table(
+            &tables.join(&synapse_label_name),
+            volume,
+            &synapse_label_name,
+            synapse.zip(synapse_features.as_deref()),
+        )?;
+        publish::install(&pyramid, &spots_label, &spot_level, &tables.join(&spots_label), config.overwrite)?;
+        publish::install(
+            &pyramid,
+            &synapse_label_name,
+            &cell_level,
+            &tables.join(&synapse_label_name),
+            config.overwrite,
+        )?;
+        fs::remove_dir_all(&work).map_err(Error::backend)?;
+        let (condition, field, roi) = identity(&name);
+        publish::image_metadata(&pyramid, &condition, &field, &roi)?;
         let seconds = t0.elapsed().as_secs_f64();
         match synapse {
             Some(c) => writeln!(
@@ -274,32 +324,64 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn process(
-    config: &Config,
-    zarr: &Path,
-    labels_dir: &Path,
-    name: &str,
-) -> Result<(usize, usize, Vec<CellRow>, Vec<SpotRow>, Planes)> {
-    // level 0 of a `[t, c, z, y, x]` image: the one plane at t = 0, c = 0
-    let source = AttachedImage::at(zarr.join("0")).volume([2, 3, 4], vec![(0, 0), (1, 0)]);
+/// One image's results, with its work directory still holding the `uint64`
+/// label arrays to publish.
+struct Processed {
+    height: usize,
+    width: usize,
+    cells: Vec<CellRow>,
+    spots: Vec<SpotRow>,
+    planes: Planes,
+    work: PathBuf,
+    spot_level: PathBuf,
+    cell_level: PathBuf,
+}
+
+fn process(config: &Config, pyramid: &OmeVolumePyramid) -> Result<Processed> {
+    let image_root = pyramid.image_root();
+    for label in [publish::spots_name(&config.layer), publish::synapse_name(&config.layer)] {
+        for dir in ["labels", "tables"] {
+            let existing = image_root.join(dir).join(&label);
+            if existing.exists() && !config.overwrite {
+                return Err(Error::invalid(format!(
+                    "lewis-synapse-spots: {} exists; pass --overwrite to replace it",
+                    existing.display()
+                )));
+            }
+        }
+    }
+    // level 0, the one plane at t = 0, c = 0
+    let source = pyramid.attached_level(0)?;
     let (dtype, volume) = source.metadata()?;
     if volume[0] != 1 {
         return Err(Error::invalid(format!(
             "lewis-synapse-spots: {} has {} z planes; this example is single-plane",
-            zarr.display(),
+            image_root.display(),
             volume[0]
         )));
     }
     let plan = build(config, volume, dtype)?;
-    let scratch = tempfile::tempdir_in(&config.out).map_err(Error::backend)?;
-    let env = ZarrEnvironment::attach(scratch.path(), std::slice::from_ref(&source))?;
-    let mut work = plan.base.work();
-    work.extend(plan.spots.phase_work());
-    work.extend(plan.cells.phase_work());
+    // next to its destination, so publishing moves rather than copies
+    let work = image_root
+        .join("labels")
+        .join(format!(".{}-blockflow-work", config.layer));
+    if work.exists() {
+        fs::remove_dir_all(&work).map_err(Error::backend)?;
+    }
+    let env = ZarrEnvironment::attach(&work, std::slice::from_ref(&source))?;
+    let mut phase_work = plan.base.work();
+    phase_work.extend(plan.spots.phase_work());
+    phase_work.extend(plan.cells.phase_work());
     let hints = Hints {
-        keep_images: [plan.spot_labels, plan.cell_labels, plan.edge_distance]
-            .into_iter()
-            .collect(),
+        keep_images: [
+            plan.spot_labels,
+            plan.cell_labels,
+            plan.edge_distance,
+            plan.spot_labels_u64,
+            plan.cell_labels_u64,
+        ]
+        .into_iter()
+        .collect(),
         ..Hints::default()
     };
     execute_phases(
@@ -309,22 +391,29 @@ fn process(
         &hints,
         &env,
         &[],
-        &work,
+        &phase_work,
     )?;
 
     let cells = cell_rows(&env, &plan.cells, volume)?;
     let spots = spot_rows(&env, &plan.spots, volume)?;
-    if config.write_labels {
-        save_labels(&env, plan.spot_labels, &labels_dir.join(format!("{name}.spots.png")))?;
-        save_labels(&env, plan.cell_labels, &labels_dir.join(format!("{name}.cell.png")))?;
-    }
     let planes = Planes {
         raw: plane_f64(&source.read()?)?,
         cell_labels: env.image(plan.cell_labels.index())?.view::<u32>()?.index_axis(Axis(0), 0).to_owned(),
         spot_labels: env.image(plan.spot_labels.index())?.view::<u32>()?.index_axis(Axis(0), 0).to_owned(),
         edge_distance: env.image(plan.edge_distance.index())?.view::<f64>()?.index_axis(Axis(0), 0).to_owned(),
     };
-    Ok((volume[1], volume[2], cells, spots, planes))
+    drop(env);
+    let level = |image: ImageId| work.join(format!("level{}", image.index()));
+    Ok(Processed {
+        height: volume[1],
+        width: volume[2],
+        cells,
+        spots,
+        planes,
+        spot_level: level(plan.spot_labels_u64),
+        cell_level: level(plan.cell_labels_u64),
+        work,
+    })
 }
 
 /// The planes the per-synapse features read, on the host.
@@ -488,6 +577,17 @@ fn build(config: &Config, volume: [usize; 3], dtype: Dtype) -> Result<Plan> {
     ]))?;
     let cell_labels = label_components(&mut b, "lewis.cells", Connectivity::FacesEdgesAndCorners)?;
 
+    // ---- published copies
+    let widen = |b: &mut PlanBuilder, labels: ImageId| -> Result<ImageId> {
+        b.pixels(Chain::sequence(vec![
+            Chain::source(labels, Dtype::U32),
+            Chain::op(WidenLabelsOp),
+        ]))?
+        .image()
+    };
+    let spot_labels_u64 = widen(&mut b, spot_labels)?;
+    let cell_labels_u64 = widen(&mut b, cell_labels)?;
+
     let base = b.finish()?;
     let spots = Measurements::for_labels(spot_labels)
         .shape(ShapeSet::standard())
@@ -526,6 +626,8 @@ fn build(config: &Config, volume: [usize; 3], dtype: Dtype) -> Result<Plan> {
         spot_labels,
         cell_labels,
         edge_distance,
+        spot_labels_u64,
+        cell_labels_u64,
     })
 }
 
@@ -664,39 +766,11 @@ fn main_component(cells: &[CellRow], shape: [f64; 2]) -> Option<&CellRow> {
         .max_by(|a, b| score(a).total_cmp(&score(b)))
 }
 
-fn save_labels(env: &ZarrEnvironment, image: ImageId, path: &Path) -> Result<()> {
-    let labels = env.image(image.index())?;
-    let labels = labels.view::<u32>()?;
-    let (h, w) = (labels.shape()[1], labels.shape()[2]);
-    let mut out = ImageBuffer::<Luma<u16>, Vec<u16>>::new(w as u32, h as u32);
-    for y in 0..h {
-        for x in 0..w {
-            let label = labels[[0, y, x]].min(u32::from(u16::MAX)) as u16;
-            out.put_pixel(x as u32, y as u32, Luma([label]));
-        }
-    }
-    out.save(path)
-        .map_err(|err| Error::invalid(format!("lewis-synapse-spots: save {}: {err}", path.display())))
-}
-
 /// `20min_icam1ucht1slb_15_m24af488_roi02` -> (`icam1ucht1slb`, `15`, `roi02`).
 fn identity(name: &str) -> (String, String, String) {
     let parts: Vec<&str> = name.split('_').collect();
     let get = |i: usize| parts.get(i).copied().unwrap_or("").to_string();
     (get(1), get(2), parts.last().copied().unwrap_or("").to_string())
-}
-
-/// The level-0 y pitch from the OME-Zarr multiscales metadata, in micrometres.
-fn pixel_size_um(zarr: &Path) -> Result<f64> {
-    let text = fs::read_to_string(zarr.join("zarr.json")).map_err(Error::backend)?;
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|err| Error::invalid(format!("{}: {err}", zarr.display())))?;
-    let scale = &json["attributes"]["ome"]["multiscales"][0]["datasets"][0]["coordinateTransformations"][0]["scale"];
-    scale
-        .as_array()
-        .and_then(|s| s.iter().rev().nth(1))
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| Error::invalid(format!("{}: no level-0 scale", zarr.display())))
 }
 
 fn discover(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {

@@ -149,7 +149,6 @@ use zarrs::filesystem::FilesystemStore;
 use zarrs::storage::{StorePrefix, WritableStorageTraits};
 
 use crate::assemble::{describe_image, is_supplied_image, ImageId};
-use crate::budget::MemoryBudget;
 use crate::cache::{ArrayPolicy, CacheElement, CacheStats, CachingSource, ChunkCache};
 use crate::decomposition::{check_chunk_exclusive_writes, Decomposition, Visibility};
 use crate::dtype::Dtype;
@@ -839,34 +838,28 @@ struct StoredArray {
     background: Option<f64>,
 }
 
-/// How large a chunk cache a [`ZarrEnvironment`] gets when nobody says.
+/// How large a chunk cache a [`ZarrEnvironment`] gets when nobody says: **as
+/// large as the process's memory cap leaves after the blocks in flight**.
 ///
-/// **A quarter of [`crate::budget::default_budget_bytes`]**, which is itself
-/// half the machine's memory or three quarters of what is available, whichever
-/// is less. So the default asks for an eighth of the machine at most, and leaves
-/// the other three quarters of the budget for the in-flight block buffers that
-/// budget is actually denominated in — `PhaseCost::working_set_bytes_per_block`
-/// times the concurrency.
+/// The figure is the [`crate::budget::process_budget`]'s total — the cap's
+/// usable bytes — and the cache leases every entry from that same budget,
+/// opportunistically. Compute leases its blocks in flight from it too, so the
+/// two cannot both have the bytes: while the active set is small the cache may
+/// grow into the rest, and when a wave of blocks needs more, the executor's
+/// lease makes the cache evict ([`crate::budget::Reclaim`]). That replaces a
+/// fixed quarter of the budget, which under a cap was a quarter the planner
+/// had to subtract from the active set, and without one was a quarter that
+/// could not grow into idle memory.
 ///
-/// **A fraction and not the whole budget**, because the two compete for one
-/// pool. The budget exists to bound what blocks in flight hold; a cache sized at
-/// the same figure would double the claim on memory while every plan continued
-/// to be admitted against half of it.
-///
-/// **A caller who knows their plan should say so** with
-/// [`ZarrEnvironment::with_cache`], and the rule to size it by is the one
-/// `docs/design/cache-and-prefetch.md` records: enough to hold a block's read
-/// extent times the blocks in flight, which is what makes a halo re-read a hit
-/// rather than a fetch. This function cannot apply that rule because it has no
-/// plan — `Environment::prepare` is the first point that does, and it takes
-/// `&self`.
+/// **A caller who knows their plan can still say so** with
+/// [`ZarrEnvironment::with_cache`]: that capacity is then a ceiling under the
+/// same shared budget.
 pub fn default_cache_bytes() -> u64 {
-    (crate::budget::default_budget_bytes() / 4).max(1 << 20)
+    crate::budget::process_budget().total().max(1 << 20)
 }
 
 fn default_cache() -> Arc<ChunkCache> {
-    let bytes = default_cache_bytes();
-    Arc::new(ChunkCache::new(MemoryBudget::new(bytes), bytes))
+    ChunkCache::in_process_budget(default_cache_bytes())
 }
 
 /// A [`StoredArray`] as a [`RegionSource`], so that [`CachingSource::attach`]
@@ -1976,10 +1969,9 @@ impl ZarrEnvironment {
     ///   the distributed locality harness would start measuring the cache
     ///   instead of the handout.
     pub fn with_cache(mut self, capacity_bytes: u64) -> Self {
-        self.cache = Some(Arc::new(ChunkCache::new(
-            MemoryBudget::new(capacity_bytes),
-            capacity_bytes,
-        )));
+        // A ceiling, under the process budget every other cache and the
+        // executor's blocks in flight share: see [`default_cache_bytes`].
+        self.cache = Some(ChunkCache::in_process_budget(capacity_bytes));
         self
     }
 

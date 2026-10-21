@@ -26,8 +26,9 @@
 //! keeps a bright vessel from raising its own background.
 //!
 //! Every step is a blockflow op: `voxelwise` maps, masks and joins
-//! (`FnCombine` for the three-way arithmetic), `rank` for the median and the
-//! masked percentiles, `local` for the sampled window statistics and the
+//! (`FnCombine` for the three-way arithmetic), `rank` for the median,
+//! `sliding` for the two wide masked percentiles (the lightsheet line and the
+//! vessel-background disk), `local` for the sampled window statistics and the
 //! adaptive isodata threshold, `smooth` for the deconvolution's flat blur and
 //! `ridge` (`RatioResponse`) for the tubeness. The two arms with an expensive
 //! op inside them — the blur in `deconvolve`, the disk percentile and the
@@ -41,14 +42,16 @@
 use blockflow::op::Chain;
 use blockflow::ops::element::{ElementShape, Rank, StructuringElement};
 use blockflow::ops::local::{
-    AdaptiveThresholdOp, Isodata, LocalStatistic, LocalStatisticOp, Sampling, Statistic,
+    AdaptiveThresholdOp, Isodata, LocalStatistic, LocalStatisticOp, Narrowing, Rounding, Sampling,
+    Statistic,
 };
 use blockflow::ops::normalise::bounded_gain_value;
-use blockflow::ops::rank::MaskedRankFilterOp;
+use blockflow::ops::rank::{ExcludedCentre, MaskedRankFilterOp};
 use blockflow::ops::ridge::{Boundary, Polarity, RatioResponse, RidgeFilterOp, ScaleSpace};
+use blockflow::ops::sliding::{Domain, SlidingHistogramOp};
 use blockflow::ops::smooth::{Gaussian, SmoothOp};
 use blockflow::ops::voxelwise::{
-    CarryOp, FnCombine, Logic, LogicCombine, VoxelwiseMapOp, VoxelwiseMaskOp,
+    CarryOp, FnCombine, Logic, LogicCombine, NarrowOp, VoxelwiseMapOp, VoxelwiseMaskOp, WidenOp,
 };
 use blockflow::{Dtype, Error, Result};
 
@@ -329,6 +332,32 @@ fn or() -> Result<Box<LogicCombine>> {
     ))
 }
 
+/// A masked percentile over `element`, by a histogram carried along a scan
+/// line (`ops::sliding`) rather than a gather of the whole element at every
+/// voxel. Byte-identical to `MaskedRankFilterOp::percentile` with the same
+/// excluded-centre fill (that op's own documented contract), and for the
+/// 150-voxel line and the 709-voxel disk an order of magnitude cheaper.
+///
+/// It counts values on the clip's `bins`, so its input must be the clipped
+/// volume's whole numbers `0 ..= bins - 1`; a value at or past `bins` is an
+/// error from the kernel rather than a wrong answer.
+fn sliding_percentile(
+    name: &'static str,
+    element: StructuringElement,
+    percentile: f64,
+    population: Image,
+    bins: u32,
+) -> Result<SlidingHistogramOp> {
+    Ok(SlidingHistogramOp::rank(
+        name,
+        element,
+        Rank::ceiling_percentile(percentile)?,
+        Domain::of_size(bins as usize)?,
+    )
+    .masked_by(population.id)
+    .with_excluded_centre(ExcludedCentre::Fill(0.0)))
+}
+
 fn statistic_percentile(
     name: &'static str,
     element: StructuringElement,
@@ -373,13 +402,14 @@ pub fn append_binarize_phases(
 
     let corrected = match (params.lightsheet, population) {
         (Some(arm), Some(population)) => {
-            let line = MaskedRankFilterOp::percentile(
+            // On the clipped `u16` volume itself, whose values are the bins.
+            let line = sliding_percentile(
                 "lightsheet line",
                 StructuringElement::from_size(ElementShape::Box, arm.line)?,
                 arm.percentile,
-                population.id,
-            )?
-            .filling_excluded_centres(0.0);
+                population,
+                clip.bins,
+            )?;
             let background = statistic_percentile(
                 "lightsheet background",
                 StructuringElement::from_size_stepped(
@@ -572,13 +602,25 @@ pub fn append_binarize_phases(
         };
         let disk =
             StructuringElement::from_size(ElementShape::Ellipsoid, [1, arm.disk[0], arm.disk[1]])?;
-        let background = MaskedRankFilterOp::percentile(
-            "vessel background",
-            disk,
-            VESSEL_BACKGROUND_PERCENTILE,
-            population.id,
-        )?
-        .filling_excluded_centres(0.0);
+        // The clamped stream is whole numbers on the clip's bins — the median
+        // (at most the top bin), or the equalized volume capped at the
+        // threshold and rescaled onto the top bin, then truncated — so it
+        // narrows to `u16` exactly, is counted on those bins, and widens back
+        // exactly. A value past the top bin would be refused by the kernel.
+        let background = Chain::sequence(vec![
+            Chain::op(NarrowOp::new(
+                "vessel background bins",
+                Narrowing::new(Dtype::U16, Rounding::TowardZero)?,
+            )),
+            Chain::op(sliding_percentile(
+                "vessel background",
+                disk,
+                VESSEL_BACKGROUND_PERCENTILE,
+                population,
+                clip.bins,
+            )?),
+            Chain::op(WidenOp::new("widen")),
+        ]);
         let tubeness = RidgeFilterOp::new(
             "tubeness",
             ScaleSpace::isotropic(&[arm.sigma], TRUNCATE, 0.0)?.with_boundary(Boundary::Reflect),
@@ -589,7 +631,7 @@ pub fn append_binarize_phases(
                 v.clamp(0.0, f64::from(u16::MAX)).trunc()
             })),
             Chain::parallel(
-                vec![Chain::op(CarryOp::new("clamped")), Chain::op(background)],
+                vec![Chain::op(CarryOp::new("clamped")), background],
                 Box::new(FnCombine::new("vessel residual", 2, |x| {
                     x[0] - x[0].min(x[1])
                 })?),

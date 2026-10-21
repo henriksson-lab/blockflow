@@ -15,6 +15,9 @@ fn main() {
     }
     limit_malloc_arenas();
     let args = Args::parse();
+    let cap = blockflow::budget::MemoryCap::resolve(args.memory_mb.map(|mib| mib << 20));
+    blockflow::budget::set_process_cap(cap);
+    eprintln!("cell-density: memory cap {cap}");
     match run(&args)
         .and_then(|report| serde_json::to_string_pretty(&report).map_err(blockflow::Error::backend))
     {

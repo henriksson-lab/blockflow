@@ -63,6 +63,7 @@
 // | `template_match` | normalised cross-correlation with radial (shell) templates, at one or several radii | **a configuration, not an op**: one `transform_bank` with the image and its square as inputs and, per radius, a group of three correlations — template, support, support over the square — combined to the NCC, folded by a maximum. What it contributes is the radial template (sampled around an exemplar, averaged over many) and the kernel geometry |
 // | `transform_bank` | several correlations of one input (and pointwise maps of it), combined per voxel in groups and folded across groups | `convolve`'s transform correlation with the input transformed **once per tile for all kernels**, `m + k` transforms instead of `2k`; tiles anchored to the volume and computed in parallel, like `TransformConvolveOp` |
 // | `suppress` | greedy suppression of nearby rows, strongest first, by a pair rule over per-row radii | the first row op whose fate for one row depends on rows in **any** block: a barrier `reduce` runs the kernel once over every row and each block emits its kept rows, so the output is a subsequence of the input like `rows`' filter. The fixed-distance suppression `classical_centers` uses is the `Fixed` radius of this kernel |
+// | `plane_sample` | physical planar intensity or support sampling | strict voxel-center domain, f64 accumulation and bounded affine source footprints |
 // | `surfaces` | stacked height-field surfaces found as one exact minimum cut, and the region labels between them | a **global combinatorial optimum** under the planner without the volume in memory: the cut needs each surface's cost pooled into columns, so blocks pool their own columns, a barrier `reduce` solves the small graph with `crate::graph_cut`, and blocks paint the answer. Bit-identical across block grids whose edges are multiples of the stride |
 // | `segment_split` | one segment of a fragment grouping split in two (or k) along its weakest membrane, from user seeds | the first op that **edits a grouping rather than computing one**: an exact minimum s-t cut (`crate::graph_cut`) over one segment's subgraph of a `rag::Rag`, with `-ln p`, area-weighted capacities and seeds as hard constraints. It is the proofreading counterpart of `agglomerate`, called per edit on a resident graph |
 //
@@ -375,6 +376,7 @@ pub mod tabulate;
 pub mod template_match;
 pub mod threshold;
 pub mod tiled_watershed;
+pub mod plane_sample;
 pub mod transform;
 pub mod transform_bank;
 pub mod voxelize;
@@ -706,6 +708,10 @@ pub use normalise::{
     LevelCorrectionOp, LocalContrastOp, LocalGainOp, Removal,
 };
 pub use path_opening::{path_opening_into, PathCones, PathOpeningOp, PathOperator, PathParams};
+pub use point_distance::{
+    append_point_distance_phases, point_distance_schema, BoundaryIndex, MaskBoundaryOp, MaskTest,
+    NearestBoundary, PointDistanceOp, STATUS_CAPPED, STATUS_EXACT, STATUS_NONE,
+};
 pub use random_walker::{
     append_grady_weight_phase, append_random_walker_binary_seed_image_phases,
     append_random_walker_row_id_phase, assemble_random_walker_system,
@@ -747,10 +753,6 @@ pub use ridge::{
     gaussian_weights, hessian_at, ridge_response_into, symmetric_eigenvalues, Boundary,
     EigenResponse, HessianEigenvalueOp, PlateResponse, Polarity, RatioResponse, Response,
     RidgeFilterOp, RidgeResponse, ScaleSpace,
-};
-pub use point_distance::{
-    append_point_distance_phases, point_distance_schema, BoundaryIndex, MaskBoundaryOp, MaskTest,
-    NearestBoundary, PointDistanceOp, STATUS_CAPPED, STATUS_EXACT, STATUS_NONE,
 };
 pub use rows::{
     append_group_phases, collect_groups, collect_rows, decode_groups, encode_groups, filter_blob,

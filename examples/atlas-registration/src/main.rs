@@ -24,6 +24,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Memory cap in MiB for the planned volume phases and their chunk caches
+    /// (default: $BLOCKFLOW_MEMORY_CAP, else the cgroup's limit, else a share
+    /// of the machine). The registration's own resident volumes are not
+    /// planned and are not bounded by it.
+    #[arg(long, global = true)]
+    memory_mb: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -523,6 +529,9 @@ fn main() {
         std::process::exit(2);
     }
     let cli = Cli::parse();
+    blockflow::budget::set_process_cap(blockflow::budget::MemoryCap::resolve(
+        cli.memory_mb.map(|mib| mib << 20),
+    ));
     let result = match &cli.command {
         Command::Register(args) => run_register(args),
         Command::Chain(args) => run_chain(args),

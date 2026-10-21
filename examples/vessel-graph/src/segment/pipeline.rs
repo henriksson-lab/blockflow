@@ -162,8 +162,7 @@ pub fn append_skeleton(c: &mut Cursor<'_>, mask: Image, params: &SkeletonParams)
     } else {
         c.make_input(mask)?;
     }
-    let phase = c.plan.iterate(params.thinning()?)?;
-    c.wrote(phase)
+    c.iterate(params.thinning()?)
 }
 
 /// The image the thinning starts from: `mask` with the volume's faces cleared

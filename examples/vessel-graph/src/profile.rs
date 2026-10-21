@@ -203,8 +203,40 @@ pub fn phase_names(assembly: &blockflow::assemble::Assembly) -> Vec<String> {
         .collect()
 }
 
-/// The listeners a planned run is given: a [`PhaseProfile`] when profiling is
-/// on, none otherwise. Call [`Listening::finish`] after the run.
+/// Hands the heap a phase freed back to the system when the next phase
+/// starts.
+///
+/// glibc keeps freed block buffers in its arenas, and a phase whose buffers are
+/// a different shape from the last one's cannot reuse all of them, so without
+/// this the resident set climbs with the freed-but-kept heap of every phase
+/// before it. On the osf-sa3x8 region `segment` peaked at 9.1 GB without it
+/// and 8.1 GB with it (7.9 GB with every large buffer handed to `mmap`, which
+/// is close to the live set, but at twice the system time). One
+/// `malloc_trim` per phase costs milliseconds.
+struct HeapRelease;
+
+impl EventListener for HeapRelease {
+    fn on_event(&self, event: &Event) {
+        if let Event::PhaseStarted { phase } = event {
+            if *phase > 0 {
+                release_freed_heap();
+            }
+        }
+    }
+}
+
+/// Return free heap pages to the system (glibc's `malloc_trim`).
+pub fn release_freed_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` only returns free heap pages to the system.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// The listeners a planned run is given: a heap release at every phase
+/// boundary, and a [`PhaseProfile`] when profiling is on. Call
+/// [`Listening::finish`] after the run.
 pub struct Listening {
     profile: Option<std::sync::Arc<PhaseProfile>>,
 }
@@ -218,10 +250,12 @@ impl Listening {
     }
 
     pub fn listeners(&self) -> Vec<std::sync::Arc<dyn EventListener>> {
-        match &self.profile {
-            Some(profile) => vec![profile.clone() as std::sync::Arc<dyn EventListener>],
-            None => Vec::new(),
+        let mut listeners: Vec<std::sync::Arc<dyn EventListener>> =
+            vec![std::sync::Arc::new(HeapRelease)];
+        if let Some(profile) = &self.profile {
+            listeners.push(profile.clone());
         }
+        listeners
     }
 
     pub fn finish(&self) {

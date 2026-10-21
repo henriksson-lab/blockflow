@@ -574,8 +574,8 @@ pub fn measure_stored(
         pack_work.join(format!("level{}", packed.index())),
     )];
     attached.extend(channels);
-    let env = ZarrEnvironment::attach(plan.work.join("measure"), &attached)?
-        .with_cache(plan.cache_bytes);
+    let env =
+        ZarrEnvironment::attach(plan.work.join("measure"), &attached)?.with_cache(plan.cache_bytes);
     run(&assembly, &env, plan, &[], "graph measure")?;
     GRAPH.stage("graph plan: collect");
     let measured = collect_measured(&env, signals.len())?;

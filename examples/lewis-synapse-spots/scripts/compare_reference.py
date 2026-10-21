@@ -1,15 +1,15 @@
 """Compare a lewis-synapse-spots run with scripts/spots_reference.py output.
-Usage: python3 -I compare_reference.py REFERENCE_DIR RUN_DIR"""
-import sys,csv,numpy as np
-from PIL import Image
+Usage: python3 -I compare_reference.py REFERENCE_DIR RUN_DIR OME_ZARR_DIR [LAYER]"""
+import sys,csv,numpy as np,zarr
 from scipy.spatial import cKDTree
-pd,bd=sys.argv[1],sys.argv[2]
+pd,bd,zd=sys.argv[1:4]; layer=sys.argv[4] if len(sys.argv)>4 else 'lewis'
 names=[r['image'] for r in csv.DictReader(open(f'{bd}/images.csv'))]
 bsp={}
 for r in csv.DictReader(open(f'{bd}/spots.csv')): bsp.setdefault(r['image'],[]).append(r)
 for n in names:
     d=np.load(f'{pd}/{n}.npz'); pc=d['cell']; ps=d['spots']
-    cl=np.array(Image.open(f'{bd}/labels/{n}.cell.png')); bs=np.array(Image.open(f'{bd}/labels/{n}.spots.png'))
+    lab=lambda k: zarr.open_array(f'{zd}/{n}.ome.zarr/labels/{layer}-{k}/0',mode='r')[0]
+    cl=lab('synapse'); bs=lab('spots')
     img=[r for r in csv.DictReader(open(f'{bd}/images.csv')) if r['image']==n][0]
     bc=cl==int(img['synapse_label'])
     iou=(pc&bc).sum()/(pc|bc).sum()

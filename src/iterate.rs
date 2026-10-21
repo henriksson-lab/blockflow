@@ -36,10 +36,9 @@
 // The buffer written at substage `k` already holds the output of substage `k-2`,
 // which nothing will read again — so two alternating buffers suffice and live
 // storage is `O(1)` in the substage count. That is what makes the shape
-// affordable, and it is also what will later make a skipped write free: a block
-// that did not change can leave the buffer holding `k-2`'s value, which is its
-// own unchanged value. The skip is not built here. Correctness first, and a
-// trivial executor is the oracle the optimisation will be tested against.
+// affordable, and it is also what makes a skipped write free: a block that did
+// not change can leave the buffer holding `k-2`'s value, which is its own
+// unchanged value. The skip is the dirty set below.
 //
 // Where the loop stops
 // --------------------
@@ -51,11 +50,23 @@
 // answer. What is given up is that the *execution trace* is a function of
 // metadata alone, which was never one of the guarantees.
 //
-// The implementation here is the trivial, obviously-correct one: every block
-// runs every substage, and after each substage the executor asks whether
+// The default implementation is the trivial, obviously-correct one: every
+// block runs every substage, and after each substage the executor asks whether
 // anything changed anywhere. In a single process that is a loop over the blocks
-// and needs no barrier primitive. The per-block skip, the frontier and the dirty
-// set are the optimisation and they come later.
+// and needs no barrier primitive.
+//
+// The dirty set
+// -------------
+// An op whose substage is the same function of its operands at every index
+// declares it ([`IterativeOp::stationary`]), and the executor then runs a block
+// at substage `k` only if a block whose core meets its fetch — itself included —
+// changed at `k - 1`. Otherwise its window is the one it read at `k - 1`, so its
+// answer would be too, and the buffer being written already holds it. Nothing
+// else moves: the convergence test, the substage count and every voxel are the
+// trivial executor's, which `tests/iterative_dirty_set.rs` checks. It is a
+// declaration rather than a default because an op that reads
+// [`Substage::index`] past substage 0 would be skipped wrongly, and nothing
+// short of the op can say it does not.
 //
 // **The runaway limit is required and is a guard, not a parameter**, on exactly
 // `ops::skeleton::PassLimit`'s argument; `SubstageLimit` carries that reasoning.
@@ -294,6 +305,20 @@ pub trait IterativeOp: Send + Sync {
     /// The default is `f64` and only `f64`, matching [`crate::op::BlockOp::accepts`].
     fn accepts(&self, dtype: Dtype) -> bool {
         dtype == Dtype::F64
+    }
+
+    /// Whether a substage is **one function of its operands' windows at every
+    /// index** — it ignores [`Substage::index`] and keeps no state between
+    /// substages — so that a block whose operands are unchanged since the
+    /// previous substage would compute what it computed then.
+    ///
+    /// Declaring it lets the executor keep a per-block dirty set: a block is
+    /// revisited only when a block it reads changed at the previous substage.
+    /// The answer and the substage count are those of the full sweep; only
+    /// the work differs. `false` by default, which is the full sweep, because a
+    /// wrong `true` would leave a block at a stale value and nothing could tell.
+    fn stationary(&self) -> bool {
+        false
     }
 
     /// Compute one substage over the whole of the block, writing into `out`.

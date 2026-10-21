@@ -13,11 +13,18 @@
 //! | group | features |
 //! |---|---|
 //! | size, shape | `area_um2`, `eq_radius_um`, `inradius_um`, `eccentricity`, `solidity`, `touches_frame` |
-//! | amount | `n_spots`, `spot_density_um2`, `spot_area_fraction`, `spot_area_median_px`, `spot_ecc_median` |
+//! | amount | `n_spots`, `spot_density_um2`, `spot_area_fraction` |
+//! | spot size, shape | `spot_area_median_px`, `spot_area_median_um2`, `spot_area_iqr_um2`, `spot_major_median_um`, `spot_minor_median_um`, `spot_ecc_median` |
 //! | heterogeneity | `pixel_cv`, `spot_int_cv`, `spot_int_gini`, `spot_int_log_p90_p10`, `punctate_fraction` |
-//! | radial | `spot_radial_index`, `spot_radial_index_w`, `radial_bin1..4` (edge to centre), `central_enrichment` |
+//! | radial | `spot_radial_index`, `spot_radial_index_w`, `radial_bin1..4` (intensity) and `radial_spot_density_bin1..4` (spot count), edge to centre, `central_enrichment` |
 //! | polarity | `polarity` |
-//! | point pattern | `clark_evans`, `nn_cv`, `ripley_h_*` |
+//! | point pattern | `nn_mean_um`, `clark_evans`, `nn_cv`, `ripley_h_*` |
+//!
+//! Radial position is relative: distance to the edge over the inradius, 0 at
+//! the edge and 1 at the point deepest inside, so rings scale with the synapse.
+//! Both radial-bin families are densities relative to a flat synapse: a bin's
+//! share of the intensity (or of the spots) over its share of the area, 1
+//! everywhere when uniform.
 
 use std::fmt::Write as _;
 
@@ -31,6 +38,9 @@ pub struct Spot {
     pub area: f64,
     pub raw_sum: f64,
     pub ecc: f64,
+    /// Principal axis lengths in Y/X, pixels.
+    pub major_axis: f64,
+    pub minor_axis: f64,
     /// Mean distance to the synapse edge over the spot's pixels, pixels.
     pub edge_distance: f64,
 }
@@ -72,6 +82,11 @@ pub fn header() -> String {
     for r in RIPLEY_REL {
         let _ = write!(h, ",ripley_h_{}R", fmt_scale(r));
     }
+    h.push_str(",spot_area_median_um2,spot_area_iqr_um2,spot_major_median_um,spot_minor_median_um");
+    for b in 1..=RADIAL_BINS {
+        let _ = write!(h, ",radial_spot_density_bin{b}");
+    }
+    h.push_str(",nn_mean_um");
     h
 }
 
@@ -79,8 +94,8 @@ fn fmt_scale(r: f64) -> String {
     format!("{r}").replace('.', "p")
 }
 
-pub fn row(inputs: &Inputs<'_>) -> String {
-    let values = compute(inputs);
+/// The CSV cells of [`compute`], `NA` where undefined.
+pub fn row(values: &[f64]) -> String {
     values
         .iter()
         .map(|v| if v.is_finite() { format!("{v:.6}") } else { "NA".into() })
@@ -88,7 +103,8 @@ pub fn row(inputs: &Inputs<'_>) -> String {
         .join(",")
 }
 
-fn compute(inp: &Inputs<'_>) -> Vec<f64> {
+/// The features in [`header`] order.
+pub fn compute(inp: &Inputs<'_>) -> Vec<f64> {
     let (h, w) = inp.synapse.dim();
     let um = inp.pixel_um;
     let mut inside = Vec::new();
@@ -147,6 +163,14 @@ fn compute(inp: &Inputs<'_>) -> Vec<f64> {
     // relative intensity density per bin: 1 everywhere for a flat synapse
     let radial_bins: Vec<f64> = (0..RADIAL_BINS)
         .map(|b| (bin_int[b] / net_total) / (bin_area[b] / area_px))
+        .collect();
+    // the same for spot counts, by each spot's mean relative radius
+    let mut bin_spots = [0.0; RADIAL_BINS];
+    for &r in &spot_r {
+        bin_spots[((r * RADIAL_BINS as f64) as usize).min(RADIAL_BINS - 1)] += 1.0;
+    }
+    let radial_spot_density: Vec<f64> = (0..RADIAL_BINS)
+        .map(|b| (bin_spots[b] / n as f64) / (bin_area[b] / area_px))
         .collect();
     let (mut central_int, mut central_area) = (0.0, 0.0);
     for (&(y, x), &v) in inside.iter().zip(&net) {
@@ -229,6 +253,18 @@ fn compute(inp: &Inputs<'_>) -> Vec<f64> {
     out.extend(radial_bins);
     out.extend([central_enrichment, polarity, clark_evans, nn_cv]);
     out.extend(ripley);
+    let px_um2 = um * um;
+    let axis_median = |f: fn(&Spot) -> f64| {
+        median(&inp.spots.iter().map(f).filter(|v| v.is_finite()).collect::<Vec<_>>()) * um
+    };
+    out.extend([
+        median(&spot_areas) * px_um2,
+        (quantile(&spot_areas, 0.75) - quantile(&spot_areas, 0.25)) * px_um2,
+        axis_median(|s| s.major_axis),
+        axis_median(|s| s.minor_axis),
+    ]);
+    out.extend(radial_spot_density);
+    out.push(nn_obs);
     out
 }
 

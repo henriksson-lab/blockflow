@@ -251,6 +251,31 @@ fn segment_publishes_the_in_memory_answer_for_two_channels() {
         assert!(!dir.join(leftover).exists(), "{leftover} is removed");
     }
 
+    // Without `--block` the planner chooses the grids (the segmentation's,
+    // the thinning's, the stored rounds'), and the labels are the same.
+    for thin_memory in ["8192", "0"] {
+        let chosen = Segment::parse_from([
+            "segment",
+            "--no-deep-fill",
+            "--zarr",
+            image.to_str().unwrap(),
+            "--channel",
+            "0,1",
+            "--params",
+            params_path.to_str().unwrap(),
+            "--workers",
+            "3",
+            "--thin-memory-mb",
+            thin_memory,
+            "--work",
+            dir.join("work").to_str().unwrap(),
+        ]);
+        run_segment(&chosen.args).expect("the run on the chosen grid");
+        assert_eq!(read_label(&image, "vessel-mask"), mask);
+        assert_eq!(read_label(&image, "vessel-skeleton"), skeleton);
+        assert_eq!(read_label(&image, "vessel-artery-mask"), artery);
+    }
+
     // `graph` reads back what `segment` published and builds the graph the
     // library builds from the in-memory answer, with the artery mask found by
     // its name.

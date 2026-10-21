@@ -252,11 +252,7 @@ fn anisotropy(l: [f64; 3]) -> (f64, f64, f64) {
         ((l[0] - l[1]).powi(2) + (l[1] - l[2]).powi(2) + (l[2] - l[0]).powi(2)).sqrt(),
         std::f64::consts::SQRT_2 * norm,
     );
-    (
-        fa,
-        ratio(l[0] - l[1], sum),
-        ratio(2.0 * (l[1] - l[2]), sum),
-    )
+    (fa, ratio(l[0] - l[1], sum), ratio(2.0 * (l[1] - l[2]), sum))
 }
 
 /// Orthonormal real spherical harmonics up to degree `lmax` at the unit
@@ -324,9 +320,8 @@ impl Extractor {
             }
         }
         let voxels = || {
-            sv.indexed_iter().filter_map(|((z, y, x), &s)| {
-                (!s.is_nan()).then_some(([z, y, x], s as f64))
-            })
+            sv.indexed_iter()
+                .filter_map(|((z, y, x), &s)| (!s.is_nan()).then_some(([z, y, x], s as f64)))
         };
 
         // normalisation: dark band and wall peak of a fine profile (0.05 in s)
@@ -341,7 +336,11 @@ impl Extractor {
             .map(|b| (!b.is_empty()).then(|| median(b)))
             .collect();
         let extreme = |range: std::ops::Range<usize>, max: bool| {
-            fine[range].iter().flatten().copied().reduce(if max { f64::max } else { f64::min })
+            fine[range]
+                .iter()
+                .flatten()
+                .copied()
+                .reduce(if max { f64::max } else { f64::min })
         };
         let wall = extreme(16..24, true).unwrap_or(0.0);
         let dark = extreme(10..20, false).unwrap_or(wall).min(wall);
@@ -474,11 +473,7 @@ impl Extractor {
                     continue;
                 }
                 let e = |k: usize| j[k][i];
-                let (l, v) = eig3([
-                    [e(0), e(1), e(2)],
-                    [e(1), e(3), e(4)],
-                    [e(2), e(4), e(5)],
-                ]);
+                let (l, v) = eig3([[e(0), e(1), e(2)], [e(1), e(3), e(4)], [e(2), e(4), e(5)]]);
                 let coh = ratio(l[0] - l[2], l[0] + l[2]);
                 let d = [i[0] as f64 - c[0], i[1] as f64 - c[1], i[2] as f64 - c[2]];
                 let r = dot(d, d).sqrt();
@@ -573,8 +568,9 @@ impl Extractor {
                 }
             }
             let mean: [f64; 3] = std::array::from_fn(|a| ratio(m1[a], w));
-            let cov: [[f64; 3]; 3] =
-                std::array::from_fn(|a| std::array::from_fn(|b| ratio(m2[a][b], w) - mean[a] * mean[b]));
+            let cov: [[f64; 3]; 3] = std::array::from_fn(|a| {
+                std::array::from_fn(|b| ratio(m2[a][b], w) - mean[a] * mean[b])
+            });
             let (fa, cl, cp) = anisotropy(eig3(cov).0);
             out.extend([fa, cl, cp, dot(mean, mean).sqrt() / rbar]);
             let mut t = [[0.0; 3]; 3];
@@ -629,9 +625,11 @@ impl Extractor {
         }
         for pair in coefficients.windows(2) {
             let (a, b) = (&pair[0], &pair[1]);
-            out.extend(COHERENCE_BANDS.iter().map(|&k| {
-                ratio(band(a, b, k), (band(a, a, k) * band(b, b, k)).sqrt())
-            }));
+            out.extend(
+                COHERENCE_BANDS
+                    .iter()
+                    .map(|&k| ratio(band(a, b, k), (band(a, a, k) * band(b, b, k)).sqrt())),
+            );
         }
         debug_assert_eq!(out.len(), COLUMNS.len());
         Ok(out)
@@ -660,7 +658,9 @@ mod tests {
     #[test]
     fn eig3_recovers_a_rotated_diagonal() {
         let (l, v) = eig3([[2.0, 1.0, 0.0], [1.0, 2.0, 0.0], [0.0, 0.0, 5.0]]);
-        assert!((l[0] - 5.0).abs() < 1e-9 && (l[1] - 3.0).abs() < 1e-9 && (l[2] - 1.0).abs() < 1e-9);
+        assert!(
+            (l[0] - 5.0).abs() < 1e-9 && (l[1] - 3.0).abs() < 1e-9 && (l[2] - 1.0).abs() < 1e-9
+        );
         assert!((v[2][0].abs() - 0.5f64.sqrt()).abs() < 1e-9 && v[2][2].abs() < 1e-9);
     }
 
@@ -712,9 +712,16 @@ mod tests {
         let n = g.dim().0;
         let rotated = Array3::from_shape_fn(g.dim(), |(a, b, d)| g[[b, d, n - 1 - a]]);
         let rc = [n as f64 - 1.0 - cg[2], cg[0], cg[1]];
-        let (fs, fg, fr) = (features_of(&s, cs), features_of(&g, cg), features_of(&rotated, rc));
+        let (fs, fg, fr) = (
+            features_of(&s, cs),
+            features_of(&g, cg),
+            features_of(&rotated, rc),
+        );
         for (k, name) in COLUMNS.iter().enumerate() {
-            eprintln!("{name:20} spokes {:9.4} grains {:9.4} rotated {:9.4}", fs[k], fg[k], fr[k]);
+            eprintln!(
+                "{name:20} spokes {:9.4} grains {:9.4} rotated {:9.4}",
+                fs[k], fg[k], fr[k]
+            );
         }
     }
 
@@ -726,7 +733,12 @@ mod tests {
         let fs = features_of(&s, cs);
         let fg = features_of(&g, cg);
         for name in ["frad_mid_s1", "vario_ratio_4"] {
-            assert!(fs[col(name)] < 0.7 * fg[col(name)], "{name}: {} vs {}", fs[col(name)], fg[col(name)]);
+            assert!(
+                fs[col(name)] < 0.7 * fg[col(name)],
+                "{name}: {} vs {}",
+                fs[col(name)],
+                fg[col(name)]
+            );
         }
         assert!(fs[col("st_radial_align")] > fg[col("st_radial_align")] + 0.15);
         assert!(fs[col("coh_30_55_l9_16")] > fg[col("coh_30_55_l9_16")] + 0.3);

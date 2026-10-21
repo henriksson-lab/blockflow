@@ -266,6 +266,28 @@ pub struct Hints {
     /// constraints and gets whatever the strategy's own [`Strategy::hints`]
     /// advises.
     pub slab_policy: SlabPolicy,
+    /// **The memory budget blocks in flight are admitted against**, or `None`
+    /// for no admission (waves of `concurrency`, as before admission existed).
+    ///
+    /// The default is [`crate::budget::process_budget`]: the process's memory
+    /// cap, shared with every chunk cache. Each block of a wave leases its
+    /// phase's [`active_bytes_per_block`] charge; a block that does not fit
+    /// beside the wave already admitted — after the caches have been asked to
+    /// give bytes back — waits for the next wave, and the first block of a
+    /// wave is always admitted, so a plan whose one block exceeds the budget
+    /// runs one block at a time rather than not at all. With room to spare
+    /// every wave is `concurrency` blocks, exactly as without it.
+    ///
+    /// Near the budget (a full wave of the plan's widest phase charged at more
+    /// than half of it) the executor also **measures**: the resident set
+    /// outside the budget's leases is charged to each wave, and a phase whose
+    /// blocks are seen to hold more than they were charged is charged what was
+    /// seen. So a prediction that runs low lowers the blocks in flight instead
+    /// of breaking the cap.
+    ///
+    /// Advisory like the rest of this struct: it changes how many blocks run
+    /// at once, never which voxels they write.
+    pub memory: Option<crate::budget::MemoryBudget>,
 }
 
 impl Default for Hints {
@@ -281,6 +303,7 @@ impl Default for Hints {
             keep_images: BTreeSet::new(),
             release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
+            memory: Some(crate::budget::process_budget()),
         }
     }
 }
@@ -368,6 +391,178 @@ pub fn execute(
     env: &dyn Environment,
 ) -> Result<Stats> {
     execute_observed(strategy, workflow, decomposition, hints, env, &[])
+}
+
+/// The fraction added to a measured per-block figure (`1 / SEEN_MARGIN`, a
+/// quarter): the resident set is sampled every
+/// [`crate::budget::SAMPLE_INTERVAL`], and a block can allocate and free
+/// between two samples.
+const SEEN_MARGIN: u64 = 4;
+
+/// Whether `BLOCKFLOW_ADMISSION_LOG` is set: one line per measured wave on
+/// standard error (phases, blocks, resident set, what they held and were
+/// charged). Diagnostics only.
+fn admission_log() -> bool {
+    static LOG: OnceLock<bool> = OnceLock::new();
+    *LOG.get_or_init(|| std::env::var_os("BLOCKFLOW_ADMISSION_LOG").is_some())
+}
+
+/// The executor's memory admission: how many blocks of a wave fit the budget.
+/// See [`Hints::memory`].
+struct Admission {
+    budget: crate::budget::MemoryBudget,
+    /// Per phase: what the plan charges one block ([`active_bytes_per_block`]).
+    planned: Vec<u64>,
+    /// Per phase: the least a block is charged once measured
+    /// ([`expected_bytes_per_block`]).
+    floor: Vec<u64>,
+    /// Per phase: the most one block was seen to hold, when measuring.
+    seen: Vec<Option<u64>>,
+    /// Present when the run is near its budget: the resident set's peak per wave.
+    sampler: Option<crate::budget::ResidentSampler>,
+    /// The resident set and the caches' leases when the current wave started.
+    started: (u64, u64),
+}
+
+impl Admission {
+    fn new(
+        budget: crate::budget::MemoryBudget,
+        chain: &Chain,
+        decomposition: &Decomposition,
+        concurrency: usize,
+    ) -> Self {
+        let planned = active_bytes_per_block(chain, decomposition);
+        let floor = expected_bytes_per_block(chain, decomposition);
+        // Near the budget: a full wave of the widest phase at more than half.
+        let widest_wave = planned
+            .iter()
+            .zip(&decomposition.phases)
+            .map(|(&bytes, phase)| {
+                bytes.saturating_mul(concurrency.min(phase.grid.n_blocks()) as u64)
+            })
+            .max()
+            .unwrap_or(0);
+        let near = widest_wave.saturating_mul(2) > budget.total();
+        Self {
+            seen: vec![None; planned.len()],
+            planned,
+            floor,
+            sampler: near.then(crate::budget::ResidentSampler::start).flatten(),
+            budget,
+            started: (0, 0),
+        }
+    }
+
+    /// What one block of `phase` is charged: the plan's figure until a wave of
+    /// the phase has been measured, then the most a block of it was seen to
+    /// hold plus [`SEEN_MARGIN`] — **lower** than the plan's figure as often as
+    /// higher, since that figure carries a margin for op scratch nothing
+    /// declares (measured at 1.3x to 5.5x what the vessel pipeline's phases
+    /// hold), and a cap is no reason to run a phase at a third of the blocks
+    /// it can afford.
+    fn charge(&self, phase: usize) -> u64 {
+        match self.seen.get(phase).copied().flatten() {
+            Some(seen) => seen
+                .saturating_add(seen / SEEN_MARGIN)
+                .max(self.floor.get(phase).copied().unwrap_or(0))
+                .max(1),
+            None => self.planned.get(phase).copied().unwrap_or(0),
+        }
+    }
+
+    /// Pop the next wave from `ready`: up to `concurrency` blocks, each leasing
+    /// its charge, stopping at the first that does not fit. The first is
+    /// admitted whatever it costs.
+    fn form_wave(
+        &mut self,
+        ready: &mut BinaryHeap<Reverse<([usize; 5], usize)>>,
+        graph: &TaskGraph,
+        concurrency: usize,
+    ) -> (Vec<usize>, Vec<crate::budget::Lease>) {
+        let mut leases = Vec::new();
+        let mut over = false;
+        if let Some(sampler) = &self.sampler {
+            // What is resident and leased by nobody: the binary, the heap the
+            // allocator could not return, anything a plan does not see. Charged
+            // to the wave, so the blocks admitted are what the cap leaves.
+            crate::budget::release_freed_heap();
+            let resident = crate::budget::resident_bytes().unwrap_or(0);
+            let unaccounted = resident.saturating_sub(self.budget.in_use());
+            match self.budget.try_acquire_reclaiming(unaccounted) {
+                Some(lease) => leases.push(lease),
+                // Already over: one block at a time until the resident set
+                // comes back under.
+                None => over = true,
+            }
+            sampler.reset(resident);
+            self.started = (resident, self.budget.opportunistic_in_use());
+        }
+        let mut wave = Vec::new();
+        let concurrency = if over { 1 } else { concurrency };
+        while wave.len() < concurrency {
+            let Some(&Reverse((_, id))) = ready.peek() else {
+                break;
+            };
+            let charge = self.charge(graph.tasks[id].phase);
+            match self.budget.try_acquire_reclaiming(charge) {
+                Some(lease) => leases.push(lease),
+                None if wave.is_empty() => {}
+                None => break,
+            }
+            ready.pop();
+            wave.push(id);
+        }
+        (wave, leases)
+    }
+
+    /// After a wave: when measuring, charge each phase in it at least what
+    /// its blocks were seen to hold, then return the wave's leases.
+    fn wave_done(&mut self, wave: &[usize], graph: &TaskGraph, leases: Vec<crate::budget::Lease>) {
+        if let Some(sampler) = &self.sampler {
+            let (resident, cached) = self.started;
+            let grown_cache = self.budget.opportunistic_in_use().saturating_sub(cached);
+            let held = sampler
+                .peak()
+                .saturating_sub(resident)
+                .saturating_sub(grown_cache);
+            // **A peak of one wave, shared out in proportion to the plan's
+            // charges**: a wave can hold blocks of two phases (the next phase's
+            // first blocks are ready before the last of this one's), and the
+            // sampler sees one resident set. A proportional share can teach the
+            // dearer phase too little — the tubeness phase of the vessel
+            // pipeline was taught a third under what its blocks held — which is
+            // what the floor in [`Self::charge`] is for: a learned figure never
+            // goes under the margin-free prediction.
+            let planned: u64 = wave
+                .iter()
+                .map(|&id| self.planned.get(graph.tasks[id].phase).copied().unwrap_or(0))
+                .sum::<u64>()
+                .max(1);
+            let scale = held as f64 / planned as f64;
+            for &id in wave {
+                let phase = graph.tasks[id].phase;
+                let per_block =
+                    (self.planned.get(phase).copied().unwrap_or(0) as f64 * scale).round() as u64;
+                if let Some(seen) = self.seen.get_mut(phase) {
+                    *seen = Some(seen.map_or(per_block, |old| old.max(per_block)));
+                }
+            }
+            if admission_log() {
+                let phases: BTreeSet<usize> = wave.iter().map(|&id| graph.tasks[id].phase).collect();
+                eprintln!(
+                    "admission: phases {phases:?}, {} blocks, resident {} MiB at start, peak {} \
+                     MiB, held {} MiB against {} MiB charged, caches {} MiB",
+                    wave.len(),
+                    resident >> 20,
+                    sampler.peak() >> 20,
+                    held >> 20,
+                    leases.iter().map(|lease| lease.bytes()).sum::<u64>() >> 20,
+                    self.budget.opportunistic_in_use() >> 20
+                );
+            }
+        }
+        drop(leases);
+    }
 }
 
 /// [`execute`], with the run's **CPU-seconds against its wall-seconds**.
@@ -553,6 +748,11 @@ pub fn execute_phases(
         .then(|| worker_pool(concurrency))
         .transpose()?;
 
+    let mut admission = hints
+        .memory
+        .as_ref()
+        .map(|budget| Admission::new(budget.clone(), &workflow.chain, decomposition, concurrency));
+
     let mut indegree: Vec<usize> = graph.tasks.iter().map(Task::n_dependencies).collect();
     let dependents = graph.dependents();
     // An iterative phase runs as a whole, so its tasks never enter the ready
@@ -728,10 +928,16 @@ pub fn execute_phases(
                         graph.len()
                     )));
                 }
-                let take = concurrency.min(ready.len());
-                let wave: Vec<usize> = (0..take)
-                    .map(|_| ready.pop().expect("checked non-empty").0 .1)
-                    .collect();
+                let (wave, leases) = match admission.as_mut() {
+                    None => {
+                        let take = concurrency.min(ready.len());
+                        let wave: Vec<usize> = (0..take)
+                            .map(|_| ready.pop().expect("checked non-empty").0 .1)
+                            .collect();
+                        (wave, Vec::new())
+                    }
+                    Some(admission) => admission.form_wave(&mut ready, &graph, concurrency),
+                };
 
                 for &id in &wave {
                     let phase = graph.tasks[id].phase;
@@ -819,6 +1025,9 @@ pub fn execute_phases(
                     None => wave.iter().map(|&id| run(id)).collect(),
                     Some(pool) => pool.install(|| wave.par_iter().map(|&id| run(id)).collect()),
                 };
+                if let Some(admission) = admission.as_mut() {
+                    admission.wave_done(&wave, &graph, leases);
+                }
                 let mut gathered = Vec::with_capacity(wave.len());
                 for (&id, outcome) in wave.iter().zip(outcomes) {
                     gathered.push((id, outcome?));
@@ -2172,11 +2381,25 @@ fn run_fragment_task(
 /// image lifetime, the dependents — is the same code that runs for every other
 /// kind of phase.
 ///
-/// **The trivial form, on purpose.** Every block runs every substage, and the
+/// **The trivial form, by default.** Every block runs every substage, and the
 /// convergence test is "did any block's core come out different from what it went
-/// in as". No per-block skip, no dirty set, no frontier: those are the
-/// optimisation, and a trivial executor is correct by design, which is what makes
-/// it the oracle they will be tested against.
+/// in as". A trivial executor is correct by design, which is what makes it the
+/// oracle the per-block skip below is tested against.
+///
+/// **The dirty set, for an op that declares [`IterativeOp::stationary`].** Such
+/// an op's substage is one function of its operands' windows at every index, so
+/// a block none of whose readable neighbours — the blocks whose cores meet its
+/// fetch, itself included — changed at substage `k - 1` would compute at `k`
+/// exactly what it computed at `k - 1`, and is not run. Its core is already right
+/// in the buffer being written: that buffer holds substage `k - 2`'s output, and
+/// the block did not change at `k - 1`. The one exception is substage 1, whose
+/// buffer has never been written, where the core is copied over instead. The
+/// convergence test is unchanged — a skipped block did not change — so the
+/// substage count, and every voxel, are those of the trivial form;
+/// `tests/iterative_dirty_set.rs` holds the two against each other. Most of an
+/// iteration's work is usually done in its first few substages, and the long
+/// tail after that touches a few blocks: this is what keeps the tail from costing
+/// a full sweep per substage.
 ///
 /// **The blocks of one substage run together.** They are independent — each reads
 /// `current`, which nothing writes during the substage, and writes its own core of
@@ -2241,6 +2464,16 @@ fn run_iterative_phase(
     let mut current = env.constant(dtype, &whole, f64::NAN)?;
     let mut next = env.constant(dtype, &whole, f64::NAN)?;
 
+    // The dirty set's two halves: which blocks each block reads (empty where
+    // the op does not declare itself stationary, so nothing is skipped), and
+    // which blocks changed at the previous substage. Every block runs substage
+    // 0, which is what "all changed" says.
+    let readers = match op.stationary() {
+        true => read_neighbours(tasks, &phase.grid),
+        false => Vec::new(),
+    };
+    let mut changed_before = vec![true; tasks.len()];
+
     // Everything that can fail runs inside here, so the two buffers are released
     // on the way out however it ends. A failed run's residency counters are not
     // load-bearing, but a partial release would be a number that quietly means
@@ -2268,11 +2501,31 @@ fn run_iterative_phase(
             // reason the ready wave's outcomes are gathered rather than merged.
             let changed = AtomicBool::new(false);
             let changed_voxels = AtomicU64::new(0);
+            let changed_now: Vec<AtomicBool> =
+                (0..tasks.len()).map(|_| AtomicBool::new(false)).collect();
             {
                 let sink = Mutex::new(&mut next);
-                let one_block = |task: &Task| -> Result<()> {
+                let one_block = |(position, task): (usize, &Task)| -> Result<()> {
                     let fetch = &task.geometry.source;
                     let read = &task.geometry.read;
+                    if !readers.is_empty()
+                        && !readers[position].iter().any(|&other| changed_before[other])
+                    {
+                        // Nothing this block reads changed, so neither does its
+                        // core. Substage 1 writes a buffer nothing has written
+                        // yet, so the core is carried into it; after that the
+                        // buffer already holds it (see this function's header).
+                        if ran == 1 {
+                            let valid = &task.geometry.valid;
+                            let core = env.slice(&current, &whole, valid)?;
+                            {
+                                let mut held = sink.lock_unpoisoned();
+                                env.place(&mut held, &whole, valid, &core)?;
+                            }
+                            env.release(&core);
+                        }
+                        return Ok(());
+                    }
                     let at = Anchor::of_region(fetch, decomposition.volume_at(phase_index))?;
                     // One buffer per declared operand, every one of them over the
                     // block's read extent — see `iterate::Substage` for why they share
@@ -2355,6 +2608,7 @@ fn run_iterative_phase(
                     match env.same(&core, &before) {
                         Some(false) => {
                             changed.store(true, Ordering::SeqCst);
+                            changed_now[position].store(true, Ordering::SeqCst);
                             // Beside the decision and never in place of it: `same` is
                             // the environment's own override point and stays the sole
                             // thing that ends an iteration. This is the size of a
@@ -2391,13 +2645,18 @@ fn run_iterative_phase(
                     Ok(())
                 };
                 match pool {
-                    None => tasks.iter().try_for_each(&one_block)?,
-                    Some(pool) => pool.install(|| tasks.par_iter().try_for_each(one_block))?,
+                    None => tasks.iter().enumerate().try_for_each(&one_block)?,
+                    Some(pool) => {
+                        pool.install(|| tasks.par_iter().enumerate().try_for_each(one_block))?
+                    }
                 }
             }
             // The exchange point. Everything below reads `current`, so the swap is
             // the barrier; see this function's header for the distributed shape.
             std::mem::swap(&mut current, &mut next);
+            for (before, now) in changed_before.iter_mut().zip(&changed_now) {
+                *before = now.load(Ordering::SeqCst);
+            }
             ran += 1;
             changes.push(changed_voxels.load(Ordering::SeqCst));
             if !changed.load(Ordering::SeqCst) {
@@ -2449,6 +2708,47 @@ fn run_iterative_phase(
     env.release(&current);
     env.release(&next);
     produced
+}
+
+/// For each task of a phase, the positions (in `tasks`) of the tasks whose valid
+/// region meets its fetch, itself included: the blocks whose change can reach it
+/// at the next substage.
+///
+/// Found through the grid rather than by testing every pair, so it stays linear
+/// in the block count for a reach of a few blocks: a fetch can meet only the
+/// cores of the blocks its own extent spans.
+fn read_neighbours(tasks: &[Task], grid: &BlockGrid) -> Vec<Vec<usize>> {
+    let edge = grid.block();
+    let by_index: BTreeMap<[usize; 3], usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(position, task)| (task.index, position))
+        .collect();
+    tasks
+        .iter()
+        .map(|task| {
+            let fetch = &task.geometry.source;
+            let ranges = fetch.ranges();
+            let mut span = [(0usize, 0usize); 3];
+            for axis in 0..3 {
+                let (start, end) = ranges[axis];
+                span[axis] = (start / edge[axis], end.saturating_sub(1) / edge[axis]);
+            }
+            let mut found = Vec::new();
+            for i in span[0].0..=span[0].1 {
+                for j in span[1].0..=span[1].1 {
+                    for k in span[2].0..=span[2].1 {
+                        if let Some(&other) = by_index.get(&[i, j, k]) {
+                            if tasks[other].geometry.valid.intersect(fetch).is_some() {
+                                found.push(other);
+                            }
+                        }
+                    }
+                }
+            }
+            found
+        })
+        .collect()
 }
 
 /// One iterative map-reduce phase: broadcast state, map every block, reduce once,
@@ -2612,6 +2912,15 @@ pub fn differing_voxels(left: &Voxels, right: &Voxels) -> Result<u64> {
     fn count<T: crate::voxels::VoxelElement>(left: &Voxels, right: &Voxels) -> Result<u64> {
         let left = left.view::<T>()?;
         let right = right.view::<T>()?;
+        // Two flat slices where both are in standard layout, which a block
+        // buffer is: the same count, without the strided iterator.
+        if let (Some(left), Some(right)) = (left.as_slice(), right.as_slice()) {
+            return Ok(left
+                .iter()
+                .zip(right)
+                .filter(|(one, other)| one != other)
+                .count() as u64);
+        }
         Ok(left
             .iter()
             .zip(right.iter())
@@ -2849,6 +3158,402 @@ pub fn priority_key(task: &super::graph::Task, hints: &Hints) -> [usize; 5] {
 
 // ------------------------------------------------- choosing between paths --
 
+/// The machine a plan is chosen for: how many blocks run at once, and how many
+/// bytes they may hold between them.
+///
+/// **The information a block-size choice cannot be made without.** A plan
+/// priced at one worker always answers "the largest block that fits" (see
+/// [`Enumerating::concurrency`]), and a caller who fixes a block instead fixes
+/// a number of blocks, which on a machine with more workers than blocks leaves
+/// the rest parked. [`Host::detect`] is what a caller with nothing better to say
+/// passes; a caller who knows its pool says [`Host::with_workers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Host {
+    /// Blocks in flight at once: the worker pool.
+    pub workers: usize,
+    /// Bytes the blocks in flight may hold, as
+    /// [`Constraints::budget_bytes`](crate::decomposition::Constraints::budget_bytes)
+    /// means it.
+    pub budget_bytes: u64,
+}
+
+/// Workers assumed where the machine cannot be asked.
+///
+/// Small on purpose, on the argument `budget::FALLBACK_BUDGET_BYTES` makes for
+/// memory: a plan cut for four workers runs on forty at a few rounds too few
+/// per phase, and one cut for forty runs on four at ten times the halo it
+/// needs.
+pub const FALLBACK_WORKERS: usize = 4;
+
+impl Host {
+    /// The machine this process runs on.
+    ///
+    /// * **Workers**: `std::thread::available_parallelism`, which on Linux
+    ///   honours the CPU affinity mask and a cgroup CPU quota, so a container
+    ///   limited to eight CPUs is an eight-worker machine whatever its host
+    ///   has; [`FALLBACK_WORKERS`] where it cannot say.
+    /// * **Memory**: [`crate::budget::default_budget_bytes`] — the
+    ///   `BLOCKFLOW_MEMORY_BUDGET_BYTES` override, else half the machine or
+    ///   three quarters of what is available from `/proc/meminfo`, else the
+    ///   budget module's conservative fallback; and never more than the
+    ///   process's memory cap leaves for blocks in flight when a cap is stated
+    ///   or a cgroup sets one ([`crate::budget::process_cap`]).
+    pub fn detect() -> Self {
+        Self {
+            workers: std::thread::available_parallelism().map_or(FALLBACK_WORKERS, |n| n.get()),
+            budget_bytes: crate::budget::default_budget_bytes(),
+        }
+    }
+
+    /// The same machine with a pool of `workers` (at least one).
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.workers = workers.max(1);
+        self
+    }
+
+    /// The same machine under a memory cap: blocks in flight get the cap's
+    /// [`usable_bytes`](crate::budget::MemoryCap::usable_bytes).
+    pub fn with_cap(mut self, cap: crate::budget::MemoryCap) -> Self {
+        self.budget_bytes = cap.usable_bytes();
+        self
+    }
+
+    /// [`Constraints`] for this machine: its concurrency and its budget, and
+    /// the defaults for everything else.
+    pub fn constraints(&self) -> Constraints {
+        Constraints {
+            expected_concurrency: self.workers.max(1),
+            budget_bytes: Some(self.budget_bytes),
+            ..Constraints::default()
+        }
+    }
+}
+
+/// The smallest block edge [`grid_candidates`] offers on an axis it cuts.
+///
+/// Below it a block is mostly halo for any op that reads a neighbourhood, and
+/// the per-block overheads (a task, a read, a write, a chunk) start to rival
+/// the work.
+pub const MIN_GRID_EDGE: usize = 8;
+
+/// How many blocks per worker [`choose_grid`] looks at, at most, before it
+/// stops: room for a phase to run several rounds where that is what balances
+/// the pool, without pricing lattices so fine that only the budget could want
+/// them.
+pub const GRID_BLOCKS_PER_WORKER: usize = 4;
+
+/// The plan-wide block shapes worth pricing over `volume`: every grid that cuts
+/// each axis into a power-of-two number of pieces of at least
+/// [`MIN_GRID_EDGE`] (an axis may also stay whole), **in order of block
+/// count**, fewest first, and among equal counts the more even shapes first.
+///
+/// **Per axis, not a scalar edge**, and that is the point of the function. A
+/// scalar ladder clamps one edge to every axis, so it can offer cubes and the
+/// volume and nothing between; an op whose reach is wide on two axes and
+/// narrow on the third — a window in the image plane, a line along one axis —
+/// is cut for free along the narrow one and expensively along the others, and
+/// only a per-axis family contains the slab that says so. Measured on a vessel
+/// segmentation of a `128 x 512 x 404` volume, whose plane-wide windows reach
+/// 100 voxels in `y` and `x` and at most 2 in `z`: slabs of `[16, 512, 404]`
+/// took 30% less CPU than `[64, 256, 256]` at the same eight blocks.
+pub fn grid_candidates(volume: [usize; 3]) -> Vec<[usize; 3]> {
+    let pieces = |extent: usize| -> Vec<usize> {
+        let mut out = vec![1usize];
+        let mut count = 2usize;
+        while count <= extent && extent.div_ceil(count) >= MIN_GRID_EDGE {
+            out.push(count);
+            count *= 2;
+        }
+        out
+    };
+    let per_axis = [pieces(volume[0]), pieces(volume[1]), pieces(volume[2])];
+    let mut shapes: Vec<(usize, usize, [usize; 3])> = Vec::new();
+    for &a in &per_axis[0] {
+        for &b in &per_axis[1] {
+            for &c in &per_axis[2] {
+                let block = [
+                    volume[0].div_ceil(a),
+                    volume[1].div_ceil(b),
+                    volume[2].div_ceil(c),
+                ];
+                let blocks: usize = (0..3)
+                    .map(|axis| volume[axis].div_ceil(block[axis]))
+                    .product();
+                // The spread of the edges, so that among grids of one block
+                // count the one nearest a cube comes first: it is the one with
+                // the least surface, and the order is part of the tie rule.
+                let spread = block.iter().max().copied().unwrap_or(1)
+                    / block.iter().min().copied().unwrap_or(1).max(1);
+                shapes.push((blocks, spread, block));
+            }
+        }
+    }
+    shapes.sort();
+    shapes.dedup_by_key(|entry| entry.2);
+    shapes.into_iter().map(|(_, _, block)| block).collect()
+}
+
+/// A plan-wide grid [`choose_grid`] picked, the plan built on it, and what it
+/// looked at to pick it.
+pub struct ChosenGrid<T> {
+    pub grid: BlockGrid,
+    pub assembly: crate::assemble::Assembly,
+    /// Whatever the caller's builder returned beside the assembly.
+    pub built: T,
+    /// The predicted makespan of the chosen plan, in the model's units.
+    pub makespan: f64,
+    /// Per phase of the chosen plan: its blocks in flight and what each is
+    /// charged ([`ActiveSet`]).
+    pub active: Vec<ActiveSet>,
+    /// Every candidate looked at, with its predicted makespan, or why it was
+    /// not priced.
+    pub considered: Vec<([usize; 3], std::result::Result<f64, String>)>,
+}
+
+/// One phase's **active set** as the planner sized it: the blocks it may have
+/// in flight at once under the memory budget, and the bytes each is charged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveSet {
+    /// Bytes one block in flight is expected to hold
+    /// ([`expected_bytes_per_block`]). The executor's admission charges the
+    /// first wave of the phase this figure with the op margin, and later waves
+    /// what that wave was measured to hold ([`Hints::memory`]).
+    pub per_block: u64,
+    /// Blocks in flight: the workers, the phase's blocks, or what the budget
+    /// holds, whichever is fewest.
+    pub in_flight: usize,
+}
+
+impl ActiveSet {
+    /// What the phase holds at its widest: `per_block x in_flight`.
+    pub fn bytes(&self) -> u64 {
+        self.per_block.saturating_mul(self.in_flight as u64)
+    }
+}
+
+/// The bytes each block of every phase of `decomposition` is charged against a
+/// memory budget, margin included: [`Decomposition::active_bytes_per_block`]
+/// through [`crate::budget::admission_bytes`]. What [`choose_grid`] plans the
+/// blocks in flight with and what the executor's admission charges.
+pub fn active_bytes_per_block(chain: &Chain, decomposition: &Decomposition) -> Vec<u64> {
+    (0..decomposition.n_phases())
+        .map(|phase| {
+            crate::budget::admission_bytes(crate::budget::FrameworkFigure::Assumed(
+                decomposition.active_bytes_per_block(chain, phase),
+            ))
+        })
+        .collect()
+}
+
+/// The same figures **without** the margin: what a block of each phase is
+/// expected to hold, [`Decomposition::active_bytes_per_block`] as it is.
+///
+/// What the planner sizes the blocks in flight with. The margin is for op
+/// scratch nothing declares, and on the vessel pipeline it made the charged
+/// figure 1.3x to 5.5x what a block was measured to hold, so a plan sized on it
+/// ran a third of the blocks it could afford — or, to keep the blocks in
+/// flight, a finer grid paying a halo per block. The margin is applied where a
+/// wrong figure would break the cap rather than slow the run: the executor's
+/// first wave of each phase is charged with it, and later waves what the
+/// first was measured to hold, never less than this figure.
+pub fn expected_bytes_per_block(chain: &Chain, decomposition: &Decomposition) -> Vec<u64> {
+    (0..decomposition.n_phases())
+        .map(|phase| decomposition.active_bytes_per_block(chain, phase).ceil() as u64)
+        .collect()
+}
+
+/// **Size every phase's active set under `budget_bytes`** and price the plan
+/// at it: the predicted makespan with each phase run at the blocks in flight
+/// the budget allows, plus what the room left for the cache costs.
+///
+/// The budget is a **hard bound on the active set**: a phase none of whose
+/// blocks fits alone makes the plan infeasible, and the error names the bytes
+/// it needs. Below that, a phase runs fewer blocks at once than there are
+/// workers rather than being refused — a slower plan that fits beats a fast one
+/// that does not — and the makespan says how much slower.
+///
+/// **What is left for the cache is a cost, not a constraint.** A phase whose
+/// blocks read a halo re-reads its neighbours' voxels, and the cost model's
+/// read charge assumes those re-reads are served warm. The cache that serves
+/// them holds what the budget leaves after the phase's blocks in flight; where
+/// that is less than the phase's re-read bytes the shortfall is charged once
+/// more at the model's read cost — a miss re-reads storage. With room to spare
+/// the term is zero, so an uncapped plan is priced exactly as before.
+pub fn price_under_budget(
+    chain: &Chain,
+    decomposition: &Decomposition,
+    work: &[crate::fragment::PhaseWork<'_>],
+    model: &super::decomposition::CostModel,
+    workers: usize,
+    budget_bytes: u64,
+) -> Result<(f64, Vec<ActiveSet>)> {
+    let workers = workers.max(1);
+    let per_block = expected_bytes_per_block(chain, decomposition);
+    if let Some((phase, &needed)) = per_block
+        .iter()
+        .enumerate()
+        .find(|(_, &bytes)| bytes > budget_bytes)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "phase {phase} does not fit the budget: one block in flight needs {} MiB and the \
+             budget for blocks in flight is {} MiB",
+            needed.div_ceil(1 << 20),
+            budget_bytes >> 20
+        )));
+    }
+    let active: Vec<ActiveSet> = decomposition
+        .phases
+        .iter()
+        .zip(&per_block)
+        .map(|(phase, &bytes)| {
+            let held = budget_bytes.checked_div(bytes).unwrap_or(u64::MAX);
+            ActiveSet {
+                per_block: bytes,
+                in_flight: workers
+                    .min(phase.grid.n_blocks())
+                    .min(usize::try_from(held).unwrap_or(usize::MAX))
+                    .max(1),
+            }
+        })
+        .collect();
+    let in_flight: Vec<usize> = active.iter().map(|set| set.in_flight).collect();
+    let prices = phase_prices_at(chain, decomposition, work, model, &in_flight)?;
+    let mut makespan = 0.0;
+    for (index, ((cost, phase_makespan), set)) in prices.iter().zip(&active).enumerate() {
+        makespan += phase_makespan;
+        let phase = &decomposition.phases[index];
+        let n = phase.grid.n_blocks();
+        let images = phase.images_read(index).len().max(1) as f64;
+        let halo_voxels =
+            (cost.read_voxels_per_block / images - phase.grid.mean_core_voxels()).max(0.0) * images;
+        if halo_voxels <= 0.0 || n <= 1 {
+            continue;
+        }
+        let reread_bytes =
+            halo_voxels * n as f64 * decomposition.dtype_at(index).size_of() as f64;
+        let room = budget_bytes.saturating_sub(set.bytes()) as f64;
+        let missed = (1.0 - room / reread_bytes).clamp(0.0, 1.0);
+        if missed > 0.0 {
+            makespan += missed
+                * halo_voxels
+                * model.read_cost_per_voxel
+                * rounds(n, set.in_flight) as f64;
+        }
+    }
+    Ok((makespan, active))
+}
+
+/// **Choose the plan-wide block grid**: build the plan at each of
+/// [`grid_candidates`] and keep the one the cost model predicts finishes first
+/// on `host`, **within its memory budget**.
+///
+/// The price is [`price_under_budget`]: the phases' makespans at
+/// `host.workers` — the same objective [`Enumerating`] minimises for one chain,
+/// taken over a whole assembled plan: a phase of fewer blocks than workers
+/// leaves the rest parked, a phase of more pays its halo once per block, and
+/// the roofline in [`phase_makespan`] charges the reads a finer grid repeats —
+/// except that **`host.budget_bytes` bounds each phase's active set**: a phase
+/// whose blocks in flight would not fit runs fewer at once, priced as such, and
+/// a candidate one of whose blocks does not fit alone is not chosen. So under a
+/// tight cap the choice is between a finer grid at full parallelism and a
+/// coarser one at less, on the predicted makespan of each. Neither is chosen
+/// when the builder refuses.
+///
+/// Candidates are tried fewest blocks first, up to
+/// [`GRID_BLOCKS_PER_WORKER`] per worker, and past that only until one fits —
+/// which is what a volume too large for a coarse grid needs. Ties keep the
+/// coarser grid. The choice is a function of the volume, the plan and `host`,
+/// so it is the same for the same inputs.
+///
+/// When nothing fits, the error states the **smallest memory cap that would**:
+/// the least, over the candidates, of their largest block's charge, plus the
+/// cap's reserve ([`crate::budget::MemoryCap::needed_for`]).
+///
+/// `build` is handed a grid and returns the plan on it, which is how a plan
+/// whose phases depend on the grid (per-phase choices, partitions) is priced as
+/// it would run.
+pub fn choose_grid<T>(
+    volume: [usize; 3],
+    host: &Host,
+    model: &super::decomposition::CostModel,
+    mut build: impl FnMut(BlockGrid) -> Result<(crate::assemble::Assembly, T)>,
+) -> Result<ChosenGrid<T>> {
+    let limit = GRID_BLOCKS_PER_WORKER.saturating_mul(host.workers.max(1));
+    let mut considered = Vec::new();
+    let mut best: Option<(f64, BlockGrid, crate::assemble::Assembly, T, Vec<ActiveSet>)> = None;
+    // The least any candidate's largest block needed, for the error.
+    let mut least_needed: Option<u64> = None;
+    for block in grid_candidates(volume) {
+        let grid = BlockGrid::new(volume, block)?;
+        if grid.n_blocks() > limit && best.is_some() {
+            break;
+        }
+        let priced = build(grid.clone()).and_then(|(assembly, built)| {
+            let needed = expected_bytes_per_block(&assembly.workflow.chain, &assembly.decomposition)
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            least_needed = Some(least_needed.map_or(needed, |least| least.min(needed)));
+            let (makespan, active) = price_under_budget(
+                &assembly.workflow.chain,
+                &assembly.decomposition,
+                &assembly.work(),
+                model,
+                host.workers.max(1),
+                host.budget_bytes,
+            )?;
+            Ok((makespan, assembly, built, active))
+        });
+        match priced {
+            Err(error) => considered.push((block, Err(error.to_string()))),
+            Ok((makespan, assembly, built, active)) => {
+                considered.push((block, Ok(makespan)));
+                if best
+                    .as_ref()
+                    .is_none_or(|(old, ..)| makespan.total_cmp(old).is_lt())
+                {
+                    best = Some((makespan, grid, assembly, built, active));
+                }
+            }
+        }
+    }
+    match best {
+        Some((makespan, grid, assembly, built, active)) => Ok(ChosenGrid {
+            grid,
+            assembly,
+            built,
+            makespan,
+            active,
+            considered,
+        }),
+        None => {
+            let minimum = least_needed.map_or(String::new(), |needed| {
+                format!(
+                    " The smallest active set any candidate needs is {} MiB (one block of its \
+                     largest phase), so the least memory cap that can run this plan is about \
+                     {} MiB.",
+                    needed.div_ceil(1 << 20),
+                    crate::budget::MemoryCap::needed_for(needed).div_ceil(1 << 20)
+                )
+            });
+            Err(Error::InvalidArgument(format!(
+                "choose_grid: no block grid over {volume:?} could be planned on {} workers within \
+                 a budget of {} MiB for blocks in flight.{minimum} The candidates said: {}",
+                host.workers,
+                host.budget_bytes >> 20,
+                considered
+                    .iter()
+                    .map(|(block, why)| format!(
+                        "{block:?}: {}",
+                        why.as_ref().err().map_or("", |e| e)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )))
+        }
+    }
+}
+
 /// The block edge a phase running `chain` over `volume` would be given under
 /// `constraints`: the largest candidate that fits, cut only on the axes the
 /// reach admits.
@@ -3085,6 +3790,7 @@ impl Strategy for Trivial {
             // the rule and not a number; see `SlabPolicy` for why the rule is
             // "fill idle workers" rather than a tuning curve.
             slab_policy: SlabPolicy::default(),
+            memory: Some(crate::budget::process_budget()),
         }
     }
 }
@@ -3562,6 +4268,24 @@ pub fn predicted_phase_prices(
     model: &super::decomposition::CostModel,
     workers: usize,
 ) -> Result<Vec<(super::decomposition::PhaseCost, f64)>> {
+    phase_prices_at(
+        chain,
+        decomposition,
+        work,
+        model,
+        &vec![workers; decomposition.phases.len()],
+    )
+}
+
+/// [`predicted_phase_prices`] with each phase at its own worker count: the
+/// blocks in flight a memory budget allows it ([`price_under_budget`]).
+pub fn phase_prices_at(
+    chain: &Chain,
+    decomposition: &Decomposition,
+    work: &[crate::fragment::PhaseWork<'_>],
+    model: &super::decomposition::CostModel,
+    workers: &[usize],
+) -> Result<Vec<(super::decomposition::PhaseCost, f64)>> {
     let slots = chain.slots();
     let mut priced = Vec::with_capacity(decomposition.phases.len());
     for (index, phase) in decomposition.phases.iter().enumerate() {
@@ -3596,7 +4320,8 @@ pub fn predicted_phase_prices(
         // Zero for a phase that writes no image, so that the channel bound below
         // counts the same bytes `price_phase` charged for. See `PhaseTraffic`.
         let write = write_charge(model, traffic, is_materialised);
-        let makespan = phase_makespan(&cost, &phase.grid, workers, model, write);
+        let at = workers.get(index).copied().unwrap_or(1).max(1);
+        let makespan = phase_makespan(&cost, &phase.grid, at, model, write);
         priced.push((cost, makespan));
     }
     Ok(priced)
@@ -4375,6 +5100,7 @@ impl Strategy for Enumerating {
             keep_images: BTreeSet::new(),
             release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
+            memory: Some(crate::budget::process_budget()),
         }
     }
 }
@@ -4681,6 +5407,7 @@ impl Strategy for Greedy {
             keep_images: BTreeSet::new(),
             release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
+            memory: Some(crate::budget::process_budget()),
         }
     }
 }
@@ -4939,6 +5666,7 @@ impl Strategy for Materialising {
             keep_images: BTreeSet::new(),
             release_images: BTreeSet::new(),
             slab_policy: SlabPolicy::default(),
+            memory: Some(crate::budget::process_budget()),
         }
     }
 }

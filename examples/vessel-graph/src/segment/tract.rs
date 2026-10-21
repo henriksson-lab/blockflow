@@ -292,6 +292,9 @@ pub fn append_tract_phases(
     let mut binarize = params.binarize.clone();
     binarize.clip.range = range;
     let binarized = append_binarize_phases(c, raw, &binarize)?;
+    // The mask and the density are labels; the points' fragments share their
+    // lattice.
+    c.to_label_grid();
     let mask = c.pixels(c.on(binarized.binary, vec![Chain::op(WidenLabelsOp)]))?;
     let points = c.plan.fragments(MaskPointsOp)?;
     let grid = c.plan.grid().clone();

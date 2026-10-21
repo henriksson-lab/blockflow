@@ -65,7 +65,6 @@ use std::sync::Arc;
 
 use ndarray::{Array3, ArrayD, IxDyn};
 
-use crate::budget::MemoryBudget;
 use crate::cache::{ArrayId, ArrayPolicy, CacheStats, ChunkCache, RegionSourceFetcher};
 use crate::decomposition::Decomposition;
 use crate::dtype::Dtype;
@@ -311,7 +310,7 @@ impl SharedVolumes {
         }
         let cache = cache_bytes
             .filter(|&bytes| bytes > 0)
-            .map(|bytes| Arc::new(ChunkCache::new(MemoryBudget::new(bytes), bytes)));
+            .map(ChunkCache::in_process_budget);
         let mut cached = vec![None; images.len()];
         if let Some(cache) = &cache {
             for (image, file) in images.iter().enumerate() {

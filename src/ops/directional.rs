@@ -846,6 +846,155 @@ fn sub_iteration(
     doomed.len()
 }
 
+/// The pass's border set as two lists of flat indices, each ascending: the
+/// voxels whose whole 3x3x3 neighbourhood is inside the array (`interior`),
+/// and the rest (`shell`, the array's own one-voxel shell).
+///
+/// The same set [`border_mask`] marks, held as a list so that the twelve
+/// sub-iterations visit only it instead of testing every voxel of the array
+/// twelve times. On a vessel mask the border is a few per cent of the volume,
+/// and the scan that remains is one pass over the array per pass rather than
+/// thirteen. The split is what lets the interior list use the flat gather
+/// without a coordinate in sight.
+fn border_lists(
+    current: &[bool],
+    shape: [usize; 3],
+    interior: &mut Vec<usize>,
+    shell: &mut Vec<usize>,
+) {
+    interior.clear();
+    shell.clear();
+    let strides = [shape[1] * shape[2], shape[2], 1usize];
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            let interior_row = i > 0 && i + 1 < shape[0] && j > 0 && j + 1 < shape[1];
+            let row = flat_index(shape, [i, j, 0]);
+            for k in 0..shape[2] {
+                let at = row + k;
+                if !current[at] {
+                    continue;
+                }
+                if interior_row && k > 0 && k + 1 < shape[2] {
+                    let faces = current[at - strides[0]]
+                        && current[at + strides[0]]
+                        && current[at - strides[1]]
+                        && current[at + strides[1]]
+                        && current[at - 1]
+                        && current[at + 1];
+                    if !faces {
+                        interior.push(at);
+                    }
+                } else {
+                    // Outside the array is background, so a face of the array
+                    // is a face without an object neighbour.
+                    let position = [i, j, k];
+                    let faces = (0..3).all(|axis| {
+                        position[axis] > 0
+                            && position[axis] + 1 < shape[axis]
+                            && current[at - strides[axis]]
+                            && current[at + strides[axis]]
+                    });
+                    if !faces {
+                        shell.push(at);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// [`sub_iteration`] over the border set as [`border_lists`] gives it. The
+/// same decisions, taken against the same snapshot and applied afterwards, so
+/// the same voxels go; only the voxels that are not candidates are no longer
+/// visited.
+fn sub_iteration_listed(
+    current: &mut [bool],
+    shape: [usize; 3],
+    interior: &[usize],
+    shell: &[usize],
+    sources: &[usize; NEIGHBOURHOOD],
+    doomed: &mut Vec<usize>,
+) -> usize {
+    doomed.clear();
+    let offsets = flat_offsets(shape, sources);
+    for &at in interior {
+        if current[at] && matches_a_template(interior_word(current, at, &offsets)) {
+            doomed.push(at);
+        }
+    }
+    for &at in shell {
+        if !current[at] {
+            continue;
+        }
+        let position = [
+            at / (shape[1] * shape[2]),
+            (at / shape[2]) % shape[1],
+            at % shape[2],
+        ];
+        if matches_a_template(oriented_word(current, shape, position, sources)) {
+            doomed.push(at);
+        }
+    }
+    for &at in doomed.iter() {
+        current[at] = false;
+    }
+    doomed.len()
+}
+
+/// One pass in place over a flat C-ordered array: the border set taken once,
+/// then the twelve sub-iterations through `sources`. Returns how many voxels
+/// it deleted. The scratch lists are the caller's so that several passes
+/// reuse them.
+fn pass_in_place(
+    current: &mut [bool],
+    shape: [usize; 3],
+    sources: &[[usize; NEIGHBOURHOOD]; SUB_ITERATIONS],
+    scratch: &mut PassScratch,
+) -> usize {
+    border_lists(current, shape, &mut scratch.interior, &mut scratch.shell);
+    let mut deleted = 0;
+    for source in sources.iter() {
+        deleted += sub_iteration_listed(
+            current,
+            shape,
+            &scratch.interior,
+            &scratch.shell,
+            source,
+            &mut scratch.doomed,
+        );
+    }
+    deleted
+}
+
+/// `input` as a flat C-ordered copy: one `memcpy` where it is in standard
+/// layout, which a block buffer is.
+fn flat_copy(input: ArrayView3<'_, bool>) -> Vec<bool> {
+    match input.as_slice() {
+        Some(slice) => slice.to_vec(),
+        None => input.iter().copied().collect(),
+    }
+}
+
+/// Write a flat C-ordered array into `out`, the inverse of [`flat_copy`].
+fn write_flat(current: &[bool], mut out: ArrayViewMut3<'_, bool>) {
+    match out.as_slice_mut() {
+        Some(slice) => slice.copy_from_slice(current),
+        None => {
+            for (slot, &value) in out.iter_mut().zip(current) {
+                *slot = value;
+            }
+        }
+    }
+}
+
+/// The lists one pass works in, kept across passes.
+#[derive(Default)]
+struct PassScratch {
+    interior: Vec<usize>,
+    shell: Vec<usize>,
+    doomed: Vec<usize>,
+}
+
 /// One sub-iteration, over a border set the caller supplies.
 ///
 /// The border set is an *argument* rather than something this computes, and
@@ -886,7 +1035,7 @@ pub fn directional_sub_iteration_into(
 pub fn directional_pass_with_sources_into(
     input: ArrayView3<'_, bool>,
     sources: &[[usize; NEIGHBOURHOOD]; SUB_ITERATIONS],
-    mut out: ArrayViewMut3<'_, bool>,
+    out: ArrayViewMut3<'_, bool>,
 ) -> Result<()> {
     shapes_agree(
         input.shape(),
@@ -894,15 +1043,9 @@ pub fn directional_pass_with_sources_into(
         "directional_pass_with_sources_into",
     )?;
     let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
-    let mut current: Vec<bool> = input.iter().copied().collect();
-    let border: Vec<bool> = border_mask(input).into_iter().collect();
-    let mut doomed = Vec::new();
-    for source in sources.iter() {
-        sub_iteration(&mut current, shape, &border, source, &mut doomed);
-    }
-    for (slot, value) in out.iter_mut().zip(current) {
-        *slot = value;
-    }
+    let mut current = flat_copy(input);
+    pass_in_place(&mut current, shape, sources, &mut PassScratch::default());
+    write_flat(&current, out);
     Ok(())
 }
 
@@ -921,15 +1064,18 @@ pub fn directional_pass_into(
 pub fn directional_passes_into(
     input: ArrayView3<'_, bool>,
     passes: usize,
-    mut out: ArrayViewMut3<'_, bool>,
+    out: ArrayViewMut3<'_, bool>,
 ) -> Result<()> {
     shapes_agree(input.shape(), out.shape(), "directional_passes_into")?;
-    let mut current = input.to_owned();
+    // One flat copy for every pass: a pass runs in place on it, which is what
+    // `directional_pass_into` does on its own copy.
+    let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+    let mut current = flat_copy(input);
+    let mut scratch = PassScratch::default();
     for _ in 0..passes {
-        let source = current.clone();
-        directional_pass_into(source.view(), current.view_mut())?;
+        pass_in_place(&mut current, shape, sub_iteration_sources(), &mut scratch);
     }
-    out.assign(&current);
+    write_flat(&current, out);
     Ok(())
 }
 
@@ -949,16 +1095,20 @@ pub fn directional_to_fixed_point(
     input: ArrayView3<'_, bool>,
     limit: PassLimit,
 ) -> Result<(Array3<bool>, usize)> {
-    let mut current = input.to_owned();
+    // A pass that deleted nothing left the volume as it found it, which is the
+    // fixed point; counting deletions is that comparison without a copy.
+    let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+    let mut current = flat_copy(input);
+    let mut scratch = PassScratch::default();
     let mut passes = 0;
     loop {
-        let mut next = current.clone();
-        directional_pass_into(current.view(), next.view_mut())?;
+        let deleted = pass_in_place(&mut current, shape, sub_iteration_sources(), &mut scratch);
         passes += 1;
-        if next == current {
+        if deleted == 0 {
+            let current = Array3::from_shape_vec(shape, current)
+                .expect("the flat copy has the input's shape");
             return Ok((current, passes));
         }
-        current = next;
         if passes >= limit.passes() {
             bail!(
                 "directional thinning did not reach a fixed point in {} pass(es) over a {:?} \
@@ -1133,19 +1283,22 @@ pub fn directional_reach(passes: usize) -> usize {
 /// fourteen masked template comparisons over it, at the voxels the pass's border
 /// set admits.
 ///
-/// **Data-dependent by about a factor of three**, the same caveat
+/// **Data-dependent by about a factor of four**, the same caveat
 /// `super::skeleton::THINNING_COST` carries and for the same reason: the
-/// template comparisons run only where the border mask admits a voxel, so solid
-/// structure is cheap and speckle is not. Measured at **99** relative units over
-/// solid blocks and **315** over speckle on a 64-cubed volume; the constant is
-/// the geometric middle of that range rather than either end, because a planner
+/// template comparisons run only at the border voxels, so solid structure is
+/// cheap and speckle is not. Measured at **31** relative units over solid
+/// blocks and **124** over speckle on a 64-cubed volume; the constant is the
+/// geometric middle of that range rather than either end, because a planner
 /// wants the ordering between op families right and cannot be given a number
 /// that is right for both.
 ///
+/// It was 175, from 99 and 315, while every sub-iteration scanned the whole
+/// array for its border voxels; the border list (`border_lists`) is what moved
+/// it, most of all on solid structure, where the scan was nearly all of it.
+///
 /// For scale, `super::skeleton::THINNING_COST` is 14 for one *sub-iteration*,
-/// and a pass there is eight of them: the two families cost about the same per
-/// sub-iteration, twelve against eight.
-pub const DIRECTIONAL_PASS_COST: f64 = 175.0;
+/// and a pass there is eight of them.
+pub const DIRECTIONAL_PASS_COST: f64 = 62.0;
 
 /// How [`DIRECTIONAL_PASS_COST`] was obtained.
 pub const COST_MEASUREMENT: &str = "ops::directional::cost_report";
@@ -1326,6 +1479,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// One pass as the border mask and a scan of every voxel per
+    /// sub-iteration: the form the listed pass replaced, kept as its oracle.
+    fn masked_pass(input: &Array3<bool>) -> Array3<bool> {
+        let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+        let mut current: Vec<bool> = input.iter().copied().collect();
+        let border: Vec<bool> = border_mask(input.view()).into_iter().collect();
+        let mut doomed = Vec::new();
+        for source in sub_iteration_sources().iter() {
+            sub_iteration(&mut current, shape, &border, source, &mut doomed);
+        }
+        Array3::from_shape_vec(shape, current).unwrap()
+    }
+
+    fn speckled(shape: [usize; 3], seed: u64, density: u64) -> Array3<bool> {
+        let mut bits = seed | 1;
+        Array3::from_shape_fn((shape[0], shape[1], shape[2]), |_| {
+            bits ^= bits << 13;
+            bits ^= bits >> 7;
+            bits ^= bits << 17;
+            bits % 8 < density
+        })
+    }
+
+    #[test]
+    fn the_listed_pass_is_the_masked_pass() {
+        // Shapes with axes of one and two voxels, where every voxel is on the
+        // shell, as well as ordinary ones; densities from sparse to nearly
+        // solid, so that both lists and the interior test are exercised.
+        for shape in [[1usize, 1, 1], [1, 5, 7], [2, 3, 9], [6, 7, 8], [12, 9, 11]] {
+            for density in [2u64, 5, 7] {
+                let mut volume = speckled(shape, 0x9e37 + density, density);
+                for _ in 0..4 {
+                    let mut listed = Array3::from_elem(volume.raw_dim(), false);
+                    directional_pass_into(volume.view(), listed.view_mut()).unwrap();
+                    let masked = masked_pass(&volume);
+                    assert_eq!(listed, masked, "{shape:?} at density {density}");
+                    volume = listed;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_fixed_point_and_the_pass_count_are_those_of_repeated_passes() {
+        let mut volume = speckled([10, 12, 14], 0x51ed, 6);
+        clear_faces(&mut volume);
+        let mut expected = volume.clone();
+        let mut passes = 0;
+        loop {
+            let next = masked_pass(&expected);
+            passes += 1;
+            if next == expected {
+                break;
+            }
+            expected = next;
+        }
+        let (got, counted) =
+            directional_to_fixed_point(volume.view(), PassLimit::of(100).unwrap()).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(counted, passes);
+        let mut three = Array3::from_elem(volume.raw_dim(), false);
+        directional_passes_into(volume.view(), 3, three.view_mut()).unwrap();
+        let by_hand = masked_pass(&masked_pass(&masked_pass(&volume)));
+        assert_eq!(three, by_hand);
     }
 
     #[test]

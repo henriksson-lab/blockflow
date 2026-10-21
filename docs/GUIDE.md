@@ -253,6 +253,21 @@ inside the plan with `ops::resample::{ResampleOp, resample_phase}`
 (`append_resample_phase` on a `PlanBuilder`; `append_block_mean_phases` for a
 box mean to a coarser grid).
 
+### 4.8.1 Physical planar sampling
+
+`ops::plane_sample::{PhysicalGrid, PlaneGrid, PlaneSampleOp, append_plane_sample_phase}`
+samples an oriented plane at a signed physical depth. Coordinates use z,y,x,
+voxel centers, explicit origin and anisotropic spacing. Use the same op in
+separate runs for intensity and bool or numeric 0/1 support: output is f64,
+with NaN for samples outside the voxel-center domain or at nonfinite contributing
+values. Support division, depth averaging and validity thresholds belong to the
+caller. The helper reuses affine warp source footprints with zero output halo;
+use it instead of ordinary `pixels` for shape-changing planar sampling.
+`trilinear` and `sample_plane` are resident getter-based kernels, independent of
+the caller's ndarray version. See `examples/physical-plane-sampling` for
+planned execution on prepared Zarr inputs, explicit plane metadata and analytic
+round-trip validation. `SurfaceBandOp` remains a height-field band mask.
+
 ### 4.9 Iterating to a fixed point
 
 `src/iterate.rs`, added to a plan with `PlanBuilder::iterate(op)`.
@@ -302,6 +317,13 @@ on `examples/shell-objects-3d-ome-zarr` (SHELL_OBJECTS_3D_PLAN.md, "Speed").
   other image keeps. Not carried over the distributed wire. The label pyramid
   (`label_pyramid`) and `StarConvexLabelsOp` declare 0; other label writers do
   not yet.
+- **Settled blocks of an iteration.** An `IterativeOp` whose substage is one
+  function of its operands' windows at every index declares
+  `stationary() -> true`; the executor then reruns a block only when a block
+  whose core meets its fetch changed in the previous substage (a per-block
+  dirty set in `strategy::run_iterative_phase`). Same voxels and substage
+  count (`tests/iterative_dirty_set.rs`); the long tail of a fixed point stops
+  costing a sweep per substage.
 - **Known-empty chunks in the cache.** The chunk cache does not fetch a chunk
   its backend reports `is_known_empty` (`cache.rs`, `ChunkFetcher`/`RegionSource`)
   and leaves zeros there; only synthetic sources implement it.
@@ -324,6 +346,18 @@ on `examples/shell-objects-3d-ome-zarr` (SHELL_OBJECTS_3D_PLAN.md, "Speed").
 - Threads inside a block (`run_tiles`, rayon in row ops) pay when there are
   fewer blocks than cores; with many blocks in flight they share one rayon pool
   with the executor's workers.
+
+**Choosing the grid.** A fixed block edge fixes the block count, which on a
+machine with more workers than blocks leaves the rest parked, and a cut
+across a wide reach pays its halo per block. `strategy::choose_grid(volume,
+&Host::detect().with_workers(w), &CostModel::default(), |grid| build(grid))`
+builds the plan on each of `grid_candidates(volume)` (per-axis power-of-two
+cuts, fewest blocks first) and keeps the one `predicted_phase_prices` says
+finishes first on those workers within the memory budget; `Host::detect`
+takes the workers from `available_parallelism` (affinity and cgroup quota)
+and the budget from `budget::default_budget_bytes`. Per-axis matters: an op
+reaching far in `y, x` and not in `z` is cut into `z` slabs, which no scalar
+edge offers. `examples/vessel-graph` uses it unless `--block` is given.
 
 **Costs that are easy to miss:**
 

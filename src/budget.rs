@@ -170,7 +170,7 @@
 // estimate known to run low, not a ceiling.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 /// Environment override consulted by [`default_budget_bytes`].
@@ -227,9 +227,10 @@ struct State {
     oversubscribed: u64,
 }
 
-#[derive(Debug)]
 struct Inner {
-    total: u64,
+    /// Atomic so that a process budget created before the cap was stated can
+    /// be resized once it is ([`set_process_cap`]).
+    total: AtomicU64,
     state: Mutex<State>,
     released: Condvar,
     /// Set whenever a `Reserved` request is waiting; read by opportunistic
@@ -238,9 +239,25 @@ struct Inner {
     /// High-water mark, duplicated outside the lock so instrumentation can read
     /// it from a signal handler or a progress thread without blocking.
     high_water: AtomicU64,
+    /// Holders of opportunistic bytes that can give them back on request
+    /// ([`Reclaim`]): the chunk caches leasing from this budget.
+    reclaimers: Mutex<Vec<Weak<dyn Reclaim>>>,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("total", &self.total.load(Ordering::Relaxed))
+            .field("high_water", &self.high_water.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl Inner {
+    fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         // A panic while holding the budget lock must not wedge every other
         // worker: the invariant the lock protects is two integers, and a
@@ -285,16 +302,38 @@ pub struct MemoryBudget {
     inner: Arc<Inner>,
 }
 
+/// One pool is equal only to itself: clones are the same budget.
+impl PartialEq for MemoryBudget {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for MemoryBudget {}
+
+/// A holder of [`Class::Opportunistic`] bytes that can give some back when
+/// compute needs them: a chunk cache, which evicts.
+///
+/// **This is the eviction the module header says it does not do, and it is
+/// still not done *by* the budget.** The budget asks; the holder decides what
+/// to drop, under its own lock, and the bytes come back through the leases it
+/// drops. See [`MemoryBudget::reclaim`] for the lock order.
+pub trait Reclaim: Send + Sync {
+    /// Free at least `bytes` if possible; answer how many were freed.
+    fn reclaim(&self, bytes: u64) -> u64;
+}
+
 impl MemoryBudget {
     /// A budget of exactly `total_bytes`.
     pub fn new(total_bytes: u64) -> Self {
         Self {
             inner: Arc::new(Inner {
-                total: total_bytes.max(1),
+                total: AtomicU64::new(total_bytes.max(1)),
                 state: Mutex::new(State::default()),
                 released: Condvar::new(),
                 revoke: AtomicBool::new(false),
                 high_water: AtomicU64::new(0),
+                reclaimers: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -306,7 +345,80 @@ impl MemoryBudget {
 
     /// Total bytes this budget may hand out.
     pub fn total(&self) -> u64 {
-        self.inner.total
+        self.inner.total()
+    }
+
+    /// Change what this budget may hand out. Leases already granted are kept;
+    /// a smaller total only refuses new ones until enough have returned.
+    pub fn set_total(&self, total_bytes: u64) {
+        self.inner
+            .total
+            .store(total_bytes.max(1), Ordering::Relaxed);
+        self.inner.released.notify_all();
+    }
+
+    /// Bytes not leased to anybody right now.
+    pub fn free(&self) -> u64 {
+        let state = self.inner.lock();
+        self.inner.total().saturating_sub(Inner::in_use(&state))
+    }
+
+    /// Register a holder of opportunistic bytes that [`Self::reclaim`] may ask
+    /// to give some back. Held weakly: a dropped cache unregisters itself.
+    pub fn register_reclaimer(&self, reclaimer: Weak<dyn Reclaim>) {
+        let mut list = self
+            .inner
+            .reclaimers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        list.retain(|weak| weak.strong_count() > 0);
+        list.push(reclaimer);
+    }
+
+    /// Ask the registered opportunistic holders to give back `bytes`, in
+    /// registration order, and answer how many they freed.
+    ///
+    /// **Never called with this budget's lock held**, and that is the whole of
+    /// the deadlock argument: a reclaimer drops leases, and a lease's drop takes
+    /// this lock. A reclaimer takes its own lock and then, through the drops,
+    /// this one — the same order the cache's admission path takes them in.
+    pub fn reclaim(&self, bytes: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
+        let live: Vec<Arc<dyn Reclaim>> = {
+            let list = self
+                .inner
+                .reclaimers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            list.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut freed = 0u64;
+        for reclaimer in live {
+            if freed >= bytes {
+                break;
+            }
+            freed = freed.saturating_add(reclaimer.reclaim(bytes - freed));
+        }
+        freed
+    }
+
+    /// Lease `bytes` for compute **without waiting on another compute lease**:
+    /// granted from the free bytes, after asking the opportunistic holders for
+    /// whatever is missing, and refused (`None`) if that is still not enough.
+    ///
+    /// The executor's admission call. It runs blocks in waves and holds no
+    /// compute lease of its own while it forms one, so waiting could only be
+    /// waiting on a cache — which is what the reclaim is for — or on another
+    /// executor sharing the budget, which may hold its leases for a whole wave.
+    pub fn try_acquire_reclaiming(&self, bytes: u64) -> Option<Lease> {
+        if let Some(lease) = self.try_acquire(bytes) {
+            return Some(lease);
+        }
+        let short = bytes.saturating_sub(self.free());
+        self.reclaim(short);
+        self.try_acquire(bytes)
     }
 
     /// Bytes currently leased, both classes.
@@ -362,8 +474,14 @@ impl MemoryBudget {
         if bytes == 0 {
             return self.zero_lease(Class::Reserved);
         }
+        // Ask the caches first, without the lock: a request that does not fit
+        // beside what they hold is the moment they exist to give it up.
+        let short = bytes.saturating_sub(self.free());
+        if short > 0 {
+            self.reclaim(short);
+        }
         let mut state = self.inner.lock();
-        let oversized = bytes > self.inner.total;
+        let oversized = bytes > self.inner.total();
         state.waiting_reserved += 1;
         self.inner.revoke.store(true, Ordering::Relaxed);
         loop {
@@ -371,7 +489,7 @@ impl MemoryBudget {
             let grantable = if oversized {
                 in_use == 0
             } else {
-                in_use + bytes <= self.inner.total
+                in_use + bytes <= self.inner.total()
             };
             if grantable {
                 state.reserved += bytes;
@@ -411,7 +529,7 @@ impl MemoryBudget {
             return Some(self.zero_lease(Class::Reserved));
         }
         let mut state = self.inner.lock();
-        if Inner::in_use(&state) + bytes > self.inner.total {
+        if Inner::in_use(&state) + bytes > self.inner.total() {
             return None;
         }
         state.reserved += bytes;
@@ -438,7 +556,7 @@ impl MemoryBudget {
         if state.waiting_reserved > 0 {
             return None;
         }
-        if Inner::in_use(&state) + bytes > self.inner.total {
+        if Inner::in_use(&state) + bytes > self.inner.total() {
             return None;
         }
         state.opportunistic += bytes;
@@ -535,7 +653,8 @@ impl Drop for Lease {
 }
 
 /// The default budget: the environment if it says, otherwise a fraction of what
-/// the kernel reports.
+/// the kernel reports — and never more than the process's memory cap leaves
+/// for blocks in flight, when a cap was stated ([`process_cap`]).
 ///
 /// The fraction is `min(MemTotal / 2, MemAvailable * 3 / 4)`. Two terms because
 /// they fail differently: `MemTotal / 2` bounds us on an idle machine, where
@@ -555,23 +674,414 @@ pub fn default_budget_bytes() -> u64 {
 /// set, and forcing them onto a second one is a needless break. It passes its
 /// own name first and [`BUDGET_ENV`] second; the first name that parses wins,
 /// and an unparseable value is skipped rather than treated as zero.
+///
+/// A **binding** cap ([`MemoryCap::is_binding`]: stated, or a cgroup limit)
+/// clamps whatever the names say to [`MemoryCap::usable_bytes`]: a budget for
+/// blocks in flight larger than the memory the process may hold is a budget
+/// the kernel enforces instead.
 pub fn budget_bytes_from(names: &[&str]) -> u64 {
+    let cap = process_cap();
     for name in names {
         if let Ok(raw) = std::env::var(name) {
             if let Some(bytes) = parse_budget(raw.trim()) {
-                return bytes;
+                return match cap.is_binding() {
+                    true => bytes.min(cap.usable_bytes()),
+                    false => bytes,
+                };
             }
         }
     }
-    auto_budget_bytes().unwrap_or(FALLBACK_BUDGET_BYTES)
+    cap.usable_bytes()
 }
 
 /// The `auto` rule, or `None` where `/proc/meminfo` cannot be read.
 pub fn auto_budget_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let total = meminfo_field(&meminfo, "MemTotal:")?;
-    let available = meminfo_field(&meminfo, "MemAvailable:").unwrap_or(total);
+    machine_rule(&meminfo)
+}
+
+fn machine_rule(meminfo: &str) -> Option<u64> {
+    let total = meminfo_field(meminfo, "MemTotal:")?;
+    let available = meminfo_field(meminfo, "MemAvailable:").unwrap_or(total);
     Some((total / 2).min(available / 4 * 3).max(MIN_BUDGET_BYTES))
+}
+
+// --------------------------------------------------------- the memory cap --
+
+/// Environment variable naming the **memory cap**: the most this process may
+/// hold resident, in bytes, with the same `K`/`M`/`G`/`T` suffixes as
+/// [`BUDGET_ENV`].
+///
+/// Not the same quantity as [`BUDGET_ENV`], and both exist for that reason.
+/// The budget is what blocks in flight may hold; the cap is everything — the
+/// blocks in flight, the chunk caches that fill the rest, and the process's own
+/// baseline. A run under a cap plans its blocks in flight into
+/// [`MemoryCap::usable_bytes`], and the caches fit themselves into what the
+/// blocks leave.
+pub const CAP_ENV: &str = "BLOCKFLOW_MEMORY_CAP";
+
+/// Where a [`MemoryCap`] came from, in the order they are consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CapSource {
+    /// The caller said so: a command-line flag ([`MemoryCap::resolve`]).
+    Explicit,
+    /// [`CAP_ENV`], or else [`BUDGET_ENV`] read as a cap.
+    Environment,
+    /// The process's cgroup: v2 `memory.max`, or v1 `memory.limit_in_bytes`,
+    /// the smallest along the path from the process's group to the root.
+    Cgroup,
+    /// Nothing stated: `min(MemTotal / 2, MemAvailable * 3 / 4)`, the rule
+    /// [`default_budget_bytes`] has always used.
+    Machine,
+    /// `/proc/meminfo` could not be read: [`FALLBACK_BUDGET_BYTES`].
+    Fallback,
+}
+
+/// The most this process may hold resident, and where that figure came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryCap {
+    pub bytes: u64,
+    pub source: CapSource,
+}
+
+/// The least a binding cap holds back from the blocks in flight. See
+/// [`MemoryCap::reserve_bytes`].
+pub const MIN_CAP_RESERVE_BYTES: u64 = 96 << 20;
+
+impl MemoryCap {
+    /// The cap from the environment, the cgroup or the machine, in that order.
+    pub fn detect() -> Self {
+        Self::resolve(None)
+    }
+
+    /// `explicit` (a command-line flag) if given, else [`Self::detect`]'s
+    /// order. A cgroup limit below a stated cap still binds: it is the kernel's
+    /// and the run cannot exceed it by saying otherwise.
+    pub fn resolve(explicit: Option<u64>) -> Self {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
+        Self::from_sources(
+            explicit,
+            std::env::var(CAP_ENV).ok().as_deref(),
+            std::env::var(BUDGET_ENV).ok().as_deref(),
+            cgroup_memory_limit(),
+            meminfo.as_deref(),
+        )
+    }
+
+    /// The precedence, on its inputs: `explicit`, then `cap_env`, then
+    /// `budget_env` (the older variable, read as a cap), then `cgroup`, then the
+    /// machine rule on `meminfo`, then [`FALLBACK_BUDGET_BYTES`]. An
+    /// unparseable or zero variable is skipped. A cgroup limit at or above the
+    /// machine's `MemTotal` is no limit, and one below a stated cap wins.
+    pub fn from_sources(
+        explicit: Option<u64>,
+        cap_env: Option<&str>,
+        budget_env: Option<&str>,
+        cgroup: Option<u64>,
+        meminfo: Option<&str>,
+    ) -> Self {
+        let total = meminfo.and_then(|text| meminfo_field(text, "MemTotal:"));
+        let cgroup = cgroup.filter(|&limit| limit > 0 && total.is_none_or(|total| limit < total));
+        let stated = explicit
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| (bytes, CapSource::Explicit))
+            .or_else(|| {
+                [cap_env, budget_env]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|raw| parse_cap(raw.trim()))
+                    .map(|bytes| (bytes, CapSource::Environment))
+            });
+        let cap = match (stated, cgroup) {
+            (Some((bytes, _)), Some(limit)) if limit < bytes => (limit, CapSource::Cgroup),
+            (Some(stated), _) => stated,
+            (None, Some(limit)) => (limit, CapSource::Cgroup),
+            (None, None) => match meminfo.and_then(machine_rule) {
+                Some(bytes) => (bytes, CapSource::Machine),
+                None => (FALLBACK_BUDGET_BYTES, CapSource::Fallback),
+            },
+        };
+        Self {
+            bytes: cap.0,
+            source: cap.1,
+        }
+    }
+
+    /// A cap somebody stated or the kernel enforces, rather than this module's
+    /// estimate of a polite share of the machine.
+    pub fn is_binding(&self) -> bool {
+        matches!(
+            self.source,
+            CapSource::Explicit | CapSource::Environment | CapSource::Cgroup
+        )
+    }
+
+    /// What a binding cap holds back from the blocks in flight: a tenth, and at
+    /// least [`MIN_CAP_RESERVE_BYTES`] (never more than half the cap).
+    ///
+    /// For what no plan sees: the binary, its thread stacks, the allocator's
+    /// retained and fragmented heap, and the moment between two samples of the
+    /// resident set during which a block can allocate more than it was charged.
+    /// The executor measures the first three as they are
+    /// ([`resident_bytes`]); this is the margin for the last. Zero for the
+    /// machine rule, which already leaves half the machine.
+    pub fn reserve_bytes(&self) -> u64 {
+        if !self.is_binding() {
+            return 0;
+        }
+        (self.bytes / 10)
+            .max(MIN_CAP_RESERVE_BYTES)
+            .min(self.bytes / 2)
+    }
+
+    /// The bytes the blocks in flight and the caches may share between them.
+    pub fn usable_bytes(&self) -> u64 {
+        self.bytes.saturating_sub(self.reserve_bytes()).max(1)
+    }
+
+    /// The least binding cap whose usable bytes are at least `usable`: what a
+    /// plan needing `usable` bytes for its blocks in flight has to be given.
+    pub fn needed_for(usable: u64) -> u64 {
+        // The reserve is one of three pieces (half, the floor, a tenth), so the
+        // answer is the least of the three inversions that actually holds.
+        [
+            usable.saturating_mul(2),
+            usable.saturating_add(MIN_CAP_RESERVE_BYTES),
+            usable.saturating_mul(10).div_ceil(9),
+        ]
+        .into_iter()
+        .filter(|&bytes| {
+            Self {
+                bytes,
+                source: CapSource::Explicit,
+            }
+            .usable_bytes()
+                >= usable
+        })
+        .min()
+        .unwrap_or(u64::MAX)
+    }
+}
+
+impl std::fmt::Display for MemoryCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match self.source {
+            CapSource::Explicit => "stated",
+            CapSource::Environment => "environment",
+            CapSource::Cgroup => "cgroup",
+            CapSource::Machine => "machine",
+            CapSource::Fallback => "fallback",
+        };
+        write!(f, "{} MiB ({source})", self.bytes >> 20)
+    }
+}
+
+/// A cap value: a byte count with an optional `K`/`M`/`G`/`T` suffix. Unlike
+/// [`BUDGET_ENV`], `auto` means "not stated" here, so the cgroup and the
+/// machine still get their say.
+fn parse_cap(raw: &str) -> Option<u64> {
+    if raw.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    parse_budget(raw)
+}
+
+/// The memory limit of this process's cgroup, or `None` where there is none
+/// (or no cgroup filesystem to ask).
+pub fn cgroup_memory_limit() -> Option<u64> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_limit_with(&membership, &|path| std::fs::read_to_string(path).ok())
+}
+
+/// [`cgroup_memory_limit`] on a `/proc/self/cgroup` text and a file reader, so
+/// both hierarchies can be tested without one.
+///
+/// The smallest limit from the process's group up to the root, because a
+/// limit on a parent slice binds every group inside it. v2 first (the
+/// `0::<path>` line, `memory.max`, `max` for none), then v1 (the line whose
+/// controllers include `memory`, `memory.limit_in_bytes`, where unlimited is a
+/// page-rounded `i64::MAX`). Inside a container the group path is often not
+/// visible from its own mount, so the mount's root is also asked.
+pub fn cgroup_limit_with(membership: &str, read: &dyn Fn(&str) -> Option<String>) -> Option<u64> {
+    let parse = |text: Option<String>| -> Option<u64> {
+        let text = text?;
+        let text = text.trim();
+        if text == "max" {
+            return None;
+        }
+        text.parse::<u64>().ok().filter(|&v| v > 0 && v < (1u64 << 62))
+    };
+    let smallest_along = |root: &str, path: &str, file: &str| -> Option<u64> {
+        let mut best: Option<u64> = None;
+        let mut current = path.trim_end_matches('/').to_string();
+        loop {
+            let candidate = format!("{root}{current}/{file}");
+            if let Some(limit) = parse(read(&candidate)) {
+                best = Some(best.map_or(limit, |b| b.min(limit)));
+            }
+            match current.rfind('/') {
+                Some(at) => current.truncate(at),
+                None => break,
+            }
+            if current.is_empty() {
+                if let Some(limit) = parse(read(&format!("{root}/{file}"))) {
+                    best = Some(best.map_or(limit, |b| b.min(limit)));
+                }
+                break;
+            }
+        }
+        best
+    };
+    for line in membership.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(_id), Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if controllers.is_empty() {
+            if let Some(limit) = smallest_along("/sys/fs/cgroup", path, "memory.max") {
+                return Some(limit);
+            }
+        }
+    }
+    for line in membership.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(_id), Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if controllers.split(',').any(|c| c == "memory") {
+            return smallest_along("/sys/fs/cgroup/memory", path, "memory.limit_in_bytes");
+        }
+    }
+    None
+}
+
+static PROCESS_CAP: Mutex<Option<MemoryCap>> = Mutex::new(None);
+static PROCESS_BUDGET: OnceLock<MemoryBudget> = OnceLock::new();
+
+/// The memory cap this process runs under: what [`set_process_cap`] stated,
+/// else [`MemoryCap::detect`], read once and kept.
+pub fn process_cap() -> MemoryCap {
+    let mut cap = PROCESS_CAP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cap.get_or_insert_with(MemoryCap::detect)
+}
+
+/// State the process's memory cap — a command-line flag, typically, at the
+/// top of `main` — and resize [`process_budget`] to it.
+pub fn set_process_cap(cap: MemoryCap) {
+    *PROCESS_CAP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cap);
+    if let Some(budget) = PROCESS_BUDGET.get() {
+        budget.set_total(cap.usable_bytes());
+    }
+}
+
+/// The one budget every chunk cache and the executor's admission lease from
+/// unless told otherwise, sized at [`process_cap`]'s usable bytes.
+///
+/// One pool for both on purpose: compute leases [`Class::Reserved`] for its
+/// blocks in flight, the caches lease [`Class::Opportunistic`] for what they
+/// retain, and a compute lease that does not fit beside the caches makes them
+/// give bytes back ([`Reclaim`]). So a cache is as large as the cap leaves
+/// after the active set, and shrinks when the active set grows.
+pub fn process_budget() -> MemoryBudget {
+    PROCESS_BUDGET
+        .get_or_init(|| MemoryBudget::new(process_cap().usable_bytes()))
+        .clone()
+}
+
+/// This process's resident set in bytes (`VmRSS` of `/proc/self/status`), or
+/// `None` where that cannot be read. One small read; cheap enough to take per
+/// wave of blocks.
+pub fn resident_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    meminfo_field(&status, "VmRSS:")
+}
+
+/// Hand the heap's free pages back to the system (glibc's `malloc_trim`); a
+/// no-op elsewhere.
+///
+/// glibc keeps freed block buffers in its arenas, so without this the resident
+/// set after a wave of blocks is the wave's high-water mark rather than what is
+/// live, and an admission that measures the resident set would charge the next
+/// wave for buffers nobody holds. Milliseconds; called between waves only when
+/// a run is near its cap.
+pub fn release_freed_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` only returns free heap pages to the system.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// A thread that samples [`resident_bytes`] every few milliseconds and keeps
+/// the largest it has seen since the last [`Self::reset`]: the peak of a wave
+/// of blocks, which the executor compares with what the wave was charged.
+///
+/// One small file read per sample; the thread exists only while a run near its
+/// cap is executing, and stops when dropped.
+pub struct ResidentSampler {
+    peak: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How often [`ResidentSampler`] reads the resident set.
+pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(2);
+
+impl ResidentSampler {
+    /// `None` where the resident set cannot be read.
+    pub fn start() -> Option<Self> {
+        let first = resident_bytes()?;
+        let peak = Arc::new(AtomicU64::new(first));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let peak = Arc::clone(&peak);
+            let stop = Arc::clone(&stop);
+            std::thread::Builder::new()
+                .name("blockflow-rss".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some(now) = resident_bytes() {
+                            peak.fetch_max(now, Ordering::Relaxed);
+                        }
+                        std::thread::sleep(SAMPLE_INTERVAL);
+                    }
+                })
+                .ok()?
+        };
+        Some(Self {
+            peak,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    /// Start a new window at `now`.
+    pub fn reset(&self, now: u64) {
+        self.peak.store(now, Ordering::Relaxed);
+    }
+
+    /// The largest resident set since the last reset, this moment included.
+    pub fn peak(&self) -> u64 {
+        if let Some(now) = resident_bytes() {
+            self.peak.fetch_max(now, Ordering::Relaxed);
+        }
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ResidentSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 // ------------------------------------------------ what admission charges --
@@ -1154,5 +1664,173 @@ mod tests {
         // And the live one, whatever this machine is, obeys the same bounds.
         let live = default_budget_bytes();
         assert!(live >= MIN_BUDGET_BYTES);
+    }
+
+    const MEMINFO: &str = "MemTotal:       65536000 kB\nMemFree:  1 kB\nMemAvailable:   32768000 kB\n";
+
+    #[test]
+    fn a_cap_is_explicit_then_environment_then_cgroup_then_machine() {
+        let machine = machine_rule(MEMINFO).unwrap();
+        let cap = |e: Option<u64>, env: Option<&str>, old: Option<&str>, cg: Option<u64>| {
+            MemoryCap::from_sources(e, env, old, cg, Some(MEMINFO))
+        };
+        assert_eq!(
+            cap(Some(3 << 30), Some("2G"), Some("1G"), None),
+            MemoryCap { bytes: 3 << 30, source: CapSource::Explicit }
+        );
+        assert_eq!(
+            cap(None, Some("2G"), Some("1G"), None),
+            MemoryCap { bytes: 2 << 30, source: CapSource::Environment }
+        );
+        // The older budget variable is read as a cap when the cap's is absent
+        // or unreadable.
+        assert_eq!(cap(None, Some("lots"), Some("1G"), None).bytes, 1 << 30);
+        assert_eq!(
+            cap(None, None, None, Some(5 << 30)),
+            MemoryCap { bytes: 5 << 30, source: CapSource::Cgroup }
+        );
+        assert_eq!(
+            cap(None, None, None, None),
+            MemoryCap { bytes: machine, source: CapSource::Machine }
+        );
+        assert_eq!(
+            MemoryCap::from_sources(None, None, None, None, None),
+            MemoryCap { bytes: FALLBACK_BUDGET_BYTES, source: CapSource::Fallback }
+        );
+        // `auto` and zero mean "not stated".
+        assert_eq!(cap(None, Some("auto"), Some("0"), None).source, CapSource::Machine);
+        assert_eq!(cap(Some(0), None, None, None).source, CapSource::Machine);
+    }
+
+    #[test]
+    fn a_cgroup_limit_below_a_stated_cap_still_binds_and_one_above_the_machine_does_not() {
+        let stated_above = MemoryCap::from_sources(Some(8 << 30), None, None, Some(2 << 30), Some(MEMINFO));
+        assert_eq!(stated_above, MemoryCap { bytes: 2 << 30, source: CapSource::Cgroup });
+        let stated_below = MemoryCap::from_sources(Some(1 << 30), None, None, Some(2 << 30), Some(MEMINFO));
+        assert_eq!(stated_below.source, CapSource::Explicit);
+        // 64 GB of machine: a 1 TB cgroup limit is no limit.
+        let roomy = MemoryCap::from_sources(None, None, None, Some(1 << 40), Some(MEMINFO));
+        assert_eq!(roomy.source, CapSource::Machine);
+    }
+
+    #[test]
+    fn a_binding_cap_holds_back_a_reserve_and_the_machine_rule_does_not() {
+        let machine = MemoryCap { bytes: 16 << 30, source: CapSource::Machine };
+        assert_eq!(machine.usable_bytes(), 16 << 30);
+        let big = MemoryCap { bytes: 10 << 30, source: CapSource::Explicit };
+        assert_eq!(big.reserve_bytes(), (10 << 30) / 10);
+        let small = MemoryCap { bytes: 512 << 20, source: CapSource::Cgroup };
+        assert_eq!(small.reserve_bytes(), MIN_CAP_RESERVE_BYTES);
+        let tiny = MemoryCap { bytes: 100 << 20, source: CapSource::Explicit };
+        assert_eq!(tiny.reserve_bytes(), 50 << 20, "never more than half");
+        // `needed_for` inverts `usable_bytes`.
+        for usable in [10u64 << 20, 500 << 20, 3 << 30, 40 << 30] {
+            let cap = MemoryCap { bytes: MemoryCap::needed_for(usable), source: CapSource::Explicit };
+            assert!(cap.usable_bytes() >= usable, "{usable}");
+            let less = MemoryCap { bytes: cap.bytes - (2 << 20), source: CapSource::Explicit };
+            assert!(less.usable_bytes() < usable + (2 << 20), "{usable}");
+        }
+    }
+
+    #[test]
+    fn cgroup_v2_takes_the_smallest_limit_from_the_group_to_the_root() {
+        let files: std::collections::HashMap<&str, &str> = [
+            ("/sys/fs/cgroup/user.slice/memory.max", "max\n"),
+            ("/sys/fs/cgroup/user.slice/app.scope/memory.max", "2147483648\n"),
+            ("/sys/fs/cgroup/user.slice/app.scope/run/memory.max", "max\n"),
+            ("/sys/fs/cgroup/memory.max", "8589934592"),
+        ]
+        .into_iter()
+        .collect();
+        let read = |path: &str| files.get(path).map(|text| text.to_string());
+        assert_eq!(
+            cgroup_limit_with("0::/user.slice/app.scope/run\n", &read),
+            Some(2 << 30)
+        );
+        let none = |_: &str| -> Option<String> { Some("max".into()) };
+        assert_eq!(cgroup_limit_with("0::/user.slice\n", &none), None);
+    }
+
+    #[test]
+    fn cgroup_v1_reads_the_memory_controller_and_ignores_its_unlimited_value() {
+        let membership = "12:cpu,cpuacct:/a\n4:memory:/docker/abc\n1:name=systemd:/x\n";
+        let limited = |path: &str| {
+            (path == "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes")
+                .then(|| "1073741824\n".to_string())
+        };
+        assert_eq!(cgroup_limit_with(membership, &limited), Some(1 << 30));
+        let unlimited = |_: &str| Some("9223372036854771712\n".to_string());
+        assert_eq!(cgroup_limit_with(membership, &unlimited), None);
+        assert_eq!(cgroup_limit_with("", &unlimited), None);
+    }
+
+    struct Holder {
+        budget: MemoryBudget,
+        held: Mutex<Vec<Lease>>,
+    }
+
+    impl Reclaim for Holder {
+        fn reclaim(&self, bytes: u64) -> u64 {
+            let mut held = self.held.lock().unwrap();
+            let mut freed = 0;
+            while freed < bytes {
+                match held.pop() {
+                    Some(lease) => freed += lease.bytes(),
+                    None => break,
+                }
+            }
+            freed
+        }
+    }
+
+    #[test]
+    fn a_compute_lease_that_does_not_fit_beside_a_cache_makes_it_give_bytes_back() {
+        let budget = MemoryBudget::new(1000);
+        let holder = Arc::new(Holder {
+            budget: budget.clone(),
+            held: Mutex::new(Vec::new()),
+        });
+        for _ in 0..9 {
+            let lease = holder.budget.try_acquire_opportunistic(100).unwrap();
+            holder.held.lock().unwrap().push(lease);
+        }
+        let weak: Weak<dyn Reclaim> = Arc::downgrade(&holder) as Weak<dyn Reclaim>;
+        budget.register_reclaimer(weak);
+        assert!(budget.try_acquire(300).is_none(), "900 of 1000 are cached");
+        let lease = budget.try_acquire_reclaiming(300).expect("the cache gives back 200");
+        assert_eq!(lease.bytes(), 300);
+        assert_eq!(budget.opportunistic_in_use(), 700);
+        // And the blocking acquire asks too, rather than waiting forever.
+        let more = budget.acquire(600);
+        assert_eq!(more.bytes(), 600);
+        assert_eq!(budget.opportunistic_in_use(), 100);
+        // A request beyond everything is refused rather than blocked.
+        assert!(budget.try_acquire_reclaiming(2000).is_none());
+    }
+
+    #[test]
+    fn a_budget_can_be_resized_and_is_equal_only_to_its_clones() {
+        let budget = MemoryBudget::new(1000);
+        let _held = budget.acquire(800);
+        budget.set_total(500);
+        assert_eq!(budget.total(), 500);
+        assert_eq!(budget.free(), 0);
+        assert!(budget.try_acquire(1).is_none());
+        assert_eq!(budget, budget.clone());
+        assert_ne!(budget, MemoryBudget::new(1000));
+    }
+
+    #[test]
+    fn the_resident_set_is_readable_and_the_sampler_sees_a_peak() {
+        let Some(now) = resident_bytes() else {
+            return;
+        };
+        assert!(now > 0);
+        let sampler = ResidentSampler::start().unwrap();
+        sampler.reset(0);
+        let big = std::hint::black_box(vec![1u8; 64 << 20]);
+        std::thread::sleep(SAMPLE_INTERVAL * 5);
+        assert!(sampler.peak() >= 64 << 20, "{}", sampler.peak());
+        drop(std::hint::black_box(big));
     }
 }

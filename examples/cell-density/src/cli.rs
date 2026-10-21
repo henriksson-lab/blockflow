@@ -73,6 +73,13 @@ pub struct Args {
     /// four times the CPU on a whole tile).
     #[arg(long, default_value_t = 2048)]
     pub cache_mb: u64,
+    /// Memory cap in MiB: the most the run may hold resident (default:
+    /// $BLOCKFLOW_MEMORY_CAP, else the cgroup's limit, else a share of the
+    /// machine). The planned phases admit blocks in flight under it and the
+    /// chunk cache (at most `--cache-mb`) fills what they leave. Does not
+    /// change any result.
+    #[arg(long)]
+    pub memory_mb: Option<u64>,
     /// Table (and label) name.
     #[arg(long, default_value = "cell-density")]
     pub name: String,

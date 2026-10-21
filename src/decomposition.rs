@@ -1139,6 +1139,49 @@ impl Decomposition {
         })
     }
 
+    /// **Bytes one block of phase `index` holds while it is in flight**: its
+    /// share of the run's *active set*, before any margin.
+    ///
+    /// The same count [`Self::residency`] makes — the clamped read extent, times
+    /// one buffer per image read, one for the output and one per buffer the
+    /// chain holds between them ([`Chain::resident_block_buffers`]) — with one
+    /// difference that is the reason this exists beside it: **the element width
+    /// is the widest the phase's chain handles, not its input's.** A phase that
+    /// reads `uint16` and widens to `f64` at its head holds `f64` buffers; the
+    /// input's width under-charged such a phase fourfold, and the vessel
+    /// pipeline's phases are almost all of that shape.
+    ///
+    /// Charged by the planner against a memory cap (`strategy::choose_grid`)
+    /// and by the executor's admission (`Hints::memory`), both through
+    /// [`crate::budget::admission_bytes`] — the margin for what an op allocates
+    /// inside itself, which nothing declares.
+    pub fn active_bytes_per_block(&self, chain: &Chain, index: usize) -> f64 {
+        let Some(phase) = self.phases.get(index) else {
+            return 0.0;
+        };
+        let slots = chain.slots();
+        let input = self.dtype_at(index);
+        let output = phase.dtype.unwrap_or(self.dtype);
+        let mut widest = input.size_of().max(output.size_of());
+        for &image in &phase.source_images {
+            widest = widest.max(self.dtype_at(image).size_of());
+        }
+        let owns_slots =
+            !phase.slots.is_empty() && phase.slots.iter().all(|&slot| slot < slots.len());
+        let buffers = if owns_slots {
+            let mut current = input;
+            for &slot in &phase.slots {
+                let (out, width) = widest_in(slots[slot], current);
+                widest = widest.max(width);
+                current = out;
+            }
+            phase.images_read(index).len() + 1 + resident_buffers_of(&slots, &phase.slots)
+        } else {
+            phase.images_read(index).len() + 1
+        };
+        resident_voxels_per_block(&phase.grid, &phase.halo) * widest as f64 * buffers as f64
+    }
+
     /// The largest a **barrier gather** gets: every contributing block's
     /// fragment, resident at once, from the declared
     /// [`crate::fragment::SidecarSize`] of each stream.
@@ -2867,6 +2910,46 @@ impl Residency {
 ///
 /// Clamped per axis: the grown block can never exceed the volume, because a
 /// read cannot.
+/// What `chain` produces from `input`, and the widest element (in bytes) any
+/// buffer inside it holds on the way. A chain whose types do not resolve is
+/// answered at `f64`'s width, the widest there is: a charge that runs high
+/// refuses a plan, one that runs low admits a plan that cannot run.
+fn widest_in(chain: &Chain, input: Dtype) -> (Dtype, usize) {
+    let unresolved = (Dtype::F64, Dtype::F64.size_of());
+    match chain {
+        Chain::Op(_) => match chain.produces(input) {
+            Ok(out) => (out, input.size_of().max(out.size_of())),
+            Err(_) => unresolved,
+        },
+        Chain::Source { dtype, .. } => (*dtype, dtype.size_of()),
+        Chain::Sequence(children) => {
+            let mut current = input;
+            let mut widest = input.size_of();
+            for child in children {
+                let (out, width) = widest_in(child, current);
+                widest = widest.max(width);
+                current = out;
+            }
+            (current, widest)
+        }
+        Chain::Alternative { branches, taken } => match branches.get(*taken) {
+            Some(branch) => widest_in(branch, input),
+            None => unresolved,
+        },
+        Chain::Parallel { branches, .. } => {
+            let widest = branches
+                .iter()
+                .map(|branch| widest_in(branch, input).1)
+                .max()
+                .unwrap_or(input.size_of());
+            match chain.produces(input) {
+                Ok(out) => (out, widest.max(out.size_of())),
+                Err(_) => unresolved,
+            }
+        }
+    }
+}
+
 fn resident_voxels_per_block(grid: &BlockGrid, halo: &Reach) -> f64 {
     let block = grid.block();
     let volume = grid.volume();

@@ -38,12 +38,23 @@ The step table is at the top of [`src/main.rs`](src/main.rs). In short:
 examples/lewis-synapse-spots/scripts/run.sh /husky/otherdataset/teresa/lewis/omezarr .tmp/lewis
 ```
 
-Writes `spots.csv` (one row per spot: centroid, intensity-weighted centroid,
-area, raw sum and max, response max, eccentricity, principal axes, the synapse
-component under it, `in_synapse`), `images.csv` (one row per image: synapse
-area, centroid, eccentricity, mean intensity, spot counts), `params.json`, and
-16-bit label PNGs under `labels/`, and `synapse_features.csv` (below). All
-216 images take ~4 min, most of it the Monte Carlo point-pattern reference.
+The segmentation goes into each input image, as in the other OME-Zarr
+examples: `uint64` label pyramids installed with `ome_zarr::publish_label`,
+each paired with an object table whose `region` is that label.
+
+| in `<image>.ome.zarr/` | content |
+|---|---|
+| `labels/lewis-spots`, `tables/lewis-spots` | spot basins; one row per spot (centroid, intensity-weighted centroid, area, raw sum and max, response max, eccentricity, principal axes, edge distance, the synapse component under it, `in_synapse`) |
+| `labels/lewis-synapse`, `tables/lewis-synapse` | filled synapse mask components; one row, the analysed synapse, with its per-synapse features and `radius_px` |
+| `rozt:imageMetadata` (image attributes) | `condition` (SLB1..4, categorical), `field`, `roi` |
+
+`--layer` changes the `lewis` prefix; an existing publication is replaced only
+with `--overwrite`. Work is staged in `labels/.<layer>-blockflow-work` and
+moved into place. Under `--out` the same rows are gathered over all images for
+the cross-image analysis: `spots.csv`, `images.csv` (one row per image:
+synapse area, centroid, eccentricity, mean intensity, spot counts),
+`synapse_features.csv` (below) and `params.json`. All 216 images take ~4 min,
+most of it the Monte Carlo point-pattern reference.
 
 ## Per-synapse features
 
@@ -60,6 +71,15 @@ random points in the same mask. The table at the top of
 The crate is standalone (its own `[workspace]` and lockfile) so it builds
 without touching the root workspace; its `Cargo.lock` is the workspace's.
 
+## Browsing in ROZT
+
+Because each synapse table has one fully defined row and each image carries
+its condition, ROZT's `analysis.build-collection` job can gather all images
+into one collection (one point per synapse, coloured by `condition`, linked to
+its image). `scripts/rozt_collections.py` writes the job payloads; submit them
+with `curl -X POST -H 'content-type: application/json' --data @job.json
+http://<rozt>/v1/jobs`.
+
 ## Reference and QC
 
 [`scripts/spots_reference.py`](scripts/spots_reference.py) is the same
@@ -70,7 +90,8 @@ identical, spot label images identical except 6 pixels (DoG values on the
 extent level, rounding), and 6 of 39 913 spot rows differing by that pixel.
 
 [`scripts/qc_overlay.py`](scripts/qc_overlay.py) draws the synapse (cyan),
-spots (amber) and spots outside the synapse (magenta).
+spots (amber) and spots outside the synapse (magenta) from the published
+labels.
 
 ## Known limits
 

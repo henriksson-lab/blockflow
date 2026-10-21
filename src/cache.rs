@@ -82,7 +82,7 @@ use std::time::{Duration, Instant};
 
 use ndarray::{ArrayD, IxDyn};
 
-use crate::budget::{Lease, MemoryBudget};
+use crate::budget::{Lease, MemoryBudget, Reclaim};
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::listener::EventListener;
@@ -669,6 +669,19 @@ impl ChunkCache {
             listeners: Vec::new(),
             counters: Counters::default(),
         }
+    }
+
+    /// A cache of at most `capacity_bytes` leasing from
+    /// [`crate::budget::process_budget`], registered so that compute can make
+    /// it give bytes back ([`Self::register_reclaim`]).
+    ///
+    /// The cache the environments build by default: it holds what the memory
+    /// cap leaves after the blocks in flight, up to `capacity_bytes`, and no
+    /// more.
+    pub fn in_process_budget(capacity_bytes: u64) -> Arc<Self> {
+        let cache = Arc::new(Self::new(crate::budget::process_budget(), capacity_bytes));
+        cache.register_reclaim();
+        cache
     }
 
     pub fn with_codec(mut self, codec: Arc<dyn Codec>) -> Self {
@@ -1288,11 +1301,27 @@ impl ChunkCache {
                     }
                 }
             }
-            let lease = if admissible && state.bytes + cost <= self.capacity {
+            let mut lease = if admissible && state.bytes + cost <= self.capacity {
                 self.budget.try_acquire_opportunistic(cost)
             } else {
                 None
             };
+            // **The shared budget is full, and this cache holds some of it.**
+            // Under a memory cap the budget is shared with compute and with
+            // every other cache, so the room is what they leave; trading this
+            // cache's own least recent entries for the new one keeps it fresh
+            // within that room rather than frozen at whatever it held first.
+            // Never while compute is waiting: those bytes are compute's.
+            while admissible
+                && lease.is_none()
+                && !self.budget.revoking()
+                && state.bytes + cost <= self.capacity
+            {
+                if !self.evict_one(&mut state, &reg.name, &mut events) {
+                    break;
+                }
+                lease = self.budget.try_acquire_opportunistic(cost);
+            }
             match lease {
                 Some(lease) => {
                     let tick = state.clock + 1;
@@ -1336,6 +1365,19 @@ impl ChunkCache {
             self.resolved.notify_all();
         }
         self.emit(events);
+    }
+
+    /// Let [`MemoryBudget::reclaim`] ask this cache for bytes back: what makes
+    /// a cache sharing the process budget ([`crate::budget::process_budget`])
+    /// as large as the active set leaves it, and no larger.
+    pub fn register_reclaim(self: &Arc<Self>) {
+        let weak: std::sync::Weak<dyn Reclaim> = Arc::downgrade(self) as std::sync::Weak<dyn Reclaim>;
+        self.budget.register_reclaimer(weak);
+    }
+
+    /// The budget this cache leases from.
+    pub fn budget(&self) -> &MemoryBudget {
+        &self.budget
     }
 
     /// Drop the least recently used entry, whichever array it belongs to.
@@ -1877,5 +1919,26 @@ mod tests {
         let codec = DeflateCodec::default();
         let encoded = codec.encode(&[1u8, 2, 3, 4]);
         assert!(codec.decode(&encoded, 8).is_err());
+    }
+}
+
+impl Reclaim for ChunkCache {
+    /// Evict least recently used entries, across every array, until `bytes`
+    /// are freed or the cache is empty.
+    fn reclaim(&self, bytes: u64) -> u64 {
+        let mut events = Vec::new();
+        let mut freed = 0u64;
+        {
+            let mut state = self.state.lock_unpoisoned();
+            while freed < bytes {
+                let before = state.bytes;
+                if !self.evict_one(&mut state, "compute", &mut events) {
+                    break;
+                }
+                freed += before.saturating_sub(state.bytes);
+            }
+        }
+        self.emit(events);
+        freed
     }
 }

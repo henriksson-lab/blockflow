@@ -160,6 +160,7 @@ pub mod gui;
 /// no-feature configuration is the one everything else is measured against —
 /// and see its header for the measured defect it exists instead of.
 pub mod http;
+pub mod image_metadata;
 /// Out-of-core, anisotropy-aware intensity pyramids added to an existing
 /// OME-Zarr image in place.
 #[cfg(feature = "zarr")]

@@ -16,7 +16,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::assemble::{Assembly, ImageId, PlanBuilder};
+use blockflow::decomposition::CostModel;
 use blockflow::geometry::BlockGrid;
 use blockflow::ome_zarr::{publish_label, LabelPublication, OmeVolumePyramid};
 use blockflow::op::Chain;
@@ -24,7 +25,7 @@ use blockflow::ops::voxelize::{ball, voxelize_into};
 use blockflow::ops::WidenLabelsOp;
 use blockflow::points::Point;
 use blockflow::region::Region;
-use blockflow::strategy::{execute_phases, Hints};
+use blockflow::strategy::{choose_grid, execute_phases, Hints, Host};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::AttachedImage;
 use blockflow::{Dtype, Error, Result, ZarrEnvironment};
@@ -43,7 +44,7 @@ use super::params::{ChannelOverrides, ChannelRole, PostOverrides, SegmentOverrid
 use super::pipeline::{append_segment_phases, append_segment_phases_unthinned, SegmentParams};
 use super::plan::{workers, Cursor, Image};
 use super::skeleton::SkeletonParams;
-use super::thin::{thin_stored, ThinPlan};
+use super::thin::{round_plan, thin_stored, ThinPlan};
 use super::tract::{
     append_clip_range_phases, append_tract_phases, count_points, for_each_point_slab,
     read_clip_range, tract_binarize, Rescale, TractParams,
@@ -71,9 +72,11 @@ pub struct InputArgs {
     /// Time point.
     #[arg(long, default_value_t = 0)]
     pub time: usize,
-    /// Block edge, z,y,x.
-    #[arg(long, value_delimiter = ',', default_values_t = vec![64, 256, 256])]
-    pub block: Vec<usize>,
+    /// Block edge, z,y,x. Without it the planner chooses the block grid for
+    /// the volume, the plan and the worker count
+    /// (`blockflow::strategy::choose_grid`).
+    #[arg(long, value_delimiter = ',')]
+    pub block: Option<Vec<usize>>,
     /// Worker threads (default: one per core).
     #[arg(long)]
     pub workers: Option<usize>,
@@ -109,8 +112,65 @@ impl InputArgs {
         self.workers.unwrap_or_else(workers).max(1)
     }
 
-    fn block(&self) -> Result<[usize; 3]> {
-        triple(&self.block, "--block")
+    fn block(&self) -> Result<Option<[usize; 3]>> {
+        self.block
+            .as_deref()
+            .map(|block| triple(block, "--block"))
+            .transpose()
+    }
+
+    /// Without `--block`, a cursor that writes its labels on [`LABEL_BLOCK`].
+    fn labelled<'a>(&self, c: Cursor<'a>, volume: [usize; 3]) -> Result<Cursor<'a>> {
+        Ok(match self.block {
+            Some(_) => c,
+            None => c.labelling_on(BlockGrid::new(volume, LABEL_BLOCK)?),
+        })
+    }
+
+    /// The plan `build` makes on `--block`, or on the grid the planner prices
+    /// fastest for this volume on `--workers` (and the machine's memory).
+    fn planned<T>(
+        &self,
+        what: &str,
+        volume: [usize; 3],
+        mut build: impl FnMut(BlockGrid) -> Result<(Assembly, T)>,
+    ) -> Result<(BlockGrid, Assembly, T)> {
+        if let Some(block) = self.block()? {
+            let grid = BlockGrid::new(volume, block)?;
+            let (assembly, built) = build(grid.clone())?;
+            eprintln!(
+                "{what}: block {:?} (--block), {} blocks",
+                grid.block(),
+                grid.n_blocks()
+            );
+            return Ok((grid, assembly, built));
+        }
+        let started = Instant::now();
+        let host = Host::detect().with_workers(self.workers());
+        let chosen = choose_grid(volume, &host, &CostModel::default(), build)?;
+        let widest = chosen.active.iter().map(|set| set.bytes()).max().unwrap_or(0);
+        eprintln!(
+            "{what}: block {:?}, {} blocks, chosen of {} grids for {} workers ({:.2}s); \
+             active set at most {} MiB of {} MiB",
+            chosen.grid.block(),
+            chosen.grid.n_blocks(),
+            chosen.considered.len(),
+            host.workers,
+            started.elapsed().as_secs_f64(),
+            widest >> 20,
+            host.budget_bytes >> 20
+        );
+        if crate::profile::enabled() {
+            for (phase, set) in chosen.active.iter().enumerate() {
+                eprintln!(
+                    "active {what}: {phase:>2} {:>7.1} MiB x {:>2} in flight = {:>7.1} MiB",
+                    set.per_block as f64 / (1u64 << 20) as f64,
+                    set.in_flight,
+                    set.bytes() as f64 / (1u64 << 20) as f64
+                );
+            }
+        }
+        Ok((chosen.grid, chosen.assembly, chosen.built))
     }
 
     /// With `--crop`: copy the crop of `channels` and return the arguments
@@ -203,9 +263,11 @@ pub struct SegmentArgs {
     pub keep_border: bool,
     /// The thinning runs resident (one iterative phase holding two bytes a
     /// voxel) when that is at most this many MiB, and over stored images, a
-    /// round per phase, otherwise. The skeleton is the same either way.
-    #[arg(long, default_value_t = 2048)]
-    pub thin_memory_mb: u64,
+    /// round per phase, otherwise (default: 8192, or a quarter of the memory
+    /// cap's usable bytes when that is less). The skeleton is the same either
+    /// way; the stored rounds take more wall time.
+    #[arg(long)]
+    pub thin_memory_mb: Option<u64>,
     /// Skip the deep vessel filling (the CNN that fills hollow lumens after
     /// each channel's smooth and fill). It is on by default in a build with
     /// the `deep-fill` feature, as in the reference's configuration, and off
@@ -441,40 +503,50 @@ pub fn run_segment(args: &SegmentArgs) -> Result<SegmentSummary> {
         sources.push(Image::new(ImageId::supplied(index - 1), other_dtype));
     }
 
-    let mut plan = PlanBuilder::new(volume, dtype, BlockGrid::new(volume, args.input.block()?)?);
-    let mut c = Cursor::new(&mut plan, sources[0]);
     // The thinning in the plan, as one iterative phase holding the volume
     // twice, when that fits `--thin-memory-mb`; otherwise everything but the
     // thinning, which then runs over the stored image the plan leaves
     // (`thin::thin_stored`).
     let voxels = volume.iter().product::<usize>() as u64;
-    let resident_thinning = 2 * voxels <= args.thin_memory_mb.saturating_mul(1 << 20);
-    let segmented = match resident_thinning {
-        true => append_segment_phases(&mut c, &sources, &params)?,
-        false => append_segment_phases_unthinned(&mut c, &sources, &params)?,
-    };
-    let mask = c.pixels(c.on(segmented.mask, vec![Chain::op(WidenLabelsOp)]))?;
-    // The skeleton as a label (resident thinning), or the image the stored
-    // thinning starts from.
-    let skeleton = match resident_thinning {
-        true => c.pixels(c.on(segmented.skeleton, vec![Chain::op(WidenLabelsOp)]))?,
-        false => segmented.skeleton,
-    };
-    // With several channels, each channel's own mask too: the large-vessel
-    // masks are what the graph's artery/vein columns read.
-    let channel_masks = match segmented.channels.len() {
-        1 => Vec::new(),
-        _ => segmented
-            .channels
-            .iter()
-            .map(|channel| c.pixels(c.on(channel.processed, vec![Chain::op(WidenLabelsOp)])))
-            .collect::<Result<Vec<_>>>()?,
-    };
+    let resident_thinning = 2 * voxels <= thin_memory_bytes(args.thin_memory_mb);
+    let (grid, assembly, planned) = args.input.planned("segment", volume, |grid| {
+        let mut plan = PlanBuilder::new(volume, dtype, grid);
+        let mut c = Cursor::new(&mut plan, sources[0]);
+        if args.input.block.is_none() {
+            c = c.pricing_iterations();
+        }
+        let mut c = args.input.labelled(c, volume)?;
+        let segmented = match resident_thinning {
+            true => append_segment_phases(&mut c, &sources, &params)?,
+            false => append_segment_phases_unthinned(&mut c, &sources, &params)?,
+        };
+        // The labels are written on the publication grid, which sets their
+        // chunk shape, whatever grid computed them.
+        c.to_label_grid();
+        let mask = c.pixels(c.on(segmented.mask, vec![Chain::op(WidenLabelsOp)]))?;
+        // The skeleton as a label (resident thinning), or the image the stored
+        // thinning starts from.
+        let skeleton = match resident_thinning {
+            true => c.pixels(c.on(segmented.skeleton, vec![Chain::op(WidenLabelsOp)]))?,
+            false => segmented.skeleton,
+        };
+        // With several channels, each channel's own mask too: the large-vessel
+        // masks are what the graph's artery/vein columns read.
+        let channel_masks = match segmented.channels.len() {
+            1 => Vec::new(),
+            _ => segmented
+                .channels
+                .iter()
+                .map(|channel| c.pixels(c.on(channel.processed, vec![Chain::op(WidenLabelsOp)])))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        Ok((plan.finish()?, (mask, skeleton, channel_masks)))
+    })?;
+    let (mask, skeleton, channel_masks) = planned;
     let channel_labels = match channel_masks.is_empty() {
         true => Vec::new(),
         false => channel_mask_labels(&args.name, &roles, &args.channel),
     };
-    let assembly = plan.finish()?;
 
     let work = args.input.work_dir("segment");
     fresh(&work)?;
@@ -533,10 +605,16 @@ pub fn run_segment(args: &SegmentArgs) -> Result<SegmentSummary> {
         true => (work.clone(), skeleton),
         false => {
             let thin_work = work.with_extension("thin");
+            // The rounds' own grid: the thinning reaches as far on every axis,
+            // which is rarely what suits the windows before it.
+            let passes = params.skeleton.passes_per_round;
+            let (thin_grid, _, _) = args.input.planned("thinning", volume, |grid| {
+                Ok((round_plan(volume, grid, passes)?, ()))
+            })?;
             let thinned = thin_stored(
                 &AttachedImage::at(work.join(format!("level{}", skeleton.id.index()))),
                 &ThinPlan {
-                    grid: args.input.block()?,
+                    grid: thin_grid.block(),
                     rounds_per_plan: THIN_ROUNDS_PER_PLAN,
                     workers: args.input.workers(),
                     round_limit: params.skeleton.round_limit,
@@ -549,11 +627,11 @@ pub fn run_segment(args: &SegmentArgs) -> Result<SegmentSummary> {
                 "segment: thinned over stored images in {} rounds",
                 thinned.rounds
             );
-            let mut plan = PlanBuilder::new(
-                volume,
-                Dtype::Bool,
-                BlockGrid::new(volume, args.input.block()?)?,
-            );
+            let label_grid = match args.input.block {
+                Some(_) => grid.clone(),
+                None => BlockGrid::new(volume, LABEL_BLOCK)?,
+            };
+            let mut plan = PlanBuilder::new(volume, Dtype::Bool, label_grid);
             let widened = plan.pixels(Chain::op(WidenLabelsOp))?.image()?;
             let assembly = plan.finish()?;
             fresh(&widen_work)?;
@@ -600,6 +678,29 @@ pub fn run_segment(args: &SegmentArgs) -> Result<SegmentSummary> {
         phases: assembly.n_phases(),
     })
 }
+
+/// The block the published labels are written on when the planner chooses the
+/// compute grid. A label's chunk shape follows the block that wrote it
+/// (`zarr_env::chunk_for_block`: `[64, 64, 128]` for `uint64` here), and that
+/// is a layout for its readers — `graph`'s blocks, a viewer — rather than a
+/// compute choice, so it does not move with the grid the segmentation ran on.
+/// It is the grid `--block` defaulted to before the planner chose.
+const LABEL_BLOCK: [usize; 3] = [64, 256, 256];
+
+/// The resident thinning's ceiling: `--thin-memory-mb`, else
+/// [`THIN_MEMORY_BYTES`] or a quarter of the memory cap's usable bytes,
+/// whichever is less. The resident phase holds its two buffers for the whole
+/// iteration, beside the blocks in flight, so it may take only part of the cap.
+fn thin_memory_bytes(stated_mb: Option<u64>) -> u64 {
+    match stated_mb {
+        Some(mb) => mb.saturating_mul(1 << 20),
+        None => THIN_MEMORY_BYTES.min(blockflow::budget::process_cap().usable_bytes() / 4),
+    }
+}
+
+/// The resident thinning's default ceiling: a volume of 4 G voxels, a whole
+/// tile but not a whole brain.
+const THIN_MEMORY_BYTES: u64 = 8192 << 20;
 
 /// Thinning rounds per plan: a convergence test after each plan, and up to
 /// this many rounds run past the fixed point (copies, every window unchanged).
@@ -738,9 +839,20 @@ pub fn run_tract(args: &TractArgs) -> Result<TractSummary> {
     let level0 = level_lattice(&pyramid.levels()[0]);
     let attached = pyramid.attached_level(0)?;
     let (dtype, volume) = attached.metadata()?;
-    let grid = BlockGrid::new(volume, args.input.block()?)?;
     let source = Image::new(0usize, dtype);
     let work = args.input.work_dir("tract");
+    // One grid for both runs, chosen (without `--block`) on the second, which
+    // is where the work is.
+    let (grid, assembly, images) = args.input.planned("tract", volume, |grid| {
+        let mut plan = PlanBuilder::new(volume, dtype, grid);
+        let mut c = args
+            .input
+            .labelled(Cursor::new(&mut plan, source), volume)?;
+        // The range is only known after run 1; any range plans the same phases.
+        let images = append_tract_phases(&mut c, source, &params, (0.0, 1.0))?;
+        Ok((plan.finish()?, images))
+    })?;
+    drop((assembly, images));
 
     // Run 1: the clip range.
     let mut plan = PlanBuilder::new(volume, dtype, grid.clone());
@@ -765,7 +877,9 @@ pub fn run_tract(args: &TractArgs) -> Result<TractSummary> {
 
     // Run 2: mask, points, density.
     let mut plan = PlanBuilder::new(volume, dtype, grid);
-    let mut c = Cursor::new(&mut plan, source);
+    let mut c = args
+        .input
+        .labelled(Cursor::new(&mut plan, source), volume)?;
     let images = append_tract_phases(&mut c, source, &params, range)?;
     let assembly = plan.finish()?;
     fresh(&work)?;

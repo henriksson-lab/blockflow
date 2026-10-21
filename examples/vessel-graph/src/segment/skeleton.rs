@@ -10,7 +10,10 @@
 //! passes at a fixed halo, neighbours exchange their previous round through
 //! that halo, and the phase stops when no block changed anywhere — the global
 //! convergence test a blocked thinning needs, since a voxel deletable in one
-//! block can make a neighbour's voxel deletable in the next round.
+//! block can make a neighbour's voxel deletable in the next round. The op
+//! declares itself stationary, so a round runs only the blocks a change in the
+//! round before could reach (the executor's dirty set); the rounds and the
+//! skeleton are the same.
 //!
 //! The faces are cleared because the thinning templates treat the outside of
 //! the volume as background only when the volume's own faces hold none of the
@@ -135,6 +138,14 @@ impl IterativeOp for ThinToFixedPoint {
 
     fn accepts(&self, dtype: Dtype) -> bool {
         dtype == Dtype::Bool
+    }
+
+    /// A round is the same passes at every substage, a function of the window
+    /// alone, so the executor revisits only the blocks whose window changed in
+    /// the previous round: after the first few rounds the thinning is a
+    /// handful of blocks along the last thick parts, not the whole volume.
+    fn stationary(&self) -> bool {
+        true
     }
 
     fn substage(&self, at: &Substage<'_>, out: &mut Voxels) -> Result<()> {
