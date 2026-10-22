@@ -140,6 +140,7 @@ pub mod export;
 /// executor over the same task DAG. A second trait beside `BlockOp`, because
 /// they are a different shape rather than a wider signature.
 pub mod forest;
+pub mod feature_index;
 pub mod fragment;
 pub mod geometry;
 /// GPU implementations of block ops, selected at run time beside the CPU

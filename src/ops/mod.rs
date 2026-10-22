@@ -38,6 +38,7 @@
 // | `resample` | resizing by an exact rational factor per axis | the first op here whose **output image is a different shape from its input image** — the capability `docs/design/BLOCK_OPS.md` opened and left unused until this. Everything above it writes the extent it was handed |
 // | `skeleton` | one thinning sub-iteration, and the sequence of them | an answer that depends on **where** the block is (the parity class is a fact about position), and a `Sequence` whose reach is the fold rather than a declaration |
 // | `directional` | a whole thinning pass, as one op, and the sequence of them | the first op whose **sub-iteration cannot be a slot**: it reads a second array — the border set taken once per pass — that a `Sequence` has nowhere to thread, so the indivisible unit is the pass and the reach of twelve is a derivation the op has to state rather than a fold |
+// | `envelope` | physical rolling-ball envelopes of binary masks | composes exact distance sweeps and a global exterior-component merge; narrow clefts are bridged without treating them as measured tissue |
 // | `fill` | hole filling, as two `FragmentOp` phases | the first operation here that **no halo can express**: reachability is transitive over the whole volume, so it is a fragment-and-join rather than a `BlockOp` at all |
 // | `regional` | the maxima of a greyscale volume, as the same two phases | the **second** op of that shape, which is what turned one op's internals into `components`: the same program with a different per-label fact, and a seam meeting that compares before it joins |
 // | `components` | the union-find, the six-face geometry and the seam walk | nothing on its own — it is the part of `fill` and `regional` that is the *program* rather than the question. Its one *choice* is `Connectivity`, re-exported here: `fill`, `regional` and `detect` each take it and each defaults to face connectivity, so nothing that predates it moved, and the wider ones are the same program over more seam pairs |
@@ -334,6 +335,7 @@ pub mod features;
 /// took instead and why the three obvious ways of wrapping it in this crate's
 /// lattice do not exist.
 pub mod fft;
+pub mod envelope;
 pub mod fill;
 pub(crate) mod histogram;
 pub mod intensity_statistics;

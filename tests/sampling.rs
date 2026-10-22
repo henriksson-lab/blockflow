@@ -88,6 +88,10 @@ fn typed_seams_edges_and_gradients_use_calibrated_pixel_centres() {
                 );
             }
         }
+        assert_eq!(
+            stats.peak_planned_working_bytes,
+            sampling_working_bytes(&s.layout, p.len()).unwrap()
+        );
         assert_eq!(stats.chunk_reads, s.reads);
         assert!(stats.peak_planned_working_bytes <= budget().max_working_bytes);
     }
@@ -202,4 +206,37 @@ fn physical_centre_roundoff_does_not_bridge_a_masked_boundary() {
     sample_points(&mut s, &p, &mut out, budget()).unwrap();
     assert!(out[0].valid);
     assert!((out[0].value - 1022.).abs() < 1e-9);
+}
+
+#[test]
+fn public_memory_preflight_matches_sampler_admission_without_allocating() {
+    let mut s = source(Dtype::U16);
+    assert_eq!(sampling_working_bytes(&s.layout, 0).unwrap(), 0);
+    assert!(sampling_working_bytes(&s.layout, usize::MAX).is_err());
+    let p = [[-10.3, 18.3, 33.1]];
+    let mut output = [Sample::default()];
+    let planned = sampling_working_bytes(&s.layout, p.len()).unwrap();
+    assert!(sample_points(
+        &mut s,
+        &p,
+        &mut output,
+        SamplingBudget {
+            max_working_bytes: planned - 1,
+            ..budget()
+        }
+    )
+    .is_err());
+    assert_eq!(s.reads, 0);
+    let stats = sample_points(
+        &mut s,
+        &p,
+        &mut output,
+        SamplingBudget {
+            max_working_bytes: planned,
+            ..budget()
+        },
+    )
+    .unwrap();
+    assert_eq!(stats.peak_planned_working_bytes, planned);
+    assert!(output[0].valid);
 }

@@ -746,7 +746,7 @@ pub struct MemoryCap {
 
 /// The least a binding cap holds back from the blocks in flight. See
 /// [`MemoryCap::reserve_bytes`].
-pub const MIN_CAP_RESERVE_BYTES: u64 = 96 << 20;
+pub const MIN_CAP_RESERVE_BYTES: u64 = 128 << 20;
 
 impl MemoryCap {
     /// The cap from the environment, the cgroup or the machine, in that order.
@@ -816,8 +816,10 @@ impl MemoryCap {
         )
     }
 
-    /// What a binding cap holds back from the blocks in flight: a tenth, and at
-    /// least [`MIN_CAP_RESERVE_BYTES`] (never more than half the cap).
+    /// What a binding cap holds back from the blocks in flight: an eighth, and
+    /// at least [`MIN_CAP_RESERVE_BYTES`] (never more than half the cap).
+    /// A tenth and 96 MiB let the osf-sa3x8 region's tract map peak 3% over a
+    /// 1 GiB cap.
     ///
     /// For what no plan sees: the binary, its thread stacks, the allocator's
     /// retained and fragmented heap, and the moment between two samples of the
@@ -829,7 +831,7 @@ impl MemoryCap {
         if !self.is_binding() {
             return 0;
         }
-        (self.bytes / 10)
+        (self.bytes / 8)
             .max(MIN_CAP_RESERVE_BYTES)
             .min(self.bytes / 2)
     }
@@ -842,12 +844,12 @@ impl MemoryCap {
     /// The least binding cap whose usable bytes are at least `usable`: what a
     /// plan needing `usable` bytes for its blocks in flight has to be given.
     pub fn needed_for(usable: u64) -> u64 {
-        // The reserve is one of three pieces (half, the floor, a tenth), so the
+        // The reserve is one of three pieces (half, the floor, an eighth), so the
         // answer is the least of the three inversions that actually holds.
         [
             usable.saturating_mul(2),
             usable.saturating_add(MIN_CAP_RESERVE_BYTES),
-            usable.saturating_mul(10).div_ceil(9),
+            usable.saturating_mul(8).div_ceil(7),
         ]
         .into_iter()
         .filter(|&bytes| {
@@ -1755,7 +1757,7 @@ mod tests {
             bytes: 10 << 30,
             source: CapSource::Explicit,
         };
-        assert_eq!(big.reserve_bytes(), (10 << 30) / 10);
+        assert_eq!(big.reserve_bytes(), (10 << 30) / 8);
         let small = MemoryCap {
             bytes: 512 << 20,
             source: CapSource::Cgroup,

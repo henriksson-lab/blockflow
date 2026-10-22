@@ -89,9 +89,11 @@ fn a_plane_wide_reach_is_cut_across_the_plane() {
 fn a_budget_too_small_for_a_coarse_grid_moves_the_choice_finer() {
     let model = CostModel::default();
     let roomy = choose_grid(VOLUME, &host(1), &model, plane_blur).unwrap();
+    // Half what one block of the roomy plan is expected to hold.
+    let whole = roomy.active.iter().map(|set| set.per_block).max().unwrap();
     let tight = Host {
         workers: 1,
-        budget_bytes: 96 << 20,
+        budget_bytes: whole / 2,
     };
     let chosen = choose_grid(VOLUME, &tight, &model, plane_blur).unwrap();
     assert!(chosen.grid.n_blocks() > roomy.grid.n_blocks());

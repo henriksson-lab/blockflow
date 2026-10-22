@@ -1,0 +1,11 @@
+# Reusing FFT correlation work
+
+`ops::fft::Correlation2` now supports `prepare_operand` and `correlate_prepared[_into]` in addition to the existing direct-input methods. Preparing an operand performs its zero-padded forward transform once. The returned `CorrelationSpectrum2` owns an immutable spectrum tagged by original shape, padded shape and backend.
+
+Correlation checks both operand roles, padding/backend compatibility and output extent before multiplying `A * conjugate(B)` into separate scratch. Inverse transforms do not consume either prepared operand. A caller can therefore retain a template while transforming many reference planes, or reuse several fields in masked metrics. Different lag windows can share prepared data when their plan padding is compatible. Original operand dimensions must still match each role.
+
+The existing `correlate` and `correlate_into` APIs retain their behavior. Normalization, lag sign and padding conventions are unchanged. `CorrelationSpectrum2::bytes` reports spectrum payload only; plan internals, FFT scratch, object overhead and caller arrays are additional. Reuse trades memory for fewer forward transforms, so callers must price retained spectra alongside their existing plan and image buffers. The API adds no unbounded cache or automatic global retention policy.
+
+The section-to-volume consumer retains one plan geometry and three invariant template spectra (values, mask, squared values). It transforms the corresponding three reference fields once per plane, then computes the same six correlations as its original masked-NCC implementation. This reduces forward transforms from twelve per plane to three per plane plus three per retained-geometry build; there are still six inverse transforms per plane. Geometry changes release the old retained plan before allocating its replacement.
+
+`tests/fft_prepared.rs` compares prepared and legacy correlation against direct signed-lag sums, checks repeated inverse calls and changed reference data, and refuses incompatible padding, roles, shapes and output arrays. The consumer additionally checks masked NCC against direct pairs and compares complete frozen searches. Numerical equivalence is required before attributing a speed result to reuse.

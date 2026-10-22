@@ -159,6 +159,20 @@ fn numeric(v: &Voxels, p: [usize; 3]) -> f64 {
         Voxels::F64(a) => a[p],
     }
 }
+/// Planned sampler working bytes for a batch, excluding caller-owned positions
+/// and results. Includes the largest clipped typed chunk, reserved validity and
+/// the source's declared workspace/cache. Empty batches allocate/read nothing.
+/// This is allocation accounting, not a measured process/codec memory ceiling.
+pub fn sampling_working_bytes(layout: &SourceLayout, points: usize) -> Result<usize> {
+    layout.validate()?;
+    if points == 0 {
+        return Ok(0);
+    }
+    let requests = mul(mul(points, 8)?, std::mem::size_of::<Corner>())?;
+    let shape = std::array::from_fn(|i| layout.chunk_zyx[i].min(layout.shape_zyx[i]));
+    let chunk = mul(count(shape)?, add(layout.dtype.size_of(), 1)?)?;
+    add(add(requests, layout.additional_workspace_bytes)?, chunk)
+}
 /// Fill caller-owned results. Integer values are numerically converted to f64;
 /// U64/I64 above its exact integer range therefore lose precision. At the upper
 /// acquisition boundary the gradient is the inward linear-cell derivative.
@@ -185,11 +199,7 @@ pub fn sample_points(
         return Ok(SamplingStats::default());
     }
     let capacity = mul(n, 8)?;
-    let request_bytes = mul(capacity, std::mem::size_of::<Corner>())?;
-    let fixed = add(request_bytes, layout.additional_workspace_bytes)?;
-    let max_chunk_shape = std::array::from_fn(|i| layout.chunk_zyx[i].min(layout.shape_zyx[i]));
-    let max_chunk_bytes = mul(count(max_chunk_shape)?, add(layout.dtype.size_of(), 1)?)?;
-    let planned = add(fixed, max_chunk_bytes)?;
+    let planned = sampling_working_bytes(&layout, n)?;
     if planned > budget.max_working_bytes {
         return Err(Error::invalid("sampling_memory_budget_exceeded"));
     }

@@ -40,6 +40,8 @@ If an op you write needs the whole volume in memory, it will not scale; see
 | arbitrary physical points and gradients | `src/sampling.rs`, [source and budget contracts](physical-point-sampling.md) |
 | OME-Zarr in/out | `src/ome_zarr.rs` (`OmeVolumePyramid`, `write_label_metadata`, `ensure_zarr_group`), `src/label_pyramid.rs`, `src/object_table.rs`, `crates/ngff-object-table` |
 | rows | `src/table.rs` (`Schema`, `Column`, `RowBuilder`, `Row`, `Table`), `src/ops/rows.rs` |
+| paged physical feature neighborhoods | `src/feature_index.rs`, [storage and budget contracts](physical-feature-index.md) |
+| reusable FFT operands | `src/ops/fft.rs`, [prepared correlation](prepared-fft-correlation.md) |
 | ops by topic | `src/ops/mod.rs` — its header table lists every module and what it makes expressible |
 | finished pipelines | `examples/*` (§7) |
 | design rationale | `docs/design/*.md` (note the trust caveat at the top of `writing-an-op.md`) |
@@ -377,6 +379,26 @@ takes the workers from `available_parallelism` (affinity and cgroup quota)
 and the budget from `budget::default_budget_bytes`. Per-axis matters: an op
 reaching far in `y, x` and not in `z` is cut into `z` slabs, which no scalar
 edge offers. `examples/vessel-graph` uses it unless `--block` is given.
+
+**Memory caps.** `budget::process_cap()` is the most the process may hold:
+a stated cap (`budget::set_process_cap(MemoryCap::resolve(flag))`, which the
+examples' `--memory-mb` does), else `BLOCKFLOW_MEMORY_CAP` (or the older
+`BLOCKFLOW_MEMORY_BUDGET_BYTES`), else the cgroup's `memory.max` /
+`memory.limit_in_bytes`, else `min(MemTotal / 2, MemAvailable * 3 / 4)`. A
+stated or cgroup cap keeps back a reserve (an eighth, at least 128 MiB). The
+cap is a **hard bound on the active set** (blocks in flight): `choose_grid`
+sizes each phase's blocks in flight under it (`ChosenGrid::active`, from
+`strategy::expected_bytes_per_block`), runs a phase with fewer blocks at once
+rather than refusing it, prices that, and errors with the least cap that
+would do when no candidate's block fits. What the cap leaves for the cache is
+a **cost**: halo re-reads that would not fit are charged again. The caches
+(`ZarrEnvironment` default and `with_cache`) lease from the same
+`budget::process_budget()`, so they hold what the blocks leave and evict when
+a wave needs more. The executor admits each wave against that budget
+(`Hints::memory`, on by default): the first wave of a phase at the charged
+figure (`strategy::active_bytes_per_block`, with the op margin), later waves
+at what a wave of that phase alone was measured to hold, never under the
+margin-free figure (resident-set sampling, only near the cap).
 
 **Costs that are easy to miss:**
 

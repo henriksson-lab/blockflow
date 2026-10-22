@@ -535,30 +535,19 @@ impl Admission {
                 .peak()
                 .saturating_sub(resident)
                 .saturating_sub(grown_cache);
-            // **A peak of one wave, shared out in proportion to the plan's
-            // charges**: a wave can hold blocks of two phases (the next phase's
-            // first blocks are ready before the last of this one's), and the
-            // sampler sees one resident set. A proportional share can teach the
-            // dearer phase too little — the tubeness phase of the vessel
-            // pipeline was taught a third under what its blocks held — which is
-            // what the floor in [`Self::charge`] is for: a learned figure never
-            // goes under the margin-free prediction.
-            let planned: u64 = wave
-                .iter()
-                .map(|&id| {
-                    self.planned
-                        .get(graph.tasks[id].phase)
-                        .copied()
-                        .unwrap_or(0)
-                })
-                .sum::<u64>()
-                .max(1);
-            let scale = held as f64 / planned as f64;
-            for &id in wave {
-                let phase = graph.tasks[id].phase;
-                let per_block =
-                    (self.planned.get(phase).copied().unwrap_or(0) as f64 * scale).round() as u64;
-                if let Some(seen) = self.seen.get_mut(phase) {
+            // **Learned from waves of one phase only.** A wave can hold blocks
+            // of two (the next phase's first blocks are ready before the last of
+            // this one's), and no division of one peak between two phases is
+            // safe: the blocks of the two do not peak together, so an even
+            // share, or one in proportion to the plan's charges, taught the
+            // dearer phase a figure under what its blocks held — measured on
+            // the vessel pipeline at a third under for the tubeness phase and a
+            // fifth under for the equalisation, and the next wave broke the cap
+            // both times.
+            let first = graph.tasks[wave[0]].phase;
+            if wave.iter().all(|&id| graph.tasks[id].phase == first) {
+                let per_block = held / wave.len().max(1) as u64;
+                if let Some(seen) = self.seen.get_mut(first) {
                     *seen = Some(seen.map_or(per_block, |old| old.max(per_block)));
                 }
             }

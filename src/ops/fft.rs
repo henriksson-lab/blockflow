@@ -1731,6 +1731,23 @@ impl Padding {
 
 // ----------------------------------------------------------- the correlation --
 
+/// Immutable forward transform of one correlation operand. Geometry and
+/// backend travel with it so incompatible padded lattices cannot be mixed.
+/// Inverse correlation uses separate scratch and never consumes this spectrum.
+#[derive(Debug, Clone)]
+pub struct CorrelationSpectrum2 {
+    shape: [usize; 2],
+    padded: [usize; 2],
+    backend: TransformBackend,
+    spectrum: Spectrum,
+}
+impl CorrelationSpectrum2 {
+    /// Decoded spectrum payload only, excluding object and FFT plan overhead.
+    pub fn bytes(&self) -> usize {
+        self.spectrum.len() * std::mem::size_of::<Complex<f64>>()
+    }
+}
+
 /// `C(k) = sum_x a[x] b[x-k]` over a window of integer lags, through the
 /// correlation theorem.
 ///
@@ -1843,6 +1860,68 @@ impl Correlation2 {
         self.window
     }
 
+    /// Transform an operand once for reuse across multiple correlations. Input
+    /// must have one of this plan's operand shapes; role is checked on use.
+    pub fn prepare_operand(&mut self, input: ArrayView2<f64>) -> Result<CorrelationSpectrum2> {
+        let shape = [input.nrows(), input.ncols()];
+        if shape != self.shape_a && shape != self.shape_b {
+            return Err(Error::invalid(
+                "prepared correlation operand has incompatible shape",
+            ));
+        }
+        let mut spectrum = self.transform.spectrum();
+        self.transform.forward_zero_padded(input, &mut spectrum)?;
+        Ok(CorrelationSpectrum2 {
+            shape,
+            padded: self.padded,
+            backend: self.backend(),
+            spectrum,
+        })
+    }
+
+    /// Correlation from immutable prepared operands. Their padded shapes and
+    /// backend must match this plan; the lag window may differ if padding fits.
+    pub fn correlate_prepared(
+        &mut self,
+        a: &CorrelationSpectrum2,
+        b: &CorrelationSpectrum2,
+    ) -> Result<Array2<f64>> {
+        let [rows, cols] = self.window.extent();
+        let mut out = Array2::zeros((rows, cols));
+        self.correlate_prepared_into(a, b, &mut out)?;
+        Ok(out)
+    }
+    pub fn correlate_prepared_into(
+        &mut self,
+        a: &CorrelationSpectrum2,
+        b: &CorrelationSpectrum2,
+        out: &mut Array2<f64>,
+    ) -> Result<()> {
+        if a.shape != self.shape_a
+            || b.shape != self.shape_b
+            || a.padded != self.padded
+            || b.padded != self.padded
+            || a.backend != self.backend()
+            || b.backend != self.backend()
+        {
+            return Err(Error::invalid(
+                "prepared correlation shape/padding/backend mismatch",
+            ));
+        }
+        let [rows, cols] = self.window.extent();
+        if out.dim() != (rows, cols) {
+            return Err(Error::ShapeMismatch {
+                expected: vec![rows, cols],
+                got: vec![out.nrows(), out.ncols()],
+            });
+        }
+        for ((product, left), right) in self.spectrum_a.iter_mut().zip(&a.spectrum).zip(&b.spectrum)
+        {
+            *product = *left * right.conj();
+        }
+        self.finish_correlation(out)
+    }
+
     /// The correlation over the whole window, allocated.
     pub fn correlate(&mut self, a: ArrayView2<f64>, b: ArrayView2<f64>) -> Result<Array2<f64>> {
         let [rows, cols] = self.window.extent();
@@ -1889,9 +1968,12 @@ impl Correlation2 {
         // than a variant.
         self.spectrum_a
             .zip_mut_with(&self.spectrum_b, |left, right| *left *= right.conj());
+        self.finish_correlation(out)
+    }
+    fn finish_correlation(&mut self, out: &mut Array2<f64>) -> Result<()> {
         self.transform
             .inverse(&mut self.spectrum_a, &mut self.plane)?;
-
+        let [rows, cols] = self.window.extent();
         let [padded_rows, padded_cols] = self.padded;
         for row in 0..rows {
             let lag_row = self.window.lower()[0] + row as isize;

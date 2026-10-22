@@ -339,6 +339,53 @@ per raw vertex by its source (not measured here). Ours is several times that:
 four radius arrays carried per vertex, the transient structures of clean and
 reduce, and the object table writer's per-row values.
 
+**Memory cap** (`--memory-mb`, any subcommand; else `$BLOCKFLOW_MEMORY_CAP`,
+else the cgroup's `memory.max`, else `min(MemTotal / 2, MemAvailable * 3 /
+4)`; the first stderr line says which). An eighth of a stated or cgroup cap
+(at least 128 MiB) is held back; the rest is shared by the blocks in flight
+and the chunk caches (`blockflow::budget::process_budget`). The grid choice
+sizes each phase's blocks in flight under it (the `segment:`/`tract:` line
+reports the widest active set; `VESSEL_GRAPH_PROFILE=1` lists them per
+phase), the executor admits each wave against it and measures the resident
+set near the cap, and the caches hold what the blocks leave. Below the least
+feasible cap the run stops before reading anything and names that cap (about
+330 MiB for `tract` on the smoke crop: the label phases are on their own
+fixed grid). The resident thinning's ceiling (`--thin-memory-mb`) defaults to
+8 GiB or a quarter of the cap's usable bytes, whichever is less. The graph's
+own in-memory stages (raw graph, clean, reduce, tables) are not bounded by it.
+Results do not depend on the cap.
+
+Measured 2026-10-22 at `--workers 16` (load 6–22): peak RSS (`/usr/bin/time`),
+wall s, CPU s. Every label, the tract CSV and the graph JSON are byte for
+byte those of the uncapped run.
+
+| run | cap | peak | wall | CPU |
+|---|---|---|---|---|
+| `tract`, smoke crop | none | 2.2–2.5 GB | 10 | 76 |
+| | 2048 MiB | 1365 MiB | 18 | 77 |
+| | 1536 MiB | 1119 MiB | 16 | 76 |
+| | 1536 MiB (cgroup) | 1129 MiB | 17 | 79 |
+| | 1024 MiB | 796 MiB | 22 | 74 |
+| | 768 MiB | 513 MiB | 29 | 74 |
+| | 512 MiB | 344 MiB | 47 | 74 |
+| | 256 MiB | refused: needs about 330 MiB | | |
+| `tract`, region | none | 3.6 GB | 18 | 147 |
+| | 2048 MiB | 1500 MiB | 29 | 170 |
+| | 1024 MiB | 770 MiB | 35 | 165 |
+| `segment`, smoke crop | none | 3.4–3.7 GB | 28 | 245 |
+| | 2048 MiB | 1530 MiB | 40 | 242 |
+| | 2048 MiB (cgroup) | 1465 MiB | 40 | 237 |
+| | 1024 MiB | 844 MiB | 86 | 247 |
+| `segment`, region | none | 8.0 GB | 52 | 440 |
+| | 4096 MiB | 3008 MiB | 68 | 481 |
+| | 2048 MiB | 1941 MiB | 76 | 547 |
+
+The CPU time does not move; the wall time does, because the executor runs a
+wave of blocks at a time and a phase that fits fewer blocks runs more waves,
+and the first wave of each phase is charged with the op margin (2–5x what the
+vessel phases were measured to hold) before later waves are charged what was
+measured.
+
 `VESSEL_GRAPH_PROFILE=1` prints, per stage and per planned phase, the wall
 and CPU time and the resident set and its peak (it resets the peak through
 `/proc/self/clear_refs`, so a profiled run's overall peak is the largest

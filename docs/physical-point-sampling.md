@@ -13,3 +13,10 @@ The source workspace declaration must include cache, encoded data, decoder scrat
 Integer samples convert numerically to f64; uint64/int64 values outside its exact integer range lose precision. F16 is refused because `Voxels` does not have a native half-precision variant.
 
 `tests/sampling.rs` covers typed calibration, seams, edges, masks, separate derivative validity, singleton axes, empty batches, preflight failures and constant planned memory over enormous procedural volumes. Storage adapters must additionally verify their actual decoder/cache allocations and IO behavior.
+
+`sampling_working_bytes(layout, point_count)` exposes the same checked allocation
+plan used by `sample_points`, without allocating or reading chunks. Consumers
+can reserve their own positions/results and other live sources' workspace before
+admitting a batch. An empty batch reports zero; invalid layouts and arithmetic
+overflow remain errors. This does not turn a declared decoder reservation into a
+verified codec or process memory ceiling.

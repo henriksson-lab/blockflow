@@ -1791,6 +1791,27 @@ fn runs(chunks: &[u64], width: usize, limit: usize) -> Vec<Vec<u64>> {
     out
 }
 
+impl Reclaim for ChunkCache {
+    /// Evict least recently used entries, across every array, until `bytes`
+    /// are freed or the cache is empty.
+    fn reclaim(&self, bytes: u64) -> u64 {
+        let mut events = Vec::new();
+        let mut freed = 0u64;
+        {
+            let mut state = self.state.lock_unpoisoned();
+            while freed < bytes {
+                let before = state.bytes;
+                if !self.evict_one(&mut state, "compute", &mut events) {
+                    break;
+                }
+                freed += before.saturating_sub(state.bytes);
+            }
+        }
+        self.emit(events);
+        freed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1920,26 +1941,5 @@ mod tests {
         let codec = DeflateCodec::default();
         let encoded = codec.encode(&[1u8, 2, 3, 4]);
         assert!(codec.decode(&encoded, 8).is_err());
-    }
-}
-
-impl Reclaim for ChunkCache {
-    /// Evict least recently used entries, across every array, until `bytes`
-    /// are freed or the cache is empty.
-    fn reclaim(&self, bytes: u64) -> u64 {
-        let mut events = Vec::new();
-        let mut freed = 0u64;
-        {
-            let mut state = self.state.lock_unpoisoned();
-            while freed < bytes {
-                let before = state.bytes;
-                if !self.evict_one(&mut state, "compute", &mut events) {
-                    break;
-                }
-                freed += before.saturating_sub(state.bytes);
-            }
-        }
-        self.emit(events);
-        freed
     }
 }
