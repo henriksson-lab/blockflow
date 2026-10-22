@@ -909,7 +909,9 @@ pub fn cgroup_limit_with(membership: &str, read: &dyn Fn(&str) -> Option<String>
         if text == "max" {
             return None;
         }
-        text.parse::<u64>().ok().filter(|&v| v > 0 && v < (1u64 << 62))
+        text.parse::<u64>()
+            .ok()
+            .filter(|&v| v > 0 && v < (1u64 << 62))
     };
     let smallest_along = |root: &str, path: &str, file: &str| -> Option<u64> {
         let mut best: Option<u64> = None;
@@ -934,7 +936,8 @@ pub fn cgroup_limit_with(membership: &str, read: &dyn Fn(&str) -> Option<String>
     };
     for line in membership.lines() {
         let mut fields = line.splitn(3, ':');
-        let (Some(_id), Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next())
+        let (Some(_id), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
@@ -946,7 +949,8 @@ pub fn cgroup_limit_with(membership: &str, read: &dyn Fn(&str) -> Option<String>
     }
     for line in membership.lines() {
         let mut fields = line.splitn(3, ':');
-        let (Some(_id), Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next())
+        let (Some(_id), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
@@ -1666,7 +1670,8 @@ mod tests {
         assert!(live >= MIN_BUDGET_BYTES);
     }
 
-    const MEMINFO: &str = "MemTotal:       65536000 kB\nMemFree:  1 kB\nMemAvailable:   32768000 kB\n";
+    const MEMINFO: &str =
+        "MemTotal:       65536000 kB\nMemFree:  1 kB\nMemAvailable:   32768000 kB\n";
 
     #[test]
     fn a_cap_is_explicit_then_environment_then_cgroup_then_machine() {
@@ -1676,37 +1681,63 @@ mod tests {
         };
         assert_eq!(
             cap(Some(3 << 30), Some("2G"), Some("1G"), None),
-            MemoryCap { bytes: 3 << 30, source: CapSource::Explicit }
+            MemoryCap {
+                bytes: 3 << 30,
+                source: CapSource::Explicit
+            }
         );
         assert_eq!(
             cap(None, Some("2G"), Some("1G"), None),
-            MemoryCap { bytes: 2 << 30, source: CapSource::Environment }
+            MemoryCap {
+                bytes: 2 << 30,
+                source: CapSource::Environment
+            }
         );
         // The older budget variable is read as a cap when the cap's is absent
         // or unreadable.
         assert_eq!(cap(None, Some("lots"), Some("1G"), None).bytes, 1 << 30);
         assert_eq!(
             cap(None, None, None, Some(5 << 30)),
-            MemoryCap { bytes: 5 << 30, source: CapSource::Cgroup }
+            MemoryCap {
+                bytes: 5 << 30,
+                source: CapSource::Cgroup
+            }
         );
         assert_eq!(
             cap(None, None, None, None),
-            MemoryCap { bytes: machine, source: CapSource::Machine }
+            MemoryCap {
+                bytes: machine,
+                source: CapSource::Machine
+            }
         );
         assert_eq!(
             MemoryCap::from_sources(None, None, None, None, None),
-            MemoryCap { bytes: FALLBACK_BUDGET_BYTES, source: CapSource::Fallback }
+            MemoryCap {
+                bytes: FALLBACK_BUDGET_BYTES,
+                source: CapSource::Fallback
+            }
         );
         // `auto` and zero mean "not stated".
-        assert_eq!(cap(None, Some("auto"), Some("0"), None).source, CapSource::Machine);
+        assert_eq!(
+            cap(None, Some("auto"), Some("0"), None).source,
+            CapSource::Machine
+        );
         assert_eq!(cap(Some(0), None, None, None).source, CapSource::Machine);
     }
 
     #[test]
     fn a_cgroup_limit_below_a_stated_cap_still_binds_and_one_above_the_machine_does_not() {
-        let stated_above = MemoryCap::from_sources(Some(8 << 30), None, None, Some(2 << 30), Some(MEMINFO));
-        assert_eq!(stated_above, MemoryCap { bytes: 2 << 30, source: CapSource::Cgroup });
-        let stated_below = MemoryCap::from_sources(Some(1 << 30), None, None, Some(2 << 30), Some(MEMINFO));
+        let stated_above =
+            MemoryCap::from_sources(Some(8 << 30), None, None, Some(2 << 30), Some(MEMINFO));
+        assert_eq!(
+            stated_above,
+            MemoryCap {
+                bytes: 2 << 30,
+                source: CapSource::Cgroup
+            }
+        );
+        let stated_below =
+            MemoryCap::from_sources(Some(1 << 30), None, None, Some(2 << 30), Some(MEMINFO));
         assert_eq!(stated_below.source, CapSource::Explicit);
         // 64 GB of machine: a 1 TB cgroup limit is no limit.
         let roomy = MemoryCap::from_sources(None, None, None, Some(1 << 40), Some(MEMINFO));
@@ -1715,19 +1746,37 @@ mod tests {
 
     #[test]
     fn a_binding_cap_holds_back_a_reserve_and_the_machine_rule_does_not() {
-        let machine = MemoryCap { bytes: 16 << 30, source: CapSource::Machine };
+        let machine = MemoryCap {
+            bytes: 16 << 30,
+            source: CapSource::Machine,
+        };
         assert_eq!(machine.usable_bytes(), 16 << 30);
-        let big = MemoryCap { bytes: 10 << 30, source: CapSource::Explicit };
+        let big = MemoryCap {
+            bytes: 10 << 30,
+            source: CapSource::Explicit,
+        };
         assert_eq!(big.reserve_bytes(), (10 << 30) / 10);
-        let small = MemoryCap { bytes: 512 << 20, source: CapSource::Cgroup };
+        let small = MemoryCap {
+            bytes: 512 << 20,
+            source: CapSource::Cgroup,
+        };
         assert_eq!(small.reserve_bytes(), MIN_CAP_RESERVE_BYTES);
-        let tiny = MemoryCap { bytes: 100 << 20, source: CapSource::Explicit };
+        let tiny = MemoryCap {
+            bytes: 100 << 20,
+            source: CapSource::Explicit,
+        };
         assert_eq!(tiny.reserve_bytes(), 50 << 20, "never more than half");
         // `needed_for` inverts `usable_bytes`.
         for usable in [10u64 << 20, 500 << 20, 3 << 30, 40 << 30] {
-            let cap = MemoryCap { bytes: MemoryCap::needed_for(usable), source: CapSource::Explicit };
+            let cap = MemoryCap {
+                bytes: MemoryCap::needed_for(usable),
+                source: CapSource::Explicit,
+            };
             assert!(cap.usable_bytes() >= usable, "{usable}");
-            let less = MemoryCap { bytes: cap.bytes - (2 << 20), source: CapSource::Explicit };
+            let less = MemoryCap {
+                bytes: cap.bytes - (2 << 20),
+                source: CapSource::Explicit,
+            };
             assert!(less.usable_bytes() < usable + (2 << 20), "{usable}");
         }
     }
@@ -1736,8 +1785,14 @@ mod tests {
     fn cgroup_v2_takes_the_smallest_limit_from_the_group_to_the_root() {
         let files: std::collections::HashMap<&str, &str> = [
             ("/sys/fs/cgroup/user.slice/memory.max", "max\n"),
-            ("/sys/fs/cgroup/user.slice/app.scope/memory.max", "2147483648\n"),
-            ("/sys/fs/cgroup/user.slice/app.scope/run/memory.max", "max\n"),
+            (
+                "/sys/fs/cgroup/user.slice/app.scope/memory.max",
+                "2147483648\n",
+            ),
+            (
+                "/sys/fs/cgroup/user.slice/app.scope/run/memory.max",
+                "max\n",
+            ),
             ("/sys/fs/cgroup/memory.max", "8589934592"),
         ]
         .into_iter()
@@ -1797,7 +1852,9 @@ mod tests {
         let weak: Weak<dyn Reclaim> = Arc::downgrade(&holder) as Weak<dyn Reclaim>;
         budget.register_reclaimer(weak);
         assert!(budget.try_acquire(300).is_none(), "900 of 1000 are cached");
-        let lease = budget.try_acquire_reclaiming(300).expect("the cache gives back 200");
+        let lease = budget
+            .try_acquire_reclaiming(300)
+            .expect("the cache gives back 200");
         assert_eq!(lease.bytes(), 300);
         assert_eq!(budget.opportunistic_in_use(), 700);
         // And the blocking acquire asks too, rather than waiting forever.

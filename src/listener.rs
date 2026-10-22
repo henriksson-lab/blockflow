@@ -522,7 +522,9 @@ impl EventListener for LatestOpPerChunk {
     fn on_event(&self, event: &Event) {
         let seq = self.next_seq();
         match event {
-            Event::PhaseStarted { .. } => {}
+            Event::PhaseStarted { .. }
+            | Event::TaskPrepared { .. }
+            | Event::FragmentApplied { .. } => {}
             // The IO-layer and materialisation events carry no per-block state
             // this listener is about — they are for the statistics listener.
             // Ignoring them here keeps a poll's meaning exactly "the last op

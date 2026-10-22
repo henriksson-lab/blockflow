@@ -237,6 +237,12 @@ fn an_anisotropic_pyramid_writes_its_scale_in_axis_order() {
         .map(|axis| axis["name"].as_str().unwrap())
         .collect();
     assert_eq!(axes, ["z", "y", "x"]);
+    for axis in multiscale["axes"].as_array().unwrap() {
+        assert!(
+            axis.get("unit").is_none(),
+            "uncalibrated axes have no physical unit"
+        );
+    }
     let scale = &multiscale["datasets"][1]["coordinateTransformations"][0]["scale"];
     assert_eq!(scale, &serde_json::json!([2, 1, 1]));
 }

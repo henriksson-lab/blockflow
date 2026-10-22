@@ -1371,7 +1371,8 @@ impl ChunkCache {
     /// a cache sharing the process budget ([`crate::budget::process_budget`])
     /// as large as the active set leaves it, and no larger.
     pub fn register_reclaim(self: &Arc<Self>) {
-        let weak: std::sync::Weak<dyn Reclaim> = Arc::downgrade(self) as std::sync::Weak<dyn Reclaim>;
+        let weak: std::sync::Weak<dyn Reclaim> =
+            Arc::downgrade(self) as std::sync::Weak<dyn Reclaim>;
         self.budget.register_reclaimer(weak);
     }
 

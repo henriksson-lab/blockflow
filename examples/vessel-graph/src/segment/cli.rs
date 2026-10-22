@@ -148,7 +148,12 @@ impl InputArgs {
         let started = Instant::now();
         let host = Host::detect().with_workers(self.workers());
         let chosen = choose_grid(volume, &host, &CostModel::default(), build)?;
-        let widest = chosen.active.iter().map(|set| set.bytes()).max().unwrap_or(0);
+        let widest = chosen
+            .active
+            .iter()
+            .map(|set| set.bytes())
+            .max()
+            .unwrap_or(0);
         eprintln!(
             "{what}: block {:?}, {} blocks, chosen of {} grids for {} workers ({:.2}s); \
              active set at most {} MiB of {} MiB",

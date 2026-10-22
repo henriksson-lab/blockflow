@@ -947,16 +947,48 @@ impl<'a> PhaseView<'a> {
 #[derive(Clone, Copy)]
 pub struct SourceBlocks<'a> {
     entries: &'a [(usize, &'a BlockBuf)],
+    regions: &'a [Region],
 }
 
 impl<'a> SourceBlocks<'a> {
     /// Nothing stored: what an op declaring no source input is applied with.
     pub const fn none() -> Self {
-        Self { entries: &[] }
+        Self {
+            entries: &[],
+            regions: &[],
+        }
     }
 
     pub fn new(entries: &'a [(usize, &'a BlockBuf)]) -> Self {
-        Self { entries }
+        Self {
+            entries,
+            regions: &[],
+        }
+    }
+
+    pub(crate) fn with_regions(
+        entries: &'a [(usize, &'a BlockBuf)],
+        regions: &'a [Region],
+    ) -> Self {
+        Self { entries, regions }
+    }
+    /// Find a source window covering `region`, and its actual global origin.
+    /// For manually supplied legacy blocks, `fallback` is their declared extent.
+    pub fn covering(
+        &self,
+        image: usize,
+        region: &Region,
+        fallback: &'a Region,
+    ) -> Result<(&'a BlockBuf, &'a Region)> {
+        for (i, (named, buf)) in self.entries.iter().enumerate() {
+            let extent = self.regions.get(i).unwrap_or(fallback);
+            if *named == image && extent.intersect(region).as_ref() == Some(region) {
+                return Ok((*buf, extent));
+            }
+        }
+        Err(Error::invalid(format!(
+            "no supplied window of image {image} covers {region:?}"
+        )))
     }
 
     /// The images supplied, in the order the executor read them.
@@ -966,6 +998,17 @@ impl<'a> SourceBlocks<'a> {
 
     /// The block of `image`, or an error naming what was supplied.
     pub fn get(&self, image: usize) -> Result<&'a BlockBuf> {
+        if self
+            .entries
+            .iter()
+            .filter(|(named, _)| *named == image)
+            .count()
+            > 1
+        {
+            return Err(Error::invalid(
+                "multiple source windows: use SourceBlocks::covering to obtain the origin",
+            ));
+        }
         self.entries
             .iter()
             .find(|(named, _)| *named == image)
@@ -984,6 +1027,166 @@ impl<'a> SourceBlocks<'a> {
                 ))
             })
     }
+}
+
+/// One runtime read, bounded by the phase's statically declared source extent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadWindow {
+    pub image: usize,
+    pub region: Region,
+}
+
+/// Metadata-first execution decision. The default preserves dense execution.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BlockPreparation {
+    Run,
+    /// Replace declared auxiliary-source reads. The primary pixel input, when
+    /// declared, retains its complete halo. Empty is valid for metadata-only work.
+    ReadWindows(Vec<ReadWindow>),
+    /// Complete without reading pixels. Fragments must use the stream's actual
+    /// encoding, including encoded empty tables. Pixel writers must state a value.
+    Complete {
+        fragments: Vec<(String, Vec<u8>)>,
+        constant: Option<f64>,
+    },
+}
+
+/// A metadata-only view: no pixel reads, allocation or writes are exposed.
+pub struct PreparationView<'a> {
+    pub phase: usize,
+    pub index: [usize; 3],
+    pub core: &'a Region,
+    pub read: &'a Region,
+    pub valid: &'a Region,
+    block: &'a BlockView<'a>,
+    sources: &'a [usize],
+}
+impl<'a> PreparationView<'a> {
+    pub(crate) fn new(block: &'a BlockView<'a>, sources: &'a [usize]) -> Self {
+        Self {
+            phase: block.phase,
+            index: block.index,
+            core: block.core,
+            read: block.read,
+            valid: block.valid,
+            block,
+            sources,
+        }
+    }
+    pub fn volume(&self) -> [usize; 3] {
+        self.block.volume()
+    }
+    pub fn own(&self, stream: &str) -> Option<&[u8]> {
+        self.block.own(stream)
+    }
+    pub fn fragments(&self, stream: &str) -> impl Iterator<Item = (&FragmentKey, &[u8])> {
+        self.block
+            .fragments(stream)
+            .iter()
+            .map(|(key, bytes)| (key, bytes.as_slice()))
+    }
+    /// True only if every requested fragment was present. Absence is unknown.
+    pub fn complete(&self, stream: &str) -> bool {
+        let Some((_, blocks)) = self.block.wanted.get(stream) else {
+            return false;
+        };
+        self.block
+            .gathered
+            .get(stream)
+            .is_some_and(|found| found.len() == blocks.len())
+    }
+    /// Decode an owned row table; missing is unknown, malformed is an error.
+    pub fn own_rows_empty(
+        &self,
+        stream: &str,
+        schema: &crate::table::Schema,
+    ) -> Result<Option<bool>> {
+        self.own(stream)
+            .map(|bytes| {
+                crate::ops::rows::sealed_rows(self.volume(), schema, bytes)
+                    .map(|rows| rows.is_empty())
+            })
+            .transpose()
+    }
+    /// Authoritative storage metadata only; never scans the mask. Unknown stays unknown.
+    pub fn known_uniform(&self, image: usize, region: &Region) -> Option<f64> {
+        if !self.sources.contains(&image) || region.intersect(self.read).as_ref() != Some(region) {
+            return None;
+        }
+        self.block.env.known_uniform(image, region)
+    }
+}
+
+/// Merge overlapping source boxes per image, retaining deterministic order.
+/// Never expands beyond the union's bounding box; disjoint windows stay separate.
+pub fn coalesce_read_windows(windows: Vec<ReadWindow>) -> Vec<ReadWindow> {
+    coalesce_windows(windows, None)
+}
+
+/// Also merge windows sharing storage chunks when the resulting bounding box
+/// requests no more than twice their combined voxels. Chunk caches handle the
+/// remaining sharing without forcing large empty gaps into source buffers.
+pub fn coalesce_read_windows_for_chunks(
+    windows: Vec<ReadWindow>,
+    chunks: [usize; 3],
+) -> Vec<ReadWindow> {
+    coalesce_windows(windows, (!chunks.contains(&0)).then_some(chunks))
+}
+
+fn coalesce_windows(mut windows: Vec<ReadWindow>, chunks: Option<[usize; 3]>) -> Vec<ReadWindow> {
+    windows.sort_by(|a, b| {
+        (a.image, &a.region.start, &a.region.shape).cmp(&(
+            b.image,
+            &b.region.start,
+            &b.region.shape,
+        ))
+    });
+    let mut out: Vec<ReadWindow> = Vec::new();
+    for mut w in windows {
+        let mut i = 0;
+        while i < out.len() {
+            let chunk_near = chunks.is_some_and(|chunks| {
+                let other = &out[i].region;
+                let shares_chunks = (0..3).all(|a| {
+                    w.region.start[a] / chunks[a]
+                        <= (other.start[a] + other.shape[a] - 1) / chunks[a]
+                        && other.start[a] / chunks[a]
+                            <= (w.region.start[a] + w.region.shape[a] - 1) / chunks[a]
+                });
+                let box_voxels: u128 = (0..3)
+                    .map(|a| {
+                        ((w.region.start[a] + w.region.shape[a])
+                            .max(other.start[a] + other.shape[a])
+                            - w.region.start[a].min(other.start[a])) as u128
+                    })
+                    .product();
+                shares_chunks
+                    && box_voxels <= 2 * (w.region.voxels() as u128 + other.voxels() as u128)
+            });
+            if out[i].image == w.image
+                && (out[i].region.intersect(&w.region).is_some() || chunk_near)
+            {
+                let other = out.remove(i);
+                let start: Vec<usize> = (0..3)
+                    .map(|a| w.region.start[a].min(other.region.start[a]))
+                    .collect();
+                let shape: Vec<usize> = (0..3)
+                    .map(|a| {
+                        (w.region.start[a] + w.region.shape[a])
+                            .max(other.region.start[a] + other.region.shape[a])
+                            - start[a]
+                    })
+                    .collect();
+                w.region = Region::new(&start, &shape);
+                i = 0;
+            } else {
+                i += 1;
+            }
+        }
+        out.push(w);
+    }
+    out.sort_by(|a, b| (a.image, &a.region.start).cmp(&(b.image, &b.region.start)));
+    out
 }
 
 /// What an op does with values that straddle a block seam, and therefore
@@ -1317,6 +1520,18 @@ pub trait FragmentOp: Send + Sync {
     /// outside the op. An op that reaches over the whole lattice should say
     /// `false` and use [`BlockView::stream_fragments`]: the reads are the same,
     /// the residency is one fragment instead of all of them.
+    /// Opt in to metadata-first preparation before pixel I/O and task admission.
+    /// Preparation must be cheap and may not depend on fragment iteration order.
+    /// Streaming (`gathers == false`) ops can use storage metadata, but gathered
+    /// fragment helpers report unknown for them.
+    fn prepares(&self) -> bool {
+        false
+    }
+
+    fn prepare(&self, _at: &PreparationView<'_>) -> Result<BlockPreparation> {
+        Ok(BlockPreparation::Run)
+    }
+
     fn gathers(&self) -> bool {
         true
     }
@@ -2682,5 +2897,59 @@ mod tests {
         assert_eq!(packed.len(), 32);
         assert_eq!(unpack_u64(&packed).unwrap(), vec![1, 2, 3, u64::MAX]);
         assert!(unpack_u64(&packed[..31]).is_err());
+    }
+}
+
+/// Disable runtime preparation while preserving the same kernel and static plan.
+/// Useful for dense-reference validation and measurements.
+pub struct Unprepared<O>(pub O);
+impl<O: FragmentOp> FragmentOp for Unprepared<O> {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    fn reach(&self, a: usize, n: usize) -> usize {
+        self.0.reach(a, n)
+    }
+    fn cost_per_voxel(&self) -> f64 {
+        self.0.cost_per_voxel()
+    }
+    fn reads_pixels(&self) -> bool {
+        self.0.reads_pixels()
+    }
+    fn writes_pixels(&self) -> bool {
+        self.0.writes_pixels()
+    }
+    fn produces(&self, d: Dtype) -> Dtype {
+        self.0.produces(d)
+    }
+    fn source_inputs(&self, v: [usize; 3]) -> Vec<SourceInput> {
+        self.0.source_inputs(v)
+    }
+    fn inputs(&self) -> Vec<FragmentInput> {
+        self.0.inputs()
+    }
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        self.0.outputs()
+    }
+    fn barrier(&self) -> bool {
+        self.0.barrier()
+    }
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        self.0.reduce(at)
+    }
+    fn gathers(&self) -> bool {
+        self.0.gathers()
+    }
+    fn background(&self) -> Option<f64> {
+        self.0.background()
+    }
+    fn seam_fold(&self) -> Option<SeamFold> {
+        self.0.seam_fold()
+    }
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        self.0.apply(at)
+    }
+    fn apply_with(&self, at: &BlockView<'_>, s: SourceBlocks<'_>) -> Result<BlockOutput> {
+        self.0.apply_with(at, s)
     }
 }

@@ -355,3 +355,80 @@ fn an_unfinished_pyramid_is_refused() {
     let message = writer.finish().expect_err("a refusal").to_string();
     assert!(message.contains("rows"), "{message}");
 }
+
+/// Independent coordinate oracle alongside byte-for-byte resident comparisons.
+#[test]
+fn slab_coordinates_follow_mean_centres_and_boolean_first_samples() {
+    let dir = common::scratch("slab_coordinates");
+    for calibrated in [false, true] {
+        for boolean in [false, true] {
+            let root = dir.join(format!("{calibrated}-{boolean}.zarr"));
+            let shape = [9, 11, 13];
+            let factors = [[2, 3, 2], [2, 1, 3]];
+            let frame = calibrated.then(|| {
+                PhysicalFrame::new([3.0, 0.5, 1.25], Some("micrometer"))
+                    .with_origin([-7.0, 5.0, -2.5])
+            });
+            if boolean {
+                let mut writer =
+                    PyramidWriter::<bool>::create(&root, shape, &factors, 0, frame).unwrap();
+                writer
+                    .push(Array3::from_shape_fn(shape, |(z, y, x)| {
+                        (z * 17 + y * 11 + x) % 5 == 0
+                    }))
+                    .unwrap();
+                writer.finish().unwrap();
+            } else {
+                let mut writer =
+                    PyramidWriter::<f64>::create(&root, shape, &factors, 0, frame).unwrap();
+                writer
+                    .push(Array3::from_shape_fn(shape, |(z, y, x)| {
+                        (z + 10 * y + 100 * x) as f64
+                    }))
+                    .unwrap();
+                writer.finish().unwrap();
+            }
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.join("zarr.json")).unwrap()).unwrap();
+            for axis in metadata["attributes"]["ome"]["multiscales"][0]["axes"]
+                .as_array()
+                .unwrap()
+            {
+                if calibrated {
+                    assert_eq!(axis["unit"], "micrometer");
+                } else {
+                    assert!(axis.get("unit").is_none());
+                }
+            }
+            for (level, factor) in [[1, 1, 1], [2, 3, 2], [4, 3, 6]].into_iter().enumerate() {
+                let transforms = metadata["attributes"]["ome"]["multiscales"][0]["datasets"][level]
+                    ["coordinateTransformations"]
+                    .as_array()
+                    .unwrap();
+                let mut origin = [0.0; 3];
+                let scale = transforms[0]["scale"].as_array().unwrap();
+                if transforms.len() > 1 {
+                    origin =
+                        std::array::from_fn(|a| transforms[1]["translation"][a].as_f64().unwrap());
+                }
+                for a in 0..3 {
+                    let pitch = if calibrated { [3.0, 0.5, 1.25][a] } else { 1.0 };
+                    let base = if calibrated {
+                        [-7.0, 5.0, -2.5][a]
+                    } else {
+                        0.0
+                    };
+                    // Enumerate the original samples represented by this output.
+                    let expected = if boolean {
+                        base
+                    } else {
+                        (0..factor[a]).map(|i| base + i as f64 * pitch).sum::<f64>()
+                            / factor[a] as f64
+                    };
+                    assert_eq!(origin[a], expected);
+                    assert_eq!(scale[a].as_f64().unwrap(), factor[a] as f64 * pitch);
+                }
+            }
+        }
+    }
+}

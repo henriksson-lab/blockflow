@@ -478,6 +478,7 @@ impl Admission {
         ready: &mut BinaryHeap<Reverse<([usize; 5], usize)>>,
         graph: &TaskGraph,
         concurrency: usize,
+        prepared: &BTreeMap<usize, PreparedFragment>,
     ) -> (Vec<usize>, Vec<crate::budget::Lease>) {
         let mut leases = Vec::new();
         let mut over = false;
@@ -503,7 +504,16 @@ impl Admission {
             let Some(&Reverse((_, id))) = ready.peek() else {
                 break;
             };
-            let charge = self.charge(graph.tasks[id].phase);
+            // Only completed tasks may shed their compute/scratch reservation.
+            // Active tasks retain the conservative phase charge even with small reads.
+            let charge = prepared
+                .get(&id)
+                .and_then(|p| p.completion_charge)
+                .unwrap_or_else(|| {
+                    self.charge(graph.tasks[id].phase)
+                        .saturating_sub(prepared.get(&id).map_or(0, |p| p.saved_source_bytes))
+                        .max(1)
+                });
             match self.budget.try_acquire_reclaiming(charge) {
                 Some(lease) => leases.push(lease),
                 None if wave.is_empty() => {}
@@ -535,7 +545,12 @@ impl Admission {
             // goes under the margin-free prediction.
             let planned: u64 = wave
                 .iter()
-                .map(|&id| self.planned.get(graph.tasks[id].phase).copied().unwrap_or(0))
+                .map(|&id| {
+                    self.planned
+                        .get(graph.tasks[id].phase)
+                        .copied()
+                        .unwrap_or(0)
+                })
                 .sum::<u64>()
                 .max(1);
             let scale = held as f64 / planned as f64;
@@ -548,7 +563,8 @@ impl Admission {
                 }
             }
             if admission_log() {
-                let phases: BTreeSet<usize> = wave.iter().map(|&id| graph.tasks[id].phase).collect();
+                let phases: BTreeSet<usize> =
+                    wave.iter().map(|&id| graph.tasks[id].phase).collect();
                 eprintln!(
                     "admission: phases {phases:?}, {} blocks, resident {} MiB at start, peak {} \
                      MiB, held {} MiB against {} MiB charged, caches {} MiB",
@@ -840,6 +856,7 @@ pub fn execute_phases(
     let mut done = 0usize;
     let mut short_circuited = 0usize;
 
+    let mut prepared_tasks = BTreeMap::new();
     while done < graph.len() {
         // **The gate, and the one thing that goes in the gap it creates.**
         // Every earlier phase has finished and no block of this phase has
@@ -928,6 +945,36 @@ pub fn execute_phases(
                         graph.len()
                     )));
                 }
+                // Ready means all declared metadata dependencies are durable. Bound
+                // lookahead to one wave; cache decisions until the task is admitted.
+                let mut candidates = Vec::new();
+                if work
+                    .iter()
+                    .any(|w| matches!(w, PhaseWork::Fragments(op) if op.prepares()))
+                {
+                    for _ in 0..concurrency.min(ready.len()) {
+                        candidates.push(ready.pop().unwrap());
+                    }
+                    prepared_tasks.retain(|id, _| candidates.iter().any(|key| key.0 .1 == *id));
+                    for key in &candidates {
+                        let id = key.0 .1;
+                        if let PhaseWork::Fragments(op) = &work[graph.tasks[id].phase] {
+                            if op.prepares() && !prepared_tasks.contains_key(&id) {
+                                let task = &graph.tasks[id];
+                                let prepared = prepare_fragment_task(
+                                    task,
+                                    decomposition,
+                                    *op,
+                                    env,
+                                    &events,
+                                    &reduced[task.phase],
+                                )?;
+                                prepared_tasks.insert(id, prepared);
+                            }
+                        }
+                    }
+                    ready.extend(candidates);
+                }
                 let (wave, leases) = match admission.as_mut() {
                     None => {
                         let take = concurrency.min(ready.len());
@@ -936,7 +983,9 @@ pub fn execute_phases(
                             .collect();
                         (wave, Vec::new())
                     }
-                    Some(admission) => admission.form_wave(&mut ready, &graph, concurrency),
+                    Some(admission) => {
+                        admission.form_wave(&mut ready, &graph, concurrency, &prepared_tasks)
+                    }
                 };
 
                 for &id in &wave {
@@ -968,7 +1017,10 @@ pub fn execute_phases(
                         // phase's, so declaring them means asking each leaf what
                         // it will read — worth doing, with a measurement rather
                         // than a guess.
-                        if hints.prefetch_depth > 0 {
+                        if hints.prefetch_depth > 0
+                            && !matches!(&work[phase],
+                            PhaseWork::Fragments(op) if op.prepares())
+                        {
                             let regions: Vec<Region> = graph
                                 .tasks_in_phase(phase)
                                 .iter()
@@ -981,6 +1033,50 @@ pub fn execute_phases(
                         phase,
                         index: graph.tasks[id].index,
                     });
+                }
+
+                if hints.prefetch_depth > 0 {
+                    let mut requests = BTreeMap::<usize, Vec<(u32, Region)>>::new();
+                    for &id in &wave {
+                        let Some(p) = prepared_tasks.get(&id) else {
+                            continue;
+                        };
+                        use crate::fragment::BlockPreparation;
+                        if matches!(&p.decision, BlockPreparation::Complete { .. }) {
+                            continue;
+                        }
+                        let task = &graph.tasks[id];
+                        let phase = &decomposition.phases[task.phase];
+                        let rank = id.min(u32::MAX as usize) as u32;
+                        if phase.reads_input_image {
+                            requests
+                                .entry(task.phase)
+                                .or_default()
+                                .push((rank, task.geometry.source.clone()));
+                        }
+                        match &p.decision {
+                            BlockPreparation::ReadWindows(windows) => {
+                                for w in windows {
+                                    requests
+                                        .entry(w.image)
+                                        .or_default()
+                                        .push((rank, w.region.clone()));
+                                }
+                            }
+                            BlockPreparation::Run => {
+                                for &image in &phase.source_images {
+                                    requests
+                                        .entry(image)
+                                        .or_default()
+                                        .push((rank, task.geometry.source.clone()));
+                                }
+                            }
+                            BlockPreparation::Complete { .. } => unreachable!(),
+                        }
+                    }
+                    for (image, regions) in requests {
+                        let _ = env.prefetch_prepared(image, &regions);
+                    }
                 }
 
                 let run = |id: usize| {
@@ -1019,6 +1115,7 @@ pub fn execute_phases(
                         n_phases,
                         &reduced[phase],
                         slabs,
+                        prepared_tasks.get(&id),
                     )
                 };
                 let outcomes: Vec<Result<TaskOutcome>> = match &pool {
@@ -1030,6 +1127,7 @@ pub fn execute_phases(
                 }
                 let mut gathered = Vec::with_capacity(wave.len());
                 for (&id, outcome) in wave.iter().zip(outcomes) {
+                    prepared_tasks.remove(&id);
                     gathered.push((id, outcome?));
                 }
                 gathered
@@ -1636,6 +1734,7 @@ pub fn execute_task_with_reduction(
         decomposition.n_phases(),
         reduced,
         slabs,
+        None,
     )?;
     outcome.listener_faults = events.faults();
     Ok(outcome)
@@ -1652,9 +1751,19 @@ fn run_task(
     n_phases: usize,
     reduced: &[u8],
     slabs: usize,
+    prepared: Option<&PreparedFragment>,
 ) -> Result<TaskOutcome> {
     if let PhaseWork::Fragments(op) = work {
-        return run_fragment_task(task, decomposition, *op, env, events, n_phases, reduced);
+        return run_fragment_task(
+            task,
+            decomposition,
+            *op,
+            env,
+            events,
+            n_phases,
+            reduced,
+            prepared,
+        );
     }
     if let PhaseWork::Iterate(op) = work {
         // Refused rather than fallen through. An iterative phase owns no chain
@@ -2046,21 +2155,210 @@ fn order_disagreement(
     }
 }
 
-/// One `(block, phase)` of a phase that runs a fragment op.
-///
-/// The shape of the body is deliberately the same as `run_task`'s — read, work,
-/// write, report — because it is the same task in the same DAG. What differs:
-///
-/// * the pixel read happens only if the op declares it, so a `fragments ->
-///   fragments` phase moves no voxel and touches no read counter;
-/// * the inputs the op declared are gathered from the sidecar store, and
-///   **nothing else is**: the neighbourhood comes from the declaration, so a
-///   zero-reach phase fetches exactly one fragment per stream;
-/// * the pixel write happens only if the op declares it, so a fragment-only
-///   phase leaves the write counters at zero;
-/// * there is no short circuit. It is licensed by `constant_maps_to`, which is
-///   an algebra over pixel values, and a fragment's bytes are not pixel values.
-///   An op that could skip cheaply skips inside `apply`.
+type WantedFragments = BTreeMap<String, (usize, Vec<[usize; 3]>)>;
+type GatheredFragments = BTreeMap<String, Vec<(crate::sidecar::FragmentKey, Vec<u8>)>>;
+struct PreparedFragment {
+    wanted: WantedFragments,
+    gathered: GatheredFragments,
+    decision: crate::fragment::BlockPreparation,
+    completion_charge: Option<u64>,
+    saved_source_bytes: u64,
+}
+
+fn gather_fragment_metadata(
+    task: &super::graph::Task,
+    phase: &PhaseDecomposition,
+    op: &dyn super::fragment::FragmentOp,
+    env: &dyn Environment,
+) -> Result<(WantedFragments, GatheredFragments)> {
+    let counts = phase.grid.blocks_per_axis();
+    let mut wanted = BTreeMap::new();
+    let mut gathered = BTreeMap::new();
+    for input in op.inputs() {
+        let blocks = neighbourhood(task.index, input.reach, counts);
+        if op.gathers() {
+            let mut found = Vec::with_capacity(blocks.len());
+            for &block in &blocks {
+                if let Some(bytes) = env.read_sidecar(&input.stream, input.phase, block)? {
+                    found.push((
+                        crate::sidecar::FragmentKey::new(&input.stream, input.phase, block),
+                        bytes,
+                    ));
+                }
+            }
+            gathered.insert(input.stream.clone(), found);
+        }
+        wanted.insert(input.stream.clone(), (input.phase, blocks));
+    }
+    Ok((wanted, gathered))
+}
+
+fn prepare_fragment_task(
+    task: &super::graph::Task,
+    decomposition: &Decomposition,
+    op: &dyn super::fragment::FragmentOp,
+    env: &dyn Environment,
+    events: &Dispatch,
+    reduced: &[u8],
+) -> Result<PreparedFragment> {
+    use crate::fragment::{BlockPreparation, PreparationView};
+    let started = Instant::now();
+    let phase = &decomposition.phases[task.phase];
+    let (wanted, gathered) = gather_fragment_metadata(task, phase, op, env)?;
+    let make_decision = |wanted, gathered| -> Result<BlockPreparation> {
+        let view = BlockView::new(
+            task.phase,
+            task.index,
+            &phase.grid,
+            &task.geometry.core,
+            &task.geometry.read,
+            &task.geometry.valid,
+            Anchor::of_region(&task.geometry.source, decomposition.volume_at(task.phase))?,
+            decomposition.dtype_at(task.phase + 1),
+            env,
+            None,
+            wanted,
+            gathered,
+        )
+        .with_reduced(reduced);
+        let mut decision = op.prepare(&PreparationView::new(&view, &phase.source_images))?;
+        if let BlockPreparation::ReadWindows(windows) = &mut decision {
+            for window in windows.iter() {
+                if !phase.source_images.contains(&window.image)
+                    || window.region.start.len() != 3
+                    || window.region.shape.len() != 3
+                    || window.region.shape.contains(&0)
+                    || window
+                        .region
+                        .start
+                        .iter()
+                        .zip(&window.region.shape)
+                        .any(|(a, b)| a.checked_add(*b).is_none())
+                    || window.region.intersect(&task.geometry.source).as_ref()
+                        != Some(&window.region)
+                {
+                    return Err(Error::invalid(format!(
+                        "runtime source window {:?} exceeds the declared source footprint",
+                        window
+                    )));
+                }
+            }
+            *windows = crate::fragment::coalesce_read_windows_for_chunks(
+                std::mem::take(windows),
+                env.chunk_shape(),
+            );
+        }
+        Ok(decision)
+    };
+    let decision = make_decision(wanted.clone(), gathered.clone())?;
+    if op.seam_fold() == Some(SeamFold::Unordered) {
+        let mut reversed_wanted = wanted.clone();
+        let mut reversed_gathered = gathered.clone();
+        for (_, blocks) in reversed_wanted.values_mut() {
+            blocks.reverse();
+        }
+        for found in reversed_gathered.values_mut() {
+            found.reverse();
+        }
+        if decision != make_decision(reversed_wanted, reversed_gathered)? {
+            return Err(Error::invalid(
+                "metadata preparation depends on unordered fragment iteration order",
+            ));
+        }
+    }
+    let completion_charge = if let BlockPreparation::Complete {
+        fragments,
+        constant,
+    } = &decision
+    {
+        if op.writes_pixels() != constant.is_some() || constant.is_some_and(|v| !v.is_finite()) {
+            return Err(Error::invalid(
+                "completed task must declare a finite constant exactly when it writes pixels",
+            ));
+        }
+        let declared = op.outputs();
+        for output in &declared {
+            if output.coverage == crate::fragment::Coverage::EveryBlock
+                && !fragments.iter().any(|(stream, _)| stream == &output.stream)
+            {
+                return Err(Error::invalid(
+                    "completed task omitted an every-block fragment",
+                ));
+            }
+        }
+        let metadata: u64 = gathered
+            .values()
+            .flatten()
+            .map(|(_, b)| b.len() as u64)
+            .sum();
+        let encoded: u64 = fragments.iter().map(|(_, b)| b.len() as u64).sum();
+        let pixels = constant
+            .filter(|v| {
+                env.background(task.phase + 1)
+                    .is_none_or(|b| b.to_bits() != v.to_bits())
+            })
+            .map_or(0, |_| {
+                task.geometry.read.voxels() as u64
+                    * decomposition.dtype_at(task.phase + 1).size_of() as u64
+            });
+        Some(
+            metadata
+                .saturating_add(encoded)
+                .saturating_mul(2)
+                .saturating_add(pixels)
+                .max(1),
+        )
+    } else {
+        None
+    };
+    let default_voxels = task.geometry.source.voxels() as u64
+        * (phase.source_images.len() as u64 + u64::from(op.reads_pixels()));
+    let read_voxels = match &decision {
+        BlockPreparation::Run => default_voxels,
+        BlockPreparation::Complete { .. } => 0,
+        BlockPreparation::ReadWindows(w) => {
+            w.iter().map(|w| w.region.voxels() as u64).sum::<u64>()
+                + u64::from(op.reads_pixels()) * task.geometry.source.voxels() as u64
+        }
+    };
+    events.emit(Event::TaskPrepared {
+        phase: task.phase,
+        index: task.index,
+        skipped: matches!(&decision, BlockPreparation::Complete { .. }),
+        default_voxels,
+        read_voxels,
+        duration_ns: started.elapsed().as_nanos() as u64,
+    });
+    let saved_source_bytes = if let BlockPreparation::ReadWindows(windows) = &decision {
+        let dense: u64 = phase
+            .source_images
+            .iter()
+            .map(|&image| {
+                task.geometry.source.voxels() as u64
+                    * decomposition.dtype_at(image).size_of() as u64
+            })
+            .sum();
+        let actual: u64 = windows
+            .iter()
+            .map(|w| w.region.voxels() as u64 * decomposition.dtype_at(w.image).size_of() as u64)
+            .sum();
+        dense.saturating_sub(actual)
+    } else {
+        0
+    };
+    Ok(PreparedFragment {
+        wanted,
+        gathered,
+        decision,
+        completion_charge,
+        saved_source_bytes,
+    })
+}
+
+/// One fragment task uses the same DAG and output guards as a dense task.
+/// Opted-in operations prepare from ready metadata before pixel I/O; all other
+/// operations retain the original read/apply/write path.
+#[allow(clippy::too_many_arguments)]
 fn run_fragment_task(
     task: &super::graph::Task,
     decomposition: &Decomposition,
@@ -2069,6 +2367,7 @@ fn run_fragment_task(
     events: &Dispatch,
     n_phases: usize,
     reduced: &[u8],
+    prepared: Option<&PreparedFragment>,
 ) -> Result<TaskOutcome> {
     let phase = &decomposition.phases[task.phase];
     // As in `run_task`: `fetch` is in the read image's space, `read` in this
@@ -2078,7 +2377,25 @@ fn run_fragment_task(
     let read_bytes_per_voxel = decomposition.dtype_at(task.phase).size_of() as u64;
     let write_bytes_per_voxel = decomposition.dtype_at(task.phase + 1).size_of() as u64;
 
-    let pixels = if op.reads_pixels() {
+    use crate::fragment::BlockPreparation;
+    // Standalone/distributed execution uses exactly the same preparation path.
+    let local;
+    let prepared = if let Some(p) = prepared {
+        Some(p)
+    } else if op.prepares() {
+        local = prepare_fragment_task(task, decomposition, op, env, events, reduced)?;
+        Some(&local)
+    } else {
+        None
+    };
+    let completed = prepared.and_then(|p| match &p.decision {
+        BlockPreparation::Complete {
+            fragments,
+            constant,
+        } => Some((fragments, *constant)),
+        _ => None,
+    });
+    let pixels = if completed.is_none() && op.reads_pixels() {
         let started = Instant::now();
         let buf = env.read(task.phase, fetch)?;
         let read_ns = started.elapsed().as_nanos() as u64;
@@ -2116,30 +2433,43 @@ fn run_fragment_task(
     // image `p` and `source_inputs` is about every other image, so an op that
     // consults a stored array without wanting its own input pays for one array
     // rather than two.
-    let sources =
-        read_declared_source_images(phase, decomposition, env, events, task.index, fetch)?;
-    let borrowed: Vec<(usize, &BlockBuf)> =
-        sources.iter().map(|(image, buf)| (*image, buf)).collect();
-
-    let counts = phase.grid.blocks_per_axis();
-    let mut wanted = BTreeMap::new();
-    let mut gathered = BTreeMap::new();
-    for input in op.inputs() {
-        let blocks = neighbourhood(task.index, input.reach, counts);
-        if op.gathers() {
-            let mut found = Vec::with_capacity(blocks.len());
-            for &block in &blocks {
-                if let Some(bytes) = env.read_sidecar(&input.stream, input.phase, block)? {
-                    found.push((
-                        crate::sidecar::FragmentKey::new(&input.stream, input.phase, block),
-                        bytes,
-                    ));
-                }
-            }
-            gathered.insert(input.stream.clone(), found);
+    let windows = prepared.and_then(|p| match &p.decision {
+        BlockPreparation::ReadWindows(w) => Some(w.as_slice()),
+        _ => None,
+    });
+    let mut source_regions = Vec::new();
+    let sources = if completed.is_some() {
+        Vec::new()
+    } else if let Some(windows) = windows {
+        let mut sources = Vec::new();
+        for w in windows {
+            let started = Instant::now();
+            let buf = env.read(w.image, &w.region)?;
+            events.emit(Event::RegionRead {
+                source: format!("level {}", w.image),
+                image: w.image,
+                index: Some(task.index),
+                region: w.region.clone(),
+                voxels: w.region.voxels(),
+                bytes: w.region.voxels() as u64 * decomposition.dtype_at(w.image).size_of() as u64,
+                chunks: chunks_touched(&w.region, &env.chunk_shape()),
+                duration_ns: started.elapsed().as_nanos() as u64,
+            });
+            sources.push((w.image, buf));
+            source_regions.push(w.region.clone());
         }
-        wanted.insert(input.stream.clone(), (input.phase, blocks));
-    }
+        sources
+    } else {
+        let sources =
+            read_declared_source_images(phase, decomposition, env, events, task.index, fetch)?;
+        source_regions.resize(sources.len(), fetch.clone());
+        sources
+    };
+    let borrowed: Vec<(usize, &BlockBuf)> = sources.iter().map(|(i, b)| (*i, b)).collect();
+    let (wanted, gathered) = match prepared {
+        Some(p) => (p.wanted.clone(), p.gathered.clone()),
+        None => gather_fragment_metadata(task, phase, op, env)?,
+    };
 
     // **`SeamFold::Unordered` is checked, not believed.** The claim is that this
     // block's output is a function of the *set* of fragments it was handed and
@@ -2157,7 +2487,8 @@ fn run_fragment_task(
     // `BlockView::stream_fragments` — that op pays a second pass of sidecar
     // reads, and the counters show it.
     let ordered: usize = wanted.values().map(|(_, blocks)| blocks.len()).sum();
-    let verify_order = op.seam_fold() == Some(SeamFold::Unordered) && ordered > 1;
+    let verify_order =
+        completed.is_none() && op.seam_fold() == Some(SeamFold::Unordered) && ordered > 1;
     let (reversed_wanted, reversed_gathered) = if verify_order {
         (
             wanted
@@ -2182,7 +2513,13 @@ fn run_fragment_task(
     };
 
     let at = Anchor::of_region(fetch, decomposition.volume_at(task.phase))?;
-    let produced = {
+    let compute_started = Instant::now();
+    let produced = if let Some((fragments, _)) = completed {
+        BlockOutput {
+            fragments: fragments.clone(),
+            pixels: None,
+        }
+    } else {
         let view = BlockView::new(
             task.phase,
             task.index,
@@ -2204,7 +2541,10 @@ fn run_fragment_task(
         env.counters()
             .fragment_applications
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        op.apply_with(&view, SourceBlocks::new(&borrowed))?
+        op.apply_with(
+            &view,
+            SourceBlocks::with_regions(&borrowed, &source_regions),
+        )?
     };
     if verify_order {
         let again = {
@@ -2229,7 +2569,10 @@ fn run_fragment_task(
             env.counters()
                 .fragment_applications
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            op.apply_with(&view, SourceBlocks::new(&borrowed))?
+            op.apply_with(
+                &view,
+                SourceBlocks::with_regions(&borrowed, &source_regions),
+            )?
         };
         let disagreement =
             order_disagreement(&produced, &again, &task.geometry.valid_within_read());
@@ -2268,6 +2611,13 @@ fn run_fragment_task(
                 task.phase
             )));
         }
+    }
+    if completed.is_none() {
+        events.emit(Event::FragmentApplied {
+            phase: task.phase,
+            index: task.index,
+            duration_ns: compute_started.elapsed().as_nanos() as u64,
+        });
     }
     for (_, stored) in &sources {
         env.release(stored);
@@ -2318,6 +2668,18 @@ fn run_fragment_task(
             }
         }
         env.write_sidecar(stream, task.phase, task.index, bytes)?;
+    }
+
+    if let Some((_, constant)) = completed {
+        if let Some(value) = constant {
+            return write_uniform_block(task, decomposition, env, events, n_phases, read, value);
+        }
+        return Ok(TaskOutcome {
+            valid: task.geometry.valid.clone(),
+            short_circuited: true,
+            side_written: Vec::new(),
+            listener_faults: 0,
+        });
     }
 
     if op.writes_pixels() {
@@ -3429,15 +3791,12 @@ pub fn price_under_budget(
         if halo_voxels <= 0.0 || n <= 1 {
             continue;
         }
-        let reread_bytes =
-            halo_voxels * n as f64 * decomposition.dtype_at(index).size_of() as f64;
+        let reread_bytes = halo_voxels * n as f64 * decomposition.dtype_at(index).size_of() as f64;
         let room = budget_bytes.saturating_sub(set.bytes()) as f64;
         let missed = (1.0 - room / reread_bytes).clamp(0.0, 1.0);
         if missed > 0.0 {
-            makespan += missed
-                * halo_voxels
-                * model.read_cost_per_voxel
-                * rounds(n, set.in_flight) as f64;
+            makespan +=
+                missed * halo_voxels * model.read_cost_per_voxel * rounds(n, set.in_flight) as f64;
         }
     }
     Ok((makespan, active))
@@ -3489,10 +3848,11 @@ pub fn choose_grid<T>(
             break;
         }
         let priced = build(grid.clone()).and_then(|(assembly, built)| {
-            let needed = expected_bytes_per_block(&assembly.workflow.chain, &assembly.decomposition)
-                .into_iter()
-                .max()
-                .unwrap_or(0);
+            let needed =
+                expected_bytes_per_block(&assembly.workflow.chain, &assembly.decomposition)
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0);
             least_needed = Some(least_needed.map_or(needed, |least| least.min(needed)));
             let (makespan, active) = price_under_budget(
                 &assembly.workflow.chain,

@@ -27,7 +27,7 @@ use blockflow::intensity_pyramid::{
 
 const USAGE: &str = "usage: blockflow-pyramid <image.zarr> [--method mean|max] [--target-size 256] \
 [--max-levels N] [--chunk z,y,x] [--shard z,y,x|none] [--compression level0|none|gzipN|zstdN|blosc-zstd5] \
-[--workers N] [--memory-gb G] [--no-translation] [--output DIR] [--overwrite] [--dry-run] [--json-progress]";
+[--workers N] [--memory-gb G] [--no-translation] [--output DIR] [--overwrite] [--dry-run] [--json-progress]\n\n--no-translation preserves legacy scale-only placement despite pooling; it does not select first-sample decimation.";
 
 fn main() -> ExitCode {
     match run() {

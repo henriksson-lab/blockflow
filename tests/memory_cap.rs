@@ -62,7 +62,11 @@ fn with_room_to_spare_every_phase_runs_a_full_wave_and_the_choice_does_not_move(
     let vast = choose(8, u64::MAX / 4).unwrap();
     assert_eq!(roomy.grid.block(), vast.grid.block());
     assert_eq!(roomy.makespan.to_bits(), vast.makespan.to_bits());
-    for (set, phase) in roomy.active.iter().zip(&roomy.assembly.decomposition.phases) {
+    for (set, phase) in roomy
+        .active
+        .iter()
+        .zip(&roomy.assembly.decomposition.phases)
+    {
         assert_eq!(set.in_flight, 8.min(phase.grid.n_blocks()));
     }
 }
@@ -145,8 +149,8 @@ fn input() -> Voxels {
 
 fn run(memory: Option<MemoryBudget>) -> (Voxels, usize) {
     let (assembly, ()) = plane_blur(BlockGrid::new(VOLUME, [8, 256, 256]).unwrap()).unwrap();
-    let env = ArrayEnvironment::for_decomposition(input(), &assembly.decomposition, [8, 64, 64])
-        .unwrap();
+    let env =
+        ArrayEnvironment::for_decomposition(input(), &assembly.decomposition, [8, 64, 64]).unwrap();
     let counting = Arc::new(InFlight::default());
     let listeners: Vec<Arc<dyn EventListener>> = vec![counting.clone()];
     execute_phases(
@@ -182,5 +186,8 @@ fn the_executor_admits_only_the_blocks_that_fit_and_writes_the_same_voxels() {
     let (tight, tight_most) = run(Some(MemoryBudget::new(charge * 2 + charge / 2)));
     assert!((1..=2).contains(&tight_most), "{tight_most} in flight");
     assert!(free == roomy, "admission with room to spare moved a voxel");
-    assert!(free == tight, "admission under a tight budget moved a voxel");
+    assert!(
+        free == tight,
+        "admission under a tight budget moved a voxel"
+    );
 }

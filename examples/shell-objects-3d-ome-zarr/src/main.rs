@@ -34,9 +34,9 @@ use blockflow::ops::{
     append_block_mean_phases, append_response_peak_table_phases, decode_shapes, fit_shell,
     gaussian_smooth_into_with, multi_radius_ncc_chain, radial_profile, shape_label, Boundary,
     ColumnTest, Connectivity, FilterRowsOp, Gaussian, InteriorOp, InteriorParams, InteriorStreams,
-    NearbyShapesOp,     RadialTemplate, RadiusPair, RunLabelsOp, ShellFit, ShellFitOp, ShellFitParams, ShellJudge,
-    StarConvexLabelsOp, StarShape, SuppressRowsOp, Suppression, SuppressionRadius, BLOB_COLUMNS,
-    SUMMARY_COLUMNS,
+    NearbyShapesOp, RadialTemplate, RadiusPair, RunLabelsOp, ShellFit, ShellFitOp, ShellFitParams,
+    ShellJudge, StarConvexLabelsOp, StarShape, SuppressRowsOp, Suppression, SuppressionRadius,
+    BLOB_COLUMNS, SUMMARY_COLUMNS,
 };
 use blockflow::sidecar::Lifecycle;
 use blockflow::sphere::{fibonacci_sphere, RaySet};

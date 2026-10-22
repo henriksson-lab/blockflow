@@ -35,13 +35,16 @@
 //!
 //! # Coordinate transformations
 //!
-//! `scale` is multiplied by the factor. By default `translation` is also
-//! shifted by `(f - 1) / 2 * previous_scale`, because NGFF coordinates name
-//! voxel *centres* and the centre of a mean-pooled voxel is the centroid of its
-//! window. Without it a level is displaced by half a coarse voxel against level
-//! 0 in any viewer that honours translations. Set
-//! [`PyramidOptions::half_voxel_translation`] to `false` to write scale only
-//! (what ome-zarr-py's scaler and bioformats2raw do).
+//! `scale` is multiplied by the factor. Integer indices locate voxel centres.
+//! By default `translation` moves by `(f - 1) / 2 * previous_scale`, locating
+//! the centre of each nominal pooling window. This also applies to max pooling:
+//! the output represents the window, not the location of its winning sample.
+//! Clipped edge windows retain this regular lattice; their available samples'
+//! centroid can differ from the nominal centre.
+//! [`PyramidOptions::half_voxel_translation`] may be set to `false` for legacy
+//! scale-only compatibility. That opt-out does not change the pooling kernel
+//! and intentionally loses voxel-centre alignment across levels. It is not the
+//! convention for first-sample decimation, which is a different sampling method.
 //!
 //! # Memory and parallelism
 //!
@@ -113,7 +116,8 @@ pub struct PyramidOptions {
     pub workers: usize,
     /// Replace target directories that exist but are not listed levels.
     pub overwrite: bool,
-    /// Shift `translation` by half a voxel per level; see the module docs.
+    /// Locate nominal pooling-window centres (default). `false` preserves legacy
+    /// scale-only placement despite pooling; see the module docs.
     pub half_voxel_translation: bool,
     /// Bytes the build may hold in flight. `0` means
     /// [`crate::budget::default_budget_bytes`].
@@ -467,7 +471,15 @@ pub fn plan_pyramid(image: &Path, options: &PyramidOptions) -> Result<PyramidPla
                 .clone()
                 .unwrap_or_else(|| vec![0.0; shape.len()]);
             let shifted: Vec<f64> = (0..shape.len())
-                .map(|axis| base[axis] + (factor[axis] as f64 - 1.0) / 2.0 * previous.scale[axis])
+                .map(|axis| {
+                    crate::pyramid_geometry::pyramid_axis_transform(
+                        base[axis],
+                        previous.scale[axis],
+                        factor[axis],
+                        crate::pyramid_geometry::PyramidSampling::WindowCentre,
+                    )
+                    .1
+                })
                 .collect();
             (previous.translation.is_some() || shifted.iter().any(|&v| v != 0.0)).then_some(shifted)
         } else {

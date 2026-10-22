@@ -1614,7 +1614,9 @@ pub struct PyramidSpec {
 /// centre of voxel 0, both in `unit`. A coarser level's voxel is the block mean
 /// of `factor` level-0 voxels, so its scale is `factor * voxel_size` and its
 /// first voxel's centre sits half a block in, at
-/// `origin + (factor - 1) / 2 * voxel_size`.
+/// `origin + (factor - 1) / 2 * voxel_size`. Boolean pyramids select the first
+/// sample instead and retain `origin`. Without a physical frame, the same
+/// rules apply with unit pitch and a zero level-zero origin.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalFrame {
     pub voxel_size: [f64; 3],
@@ -1887,7 +1889,7 @@ impl ZarrEnvironment {
             levels.push(AttachedImage::at(root.join((index + 1).to_string())));
         }
 
-        write_multiscales_metadata(&root, &scales, spec.physical())?;
+        write_multiscales_metadata(&root, &scales, spec.physical(), input.dtype())?;
         MultiscaleImage::new(levels, scales)
     }
 
@@ -2925,28 +2927,37 @@ fn write_multiscales_metadata(
     root: &Path,
     scales: &[[usize; 3]],
     physical: Option<&PhysicalFrame>,
+    dtype: Dtype,
 ) -> Result<()> {
+    use crate::pyramid_geometry::{pyramid_axis_transform, PyramidSampling};
+    let sampling = if dtype == Dtype::Bool {
+        PyramidSampling::FirstSample
+    } else {
+        PyramidSampling::WindowCentre
+    };
     let datasets = scales
         .iter()
         .enumerate()
         .map(|(index, scale)| {
             // `scale` is per axis in the arrays' own `[z, y, x]` order, the
             // order the axes below are listed in.
-            let transformations = match physical {
-                None => serde_json::json!([{"type": "scale", "scale": scale}]),
-                Some(frame) => {
-                    let size: [f64; 3] =
-                        std::array::from_fn(|axis| scale[axis] as f64 * frame.voxel_size[axis]);
-                    let at: [f64; 3] = std::array::from_fn(|axis| {
-                        frame.origin[axis]
-                            + (scale[axis] as f64 - 1.0) / 2.0 * frame.voxel_size[axis]
-                    });
-                    serde_json::json!([
-                        {"type": "scale", "scale": size},
-                        {"type": "translation", "translation": at}
-                    ])
-                }
+            let coordinates: [(f64, f64); 3] = std::array::from_fn(|axis| {
+                let pitch = physical.map_or(1.0, |frame| frame.voxel_size[axis]);
+                let origin = physical.map_or(0.0, |frame| frame.origin[axis]);
+                pyramid_axis_transform(origin, pitch, scale[axis], sampling)
+            });
+            let size = coordinates.map(|(pitch, _)| pitch);
+            let at = coordinates.map(|(_, origin)| origin);
+            // Keep integral voxel-unit scales for backwards-compatible metadata.
+            let size = if physical.is_some() {
+                serde_json::json!(size)
+            } else {
+                serde_json::json!(scale)
             };
+            let mut transformations = vec![serde_json::json!({"type": "scale", "scale": size})];
+            if physical.is_some() || at.iter().any(|&value| value != 0.0) {
+                transformations.push(serde_json::json!({"type": "translation", "translation": at}));
+            }
             serde_json::json!({
                 "path": index.to_string(),
                 "coordinateTransformations": transformations
@@ -2954,7 +2965,7 @@ fn write_multiscales_metadata(
         })
         .collect::<Vec<_>>();
     let axis = |name: &str| match physical {
-        None => serde_json::json!({"name": name, "type": "space", "unit": "voxel"}),
+        None => serde_json::json!({"name": name, "type": "space"}),
         Some(PhysicalFrame {
             unit: Some(unit), ..
         }) => serde_json::json!({"name": name, "type": "space", "unit": unit}),
@@ -3586,6 +3597,39 @@ impl Environment for ZarrEnvironment {
         // is the cost the lookahead bounds.
         let plan = BlockPlan::in_order(*id, regions.iter().cloned()).head(self.lookahead);
         prefetcher.submit(&plan);
+        Ok(())
+    }
+
+    fn prefetch_prepared(&self, image: usize, regions: &[(u32, Region)]) -> Result<()> {
+        let Some(prefetcher) = self.prefetcher.as_ref() else {
+            return Ok(());
+        };
+        if regions.is_empty() || !self.cacheable(image) {
+            return Ok(());
+        }
+        let array = self.image_array(image)?;
+        // Registers on first call, and the returned handle is discarded: what
+        // is wanted from it here is the side effect of registration, so that
+        // `ArrayId` below resolves.
+        by_dtype!(array.dtype, |Element| {
+            let _ = self.caching_source::<Element>(image, &array);
+            Ok::<(), Error>(())
+        })?;
+        let registered = self
+            .cached
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some((id, _)) = registered.get(&image) else {
+            // Registration declined — a duplicate name from a racing thread, or
+            // a dtype the cache cannot hold. A demand read still serves it.
+            return Ok(());
+        };
+        let requests: Vec<crate::prefetch::RegionRequest> = regions
+            .iter()
+            .take(self.lookahead)
+            .map(|(rank, region)| crate::prefetch::RegionRequest::new(*id, region.clone(), *rank))
+            .collect();
+        prefetcher.submit(&requests);
         Ok(())
     }
 

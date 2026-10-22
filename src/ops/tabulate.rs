@@ -1351,6 +1351,7 @@ pub fn decode_partial(bytes: &[u8]) -> Result<Vec<Tally>> {
 /// against its fragment reach: a partial is a function of its own block, and the
 /// fold across the seam belongs to [`MergeTabulationOp`].
 pub struct TabulateValuesOp {
+    activity: Option<(String, usize)>,
     name: &'static str,
     /// Label operand identity plus optional supplied-input dtype.
     ///
@@ -1417,6 +1418,7 @@ impl TabulateValuesOp {
             )));
         }
         Ok(Self {
+            activity: None,
             name,
             labels,
             values,
@@ -1424,6 +1426,13 @@ impl TabulateValuesOp {
             stream: stream.into(),
             lifecycle,
         })
+    }
+
+    /// Reuse an ActivityOp over the same label image and block grid in this run.
+    /// The normal fragment DAG makes the summary durable before preparation.
+    pub fn with_activity(mut self, stream: impl Into<String>, phase: usize) -> Self {
+        self.activity = Some((stream.into(), phase));
+        self
     }
 
     /// The same op, with the element types of its two operands said out loud.
@@ -1928,6 +1937,39 @@ impl FragmentOp for TabulateValuesOp {
                 // One row per object, and a block finds no more objects than it read voxels.
                 .sized(SidecarSize::row_table(&tabulation_schema(self.fixed), 1)),
         ]
+    }
+
+    fn inputs(&self) -> Vec<crate::fragment::FragmentInput> {
+        self.activity
+            .as_ref()
+            .map(|(stream, phase)| crate::fragment::FragmentInput::own(stream, *phase))
+            .into_iter()
+            .collect()
+    }
+    fn prepares(&self) -> bool {
+        true
+    }
+    fn prepare(
+        &self,
+        at: &crate::fragment::PreparationView<'_>,
+    ) -> Result<crate::fragment::BlockPreparation> {
+        use crate::fragment::BlockPreparation;
+        let inactive = at.known_uniform(self.labels.image_index(), at.core) == Some(0.0)
+            || self
+                .activity
+                .as_ref()
+                .map(|(stream, _)| at.own(stream).map(crate::ops::activity::decode).transpose())
+                .transpose()?
+                .flatten()
+                == Some(false);
+        Ok(if inactive {
+            BlockPreparation::Complete {
+                fragments: vec![(self.stream.clone(), encode_partial(&BTreeMap::new()))],
+                constant: None,
+            }
+        } else {
+            BlockPreparation::Run
+        })
     }
 
     fn apply(&self, _at: &BlockView<'_>) -> Result<BlockOutput> {

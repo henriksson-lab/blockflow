@@ -1045,6 +1045,41 @@ impl RunLabelsOp {
     }
 }
 
+/// Metadata selector shared by painters of run-encoded image outputs.
+pub fn prepare_run_paint(
+    at: &crate::fragment::PreparationView<'_>,
+    stream: &str,
+    max_extent: f64,
+) -> Result<crate::fragment::BlockPreparation> {
+    use crate::fragment::BlockPreparation;
+    if !at.complete(stream) {
+        return Ok(BlockPreparation::Run);
+    }
+    // Check neighbours as well as the owner: a run can enter this core from
+    // a different block. Keep the dense path's extent validation in force.
+    if max_extent > at.core.shape.iter().copied().min().unwrap_or(0) as f64 {
+        return Ok(BlockPreparation::Run);
+    }
+    for (_, bytes) in at.fragments(stream) {
+        for r in decode_runs(bytes)? {
+            let [z, y, x] = r.at;
+            if z >= at.core.start[0]
+                && z < at.core.start[0] + at.core.shape[0]
+                && y >= at.core.start[1]
+                && y < at.core.start[1] + at.core.shape[1]
+                && x < at.core.start[2] + at.core.shape[2]
+                && x + r.len > at.core.start[2]
+            {
+                return Ok(BlockPreparation::Run);
+            }
+        }
+    }
+    Ok(BlockPreparation::Complete {
+        fragments: Vec::new(),
+        constant: Some(0.0),
+    })
+}
+
 impl FragmentOp for RunLabelsOp {
     fn name(&self) -> &'static str {
         self.name
@@ -1077,6 +1112,17 @@ impl FragmentOp for RunLabelsOp {
 
     fn seam_fold(&self) -> Option<SeamFold> {
         Some(SeamFold::Unordered)
+    }
+
+    fn prepares(&self) -> bool {
+        true
+    }
+
+    fn prepare(
+        &self,
+        at: &crate::fragment::PreparationView<'_>,
+    ) -> Result<crate::fragment::BlockPreparation> {
+        prepare_run_paint(at, &self.runs.0, self.max_extent)
     }
 
     fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {

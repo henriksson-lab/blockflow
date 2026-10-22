@@ -239,6 +239,44 @@ pub fn write_label_metadata(root: &Path, levels: &[OmeVolumeLevel], source: &str
 /// Return the image group for either a direct multiscale image or the first
 /// series in the transitional OME-Zarr image-collection layout
 /// (`OME/zarr.json`).
+pub fn resolve_ome_image_group(container: impl AsRef<Path>) -> Result<PathBuf> {
+    let container = container.as_ref();
+    if container.join("zarr.json").is_file() {
+        return locate_image_group(container).map(|(root, _)| root);
+    }
+    let metadata = read_json(&container.join(".zattrs"))?;
+    if multiscale(&metadata).is_some() {
+        return Ok(container.to_owned());
+    }
+    let ome_path = container.join("OME").join(".zattrs");
+    let ome = read_json(&ome_path).map_err(|_| {
+        Error::invalid(format!(
+            "{} has no OME multiscales entry and {} is unavailable",
+            container.display(),
+            ome_path.display()
+        ))
+    })?;
+    let series = ome
+        .pointer("/ome/series")
+        .or_else(|| ome.get("series"))
+        .and_then(Value::as_array)
+        .and_then(|series| series.first())
+        .and_then(|series| {
+            series
+                .as_str()
+                .or_else(|| series.get("path").and_then(Value::as_str))
+        })
+        .ok_or_else(|| Error::invalid("OME metadata has no image series"))?;
+    let image_root = container.join(series);
+    let image_metadata = read_json(&image_root.join(".zattrs"))?;
+    if multiscale(&image_metadata).is_none() {
+        return Err(Error::invalid(format!(
+            "OME series {series} has no multiscales entry"
+        )));
+    }
+    Ok(image_root)
+}
+
 pub(crate) fn locate_image_group(container: &Path) -> Result<(PathBuf, Value)> {
     let metadata = read_json(&container.join("zarr.json"))?;
     if multiscale(&metadata).is_some() {
@@ -443,6 +481,8 @@ fn multiscale(metadata: &Value) -> Option<&Value> {
     metadata
         .pointer("/attributes/ome/multiscales/0")
         .or_else(|| metadata.pointer("/attributes/multiscales/0"))
+        .or_else(|| metadata.pointer("/ome/multiscales/0"))
+        .or_else(|| metadata.pointer("/multiscales/0"))
 }
 
 fn fixed_indices(
@@ -542,6 +582,47 @@ mod publish_tests {
             .unwrap();
         a.store_metadata().unwrap();
         a
+    }
+
+    #[test]
+    fn image_group_resolution_does_not_require_a_z_axis() {
+        let root = TestRoot(
+            std::env::temp_dir().join(format!("blockflow-resolve-2d-{}", std::process::id())),
+        );
+        let image = root.0.join("image.ome.zarr");
+        fs::create_dir_all(&image).unwrap();
+        fs::write(
+            image.join("zarr.json"),
+            serde_json::to_vec(&json!({
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": {"ome": {"multiscales": [{
+                    "axes": [{"name":"y","type":"space"},{"name":"x","type":"space"}],
+                    "datasets": [{"path":"0"}]
+                }]}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolve_ome_image_group(&image).unwrap(), image);
+        assert!(OmeVolumePyramid::open(&image, 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("no z axis"));
+        let image_v2 = root.0.join("image-v2.ome.zarr");
+        fs::create_dir_all(&image_v2).unwrap();
+        fs::write(
+            image_v2.join(".zattrs"),
+            serde_json::to_vec(&json!({
+                "multiscales": [{
+                    "axes": [{"name":"y","type":"space"},{"name":"x","type":"space"}],
+                    "datasets": [{"path":"0"}]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolve_ome_image_group(&image_v2).unwrap(), image_v2);
     }
 
     #[test]

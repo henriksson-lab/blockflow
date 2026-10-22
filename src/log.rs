@@ -63,6 +63,21 @@ use crate::region::Region;
 /// rate stays bounded by the task count.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
+    /// Time spent applying a fragment op, including unordered-fold verification.
+    FragmentApplied {
+        phase: usize,
+        index: [usize; 3],
+        duration_ns: u64,
+    },
+    /// Metadata preparation before pixel I/O. Counts requested voxels, not cache misses.
+    TaskPrepared {
+        phase: usize,
+        index: [usize; 3],
+        skipped: bool,
+        default_voxels: u64,
+        read_voxels: u64,
+        duration_ns: u64,
+    },
     PhaseStarted {
         phase: usize,
     },
@@ -343,7 +358,37 @@ pub struct ExecutionLog {
     events: Mutex<Vec<Event>>,
 }
 
+/// Measured metadata preparation totals; voxels are requested, not physical I/O.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreparationStats {
+    pub tasks: u64,
+    pub completed: u64,
+    pub duration_ns: u64,
+    pub dense_read_voxels: u64,
+    pub requested_read_voxels: u64,
+}
 impl ExecutionLog {
+    pub fn preparation_stats(&self) -> PreparationStats {
+        let mut out = PreparationStats::default();
+        for event in self.events.lock_unpoisoned().iter() {
+            if let Event::TaskPrepared {
+                skipped,
+                default_voxels,
+                read_voxels,
+                duration_ns,
+                ..
+            } = event
+            {
+                out.tasks += 1;
+                out.completed += u64::from(*skipped);
+                out.duration_ns += duration_ns;
+                out.dense_read_voxels += default_voxels;
+                out.requested_read_voxels += read_voxels;
+            }
+        }
+        out
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

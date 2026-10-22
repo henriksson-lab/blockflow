@@ -224,6 +224,7 @@ pub mod probes;
 /// never change the result of a computation.
 pub mod progress;
 pub mod pyramid;
+pub mod pyramid_geometry;
 /// What an operation reads beyond what it writes, and in which coordinate
 /// space it is counted. See [`reach::Reach`].
 pub mod reach;
@@ -233,6 +234,7 @@ pub mod sam;
 /// Native SAM-family training policy over the faithful sam2-rs operation boundary.
 #[cfg(feature = "sam")]
 pub mod sam_training;
+pub mod sampling;
 /// **Cost scenarios**: a measured baseline and the plausible machines around
 /// it — slower disk, less memory, fewer cores — as files, so that a planner
 /// change can be held to more than the machine it was written on.

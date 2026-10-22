@@ -855,6 +855,13 @@ pub trait Environment: Sync {
         Ok(())
     }
 
+    /// Prefetch only reads licensed by ready-task preparation. Ranks are stable
+    /// task positions in the static plan, never reset at each scheduler wave.
+    /// Environments may decline; wrappers should forward to preserve lookahead.
+    fn prefetch_prepared(&self, _image: usize, _regions: &[(u32, Region)]) -> Result<()> {
+        Ok(())
+    }
+
     fn counters(&self) -> &EnvCounters;
 
     fn chunk_shape(&self) -> [usize; 3] {

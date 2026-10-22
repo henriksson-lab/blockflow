@@ -37,6 +37,7 @@ If an op you write needs the whole volume in memory, it will not scale; see
 | op traits | `src/op.rs` (`BlockOp`, `SourceInput`, `Combine`), `src/fragment.rs` (`FragmentOp`, `BlockView`, `BlockOutput`, `FragmentInput/Output`), `src/iterate.rs` |
 | plan assembly | `src/assemble.rs` (`PlanBuilder`, `Phase`, `ImageId`, `Chain`), `src/reach.rs` (`Reach`) |
 | running | `src/strategy.rs` (`execute_phases`, `Hints`), `src/zarr_env.rs` (`ZarrEnvironment`) |
+| arbitrary physical points and gradients | `src/sampling.rs`, [source and budget contracts](physical-point-sampling.md) |
 | OME-Zarr in/out | `src/ome_zarr.rs` (`OmeVolumePyramid`, `write_label_metadata`, `ensure_zarr_group`), `src/label_pyramid.rs`, `src/object_table.rs`, `crates/ngff-object-table` |
 | rows | `src/table.rs` (`Schema`, `Column`, `RowBuilder`, `Row`, `Table`), `src/ops/rows.rs` |
 | ops by topic | `src/ops/mod.rs` — its header table lists every module and what it makes expressible |
@@ -253,6 +254,17 @@ inside the plan with `ops::resample::{ResampleOp, resample_phase}`
 (`append_resample_phase` on a `PlanBuilder`; `append_block_mean_phases` for a
 box mean to a coarser grid).
 
+Pyramid coordinates use integer indices at voxel centres. Numeric
+`ZarrEnvironment::build_multiscale` and tile-stitching pyramids average complete
+windows and discard incomplete far-edge windows; their first sample is at
+`origin + (cumulative_factor - 1) * native_pitch / 2`, including when no physical
+frame was supplied (unit pitch, no physical unit attribute). Boolean pyramids select the first sample and
+retain the origin. `intensity_pyramid` retains partial edge windows and puts
+mean/max samples at nominal full-window centres on a regular lattice. Its
+`half_voxel_translation = false` option preserves legacy metadata placement;
+it does not switch to first-sample decimation. All three writers share
+`pyramid_geometry::pyramid_axis_transform` for the sample-position calculation.
+
 ### 4.8.1 Physical planar sampling
 
 `ops::plane_sample::{PhysicalGrid, PlaneGrid, PlaneSampleOp, append_plane_sample_phase}`
@@ -295,6 +307,13 @@ Both default `accepts` to `F64` only, like `BlockOp`.
 
 What the framework already skips, and what an op has to skip itself. Measured
 on `examples/shell-objects-3d-ome-zarr` (SHELL_OBJECTS_3D_PLAN.md, "Speed").
+
+**Metadata-first tasks.** `FragmentOp::prepares` and `prepare` can complete
+an empty task before pixel reads and admission, or request bounded source windows.
+`PreparationView` has typed row and neighbourhood selectors; `ActivityOp` supplies
+per-run mask occupancy for reuse by measurements. Completed tasks still emit
+valid fragments and constant pixels. See [TASK_PREPARATION.md](TASK_PREPARATION.md)
+for contracts, metrics, dense-reference validation and limitations.
 
 **Free, if declared:**
 

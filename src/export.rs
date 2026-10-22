@@ -198,6 +198,32 @@ pub fn event_json(event: &Event) -> Value {
             map.insert("type".to_string(), json!("phase_started"));
             map.insert("phase".to_string(), json!(phase));
         }
+        Event::FragmentApplied {
+            phase,
+            index,
+            duration_ns,
+        } => {
+            map.insert("type".into(), json!("fragment_applied"));
+            map.insert("phase".into(), json!(phase));
+            map.insert("index".into(), json!(index));
+            map.insert("duration_ns".into(), json!(duration_ns));
+        }
+        Event::TaskPrepared {
+            phase,
+            index,
+            skipped,
+            default_voxels,
+            read_voxels,
+            duration_ns,
+        } => {
+            map.insert("type".into(), json!("task_prepared"));
+            map.insert("phase".into(), json!(phase));
+            map.insert("index".into(), json!(index));
+            map.insert("skipped".into(), json!(skipped));
+            map.insert("default_voxels".into(), json!(default_voxels));
+            map.insert("read_voxels".into(), json!(read_voxels));
+            map.insert("duration_ns".into(), json!(duration_ns));
+        }
         Event::TaskAdmitted { phase, index } => {
             map.insert("type".to_string(), json!("task_admitted"));
             map.insert("phase".to_string(), json!(phase));
@@ -655,6 +681,19 @@ pub fn event_from_json(object: &Value, at: usize) -> Result<Option<Event>> {
     Ok(Some(match kind.as_str() {
         "phase_started" => Event::PhaseStarted {
             phase: usize_at(object, "phase", at)?,
+        },
+        "fragment_applied" => Event::FragmentApplied {
+            phase: usize_at(object, "phase", at)?,
+            index: triple_at(object, "index", at)?,
+            duration_ns: u64_at(object, "duration_ns", at)?,
+        },
+        "task_prepared" => Event::TaskPrepared {
+            phase: usize_at(object, "phase", at)?,
+            index: triple_at(object, "index", at)?,
+            skipped: bool_at(object, "skipped", at)?,
+            default_voxels: u64_at(object, "default_voxels", at)?,
+            read_voxels: u64_at(object, "read_voxels", at)?,
+            duration_ns: u64_at(object, "duration_ns", at)?,
         },
         "task_admitted" => Event::TaskAdmitted {
             phase: usize_at(object, "phase", at)?,

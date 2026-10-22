@@ -326,7 +326,7 @@ impl<T: PyramidElement> PyramidWriter<T> {
                 )));
             }
         }
-        write_multiscales_metadata(&self.root, &self.scales, self.physical.as_ref())
+        write_multiscales_metadata(&self.root, &self.scales, self.physical.as_ref(), T::DTYPE)
     }
 }
 
@@ -431,26 +431,35 @@ fn write_multiscales_metadata(
     root: &Path,
     scales: &[[usize; 3]],
     physical: Option<&PhysicalFrame>,
+    dtype: Dtype,
 ) -> Result<()> {
+    use blockflow::pyramid_geometry::{pyramid_axis_transform, PyramidSampling};
+    let sampling = if dtype == Dtype::Bool {
+        PyramidSampling::FirstSample
+    } else {
+        PyramidSampling::WindowCentre
+    };
     let datasets = scales
         .iter()
         .enumerate()
         .map(|(index, scale)| {
-            let transformations = match physical {
-                None => serde_json::json!([{"type": "scale", "scale": scale}]),
-                Some(frame) => {
-                    let size: [f64; 3] =
-                        std::array::from_fn(|axis| scale[axis] as f64 * frame.voxel_size[axis]);
-                    let at: [f64; 3] = std::array::from_fn(|axis| {
-                        frame.origin[axis]
-                            + (scale[axis] as f64 - 1.0) / 2.0 * frame.voxel_size[axis]
-                    });
-                    serde_json::json!([
-                        {"type": "scale", "scale": size},
-                        {"type": "translation", "translation": at}
-                    ])
-                }
+            let coordinates: [(f64, f64); 3] = std::array::from_fn(|axis| {
+                let pitch = physical.map_or(1.0, |frame| frame.voxel_size[axis]);
+                let origin = physical.map_or(0.0, |frame| frame.origin[axis]);
+                pyramid_axis_transform(origin, pitch, scale[axis], sampling)
+            });
+            let size = coordinates.map(|(pitch, _)| pitch);
+            let at = coordinates.map(|(_, origin)| origin);
+            // Keep integral voxel-unit scales for backwards-compatible metadata.
+            let size = if physical.is_some() {
+                serde_json::json!(size)
+            } else {
+                serde_json::json!(scale)
             };
+            let mut transformations = vec![serde_json::json!({"type": "scale", "scale": size})];
+            if physical.is_some() || at.iter().any(|&value| value != 0.0) {
+                transformations.push(serde_json::json!({"type": "translation", "translation": at}));
+            }
             serde_json::json!({
                 "path": index.to_string(),
                 "coordinateTransformations": transformations
@@ -458,7 +467,7 @@ fn write_multiscales_metadata(
         })
         .collect::<Vec<_>>();
     let axis = |name: &str| match physical {
-        None => serde_json::json!({"name": name, "type": "space", "unit": "voxel"}),
+        None => serde_json::json!({"name": name, "type": "space"}),
         Some(PhysicalFrame {
             unit: Some(unit), ..
         }) => serde_json::json!({"name": name, "type": "space", "unit": unit}),
